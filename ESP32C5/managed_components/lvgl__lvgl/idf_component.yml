@@ -1,0 +1,9 @@
+description: LVGL - Light and Versatile Graphics Library
+documentation: https://docs.lvgl.io/
+issues: https://github.com/lvgl/lvgl/issues
+repository: git://github.com/lvgl/lvgl.git
+repository_info:
+  commit_sha: 4495f428630cc1741bd8bfd977f080e8460e8e8d
+  path: .
+url: https://lvgl.io/
+version: 8.4.0

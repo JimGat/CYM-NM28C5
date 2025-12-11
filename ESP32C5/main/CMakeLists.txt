@@ -1,1 +1,1 @@
-idf_component_register(SRCS "attack_handshake.c" "ft6336.c" "lvgl_memory.c" "main.c" INCLUDE_DIRS . REQUIRES heap driver esp_event console PRIV_REQUIRES wifi_attacks wifi_cli wifi_scanner wifi_sniffer wifi_wardrive sniffer frame_analyzer hccapx_serializer pcap_serializer)
+idf_component_register(SRCS "attack_handshake.c" "ft6336.c" "lvgl_memory.c" "main.c" INCLUDE_DIRS . REQUIRES heap driver esp_event console bt PRIV_REQUIRES wifi_attacks wifi_cli wifi_scanner wifi_sniffer wifi_wardrive sniffer frame_analyzer hccapx_serializer pcap_serializer)

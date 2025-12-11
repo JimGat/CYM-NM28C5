@@ -1,0 +1,2 @@
+source /Users/janulrich/kod/dev/screens/pancake/ESP32C5/build/gdbinit/symbols
+source /Users/janulrich/kod/dev/screens/pancake/ESP32C5/build/gdbinit/connect

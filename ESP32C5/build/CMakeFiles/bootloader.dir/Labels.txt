@@ -1,0 +1,13 @@
+# Target labels
+ bootloader
+# Source files and their labels
+/Users/janulrich/kod/dev/screens/pancake/ESP32C5/build/CMakeFiles/bootloader
+/Users/janulrich/kod/dev/screens/pancake/ESP32C5/build/CMakeFiles/bootloader.rule
+/Users/janulrich/kod/dev/screens/pancake/ESP32C5/build/CMakeFiles/bootloader-complete.rule
+/Users/janulrich/kod/dev/screens/pancake/ESP32C5/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule
+/Users/janulrich/kod/dev/screens/pancake/ESP32C5/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule
+/Users/janulrich/kod/dev/screens/pancake/ESP32C5/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule
+/Users/janulrich/kod/dev/screens/pancake/ESP32C5/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule
+/Users/janulrich/kod/dev/screens/pancake/ESP32C5/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule
+/Users/janulrich/kod/dev/screens/pancake/ESP32C5/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule
+/Users/janulrich/kod/dev/screens/pancake/ESP32C5/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule

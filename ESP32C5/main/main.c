@@ -36,7 +36,64 @@
 // GPS
 #include "driver/uart.h"
 
+// NimBLE (BLE scanner)
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "host/ble_hs.h"
+
 #define TAG "WiFi_Hacker"
+
+// ============================================================================
+// Radio Mode Management (WiFi <-> BLE switching)
+// ============================================================================
+typedef enum {
+    RADIO_MODE_NONE,
+    RADIO_MODE_WIFI,
+    RADIO_MODE_BLE
+} radio_mode_t;
+
+static radio_mode_t current_radio_mode = RADIO_MODE_NONE;
+static bool wifi_initialized = false;
+
+// ============================================================================
+// BLE Scanner state (NimBLE)
+// ============================================================================
+
+// Apple Company ID (Little Endian)
+#define APPLE_COMPANY_ID        0x004C
+// Samsung Company ID (Little Endian)
+#define SAMSUNG_COMPANY_ID      0x0075
+// Apple Find My Network device type (AirTag, AirPods, etc.)
+#define APPLE_FIND_MY_TYPE      0x12
+
+// BLE scan state
+static volatile bool bt_scan_active = false;
+static TaskHandle_t bt_scan_task_handle = NULL;
+static volatile bool nimble_initialized = false;
+
+// BLE device tracking for deduplication
+#define BT_MAX_DEVICES 128
+static uint8_t bt_found_devices[BT_MAX_DEVICES][6];
+static int bt_found_device_count = 0;
+
+// AirTag/SmartTag counters
+static int bt_airtag_count = 0;
+static int bt_smarttag_count = 0;
+
+// Generic BT device storage for scan_bt command
+typedef struct {
+    uint8_t addr[6];
+    int8_t rssi;
+    char name[32];
+    uint16_t company_id;
+    bool is_airtag;
+    bool is_smarttag;
+} bt_device_info_t;
+
+static bt_device_info_t bt_devices[BT_MAX_DEVICES];
+static int bt_device_count = 0;
+
+// ============================================================================
 
 // Pin configuration
 #define LCD_MOSI 24
@@ -250,6 +307,15 @@ static lv_obj_t *portal_start_btn = NULL;
 static lv_obj_t *portal_keyboard = NULL;
 static char portal_ssid_buffer[33] = "Free WiFi";
 
+// BLE Scan UI state
+static lv_obj_t *ble_scan_content = NULL;
+static lv_obj_t *ble_scan_list = NULL;
+static lv_obj_t *ble_scan_status_label = NULL;
+static volatile bool ble_scan_ui_active = false;
+static volatile bool ble_scan_needs_ui_update = false;
+static volatile bool ble_scan_finished = false;
+static char ble_scan_status_text[48] = "";
+
 // Dual-band channel list (2.4GHz + 5GHz)
 static const int dual_band_channels[] = {
     // 2.4GHz channels
@@ -343,6 +409,34 @@ static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode);
 static bool wait_for_gps_fix(int timeout_seconds);
 void load_whitelist_from_sd(void);
 bool is_bssid_whitelisted(const uint8_t *bssid);
+
+// Radio mode switching (WiFi <-> BLE)
+static bool ensure_wifi_mode(void);
+static bool ensure_ble_mode(void);
+
+// NimBLE BLE scanner functions
+static esp_err_t bt_nimble_init(void);
+static void bt_nimble_deinit(void);
+static void bt_scan_stop(void);
+static void bt_scan_task(void *pvParameters);
+static int bt_gap_event_callback(struct ble_gap_event *event, void *arg);
+static void bt_on_sync(void);
+static void bt_on_reset(int reason);
+static void nimble_host_task(void *param);
+static int bt_start_scan(void);
+static void bt_stop_scan(void);
+static bool bt_is_device_found(const uint8_t *addr);
+static int bt_find_device_index(const uint8_t *addr);
+static void bt_add_found_device(const uint8_t *addr);
+static void bt_reset_counters(void);
+static void bt_format_addr(const uint8_t *addr, char *str);
+static bool bt_is_apple_airtag(const uint8_t *data, uint8_t len, bool has_name);
+static bool bt_is_samsung_smarttag(const uint8_t *data, uint8_t len);
+
+// BLE Scan UI
+static void ble_scan_back_btn_cb(lv_event_t *e);
+static void ble_scan_update_list(void);
+
 static void wifi_scan_done_cb(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE) {
@@ -1316,6 +1410,9 @@ void app_main(void)
         ESP_LOGE(TAG, "WiFi CLI init failed: %s", esp_err_to_name(ret));
     } else {
         ESP_LOGI(TAG, "WiFi CLI system initialized");
+        // Set radio mode to WiFi after successful init
+        current_radio_mode = RADIO_MODE_WIFI;
+        wifi_initialized = true;
         // Start console in background (optional)
         // wifi_cli_start_console();
     }
@@ -1474,6 +1571,7 @@ void app_main(void)
     item = create_clickable_item(sniffer_page, LV_SYMBOL_EYE_OPEN, "Sniffer", attack_event_cb, "Sniffer");
     item = create_clickable_item(sniffer_page, LV_SYMBOL_LIST, "Browse Clients", attack_event_cb, "Browse Clients");
     item = create_clickable_item(sniffer_page, LV_SYMBOL_CALL, "Show Probes", attack_event_cb, "Show Probes");
+    item = create_clickable_item(sniffer_page, LV_SYMBOL_BLUETOOTH, "BLE Scan", attack_event_cb, "BLE Scan");
     
     // Create Wardrive sub-page
     lv_obj_t *wardrive_page = lv_menu_page_create(menu_obj, NULL);
@@ -1998,6 +2096,19 @@ void app_main(void)
                     lv_obj_t *label = lv_obj_get_child(deauth_pause_btn, 0);
                     if (label) lv_label_set_text(label, "Pause");
                 }
+            }
+
+            // BLE Scan UI update (thread-safe - only update from LVGL task)
+            if (ble_scan_needs_ui_update && ble_scan_ui_active) {
+                ble_scan_needs_ui_update = false;
+                
+                // Update status label
+                if (ble_scan_status_label) {
+                    lv_label_set_text(ble_scan_status_label, ble_scan_status_text);
+                }
+                
+                // Update device list
+                ble_scan_update_list();
             }
 
             sleep_ms = lv_timer_handler();
@@ -4223,6 +4334,12 @@ void attack_event_cb(lv_event_t *e)
     if (!attack_name) return;
 
     if (strcmp(attack_name, "Scan") == 0) {
+        // Ensure WiFi mode is active (switch from BLE if needed)
+        if (!ensure_wifi_mode()) {
+            ESP_LOGE(TAG, "Failed to switch to WiFi mode for scan");
+            return;
+        }
+        
         // Open scan page (clear previous content) - use base only to avoid default center label
         create_function_page_base("Scan");
 
@@ -4252,6 +4369,12 @@ void attack_event_cb(lv_event_t *e)
     }
 
     if (strcmp(attack_name, "Deauther") == 0) {
+        // Ensure WiFi mode is active (switch from BLE if needed)
+        if (!ensure_wifi_mode()) {
+            ESP_LOGE(TAG, "Failed to switch to WiFi mode for deauth");
+            return;
+        }
+        
         // Open Deauther page
         show_function_page("Deauther");
 
@@ -4934,6 +5057,76 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
 
+    if (strcmp(attack_name, "BLE Scan") == 0) {
+        // BLE Scanner - switch from WiFi to BLE mode and scan
+        ui_locked = true;
+        if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+        
+        // Create base page
+        create_function_page_base("BLE Scan");
+        ble_scan_ui_active = true;
+        
+        // Status label at top (below title bar which is 30px)
+        ble_scan_status_label = lv_label_create(function_page);
+        lv_label_set_text(ble_scan_status_label, "Initializing BLE...");
+        lv_obj_set_style_text_color(ble_scan_status_label, lv_color_make(0, 255, 0), 0);
+        lv_obj_set_style_text_font(ble_scan_status_label, &lv_font_montserrat_14, 0);
+        lv_obj_align(ble_scan_status_label, LV_ALIGN_TOP_LEFT, 5, 0);
+        
+        // Scrollable list for devices (starts below status label)
+        ble_scan_list = lv_obj_create(function_page);
+        lv_obj_set_size(ble_scan_list, lv_pct(100), LCD_V_RES - 30 - 50 - 20);  // Leave space for title, status and back button
+        lv_obj_align(ble_scan_list, LV_ALIGN_TOP_MID, 0, 20);
+        lv_obj_set_style_bg_color(ble_scan_list, lv_color_make(0, 0, 0), 0);
+        lv_obj_set_style_border_color(ble_scan_list, lv_color_make(0, 100, 0), 0);
+        lv_obj_set_style_border_width(ble_scan_list, 1, 0);
+        lv_obj_set_flex_flow(ble_scan_list, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_all(ble_scan_list, 4, 0);
+        lv_obj_set_scrollbar_mode(ble_scan_list, LV_SCROLLBAR_MODE_AUTO);
+        
+        // Back button
+        lv_obj_t *back_btn = lv_btn_create(function_page);
+        lv_obj_set_size(back_btn, lv_pct(100), 45);
+        lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
+        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(back_btn, lv_color_make(0, 255, 0), 0);
+        lv_obj_set_style_border_width(back_btn, 3, 0);
+        lv_obj_t *back_lbl = lv_label_create(back_btn);
+        lv_label_set_text(back_lbl, "Back");
+        lv_obj_set_style_text_color(back_lbl, lv_color_make(0, 255, 0), 0);
+        lv_obj_center(back_lbl);
+        lv_obj_add_event_cb(back_btn, ble_scan_back_btn_cb, LV_EVENT_CLICKED, NULL);
+        
+        // Switch to BLE mode
+        if (!ensure_ble_mode()) {
+            lv_label_set_text(ble_scan_status_label, "BLE init failed!");
+            ui_locked = false;
+            return;
+        }
+        
+        // Start BLE scan task
+        bt_scan_active = true;
+        BaseType_t task_ret = xTaskCreate(
+            bt_scan_task,
+            "bt_scan_task",
+            4096,
+            NULL,
+            5,
+            &bt_scan_task_handle
+        );
+        
+        if (task_ret != pdPASS) {
+            bt_scan_active = false;
+            lv_label_set_text(ble_scan_status_label, "Failed to start scan task!");
+        } else {
+            lv_label_set_text(ble_scan_status_label, "Scanning... 0 devices (10s)");
+        }
+        
+        ui_locked = false;
+        return;
+    }
+
     // Default: open function page
     show_function_page(attack_name);
 }
@@ -5172,4 +5365,549 @@ static void evil_twin_start_btn_cb(lv_event_t *e)
     if (touch_dot) {
         lv_obj_add_flag(touch_dot, LV_OBJ_FLAG_HIDDEN);
     }
+}
+
+// ============================================================================
+// Radio Mode Switching (WiFi <-> BLE)
+// ============================================================================
+
+/**
+ * Ensure WiFi mode is active. If BLE is active, deinits BLE first.
+ * Returns true if WiFi is ready to use.
+ */
+static bool ensure_wifi_mode(void)
+{
+    switch (current_radio_mode) {
+        case RADIO_MODE_WIFI:
+            // Already in WiFi mode
+            return true;
+            
+        case RADIO_MODE_NONE:
+            // Initialize WiFi
+            ESP_LOGI(TAG, "Initializing WiFi...");
+            esp_err_t ret = wifi_cli_init();
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "WiFi init failed: %d", ret);
+                return false;
+            }
+            
+            // Set WiFi country for extended channels
+            wifi_country_t wifi_country = {
+                .cc = "PH",
+                .schan = 1,
+                .nchan = 14,
+                .policy = WIFI_COUNTRY_POLICY_AUTO,
+            };
+            esp_wifi_set_country(&wifi_country);
+            
+            current_radio_mode = RADIO_MODE_WIFI;
+            wifi_initialized = true;
+            ESP_LOGI(TAG, "WiFi initialized OK");
+            return true;
+            
+        case RADIO_MODE_BLE:
+            // Deinitialize BLE and switch to WiFi
+            ESP_LOGI(TAG, "Switching from BLE to WiFi mode...");
+            bt_nimble_deinit();
+            current_radio_mode = RADIO_MODE_NONE;
+            // Now initialize WiFi (recursive call with RADIO_MODE_NONE)
+            return ensure_wifi_mode();
+    }
+    return false;
+}
+
+/**
+ * Ensure BLE mode is active. If WiFi is active, deinits WiFi first.
+ * Returns true if BLE is ready to use.
+ */
+static bool ensure_ble_mode(void)
+{
+    switch (current_radio_mode) {
+        case RADIO_MODE_BLE:
+            // Already in BLE mode
+            return true;
+            
+        case RADIO_MODE_NONE:
+            // Initialize BLE
+            ESP_LOGI(TAG, "Initializing BLE (NimBLE)...");
+            esp_err_t ret = bt_nimble_init();
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "BLE init failed: %d", ret);
+                return false;
+            }
+            current_radio_mode = RADIO_MODE_BLE;
+            ESP_LOGI(TAG, "BLE initialized OK");
+            return true;
+            
+        case RADIO_MODE_WIFI: {
+            // Deinitialize WiFi and switch to BLE
+            ESP_LOGI(TAG, "Switching from WiFi to BLE mode...");
+            esp_wifi_stop();
+            esp_wifi_deinit();
+            // Only destroy AP netif, keep STA netif for reuse on WiFi re-init
+            esp_netif_t *ap_nif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+            if (ap_nif) {
+                esp_netif_destroy(ap_nif);
+            }
+            wifi_initialized = false;
+            current_radio_mode = RADIO_MODE_NONE;
+            // Now initialize BLE (recursive call with RADIO_MODE_NONE)
+            return ensure_ble_mode();
+        }
+    }
+    return false;
+}
+
+// ============================================================================
+// NimBLE BLE Scanner Functions
+// ============================================================================
+
+/**
+ * Check if BLE device already found (by MAC address)
+ */
+static bool bt_is_device_found(const uint8_t *addr)
+{
+    for (int i = 0; i < bt_found_device_count; i++) {
+        if (memcmp(bt_found_devices[i], addr, 6) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Find device index by MAC address in bt_devices array
+ * Returns -1 if not found
+ */
+static int bt_find_device_index(const uint8_t *addr)
+{
+    for (int i = 0; i < bt_device_count; i++) {
+        if (memcmp(bt_devices[i].addr, addr, 6) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/**
+ * Add BLE device to found list
+ */
+static void bt_add_found_device(const uint8_t *addr)
+{
+    if (bt_found_device_count < BT_MAX_DEVICES) {
+        memcpy(bt_found_devices[bt_found_device_count], addr, 6);
+        bt_found_device_count++;
+    }
+}
+
+/**
+ * Reset BLE scan counters
+ */
+static void bt_reset_counters(void)
+{
+    bt_airtag_count = 0;
+    bt_smarttag_count = 0;
+    bt_found_device_count = 0;
+    bt_device_count = 0;
+    memset(bt_found_devices, 0, sizeof(bt_found_devices));
+    memset(bt_devices, 0, sizeof(bt_devices));
+}
+
+/**
+ * Format BLE MAC address to string
+ */
+static void bt_format_addr(const uint8_t *addr, char *str)
+{
+    sprintf(str, "%02X:%02X:%02X:%02X:%02X:%02X",
+            addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
+}
+
+/**
+ * Check if manufacturer data indicates Apple AirTag/Find My device
+ */
+static bool bt_is_apple_airtag(const uint8_t *data, uint8_t len, bool has_name)
+{
+    if (len < 4) return false;
+    
+    // Check Company ID (Little Endian: 0x4C 0x00)
+    uint16_t company_id = data[0] | (data[1] << 8);
+    if (company_id != APPLE_COMPANY_ID) return false;
+    
+    // Check Find My device type (0x12)
+    if (data[2] != APPLE_FIND_MY_TYPE) return false;
+    
+    // AirTags typically have 25-29 bytes of manufacturer data
+    // and don't broadcast a device name (unlike iPhone/iPad)
+    if (len >= 25 && len <= 29 && !has_name) {
+        return true;
+    }
+    
+    return false;
+}
+
+/**
+ * Check if manufacturer data indicates Samsung SmartTag
+ */
+static bool bt_is_samsung_smarttag(const uint8_t *data, uint8_t len)
+{
+    if (len < 4) return false;
+    
+    // Check Company ID (Little Endian: 0x75 0x00)
+    uint16_t company_id = data[0] | (data[1] << 8);
+    if (company_id != SAMSUNG_COMPANY_ID) return false;
+    
+    // SmartTag uses SmartThings Find protocol
+    uint8_t device_type = data[2];
+    
+    // SmartTag typical payload length is 22-28 bytes
+    if ((device_type == 0x02 || device_type == 0x03) && len >= 20 && len <= 30) {
+        return true;
+    }
+    
+    return false;
+}
+
+/**
+ * BLE GAP event callback for scanning
+ */
+static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
+{
+    if (event->type != BLE_GAP_EVENT_DISC) {
+        return 0;
+    }
+    
+    struct ble_gap_disc_desc *desc = &event->disc;
+    
+    // Parse advertising data
+    struct ble_hs_adv_fields fields;
+    int rc = ble_hs_adv_parse_fields(&fields, desc->data, desc->length_data);
+    if (rc != 0) {
+        return 0;
+    }
+    
+    // Check if this is a Scan Response packet (contains names more often)
+    bool is_scan_response = (desc->event_type == BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP);
+    
+    // Check if device already seen
+    bool already_seen = bt_is_device_found(desc->addr.val);
+    
+    // If already seen, only process scan responses to update names
+    if (already_seen) {
+        // Try to update name from scan response if we don't have one
+        if (is_scan_response && fields.name != NULL && fields.name_len > 0) {
+            int dev_idx = bt_find_device_index(desc->addr.val);
+            if (dev_idx >= 0 && bt_devices[dev_idx].name[0] == '\0') {
+                int name_len = fields.name_len < 31 ? fields.name_len : 31;
+                memcpy(bt_devices[dev_idx].name, fields.name, name_len);
+                bt_devices[dev_idx].name[name_len] = '\0';
+            }
+        }
+        return 0;
+    }
+    
+    // Add to found devices list
+    bt_add_found_device(desc->addr.val);
+    
+    // Store device info
+    if (bt_device_count < BT_MAX_DEVICES) {
+        bt_device_info_t *dev = &bt_devices[bt_device_count];
+        memcpy(dev->addr, desc->addr.val, 6);
+        dev->rssi = desc->rssi;
+        dev->name[0] = '\0';
+        dev->company_id = 0;
+        dev->is_airtag = false;
+        dev->is_smarttag = false;
+        
+        // Extract device name if available
+        bool has_name = (fields.name != NULL && fields.name_len > 0);
+        if (has_name) {
+            int name_len = fields.name_len < 31 ? fields.name_len : 31;
+            memcpy(dev->name, fields.name, name_len);
+            dev->name[name_len] = '\0';
+        }
+        
+        // Check manufacturer data
+        if (fields.mfg_data != NULL && fields.mfg_data_len >= 2) {
+            dev->company_id = fields.mfg_data[0] | (fields.mfg_data[1] << 8);
+            
+            if (bt_is_apple_airtag(fields.mfg_data, fields.mfg_data_len, has_name)) {
+                dev->is_airtag = true;
+                bt_airtag_count++;
+            }
+            else if (bt_is_samsung_smarttag(fields.mfg_data, fields.mfg_data_len)) {
+                dev->is_smarttag = true;
+                bt_smarttag_count++;
+            }
+        }
+        
+        bt_device_count++;
+    }
+    
+    return 0;
+}
+
+/**
+ * Start BLE scanning
+ */
+static int bt_start_scan(void)
+{
+    struct ble_gap_disc_params scan_params = {
+        .itvl = 0x60,             // 60ms interval
+        .window = 0x60,           // 60ms window = continuous listening
+        .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
+        .limited = 0,
+        .passive = 0,             // ACTIVE scan - critical for Scan Response names
+        .filter_duplicates = 0,   // We handle duplicates ourselves
+    };
+    
+    int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &scan_params,
+                          bt_gap_event_callback, NULL);
+    return rc;
+}
+
+/**
+ * Stop BLE scanning
+ */
+static void bt_stop_scan(void)
+{
+    ble_gap_disc_cancel();
+}
+
+/**
+ * NimBLE host sync callback
+ */
+static void bt_on_sync(void)
+{
+    ESP_LOGI(TAG, "BLE Host synchronized");
+    nimble_initialized = true;
+}
+
+/**
+ * NimBLE host reset callback
+ */
+static void bt_on_reset(int reason)
+{
+    ESP_LOGE(TAG, "BLE Host reset, reason: %d", reason);
+    nimble_initialized = false;
+}
+
+/**
+ * NimBLE host task
+ */
+static void nimble_host_task(void *param)
+{
+    ESP_LOGI(TAG, "NimBLE host task started");
+    nimble_port_run();
+    nimble_port_freertos_deinit();
+}
+
+/**
+ * Initialize NimBLE stack
+ */
+static esp_err_t bt_nimble_init(void)
+{
+    if (nimble_initialized) {
+        return ESP_OK;
+    }
+    
+    esp_err_t ret = nimble_port_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "NimBLE port init failed: %d", ret);
+        return ret;
+    }
+    
+    // Configure BLE host callbacks
+    ble_hs_cfg.sync_cb = bt_on_sync;
+    ble_hs_cfg.reset_cb = bt_on_reset;
+    
+    // Start NimBLE host task
+    nimble_port_freertos_init(nimble_host_task);
+    
+    // Wait for sync (max 3 seconds)
+    for (int i = 0; i < 30 && !nimble_initialized; i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    
+    if (!nimble_initialized) {
+        ESP_LOGE(TAG, "NimBLE failed to sync");
+        return ESP_FAIL;
+    }
+    
+    return ESP_OK;
+}
+
+/**
+ * Deinitialize NimBLE stack
+ */
+static void bt_nimble_deinit(void)
+{
+    if (!nimble_initialized) {
+        return;
+    }
+    
+    // Stop any active scanning
+    bt_scan_active = false;
+    bt_stop_scan();
+    
+    // Wait for scan task to finish
+    if (bt_scan_task_handle != NULL) {
+        for (int i = 0; i < 20 && bt_scan_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+    
+    // Stop NimBLE host task
+    nimble_port_stop();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    // Deinitialize NimBLE port
+    nimble_port_deinit();
+    
+    nimble_initialized = false;
+    ESP_LOGI(TAG, "NimBLE stopped");
+}
+
+/**
+ * Stop BLE scanner
+ */
+static void bt_scan_stop(void)
+{
+    if (!bt_scan_active && bt_scan_task_handle == NULL) {
+        return;
+    }
+    
+    bt_scan_active = false;
+    bt_stop_scan();
+    
+    // Wait for task to finish
+    for (int i = 0; i < 40 && bt_scan_task_handle != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    
+    if (bt_scan_task_handle != NULL) {
+        vTaskDelete(bt_scan_task_handle);
+        bt_scan_task_handle = NULL;
+    }
+    
+    ESP_LOGI(TAG, "BLE scanner stopped.");
+}
+
+/**
+ * Update BLE scan list UI with current results
+ */
+static void ble_scan_update_list(void)
+{
+    if (!ble_scan_list) return;
+    
+    // Clear existing items
+    lv_obj_clean(ble_scan_list);
+    
+    for (int i = 0; i < bt_device_count; i++) {
+        bt_device_info_t *dev = &bt_devices[i];
+        char addr_str[18];
+        bt_format_addr(dev->addr, addr_str);
+        
+        char item_text[80];
+        const char *type_str = "";
+        if (dev->is_airtag) {
+            type_str = " AirTag";
+        } else if (dev->is_smarttag) {
+            type_str = " SmartTag";
+        }
+        
+        if (dev->name[0] != '\0') {
+            // Truncate name if too long
+            char short_name[13];
+            strncpy(short_name, dev->name, 12);
+            short_name[12] = '\0';
+            snprintf(item_text, sizeof(item_text), "%d %s%s %s", 
+                     dev->rssi, short_name, type_str, addr_str);
+        } else {
+            snprintf(item_text, sizeof(item_text), "%d%s %s", 
+                     dev->rssi, type_str, addr_str);
+        }
+        
+        lv_obj_t *item = lv_label_create(ble_scan_list);
+        lv_label_set_text(item, item_text);
+        lv_obj_set_width(item, lv_pct(100));
+        lv_obj_set_style_text_color(item, lv_color_make(0, 255, 0), 0);
+        lv_obj_set_style_text_font(item, &lv_font_montserrat_12, 0);  // Smaller font to fit more
+        lv_obj_set_style_pad_ver(item, 1, 0);
+        lv_label_set_long_mode(item, LV_LABEL_LONG_SCROLL_CIRCULAR);  // Scroll if too long
+    }
+}
+
+/**
+ * BLE scan task - runs for 10 seconds then stops
+ */
+static void bt_scan_task(void *pvParameters)
+{
+    bt_reset_counters();
+    ble_scan_finished = false;
+    
+    ESP_LOGI(TAG, "BLE scan starting (10 seconds)...");
+    
+    int rc = bt_start_scan();
+    if (rc != 0) {
+        ESP_LOGE(TAG, "BLE scan start failed: %d", rc);
+        bt_scan_active = false;
+        bt_scan_task_handle = NULL;
+        
+        // Set status for UI update (thread-safe)
+        snprintf(ble_scan_status_text, sizeof(ble_scan_status_text), "Scan failed!");
+        ble_scan_needs_ui_update = true;
+        
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    // Scan for 10 seconds, updating UI every 500ms via flag
+    for (int i = 0; i < 100 && bt_scan_active; i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        
+        // Update UI every 500ms via flag (thread-safe)
+        if (i % 5 == 0) {
+            snprintf(ble_scan_status_text, sizeof(ble_scan_status_text), 
+                     "Scanning... %d (%ds)", bt_device_count, (100 - i) / 10);
+            ble_scan_needs_ui_update = true;
+        }
+    }
+    
+    bt_stop_scan();
+    bt_scan_active = false;
+    
+    // Final UI update via flag (thread-safe)
+    snprintf(ble_scan_status_text, sizeof(ble_scan_status_text), 
+             "%d devices (%d AT, %d ST)", bt_device_count, bt_airtag_count, bt_smarttag_count);
+    ble_scan_finished = true;
+    ble_scan_needs_ui_update = true;
+    
+    ESP_LOGI(TAG, "BLE scan complete: %d devices found", bt_device_count);
+    
+    bt_scan_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+/**
+ * BLE Scan Back button callback
+ */
+static void ble_scan_back_btn_cb(lv_event_t *e)
+{
+    // Stop scan if running (waits for task to finish)
+    bt_scan_stop();
+    
+    // Clean up UI
+    ble_scan_ui_active = false;
+    ble_scan_list = NULL;
+    ble_scan_status_label = NULL;
+    ble_scan_content = NULL;
+    
+    // Switch back to WiFi mode
+    if (current_radio_mode == RADIO_MODE_BLE) {
+        bt_nimble_deinit();
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+    
+    // Return to menu
+    nav_to_menu_flag = true;
 }

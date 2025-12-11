@@ -1,0 +1,11 @@
+{
+    "idf.espIdfPath": "/Users/janulrich/esp/v5.5/esp-idf",
+    "idf.toolsPath": "/Users/janulrich/.espressif",
+    "idf.pythonInstallPath": "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
+    "idf.openOcdConfigs": [
+        "board/esp32c5-builtin.cfg"
+    ],
+    "idf.port": "/dev/tty.usbmodem2401",
+    "idf.monitorPort": "/dev/tty.usbmodem2401",
+    "idf.flashType": "UART"
+}
