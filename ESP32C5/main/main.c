@@ -889,7 +889,7 @@ static void init_display(void)
     esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num = LCD_DC,
         .cs_gpio_num = LCD_CS,
-        .pclk_hz = 40 * 1000 * 1000,  // Push to 60MHz - ILI9341 can handle up to 80MHz
+        .pclk_hz = 40 * 1000 * 1000,
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
         .spi_mode = 0,
@@ -900,19 +900,7 @@ static void init_display(void)
         },
     };
 
-    // Memory barrier and heap validation BEFORE
-    asm volatile("fence" ::: "memory");
-    
-    //check_heap_integrity("Before susp step 4b");
-    //print_memory_stats();
-    
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(LCD_HOST, &io_config, &io_handle));
-    
-    // Memory barrier and heap validation AFTER
-    asm volatile("fence" ::: "memory");
-
-    //check_heap_integrity("After susp step 4b");
-    //print_memory_stats();
     
     const esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = LCD_RST,
@@ -920,9 +908,21 @@ static void init_display(void)
         .bits_per_pixel = 16,
     };
 
+    // CRITICAL FIX for Waveshare ESP32-C5:
+    // GPIO 2 and 3 are strapping pins - must reset and configure before use
+    gpio_reset_pin(LCD_RST);
+    gpio_reset_pin(LCD_DC);
+    gpio_reset_pin(LCD_CS);
     
-    // Memory barrier and heap validation BEFORE
-    asm volatile("fence" ::: "memory");
+    gpio_set_direction(LCD_RST, GPIO_MODE_OUTPUT);
+    gpio_set_direction(LCD_DC, GPIO_MODE_OUTPUT);
+    gpio_set_direction(LCD_CS, GPIO_MODE_OUTPUT);
+    
+    // Hardware reset LCD
+    gpio_set_level(LCD_RST, 0);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    gpio_set_level(LCD_RST, 1);
+    vTaskDelay(pdMS_TO_TICKS(120));
 
     ESP_ERROR_CHECK(esp_lcd_new_panel_ili9341(io_handle, &panel_config, &panel_handle));
     

@@ -1,0 +1,35 @@
+# Build output
+build/
+
+# Binaries (can be regenerated)
+binaries-esp32c5/
+
+# Managed components (downloaded automatically by idf.py)
+managed_components/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+
+# ESP-IDF
+sdkconfig.old
+dependencies.lock
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*~
+
