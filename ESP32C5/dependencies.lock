@@ -6,23 +6,9 @@ dependencies:
       require: private
       version: '>=4.1'
     source:
-      registry_url: https://components.espressif.com
-      type: service
-    version: 0.5.3
-  espressif/esp_lcd_ili9341:
-    component_hash: 31f1b793aa2110dd2ae071c21ccbff0a4eb20d9a4ee40b6294c0dc0ad9552c4e
-    dependencies:
-    - name: idf
-      require: private
-      version: '>=4.4'
-    - name: espressif/cmake_utilities
-      registry_url: https://components.espressif.com
-      require: private
-      version: 0.*
-    source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 1.2.0
+    version: 0.5.3
   espressif/esp_lcd_touch:
     component_hash: 779b4ba2464a3ae85681e4b860caa5fdc35801458c23f3039ee761bae7f442a4
     dependencies:
@@ -46,7 +32,7 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 5.4.1
+    version: 6.0.0
   lvgl/lvgl:
     component_hash: d7c1ac037ae6e85d94897f807d6e7ba0946a83e720074fc95a4f6241da9f9f53
     dependencies: []
@@ -55,11 +41,11 @@ dependencies:
       type: service
     version: 8.4.0
 direct_dependencies:
-- espressif/esp_lcd_ili9341
+- espressif/cmake_utilities
 - espressif/esp_lcd_touch
 - espressif/led_strip
 - idf
 - lvgl/lvgl
-manifest_hash: 2e658d1cad336f0506c7dddf6beb44279fe66bd6f04decf12f0f0858e3fb3ba7
+manifest_hash: c8baa02f589f97ddab5ab941c945459ca4a73708868d680cb63ad7603ded3c50
 target: esp32c5
 version: 2.0.0

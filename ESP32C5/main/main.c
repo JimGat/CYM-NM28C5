@@ -113,6 +113,10 @@ static int bt_device_count = 0;
 #define LCD_V_RES 320
 #define LCD_HOST SPI2_HOST
 
+// Color definitions (used throughout the file)
+#define COLOR_MATERIAL_BLUE     lv_color_make(33, 150, 243)    // #2196F3 - default text color
+#define COLOR_DARK_BLUE         lv_color_make(15, 60, 100)     // Dark blue for pressed states
+
 typedef int (*vprintf_like_t)(const char *, va_list);
 
 static lv_disp_draw_buf_t draw_buf;
@@ -129,9 +133,7 @@ static volatile bool nav_to_menu_flag = false;
 
 static esp_lcd_panel_handle_t panel_handle;
 static ft6336_handle_t touch_handle;
-static lv_obj_t *root_page;
 static lv_obj_t *touch_dot;  // DEBUG: visual touch indicator
-static lv_obj_t *menu_obj;
 static lv_obj_t *title_bar;
 static lv_obj_t *function_page = NULL;
 
@@ -188,6 +190,16 @@ static volatile bool deauth_stop_flag = false;
 static volatile bool deauth_resume_flag = false;
 static volatile bool deauth_paused = false;
 static volatile uint32_t lvgl_flush_counter = 0;
+
+// Deauth rescan feature - periodic channel verification
+static volatile bool deauth_rescan_pending = false;
+static volatile bool deauth_rescan_active = false;
+static volatile bool deauth_rescan_done_flag = false;  // Separate flag for rescan completion
+static esp_timer_handle_t deauth_rescan_timer = NULL;
+#define DEAUTH_RESCAN_INTERVAL_MS 180000  // 3 minutes
+static uint8_t deauth_target_bssids[MAX_SCAN_RESULTS][6];
+static uint8_t deauth_target_channels[MAX_SCAN_RESULTS];
+static int deauth_target_count = 0;
 
 static lv_obj_t *evil_twin_network_dd = NULL;
 static lv_obj_t *evil_twin_html_dd = NULL;
@@ -352,8 +364,24 @@ lv_obj_t *create_clickable_item(lv_obj_t *parent, const char *icon, const char *
 void show_function_page(const char *name);
 void show_menu(void);
 void back_to_menu_cb(lv_event_t *e);
-static void deauth_pause_event_cb(lv_event_t *e);
+
+// Tile-based navigation system
+static lv_obj_t *tiles_container = NULL;
+static lv_obj_t *create_tile(lv_obj_t *parent, const char *icon, const char *text, lv_color_t bg_color, lv_event_cb_t callback, const char *user_data);
+static void show_main_tiles(void);
+static void show_wifi_scan_attack_screen(void);
+static void show_attack_tiles_screen(void);
+static void show_global_attacks_screen(void);
+static void show_sniff_karma_screen(void);
+static void show_wifi_monitor_screen(void);
+static void show_bluetooth_screen(void);
+static void show_stub_screen(const char *name);
+static void main_tile_event_cb(lv_event_t *e);
+static void attack_tile_event_cb(lv_event_t *e);
+static void home_btn_event_cb(lv_event_t *e);
+static void wifi_scan_next_btn_cb(lv_event_t *e);
 static void deauth_quit_event_cb(lv_event_t *e);
+static void deauth_rescan_timer_stop(void);
 
 static void create_function_page_base(const char *name);
 void show_function_page(const char *name);
@@ -440,7 +468,12 @@ static void ble_scan_update_list(void);
 static void wifi_scan_done_cb(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE) {
-        scan_done_ui_flag = true;
+        // Use separate flag for deauth rescan to avoid conflicts
+        if (deauth_rescan_active) {
+            deauth_rescan_done_flag = true;
+        } else {
+            scan_done_ui_flag = true;
+        }
     }
 }
 
@@ -1507,121 +1540,25 @@ void app_main(void)
 
     ESP_LOGI(TAG, "LVGL OBJECTS:");
 
-    // Title bar
+    // Set screen background to Material Dark
+    lv_obj_set_style_bg_color(lv_scr_act(), lv_color_make(18, 18, 18), 0);  // #121212
+    
+    // Title bar - Material Dark Surface
     title_bar = lv_obj_create(lv_scr_act());
     lv_obj_set_size(title_bar, lv_pct(100), 30);
     lv_obj_align(title_bar, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_bg_color(title_bar, lv_color_make(20, 20, 20), 0);
+    lv_obj_set_style_bg_color(title_bar, lv_color_make(30, 30, 30), 0);  // #1E1E1E
     lv_obj_set_style_border_width(title_bar, 0, 0);
     lv_obj_set_style_radius(title_bar, 0, 0);
     lv_obj_clear_flag(title_bar, LV_OBJ_FLAG_SCROLLABLE);  // No scroll
     
     lv_obj_t *title_label = lv_label_create(title_bar);
     lv_label_set_text(title_label, "Laboratorium");
-    lv_obj_set_style_text_color(title_label, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_text_color(title_label, lv_color_make(255, 255, 255), 0);  // White text
     lv_obj_center(title_label);
     
-    // Create main menu
-    menu_obj = lv_menu_create(lv_scr_act());
-    lv_obj_set_size(menu_obj, lv_pct(100), 290);
-    lv_obj_align(menu_obj, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_menu_set_mode_root_back_btn(menu_obj, LV_MENU_ROOT_BACK_BTN_DISABLED);
-    // Style menu with black background
-    lv_obj_set_style_bg_color(menu_obj, lv_color_make(0, 0, 0), LV_PART_MAIN);
-    lv_obj_set_style_text_color(menu_obj, lv_color_make(0, 255, 0), LV_PART_MAIN);
-    
-    // Create Attacks sub-pages with clickable buttons
-    lv_obj_t *attacks_page = lv_menu_page_create(menu_obj, NULL);
-    lv_obj_set_style_pad_hor(attacks_page, 5, 0);
-    lv_obj_set_style_pad_ver(attacks_page, 5, 0);
-    lv_obj_set_flex_flow(attacks_page, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(attacks_page, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_set_style_bg_color(attacks_page, lv_color_make(0, 0, 0), 0);  // Black background
-    
-    lv_obj_t *item;
-    
-    item = create_clickable_item(attacks_page, LV_SYMBOL_CHARGE, "Deauther", attack_event_cb, "Deauther");
-    item = create_clickable_item(attacks_page, LV_SYMBOL_WARNING, "Evil Twin", attack_event_cb, "Evil Twin");
-    item = create_clickable_item(attacks_page, LV_SYMBOL_POWER, "Blackout", attack_event_cb, "Blackout");
-    item = create_clickable_item(attacks_page, LV_SYMBOL_EYE_OPEN, "Snifferdog", attack_event_cb, "Snifferdog");
-    item = create_clickable_item(attacks_page, LV_SYMBOL_WARNING, "SAE Overflow", attack_event_cb, "SAE Overflow");
-    item = create_clickable_item(attacks_page, LV_SYMBOL_DOWNLOAD, "Handshakes", attack_event_cb, "Handshakes");
-    item = create_clickable_item(attacks_page, LV_SYMBOL_SHUFFLE, "Karma", attack_event_cb, "Karma");
-    item = create_clickable_item(attacks_page, LV_SYMBOL_WIFI, "Portal", attack_event_cb, "Portal");
-    
-    // Create Scanner sub-page
-    lv_obj_t *scanner_page = lv_menu_page_create(menu_obj, NULL);
-    lv_obj_set_style_pad_hor(scanner_page, 5, 0);
-    lv_obj_set_style_pad_ver(scanner_page, 5, 0);
-    lv_obj_set_flex_flow(scanner_page, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(scanner_page, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_set_style_bg_color(scanner_page, lv_color_make(0, 0, 0), 0);  // Black background
-    
-    item = create_clickable_item(scanner_page, LV_SYMBOL_REFRESH, "Scan", attack_event_cb, "Scan");
-    item = create_clickable_item(scanner_page, LV_SYMBOL_LIST, "Browse Networks", attack_event_cb, "Browse Networks");
-    
-    // Create Sniffer sub-page
-    lv_obj_t *sniffer_page = lv_menu_page_create(menu_obj, NULL);
-    lv_obj_set_style_pad_hor(sniffer_page, 5, 0);
-    lv_obj_set_style_pad_ver(sniffer_page, 5, 0);
-    lv_obj_set_flex_flow(sniffer_page, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(sniffer_page, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_set_style_bg_color(sniffer_page, lv_color_make(0, 0, 0), 0);  // Black background
-    
-    item = create_clickable_item(sniffer_page, LV_SYMBOL_EYE_OPEN, "Sniffer", attack_event_cb, "Sniffer");
-    item = create_clickable_item(sniffer_page, LV_SYMBOL_LIST, "Browse Clients", attack_event_cb, "Browse Clients");
-    item = create_clickable_item(sniffer_page, LV_SYMBOL_CALL, "Show Probes", attack_event_cb, "Show Probes");
-    item = create_clickable_item(sniffer_page, LV_SYMBOL_BLUETOOTH, "BLE Scan", attack_event_cb, "BLE Scan");
-    
-    // Create Wardrive sub-page
-    lv_obj_t *wardrive_page = lv_menu_page_create(menu_obj, NULL);
-    lv_obj_set_style_pad_hor(wardrive_page, 5, 0);
-    lv_obj_set_style_pad_ver(wardrive_page, 5, 0);
-    lv_obj_set_flex_flow(wardrive_page, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(wardrive_page, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_set_style_bg_color(wardrive_page, lv_color_make(0, 0, 0), 0);  // Black background
-    
-    item = create_clickable_item(wardrive_page, LV_SYMBOL_GPS, "Get GPS Fix", attack_event_cb, "Get GPS Fix");
-    item = create_clickable_item(wardrive_page, LV_SYMBOL_DRIVE, "Start Wardrive", attack_event_cb, "Start Wardrive");
-    
-    // Create root page
-    root_page = lv_menu_page_create(menu_obj, NULL);
-    lv_obj_set_style_pad_hor(root_page, 5, 0);
-    lv_obj_set_style_bg_color(root_page, lv_color_make(0, 0, 0), 0);  // Black background
-    
-    lv_obj_t *root_section = lv_menu_section_create(root_page);
-    lv_obj_set_style_bg_color(root_section, lv_color_make(0, 0, 0), 0);  // Black background
-    
-    item = create_menu_item(root_section, LV_SYMBOL_LIST, "Scanner & Targets");
-    lv_menu_set_load_page_event(menu_obj, item, scanner_page);
-    
-    item = create_menu_item(root_section, LV_SYMBOL_EYE_OPEN, "Sniffer");
-    lv_menu_set_load_page_event(menu_obj, item, sniffer_page);
-    
-    item = create_menu_item(root_section, LV_SYMBOL_WARNING, "Attacks");
-    lv_menu_set_load_page_event(menu_obj, item, attacks_page);
-    
-    item = create_menu_item(root_section, LV_SYMBOL_GPS, "Wardrive");
-    lv_menu_set_load_page_event(menu_obj, item, wardrive_page);
-    
-    lv_menu_set_sidebar_page(menu_obj, root_page);
-    
-    // Adjust column widths: sidebar 40% (was ~30%), main content 60% (was ~50%)
-    lv_obj_t *sidebar = lv_menu_get_sidebar_header(menu_obj);
-    if (sidebar) {
-        lv_obj_set_width(lv_obj_get_parent(sidebar), lv_pct(45));  // Sidebar 45% width
-    }
-    lv_obj_t *main_header = lv_menu_get_main_header(menu_obj);
-    if (main_header) {
-        lv_obj_set_width(lv_obj_get_parent(main_header), lv_pct(55));  // Main content 55% width
-    }
-    
-    // Hide headers after pages are created
-    lv_obj_t *header = lv_menu_get_main_header(menu_obj);
-    if (header) lv_obj_add_flag(header, LV_OBJ_FLAG_HIDDEN);
-    
-    header = lv_menu_get_sidebar_header(menu_obj);
-    if (header) lv_obj_add_flag(header, LV_OBJ_FLAG_HIDDEN);
+    // Create tile-based main menu
+    show_main_tiles();
     
     // DEBUG: Visual touch indicator (red dot)
     touch_dot = lv_obj_create(lv_scr_act());
@@ -1982,11 +1919,11 @@ void app_main(void)
                 }
                 lv_obj_set_size(scan_list, lv_pct(100), LCD_V_RES - 30);
                 lv_obj_align(scan_list, LV_ALIGN_BOTTOM_MID, 0, 0);
-                lv_obj_set_style_bg_color(scan_list, lv_color_make(0, 0, 0), 0);  // Black background
-                lv_obj_set_style_text_color(scan_list, lv_color_make(0, 255, 0), 0);  // Green text
-                // Remove white separator lines between items
+                lv_obj_set_style_bg_color(scan_list, lv_color_make(18, 18, 18), 0);  // Material Dark #121212
+                lv_obj_set_style_text_color(scan_list, lv_color_make(255, 255, 255), 0);  // White text
+                // Remove separator lines between items
                 lv_obj_set_style_border_width(scan_list, 0, LV_PART_ITEMS);
-                lv_obj_set_style_border_color(scan_list, lv_color_make(0, 0, 0), LV_PART_ITEMS);
+                lv_obj_set_style_border_color(scan_list, lv_color_make(18, 18, 18), LV_PART_ITEMS);
 
                 uint16_t count = wifi_scanner_get_count();
                 if (count == 0U) {
@@ -2009,22 +1946,24 @@ void app_main(void)
                                 lv_obj_set_width(row, lv_pct(100));
                                 lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
                                 lv_obj_set_style_pad_all(row, 8, 0);  // 1.2x bigger (was 6, now 8)
-                                lv_obj_set_style_pad_gap(row, 10, 0);  // 1.2x bigger (was 8, now 10)
+                                lv_obj_set_style_pad_gap(row, 10, 0);
                                 lv_obj_set_height(row, LV_SIZE_CONTENT);
-                                lv_obj_set_style_bg_color(row, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black background
-                                lv_obj_set_style_bg_color(row, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+                                lv_obj_set_style_bg_color(row, lv_color_make(30, 30, 30), LV_STATE_DEFAULT);  // Material Surface
+                                lv_obj_set_style_bg_color(row, lv_color_make(50, 50, 50), LV_STATE_PRESSED);  // Lighter on press
+                                lv_obj_set_style_radius(row, 8, 0);
 
                                 lv_obj_t *cb = lv_checkbox_create(row);
                                 if (!cb) break;
                                 lv_checkbox_set_text(cb, "");
                                 lv_obj_add_event_cb(cb, scan_checkbox_event_cb, LV_EVENT_VALUE_CHANGED, (void *)(intptr_t)i);
-                                // Green checkbox styling (retro terminal theme) - 1.2x bigger
-                                lv_obj_set_style_bg_color(cb, lv_color_make(0, 0, 0), LV_PART_INDICATOR);  // Black background for checkbox
-                                lv_obj_set_style_bg_color(cb, lv_color_make(0, 100, 0), LV_PART_INDICATOR | LV_STATE_CHECKED);  // Dark green when checked
-                                lv_obj_set_style_border_color(cb, lv_color_make(0, 255, 0), LV_PART_INDICATOR);  // Green border
-                                lv_obj_set_style_border_width(cb, 4, LV_PART_INDICATOR);  // 1.2x thicker border (was 3, now 4)
-                                lv_obj_set_style_text_color(cb, lv_color_make(0, 255, 0), 0);  // Green text
-                                lv_obj_set_style_pad_all(cb, 6, LV_PART_MAIN);  // Bigger checkbox padding
+                                // Material checkbox styling
+                                lv_obj_set_style_bg_color(cb, lv_color_make(60, 60, 60), LV_PART_INDICATOR);  // Dark gray unchecked
+                                lv_obj_set_style_bg_color(cb, lv_color_make(33, 150, 243), LV_PART_INDICATOR | LV_STATE_CHECKED);  // Material Blue checked
+                                lv_obj_set_style_border_color(cb, lv_color_make(100, 100, 100), LV_PART_INDICATOR);  // Gray border
+                                lv_obj_set_style_border_width(cb, 2, LV_PART_INDICATOR);
+                                lv_obj_set_style_radius(cb, 4, LV_PART_INDICATOR);  // Rounded
+                                lv_obj_set_style_text_color(cb, lv_color_make(255, 255, 255), 0);  // White text
+                                lv_obj_set_style_pad_all(cb, 6, LV_PART_MAIN);
 
                                 lv_obj_t *ssid_lbl = lv_label_create(row);
                                 if (!ssid_lbl) break;
@@ -2043,7 +1982,7 @@ void app_main(void)
                                 lv_label_set_text(ssid_lbl, name_buf);
                                 lv_label_set_long_mode(ssid_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
                                 lv_obj_set_style_text_font(ssid_lbl, &lv_font_montserrat_14, 0);
-                                lv_obj_set_style_text_color(ssid_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+                                lv_obj_set_style_text_color(ssid_lbl, lv_color_make(255, 255, 255), 0);  // White text
                                 lv_obj_align(ssid_lbl, LV_ALIGN_LEFT_MID, 0, 5);  // 5px down for better alignment
                                 lv_obj_set_width(ssid_lbl, lv_pct(85));
 
@@ -2062,6 +2001,29 @@ void app_main(void)
                         }
                     }
                 }
+                
+                // Resize scan_list to leave space for Next button
+                lv_obj_set_size(scan_list, lv_pct(100), LCD_V_RES - 30 - 50);
+                lv_obj_align(scan_list, LV_ALIGN_TOP_MID, 0, 30);
+                
+                // Add "Next" button at the bottom - Material Blue
+                lv_obj_t *next_btn = lv_btn_create(function_page);
+                lv_obj_set_size(next_btn, lv_pct(100), 45);
+                lv_obj_align(next_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
+                lv_obj_set_style_bg_color(next_btn, lv_color_make(33, 150, 243), LV_STATE_DEFAULT);  // Material Blue
+                lv_obj_set_style_bg_color(next_btn, lv_color_make(66, 165, 245), LV_STATE_PRESSED);  // Lighter blue
+                lv_obj_set_style_border_width(next_btn, 0, 0);
+                lv_obj_set_style_radius(next_btn, 8, 0);
+                lv_obj_set_style_shadow_width(next_btn, 6, 0);
+                lv_obj_set_style_shadow_color(next_btn, lv_color_make(0, 0, 0), 0);
+                lv_obj_set_style_shadow_opa(next_btn, LV_OPA_30, 0);
+                lv_obj_t *next_lbl = lv_label_create(next_btn);
+                lv_label_set_text(next_lbl, "Next " LV_SYMBOL_RIGHT);
+                lv_obj_set_style_text_color(next_lbl, lv_color_make(255, 255, 255), 0);  // White text
+                lv_obj_set_style_text_font(next_lbl, &lv_font_montserrat_16, 0);
+                lv_obj_center(next_lbl);
+                lv_obj_add_event_cb(next_btn, wifi_scan_next_btn_cb, LV_EVENT_CLICKED, NULL);
+                
                 }  // End of else block for !blackout_ui_active
             }
             // Update FPS label if on Deauther page
@@ -2096,6 +2058,154 @@ void app_main(void)
                     lv_obj_t *label = lv_obj_get_child(deauth_pause_btn, 0);
                     if (label) lv_label_set_text(label, "Pause");
                 }
+            }
+            
+            // Handle periodic deauth rescan
+            if (deauth_rescan_pending && !deauth_rescan_active) {
+                deauth_rescan_pending = false;
+                
+                // Check if deauth UI is still valid before starting rescan
+                bool can_rescan = (deauth_list != NULL && function_page != NULL &&
+                                   lv_obj_is_valid(deauth_list) && lv_obj_is_valid(function_page));
+                
+                if (can_rescan) {
+                    deauth_rescan_active = true;
+                    
+                    // Update UI to show rescanning message
+                    if (deauth_prompt_label && lv_obj_is_valid(deauth_prompt_label)) {
+                        lv_label_set_text(deauth_prompt_label, "Rescanning to double check channels...");
+                    }
+                    
+                    // Clear the network list temporarily
+                    lv_obj_clean(deauth_list);
+                    lv_obj_t *rescan_msg = lv_label_create(deauth_list);
+                    lv_label_set_text(rescan_msg, "Rescanning...");
+                    lv_obj_set_style_text_color(rescan_msg, COLOR_MATERIAL_BLUE, 0);
+                    lv_obj_set_style_text_font(rescan_msg, &lv_font_montserrat_14, 0);
+                    
+                    // Pause deauth briefly
+                    wifi_attacks_stop_deauth();
+                    
+                    // Start a new scan (will trigger deauth_rescan_done_flag when complete)
+                    wifi_scanner_start_scan();
+                } else {
+                    // UI no longer valid, just stop the timer
+                    ESP_LOGW(TAG, "Deauth rescan skipped - UI no longer valid");
+                    deauth_rescan_timer_stop();
+                }
+            }
+            
+            // Handle deauth rescan completion (using dedicated flag)
+            if (deauth_rescan_done_flag && deauth_rescan_active) {
+                deauth_rescan_done_flag = false;
+                
+                // Validate that deauth UI is still valid before manipulating
+                bool ui_valid = (deauth_list != NULL && function_page != NULL && 
+                                 lv_obj_is_valid(deauth_list) && lv_obj_is_valid(function_page));
+                
+                // Get new scan results and check for channel changes
+                uint16_t new_count = wifi_scanner_get_count();
+                wifi_ap_record_t *new_records = NULL;
+                bool channels_updated = false;
+                
+                if (new_count > 0) {
+                    new_records = (wifi_ap_record_t *)lv_mem_alloc(sizeof(wifi_ap_record_t) * new_count);
+                    if (new_records) {
+                        wifi_scanner_get_results(new_records, new_count);
+                        
+                        // Check each target for channel changes
+                        for (int t = 0; t < deauth_target_count; t++) {
+                            for (int n = 0; n < (int)new_count; n++) {
+                                if (memcmp(deauth_target_bssids[t], new_records[n].bssid, 6) == 0) {
+                                    if (deauth_target_channels[t] != new_records[n].primary) {
+                                        ESP_LOGI(TAG, "Channel change detected: %02X:%02X:%02X:%02X:%02X:%02X Ch%d -> Ch%d",
+                                                 deauth_target_bssids[t][0], deauth_target_bssids[t][1],
+                                                 deauth_target_bssids[t][2], deauth_target_bssids[t][3],
+                                                 deauth_target_bssids[t][4], deauth_target_bssids[t][5],
+                                                 deauth_target_channels[t], new_records[n].primary);
+                                        deauth_target_channels[t] = new_records[n].primary;
+                                        channels_updated = true;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Only update UI if it's still valid
+                if (ui_valid) {
+                    // Rebuild the deauth list UI with updated channel info
+                    lv_obj_clean(deauth_list);
+                    
+                    if (new_records && new_count > 0) {
+                        for (int t = 0; t < deauth_target_count; t++) {
+                            // Find matching record for SSID display
+                            char ssid_str[33] = "";
+                            for (int n = 0; n < (int)new_count; n++) {
+                                if (memcmp(deauth_target_bssids[t], new_records[n].bssid, 6) == 0) {
+                                    if (new_records[n].ssid[0] != 0) {
+                                        strncpy(ssid_str, (const char *)new_records[n].ssid, sizeof(ssid_str) - 1);
+                                    }
+                                    break;
+                                }
+                            }
+                            
+                            char line[128];
+                            const char *band = (deauth_target_channels[t] <= 14) ? "2.4" : "5";
+                            
+                            if (ssid_str[0] != 0) {
+                                snprintf(line, sizeof(line), "%s (Ch%d, %s) %02X:%02X:%02X:%02X:%02X:%02X",
+                                         ssid_str, deauth_target_channels[t], band,
+                                         deauth_target_bssids[t][0], deauth_target_bssids[t][1],
+                                         deauth_target_bssids[t][2], deauth_target_bssids[t][3],
+                                         deauth_target_bssids[t][4], deauth_target_bssids[t][5]);
+                            } else {
+                                snprintf(line, sizeof(line), "(Ch%d, %s) %02X:%02X:%02X:%02X:%02X:%02X",
+                                         deauth_target_channels[t], band,
+                                         deauth_target_bssids[t][0], deauth_target_bssids[t][1],
+                                         deauth_target_bssids[t][2], deauth_target_bssids[t][3],
+                                         deauth_target_bssids[t][4], deauth_target_bssids[t][5]);
+                            }
+                            
+                            lv_obj_t *row = lv_list_add_btn(deauth_list, NULL, "");
+                            lv_obj_set_width(row, lv_pct(100));
+                            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+                            lv_obj_set_style_pad_all(row, 6, 0);
+                            lv_obj_set_style_pad_gap(row, 8, 0);
+                            lv_obj_set_height(row, LV_SIZE_CONTENT);
+                            lv_obj_set_style_bg_color(row, lv_color_make(30, 30, 30), LV_STATE_DEFAULT);
+                            lv_obj_set_style_bg_color(row, lv_color_make(50, 50, 50), LV_STATE_PRESSED);
+                            lv_obj_set_style_radius(row, 8, 0);
+                            
+                            lv_obj_t *lbl = lv_label_create(row);
+                            lv_label_set_text(lbl, line);
+                            lv_label_set_long_mode(lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+                            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+                            lv_obj_set_style_text_color(lbl, COLOR_MATERIAL_BLUE, 0);
+                            lv_obj_set_width(lbl, lv_pct(95));
+                        }
+                    }
+                    
+                    // Update title
+                    if (deauth_prompt_label && lv_obj_is_valid(deauth_prompt_label)) {
+                        lv_label_set_text(deauth_prompt_label, channels_updated ? 
+                                          "Deauth attack in progress (channels updated)" : 
+                                          "Deauth attack in progress");
+                    }
+                }
+                
+                // Free records if allocated
+                if (new_records) {
+                    lv_mem_free(new_records);
+                }
+                
+                // Re-save targets with updated channels and resume attack
+                wifi_scanner_save_target_bssids();
+                wifi_attacks_start_deauth();
+                
+                deauth_rescan_active = false;
+                ESP_LOGI(TAG, "Deauth rescan complete, attack resumed");
             }
 
             // BLE Scan UI update (thread-safe - only update from LVGL task)
@@ -2192,13 +2302,13 @@ lv_obj_t *create_menu_item(lv_obj_t *parent, const char *icon, const char *text)
     lv_obj_set_style_pad_all(cont, 6, 0);  // 1.5x bigger (was 3, now 6)
     lv_obj_set_style_pad_gap(cont, 8, 0);  // 1.5x bigger (was 5, now 8)
     lv_obj_set_style_bg_color(cont, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black background
-    lv_obj_set_style_bg_color(cont, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+    lv_obj_set_style_bg_color(cont, COLOR_DARK_BLUE, LV_STATE_PRESSED);  // Dark green when pressed
     
     if (icon) {
         lv_obj_t *img = lv_img_create(cont);
         lv_img_set_src(img, icon);
         lv_obj_set_width(img, 30);  // 1.5x bigger icon (was 20, now 30)
-        lv_obj_set_style_text_color(img, lv_color_make(0, 255, 0), 0);  // Green icon
+        lv_obj_set_style_text_color(img, COLOR_MATERIAL_BLUE, 0);  // Green icon
     }
     
     if (text) {
@@ -2207,7 +2317,7 @@ lv_obj_t *create_menu_item(lv_obj_t *parent, const char *icon, const char *text)
         lv_label_set_long_mode(label, LV_LABEL_LONG_SCROLL_CIRCULAR);  // Scrolling animation
         lv_obj_set_width(label, 180);  // 1.5x bigger (was 120, now 180)
         lv_obj_set_style_text_font(label, &lv_font_montserrat_20, 0);  // Bigger font (was 14, now 20)
-        lv_obj_set_style_text_color(label, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_set_style_text_color(label, COLOR_MATERIAL_BLUE, 0);  // Green text
         lv_obj_set_style_anim_time(label, 2000, 0);  // 2 second animation cycle
         lv_obj_set_style_anim_speed(label, 25, 0);  // Animation speed (pixels/sec)
     }
@@ -2221,7 +2331,7 @@ lv_obj_t *create_clickable_item(lv_obj_t *parent, const char *icon, const char *
     lv_obj_t *btn = lv_btn_create(parent);
     lv_obj_set_size(btn, lv_pct(100), LV_SIZE_CONTENT);
     lv_obj_set_style_bg_color(btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black background
-    lv_obj_set_style_bg_color(btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+    lv_obj_set_style_bg_color(btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);  // Dark green when pressed
     lv_obj_set_style_radius(btn, 5, 0);
     lv_obj_set_style_pad_all(btn, 12, 0);  // 1.5x bigger (was 8, now 12)
     lv_obj_set_style_pad_gap(btn, 8, 0);  // 1.5x bigger (was 5, now 8)
@@ -2232,7 +2342,7 @@ lv_obj_t *create_clickable_item(lv_obj_t *parent, const char *icon, const char *
         lv_obj_t *icon_label = lv_label_create(btn);
         lv_label_set_text(icon_label, icon);
         lv_obj_set_style_text_font(icon_label, &lv_font_montserrat_20, 0);  // Bigger (was 14, now 20)
-        lv_obj_set_style_text_color(icon_label, lv_color_make(0, 255, 0), 0);  // Green icons
+        lv_obj_set_style_text_color(icon_label, COLOR_MATERIAL_BLUE, 0);  // Green icons
     }
     
     if (text) {
@@ -2241,7 +2351,7 @@ lv_obj_t *create_clickable_item(lv_obj_t *parent, const char *icon, const char *
         lv_label_set_long_mode(label, LV_LABEL_LONG_SCROLL_CIRCULAR);
         lv_obj_set_width(label, 180);  // 1.5x bigger (was 120, now 180)
         lv_obj_set_style_text_font(label, &lv_font_montserrat_20, 0);  // Bigger (was 14, now 20)
-        lv_obj_set_style_text_color(label, lv_color_make(0, 255, 0), 0);  // Green text (retro terminal)
+        lv_obj_set_style_text_color(label, COLOR_MATERIAL_BLUE, 0);  // Green text (retro terminal)
         lv_obj_set_style_anim_time(label, 2000, 0);
         lv_obj_set_style_anim_speed(label, 25, 0);
     }
@@ -2259,22 +2369,53 @@ void back_to_menu_cb(lv_event_t *e)
     nav_to_menu_flag = true;
 }
 
-static void deauth_pause_event_cb(lv_event_t *e)
+// Timer callback for periodic deauth rescan
+static void deauth_rescan_timer_cb(void *arg)
 {
-    (void)e;
-    // Toggle pause/resume
-    if (deauth_paused) {
-        deauth_resume_flag = true;
-        deauth_paused = false;
-    } else {
-    deauth_stop_flag = true;
-        deauth_paused = true;
+    (void)arg;
+    // Set flag to trigger rescan in main loop (don't do heavy work in timer callback)
+    if (!deauth_rescan_active) {
+        deauth_rescan_pending = true;
     }
+}
+
+static void deauth_rescan_timer_start(void)
+{
+    if (deauth_rescan_timer != NULL) {
+        esp_timer_stop(deauth_rescan_timer);
+        esp_timer_delete(deauth_rescan_timer);
+        deauth_rescan_timer = NULL;
+    }
+    
+    const esp_timer_create_args_t timer_args = {
+        .callback = &deauth_rescan_timer_cb,
+        .name = "deauth_rescan"
+    };
+    
+    if (esp_timer_create(&timer_args, &deauth_rescan_timer) == ESP_OK) {
+        esp_timer_start_periodic(deauth_rescan_timer, DEAUTH_RESCAN_INTERVAL_MS * 1000);
+        ESP_LOGI(TAG, "Deauth rescan timer started (every %d seconds)", DEAUTH_RESCAN_INTERVAL_MS / 1000);
+    }
+}
+
+static void deauth_rescan_timer_stop(void)
+{
+    if (deauth_rescan_timer != NULL) {
+        esp_timer_stop(deauth_rescan_timer);
+        esp_timer_delete(deauth_rescan_timer);
+        deauth_rescan_timer = NULL;
+        ESP_LOGI(TAG, "Deauth rescan timer stopped");
+    }
+    deauth_rescan_pending = false;
+    deauth_rescan_active = false;
+    deauth_rescan_done_flag = false;
 }
 
 static void deauth_quit_event_cb(lv_event_t *e)
 {
     (void)e;
+    // Stop rescan timer
+    deauth_rescan_timer_stop();
     // Stop all attacks (deauth, evil twin, etc.)
     wifi_attacks_stop_all();
     deauth_stop_flag = true;
@@ -2302,8 +2443,8 @@ static void blackout_yes_btn_cb(lv_event_t *e)
     lv_obj_align(blackout_log_ta, LV_ALIGN_TOP_MID, 0, 30);
     lv_textarea_set_text(blackout_log_ta, "Starting Blackout Attack...\n");
     lv_obj_set_style_bg_color(blackout_log_ta, lv_color_make(0, 0, 0), 0);  // Black background
-    lv_obj_set_style_text_color(blackout_log_ta, lv_color_make(0, 255, 0), 0);  // Green text
-    lv_obj_set_style_border_color(blackout_log_ta, lv_color_make(0, 255, 0), 0);  // Green border
+    lv_obj_set_style_text_color(blackout_log_ta, COLOR_MATERIAL_BLUE, 0);  // Green text
+    lv_obj_set_style_border_color(blackout_log_ta, COLOR_MATERIAL_BLUE, 0);  // Green border
     lv_obj_set_style_border_width(blackout_log_ta, 2, 0);
     lv_obj_clear_state(blackout_log_ta, LV_STATE_FOCUSED);  // Hide cursor
     
@@ -2312,12 +2453,12 @@ static void blackout_yes_btn_cb(lv_event_t *e)
     lv_obj_set_size(blackout_stop_btn, lv_pct(100), 45);
     lv_obj_align(blackout_stop_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(blackout_stop_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
-    lv_obj_set_style_bg_color(blackout_stop_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
-    lv_obj_set_style_border_color(blackout_stop_btn, lv_color_make(0, 255, 0), 0);  // Green border
+    lv_obj_set_style_bg_color(blackout_stop_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);  // Dark green when pressed
+    lv_obj_set_style_border_color(blackout_stop_btn, COLOR_MATERIAL_BLUE, 0);  // Green border
     lv_obj_set_style_border_width(blackout_stop_btn, 3, 0);
     lv_obj_t *stop_lbl = lv_label_create(blackout_stop_btn);
     lv_label_set_text(stop_lbl, "Stop");
-    lv_obj_set_style_text_color(stop_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_obj_set_style_text_color(stop_lbl, COLOR_MATERIAL_BLUE, 0);  // Green text
     lv_obj_center(stop_lbl);
     lv_obj_add_event_cb(blackout_stop_btn, blackout_stop_btn_cb, LV_EVENT_CLICKED, NULL);
     
@@ -2361,8 +2502,8 @@ static void snifferdog_yes_btn_cb(lv_event_t *e)
     lv_obj_align(snifferdog_log_ta, LV_ALIGN_TOP_MID, 0, 30);
     lv_textarea_set_text(snifferdog_log_ta, "Starting Snifferdog Attack...\n");
     lv_obj_set_style_bg_color(snifferdog_log_ta, lv_color_make(0, 0, 0), 0);  // Black background
-    lv_obj_set_style_text_color(snifferdog_log_ta, lv_color_make(0, 255, 0), 0);  // Green text
-    lv_obj_set_style_border_color(snifferdog_log_ta, lv_color_make(0, 255, 0), 0);  // Green border
+    lv_obj_set_style_text_color(snifferdog_log_ta, COLOR_MATERIAL_BLUE, 0);  // Green text
+    lv_obj_set_style_border_color(snifferdog_log_ta, COLOR_MATERIAL_BLUE, 0);  // Green border
     lv_obj_set_style_border_width(snifferdog_log_ta, 2, 0);
     lv_obj_clear_state(snifferdog_log_ta, LV_STATE_FOCUSED);  // Hide cursor
     
@@ -2371,12 +2512,12 @@ static void snifferdog_yes_btn_cb(lv_event_t *e)
     lv_obj_set_size(snifferdog_stop_btn, lv_pct(100), 45);
     lv_obj_align(snifferdog_stop_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(snifferdog_stop_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
-    lv_obj_set_style_bg_color(snifferdog_stop_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
-    lv_obj_set_style_border_color(snifferdog_stop_btn, lv_color_make(0, 255, 0), 0);  // Green border
+    lv_obj_set_style_bg_color(snifferdog_stop_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);  // Dark green when pressed
+    lv_obj_set_style_border_color(snifferdog_stop_btn, COLOR_MATERIAL_BLUE, 0);  // Green border
     lv_obj_set_style_border_width(snifferdog_stop_btn, 3, 0);
     lv_obj_t *stop_lbl = lv_label_create(snifferdog_stop_btn);
     lv_label_set_text(stop_lbl, "Stop");
-    lv_obj_set_style_text_color(stop_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_obj_set_style_text_color(stop_lbl, COLOR_MATERIAL_BLUE, 0);  // Green text
     lv_obj_center(stop_lbl);
     lv_obj_add_event_cb(snifferdog_stop_btn, snifferdog_stop_btn_cb, LV_EVENT_CLICKED, NULL);
     
@@ -2484,8 +2625,8 @@ static void sniffer_yes_btn_cb(lv_event_t *e)
     lv_obj_align(sniffer_log_ta, LV_ALIGN_TOP_MID, 0, 30);
     lv_textarea_set_text(sniffer_log_ta, "Starting WiFi Sniffer...\n");
     lv_obj_set_style_bg_color(sniffer_log_ta, lv_color_make(0, 0, 0), 0);  // Black background
-    lv_obj_set_style_text_color(sniffer_log_ta, lv_color_make(0, 255, 0), 0);  // Green text
-    lv_obj_set_style_border_color(sniffer_log_ta, lv_color_make(0, 255, 0), 0);  // Green border
+    lv_obj_set_style_text_color(sniffer_log_ta, COLOR_MATERIAL_BLUE, 0);  // Green text
+    lv_obj_set_style_border_color(sniffer_log_ta, COLOR_MATERIAL_BLUE, 0);  // Green border
     lv_obj_set_style_border_width(sniffer_log_ta, 2, 0);
     lv_obj_clear_state(sniffer_log_ta, LV_STATE_FOCUSED);  // Hide cursor
     
@@ -2494,12 +2635,12 @@ static void sniffer_yes_btn_cb(lv_event_t *e)
     lv_obj_set_size(sniffer_stop_btn, lv_pct(100), 45);
     lv_obj_align(sniffer_stop_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(sniffer_stop_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
-    lv_obj_set_style_bg_color(sniffer_stop_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
-    lv_obj_set_style_border_color(sniffer_stop_btn, lv_color_make(0, 255, 0), 0);  // Green border
+    lv_obj_set_style_bg_color(sniffer_stop_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);  // Dark green when pressed
+    lv_obj_set_style_border_color(sniffer_stop_btn, COLOR_MATERIAL_BLUE, 0);  // Green border
     lv_obj_set_style_border_width(sniffer_stop_btn, 3, 0);
     lv_obj_t *enough_lbl = lv_label_create(sniffer_stop_btn);
     lv_label_set_text(enough_lbl, "Enough");
-    lv_obj_set_style_text_color(enough_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_obj_set_style_text_color(enough_lbl, COLOR_MATERIAL_BLUE, 0);  // Green text
     lv_obj_center(enough_lbl);
     lv_obj_add_event_cb(sniffer_stop_btn, sniffer_enough_btn_cb, LV_EVENT_CLICKED, NULL);
     
@@ -2597,7 +2738,7 @@ static void sae_overflow_yes_btn_cb(lv_event_t *e)
         lv_obj_t *error_label = lv_label_create(function_page);
         lv_label_set_text(error_label, "SAE Overflow requires\nexactly ONE network.\n\nPlease scan and select\none network.");
         lv_obj_set_style_text_align(error_label, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_text_color(error_label, lv_color_make(0, 255, 0), 0);
+        lv_obj_set_style_text_color(error_label, COLOR_MATERIAL_BLUE, 0);
         lv_obj_set_style_text_font(error_label, &lv_font_montserrat_16, 0);
         lv_obj_center(error_label);
         
@@ -2606,12 +2747,12 @@ static void sae_overflow_yes_btn_cb(lv_event_t *e)
         lv_obj_set_size(back_btn, lv_pct(90), LV_SIZE_CONTENT);
         lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -15);
         lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);
-        lv_obj_set_style_border_color(back_btn, lv_color_make(0, 255, 0), 0);
+        lv_obj_set_style_bg_color(back_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(back_btn, COLOR_MATERIAL_BLUE, 0);
         lv_obj_set_style_border_width(back_btn, 2, 0);
         lv_obj_t *back_lbl = lv_label_create(back_btn);
         lv_label_set_text(back_lbl, "BACK");
-        lv_obj_set_style_text_color(back_lbl, lv_color_make(0, 255, 0), 0);
+        lv_obj_set_style_text_color(back_lbl, COLOR_MATERIAL_BLUE, 0);
         lv_obj_center(back_lbl);
         lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
         
@@ -2633,8 +2774,8 @@ static void sae_overflow_yes_btn_cb(lv_event_t *e)
     lv_obj_align(sae_overflow_log_ta, LV_ALIGN_TOP_MID, 0, 30);
     lv_textarea_set_text(sae_overflow_log_ta, "Starting SAE Overflow Attack...\n");
     lv_obj_set_style_bg_color(sae_overflow_log_ta, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_text_color(sae_overflow_log_ta, lv_color_make(0, 255, 0), 0);
-    lv_obj_set_style_border_color(sae_overflow_log_ta, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_text_color(sae_overflow_log_ta, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_border_color(sae_overflow_log_ta, COLOR_MATERIAL_BLUE, 0);
     lv_obj_set_style_border_width(sae_overflow_log_ta, 2, 0);
     lv_obj_clear_state(sae_overflow_log_ta, LV_STATE_FOCUSED);
     
@@ -2643,12 +2784,12 @@ static void sae_overflow_yes_btn_cb(lv_event_t *e)
     lv_obj_set_size(sae_overflow_stop_btn, lv_pct(100), 45);
     lv_obj_align(sae_overflow_stop_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(sae_overflow_stop_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(sae_overflow_stop_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);
-    lv_obj_set_style_border_color(sae_overflow_stop_btn, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_bg_color(sae_overflow_stop_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(sae_overflow_stop_btn, COLOR_MATERIAL_BLUE, 0);
     lv_obj_set_style_border_width(sae_overflow_stop_btn, 3, 0);
     lv_obj_t *stop_lbl = lv_label_create(sae_overflow_stop_btn);
     lv_label_set_text(stop_lbl, "STOP");
-    lv_obj_set_style_text_color(stop_lbl, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_text_color(stop_lbl, COLOR_MATERIAL_BLUE, 0);
     lv_obj_center(stop_lbl);
     lv_obj_add_event_cb(sae_overflow_stop_btn, sae_overflow_stop_btn_cb, LV_EVENT_CLICKED, NULL);
     
@@ -3012,8 +3153,8 @@ static void handshake_yes_btn_cb(lv_event_t *e)
     lv_obj_align(handshake_log_ta, LV_ALIGN_TOP_MID, 0, 30);
     lv_textarea_set_text(handshake_log_ta, "Starting WPA Handshake Capture...\n");
     lv_obj_set_style_bg_color(handshake_log_ta, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_text_color(handshake_log_ta, lv_color_make(0, 255, 0), 0);
-    lv_obj_set_style_border_color(handshake_log_ta, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_text_color(handshake_log_ta, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_border_color(handshake_log_ta, COLOR_MATERIAL_BLUE, 0);
     lv_obj_set_style_border_width(handshake_log_ta, 2, 0);
     lv_obj_clear_state(handshake_log_ta, LV_STATE_FOCUSED);
     
@@ -3022,12 +3163,12 @@ static void handshake_yes_btn_cb(lv_event_t *e)
     lv_obj_set_size(handshake_stop_btn, lv_pct(100), 45);
     lv_obj_align(handshake_stop_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(handshake_stop_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(handshake_stop_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);
-    lv_obj_set_style_border_color(handshake_stop_btn, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_bg_color(handshake_stop_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(handshake_stop_btn, COLOR_MATERIAL_BLUE, 0);
     lv_obj_set_style_border_width(handshake_stop_btn, 3, 0);
     lv_obj_t *stop_lbl = lv_label_create(handshake_stop_btn);
     lv_label_set_text(stop_lbl, "STOP");
-    lv_obj_set_style_text_color(stop_lbl, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_text_color(stop_lbl, COLOR_MATERIAL_BLUE, 0);
     lv_obj_center(stop_lbl);
     lv_obj_add_event_cb(handshake_stop_btn, handshake_stop_btn_cb, LV_EVENT_CLICKED, NULL);
     
@@ -3334,8 +3475,8 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_align(wardrive_log_ta, LV_ALIGN_TOP_MID, 0, 30);
     lv_textarea_set_text(wardrive_log_ta, "Starting Wardrive...\n");
     lv_obj_set_style_bg_color(wardrive_log_ta, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_text_color(wardrive_log_ta, lv_color_make(0, 255, 0), 0);
-    lv_obj_set_style_border_color(wardrive_log_ta, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_text_color(wardrive_log_ta, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_border_color(wardrive_log_ta, COLOR_MATERIAL_BLUE, 0);
     lv_obj_set_style_border_width(wardrive_log_ta, 2, 0);
     lv_obj_clear_state(wardrive_log_ta, LV_STATE_FOCUSED);
     
@@ -3344,12 +3485,12 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_set_size(wardrive_stop_btn, lv_pct(100), 45);
     lv_obj_align(wardrive_stop_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(wardrive_stop_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(wardrive_stop_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);
-    lv_obj_set_style_border_color(wardrive_stop_btn, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_bg_color(wardrive_stop_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(wardrive_stop_btn, COLOR_MATERIAL_BLUE, 0);
     lv_obj_set_style_border_width(wardrive_stop_btn, 3, 0);
     lv_obj_t *stop_lbl = lv_label_create(wardrive_stop_btn);
     lv_label_set_text(stop_lbl, "Stop");
-    lv_obj_set_style_text_color(stop_lbl, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_text_color(stop_lbl, COLOR_MATERIAL_BLUE, 0);
     lv_obj_center(stop_lbl);
     lv_obj_add_event_cb(wardrive_stop_btn, wardrive_stop_btn_cb, LV_EVENT_CLICKED, NULL);
     
@@ -3435,20 +3576,20 @@ static void show_karma_page(void)
     lv_obj_t *probe_label = lv_label_create(karma_content);
     lv_label_set_text(probe_label, "Probe Request SSID:");
     lv_obj_set_style_text_font(probe_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(probe_label, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_obj_set_style_text_color(probe_label, COLOR_MATERIAL_BLUE, 0);  // Green text
 
     karma_probe_dd = lv_dropdown_create(karma_content);
     lv_obj_set_width(karma_probe_dd, lv_pct(100));
     lv_dropdown_set_dir(karma_probe_dd, LV_DIR_BOTTOM);
     // Retro terminal styling for dropdown
     lv_obj_set_style_bg_color(karma_probe_dd, lv_color_make(0, 0, 0), LV_PART_MAIN);  // Black background
-    lv_obj_set_style_text_color(karma_probe_dd, lv_color_make(0, 255, 0), LV_PART_MAIN);  // Green text
-    lv_obj_set_style_border_color(karma_probe_dd, lv_color_make(0, 255, 0), LV_PART_MAIN);  // Green border
+    lv_obj_set_style_text_color(karma_probe_dd, COLOR_MATERIAL_BLUE, LV_PART_MAIN);  // Green text
+    lv_obj_set_style_border_color(karma_probe_dd, COLOR_MATERIAL_BLUE, LV_PART_MAIN);  // Green border
     lv_obj_t *dd_list1 = lv_dropdown_get_list(karma_probe_dd);
     if (dd_list1) {
         lv_obj_set_style_bg_color(dd_list1, lv_color_make(0, 0, 0), 0);  // Black background for list
-        lv_obj_set_style_text_color(dd_list1, lv_color_make(0, 255, 0), 0);  // Green text for list
-        lv_obj_set_style_border_color(dd_list1, lv_color_make(0, 255, 0), 0);  // Green border
+        lv_obj_set_style_text_color(dd_list1, COLOR_MATERIAL_BLUE, 0);  // Green text for list
+        lv_obj_set_style_border_color(dd_list1, COLOR_MATERIAL_BLUE, 0);  // Green border
     }
 
     // Get probe requests from sniffer
@@ -3517,20 +3658,20 @@ static void show_karma_page(void)
     lv_obj_t *html_label = lv_label_create(karma_content);
     lv_label_set_text(html_label, "HTML Portal");
     lv_obj_set_style_text_font(html_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(html_label, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_obj_set_style_text_color(html_label, COLOR_MATERIAL_BLUE, 0);  // Green text
 
     karma_html_dd = lv_dropdown_create(karma_content);
     lv_obj_set_width(karma_html_dd, lv_pct(100));
     lv_dropdown_set_dir(karma_html_dd, LV_DIR_BOTTOM);
     // Retro terminal styling for dropdown
     lv_obj_set_style_bg_color(karma_html_dd, lv_color_make(0, 0, 0), LV_PART_MAIN);  // Black background
-    lv_obj_set_style_text_color(karma_html_dd, lv_color_make(0, 255, 0), LV_PART_MAIN);  // Green text
-    lv_obj_set_style_border_color(karma_html_dd, lv_color_make(0, 255, 0), LV_PART_MAIN);  // Green border
+    lv_obj_set_style_text_color(karma_html_dd, COLOR_MATERIAL_BLUE, LV_PART_MAIN);  // Green text
+    lv_obj_set_style_border_color(karma_html_dd, COLOR_MATERIAL_BLUE, LV_PART_MAIN);  // Green border
     lv_obj_t *dd_list2 = lv_dropdown_get_list(karma_html_dd);
     if (dd_list2) {
         lv_obj_set_style_bg_color(dd_list2, lv_color_make(0, 0, 0), 0);  // Black background for list
-        lv_obj_set_style_text_color(dd_list2, lv_color_make(0, 255, 0), 0);  // Green text for list
-        lv_obj_set_style_border_color(dd_list2, lv_color_make(0, 255, 0), 0);  // Green border
+        lv_obj_set_style_text_color(dd_list2, COLOR_MATERIAL_BLUE, 0);  // Green text for list
+        lv_obj_set_style_border_color(dd_list2, COLOR_MATERIAL_BLUE, 0);  // Green border
     }
 
     int html_total = wifi_attacks_get_sd_html_count();
@@ -3589,15 +3730,15 @@ static void show_karma_page(void)
     lv_obj_set_height(karma_start_btn, 40);
     // Retro terminal styling for button with visible border
     lv_obj_set_style_bg_color(karma_start_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black background
-    lv_obj_set_style_bg_color(karma_start_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
-    lv_obj_set_style_border_color(karma_start_btn, lv_color_make(0, 255, 0), 0);  // Green border
+    lv_obj_set_style_bg_color(karma_start_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);  // Dark green when pressed
+    lv_obj_set_style_border_color(karma_start_btn, COLOR_MATERIAL_BLUE, 0);  // Green border
     lv_obj_set_style_border_width(karma_start_btn, 3, 0);  // Thick border (3px)
     lv_obj_set_style_border_opa(karma_start_btn, LV_OPA_COVER, 0);  // Fully opaque border
     lv_obj_add_event_cb(karma_start_btn, karma_start_btn_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *start_label = lv_label_create(karma_start_btn);
     lv_label_set_text(start_label, "Start Karma");
-    lv_obj_set_style_text_color(start_label, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_obj_set_style_text_color(start_label, COLOR_MATERIAL_BLUE, 0);  // Green text
     lv_obj_center(start_label);
 
     // Disable button if no probes or no HTML
@@ -3670,21 +3811,21 @@ static void karma_start_btn_cb(lv_event_t *e)
     lv_textarea_set_text(karma_log_ta, "");
     // Retro terminal styling
     lv_obj_set_style_bg_color(karma_log_ta, lv_color_make(0, 0, 0), 0);  // Black background
-    lv_obj_set_style_text_color(karma_log_ta, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_obj_set_style_text_color(karma_log_ta, COLOR_MATERIAL_BLUE, 0);  // Green text
 
     // Stop button at the bottom
     karma_stop_btn = lv_btn_create(function_page);
     lv_obj_set_size(karma_stop_btn, lv_pct(100), 40);
     lv_obj_align(karma_stop_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(karma_stop_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(karma_stop_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);
-    lv_obj_set_style_border_color(karma_stop_btn, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_bg_color(karma_stop_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(karma_stop_btn, COLOR_MATERIAL_BLUE, 0);
     lv_obj_set_style_border_width(karma_stop_btn, 3, 0);
     lv_obj_add_event_cb(karma_stop_btn, karma_stop_btn_cb, LV_EVENT_CLICKED, NULL);
     
     lv_obj_t *stop_label = lv_label_create(karma_stop_btn);
     lv_label_set_text(stop_label, "Stop");
-    lv_obj_set_style_text_color(stop_label, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_text_color(stop_label, COLOR_MATERIAL_BLUE, 0);
     lv_obj_center(stop_label);
 
     karma_ui_active = true;
@@ -3800,15 +3941,15 @@ static void show_portal_page(void)
     lv_obj_t *ssid_label = lv_label_create(portal_content);
     lv_label_set_text(ssid_label, "Portal SSID:");
     lv_obj_set_style_text_font(ssid_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(ssid_label, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_obj_set_style_text_color(ssid_label, COLOR_MATERIAL_BLUE, 0);  // Green text
 
     portal_ssid_ta = lv_textarea_create(portal_content);
     lv_obj_set_width(portal_ssid_ta, lv_pct(100));
     lv_textarea_set_one_line(portal_ssid_ta, true);
     lv_textarea_set_text(portal_ssid_ta, portal_ssid_buffer);
     lv_obj_set_style_bg_color(portal_ssid_ta, lv_color_make(0, 0, 0), 0);  // Black background
-    lv_obj_set_style_text_color(portal_ssid_ta, lv_color_make(0, 255, 0), 0);  // Green text
-    lv_obj_set_style_border_color(portal_ssid_ta, lv_color_make(0, 255, 0), 0);  // Green border
+    lv_obj_set_style_text_color(portal_ssid_ta, COLOR_MATERIAL_BLUE, 0);  // Green text
+    lv_obj_set_style_border_color(portal_ssid_ta, COLOR_MATERIAL_BLUE, 0);  // Green border
     
     // Add event to show keyboard when text area is clicked
     lv_obj_add_event_cb(portal_ssid_ta, portal_ssid_ta_event_cb, LV_EVENT_CLICKED, NULL);
@@ -3822,13 +3963,13 @@ static void show_portal_page(void)
     
     // Keyboard background - black
     lv_obj_set_style_bg_color(portal_keyboard, lv_color_make(0, 0, 0), LV_PART_MAIN);
-    lv_obj_set_style_text_color(portal_keyboard, lv_color_make(0, 255, 0), LV_PART_MAIN);
+    lv_obj_set_style_text_color(portal_keyboard, COLOR_MATERIAL_BLUE, LV_PART_MAIN);
     
     // Keyboard buttons - green with black background
     lv_obj_set_style_bg_color(portal_keyboard, lv_color_make(0, 100, 0), LV_PART_ITEMS);  // Dark green buttons
     lv_obj_set_style_bg_color(portal_keyboard, lv_color_make(0, 150, 0), LV_PART_ITEMS | LV_STATE_PRESSED);  // Lighter green when pressed
-    lv_obj_set_style_text_color(portal_keyboard, lv_color_make(0, 255, 0), LV_PART_ITEMS);  // Bright green text
-    lv_obj_set_style_border_color(portal_keyboard, lv_color_make(0, 255, 0), LV_PART_ITEMS);  // Green border
+    lv_obj_set_style_text_color(portal_keyboard, COLOR_MATERIAL_BLUE, LV_PART_ITEMS);  // Bright green text
+    lv_obj_set_style_border_color(portal_keyboard, COLOR_MATERIAL_BLUE, LV_PART_ITEMS);  // Green border
     lv_obj_set_style_border_width(portal_keyboard, 1, LV_PART_ITEMS);
     
     lv_obj_add_event_cb(portal_keyboard, portal_keyboard_event_cb, LV_EVENT_VALUE_CHANGED, portal_ssid_ta);
@@ -3840,20 +3981,20 @@ static void show_portal_page(void)
     lv_obj_t *html_label = lv_label_create(portal_content);
     lv_label_set_text(html_label, "HTML Portal");
     lv_obj_set_style_text_font(html_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(html_label, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_obj_set_style_text_color(html_label, COLOR_MATERIAL_BLUE, 0);  // Green text
 
     portal_html_dd = lv_dropdown_create(portal_content);
     lv_obj_set_width(portal_html_dd, lv_pct(100));
     lv_dropdown_set_dir(portal_html_dd, LV_DIR_BOTTOM);
     // Retro terminal styling for dropdown
     lv_obj_set_style_bg_color(portal_html_dd, lv_color_make(0, 0, 0), LV_PART_MAIN);  // Black background
-    lv_obj_set_style_text_color(portal_html_dd, lv_color_make(0, 255, 0), LV_PART_MAIN);  // Green text
-    lv_obj_set_style_border_color(portal_html_dd, lv_color_make(0, 255, 0), LV_PART_MAIN);  // Green border
+    lv_obj_set_style_text_color(portal_html_dd, COLOR_MATERIAL_BLUE, LV_PART_MAIN);  // Green text
+    lv_obj_set_style_border_color(portal_html_dd, COLOR_MATERIAL_BLUE, LV_PART_MAIN);  // Green border
     lv_obj_t *dd_list = lv_dropdown_get_list(portal_html_dd);
     if (dd_list) {
         lv_obj_set_style_bg_color(dd_list, lv_color_make(0, 0, 0), 0);  // Black background for list
-        lv_obj_set_style_text_color(dd_list, lv_color_make(0, 255, 0), 0);  // Green text for list
-        lv_obj_set_style_border_color(dd_list, lv_color_make(0, 255, 0), 0);  // Green border
+        lv_obj_set_style_text_color(dd_list, COLOR_MATERIAL_BLUE, 0);  // Green text for list
+        lv_obj_set_style_border_color(dd_list, COLOR_MATERIAL_BLUE, 0);  // Green border
     }
 
     int html_total = wifi_attacks_get_sd_html_count();
@@ -3912,15 +4053,15 @@ static void show_portal_page(void)
     lv_obj_set_height(portal_start_btn, 40);
     // Retro terminal styling for button with visible border
     lv_obj_set_style_bg_color(portal_start_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black background
-    lv_obj_set_style_bg_color(portal_start_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
-    lv_obj_set_style_border_color(portal_start_btn, lv_color_make(0, 255, 0), 0);  // Green border
+    lv_obj_set_style_bg_color(portal_start_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);  // Dark green when pressed
+    lv_obj_set_style_border_color(portal_start_btn, COLOR_MATERIAL_BLUE, 0);  // Green border
     lv_obj_set_style_border_width(portal_start_btn, 3, 0);  // Thick border (3px)
     lv_obj_set_style_border_opa(portal_start_btn, LV_OPA_COVER, 0);  // Fully opaque border
     lv_obj_add_event_cb(portal_start_btn, portal_start_btn_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *start_label = lv_label_create(portal_start_btn);
     lv_label_set_text(start_label, "Start Portal");
-    lv_obj_set_style_text_color(start_label, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_obj_set_style_text_color(start_label, COLOR_MATERIAL_BLUE, 0);  // Green text
     lv_obj_center(start_label);
 
     // Disable button if no HTML
@@ -4050,14 +4191,16 @@ static void create_function_page_base(const char *name)
         function_page = NULL;
     }
 
-    // Hide menu and title bar while the function page is active
-    lv_obj_add_flag(menu_obj, LV_OBJ_FLAG_HIDDEN);
+    // Hide tiles container and title bar while the function page is active
+    if (tiles_container) {
+        lv_obj_add_flag(tiles_container, LV_OBJ_FLAG_HIDDEN);
+    }
     lv_obj_add_flag(title_bar, LV_OBJ_FLAG_HIDDEN);
 
     function_page = lv_obj_create(lv_scr_act());
     lv_obj_set_size(function_page, lv_pct(100), lv_pct(100));
     lv_obj_align(function_page, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_bg_color(function_page, lv_color_make(0, 0, 0), 0);  // Black background
+    lv_obj_set_style_bg_color(function_page, lv_color_make(18, 18, 18), 0);  // Material Dark #121212
     lv_obj_set_style_border_width(function_page, 0, 0);
     lv_obj_set_style_radius(function_page, 0, 0);
     lv_obj_set_style_pad_all(function_page, 0, 0);
@@ -4065,26 +4208,31 @@ static void create_function_page_base(const char *name)
     lv_obj_t *page_title_bar = lv_obj_create(function_page);
     lv_obj_set_size(page_title_bar, lv_pct(100), 30);
     lv_obj_align(page_title_bar, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_bg_color(page_title_bar, lv_color_make(20, 20, 20), 0);
+    lv_obj_set_style_bg_color(page_title_bar, lv_color_make(30, 30, 30), 0);  // Material Surface #1E1E1E
     lv_obj_set_style_border_width(page_title_bar, 0, 0);
     lv_obj_set_style_radius(page_title_bar, 0, 0);
     lv_obj_clear_flag(page_title_bar, LV_OBJ_FLAG_SCROLLABLE);  // No scroll
 
-    lv_obj_t *back_btn = lv_btn_create(page_title_bar);
-    lv_obj_set_size(back_btn, 30, 30);
-    lv_obj_align(back_btn, LV_ALIGN_LEFT_MID, 0, 0);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(40, 40, 40), 0);
-    lv_obj_set_style_radius(back_btn, 5, 0);
-    lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
+    // Home button - Material Blue accent
+    lv_obj_t *home_btn = lv_btn_create(page_title_bar);
+    lv_obj_set_size(home_btn, 30, 30);
+    lv_obj_align(home_btn, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_set_style_bg_color(home_btn, lv_color_make(33, 150, 243), 0);  // Material Blue #2196F3
+    lv_obj_set_style_bg_color(home_btn, lv_color_make(66, 165, 245), LV_STATE_PRESSED);  // Lighter blue
+    lv_obj_set_style_radius(home_btn, 5, 0);
+    lv_obj_set_style_shadow_width(home_btn, 4, 0);
+    lv_obj_set_style_shadow_color(home_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(home_btn, LV_OPA_30, 0);
+    lv_obj_add_event_cb(home_btn, home_btn_event_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *back_label = lv_label_create(back_btn);
-    lv_label_set_text(back_label, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_color(back_label, lv_color_make(255, 0, 0), 0);
-    lv_obj_center(back_label);
+    lv_obj_t *home_label = lv_label_create(home_btn);
+    lv_label_set_text(home_label, LV_SYMBOL_HOME);
+    lv_obj_set_style_text_color(home_label, lv_color_make(255, 255, 255), 0);  // White icon
+    lv_obj_center(home_label);
 
     lv_obj_t *page_title_label = lv_label_create(page_title_bar);
     lv_label_set_text(page_title_label, name ? name : "");
-    lv_obj_set_style_text_color(page_title_label, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_text_color(page_title_label, lv_color_make(255, 255, 255), 0);  // White text
     lv_obj_center(page_title_label);
 }
 
@@ -4099,8 +4247,8 @@ void show_menu(void)
     }
     // scan_list lives under function_page; NULL already if page deleted
     
-    // Show menu and title bar
-    lv_obj_clear_flag(menu_obj, LV_OBJ_FLAG_HIDDEN);
+    // Show main tiles and title bar
+    show_main_tiles();
     lv_obj_clear_flag(title_bar, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -4111,11 +4259,601 @@ void show_function_page(const char *name)
     lv_obj_t *center_label = lv_label_create(function_page);
     lv_label_set_text(center_label, name);
     lv_obj_set_style_text_font(center_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(center_label, lv_color_make(0, 255, 0), 0);  // Green text (retro terminal)
+    lv_obj_set_style_text_color(center_label, COLOR_MATERIAL_BLUE, 0);  // Green text (retro terminal)
     lv_obj_center(center_label);
     
     // Logging removed to avoid VFS writes during draw
 }
+
+// ============================================================================
+// TILE-BASED NAVIGATION SYSTEM
+// ============================================================================
+
+// Home button callback - sends UART reboot command and returns to main tiles
+static void home_btn_event_cb(lv_event_t *e)
+{
+    (void)e;
+    // Send "reboot" command via UART (GPS UART port)
+    const char *reboot_cmd = "reboot\n";
+    uart_write_bytes(GPS_UART_NUM, reboot_cmd, strlen(reboot_cmd));
+    ESP_LOGI(TAG, "UART reboot command sent");
+    
+    // Stop all active attacks
+    wifi_attacks_stop_all();
+    
+    // Navigate back to main tiles
+    nav_to_menu_flag = true;
+}
+
+// Create a single tile button
+static lv_obj_t *create_tile(lv_obj_t *parent, const char *icon, const char *text, lv_color_t bg_color, lv_event_cb_t callback, const char *user_data)
+{
+    lv_obj_t *tile = lv_btn_create(parent);
+    lv_obj_set_size(tile, 145, 85);  // Tile size for 3 columns
+    lv_obj_set_style_bg_color(tile, bg_color, LV_STATE_DEFAULT);
+    // Pressed state: lighten the color
+    lv_obj_set_style_bg_color(tile, lv_color_lighten(bg_color, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(tile, 0, 0);  // No border for Material look
+    lv_obj_set_style_radius(tile, 12, 0);  // Rounded corners
+    lv_obj_set_style_shadow_width(tile, 8, 0);  // Material shadow
+    lv_obj_set_style_shadow_color(tile, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(tile, LV_OPA_30, 0);
+    lv_obj_set_flex_flow(tile, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(tile, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(tile, 8, 0);
+    
+    if (icon) {
+        lv_obj_t *icon_label = lv_label_create(tile);
+        lv_label_set_text(icon_label, icon);
+        lv_obj_set_style_text_font(icon_label, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(icon_label, lv_color_make(255, 255, 255), 0);  // White icon
+    }
+    
+    if (text) {
+        lv_obj_t *text_label = lv_label_create(tile);
+        lv_label_set_text(text_label, text);
+        lv_obj_set_style_text_font(text_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(text_label, lv_color_make(255, 255, 255), 0);  // White text
+        lv_obj_set_style_text_align(text_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(text_label, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(text_label, 130);
+    }
+    
+    if (callback && user_data) {
+        lv_obj_add_event_cb(tile, callback, LV_EVENT_CLICKED, (void*)user_data);
+    }
+    
+    return tile;
+}
+
+// Create a smaller tile button for compact layouts (e.g., attack selection row)
+static lv_obj_t *create_small_tile(lv_obj_t *parent, const char *icon, const char *text, lv_color_t bg_color, lv_event_cb_t callback, const char *user_data)
+{
+    lv_obj_t *tile = lv_btn_create(parent);
+    lv_obj_set_size(tile, 85, 55);  // Smaller tile size for single row
+    lv_obj_set_style_bg_color(tile, bg_color, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(tile, lv_color_lighten(bg_color, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(tile, 0, 0);
+    lv_obj_set_style_radius(tile, 8, 0);  // Smaller radius
+    lv_obj_set_style_shadow_width(tile, 4, 0);  // Smaller shadow
+    lv_obj_set_style_shadow_color(tile, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(tile, LV_OPA_30, 0);
+    lv_obj_set_flex_flow(tile, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(tile, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(tile, 4, 0);
+    
+    if (icon) {
+        lv_obj_t *icon_label = lv_label_create(tile);
+        lv_label_set_text(icon_label, icon);
+        lv_obj_set_style_text_font(icon_label, &lv_font_montserrat_14, 0);  // Smaller icon
+        lv_obj_set_style_text_color(icon_label, lv_color_make(255, 255, 255), 0);
+    }
+    
+    if (text) {
+        lv_obj_t *text_label = lv_label_create(tile);
+        lv_label_set_text(text_label, text);
+        lv_obj_set_style_text_font(text_label, &lv_font_montserrat_12, 0);  // Smaller text
+        lv_obj_set_style_text_color(text_label, lv_color_make(255, 255, 255), 0);
+        lv_obj_set_style_text_align(text_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(text_label, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(text_label, 75);
+    }
+    
+    if (callback && user_data) {
+        lv_obj_add_event_cb(tile, callback, LV_EVENT_CLICKED, (void*)user_data);
+    }
+    
+    return tile;
+}
+
+// Main tile event callback - routes to appropriate screen
+static void main_tile_event_cb(lv_event_t *e)
+{
+    const char *tile_name = (const char *)lv_event_get_user_data(e);
+    if (!tile_name) return;
+    
+    if (strcmp(tile_name, "WiFi Scan & Attack") == 0) {
+        show_wifi_scan_attack_screen();
+    } else if (strcmp(tile_name, "Global WiFi Attacks") == 0) {
+        show_global_attacks_screen();
+    } else if (strcmp(tile_name, "WiFi Sniff&Karma") == 0) {
+        show_sniff_karma_screen();
+    } else if (strcmp(tile_name, "WiFi Monitor") == 0) {
+        show_wifi_monitor_screen();
+    } else if (strcmp(tile_name, "Bluetooth") == 0) {
+        show_bluetooth_screen();
+    }
+}
+
+// Attack tile event callback - after selecting networks
+static void attack_tile_event_cb(lv_event_t *e)
+{
+    const char *attack_name = (const char *)lv_event_get_user_data(e);
+    if (!attack_name) return;
+    
+    // Route to existing attack handlers
+    if (strcmp(attack_name, "Deauth") == 0) {
+        // Redirect to "Deauther" handler in attack_event_cb with a synthetic event
+        lv_event_t synthetic_event;
+        memset(&synthetic_event, 0, sizeof(synthetic_event));
+        synthetic_event.user_data = (void*)"Deauther";
+        attack_event_cb(&synthetic_event);
+        return;
+    } else if (strcmp(attack_name, "Evil Twin") == 0) {
+        show_evil_twin_page();
+    } else if (strcmp(attack_name, "SAE Overflow") == 0) {
+        // Reuse existing SAE overflow logic
+        create_function_page_base("SAE Overflow");
+        lv_obj_t *warning_label = lv_label_create(function_page);
+        lv_label_set_text(warning_label, "Warning: This will start\nSAE Overflow attack.\n\nSelect ONE network first.\n\nAre you sure?");
+        lv_obj_set_style_text_align(warning_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(warning_label, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_text_font(warning_label, &lv_font_montserrat_16, 0);
+        lv_obj_center(warning_label);
+        
+        lv_obj_t *btn_bar = lv_obj_create(function_page);
+        lv_obj_set_size(btn_bar, lv_pct(100), 50);
+        lv_obj_align(btn_bar, LV_ALIGN_BOTTOM_MID, 0, -15);
+        lv_obj_set_style_bg_color(btn_bar, lv_color_make(0, 0, 0), 0);
+        lv_obj_set_style_border_width(btn_bar, 0, 0);
+        lv_obj_clear_flag(btn_bar, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(btn_bar, LV_FLEX_FLOW_ROW);
+        lv_obj_set_style_pad_all(btn_bar, 4, 0);
+        lv_obj_set_style_pad_gap(btn_bar, 4, 0);
+        
+        lv_obj_t *back_btn = lv_btn_create(btn_bar);
+        lv_obj_set_size(back_btn, lv_pct(48), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
+        lv_obj_set_style_border_color(back_btn, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_border_width(back_btn, 2, 0);
+        lv_obj_t *back_lbl = lv_label_create(back_btn);
+        lv_label_set_text(back_lbl, "BACK");
+        lv_obj_set_style_text_color(back_lbl, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_center(back_lbl);
+        lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
+        
+        lv_obj_t *yes_btn = lv_btn_create(btn_bar);
+        lv_obj_set_size(yes_btn, lv_pct(48), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(yes_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
+        lv_obj_set_style_border_color(yes_btn, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_border_width(yes_btn, 2, 0);
+        lv_obj_t *yes_lbl = lv_label_create(yes_btn);
+        lv_label_set_text(yes_lbl, "YES");
+        lv_obj_set_style_text_color(yes_lbl, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_center(yes_lbl);
+        lv_obj_add_event_cb(yes_btn, sae_overflow_yes_btn_cb, LV_EVENT_CLICKED, NULL);
+        
+    } else if (strcmp(attack_name, "Handshaker") == 0) {
+        // Reuse existing handshake logic
+        create_function_page_base("Handshakes");
+        lv_obj_t *warning_label = lv_label_create(function_page);
+        lv_label_set_text(warning_label, "WPA Handshake Capture\n\nSelected networks: Attack those\nNo selection: Scan & attack all\n\nAre you sure?");
+        lv_obj_set_style_text_align(warning_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(warning_label, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_text_font(warning_label, &lv_font_montserrat_14, 0);
+        lv_obj_center(warning_label);
+        
+        lv_obj_t *btn_bar = lv_obj_create(function_page);
+        lv_obj_set_size(btn_bar, lv_pct(100), 50);
+        lv_obj_align(btn_bar, LV_ALIGN_BOTTOM_MID, 0, -15);
+        lv_obj_set_style_bg_color(btn_bar, lv_color_make(0, 0, 0), 0);
+        lv_obj_set_style_border_width(btn_bar, 0, 0);
+        lv_obj_clear_flag(btn_bar, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(btn_bar, LV_FLEX_FLOW_ROW);
+        lv_obj_set_style_pad_all(btn_bar, 4, 0);
+        lv_obj_set_style_pad_gap(btn_bar, 4, 0);
+        
+        lv_obj_t *back_btn = lv_btn_create(btn_bar);
+        lv_obj_set_size(back_btn, lv_pct(48), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
+        lv_obj_set_style_border_color(back_btn, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_border_width(back_btn, 2, 0);
+        lv_obj_t *back_lbl = lv_label_create(back_btn);
+        lv_label_set_text(back_lbl, "BACK");
+        lv_obj_set_style_text_color(back_lbl, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_center(back_lbl);
+        lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
+        
+        lv_obj_t *yes_btn = lv_btn_create(btn_bar);
+        lv_obj_set_size(yes_btn, lv_pct(48), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(yes_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
+        lv_obj_set_style_border_color(yes_btn, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_border_width(yes_btn, 2, 0);
+        lv_obj_t *yes_lbl = lv_label_create(yes_btn);
+        lv_label_set_text(yes_lbl, "YES");
+        lv_obj_set_style_text_color(yes_lbl, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_center(yes_lbl);
+        lv_obj_add_event_cb(yes_btn, handshake_yes_btn_cb, LV_EVENT_CLICKED, NULL);
+        
+    } else if (strcmp(attack_name, "Sniffer") == 0) {
+        // Reuse existing sniffer logic
+        create_function_page_base("Sniffer");
+        lv_obj_t *warning_label = lv_label_create(function_page);
+        lv_label_set_text(warning_label, "This will start\nWiFi Sniffer.\n\nAre you sure?");
+        lv_obj_set_style_text_align(warning_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(warning_label, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_text_font(warning_label, &lv_font_montserrat_16, 0);
+        lv_obj_center(warning_label);
+        
+        lv_obj_t *btn_bar = lv_obj_create(function_page);
+        lv_obj_set_size(btn_bar, lv_pct(100), 50);
+        lv_obj_align(btn_bar, LV_ALIGN_BOTTOM_MID, 0, -15);
+        lv_obj_set_style_bg_color(btn_bar, lv_color_make(0, 0, 0), 0);
+        lv_obj_set_style_border_width(btn_bar, 0, 0);
+        lv_obj_clear_flag(btn_bar, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(btn_bar, LV_FLEX_FLOW_ROW);
+        lv_obj_set_style_pad_all(btn_bar, 4, 0);
+        lv_obj_set_style_pad_gap(btn_bar, 4, 0);
+        
+        lv_obj_t *back_btn = lv_btn_create(btn_bar);
+        lv_obj_set_size(back_btn, lv_pct(48), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
+        lv_obj_set_style_border_color(back_btn, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_border_width(back_btn, 2, 0);
+        lv_obj_t *back_lbl = lv_label_create(back_btn);
+        lv_label_set_text(back_lbl, "BACK");
+        lv_obj_set_style_text_color(back_lbl, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_center(back_lbl);
+        lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
+        
+        lv_obj_t *yes_btn = lv_btn_create(btn_bar);
+        lv_obj_set_size(yes_btn, lv_pct(48), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(yes_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
+        lv_obj_set_style_border_color(yes_btn, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_border_width(yes_btn, 2, 0);
+        lv_obj_t *yes_lbl = lv_label_create(yes_btn);
+        lv_label_set_text(yes_lbl, "YES");
+        lv_obj_set_style_text_color(yes_lbl, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_center(yes_lbl);
+        lv_obj_add_event_cb(yes_btn, sniffer_yes_btn_cb, LV_EVENT_CLICKED, NULL);
+    }
+}
+
+// Material Dark color palette
+#define COLOR_MATERIAL_BG       lv_color_make(18, 18, 18)      // #121212
+#define COLOR_MATERIAL_SURFACE  lv_color_make(30, 30, 30)      // #1E1E1E
+// COLOR_MATERIAL_BLUE defined at top of file
+#define COLOR_MATERIAL_RED      lv_color_make(244, 67, 54)     // #F44336
+#define COLOR_MATERIAL_PURPLE   lv_color_make(156, 39, 176)    // #9C27B0
+#define COLOR_MATERIAL_GREEN    lv_color_make(76, 175, 80)     // #4CAF50
+#define COLOR_MATERIAL_CYAN     lv_color_make(0, 188, 212)     // #00BCD4
+#define COLOR_MATERIAL_ORANGE   lv_color_make(255, 152, 0)     // #FF9800
+#define COLOR_MATERIAL_PINK     lv_color_make(233, 30, 99)     // #E91E63
+#define COLOR_MATERIAL_TEAL     lv_color_make(0, 150, 136)     // #009688
+#define COLOR_MATERIAL_AMBER    lv_color_make(255, 193, 7)     // #FFC107
+#define COLOR_MATERIAL_INDIGO   lv_color_make(63, 81, 181)     // #3F51B5
+
+// Show main tiles screen (5 tiles)
+static void show_main_tiles(void)
+{
+    // Delete existing tiles container if present
+    if (tiles_container) {
+        lv_obj_del(tiles_container);
+        tiles_container = NULL;
+    }
+    
+    // Delete function page if present
+    if (function_page) {
+        lv_obj_del(function_page);
+        function_page = NULL;
+    }
+    
+    // Create tiles container with Material Dark background
+    tiles_container = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(tiles_container, lv_pct(100), 290);
+    lv_obj_align(tiles_container, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(tiles_container, COLOR_MATERIAL_BG, 0);
+    lv_obj_set_style_border_width(tiles_container, 0, 0);
+    lv_obj_set_style_radius(tiles_container, 0, 0);
+    lv_obj_set_style_pad_all(tiles_container, 10, 0);
+    lv_obj_set_style_pad_gap(tiles_container, 10, 0);
+    lv_obj_set_flex_flow(tiles_container, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles_container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles_container, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Create 5 main tiles with Material colors
+    create_tile(tiles_container, LV_SYMBOL_WIFI, "WiFi Scan\n& Attack", COLOR_MATERIAL_BLUE, main_tile_event_cb, "WiFi Scan & Attack");
+    create_tile(tiles_container, LV_SYMBOL_WARNING, "Global WiFi\nAttacks", COLOR_MATERIAL_RED, main_tile_event_cb, "Global WiFi Attacks");
+    create_tile(tiles_container, LV_SYMBOL_EYE_OPEN, "WiFi Sniff\n& Karma", COLOR_MATERIAL_PURPLE, main_tile_event_cb, "WiFi Sniff&Karma");
+    create_tile(tiles_container, LV_SYMBOL_SETTINGS, "WiFi\nMonitor", COLOR_MATERIAL_GREEN, main_tile_event_cb, "WiFi Monitor");
+    create_tile(tiles_container, LV_SYMBOL_BLUETOOTH, "Bluetooth", COLOR_MATERIAL_CYAN, main_tile_event_cb, "Bluetooth");
+    
+    // Show title bar
+    lv_obj_clear_flag(title_bar, LV_OBJ_FLAG_HIDDEN);
+}
+
+// WiFi Scan Next button callback - shows attack tiles
+static void wifi_scan_next_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    show_attack_tiles_screen();
+}
+
+// WiFi Scan & Attack screen - scan and show network list with checkboxes
+static void show_wifi_scan_attack_screen(void)
+{
+    // Ensure WiFi mode is active
+    if (!ensure_wifi_mode()) {
+        ESP_LOGE(TAG, "Failed to switch to WiFi mode for scan");
+        return;
+    }
+    
+    create_function_page_base("WiFi Scan & Attack");
+    
+    // Create centered scanning container with icon and text
+    lv_obj_t *scan_container = lv_obj_create(function_page);
+    lv_obj_set_size(scan_container, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_center(scan_container);
+    lv_obj_set_style_bg_opa(scan_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(scan_container, 0, 0);
+    lv_obj_set_flex_flow(scan_container, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(scan_container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(scan_container, 10, 0);
+    
+    // WiFi scanning icon
+    lv_obj_t *scan_icon = lv_label_create(scan_container);
+    lv_label_set_text(scan_icon, LV_SYMBOL_WIFI);
+    lv_obj_set_style_text_font(scan_icon, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(scan_icon, COLOR_MATERIAL_BLUE, 0);
+    
+    // Scanning text
+    scan_status_label = lv_label_create(scan_container);
+    lv_label_set_text(scan_status_label, "Scanning...");
+    lv_obj_set_style_text_color(scan_status_label, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_text_font(scan_status_label, &lv_font_montserrat_20, 0);
+    
+    // Start scan
+    wifi_scanner_start_scan();
+}
+
+// Attack tiles screen - shown after selecting networks
+static void show_attack_tiles_screen(void)
+{
+    create_function_page_base("Select Attack");
+    
+    // Create small tiles container at top (single row) with extra spacing
+    lv_obj_t *attack_tiles = lv_obj_create(function_page);
+    lv_obj_set_size(attack_tiles, lv_pct(100), 70);
+    lv_obj_align(attack_tiles, LV_ALIGN_TOP_MID, 0, 40);  // Extra 10px spacing above tiles
+    lv_obj_set_style_bg_color(attack_tiles, COLOR_MATERIAL_BG, 0);
+    lv_obj_set_style_border_width(attack_tiles, 0, 0);
+    lv_obj_set_style_pad_all(attack_tiles, 5, 0);
+    lv_obj_set_style_pad_gap(attack_tiles, 5, 0);
+    lv_obj_set_flex_flow(attack_tiles, LV_FLEX_FLOW_ROW);  // Single row, no wrap
+    lv_obj_set_flex_align(attack_tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(attack_tiles, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Create smaller attack tiles in single row
+    create_small_tile(attack_tiles, LV_SYMBOL_CHARGE, "Deauth", COLOR_MATERIAL_RED, attack_tile_event_cb, "Deauth");
+    create_small_tile(attack_tiles, LV_SYMBOL_WARNING, "Evil Twin", COLOR_MATERIAL_ORANGE, attack_tile_event_cb, "Evil Twin");
+    create_small_tile(attack_tiles, LV_SYMBOL_POWER, "SAE", COLOR_MATERIAL_PINK, attack_tile_event_cb, "SAE Overflow");
+    create_small_tile(attack_tiles, LV_SYMBOL_DOWNLOAD, "Handshake", COLOR_MATERIAL_AMBER, attack_tile_event_cb, "Handshaker");
+    create_small_tile(attack_tiles, LV_SYMBOL_EYE_OPEN, "Sniffer", COLOR_MATERIAL_PURPLE, attack_tile_event_cb, "Sniffer");
+    
+    // Horizontal separator line above Selected Networks
+    lv_obj_t *separator = lv_obj_create(function_page);
+    lv_obj_set_size(separator, lv_pct(90), 2);
+    lv_obj_align(separator, LV_ALIGN_TOP_MID, 0, 115);
+    lv_obj_set_style_bg_color(separator, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_bg_opa(separator, LV_OPA_50, 0);
+    lv_obj_set_style_border_width(separator, 0, 0);
+    lv_obj_set_style_radius(separator, 1, 0);
+    
+    // Selected networks header
+    lv_obj_t *header_label = lv_label_create(function_page);
+    lv_label_set_text(header_label, "Selected Networks:");
+    lv_obj_set_style_text_font(header_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(header_label, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_align(header_label, LV_ALIGN_TOP_LEFT, 10, 122);
+    
+    // Selected networks list
+    lv_obj_t *network_list = lv_obj_create(function_page);
+    lv_obj_set_size(network_list, lv_pct(100), LCD_V_RES - 30 - 70 - 40);  // Remaining height (extra 10px for header)
+    lv_obj_align(network_list, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(network_list, COLOR_MATERIAL_BG, 0);
+    lv_obj_set_style_border_width(network_list, 0, 0);
+    lv_obj_set_style_pad_all(network_list, 10, 0);
+    lv_obj_set_flex_flow(network_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_gap(network_list, 5, 0);
+    
+    // Get selected networks and display them
+    int selected_indices[SCAN_RESULTS_MAX_DISPLAY];
+    int selected_count = wifi_scanner_get_selected(selected_indices, SCAN_RESULTS_MAX_DISPLAY);
+    const wifi_ap_record_t *records = wifi_scanner_get_results_ptr();
+    const uint16_t *count_ptr = wifi_scanner_get_count_ptr();
+    uint16_t total_count = count_ptr ? *count_ptr : 0;
+    
+    if (selected_count <= 0 || !records || total_count == 0) {
+        lv_obj_t *no_sel_label = lv_label_create(network_list);
+        lv_label_set_text(no_sel_label, "No networks selected");
+        lv_obj_set_style_text_color(no_sel_label, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_text_font(no_sel_label, &lv_font_montserrat_14, 0);
+    } else {
+        for (int i = 0; i < selected_count; i++) {
+            int idx = selected_indices[i];
+            if (idx < 0 || idx >= (int)total_count) continue;
+            
+            const wifi_ap_record_t *ap = &records[idx];
+            char line[64];
+            const char *band = (ap->primary <= 14) ? "2.4" : "5";
+            
+            if (ap->ssid[0] != 0) {
+                snprintf(line, sizeof(line), "%s (%s)", (const char *)ap->ssid, band);
+            } else {
+                snprintf(line, sizeof(line), "%02X:%02X:%02X:%02X:%02X:%02X (%s)",
+                         ap->bssid[0], ap->bssid[1], ap->bssid[2],
+                         ap->bssid[3], ap->bssid[4], ap->bssid[5], band);
+            }
+            
+            lv_obj_t *net_label = lv_label_create(network_list);
+            lv_label_set_text(net_label, line);
+            lv_obj_set_style_text_color(net_label, COLOR_MATERIAL_BLUE, 0);
+            lv_obj_set_style_text_font(net_label, &lv_font_montserrat_14, 0);
+        }
+    }
+}
+
+// Global WiFi Attacks screen
+static void show_global_attacks_screen(void)
+{
+    create_function_page_base("Global WiFi Attacks");
+    
+    lv_obj_t *tiles = lv_obj_create(function_page);
+    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(tiles, COLOR_MATERIAL_BG, 0);
+    lv_obj_set_style_border_width(tiles, 0, 0);
+    lv_obj_set_style_pad_all(tiles, 10, 0);
+    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+    
+    // Blackout tile - Red (dangerous)
+    lv_obj_t *blackout_tile = create_tile(tiles, LV_SYMBOL_POWER, "Blackout", COLOR_MATERIAL_RED, NULL, NULL);
+    lv_obj_add_event_cb(blackout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Blackout");
+    
+    // Handshaker tile - Amber
+    lv_obj_t *handshaker_tile = create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Handshaker", COLOR_MATERIAL_AMBER, NULL, NULL);
+    lv_obj_add_event_cb(handshaker_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Handshakes");
+    
+    // Portal tile - Orange
+    lv_obj_t *portal_tile = create_tile(tiles, LV_SYMBOL_WIFI, "Portal", COLOR_MATERIAL_ORANGE, NULL, NULL);
+    lv_obj_add_event_cb(portal_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Portal");
+    
+    // Snifferdog tile - Purple
+    lv_obj_t *snifferdog_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Sniffer dog", COLOR_MATERIAL_PURPLE, NULL, NULL);
+    lv_obj_add_event_cb(snifferdog_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Snifferdog");
+    
+    // Wardrive tile - Teal
+    lv_obj_t *wardrive_tile = create_tile(tiles, LV_SYMBOL_GPS, "Wardrive", COLOR_MATERIAL_TEAL, NULL, NULL);
+    lv_obj_add_event_cb(wardrive_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Start Wardrive");
+}
+
+// WiFi Sniff & Karma screen
+static void show_sniff_karma_screen(void)
+{
+    create_function_page_base("WiFi Sniff & Karma");
+    
+    lv_obj_t *tiles = lv_obj_create(function_page);
+    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(tiles, COLOR_MATERIAL_BG, 0);
+    lv_obj_set_style_border_width(tiles, 0, 0);
+    lv_obj_set_style_pad_all(tiles, 10, 0);
+    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+    
+    // Sniffer tile - Purple
+    lv_obj_t *sniffer_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Sniffer", COLOR_MATERIAL_PURPLE, NULL, NULL);
+    lv_obj_add_event_cb(sniffer_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Sniffer");
+    
+    // Browse Clients tile - Indigo
+    lv_obj_t *clients_tile = create_tile(tiles, LV_SYMBOL_LIST, "Browse\nClients", COLOR_MATERIAL_INDIGO, NULL, NULL);
+    lv_obj_add_event_cb(clients_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Browse Clients");
+    
+    // Show Probes tile - Teal
+    lv_obj_t *probes_tile = create_tile(tiles, LV_SYMBOL_CALL, "Show\nProbes", COLOR_MATERIAL_TEAL, NULL, NULL);
+    lv_obj_add_event_cb(probes_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Show Probes");
+    
+    // Karma tile - Pink
+    lv_obj_t *karma_tile = create_tile(tiles, LV_SYMBOL_SHUFFLE, "Karma", COLOR_MATERIAL_PINK, NULL, NULL);
+    lv_obj_add_event_cb(karma_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Karma");
+}
+
+// WiFi Monitor screen
+static void show_wifi_monitor_screen(void)
+{
+    create_function_page_base("WiFi Monitor");
+    
+    lv_obj_t *tiles = lv_obj_create(function_page);
+    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(tiles, COLOR_MATERIAL_BG, 0);
+    lv_obj_set_style_border_width(tiles, 0, 0);
+    lv_obj_set_style_pad_all(tiles, 10, 0);
+    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    
+    // Package Monitor - stub - Green
+    lv_obj_t *pkg_tile = create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Package\nMonitor", COLOR_MATERIAL_GREEN, NULL, NULL);
+    lv_obj_add_event_cb(pkg_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Package Monitor");
+    
+    // Channel View - stub - Teal
+    lv_obj_t *chan_tile = create_tile(tiles, LV_SYMBOL_LIST, "Channel\nView", COLOR_MATERIAL_TEAL, NULL, NULL);
+    lv_obj_add_event_cb(chan_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Channel View");
+}
+
+// Bluetooth screen
+static void show_bluetooth_screen(void)
+{
+    create_function_page_base("Bluetooth");
+    
+    lv_obj_t *tiles = lv_obj_create(function_page);
+    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(tiles, COLOR_MATERIAL_BG, 0);
+    lv_obj_set_style_border_width(tiles, 0, 0);
+    lv_obj_set_style_pad_all(tiles, 10, 0);
+    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    
+    // AirTag scan - stub - Apple-like gray
+    lv_obj_t *airtag_tile = create_tile(tiles, LV_SYMBOL_GPS, "AirTag\nscan", lv_color_make(142, 142, 147), NULL, NULL);
+    lv_obj_add_event_cb(airtag_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"AirTag scan");
+    
+    // BT Scan - existing BLE Scan - Cyan
+    lv_obj_t *bt_tile = create_tile(tiles, LV_SYMBOL_BLUETOOTH, "BT Scan", COLOR_MATERIAL_CYAN, NULL, NULL);
+    lv_obj_add_event_cb(bt_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Scan");
+    
+    // BT Locator - stub - Blue
+    lv_obj_t *locator_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "BT Locator", COLOR_MATERIAL_BLUE, NULL, NULL);
+    lv_obj_add_event_cb(locator_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Locator");
+}
+
+// Stub screen for not-yet-implemented features
+static void show_stub_screen(const char *name)
+{
+    create_function_page_base(name);
+    
+    lv_obj_t *label = lv_label_create(function_page);
+    lv_label_set_text(label, "Coming Soon");
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(label, lv_color_make(255, 255, 255), 0);  // White
+    lv_obj_center(label);
+    
+    lv_obj_t *sublabel = lv_label_create(function_page);
+    lv_label_set_text(sublabel, "This feature is under development");
+    lv_obj_set_style_text_font(sublabel, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(sublabel, lv_color_make(176, 176, 176), 0);  // Light gray #B0B0B0
+    lv_obj_align(sublabel, LV_ALIGN_CENTER, 0, 40);
+}
+
+// ============================================================================
+// END TILE-BASED NAVIGATION SYSTEM
+// ============================================================================
 
 static void show_evil_twin_page(void)
 {
@@ -4135,26 +4873,26 @@ static void show_evil_twin_page(void)
     // Status label at the top
     evil_twin_status_label = lv_label_create(evil_twin_content);
     lv_obj_set_style_text_font(evil_twin_status_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(evil_twin_status_label, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_obj_set_style_text_color(evil_twin_status_label, COLOR_MATERIAL_BLUE, 0);  // Green text
     lv_label_set_text(evil_twin_status_label, "Select network and portal template");
 
     lv_obj_t *net_label = lv_label_create(evil_twin_content);
     lv_label_set_text(net_label, "Evil Twin name:");
     lv_obj_set_style_text_font(net_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(net_label, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_obj_set_style_text_color(net_label, COLOR_MATERIAL_BLUE, 0);  // Green text
 
     evil_twin_network_dd = lv_dropdown_create(evil_twin_content);
     lv_obj_set_width(evil_twin_network_dd, lv_pct(100));
     lv_dropdown_set_dir(evil_twin_network_dd, LV_DIR_BOTTOM);
     // Retro terminal styling for dropdown
     lv_obj_set_style_bg_color(evil_twin_network_dd, lv_color_make(0, 0, 0), LV_PART_MAIN);  // Black background
-    lv_obj_set_style_text_color(evil_twin_network_dd, lv_color_make(0, 255, 0), LV_PART_MAIN);  // Green text
-    lv_obj_set_style_border_color(evil_twin_network_dd, lv_color_make(0, 255, 0), LV_PART_MAIN);  // Green border
+    lv_obj_set_style_text_color(evil_twin_network_dd, COLOR_MATERIAL_BLUE, LV_PART_MAIN);  // Green text
+    lv_obj_set_style_border_color(evil_twin_network_dd, COLOR_MATERIAL_BLUE, LV_PART_MAIN);  // Green border
     lv_obj_t *dd_list1 = lv_dropdown_get_list(evil_twin_network_dd);
     if (dd_list1) {
         lv_obj_set_style_bg_color(dd_list1, lv_color_make(0, 0, 0), 0);  // Black background for list
-        lv_obj_set_style_text_color(dd_list1, lv_color_make(0, 255, 0), 0);  // Green text for list
-        lv_obj_set_style_border_color(dd_list1, lv_color_make(0, 255, 0), 0);  // Green border
+        lv_obj_set_style_text_color(dd_list1, COLOR_MATERIAL_BLUE, 0);  // Green text for list
+        lv_obj_set_style_border_color(dd_list1, COLOR_MATERIAL_BLUE, 0);  // Green border
     }
 
     evil_twin_network_count = 0;
@@ -4219,20 +4957,20 @@ static void show_evil_twin_page(void)
     lv_obj_t *html_label = lv_label_create(evil_twin_content);
     lv_label_set_text(html_label, "HTML Portal");
     lv_obj_set_style_text_font(html_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(html_label, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_obj_set_style_text_color(html_label, COLOR_MATERIAL_BLUE, 0);  // Green text
 
     evil_twin_html_dd = lv_dropdown_create(evil_twin_content);
     lv_obj_set_width(evil_twin_html_dd, lv_pct(100));
     lv_dropdown_set_dir(evil_twin_html_dd, LV_DIR_BOTTOM);
     // Retro terminal styling for dropdown
     lv_obj_set_style_bg_color(evil_twin_html_dd, lv_color_make(0, 0, 0), LV_PART_MAIN);  // Black background
-    lv_obj_set_style_text_color(evil_twin_html_dd, lv_color_make(0, 255, 0), LV_PART_MAIN);  // Green text
-    lv_obj_set_style_border_color(evil_twin_html_dd, lv_color_make(0, 255, 0), LV_PART_MAIN);  // Green border
+    lv_obj_set_style_text_color(evil_twin_html_dd, COLOR_MATERIAL_BLUE, LV_PART_MAIN);  // Green text
+    lv_obj_set_style_border_color(evil_twin_html_dd, COLOR_MATERIAL_BLUE, LV_PART_MAIN);  // Green border
     lv_obj_t *dd_list2 = lv_dropdown_get_list(evil_twin_html_dd);
     if (dd_list2) {
         lv_obj_set_style_bg_color(dd_list2, lv_color_make(0, 0, 0), 0);  // Black background for list
-        lv_obj_set_style_text_color(dd_list2, lv_color_make(0, 255, 0), 0);  // Green text for list
-        lv_obj_set_style_border_color(dd_list2, lv_color_make(0, 255, 0), 0);  // Green border
+        lv_obj_set_style_text_color(dd_list2, COLOR_MATERIAL_BLUE, 0);  // Green text for list
+        lv_obj_set_style_border_color(dd_list2, COLOR_MATERIAL_BLUE, 0);  // Green border
     }
 
     int html_total = wifi_attacks_get_sd_html_count();
@@ -4289,15 +5027,15 @@ static void show_evil_twin_page(void)
     lv_obj_set_height(evil_twin_start_btn, 40);
     // Retro terminal styling for button with visible border
     lv_obj_set_style_bg_color(evil_twin_start_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black background
-    lv_obj_set_style_bg_color(evil_twin_start_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
-    lv_obj_set_style_border_color(evil_twin_start_btn, lv_color_make(0, 255, 0), 0);  // Green border
+    lv_obj_set_style_bg_color(evil_twin_start_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);  // Dark green when pressed
+    lv_obj_set_style_border_color(evil_twin_start_btn, COLOR_MATERIAL_BLUE, 0);  // Green border
     lv_obj_set_style_border_width(evil_twin_start_btn, 3, 0);  // Thick border (3px)
     lv_obj_set_style_border_opa(evil_twin_start_btn, LV_OPA_COVER, 0);  // Fully opaque border
     lv_obj_add_event_cb(evil_twin_start_btn, evil_twin_start_btn_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *start_label = lv_label_create(evil_twin_start_btn);
     lv_label_set_text(start_label, "Start Evil Twin");
-    lv_obj_set_style_text_color(start_label, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_obj_set_style_text_color(start_label, COLOR_MATERIAL_BLUE, 0);  // Green text
     lv_obj_center(start_label);
 
     // Update status label based on availability
@@ -4356,12 +5094,27 @@ void attack_event_cb(lv_event_t *e)
             scan_status_label = NULL;
         }
 
-        // Large technical scanning message (no spinner)
-        scan_status_label = lv_label_create(function_page);
+        // Create centered scanning container with icon and text
+        lv_obj_t *scan_container = lv_obj_create(function_page);
+        lv_obj_set_size(scan_container, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_center(scan_container);
+        lv_obj_set_style_bg_opa(scan_container, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(scan_container, 0, 0);
+        lv_obj_set_flex_flow(scan_container, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(scan_container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_gap(scan_container, 10, 0);
+        
+        // WiFi scanning icon
+        lv_obj_t *scan_icon = lv_label_create(scan_container);
+        lv_label_set_text(scan_icon, LV_SYMBOL_WIFI);
+        lv_obj_set_style_text_font(scan_icon, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(scan_icon, COLOR_MATERIAL_BLUE, 0);
+        
+        // Scanning text (larger)
+        scan_status_label = lv_label_create(scan_container);
         lv_label_set_text(scan_status_label, "Scanning...");
-        lv_obj_set_style_text_color(scan_status_label, lv_color_make(0, 255, 0), 0);  // Green text
-        lv_obj_set_style_text_font(scan_status_label, &lv_font_montserrat_20, 0);  // Larger font
-        lv_obj_center(scan_status_label);
+        lv_obj_set_style_text_color(scan_status_label, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_text_font(scan_status_label, &lv_font_montserrat_20, 0);
 
         // Start scan
         wifi_scanner_start_scan();
@@ -4381,29 +5134,48 @@ void attack_event_cb(lv_event_t *e)
         // Save current selection as attack targets, then start deauth
         wifi_scanner_save_target_bssids();
         wifi_attacks_start_deauth();
+        
+        // Store targets for rescan comparison and start rescan timer
+        {
+            int sel_indices[MAX_SCAN_RESULTS];
+            int sel_count = wifi_scanner_get_selected(sel_indices, MAX_SCAN_RESULTS);
+            uint16_t total_count = wifi_scanner_get_count();
+            wifi_ap_record_t *recs = (wifi_ap_record_t *)lv_mem_alloc(sizeof(wifi_ap_record_t) * total_count);
+            if (recs && total_count > 0) {
+                int got_cnt = wifi_scanner_get_results(recs, total_count);
+                deauth_target_count = 0;
+                for (int i = 0; i < sel_count && deauth_target_count < MAX_SCAN_RESULTS; i++) {
+                    int idx = sel_indices[i];
+                    if (idx >= 0 && idx < got_cnt) {
+                        memcpy(deauth_target_bssids[deauth_target_count], recs[idx].bssid, 6);
+                        deauth_target_channels[deauth_target_count] = recs[idx].primary;
+                        deauth_target_count++;
+                    }
+                }
+                lv_mem_free(recs);
+            }
+            deauth_rescan_timer_start();
+        }
 
-        // Prompt top-left
+        // Title centered at top - "Deauth attack in progress"
         deauth_prompt_label = lv_label_create(function_page);
-        lv_label_set_text(deauth_prompt_label, "Networks attacked");
-        lv_obj_set_style_text_font(deauth_prompt_label, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(deauth_prompt_label, lv_color_make(0, 255, 0), 0);  // Green text
-        lv_obj_align(deauth_prompt_label, LV_ALIGN_TOP_LEFT, 6, 36);
+        lv_label_set_text(deauth_prompt_label, "Deauth attack in progress");
+        lv_obj_set_style_text_font(deauth_prompt_label, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(deauth_prompt_label, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_align(deauth_prompt_label, LV_ALIGN_TOP_MID, 0, 36);
 
-        // FPS top-right
+        // FPS label (hidden, but kept for internal use)
         deauth_fps_label = lv_label_create(function_page);
-        lv_label_set_text(deauth_fps_label, "0 FPS");
-        lv_obj_set_style_text_font(deauth_fps_label, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(deauth_fps_label, lv_color_make(0, 255, 0), 0);  // Green text
-        lv_obj_align(deauth_fps_label, LV_ALIGN_TOP_RIGHT, -6, 36);
+        lv_label_set_text(deauth_fps_label, "");
+        lv_obj_add_flag(deauth_fps_label, LV_OBJ_FLAG_HIDDEN);
 
-        // Build list of attacked SSIDs
+        // Build list of attacked networks with SSID, Freq, BSSID
         if (deauth_list) { deauth_list = NULL; }
         deauth_list = lv_list_create(function_page);
-        lv_obj_set_size(deauth_list, lv_pct(100), LCD_V_RES - 30 - 36 - 40);
-        lv_obj_align(deauth_list, LV_ALIGN_TOP_MID, 0, 56);
-        lv_obj_set_style_bg_color(deauth_list, lv_color_make(0, 0, 0), 0);  // Black background
-        lv_obj_set_style_text_color(deauth_list, lv_color_make(0, 255, 0), 0);  // Green text
-        // Remove white separator lines between items
+        lv_obj_set_size(deauth_list, lv_pct(100), LCD_V_RES - 30 - 36 - 70);  // Leave space for stop tile
+        lv_obj_align(deauth_list, LV_ALIGN_TOP_MID, 0, 60);
+        lv_obj_set_style_bg_color(deauth_list, lv_color_make(0, 0, 0), 0);
+        lv_obj_set_style_text_color(deauth_list, COLOR_MATERIAL_BLUE, 0);
         lv_obj_set_style_border_width(deauth_list, 0, LV_PART_ITEMS);
         lv_obj_set_style_border_color(deauth_list, lv_color_make(0, 0, 0), LV_PART_ITEMS);
 
@@ -4411,89 +5183,91 @@ void attack_event_cb(lv_event_t *e)
         int sel_cnt = wifi_scanner_get_selected(selected_indices, MAX_SCAN_RESULTS);
         if (sel_cnt <= 0) {
             lv_list_add_text(deauth_list, "No networks selected");
-            // Still create bottom buttons
         }
 
         uint16_t total = wifi_scanner_get_count();
         if (total == 0) {
             lv_list_add_text(deauth_list, "No scan results available");
-            return;
-        }
-
-        wifi_ap_record_t *records = (wifi_ap_record_t *)lv_mem_alloc(sizeof(wifi_ap_record_t) * total);
-        if (!records) {
-            lv_list_add_text(deauth_list, "Memory error");
-            return;
-        }
-        int got = wifi_scanner_get_results(records, total);
-
-        for (int i = 0; i < sel_cnt; i++) {
-            int idx = selected_indices[i];
-            if (idx < 0 || idx >= got) continue;
-
-            const wifi_ap_record_t *ap = &records[idx];
-            char line[64];
-            if (ap->ssid[0] != 0) {
-                snprintf(line, sizeof(line), "%s", (const char *)ap->ssid);
+        } else {
+            wifi_ap_record_t *records = (wifi_ap_record_t *)lv_mem_alloc(sizeof(wifi_ap_record_t) * total);
+            if (!records) {
+                lv_list_add_text(deauth_list, "Memory error");
             } else {
-                snprintf(line, sizeof(line), "%02X:%02X:%02X:%02X:%02X:%02X",
-                         ap->bssid[0], ap->bssid[1], ap->bssid[2],
-                         ap->bssid[3], ap->bssid[4], ap->bssid[5]);
+                int got = wifi_scanner_get_results(records, total);
+
+                for (int i = 0; i < sel_cnt; i++) {
+                    int idx = selected_indices[i];
+                    if (idx < 0 || idx >= got) continue;
+
+                    const wifi_ap_record_t *ap = &records[idx];
+                    char line[128];
+                    const char *band = (ap->primary <= 14) ? "2.4" : "5";
+                    
+                    if (ap->ssid[0] != 0) {
+                        snprintf(line, sizeof(line), "%s (Ch%d, %s) %02X:%02X:%02X:%02X:%02X:%02X",
+                                 (const char *)ap->ssid, ap->primary, band,
+                                 ap->bssid[0], ap->bssid[1], ap->bssid[2],
+                                 ap->bssid[3], ap->bssid[4], ap->bssid[5]);
+                    } else {
+                        snprintf(line, sizeof(line), "(Ch%d, %s) %02X:%02X:%02X:%02X:%02X:%02X",
+                                 ap->primary, band,
+                                 ap->bssid[0], ap->bssid[1], ap->bssid[2],
+                                 ap->bssid[3], ap->bssid[4], ap->bssid[5]);
+                    }
+
+                    lv_obj_t *row = lv_list_add_btn(deauth_list, NULL, "");
+                    lv_obj_set_width(row, lv_pct(100));
+                    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+                    lv_obj_set_style_pad_all(row, 6, 0);
+                    lv_obj_set_style_pad_gap(row, 8, 0);
+                    lv_obj_set_height(row, LV_SIZE_CONTENT);
+                    lv_obj_set_style_bg_color(row, lv_color_make(30, 30, 30), LV_STATE_DEFAULT);
+                    lv_obj_set_style_bg_color(row, lv_color_make(50, 50, 50), LV_STATE_PRESSED);
+                    lv_obj_set_style_radius(row, 8, 0);
+
+                    lv_obj_t *lbl = lv_label_create(row);
+                    lv_label_set_text(lbl, line);
+                    lv_label_set_long_mode(lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+                    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+                    lv_obj_set_style_text_color(lbl, COLOR_MATERIAL_BLUE, 0);
+                    lv_obj_set_width(lbl, lv_pct(95));
+                }
+
+                lv_mem_free(records);
             }
-
-            // Use list button to get compact row; just a label
-            lv_obj_t *row = lv_list_add_btn(deauth_list, NULL, "");
-            lv_obj_set_width(row, lv_pct(100));
-            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-            lv_obj_set_style_pad_all(row, 6, 0);
-            lv_obj_set_style_pad_gap(row, 8, 0);
-            lv_obj_set_height(row, LV_SIZE_CONTENT);
-            lv_obj_set_style_bg_color(row, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black background
-            lv_obj_set_style_bg_color(row, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
-
-            lv_obj_t *lbl = lv_label_create(row);
-            lv_label_set_text(lbl, line);
-            lv_label_set_long_mode(lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
-            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
-            lv_obj_set_style_text_color(lbl, lv_color_make(0, 255, 0), 0);  // Green text
-            lv_obj_set_width(lbl, lv_pct(95));
         }
 
-        lv_mem_free(records);
-
-        // Bottom buttons: Pause/Resume and Quit
-        lv_obj_t *btn_bar = lv_obj_create(function_page);
-        lv_obj_set_size(btn_bar, lv_pct(100), 40);
-        lv_obj_align(btn_bar, LV_ALIGN_BOTTOM_MID, 0, 0);
-        lv_obj_set_style_bg_color(btn_bar, lv_color_make(0, 0, 0), 0);  // Black background
-        lv_obj_set_style_border_width(btn_bar, 0, 0);
-        lv_obj_set_style_radius(btn_bar, 0, 0);
-        lv_obj_clear_flag(btn_bar, LV_OBJ_FLAG_SCROLLABLE);  // No scroll
-        lv_obj_set_flex_flow(btn_bar, LV_FLEX_FLOW_ROW);
-        lv_obj_set_style_pad_all(btn_bar, 6, 0);
-        lv_obj_set_style_pad_gap(btn_bar, 8, 0);
-
-        deauth_pause_btn = lv_btn_create(btn_bar);
-        lv_obj_set_size(deauth_pause_btn, lv_pct(50), LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_color(deauth_pause_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
-        lv_obj_set_style_bg_color(deauth_pause_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
-        lv_obj_t *pause_lbl = lv_label_create(deauth_pause_btn);
-        lv_label_set_text(pause_lbl, deauth_paused ? "Resume" : "Pause");
-        lv_obj_set_style_text_color(pause_lbl, lv_color_make(0, 255, 0), 0);  // Green text
-        lv_obj_center(pause_lbl);
-        lv_obj_add_event_cb(deauth_pause_btn, deauth_pause_event_cb, LV_EVENT_CLICKED, NULL);
-
-        deauth_quit_btn = lv_btn_create(btn_bar);
-        lv_obj_set_size(deauth_quit_btn, lv_pct(50), LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_color(deauth_quit_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
-        lv_obj_set_style_bg_color(deauth_quit_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
-        lv_obj_t *quit_lbl = lv_label_create(deauth_quit_btn);
-        lv_label_set_text(quit_lbl, "Quit");
-        lv_obj_set_style_text_color(quit_lbl, lv_color_make(0, 255, 0), 0);  // Green text
-        lv_obj_center(quit_lbl);
-        lv_obj_add_event_cb(deauth_quit_btn, deauth_quit_event_cb, LV_EVENT_CLICKED, NULL);
+        // Stop & Exit tile at bottom (red with X icon)
+        lv_obj_t *stop_tile = lv_btn_create(function_page);
+        lv_obj_set_size(stop_tile, 120, 55);
+        lv_obj_align(stop_tile, LV_ALIGN_BOTTOM_MID, 0, -10);
+        lv_obj_set_style_bg_color(stop_tile, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(stop_tile, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(stop_tile, 0, 0);
+        lv_obj_set_style_radius(stop_tile, 10, 0);
+        lv_obj_set_style_shadow_width(stop_tile, 6, 0);
+        lv_obj_set_style_shadow_color(stop_tile, lv_color_make(0, 0, 0), 0);
+        lv_obj_set_style_shadow_opa(stop_tile, LV_OPA_40, 0);
+        lv_obj_set_flex_flow(stop_tile, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(stop_tile, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         
-        deauth_paused = false;  // Reset pause state when starting
+        lv_obj_t *x_icon = lv_label_create(stop_tile);
+        lv_label_set_text(x_icon, LV_SYMBOL_CLOSE);
+        lv_obj_set_style_text_font(x_icon, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(x_icon, lv_color_make(255, 255, 255), 0);
+        
+        lv_obj_t *stop_text = lv_label_create(stop_tile);
+        lv_label_set_text(stop_text, "Stop & Exit");
+        lv_obj_set_style_text_font(stop_text, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(stop_text, lv_color_make(255, 255, 255), 0);
+        
+        lv_obj_add_event_cb(stop_tile, deauth_quit_event_cb, LV_EVENT_CLICKED, NULL);
+        
+        // Store reference (reuse quit_btn pointer)
+        deauth_quit_btn = stop_tile;
+        deauth_pause_btn = NULL;  // No pause button anymore
+        
+        deauth_paused = false;
         return;
     }
 
@@ -4510,7 +5284,7 @@ void attack_event_cb(lv_event_t *e)
         lv_obj_t *warning_label = lv_label_create(function_page);
         lv_label_set_text(warning_label, "Warning: This will attack\nall the networks around you.\n\nAre you sure?");
         lv_obj_set_style_text_align(warning_label, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_text_color(warning_label, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_set_style_text_color(warning_label, COLOR_MATERIAL_BLUE, 0);  // Green text
         lv_obj_set_style_text_font(warning_label, &lv_font_montserrat_16, 0);
         lv_obj_center(warning_label);
         
@@ -4530,12 +5304,12 @@ void attack_event_cb(lv_event_t *e)
         lv_obj_t *back_btn = lv_btn_create(btn_bar);
         lv_obj_set_size(back_btn, lv_pct(48), LV_SIZE_CONTENT);
         lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
-        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
-        lv_obj_set_style_border_color(back_btn, lv_color_make(0, 255, 0), 0);  // Green border
+        lv_obj_set_style_bg_color(back_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);  // Dark green when pressed
+        lv_obj_set_style_border_color(back_btn, COLOR_MATERIAL_BLUE, 0);  // Green border
         lv_obj_set_style_border_width(back_btn, 2, 0);  // 2px border
         lv_obj_t *back_lbl = lv_label_create(back_btn);
         lv_label_set_text(back_lbl, "BACK");
-        lv_obj_set_style_text_color(back_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_set_style_text_color(back_lbl, COLOR_MATERIAL_BLUE, 0);  // Green text
         lv_obj_center(back_lbl);
         lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
         
@@ -4543,12 +5317,12 @@ void attack_event_cb(lv_event_t *e)
         lv_obj_t *yes_btn = lv_btn_create(btn_bar);
         lv_obj_set_size(yes_btn, lv_pct(48), LV_SIZE_CONTENT);
         lv_obj_set_style_bg_color(yes_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
-        lv_obj_set_style_bg_color(yes_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
-        lv_obj_set_style_border_color(yes_btn, lv_color_make(0, 255, 0), 0);  // Green border
+        lv_obj_set_style_bg_color(yes_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);  // Dark green when pressed
+        lv_obj_set_style_border_color(yes_btn, COLOR_MATERIAL_BLUE, 0);  // Green border
         lv_obj_set_style_border_width(yes_btn, 2, 0);  // 2px border
         lv_obj_t *yes_lbl = lv_label_create(yes_btn);
         lv_label_set_text(yes_lbl, "YES");
-        lv_obj_set_style_text_color(yes_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_set_style_text_color(yes_lbl, COLOR_MATERIAL_BLUE, 0);  // Green text
         lv_obj_center(yes_lbl);
         lv_obj_add_event_cb(yes_btn, blackout_yes_btn_cb, LV_EVENT_CLICKED, NULL);
         
@@ -4563,7 +5337,7 @@ void attack_event_cb(lv_event_t *e)
         lv_obj_t *warning_label = lv_label_create(function_page);
         lv_label_set_text(warning_label, "Warning: This will start\nSnifferdog attack.\n\nAre you sure?");
         lv_obj_set_style_text_align(warning_label, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_text_color(warning_label, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_set_style_text_color(warning_label, COLOR_MATERIAL_BLUE, 0);  // Green text
         lv_obj_set_style_text_font(warning_label, &lv_font_montserrat_16, 0);
         lv_obj_center(warning_label);
         
@@ -4583,12 +5357,12 @@ void attack_event_cb(lv_event_t *e)
         lv_obj_t *back_btn = lv_btn_create(btn_bar);
         lv_obj_set_size(back_btn, lv_pct(48), LV_SIZE_CONTENT);
         lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
-        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
-        lv_obj_set_style_border_color(back_btn, lv_color_make(0, 255, 0), 0);  // Green border
+        lv_obj_set_style_bg_color(back_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);  // Dark green when pressed
+        lv_obj_set_style_border_color(back_btn, COLOR_MATERIAL_BLUE, 0);  // Green border
         lv_obj_set_style_border_width(back_btn, 2, 0);  // 2px border
         lv_obj_t *back_lbl = lv_label_create(back_btn);
         lv_label_set_text(back_lbl, "BACK");
-        lv_obj_set_style_text_color(back_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_set_style_text_color(back_lbl, COLOR_MATERIAL_BLUE, 0);  // Green text
         lv_obj_center(back_lbl);
         lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
         
@@ -4596,12 +5370,12 @@ void attack_event_cb(lv_event_t *e)
         lv_obj_t *yes_btn = lv_btn_create(btn_bar);
         lv_obj_set_size(yes_btn, lv_pct(48), LV_SIZE_CONTENT);
         lv_obj_set_style_bg_color(yes_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
-        lv_obj_set_style_bg_color(yes_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
-        lv_obj_set_style_border_color(yes_btn, lv_color_make(0, 255, 0), 0);  // Green border
+        lv_obj_set_style_bg_color(yes_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);  // Dark green when pressed
+        lv_obj_set_style_border_color(yes_btn, COLOR_MATERIAL_BLUE, 0);  // Green border
         lv_obj_set_style_border_width(yes_btn, 2, 0);  // 2px border
         lv_obj_t *yes_lbl = lv_label_create(yes_btn);
         lv_label_set_text(yes_lbl, "YES");
-        lv_obj_set_style_text_color(yes_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_set_style_text_color(yes_lbl, COLOR_MATERIAL_BLUE, 0);  // Green text
         lv_obj_center(yes_lbl);
         lv_obj_add_event_cb(yes_btn, snifferdog_yes_btn_cb, LV_EVENT_CLICKED, NULL);
         
@@ -4616,7 +5390,7 @@ void attack_event_cb(lv_event_t *e)
         lv_obj_t *warning_label = lv_label_create(function_page);
         lv_label_set_text(warning_label, "This will start\nWiFi Sniffer.\n\nAre you sure?");
         lv_obj_set_style_text_align(warning_label, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_text_color(warning_label, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_set_style_text_color(warning_label, COLOR_MATERIAL_BLUE, 0);  // Green text
         lv_obj_set_style_text_font(warning_label, &lv_font_montserrat_16, 0);
         lv_obj_center(warning_label);
         
@@ -4636,12 +5410,12 @@ void attack_event_cb(lv_event_t *e)
         lv_obj_t *back_btn = lv_btn_create(btn_bar);
         lv_obj_set_size(back_btn, lv_pct(48), LV_SIZE_CONTENT);
         lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
-        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
-        lv_obj_set_style_border_color(back_btn, lv_color_make(0, 255, 0), 0);  // Green border
+        lv_obj_set_style_bg_color(back_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);  // Dark green when pressed
+        lv_obj_set_style_border_color(back_btn, COLOR_MATERIAL_BLUE, 0);  // Green border
         lv_obj_set_style_border_width(back_btn, 2, 0);  // 2px border
         lv_obj_t *back_lbl = lv_label_create(back_btn);
         lv_label_set_text(back_lbl, "BACK");
-        lv_obj_set_style_text_color(back_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_set_style_text_color(back_lbl, COLOR_MATERIAL_BLUE, 0);  // Green text
         lv_obj_center(back_lbl);
         lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
         
@@ -4649,12 +5423,12 @@ void attack_event_cb(lv_event_t *e)
         lv_obj_t *yes_btn = lv_btn_create(btn_bar);
         lv_obj_set_size(yes_btn, lv_pct(48), LV_SIZE_CONTENT);
         lv_obj_set_style_bg_color(yes_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
-        lv_obj_set_style_bg_color(yes_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
-        lv_obj_set_style_border_color(yes_btn, lv_color_make(0, 255, 0), 0);  // Green border
+        lv_obj_set_style_bg_color(yes_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);  // Dark green when pressed
+        lv_obj_set_style_border_color(yes_btn, COLOR_MATERIAL_BLUE, 0);  // Green border
         lv_obj_set_style_border_width(yes_btn, 2, 0);  // 2px border
         lv_obj_t *yes_lbl = lv_label_create(yes_btn);
         lv_label_set_text(yes_lbl, "YES");
-        lv_obj_set_style_text_color(yes_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_set_style_text_color(yes_lbl, COLOR_MATERIAL_BLUE, 0);  // Green text
         lv_obj_center(yes_lbl);
         lv_obj_add_event_cb(yes_btn, sniffer_yes_btn_cb, LV_EVENT_CLICKED, NULL);
         
@@ -4669,7 +5443,7 @@ void attack_event_cb(lv_event_t *e)
         lv_obj_t *warning_label = lv_label_create(function_page);
         lv_label_set_text(warning_label, "Warning: This will start\nSAE Overflow attack.\n\nSelect ONE network first.\n\nAre you sure?");
         lv_obj_set_style_text_align(warning_label, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_text_color(warning_label, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_set_style_text_color(warning_label, COLOR_MATERIAL_BLUE, 0);  // Green text
         lv_obj_set_style_text_font(warning_label, &lv_font_montserrat_16, 0);
         lv_obj_center(warning_label);
         
@@ -4689,12 +5463,12 @@ void attack_event_cb(lv_event_t *e)
         lv_obj_t *back_btn = lv_btn_create(btn_bar);
         lv_obj_set_size(back_btn, lv_pct(48), LV_SIZE_CONTENT);
         lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
-        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
-        lv_obj_set_style_border_color(back_btn, lv_color_make(0, 255, 0), 0);  // Green border
+        lv_obj_set_style_bg_color(back_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);  // Dark green when pressed
+        lv_obj_set_style_border_color(back_btn, COLOR_MATERIAL_BLUE, 0);  // Green border
         lv_obj_set_style_border_width(back_btn, 2, 0);  // 2px border
         lv_obj_t *back_lbl = lv_label_create(back_btn);
         lv_label_set_text(back_lbl, "BACK");
-        lv_obj_set_style_text_color(back_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_set_style_text_color(back_lbl, COLOR_MATERIAL_BLUE, 0);  // Green text
         lv_obj_center(back_lbl);
         lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
         
@@ -4702,12 +5476,12 @@ void attack_event_cb(lv_event_t *e)
         lv_obj_t *yes_btn = lv_btn_create(btn_bar);
         lv_obj_set_size(yes_btn, lv_pct(48), LV_SIZE_CONTENT);
         lv_obj_set_style_bg_color(yes_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
-        lv_obj_set_style_bg_color(yes_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
-        lv_obj_set_style_border_color(yes_btn, lv_color_make(0, 255, 0), 0);  // Green border
+        lv_obj_set_style_bg_color(yes_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);  // Dark green when pressed
+        lv_obj_set_style_border_color(yes_btn, COLOR_MATERIAL_BLUE, 0);  // Green border
         lv_obj_set_style_border_width(yes_btn, 2, 0);  // 2px border
         lv_obj_t *yes_lbl = lv_label_create(yes_btn);
         lv_label_set_text(yes_lbl, "YES");
-        lv_obj_set_style_text_color(yes_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_set_style_text_color(yes_lbl, COLOR_MATERIAL_BLUE, 0);  // Green text
         lv_obj_center(yes_lbl);
         lv_obj_add_event_cb(yes_btn, sae_overflow_yes_btn_cb, LV_EVENT_CLICKED, NULL);
         
@@ -4722,7 +5496,7 @@ void attack_event_cb(lv_event_t *e)
         lv_obj_t *warning_label = lv_label_create(function_page);
         lv_label_set_text(warning_label, "WPA Handshake Capture\n\nSelected networks: Attack those\nNo selection: Scan & attack all\n\nAre you sure?");
         lv_obj_set_style_text_align(warning_label, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_text_color(warning_label, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_set_style_text_color(warning_label, COLOR_MATERIAL_BLUE, 0);  // Green text
         lv_obj_set_style_text_font(warning_label, &lv_font_montserrat_14, 0);
         lv_obj_center(warning_label);
         
@@ -4742,12 +5516,12 @@ void attack_event_cb(lv_event_t *e)
         lv_obj_t *back_btn = lv_btn_create(btn_bar);
         lv_obj_set_size(back_btn, lv_pct(48), LV_SIZE_CONTENT);
         lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
-        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
-        lv_obj_set_style_border_color(back_btn, lv_color_make(0, 255, 0), 0);  // Green border
+        lv_obj_set_style_bg_color(back_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);  // Dark green when pressed
+        lv_obj_set_style_border_color(back_btn, COLOR_MATERIAL_BLUE, 0);  // Green border
         lv_obj_set_style_border_width(back_btn, 2, 0);  // 2px border
         lv_obj_t *back_lbl = lv_label_create(back_btn);
         lv_label_set_text(back_lbl, "BACK");
-        lv_obj_set_style_text_color(back_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_set_style_text_color(back_lbl, COLOR_MATERIAL_BLUE, 0);  // Green text
         lv_obj_center(back_lbl);
         lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
         
@@ -4755,12 +5529,12 @@ void attack_event_cb(lv_event_t *e)
         lv_obj_t *yes_btn = lv_btn_create(btn_bar);
         lv_obj_set_size(yes_btn, lv_pct(48), LV_SIZE_CONTENT);
         lv_obj_set_style_bg_color(yes_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
-        lv_obj_set_style_bg_color(yes_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
-        lv_obj_set_style_border_color(yes_btn, lv_color_make(0, 255, 0), 0);  // Green border
+        lv_obj_set_style_bg_color(yes_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);  // Dark green when pressed
+        lv_obj_set_style_border_color(yes_btn, COLOR_MATERIAL_BLUE, 0);  // Green border
         lv_obj_set_style_border_width(yes_btn, 2, 0);  // 2px border
         lv_obj_t *yes_lbl = lv_label_create(yes_btn);
         lv_label_set_text(yes_lbl, "YES");
-        lv_obj_set_style_text_color(yes_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+        lv_obj_set_style_text_color(yes_lbl, COLOR_MATERIAL_BLUE, 0);  // Green text
         lv_obj_center(yes_lbl);
         lv_obj_add_event_cb(yes_btn, handshake_yes_btn_cb, LV_EVENT_CLICKED, NULL);
         
@@ -4782,17 +5556,17 @@ void attack_event_cb(lv_event_t *e)
         scan_list = lv_list_create(function_page);
         lv_obj_set_size(scan_list, lv_pct(100), LCD_V_RES - 30);
         lv_obj_align(scan_list, LV_ALIGN_BOTTOM_MID, 0, 0);
-        lv_obj_set_style_bg_color(scan_list, lv_color_make(0, 0, 0), 0);  // Black background
-        lv_obj_set_style_text_color(scan_list, lv_color_make(0, 255, 0), 0);  // Green text
-        // Remove white separator lines between items
+        lv_obj_set_style_bg_color(scan_list, lv_color_make(18, 18, 18), 0);  // Material Dark #121212
+        lv_obj_set_style_text_color(scan_list, lv_color_make(255, 255, 255), 0);  // White text
+        // Remove separator lines between items
         lv_obj_set_style_border_width(scan_list, 0, LV_PART_ITEMS);
-        lv_obj_set_style_border_color(scan_list, lv_color_make(0, 0, 0), LV_PART_ITEMS);
+        lv_obj_set_style_border_color(scan_list, lv_color_make(18, 18, 18), LV_PART_ITEMS);
 
         uint16_t count = wifi_scanner_get_count();
         if (count == 0) {
             lv_obj_t *msg_label = lv_label_create(scan_list);
             lv_label_set_text(msg_label, "Scan networks first");
-            lv_obj_set_style_text_color(msg_label, lv_color_make(0, 255, 0), 0);  // Green text
+            lv_obj_set_style_text_color(msg_label, COLOR_MATERIAL_BLUE, 0);  // Green text
             lv_obj_set_style_text_font(msg_label, &lv_font_montserrat_14, 0);
             lv_obj_center(msg_label);
             return;
@@ -4812,21 +5586,23 @@ void attack_event_cb(lv_event_t *e)
             lv_obj_set_width(row, lv_pct(100));
             lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
             lv_obj_set_style_pad_all(row, 8, 0);  // 1.2x bigger (was 6, now 8)
-            lv_obj_set_style_pad_gap(row, 10, 0);  // 1.2x bigger (was 8, now 10)
+            lv_obj_set_style_pad_gap(row, 10, 0);
             lv_obj_set_height(row, LV_SIZE_CONTENT);
-            lv_obj_set_style_bg_color(row, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black background
-            lv_obj_set_style_bg_color(row, lv_color_make(0, 50, 0), LV_STATE_PRESSED);  // Dark green when pressed
+            lv_obj_set_style_bg_color(row, lv_color_make(30, 30, 30), LV_STATE_DEFAULT);  // Material Surface
+            lv_obj_set_style_bg_color(row, lv_color_make(50, 50, 50), LV_STATE_PRESSED);  // Lighter on press
+            lv_obj_set_style_radius(row, 8, 0);
 
             lv_obj_t *cb = lv_checkbox_create(row);
             lv_checkbox_set_text(cb, "");
             lv_obj_add_event_cb(cb, scan_checkbox_event_cb, LV_EVENT_VALUE_CHANGED, (void *)(intptr_t)i);
-            // Green checkbox styling (retro terminal theme) - 1.2x bigger
-            lv_obj_set_style_bg_color(cb, lv_color_make(0, 0, 0), LV_PART_INDICATOR);  // Black background for checkbox
-            lv_obj_set_style_bg_color(cb, lv_color_make(0, 100, 0), LV_PART_INDICATOR | LV_STATE_CHECKED);  // Dark green when checked
-            lv_obj_set_style_border_color(cb, lv_color_make(0, 255, 0), LV_PART_INDICATOR);  // Green border
-            lv_obj_set_style_border_width(cb, 4, LV_PART_INDICATOR);  // 1.2x thicker border (was 3, now 4)
-            lv_obj_set_style_text_color(cb, lv_color_make(0, 255, 0), 0);  // Green text
-            lv_obj_set_style_pad_all(cb, 6, LV_PART_MAIN);  // Bigger checkbox padding
+            // Material checkbox styling
+            lv_obj_set_style_bg_color(cb, lv_color_make(60, 60, 60), LV_PART_INDICATOR);  // Dark gray unchecked
+            lv_obj_set_style_bg_color(cb, lv_color_make(33, 150, 243), LV_PART_INDICATOR | LV_STATE_CHECKED);  // Material Blue checked
+            lv_obj_set_style_border_color(cb, lv_color_make(100, 100, 100), LV_PART_INDICATOR);  // Gray border
+            lv_obj_set_style_border_width(cb, 2, LV_PART_INDICATOR);
+            lv_obj_set_style_radius(cb, 4, LV_PART_INDICATOR);  // Rounded
+            lv_obj_set_style_text_color(cb, lv_color_make(255, 255, 255), 0);  // White text
+            lv_obj_set_style_pad_all(cb, 6, LV_PART_MAIN);
             // Check if selected
             bool is_selected = false;
             for (int s = 0; s < sel_cnt; s++) { if (sel_idx[s] == i) { is_selected = true; break; } }
@@ -4848,7 +5624,7 @@ void attack_event_cb(lv_event_t *e)
             lv_label_set_text(ssid_lbl, name_buf);
             lv_label_set_long_mode(ssid_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
             lv_obj_set_style_text_font(ssid_lbl, &lv_font_montserrat_14, 0);
-            lv_obj_set_style_text_color(ssid_lbl, lv_color_make(0, 255, 0), 0);  // Green text
+            lv_obj_set_style_text_color(ssid_lbl, lv_color_make(255, 255, 255), 0);  // White text
             lv_obj_align(ssid_lbl, LV_ALIGN_LEFT_MID, 0, 5);  // 5px down for better alignment
             lv_obj_set_width(ssid_lbl, lv_pct(85));
 
@@ -4881,7 +5657,7 @@ void attack_event_cb(lv_event_t *e)
         lv_obj_set_size(list, lv_pct(100), LCD_V_RES - 30 - 50);
         lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 30);
         lv_obj_set_style_bg_color(list, lv_color_make(0, 0, 0), 0);
-        lv_obj_set_style_text_color(list, lv_color_make(0, 255, 0), 0);
+        lv_obj_set_style_text_color(list, COLOR_MATERIAL_BLUE, 0);
         lv_obj_set_style_border_width(list, 0, LV_PART_ITEMS);
         lv_obj_set_style_border_color(list, lv_color_make(0, 0, 0), LV_PART_ITEMS);
         
@@ -4891,7 +5667,7 @@ void attack_event_cb(lv_event_t *e)
         if (ap_count == 0 || aps == NULL) {
             lv_obj_t *msg_label = lv_label_create(list);
             lv_label_set_text(msg_label, "No APs sniffed yet.\nRun Sniffer first.");
-            lv_obj_set_style_text_color(msg_label, lv_color_make(0, 255, 0), 0);
+            lv_obj_set_style_text_color(msg_label, COLOR_MATERIAL_BLUE, 0);
             lv_obj_set_style_text_font(msg_label, &lv_font_montserrat_14, 0);
         } else {
             int displayed_aps = 0;
@@ -4923,7 +5699,7 @@ void attack_event_cb(lv_event_t *e)
                              ap->bssid[3], ap->bssid[4], ap->bssid[5], ap->client_count);
                 }
                 lv_label_set_text(ap_label, ap_text);
-                lv_obj_set_style_text_color(ap_label, lv_color_make(0, 255, 0), 0);
+                lv_obj_set_style_text_color(ap_label, COLOR_MATERIAL_BLUE, 0);
                 lv_obj_set_style_text_font(ap_label, &lv_font_montserrat_14, 0);
                 lv_label_set_long_mode(ap_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
                 lv_obj_set_width(ap_label, lv_pct(85));
@@ -4960,7 +5736,7 @@ void attack_event_cb(lv_event_t *e)
             if (displayed_aps == 0) {
                 lv_obj_t *msg_label = lv_label_create(list);
                 lv_label_set_text(msg_label, "No clients detected yet.\nAPs found but no clients.");
-                lv_obj_set_style_text_color(msg_label, lv_color_make(0, 255, 0), 0);
+                lv_obj_set_style_text_color(msg_label, COLOR_MATERIAL_BLUE, 0);
                 lv_obj_set_style_text_font(msg_label, &lv_font_montserrat_14, 0);
             }
         }
@@ -4970,12 +5746,12 @@ void attack_event_cb(lv_event_t *e)
         lv_obj_set_size(back_btn, lv_pct(100), 45);
         lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
         lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);
-        lv_obj_set_style_border_color(back_btn, lv_color_make(0, 255, 0), 0);
+        lv_obj_set_style_bg_color(back_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(back_btn, COLOR_MATERIAL_BLUE, 0);
         lv_obj_set_style_border_width(back_btn, 3, 0);
         lv_obj_t *back_lbl = lv_label_create(back_btn);
         lv_label_set_text(back_lbl, "Back");
-        lv_obj_set_style_text_color(back_lbl, lv_color_make(0, 255, 0), 0);
+        lv_obj_set_style_text_color(back_lbl, COLOR_MATERIAL_BLUE, 0);
         lv_obj_center(back_lbl);
         lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
         
@@ -4993,7 +5769,7 @@ void attack_event_cb(lv_event_t *e)
         lv_obj_set_size(list, lv_pct(100), LCD_V_RES - 30 - 50);
         lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 30);
         lv_obj_set_style_bg_color(list, lv_color_make(0, 0, 0), 0);
-        lv_obj_set_style_text_color(list, lv_color_make(0, 255, 0), 0);
+        lv_obj_set_style_text_color(list, COLOR_MATERIAL_BLUE, 0);
         lv_obj_set_style_border_width(list, 0, LV_PART_ITEMS);
         lv_obj_set_style_border_color(list, lv_color_make(0, 0, 0), LV_PART_ITEMS);
         
@@ -5003,7 +5779,7 @@ void attack_event_cb(lv_event_t *e)
         if (probe_count == 0 || probes == NULL) {
             lv_obj_t *msg_label = lv_label_create(list);
             lv_label_set_text(msg_label, "No probes sniffed yet.\nRun Sniffer first.");
-            lv_obj_set_style_text_color(msg_label, lv_color_make(0, 255, 0), 0);
+            lv_obj_set_style_text_color(msg_label, COLOR_MATERIAL_BLUE, 0);
             lv_obj_set_style_text_font(msg_label, &lv_font_montserrat_14, 0);
         } else {
             for (int i = 0; i < probe_count; i++) {
@@ -5027,7 +5803,7 @@ void attack_event_cb(lv_event_t *e)
                              probe->mac[3], probe->mac[4], probe->mac[5], probe->rssi);
                 }
                 lv_label_set_text(probe_label, probe_text);
-                lv_obj_set_style_text_color(probe_label, lv_color_make(0, 255, 0), 0);
+                lv_obj_set_style_text_color(probe_label, COLOR_MATERIAL_BLUE, 0);
                 lv_obj_set_style_text_font(probe_label, &lv_font_montserrat_12, 0);
                 lv_label_set_long_mode(probe_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
                 lv_obj_set_width(probe_label, lv_pct(85));
@@ -5044,12 +5820,12 @@ void attack_event_cb(lv_event_t *e)
         lv_obj_set_size(back_btn, lv_pct(100), 45);
         lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
         lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);
-        lv_obj_set_style_border_color(back_btn, lv_color_make(0, 255, 0), 0);
+        lv_obj_set_style_bg_color(back_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(back_btn, COLOR_MATERIAL_BLUE, 0);
         lv_obj_set_style_border_width(back_btn, 3, 0);
         lv_obj_t *back_lbl = lv_label_create(back_btn);
         lv_label_set_text(back_lbl, "Back");
-        lv_obj_set_style_text_color(back_lbl, lv_color_make(0, 255, 0), 0);
+        lv_obj_set_style_text_color(back_lbl, COLOR_MATERIAL_BLUE, 0);
         lv_obj_center(back_lbl);
         lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
         
@@ -5069,7 +5845,7 @@ void attack_event_cb(lv_event_t *e)
         // Status label at top (below title bar which is 30px)
         ble_scan_status_label = lv_label_create(function_page);
         lv_label_set_text(ble_scan_status_label, "Initializing BLE...");
-        lv_obj_set_style_text_color(ble_scan_status_label, lv_color_make(0, 255, 0), 0);
+        lv_obj_set_style_text_color(ble_scan_status_label, COLOR_MATERIAL_BLUE, 0);
         lv_obj_set_style_text_font(ble_scan_status_label, &lv_font_montserrat_14, 0);
         lv_obj_align(ble_scan_status_label, LV_ALIGN_TOP_LEFT, 5, 0);
         
@@ -5089,12 +5865,12 @@ void attack_event_cb(lv_event_t *e)
         lv_obj_set_size(back_btn, lv_pct(100), 45);
         lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
         lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);
-        lv_obj_set_style_border_color(back_btn, lv_color_make(0, 255, 0), 0);
+        lv_obj_set_style_bg_color(back_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(back_btn, COLOR_MATERIAL_BLUE, 0);
         lv_obj_set_style_border_width(back_btn, 3, 0);
         lv_obj_t *back_lbl = lv_label_create(back_btn);
         lv_label_set_text(back_lbl, "Back");
-        lv_obj_set_style_text_color(back_lbl, lv_color_make(0, 255, 0), 0);
+        lv_obj_set_style_text_color(back_lbl, COLOR_MATERIAL_BLUE, 0);
         lv_obj_center(back_lbl);
         lv_obj_add_event_cb(back_btn, ble_scan_back_btn_cb, LV_EVENT_CLICKED, NULL);
         
@@ -5124,6 +5900,15 @@ void attack_event_cb(lv_event_t *e)
         }
         
         ui_locked = false;
+        return;
+    }
+
+    // Stub screens for not-yet-implemented features
+    if (strcmp(attack_name, "Package Monitor") == 0 ||
+        strcmp(attack_name, "Channel View") == 0 ||
+        strcmp(attack_name, "AirTag scan") == 0 ||
+        strcmp(attack_name, "BT Locator") == 0) {
+        show_stub_screen(attack_name);
         return;
     }
 
@@ -5295,21 +6080,21 @@ static void evil_twin_start_btn_cb(lv_event_t *e)
     lv_textarea_set_text(evil_twin_log_ta, "");
     // Retro terminal styling
     lv_obj_set_style_bg_color(evil_twin_log_ta, lv_color_make(0, 0, 0), 0);  // Black background
-    lv_obj_set_style_text_color(evil_twin_log_ta, lv_color_make(0, 255, 0), 0);  // Green text
+    lv_obj_set_style_text_color(evil_twin_log_ta, COLOR_MATERIAL_BLUE, 0);  // Green text
 
     // Exit button at the bottom
     lv_obj_t *exit_btn = lv_btn_create(function_page);
     lv_obj_set_size(exit_btn, lv_pct(100), 40);
     lv_obj_align(exit_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(exit_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(exit_btn, lv_color_make(0, 50, 0), LV_STATE_PRESSED);
-    lv_obj_set_style_border_color(exit_btn, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_bg_color(exit_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(exit_btn, COLOR_MATERIAL_BLUE, 0);
     lv_obj_set_style_border_width(exit_btn, 3, 0);
     lv_obj_add_event_cb(exit_btn, deauth_quit_event_cb, LV_EVENT_CLICKED, NULL);  // Reuse quit callback
     
     lv_obj_t *exit_label = lv_label_create(exit_btn);
     lv_label_set_text(exit_label, "Exit");
-    lv_obj_set_style_text_color(exit_label, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_text_color(exit_label, COLOR_MATERIAL_BLUE, 0);
     lv_obj_center(exit_label);
 
     if (evil_twin_enable_log_capture() != ESP_OK) {
@@ -5830,7 +6615,7 @@ static void ble_scan_update_list(void)
         lv_obj_t *item = lv_label_create(ble_scan_list);
         lv_label_set_text(item, item_text);
         lv_obj_set_width(item, lv_pct(100));
-        lv_obj_set_style_text_color(item, lv_color_make(0, 255, 0), 0);
+        lv_obj_set_style_text_color(item, COLOR_MATERIAL_BLUE, 0);
         lv_obj_set_style_text_font(item, &lv_font_montserrat_12, 0);  // Smaller font to fit more
         lv_obj_set_style_pad_ver(item, 1, 0);
         lv_label_set_long_mode(item, LV_LABEL_LONG_SCROLL_CIRCULAR);  // Scroll if too long
