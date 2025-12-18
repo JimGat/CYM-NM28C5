@@ -117,6 +117,9 @@ static int bt_device_count = 0;
 #define COLOR_MATERIAL_BLUE     lv_color_make(33, 150, 243)    // #2196F3 - default text color
 #define COLOR_MATERIAL_RED      lv_color_make(244, 67, 54)     // #F44336 - error/stop color
 #define COLOR_MATERIAL_GREEN    lv_color_make(76, 175, 80)     // #4CAF50 - success color
+#define COLOR_MATERIAL_INDIGO   lv_color_make(63, 81, 181)     // #3F51B5 - indigo
+#define COLOR_MATERIAL_TEAL     lv_color_make(0, 150, 136)     // #009688 - teal
+#define COLOR_MATERIAL_PINK     lv_color_make(233, 30, 99)     // #E91E63 - pink
 #define COLOR_DARK_BLUE         lv_color_make(15, 60, 100)     // Dark blue for pressed states
 
 typedef int (*vprintf_like_t)(const char *, va_list);
@@ -258,9 +261,14 @@ static const int sniffer_channel_hop_delay_ms = 250;
 // Sniffer UI state
 static lv_obj_t *sniffer_log_ta = NULL;
 static lv_obj_t *sniffer_stop_btn = NULL;
+static lv_obj_t *sniffer_start_btn = NULL;
+static lv_obj_t *sniffer_packets_label = NULL;
+static lv_obj_t *sniffer_aps_label = NULL;
+static lv_obj_t *sniffer_probes_label = NULL;
 static QueueHandle_t sniffer_log_queue = NULL;
 static bool sniffer_log_capture_enabled = false;
 static volatile bool sniffer_ui_active = false;
+static bool sniffer_return_pending = false;  // Track if we should return to sniffer from sub-pages
 
 // Sniffer task state
 static TaskHandle_t sniffer_task_handle = NULL;
@@ -419,6 +427,10 @@ static void reset_function_page_children(void) {
     snifferdog_stop_btn = NULL;
     sniffer_log_ta = NULL;
     sniffer_stop_btn = NULL;
+    sniffer_start_btn = NULL;
+    sniffer_packets_label = NULL;
+    sniffer_aps_label = NULL;
+    sniffer_probes_label = NULL;
     sae_overflow_log_ta = NULL;
     sae_overflow_stop_btn = NULL;
     handshake_log_ta = NULL;
@@ -1856,7 +1868,38 @@ void app_main(void)
                 }
             }
 
-            if (sniffer_log_ta && sniffer_log_queue) {
+            // Update sniffer counters if UI is active
+            if (sniffer_packets_label || sniffer_aps_label || sniffer_probes_label) {
+                // Drain the log queue silently (don't display logs anymore)
+                if (sniffer_log_queue) {
+                    evil_log_msg_t msg;
+                    while (xQueueReceive(sniffer_log_queue, &msg, 0) == pdTRUE) {
+                        // Discard log messages - we're showing counters instead
+                    }
+                }
+                
+                // Update packet counter
+                if (sniffer_packets_label) {
+                    char buf[16];
+                    snprintf(buf, sizeof(buf), "%lu", (unsigned long)wifi_sniffer_get_packet_count());
+                    lv_label_set_text(sniffer_packets_label, buf);
+                }
+                
+                // Update AP counter
+                if (sniffer_aps_label) {
+                    char buf[16];
+                    snprintf(buf, sizeof(buf), "%d", wifi_sniffer_get_ap_count());
+                    lv_label_set_text(sniffer_aps_label, buf);
+                }
+                
+                // Update probes counter
+                if (sniffer_probes_label) {
+                    char buf[16];
+                    snprintf(buf, sizeof(buf), "%d", wifi_sniffer_get_probe_count());
+                    lv_label_set_text(sniffer_probes_label, buf);
+                }
+            } else if (sniffer_log_ta && sniffer_log_queue) {
+                // Legacy textarea mode (if still used elsewhere)
                 evil_log_msg_t msg;
                 while (xQueueReceive(sniffer_log_queue, &msg, 0) == pdTRUE) {
                     size_t line_len = strlen(msg.text);
@@ -1864,13 +1907,10 @@ void app_main(void)
                         continue;
                     }
                     
-                    // Trim textarea if too long (keep last ~2000 chars to prevent rendering slowdown)
                     const char *current_text = lv_textarea_get_text(sniffer_log_ta);
                     if (current_text && strlen(current_text) > 2000) {
-                        // Find newline after first 500 chars and keep everything after it
                         const char *trim_point = strchr(current_text + 500, '\n');
                         if (trim_point) {
-                            // Copy trimmed text to temp buffer to avoid use-after-free
                             char *trimmed = lv_mem_alloc(strlen(trim_point));
                             if (trimmed) {
                                 strcpy(trimmed, trim_point + 1);
@@ -2540,6 +2580,16 @@ lv_obj_t *create_clickable_item(lv_obj_t *parent, const char *icon, const char *
 
 void back_to_menu_cb(lv_event_t *e)
 {
+    (void)e;
+    // Check if we should return to sniffer screen instead of menu
+    if (sniffer_return_pending) {
+        sniffer_return_pending = false;
+        // Trigger sniffer screen recreation by calling sniffer_yes_btn_cb
+        lv_event_t synthetic_event;
+        memset(&synthetic_event, 0, sizeof(synthetic_event));
+        sniffer_yes_btn_cb(&synthetic_event);
+        return;
+    }
     // Defer navigation to main loop to avoid deleting objects during event handling
     nav_to_menu_flag = true;
 }
@@ -2781,48 +2831,12 @@ static void snifferdog_stop_btn_cb(lv_event_t *e)
     nav_to_menu_flag = true;
 }
 
-static void sniffer_yes_btn_cb(lv_event_t *e)
+// Forward declaration already exists at line 376 for attack_event_cb
+
+static void sniffer_start_btn_cb(lv_event_t *e)
 {
     (void)e;
     
-    // Set sniffer UI active flag
-    sniffer_ui_active = true;
-    scan_done_ui_flag = false;  // Clear any pending scan done flag
-    
-    // Delete the warning page content
-    if (function_page) {
-        lv_obj_clean(function_page);
-    }
-    
-    // Create log display page
-    sniffer_log_ta = lv_textarea_create(function_page);
-    lv_obj_set_size(sniffer_log_ta, lv_pct(100), LCD_V_RES - 30 - 50);
-    lv_obj_align(sniffer_log_ta, LV_ALIGN_TOP_MID, 0, 30);
-    lv_textarea_set_text(sniffer_log_ta, "Starting WiFi Sniffer...\n");
-    lv_obj_set_style_bg_color(sniffer_log_ta, lv_color_make(0, 0, 0), 0);  // Black background
-    lv_obj_set_style_text_color(sniffer_log_ta, COLOR_MATERIAL_BLUE, 0);  // Green text
-    lv_obj_set_style_border_color(sniffer_log_ta, COLOR_MATERIAL_BLUE, 0);  // Green border
-    lv_obj_set_style_border_width(sniffer_log_ta, 2, 0);
-    lv_obj_clear_state(sniffer_log_ta, LV_STATE_FOCUSED);  // Hide cursor
-    
-    // Create Enough button at bottom
-    sniffer_stop_btn = lv_btn_create(function_page);
-    lv_obj_set_size(sniffer_stop_btn, lv_pct(100), 45);
-    lv_obj_align(sniffer_stop_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(sniffer_stop_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
-    lv_obj_set_style_bg_color(sniffer_stop_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);  // Dark green when pressed
-    lv_obj_set_style_border_color(sniffer_stop_btn, COLOR_MATERIAL_BLUE, 0);  // Green border
-    lv_obj_set_style_border_width(sniffer_stop_btn, 3, 0);
-    lv_obj_t *enough_lbl = lv_label_create(sniffer_stop_btn);
-    lv_label_set_text(enough_lbl, "Enough");
-    lv_obj_set_style_text_color(enough_lbl, COLOR_MATERIAL_BLUE, 0);  // Green text
-    lv_obj_center(enough_lbl);
-    lv_obj_add_event_cb(sniffer_stop_btn, sniffer_enough_btn_cb, LV_EVENT_CLICKED, NULL);
-    
-    // Enable log capture
-    sniffer_enable_log_capture();
-    
-    // Start sniffer task (custom implementation using wifi_sniffer.h)
     if (sniffer_task_active) {
         ESP_LOGI(TAG, "Sniffer already active");
         return;
@@ -2847,6 +2861,410 @@ static void sniffer_yes_btn_cb(lv_event_t *e)
     } else {
         ESP_LOGE(TAG, "Failed to allocate sniffer task stack from PSRAM");
         sniffer_task_active = false;
+    }
+}
+
+static void sniffer_stop_only_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    if (sniffer_task_active || sniffer_task_handle != NULL) {
+        ESP_LOGI(TAG, "Stopping WiFi Sniffer...");
+        sniffer_task_active = false;
+        
+        // Wait for task to finish
+        for (int i = 0; i < 20 && sniffer_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        
+        // Force delete if still running
+        if (sniffer_task_handle != NULL) {
+            vTaskDelete(sniffer_task_handle);
+            sniffer_task_handle = NULL;
+            if (sniffer_task_stack != NULL) {
+                heap_caps_free(sniffer_task_stack);
+                sniffer_task_stack = NULL;
+            }
+        }
+        
+        ESP_LOGI(TAG, "Sniffer stopped");
+    }
+}
+
+static void sniffer_nav_clients_cb(lv_event_t *e)
+{
+    (void)e;
+    sniffer_return_pending = true;  // Mark that we should return to sniffer
+    lv_event_t synthetic_event;
+    memset(&synthetic_event, 0, sizeof(synthetic_event));
+    synthetic_event.user_data = (void*)"Browse Clients";
+    attack_event_cb(&synthetic_event);
+}
+
+static void sniffer_nav_probes_cb(lv_event_t *e)
+{
+    (void)e;
+    sniffer_return_pending = true;  // Mark that we should return to sniffer
+    lv_event_t synthetic_event;
+    memset(&synthetic_event, 0, sizeof(synthetic_event));
+    synthetic_event.user_data = (void*)"Show Probes";
+    attack_event_cb(&synthetic_event);
+}
+
+static void sniffer_nav_karma_cb(lv_event_t *e)
+{
+    (void)e;
+    sniffer_return_pending = true;  // Mark that we should return to sniffer
+    lv_event_t synthetic_event;
+    memset(&synthetic_event, 0, sizeof(synthetic_event));
+    synthetic_event.user_data = (void*)"Karma";
+    attack_event_cb(&synthetic_event);
+}
+
+static void sniffer_quit_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    // Stop sniffer task
+    if (sniffer_task_active || sniffer_task_handle != NULL) {
+        ESP_LOGI(TAG, "Stopping WiFi Sniffer...");
+        sniffer_task_active = false;
+        
+        for (int i = 0; i < 20 && sniffer_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        
+        if (sniffer_task_handle != NULL) {
+            vTaskDelete(sniffer_task_handle);
+            sniffer_task_handle = NULL;
+            if (sniffer_task_stack != NULL) {
+                heap_caps_free(sniffer_task_stack);
+                sniffer_task_stack = NULL;
+            }
+        }
+    }
+    
+    // Clear sniffer data (packets, APs, probes)
+    wifi_sniffer_stop();  // This should clear the internal counters
+    
+    // Clear selected networks
+    wifi_scanner_clear_selections();
+    g_shared_selected_count = 0;
+    
+    // Cleanup UI state
+    sniffer_disable_log_capture();
+    sniffer_log_ta = NULL;
+    sniffer_stop_btn = NULL;
+    sniffer_start_btn = NULL;
+    sniffer_packets_label = NULL;
+    sniffer_aps_label = NULL;
+    sniffer_probes_label = NULL;
+    sniffer_ui_active = false;
+    sniffer_return_pending = false;
+    scan_done_ui_flag = false;
+    
+    ESP_LOGI(TAG, "Sniffer quit - cleared all data");
+    
+    // Navigate back to menu
+    nav_to_menu_flag = true;
+}
+
+static void sniffer_yes_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    // Set sniffer UI active flag
+    sniffer_ui_active = true;
+    scan_done_ui_flag = false;  // Clear any pending scan done flag
+    
+    // Delete the warning page content
+    if (function_page) {
+        lv_obj_clean(function_page);
+    }
+    
+    // No log textarea anymore
+    sniffer_log_ta = NULL;
+    
+    // Create main content container
+    lv_obj_t *content = lv_obj_create(function_page);
+    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 55);  // Leave space for header and bottom buttons
+    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_color(content, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_pad_all(content, 8, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_row(content, 6, 0);
+    
+    // === Title "Sniffer" (white, centered) ===
+    lv_obj_t *title_label = lv_label_create(content);
+    lv_label_set_text(title_label, "Sniffer");
+    lv_obj_set_style_text_color(title_label, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_text_font(title_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_width(title_label, lv_pct(100));
+    lv_obj_set_style_text_align(title_label, LV_TEXT_ALIGN_CENTER, 0);
+    
+    // === Attacked Networks section ===
+    lv_obj_t *networks_header = lv_label_create(content);
+    lv_label_set_text(networks_header, "Attacked Networks:");
+    lv_obj_set_style_text_color(networks_header, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_text_font(networks_header, &lv_font_montserrat_14, 0);
+    
+    // Networks list
+    lv_obj_t *networks_label = lv_label_create(content);
+    
+    // Check if networks were selected
+    if (g_shared_selected_count > 0) {
+        // Build comma-separated list of SSIDs
+        static char networks_text[256];
+        networks_text[0] = '\0';
+        for (int i = 0; i < g_shared_selected_count && i < 5; i++) {  // Max 5 SSIDs
+            int idx = g_shared_selected_indices[i];
+            if (idx >= 0 && idx < g_shared_scan_count) {
+                if (i > 0) strncat(networks_text, ", ", sizeof(networks_text) - strlen(networks_text) - 1);
+                if (g_shared_scan_results[idx].ssid[0]) {
+                    strncat(networks_text, (const char*)g_shared_scan_results[idx].ssid, 
+                            sizeof(networks_text) - strlen(networks_text) - 1);
+                } else {
+                    strncat(networks_text, "[Hidden]", sizeof(networks_text) - strlen(networks_text) - 1);
+                }
+            }
+        }
+        if (g_shared_selected_count > 5) {
+            char more[32];
+            snprintf(more, sizeof(more), " (+%d more)", g_shared_selected_count - 5);
+            strncat(networks_text, more, sizeof(networks_text) - strlen(networks_text) - 1);
+        }
+        lv_label_set_text(networks_label, networks_text);
+    } else {
+        lv_label_set_text(networks_label, "ALL");
+    }
+    lv_obj_set_style_text_color(networks_label, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_text_font(networks_label, &lv_font_montserrat_12, 0);
+    lv_label_set_long_mode(networks_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(networks_label, lv_pct(100));
+    
+    // === Counters row (larger) ===
+    lv_obj_t *counters_row = lv_obj_create(content);
+    lv_obj_set_size(counters_row, lv_pct(100), 50);
+    lv_obj_set_style_bg_color(counters_row, lv_color_make(20, 20, 20), 0);
+    lv_obj_set_style_border_color(counters_row, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_border_width(counters_row, 2, 0);
+    lv_obj_set_style_radius(counters_row, 8, 0);
+    lv_obj_set_style_pad_all(counters_row, 8, 0);
+    lv_obj_set_flex_flow(counters_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(counters_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(counters_row, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Packets counter
+    lv_obj_t *pkt_container = lv_obj_create(counters_row);
+    lv_obj_set_size(pkt_container, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(pkt_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(pkt_container, 0, 0);
+    lv_obj_set_style_pad_all(pkt_container, 0, 0);
+    lv_obj_set_flex_flow(pkt_container, LV_FLEX_FLOW_ROW);
+    lv_obj_clear_flag(pkt_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *pkt_lbl = lv_label_create(pkt_container);
+    lv_label_set_text(pkt_lbl, "Pkts:");
+    lv_obj_set_style_text_color(pkt_lbl, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_text_font(pkt_lbl, &lv_font_montserrat_12, 0);
+    sniffer_packets_label = lv_label_create(pkt_container);
+    lv_label_set_text(sniffer_packets_label, "0");
+    lv_obj_set_style_text_color(sniffer_packets_label, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_text_font(sniffer_packets_label, &lv_font_montserrat_12, 0);
+    
+    // APs counter
+    lv_obj_t *aps_container = lv_obj_create(counters_row);
+    lv_obj_set_size(aps_container, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(aps_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(aps_container, 0, 0);
+    lv_obj_set_style_pad_all(aps_container, 0, 0);
+    lv_obj_set_flex_flow(aps_container, LV_FLEX_FLOW_ROW);
+    lv_obj_clear_flag(aps_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *aps_lbl = lv_label_create(aps_container);
+    lv_label_set_text(aps_lbl, "APs:");
+    lv_obj_set_style_text_color(aps_lbl, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_text_font(aps_lbl, &lv_font_montserrat_12, 0);
+    sniffer_aps_label = lv_label_create(aps_container);
+    lv_label_set_text(sniffer_aps_label, "0");
+    lv_obj_set_style_text_color(sniffer_aps_label, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_text_font(sniffer_aps_label, &lv_font_montserrat_12, 0);
+    
+    // Probes counter
+    lv_obj_t *probes_container = lv_obj_create(counters_row);
+    lv_obj_set_size(probes_container, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(probes_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(probes_container, 0, 0);
+    lv_obj_set_style_pad_all(probes_container, 0, 0);
+    lv_obj_set_flex_flow(probes_container, LV_FLEX_FLOW_ROW);
+    lv_obj_clear_flag(probes_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *probes_lbl = lv_label_create(probes_container);
+    lv_label_set_text(probes_lbl, "Probes:");
+    lv_obj_set_style_text_color(probes_lbl, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_text_font(probes_lbl, &lv_font_montserrat_12, 0);
+    sniffer_probes_label = lv_label_create(probes_container);
+    lv_label_set_text(sniffer_probes_label, "0");
+    lv_obj_set_style_text_color(sniffer_probes_label, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_text_font(sniffer_probes_label, &lv_font_montserrat_12, 0);
+    
+    // === Start/Stop buttons row (under counters) ===
+    lv_obj_t *control_row = lv_obj_create(content);
+    lv_obj_set_size(control_row, lv_pct(100), 40);
+    lv_obj_set_style_bg_opa(control_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(control_row, 0, 0);
+    lv_obj_set_style_pad_all(control_row, 0, 0);
+    lv_obj_set_flex_flow(control_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(control_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(control_row, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Start button (green)
+    sniffer_start_btn = lv_btn_create(control_row);
+    lv_obj_set_size(sniffer_start_btn, 100, 35);
+    lv_obj_set_style_bg_color(sniffer_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(sniffer_start_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(sniffer_start_btn, 8, 0);
+    lv_obj_t *start_lbl = lv_label_create(sniffer_start_btn);
+    lv_label_set_text(start_lbl, "Start");
+    lv_obj_set_style_text_color(start_lbl, lv_color_make(255, 255, 255), 0);
+    lv_obj_center(start_lbl);
+    lv_obj_add_event_cb(sniffer_start_btn, sniffer_start_btn_cb, LV_EVENT_CLICKED, NULL);
+    
+    // Stop button (red)
+    sniffer_stop_btn = lv_btn_create(control_row);
+    lv_obj_set_size(sniffer_stop_btn, 100, 35);
+    lv_obj_set_style_bg_color(sniffer_stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(sniffer_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(sniffer_stop_btn, 8, 0);
+    lv_obj_t *stop_lbl = lv_label_create(sniffer_stop_btn);
+    lv_label_set_text(stop_lbl, "Stop");
+    lv_obj_set_style_text_color(stop_lbl, lv_color_make(255, 255, 255), 0);
+    lv_obj_center(stop_lbl);
+    lv_obj_add_event_cb(sniffer_stop_btn, sniffer_stop_only_btn_cb, LV_EVENT_CLICKED, NULL);
+    
+    // === Navigation tiles row at bottom (styled like menu tiles) ===
+    lv_obj_t *nav_row = lv_obj_create(function_page);
+    lv_obj_set_size(nav_row, lv_pct(100), 65);
+    lv_obj_align(nav_row, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(nav_row, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_border_width(nav_row, 0, 0);
+    lv_obj_set_style_pad_all(nav_row, 4, 0);
+    lv_obj_set_style_pad_gap(nav_row, 8, 0);
+    lv_obj_set_flex_flow(nav_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(nav_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(nav_row, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Clients tile (Indigo - like in WiFi Sniff & Karma menu)
+    lv_obj_t *clients_tile = lv_btn_create(nav_row);
+    lv_obj_set_size(clients_tile, 72, 50);
+    lv_obj_set_style_bg_color(clients_tile, COLOR_MATERIAL_INDIGO, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(clients_tile, lv_color_lighten(COLOR_MATERIAL_INDIGO, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(clients_tile, 0, 0);
+    lv_obj_set_style_radius(clients_tile, 8, 0);
+    lv_obj_set_style_shadow_width(clients_tile, 4, 0);
+    lv_obj_set_style_shadow_color(clients_tile, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(clients_tile, LV_OPA_40, 0);
+    lv_obj_set_flex_flow(clients_tile, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(clients_tile, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_t *clients_icon = lv_label_create(clients_tile);
+    lv_label_set_text(clients_icon, LV_SYMBOL_LIST);
+    lv_obj_set_style_text_font(clients_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(clients_icon, lv_color_make(255, 255, 255), 0);
+    lv_obj_t *clients_lbl = lv_label_create(clients_tile);
+    lv_label_set_text(clients_lbl, "Clients");
+    lv_obj_set_style_text_font(clients_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(clients_lbl, lv_color_make(255, 255, 255), 0);
+    lv_obj_add_event_cb(clients_tile, sniffer_nav_clients_cb, LV_EVENT_CLICKED, NULL);
+    
+    // Probes tile (Teal - like in WiFi Sniff & Karma menu)
+    lv_obj_t *probes_tile = lv_btn_create(nav_row);
+    lv_obj_set_size(probes_tile, 72, 50);
+    lv_obj_set_style_bg_color(probes_tile, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(probes_tile, lv_color_lighten(COLOR_MATERIAL_TEAL, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(probes_tile, 0, 0);
+    lv_obj_set_style_radius(probes_tile, 8, 0);
+    lv_obj_set_style_shadow_width(probes_tile, 4, 0);
+    lv_obj_set_style_shadow_color(probes_tile, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(probes_tile, LV_OPA_40, 0);
+    lv_obj_set_flex_flow(probes_tile, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(probes_tile, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_t *probes_icon = lv_label_create(probes_tile);
+    lv_label_set_text(probes_icon, LV_SYMBOL_CALL);
+    lv_obj_set_style_text_font(probes_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(probes_icon, lv_color_make(255, 255, 255), 0);
+    lv_obj_t *probes_btn_lbl = lv_label_create(probes_tile);
+    lv_label_set_text(probes_btn_lbl, "Probes");
+    lv_obj_set_style_text_font(probes_btn_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(probes_btn_lbl, lv_color_make(255, 255, 255), 0);
+    lv_obj_add_event_cb(probes_tile, sniffer_nav_probes_cb, LV_EVENT_CLICKED, NULL);
+    
+    // Karma tile (Pink - like in WiFi Sniff & Karma menu)
+    lv_obj_t *karma_tile = lv_btn_create(nav_row);
+    lv_obj_set_size(karma_tile, 72, 50);
+    lv_obj_set_style_bg_color(karma_tile, COLOR_MATERIAL_PINK, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(karma_tile, lv_color_lighten(COLOR_MATERIAL_PINK, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(karma_tile, 0, 0);
+    lv_obj_set_style_radius(karma_tile, 8, 0);
+    lv_obj_set_style_shadow_width(karma_tile, 4, 0);
+    lv_obj_set_style_shadow_color(karma_tile, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(karma_tile, LV_OPA_40, 0);
+    lv_obj_set_flex_flow(karma_tile, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(karma_tile, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_t *karma_icon = lv_label_create(karma_tile);
+    lv_label_set_text(karma_icon, LV_SYMBOL_SHUFFLE);
+    lv_obj_set_style_text_font(karma_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(karma_icon, lv_color_make(255, 255, 255), 0);
+    lv_obj_t *karma_lbl = lv_label_create(karma_tile);
+    lv_label_set_text(karma_lbl, "Karma");
+    lv_obj_set_style_text_font(karma_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(karma_lbl, lv_color_make(255, 255, 255), 0);
+    lv_obj_add_event_cb(karma_tile, sniffer_nav_karma_cb, LV_EVENT_CLICKED, NULL);
+    
+    // Quit tile (Red - exits and clears data)
+    lv_obj_t *quit_tile = lv_btn_create(nav_row);
+    lv_obj_set_size(quit_tile, 72, 50);
+    lv_obj_set_style_bg_color(quit_tile, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(quit_tile, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(quit_tile, 0, 0);
+    lv_obj_set_style_radius(quit_tile, 8, 0);
+    lv_obj_set_style_shadow_width(quit_tile, 4, 0);
+    lv_obj_set_style_shadow_color(quit_tile, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(quit_tile, LV_OPA_40, 0);
+    lv_obj_set_flex_flow(quit_tile, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(quit_tile, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_t *quit_icon = lv_label_create(quit_tile);
+    lv_label_set_text(quit_icon, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_font(quit_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(quit_icon, lv_color_make(255, 255, 255), 0);
+    lv_obj_t *quit_lbl = lv_label_create(quit_tile);
+    lv_label_set_text(quit_lbl, "Quit");
+    lv_obj_set_style_text_font(quit_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(quit_lbl, lv_color_make(255, 255, 255), 0);
+    lv_obj_add_event_cb(quit_tile, sniffer_quit_cb, LV_EVENT_CLICKED, NULL);
+    
+    // Enable log capture (still needed for background processing)
+    sniffer_enable_log_capture();
+    
+    // Auto-start sniffer task
+    if (!sniffer_task_active) {
+        ESP_LOGI(TAG, "Starting WiFi Sniffer...");
+        sniffer_task_active = true;
+        
+        sniffer_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+        if (sniffer_task_stack != NULL) {
+            sniffer_task_handle = xTaskCreateStatic(sniffer_task, "sniffer", 4096, NULL, 
+                5, sniffer_task_stack, &sniffer_task_buffer);
+            if (sniffer_task_handle == NULL) {
+                ESP_LOGE(TAG, "Failed to create sniffer task");
+                heap_caps_free(sniffer_task_stack);
+                sniffer_task_stack = NULL;
+                sniffer_task_active = false;
+            } else {
+                ESP_LOGI(TAG, "Sniffer task created with PSRAM stack");
+            }
+        } else {
+            ESP_LOGE(TAG, "Failed to allocate sniffer task stack from PSRAM");
+            sniffer_task_active = false;
+        }
     }
 }
 
@@ -2880,6 +3298,10 @@ static void sniffer_enough_btn_cb(lv_event_t *e)
     sniffer_disable_log_capture();
     sniffer_log_ta = NULL;
     sniffer_stop_btn = NULL;
+    sniffer_start_btn = NULL;
+    sniffer_packets_label = NULL;
+    sniffer_aps_label = NULL;
+    sniffer_probes_label = NULL;
     sniffer_ui_active = false;  // Clear sniffer UI active flag
     scan_done_ui_flag = false;  // Clear any pending scan done flag
     // Navigate back to menu
@@ -4442,6 +4864,10 @@ static void create_function_page_base(const char *name)
     sniffer_disable_log_capture();
     sniffer_log_ta = NULL;
     sniffer_stop_btn = NULL;
+    sniffer_start_btn = NULL;
+    sniffer_packets_label = NULL;
+    sniffer_aps_label = NULL;
+    sniffer_probes_label = NULL;
     sniffer_ui_active = false;
 
     sae_overflow_disable_log_capture();
@@ -4830,14 +5256,11 @@ static void attack_tile_event_cb(lv_event_t *e)
 // Material Dark color palette
 #define COLOR_MATERIAL_BG       lv_color_make(18, 18, 18)      // #121212
 #define COLOR_MATERIAL_SURFACE  lv_color_make(30, 30, 30)      // #1E1E1E
-// COLOR_MATERIAL_BLUE, COLOR_MATERIAL_RED, COLOR_MATERIAL_GREEN defined at top of file
+// COLOR_MATERIAL_BLUE, RED, GREEN, INDIGO, TEAL, PINK defined at top of file
 #define COLOR_MATERIAL_PURPLE   lv_color_make(156, 39, 176)    // #9C27B0
 #define COLOR_MATERIAL_CYAN     lv_color_make(0, 188, 212)     // #00BCD4
 #define COLOR_MATERIAL_ORANGE   lv_color_make(255, 152, 0)     // #FF9800
-#define COLOR_MATERIAL_PINK     lv_color_make(233, 30, 99)     // #E91E63
-#define COLOR_MATERIAL_TEAL     lv_color_make(0, 150, 136)     // #009688
 #define COLOR_MATERIAL_AMBER    lv_color_make(255, 193, 7)     // #FFC107
-#define COLOR_MATERIAL_INDIGO   lv_color_make(63, 81, 181)     // #3F51B5
 
 // Show main tiles screen (5 tiles)
 static void show_main_tiles(void)

@@ -529,6 +529,10 @@ int wifi_sniffer_get_probe_count(void) {
     return probe_request_count;
 }
 
+uint32_t wifi_sniffer_get_packet_count(void) {
+    return sniffer_packet_count;
+}
+
 const sniffer_ap_t* wifi_sniffer_get_aps(int *count) {
     if (count) {
         *count = sniffer_ap_count;

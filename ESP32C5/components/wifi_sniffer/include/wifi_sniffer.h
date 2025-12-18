@@ -38,6 +38,11 @@ int wifi_sniffer_get_ap_count(void);
 int wifi_sniffer_get_probe_count(void);
 
 /**
+ * @brief Get total packet count
+ */
+uint32_t wifi_sniffer_get_packet_count(void);
+
+/**
  * @brief Get sniffed APs data (read-only access)
  * @param count Output parameter for number of APs
  * @return Pointer to AP array or NULL if not available
