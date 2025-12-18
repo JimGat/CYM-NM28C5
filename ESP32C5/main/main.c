@@ -116,6 +116,7 @@ static int bt_device_count = 0;
 // Color definitions (used throughout the file)
 #define COLOR_MATERIAL_BLUE     lv_color_make(33, 150, 243)    // #2196F3 - default text color
 #define COLOR_MATERIAL_RED      lv_color_make(244, 67, 54)     // #F44336 - error/stop color
+#define COLOR_MATERIAL_GREEN    lv_color_make(76, 175, 80)     // #4CAF50 - success color
 #define COLOR_DARK_BLUE         lv_color_make(15, 60, 100)     // Dark blue for pressed states
 
 typedef int (*vprintf_like_t)(const char *, va_list);
@@ -277,6 +278,7 @@ static volatile bool sae_overflow_ui_active = false;
 // Handshake UI state
 static lv_obj_t *handshake_log_ta = NULL;
 static lv_obj_t *handshake_stop_btn = NULL;
+static lv_obj_t *handshake_status_list = NULL;
 static QueueHandle_t handshake_log_queue = NULL;
 static bool handshake_log_capture_enabled = false;
 static volatile bool handshake_ui_active = false;
@@ -421,6 +423,7 @@ static void reset_function_page_children(void) {
     sae_overflow_stop_btn = NULL;
     handshake_log_ta = NULL;
     handshake_stop_btn = NULL;
+    handshake_status_list = NULL;
     wardrive_log_ta = NULL;
     wardrive_stop_btn = NULL;
     karma_log_ta = NULL;
@@ -1920,7 +1923,7 @@ void app_main(void)
                 }
             }
 
-            if (handshake_log_ta && handshake_log_queue) {
+            if (handshake_status_list && handshake_log_queue) {
                 evil_log_msg_t msg;
                 // Process max 3 messages per UI cycle to avoid blocking
                 int msg_count = 0;
@@ -1931,27 +1934,77 @@ void app_main(void)
                         continue;
                     }
                     
-                    // Trim textarea if too long (keep last ~2000 chars to prevent rendering slowdown)
-                    const char *current_text = lv_textarea_get_text(handshake_log_ta);
-                    if (current_text && strlen(current_text) > 2000) {
-                        // Find newline after first 500 chars and keep everything after it
-                        const char *trim_point = strchr(current_text + 500, '\n');
-                        if (trim_point) {
-                            // Copy trimmed text to temp buffer to avoid use-after-free
-                            char *trimmed = lv_mem_alloc(strlen(trim_point));
-                            if (trimmed) {
-                                strcpy(trimmed, trim_point + 1);
-                                lv_textarea_set_text(handshake_log_ta, trimmed);
-                                lv_mem_free(trimmed);
-                            }
+                    // Filter messages to show only relevant status updates
+                    // Look for: "handshake", "scanning", "finished", "captured", "attack", "EAPOL"
+                    bool is_relevant = false;
+                    char *lower_msg = lv_mem_alloc(line_len + 1);
+                    if (lower_msg) {
+                        for (size_t i = 0; i <= line_len; i++) {
+                            lower_msg[i] = (msg.text[i] >= 'A' && msg.text[i] <= 'Z') ? 
+                                           msg.text[i] + 32 : msg.text[i];
                         }
+                        if (strstr(lower_msg, "handshake") || strstr(lower_msg, "scanning") ||
+                            strstr(lower_msg, "finished") || strstr(lower_msg, "captured") ||
+                            strstr(lower_msg, "attack") || strstr(lower_msg, "eapol") ||
+                            strstr(lower_msg, "got") || strstr(lower_msg, "saved") ||
+                            strstr(lower_msg, "target") || strstr(lower_msg, "complete")) {
+                            is_relevant = true;
+                        }
+                        lv_mem_free(lower_msg);
                     }
                     
-                    lv_textarea_add_text(handshake_log_ta, msg.text);
-                    if (msg.text[line_len - 1] != '\n') {
-                        lv_textarea_add_text(handshake_log_ta, "\n");
+                    if (is_relevant) {
+                        // Parse ESP-IDF log format: "I (12345) TAG: message" -> extract just "message"
+                        char clean_msg[256];
+                        const char *msg_start = msg.text;
+                        
+                        // Skip log level and timestamp: "I (12345) "
+                        if ((msg.text[0] == 'I' || msg.text[0] == 'W' || msg.text[0] == 'E' || msg.text[0] == 'D') 
+                            && msg.text[1] == ' ' && msg.text[2] == '(') {
+                            // Find closing paren and space after timestamp
+                            const char *paren_end = strchr(msg.text + 3, ')');
+                            if (paren_end && paren_end[1] == ' ') {
+                                msg_start = paren_end + 2;  // Skip ") "
+                            }
+                        }
+                        
+                        // Skip TAG: part - find first ": " and skip it
+                        const char *colon = strstr(msg_start, ": ");
+                        if (colon) {
+                            msg_start = colon + 2;  // Skip ": "
+                        }
+                        
+                        // Copy cleaned message
+                        strncpy(clean_msg, msg_start, sizeof(clean_msg) - 1);
+                        clean_msg[sizeof(clean_msg) - 1] = '\0';
+                        
+                        // Remove trailing newline if present
+                        size_t clean_len = strlen(clean_msg);
+                        if (clean_len > 0 && clean_msg[clean_len - 1] == '\n') {
+                            clean_msg[clean_len - 1] = '\0';
+                        }
+                        
+                        // Skip empty messages after cleanup
+                        if (strlen(clean_msg) == 0) {
+                            continue;
+                        }
+                        
+                        // Add to status list - terminal style (black bg, green text)
+                        lv_obj_t *item = lv_list_add_text(handshake_status_list, clean_msg);
+                        lv_obj_set_style_bg_color(item, lv_color_make(0, 0, 0), 0);  // Black background
+                        
+                        // Color based on content - brighter green for success
+                        if (strstr(msg.text, "Got") || strstr(msg.text, "captured") || 
+                            strstr(msg.text, "Saved") || strstr(msg.text, "Complete")) {
+                            lv_obj_set_style_text_color(item, lv_color_make(0, 255, 0), 0);  // Bright green
+                        } else {
+                            lv_obj_set_style_text_color(item, COLOR_MATERIAL_GREEN, 0);  // Normal green
+                        }
+                        lv_obj_set_style_text_font(item, &lv_font_montserrat_12, 0);
+                        
+                        // Scroll to bottom
+                        lv_obj_scroll_to_y(handshake_status_list, LV_COORD_MAX, LV_ANIM_ON);
                     }
-                    lv_textarea_set_cursor_pos(handshake_log_ta, LV_TEXTAREA_CURSOR_LAST);
                 }
             }
 
@@ -3072,7 +3125,7 @@ static void attack_network_with_burst(const wifi_ap_record_t *ap) {
             
             // Check if handshake captured
             if (attack_handshake_is_complete()) {
-                ESP_LOGI(TAG, "✓ Handshake captured for '%s' after burst #%d!", 
+                ESP_LOGI(TAG, " Handshake captured for '%s' after burst #%d!", 
                            ap->ssid, burst + 1);
                 
                 // Wait 2s to capture any remaining frames
@@ -3209,7 +3262,7 @@ static void handshake_attack_task(void *pvParameters) {
             if (attack_handshake_is_complete()) {
                 handshake_captured[i] = true;
                 captured_count++;
-                ESP_LOGI(TAG, "✓✓✓ Handshake #%d captured! ✓✓✓", captured_count);
+                ESP_LOGI(TAG, " Handshake #%d captured! ", captured_count);
             }
             
             // Delay before next network
@@ -3237,7 +3290,7 @@ static void handshake_attack_task(void *pvParameters) {
             }
             
             if (all_done) {
-                ESP_LOGI(TAG, "✓✓✓ All selected networks captured! Attack complete. ✓✓✓");
+                ESP_LOGI(TAG, "All selected networks captured! Attack complete.");
                 break;
             }
             
@@ -3292,43 +3345,22 @@ static void handshake_yes_btn_cb(lv_event_t *e)
         lv_obj_clean(function_page);
     }
     
-    // Create log display page
-    handshake_log_ta = lv_textarea_create(function_page);
-    lv_obj_set_size(handshake_log_ta, lv_pct(100), LCD_V_RES - 30 - 50);
-    lv_obj_align(handshake_log_ta, LV_ALIGN_TOP_MID, 0, 30);
-    lv_textarea_set_text(handshake_log_ta, "Starting WPA Handshake Capture...\n");
-    lv_obj_set_style_bg_color(handshake_log_ta, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_text_color(handshake_log_ta, COLOR_MATERIAL_BLUE, 0);
-    lv_obj_set_style_border_color(handshake_log_ta, COLOR_MATERIAL_BLUE, 0);
-    lv_obj_set_style_border_width(handshake_log_ta, 2, 0);
-    lv_obj_clear_state(handshake_log_ta, LV_STATE_FOCUSED);
+    // Create scrollable content container (like Evil Twin)
+    lv_obj_t *content = lv_obj_create(function_page);
+    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 70);  // Leave space for header and Stop button
+    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_color(content, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_pad_all(content, 8, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_row(content, 6, 0);
     
-    // Create Stop button at bottom
-    handshake_stop_btn = lv_btn_create(function_page);
-    lv_obj_set_size(handshake_stop_btn, lv_pct(100), 45);
-    lv_obj_align(handshake_stop_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(handshake_stop_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(handshake_stop_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);
-    lv_obj_set_style_border_color(handshake_stop_btn, COLOR_MATERIAL_BLUE, 0);
-    lv_obj_set_style_border_width(handshake_stop_btn, 3, 0);
-    lv_obj_t *stop_lbl = lv_label_create(handshake_stop_btn);
-    lv_label_set_text(stop_lbl, "STOP");
-    lv_obj_set_style_text_color(stop_lbl, COLOR_MATERIAL_BLUE, 0);
-    lv_obj_center(stop_lbl);
-    lv_obj_add_event_cb(handshake_stop_btn, handshake_stop_btn_cb, LV_EVENT_CLICKED, NULL);
-    
-    // Enable log capture
-    handshake_enable_log_capture();
-    
-    // Check if networks were selected
+    // Check if networks were selected and prepare targets
     if (g_shared_selected_count > 0) {
         // Selected networks mode
         handshake_selected_mode = true;
         handshake_target_count = g_shared_selected_count;
-        
-        char header[160];
-        snprintf(header, sizeof(header), "Selected Networks Mode\nTargets: %d network(s)\n", g_shared_selected_count);
-        lv_textarea_add_text(handshake_log_ta, header);
         
         // Copy selected networks to handshake targets
         for (int i = 0; i < g_shared_selected_count; i++) {
@@ -3339,8 +3371,6 @@ static void handshake_yes_btn_cb(lv_event_t *e)
         // Scan-all mode
         handshake_selected_mode = false;
         
-        lv_textarea_add_text(handshake_log_ta, "Scan All Mode\nNo networks selected - will scan and attack all\n");
-        
         // Use existing scan results if available
         if (g_shared_scan_count > 0) {
             handshake_target_count = (g_shared_scan_count < MAX_AP_CNT) ? g_shared_scan_count : MAX_AP_CNT;
@@ -3348,8 +3378,112 @@ static void handshake_yes_btn_cb(lv_event_t *e)
         }
     }
     
-    lv_textarea_add_text(handshake_log_ta, "Starting handshake attack task...\n");
-    lv_textarea_set_cursor_pos(handshake_log_ta, LV_TEXTAREA_CURSOR_LAST);
+    // "Attacked Networks:" header
+    lv_obj_t *networks_header = lv_label_create(content);
+    lv_label_set_text(networks_header, "Attacked Networks:");
+    lv_obj_set_style_text_color(networks_header, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_text_font(networks_header, &lv_font_montserrat_14, 0);
+    
+    // Networks list (scrollable)
+    lv_obj_t *networks_list = lv_obj_create(content);
+    lv_obj_set_size(networks_list, lv_pct(100), 80);
+    lv_obj_set_style_bg_color(networks_list, lv_color_make(20, 20, 20), 0);
+    lv_obj_set_style_border_color(networks_list, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_border_width(networks_list, 1, 0);
+    lv_obj_set_style_pad_all(networks_list, 4, 0);
+    lv_obj_set_style_pad_row(networks_list, 2, 0);
+    lv_obj_set_flex_flow(networks_list, LV_FLEX_FLOW_COLUMN);
+    
+    if (handshake_target_count == 0 && !handshake_selected_mode) {
+        // Will scan for networks
+        lv_obj_t *scan_label = lv_label_create(networks_list);
+        lv_label_set_text(scan_label, "(Will scan for networks...)");
+        lv_obj_set_style_text_color(scan_label, lv_color_make(180, 180, 180), 0);
+        lv_obj_set_style_text_font(scan_label, &lv_font_montserrat_12, 0);
+    } else {
+        // Show selected/available networks
+        for (int i = 0; i < handshake_target_count; i++) {
+            const wifi_ap_record_t *ap = &handshake_targets[i];
+            char line[100];
+            const char *band = (ap->primary <= 14) ? "2.4GHz" : "5GHz";
+            
+            if (ap->ssid[0] != 0) {
+                snprintf(line, sizeof(line), "%s (Ch%d, %s)\n  %02X:%02X:%02X:%02X:%02X:%02X",
+                         (const char *)ap->ssid, ap->primary, band,
+                         ap->bssid[0], ap->bssid[1], ap->bssid[2],
+                         ap->bssid[3], ap->bssid[4], ap->bssid[5]);
+            } else {
+                snprintf(line, sizeof(line), "[Hidden] (Ch%d, %s)\n  %02X:%02X:%02X:%02X:%02X:%02X",
+                         ap->primary, band,
+                         ap->bssid[0], ap->bssid[1], ap->bssid[2],
+                         ap->bssid[3], ap->bssid[4], ap->bssid[5]);
+            }
+            
+            lv_obj_t *net_label = lv_label_create(networks_list);
+            lv_label_set_text(net_label, line);
+            lv_obj_set_style_text_color(net_label, COLOR_MATERIAL_BLUE, 0);
+            lv_obj_set_style_text_font(net_label, &lv_font_montserrat_12, 0);
+        }
+    }
+    
+    // "Status:" header
+    lv_obj_t *status_header = lv_label_create(content);
+    lv_label_set_text(status_header, "Status:");
+    lv_obj_set_style_text_color(status_header, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_text_font(status_header, &lv_font_montserrat_14, 0);
+    
+    // Status list (scrollable) - takes remaining space - terminal style (black bg, green text)
+    handshake_status_list = lv_list_create(content);
+    lv_obj_set_size(handshake_status_list, lv_pct(100), 80);
+    lv_obj_set_flex_grow(handshake_status_list, 1);  // Take remaining space
+    lv_obj_set_style_bg_color(handshake_status_list, lv_color_make(0, 0, 0), 0);  // Black background
+    lv_obj_set_style_border_color(handshake_status_list, COLOR_MATERIAL_GREEN, 0);  // Green border
+    lv_obj_set_style_border_width(handshake_status_list, 1, 0);
+    lv_obj_set_style_pad_all(handshake_status_list, 4, 0);
+    lv_obj_set_style_text_color(handshake_status_list, COLOR_MATERIAL_GREEN, 0);  // Green text default
+    
+    // Add initial status
+    if (!handshake_selected_mode && handshake_target_count == 0) {
+        lv_obj_t *item = lv_list_add_text(handshake_status_list, "Scanning for networks...");
+        lv_obj_set_style_text_color(item, COLOR_MATERIAL_GREEN, 0);
+        lv_obj_set_style_bg_color(item, lv_color_make(0, 0, 0), 0);
+    } else {
+        lv_obj_t *item = lv_list_add_text(handshake_status_list, "Starting handshake capture...");
+        lv_obj_set_style_text_color(item, COLOR_MATERIAL_GREEN, 0);
+        lv_obj_set_style_bg_color(item, lv_color_make(0, 0, 0), 0);
+    }
+    
+    // Stop & Exit button at bottom (red, like Deauth)
+    handshake_stop_btn = lv_btn_create(function_page);
+    lv_obj_set_size(handshake_stop_btn, 120, 55);
+    lv_obj_align(handshake_stop_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(handshake_stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(handshake_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(handshake_stop_btn, 0, 0);
+    lv_obj_set_style_radius(handshake_stop_btn, 10, 0);
+    lv_obj_set_style_shadow_width(handshake_stop_btn, 6, 0);
+    lv_obj_set_style_shadow_color(handshake_stop_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(handshake_stop_btn, LV_OPA_40, 0);
+    lv_obj_set_flex_flow(handshake_stop_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(handshake_stop_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    
+    lv_obj_t *x_icon = lv_label_create(handshake_stop_btn);
+    lv_label_set_text(x_icon, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_font(x_icon, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(x_icon, lv_color_make(255, 255, 255), 0);
+    
+    lv_obj_t *stop_text = lv_label_create(handshake_stop_btn);
+    lv_label_set_text(stop_text, "Stop & Exit");
+    lv_obj_set_style_text_font(stop_text, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(stop_text, lv_color_make(255, 255, 255), 0);
+    
+    lv_obj_add_event_cb(handshake_stop_btn, handshake_stop_btn_cb, LV_EVENT_CLICKED, NULL);
+    
+    // Enable log capture for status updates
+    handshake_enable_log_capture();
+    
+    // Keep handshake_log_ta as NULL since we're using status list now
+    handshake_log_ta = NULL;
     
     // Start handshake attack task
     handshake_attack_active = true;
@@ -3371,14 +3505,20 @@ static void handshake_yes_btn_cb(lv_event_t *e)
             handshake_attack_active = false;
             heap_caps_free(handshake_attack_task_stack);
             handshake_attack_task_stack = NULL;
-            lv_textarea_add_text(handshake_log_ta, "ERROR: Failed to create task\n");
+            // Add error to status list
+            lv_obj_t *err_item = lv_list_add_text(handshake_status_list, "ERROR: Failed to create task");
+            lv_obj_set_style_text_color(err_item, COLOR_MATERIAL_RED, 0);
+            lv_obj_set_style_bg_color(err_item, lv_color_make(0, 0, 0), 0);
         } else {
             ESP_LOGI(TAG, "Handshake attack task created with PSRAM stack (32KB)");
         }
     } else {
         ESP_LOGE(TAG, "Failed to allocate PSRAM stack for handshake attack task!");
         handshake_attack_active = false;
-        lv_textarea_add_text(handshake_log_ta, "ERROR: Failed to allocate PSRAM stack\n");
+        // Add error to status list
+        lv_obj_t *err_item = lv_list_add_text(handshake_status_list, "ERROR: Failed to allocate memory");
+        lv_obj_set_style_text_color(err_item, COLOR_MATERIAL_RED, 0);
+        lv_obj_set_style_bg_color(err_item, lv_color_make(0, 0, 0), 0);
     }
     
     show_touch_dot = false;
@@ -3439,6 +3579,7 @@ static void handshake_stop_btn_cb(lv_event_t *e)
     handshake_disable_log_capture();
     handshake_log_ta = NULL;
     handshake_stop_btn = NULL;
+    handshake_status_list = NULL;
     handshake_ui_active = false;
     scan_done_ui_flag = false;
     
@@ -4311,6 +4452,7 @@ static void create_function_page_base(const char *name)
     handshake_disable_log_capture();
     handshake_log_ta = NULL;
     handshake_stop_btn = NULL;
+    handshake_status_list = NULL;
     handshake_ui_active = false;
     handshake_attack_active = false;
     handshake_attack_task_handle = NULL;
@@ -4688,9 +4830,8 @@ static void attack_tile_event_cb(lv_event_t *e)
 // Material Dark color palette
 #define COLOR_MATERIAL_BG       lv_color_make(18, 18, 18)      // #121212
 #define COLOR_MATERIAL_SURFACE  lv_color_make(30, 30, 30)      // #1E1E1E
-// COLOR_MATERIAL_BLUE and COLOR_MATERIAL_RED defined at top of file
+// COLOR_MATERIAL_BLUE, COLOR_MATERIAL_RED, COLOR_MATERIAL_GREEN defined at top of file
 #define COLOR_MATERIAL_PURPLE   lv_color_make(156, 39, 176)    // #9C27B0
-#define COLOR_MATERIAL_GREEN    lv_color_make(76, 175, 80)     // #4CAF50
 #define COLOR_MATERIAL_CYAN     lv_color_make(0, 188, 212)     // #00BCD4
 #define COLOR_MATERIAL_ORANGE   lv_color_make(255, 152, 0)     // #FF9800
 #define COLOR_MATERIAL_PINK     lv_color_make(233, 30, 99)     // #E91E63

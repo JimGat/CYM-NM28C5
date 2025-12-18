@@ -230,7 +230,7 @@ static void mgmt_frame_handler(void *args, esp_event_base_t event_base, int32_t 
     pcap_serializer_append_frame(frame->payload, frame->rx_ctrl.sig_len, frame->rx_ctrl.timestamp);
     captured_beacon = true;
     
-    ESP_LOGI(TAG, "✓ BEACON frame captured and saved (ESSID: %s)", current_ap_record.ssid);
+    ESP_LOGI(TAG, " BEACON frame captured and saved (ESSID: %s)", current_ap_record.ssid);
     ESP_LOGI(TAG, "  This frame is needed for PMK calculation in hashcat/wpa-sec");
 }
 
@@ -252,22 +252,22 @@ static void eapolkey_frame_handler(void *args, esp_event_base_t event_base, int3
     if (msg_num == 1 && !captured_m1) {
         captured_m1 = true;
         should_save_to_pcap = true;
-        ESP_LOGI(TAG, "  ✓ M1 (ANonce from AP) - SAVED to PCAP");
+        ESP_LOGI(TAG, "   M1 (ANonce from AP) - SAVED to PCAP");
     }
     else if (msg_num == 2 && !captured_m2) {
         captured_m2 = true;
         should_save_to_pcap = true;
-        ESP_LOGI(TAG, "  ✓ M2 (SNonce from STA + MIC) - SAVED to PCAP");
+        ESP_LOGI(TAG, "   M2 (SNonce from STA + MIC) - SAVED to PCAP");
     }
     else if (msg_num == 3 && !captured_m3) {
         captured_m3 = true;
         should_save_to_pcap = true;
-        ESP_LOGI(TAG, "  ✓ M3 (ANonce + Install) - SAVED to PCAP");
+        ESP_LOGI(TAG, "   M3 (ANonce + Install) - SAVED to PCAP");
     }
     else if (msg_num == 4 && !captured_m4) {
         captured_m4 = true;
         should_save_to_pcap = true;
-        ESP_LOGI(TAG, "  ✓ M4 (Final ACK) - SAVED to PCAP");
+        ESP_LOGI(TAG, "   M4 (Final ACK) - SAVED to PCAP");
     }
     else if (msg_num > 0) {
         ESP_LOGD(TAG, "  → M%d duplicate - SKIPPED", msg_num);
@@ -295,7 +295,7 @@ static void eapolkey_frame_handler(void *args, esp_event_base_t event_base, int3
     
     // Check if we have all 4 messages
     if (captured_m1 && captured_m2 && captured_m3 && captured_m4) {
-        ESP_LOGI(TAG, "✓✓✓ ALL 4 HANDSHAKE MESSAGES CAPTURED! ✓✓✓");
+        ESP_LOGI(TAG, " ALL 4 HANDSHAKE MESSAGES CAPTURED! ");
         ESP_LOGI(TAG, "Complete handshake ready - will be saved when attack stops");
     }
 }
@@ -519,35 +519,35 @@ static bool is_handshake_complete(hccapx_t *hccapx) {
         printf("  No EAPOL frames were successfully processed by HCCAPX serializer\n");
         return false;
     }
-    printf("✓ message_pair: %d\n", hccapx->message_pair);
+    printf(" message_pair: %d\n", hccapx->message_pair);
     
     // Check ANonce (from AP)
     if (is_zero_array(hccapx->nonce_ap, 32)) {
         printf("✗ ANonce is empty - missing AP message (M1 or M3)\n");
         return false;
     }
-    printf("✓ ANonce present (from AP)\n");
+    printf(" ANonce present (from AP)\n");
     
     // Check SNonce (from STA)
     if (is_zero_array(hccapx->nonce_sta, 32)) {
         printf("✗ SNonce is empty - missing STA message (M2)\n");
         return false;
     }
-    printf("✓ SNonce present (from STA)\n");
+    printf(" SNonce present (from STA)\n");
     
     // Check Key MIC
     if (is_zero_array(hccapx->keymic, 16)) {
         printf("✗ Key MIC is empty - missing authenticated message\n");
         return false;
     }
-    printf("✓ Key MIC present\n");
+    printf(" Key MIC present\n");
     
     // Check AP MAC
     if (is_zero_array(hccapx->mac_ap, 6)) {
         printf("✗ AP MAC is empty\n");
         return false;
     }
-    printf("✓ AP MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+    printf(" AP MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
              hccapx->mac_ap[0], hccapx->mac_ap[1], hccapx->mac_ap[2],
              hccapx->mac_ap[3], hccapx->mac_ap[4], hccapx->mac_ap[5]);
     
@@ -556,7 +556,7 @@ static bool is_handshake_complete(hccapx_t *hccapx) {
         printf("✗ STA MAC is empty\n");
         return false;
     }
-    printf("✓ STA MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+    printf(" STA MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
              hccapx->mac_sta[0], hccapx->mac_sta[1], hccapx->mac_sta[2],
              hccapx->mac_sta[3], hccapx->mac_sta[4], hccapx->mac_sta[5]);
     
@@ -565,7 +565,7 @@ static bool is_handshake_complete(hccapx_t *hccapx) {
         printf("✗ EAPOL length invalid: %d\n", hccapx->eapol_len);
         return false;
     }
-    printf("✓ EAPOL data: %d bytes\n", hccapx->eapol_len);
+    printf(" EAPOL data: %d bytes\n", hccapx->eapol_len);
     
     // Check SSID
     if (hccapx->essid_len == 0 || hccapx->essid_len > 32) {
@@ -577,10 +577,10 @@ static bool is_handshake_complete(hccapx_t *hccapx) {
         }
         return false;
     }
-    printf("✓ SSID: %.*s (%d bytes)\n", hccapx->essid_len, hccapx->essid, hccapx->essid_len);
+    printf(" SSID: %.*s (%d bytes)\n", hccapx->essid_len, hccapx->essid, hccapx->essid_len);
     
     printf("=========================\n");
-    printf("✓✓✓ HANDSHAKE IS COMPLETE AND VALID ✓✓✓\n");
+    printf(" HANDSHAKE IS COMPLETE AND VALID \n");
     
     return true;
 }
@@ -735,7 +735,7 @@ bool attack_handshake_save_to_sd() {
         return false;
     }
     
-    printf("✓ PCAP saved: %s (%u bytes)\n", filename, pcap_size);
+    printf(" PCAP saved: %s (%u bytes)\n", filename, pcap_size);
     
     // Analyze PCAP content
     printf("  PCAP Analysis:\n");
@@ -775,8 +775,8 @@ bool attack_handshake_save_to_sd() {
         return false;
     }
     
-    printf("✓ HCCAPX saved: %s (%zu bytes)\n", filename, sizeof(hccapx_t));
-    printf("✓ Complete 4-way handshake saved for SSID: %s (MAC: %s, message_pair: %d)\n", 
+    printf(" HCCAPX saved: %s (%zu bytes)\n", filename, sizeof(hccapx_t));
+    printf(" Complete 4-way handshake saved for SSID: %s (MAC: %s, message_pair: %d)\n", 
              ssid_safe, mac_suffix, hccapx->message_pair);
     
     // Release SD/SPI mutex
