@@ -258,6 +258,13 @@ void wifi_scanner_clear_targets(void) {
     ESP_LOGI(TAG, "Cleared all targets");
 }
 
+// Clear all network selections
+void wifi_scanner_clear_selections(void) {
+    g_shared_selected_count = 0;
+    memset(g_shared_selected_indices, 0, sizeof(g_shared_selected_indices));
+    ESP_LOGI(TAG, "Cleared all network selections");
+}
+
 const wifi_ap_record_t *wifi_scanner_get_results_ptr(void)
 {
     return g_shared_scan_results;

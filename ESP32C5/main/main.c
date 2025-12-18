@@ -115,6 +115,7 @@ static int bt_device_count = 0;
 
 // Color definitions (used throughout the file)
 #define COLOR_MATERIAL_BLUE     lv_color_make(33, 150, 243)    // #2196F3 - default text color
+#define COLOR_MATERIAL_RED      lv_color_make(244, 67, 54)     // #F44336 - error/stop color
 #define COLOR_DARK_BLUE         lv_color_make(15, 60, 100)     // Dark blue for pressed states
 
 typedef int (*vprintf_like_t)(const char *, va_list);
@@ -212,9 +213,18 @@ static int evil_twin_network_count = 0;
 static int evil_twin_html_map[SCAN_RESULTS_MAX_DISPLAY];
 static int evil_twin_html_count = 0;
 
+// Evil Twin new UI elements
+static lv_obj_t *evil_twin_ssid_label = NULL;
+static lv_obj_t *evil_twin_deauth_list_label = NULL;
+static lv_obj_t *evil_twin_status_list = NULL;
+static char evil_twin_current_ssid[33] = "";
+
 typedef struct {
     char text[160];
 } evil_log_msg_t;
+
+// Evil Twin event queue for UI updates
+static QueueHandle_t evil_twin_event_queue = NULL;
 
 static QueueHandle_t evil_twin_log_queue = NULL;
 static bool evil_twin_log_capture_enabled = false;
@@ -383,11 +393,58 @@ static void wifi_scan_next_btn_cb(lv_event_t *e);
 static void deauth_quit_event_cb(lv_event_t *e);
 static void deauth_rescan_timer_stop(void);
 
+// Reset all child pointers when function_page is deleted
+static void reset_function_page_children(void) {
+    scan_status_label = NULL;
+    scan_list = NULL;
+    deauth_list = NULL;
+    deauth_prompt_label = NULL;
+    deauth_fps_label = NULL;
+    deauth_pause_btn = NULL;
+    deauth_quit_btn = NULL;
+    evil_twin_network_dd = NULL;
+    evil_twin_html_dd = NULL;
+    evil_twin_start_btn = NULL;
+    evil_twin_status_label = NULL;
+    evil_twin_log_ta = NULL;
+    evil_twin_content = NULL;
+    evil_twin_ssid_label = NULL;
+    evil_twin_deauth_list_label = NULL;
+    evil_twin_status_list = NULL;
+    blackout_log_ta = NULL;
+    blackout_stop_btn = NULL;
+    snifferdog_log_ta = NULL;
+    snifferdog_stop_btn = NULL;
+    sniffer_log_ta = NULL;
+    sniffer_stop_btn = NULL;
+    sae_overflow_log_ta = NULL;
+    sae_overflow_stop_btn = NULL;
+    handshake_log_ta = NULL;
+    handshake_stop_btn = NULL;
+    wardrive_log_ta = NULL;
+    wardrive_stop_btn = NULL;
+    karma_log_ta = NULL;
+    karma_stop_btn = NULL;
+    karma_content = NULL;
+    karma_probe_dd = NULL;
+    karma_html_dd = NULL;
+    karma_start_btn = NULL;
+    portal_content = NULL;
+    portal_ssid_ta = NULL;
+    portal_html_dd = NULL;
+    portal_start_btn = NULL;
+    portal_keyboard = NULL;
+    ble_scan_content = NULL;
+    ble_scan_list = NULL;
+    ble_scan_status_label = NULL;
+}
+
 static void create_function_page_base(const char *name);
 void show_function_page(const char *name);
 static void show_evil_twin_page(void);
 static void evil_twin_start_btn_cb(lv_event_t *e);
 static esp_err_t evil_twin_enable_log_capture(void);
+static void evil_twin_ui_event_callback(evil_twin_event_data_t *data);
 static void evil_twin_disable_log_capture(void);
 static void blackout_yes_btn_cb(lv_event_t *e);
 static void blackout_stop_btn_cb(lv_event_t *e);
@@ -635,6 +692,28 @@ static void evil_twin_disable_log_capture(void)
 
     if (evil_twin_log_queue) {
         xQueueReset(evil_twin_log_queue);
+    }
+}
+
+// Evil Twin UI event callback - called from wifi_attacks task context
+static void evil_twin_ui_event_callback(evil_twin_event_data_t *data) {
+    if (evil_twin_event_queue && data) {
+        // Queue event to be processed in main loop (thread-safe)
+        xQueueSend(evil_twin_event_queue, data, 0);
+    }
+}
+
+// Add status message to Evil Twin status list (must be called from main task)
+static void evil_twin_add_status_message(const char *message, lv_color_t color) {
+    if (evil_twin_status_list && lv_obj_is_valid(evil_twin_status_list)) {
+        lv_obj_t *item = lv_list_add_text(evil_twin_status_list, message);
+        if (item) {
+            lv_obj_set_style_text_color(item, color, 0);
+            lv_obj_set_style_bg_opa(item, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_pad_ver(item, 2, 0);
+        }
+        // Scroll to bottom
+        lv_obj_scroll_to_y(evil_twin_status_list, LV_COORD_MAX, LV_ANIM_ON);
     }
 }
 
@@ -1635,6 +1714,49 @@ void app_main(void)
                 show_menu();
             }
 
+            // Process Evil Twin UI events
+            if (evil_twin_event_queue && evil_twin_status_list) {
+                evil_twin_event_data_t evt;
+                while (xQueueReceive(evil_twin_event_queue, &evt, 0) == pdTRUE) {
+                    char msg[160];
+                    lv_color_t color = COLOR_MATERIAL_BLUE;
+                    
+                    switch (evt.event) {
+                        case EVIL_TWIN_EVENT_DEAUTH_STARTED:
+                            strcpy(msg, "Deauth started");
+                            break;
+                        case EVIL_TWIN_EVENT_PORTAL_DEPLOYED:
+                            strcpy(msg, "Portal deployed");
+                            break;
+                        case EVIL_TWIN_EVENT_CLIENT_CONNECTED:
+                            strcpy(msg, "Client connected");
+                            color = lv_color_make(100, 255, 100);  // Green
+                            break;
+                        case EVIL_TWIN_EVENT_CLIENT_DISCONNECTED:
+                            strcpy(msg, "Client disconnected");
+                            color = lv_color_make(255, 200, 100);  // Orange
+                            break;
+                        case EVIL_TWIN_EVENT_PASSWORD_PROVIDED:
+                            strcpy(msg, "Password provided");
+                            color = lv_color_make(255, 255, 100);  // Yellow
+                            break;
+                        case EVIL_TWIN_EVENT_PASSWORD_FAILED:
+                            strcpy(msg, "Password failed");
+                            color = lv_color_make(255, 100, 100);  // Red
+                            break;
+                        case EVIL_TWIN_EVENT_PASSWORD_VERIFIED:
+                            snprintf(msg, sizeof(msg), "Password verified, credentials saved:\n  SSID: %s\n  Pass: %s",
+                                     evt.ssid, evt.password);
+                            color = lv_color_make(100, 255, 100);  // Green
+                            break;
+                        default:
+                            continue;
+                    }
+                    
+                    evil_twin_add_status_message(msg, color);
+                }
+            }
+
             if (evil_twin_log_ta && evil_twin_log_queue) {
                 evil_log_msg_t msg;
                 while (xQueueReceive(evil_twin_log_queue, &msg, 0) == pdTRUE) {
@@ -1906,7 +2028,7 @@ void app_main(void)
                 scan_done_ui_flag = false;
 
                 if (function_page) { lv_obj_del(function_page); function_page = NULL; }
-                scan_status_label = NULL;  // Reset label pointer after deletion
+                reset_function_page_children();
                 show_function_page("Scan Results");
                 show_touch_dot = true;
 
@@ -2738,7 +2860,7 @@ static void sae_overflow_yes_btn_cb(lv_event_t *e)
         lv_obj_t *error_label = lv_label_create(function_page);
         lv_label_set_text(error_label, "SAE Overflow requires\nexactly ONE network.\n\nPlease scan and select\none network.");
         lv_obj_set_style_text_align(error_label, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_text_color(error_label, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_text_color(error_label, COLOR_MATERIAL_RED, 0);
         lv_obj_set_style_text_font(error_label, &lv_font_montserrat_16, 0);
         lv_obj_center(error_label);
         
@@ -2768,48 +2890,67 @@ static void sae_overflow_yes_btn_cb(lv_event_t *e)
         lv_obj_clean(function_page);
     }
     
-    // Create log display page
-    sae_overflow_log_ta = lv_textarea_create(function_page);
-    lv_obj_set_size(sae_overflow_log_ta, lv_pct(100), LCD_V_RES - 30 - 50);
-    lv_obj_align(sae_overflow_log_ta, LV_ALIGN_TOP_MID, 0, 30);
-    lv_textarea_set_text(sae_overflow_log_ta, "Starting SAE Overflow Attack...\n");
-    lv_obj_set_style_bg_color(sae_overflow_log_ta, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_text_color(sae_overflow_log_ta, COLOR_MATERIAL_BLUE, 0);
-    lv_obj_set_style_border_color(sae_overflow_log_ta, COLOR_MATERIAL_BLUE, 0);
-    lv_obj_set_style_border_width(sae_overflow_log_ta, 2, 0);
-    lv_obj_clear_state(sae_overflow_log_ta, LV_STATE_FOCUSED);
-    
-    // Create Stop button at bottom
-    sae_overflow_stop_btn = lv_btn_create(function_page);
-    lv_obj_set_size(sae_overflow_stop_btn, lv_pct(100), 45);
-    lv_obj_align(sae_overflow_stop_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(sae_overflow_stop_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(sae_overflow_stop_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);
-    lv_obj_set_style_border_color(sae_overflow_stop_btn, COLOR_MATERIAL_BLUE, 0);
-    lv_obj_set_style_border_width(sae_overflow_stop_btn, 3, 0);
-    lv_obj_t *stop_lbl = lv_label_create(sae_overflow_stop_btn);
-    lv_label_set_text(stop_lbl, "STOP");
-    lv_obj_set_style_text_color(stop_lbl, COLOR_MATERIAL_BLUE, 0);
-    lv_obj_center(stop_lbl);
-    lv_obj_add_event_cb(sae_overflow_stop_btn, sae_overflow_stop_btn_cb, LV_EVENT_CLICKED, NULL);
-    
-    // Enable log capture
-    sae_overflow_enable_log_capture();
-    
     // Get selected network info
+    const wifi_ap_record_t *ap = &records[selected_index];
     char ssid[33];
-    if (records[selected_index].ssid[0]) {
-        snprintf(ssid, sizeof(ssid), "%s", (const char *)records[selected_index].ssid);
+    if (ap->ssid[0]) {
+        snprintf(ssid, sizeof(ssid), "%s", (const char *)ap->ssid);
     } else {
         snprintf(ssid, sizeof(ssid), "%02X%02X%02X%02X%02X%02X",
-                 records[selected_index].bssid[0], records[selected_index].bssid[1], records[selected_index].bssid[2],
-                 records[selected_index].bssid[3], records[selected_index].bssid[4], records[selected_index].bssid[5]);
+                 ap->bssid[0], ap->bssid[1], ap->bssid[2],
+                 ap->bssid[3], ap->bssid[4], ap->bssid[5]);
     }
     
-    char header[160];
-    snprintf(header, sizeof(header), "Launching SAE Overflow for %s\n", ssid);
-    lv_textarea_add_text(sae_overflow_log_ta, header);
-    lv_textarea_set_cursor_pos(sae_overflow_log_ta, LV_TEXTAREA_CURSOR_LAST);
+    // Title centered at top - "SAE Overflow attack in progress"
+    lv_obj_t *title_label = lv_label_create(function_page);
+    lv_label_set_text(title_label, "SAE Overflow attack in progress");
+    lv_obj_set_style_text_font(title_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(title_label, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_align(title_label, LV_ALIGN_TOP_MID, 0, 36);
+    
+    // Attacked network info
+    lv_obj_t *network_info = lv_label_create(function_page);
+    char info_text[160];
+    const char *band = (ap->primary <= 14) ? "2.4GHz" : "5GHz";
+    snprintf(info_text, sizeof(info_text), 
+             "Attacked network:\n\n"
+             "SSID: %s\n"
+             "Channel: %d (%s)\n"
+             "BSSID: %02X:%02X:%02X:%02X:%02X:%02X",
+             ssid, ap->primary, band,
+             ap->bssid[0], ap->bssid[1], ap->bssid[2],
+             ap->bssid[3], ap->bssid[4], ap->bssid[5]);
+    lv_label_set_text(network_info, info_text);
+    lv_obj_set_style_text_color(network_info, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_text_font(network_info, &lv_font_montserrat_14, 0);
+    lv_obj_align(network_info, LV_ALIGN_TOP_MID, 0, 70);
+    lv_obj_set_style_text_align(network_info, LV_TEXT_ALIGN_CENTER, 0);
+    
+    // Stop & Exit tile at bottom (red with X icon) - same as Deauth
+    sae_overflow_stop_btn = lv_btn_create(function_page);
+    lv_obj_set_size(sae_overflow_stop_btn, 120, 55);
+    lv_obj_align(sae_overflow_stop_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(sae_overflow_stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(sae_overflow_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(sae_overflow_stop_btn, 0, 0);
+    lv_obj_set_style_radius(sae_overflow_stop_btn, 10, 0);
+    lv_obj_set_style_shadow_width(sae_overflow_stop_btn, 6, 0);
+    lv_obj_set_style_shadow_color(sae_overflow_stop_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(sae_overflow_stop_btn, LV_OPA_40, 0);
+    lv_obj_set_flex_flow(sae_overflow_stop_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(sae_overflow_stop_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    
+    lv_obj_t *x_icon = lv_label_create(sae_overflow_stop_btn);
+    lv_label_set_text(x_icon, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_font(x_icon, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(x_icon, lv_color_make(255, 255, 255), 0);
+    
+    lv_obj_t *stop_text = lv_label_create(sae_overflow_stop_btn);
+    lv_label_set_text(stop_text, "Stop & Exit");
+    lv_obj_set_style_text_font(stop_text, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(stop_text, lv_color_make(255, 255, 255), 0);
+    
+    lv_obj_add_event_cb(sae_overflow_stop_btn, sae_overflow_stop_btn_cb, LV_EVENT_CLICKED, NULL);
     
     // Save selected network as target
     wifi_scanner_save_target_bssids();
@@ -2817,15 +2958,19 @@ static void sae_overflow_yes_btn_cb(lv_event_t *e)
     // Start SAE overflow attack
     esp_err_t start_res = wifi_attacks_start_sae_overflow();
     if (start_res != ESP_OK) {
-        char err[96];
-        snprintf(err, sizeof(err), "Start failed: %s\n", esp_err_to_name(start_res));
-        lv_textarea_add_text(sae_overflow_log_ta, err);
-        sae_overflow_disable_log_capture();
+        // Show error on the network info label
+        char err[128];
+        snprintf(err, sizeof(err), 
+                 "Attacked network:\n\n"
+                 "SSID: %s\n\n"
+                 "Start failed: %s",
+                 ssid, esp_err_to_name(start_res));
+        lv_label_set_text(network_info, err);
+        lv_obj_set_style_text_color(network_info, COLOR_MATERIAL_RED, 0);
         return;
     }
     
-    lv_textarea_add_text(sae_overflow_log_ta, "SAE Overflow started. Awaiting log output...\n");
-    lv_textarea_set_cursor_pos(sae_overflow_log_ta, LV_TEXTAREA_CURSOR_LAST);
+    sae_overflow_log_ta = NULL;  // No longer using textarea
     
     show_touch_dot = false;
     if (touch_dot) {
@@ -4138,6 +4283,10 @@ static void create_function_page_base(const char *name)
     evil_twin_html_dd = NULL;
     evil_twin_start_btn = NULL;
     evil_twin_status_label = NULL;
+    evil_twin_ssid_label = NULL;
+    evil_twin_deauth_list_label = NULL;
+    evil_twin_status_list = NULL;
+    wifi_attacks_set_evil_twin_event_cb(NULL);  // Unregister callback
 
     blackout_disable_log_capture();
     blackout_log_ta = NULL;
@@ -4190,6 +4339,7 @@ static void create_function_page_base(const char *name)
         lv_obj_del(function_page);
         function_page = NULL;
     }
+    reset_function_page_children();
 
     // Hide tiles container and title bar while the function page is active
     if (tiles_container) {
@@ -4240,12 +4390,16 @@ void show_menu(void)
 {
     evil_twin_log_capture_enabled = false;
     evil_twin_log_ta = NULL;
+    evil_twin_ssid_label = NULL;
+    evil_twin_deauth_list_label = NULL;
+    evil_twin_status_list = NULL;
+    wifi_attacks_set_evil_twin_event_cb(NULL);  // Unregister callback
     // Delete function page if it exists
     if (function_page) {
         lv_obj_del(function_page);
         function_page = NULL;
     }
-    // scan_list lives under function_page; NULL already if page deleted
+    reset_function_page_children();
     
     // Show main tiles and title bar
     show_main_tiles();
@@ -4380,6 +4534,8 @@ static void main_tile_event_cb(lv_event_t *e)
         show_sniff_karma_screen();
     } else if (strcmp(tile_name, "WiFi Monitor") == 0) {
         show_wifi_monitor_screen();
+    } else if (strcmp(tile_name, "Deauth Monitor") == 0) {
+        show_stub_screen("Deauth Monitor");
     } else if (strcmp(tile_name, "Bluetooth") == 0) {
         show_bluetooth_screen();
     }
@@ -4532,8 +4688,7 @@ static void attack_tile_event_cb(lv_event_t *e)
 // Material Dark color palette
 #define COLOR_MATERIAL_BG       lv_color_make(18, 18, 18)      // #121212
 #define COLOR_MATERIAL_SURFACE  lv_color_make(30, 30, 30)      // #1E1E1E
-// COLOR_MATERIAL_BLUE defined at top of file
-#define COLOR_MATERIAL_RED      lv_color_make(244, 67, 54)     // #F44336
+// COLOR_MATERIAL_BLUE and COLOR_MATERIAL_RED defined at top of file
 #define COLOR_MATERIAL_PURPLE   lv_color_make(156, 39, 176)    // #9C27B0
 #define COLOR_MATERIAL_GREEN    lv_color_make(76, 175, 80)     // #4CAF50
 #define COLOR_MATERIAL_CYAN     lv_color_make(0, 188, 212)     // #00BCD4
@@ -4557,6 +4712,7 @@ static void show_main_tiles(void)
         lv_obj_del(function_page);
         function_page = NULL;
     }
+    reset_function_page_children();
     
     // Create tiles container with Material Dark background
     tiles_container = lv_obj_create(lv_scr_act());
@@ -4571,11 +4727,12 @@ static void show_main_tiles(void)
     lv_obj_set_flex_align(tiles_container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(tiles_container, LV_OBJ_FLAG_SCROLLABLE);
     
-    // Create 5 main tiles with Material colors
+    // Create 6 main tiles with Material colors
     create_tile(tiles_container, LV_SYMBOL_WIFI, "WiFi Scan\n& Attack", COLOR_MATERIAL_BLUE, main_tile_event_cb, "WiFi Scan & Attack");
     create_tile(tiles_container, LV_SYMBOL_WARNING, "Global WiFi\nAttacks", COLOR_MATERIAL_RED, main_tile_event_cb, "Global WiFi Attacks");
     create_tile(tiles_container, LV_SYMBOL_EYE_OPEN, "WiFi Sniff\n& Karma", COLOR_MATERIAL_PURPLE, main_tile_event_cb, "WiFi Sniff&Karma");
     create_tile(tiles_container, LV_SYMBOL_SETTINGS, "WiFi\nMonitor", COLOR_MATERIAL_GREEN, main_tile_event_cb, "WiFi Monitor");
+    create_tile(tiles_container, LV_SYMBOL_GPS, "Deauth\nMonitor", COLOR_MATERIAL_AMBER, main_tile_event_cb, "Deauth Monitor");
     create_tile(tiles_container, LV_SYMBOL_BLUETOOTH, "Bluetooth", COLOR_MATERIAL_CYAN, main_tile_event_cb, "Bluetooth");
     
     // Show title bar
@@ -4621,6 +4778,10 @@ static void show_wifi_scan_attack_screen(void)
     lv_label_set_text(scan_status_label, "Scanning...");
     lv_obj_set_style_text_color(scan_status_label, COLOR_MATERIAL_BLUE, 0);
     lv_obj_set_style_text_font(scan_status_label, &lv_font_montserrat_20, 0);
+    
+    // Clear previous selections when user manually starts scan
+    wifi_scanner_clear_selections();
+    wifi_scanner_clear_targets();
     
     // Start scan
     wifi_scanner_start_scan();
@@ -5116,6 +5277,10 @@ void attack_event_cb(lv_event_t *e)
         lv_obj_set_style_text_color(scan_status_label, COLOR_MATERIAL_BLUE, 0);
         lv_obj_set_style_text_font(scan_status_label, &lv_font_montserrat_20, 0);
 
+        // Clear previous selections when user manually starts scan
+        wifi_scanner_clear_selections();
+        wifi_scanner_clear_targets();
+
         // Start scan
         wifi_scanner_start_scan();
         return;
@@ -5552,6 +5717,7 @@ void attack_event_cb(lv_event_t *e)
         // Show last scan results with selection state
         ui_locked = true;
         if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+        reset_function_page_children();
         show_function_page("Browse Networks");
         scan_list = lv_list_create(function_page);
         lv_obj_set_size(scan_list, lv_pct(100), LCD_V_RES - 30);
@@ -5651,6 +5817,7 @@ void attack_event_cb(lv_event_t *e)
         // Show sniffer AP list with clients (indented)
         ui_locked = true;
         if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+        reset_function_page_children();
         show_function_page("Browse Clients");
         
         lv_obj_t *list = lv_list_create(function_page);
@@ -5763,6 +5930,7 @@ void attack_event_cb(lv_event_t *e)
         // Show probe requests list
         ui_locked = true;
         if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+        reset_function_page_children();
         show_function_page("Show Probes");
         
         lv_obj_t *list = lv_list_create(function_page);
@@ -5837,6 +6005,7 @@ void attack_event_cb(lv_event_t *e)
         // BLE Scanner - switch from WiFi to BLE mode and scan
         ui_locked = true;
         if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+        reset_function_page_children();
         
         // Create base page
         create_function_page_base("BLE Scan");
@@ -6051,36 +6220,91 @@ static void evil_twin_start_btn_cb(lv_event_t *e)
                  records[record_index].bssid[3], records[record_index].bssid[4], records[record_index].bssid[5]);
     }
 
+    // Store SSID for event callback
+    strncpy(evil_twin_current_ssid, ssid, sizeof(evil_twin_current_ssid) - 1);
+    evil_twin_current_ssid[sizeof(evil_twin_current_ssid) - 1] = '\0';
+
     int html_index = evil_twin_html_map[html_sel];
     const char *html_name = wifi_attacks_get_sd_html_name(html_index);
 
-    if (evil_twin_status_label) {
-        char info[128];
-        const char *html_display = html_name;
-        if (html_display) {
-            const char *slash = strrchr(html_display, '/');
-            if (slash) {
-                html_display = slash + 1;
-            }
+    // Save target networks before starting attack
+    wifi_scanner_save_target_bssids();
+
+    // Get deauth targets for display
+    target_bssid_t targets[MAX_TARGET_BSSIDS];
+    int target_count = wifi_scanner_get_targets(targets, MAX_TARGET_BSSIDS);
+
+    // Create new UI page
+    create_function_page_base("Evil Twin Attack");
+
+    // Create scrollable content container
+    lv_obj_t *content = lv_obj_create(function_page);
+    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 45);  // Leave space for header and Exit button
+    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_color(content, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_pad_all(content, 8, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_row(content, 6, 0);
+
+    // Evil Twin network deployed label
+    evil_twin_ssid_label = lv_label_create(content);
+    char ssid_text[80];
+    snprintf(ssid_text, sizeof(ssid_text), "Evil Twin network deployed:\n  %s", ssid);
+    lv_label_set_text(evil_twin_ssid_label, ssid_text);
+    lv_obj_set_style_text_color(evil_twin_ssid_label, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_width(evil_twin_ssid_label, lv_pct(100));
+
+    // Other deauthenticated networks label
+    lv_obj_t *deauth_header = lv_label_create(content);
+    lv_label_set_text(deauth_header, "Other deauthenticated networks:");
+    lv_obj_set_style_text_color(deauth_header, COLOR_MATERIAL_BLUE, 0);
+
+    // Build deauth network list
+    evil_twin_deauth_list_label = lv_label_create(content);
+    lv_obj_set_width(evil_twin_deauth_list_label, lv_pct(100));
+    lv_label_set_long_mode(evil_twin_deauth_list_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(evil_twin_deauth_list_label, lv_color_make(180, 180, 180), 0);
+    
+    static char deauth_list_text[512];
+    deauth_list_text[0] = '\0';
+    int shown = 0;
+    for (int i = 0; i < target_count; i++) {
+        // Skip the Evil Twin SSID itself
+        if (strcmp(targets[i].ssid, ssid) == 0) {
+            continue;
         }
-        snprintf(info, sizeof(info), "Starting Evil Twin on '%s' with portal '%s'",
-                 ssid,
-                 html_display ? html_display : "(none)");
-        lv_label_set_text(evil_twin_status_label, info);
+        if (shown > 0) {
+            strncat(deauth_list_text, "\n", sizeof(deauth_list_text) - strlen(deauth_list_text) - 1);
+        }
+        char entry[48];
+        if (targets[i].ssid[0]) {
+            snprintf(entry, sizeof(entry), "  - %s", targets[i].ssid);
+        } else {
+            snprintf(entry, sizeof(entry), "  - [Hidden]");
+        }
+        strncat(deauth_list_text, entry, sizeof(deauth_list_text) - strlen(deauth_list_text) - 1);
+        shown++;
     }
+    if (shown == 0) {
+        strcpy(deauth_list_text, "  (none)");
+    }
+    lv_label_set_text(evil_twin_deauth_list_label, deauth_list_text);
 
-    create_function_page_base("Evil Twin Log");
+    // Status header
+    lv_obj_t *status_header = lv_label_create(content);
+    lv_label_set_text(status_header, "Status:");
+    lv_obj_set_style_text_color(status_header, COLOR_MATERIAL_BLUE, 0);
 
-    evil_twin_log_ta = lv_textarea_create(function_page);
-    lv_obj_set_size(evil_twin_log_ta, lv_pct(100), LCD_V_RES - 30 - 45);  // Leave space for Exit button
-    lv_obj_align(evil_twin_log_ta, LV_ALIGN_TOP_MID, 0, 30);
-    lv_textarea_set_one_line(evil_twin_log_ta, false);
-    lv_textarea_set_cursor_click_pos(evil_twin_log_ta, false);
-    lv_textarea_set_password_mode(evil_twin_log_ta, false);
-    lv_textarea_set_text(evil_twin_log_ta, "");
-    // Retro terminal styling
-    lv_obj_set_style_bg_color(evil_twin_log_ta, lv_color_make(0, 0, 0), 0);  // Black background
-    lv_obj_set_style_text_color(evil_twin_log_ta, COLOR_MATERIAL_BLUE, 0);  // Green text
+    // Status list (scrollable)
+    evil_twin_status_list = lv_list_create(content);
+    lv_obj_set_size(evil_twin_status_list, lv_pct(100), 100);
+    lv_obj_set_flex_grow(evil_twin_status_list, 1);  // Take remaining space
+    lv_obj_set_style_bg_color(evil_twin_status_list, lv_color_make(20, 20, 20), 0);
+    lv_obj_set_style_border_color(evil_twin_status_list, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_border_width(evil_twin_status_list, 1, 0);
+    lv_obj_set_style_pad_all(evil_twin_status_list, 4, 0);
 
     // Exit button at the bottom
     lv_obj_t *exit_btn = lv_btn_create(function_page);
@@ -6090,61 +6314,44 @@ static void evil_twin_start_btn_cb(lv_event_t *e)
     lv_obj_set_style_bg_color(exit_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);
     lv_obj_set_style_border_color(exit_btn, COLOR_MATERIAL_BLUE, 0);
     lv_obj_set_style_border_width(exit_btn, 3, 0);
-    lv_obj_add_event_cb(exit_btn, deauth_quit_event_cb, LV_EVENT_CLICKED, NULL);  // Reuse quit callback
+    lv_obj_add_event_cb(exit_btn, deauth_quit_event_cb, LV_EVENT_CLICKED, NULL);
     
     lv_obj_t *exit_label = lv_label_create(exit_btn);
     lv_label_set_text(exit_label, "Exit");
     lv_obj_set_style_text_color(exit_label, COLOR_MATERIAL_BLUE, 0);
     lv_obj_center(exit_label);
 
-    if (evil_twin_enable_log_capture() != ESP_OK) {
-        lv_textarea_add_text(evil_twin_log_ta, "Failed to initialize log capture\n");
-        return;
+    // Create event queue for Evil Twin UI events
+    if (!evil_twin_event_queue) {
+        evil_twin_event_queue = xQueueCreate(16, sizeof(evil_twin_event_data_t));
+    } else {
+        xQueueReset(evil_twin_event_queue);
     }
 
-    char header[160];
-    snprintf(header, sizeof(header), "Launching Evil Twin for %s\n", ssid);
-    lv_textarea_add_text(evil_twin_log_ta, header);
-    lv_textarea_set_cursor_pos(evil_twin_log_ta, LV_TEXTAREA_CURSOR_LAST);
+    // Register event callback
+    wifi_attacks_set_evil_twin_event_cb(evil_twin_ui_event_callback);
 
+    // Set HTML template
     if (html_name) {
-        const char *html_display = strrchr(html_name, '/');
-        if (html_display) {
-            html_display++;
-        } else {
-            html_display = html_name;
-        }
-
         esp_err_t html_res = wifi_attacks_select_sd_html(html_index);
         if (html_res != ESP_OK) {
-            char warn[120];
-            snprintf(warn, sizeof(warn), "Failed to set portal template: %s\n", esp_err_to_name(html_res));
-            lv_textarea_add_text(evil_twin_log_ta, warn);
-        } else {
-            char msg[120];
-            snprintf(msg, sizeof(msg), "Portal template: %s\n", html_display);
-            lv_textarea_add_text(evil_twin_log_ta, msg);
+            // Add error to status list
+            lv_obj_t *item = lv_list_add_text(evil_twin_status_list, "Failed to set portal template");
+            lv_obj_set_style_text_color(item, lv_color_make(255, 100, 100), 0);
         }
-    } else {
-        lv_textarea_add_text(evil_twin_log_ta, "Portal template: (none)\n");
     }
-
-    wifi_scanner_save_target_bssids();
 
     // Ensure Karma mode is disabled for Evil Twin (enables WiFi password verification)
     wifi_attacks_set_karma_mode(false);
 
+    // Start the attack
     esp_err_t start_res = wifi_attacks_start_evil_twin(ssid, NULL);
     if (start_res != ESP_OK) {
-        char err[96];
-        snprintf(err, sizeof(err), "Start failed: %s\n", esp_err_to_name(start_res));
-        lv_textarea_add_text(evil_twin_log_ta, err);
-        evil_twin_disable_log_capture();
+        lv_obj_t *item = lv_list_add_text(evil_twin_status_list, "Failed to start Evil Twin attack");
+        lv_obj_set_style_text_color(item, lv_color_make(255, 100, 100), 0);
+        wifi_attacks_set_evil_twin_event_cb(NULL);
         return;
     }
-
-    lv_textarea_add_text(evil_twin_log_ta, "Evil Twin started. Awaiting log output...\n");
-    lv_textarea_set_cursor_pos(evil_twin_log_ta, LV_TEXTAREA_CURSOR_LAST);
 
     show_touch_dot = false;
     if (touch_dot) {

