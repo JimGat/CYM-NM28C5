@@ -32,6 +32,39 @@ bool wifi_attacks_is_deauth_active(void);
 // ============================================================================
 
 /**
+ * @brief Evil Twin event types for UI notification
+ */
+typedef enum {
+    EVIL_TWIN_EVENT_DEAUTH_STARTED,
+    EVIL_TWIN_EVENT_PORTAL_DEPLOYED,
+    EVIL_TWIN_EVENT_CLIENT_CONNECTED,
+    EVIL_TWIN_EVENT_CLIENT_DISCONNECTED,
+    EVIL_TWIN_EVENT_PASSWORD_PROVIDED,
+    EVIL_TWIN_EVENT_PASSWORD_FAILED,
+    EVIL_TWIN_EVENT_PASSWORD_VERIFIED,
+} evil_twin_event_t;
+
+/**
+ * @brief Evil Twin event data structure
+ */
+typedef struct {
+    evil_twin_event_t event;
+    char ssid[33];
+    char password[64];
+} evil_twin_event_data_t;
+
+/**
+ * @brief Callback type for Evil Twin events
+ */
+typedef void (*evil_twin_event_cb_t)(evil_twin_event_data_t *data);
+
+/**
+ * @brief Set callback for Evil Twin events
+ * @param cb Callback function (NULL to disable)
+ */
+void wifi_attacks_set_evil_twin_event_cb(evil_twin_event_cb_t cb);
+
+/**
  * @brief Start Evil Twin AP
  * @param ssid SSID to clone
  * @param password Optional password (NULL for open)

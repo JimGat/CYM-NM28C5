@@ -102,6 +102,11 @@ void wifi_scanner_update_target_seen(const uint8_t *bssid);
  */
 void wifi_scanner_clear_targets(void);
 
+/**
+ * @brief Clear all network selections
+ */
+void wifi_scanner_clear_selections(void);
+
 #ifdef __cplusplus
 }
 #endif
