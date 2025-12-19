@@ -235,14 +235,16 @@ static bool evil_twin_log_capture_enabled = false;
 static vprintf_like_t previous_vprintf = NULL;
 
 // Blackout UI state
-static lv_obj_t *blackout_log_ta = NULL;
+static lv_obj_t *blackout_networks_label = NULL;
+static lv_obj_t *blackout_status_label = NULL;
 static lv_obj_t *blackout_stop_btn = NULL;
 static QueueHandle_t blackout_log_queue = NULL;
 static bool blackout_log_capture_enabled = false;
 static volatile bool blackout_ui_active = false;
 
 // Snifferdog UI state
-static lv_obj_t *snifferdog_log_ta = NULL;
+static lv_obj_t *snifferdog_kick_label = NULL;
+static lv_obj_t *snifferdog_recent_label = NULL;
 static lv_obj_t *snifferdog_stop_btn = NULL;
 static QueueHandle_t snifferdog_log_queue = NULL;
 static bool snifferdog_log_capture_enabled = false;
@@ -257,6 +259,9 @@ static int sniffer_dog_current_channel = 1;
 static int sniffer_dog_channel_index = 0;
 static int64_t sniffer_dog_last_channel_hop = 0;
 static const int sniffer_channel_hop_delay_ms = 250;
+static volatile uint32_t snifferdog_kick_count = 0;
+static char snifferdog_last_pair[48] = "N/A";
+static portMUX_TYPE snifferdog_stats_spin = portMUX_INITIALIZER_UNLOCKED;
 
 // Sniffer UI state
 static lv_obj_t *sniffer_log_ta = NULL;
@@ -421,9 +426,11 @@ static void reset_function_page_children(void) {
     evil_twin_ssid_label = NULL;
     evil_twin_deauth_list_label = NULL;
     evil_twin_status_list = NULL;
-    blackout_log_ta = NULL;
+    blackout_networks_label = NULL;
+    blackout_status_label = NULL;
     blackout_stop_btn = NULL;
-    snifferdog_log_ta = NULL;
+    snifferdog_kick_label = NULL;
+    snifferdog_recent_label = NULL;
     snifferdog_stop_btn = NULL;
     sniffer_log_ta = NULL;
     sniffer_stop_btn = NULL;
@@ -1209,8 +1216,6 @@ static void sniffer_dog_task(void *pvParameters) {
 
 // Snifferdog promiscuous callback - captures AP-STA pairs and sends deauth
 static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
-    static uint32_t deauth_sent_count = 0;
-    
     if (!sniffer_dog_active) {
         return;
     }
@@ -1294,11 +1299,17 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
     memcpy(&deauth_frame[16], ap_mac, 6);   // BSSID: AP
     
     esp_wifi_80211_tx(WIFI_IF_AP, deauth_frame, sizeof(deauth_frame_default), false);
-    deauth_sent_count++;
+    portENTER_CRITICAL(&snifferdog_stats_spin);
+    snifferdog_kick_count++;
+    snprintf(snifferdog_last_pair, sizeof(snifferdog_last_pair),
+             "%02X:%02X:%02X:%02X:%02X:%02X -> %02X:%02X:%02X:%02X:%02X:%02X",
+             ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5],
+             sta_mac[0], sta_mac[1], sta_mac[2], sta_mac[3], sta_mac[4], sta_mac[5]);
+    portEXIT_CRITICAL(&snifferdog_stats_spin);
     
     // Log deauth
     ESP_LOGI(TAG, "[SnifferDog #%lu] DEAUTH: AP=%02X:%02X:%02X:%02X:%02X:%02X -> STA=%02X:%02X:%02X:%02X:%02X:%02X (Ch=%d, RSSI=%d)",
-             deauth_sent_count,
+             (unsigned long)snifferdog_kick_count,
              ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5],
              sta_mac[0], sta_mac[1], sta_mac[2], sta_mac[3], sta_mac[4], sta_mac[5],
              sniffer_dog_current_channel, pkt->rx_ctrl.rssi);
@@ -1804,67 +1815,46 @@ void app_main(void)
                 }
             }
 
-            if (blackout_log_ta && blackout_log_queue) {
-                evil_log_msg_t msg;
-                while (xQueueReceive(blackout_log_queue, &msg, 0) == pdTRUE) {
-                    size_t line_len = strlen(msg.text);
-                    if (line_len == 0) {
-                        continue;
+            if (blackout_ui_active && (blackout_networks_label || blackout_status_label)) {
+                blackout_stats_t stats;
+                if (wifi_attacks_get_blackout_stats(&stats) == ESP_OK) {
+                    if (blackout_networks_label) {
+                        char buf[48];
+                        snprintf(buf, sizeof(buf), "Networks attacked: %u", (unsigned)stats.networks_attacked);
+                        lv_label_set_text(blackout_networks_label, buf);
                     }
-                    
-                    // Trim textarea if too long (keep last ~2000 chars to prevent rendering slowdown)
-                    const char *current_text = lv_textarea_get_text(blackout_log_ta);
-                    if (current_text && strlen(current_text) > 2000) {
-                        // Find newline after first 500 chars and keep everything after it
-                        const char *trim_point = strchr(current_text + 500, '\n');
-                        if (trim_point) {
-                            // Copy trimmed text to temp buffer to avoid use-after-free
-                            char *trimmed = lv_mem_alloc(strlen(trim_point));
-                            if (trimmed) {
-                                strcpy(trimmed, trim_point + 1);
-                                lv_textarea_set_text(blackout_log_ta, trimmed);
-                                lv_mem_free(trimmed);
-                            }
+                    if (blackout_status_label) {
+                        const char *state = "Re-scanning";
+                        if (!stats.active) {
+                            state = "Stopped";
+                        } else if (stats.status == BLACKOUT_STATUS_ATTACKING) {
+                            state = "Attacking";
                         }
+                        char buf[32];
+                        snprintf(buf, sizeof(buf), "Status: %s", state);
+                        lv_label_set_text(blackout_status_label, buf);
                     }
-                    
-                    lv_textarea_add_text(blackout_log_ta, msg.text);
-                    if (msg.text[line_len - 1] != '\n') {
-                        lv_textarea_add_text(blackout_log_ta, "\n");
-                    }
-                    lv_textarea_set_cursor_pos(blackout_log_ta, LV_TEXTAREA_CURSOR_LAST);
                 }
             }
 
-            if (snifferdog_log_ta && snifferdog_log_queue) {
-                evil_log_msg_t msg;
-                while (xQueueReceive(snifferdog_log_queue, &msg, 0) == pdTRUE) {
-                    size_t line_len = strlen(msg.text);
-                    if (line_len == 0) {
-                        continue;
-                    }
-                    
-                    // Trim textarea if too long (keep last ~2000 chars to prevent rendering slowdown)
-                    const char *current_text = lv_textarea_get_text(snifferdog_log_ta);
-                    if (current_text && strlen(current_text) > 2000) {
-                        // Find newline after first 500 chars and keep everything after it
-                        const char *trim_point = strchr(current_text + 500, '\n');
-                        if (trim_point) {
-                            // Copy trimmed text to temp buffer to avoid use-after-free
-                            char *trimmed = lv_mem_alloc(strlen(trim_point));
-                            if (trimmed) {
-                                strcpy(trimmed, trim_point + 1);
-                                lv_textarea_set_text(snifferdog_log_ta, trimmed);
-                                lv_mem_free(trimmed);
-                            }
-                        }
-                    }
-                    
-                    lv_textarea_add_text(snifferdog_log_ta, msg.text);
-                    if (msg.text[line_len - 1] != '\n') {
-                        lv_textarea_add_text(snifferdog_log_ta, "\n");
-                    }
-                    lv_textarea_set_cursor_pos(snifferdog_log_ta, LV_TEXTAREA_CURSOR_LAST);
+            if (snifferdog_ui_active && (snifferdog_kick_label || snifferdog_recent_label)) {
+                uint32_t kicks;
+                char recent_buf[48];
+                portENTER_CRITICAL(&snifferdog_stats_spin);
+                kicks = snifferdog_kick_count;
+                strncpy(recent_buf, snifferdog_last_pair, sizeof(recent_buf));
+                recent_buf[sizeof(recent_buf) - 1] = '\0';
+                portEXIT_CRITICAL(&snifferdog_stats_spin);
+
+                if (snifferdog_kick_label) {
+                    char buf[48];
+                    snprintf(buf, sizeof(buf), "Stations kicked out: %lu", (unsigned long)kicks);
+                    lv_label_set_text(snifferdog_kick_label, buf);
+                }
+                if (snifferdog_recent_label) {
+                    char buf[96];
+                    snprintf(buf, sizeof(buf), "Recent kick: %s", recent_buf);
+                    lv_label_set_text(snifferdog_recent_label, buf);
                 }
             }
 
@@ -2662,33 +2652,63 @@ static void blackout_yes_btn_cb(lv_event_t *e)
         lv_obj_clean(function_page);
     }
     
-    // Create log display page
-    blackout_log_ta = lv_textarea_create(function_page);
-    lv_obj_set_size(blackout_log_ta, lv_pct(100), LCD_V_RES - 30 - 50);
-    lv_obj_align(blackout_log_ta, LV_ALIGN_TOP_MID, 0, 30);
-    lv_textarea_set_text(blackout_log_ta, "Starting Blackout Attack...\n");
-    lv_obj_set_style_bg_color(blackout_log_ta, lv_color_make(0, 0, 0), 0);  // Black background
-    lv_obj_set_style_text_color(blackout_log_ta, COLOR_MATERIAL_BLUE, 0);  // Green text
-    lv_obj_set_style_border_color(blackout_log_ta, COLOR_MATERIAL_BLUE, 0);  // Green border
-    lv_obj_set_style_border_width(blackout_log_ta, 2, 0);
-    lv_obj_clear_state(blackout_log_ta, LV_STATE_FOCUSED);  // Hide cursor
+    // Title label (white, centered)
+    lv_obj_t *title_lbl = lv_label_create(function_page);
+    lv_label_set_text(title_lbl, "Blackout");
+    lv_obj_set_style_text_color(title_lbl, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_text_font(title_lbl, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_align(title_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(title_lbl, LV_ALIGN_TOP_MID, 0, 35);
     
-    // Create Stop button at bottom
+    // Content container
+    lv_obj_t *content = lv_obj_create(function_page);
+    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 80 - 40);
+    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 70);
+    lv_obj_set_style_bg_color(content, lv_color_make(18, 18, 18), 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_radius(content, 0, 0);
+    lv_obj_set_style_pad_all(content, 12, 0);
+    lv_obj_set_style_pad_row(content, 10, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    
+    blackout_networks_label = lv_label_create(content);
+    lv_label_set_text(blackout_networks_label, "Networks attacked: 0");
+    lv_obj_set_style_text_font(blackout_networks_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(blackout_networks_label, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_text_align(blackout_networks_label, LV_TEXT_ALIGN_CENTER, 0);
+    
+    blackout_status_label = lv_label_create(content);
+    lv_label_set_text(blackout_status_label, "Status: Re-scanning");
+    lv_obj_set_style_text_font(blackout_status_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(blackout_status_label, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_text_align(blackout_status_label, LV_TEXT_ALIGN_CENTER, 0);
+    
+    // Stop & Exit button (handshaker style)
     blackout_stop_btn = lv_btn_create(function_page);
-    lv_obj_set_size(blackout_stop_btn, lv_pct(100), 45);
-    lv_obj_align(blackout_stop_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(blackout_stop_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
-    lv_obj_set_style_bg_color(blackout_stop_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);  // Dark green when pressed
-    lv_obj_set_style_border_color(blackout_stop_btn, COLOR_MATERIAL_BLUE, 0);  // Green border
-    lv_obj_set_style_border_width(blackout_stop_btn, 3, 0);
-    lv_obj_t *stop_lbl = lv_label_create(blackout_stop_btn);
-    lv_label_set_text(stop_lbl, "Stop");
-    lv_obj_set_style_text_color(stop_lbl, COLOR_MATERIAL_BLUE, 0);  // Green text
-    lv_obj_center(stop_lbl);
-    lv_obj_add_event_cb(blackout_stop_btn, blackout_stop_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_set_size(blackout_stop_btn, 120, 55);
+    lv_obj_align(blackout_stop_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(blackout_stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(blackout_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(blackout_stop_btn, 0, 0);
+    lv_obj_set_style_radius(blackout_stop_btn, 10, 0);
+    lv_obj_set_style_shadow_width(blackout_stop_btn, 6, 0);
+    lv_obj_set_style_shadow_color(blackout_stop_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(blackout_stop_btn, LV_OPA_40, 0);
+    lv_obj_set_flex_flow(blackout_stop_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(blackout_stop_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     
-    // Enable log capture
-    blackout_enable_log_capture();
+    lv_obj_t *x_icon = lv_label_create(blackout_stop_btn);
+    lv_label_set_text(x_icon, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_font(x_icon, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(x_icon, lv_color_make(255, 255, 255), 0);
+    
+    lv_obj_t *stop_text = lv_label_create(blackout_stop_btn);
+    lv_label_set_text(stop_text, "Exit");
+    lv_obj_set_style_text_font(stop_text, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(stop_text, lv_color_make(255, 255, 255), 0);
+    
+    lv_obj_add_event_cb(blackout_stop_btn, blackout_stop_btn_cb, LV_EVENT_CLICKED, NULL);
     
     // Start blackout attack
     wifi_attacks_start_blackout();
@@ -2700,7 +2720,8 @@ static void blackout_stop_btn_cb(lv_event_t *e)
     // Stop blackout attack
     wifi_attacks_stop_all();
     blackout_disable_log_capture();
-    blackout_log_ta = NULL;
+    blackout_networks_label = NULL;
+    blackout_status_label = NULL;
     blackout_stop_btn = NULL;
     blackout_ui_active = false;  // Clear blackout UI active flag
     scan_done_ui_flag = false;  // Clear any pending scan done flag
@@ -2721,33 +2742,70 @@ static void snifferdog_yes_btn_cb(lv_event_t *e)
         lv_obj_clean(function_page);
     }
     
-    // Create log display page
-    snifferdog_log_ta = lv_textarea_create(function_page);
-    lv_obj_set_size(snifferdog_log_ta, lv_pct(100), LCD_V_RES - 30 - 50);
-    lv_obj_align(snifferdog_log_ta, LV_ALIGN_TOP_MID, 0, 30);
-    lv_textarea_set_text(snifferdog_log_ta, "Starting Snifferdog Attack...\n");
-    lv_obj_set_style_bg_color(snifferdog_log_ta, lv_color_make(0, 0, 0), 0);  // Black background
-    lv_obj_set_style_text_color(snifferdog_log_ta, COLOR_MATERIAL_BLUE, 0);  // Green text
-    lv_obj_set_style_border_color(snifferdog_log_ta, COLOR_MATERIAL_BLUE, 0);  // Green border
-    lv_obj_set_style_border_width(snifferdog_log_ta, 2, 0);
-    lv_obj_clear_state(snifferdog_log_ta, LV_STATE_FOCUSED);  // Hide cursor
+    // Reset counters
+    portENTER_CRITICAL(&snifferdog_stats_spin);
+    snifferdog_kick_count = 0;
+    strncpy(snifferdog_last_pair, "N/A", sizeof(snifferdog_last_pair));
+    snifferdog_last_pair[sizeof(snifferdog_last_pair) - 1] = '\0';
+    portEXIT_CRITICAL(&snifferdog_stats_spin);
     
-    // Create Stop button at bottom
+    // Title label (white, centered)
+    lv_obj_t *title_lbl = lv_label_create(function_page);
+    lv_label_set_text(title_lbl, "Snifferdog");
+    lv_obj_set_style_text_color(title_lbl, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_text_font(title_lbl, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_align(title_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(title_lbl, LV_ALIGN_TOP_MID, 0, 35);
+    
+    // Create compact status panel
+    lv_obj_t *content = lv_obj_create(function_page);
+    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 80 - 40);
+    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 70);
+    lv_obj_set_style_bg_color(content, lv_color_make(18, 18, 18), 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_radius(content, 0, 0);
+    lv_obj_set_style_pad_all(content, 12, 0);
+    lv_obj_set_style_pad_row(content, 10, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    
+    snifferdog_kick_label = lv_label_create(content);
+    lv_label_set_text(snifferdog_kick_label, "Stations kicked out: 0");
+    lv_obj_set_style_text_font(snifferdog_kick_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(snifferdog_kick_label, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_text_align(snifferdog_kick_label, LV_TEXT_ALIGN_CENTER, 0);
+    
+    snifferdog_recent_label = lv_label_create(content);
+    lv_label_set_text(snifferdog_recent_label, "Recent kick: N/A");
+    lv_obj_set_style_text_font(snifferdog_recent_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(snifferdog_recent_label, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_text_align(snifferdog_recent_label, LV_TEXT_ALIGN_CENTER, 0);
+    
+    // Stop & Exit button (handshaker style)
     snifferdog_stop_btn = lv_btn_create(function_page);
-    lv_obj_set_size(snifferdog_stop_btn, lv_pct(100), 45);
-    lv_obj_align(snifferdog_stop_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(snifferdog_stop_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);  // Black button
-    lv_obj_set_style_bg_color(snifferdog_stop_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);  // Dark green when pressed
-    lv_obj_set_style_border_color(snifferdog_stop_btn, COLOR_MATERIAL_BLUE, 0);  // Green border
-    lv_obj_set_style_border_width(snifferdog_stop_btn, 3, 0);
-    lv_obj_t *stop_lbl = lv_label_create(snifferdog_stop_btn);
-    lv_label_set_text(stop_lbl, "Stop");
-    lv_obj_set_style_text_color(stop_lbl, COLOR_MATERIAL_BLUE, 0);  // Green text
-    lv_obj_center(stop_lbl);
-    lv_obj_add_event_cb(snifferdog_stop_btn, snifferdog_stop_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_set_size(snifferdog_stop_btn, 120, 55);
+    lv_obj_align(snifferdog_stop_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(snifferdog_stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(snifferdog_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(snifferdog_stop_btn, 0, 0);
+    lv_obj_set_style_radius(snifferdog_stop_btn, 10, 0);
+    lv_obj_set_style_shadow_width(snifferdog_stop_btn, 6, 0);
+    lv_obj_set_style_shadow_color(snifferdog_stop_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(snifferdog_stop_btn, LV_OPA_40, 0);
+    lv_obj_set_flex_flow(snifferdog_stop_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(snifferdog_stop_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     
-    // Enable log capture
-    snifferdog_enable_log_capture();
+    lv_obj_t *x_icon = lv_label_create(snifferdog_stop_btn);
+    lv_label_set_text(x_icon, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_font(x_icon, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(x_icon, lv_color_make(255, 255, 255), 0);
+    
+    lv_obj_t *stop_text = lv_label_create(snifferdog_stop_btn);
+    lv_label_set_text(stop_text, "Exit");
+    lv_obj_set_style_text_font(stop_text, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(stop_text, lv_color_make(255, 255, 255), 0);
+    
+    lv_obj_add_event_cb(snifferdog_stop_btn, snifferdog_stop_btn_cb, LV_EVENT_CLICKED, NULL);
     
     // Start snifferdog attack (custom implementation)
     if (sniffer_dog_active) {
@@ -2823,8 +2881,14 @@ static void snifferdog_stop_btn_cb(lv_event_t *e)
         ESP_LOGI(TAG, "Snifferdog stopped");
     }
     snifferdog_disable_log_capture();
-    snifferdog_log_ta = NULL;
+    snifferdog_kick_label = NULL;
+    snifferdog_recent_label = NULL;
     snifferdog_stop_btn = NULL;
+    portENTER_CRITICAL(&snifferdog_stats_spin);
+    snifferdog_kick_count = 0;
+    strncpy(snifferdog_last_pair, "N/A", sizeof(snifferdog_last_pair));
+    snifferdog_last_pair[sizeof(snifferdog_last_pair) - 1] = '\0';
+    portEXIT_CRITICAL(&snifferdog_stats_spin);
     snifferdog_ui_active = false;  // Clear snifferdog UI active flag
     scan_done_ui_flag = false;  // Clear any pending scan done flag
     // Navigate back to menu
@@ -4852,12 +4916,14 @@ static void create_function_page_base(const char *name)
     wifi_attacks_set_evil_twin_event_cb(NULL);  // Unregister callback
 
     blackout_disable_log_capture();
-    blackout_log_ta = NULL;
+    blackout_networks_label = NULL;
+    blackout_status_label = NULL;
     blackout_stop_btn = NULL;
     blackout_ui_active = false;
 
     snifferdog_disable_log_capture();
-    snifferdog_log_ta = NULL;
+    snifferdog_kick_label = NULL;
+    snifferdog_recent_label = NULL;
     snifferdog_stop_btn = NULL;
     snifferdog_ui_active = false;
 
