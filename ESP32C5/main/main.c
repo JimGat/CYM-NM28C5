@@ -7398,11 +7398,8 @@ static bool ensure_ble_mode(void)
             ESP_LOGI(TAG, "Switching from WiFi to BLE mode...");
             esp_wifi_stop();
             esp_wifi_deinit();
-            // Only destroy AP netif, keep STA netif for reuse on WiFi re-init
-            esp_netif_t *ap_nif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-            if (ap_nif) {
-                esp_netif_destroy(ap_nif);
-            }
+            // STA netif is kept for reuse on WiFi re-init
+            // AP netif is created/destroyed dynamically when needed
             wifi_initialized = false;
             current_radio_mode = RADIO_MODE_NONE;
             // Now initialize BLE (recursive call with RADIO_MODE_NONE)

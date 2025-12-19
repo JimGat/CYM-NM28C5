@@ -17,6 +17,13 @@
 
 static const char *TAG = "wifi_cli";
 
+// Initialization state tracking (persist across WiFi/BLE mode switches)
+static bool event_loop_initialized = false;
+static bool netif_initialized = false;
+static esp_netif_t *sta_netif_handle = NULL;
+static esp_netif_t *ap_netif_handle = NULL;
+static bool wifi_event_handler_registered = false;
+
 // LED strip (NeoPixel)
 #define RMT_RES_HZ (10 * 1000 * 1000)
 
@@ -31,37 +38,49 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 }
 
 static esp_err_t init_wifi(void) {
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    // Initialize netif only once (persists across radio mode switches)
+    if (!netif_initialized) {
+        ESP_ERROR_CHECK(esp_netif_init());
+        netif_initialized = true;
+    }
     
-    esp_netif_create_default_wifi_ap();
-    esp_netif_create_default_wifi_sta();
+    // Create event loop only once (shared between WiFi and BLE modes)
+    if (!event_loop_initialized) {
+        ESP_ERROR_CHECK(esp_event_loop_create_default());
+        event_loop_initialized = true;
+    }
+    
+    // Only create STA interface (reused on WiFi re-init)
+    // AP interface is NOT created here - it will be created dynamically when needed
+    // Check if STA netif already exists (from previous init)
+    sta_netif_handle = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta_netif_handle == NULL) {
+        sta_netif_handle = esp_netif_create_default_wifi_sta();
+    }
     
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        NULL));
+    // Register event handler only once
+    if (!wifi_event_handler_registered) {
+        esp_err_t reg_err = esp_event_handler_instance_register(WIFI_EVENT,
+                                                            ESP_EVENT_ANY_ID,
+                                                            &wifi_event_handler,
+                                                            NULL,
+                                                            NULL);
+        if (reg_err == ESP_OK) {
+            wifi_event_handler_registered = true;
+        } else if (reg_err != ESP_ERR_INVALID_STATE) {
+            // ESP_ERR_INVALID_STATE means already registered - that's OK
+            ESP_ERROR_CHECK(reg_err);
+        }
+    }
     
+    // Initialize in STA-only mode (uses less memory, avoids AP netif issues)
+    // AP mode will be enabled dynamically when needed (Evil Twin, etc.)
     wifi_config_t wifi_config = {0};
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    
-    wifi_config_t ap_config = {
-        .ap = {
-            .ssid = "",
-            .ssid_len = 0,
-            .ssid_hidden = 1,
-            .password = "nevermind",
-            .max_connection = 0,
-            .authmode = WIFI_AUTH_WPA2_PSK
-        },
-    };
-    
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
     ESP_ERROR_CHECK(esp_wifi_start());
     
     uint8_t mac[6];
