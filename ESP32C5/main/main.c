@@ -17,6 +17,7 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <errno.h>
 #include "esp_event.h"
 #include "freertos/semphr.h"
 #include "wifi_cli.h"
@@ -141,6 +142,9 @@ static ft6336_handle_t touch_handle;
 static lv_obj_t *touch_dot;  // DEBUG: visual touch indicator
 static lv_obj_t *title_bar;
 static lv_obj_t *function_page = NULL;
+static lv_obj_t *screenshot_btn = NULL;
+
+#define SCREENSHOT_DIR "/sdcard/screenshots"
 
 // Use GPS definitions from wifi_common.h via wifi_cli.h
 static gps_data_t current_gps = {0};
@@ -155,6 +159,10 @@ static StackType_t *sd_init_task_stack = NULL;
 static esp_err_t init_gps_uart(void);
 static bool parse_gps_nmea(const char *nmea_sentence);
 static void gps_task(void *arg);
+static void screenshot_btn_event_cb(lv_event_t *e);
+static esp_err_t save_snapshot_bmp(lv_img_dsc_t *shot, const char *filepath);
+static int find_next_screenshot_index(void);
+static esp_err_t ensure_screenshot_dir(void);
 
 // Route ESP logging directly to ROM UART to avoid VFS write paths during GUI/ISR contexts
 static int rom_vprintf(const char *fmt, va_list ap)
@@ -459,6 +467,7 @@ static void reset_function_page_children(void) {
     ble_scan_content = NULL;
     ble_scan_list = NULL;
     ble_scan_status_label = NULL;
+    screenshot_btn = NULL;
 }
 
 static void create_function_page_base(const char *name);
@@ -2501,6 +2510,161 @@ void lvgl_touch_read_cb(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
     }
 }
 
+// ============================================================================
+// Screenshot utilities (BMP, uncompressed 24-bit)
+// ============================================================================
+
+static esp_err_t ensure_screenshot_dir(void)
+{
+    struct stat st;
+    if (stat(SCREENSHOT_DIR, &st) == 0 && S_ISDIR(st.st_mode)) {
+        return ESP_OK;
+    }
+    if (mkdir(SCREENSHOT_DIR, 0775) == 0) {
+        return ESP_OK;
+    }
+    return (errno == EEXIST) ? ESP_OK : ESP_FAIL;
+}
+
+static int find_next_screenshot_index(void)
+{
+    DIR *dir = opendir(SCREENSHOT_DIR);
+    if (!dir) {
+        return 1;
+    }
+    int max_idx = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        int idx = 0;
+        if (sscanf(entry->d_name, "screen_%d.png", &idx) == 1) {
+            if (idx > max_idx) max_idx = idx;
+        }
+    }
+    closedir(dir);
+    return max_idx + 1;
+}
+
+static esp_err_t save_snapshot_bmp(lv_img_dsc_t *shot, const char *filepath)
+{
+    if (!shot || !filepath) return ESP_ERR_INVALID_ARG;
+
+    const uint32_t w = shot->header.w;
+    const uint32_t h = shot->header.h;
+    if (w == 0 || h == 0) return ESP_ERR_INVALID_SIZE;
+
+    const uint32_t row_stride = ((w * 3 + 3) / 4) * 4; // padded to 4 bytes
+    const uint32_t pixel_data_size = row_stride * h;
+    const uint32_t file_size = 14 + 40 + pixel_data_size;
+
+    uint8_t *row_buf = heap_caps_malloc(row_stride, MALLOC_CAP_SPIRAM);
+    if (!row_buf) return ESP_ERR_NO_MEM;
+
+    FILE *f = fopen(filepath, "wb");
+    if (!f) {
+        heap_caps_free(row_buf);
+        return ESP_FAIL;
+    }
+
+    // BITMAPFILEHEADER
+    uint8_t bf[14] = {0};
+    bf[0] = 'B'; bf[1] = 'M';
+    bf[2] = (uint8_t)(file_size);
+    bf[3] = (uint8_t)(file_size >> 8);
+    bf[4] = (uint8_t)(file_size >> 16);
+    bf[5] = (uint8_t)(file_size >> 24);
+    bf[10] = 14 + 40; // pixel data offset
+    fwrite(bf, 1, sizeof(bf), f);
+
+    // BITMAPINFOHEADER
+    uint8_t bi[40] = {0};
+    bi[0] = 40; // header size
+    bi[4] = (uint8_t)(w);
+    bi[5] = (uint8_t)(w >> 8);
+    bi[6] = (uint8_t)(w >> 16);
+    bi[7] = (uint8_t)(w >> 24);
+    bi[8] = (uint8_t)(h);
+    bi[9] = (uint8_t)(h >> 8);
+    bi[10] = (uint8_t)(h >> 16);
+    bi[11] = (uint8_t)(h >> 24);
+    bi[12] = 1; bi[13] = 0;      // planes
+    bi[14] = 24; bi[15] = 0;     // bpp
+    fwrite(bi, 1, sizeof(bi), f);
+
+    const lv_color_t *src = (const lv_color_t *)shot->data;
+    for (int y = (int)h - 1; y >= 0; y--) { // BMP bottom-up
+        uint8_t *row = row_buf;
+        for (uint32_t x = 0; x < w; x++) {
+            lv_color_t c = src[(uint32_t)y * w + x];
+#if LV_COLOR_DEPTH == 16
+            uint8_t r = (c.ch.red << 3) | (c.ch.red >> 2);
+            uint8_t g6 = (c.ch.green_h << 3) | c.ch.green_l;  // 6-bit green
+            uint8_t g = (g6 << 2) | (g6 >> 4);  // expand to 8-bit
+            uint8_t b = (c.ch.blue << 3) | (c.ch.blue >> 2);
+#else
+            uint8_t r = LV_COLOR_GET_R(c);
+            uint8_t g = LV_COLOR_GET_G(c);
+            uint8_t b = LV_COLOR_GET_B(c);
+#endif
+            *row++ = b;
+            *row++ = g;
+            *row++ = r;
+        }
+        while ((row - row_buf) < (int)row_stride) {
+            *row++ = 0;
+        }
+        fwrite(row_buf, 1, row_stride, f);
+        esp_task_wdt_reset();  // Prevent watchdog timeout during long SD write
+    }
+
+    fclose(f);
+    heap_caps_free(row_buf);
+    return ESP_OK;
+}
+
+static void screenshot_btn_event_cb(lv_event_t *e)
+{
+    (void)e;
+
+    if (!wifi_wardrive_is_sd_mounted()) {
+        ESP_LOGW(TAG, "Screenshot: SD card not mounted");
+        return;
+    }
+
+    // Run inside LVGL context (button callback), safe to snapshot without mutex
+    lv_img_dsc_t *shot = lv_snapshot_take(lv_scr_act(), LV_IMG_CF_TRUE_COLOR);  // RGB565
+    if (!shot) {
+        ESP_LOGW(TAG, "Screenshot: lv_snapshot_take returned NULL");
+        return;
+    }
+
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        ESP_LOGW(TAG, "Screenshot: SD mutex timeout");
+        lv_snapshot_free(shot);
+        return;
+    }
+
+    esp_err_t res_dir = ensure_screenshot_dir();
+    if (res_dir != ESP_OK) {
+        ESP_LOGW(TAG, "Screenshot: cannot ensure directory");
+        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+        lv_snapshot_free(shot);
+        return;
+    }
+
+    int next_idx = find_next_screenshot_index();
+    char path[128];
+    snprintf(path, sizeof(path), SCREENSHOT_DIR "/screen_%d.bmp", next_idx);
+
+    esp_err_t res = save_snapshot_bmp(shot, path);
+    if (res == ESP_OK) {
+        ESP_LOGI(TAG, "Screenshot saved: %s", path);
+    } else {
+        ESP_LOGW(TAG, "Screenshot failed to save");
+    }
+
+    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+    lv_snapshot_free(shot);
+}
 lv_obj_t *create_menu_item(lv_obj_t *parent, const char *icon, const char *text)
 {
     lv_obj_t *cont = lv_menu_cont_create(parent);
@@ -4976,10 +5140,32 @@ static void create_function_page_base(const char *name)
     lv_obj_set_style_shadow_opa(home_btn, LV_OPA_30, 0);
     lv_obj_add_event_cb(home_btn, home_btn_event_cb, LV_EVENT_CLICKED, NULL);
 
+    // Home icon
     lv_obj_t *home_label = lv_label_create(home_btn);
     lv_label_set_text(home_label, LV_SYMBOL_HOME);
-    lv_obj_set_style_text_color(home_label, lv_color_make(255, 255, 255), 0);  // White icon
+    lv_obj_set_style_text_font(home_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(home_label, lv_color_make(255, 255, 255), 0);
     lv_obj_center(home_label);
+
+    // Screenshot button - visible only when SD is mounted
+    screenshot_btn = lv_btn_create(page_title_bar);
+    lv_obj_set_size(screenshot_btn, 30, 30);
+    lv_obj_align(screenshot_btn, LV_ALIGN_LEFT_MID, 35, 0);
+    lv_obj_set_style_bg_color(screenshot_btn, lv_color_make(33, 150, 243), 0);
+    lv_obj_set_style_bg_color(screenshot_btn, lv_color_make(66, 165, 245), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(screenshot_btn, 5, 0);
+    lv_obj_set_style_shadow_width(screenshot_btn, 4, 0);
+    lv_obj_set_style_shadow_color(screenshot_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(screenshot_btn, LV_OPA_30, 0);
+    lv_obj_add_event_cb(screenshot_btn, screenshot_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    if (!wifi_wardrive_is_sd_mounted()) {
+        lv_obj_add_flag(screenshot_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    lv_obj_t *shot_label = lv_label_create(screenshot_btn);
+    lv_label_set_text(shot_label, LV_SYMBOL_SAVE);
+    lv_obj_set_style_text_color(shot_label, lv_color_make(255, 255, 255), 0);
+    lv_obj_center(shot_label);
 
     lv_obj_t *page_title_label = lv_label_create(page_title_bar);
     lv_label_set_text(page_title_label, name ? name : "");
