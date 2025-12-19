@@ -2643,27 +2643,17 @@ static void blackout_yes_btn_cb(lv_event_t *e)
 {
     (void)e;
     
+    // Recreate base page to keep title bar
+    create_function_page_base("Blackout");
+    
     // Set blackout UI active flag
     blackout_ui_active = true;
     scan_done_ui_flag = false;  // Clear any pending scan done flag
     
-    // Delete the warning page content
-    if (function_page) {
-        lv_obj_clean(function_page);
-    }
-    
-    // Title label (white, centered)
-    lv_obj_t *title_lbl = lv_label_create(function_page);
-    lv_label_set_text(title_lbl, "Blackout");
-    lv_obj_set_style_text_color(title_lbl, lv_color_make(255, 255, 255), 0);
-    lv_obj_set_style_text_font(title_lbl, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_align(title_lbl, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(title_lbl, LV_ALIGN_TOP_MID, 0, 35);
-    
     // Content container
     lv_obj_t *content = lv_obj_create(function_page);
-    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 80 - 40);
-    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 70);
+    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 70);
+    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 35);
     lv_obj_set_style_bg_color(content, lv_color_make(18, 18, 18), 0);
     lv_obj_set_style_border_width(content, 0, 0);
     lv_obj_set_style_radius(content, 0, 0);
@@ -2733,14 +2723,12 @@ static void snifferdog_yes_btn_cb(lv_event_t *e)
 {
     (void)e;
     
+    // Recreate base page to keep title bar
+    create_function_page_base("Snifferdog");
+    
     // Set snifferdog UI active flag
     snifferdog_ui_active = true;
     scan_done_ui_flag = false;  // Clear any pending scan done flag
-    
-    // Delete the warning page content
-    if (function_page) {
-        lv_obj_clean(function_page);
-    }
     
     // Reset counters
     portENTER_CRITICAL(&snifferdog_stats_spin);
@@ -2759,8 +2747,8 @@ static void snifferdog_yes_btn_cb(lv_event_t *e)
     
     // Create compact status panel
     lv_obj_t *content = lv_obj_create(function_page);
-    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 80 - 40);
-    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 70);
+    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 70);
+    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 35);
     lv_obj_set_style_bg_color(content, lv_color_make(18, 18, 18), 0);
     lv_obj_set_style_border_width(content, 0, 0);
     lv_obj_set_style_radius(content, 0, 0);
@@ -3037,14 +3025,12 @@ static void sniffer_yes_btn_cb(lv_event_t *e)
 {
     (void)e;
     
+    // Recreate base page to keep title bar
+    create_function_page_base("Sniffer");
+    
     // Set sniffer UI active flag
     sniffer_ui_active = true;
     scan_done_ui_flag = false;  // Clear any pending scan done flag
-    
-    // Delete the warning page content
-    if (function_page) {
-        lv_obj_clean(function_page);
-    }
     
     // No log textarea anymore
     sniffer_log_ta = NULL;
@@ -3052,21 +3038,13 @@ static void sniffer_yes_btn_cb(lv_event_t *e)
     // Create main content container
     lv_obj_t *content = lv_obj_create(function_page);
     lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 55);  // Leave space for header and bottom buttons
-    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 35);
     lv_obj_set_style_bg_color(content, lv_color_make(0, 0, 0), 0);
     lv_obj_set_style_border_width(content, 0, 0);
     lv_obj_set_style_pad_all(content, 8, 0);
     lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
     lv_obj_set_style_pad_row(content, 6, 0);
-    
-    // === Title "Sniffer" (white, centered) ===
-    lv_obj_t *title_label = lv_label_create(content);
-    lv_label_set_text(title_label, "Sniffer");
-    lv_obj_set_style_text_color(title_label, lv_color_make(255, 255, 255), 0);
-    lv_obj_set_style_text_font(title_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_width(title_label, lv_pct(100));
-    lv_obj_set_style_text_align(title_label, LV_TEXT_ALIGN_CENTER, 0);
     
     // === Attacked Networks section ===
     lv_obj_t *networks_header = lv_label_create(content);
@@ -3391,17 +3369,15 @@ static void sae_overflow_yes_btn_cb(lv_event_t *e)
     
     // SAE Overflow requires exactly ONE selected network
     if (selected_count != 1) {
-        // Show error message
-        if (function_page) {
-            lv_obj_clean(function_page);
-        }
+        // Show error message with title bar intact
+        create_function_page_base("SAE Overflow");
         
         lv_obj_t *error_label = lv_label_create(function_page);
         lv_label_set_text(error_label, "SAE Overflow requires\nexactly ONE network.\n\nPlease scan and select\none network.");
         lv_obj_set_style_text_align(error_label, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_color(error_label, COLOR_MATERIAL_RED, 0);
         lv_obj_set_style_text_font(error_label, &lv_font_montserrat_16, 0);
-        lv_obj_center(error_label);
+        lv_obj_align(error_label, LV_ALIGN_TOP_MID, 0, 40);
         
         // Back button
         lv_obj_t *back_btn = lv_btn_create(function_page);
@@ -3420,14 +3396,12 @@ static void sae_overflow_yes_btn_cb(lv_event_t *e)
         return;
     }
     
+    // Recreate base page to keep title bar
+    create_function_page_base("SAE Overflow");
+    
     // Set SAE overflow UI active flag
     sae_overflow_ui_active = true;
     scan_done_ui_flag = false;
-    
-    // Delete the warning page content
-    if (function_page) {
-        lv_obj_clean(function_page);
-    }
     
     // Get selected network info
     const wifi_ap_record_t *ap = &records[selected_index];
@@ -3439,13 +3413,6 @@ static void sae_overflow_yes_btn_cb(lv_event_t *e)
                  ap->bssid[0], ap->bssid[1], ap->bssid[2],
                  ap->bssid[3], ap->bssid[4], ap->bssid[5]);
     }
-    
-    // Title centered at top - "SAE Overflow attack in progress"
-    lv_obj_t *title_label = lv_label_create(function_page);
-    lv_label_set_text(title_label, "SAE Overflow attack in progress");
-    lv_obj_set_style_text_font(title_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(title_label, COLOR_MATERIAL_BLUE, 0);
-    lv_obj_align(title_label, LV_ALIGN_TOP_MID, 0, 36);
     
     // Attacked network info
     lv_obj_t *network_info = lv_label_create(function_page);
@@ -3462,7 +3429,7 @@ static void sae_overflow_yes_btn_cb(lv_event_t *e)
     lv_label_set_text(network_info, info_text);
     lv_obj_set_style_text_color(network_info, COLOR_MATERIAL_BLUE, 0);
     lv_obj_set_style_text_font(network_info, &lv_font_montserrat_14, 0);
-    lv_obj_align(network_info, LV_ALIGN_TOP_MID, 0, 70);
+    lv_obj_align(network_info, LV_ALIGN_TOP_MID, 0, 40);
     lv_obj_set_style_text_align(network_info, LV_TEXT_ALIGN_CENTER, 0);
     
     // Stop & Exit tile at bottom (red with X icon) - same as Deauth
