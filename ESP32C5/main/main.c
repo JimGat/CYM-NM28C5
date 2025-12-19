@@ -361,6 +361,35 @@ static volatile bool ble_scan_needs_ui_update = false;
 static volatile bool ble_scan_finished = false;
 static char ble_scan_status_text[48] = "";
 
+// Deauth Monitor state
+#define DEAUTH_MONITOR_MAX_ATTACKS 50
+typedef struct {
+    char ssid[33];
+    uint8_t bssid[6];
+    int8_t rssi;
+    uint8_t channel;
+    uint32_t timestamp;
+} deauth_monitor_attack_t;
+
+static TaskHandle_t deauth_monitor_task_handle = NULL;
+static StaticTask_t deauth_monitor_task_buffer;
+static StackType_t *deauth_monitor_task_stack = NULL;
+static volatile bool deauth_monitor_active = false;
+static int deauth_monitor_current_channel = 1;
+static int deauth_monitor_channel_index = 0;
+static int64_t deauth_monitor_last_channel_hop = 0;
+
+static deauth_monitor_attack_t deauth_monitor_attacks[DEAUTH_MONITOR_MAX_ATTACKS];
+static volatile int deauth_monitor_attack_count = 0;
+static portMUX_TYPE deauth_monitor_spin = portMUX_INITIALIZER_UNLOCKED;
+
+// Deauth Monitor UI state
+static lv_obj_t *deauth_monitor_list = NULL;
+static lv_obj_t *deauth_monitor_status_label = NULL;
+static volatile bool deauth_monitor_ui_active = false;
+static volatile bool deauth_monitor_update_flag = false;
+static volatile bool deauth_monitor_scan_pending = false;  // Waiting for initial scan to complete
+
 // Dual-band channel list (2.4GHz + 5GHz)
 static const int dual_band_channels[] = {
     // 2.4GHz channels
@@ -468,6 +497,8 @@ static void reset_function_page_children(void) {
     ble_scan_list = NULL;
     ble_scan_status_label = NULL;
     screenshot_btn = NULL;
+    deauth_monitor_list = NULL;
+    deauth_monitor_status_label = NULL;
 }
 
 static void create_function_page_base(const char *name);
@@ -552,6 +583,15 @@ static bool bt_is_samsung_smarttag(const uint8_t *data, uint8_t len);
 // BLE Scan UI
 static void ble_scan_back_btn_cb(lv_event_t *e);
 static void ble_scan_update_list(void);
+
+// Deauth Monitor functions
+static void show_deauth_monitor_screen(void);
+static void deauth_monitor_exit_cb(lv_event_t *e);
+static void deauth_monitor_start_monitoring(void);
+static void deauth_monitor_task(void *pvParameters);
+static void deauth_monitor_channel_hop(void);
+static void deauth_monitor_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
+static const char* deauth_monitor_find_ssid_by_bssid(const uint8_t *bssid);
 
 static void wifi_scan_done_cb(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
@@ -2111,9 +2151,22 @@ void app_main(void)
                 }
             }
 
-            // If scan finished, build results UI (but not during blackout/snifferdog/sae_overflow/handshake/wardrive/karma attack)
-            if (scan_done_ui_flag) {
-                if (blackout_ui_active || snifferdog_ui_active || sae_overflow_ui_active || handshake_ui_active || wardrive_ui_active || karma_ui_active) {
+            // Handle deauth monitor scan completion - start monitoring after scan
+            if (scan_done_ui_flag && deauth_monitor_scan_pending && deauth_monitor_ui_active) {
+                scan_done_ui_flag = false;
+                deauth_monitor_scan_pending = false;
+                
+                // Change status label color to gray after scan
+                if (deauth_monitor_status_label && lv_obj_is_valid(deauth_monitor_status_label)) {
+                    lv_obj_set_style_text_color(deauth_monitor_status_label, lv_color_make(176, 176, 176), 0);
+                }
+                
+                // Start the actual monitoring
+                deauth_monitor_start_monitoring();
+            }
+            // If scan finished, build results UI (but not during blackout/snifferdog/sae_overflow/handshake/wardrive/karma attack/deauth_monitor)
+            else if (scan_done_ui_flag) {
+                if (blackout_ui_active || snifferdog_ui_active || sae_overflow_ui_active || handshake_ui_active || wardrive_ui_active || karma_ui_active || deauth_monitor_ui_active) {
                     // During attacks, just clear the flag without showing results
                     scan_done_ui_flag = false;
                 } else {
@@ -2433,6 +2486,60 @@ void app_main(void)
                 
                 // Update device list
                 ble_scan_update_list();
+            }
+
+            // Deauth Monitor UI update
+            if (deauth_monitor_update_flag && deauth_monitor_ui_active) {
+                deauth_monitor_update_flag = false;
+                
+                // Check if we have attacks to display
+                portENTER_CRITICAL(&deauth_monitor_spin);
+                int attack_count = deauth_monitor_attack_count;
+                portEXIT_CRITICAL(&deauth_monitor_spin);
+                
+                if (attack_count > 0 && deauth_monitor_list && deauth_monitor_status_label) {
+                    // Hide status label, show list
+                    lv_obj_add_flag(deauth_monitor_status_label, LV_OBJ_FLAG_HIDDEN);
+                    lv_obj_clear_flag(deauth_monitor_list, LV_OBJ_FLAG_HIDDEN);
+                    
+                    // Rebuild attack list (keep title, clear rest)
+                    uint32_t child_count = lv_obj_get_child_cnt(deauth_monitor_list);
+                    while (child_count > 1) {
+                        lv_obj_t *last_child = lv_obj_get_child(deauth_monitor_list, child_count - 1);
+                        lv_obj_del(last_child);
+                        child_count--;
+                    }
+                    
+                    // Add attacks (most recent first)
+                    portENTER_CRITICAL(&deauth_monitor_spin);
+                    int display_count = (attack_count > DEAUTH_MONITOR_MAX_ATTACKS) ? DEAUTH_MONITOR_MAX_ATTACKS : attack_count;
+                    for (int i = display_count - 1; i >= 0; i--) {
+                        int idx = (attack_count > DEAUTH_MONITOR_MAX_ATTACKS) 
+                                  ? (attack_count + i) % DEAUTH_MONITOR_MAX_ATTACKS 
+                                  : i;
+                        
+                        char line[80];
+                        snprintf(line, sizeof(line), "%s | CH: %d | RSSI: %d",
+                                 deauth_monitor_attacks[idx].ssid,
+                                 deauth_monitor_attacks[idx].channel,
+                                 deauth_monitor_attacks[idx].rssi);
+                        
+                        lv_obj_t *row = lv_list_add_btn(deauth_monitor_list, NULL, "");
+                        lv_obj_set_width(row, lv_pct(100));
+                        lv_obj_set_style_pad_all(row, 6, 0);
+                        lv_obj_set_height(row, LV_SIZE_CONTENT);
+                        lv_obj_set_style_bg_color(row, lv_color_make(30, 30, 30), LV_STATE_DEFAULT);
+                        lv_obj_set_style_radius(row, 8, 0);
+                        
+                        lv_obj_t *lbl = lv_label_create(row);
+                        lv_label_set_text(lbl, line);
+                        lv_label_set_long_mode(lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+                        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+                        lv_obj_set_style_text_color(lbl, COLOR_MATERIAL_RED, 0);
+                        lv_obj_set_width(lbl, lv_pct(95));
+                    }
+                    portEXIT_CRITICAL(&deauth_monitor_spin);
+                }
             }
 
             sleep_ms = lv_timer_handler();
@@ -5322,7 +5429,7 @@ static void main_tile_event_cb(lv_event_t *e)
     } else if (strcmp(tile_name, "WiFi Monitor") == 0) {
         show_wifi_monitor_screen();
     } else if (strcmp(tile_name, "Deauth Monitor") == 0) {
-        show_stub_screen("Deauth Monitor");
+        show_deauth_monitor_screen();
     } else if (strcmp(tile_name, "Bluetooth") == 0) {
         show_bluetooth_screen();
     }
@@ -7685,4 +7792,288 @@ static void ble_scan_back_btn_cb(lv_event_t *e)
     
     // Return to menu
     nav_to_menu_flag = true;
+}
+
+// ============================================================================
+// DEAUTH MONITOR IMPLEMENTATION
+// ============================================================================
+
+// Helper function to find SSID by BSSID from scan results
+static const char* deauth_monitor_find_ssid_by_bssid(const uint8_t *bssid)
+{
+    const wifi_ap_record_t *records = wifi_scanner_get_results_ptr();
+    const uint16_t *count_ptr = wifi_scanner_get_count_ptr();
+    uint16_t count = count_ptr ? *count_ptr : 0;
+    
+    for (uint16_t i = 0; i < count; i++) {
+        if (memcmp(records[i].bssid, bssid, 6) == 0) {
+            return (const char*)records[i].ssid;
+        }
+    }
+    return NULL;
+}
+
+// Channel hopping for deauth monitor
+static void deauth_monitor_channel_hop(void)
+{
+    if (!deauth_monitor_active) {
+        return;
+    }
+    
+    deauth_monitor_current_channel = dual_band_channels[deauth_monitor_channel_index];
+    deauth_monitor_channel_index++;
+    if (deauth_monitor_channel_index >= dual_band_channels_count) {
+        deauth_monitor_channel_index = 0;
+    }
+    
+    esp_wifi_set_channel(deauth_monitor_current_channel, WIFI_SECOND_CHAN_NONE);
+    deauth_monitor_last_channel_hop = esp_timer_get_time() / 1000;
+}
+
+// Promiscuous callback for detecting deauth frames
+static void deauth_monitor_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    if (!deauth_monitor_active) {
+        return;
+    }
+    
+    // Filter only MGMT packets (deauth is a management frame)
+    if (type != WIFI_PKT_MGMT) {
+        return;
+    }
+    
+    const wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *frame = pkt->payload;
+    int len = pkt->rx_ctrl.sig_len;
+    
+    if (len < 24) { // Minimum 802.11 header size
+        return;
+    }
+    
+    // Check if this is a deauthentication frame
+    // Frame Control: Type=0 (Management), Subtype=12 (Deauthentication)
+    // Frame Control byte 0: 0xC0 = (subtype << 4) | (type << 2) = (12 << 4) | (0 << 2) = 0xC0
+    uint8_t frame_type = frame[0] & 0xFC;
+    if (frame_type != 0xC0) {
+        return; // Not a deauthentication frame
+    }
+    
+    // Extract BSSID (Address 3 in management frames) at offset 16
+    const uint8_t *bssid = &frame[16];
+    int8_t rssi = pkt->rx_ctrl.rssi;
+    
+    // Lookup SSID
+    const char *ssid = deauth_monitor_find_ssid_by_bssid(bssid);
+    
+    // Add to attacks array (thread-safe)
+    portENTER_CRITICAL(&deauth_monitor_spin);
+    
+    int idx = deauth_monitor_attack_count % DEAUTH_MONITOR_MAX_ATTACKS;
+    
+    if (ssid && ssid[0] != '\0') {
+        strncpy(deauth_monitor_attacks[idx].ssid, ssid, 32);
+        deauth_monitor_attacks[idx].ssid[32] = '\0';
+    } else {
+        snprintf(deauth_monitor_attacks[idx].ssid, 33, "%02X:%02X:%02X:%02X:%02X:%02X",
+                 bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+    }
+    memcpy(deauth_monitor_attacks[idx].bssid, bssid, 6);
+    deauth_monitor_attacks[idx].rssi = rssi;
+    deauth_monitor_attacks[idx].channel = deauth_monitor_current_channel;
+    deauth_monitor_attacks[idx].timestamp = esp_timer_get_time() / 1000;
+    
+    if (deauth_monitor_attack_count < DEAUTH_MONITOR_MAX_ATTACKS) {
+        deauth_monitor_attack_count++;
+    }
+    
+    deauth_monitor_update_flag = true;
+    
+    portEXIT_CRITICAL(&deauth_monitor_spin);
+    
+    ESP_LOGI(TAG, "[DEAUTH] CH: %d | %s | RSSI: %d", 
+             deauth_monitor_current_channel,
+             deauth_monitor_attacks[idx].ssid,
+             rssi);
+}
+
+// Channel hopping task for deauth monitor
+static void deauth_monitor_task(void *pvParameters)
+{
+    (void)pvParameters;
+    
+    ESP_LOGI(TAG, "Deauth monitor task started");
+    
+    while (deauth_monitor_active) {
+        vTaskDelay(pdMS_TO_TICKS(50)); // Check every 50ms
+        
+        if (!deauth_monitor_active) {
+            break;
+        }
+        
+        // Force channel hop if 250ms passed
+        int64_t current_time = esp_timer_get_time() / 1000;
+        bool time_expired = (current_time - deauth_monitor_last_channel_hop >= sniffer_channel_hop_delay_ms);
+        
+        if (time_expired) {
+            deauth_monitor_channel_hop();
+        }
+    }
+    
+    ESP_LOGI(TAG, "Deauth monitor task ending");
+    deauth_monitor_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// Exit callback for deauth monitor
+static void deauth_monitor_exit_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    ESP_LOGI(TAG, "Stopping deauth monitor...");
+    
+    // Stop monitoring
+    deauth_monitor_active = false;
+    deauth_monitor_ui_active = false;
+    deauth_monitor_scan_pending = false;
+    
+    // Disable promiscuous mode
+    esp_wifi_set_promiscuous(false);
+    
+    // Wait for task to finish
+    if (deauth_monitor_task_handle != NULL) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    
+    // Free task stack
+    if (deauth_monitor_task_stack != NULL) {
+        heap_caps_free(deauth_monitor_task_stack);
+        deauth_monitor_task_stack = NULL;
+    }
+    
+    // Reset state
+    deauth_monitor_attack_count = 0;
+    deauth_monitor_channel_index = 0;
+    deauth_monitor_current_channel = 1;
+    
+    // Navigate to menu
+    nav_to_menu_flag = true;
+}
+
+// Helper to start deauth monitoring after scan completes
+static void deauth_monitor_start_monitoring(void)
+{
+    // Update status label
+    if (deauth_monitor_status_label && lv_obj_is_valid(deauth_monitor_status_label)) {
+        uint16_t scan_count = wifi_scanner_get_count();
+        char status_text[64];
+        snprintf(status_text, sizeof(status_text), "Monitoring... (%d networks known)\n\nNo attacks recorded yet", scan_count);
+        lv_label_set_text(deauth_monitor_status_label, status_text);
+    }
+    
+    // Start deauth monitor
+    deauth_monitor_active = true;
+    deauth_monitor_channel_index = 0;
+    deauth_monitor_current_channel = dual_band_channels[0];
+    esp_wifi_set_channel(deauth_monitor_current_channel, WIFI_SECOND_CHAN_NONE);
+    deauth_monitor_last_channel_hop = esp_timer_get_time() / 1000;
+    
+    // Set promiscuous filter for MGMT frames only
+    wifi_promiscuous_filter_t mgmt_filter = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT
+    };
+    esp_wifi_set_promiscuous_filter(&mgmt_filter);
+    esp_wifi_set_promiscuous_rx_cb(deauth_monitor_promiscuous_callback);
+    esp_wifi_set_promiscuous(true);
+    
+    // Create channel hopping task with PSRAM stack
+    deauth_monitor_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    if (deauth_monitor_task_stack) {
+        deauth_monitor_task_handle = xTaskCreateStatic(
+            deauth_monitor_task,
+            "deauth_mon",
+            4096,
+            NULL,
+            5,
+            deauth_monitor_task_stack,
+            &deauth_monitor_task_buffer
+        );
+    } else {
+        ESP_LOGE(TAG, "Failed to allocate deauth monitor task stack");
+    }
+    
+    ESP_LOGI(TAG, "Deauth monitor started after scan");
+}
+
+// Show deauth monitor screen
+static void show_deauth_monitor_screen(void)
+{
+    // Ensure WiFi mode is active
+    if (!ensure_wifi_mode()) {
+        ESP_LOGE(TAG, "Failed to switch to WiFi mode for deauth monitor");
+        return;
+    }
+    
+    create_function_page_base("Deauth Monitor");
+    
+    // Reset attack data
+    portENTER_CRITICAL(&deauth_monitor_spin);
+    deauth_monitor_attack_count = 0;
+    deauth_monitor_update_flag = false;
+    portEXIT_CRITICAL(&deauth_monitor_spin);
+    
+    // Status label - centered - show scanning status first
+    deauth_monitor_status_label = lv_label_create(function_page);
+    lv_label_set_text(deauth_monitor_status_label, LV_SYMBOL_WIFI "  Scanning networks...\n\nPlease wait");
+    lv_obj_set_style_text_align(deauth_monitor_status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(deauth_monitor_status_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(deauth_monitor_status_label, COLOR_MATERIAL_BLUE, 0);  // Blue during scan
+    lv_obj_align(deauth_monitor_status_label, LV_ALIGN_CENTER, 0, -20);
+    
+    // Create attack list (hidden initially)
+    deauth_monitor_list = lv_list_create(function_page);
+    lv_obj_set_size(deauth_monitor_list, lv_pct(100), LCD_V_RES - 30 - 70);  // Leave space for title and exit button
+    lv_obj_align(deauth_monitor_list, LV_ALIGN_TOP_MID, 0, 35);
+    lv_obj_set_style_bg_color(deauth_monitor_list, lv_color_make(18, 18, 18), 0);
+    lv_obj_set_style_border_width(deauth_monitor_list, 0, LV_PART_ITEMS);
+    lv_obj_add_flag(deauth_monitor_list, LV_OBJ_FLAG_HIDDEN);  // Hidden until attacks detected
+    
+    // Add list title
+    lv_obj_t *list_title = lv_list_add_text(deauth_monitor_list, "Most recent attacks:");
+    lv_obj_set_style_text_color(list_title, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_text_font(list_title, &lv_font_montserrat_14, 0);
+    
+    // Red Exit button at bottom
+    lv_obj_t *exit_btn = lv_btn_create(function_page);
+    lv_obj_set_size(exit_btn, 120, 55);
+    lv_obj_align(exit_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(exit_btn, 0, 0);
+    lv_obj_set_style_radius(exit_btn, 10, 0);
+    lv_obj_set_style_shadow_width(exit_btn, 6, 0);
+    lv_obj_set_style_shadow_color(exit_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(exit_btn, LV_OPA_40, 0);
+    lv_obj_set_flex_flow(exit_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(exit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    
+    lv_obj_t *exit_icon = lv_label_create(exit_btn);
+    lv_label_set_text(exit_icon, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_font(exit_icon, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(exit_icon, lv_color_make(255, 255, 255), 0);
+    
+    lv_obj_t *exit_text = lv_label_create(exit_btn);
+    lv_label_set_text(exit_text, "Exit");
+    lv_obj_set_style_text_font(exit_text, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(exit_text, lv_color_make(255, 255, 255), 0);
+    
+    lv_obj_add_event_cb(exit_btn, deauth_monitor_exit_cb, LV_EVENT_CLICKED, NULL);
+    
+    // Set UI active but not monitoring yet (waiting for scan)
+    deauth_monitor_ui_active = true;
+    deauth_monitor_active = false;  // Will be set true after scan
+    deauth_monitor_scan_pending = true;
+    
+    // Start WiFi scan to gather network SSIDs
+    ESP_LOGI(TAG, "Starting WiFi scan for deauth monitor...");
+    wifi_scanner_start_scan();
 }
