@@ -390,6 +390,24 @@ static volatile bool deauth_monitor_ui_active = false;
 static volatile bool deauth_monitor_update_flag = false;
 static volatile bool deauth_monitor_scan_pending = false;  // Waiting for initial scan to complete
 
+// AirTag Scanner state
+static TaskHandle_t airtag_scan_task_handle = NULL;
+static StaticTask_t airtag_scan_task_buffer;
+static StackType_t *airtag_scan_task_stack = NULL;
+static volatile bool airtag_scan_active = false;
+
+// AirTag Scanner UI state
+static lv_obj_t *airtag_scan_status_label = NULL;
+static lv_obj_t *airtag_scan_stats_label1 = NULL;  // Air Tags: X  Smart Tags: X
+static lv_obj_t *airtag_scan_stats_label2 = NULL;  // Other BT Devices: X
+static lv_obj_t *airtag_scan_stats_label3 = NULL;  // Total BT devices: X
+static volatile bool airtag_scan_ui_active = false;
+static volatile bool airtag_scan_update_flag = false;
+// Snapshot values for UI (copied before reset)
+static volatile int airtag_scan_snapshot_airtag = 0;
+static volatile int airtag_scan_snapshot_smarttag = 0;
+static volatile int airtag_scan_snapshot_total = 0;
+
 // Dual-band channel list (2.4GHz + 5GHz)
 static const int dual_band_channels[] = {
     // 2.4GHz channels
@@ -499,6 +517,10 @@ static void reset_function_page_children(void) {
     screenshot_btn = NULL;
     deauth_monitor_list = NULL;
     deauth_monitor_status_label = NULL;
+    airtag_scan_status_label = NULL;
+    airtag_scan_stats_label1 = NULL;
+    airtag_scan_stats_label2 = NULL;
+    airtag_scan_stats_label3 = NULL;
 }
 
 static void create_function_page_base(const char *name);
@@ -592,6 +614,11 @@ static void deauth_monitor_task(void *pvParameters);
 static void deauth_monitor_channel_hop(void);
 static void deauth_monitor_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
 static const char* deauth_monitor_find_ssid_by_bssid(const uint8_t *bssid);
+
+// AirTag Scanner functions
+static void show_airtag_scan_screen(void);
+static void airtag_scan_exit_cb(lv_event_t *e);
+static void airtag_scan_task(void *pvParameters);
 
 static void wifi_scan_done_cb(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
@@ -2539,6 +2566,46 @@ void app_main(void)
                         lv_obj_set_width(lbl, lv_pct(95));
                     }
                     portEXIT_CRITICAL(&deauth_monitor_spin);
+                }
+            }
+
+            // AirTag Scanner UI update
+            if (airtag_scan_update_flag && airtag_scan_ui_active) {
+                airtag_scan_update_flag = false;
+                
+                // Read snapshot values (thread-safe copy)
+                int snap_airtag = airtag_scan_snapshot_airtag;
+                int snap_smarttag = airtag_scan_snapshot_smarttag;
+                int snap_total = airtag_scan_snapshot_total;
+                
+                // Hide "Scan in progress", show stats
+                if (airtag_scan_status_label && lv_obj_is_valid(airtag_scan_status_label)) {
+                    lv_obj_add_flag(airtag_scan_status_label, LV_OBJ_FLAG_HIDDEN);
+                }
+                
+                // Update and show stats labels
+                if (airtag_scan_stats_label1 && lv_obj_is_valid(airtag_scan_stats_label1)) {
+                    char stats1[64];
+                    snprintf(stats1, sizeof(stats1), "Air Tags: %d    Smart Tags: %d", 
+                             snap_airtag, snap_smarttag);
+                    lv_label_set_text(airtag_scan_stats_label1, stats1);
+                    lv_obj_clear_flag(airtag_scan_stats_label1, LV_OBJ_FLAG_HIDDEN);
+                }
+                
+                if (airtag_scan_stats_label2 && lv_obj_is_valid(airtag_scan_stats_label2)) {
+                    int other_devices = snap_total - snap_airtag - snap_smarttag;
+                    if (other_devices < 0) other_devices = 0;
+                    char stats2[48];
+                    snprintf(stats2, sizeof(stats2), "Other BT Devices: %d", other_devices);
+                    lv_label_set_text(airtag_scan_stats_label2, stats2);
+                    lv_obj_clear_flag(airtag_scan_stats_label2, LV_OBJ_FLAG_HIDDEN);
+                }
+                
+                if (airtag_scan_stats_label3 && lv_obj_is_valid(airtag_scan_stats_label3)) {
+                    char stats3[48];
+                    snprintf(stats3, sizeof(stats3), "Total BT devices: %d", snap_total);
+                    lv_label_set_text(airtag_scan_stats_label3, stats3);
+                    lv_obj_clear_flag(airtag_scan_stats_label3, LV_OBJ_FLAG_HIDDEN);
                 }
             }
 
@@ -6962,10 +7029,15 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
 
+    // AirTag scan
+    if (strcmp(attack_name, "AirTag scan") == 0) {
+        show_airtag_scan_screen();
+        return;
+    }
+
     // Stub screens for not-yet-implemented features
     if (strcmp(attack_name, "Package Monitor") == 0 ||
         strcmp(attack_name, "Channel View") == 0 ||
-        strcmp(attack_name, "AirTag scan") == 0 ||
         strcmp(attack_name, "BT Locator") == 0) {
         show_stub_screen(attack_name);
         return;
@@ -8076,4 +8148,187 @@ static void show_deauth_monitor_screen(void)
     // Start WiFi scan to gather network SSIDs
     ESP_LOGI(TAG, "Starting WiFi scan for deauth monitor...");
     wifi_scanner_start_scan();
+}
+
+// ============================================================================
+// AIRTAG SCANNER IMPLEMENTATION
+// ============================================================================
+
+// AirTag scan task - continuous BLE scanning
+static void airtag_scan_task(void *pvParameters)
+{
+    (void)pvParameters;
+    
+    ESP_LOGI(TAG, "AirTag scanner task started");
+    
+    while (airtag_scan_active) {
+        // Reset counters for each scan cycle
+        bt_reset_counters();
+        
+        // Start BLE scan
+        int rc = bt_start_scan();
+        if (rc != 0) {
+            ESP_LOGE(TAG, "BLE scan start failed: %d", rc);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        
+        // Scan for 10 seconds
+        for (int i = 0; i < 100 && airtag_scan_active; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        
+        // Stop scan
+        bt_stop_scan();
+        
+        if (!airtag_scan_active) {
+            break;
+        }
+        
+        // Save snapshot for UI before reset
+        airtag_scan_snapshot_airtag = bt_airtag_count;
+        airtag_scan_snapshot_smarttag = bt_smarttag_count;
+        airtag_scan_snapshot_total = bt_device_count;
+        
+        // Signal UI update
+        airtag_scan_update_flag = true;
+        
+        ESP_LOGI(TAG, "AirTag scan cycle: %d AT, %d ST, %d total",
+                 airtag_scan_snapshot_airtag, airtag_scan_snapshot_smarttag, airtag_scan_snapshot_total);
+    }
+    
+    ESP_LOGI(TAG, "AirTag scanner task ending");
+    airtag_scan_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// Exit callback for AirTag scanner
+static void airtag_scan_exit_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    ESP_LOGI(TAG, "Stopping AirTag scanner...");
+    
+    // Stop scanning
+    airtag_scan_active = false;
+    airtag_scan_ui_active = false;
+    
+    // Stop BLE scan
+    bt_stop_scan();
+    
+    // Wait for task to finish
+    if (airtag_scan_task_handle != NULL) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    
+    // Free task stack
+    if (airtag_scan_task_stack != NULL) {
+        heap_caps_free(airtag_scan_task_stack);
+        airtag_scan_task_stack = NULL;
+    }
+    
+    // Switch back to WiFi mode
+    if (current_radio_mode == RADIO_MODE_BLE) {
+        bt_nimble_deinit();
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+    
+    // Navigate to menu
+    nav_to_menu_flag = true;
+}
+
+// Show AirTag scanner screen
+static void show_airtag_scan_screen(void)
+{
+    // Ensure BLE mode is active
+    if (!ensure_ble_mode()) {
+        ESP_LOGE(TAG, "Failed to switch to BLE mode for AirTag scanner");
+        return;
+    }
+    
+    create_function_page_base("Airtag Scanner");
+    
+    // Status label - "Scan in progress..." (blue, centered)
+    airtag_scan_status_label = lv_label_create(function_page);
+    lv_label_set_text(airtag_scan_status_label, LV_SYMBOL_BLUETOOTH "  Scan in progress...");
+    lv_obj_set_style_text_align(airtag_scan_status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(airtag_scan_status_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(airtag_scan_status_label, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_align(airtag_scan_status_label, LV_ALIGN_CENTER, 0, -40);
+    
+    // Stats label 1: "Air Tags: X  Smart Tags: X" (larger font)
+    airtag_scan_stats_label1 = lv_label_create(function_page);
+    lv_label_set_text(airtag_scan_stats_label1, "Air Tags: 0    Smart Tags: 0");
+    lv_obj_set_style_text_align(airtag_scan_stats_label1, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(airtag_scan_stats_label1, &lv_font_montserrat_20, 0);  // Larger font
+    lv_obj_set_style_text_color(airtag_scan_stats_label1, lv_color_make(255, 255, 255), 0);
+    lv_obj_align(airtag_scan_stats_label1, LV_ALIGN_CENTER, 0, -20);
+    lv_obj_add_flag(airtag_scan_stats_label1, LV_OBJ_FLAG_HIDDEN);
+    
+    // Stats label 2: "Other BT Devices: X"
+    airtag_scan_stats_label2 = lv_label_create(function_page);
+    lv_label_set_text(airtag_scan_stats_label2, "Other BT Devices: 0");
+    lv_obj_set_style_text_align(airtag_scan_stats_label2, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(airtag_scan_stats_label2, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(airtag_scan_stats_label2, lv_color_make(176, 176, 176), 0);
+    lv_obj_align(airtag_scan_stats_label2, LV_ALIGN_CENTER, 0, 10);
+    lv_obj_add_flag(airtag_scan_stats_label2, LV_OBJ_FLAG_HIDDEN);
+    
+    // Stats label 3: "Total BT devices: X"
+    airtag_scan_stats_label3 = lv_label_create(function_page);
+    lv_label_set_text(airtag_scan_stats_label3, "Total BT devices: 0");
+    lv_obj_set_style_text_align(airtag_scan_stats_label3, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(airtag_scan_stats_label3, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(airtag_scan_stats_label3, lv_color_make(176, 176, 176), 0);
+    lv_obj_align(airtag_scan_stats_label3, LV_ALIGN_CENTER, 0, 35);
+    lv_obj_add_flag(airtag_scan_stats_label3, LV_OBJ_FLAG_HIDDEN);
+    
+    // Red Exit button at bottom
+    lv_obj_t *exit_btn = lv_btn_create(function_page);
+    lv_obj_set_size(exit_btn, 120, 55);
+    lv_obj_align(exit_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(exit_btn, 0, 0);
+    lv_obj_set_style_radius(exit_btn, 10, 0);
+    lv_obj_set_style_shadow_width(exit_btn, 6, 0);
+    lv_obj_set_style_shadow_color(exit_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(exit_btn, LV_OPA_40, 0);
+    lv_obj_set_flex_flow(exit_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(exit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    
+    lv_obj_t *exit_icon = lv_label_create(exit_btn);
+    lv_label_set_text(exit_icon, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_font(exit_icon, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(exit_icon, lv_color_make(255, 255, 255), 0);
+    
+    lv_obj_t *exit_text = lv_label_create(exit_btn);
+    lv_label_set_text(exit_text, "Exit");
+    lv_obj_set_style_text_font(exit_text, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(exit_text, lv_color_make(255, 255, 255), 0);
+    
+    lv_obj_add_event_cb(exit_btn, airtag_scan_exit_cb, LV_EVENT_CLICKED, NULL);
+    
+    // Set UI active and start scanning
+    airtag_scan_ui_active = true;
+    airtag_scan_active = true;
+    airtag_scan_update_flag = false;
+    
+    // Create scanning task with PSRAM stack
+    airtag_scan_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    if (airtag_scan_task_stack) {
+        airtag_scan_task_handle = xTaskCreateStatic(
+            airtag_scan_task,
+            "airtag_scan",
+            4096,
+            NULL,
+            5,
+            airtag_scan_task_stack,
+            &airtag_scan_task_buffer
+        );
+    } else {
+        ESP_LOGE(TAG, "Failed to allocate AirTag scan task stack");
+    }
+    
+    ESP_LOGI(TAG, "AirTag scanner started");
 }
