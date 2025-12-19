@@ -7,10 +7,12 @@
 #include "esp_timer.h"
 #include "esp_http_server.h"
 #include "esp_attr.h"
+#include "esp_mac.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -101,6 +103,8 @@ static size_t custom_portal_html_size = 0;
 static uint32_t stats_deauth_sent = 0;
 static uint32_t stats_beacon_sent = 0;
 static uint32_t stats_clients_connected = 0;
+static blackout_stats_t blackout_stats = { 0 };
+static portMUX_TYPE blackout_stats_spin = portMUX_INITIALIZER_UNLOCKED;
 
 // Forward declarations for portal services used across sections
 static esp_err_t start_portal_services(void);
@@ -620,6 +624,11 @@ static void blackout_attack_task(void *pvParameters) {
     ESP_LOGI(TAG, "Blackout attack task started");
     
     stats_deauth_sent = 0;
+    portENTER_CRITICAL(&blackout_stats_spin);
+    blackout_stats.networks_attacked = 0;
+    blackout_stats.status = BLACKOUT_STATUS_RESCANNING;
+    blackout_stats.active = true;
+    portEXIT_CRITICAL(&blackout_stats_spin);
     
     // Main loop: continuously scan and attack for 100 cycles each iteration
     while (blackout_attack_active && !g_operation_stop_requested) {
@@ -654,6 +663,10 @@ static void blackout_attack_task(void *pvParameters) {
         uint16_t scan_count = wifi_scanner_get_count();
         if (!wifi_scanner_is_done() || scan_count == 0) {
             ESP_LOGI(TAG, "No scan results available, retrying...");
+            portENTER_CRITICAL(&blackout_stats_spin);
+            blackout_stats.networks_attacked = 0;
+            blackout_stats.status = BLACKOUT_STATUS_RESCANNING;
+            portEXIT_CRITICAL(&blackout_stats_spin);
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
@@ -671,6 +684,10 @@ static void blackout_attack_task(void *pvParameters) {
         int got = wifi_scanner_get_results(scan_results, scan_count);
         if (got == 0) {
             ESP_LOGI(TAG, "No results returned");
+            portENTER_CRITICAL(&blackout_stats_spin);
+            blackout_stats.networks_attacked = 0;
+            blackout_stats.status = BLACKOUT_STATUS_RESCANNING;
+            portEXIT_CRITICAL(&blackout_stats_spin);
             free(scan_results);
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
@@ -699,6 +716,11 @@ static void blackout_attack_task(void *pvParameters) {
             targets[i].last_seen = esp_timer_get_time() / 1000;
             targets[i].active = true;
         }
+        
+        portENTER_CRITICAL(&blackout_stats_spin);
+        blackout_stats.networks_attacked = target_count;
+        blackout_stats.status = BLACKOUT_STATUS_ATTACKING;
+        portEXIT_CRITICAL(&blackout_stats_spin);
         
         // Display whitelist information
         if (whitelistedBssidsCount > 0) {
@@ -760,11 +782,18 @@ static void blackout_attack_task(void *pvParameters) {
         }
         
         ESP_LOGI(TAG, "Attack cycle completed, starting new scan...");
+        portENTER_CRITICAL(&blackout_stats_spin);
+        blackout_stats.status = BLACKOUT_STATUS_RESCANNING;
+        portEXIT_CRITICAL(&blackout_stats_spin);
         
         // Immediately start next scan cycle (no waiting)
     }
     
     ESP_LOGI(TAG, "Blackout attack task finished");
+    portENTER_CRITICAL(&blackout_stats_spin);
+    blackout_stats.active = false;
+    blackout_stats.status = BLACKOUT_STATUS_RESCANNING;
+    portEXIT_CRITICAL(&blackout_stats_spin);
     blackout_attack_active = false;
     blackout_attack_task_handle = NULL;
     vTaskDelete(NULL);
@@ -780,6 +809,11 @@ esp_err_t wifi_attacks_start_blackout(void) {
     
     stats_deauth_sent = 0;
     blackout_attack_active = true;
+    portENTER_CRITICAL(&blackout_stats_spin);
+    blackout_stats.active = true;
+    blackout_stats.networks_attacked = 0;
+    blackout_stats.status = BLACKOUT_STATUS_RESCANNING;
+    portEXIT_CRITICAL(&blackout_stats_spin);
     
     xTaskCreate(blackout_attack_task, "blackout_attack", 8192, NULL, 3, &blackout_attack_task_handle);
     
@@ -793,6 +827,10 @@ esp_err_t wifi_attacks_stop_blackout(void) {
     
     ESP_LOGI(TAG, "Stopping blackout attack...");
     blackout_attack_active = false;
+    portENTER_CRITICAL(&blackout_stats_spin);
+    blackout_stats.active = false;
+    blackout_stats.status = BLACKOUT_STATUS_RESCANNING;
+    portEXIT_CRITICAL(&blackout_stats_spin);
     
     int wait_count = 0;
     while (blackout_attack_task_handle != NULL && wait_count < 50) {
@@ -805,6 +843,16 @@ esp_err_t wifi_attacks_stop_blackout(void) {
 
 bool wifi_attacks_is_blackout_active(void) {
     return blackout_attack_active;
+}
+
+esp_err_t wifi_attacks_get_blackout_stats(blackout_stats_t *out) {
+    if (!out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    portENTER_CRITICAL(&blackout_stats_spin);
+    *out = blackout_stats;
+    portEXIT_CRITICAL(&blackout_stats_spin);
+    return ESP_OK;
 }
 
 // ============================================================================

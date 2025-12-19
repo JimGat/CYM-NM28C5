@@ -95,6 +95,29 @@ esp_err_t wifi_attacks_stop_blackout(void);
  */
 bool wifi_attacks_is_blackout_active(void);
 
+/**
+ * @brief Blackout status phases
+ */
+typedef enum {
+    BLACKOUT_STATUS_RESCANNING = 0,
+    BLACKOUT_STATUS_ATTACKING  = 1,
+} blackout_status_t;
+
+/**
+ * @brief Snapshot of blackout attack progress
+ */
+typedef struct {
+    uint16_t networks_attacked;   // Number of networks from last scan being attacked
+    blackout_status_t status;     // Current phase
+    bool active;                  // Attack running flag
+} blackout_stats_t;
+
+/**
+ * @brief Get blackout attack stats
+ * @param out Pointer to struct to fill
+ */
+esp_err_t wifi_attacks_get_blackout_stats(blackout_stats_t *out);
+
 // ============================================================================
 // SAE OVERFLOW ATTACK
 // ============================================================================
