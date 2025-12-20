@@ -343,6 +343,11 @@ static lv_obj_t *karma_start_btn = NULL;
 static QueueHandle_t karma_log_queue = NULL;
 static bool karma_log_capture_enabled = false;
 static volatile bool karma_ui_active = false;
+static lv_obj_t *karma_info_ssid_label = NULL;
+static lv_obj_t *karma_info_filename_label = NULL;
+static QueueHandle_t karma_event_queue = NULL;
+static char karma_selected_html_name[64] = "default";
+static char karma_selected_ssid[33] = "";
 
 // Portal UI state (setup page)
 static lv_obj_t *portal_content = NULL;
@@ -536,6 +541,8 @@ static void reset_function_page_children(void) {
     karma_probe_dd = NULL;
     karma_html_dd = NULL;
     karma_start_btn = NULL;
+    karma_info_ssid_label = NULL;
+    karma_info_filename_label = NULL;
     portal_content = NULL;
     portal_ssid_ta = NULL;
     portal_html_dd = NULL;
@@ -612,6 +619,7 @@ static void portal_stop_btn_cb(lv_event_t *e);
 static esp_err_t portal_enable_log_capture(void);
 static void portal_disable_log_capture(void);
 static void portal_ui_event_callback(evil_twin_event_data_t *data);
+static void karma_ui_event_callback(evil_twin_event_data_t *data);
 static void get_timestamp_string(char* buffer, size_t size);
 static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode);
 static bool wait_for_gps_fix(int timeout_seconds);
@@ -1152,6 +1160,14 @@ static void portal_ui_event_callback(evil_twin_event_data_t *data) {
     if (portal_event_queue && data) {
         // Queue event to be processed in main loop (thread-safe)
         xQueueSend(portal_event_queue, data, 0);
+    }
+}
+
+// Karma UI event callback - called from wifi_attacks task context
+static void karma_ui_event_callback(evil_twin_event_data_t *data) {
+    if (karma_event_queue && data) {
+        // Queue event to be processed in main loop (thread-safe)
+        xQueueSend(karma_event_queue, data, 0);
     }
 }
 
@@ -2314,6 +2330,55 @@ void app_main(void)
                     
                     lv_textarea_add_text(portal_log_ta, event_msg);
                     lv_textarea_set_cursor_pos(portal_log_ta, LV_TEXTAREA_CURSOR_LAST);
+                }
+            }
+
+            // Process Karma UI events (same format as Portal)
+            if (karma_log_ta && karma_event_queue && karma_ui_active) {
+                evil_twin_event_data_t evt;
+                while (xQueueReceive(karma_event_queue, &evt, 0) == pdTRUE) {
+                    char event_msg[320];
+                    switch (evt.event) {
+                        case EVIL_TWIN_EVENT_CLIENT_CONNECTED:
+                            snprintf(event_msg, sizeof(event_msg), "Client connected\n");
+                            break;
+                        case EVIL_TWIN_EVENT_CLIENT_DISCONNECTED:
+                            snprintf(event_msg, sizeof(event_msg), "Client disconnected\n");
+                            break;
+                        case EVIL_TWIN_EVENT_PASSWORD_PROVIDED:
+                            // Show the actual captured data (stored in password field)
+                            if (evt.password[0] != '\0') {
+                                snprintf(event_msg, sizeof(event_msg), "%s\n", evt.password);
+                            } else {
+                                snprintf(event_msg, sizeof(event_msg), "Data captured\n");
+                            }
+                            break;
+                        case EVIL_TWIN_EVENT_PORTAL_DEPLOYED:
+                            snprintf(event_msg, sizeof(event_msg), "Portal deployed\n");
+                            break;
+                        case EVIL_TWIN_EVENT_DEAUTH_STARTED:
+                            snprintf(event_msg, sizeof(event_msg), "Deauth started\n");
+                            break;
+                        default:
+                            continue;  // Skip unknown events
+                    }
+                    
+                    // Trim textarea if too long
+                    const char *current_text = lv_textarea_get_text(karma_log_ta);
+                    if (current_text && strlen(current_text) > 1500) {
+                        const char *trim_point = strchr(current_text + 300, '\n');
+                        if (trim_point) {
+                            char *trimmed = lv_mem_alloc(strlen(trim_point));
+                            if (trimmed) {
+                                strcpy(trimmed, trim_point + 1);
+                                lv_textarea_set_text(karma_log_ta, trimmed);
+                                lv_mem_free(trimmed);
+                            }
+                        }
+                    }
+                    
+                    lv_textarea_add_text(karma_log_ta, event_msg);
+                    lv_textarea_set_cursor_pos(karma_log_ta, LV_TEXTAREA_CURSOR_LAST);
                 }
             }
 
@@ -5057,69 +5122,119 @@ static void karma_start_btn_cb(lv_event_t *e)
     }
 
     const char *html_name = wifi_attacks_get_sd_html_name(html_sel);
+    
+    // Save selected SSID and HTML name for display
+    strncpy(karma_selected_ssid, selected_ssid, sizeof(karma_selected_ssid) - 1);
+    karma_selected_ssid[sizeof(karma_selected_ssid) - 1] = '\0';
+    
+    if (html_name) {
+        const char *short_name = strrchr(html_name, '/');
+        if (short_name) {
+            short_name++;
+        } else {
+            short_name = html_name;
+        }
+        strncpy(karma_selected_html_name, short_name, sizeof(karma_selected_html_name) - 1);
+        karma_selected_html_name[sizeof(karma_selected_html_name) - 1] = '\0';
+    } else {
+        strcpy(karma_selected_html_name, "default");
+    }
 
     ESP_LOGI(TAG, "Starting Karma for SSID: %s", selected_ssid);
 
-    // Create log display page
-    create_function_page_base("Karma Log");
+    // Select HTML template
+    if (html_name) {
+        esp_err_t html_res = wifi_attacks_select_sd_html(html_sel);
+        if (html_res != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to set portal template: %s", esp_err_to_name(html_res));
+        }
+    }
 
-    karma_log_ta = lv_textarea_create(function_page);
-    lv_obj_set_size(karma_log_ta, lv_pct(100), LCD_V_RES - 30 - 45);  // Leave space for Stop button
-    lv_obj_align(karma_log_ta, LV_ALIGN_TOP_MID, 0, 30);
+    // Create Karma Running page (Portal-style UI)
+    create_function_page_base("Karma");
+
+    // Content container below title bar (leave space for button at bottom)
+    lv_obj_t *content = lv_obj_create(function_page);
+    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 70);  // Leave 70px for button
+    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 30);  // Start below title bar
+    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_pad_all(content, 8, 0);
+    lv_obj_set_style_pad_gap(content, 4, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+    // SSID label
+    karma_info_ssid_label = lv_label_create(content);
+    char ssid_text[64];
+    snprintf(ssid_text, sizeof(ssid_text), "SSID: %s", karma_selected_ssid);
+    lv_label_set_text(karma_info_ssid_label, ssid_text);
+    lv_obj_set_style_text_font(karma_info_ssid_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(karma_info_ssid_label, COLOR_MATERIAL_BLUE, 0);
+
+    // Filename label
+    karma_info_filename_label = lv_label_create(content);
+    char filename_text[96];
+    snprintf(filename_text, sizeof(filename_text), "File: %s", karma_selected_html_name);
+    lv_label_set_text(karma_info_filename_label, filename_text);
+    lv_obj_set_style_text_font(karma_info_filename_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(karma_info_filename_label, COLOR_MATERIAL_BLUE, 0);
+
+    // Events label
+    lv_obj_t *events_label = lv_label_create(content);
+    lv_label_set_text(events_label, "Events:");
+    lv_obj_set_style_text_font(events_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(events_label, lv_color_make(150, 150, 150), 0);
+
+    // Events textarea (scrollable)
+    karma_log_ta = lv_textarea_create(content);
+    lv_obj_set_width(karma_log_ta, lv_pct(100));
+    lv_obj_set_flex_grow(karma_log_ta, 1);  // Take remaining space
     lv_textarea_set_one_line(karma_log_ta, false);
     lv_textarea_set_cursor_click_pos(karma_log_ta, false);
     lv_textarea_set_password_mode(karma_log_ta, false);
     lv_textarea_set_text(karma_log_ta, "");
-    // Retro terminal styling
-    lv_obj_set_style_bg_color(karma_log_ta, lv_color_make(0, 0, 0), 0);  // Black background
-    lv_obj_set_style_text_color(karma_log_ta, COLOR_MATERIAL_BLUE, 0);  // Green text
+    lv_obj_set_style_bg_color(karma_log_ta, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_text_color(karma_log_ta, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_border_color(karma_log_ta, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_border_width(karma_log_ta, 1, 0);
+    lv_obj_set_style_text_font(karma_log_ta, &lv_font_montserrat_12, 0);
 
-    // Stop button at the bottom
+    // Red Stop button at the bottom (styled like Portal)
     karma_stop_btn = lv_btn_create(function_page);
-    lv_obj_set_size(karma_stop_btn, lv_pct(100), 40);
-    lv_obj_align(karma_stop_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(karma_stop_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(karma_stop_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);
-    lv_obj_set_style_border_color(karma_stop_btn, COLOR_MATERIAL_BLUE, 0);
-    lv_obj_set_style_border_width(karma_stop_btn, 3, 0);
+    lv_obj_set_size(karma_stop_btn, 120, 55);
+    lv_obj_align(karma_stop_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(karma_stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(karma_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(karma_stop_btn, 0, 0);
+    lv_obj_set_style_radius(karma_stop_btn, 10, 0);
+    lv_obj_set_style_shadow_width(karma_stop_btn, 6, 0);
+    lv_obj_set_style_shadow_color(karma_stop_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(karma_stop_btn, LV_OPA_40, 0);
+    lv_obj_set_flex_flow(karma_stop_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(karma_stop_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_add_event_cb(karma_stop_btn, karma_stop_btn_cb, LV_EVENT_CLICKED, NULL);
-    
+
+    lv_obj_t *stop_icon = lv_label_create(karma_stop_btn);
+    lv_label_set_text(stop_icon, LV_SYMBOL_STOP);
+    lv_obj_set_style_text_font(stop_icon, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(stop_icon, lv_color_make(255, 255, 255), 0);
+
     lv_obj_t *stop_label = lv_label_create(karma_stop_btn);
     lv_label_set_text(stop_label, "Stop");
-    lv_obj_set_style_text_color(stop_label, COLOR_MATERIAL_BLUE, 0);
-    lv_obj_center(stop_label);
+    lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(stop_label, lv_color_make(255, 255, 255), 0);
 
+    // Set UI active flag
     karma_ui_active = true;
 
-    if (karma_enable_log_capture() != ESP_OK) {
-        lv_textarea_add_text(karma_log_ta, "Failed to initialize log capture\n");
-        return;
+    // Create event queue for UI updates
+    if (!karma_event_queue) {
+        karma_event_queue = xQueueCreate(10, sizeof(evil_twin_event_data_t));
     }
 
-    char header[160];
-    snprintf(header, sizeof(header), "Launching Karma for %s\n", selected_ssid);
-    lv_textarea_add_text(karma_log_ta, header);
-    lv_textarea_set_cursor_pos(karma_log_ta, LV_TEXTAREA_CURSOR_LAST);
-
-    if (html_name) {
-        const char *html_display = strrchr(html_name, '/');
-        if (html_display) {
-            html_display++;
-        } else {
-            html_display = html_name;
-        }
-
-        esp_err_t html_res = wifi_attacks_select_sd_html(html_sel);
-        if (html_res != ESP_OK) {
-            char warn[120];
-            snprintf(warn, sizeof(warn), "Failed to set portal template: %s\n", esp_err_to_name(html_res));
-            lv_textarea_add_text(karma_log_ta, warn);
-        } else {
-            char msg[120];
-            snprintf(msg, sizeof(msg), "Portal template: %s\n", html_display);
-            lv_textarea_add_text(karma_log_ta, msg);
-        }
-    }
+    // Register event callback for karma events
+    wifi_attacks_set_evil_twin_event_cb(karma_ui_event_callback);
 
     // Start portal with the selected SSID
     esp_err_t start_res = wifi_attacks_start_portal(selected_ssid);
@@ -5127,13 +5242,16 @@ static void karma_start_btn_cb(lv_event_t *e)
         char err[96];
         snprintf(err, sizeof(err), "Start failed: %s\n", esp_err_to_name(start_res));
         lv_textarea_add_text(karma_log_ta, err);
-        karma_disable_log_capture();
+        wifi_attacks_set_evil_twin_event_cb(NULL);
         karma_ui_active = false;
         return;
     }
 
-    lv_textarea_add_text(karma_log_ta, "Karma started. Awaiting log output...\n");
+    // Add initial "Karma Started" event
+    lv_textarea_add_text(karma_log_ta, "Karma Started\n");
     lv_textarea_set_cursor_pos(karma_log_ta, LV_TEXTAREA_CURSOR_LAST);
+
+    ESP_LOGI(TAG, "Karma started successfully");
 }
 
 static void karma_stop_btn_cb(lv_event_t *e)
@@ -5141,11 +5259,18 @@ static void karma_stop_btn_cb(lv_event_t *e)
     (void)e;
     
     ESP_LOGI(TAG, "Stopping Karma...");
+    
+    // Stop the portal
     wifi_attacks_stop_portal();
     
-    karma_disable_log_capture();
+    // Unregister event callback
+    wifi_attacks_set_evil_twin_event_cb(NULL);
+    
+    // Reset UI state
     karma_log_ta = NULL;
     karma_stop_btn = NULL;
+    karma_info_ssid_label = NULL;
+    karma_info_filename_label = NULL;
     karma_ui_active = false;
     
     nav_to_menu_flag = true;
@@ -5578,12 +5703,15 @@ static void create_function_page_base(const char *name)
     wardrive_ui_active = false;
 
     karma_disable_log_capture();
+    wifi_attacks_set_evil_twin_event_cb(NULL);  // Unregister karma event callback
     karma_log_ta = NULL;
     karma_stop_btn = NULL;
     karma_content = NULL;
     karma_probe_dd = NULL;
     karma_html_dd = NULL;
     karma_start_btn = NULL;
+    karma_info_ssid_label = NULL;
+    karma_info_filename_label = NULL;
     karma_ui_active = false;
 
     // Portal setup page cleanup
