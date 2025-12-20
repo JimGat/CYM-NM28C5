@@ -344,13 +344,23 @@ static QueueHandle_t karma_log_queue = NULL;
 static bool karma_log_capture_enabled = false;
 static volatile bool karma_ui_active = false;
 
-// Portal UI state
+// Portal UI state (setup page)
 static lv_obj_t *portal_content = NULL;
 static lv_obj_t *portal_ssid_ta = NULL;
 static lv_obj_t *portal_html_dd = NULL;
 static lv_obj_t *portal_start_btn = NULL;
 static lv_obj_t *portal_keyboard = NULL;
 static char portal_ssid_buffer[33] = "Free WiFi";
+
+// Portal Running UI state
+static lv_obj_t *portal_log_ta = NULL;
+static lv_obj_t *portal_stop_btn = NULL;
+static lv_obj_t *portal_info_ssid_label = NULL;
+static lv_obj_t *portal_info_filename_label = NULL;
+static QueueHandle_t portal_event_queue = NULL;
+static bool portal_log_capture_enabled = false;
+static volatile bool portal_ui_active = false;
+static char portal_selected_html_name[64] = "";
 
 // BLE Scan UI state
 static lv_obj_t *ble_scan_content = NULL;
@@ -598,7 +608,10 @@ static void show_portal_page(void);
 static void portal_ssid_ta_event_cb(lv_event_t *e);
 static void portal_keyboard_event_cb(lv_event_t *e);
 static void portal_start_btn_cb(lv_event_t *e);
-static void portal_keyboard_event_cb(lv_event_t *e);
+static void portal_stop_btn_cb(lv_event_t *e);
+static esp_err_t portal_enable_log_capture(void);
+static void portal_disable_log_capture(void);
+static void portal_ui_event_callback(evil_twin_event_data_t *data);
 static void get_timestamp_string(char* buffer, size_t size);
 static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode);
 static bool wait_for_gps_fix(int timeout_seconds);
@@ -1074,7 +1087,7 @@ static esp_err_t karma_enable_log_capture(void)
     }
 
     if (!karma_log_capture_enabled) {
-        if (!evil_twin_log_capture_enabled && !blackout_log_capture_enabled && !snifferdog_log_capture_enabled && !sniffer_log_capture_enabled && !sae_overflow_log_capture_enabled && !handshake_log_capture_enabled && !wardrive_log_capture_enabled) {
+        if (!evil_twin_log_capture_enabled && !blackout_log_capture_enabled && !snifferdog_log_capture_enabled && !sniffer_log_capture_enabled && !sae_overflow_log_capture_enabled && !handshake_log_capture_enabled && !wardrive_log_capture_enabled && !portal_log_capture_enabled) {
             previous_vprintf = esp_log_set_vprintf(dual_vprintf);
         }
         karma_log_capture_enabled = true;
@@ -1087,7 +1100,7 @@ static void karma_disable_log_capture(void)
 {
     if (karma_log_capture_enabled) {
         karma_log_capture_enabled = false;
-        if (!evil_twin_log_capture_enabled && !blackout_log_capture_enabled && !snifferdog_log_capture_enabled && !sniffer_log_capture_enabled && !sae_overflow_log_capture_enabled && !handshake_log_capture_enabled && !wardrive_log_capture_enabled) {
+        if (!evil_twin_log_capture_enabled && !blackout_log_capture_enabled && !snifferdog_log_capture_enabled && !sniffer_log_capture_enabled && !sae_overflow_log_capture_enabled && !handshake_log_capture_enabled && !wardrive_log_capture_enabled && !portal_log_capture_enabled) {
             esp_log_set_vprintf(previous_vprintf ? previous_vprintf : rom_vprintf);
             previous_vprintf = NULL;
         }
@@ -1095,6 +1108,50 @@ static void karma_disable_log_capture(void)
 
     if (karma_log_queue) {
         xQueueReset(karma_log_queue);
+    }
+}
+
+static esp_err_t portal_enable_log_capture(void)
+{
+    if (!portal_event_queue) {
+        portal_event_queue = xQueueCreate(16, sizeof(evil_twin_event_data_t));
+        if (!portal_event_queue) {
+            return ESP_ERR_NO_MEM;
+        }
+    } else {
+        xQueueReset(portal_event_queue);
+    }
+
+    if (!portal_log_capture_enabled) {
+        if (!evil_twin_log_capture_enabled && !blackout_log_capture_enabled && !snifferdog_log_capture_enabled && !sniffer_log_capture_enabled && !sae_overflow_log_capture_enabled && !handshake_log_capture_enabled && !wardrive_log_capture_enabled && !karma_log_capture_enabled) {
+            previous_vprintf = esp_log_set_vprintf(dual_vprintf);
+        }
+        portal_log_capture_enabled = true;
+    }
+
+    return ESP_OK;
+}
+
+static void portal_disable_log_capture(void)
+{
+    if (portal_log_capture_enabled) {
+        portal_log_capture_enabled = false;
+        if (!evil_twin_log_capture_enabled && !blackout_log_capture_enabled && !snifferdog_log_capture_enabled && !sniffer_log_capture_enabled && !sae_overflow_log_capture_enabled && !handshake_log_capture_enabled && !wardrive_log_capture_enabled && !karma_log_capture_enabled) {
+            esp_log_set_vprintf(previous_vprintf ? previous_vprintf : rom_vprintf);
+            previous_vprintf = NULL;
+        }
+    }
+
+    if (portal_event_queue) {
+        xQueueReset(portal_event_queue);
+    }
+}
+
+// Portal UI event callback - called from wifi_attacks task context
+static void portal_ui_event_callback(evil_twin_event_data_t *data) {
+    if (portal_event_queue && data) {
+        // Queue event to be processed in main loop (thread-safe)
+        xQueueSend(portal_event_queue, data, 0);
     }
 }
 
@@ -2211,6 +2268,50 @@ void app_main(void)
                 }
             }
 
+            // Process Portal UI events
+            if (portal_log_ta && portal_event_queue && portal_ui_active) {
+                evil_twin_event_data_t evt;
+                while (xQueueReceive(portal_event_queue, &evt, 0) == pdTRUE) {
+                    char event_msg[128];
+                    switch (evt.event) {
+                        case EVIL_TWIN_EVENT_CLIENT_CONNECTED:
+                            snprintf(event_msg, sizeof(event_msg), "Client connected\n");
+                            break;
+                        case EVIL_TWIN_EVENT_CLIENT_DISCONNECTED:
+                            snprintf(event_msg, sizeof(event_msg), "Client disconnected\n");
+                            break;
+                        case EVIL_TWIN_EVENT_PASSWORD_PROVIDED:
+                            snprintf(event_msg, sizeof(event_msg), "Data entered and saved to file\n");
+                            break;
+                        case EVIL_TWIN_EVENT_PORTAL_DEPLOYED:
+                            snprintf(event_msg, sizeof(event_msg), "Portal deployed\n");
+                            break;
+                        case EVIL_TWIN_EVENT_DEAUTH_STARTED:
+                            snprintf(event_msg, sizeof(event_msg), "Deauth started\n");
+                            break;
+                        default:
+                            continue;  // Skip unknown events
+                    }
+                    
+                    // Trim textarea if too long
+                    const char *current_text = lv_textarea_get_text(portal_log_ta);
+                    if (current_text && strlen(current_text) > 1500) {
+                        const char *trim_point = strchr(current_text + 300, '\n');
+                        if (trim_point) {
+                            char *trimmed = lv_mem_alloc(strlen(trim_point));
+                            if (trimmed) {
+                                strcpy(trimmed, trim_point + 1);
+                                lv_textarea_set_text(portal_log_ta, trimmed);
+                                lv_mem_free(trimmed);
+                            }
+                        }
+                    }
+                    
+                    lv_textarea_add_text(portal_log_ta, event_msg);
+                    lv_textarea_set_cursor_pos(portal_log_ta, LV_TEXTAREA_CURSOR_LAST);
+                }
+            }
+
             // Handle deauth monitor scan completion - start monitoring after scan
             if (scan_done_ui_flag && deauth_monitor_scan_pending && deauth_monitor_ui_active) {
                 scan_done_ui_flag = false;
@@ -2224,9 +2325,9 @@ void app_main(void)
                 // Start the actual monitoring
                 deauth_monitor_start_monitoring();
             }
-            // If scan finished, build results UI (but not during blackout/snifferdog/sae_overflow/handshake/wardrive/karma attack/deauth_monitor)
+            // If scan finished, build results UI (but not during blackout/snifferdog/sae_overflow/handshake/wardrive/karma attack/deauth_monitor/portal)
             else if (scan_done_ui_flag) {
-                if (blackout_ui_active || snifferdog_ui_active || sae_overflow_ui_active || handshake_ui_active || wardrive_ui_active || karma_ui_active || deauth_monitor_ui_active) {
+                if (blackout_ui_active || snifferdog_ui_active || sae_overflow_ui_active || handshake_ui_active || wardrive_ui_active || karma_ui_active || deauth_monitor_ui_active || portal_ui_active) {
                     // During attacks, just clear the flag without showing results
                     scan_done_ui_flag = false;
                 } else {
@@ -5247,6 +5348,20 @@ static void portal_start_btn_cb(lv_event_t *e)
     }
 
     const char *html_name = wifi_attacks_get_sd_html_name(html_sel);
+    
+    // Save the HTML filename for display
+    if (html_name) {
+        const char *short_name = strrchr(html_name, '/');
+        if (short_name) {
+            short_name++;
+        } else {
+            short_name = html_name;
+        }
+        strncpy(portal_selected_html_name, short_name, sizeof(portal_selected_html_name) - 1);
+        portal_selected_html_name[sizeof(portal_selected_html_name) - 1] = '\0';
+    } else {
+        strcpy(portal_selected_html_name, "default");
+    }
 
     ESP_LOGI(TAG, "Starting Portal with SSID: %s", portal_ssid_buffer);
 
@@ -5264,14 +5379,134 @@ static void portal_start_btn_cb(lv_event_t *e)
         }
     }
 
+    // Create Portal Running page
+    create_function_page_base("Portal");
+
+    // Content container below title bar (leave space for button at bottom)
+    lv_obj_t *content = lv_obj_create(function_page);
+    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 70);  // Leave 70px for button
+    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 30);  // Start below title bar
+    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_pad_all(content, 8, 0);
+    lv_obj_set_style_pad_gap(content, 4, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+    // SSID label
+    portal_info_ssid_label = lv_label_create(content);
+    char ssid_text[64];
+    snprintf(ssid_text, sizeof(ssid_text), "SSID: %s", portal_ssid_buffer);
+    lv_label_set_text(portal_info_ssid_label, ssid_text);
+    lv_obj_set_style_text_font(portal_info_ssid_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(portal_info_ssid_label, COLOR_MATERIAL_BLUE, 0);
+
+    // Filename label
+    portal_info_filename_label = lv_label_create(content);
+    char filename_text[96];
+    snprintf(filename_text, sizeof(filename_text), "File: %s", portal_selected_html_name);
+    lv_label_set_text(portal_info_filename_label, filename_text);
+    lv_obj_set_style_text_font(portal_info_filename_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(portal_info_filename_label, COLOR_MATERIAL_BLUE, 0);
+
+    // Events label
+    lv_obj_t *events_label = lv_label_create(content);
+    lv_label_set_text(events_label, "Events:");
+    lv_obj_set_style_text_font(events_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(events_label, lv_color_make(150, 150, 150), 0);
+
+    // Events textarea (scrollable)
+    portal_log_ta = lv_textarea_create(content);
+    lv_obj_set_width(portal_log_ta, lv_pct(100));
+    lv_obj_set_flex_grow(portal_log_ta, 1);  // Take remaining space
+    lv_textarea_set_one_line(portal_log_ta, false);
+    lv_textarea_set_cursor_click_pos(portal_log_ta, false);
+    lv_textarea_set_password_mode(portal_log_ta, false);
+    lv_textarea_set_text(portal_log_ta, "");
+    lv_obj_set_style_bg_color(portal_log_ta, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_text_color(portal_log_ta, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_border_color(portal_log_ta, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_border_width(portal_log_ta, 1, 0);
+    lv_obj_set_style_text_font(portal_log_ta, &lv_font_montserrat_12, 0);
+
+    // Red Stop button at the bottom (styled like BT Locator)
+    portal_stop_btn = lv_btn_create(function_page);
+    lv_obj_set_size(portal_stop_btn, 120, 55);
+    lv_obj_align(portal_stop_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(portal_stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(portal_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(portal_stop_btn, 0, 0);
+    lv_obj_set_style_radius(portal_stop_btn, 10, 0);
+    lv_obj_set_style_shadow_width(portal_stop_btn, 6, 0);
+    lv_obj_set_style_shadow_color(portal_stop_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(portal_stop_btn, LV_OPA_40, 0);
+    lv_obj_set_flex_flow(portal_stop_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(portal_stop_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_add_event_cb(portal_stop_btn, portal_stop_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *stop_icon = lv_label_create(portal_stop_btn);
+    lv_label_set_text(stop_icon, LV_SYMBOL_STOP);
+    lv_obj_set_style_text_font(stop_icon, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(stop_icon, lv_color_make(255, 255, 255), 0);
+
+    lv_obj_t *stop_label = lv_label_create(portal_stop_btn);
+    lv_label_set_text(stop_label, "Stop");
+    lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(stop_label, lv_color_make(255, 255, 255), 0);
+
+    // Set UI active flag
+    portal_ui_active = true;
+
+    // Enable log capture and register event callback
+    if (portal_enable_log_capture() != ESP_OK) {
+        lv_textarea_add_text(portal_log_ta, "Failed to init event capture\n");
+    }
+
+    // Register event callback for portal events
+    wifi_attacks_set_evil_twin_event_cb(portal_ui_event_callback);
+
     // Start portal
     esp_err_t start_res = wifi_attacks_start_portal(portal_ssid_buffer);
     if (start_res != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start portal: %s", esp_err_to_name(start_res));
+        char err[96];
+        snprintf(err, sizeof(err), "Start failed: %s\n", esp_err_to_name(start_res));
+        lv_textarea_add_text(portal_log_ta, err);
+        portal_disable_log_capture();
+        wifi_attacks_set_evil_twin_event_cb(NULL);
+        portal_ui_active = false;
         return;
     }
 
+    // Add initial "Portal Started" event
+    lv_textarea_add_text(portal_log_ta, "Portal Started\n");
+    lv_textarea_set_cursor_pos(portal_log_ta, LV_TEXTAREA_CURSOR_LAST);
+
     ESP_LOGI(TAG, "Portal started successfully");
+}
+
+static void portal_stop_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    ESP_LOGI(TAG, "Stopping Portal...");
+    
+    // Stop the portal
+    wifi_attacks_stop_portal();
+    
+    // Unregister event callback
+    wifi_attacks_set_evil_twin_event_cb(NULL);
+    
+    // Disable log capture
+    portal_disable_log_capture();
+    
+    // Reset UI state
+    portal_log_ta = NULL;
+    portal_stop_btn = NULL;
+    portal_info_ssid_label = NULL;
+    portal_info_filename_label = NULL;
+    portal_ui_active = false;
+    
+    // Navigate back to menu
     nav_to_menu_flag = true;
 }
 
@@ -5340,11 +5575,20 @@ static void create_function_page_base(const char *name)
     karma_start_btn = NULL;
     karma_ui_active = false;
 
+    // Portal setup page cleanup
     portal_content = NULL;
     portal_ssid_ta = NULL;
     portal_html_dd = NULL;
     portal_start_btn = NULL;
     portal_keyboard = NULL;
+
+    // Portal running page cleanup
+    portal_disable_log_capture();
+    portal_log_ta = NULL;
+    portal_stop_btn = NULL;
+    portal_info_ssid_label = NULL;
+    portal_info_filename_label = NULL;
+    portal_ui_active = false;
 
     if (function_page) {
         lv_obj_del(function_page);
@@ -5427,6 +5671,15 @@ void show_menu(void)
     evil_twin_deauth_list_label = NULL;
     evil_twin_status_list = NULL;
     wifi_attacks_set_evil_twin_event_cb(NULL);  // Unregister callback
+    
+    // Portal cleanup
+    portal_disable_log_capture();
+    portal_log_ta = NULL;
+    portal_stop_btn = NULL;
+    portal_info_ssid_label = NULL;
+    portal_info_filename_label = NULL;
+    portal_ui_active = false;
+    
     // Delete function page if it exists
     if (function_page) {
         lv_obj_del(function_page);
