@@ -409,12 +409,10 @@ static lv_obj_t *bt_locator_list = NULL;
 static lv_obj_t *bt_locator_status_label = NULL;
 static lv_obj_t *bt_locator_rssi_label = NULL;
 static lv_obj_t *bt_locator_mac_label = NULL;
-static lv_obj_t *bt_locator_countdown_label = NULL;
 static lv_obj_t *bt_locator_exit_btn = NULL;
 static volatile bool bt_locator_ui_active = false;
 static volatile bool bt_locator_tracking_active = false;
 static volatile bool bt_locator_needs_ui_update = false;
-static volatile int bt_locator_countdown = 10;
 static char bt_locator_status_text[48] = "";
 
 // BT tracking mode support (for BT Locator)
@@ -548,7 +546,6 @@ static void reset_function_page_children(void) {
     bt_locator_status_label = NULL;
     bt_locator_rssi_label = NULL;
     bt_locator_mac_label = NULL;
-    bt_locator_countdown_label = NULL;
     bt_locator_exit_btn = NULL;
 }
 
@@ -2556,24 +2553,13 @@ void app_main(void)
                 bt_locator_needs_ui_update = false;
                 
                 if (bt_locator_tracking_active) {
-                    // Tracking mode - update countdown and RSSI
-                    if (bt_locator_countdown_label) {
-                        char countdown_text[8];
-                        snprintf(countdown_text, sizeof(countdown_text), "%d", bt_locator_countdown);
-                        lv_label_set_text(bt_locator_countdown_label, countdown_text);
-                    }
+                    // Tracking mode - update RSSI display
                     if (bt_locator_rssi_label) {
                         if (bt_tracking_found) {
                             char rssi_text[32];
                             snprintf(rssi_text, sizeof(rssi_text), "RSSI: %d", bt_tracking_rssi);
                             lv_label_set_text(bt_locator_rssi_label, rssi_text);
-                        } else if (bt_locator_countdown == 0) {
-                            // Only show "not found" after full scan cycle
-                            lv_label_set_text(bt_locator_rssi_label, "Not found");
                         }
-                    }
-                    if (bt_locator_status_label) {
-                        lv_label_set_text(bt_locator_status_label, bt_locator_status_text);
                     }
                 } else {
                     // Scanning mode - update status and show list when done
@@ -2583,9 +2569,18 @@ void app_main(void)
                         lv_label_set_text(bt_locator_status_label, bt_locator_status_text);
                     }
                     
-                    // If scan finished, show the list
+                    // If scan finished, show the list and hide status
                     if (ble_scan_finished && bt_locator_list) {
-                        lv_label_set_text(bt_locator_status_label, "");
+                        if (bt_locator_status_label) {
+                            lv_obj_add_flag(bt_locator_status_label, LV_OBJ_FLAG_HIDDEN);
+                        }
+                        // Show header label (stored in content user_data)
+                        if (bt_locator_content) {
+                            lv_obj_t *header = (lv_obj_t *)lv_obj_get_user_data(bt_locator_content);
+                            if (header) {
+                                lv_obj_clear_flag(header, LV_OBJ_FLAG_HIDDEN);
+                            }
+                        }
                         lv_obj_clear_flag(bt_locator_list, LV_OBJ_FLAG_HIDDEN);
                         bt_locator_update_list();
                     }
@@ -6041,26 +6036,35 @@ static void show_bt_locator_screen(void)
     bt_locator_tracking_active = false;
     bt_tracking_mode = false;
     
-    // Content container
+    // Content container - positioned below title bar (30px)
     bt_locator_content = lv_obj_create(function_page);
     lv_obj_set_size(bt_locator_content, lv_pct(100), LCD_V_RES - 30 - 50);  // Leave space for title and exit btn
-    lv_obj_align(bt_locator_content, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_align(bt_locator_content, LV_ALIGN_TOP_MID, 0, 30);  // Start below title bar
     lv_obj_set_style_bg_opa(bt_locator_content, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(bt_locator_content, 0, 0);
     lv_obj_set_style_pad_all(bt_locator_content, 5, 0);
     lv_obj_clear_flag(bt_locator_content, LV_OBJ_FLAG_SCROLLABLE);
     
-    // Status label at top - "BT scanning..."
+    // Status label centered - "BT scanning..." (will be hidden when list/tracking shown)
     bt_locator_status_label = lv_label_create(bt_locator_content);
     lv_label_set_text(bt_locator_status_label, "BT scanning...");
     lv_obj_set_style_text_color(bt_locator_status_label, COLOR_MATERIAL_BLUE, 0);
     lv_obj_set_style_text_font(bt_locator_status_label, &lv_font_montserrat_16, 0);
-    lv_obj_align(bt_locator_status_label, LV_ALIGN_TOP_LEFT, 5, 5);
+    lv_obj_center(bt_locator_status_label);
+    
+    // Header label above list (hidden until scan complete)
+    lv_obj_t *list_header = lv_label_create(bt_locator_content);
+    lv_label_set_text(list_header, "Select BT Target:");
+    lv_obj_set_style_text_color(list_header, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_text_font(list_header, &lv_font_montserrat_14, 0);
+    lv_obj_align(list_header, LV_ALIGN_TOP_LEFT, 5, 0);
+    lv_obj_add_flag(list_header, LV_OBJ_FLAG_HIDDEN);  // Hidden until scan done
+    lv_obj_set_user_data(bt_locator_content, list_header);  // Store for later access
     
     // Scrollable list for devices (hidden until scan complete)
     bt_locator_list = lv_obj_create(bt_locator_content);
-    lv_obj_set_size(bt_locator_list, lv_pct(100), LCD_V_RES - 30 - 50 - 35);
-    lv_obj_align(bt_locator_list, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_size(bt_locator_list, lv_pct(100), LCD_V_RES - 30 - 70 - 25);  // Same height as BLE Scan list
+    lv_obj_align(bt_locator_list, LV_ALIGN_TOP_MID, 0, 20);  // Below header
     lv_obj_set_style_bg_color(bt_locator_list, lv_color_make(0, 0, 0), 0);
     lv_obj_set_style_border_color(bt_locator_list, COLOR_MATERIAL_BLUE, 0);
     lv_obj_set_style_border_width(bt_locator_list, 1, 0);
@@ -6086,26 +6090,30 @@ static void show_bt_locator_screen(void)
     lv_obj_align(bt_locator_mac_label, LV_ALIGN_CENTER, 0, 20);
     lv_obj_add_flag(bt_locator_mac_label, LV_OBJ_FLAG_HIDDEN);
     
-    // Countdown label on the right (hidden until tracking)
-    bt_locator_countdown_label = lv_label_create(bt_locator_content);
-    lv_label_set_text(bt_locator_countdown_label, "10");
-    lv_obj_set_style_text_color(bt_locator_countdown_label, lv_color_make(100, 200, 255), 0);  // Light blue
-    lv_obj_set_style_text_font(bt_locator_countdown_label, &lv_font_montserrat_20, 0);
-    lv_obj_align(bt_locator_countdown_label, LV_ALIGN_RIGHT_MID, -15, 0);
-    lv_obj_add_flag(bt_locator_countdown_label, LV_OBJ_FLAG_HIDDEN);
-    
-    // Exit button at bottom
+    // Red Exit button at bottom (like AirTag scanner)
     bt_locator_exit_btn = lv_btn_create(function_page);
-    lv_obj_set_size(bt_locator_exit_btn, lv_pct(100), 45);
-    lv_obj_align(bt_locator_exit_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(bt_locator_exit_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(bt_locator_exit_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);
-    lv_obj_set_style_border_color(bt_locator_exit_btn, COLOR_MATERIAL_BLUE, 0);
-    lv_obj_set_style_border_width(bt_locator_exit_btn, 3, 0);
+    lv_obj_set_size(bt_locator_exit_btn, 120, 55);
+    lv_obj_align(bt_locator_exit_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(bt_locator_exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(bt_locator_exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(bt_locator_exit_btn, 0, 0);
+    lv_obj_set_style_radius(bt_locator_exit_btn, 10, 0);
+    lv_obj_set_style_shadow_width(bt_locator_exit_btn, 6, 0);
+    lv_obj_set_style_shadow_color(bt_locator_exit_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(bt_locator_exit_btn, LV_OPA_40, 0);
+    lv_obj_set_flex_flow(bt_locator_exit_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(bt_locator_exit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    
+    lv_obj_t *exit_icon = lv_label_create(bt_locator_exit_btn);
+    lv_label_set_text(exit_icon, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_font(exit_icon, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(exit_icon, lv_color_make(255, 255, 255), 0);
+    
     lv_obj_t *exit_lbl = lv_label_create(bt_locator_exit_btn);
     lv_label_set_text(exit_lbl, "Exit");
-    lv_obj_set_style_text_color(exit_lbl, COLOR_MATERIAL_BLUE, 0);
-    lv_obj_center(exit_lbl);
+    lv_obj_set_style_text_font(exit_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(exit_lbl, lv_color_make(255, 255, 255), 0);
+    
     lv_obj_add_event_cb(bt_locator_exit_btn, bt_locator_exit_cb, LV_EVENT_CLICKED, NULL);
     
     // Switch to BLE mode
@@ -7154,17 +7162,17 @@ void attack_event_cb(lv_event_t *e)
         create_function_page_base("BLE Scan");
         ble_scan_ui_active = true;
         
-        // Status label at top (below title bar which is 30px)
+        // Status label below title bar (30px from top)
         ble_scan_status_label = lv_label_create(function_page);
         lv_label_set_text(ble_scan_status_label, "Initializing BLE...");
         lv_obj_set_style_text_color(ble_scan_status_label, COLOR_MATERIAL_BLUE, 0);
         lv_obj_set_style_text_font(ble_scan_status_label, &lv_font_montserrat_14, 0);
-        lv_obj_align(ble_scan_status_label, LV_ALIGN_TOP_LEFT, 5, 0);
+        lv_obj_align(ble_scan_status_label, LV_ALIGN_TOP_LEFT, 5, 35);
         
         // Scrollable list for devices (starts below status label)
         ble_scan_list = lv_obj_create(function_page);
-        lv_obj_set_size(ble_scan_list, lv_pct(100), LCD_V_RES - 30 - 50 - 20);  // Leave space for title, status and back button
-        lv_obj_align(ble_scan_list, LV_ALIGN_TOP_MID, 0, 20);
+        lv_obj_set_size(ble_scan_list, lv_pct(100), LCD_V_RES - 30 - 70 - 25);  // Leave space for title, status and exit button
+        lv_obj_align(ble_scan_list, LV_ALIGN_TOP_MID, 0, 55);
         lv_obj_set_style_bg_color(ble_scan_list, lv_color_make(0, 0, 0), 0);
         lv_obj_set_style_border_color(ble_scan_list, lv_color_make(0, 100, 0), 0);
         lv_obj_set_style_border_width(ble_scan_list, 1, 0);
@@ -7172,18 +7180,30 @@ void attack_event_cb(lv_event_t *e)
         lv_obj_set_style_pad_all(ble_scan_list, 4, 0);
         lv_obj_set_scrollbar_mode(ble_scan_list, LV_SCROLLBAR_MODE_AUTO);
         
-        // Back button
+        // Red Exit button (like AirTag scanner)
         lv_obj_t *back_btn = lv_btn_create(function_page);
-        lv_obj_set_size(back_btn, lv_pct(100), 45);
-        lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
-        lv_obj_set_style_bg_color(back_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_color(back_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);
-        lv_obj_set_style_border_color(back_btn, COLOR_MATERIAL_BLUE, 0);
-        lv_obj_set_style_border_width(back_btn, 3, 0);
+        lv_obj_set_size(back_btn, 120, 55);
+        lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+        lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(back_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(back_btn, 0, 0);
+        lv_obj_set_style_radius(back_btn, 10, 0);
+        lv_obj_set_style_shadow_width(back_btn, 6, 0);
+        lv_obj_set_style_shadow_color(back_btn, lv_color_make(0, 0, 0), 0);
+        lv_obj_set_style_shadow_opa(back_btn, LV_OPA_40, 0);
+        lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        
+        lv_obj_t *back_icon = lv_label_create(back_btn);
+        lv_label_set_text(back_icon, LV_SYMBOL_CLOSE);
+        lv_obj_set_style_text_font(back_icon, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(back_icon, lv_color_make(255, 255, 255), 0);
+        
         lv_obj_t *back_lbl = lv_label_create(back_btn);
-        lv_label_set_text(back_lbl, "Back");
-        lv_obj_set_style_text_color(back_lbl, COLOR_MATERIAL_BLUE, 0);
-        lv_obj_center(back_lbl);
+        lv_label_set_text(back_lbl, "Exit");
+        lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(back_lbl, lv_color_make(255, 255, 255), 0);
+        
         lv_obj_add_event_cb(back_btn, ble_scan_back_btn_cb, LV_EVENT_CLICKED, NULL);
         
         // Switch to BLE mode
@@ -8010,13 +8030,12 @@ static void bt_locator_tracking_task(void *pvParameters)
             break;
         }
         
-        // Scan for 10 seconds with countdown
-        for (int i = 100; i > 0 && bt_locator_tracking_active && bt_locator_ui_active; i--) {
+        // Scan for 10 seconds, updating RSSI display periodically
+        for (int i = 0; i < 100 && bt_locator_tracking_active && bt_locator_ui_active; i++) {
             vTaskDelay(pdMS_TO_TICKS(100));
             
-            // Update countdown every second (every 10 iterations)
-            if (i % 10 == 0) {
-                bt_locator_countdown = i / 10;
+            // Update UI every 500ms if device found
+            if (i % 5 == 0 && bt_tracking_found) {
                 bt_locator_needs_ui_update = true;
             }
         }
@@ -8070,7 +8089,6 @@ static void bt_locator_exit_cb(lv_event_t *e)
     bt_locator_status_label = NULL;
     bt_locator_rssi_label = NULL;
     bt_locator_mac_label = NULL;
-    bt_locator_countdown_label = NULL;
     bt_locator_exit_btn = NULL;
     bt_locator_content = NULL;
     
@@ -8134,15 +8152,21 @@ static void bt_locator_device_selected_cb(lv_event_t *e)
         lv_label_set_text(bt_locator_mac_label, mac_text);
         lv_obj_clear_flag(bt_locator_mac_label, LV_OBJ_FLAG_HIDDEN);
     }
-    if (bt_locator_countdown_label) {
-        lv_label_set_text(bt_locator_countdown_label, "10");
-        lv_obj_clear_flag(bt_locator_countdown_label, LV_OBJ_FLAG_HIDDEN);
+    
+    // Hide status label and header when tracking
+    if (bt_locator_status_label) {
+        lv_obj_add_flag(bt_locator_status_label, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (bt_locator_content) {
+        lv_obj_t *header = (lv_obj_t *)lv_obj_get_user_data(bt_locator_content);
+        if (header) {
+            lv_obj_add_flag(header, LV_OBJ_FLAG_HIDDEN);
+        }
     }
     
     // Start tracking task
     bt_locator_tracking_active = true;
     bt_tracking_mode = true;
-    bt_locator_countdown = 10;
     
     BaseType_t task_ret = xTaskCreate(
         bt_locator_tracking_task,
@@ -8172,13 +8196,6 @@ static void bt_locator_update_list(void)
     // Clear existing items
     lv_obj_clean(bt_locator_list);
     
-    // Add header label
-    lv_obj_t *header = lv_label_create(bt_locator_list);
-    lv_label_set_text(header, "Select BT Target:");
-    lv_obj_set_style_text_color(header, lv_color_make(255, 255, 255), 0);
-    lv_obj_set_style_text_font(header, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_pad_bottom(header, 5, 0);
-    
     for (int i = 0; i < bt_device_count; i++) {
         bt_device_info_t *dev = &bt_devices[i];
         char addr_str[18];
@@ -8196,11 +8213,11 @@ static void bt_locator_update_list(void)
                      dev->rssi, addr_str);
         }
         
-        // Create a clickable button for each device
+        // Create a clickable button for each device (subtle pressed color to avoid scroll highlight)
         lv_obj_t *btn = lv_btn_create(bt_locator_list);
         lv_obj_set_size(btn, lv_pct(100), 32);
         lv_obj_set_style_bg_color(btn, lv_color_make(30, 30, 30), LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_color(btn, COLOR_MATERIAL_BLUE, LV_STATE_PRESSED);
+        lv_obj_set_style_bg_color(btn, lv_color_make(50, 50, 50), LV_STATE_PRESSED);  // Subtle gray on press
         lv_obj_set_style_border_color(btn, COLOR_MATERIAL_BLUE, 0);
         lv_obj_set_style_border_width(btn, 1, 0);
         lv_obj_set_style_radius(btn, 4, 0);
