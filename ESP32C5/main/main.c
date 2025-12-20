@@ -402,6 +402,28 @@ static lv_obj_t *airtag_scan_stats_label1 = NULL;  // Air Tags: X  Smart Tags: X
 static lv_obj_t *airtag_scan_stats_label2 = NULL;  // Other BT Devices: X
 static lv_obj_t *airtag_scan_stats_label3 = NULL;  // Total BT devices: X
 static volatile bool airtag_scan_ui_active = false;
+
+// BT Locator UI state
+static lv_obj_t *bt_locator_content = NULL;
+static lv_obj_t *bt_locator_list = NULL;
+static lv_obj_t *bt_locator_status_label = NULL;
+static lv_obj_t *bt_locator_rssi_label = NULL;
+static lv_obj_t *bt_locator_mac_label = NULL;
+static lv_obj_t *bt_locator_countdown_label = NULL;
+static lv_obj_t *bt_locator_exit_btn = NULL;
+static volatile bool bt_locator_ui_active = false;
+static volatile bool bt_locator_tracking_active = false;
+static volatile bool bt_locator_needs_ui_update = false;
+static volatile int bt_locator_countdown = 10;
+static char bt_locator_status_text[48] = "";
+
+// BT tracking mode support (for BT Locator)
+static bool bt_tracking_mode = false;
+static uint8_t bt_tracking_mac[6] = {0};
+static volatile int8_t bt_tracking_rssi = 0;
+static volatile bool bt_tracking_found = false;
+static char bt_tracking_name[32] = "";
+static TaskHandle_t bt_locator_task_handle = NULL;
 static volatile bool airtag_scan_update_flag = false;
 // Snapshot values for UI (copied before reset)
 static volatile int airtag_scan_snapshot_airtag = 0;
@@ -521,6 +543,13 @@ static void reset_function_page_children(void) {
     airtag_scan_stats_label1 = NULL;
     airtag_scan_stats_label2 = NULL;
     airtag_scan_stats_label3 = NULL;
+    bt_locator_content = NULL;
+    bt_locator_list = NULL;
+    bt_locator_status_label = NULL;
+    bt_locator_rssi_label = NULL;
+    bt_locator_mac_label = NULL;
+    bt_locator_countdown_label = NULL;
+    bt_locator_exit_btn = NULL;
 }
 
 static void create_function_page_base(const char *name);
@@ -619,6 +648,13 @@ static const char* deauth_monitor_find_ssid_by_bssid(const uint8_t *bssid);
 static void show_airtag_scan_screen(void);
 static void airtag_scan_exit_cb(lv_event_t *e);
 static void airtag_scan_task(void *pvParameters);
+
+// BT Locator functions
+static void show_bt_locator_screen(void);
+static void bt_locator_device_selected_cb(lv_event_t *e);
+static void bt_locator_exit_cb(lv_event_t *e);
+static void bt_locator_tracking_task(void *pvParameters);
+static void bt_locator_update_list(void);
 
 static void wifi_scan_done_cb(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
@@ -2513,6 +2549,47 @@ void app_main(void)
                 
                 // Update device list
                 ble_scan_update_list();
+            }
+
+            // BT Locator UI update (thread-safe - only update from LVGL task)
+            if (bt_locator_needs_ui_update && bt_locator_ui_active) {
+                bt_locator_needs_ui_update = false;
+                
+                if (bt_locator_tracking_active) {
+                    // Tracking mode - update countdown and RSSI
+                    if (bt_locator_countdown_label) {
+                        char countdown_text[8];
+                        snprintf(countdown_text, sizeof(countdown_text), "%d", bt_locator_countdown);
+                        lv_label_set_text(bt_locator_countdown_label, countdown_text);
+                    }
+                    if (bt_locator_rssi_label) {
+                        if (bt_tracking_found) {
+                            char rssi_text[32];
+                            snprintf(rssi_text, sizeof(rssi_text), "RSSI: %d", bt_tracking_rssi);
+                            lv_label_set_text(bt_locator_rssi_label, rssi_text);
+                        } else if (bt_locator_countdown == 0) {
+                            // Only show "not found" after full scan cycle
+                            lv_label_set_text(bt_locator_rssi_label, "Not found");
+                        }
+                    }
+                    if (bt_locator_status_label) {
+                        lv_label_set_text(bt_locator_status_label, bt_locator_status_text);
+                    }
+                } else {
+                    // Scanning mode - update status and show list when done
+                    if (bt_locator_status_label) {
+                        snprintf(bt_locator_status_text, sizeof(bt_locator_status_text),
+                                 "BT scanning... %d devices", bt_device_count);
+                        lv_label_set_text(bt_locator_status_label, bt_locator_status_text);
+                    }
+                    
+                    // If scan finished, show the list
+                    if (ble_scan_finished && bt_locator_list) {
+                        lv_label_set_text(bt_locator_status_label, "");
+                        lv_obj_clear_flag(bt_locator_list, LV_OBJ_FLAG_HIDDEN);
+                        bt_locator_update_list();
+                    }
+                }
             }
 
             // Deauth Monitor UI update
@@ -5951,6 +6028,115 @@ static void show_bluetooth_screen(void)
     lv_obj_add_event_cb(locator_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Locator");
 }
 
+// BT Locator screen - scan BT devices, select one, then track RSSI every 10s
+static void show_bt_locator_screen(void)
+{
+    ui_locked = true;
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+    
+    // Create base page with title "Bluetooth Locator"
+    create_function_page_base("Bluetooth Locator");
+    bt_locator_ui_active = true;
+    bt_locator_tracking_active = false;
+    bt_tracking_mode = false;
+    
+    // Content container
+    bt_locator_content = lv_obj_create(function_page);
+    lv_obj_set_size(bt_locator_content, lv_pct(100), LCD_V_RES - 30 - 50);  // Leave space for title and exit btn
+    lv_obj_align(bt_locator_content, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_opa(bt_locator_content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(bt_locator_content, 0, 0);
+    lv_obj_set_style_pad_all(bt_locator_content, 5, 0);
+    lv_obj_clear_flag(bt_locator_content, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Status label at top - "BT scanning..."
+    bt_locator_status_label = lv_label_create(bt_locator_content);
+    lv_label_set_text(bt_locator_status_label, "BT scanning...");
+    lv_obj_set_style_text_color(bt_locator_status_label, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_text_font(bt_locator_status_label, &lv_font_montserrat_16, 0);
+    lv_obj_align(bt_locator_status_label, LV_ALIGN_TOP_LEFT, 5, 5);
+    
+    // Scrollable list for devices (hidden until scan complete)
+    bt_locator_list = lv_obj_create(bt_locator_content);
+    lv_obj_set_size(bt_locator_list, lv_pct(100), LCD_V_RES - 30 - 50 - 35);
+    lv_obj_align(bt_locator_list, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_color(bt_locator_list, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_border_color(bt_locator_list, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_border_width(bt_locator_list, 1, 0);
+    lv_obj_set_flex_flow(bt_locator_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(bt_locator_list, 4, 0);
+    lv_obj_set_style_pad_gap(bt_locator_list, 4, 0);
+    lv_obj_set_scrollbar_mode(bt_locator_list, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_add_flag(bt_locator_list, LV_OBJ_FLAG_HIDDEN);  // Hidden until scan done
+    
+    // RSSI label (hidden until device selected) - large centered
+    bt_locator_rssi_label = lv_label_create(bt_locator_content);
+    lv_label_set_text(bt_locator_rssi_label, "RSSI: ---");
+    lv_obj_set_style_text_color(bt_locator_rssi_label, lv_color_make(0, 255, 0), 0);  // Green
+    lv_obj_set_style_text_font(bt_locator_rssi_label, &lv_font_montserrat_20, 0);
+    lv_obj_align(bt_locator_rssi_label, LV_ALIGN_CENTER, 0, -30);
+    lv_obj_add_flag(bt_locator_rssi_label, LV_OBJ_FLAG_HIDDEN);
+    
+    // MAC label (hidden until device selected)
+    bt_locator_mac_label = lv_label_create(bt_locator_content);
+    lv_label_set_text(bt_locator_mac_label, "Device: --:--:--:--:--:--");
+    lv_obj_set_style_text_color(bt_locator_mac_label, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_text_font(bt_locator_mac_label, &lv_font_montserrat_16, 0);
+    lv_obj_align(bt_locator_mac_label, LV_ALIGN_CENTER, 0, 20);
+    lv_obj_add_flag(bt_locator_mac_label, LV_OBJ_FLAG_HIDDEN);
+    
+    // Countdown label on the right (hidden until tracking)
+    bt_locator_countdown_label = lv_label_create(bt_locator_content);
+    lv_label_set_text(bt_locator_countdown_label, "10");
+    lv_obj_set_style_text_color(bt_locator_countdown_label, lv_color_make(100, 200, 255), 0);  // Light blue
+    lv_obj_set_style_text_font(bt_locator_countdown_label, &lv_font_montserrat_20, 0);
+    lv_obj_align(bt_locator_countdown_label, LV_ALIGN_RIGHT_MID, -15, 0);
+    lv_obj_add_flag(bt_locator_countdown_label, LV_OBJ_FLAG_HIDDEN);
+    
+    // Exit button at bottom
+    bt_locator_exit_btn = lv_btn_create(function_page);
+    lv_obj_set_size(bt_locator_exit_btn, lv_pct(100), 45);
+    lv_obj_align(bt_locator_exit_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(bt_locator_exit_btn, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(bt_locator_exit_btn, COLOR_DARK_BLUE, LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(bt_locator_exit_btn, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_border_width(bt_locator_exit_btn, 3, 0);
+    lv_obj_t *exit_lbl = lv_label_create(bt_locator_exit_btn);
+    lv_label_set_text(exit_lbl, "Exit");
+    lv_obj_set_style_text_color(exit_lbl, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_center(exit_lbl);
+    lv_obj_add_event_cb(bt_locator_exit_btn, bt_locator_exit_cb, LV_EVENT_CLICKED, NULL);
+    
+    // Switch to BLE mode
+    if (!ensure_ble_mode()) {
+        lv_label_set_text(bt_locator_status_label, "BLE init failed!");
+        ui_locked = false;
+        return;
+    }
+    
+    // Start BLE scan task
+    bt_scan_active = true;
+    BaseType_t task_ret = xTaskCreate(
+        bt_scan_task,
+        "bt_scan_task",
+        4096,
+        NULL,
+        5,
+        &bt_scan_task_handle
+    );
+    
+    if (task_ret != pdPASS) {
+        bt_scan_active = false;
+        lv_label_set_text(bt_locator_status_label, "Failed to start scan!");
+    } else {
+        snprintf(bt_locator_status_text, sizeof(bt_locator_status_text), "BT scanning... 0 devices (10s)");
+        lv_label_set_text(bt_locator_status_label, bt_locator_status_text);
+    }
+    
+    ui_locked = false;
+}
+
 // Stub screen for not-yet-implemented features
 static void show_stub_screen(const char *name)
 {
@@ -7035,10 +7221,15 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
 
+    // BT Locator
+    if (strcmp(attack_name, "BT Locator") == 0) {
+        show_bt_locator_screen();
+        return;
+    }
+
     // Stub screens for not-yet-implemented features
     if (strcmp(attack_name, "Package Monitor") == 0 ||
-        strcmp(attack_name, "Channel View") == 0 ||
-        strcmp(attack_name, "BT Locator") == 0) {
+        strcmp(attack_name, "Channel View") == 0) {
         show_stub_screen(attack_name);
         return;
     }
@@ -7529,6 +7720,15 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
     
     struct ble_gap_disc_desc *desc = &event->disc;
     
+    // MAC tracking mode - update RSSI for tracked device (BT Locator)
+    if (bt_tracking_mode) {
+        if (memcmp(desc->addr.val, bt_tracking_mac, 6) == 0) {
+            bt_tracking_rssi = desc->rssi;
+            bt_tracking_found = true;
+        }
+        return 0;
+    }
+    
     // Parse advertising data
     struct ble_hs_adv_fields fields;
     int rc = ble_hs_adv_parse_fields(&fields, desc->data, desc->length_data);
@@ -7789,6 +7989,235 @@ static void ble_scan_update_list(void)
 }
 
 /**
+ * BT Locator tracking task - scan for specific device every 10 seconds
+ */
+static void bt_locator_tracking_task(void *pvParameters)
+{
+    (void)pvParameters;
+    
+    char mac_str[18];
+    bt_format_addr(bt_tracking_mac, mac_str);
+    ESP_LOGI(TAG, "BT Locator tracking %s (10s intervals)...", mac_str);
+    
+    while (bt_locator_tracking_active && bt_locator_ui_active) {
+        // Reset tracking state for this scan cycle
+        bt_tracking_found = false;
+        bt_tracking_rssi = 0;
+        
+        int rc = bt_start_scan();
+        if (rc != 0) {
+            ESP_LOGE(TAG, "BT Locator scan start failed: %d", rc);
+            break;
+        }
+        
+        // Scan for 10 seconds with countdown
+        for (int i = 100; i > 0 && bt_locator_tracking_active && bt_locator_ui_active; i--) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            
+            // Update countdown every second (every 10 iterations)
+            if (i % 10 == 0) {
+                bt_locator_countdown = i / 10;
+                bt_locator_needs_ui_update = true;
+            }
+        }
+        
+        bt_stop_scan();
+        
+        if (!bt_locator_tracking_active || !bt_locator_ui_active) {
+            break;
+        }
+        
+        // Update RSSI display
+        if (bt_tracking_found) {
+            snprintf(bt_locator_status_text, sizeof(bt_locator_status_text), 
+                     "RSSI: %d", bt_tracking_rssi);
+        } else {
+            snprintf(bt_locator_status_text, sizeof(bt_locator_status_text), 
+                     "Device not found");
+        }
+        bt_locator_needs_ui_update = true;
+    }
+    
+    bt_tracking_mode = false;
+    bt_locator_tracking_active = false;
+    bt_locator_task_handle = NULL;
+    ESP_LOGI(TAG, "BT Locator tracking stopped.");
+    vTaskDelete(NULL);
+}
+
+/**
+ * BT Locator exit callback - cleanup and return to menu
+ */
+static void bt_locator_exit_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    // Stop tracking if running
+    bt_locator_tracking_active = false;
+    bt_tracking_mode = false;
+    
+    // Stop scan if running
+    if (bt_scan_active && bt_scan_task_handle != NULL) {
+        bt_scan_active = false;
+    }
+    
+    // Wait for tasks to stop
+    vTaskDelay(pdMS_TO_TICKS(300));
+    
+    // Clean up UI
+    bt_locator_ui_active = false;
+    bt_locator_list = NULL;
+    bt_locator_status_label = NULL;
+    bt_locator_rssi_label = NULL;
+    bt_locator_mac_label = NULL;
+    bt_locator_countdown_label = NULL;
+    bt_locator_exit_btn = NULL;
+    bt_locator_content = NULL;
+    
+    // Switch back to WiFi mode
+    if (current_radio_mode == RADIO_MODE_BLE) {
+        bt_nimble_deinit();
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+    
+    // Return to menu
+    nav_to_menu_flag = true;
+}
+
+/**
+ * BT Locator device selected callback - start tracking selected device
+ */
+static void bt_locator_device_selected_cb(lv_event_t *e)
+{
+    int dev_idx = (int)(intptr_t)lv_event_get_user_data(e);
+    
+    if (dev_idx < 0 || dev_idx >= bt_device_count) return;
+    
+    bt_device_info_t *dev = &bt_devices[dev_idx];
+    
+    // Copy MAC address for tracking
+    memcpy(bt_tracking_mac, dev->addr, 6);
+    bt_tracking_rssi = dev->rssi;
+    bt_tracking_found = false;
+    bt_tracking_name[0] = '\0';
+    if (dev->name[0] != '\0') {
+        strncpy(bt_tracking_name, dev->name, sizeof(bt_tracking_name) - 1);
+        bt_tracking_name[sizeof(bt_tracking_name) - 1] = '\0';
+    }
+    
+    // Stop current scan if running
+    if (bt_scan_active && bt_scan_task_handle != NULL) {
+        bt_scan_active = false;
+        vTaskDelay(pdMS_TO_TICKS(200));  // Wait for scan to stop
+    }
+    
+    // Hide list, show tracking UI
+    if (bt_locator_list) {
+        lv_obj_add_flag(bt_locator_list, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (bt_locator_status_label) {
+        lv_label_set_text(bt_locator_status_label, "Tracking device...");
+    }
+    
+    // Show RSSI and MAC labels
+    if (bt_locator_rssi_label) {
+        char rssi_text[32];
+        snprintf(rssi_text, sizeof(rssi_text), "RSSI: %d", bt_tracking_rssi);
+        lv_label_set_text(bt_locator_rssi_label, rssi_text);
+        lv_obj_clear_flag(bt_locator_rssi_label, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (bt_locator_mac_label) {
+        char mac_text[48];
+        char addr_str[18];
+        bt_format_addr(bt_tracking_mac, addr_str);
+        snprintf(mac_text, sizeof(mac_text), "Device: %s", addr_str);
+        lv_label_set_text(bt_locator_mac_label, mac_text);
+        lv_obj_clear_flag(bt_locator_mac_label, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (bt_locator_countdown_label) {
+        lv_label_set_text(bt_locator_countdown_label, "10");
+        lv_obj_clear_flag(bt_locator_countdown_label, LV_OBJ_FLAG_HIDDEN);
+    }
+    
+    // Start tracking task
+    bt_locator_tracking_active = true;
+    bt_tracking_mode = true;
+    bt_locator_countdown = 10;
+    
+    BaseType_t task_ret = xTaskCreate(
+        bt_locator_tracking_task,
+        "bt_locator_task",
+        4096,
+        NULL,
+        5,
+        &bt_locator_task_handle
+    );
+    
+    if (task_ret != pdPASS) {
+        bt_locator_tracking_active = false;
+        bt_tracking_mode = false;
+        if (bt_locator_status_label) {
+            lv_label_set_text(bt_locator_status_label, "Failed to start tracking!");
+        }
+    }
+}
+
+/**
+ * Update BT Locator list UI with clickable device items
+ */
+static void bt_locator_update_list(void)
+{
+    if (!bt_locator_list) return;
+    
+    // Clear existing items
+    lv_obj_clean(bt_locator_list);
+    
+    // Add header label
+    lv_obj_t *header = lv_label_create(bt_locator_list);
+    lv_label_set_text(header, "Select BT Target:");
+    lv_obj_set_style_text_color(header, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_text_font(header, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_pad_bottom(header, 5, 0);
+    
+    for (int i = 0; i < bt_device_count; i++) {
+        bt_device_info_t *dev = &bt_devices[i];
+        char addr_str[18];
+        bt_format_addr(dev->addr, addr_str);
+        
+        char item_text[80];
+        if (dev->name[0] != '\0') {
+            char short_name[16];
+            strncpy(short_name, dev->name, 15);
+            short_name[15] = '\0';
+            snprintf(item_text, sizeof(item_text), "%d dBm  %s  %s", 
+                     dev->rssi, short_name, addr_str);
+        } else {
+            snprintf(item_text, sizeof(item_text), "%d dBm  %s", 
+                     dev->rssi, addr_str);
+        }
+        
+        // Create a clickable button for each device
+        lv_obj_t *btn = lv_btn_create(bt_locator_list);
+        lv_obj_set_size(btn, lv_pct(100), 32);
+        lv_obj_set_style_bg_color(btn, lv_color_make(30, 30, 30), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(btn, COLOR_MATERIAL_BLUE, LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(btn, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_border_width(btn, 1, 0);
+        lv_obj_set_style_radius(btn, 4, 0);
+        
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, item_text);
+        lv_obj_set_style_text_color(lbl, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 5, 0);
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
+        
+        // Store device index as user data
+        lv_obj_add_event_cb(btn, bt_locator_device_selected_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+    }
+}
+
+/**
  * BLE scan task - runs for 10 seconds then stops
  */
 static void bt_scan_task(void *pvParameters)
@@ -7807,6 +8236,7 @@ static void bt_scan_task(void *pvParameters)
         // Set status for UI update (thread-safe)
         snprintf(ble_scan_status_text, sizeof(ble_scan_status_text), "Scan failed!");
         ble_scan_needs_ui_update = true;
+        bt_locator_needs_ui_update = true;  // Also update BT Locator if active
         
         vTaskDelete(NULL);
         return;
@@ -7821,6 +8251,7 @@ static void bt_scan_task(void *pvParameters)
             snprintf(ble_scan_status_text, sizeof(ble_scan_status_text), 
                      "Scanning... %d (%ds)", bt_device_count, (100 - i) / 10);
             ble_scan_needs_ui_update = true;
+            bt_locator_needs_ui_update = true;  // Also update BT Locator if active
         }
     }
     
@@ -7832,6 +8263,7 @@ static void bt_scan_task(void *pvParameters)
              "%d devices (%d AT, %d ST)", bt_device_count, bt_airtag_count, bt_smarttag_count);
     ble_scan_finished = true;
     ble_scan_needs_ui_update = true;
+    bt_locator_needs_ui_update = true;  // Also update BT Locator if active
     
     ESP_LOGI(TAG, "BLE scan complete: %d devices found", bt_device_count);
     
