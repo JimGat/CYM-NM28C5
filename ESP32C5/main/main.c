@@ -137,6 +137,7 @@ static int bt_device_count = 0;
 #define COLOR_MATERIAL_TEAL     lv_color_make(0, 150, 136)     // #009688 - teal
 #define COLOR_MATERIAL_PINK     lv_color_make(233, 30, 99)     // #E91E63 - pink
 #define COLOR_DARK_BLUE         lv_color_make(15, 60, 100)     // Dark blue for pressed states
+#define COLOR_LABEL_DEFAULT     lv_color_white()               // Default label text color (contrasts blue inputs)
 
 typedef int (*vprintf_like_t)(const char *, va_list);
 
@@ -5093,7 +5094,7 @@ static void show_karma_page(void)
     lv_obj_t *probe_label = lv_label_create(karma_content);
     lv_label_set_text(probe_label, "Probe Request SSID:");
     lv_obj_set_style_text_font(probe_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(probe_label, COLOR_MATERIAL_BLUE, 0);  // Green text
+    lv_obj_set_style_text_color(probe_label, COLOR_LABEL_DEFAULT, 0);  // White text for contrast
 
     karma_probe_dd = lv_dropdown_create(karma_content);
     lv_obj_set_width(karma_probe_dd, lv_pct(100));
@@ -5175,7 +5176,7 @@ static void show_karma_page(void)
     lv_obj_t *html_label = lv_label_create(karma_content);
     lv_label_set_text(html_label, "HTML Portal");
     lv_obj_set_style_text_font(html_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(html_label, COLOR_MATERIAL_BLUE, 0);  // Green text
+    lv_obj_set_style_text_color(html_label, COLOR_LABEL_DEFAULT, 0);  // White text for contrast
 
     karma_html_dd = lv_dropdown_create(karma_content);
     lv_obj_set_width(karma_html_dd, lv_pct(100));
@@ -5518,7 +5519,7 @@ static void show_portal_page(void)
     lv_obj_t *ssid_label = lv_label_create(portal_content);
     lv_label_set_text(ssid_label, "Portal SSID:");
     lv_obj_set_style_text_font(ssid_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(ssid_label, COLOR_MATERIAL_BLUE, 0);  // Green text
+    lv_obj_set_style_text_color(ssid_label, COLOR_LABEL_DEFAULT, 0);  // White text for contrast
 
     portal_ssid_ta = lv_textarea_create(portal_content);
     lv_obj_set_width(portal_ssid_ta, lv_pct(100));
@@ -5558,7 +5559,7 @@ static void show_portal_page(void)
     lv_obj_t *html_label = lv_label_create(portal_content);
     lv_label_set_text(html_label, "HTML Portal");
     lv_obj_set_style_text_font(html_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(html_label, COLOR_MATERIAL_BLUE, 0);  // Green text
+    lv_obj_set_style_text_color(html_label, COLOR_LABEL_DEFAULT, 0);  // White text for contrast
 
     portal_html_dd = lv_dropdown_create(portal_content);
     lv_obj_set_width(portal_html_dd, lv_pct(100));
@@ -6774,7 +6775,7 @@ static void show_evil_twin_page(void)
     lv_obj_t *net_label = lv_label_create(evil_twin_content);
     lv_label_set_text(net_label, "Evil Twin name:");
     lv_obj_set_style_text_font(net_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(net_label, COLOR_MATERIAL_BLUE, 0);  // Green text
+    lv_obj_set_style_text_color(net_label, COLOR_LABEL_DEFAULT, 0);  // White text for contrast
 
     evil_twin_network_dd = lv_dropdown_create(evil_twin_content);
     lv_obj_set_width(evil_twin_network_dd, lv_pct(100));
@@ -6852,7 +6853,7 @@ static void show_evil_twin_page(void)
     lv_obj_t *html_label = lv_label_create(evil_twin_content);
     lv_label_set_text(html_label, "HTML Portal");
     lv_obj_set_style_text_font(html_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(html_label, COLOR_MATERIAL_BLUE, 0);  // Green text
+    lv_obj_set_style_text_color(html_label, COLOR_LABEL_DEFAULT, 0);  // White text for contrast
 
     evil_twin_html_dd = lv_dropdown_create(evil_twin_content);
     lv_obj_set_width(evil_twin_html_dd, lv_pct(100));
