@@ -4455,10 +4455,8 @@ static void handshake_yes_btn_cb(lv_event_t *e)
     handshake_ui_active = true;
     scan_done_ui_flag = false;
     
-    // Delete the warning page content
-    if (function_page) {
-        lv_obj_clean(function_page);
-    }
+    // Recreate function page with proper title bar (home + screenshot buttons)
+    create_function_page_base("Handshake Attack");
     
     // Create scrollable content container (like Evil Twin)
     lv_obj_t *content = lv_obj_create(function_page);
