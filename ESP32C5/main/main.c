@@ -159,8 +159,17 @@ static lv_obj_t *title_bar;
 static lv_obj_t *function_page = NULL;
 static lv_obj_t *screenshot_btn = NULL;
 static lv_obj_t *main_screenshot_btn = NULL;  // Screenshot button on main screen
+static QueueHandle_t screenshot_queue = NULL;
+static TaskHandle_t screenshot_task_handle = NULL;
+static StaticTask_t screenshot_task_buffer;
+static StackType_t *screenshot_task_stack = NULL;
+static volatile bool screenshot_in_progress = false;
 
 #define SCREENSHOT_DIR "/sdcard/screenshots"
+
+typedef struct {
+    lv_img_dsc_t *shot;
+} screenshot_msg_t;
 
 // Use GPS definitions from wifi_common.h via wifi_cli.h
 static gps_data_t current_gps = {0};
@@ -526,6 +535,9 @@ static void home_btn_event_cb(lv_event_t *e);
 static void wifi_scan_next_btn_cb(lv_event_t *e);
 static void deauth_quit_event_cb(lv_event_t *e);
 static void deauth_rescan_timer_stop(void);
+static void set_screenshot_buttons_disabled(bool disabled);
+static void screenshot_finish_ui_cb(void *user_data);
+static void screenshot_save_task(void *arg);
 
 // Reset all child pointers when function_page is deleted
 static void reset_function_page_children(void) {
@@ -1821,6 +1833,34 @@ void app_main(void)
         return;
     }
 
+    // Screenshot worker (queue + background saver task)
+    screenshot_queue = xQueueCreate(1, sizeof(screenshot_msg_t));
+    if (screenshot_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create screenshot queue!");
+        return;
+    }
+
+    screenshot_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    if (screenshot_task_stack != NULL) {
+        screenshot_task_handle = xTaskCreateStatic(
+            screenshot_save_task,
+            "shot_save",
+            4096,
+            NULL,
+            tskIDLE_PRIORITY + 2,
+            screenshot_task_stack,
+            &screenshot_task_buffer);
+        if (screenshot_task_handle == NULL) {
+            ESP_LOGE(TAG, "Failed to create screenshot save task");
+            heap_caps_free(screenshot_task_stack);
+            screenshot_task_stack = NULL;
+            return;
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to allocate screenshot task stack");
+        return;
+    }
+
     // For 32-bit color depth, we need to reduce buffer size due to memory constraints
     // 15 lines * 480 pixels * 4 bytes = 28.8 KB per buffer (vs 28.8 KB for 30 lines @ 16-bit)
     const size_t buf_size = LCD_H_RES * 15 * sizeof(lv_color_t);
@@ -2966,16 +3006,22 @@ void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_
     
     // CRITICAL: Take SD/SPI mutex before drawing to display
     // Display and SD card share the same SPI bus (SPI2_HOST)
-    // Without mutex protection, simultaneous access causes crash: "assert failed: spi_hal_setup_trans"
-    // Use short timeout (100ms) - if SD is busy, LVGL will retry on next refresh cycle
+    // Avoid concurrent SPI: wait for the bus; do NOT draw without the lock
     if (sd_spi_mutex) {
-        if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
-            xSemaphoreGive(sd_spi_mutex);
-        } else {
-            // Mutex timeout - SD card operation in progress
-            // Skip this refresh, LVGL will call us again
-            ESP_LOGD(TAG, "Display refresh skipped - SD busy");
+        TickType_t start = xTaskGetTickCount();
+        bool drawn = false;
+        while (!drawn) {
+            if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
+                xSemaphoreGive(sd_spi_mutex);
+                drawn = true;
+            } else {
+                esp_task_wdt_reset();
+                if ((xTaskGetTickCount() - start) > pdMS_TO_TICKS(5000)) {
+                    ESP_LOGW(TAG, "Display refresh waiting >5s (SD busy)...");
+                    start = xTaskGetTickCount();  // keep waiting, but log periodically
+                }
+            }
         }
     } else {
         // Mutex not initialized yet (early boot) - draw without protection
@@ -3037,7 +3083,7 @@ static int find_next_screenshot_index(void)
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
         int idx = 0;
-        if (sscanf(entry->d_name, "screen_%d.png", &idx) == 1) {
+        if (sscanf(entry->d_name, "screen_%d.bmp", &idx) == 1) {
             if (idx > max_idx) max_idx = idx;
         }
     }
@@ -3114,12 +3160,80 @@ static esp_err_t save_snapshot_bmp(lv_img_dsc_t *shot, const char *filepath)
             *row++ = 0;
         }
         fwrite(row_buf, 1, row_stride, f);
-        esp_task_wdt_reset();  // Prevent watchdog timeout during long SD write
     }
 
     fclose(f);
     heap_caps_free(row_buf);
     return ESP_OK;
+}
+
+static void set_screenshot_buttons_disabled(bool disabled)
+{
+    lv_obj_t *buttons[] = { main_screenshot_btn, screenshot_btn };
+    for (size_t i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++) {
+        lv_obj_t *btn = buttons[i];
+        if (btn && lv_obj_is_valid(btn)) {
+            if (disabled) {
+                lv_obj_add_state(btn, LV_STATE_DISABLED);
+                lv_obj_add_flag(btn, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_clear_state(btn, LV_STATE_DISABLED);
+                lv_obj_clear_flag(btn, LV_OBJ_FLAG_HIDDEN);
+            }
+            lv_obj_invalidate(btn);
+        }
+    }
+    lv_obj_invalidate(lv_scr_act());
+}
+
+static void screenshot_finish_ui_cb(void *user_data)
+{
+    bool ok = ((uintptr_t)user_data) != 0;
+    screenshot_in_progress = false;
+    set_screenshot_buttons_disabled(false);
+    if (ok) {
+        ESP_LOGI(TAG, "Screenshot: saved successfully");
+    } else {
+        ESP_LOGW(TAG, "Screenshot: save failed");
+    }
+    lv_refr_now(NULL);
+}
+
+static void screenshot_save_task(void *arg)
+{
+    (void)arg;
+    screenshot_msg_t msg;
+    for (;;) {
+        if (xQueueReceive(screenshot_queue, &msg, portMAX_DELAY) == pdTRUE) {
+            esp_err_t res = ESP_FAIL;
+            char path[128] = {0};
+
+            if (msg.shot) {
+                if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, portMAX_DELAY) == pdTRUE) {
+                    esp_err_t dir_res = ensure_screenshot_dir();
+                    if (dir_res == ESP_OK) {
+                        int next_idx = find_next_screenshot_index();
+                        snprintf(path, sizeof(path), SCREENSHOT_DIR "/screen_%d.bmp", next_idx);
+                        res = save_snapshot_bmp(msg.shot, path);
+                        if (res == ESP_OK) {
+                            ESP_LOGI(TAG, "Screenshot saved: %s", path);
+                        } else {
+                            ESP_LOGW(TAG, "Screenshot failed to save (path: %s)", path);
+                        }
+                    } else {
+                        ESP_LOGW(TAG, "Screenshot: cannot ensure directory");
+                        res = dir_res;
+                    }
+                    xSemaphoreGive(sd_spi_mutex);
+                } else {
+                    ESP_LOGW(TAG, "Screenshot: SD mutex unavailable");
+                }
+                lv_snapshot_free(msg.shot);
+            }
+
+            lv_async_call(screenshot_finish_ui_cb, (void *)(uintptr_t)(res == ESP_OK));
+        }
+    }
 }
 
 static void screenshot_btn_event_cb(lv_event_t *e)
@@ -3131,40 +3245,41 @@ static void screenshot_btn_event_cb(lv_event_t *e)
         return;
     }
 
+    if (screenshot_in_progress) {
+        ESP_LOGW(TAG, "Screenshot already in progress");
+        return;
+    }
+
+    if (!screenshot_queue || !screenshot_task_handle) {
+        ESP_LOGE(TAG, "Screenshot: worker not initialized");
+        return;
+    }
+
+    set_screenshot_buttons_disabled(true);
+    lv_refr_now(NULL);
+
     // Run inside LVGL context (button callback), safe to snapshot without mutex
     lv_img_dsc_t *shot = lv_snapshot_take(lv_scr_act(), LV_IMG_CF_TRUE_COLOR);  // RGB565
     if (!shot) {
         ESP_LOGW(TAG, "Screenshot: lv_snapshot_take returned NULL");
+        set_screenshot_buttons_disabled(false);
+        lv_refr_now(NULL);
         return;
     }
 
-    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
-        ESP_LOGW(TAG, "Screenshot: SD mutex timeout");
+    screenshot_msg_t msg = {
+        .shot = shot,
+    };
+
+    if (xQueueSend(screenshot_queue, &msg, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "Screenshot: queue busy");
         lv_snapshot_free(shot);
+        set_screenshot_buttons_disabled(false);
+        lv_refr_now(NULL);
         return;
     }
 
-    esp_err_t res_dir = ensure_screenshot_dir();
-    if (res_dir != ESP_OK) {
-        ESP_LOGW(TAG, "Screenshot: cannot ensure directory");
-        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
-        lv_snapshot_free(shot);
-        return;
-    }
-
-    int next_idx = find_next_screenshot_index();
-    char path[128];
-    snprintf(path, sizeof(path), SCREENSHOT_DIR "/screen_%d.bmp", next_idx);
-
-    esp_err_t res = save_snapshot_bmp(shot, path);
-    if (res == ESP_OK) {
-        ESP_LOGI(TAG, "Screenshot saved: %s", path);
-    } else {
-        ESP_LOGW(TAG, "Screenshot failed to save");
-    }
-
-    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
-    lv_snapshot_free(shot);
+    screenshot_in_progress = true;
 }
 lv_obj_t *create_menu_item(lv_obj_t *parent, const char *icon, const char *text)
 {
