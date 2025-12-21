@@ -37,6 +37,11 @@
 // GPS
 #include "driver/uart.h"
 
+// ADC for battery voltage monitoring
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+
 // NimBLE (BLE scanner)
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -114,6 +119,13 @@ static int bt_device_count = 0;
 #define LCD_V_RES 320
 #define LCD_HOST SPI2_HOST
 
+// Battery ADC configuration
+#define BATTERY_ADC_CHANNEL    ADC_CHANNEL_0  // GPIO0 on ESP32-C5 - change if different
+#define BATTERY_ADC_UNIT       ADC_UNIT_1
+#define BATTERY_ADC_ATTEN      ADC_ATTEN_DB_12  // Full scale ~3.3V
+#define BATTERY_VOLTAGE_DIVIDER_RATIO  4.0f    // Voltage divider ratio (calibrated for Waveshare ESP32-C5)
+#define BATTERY_UPDATE_INTERVAL_MS     30000   // 30 seconds
+
 // Color definitions (used throughout the file)
 #define COLOR_MATERIAL_BLUE     lv_color_make(33, 150, 243)    // #2196F3 - default text color
 #define COLOR_MATERIAL_RED      lv_color_make(244, 67, 54)     // #F44336 - error/stop color
@@ -143,6 +155,7 @@ static lv_obj_t *touch_dot;  // DEBUG: visual touch indicator
 static lv_obj_t *title_bar;
 static lv_obj_t *function_page = NULL;
 static lv_obj_t *screenshot_btn = NULL;
+static lv_obj_t *main_screenshot_btn = NULL;  // Screenshot button on main screen
 
 #define SCREENSHOT_DIR "/sdcard/screenshots"
 
@@ -160,6 +173,11 @@ static esp_err_t init_gps_uart(void);
 static bool parse_gps_nmea(const char *nmea_sentence);
 static void gps_task(void *arg);
 static void screenshot_btn_event_cb(lv_event_t *e);
+
+// Battery voltage monitor forward declarations
+static esp_err_t init_battery_adc(void);
+static float read_battery_voltage(void);
+static void battery_monitor_task(void *arg);
 static esp_err_t save_snapshot_bmp(lv_img_dsc_t *shot, const char *filepath);
 static int find_next_screenshot_index(void);
 static esp_err_t ensure_screenshot_dir(void);
@@ -432,6 +450,14 @@ static char bt_locator_status_text[48] = "";
 
 // BT tracking mode support (for BT Locator)
 static bool bt_tracking_mode = false;
+
+// Battery voltage monitor state
+static lv_obj_t *battery_label = NULL;
+static adc_oneshot_unit_handle_t battery_adc_handle = NULL;
+static adc_cali_handle_t battery_adc_cali_handle = NULL;
+static StaticTask_t battery_task_buffer;
+static StackType_t *battery_task_stack = NULL;
+static TaskHandle_t battery_task_handle = NULL;
 static uint8_t bt_tracking_mac[6] = {0};
 static volatile int8_t bt_tracking_rssi = 0;
 static volatile bool bt_tracking_found = false;
@@ -1844,6 +1870,34 @@ void app_main(void)
     lv_obj_set_style_text_color(title_label, lv_color_make(255, 255, 255), 0);  // White text
     lv_obj_center(title_label);
     
+    // Screenshot button on main screen - left side
+    main_screenshot_btn = lv_btn_create(title_bar);
+    lv_obj_set_size(main_screenshot_btn, 28, 28);
+    lv_obj_align(main_screenshot_btn, LV_ALIGN_LEFT_MID, 2, 0);
+    lv_obj_set_style_bg_color(main_screenshot_btn, lv_color_make(33, 150, 243), 0);  // Material Blue
+    lv_obj_set_style_bg_color(main_screenshot_btn, lv_color_make(66, 165, 245), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(main_screenshot_btn, 5, 0);
+    lv_obj_set_style_shadow_width(main_screenshot_btn, 4, 0);
+    lv_obj_set_style_shadow_color(main_screenshot_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(main_screenshot_btn, LV_OPA_30, 0);
+    lv_obj_add_event_cb(main_screenshot_btn, screenshot_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    // Hide if SD not mounted
+    if (!wifi_wardrive_is_sd_mounted()) {
+        lv_obj_add_flag(main_screenshot_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+    
+    lv_obj_t *main_shot_icon = lv_label_create(main_screenshot_btn);
+    lv_label_set_text(main_shot_icon, LV_SYMBOL_IMAGE);
+    lv_obj_set_style_text_color(main_shot_icon, lv_color_make(255, 255, 255), 0);
+    lv_obj_center(main_shot_icon);
+    
+    // Battery voltage label - right side of title bar
+    battery_label = lv_label_create(title_bar);
+    lv_label_set_text(battery_label, "-.--V");
+    lv_obj_set_style_text_color(battery_label, lv_color_make(180, 180, 180), 0);  // Light gray
+    lv_obj_set_style_text_font(battery_label, &lv_font_montserrat_12, 0);  // Smaller font
+    lv_obj_align(battery_label, LV_ALIGN_RIGHT_MID, -8, 0);
+    
     // Create tile-based main menu
     show_main_tiles();
     
@@ -1896,6 +1950,27 @@ void app_main(void)
     ESP_LOGI(TAG, "[DIAG] System ready - final memory state");
     check_heap_integrity("Before main loop");
     print_memory_stats();
+    
+    // Initialize battery voltage monitor
+    if (init_battery_adc() == ESP_OK) {
+        // Allocate battery task stack from PSRAM
+        battery_task_stack = (StackType_t *)heap_caps_malloc(2048 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+        if (battery_task_stack != NULL) {
+            battery_task_handle = xTaskCreateStatic(battery_monitor_task, "bat_mon", 2048, NULL,
+                tskIDLE_PRIORITY + 1, battery_task_stack, &battery_task_buffer);
+            if (battery_task_handle == NULL) {
+                ESP_LOGE(TAG, "Failed to create battery monitor task");
+                heap_caps_free(battery_task_stack);
+                battery_task_stack = NULL;
+            } else {
+                ESP_LOGI(TAG, "Battery monitor task running (PSRAM stack, 30s refresh)");
+            }
+        } else {
+            ESP_LOGE(TAG, "Failed to allocate battery task stack from PSRAM");
+        }
+    } else {
+        ESP_LOGW(TAG, "Battery ADC init failed - voltage monitor disabled");
+    }
 
     // Subscribe main task to watchdog to prevent IDLE task starvation during LVGL rendering
     esp_task_wdt_add(NULL);
@@ -7736,6 +7811,112 @@ static void gps_task(void *arg)
 		}
 		vTaskDelay(pdMS_TO_TICKS(100));
 	}
+}
+
+// === BATTERY VOLTAGE MONITOR IMPLEMENTATION ===
+
+static esp_err_t init_battery_adc(void)
+{
+    // Configure ADC unit
+    adc_oneshot_unit_init_cfg_t init_cfg = {
+        .unit_id = BATTERY_ADC_UNIT,
+        .ulp_mode = ADC_ULP_MODE_DISABLE,
+    };
+    
+    esp_err_t ret = adc_oneshot_new_unit(&init_cfg, &battery_adc_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create ADC unit: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    // Configure ADC channel
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten = BATTERY_ADC_ATTEN,
+        .bitwidth = ADC_BITWIDTH_12,
+    };
+    
+    ret = adc_oneshot_config_channel(battery_adc_handle, BATTERY_ADC_CHANNEL, &chan_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure ADC channel: %s", esp_err_to_name(ret));
+        adc_oneshot_del_unit(battery_adc_handle);
+        battery_adc_handle = NULL;
+        return ret;
+    }
+    
+    // Try to create calibration handle for more accurate readings
+    adc_cali_curve_fitting_config_t cali_cfg = {
+        .unit_id = BATTERY_ADC_UNIT,
+        .chan = BATTERY_ADC_CHANNEL,
+        .atten = BATTERY_ADC_ATTEN,
+        .bitwidth = ADC_BITWIDTH_12,
+    };
+    
+    ret = adc_cali_create_scheme_curve_fitting(&cali_cfg, &battery_adc_cali_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "ADC calibration not available, using raw values");
+        battery_adc_cali_handle = NULL;
+    } else {
+        ESP_LOGI(TAG, "ADC calibration enabled");
+    }
+    
+    ESP_LOGI(TAG, "Battery ADC initialized on channel %d", BATTERY_ADC_CHANNEL);
+    return ESP_OK;
+}
+
+static float read_battery_voltage(void)
+{
+    if (battery_adc_handle == NULL) {
+        return 0.0f;
+    }
+    
+    int raw_value = 0;
+    esp_err_t ret = adc_oneshot_read(battery_adc_handle, BATTERY_ADC_CHANNEL, &raw_value);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ADC read failed: %s", esp_err_to_name(ret));
+        return 0.0f;
+    }
+    
+    float voltage_mv;
+    if (battery_adc_cali_handle != NULL) {
+        // Use calibrated value
+        int calibrated_mv = 0;
+        adc_cali_raw_to_voltage(battery_adc_cali_handle, raw_value, &calibrated_mv);
+        voltage_mv = (float)calibrated_mv;
+    } else {
+        // Fallback: raw to voltage approximation (12-bit ADC, ~3.3V reference)
+        voltage_mv = (raw_value / 4095.0f) * 3300.0f;
+    }
+    
+    // Apply voltage divider ratio to get actual battery voltage
+    float battery_voltage = (voltage_mv / 1000.0f) * BATTERY_VOLTAGE_DIVIDER_RATIO;
+    
+    return battery_voltage;
+}
+
+static void battery_monitor_task(void *arg)
+{
+    (void)arg;
+    char voltage_str[16];
+    
+    // Initial delay to let UI stabilize
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    
+    for (;;) {
+        float voltage = read_battery_voltage();
+        
+        // Format voltage string
+        snprintf(voltage_str, sizeof(voltage_str), "%.2fV", voltage);
+        
+        // Update label with LVGL mutex protection
+        if (lvgl_mutex && xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (battery_label != NULL && lv_obj_is_valid(battery_label)) {
+                lv_label_set_text(battery_label, voltage_str);
+            }
+            xSemaphoreGive(lvgl_mutex);
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(BATTERY_UPDATE_INTERVAL_MS));
+    }
 }
 
 static void evil_twin_start_btn_cb(lv_event_t *e)
