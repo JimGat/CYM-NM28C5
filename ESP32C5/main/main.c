@@ -105,7 +105,7 @@ static int bt_device_count = 0;
 #define LCD_MOSI 24
 #define LCD_MISO 4
 #define LCD_CLK  23
-#define LCD_CS   6//13//15
+#define LCD_CS   5  // Changed from 6 - GPIO6 is now used for battery ADC
 #define LCD_DC   3
 #define LCD_RST  2  
 
@@ -119,11 +119,14 @@ static int bt_device_count = 0;
 #define LCD_V_RES 320
 #define LCD_HOST SPI2_HOST
 
-// Battery ADC configuration
-#define BATTERY_ADC_CHANNEL    ADC_CHANNEL_0  // GPIO0 on ESP32-C5 - change if different
+// Battery ADC configuration - Waveshare ESP32-C5-WIFI6-KIT
+// Schematic: R10=200k, R16=100k voltage divider on BAT_ADC line
+// Note: GPIO6 = ADC1_CH5 on ESP32-C5 (not CH6!)
+#define BATTERY_ADC_CHANNEL    ADC_CHANNEL_5  // GPIO6 = ADC1_CH5 (BAT_ADC on Waveshare)
 #define BATTERY_ADC_UNIT       ADC_UNIT_1
 #define BATTERY_ADC_ATTEN      ADC_ATTEN_DB_12  // Full scale ~3.3V
-#define BATTERY_VOLTAGE_DIVIDER_RATIO  4.0f    // Voltage divider ratio (calibrated for Waveshare ESP32-C5)
+#define BATTERY_VOLTAGE_DIVIDER_RATIO  3.2f    // Calibrated: VBAT 4.14V / GPIO6 1.29V = 3.21
+#define BATTERY_ADC_SAMPLES            32      // Number of samples to average
 #define BATTERY_UPDATE_INTERVAL_MS     30000   // 30 seconds
 
 // Color definitions (used throughout the file)
@@ -7867,22 +7870,35 @@ static float read_battery_voltage(void)
         return 0.0f;
     }
     
-    int raw_value = 0;
-    esp_err_t ret = adc_oneshot_read(battery_adc_handle, BATTERY_ADC_CHANNEL, &raw_value);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "ADC read failed: %s", esp_err_to_name(ret));
+    // Take multiple samples and average them for stability
+    int32_t sum = 0;
+    int valid_samples = 0;
+    
+    for (int i = 0; i < BATTERY_ADC_SAMPLES; i++) {
+        int raw_value = 0;
+        esp_err_t ret = adc_oneshot_read(battery_adc_handle, BATTERY_ADC_CHANNEL, &raw_value);
+        if (ret == ESP_OK) {
+            sum += raw_value;
+            valid_samples++;
+        }
+    }
+    
+    if (valid_samples == 0) {
         return 0.0f;
     }
     
+    int avg_raw = sum / valid_samples;
+    
+    // Convert raw ADC to voltage (12-bit ADC, ~3.3V reference with DB_12 attenuation)
+    // Note: Calibration may not be available on all ESP32-C5 chips
     float voltage_mv;
     if (battery_adc_cali_handle != NULL) {
-        // Use calibrated value
         int calibrated_mv = 0;
-        adc_cali_raw_to_voltage(battery_adc_cali_handle, raw_value, &calibrated_mv);
+        adc_cali_raw_to_voltage(battery_adc_cali_handle, avg_raw, &calibrated_mv);
         voltage_mv = (float)calibrated_mv;
     } else {
-        // Fallback: raw to voltage approximation (12-bit ADC, ~3.3V reference)
-        voltage_mv = (raw_value / 4095.0f) * 3300.0f;
+        // Fallback: raw to voltage (12-bit, 3.3V ref)
+        voltage_mv = (avg_raw / 4095.0f) * 3300.0f;
     }
     
     // Apply voltage divider ratio to get actual battery voltage

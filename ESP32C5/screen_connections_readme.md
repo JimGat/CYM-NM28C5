@@ -8,6 +8,7 @@ This document describes the hardware connections for the ESP32-C5 project with:
 - SD Card (SPI, shared bus with display)
 - GPS Module (UART)
 - NeoPixel LED Strip
+- Battery Voltage Monitor (ADC)
 
 ---
 
@@ -33,7 +34,7 @@ This document describes the hardware connections for the ESP32-C5 project with:
 | MOSI (SDI) | **GPIO 24** | SPI Data Out (shared with SD) |
 | MISO (SDO) | **GPIO 4** | SPI Data In (shared with SD) |
 | SCK (CLK) | **GPIO 23** | SPI Clock (shared with SD) |
-| CS | **GPIO 6** | Chip Select (active LOW) |
+| CS | **GPIO 5** | Chip Select (active LOW) - changed from GPIO6 |
 | DC (RS) | **GPIO 3** | Data/Command select |
 | RST | **GPIO 2** | Hardware Reset (active LOW) |
 | VCC | 3.3V | Power supply |
@@ -86,6 +87,19 @@ This document describes the hardware connections for the ESP32-C5 project with:
 | TX | **GPIO 11** | Console output |
 | RX | **GPIO 12** | Console input |
 
+### Battery Voltage Monitor (ADC)
+
+| Signal | GPIO | Description |
+|--------|------|-------------|
+| BAT_ADC | **GPIO 6** | Battery voltage via divider (ADC1_CH5) |
+
+**Note**: On Waveshare ESP32-C5-WIFI6-KIT, GPIO6 is connected to the battery voltage divider:
+- R10 = 200kΩ (VBAT to BAT_ADC)
+- R16 = 100kΩ (BAT_ADC to GND)
+- Divider ratio: (200k + 100k) / 100k = 3.0 (calibrated: 3.2)
+
+⚠️ GPIO6 was originally used for LCD_CS but moved to GPIO5 to enable battery monitoring.
+
 ---
 
 ## GPIO Summary Table
@@ -95,7 +109,8 @@ This document describes the hardware connections for the ESP32-C5 project with:
 | 2 | LCD_RST | Output | ⚠️ Strapping pin - requires reset |
 | 3 | LCD_DC | Output | ⚠️ Strapping pin - requires reset |
 | 4 | MISO | SPI | Shared: LCD + SD |
-| 6 | LCD_CS | SPI | Display Chip Select |
+| 5 | LCD_CS | SPI | Display Chip Select (moved from GPIO6) |
+| 6 | BAT_ADC | ADC1_CH5 | Battery voltage monitor |
 | 7 | SD_CS | SPI | SD Card Chip Select |
 | 8 | CTP_RST | Output | Touch Reset |
 | 9 | CTP_SDA | I2C | Touch Data |
@@ -135,7 +150,7 @@ Before configuring SPI for the display, **reset these GPIO pins** and perform ha
 // Reset pins before use - REQUIRED on Waveshare ESP32-C5!
 gpio_reset_pin(LCD_RST);  // GPIO 2 - Strapping pin
 gpio_reset_pin(LCD_DC);   // GPIO 3 - Strapping pin
-gpio_reset_pin(LCD_CS);   // GPIO 6
+gpio_reset_pin(LCD_CS);   // GPIO 5
 
 gpio_set_direction(LCD_RST, GPIO_MODE_OUTPUT);
 gpio_set_direction(LCD_DC, GPIO_MODE_OUTPUT);
@@ -172,7 +187,7 @@ The display and SD card share the same SPI bus (SPI2_HOST) with different Chip S
 
 ```
 SPI2_HOST
-├── LCD (CS = GPIO 6)
+├── LCD (CS = GPIO 5)
 │   ├── MOSI = GPIO 24
 │   ├── MISO = GPIO 4
 │   ├── CLK  = GPIO 23
@@ -182,6 +197,10 @@ SPI2_HOST
     ├── MOSI = GPIO 24
     ├── MISO = GPIO 4
     └── CLK  = GPIO 23
+
+Battery Monitor (ADC)
+└── BAT_ADC = GPIO 6 (ADC1_CH5)
+    └── Voltage divider: R10=200k, R16=100k
 ```
 
 A mutex (`sd_spi_mutex`) is used to prevent simultaneous access to the SPI bus.
@@ -219,9 +238,11 @@ CONFIG_SPIRAM=y
     (shared)        │ GPIO 4  (MISO)  │         (shared)
                     │ GPIO 23 (CLK)   │
                     │                 │
-    LCD CS ─────────┤ GPIO 6          │
+    LCD CS ─────────┤ GPIO 5          │
     LCD DC ─────────┤ GPIO 3  ⚠️      │
     LCD RST ────────┤ GPIO 2  ⚠️      │
+                    │                 │
+    BAT_ADC ────────┤ GPIO 6  (ADC)   │──────── Battery divider
                     │                 │
     SD CS ──────────┤ GPIO 7          │
                     │                 │
@@ -273,6 +294,7 @@ CONFIG_SPIRAM=y
 
 ## Version History
 
+- **December 2025**: Added battery voltage monitor (GPIO6 = ADC1_CH5), moved LCD_CS to GPIO5
 - **December 2025**: Added GPIO reset fix for Waveshare ESP32-C5
 - **December 2025**: Updated ILI9341 driver for ESP-IDF 6.0 compatibility
 
