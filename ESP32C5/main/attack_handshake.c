@@ -93,11 +93,13 @@ static void send_deauth_frame() {
     memcpy(&deauth_frame[10], current_ap_record.bssid, 6);
     memcpy(&deauth_frame[16], current_ap_record.bssid, 6);
     
-    ESP_LOGI(TAG, "Sending deauth BURST (5 packets) to %02x:%02x:%02x:%02x:%02x:%02x (SSID: %s) Ch %d", 
+    // Log deauth packet info: SSID, BSSID, Channel
+    ESP_LOGI(TAG, "[HANDSHAKE] SSID: %-32s | BSSID: %02X:%02X:%02X:%02X:%02X:%02X | CH: %2d | burst x5", 
+             current_ap_record.ssid[0] ? (char*)current_ap_record.ssid : "(hidden)",
              current_ap_record.bssid[0], current_ap_record.bssid[1], 
              current_ap_record.bssid[2], current_ap_record.bssid[3],
              current_ap_record.bssid[4], current_ap_record.bssid[5],
-             current_ap_record.ssid, current_channel);
+             current_channel);
     
     if (current_channel != current_ap_record.primary) {
         ESP_LOGW(TAG, "WARNING: Channel mismatch! Currently on %d but target is on %d", 

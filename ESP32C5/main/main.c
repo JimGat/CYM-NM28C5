@@ -1522,6 +1522,13 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
     memcpy(&deauth_frame[10], ap_mac, 6);   // Source: AP
     memcpy(&deauth_frame[16], ap_mac, 6);   // BSSID: AP
     
+    // Log deauth packet info: SSID (unknown when sniffing), BSSID, Channel
+    ESP_LOGI(TAG, "[SNIFFERDOG] SSID: %-32s | BSSID: %02X:%02X:%02X:%02X:%02X:%02X | CH: %2d | STA: %02X:%02X:%02X:%02X:%02X:%02X",
+             "(sniffed-unknown)",
+             ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5],
+             sniffer_dog_current_channel,
+             sta_mac[0], sta_mac[1], sta_mac[2], sta_mac[3], sta_mac[4], sta_mac[5]);
+    
     esp_wifi_80211_tx(WIFI_IF_AP, deauth_frame, sizeof(deauth_frame_default), false);
     portENTER_CRITICAL(&snifferdog_stats_spin);
     snifferdog_kick_count++;
@@ -1530,13 +1537,6 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
              ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5],
              sta_mac[0], sta_mac[1], sta_mac[2], sta_mac[3], sta_mac[4], sta_mac[5]);
     portEXIT_CRITICAL(&snifferdog_stats_spin);
-    
-    // Log deauth
-    ESP_LOGI(TAG, "[SnifferDog #%lu] DEAUTH: AP=%02X:%02X:%02X:%02X:%02X:%02X -> STA=%02X:%02X:%02X:%02X:%02X:%02X (Ch=%d, RSSI=%d)",
-             (unsigned long)snifferdog_kick_count,
-             ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5],
-             sta_mac[0], sta_mac[1], sta_mac[2], sta_mac[3], sta_mac[4], sta_mac[5],
-             sniffer_dog_current_channel, pkt->rx_ctrl.rssi);
 }
 
 // Sniffer task - calls wifi_sniffer_start and runs until stopped

