@@ -54,7 +54,12 @@ static sniffer_ap_t* find_or_add_ap(const uint8_t *bssid) {
         }
     }
     
-    // Add new
+    // In selected mode, don't add new APs - only track selected ones
+    if (sniffer_selected_mode) {
+        return NULL;
+    }
+    
+    // Add new (only in normal/scan-all mode)
     if (sniffer_ap_count < MAX_SNIFFER_APS) {
         sniffer_ap_t *ap = &sniffer_aps[sniffer_ap_count];
         memcpy(ap->bssid, bssid, 6);
