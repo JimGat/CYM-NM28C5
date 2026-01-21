@@ -83,6 +83,67 @@ void wifi_sniffer_list_probes(void);
 void wifi_sniffer_set_debug(bool enable);
 
 // ============================================================================
+// CHANNEL CONTROL API
+// ============================================================================
+
+/**
+ * @brief Get current channel
+ */
+uint8_t wifi_sniffer_get_current_channel(void);
+
+/**
+ * @brief Pause channel hopping
+ */
+void wifi_sniffer_pause_channel_hop(void);
+
+/**
+ * @brief Resume channel hopping
+ */
+void wifi_sniffer_resume_channel_hop(void);
+
+/**
+ * @brief Set fixed channel (for observation mode)
+ * @param channel WiFi channel to lock to
+ */
+void wifi_sniffer_set_fixed_channel(uint8_t channel);
+
+/**
+ * @brief Check if channel hopping is paused
+ */
+bool wifi_sniffer_is_channel_hop_paused(void);
+
+// ============================================================================
+// CALLBACK API
+// ============================================================================
+
+/**
+ * @brief Callback type for new client detection
+ */
+typedef void (*sniffer_new_client_cb_t)(void);
+
+/**
+ * @brief Set callback for new client detection (for UI refresh)
+ * @param cb Callback function, or NULL to disable
+ */
+void wifi_sniffer_set_new_client_callback(sniffer_new_client_cb_t cb);
+
+// ============================================================================
+// NOSCAN API
+// ============================================================================
+
+/**
+ * @brief Start sniffer without resetting data (resume mode)
+ * @return ESP_OK on success
+ */
+esp_err_t wifi_sniffer_start_noscan(void);
+
+/**
+ * @brief Clear all sniffer data (networks, clients, probes)
+ * Call this for a fresh rescan
+ */
+void wifi_sniffer_clear_data(void);
+
+// ============================================================================
 // SNIFFER DOG API (Passive client detection)
 // ============================================================================
 

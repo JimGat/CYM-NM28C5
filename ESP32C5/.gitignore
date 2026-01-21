@@ -1,6 +1,9 @@
 # Build output
 build/
 
+# IDE files
+.vscode/
+
 # Binaries (can be regenerated)
 binaries-esp32c5/
 
