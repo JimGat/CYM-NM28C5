@@ -1,8 +1,4 @@
 {
-    "idf.espIdfPath": "/Users/janulrich/esp/v6/esp-idf",
-    "idf.pythonBinPath": "/Users/janulrich/.espressif/python_env/idf6.0_py3.12_env/bin/python",
-    "idf.toolsPath": "/Users/janulrich/.espressif",
-
     "idf.pwythonInstallPath": "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
     "idf.openOcdConfigs": [
         "board/esp32c5-builtin.cfg"
