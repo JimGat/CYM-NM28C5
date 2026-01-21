@@ -316,6 +316,7 @@ static QueueHandle_t sniffer_log_queue = NULL;
 // New sniffer UI elements
 static lv_obj_t *sniffer_channel_label = NULL;
 static lv_obj_t *sniffer_ap_list = NULL;
+static lv_obj_t *sniffer_observe_client_list = NULL;  // Client list in observation view
 static volatile bool sniffer_observe_mode = false;
 static int sniffer_observe_ap_index = -1;
 static volatile bool sniffer_ui_needs_refresh = false;
@@ -327,6 +328,7 @@ static bool sniffer_return_pending = false;  // Track if we should return to sni
 static int *sniffer_sorted_indices = NULL;  // PSRAM allocated
 static int sniffer_sorted_count = 0;        // How many entries in sorted array
 static bool sniffer_initial_sort_done = false;
+static uint32_t sniffer_start_time = 0;     // Time when sniffer started (for delayed sorting)
 
 // Sniffer task state
 static TaskHandle_t sniffer_task_handle = NULL;
@@ -649,6 +651,7 @@ static void sniffer_task(void *pvParameters);
 static void sniffer_ap_click_cb(lv_event_t *e);
 static void sniffer_observe_close_cb(lv_event_t *e);
 static void sniffer_refresh_ap_list(void);
+static void sniffer_refresh_observe_view(void);
 static void sniffer_new_client_notify(void);
 static void sae_overflow_yes_btn_cb(lv_event_t *e);
 static void sae_overflow_stop_btn_cb(lv_event_t *e);
@@ -2191,6 +2194,15 @@ void app_main(void)
                     last_ap_refresh = now;
                     sniffer_refresh_ap_list();
                 }
+            } else if (sniffer_ui_active && sniffer_observe_mode) {
+                // Observation mode - refresh client list more frequently (every 2s)
+                static uint32_t last_observe_refresh = 0;
+                uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+                if (sniffer_ui_needs_refresh || (now - last_observe_refresh > 2000)) {
+                    sniffer_ui_needs_refresh = false;
+                    last_observe_refresh = now;
+                    sniffer_refresh_observe_view();
+                }
             } else if (sniffer_log_ta && sniffer_log_queue) {
                 // Legacy textarea mode (if still used elsewhere)
                 evil_log_msg_t msg;
@@ -3679,6 +3691,7 @@ static void sniffer_start_btn_cb(lv_event_t *e)
     
     ESP_LOGI(TAG, "Starting WiFi Sniffer...");
     sniffer_task_active = true;
+    sniffer_start_time = (uint32_t)(esp_timer_get_time() / 1000);  // Record start time for delayed sorting
     
     // Create sniffer task with PSRAM stack
     sniffer_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
@@ -3843,6 +3856,7 @@ static void sniffer_rescan_cb(lv_event_t *e)
     
     // Restart sniffer
     sniffer_task_active = true;
+    sniffer_start_time = (uint32_t)(esp_timer_get_time() / 1000);  // Record start time for delayed sorting
     sniffer_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
     if (sniffer_task_stack != NULL) {
         sniffer_task_handle = xTaskCreateStatic(sniffer_task, "sniffer", 4096, NULL, 
@@ -3897,9 +3911,12 @@ static void sniffer_refresh_ap_list(void) {
     }
     
     int max_display = (ap_count < MAX_SNIFFER_APS) ? ap_count : MAX_SNIFFER_APS;
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t elapsed = now - sniffer_start_time;
     
-    if (!sniffer_initial_sort_done && ap_count > 0) {
-        // First time: sort all networks by RSSI (strongest first)
+    // Wait 10 seconds before sorting to allow full channel scan
+    if (!sniffer_initial_sort_done && ap_count > 0 && elapsed > 10000) {
+        // First time (after 10s): sort all networks by RSSI (strongest first)
         for (int i = 0; i < max_display; i++) sniffer_sorted_indices[i] = i;
         for (int i = 0; i < max_display - 1; i++) {
             for (int j = i + 1; j < max_display; j++) {
@@ -3912,8 +3929,15 @@ static void sniffer_refresh_ap_list(void) {
         }
         sniffer_sorted_count = max_display;
         sniffer_initial_sort_done = true;
+        ESP_LOGI(TAG, "Sorted %d networks by RSSI after 10s scan", max_display);
+    } else if (!sniffer_initial_sort_done && ap_count > 0) {
+        // Before 10s: just show networks in discovery order (unsorted)
+        for (int i = sniffer_sorted_count; i < max_display; i++) {
+            sniffer_sorted_indices[i] = i;
+        }
+        sniffer_sorted_count = max_display;
     } else if (ap_count > sniffer_sorted_count) {
-        // New networks appeared - append them to end (no re-sort)
+        // After initial sort: new networks append to end (no re-sort)
         for (int i = sniffer_sorted_count; i < max_display; i++) {
             sniffer_sorted_indices[i] = i;
         }
@@ -3978,6 +4002,44 @@ static void sniffer_refresh_ap_list(void) {
     lv_obj_scroll_to_y(sniffer_ap_list, scroll_y, LV_ANIM_OFF);
 }
 
+// Refresh the observation view (single AP with its clients)
+static void sniffer_refresh_observe_view(void) {
+    if (!sniffer_observe_client_list || !sniffer_observe_mode || sniffer_observe_ap_index < 0) return;
+    
+    int ap_count = 0;
+    const sniffer_ap_t *aps = wifi_sniffer_get_aps(&ap_count);
+    
+    if (sniffer_observe_ap_index >= ap_count || aps == NULL) return;
+    
+    const sniffer_ap_t *ap = &aps[sniffer_observe_ap_index];
+    
+    // Clear and rebuild client list
+    lv_obj_clean(sniffer_observe_client_list);
+    
+    if (ap->client_count == 0) {
+        lv_obj_t *msg = lv_label_create(sniffer_observe_client_list);
+        lv_label_set_text(msg, "No clients detected yet.\nWaiting for activity...");
+        lv_obj_set_style_text_color(msg, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_text_font(msg, &lv_font_montserrat_14, 0);
+    } else {
+        for (int j = 0; j < ap->client_count && j < MAX_CLIENTS_PER_AP; j++) {
+            const sniffer_client_t *client = &ap->clients[j];
+            
+            char client_text[96];
+            snprintf(client_text, sizeof(client_text), "%02X:%02X:%02X:%02X:%02X:%02X   RSSI: %d dBm",
+                     client->mac[0], client->mac[1], client->mac[2],
+                     client->mac[3], client->mac[4], client->mac[5],
+                     client->rssi);
+            
+            lv_obj_t *client_row = lv_list_add_text(sniffer_observe_client_list, client_text);
+            lv_obj_set_style_bg_color(client_row, lv_color_make(0, 0, 0), 0);
+            lv_obj_set_style_bg_opa(client_row, LV_OPA_COVER, 0);
+            lv_obj_set_style_text_color(client_row, COLOR_MATERIAL_GREEN, 0);
+            lv_obj_set_style_text_font(client_row, &lv_font_montserrat_12, 0);
+        }
+    }
+}
+
 // Handle AP click - enter observation mode
 static void sniffer_ap_click_cb(lv_event_t *e) {
     int ap_index = (int)(intptr_t)lv_event_get_user_data(e);
@@ -3991,10 +4053,6 @@ static void sniffer_ap_click_cb(lv_event_t *e) {
     
     const sniffer_ap_t *ap = &aps[ap_index];
     
-    // Enter observation mode
-    sniffer_observe_mode = true;
-    sniffer_observe_ap_index = ap_index;
-    
     // Pause channel hopping and set fixed channel
     wifi_sniffer_set_fixed_channel(ap->channel);
     
@@ -4003,6 +4061,10 @@ static void sniffer_ap_click_cb(lv_event_t *e) {
     // Create fullscreen observation view
     if (function_page) { lv_obj_del(function_page); function_page = NULL; }
     reset_function_page_children();
+    
+    // Enter observation mode AFTER reset_function_page_children (which resets these values)
+    sniffer_observe_mode = true;
+    sniffer_observe_ap_index = ap_index;
     
     function_page = lv_obj_create(lv_scr_act());
     lv_obj_set_size(function_page, LCD_H_RES, LCD_V_RES);
@@ -4035,6 +4097,8 @@ static void sniffer_ap_click_cb(lv_event_t *e) {
     lv_obj_set_style_text_color(title_label, lv_color_make(255, 255, 255), 0);
     lv_obj_set_style_text_font(title_label, &lv_font_montserrat_14, 0);
     lv_obj_align(title_label, LV_ALIGN_LEFT_MID, 5, 0);
+    lv_obj_add_flag(title_label, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(title_label, screenshot_btn_event_cb, LV_EVENT_CLICKED, NULL);
     
     // Channel indicator
     char ch_text[16];
@@ -4043,38 +4107,20 @@ static void sniffer_ap_click_cb(lv_event_t *e) {
     lv_label_set_text(ch_label, ch_text);
     lv_obj_set_style_text_color(ch_label, COLOR_MATERIAL_GREEN, 0);
     lv_obj_align(ch_label, LV_ALIGN_RIGHT_MID, -5, 0);
+    lv_obj_add_flag(ch_label, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(ch_label, screenshot_btn_event_cb, LV_EVENT_CLICKED, NULL);
     
-    // Client list
-    lv_obj_t *client_list = lv_list_create(function_page);
-    lv_obj_set_size(client_list, lv_pct(100), LCD_V_RES - 35 - 50);
-    lv_obj_align(client_list, LV_ALIGN_TOP_MID, 0, 35);
-    lv_obj_set_style_bg_color(client_list, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_bg_opa(client_list, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(client_list, 0, 0);
-    lv_obj_set_style_pad_all(client_list, 8, 0);
+    // Client list (stored in static for refresh)
+    sniffer_observe_client_list = lv_list_create(function_page);
+    lv_obj_set_size(sniffer_observe_client_list, lv_pct(100), LCD_V_RES - 35 - 50);
+    lv_obj_align(sniffer_observe_client_list, LV_ALIGN_TOP_MID, 0, 35);
+    lv_obj_set_style_bg_color(sniffer_observe_client_list, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_bg_opa(sniffer_observe_client_list, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(sniffer_observe_client_list, 0, 0);
+    lv_obj_set_style_pad_all(sniffer_observe_client_list, 8, 0);
     
-    if (ap->client_count == 0) {
-        lv_obj_t *msg = lv_label_create(client_list);
-        lv_label_set_text(msg, "No clients detected yet.\nWaiting for activity...");
-        lv_obj_set_style_text_color(msg, COLOR_MATERIAL_BLUE, 0);
-        lv_obj_set_style_text_font(msg, &lv_font_montserrat_14, 0);
-    } else {
-        for (int j = 0; j < ap->client_count && j < MAX_CLIENTS_PER_AP; j++) {
-            const sniffer_client_t *client = &ap->clients[j];
-            
-            char client_text[96];
-            snprintf(client_text, sizeof(client_text), "%02X:%02X:%02X:%02X:%02X:%02X   RSSI: %d dBm",
-                     client->mac[0], client->mac[1], client->mac[2],
-                     client->mac[3], client->mac[4], client->mac[5],
-                     client->rssi);
-            
-            lv_obj_t *client_row = lv_list_add_text(client_list, client_text);
-            lv_obj_set_style_bg_color(client_row, lv_color_make(0, 0, 0), 0);
-            lv_obj_set_style_bg_opa(client_row, LV_OPA_COVER, 0);
-            lv_obj_set_style_text_color(client_row, COLOR_MATERIAL_GREEN, 0);
-            lv_obj_set_style_text_font(client_row, &lv_font_montserrat_12, 0);
-        }
-    }
+    // Initial population of client list
+    sniffer_refresh_observe_view();
     
     // Close button at bottom
     lv_obj_t *close_btn = lv_btn_create(function_page);
@@ -4100,6 +4146,7 @@ static void sniffer_observe_close_cb(lv_event_t *e) {
     
     sniffer_observe_mode = false;
     sniffer_observe_ap_index = -1;
+    sniffer_observe_client_list = NULL;  // Will be deleted with function_page
     
     ESP_LOGI(TAG, "Exiting observation mode, resuming channel hop");
     
@@ -4137,12 +4184,16 @@ static void sniffer_yes_btn_cb(lv_event_t *e)
     lv_label_set_text(title_label, "Sniffer");
     lv_obj_set_style_text_color(title_label, lv_color_make(255, 255, 255), 0);
     lv_obj_align(title_label, LV_ALIGN_LEFT_MID, 10, 0);
+    lv_obj_add_flag(title_label, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(title_label, screenshot_btn_event_cb, LV_EVENT_CLICKED, NULL);
     
     // Channel indicator on the right
     sniffer_channel_label = lv_label_create(title_bar);
     lv_label_set_text(sniffer_channel_label, "Ch: --");
     lv_obj_set_style_text_color(sniffer_channel_label, COLOR_MATERIAL_GREEN, 0);
     lv_obj_align(sniffer_channel_label, LV_ALIGN_RIGHT_MID, -10, 0);
+    lv_obj_add_flag(sniffer_channel_label, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(sniffer_channel_label, screenshot_btn_event_cb, LV_EVENT_CLICKED, NULL);
     
     // Set sniffer UI active flag
     sniffer_ui_active = true;
@@ -4236,6 +4287,7 @@ static void sniffer_yes_btn_cb(lv_event_t *e)
     if (!sniffer_task_active) {
         ESP_LOGI(TAG, "Starting WiFi Sniffer...");
         sniffer_task_active = true;
+        sniffer_start_time = (uint32_t)(esp_timer_get_time() / 1000);  // Record start time for delayed sorting
         
         sniffer_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
         if (sniffer_task_stack != NULL) {
@@ -6131,6 +6183,10 @@ static void create_function_page_base(const char *name)
     lv_label_set_text(page_title_label, name ? name : "");
     lv_obj_set_style_text_color(page_title_label, lv_color_make(255, 255, 255), 0);  // White text
     lv_obj_center(page_title_label);
+    
+    // Make title clickable for screenshot
+    lv_obj_add_flag(page_title_label, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(page_title_label, screenshot_btn_event_cb, LV_EVENT_CLICKED, NULL);
 }
 
 void show_menu(void)
