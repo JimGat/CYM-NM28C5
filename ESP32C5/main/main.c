@@ -544,6 +544,10 @@ static void show_attack_tiles_screen(void);
 static void show_global_attacks_screen(void);
 static void show_sniff_karma_screen(void);
 static void show_wifi_monitor_screen(void);
+static void show_eviltwin_passwords_screen(void);
+static void show_portal_data_screen(void);
+static void show_handshakes_list_screen(void);
+static void wifi_monitor_tile_event_cb(lv_event_t *e);
 static void show_bluetooth_screen(void);
 static void show_stub_screen(const char *name);
 static void main_tile_event_cb(lv_event_t *e);
@@ -6344,7 +6348,7 @@ static void main_tile_event_cb(lv_event_t *e)
         show_global_attacks_screen();
     } else if (strcmp(tile_name, "WiFi Sniff&Karma") == 0) {
         show_sniff_karma_screen();
-    } else if (strcmp(tile_name, "WiFi Monitor") == 0) {
+    } else if (strcmp(tile_name, "Compromised Data") == 0) {
         show_wifi_monitor_screen();
     } else if (strcmp(tile_name, "Deauth Monitor") == 0) {
         show_deauth_monitor_screen();
@@ -6545,7 +6549,7 @@ static void show_main_tiles(void)
     create_tile(tiles_container, LV_SYMBOL_WIFI, "WiFi Scan\n& Attack", COLOR_TILE_BLUE, main_tile_event_cb, "WiFi Scan & Attack");
     create_tile(tiles_container, LV_SYMBOL_WARNING, "Global WiFi\nAttacks", COLOR_MATERIAL_RED, main_tile_event_cb, "Global WiFi Attacks");
     create_tile(tiles_container, LV_SYMBOL_EYE_OPEN, "WiFi Sniff\n& Karma", COLOR_MATERIAL_PURPLE, main_tile_event_cb, "WiFi Sniff&Karma");
-    create_tile(tiles_container, LV_SYMBOL_SETTINGS, "WiFi\nMonitor", COLOR_MATERIAL_GREEN, main_tile_event_cb, "WiFi Monitor");
+    create_tile(tiles_container, LV_SYMBOL_SETTINGS, "Compromised\nData", COLOR_MATERIAL_GREEN, main_tile_event_cb, "Compromised Data");
     create_tile(tiles_container, LV_SYMBOL_GPS, "Deauth\nMonitor", COLOR_MATERIAL_AMBER, main_tile_event_cb, "Deauth Monitor");
     create_tile(tiles_container, LV_SYMBOL_BLUETOOTH, "Bluetooth", COLOR_MATERIAL_CYAN, main_tile_event_cb, "Bluetooth");
     
@@ -6756,10 +6760,281 @@ static void show_sniff_karma_screen(void)
     lv_obj_add_event_cb(karma_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Karma");
 }
 
+// WiFi Monitor tile callback
+static void wifi_monitor_tile_event_cb(lv_event_t *e)
+{
+    const char *tile_name = (const char *)lv_event_get_user_data(e);
+    if (!tile_name) return;
+    
+    if (strcmp(tile_name, "Evil Twin Passwords") == 0) {
+        show_eviltwin_passwords_screen();
+    } else if (strcmp(tile_name, "Portal Data") == 0) {
+        show_portal_data_screen();
+    } else if (strcmp(tile_name, "Handshakes") == 0) {
+        show_handshakes_list_screen();
+    }
+}
+
+// Evil Twin Passwords screen - reads /sdcard/lab/eviltwin.txt
+static void show_eviltwin_passwords_screen(void)
+{
+    create_function_page_base("Evil Twin Passwords");
+    
+    // Scrollable list container
+    lv_obj_t *list = lv_obj_create(function_page);
+    lv_obj_set_size(list, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(list, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    lv_obj_set_style_pad_all(list, 8, 0);
+    lv_obj_set_style_pad_gap(list, 4, 0);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
+    
+    // Take SD/SPI mutex before filesystem operations
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        lv_obj_t *err_label = lv_label_create(list);
+        lv_label_set_text(err_label, "SD card busy");
+        lv_obj_set_style_text_color(err_label, COLOR_MATERIAL_RED, 0);
+        return;
+    }
+    
+    FILE *file = fopen("/sdcard/lab/eviltwin.txt", "r");
+    if (file == NULL) {
+        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+        lv_obj_t *msg_label = lv_label_create(list);
+        lv_label_set_text(msg_label, "No eviltwin.txt found\nor file is empty.");
+        lv_obj_set_style_text_color(msg_label, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_text_font(msg_label, &lv_font_montserrat_14, 0);
+        return;
+    }
+    
+    char line[256];
+    int count = 0;
+    while (fgets(line, sizeof(line), file) != NULL && count < 50) {
+        // Remove trailing newline
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strlen(line) == 0) continue;
+        
+        // Parse: "SSID", "password"
+        char ssid[64] = {0};
+        char password[64] = {0};
+        char *p = line;
+        
+        // Find first opening quote for SSID
+        while (*p && *p != '"') p++;
+        if (*p == '"') p++;  // Skip opening quote
+        char *ssid_start = p;
+        while (*p && *p != '"') p++;
+        size_t ssid_len = p - ssid_start;
+        if (ssid_len > sizeof(ssid) - 1) ssid_len = sizeof(ssid) - 1;
+        strncpy(ssid, ssid_start, ssid_len);
+        
+        // Skip closing quote of SSID, then find opening quote of password
+        if (*p == '"') p++;  // Skip closing quote of SSID
+        while (*p && *p != '"') p++;  // Skip comma, spaces until next quote
+        if (*p == '"') p++;  // Skip opening quote of password
+        char *pass_start = p;
+        while (*p && *p != '"') p++;
+        size_t pass_len = p - pass_start;
+        if (pass_len > sizeof(password) - 1) pass_len = sizeof(password) - 1;
+        strncpy(password, pass_start, pass_len);
+        
+        // Create clickable button for each entry
+        lv_obj_t *btn = lv_btn_create(list);
+        lv_obj_set_size(btn, lv_pct(100), 40);
+        lv_obj_set_style_bg_color(btn, lv_color_make(30, 30, 30), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(btn, lv_color_make(50, 50, 50), LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(btn, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_border_width(btn, 1, 0);
+        lv_obj_set_style_radius(btn, 4, 0);
+        
+        lv_obj_t *lbl = lv_label_create(btn);
+        char display_text[140];
+        snprintf(display_text, sizeof(display_text), "%s: %s", ssid, password);
+        lv_label_set_text(lbl, display_text);
+        lv_obj_set_style_text_color(lbl, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 5, 0);
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+        lv_obj_set_width(lbl, lv_pct(90));
+        
+        count++;
+    }
+    
+    fclose(file);
+    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+    
+    if (count == 0) {
+        lv_obj_t *msg_label = lv_label_create(list);
+        lv_label_set_text(msg_label, "No passwords captured yet.");
+        lv_obj_set_style_text_color(msg_label, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_text_font(msg_label, &lv_font_montserrat_14, 0);
+    }
+}
+
+// Portal Data screen - reads /sdcard/lab/portals.txt
+static void show_portal_data_screen(void)
+{
+    create_function_page_base("Portal Data");
+    
+    // Scrollable list container
+    lv_obj_t *list = lv_obj_create(function_page);
+    lv_obj_set_size(list, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(list, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    lv_obj_set_style_pad_all(list, 8, 0);
+    lv_obj_set_style_pad_gap(list, 4, 0);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
+    
+    // Take SD/SPI mutex before filesystem operations
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        lv_obj_t *err_label = lv_label_create(list);
+        lv_label_set_text(err_label, "SD card busy");
+        lv_obj_set_style_text_color(err_label, COLOR_MATERIAL_RED, 0);
+        return;
+    }
+    
+    FILE *file = fopen("/sdcard/lab/portals.txt", "r");
+    if (file == NULL) {
+        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+        lv_obj_t *msg_label = lv_label_create(list);
+        lv_label_set_text(msg_label, "No portals.txt found\nor file is empty.");
+        lv_obj_set_style_text_color(msg_label, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_text_font(msg_label, &lv_font_montserrat_14, 0);
+        return;
+    }
+    
+    char line[512];
+    int count = 0;
+    while (fgets(line, sizeof(line), file) != NULL && count < 50) {
+        // Remove trailing newline
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strlen(line) == 0) continue;
+        
+        // Display the whole line (already in readable format from portals.txt)
+        // Format: "SSID", "field1=value1", "field2=value2", ...
+        
+        // Create clickable button for each entry
+        lv_obj_t *btn = lv_btn_create(list);
+        lv_obj_set_size(btn, lv_pct(100), 50);
+        lv_obj_set_style_bg_color(btn, lv_color_make(30, 30, 30), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(btn, lv_color_make(50, 50, 50), LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(btn, COLOR_MATERIAL_PURPLE, 0);
+        lv_obj_set_style_border_width(btn, 1, 0);
+        lv_obj_set_style_radius(btn, 4, 0);
+        
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, line);
+        lv_obj_set_style_text_color(lbl, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 5, 0);
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+        lv_obj_set_width(lbl, lv_pct(90));
+        
+        count++;
+    }
+    
+    fclose(file);
+    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+    
+    if (count == 0) {
+        lv_obj_t *msg_label = lv_label_create(list);
+        lv_label_set_text(msg_label, "No portal data captured yet.");
+        lv_obj_set_style_text_color(msg_label, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_text_font(msg_label, &lv_font_montserrat_14, 0);
+    }
+}
+
+// Handshakes list screen - lists .pcap files from /sdcard/lab/handshakes/
+static void show_handshakes_list_screen(void)
+{
+    create_function_page_base("Handshakes");
+    
+    // Scrollable list container
+    lv_obj_t *list = lv_obj_create(function_page);
+    lv_obj_set_size(list, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(list, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    lv_obj_set_style_pad_all(list, 8, 0);
+    lv_obj_set_style_pad_gap(list, 4, 0);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
+    
+    // Take SD/SPI mutex before filesystem operations
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        lv_obj_t *err_label = lv_label_create(list);
+        lv_label_set_text(err_label, "SD card busy");
+        lv_obj_set_style_text_color(err_label, COLOR_MATERIAL_RED, 0);
+        return;
+    }
+    
+    // Check if directory exists
+    struct stat st;
+    if (stat("/sdcard/lab/handshakes", &st) != 0) {
+        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+        lv_obj_t *msg_label = lv_label_create(list);
+        lv_label_set_text(msg_label, "No handshakes directory found.");
+        lv_obj_set_style_text_color(msg_label, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_text_font(msg_label, &lv_font_montserrat_14, 0);
+        return;
+    }
+    
+    DIR *dir = opendir("/sdcard/lab/handshakes");
+    if (!dir) {
+        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+        lv_obj_t *msg_label = lv_label_create(list);
+        lv_label_set_text(msg_label, "Cannot open handshakes directory.");
+        lv_obj_set_style_text_color(msg_label, COLOR_MATERIAL_RED, 0);
+        lv_obj_set_style_text_font(msg_label, &lv_font_montserrat_14, 0);
+        return;
+    }
+    
+    struct dirent *entry;
+    int count = 0;
+    while ((entry = readdir(dir)) != NULL && count < 50) {
+        // Only show .pcap files (skip .hccapx)
+        if (strstr(entry->d_name, ".pcap") == NULL) continue;
+        if (strstr(entry->d_name, ".hccapx") != NULL) continue;
+        
+        // Create clickable button for each pcap file
+        lv_obj_t *btn = lv_btn_create(list);
+        lv_obj_set_size(btn, lv_pct(100), 40);
+        lv_obj_set_style_bg_color(btn, lv_color_make(30, 30, 30), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(btn, lv_color_make(50, 50, 50), LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(btn, COLOR_MATERIAL_AMBER, 0);
+        lv_obj_set_style_border_width(btn, 1, 0);
+        lv_obj_set_style_radius(btn, 4, 0);
+        
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, entry->d_name);
+        lv_obj_set_style_text_color(lbl, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 5, 0);
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+        lv_obj_set_width(lbl, lv_pct(90));
+        
+        count++;
+    }
+    
+    closedir(dir);
+    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+    
+    if (count == 0) {
+        lv_obj_t *msg_label = lv_label_create(list);
+        lv_label_set_text(msg_label, "No handshakes captured yet.");
+        lv_obj_set_style_text_color(msg_label, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_text_font(msg_label, &lv_font_montserrat_14, 0);
+    }
+}
+
 // WiFi Monitor screen
 static void show_wifi_monitor_screen(void)
 {
-    create_function_page_base("WiFi Monitor");
+    create_function_page_base("Compromised Data");
     
     lv_obj_t *tiles = lv_obj_create(function_page);
     lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
@@ -6771,13 +7046,14 @@ static void show_wifi_monitor_screen(void)
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     
-    // Package Monitor - stub - Green
-    lv_obj_t *pkg_tile = create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Package\nMonitor", COLOR_MATERIAL_GREEN, NULL, NULL);
-    lv_obj_add_event_cb(pkg_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Package Monitor");
+    // Evil Twin Passwords - Blue
+    create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Evil Twin\nPasswords", COLOR_TILE_BLUE, wifi_monitor_tile_event_cb, "Evil Twin Passwords");
     
-    // Channel View - stub - Teal
-    lv_obj_t *chan_tile = create_tile(tiles, LV_SYMBOL_LIST, "Channel\nView", COLOR_MATERIAL_TEAL, NULL, NULL);
-    lv_obj_add_event_cb(chan_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Channel View");
+    // Portal Data - Purple
+    create_tile(tiles, LV_SYMBOL_LIST, "Portal\nData", COLOR_MATERIAL_PURPLE, wifi_monitor_tile_event_cb, "Portal Data");
+    
+    // Handshakes - Amber/Orange
+    create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Handshakes", COLOR_MATERIAL_AMBER, wifi_monitor_tile_event_cb, "Handshakes");
 }
 
 // Bluetooth screen
