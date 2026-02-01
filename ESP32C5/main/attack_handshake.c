@@ -110,6 +110,19 @@ static void send_deauth_frame() {
     
     // Send burst of 5 deauth packets (Pwnagotchi-style)
     for (int i = 0; i < 5; i++) {
+        // Log raw deauth frame bytes for debugging
+        {
+            char hexbuf[3 * sizeof(deauth_frame) + 1];
+            char *p = hexbuf;
+            for (size_t j = 0; j < sizeof(deauth_frame); j++) {
+                int written = sprintf(p, "%02X", deauth_frame[j]);
+                p += written;
+                if (j + 1 < sizeof(deauth_frame)) *p++ = ' ';
+            }
+            *p = '\0';
+            ESP_LOGI(TAG, "[HANDSHAKE] DEAUTH RAW: %s", hexbuf);
+        }
+
         esp_err_t ret = esp_wifi_80211_tx(WIFI_IF_AP, deauth_frame, sizeof(deauth_frame), false);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to send deauth frame #%d: %s", i+1, esp_err_to_name(ret));
