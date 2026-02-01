@@ -373,6 +373,8 @@ static TaskHandle_t handshake_attack_task_handle = NULL;
 static StaticTask_t handshake_attack_task_buffer;
 static StackType_t *handshake_attack_task_stack = NULL;
 static volatile bool handshake_attack_active = false;
+static volatile bool handshake_waiting_for_scan = false;  // Flag to suppress scan results UI
+static volatile bool g_handshaker_global_mode = false;  // Suppress scan results UI for global Handshaker flow
 static bool handshake_selected_mode = false;
 static wifi_ap_record_t handshake_targets[MAX_AP_CNT];
 static int handshake_target_count = 0;
@@ -2626,10 +2628,10 @@ void app_main(void)
                 // Start the actual monitoring
                 deauth_monitor_start_monitoring();
             }
-            // If scan finished, build results UI (but not during blackout/snifferdog/sae_overflow/handshake/wardrive/karma attack/deauth_monitor/portal)
+            // If scan finished, build results UI (but not during blackout/snifferdog/sae_overflow/handshake/wardrive/karma attack/deauth_monitor/portal or when handshaker is waiting for scan)
             else if (scan_done_ui_flag) {
-                if (blackout_ui_active || snifferdog_ui_active || sae_overflow_ui_active || handshake_ui_active || wardrive_ui_active || karma_ui_active || deauth_monitor_ui_active || portal_ui_active) {
-                    // During attacks, just clear the flag without showing results
+                if (blackout_ui_active || snifferdog_ui_active || sae_overflow_ui_active || handshake_ui_active || wardrive_ui_active || karma_ui_active || deauth_monitor_ui_active || portal_ui_active || handshake_waiting_for_scan || g_handshaker_global_mode) {
+                    // During attacks or while waiting for scan, just clear the flag without showing results
                     scan_done_ui_flag = false;
                 } else {
                 scan_done_ui_flag = false;
@@ -4353,6 +4355,10 @@ static void targeted_deauth_timer_cb(lv_timer_t *timer) {
         char status[64];
         snprintf(status, sizeof(status), "Sending deauth... (%lu)", (unsigned long)targeted_deauth_count);
         lv_label_set_text(targeted_deauth_status_label, status);
+    } else {
+        // add console logging:
+        
+
     }
 }
 
@@ -4899,6 +4905,9 @@ static void handshake_cleanup(void) {
     // Stop any running attack
     attack_handshake_stop();
     
+    // Clear global handshaker mode flag
+    g_handshaker_global_mode = false;
+
     // Reset state
     handshake_attack_active = false;
     handshake_target_count = 0;
@@ -4996,6 +5005,7 @@ static void handshake_attack_task(void *pvParameters) {
                 }
                 
                 // Get scan results
+                handshake_waiting_for_scan = false;  // Scan is done, clear the flag
                 uint16_t count = wifi_scanner_get_count();
                 if (count == 0) {
                     ESP_LOGI(TAG, "Scan failed or no results, retrying in 5 seconds...");
@@ -5177,6 +5187,9 @@ static void handshake_yes_btn_cb(lv_event_t *e)
         if (g_shared_scan_count > 0) {
             handshake_target_count = (g_shared_scan_count < MAX_AP_CNT) ? g_shared_scan_count : MAX_AP_CNT;
             memcpy(handshake_targets, g_shared_scan_results, handshake_target_count * sizeof(wifi_ap_record_t));
+        } else {
+            // Will need to scan - set flag to suppress scan results UI
+            handshake_waiting_for_scan = true;
         }
     }
     
@@ -6767,48 +6780,9 @@ static void attack_tile_event_cb(lv_event_t *e)
         lv_obj_add_event_cb(yes_btn, sae_overflow_yes_btn_cb, LV_EVENT_CLICKED, NULL);
         
     } else if (strcmp(attack_name, "Handshaker") == 0) {
-        // Reuse existing handshake logic
-        create_function_page_base("Handshakes");
-        lv_obj_t *warning_label = lv_label_create(function_page);
-        lv_label_set_text(warning_label, "WPA Handshake Capture\n\nSelected networks: Attack those\nNo selection: Scan & attack all\n\nAre you sure?");
-        lv_obj_set_style_text_align(warning_label, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_text_color(warning_label, COLOR_MATERIAL_BLUE, 0);
-        lv_obj_set_style_text_font(warning_label, &lv_font_montserrat_14, 0);
-        lv_obj_center(warning_label);
-        
-        lv_obj_t *btn_bar = lv_obj_create(function_page);
-        lv_obj_set_size(btn_bar, lv_pct(100), 50);
-        lv_obj_align(btn_bar, LV_ALIGN_BOTTOM_MID, 0, -15);
-        lv_obj_set_style_bg_color(btn_bar, lv_color_make(0, 0, 0), 0);
-        lv_obj_set_style_border_width(btn_bar, 0, 0);
-        lv_obj_clear_flag(btn_bar, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_flex_flow(btn_bar, LV_FLEX_FLOW_ROW);
-        lv_obj_set_style_pad_all(btn_bar, 4, 0);
-        lv_obj_set_style_pad_gap(btn_bar, 4, 0);
-        
-        lv_obj_t *back_btn = lv_btn_create(btn_bar);
-        lv_obj_set_size(back_btn, 90, 32);
-        lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_color(back_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
-        lv_obj_set_style_border_width(back_btn, 0, 0);
-        lv_obj_set_style_radius(back_btn, 8, 0);
-        lv_obj_t *back_lbl = lv_label_create(back_btn);
-        lv_label_set_text(back_lbl, "BACK");
-        lv_obj_set_style_text_color(back_lbl, lv_color_make(255, 255, 255), 0);
-        lv_obj_center(back_lbl);
-        lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
-        
-        lv_obj_t *yes_btn = lv_btn_create(btn_bar);
-        lv_obj_set_size(yes_btn, 90, 32);
-        lv_obj_set_style_bg_color(yes_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_color(yes_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
-        lv_obj_set_style_border_width(yes_btn, 0, 0);
-        lv_obj_set_style_radius(yes_btn, 8, 0);
-        lv_obj_t *yes_lbl = lv_label_create(yes_btn);
-        lv_label_set_text(yes_lbl, "YES");
-        lv_obj_set_style_text_color(yes_lbl, lv_color_make(255, 255, 255), 0);
-        lv_obj_center(yes_lbl);
-        lv_obj_add_event_cb(yes_btn, handshake_yes_btn_cb, LV_EVENT_CLICKED, NULL);
+        // Auto-start handshake attack immediately for all networks
+        g_handshaker_global_mode = true;
+        handshake_yes_btn_cb(NULL);
         
     } else if (strcmp(attack_name, "Sniffer") == 0) {
         // Reuse existing sniffer logic
@@ -8350,55 +8324,9 @@ void attack_event_cb(lv_event_t *e)
     }
 
     if (strcmp(attack_name, "Handshakes") == 0) {
-        // Show warning page - use base to avoid default center label
-        create_function_page_base("Handshakes");
-        
-        // Warning message in center
-        lv_obj_t *warning_label = lv_label_create(function_page);
-        lv_label_set_text(warning_label, "WPA Handshake Capture\n\nSelected networks: Attack those\nNo selection: Scan & attack all\n\nAre you sure?");
-        lv_obj_set_style_text_align(warning_label, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_text_color(warning_label, COLOR_MATERIAL_BLUE, 0);  // Green text
-        lv_obj_set_style_text_font(warning_label, &lv_font_montserrat_14, 0);
-        lv_obj_center(warning_label);
-        
-        // Button container at bottom (15px higher)
-        lv_obj_t *btn_bar = lv_obj_create(function_page);
-        lv_obj_set_size(btn_bar, lv_pct(100), 50);
-        lv_obj_align(btn_bar, LV_ALIGN_BOTTOM_MID, 0, -15);  // 15px higher
-        lv_obj_set_style_bg_color(btn_bar, lv_color_make(0, 0, 0), 0);  // Black background
-        lv_obj_set_style_border_width(btn_bar, 0, 0);
-        lv_obj_set_style_radius(btn_bar, 0, 0);
-        lv_obj_clear_flag(btn_bar, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_flex_flow(btn_bar, LV_FLEX_FLOW_ROW);
-        lv_obj_set_style_pad_all(btn_bar, 4, 0);  // 4px padding
-        lv_obj_set_style_pad_gap(btn_bar, 4, 0);  // 4px gap between buttons
-        
-        // BACK button
-        lv_obj_t *back_btn = lv_btn_create(btn_bar);
-        lv_obj_set_size(back_btn, 90, 32);
-        lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_color(back_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
-        lv_obj_set_style_border_width(back_btn, 0, 0);
-        lv_obj_set_style_radius(back_btn, 8, 0);
-        lv_obj_t *back_lbl = lv_label_create(back_btn);
-        lv_label_set_text(back_lbl, "BACK");
-        lv_obj_set_style_text_color(back_lbl, lv_color_make(255, 255, 255), 0);
-        lv_obj_center(back_lbl);
-        lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
-        
-        // YES button
-        lv_obj_t *yes_btn = lv_btn_create(btn_bar);
-        lv_obj_set_size(yes_btn, 90, 32);
-        lv_obj_set_style_bg_color(yes_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_color(yes_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
-        lv_obj_set_style_border_width(yes_btn, 0, 0);
-        lv_obj_set_style_radius(yes_btn, 8, 0);
-        lv_obj_t *yes_lbl = lv_label_create(yes_btn);
-        lv_label_set_text(yes_lbl, "YES");
-        lv_obj_set_style_text_color(yes_lbl, lv_color_make(255, 255, 255), 0);
-        lv_obj_center(yes_lbl);
-        lv_obj_add_event_cb(yes_btn, handshake_yes_btn_cb, LV_EVENT_CLICKED, NULL);
-        
+        // Auto-start handshake attack immediately for all networks
+        g_handshaker_global_mode = true;
+        handshake_yes_btn_cb(NULL);
         return;
     }
 
