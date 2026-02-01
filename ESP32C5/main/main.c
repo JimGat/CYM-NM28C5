@@ -414,6 +414,8 @@ static lv_obj_t *karma_info_filename_label = NULL;
 static QueueHandle_t karma_event_queue = NULL;
 static char karma_selected_html_name[64] = "default";
 static char karma_selected_ssid[33] = "";
+static int karma_probe_index_map[MAX_PROBE_REQUESTS];  // Map dropdown index to actual probe index
+static int karma_valid_probe_count = 0;  // Number of valid probes in dropdown
 
 // Portal UI state (setup page)
 static lv_obj_t *portal_content = NULL;
@@ -3130,10 +3132,10 @@ void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_
     flush_call_count++;
     
     // Log co 100 flushów aby nie zaśmiecić logu
-    if (flush_call_count % 100 == 0) {
+    /*if (flush_call_count % 100 == 0) {
         ESP_LOGI(TAG, "[FLUSH] Call #%u, area: (%d,%d)-(%d,%d)", 
                  flush_call_count, area->x1, area->y1, area->x2, area->y2);
-    }
+    }*/
     
     esp_lcd_panel_handle_t panel = (esp_lcd_panel_handle_t)drv->user_data;
     int32_t width = area->x2 - area->x1 + 1;
@@ -3778,20 +3780,15 @@ static void snifferdog_stop_btn_cb(lv_event_t *e)
         ESP_LOGI(TAG, "Stopping Snifferdog...");
         sniffer_dog_active = false;
         
-        // Wait for task to finish
-        for (int i = 0; i < 20 && sniffer_dog_task_handle != NULL; i++) {
-            vTaskDelay(pdMS_TO_TICKS(50));
+        // Wait for task to finish gracefully (up to 7 seconds)
+        for (int i = 0; i < 70 && sniffer_dog_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
         
-        // Force delete if still running
-        if (sniffer_dog_task_handle != NULL) {
-            vTaskDelete(sniffer_dog_task_handle);
-            sniffer_dog_task_handle = NULL;
-            // Free PSRAM stack
-            if (sniffer_dog_task_stack != NULL) {
-                heap_caps_free(sniffer_dog_task_stack);
-                sniffer_dog_task_stack = NULL;
-            }
+        // Only cleanup stack if task finished on its own
+        if (sniffer_dog_task_handle == NULL && sniffer_dog_task_stack != NULL) {
+            heap_caps_free(sniffer_dog_task_stack);
+            sniffer_dog_task_stack = NULL;
         }
         
         esp_wifi_set_promiscuous(false);
@@ -3827,12 +3824,13 @@ static void sniffer_start_btn_cb(lv_event_t *e)
         ESP_LOGI(TAG, "Stopping WiFi Sniffer...");
         sniffer_task_active = false;
         
-        // Wait for task to finish
-        if (sniffer_task_handle != NULL) {
+        // Wait for task to finish gracefully (up to 7 seconds)
+        for (int i = 0; i < 70 && sniffer_task_handle != NULL; i++) {
             vTaskDelay(pdMS_TO_TICKS(100));
-            sniffer_task_handle = NULL;
         }
-        if (sniffer_task_stack != NULL) {
+        
+        // Only cleanup stack if task finished on its own
+        if (sniffer_task_handle == NULL && sniffer_task_stack != NULL) {
             heap_caps_free(sniffer_task_stack);
             sniffer_task_stack = NULL;
         }
@@ -3847,10 +3845,10 @@ static void sniffer_start_btn_cb(lv_event_t *e)
         sniffer_task_active = true;
         sniffer_start_time = (uint32_t)(esp_timer_get_time() / 1000);  // Record start time for delayed sorting
         
-        // Create sniffer task with PSRAM stack
-        sniffer_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+        // Create sniffer task with PSRAM stack (16KB to avoid stack overflow during cleanup)
+        sniffer_task_stack = (StackType_t *)heap_caps_malloc(16384 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
         if (sniffer_task_stack != NULL) {
-            sniffer_task_handle = xTaskCreateStatic(sniffer_task, "sniffer", 4096, NULL, 
+            sniffer_task_handle = xTaskCreateStatic(sniffer_task, "sniffer", 16384, NULL, 
                 5, sniffer_task_stack, &sniffer_task_buffer);
             if (sniffer_task_handle == NULL) {
                 ESP_LOGE(TAG, "Failed to create sniffer task");
@@ -3897,19 +3895,16 @@ static void sniffer_stop_only_btn_cb(lv_event_t *e)
         ESP_LOGI(TAG, "Stopping WiFi Sniffer...");
         sniffer_task_active = false;
         
-        // Wait for task to finish
-        for (int i = 0; i < 20 && sniffer_task_handle != NULL; i++) {
-            vTaskDelay(pdMS_TO_TICKS(50));
+        // Wait for task to finish gracefully (up to 7 seconds - must be longer than
+        // wifi_sniffer_stop internal timeout of 5s to avoid stack overflow from force delete)
+        for (int i = 0; i < 70 && sniffer_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
         
-        // Force delete if still running
-        if (sniffer_task_handle != NULL) {
-            vTaskDelete(sniffer_task_handle);
-            sniffer_task_handle = NULL;
-            if (sniffer_task_stack != NULL) {
-                heap_caps_free(sniffer_task_stack);
-                sniffer_task_stack = NULL;
-            }
+        // Only cleanup stack if task finished on its own
+        if (sniffer_task_handle == NULL && sniffer_task_stack != NULL) {
+            heap_caps_free(sniffer_task_stack);
+            sniffer_task_stack = NULL;
         }
         
         ESP_LOGI(TAG, "Sniffer stopped");
@@ -3955,17 +3950,15 @@ static void sniffer_quit_cb(lv_event_t *e)
         ESP_LOGI(TAG, "Stopping WiFi Sniffer (keeping data)...");
         sniffer_task_active = false;
         
-        for (int i = 0; i < 20 && sniffer_task_handle != NULL; i++) {
-            vTaskDelay(pdMS_TO_TICKS(50));
+        // Wait for task to finish gracefully (up to 7 seconds)
+        for (int i = 0; i < 70 && sniffer_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
         
-        if (sniffer_task_handle != NULL) {
-            vTaskDelete(sniffer_task_handle);
-            sniffer_task_handle = NULL;
-            if (sniffer_task_stack != NULL) {
-                heap_caps_free(sniffer_task_stack);
-                sniffer_task_stack = NULL;
-            }
+        // Only cleanup stack if task finished on its own
+        if (sniffer_task_handle == NULL && sniffer_task_stack != NULL) {
+            heap_caps_free(sniffer_task_stack);
+            sniffer_task_stack = NULL;
         }
     }
     
@@ -4001,21 +3994,22 @@ static void sniffer_rescan_cb(lv_event_t *e)
     if (sniffer_task_active || sniffer_task_handle != NULL) {
         sniffer_task_active = false;
         
-        for (int i = 0; i < 20 && sniffer_task_handle != NULL; i++) {
-            vTaskDelay(pdMS_TO_TICKS(50));
+        // Wait for task to finish gracefully (up to 7 seconds)
+        for (int i = 0; i < 70 && sniffer_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
         
-        if (sniffer_task_handle != NULL) {
-            vTaskDelete(sniffer_task_handle);
-            sniffer_task_handle = NULL;
-            if (sniffer_task_stack != NULL) {
-                heap_caps_free(sniffer_task_stack);
-                sniffer_task_stack = NULL;
-            }
+        // Only cleanup stack if task finished on its own
+        if (sniffer_task_handle == NULL && sniffer_task_stack != NULL) {
+            heap_caps_free(sniffer_task_stack);
+            sniffer_task_stack = NULL;
         }
     }
     
-    wifi_sniffer_stop();
+    // Ensure promiscuous mode is off (task already called wifi_sniffer_stop if it finished)
+    if (wifi_sniffer_is_active()) {
+        wifi_sniffer_stop();
+    }
     
     // Clear all sniffer data
     wifi_sniffer_clear_data();
@@ -4034,9 +4028,9 @@ static void sniffer_rescan_cb(lv_event_t *e)
     // Restart sniffer
     sniffer_task_active = true;
     sniffer_start_time = (uint32_t)(esp_timer_get_time() / 1000);  // Record start time for delayed sorting
-    sniffer_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    sniffer_task_stack = (StackType_t *)heap_caps_malloc(16384 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
     if (sniffer_task_stack != NULL) {
-        sniffer_task_handle = xTaskCreateStatic(sniffer_task, "sniffer", 4096, NULL, 
+        sniffer_task_handle = xTaskCreateStatic(sniffer_task, "sniffer", 16384, NULL, 
             5, sniffer_task_stack, &sniffer_task_buffer);
         if (sniffer_task_handle == NULL) {
             ESP_LOGE(TAG, "Failed to create sniffer task");
@@ -4682,9 +4676,9 @@ static void sniffer_yes_btn_cb(lv_event_t *e)
         sniffer_task_active = true;
         sniffer_start_time = (uint32_t)(esp_timer_get_time() / 1000);  // Record start time for delayed sorting
         
-        sniffer_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+        sniffer_task_stack = (StackType_t *)heap_caps_malloc(8192 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
         if (sniffer_task_stack != NULL) {
-            sniffer_task_handle = xTaskCreateStatic(sniffer_task, "sniffer", 4096, NULL, 
+            sniffer_task_handle = xTaskCreateStatic(sniffer_task, "sniffer", 8192, NULL, 
                 5, sniffer_task_stack, &sniffer_task_buffer);
             if (sniffer_task_handle == NULL) {
                 ESP_LOGE(TAG, "Failed to create sniffer task");
@@ -4711,20 +4705,15 @@ static void sniffer_enough_btn_cb(lv_event_t *e)
         ESP_LOGI(TAG, "Stopping WiFi Sniffer...");
         sniffer_task_active = false;
         
-        // Wait for task to finish
-        for (int i = 0; i < 20 && sniffer_task_handle != NULL; i++) {
-            vTaskDelay(pdMS_TO_TICKS(50));
+        // Wait for task to finish gracefully (up to 7 seconds)
+        for (int i = 0; i < 70 && sniffer_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
         
-        // Force delete if still running
-        if (sniffer_task_handle != NULL) {
-            vTaskDelete(sniffer_task_handle);
-            sniffer_task_handle = NULL;
-            // Free PSRAM stack
-            if (sniffer_task_stack != NULL) {
-                heap_caps_free(sniffer_task_stack);
-                sniffer_task_stack = NULL;
-            }
+        // Only cleanup stack if task finished on its own
+        if (sniffer_task_handle == NULL && sniffer_task_stack != NULL) {
+            heap_caps_free(sniffer_task_stack);
+            sniffer_task_stack = NULL;
         }
         
         ESP_LOGI(TAG, "Sniffer stopped");
@@ -5745,6 +5734,8 @@ static void show_karma_page(void)
     }
 
     int valid_probes = 0;
+    memset(karma_probe_index_map, -1, sizeof(karma_probe_index_map));  // Initialize map
+    
     for (int i = 0; i < probe_count && i < MAX_PROBE_REQUESTS; i++) {
         if (probes[i].ssid[0] == '\0') {
             continue;  // Skip broadcast probes
@@ -5773,9 +5764,15 @@ static void show_karma_page(void)
             memcpy(probe_options + probe_len, entry, entry_len);
             probe_len += entry_len;
             probe_options[probe_len] = '\0';
+            // Map dropdown index to actual probe index
+            if (valid_probes < MAX_PROBE_REQUESTS) {
+                karma_probe_index_map[valid_probes] = i;
+            }
             valid_probes++;
         }
     }
+    
+    karma_valid_probe_count = valid_probes;  // Save valid probe count
 
     if (valid_probes == 0) {
         if (probe_options != (char *)"Run Sniffer first to capture probe requests") {
@@ -5888,7 +5885,7 @@ static void karma_start_btn_cb(lv_event_t *e)
         return;
     }
 
-    // Get selected probe request
+    // Get selected dropdown indices
     int probe_sel = lv_dropdown_get_selected(karma_probe_dd);
     int html_sel = lv_dropdown_get_selected(karma_html_dd);
 
@@ -5900,24 +5897,21 @@ static void karma_start_btn_cb(lv_event_t *e)
         return;
     }
 
-    // Find selected SSID from probes (skip broadcast probes)
-    char selected_ssid[33] = {0};
-    int valid_probe_index = -1;
-    int current_valid = 0;
-    for (int i = 0; i < probe_count && i < MAX_PROBE_REQUESTS; i++) {
-        if (probes[i].ssid[0] == '\0') {
-            continue;  // Skip broadcast
-        }
-        if (current_valid == probe_sel) {
-            strncpy(selected_ssid, probes[i].ssid, sizeof(selected_ssid) - 1);
-            valid_probe_index = i;
-            break;
-        }
-        current_valid++;
+    // Use pre-calculated mapping to get actual probe index
+    if (probe_sel < 0 || probe_sel >= karma_valid_probe_count) {
+        ESP_LOGW(TAG, "Invalid probe selection: %d (valid count: %d)", probe_sel, karma_valid_probe_count);
+        return;
     }
 
-    if (valid_probe_index < 0 || selected_ssid[0] == '\0') {
-        ESP_LOGW(TAG, "Invalid probe selection");
+    int actual_probe_index = karma_probe_index_map[probe_sel];
+    if (actual_probe_index < 0 || actual_probe_index >= probe_count) {
+        ESP_LOGW(TAG, "Invalid actual probe index: %d", actual_probe_index);
+        return;
+    }
+
+    const char *selected_ssid = (const char *)probes[actual_probe_index].ssid;
+    if (!selected_ssid || selected_ssid[0] == '\0') {
+        ESP_LOGW(TAG, "Selected probe SSID is empty");
         return;
     }
 
@@ -8971,7 +8965,7 @@ static void battery_monitor_task(void *arg)
             snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_BATTERY_EMPTY);
         } else if (voltage > BATTERY_VOLTAGE_CHARGING) {
             // Charging: charging symbol
-            snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_CHARGE " CHG");
+            snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_CHARGE "");
         } else {
             // Normal battery: show battery with voltage
             snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_BATTERY_FULL " %.2fV", voltage);
