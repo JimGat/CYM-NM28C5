@@ -214,6 +214,12 @@ float wifi_wardrive_get_longitude(void) {
 // ============================================================================
 
 esp_err_t wifi_wardrive_init_sd(void) {
+    // Check if already mounted
+    if (sd_card_mounted) {
+        ESP_LOGI(TAG, "[SD] SD card already mounted");
+        return ESP_OK;
+    }
+    
     ESP_LOGI(TAG, "[SD] Starting SD card initialization...");
     
     // Detailed memory diagnostics BEFORE mount
