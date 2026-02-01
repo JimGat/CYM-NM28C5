@@ -122,12 +122,12 @@ static int bt_device_count = 0;
 // Battery ADC configuration - Waveshare ESP32-C5-WIFI6-KIT (DISABLED - using regular C5 chip)
 // Schematic: R10=200k, R16=100k voltage divider on BAT_ADC line
 // Note: GPIO6 = ADC1_CH5 on ESP32-C5 (not CH6!)
-// #define BATTERY_ADC_CHANNEL    ADC_CHANNEL_5  // GPIO6 = ADC1_CH5 (BAT_ADC on Waveshare)
-// #define BATTERY_ADC_UNIT       ADC_UNIT_1
-// #define BATTERY_ADC_ATTEN      ADC_ATTEN_DB_12  // Full scale ~3.3V
-// #define BATTERY_VOLTAGE_DIVIDER_RATIO  3.2f    // Calibrated: VBAT 4.14V / GPIO6 1.29V = 3.21
-// #define BATTERY_ADC_SAMPLES            32      // Number of samples to average
-// #define BATTERY_UPDATE_INTERVAL_MS     30000   // 30 seconds
+#define BATTERY_ADC_CHANNEL    ADC_CHANNEL_5  // GPIO6 = ADC1_CH5 (BAT_ADC on Waveshare)
+#define BATTERY_ADC_UNIT       ADC_UNIT_1
+#define BATTERY_ADC_ATTEN      ADC_ATTEN_DB_12  // Full scale ~3.3V
+#define BATTERY_VOLTAGE_DIVIDER_RATIO  3.2f    // Calibrated: VBAT 4.14V / GPIO6 1.29V = 3.21
+#define BATTERY_ADC_SAMPLES            32      // Number of samples to average
+#define BATTERY_UPDATE_INTERVAL_MS     30000   // 30 seconds
 
 // Color definitions (used throughout the file)
 #define COLOR_MATERIAL_BLUE     lv_color_make(255, 255, 255)   // #FFFFFF - white text color (for labels/borders)
@@ -190,9 +190,9 @@ static void gps_task(void *arg);
 static void screenshot_btn_event_cb(lv_event_t *e);
 
 // Battery voltage monitor forward declarations (DISABLED - using regular C5 chip)
-// static esp_err_t init_battery_adc(void);
-// static float read_battery_voltage(void);
-// static void battery_monitor_task(void *arg);
+static esp_err_t init_battery_adc(void);
+static float read_battery_voltage(void);
+static void battery_monitor_task(void *arg);
 static esp_err_t save_snapshot_bmp(lv_img_dsc_t *shot, const char *filepath);
 static int find_next_screenshot_index(void);
 static esp_err_t ensure_screenshot_dir(void);
@@ -493,11 +493,11 @@ static bool bt_tracking_mode = false;
 
 // Battery voltage monitor state (DISABLED - using regular C5 chip)
 static lv_obj_t *battery_label = NULL;  // Keep for UI layout
-// static adc_oneshot_unit_handle_t battery_adc_handle = NULL;
-// static adc_cali_handle_t battery_adc_cali_handle = NULL;
-// static StaticTask_t battery_task_buffer;
-// static StackType_t *battery_task_stack = NULL;
-// static TaskHandle_t battery_task_handle = NULL;
+static adc_oneshot_unit_handle_t battery_adc_handle = NULL;
+static adc_cali_handle_t battery_adc_cali_handle = NULL;
+static StaticTask_t battery_task_buffer;
+static StackType_t *battery_task_stack = NULL;
+static TaskHandle_t battery_task_handle = NULL;
 static uint8_t bt_tracking_mac[6] = {0};
 static volatile int8_t bt_tracking_rssi = 0;
 static volatile bool bt_tracking_found = false;
@@ -1837,19 +1837,22 @@ void app_main(void)
     init_i2c();
     init_touch();
 
+    // ✅ Initialize display FIRST so SPI2_HOST is ready for SD card
+    // This must happen BEFORE SD init task to prevent "host_id not initialized" errors
     ESP_LOGI(TAG, "LV INIT");
     lv_init();
     init_display();
-
     ESP_LOGI(TAG, "Display hardware initialized");
-    
+
     ESP_LOGI(TAG, "=== INITIALIZING SD CARD ===");
     // Allocate SD init task stack from PSRAM
+    // SPI2_HOST is now initialized, so SD card can safely use it
+    TaskHandle_t sd_task_handle = NULL;
     sd_init_task_stack = (StackType_t *)heap_caps_malloc(8192 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
     if (sd_init_task_stack != NULL) {
-        TaskHandle_t task_handle = xTaskCreateStatic(sd_init_task, "sd_init", 8192, NULL, 
+        sd_task_handle = xTaskCreateStatic(sd_init_task, "sd_init", 8192, NULL, 
             5, sd_init_task_stack, &sd_init_task_buffer);
-        if (task_handle == NULL) {
+        if (sd_task_handle == NULL) {
             ESP_LOGE(TAG, "Failed to create SD init task");
             heap_caps_free(sd_init_task_stack);
             sd_init_task_stack = NULL;
@@ -1860,9 +1863,21 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to allocate SD init task stack from PSRAM");
     }
     
-    // Give SD init task time to complete (it will self-delete)
-    // Wait longer to ensure SD mount completes before starting LCD drawing
-    vTaskDelay(pdMS_TO_TICKS(2000));  // 2 seconds to complete SD init
+    // ✅ Wait for SD initialization to complete (now safe - SPI is ready)
+    if (sd_task_handle != NULL) {
+        ESP_LOGI(TAG, "Waiting for SD initialization to complete...");
+        int timeout_ms = 10000;  // 10 second timeout
+        int elapsed = 0;
+        while (eTaskGetState(sd_task_handle) != eDeleted && elapsed < timeout_ms) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            elapsed += 100;
+        }
+        if (eTaskGetState(sd_task_handle) == eDeleted) {
+            ESP_LOGI(TAG, "SD initialization complete");
+        } else {
+            ESP_LOGW(TAG, "SD initialization timeout after %dms", timeout_ms);
+        }
+    }
          
     // Create LVGL mutex for thread safety
     lvgl_mutex = xSemaphoreCreateMutex();
@@ -1961,11 +1976,11 @@ void app_main(void)
     lv_obj_add_event_cb(title_label, screenshot_btn_event_cb, LV_EVENT_CLICKED, NULL);
     
     // Battery voltage label - right side of title bar (HIDDEN)
-    // battery_label = lv_label_create(title_bar);
-    // lv_label_set_text(battery_label, "-.--V");
-    // lv_obj_set_style_text_color(battery_label, lv_color_make(180, 180, 180), 0);  // Light gray
-    // lv_obj_set_style_text_font(battery_label, &lv_font_montserrat_12, 0);  // Smaller font
-    // lv_obj_align(battery_label, LV_ALIGN_RIGHT_MID, -8, 0);
+    battery_label = lv_label_create(title_bar);
+    lv_label_set_text(battery_label, "-.--V");
+    lv_obj_set_style_text_color(battery_label, lv_color_make(180, 180, 180), 0);  // Light gray
+    lv_obj_set_style_text_font(battery_label, &lv_font_montserrat_12, 0);  // Smaller font
+    lv_obj_align(battery_label, LV_ALIGN_RIGHT_MID, -8, 0);
     
     // Create tile-based main menu
     show_main_tiles();
@@ -2020,25 +2035,25 @@ void app_main(void)
     check_heap_integrity("Before main loop");
     print_memory_stats();
     
-    // Battery voltage monitor disabled - chip changed from Waveshare to regular C5
-    // if (init_battery_adc() == ESP_OK) {
-    //     battery_task_stack = (StackType_t *)heap_caps_malloc(2048 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
-    //     if (battery_task_stack != NULL) {
-    //         battery_task_handle = xTaskCreateStatic(battery_monitor_task, "bat_mon", 2048, NULL,
-    //             tskIDLE_PRIORITY + 1, battery_task_stack, &battery_task_buffer);
-    //         if (battery_task_handle == NULL) {
-    //             ESP_LOGE(TAG, "Failed to create battery monitor task");
-    //             heap_caps_free(battery_task_stack);
-    //             battery_task_stack = NULL;
-    //         } else {
-    //             ESP_LOGI(TAG, "Battery monitor task running (PSRAM stack, 30s refresh)");
-    //         }
-    //     } else {
-    //         ESP_LOGE(TAG, "Failed to allocate battery task stack from PSRAM");
-    //     }
-    // } else {
-    //     ESP_LOGW(TAG, "Battery ADC init failed - voltage monitor disabled");
-    // }
+    //Battery voltage monitor disabled - chip changed from Waveshare to regular C5
+    if (init_battery_adc() == ESP_OK) {
+        battery_task_stack = (StackType_t *)heap_caps_malloc(2048 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+        if (battery_task_stack != NULL) {
+            battery_task_handle = xTaskCreateStatic(battery_monitor_task, "bat_mon", 2048, NULL,
+                tskIDLE_PRIORITY + 1, battery_task_stack, &battery_task_buffer);
+            if (battery_task_handle == NULL) {
+                ESP_LOGE(TAG, "Failed to create battery monitor task");
+                heap_caps_free(battery_task_stack);
+                battery_task_stack = NULL;
+            } else {
+                ESP_LOGI(TAG, "Battery monitor task running (PSRAM stack, 30s refresh)");
+            }
+        } else {
+            ESP_LOGE(TAG, "Failed to allocate battery task stack from PSRAM");
+        }
+    } else {
+        ESP_LOGW(TAG, "Battery ADC init failed - voltage monitor disabled");
+    }
 
     // Subscribe main task to watchdog to prevent IDLE task starvation during LVGL rendering
     esp_task_wdt_add(NULL);
@@ -8624,7 +8639,7 @@ static void gps_task(void *arg)
 // === BATTERY VOLTAGE MONITOR IMPLEMENTATION ===
 // Disabled - chip changed from Waveshare to regular ESP32-C5
 
-#if 0  // Battery monitor disabled
+#if 1  // Battery monitor enabled
 static esp_err_t init_battery_adc(void)
 {
     // Configure ADC unit

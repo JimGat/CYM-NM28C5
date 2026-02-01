@@ -238,9 +238,10 @@ esp_err_t wifi_wardrive_init_sd(void) {
     
     ESP_LOGI(TAG, "[SD] Configuring SPI host...");
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.slot = SPI2_HOST;  // Same as LCD
-    host.max_freq_khz = 400;  // 400 kHz for init
-    ESP_LOGI(TAG, "[SD]   SPI Host: %d, Frequency: %d kHz", host.slot, host.max_freq_khz);
+    host.slot = SPI2_HOST;  // Same as LCD (already initialized by display)
+    host.max_freq_khz = 20000;  // 20 MHz (increased from 400kHz after init)
+    host.flags = SDMMC_HOST_FLAG_SPI;  // ✅ Tell driver to NOT reinitialize SPI bus
+    ESP_LOGI(TAG, "[SD]   SPI Host: %d, Frequency: %d kHz, Flags: 0x%x", host.slot, host.max_freq_khz, host.flags);
 
     // Configure GPIO pull-ups
     ESP_LOGI(TAG, "[SD] Configuring GPIO pull-ups...");
@@ -254,7 +255,7 @@ esp_err_t wifi_wardrive_init_sd(void) {
     slot_config.gpio_cs = SD_CS_PIN;
     slot_config.gpio_cd = -1;
     slot_config.gpio_wp = -1;
-    slot_config.host_id = host.slot;
+    slot_config.host_id = (spi_host_device_t)SPI2_HOST;  // ✅ Explicit enum cast
     
     ESP_LOGI(TAG, "[SD] Attempting to mount filesystem...");
     ESP_LOGI(TAG, "[SD] This may take a few seconds...");
