@@ -500,7 +500,7 @@ esp_err_t wifi_sniffer_start(void) {
         sniffer_channel_index = 0;
         
         // Start channel hopping task
-        xTaskCreate(sniffer_channel_hop_task, "sniffer_ch_hop", 4096, NULL, 5, &sniffer_channel_task_handle);
+        xTaskCreate(sniffer_channel_hop_task, "sniffer_ch_hop", 16384, NULL, 5, &sniffer_channel_task_handle);
         
         ESP_LOGI(TAG, "[Sniffer] Started - monitoring packets...");
     }
@@ -756,7 +756,7 @@ esp_err_t wifi_sniffer_start_noscan(void) {
     
     // Start channel hopping task
     if (sniffer_channel_task_handle == NULL) {
-        xTaskCreate(sniffer_channel_hop_task, "sniffer_ch_hop", 4096, NULL, 5, &sniffer_channel_task_handle);
+        xTaskCreate(sniffer_channel_hop_task, "sniffer_ch_hop", 8192, NULL, 5, &sniffer_channel_task_handle);
     }
     
     ESP_LOGI(TAG, "[Sniffer] Started in noscan mode - preserved %d APs, %d probes", 
@@ -843,7 +843,7 @@ esp_err_t wifi_sniffer_dog_start(void) {
     sniffer_dog_channel_index = 0;
     
     // Start channel hopping task
-    xTaskCreate(sniffer_dog_channel_hop_task, "sniff_dog_ch", 4096, NULL, 5, &sniffer_dog_task_handle);
+    xTaskCreate(sniffer_dog_channel_hop_task, "sniff_dog_ch", 16384, NULL, 5, &sniffer_dog_task_handle);
     
     ESP_LOGI(TAG, "SnifferDog started");
     return ESP_OK;
