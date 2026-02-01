@@ -7,6 +7,7 @@
 #include "ft6336.h"
 #include "driver/spi_master.h"
 #include "driver/i2c.h"
+#include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -117,6 +118,15 @@ static int bt_device_count = 0;
 #define CTP_INT  25
 #define CTP_RST  8
 
+// Backlight control (set to -1 if LED is tied to 3V3 / no GPIO)
+#define LCD_BL_IO -1
+#define LCD_BL_ACTIVE_LEVEL 1
+
+#define SCREEN_INACTIVITY_TIMEOUT_MS 30000
+#define SCREEN_INACTIVITY_CHECK_MS 1000
+#define SCREEN_BACKLIGHT_ACTIVE_PERCENT 80
+#define SCREEN_BACKLIGHT_DIM_PERCENT 0
+
 #define LCD_H_RES 480
 #define LCD_V_RES 320
 #define LCD_HOST SPI2_HOST
@@ -160,6 +170,10 @@ static volatile uint16_t touch_y_flag = 0;
 static volatile bool show_touch_dot = true;
 static volatile bool ui_locked = false;
 static volatile bool nav_to_menu_flag = false;
+static volatile int64_t last_input_ms = 0;
+static volatile bool screen_dimmed = false;
+static volatile bool ignore_touch_until_release = false;
+static lv_timer_t *screen_idle_timer = NULL;
 
 static esp_lcd_panel_handle_t panel_handle;
 static ft6336_handle_t touch_handle;
@@ -202,6 +216,11 @@ static void battery_monitor_task(void *arg);
 static esp_err_t save_snapshot_bmp(lv_img_dsc_t *shot, const char *filepath);
 static int find_next_screenshot_index(void);
 static esp_err_t ensure_screenshot_dir(void);
+
+static void init_backlight(void);
+static void set_backlight_percent(uint8_t percent);
+static void screen_set_dimmed(bool dimmed);
+static void screen_idle_timer_cb(lv_timer_t *timer);
 
 // Route ESP logging directly to ROM UART to avoid VFS write paths during GUI/ISR contexts
 static int rom_vprintf(const char *fmt, va_list ap)
@@ -1373,6 +1392,47 @@ static void init_display(void)
     vTaskDelay(pdMS_TO_TICKS(50));
 }
 
+static void init_backlight(void)
+{
+    // No backlight GPIO configured; keep display always on.
+    (void)0;
+}
+
+static void set_backlight_percent(uint8_t percent)
+{
+    (void)percent;
+}
+
+static void screen_set_dimmed(bool dimmed)
+{
+    if (screen_dimmed == dimmed) {
+        return;
+    }
+    screen_dimmed = dimmed;
+    ignore_touch_until_release = true;
+
+    if (dimmed) {
+        set_backlight_percent(SCREEN_BACKLIGHT_DIM_PERCENT);
+        if (panel_handle) {
+            esp_lcd_panel_disp_on_off(panel_handle, false);
+        }
+    } else {
+        if (panel_handle) {
+            esp_lcd_panel_disp_on_off(panel_handle, true);
+        }
+        set_backlight_percent(SCREEN_BACKLIGHT_ACTIVE_PERCENT);
+    }
+}
+
+static void screen_idle_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    if (!screen_dimmed && (now_ms - last_input_ms) >= SCREEN_INACTIVITY_TIMEOUT_MS) {
+        screen_set_dimmed(true);
+    }
+}
+
 
 void print_memory_stats(void) {
     // Heap info
@@ -1723,27 +1783,59 @@ static void log_sd_root_listing(void)
     closedir(dir);
 }
 
-// SD card init task with larger stack to prevent stack overflow
-static void sd_init_task(void *param)
+// SD card lazy mount - call once before using /sdcard
+static bool sd_mounted_lazy = false;
+static SemaphoreHandle_t sd_mount_mutex = NULL;
+static TaskHandle_t sd_lazy_mount_task = NULL;
+
+// Background task to mount SD lazily
+static void sd_lazy_mount_task_fn(void *param)
 {
-    ESP_LOGI(TAG, "[SD_TASK] Starting SD initialization");
-    ESP_LOGI(TAG, "[SD_TASK] Heap at start: %u bytes (internal: %u)", 
-             esp_get_free_heap_size(),
-             heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    vTaskDelay(pdMS_TO_TICKS(2000));  // Wait 2s after startup
     
+    ESP_LOGI(TAG, "[SD_LAZY] Background SD mount task starting...");
+    
+    // Try to mount SD without blocking
+    esp_err_t ret = wifi_wardrive_init_sd();
+    if (ret == ESP_OK) {
+        sd_mounted_lazy = true;
+        ESP_LOGI(TAG, "[SD_LAZY] SD card mounted successfully in background");
+        
+        // Load whitelist now that SD is mounted
+        load_whitelist_from_sd();
+    } else {
+        ESP_LOGW(TAG, "[SD_LAZY] SD mount failed: %s (system works without SD)", esp_err_to_name(ret));
+    }
+    
+    vTaskDelete(NULL);
+}
+
+static esp_err_t ensure_sd_mounted(void)
+{
+    // Quick check: already mounted
+    if (sd_mounted_lazy) {
+        return ESP_OK;
+    }
+    
+    // SD not mounted yet - mount now (blocking with timeout protection)
+    ESP_LOGI(TAG, "[SD_MOUNT] Attempting to mount SD card on demand...");
     esp_err_t ret = wifi_wardrive_init_sd();
     
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "[SD_TASK] ✅ SD card mount successful!");
-        //log_sd_root_listing();
-        ESP_LOGI(TAG, "[SD_TASK] SD card ready for use");
+        sd_mounted_lazy = true;
+        ESP_LOGI(TAG, "[SD_MOUNT] SD card mounted successfully on demand");
+        return ESP_OK;
     } else {
-        ESP_LOGE(TAG, "[SD_TASK] ❌ SD initialization FAILED: %s (0x%x)", 
-                 esp_err_to_name(ret), ret);
+        ESP_LOGW(TAG, "[SD_MOUNT] SD mount failed: %s", esp_err_to_name(ret));
+        return ret;  // Return error to caller
     }
-    
-    ESP_LOGI(TAG, "[SD_TASK] Task complete, heap: %u bytes, deleting self",
-             esp_get_free_heap_size());
+}
+
+// SD card init task with larger stack to prevent stack overflow
+static void sd_init_task(void *param)
+{
+    // This task is now disabled - SD is mounted lazily in background
+    ESP_LOGI(TAG, "[SD_TASK] SD init task disabled (lazy mount)");
     vTaskDelete(NULL);
 }
 
@@ -1753,11 +1845,11 @@ void load_whitelist_from_sd(void) {
     
     ESP_LOGI(TAG, "Loading whitelist from /sdcard/lab/white.txt...");
     
-    // SD card should already be mounted by sd_card_task
-    // Just try to open the file directly
+    // Try to open the file - if SD not mounted, this will fail gracefully
+    // Don't try to mount SD here - let it be mounted elsewhere
     FILE *file = fopen("/sdcard/lab/white.txt", "r");
     if (file == NULL) {
-        ESP_LOGI(TAG, "white.txt not found on SD card - whitelist will be empty");
+        ESP_LOGI(TAG, "white.txt not found or SD not accessible - whitelist will be empty");
         return;
     }
     
@@ -1895,57 +1987,11 @@ void app_main(void)
     init_display();
     ESP_LOGI(TAG, "[INIT] Stage 2: Display hardware initialized, SPI bus ready");
     ESP_LOGI(TAG, "[DISPLAY] Hardware init complete, panel ready for drawing");
+    init_backlight();
 
-    ESP_LOGI(TAG, "=== INITIALIZING SD CARD ===");
-    // Allocate SD init task stack from PSRAM
-    // SPI2_HOST is now initialized, so SD card can safely use it
-    TaskHandle_t sd_task_handle = NULL;
-    sd_init_task_stack = (StackType_t *)heap_caps_malloc(8192 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
-    if (sd_init_task_stack != NULL) {
-        sd_task_handle = xTaskCreateStatic(sd_init_task, "sd_init", 8192, NULL, 
-            5, sd_init_task_stack, &sd_init_task_buffer);
-        if (sd_task_handle == NULL) {
-            ESP_LOGE(TAG, "Failed to create SD init task");
-            heap_caps_free(sd_init_task_stack);
-            sd_init_task_stack = NULL;
-        } else {
-            ESP_LOGI(TAG, "SD init task created with PSRAM stack");
-        }
-    } else {
-        ESP_LOGE(TAG, "Failed to allocate SD init task stack from PSRAM");
-    }
-    
-    // ✅ Wait for SD initialization to complete (now safe - SPI is ready)
-    if (sd_task_handle != NULL) {
-        ESP_LOGI(TAG, "[SYNC] Waiting for SD initialization (max 15 seconds)...");
-        int timeout_ms = 15000;  // 15 second timeout (increased from 10)
-        int elapsed = 0;
-        
-        while (elapsed < timeout_ms) {
-            eTaskState state = eTaskGetState(sd_task_handle);
-            
-            if (state == eDeleted || state == eInvalid) {
-                ESP_LOGI(TAG, "[SYNC] SD task finished after %d ms", elapsed);
-                break;
-            }
-            
-            if (elapsed % 1000 == 0) {  // Log co sekundę
-                ESP_LOGI(TAG, "[SYNC] Still waiting... (%d/%d ms)", elapsed, timeout_ms);
-            }
-            
-            vTaskDelay(pdMS_TO_TICKS(100));
-            esp_task_wdt_reset();  // ✅ Reset watchdog during wait
-            elapsed += 100;
-        }
-        
-        eTaskState final_state = eTaskGetState(sd_task_handle);
-        if (final_state != eDeleted && final_state != eInvalid) {
-            ESP_LOGW(TAG, "[SYNC] ⚠️ SD timeout! Forcing task delete");
-            vTaskDelete(sd_task_handle);
-        }
-    }
-    
-    ESP_LOGI(TAG, "[SYNC] SD ready, continuing with LVGL initialization");
+    ESP_LOGI(TAG, "=== SD CARD INIT DISABLED ===");
+    ESP_LOGI(TAG, "[INIT] SD card will be mounted lazily on first use");
+    ESP_LOGI(TAG, "[INIT] System works without SD card - no blocking on startup");
          
     // Create LVGL mutex for thread safety
     lvgl_mutex = xSemaphoreCreateMutex();
@@ -2067,6 +2113,8 @@ void app_main(void)
     
     // Now that UI is fully created, turn on display (prevents boot flash)
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
+    set_backlight_percent(SCREEN_BACKLIGHT_ACTIVE_PERCENT);
+    last_input_ms = esp_timer_get_time() / 1000;
     
     vTaskDelay(pdMS_TO_TICKS(100));
     
@@ -2077,6 +2125,10 @@ void app_main(void)
     indev_drv.user_data = &touch_handle;
     lv_indev_drv_register(&indev_drv);
 
+    if (screen_idle_timer == NULL) {
+        screen_idle_timer = lv_timer_create(screen_idle_timer_cb, SCREEN_INACTIVITY_CHECK_MS, NULL);
+    }
+
     const esp_timer_create_args_t periodic_timer_args = {
         .callback = &lvgl_tick_task,
         .name = "lvgl_tick"
@@ -2085,9 +2137,8 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_timer_create(&periodic_timer_args, &periodic_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(periodic_timer, 10 * 1000));
     
-    // Load BSSID whitelist from SD card
-    load_whitelist_from_sd();
-    vTaskDelay(pdMS_TO_TICKS(500));
+    // Skip loading whitelist on startup - will be loaded lazily if needed
+    // load_whitelist_from_sd();  // DISABLED - no blocking on startup
     
     // Initialize portal HTML buffer (1MB in PSRAM for large HTML files up to 900KB)
     ESP_LOGI(TAG, "Initializing portal HTML buffer in PSRAM...");
@@ -3191,15 +3242,41 @@ void lvgl_touch_read_cb(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
     static int call_count = 0;
     ft6336_handle_t *touch = (ft6336_handle_t *)indev_drv->user_data;
     ft6336_touch_point_t point;
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    bool touched = false;
     
     // Debug counter kept but no console prints (avoid VFS write during draw)
     call_count++;
-    if (ui_locked) {
+    if (ft6336_read_touch(touch, &point) && point.touched) {
+        touched = true;
+        last_input_ms = now_ms;
+    }
+
+    if (screen_dimmed) {
+        if (touched) {
+            screen_set_dimmed(false);
+        }
         data->state = LV_INDEV_STATE_RELEASED;
+        touch_pressed_flag = false;
         return;
     }
-    
-    if (ft6336_read_touch(touch, &point) && point.touched) {
+
+    if (ignore_touch_until_release) {
+        if (!touched) {
+            ignore_touch_until_release = false;
+        }
+        data->state = LV_INDEV_STATE_RELEASED;
+        touch_pressed_flag = false;
+        return;
+    }
+
+    if (ui_locked) {
+        data->state = LV_INDEV_STATE_RELEASED;
+        touch_pressed_flag = false;
+        return;
+    }
+
+    if (touched) {
         data->point.x = point.x;
         data->point.y = point.y;
         data->state = LV_INDEV_STATE_PRESSED;
@@ -7130,6 +7207,12 @@ static void wifi_monitor_tile_event_cb(lv_event_t *e)
 // Evil Twin Passwords screen - reads /sdcard/lab/eviltwin.txt
 static void show_eviltwin_passwords_screen(void)
 {
+    // Ensure SD card is mounted before trying to read files
+    esp_err_t sd_ret = ensure_sd_mounted();
+    if (sd_ret != ESP_OK) {
+        ESP_LOGW(TAG, "[EVIL_TWIN] SD card not available: %s", esp_err_to_name(sd_ret));
+    }
+    
     create_function_page_base("Evil Twin Passwords");
     
     // Scrollable list container
@@ -7228,6 +7311,12 @@ static void show_eviltwin_passwords_screen(void)
 // Portal Data screen - reads /sdcard/lab/portals.txt
 static void show_portal_data_screen(void)
 {
+    // Ensure SD card is mounted before trying to read files
+    esp_err_t sd_ret = ensure_sd_mounted();
+    if (sd_ret != ESP_OK) {
+        ESP_LOGW(TAG, "[PORTAL_DATA] SD card not available: %s", esp_err_to_name(sd_ret));
+    }
+    
     create_function_page_base("Portal Data");
     
     // Scrollable list container
@@ -7303,6 +7392,12 @@ static void show_portal_data_screen(void)
 // Handshakes list screen - lists .pcap files from /sdcard/lab/handshakes/
 static void show_handshakes_list_screen(void)
 {
+    // Ensure SD card is mounted before trying to read files
+    esp_err_t sd_ret = ensure_sd_mounted();
+    if (sd_ret != ESP_OK) {
+        ESP_LOGW(TAG, "[HANDSHAKES] SD card not available: %s", esp_err_to_name(sd_ret));
+    }
+    
     create_function_page_base("Handshakes");
     
     // Scrollable list container
@@ -7720,6 +7815,12 @@ static void show_stub_screen(const char *name)
 
 static void show_evil_twin_page(void)
 {
+    // Ensure SD card is mounted before trying to read HTML templates
+    esp_err_t sd_ret = ensure_sd_mounted();
+    if (sd_ret != ESP_OK) {
+        ESP_LOGW(TAG, "[EVIL_TWIN_PAGE] SD card not available: %s", esp_err_to_name(sd_ret));
+    }
+    
     create_function_page_base("Evil Twin");
     wifi_attacks_refresh_sd_html_list();
 
