@@ -20,6 +20,8 @@
 #include <errno.h>
 #include "esp_event.h"
 #include "freertos/semphr.h"
+#include "esp_system.h"
+#include "soc/lp_aon_reg.h"
 #include "wifi_cli.h"
 #include "wifi_scanner.h"
 #include "wifi_sniffer.h"
@@ -567,6 +569,9 @@ static void show_bluetooth_screen(void);
 static void show_stub_screen(const char *name);
 static void main_tile_event_cb(lv_event_t *e);
 static void attack_tile_event_cb(lv_event_t *e);
+static void update_sniffer_button_ui(void);
+static void show_settings_screen(void);
+static void settings_tile_event_cb(lv_event_t *e);
 static void home_btn_event_cb(lv_event_t *e);
 static void wifi_scan_next_btn_cb(lv_event_t *e);
 static void deauth_quit_event_cb(lv_event_t *e);
@@ -764,6 +769,11 @@ static void bt_locator_exit_cb(lv_event_t *e);
 static void bt_locator_tracking_task(void *pvParameters);
 static void bt_locator_update_list(void);
 
+static void sniffer_ui_async_cb(void *arg) {
+    (void)arg;
+    update_sniffer_button_ui();
+}
+
 static void wifi_scan_done_cb(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE) {
@@ -774,6 +784,8 @@ static void wifi_scan_done_cb(void *arg, esp_event_base_t event_base, int32_t ev
             scan_done_ui_flag = true;
         }
     }
+    // Ensure button UI matches actual sniffer state (in case we auto-started)
+    lv_async_call(sniffer_ui_async_cb, NULL);
 }
 
 static void scan_checkbox_event_cb(lv_event_t *e)
@@ -3794,30 +3806,69 @@ static void sniffer_start_btn_cb(lv_event_t *e)
     (void)e;
     
     if (sniffer_task_active) {
-        ESP_LOGI(TAG, "Sniffer already active");
-        return;
-    }
-    
-    ESP_LOGI(TAG, "Starting WiFi Sniffer...");
-    sniffer_task_active = true;
-    sniffer_start_time = (uint32_t)(esp_timer_get_time() / 1000);  // Record start time for delayed sorting
-    
-    // Create sniffer task with PSRAM stack
-    sniffer_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
-    if (sniffer_task_stack != NULL) {
-        sniffer_task_handle = xTaskCreateStatic(sniffer_task, "sniffer", 4096, NULL, 
-            5, sniffer_task_stack, &sniffer_task_buffer);
-        if (sniffer_task_handle == NULL) {
-            ESP_LOGE(TAG, "Failed to create sniffer task");
+        // Stop the sniffer
+        ESP_LOGI(TAG, "Stopping WiFi Sniffer...");
+        sniffer_task_active = false;
+        
+        // Wait for task to finish
+        if (sniffer_task_handle != NULL) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            sniffer_task_handle = NULL;
+        }
+        if (sniffer_task_stack != NULL) {
             heap_caps_free(sniffer_task_stack);
             sniffer_task_stack = NULL;
-            sniffer_task_active = false;
-        } else {
-            ESP_LOGI(TAG, "Sniffer task created with PSRAM stack");
         }
+        
+        // Update button to show START
+        lv_label_set_text(lv_obj_get_child(sniffer_start_btn, 0), "Start");
+        lv_obj_set_style_bg_color(sniffer_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(sniffer_start_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
     } else {
-        ESP_LOGE(TAG, "Failed to allocate sniffer task stack from PSRAM");
-        sniffer_task_active = false;
+        // Start the sniffer
+        ESP_LOGI(TAG, "Starting WiFi Sniffer...");
+        sniffer_task_active = true;
+        sniffer_start_time = (uint32_t)(esp_timer_get_time() / 1000);  // Record start time for delayed sorting
+        
+        // Create sniffer task with PSRAM stack
+        sniffer_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+        if (sniffer_task_stack != NULL) {
+            sniffer_task_handle = xTaskCreateStatic(sniffer_task, "sniffer", 4096, NULL, 
+                5, sniffer_task_stack, &sniffer_task_buffer);
+            if (sniffer_task_handle == NULL) {
+                ESP_LOGE(TAG, "Failed to create sniffer task");
+                heap_caps_free(sniffer_task_stack);
+                sniffer_task_stack = NULL;
+                sniffer_task_active = false;
+            } else {
+                ESP_LOGI(TAG, "Sniffer task created with PSRAM stack");
+                // Update button to show STOP
+                lv_label_set_text(lv_obj_get_child(sniffer_start_btn, 0), "Stop");
+                lv_obj_set_style_bg_color(sniffer_start_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+                lv_obj_set_style_bg_color(sniffer_start_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
+            }
+        } else {
+            ESP_LOGE(TAG, "Failed to allocate sniffer task stack from PSRAM");
+            sniffer_task_active = false;
+        }
+    }
+}
+
+// Update the Start/Stop button UI based on `sniffer_task_active`
+static void update_sniffer_button_ui(void)
+{
+    if (sniffer_start_btn == NULL) return;
+    lv_obj_t *lbl = lv_obj_get_child(sniffer_start_btn, 0);
+    if (lbl == NULL) return;
+
+    if (sniffer_task_active) {
+        lv_label_set_text(lbl, "Stop");
+        lv_obj_set_style_bg_color(sniffer_start_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(sniffer_start_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
+    } else {
+        lv_label_set_text(lbl, "Start");
+        lv_obj_set_style_bg_color(sniffer_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(sniffer_start_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
     }
 }
 
@@ -4487,7 +4538,7 @@ static void sniffer_yes_btn_cb(lv_event_t *e)
     lv_obj_clear_flag(title_bar, LV_OBJ_FLAG_SCROLLABLE);
     
     lv_obj_t *title_label = lv_label_create(title_bar);
-    lv_label_set_text(title_label, "Sniffer");
+    lv_label_set_text(title_label, "Network Observer");
     lv_obj_set_style_text_color(title_label, lv_color_make(255, 255, 255), 0);
     lv_obj_align(title_label, LV_ALIGN_LEFT_MID, 10, 0);
     lv_obj_add_flag(title_label, LV_OBJ_FLAG_CLICKABLE);
@@ -4531,31 +4582,26 @@ static void sniffer_yes_btn_cb(lv_event_t *e)
     lv_obj_set_flex_align(control_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(control_row, LV_OBJ_FLAG_SCROLLABLE);
     
-    // Start button (green)
+    // Start/Stop button (green when inactive, red when active)
     sniffer_start_btn = lv_btn_create(control_row);
     lv_obj_set_size(sniffer_start_btn, 90, 35);
-    lv_obj_set_style_bg_color(sniffer_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(sniffer_start_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(sniffer_start_btn, 0, 0);
     lv_obj_set_style_radius(sniffer_start_btn, 8, 0);
     lv_obj_t *start_lbl = lv_label_create(sniffer_start_btn);
-    lv_label_set_text(start_lbl, "Start");
     lv_obj_set_style_text_color(start_lbl, lv_color_make(255, 255, 255), 0);
     lv_obj_center(start_lbl);
     lv_obj_add_event_cb(sniffer_start_btn, sniffer_start_btn_cb, LV_EVENT_CLICKED, NULL);
-    
-    // Stop button (red)
-    sniffer_stop_btn = lv_btn_create(control_row);
-    lv_obj_set_size(sniffer_stop_btn, 90, 35);
-    lv_obj_set_style_bg_color(sniffer_stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(sniffer_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(sniffer_stop_btn, 0, 0);
-    lv_obj_set_style_radius(sniffer_stop_btn, 8, 0);
-    lv_obj_t *stop_lbl = lv_label_create(sniffer_stop_btn);
-    lv_label_set_text(stop_lbl, "Stop");
-    lv_obj_set_style_text_color(stop_lbl, lv_color_make(255, 255, 255), 0);
-    lv_obj_center(stop_lbl);
-    lv_obj_add_event_cb(sniffer_stop_btn, sniffer_stop_only_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    // Set initial state based on whether sniffer is already active
+    if (sniffer_task_active) {
+        lv_label_set_text(start_lbl, "Stop");
+        lv_obj_set_style_bg_color(sniffer_start_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(sniffer_start_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
+    } else {
+        lv_label_set_text(start_lbl, "Start");
+        lv_obj_set_style_bg_color(sniffer_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(sniffer_start_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
+    }
     
     // Rescan button (orange) - clears data and rescans
     lv_obj_t *rescan_btn = lv_btn_create(control_row);
@@ -4606,6 +4652,7 @@ static void sniffer_yes_btn_cb(lv_event_t *e)
                 sniffer_task_active = false;
             } else {
                 ESP_LOGI(TAG, "Sniffer task created with PSRAM stack");
+                update_sniffer_button_ui();
             }
         } else {
             ESP_LOGE(TAG, "Failed to allocate sniffer task stack from PSRAM");
@@ -6650,8 +6697,8 @@ static void main_tile_event_cb(lv_event_t *e)
         show_global_attacks_screen();
     } else if (strcmp(tile_name, "WiFi Sniff&Karma") == 0) {
         show_sniff_karma_screen();
-    } else if (strcmp(tile_name, "Compromised Data") == 0) {
-        show_wifi_monitor_screen();
+    } else if (strcmp(tile_name, "Settings") == 0) {
+        show_settings_screen();
     } else if (strcmp(tile_name, "Deauth Monitor") == 0) {
         show_deauth_monitor_screen();
     } else if (strcmp(tile_name, "Bluetooth") == 0) {
@@ -6765,7 +6812,7 @@ static void attack_tile_event_cb(lv_event_t *e)
         
     } else if (strcmp(attack_name, "Sniffer") == 0) {
         // Reuse existing sniffer logic
-        create_function_page_base("Sniffer");
+        create_function_page_base("Network Observer");
         lv_obj_t *warning_label = lv_label_create(function_page);
         lv_label_set_text(warning_label, "This will start\nWiFi Sniffer.\n\nAre you sure?");
         lv_obj_set_style_text_align(warning_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -6851,7 +6898,7 @@ static void show_main_tiles(void)
     create_tile(tiles_container, LV_SYMBOL_WIFI, "WiFi Scan\n& Attack", COLOR_TILE_BLUE, main_tile_event_cb, "WiFi Scan & Attack");
     create_tile(tiles_container, LV_SYMBOL_WARNING, "Global WiFi\nAttacks", COLOR_MATERIAL_RED, main_tile_event_cb, "Global WiFi Attacks");
     create_tile(tiles_container, LV_SYMBOL_EYE_OPEN, "WiFi Sniff\n& Karma", COLOR_MATERIAL_PURPLE, main_tile_event_cb, "WiFi Sniff&Karma");
-    create_tile(tiles_container, LV_SYMBOL_SETTINGS, "Compromised\nData", COLOR_MATERIAL_GREEN, main_tile_event_cb, "Compromised Data");
+    create_tile(tiles_container, LV_SYMBOL_SETTINGS, "Settings", COLOR_MATERIAL_GREEN, main_tile_event_cb, "Settings");
     create_tile(tiles_container, LV_SYMBOL_GPS, "Deauth\nMonitor", COLOR_MATERIAL_AMBER, main_tile_event_cb, "Deauth Monitor");
     create_tile(tiles_container, LV_SYMBOL_BLUETOOTH, "Bluetooth", COLOR_MATERIAL_CYAN, main_tile_event_cb, "Bluetooth");
     
@@ -6929,7 +6976,7 @@ static void show_attack_tiles_screen(void)
     create_small_tile(attack_tiles, LV_SYMBOL_WARNING, "Evil Twin", COLOR_MATERIAL_ORANGE, attack_tile_event_cb, "Evil Twin");
     create_small_tile(attack_tiles, LV_SYMBOL_POWER, "SAE", COLOR_MATERIAL_PINK, attack_tile_event_cb, "SAE Overflow");
     create_small_tile(attack_tiles, LV_SYMBOL_DOWNLOAD, "Handshake", COLOR_MATERIAL_AMBER, attack_tile_event_cb, "Handshaker");
-    create_small_tile(attack_tiles, LV_SYMBOL_EYE_OPEN, "Sniffer", COLOR_MATERIAL_PURPLE, attack_tile_event_cb, "Sniffer");
+    create_small_tile(attack_tiles, LV_SYMBOL_EYE_OPEN, "Observer", COLOR_MATERIAL_PURPLE, attack_tile_event_cb, "Sniffer");
     
     // Horizontal separator line above Selected Networks
     lv_obj_t *separator = lv_obj_create(function_page);
@@ -7045,8 +7092,8 @@ static void show_sniff_karma_screen(void)
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
     
-    // Sniffer tile - Purple
-    lv_obj_t *sniffer_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Sniffer", COLOR_MATERIAL_PURPLE, NULL, NULL);
+    // Network Observer tile - Purple
+    lv_obj_t *sniffer_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Network\nObserver", COLOR_MATERIAL_PURPLE, NULL, NULL);
     lv_obj_add_event_cb(sniffer_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Sniffer");
     
     // Browse Clients tile - Indigo (REMOVED - integrated into Sniffer)
@@ -7331,6 +7378,144 @@ static void show_handshakes_list_screen(void)
         lv_obj_set_style_text_color(msg_label, COLOR_MATERIAL_BLUE, 0);
         lv_obj_set_style_text_font(msg_label, &lv_font_montserrat_14, 0);
     }
+}
+
+// Download Mode - Force bootloader restart
+void GoToDownloadMode(void)
+{
+    // For ESP32C5, use LP_AON_SYS_CFG_REG
+    // LP_AON_FORCE_DOWNLOAD_BOOT[30:29] = 0x1 for download boot0 (UART/USB)
+    REG_SET_FIELD(LP_AON_SYS_CFG_REG, LP_AON_FORCE_DOWNLOAD_BOOT, 1);
+    esp_restart();
+}
+
+// Timer callback for download mode restart
+static void download_mode_timer_cb(void *arg)
+{
+    GoToDownloadMode();
+}
+
+// Download Mode confirmation dialog callback
+static void download_mode_confirm_cb(lv_event_t *e)
+{
+    // Clear screen and show DOWNLOAD MODE message
+    lv_obj_clean(lv_scr_act());
+    
+    lv_obj_t *download_label = lv_label_create(lv_scr_act());
+    lv_label_set_text(download_label, "DOWNLOAD MODE");
+    lv_obj_set_style_text_font(download_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(download_label, COLOR_MATERIAL_RED, 0);
+    lv_obj_center(download_label);
+    
+    // Use timer to delay restart, allowing LVGL to refresh
+    const esp_timer_create_args_t timer_args = {
+        .callback = download_mode_timer_cb,
+        .arg = NULL,
+        .name = "download_mode_timer"
+    };
+    esp_timer_handle_t timer;
+    esp_timer_create(&timer_args, &timer);
+    esp_timer_start_once(timer, 1500000);  // 1.5 seconds in microseconds
+}
+
+// Download Mode cancel callback
+static void download_mode_cancel_cb(lv_event_t *e)
+{
+    show_settings_screen();
+}
+
+// Download Mode screen - show confirmation and execute restart
+static void show_download_mode_screen(void)
+{
+    create_function_page_base("Download Mode");
+    
+    lv_obj_t *warning_label = lv_label_create(function_page);
+    lv_label_set_text(warning_label, "Download Mode\n\nThis will restart the device\ninto bootloader mode.\n\nAre you sure?");
+    lv_obj_set_style_text_align(warning_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(warning_label, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_text_font(warning_label, &lv_font_montserrat_16, 0);
+    lv_obj_center(warning_label);
+    
+    lv_obj_t *btn_bar = lv_obj_create(function_page);
+    lv_obj_set_size(btn_bar, lv_pct(100), 50);
+    lv_obj_align(btn_bar, LV_ALIGN_BOTTOM_MID, 0, -15);
+    lv_obj_set_style_bg_color(btn_bar, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_border_width(btn_bar, 0, 0);
+    lv_obj_clear_flag(btn_bar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(btn_bar, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_all(btn_bar, 4, 0);
+    lv_obj_set_style_pad_gap(btn_bar, 4, 0);
+    
+    lv_obj_t *cancel_btn = lv_btn_create(btn_bar);
+    lv_obj_set_size(cancel_btn, 90, 32);
+    lv_obj_set_style_bg_color(cancel_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(cancel_btn, 0, 0);
+    lv_obj_set_style_radius(cancel_btn, 8, 0);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, "BACK");
+    lv_obj_set_style_text_color(cancel_lbl, lv_color_make(255, 255, 255), 0);
+    lv_obj_center(cancel_lbl);
+    lv_obj_add_event_cb(cancel_btn, download_mode_cancel_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *confirm_btn = lv_btn_create(btn_bar);
+    lv_obj_set_size(confirm_btn, 90, 32);
+    lv_obj_set_style_bg_color(confirm_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(confirm_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(confirm_btn, 0, 0);
+    lv_obj_set_style_radius(confirm_btn, 8, 0);
+    lv_obj_t *confirm_lbl = lv_label_create(confirm_btn);
+    lv_label_set_text(confirm_lbl, "RESTART");
+    lv_obj_set_style_text_color(confirm_lbl, lv_color_make(255, 255, 255), 0);
+    lv_obj_center(confirm_lbl);
+    lv_obj_add_event_cb(confirm_btn, download_mode_confirm_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// Settings sub-menu tile event callback
+static void settings_tile_event_cb(lv_event_t *e)
+{
+    const char *tile_name = (const char *)lv_event_get_user_data(e);
+    if (!tile_name) return;
+    
+    if (strcmp(tile_name, "Compromised Data") == 0) {
+        show_wifi_monitor_screen();
+    } else if (strcmp(tile_name, "Scan Time") == 0) {
+        // No-op: just close the settings menu and go back
+        show_settings_screen();
+    } else if (strcmp(tile_name, "RedTeam mode") == 0) {
+        // No-op: just close the settings menu and go back
+        show_settings_screen();
+    } else if (strcmp(tile_name, "Download Mode") == 0) {
+        show_download_mode_screen();
+    }
+}
+
+// Settings screen - shows submenu with Compromised Data, Scan Time, RedTeam mode, Download Mode
+static void show_settings_screen(void)
+{
+    create_function_page_base("Settings");
+    
+    lv_obj_t *tiles = lv_obj_create(function_page);
+    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(tiles, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_border_width(tiles, 0, 0);
+    lv_obj_set_style_pad_all(tiles, 10, 0);
+    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    
+    // Compromised Data - Blue
+    create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Compromised\nData", COLOR_TILE_BLUE, settings_tile_event_cb, "Compromised Data");
+    
+    // Scan Time - Purple
+    create_tile(tiles, LV_SYMBOL_LOOP, "Scan\nTime", COLOR_MATERIAL_PURPLE, settings_tile_event_cb, "Scan Time");
+    
+    // RedTeam mode - Amber/Orange
+    create_tile(tiles, LV_SYMBOL_WARNING, "RedTeam\nMode", COLOR_MATERIAL_AMBER, settings_tile_event_cb, "RedTeam mode");
+    
+    // Download Mode - Red
+    create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Download\nMode", COLOR_MATERIAL_RED, settings_tile_event_cb, "Download Mode");
 }
 
 // WiFi Monitor screen
@@ -8060,11 +8245,11 @@ void attack_event_cb(lv_event_t *e)
 
     if (strcmp(attack_name, "Sniffer") == 0) {
         // Show warning page - use base to avoid default center label
-        create_function_page_base("Sniffer");
+        create_function_page_base("Network Observer");
         
         // Warning message in center
         lv_obj_t *warning_label = lv_label_create(function_page);
-        lv_label_set_text(warning_label, "This will start\nWiFi Sniffer.\n\nAre you sure?");
+        lv_label_set_text(warning_label, "This will start\nNetwork Observer.\n\nAre you sure?");
         lv_obj_set_style_text_align(warning_label, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_color(warning_label, COLOR_MATERIAL_BLUE, 0);  // Green text
         lv_obj_set_style_text_font(warning_label, &lv_font_montserrat_16, 0);
@@ -8809,7 +8994,7 @@ static float read_battery_voltage(void)
 static void battery_monitor_task(void *arg)
 {
     (void)arg;
-    char voltage_str[16];
+    char voltage_str[32];
     
     // Initial delay to let UI stabilize
     vTaskDelay(pdMS_TO_TICKS(2000));
@@ -8817,16 +9002,16 @@ static void battery_monitor_task(void *arg)
     for (;;) {
         float voltage = read_battery_voltage();
         
-        // Format battery indicator based on voltage
+        // Format battery indicator based on voltage using LVGL symbols
         if (voltage < BATTERY_VOLTAGE_CRITICAL) {
-            // No battery / critical: crossed-out battery symbol
-            snprintf(voltage_str, sizeof(voltage_str), "--");  // No battery indicator
+            // No battery / critical: empty battery symbol
+            snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_BATTERY_EMPTY);
         } else if (voltage > BATTERY_VOLTAGE_CHARGING) {
-            // Charging: lightning bolt symbol
-            snprintf(voltage_str, sizeof(voltage_str), "CHG");  // Charging indicator
+            // Charging: charging symbol
+            snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_CHARGE " CHG");
         } else {
-            // Normal battery: show voltage
-            snprintf(voltage_str, sizeof(voltage_str), "%.2fV", voltage);
+            // Normal battery: show battery with voltage
+            snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_BATTERY_FULL " %.2fV", voltage);
         }
         
         // Update label with LVGL mutex protection
