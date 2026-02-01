@@ -129,6 +129,10 @@ static int bt_device_count = 0;
 #define BATTERY_ADC_SAMPLES            32      // Number of samples to average
 #define BATTERY_UPDATE_INTERVAL_MS     30000   // 30 seconds
 
+// Battery voltage thresholds
+#define BATTERY_VOLTAGE_CRITICAL  2.0f   // Below this: no battery symbol
+#define BATTERY_VOLTAGE_CHARGING  4.8f   // Above this: charging (lightning symbol)
+
 // Color definitions (used throughout the file)
 #define COLOR_MATERIAL_BLUE     lv_color_make(255, 255, 255)   // #FFFFFF - white text color (for labels/borders)
 #define COLOR_TILE_BLUE         lv_color_make(33, 150, 243)    // #2196F3 - blue for tile backgrounds
@@ -1277,6 +1281,13 @@ static void check_heap_integrity(const char* location) {
 
 static void init_display(void)
 {    
+    // Configure pull-ups on shared SPI pins BEFORE bus initialization
+    // This prevents race conditions with SD card init which shares the same SPI bus
+    gpio_set_pull_mode(LCD_MOSI, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(LCD_MISO, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(LCD_CLK, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(LCD_CS, GPIO_PULLUP_ONLY);
+    
     spi_bus_config_t buscfg = {
         .mosi_io_num = LCD_MOSI,
         .miso_io_num = LCD_MISO,
@@ -1684,19 +1695,24 @@ static void log_sd_root_listing(void)
 // SD card init task with larger stack to prevent stack overflow
 static void sd_init_task(void *param)
 {
+    ESP_LOGI(TAG, "[SD_TASK] Starting SD initialization");
+    ESP_LOGI(TAG, "[SD_TASK] Heap at start: %u bytes (internal: %u)", 
+             esp_get_free_heap_size(),
+             heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    
     esp_err_t ret = wifi_wardrive_init_sd();
     
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "[SD_TASK] SD card mount successful!");
-        log_sd_root_listing();
+        ESP_LOGI(TAG, "[SD_TASK] ✅ SD card mount successful!");
+        //log_sd_root_listing();
         ESP_LOGI(TAG, "[SD_TASK] SD card ready for use");
     } else {
-        ESP_LOGW(TAG, "[SD_TASK] SD card initialization failed with error: %s (0x%x)", 
+        ESP_LOGE(TAG, "[SD_TASK] ❌ SD initialization FAILED: %s (0x%x)", 
                  esp_err_to_name(ret), ret);
-        ESP_LOGW(TAG, "[SD_TASK] System will continue without SD card");
     }
     
-    ESP_LOGI(TAG, "[SD_TASK] Task complete, deleting self");
+    ESP_LOGI(TAG, "[SD_TASK] Task complete, heap: %u bytes, deleting self",
+             esp_get_free_heap_size());
     vTaskDelete(NULL);
 }
 
@@ -1839,10 +1855,15 @@ void app_main(void)
 
     // ✅ Initialize display FIRST so SPI2_HOST is ready for SD card
     // This must happen BEFORE SD init task to prevent "host_id not initialized" errors
-    ESP_LOGI(TAG, "LV INIT");
+    ESP_LOGI(TAG, "[INIT] Stage 0: About to initialize LVGL");
+    ESP_LOGI(TAG, "[INIT] Heap free before LVGL: %u bytes", esp_get_free_heap_size());
+    
     lv_init();
+    ESP_LOGI(TAG, "[INIT] Stage 1: LVGL initialized");
+    
     init_display();
-    ESP_LOGI(TAG, "Display hardware initialized");
+    ESP_LOGI(TAG, "[INIT] Stage 2: Display hardware initialized, SPI bus ready");
+    ESP_LOGI(TAG, "[DISPLAY] Hardware init complete, panel ready for drawing");
 
     ESP_LOGI(TAG, "=== INITIALIZING SD CARD ===");
     // Allocate SD init task stack from PSRAM
@@ -1865,19 +1886,35 @@ void app_main(void)
     
     // ✅ Wait for SD initialization to complete (now safe - SPI is ready)
     if (sd_task_handle != NULL) {
-        ESP_LOGI(TAG, "Waiting for SD initialization to complete...");
-        int timeout_ms = 10000;  // 10 second timeout
+        ESP_LOGI(TAG, "[SYNC] Waiting for SD initialization (max 15 seconds)...");
+        int timeout_ms = 15000;  // 15 second timeout (increased from 10)
         int elapsed = 0;
-        while (eTaskGetState(sd_task_handle) != eDeleted && elapsed < timeout_ms) {
+        
+        while (elapsed < timeout_ms) {
+            eTaskState state = eTaskGetState(sd_task_handle);
+            
+            if (state == eDeleted || state == eInvalid) {
+                ESP_LOGI(TAG, "[SYNC] SD task finished after %d ms", elapsed);
+                break;
+            }
+            
+            if (elapsed % 1000 == 0) {  // Log co sekundę
+                ESP_LOGI(TAG, "[SYNC] Still waiting... (%d/%d ms)", elapsed, timeout_ms);
+            }
+            
             vTaskDelay(pdMS_TO_TICKS(100));
+            esp_task_wdt_reset();  // ✅ Reset watchdog during wait
             elapsed += 100;
         }
-        if (eTaskGetState(sd_task_handle) == eDeleted) {
-            ESP_LOGI(TAG, "SD initialization complete");
-        } else {
-            ESP_LOGW(TAG, "SD initialization timeout after %dms", timeout_ms);
+        
+        eTaskState final_state = eTaskGetState(sd_task_handle);
+        if (final_state != eDeleted && final_state != eInvalid) {
+            ESP_LOGW(TAG, "[SYNC] ⚠️ SD timeout! Forcing task delete");
+            vTaskDelete(sd_task_handle);
         }
     }
+    
+    ESP_LOGI(TAG, "[SYNC] SD ready, continuing with LVGL initialization");
          
     // Create LVGL mutex for thread safety
     lvgl_mutex = xSemaphoreCreateMutex();
@@ -2059,7 +2096,22 @@ void app_main(void)
     esp_task_wdt_add(NULL);
     ESP_LOGI(TAG, "Main task subscribed to watchdog");
 
+    // ✅ Main loop diagnostics
+    ESP_LOGI(TAG, "[MAIN LOOP] Starting main event loop...");
+    uint32_t loop_counter = 0;
+    TickType_t last_log = xTaskGetTickCount();
+
     while (1) {
+        loop_counter++;
+        
+        // Log co ~5 sekund aby zobaczyć czy pętla żyje
+        // TickType_t now = xTaskGetTickCount();
+        // if ((now - last_log) > pdMS_TO_TICKS(5000)) {
+        //     ESP_LOGI(TAG, "[MAIN LOOP] Alive - iteration #%u, heap: %u bytes", 
+        //              loop_counter, esp_get_free_heap_size());
+        //     last_log = now;
+        // }
+        
         // Thread-safe LVGL handling
         uint32_t sleep_ms = 10;
         if (xSemaphoreTake(lvgl_mutex, portMAX_DELAY) == pdTRUE) {
@@ -3040,40 +3092,63 @@ void app_main(void)
     }
 }
 
+static uint32_t flush_call_count = 0;
+static uint32_t flush_mutex_wait_count = 0;
+
 void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_p)
 {
     lvgl_flush_counter++;
+    flush_call_count++;
+    
+    // Log co 100 flushów aby nie zaśmiecić logu
+    if (flush_call_count % 100 == 0) {
+        ESP_LOGI(TAG, "[FLUSH] Call #%u, area: (%d,%d)-(%d,%d)", 
+                 flush_call_count, area->x1, area->y1, area->x2, area->y2);
+    }
+    
     esp_lcd_panel_handle_t panel = (esp_lcd_panel_handle_t)drv->user_data;
     int32_t width = area->x2 - area->x1 + 1;
     int32_t height = area->y2 - area->y1 + 1;
-    // Ensure we have valid parameters
+    
     if (color_p == NULL || width <= 0 || height <= 0) {
-        ESP_LOGE(TAG, "Invalid flush parameters!");
+        ESP_LOGE(TAG, "[FLUSH] ERROR: Invalid parameters! color_p=%p, w=%d, h=%d",
+                 color_p, width, height);
         lv_disp_flush_ready(drv);
         return;
     }
     
     // CRITICAL: Take SD/SPI mutex before drawing to display
     // Display and SD card share the same SPI bus (SPI2_HOST)
-    // Avoid concurrent SPI: wait for the bus; do NOT draw without the lock
     if (sd_spi_mutex) {
         TickType_t start = xTaskGetTickCount();
         bool drawn = false;
+        int wait_attempt = 0;
+        
         while (!drawn) {
             if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                // ✅ Mutex acquired - draw immediately
                 esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
                 xSemaphoreGive(sd_spi_mutex);
                 drawn = true;
             } else {
-                esp_task_wdt_reset();
-                if ((xTaskGetTickCount() - start) > pdMS_TO_TICKS(5000)) {
-                    ESP_LOGW(TAG, "Display refresh waiting >5s (SD busy)...");
-                    start = xTaskGetTickCount();  // keep waiting, but log periodically
+                wait_attempt++;
+                TickType_t elapsed = xTaskGetTickCount() - start;
+                
+                if (elapsed > pdMS_TO_TICKS(5000)) {
+                    ESP_LOGW(TAG, "[FLUSH] ⚠️ Mutex stuck >5s (attempt %d)! Forcing draw (may glitch)",
+                             wait_attempt);
+                    // Force draw without mutex (risky but better than black screen)
+                    esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
+                    drawn = true;
                 }
+                
+                esp_task_wdt_reset();
+                flush_mutex_wait_count++;
             }
         }
     } else {
         // Mutex not initialized yet (early boot) - draw without protection
+        ESP_LOGW(TAG, "[FLUSH] WARNING: sd_spi_mutex not initialized, drawing without protection");
         esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
     }
     
@@ -8742,8 +8817,17 @@ static void battery_monitor_task(void *arg)
     for (;;) {
         float voltage = read_battery_voltage();
         
-        // Format voltage string
-        snprintf(voltage_str, sizeof(voltage_str), "%.2fV", voltage);
+        // Format battery indicator based on voltage
+        if (voltage < BATTERY_VOLTAGE_CRITICAL) {
+            // No battery / critical: crossed-out battery symbol
+            snprintf(voltage_str, sizeof(voltage_str), "--");  // No battery indicator
+        } else if (voltage > BATTERY_VOLTAGE_CHARGING) {
+            // Charging: lightning bolt symbol
+            snprintf(voltage_str, sizeof(voltage_str), "CHG");  // Charging indicator
+        } else {
+            // Normal battery: show voltage
+            snprintf(voltage_str, sizeof(voltage_str), "%.2fV", voltage);
+        }
         
         // Update label with LVGL mutex protection
         if (lvgl_mutex && xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {

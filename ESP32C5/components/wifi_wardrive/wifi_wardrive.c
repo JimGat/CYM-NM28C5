@@ -11,11 +11,15 @@
 #include "driver/spi_master.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 static const char *TAG = "wifi_wardrive";
+
+// ✅ Mutex for shared SPI bus (SD card and display)
+extern SemaphoreHandle_t sd_spi_mutex;
 
 // GPS state (extended from common gps_data_t)
 typedef struct {
@@ -243,11 +247,9 @@ esp_err_t wifi_wardrive_init_sd(void) {
     host.flags = SDMMC_HOST_FLAG_SPI;  // ✅ Tell driver to NOT reinitialize SPI bus
     ESP_LOGI(TAG, "[SD]   SPI Host: %d, Frequency: %d kHz, Flags: 0x%x", host.slot, host.max_freq_khz, host.flags);
 
-    // Configure GPIO pull-ups
-    ESP_LOGI(TAG, "[SD] Configuring GPIO pull-ups...");
-    gpio_set_pull_mode(SD_MOSI_PIN, GPIO_PULLUP_ONLY);
-    gpio_set_pull_mode(SD_MISO_PIN, GPIO_PULLUP_ONLY);
-    gpio_set_pull_mode(SD_CLK_PIN, GPIO_PULLUP_ONLY);
+    // NOTE: GPIO pull-ups for shared SPI pins (MOSI, MISO, CLK) are configured
+    // in init_display() BEFORE spi_bus_initialize() to avoid race conditions.
+    // Only configure SD-specific CS pin pull-up here.
     gpio_set_pull_mode(SD_CS_PIN, GPIO_PULLUP_ONLY);
     
     ESP_LOGI(TAG, "[SD] Configuring slot (CS=%d)...", SD_CS_PIN);
@@ -319,11 +321,9 @@ esp_err_t wifi_wardrive_init_sd(void) {
              sd_card->host.max_freq_khz, (unsigned long long)capacity_bytes,
              (float)capacity_bytes / (1024.0f * 1024.0f));
 
-    // Set card clock if available
-    if (sd_card->host.set_card_clk) {
-        ESP_LOGI(TAG, "[SD] Setting card clock...");
-        sd_card->host.set_card_clk(sd_card->host.slot, sd_card->host.max_freq_khz);
-    }
+    // NOTE: Removed set_card_clk call - it was reconfiguring the shared SPI bus
+    // clock after mount, which could interfere with the display on SPI2_HOST.
+    // The mount function already configures the clock appropriately.
 
     ESP_LOGI(TAG, "[SD] Initialization completed successfully!");
     return ESP_OK;
@@ -342,17 +342,24 @@ static void wardrive_scan_task(void *pvParameters) {
     
     // Open CSV file
     FILE *f = NULL;
-    if (sd_card_mounted) {
+    if (sd_card_mounted && sd_spi_mutex) {
         char filename[64];
         snprintf(filename, sizeof(filename), "/sdcard/wardrive_%lu.csv", 
                 (unsigned long)(esp_timer_get_time() / 1000000));
         
-        f = fopen(filename, "w");
-        if (f) {
-            fprintf(f, "BSSID,SSID,AuthMode,Channel,RSSI,Latitude,Longitude,Altitude,Satellites\n");
-            ESP_LOGI(TAG, "Logging to: %s", filename);
+        // ✅ Protect SD file operations with mutex (SPI shared with display)
+        if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+            f = fopen(filename, "w");
+            if (f) {
+                fprintf(f, "BSSID,SSID,AuthMode,Channel,RSSI,Latitude,Longitude,Altitude,Satellites\n");
+                fflush(f);
+                ESP_LOGI(TAG, "Logging to: %s", filename);
+            } else {
+                ESP_LOGE(TAG, "Failed to open log file");
+            }
+            xSemaphoreGive(sd_spi_mutex);
         } else {
-            ESP_LOGE(TAG, "Failed to open log file");
+            ESP_LOGE(TAG, "Failed to acquire SD mutex for file open");
         }
     }
     
@@ -381,35 +388,39 @@ static void wardrive_scan_task(void *pvParameters) {
         ESP_LOGI(TAG, "Scan #%d: Found %d networks", scan_count, count);
         
         // Log to SD card
-        if (f) {
-            for (int i = 0; i < count; i++) {
-                wifi_ap_record_t *ap = &results[i];
-                
-                fprintf(f, "%02X:%02X:%02X:%02X:%02X:%02X,",
-                       ap->bssid[0], ap->bssid[1], ap->bssid[2],
-                       ap->bssid[3], ap->bssid[4], ap->bssid[5]);
-                
-                char ssid_escaped[128];
-                escape_csv_field((const char *)ap->ssid, ssid_escaped, sizeof(ssid_escaped));
-                fprintf(f, "%s,", ssid_escaped);
-                
-                fprintf(f, "%s,%d,%d,",
-                       authmode_to_string(ap->authmode),
-                       ap->primary,
-                       ap->rssi);
-                
-                if (gps_data.fix_valid) {
-                    fprintf(f, "%.6f,%.6f,%.1f,%d\n",
-                           gps_data.latitude,
-                           gps_data.longitude,
-                           gps_data.altitude,
-                           gps_data.satellites);
-                } else {
-                    fprintf(f, ",,,,\n");
+        if (f && sd_spi_mutex) {
+            // ✅ Protect SD write operations with mutex
+            if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+                for (int i = 0; i < count; i++) {
+                    wifi_ap_record_t *ap = &results[i];
+                    
+                    fprintf(f, "%02X:%02X:%02X:%02X:%02X:%02X,",
+                           ap->bssid[0], ap->bssid[1], ap->bssid[2],
+                           ap->bssid[3], ap->bssid[4], ap->bssid[5]);
+                    
+                    char ssid_escaped[128];
+                    escape_csv_field((const char *)ap->ssid, ssid_escaped, sizeof(ssid_escaped));
+                    fprintf(f, "%s,", ssid_escaped);
+                    
+                    fprintf(f, "%s,%d,%d,",
+                           authmode_to_string(ap->authmode),
+                           ap->primary,
+                           ap->rssi);
+                    
+                    if (gps_data.fix_valid) {
+                        fprintf(f, "%.6f,%.6f,%.1f,%d\n",
+                               gps_data.latitude,
+                               gps_data.longitude,
+                               gps_data.altitude,
+                               gps_data.satellites);
+                    } else {
+                        fprintf(f, ",,,,\n");
+                    }
                 }
+                
+                fflush(f);
+                xSemaphoreGive(sd_spi_mutex);
             }
-            
-            fflush(f);
         }
         
         // Print status
@@ -423,9 +434,13 @@ static void wardrive_scan_task(void *pvParameters) {
         vTaskDelay(pdMS_TO_TICKS(2000)); // Wait 2 seconds between scans
     }
     
-    if (f) {
-        fclose(f);
-        ESP_LOGI(TAG, "Log file closed");
+    if (f && sd_spi_mutex) {
+        // ✅ Protect SD close operation with mutex
+        if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+            fclose(f);
+            xSemaphoreGive(sd_spi_mutex);
+            ESP_LOGI(TAG, "Log file closed");
+        }
     }
     
     ESP_LOGI(TAG, "Wardrive stopped after %d scans", scan_count);
