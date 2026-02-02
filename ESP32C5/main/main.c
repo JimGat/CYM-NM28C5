@@ -250,6 +250,50 @@ typedef struct {
 whitelisted_bssid_t whiteListedBssids[MAX_WHITELISTED_BSSIDS];
 int whitelistedBssidsCount = 0;
 
+// ============================================================================
+// SD Card Cache in PSRAM
+// ============================================================================
+#define SD_CACHE_INITIAL_CAPACITY 50
+#define SD_CACHE_MAX_ENTRY_LEN 512
+#define SD_CACHE_MAX_FILENAME_LEN 64
+#define SD_CACHE_MAX_HTML_FILES 32
+#define SD_CACHE_MAX_HANDSHAKES 100
+
+typedef struct {
+    // Evil Twin passwords (eviltwin.txt)
+    char **eviltwin_entries;  // Array of strings "SSID", "password"
+    int eviltwin_count;
+    int eviltwin_capacity;
+    
+    // Portal data (portals.txt)
+    char **portals_entries;   // Array of strings (full lines)
+    int portals_count;
+    int portals_capacity;
+    
+    // HTML filenames from /sdcard/lab/htmls/ (content loaded on-demand)
+    char **html_filenames;  // Array of filenames only (no content)
+    int html_count;
+    
+    // Handshake filenames from /sdcard/lab/handshakes/
+    char **handshake_names;  // Array of .pcap filenames
+    int handshake_count;
+    
+    bool loaded;  // True when all data is loaded
+} sd_cache_t;
+
+static sd_cache_t *sd_cache = NULL;  // Allocated in PSRAM
+
+// SD loading popup
+static lv_obj_t *sd_loading_popup = NULL;
+static lv_obj_t *sd_loading_label = NULL;
+
+// Forward declarations for SD cache functions
+static esp_err_t sd_cache_init(void);
+static esp_err_t sd_cache_load_all(void);
+void sd_cache_add_eviltwin_entry(const char *entry);
+void sd_cache_add_portal_entry(const char *entry);
+void sd_cache_add_handshake_name(const char *name);
+
 static lv_obj_t *scan_status_label = NULL;
 static lv_obj_t *scan_list = NULL;
 static lv_obj_t *deauth_list = NULL;
@@ -1925,6 +1969,384 @@ bool is_bssid_whitelisted(const uint8_t *bssid) {
     return false;
 }
 
+// ============================================================================
+// SD Cache Functions
+// ============================================================================
+
+static esp_err_t sd_cache_init(void) {
+    if (sd_cache != NULL) {
+        ESP_LOGW(TAG, "SD cache already initialized");
+        return ESP_OK;
+    }
+    
+    // Allocate main structure in PSRAM
+    sd_cache = (sd_cache_t *)heap_caps_calloc(1, sizeof(sd_cache_t), MALLOC_CAP_SPIRAM);
+    if (sd_cache == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate SD cache structure in PSRAM");
+        return ESP_ERR_NO_MEM;
+    }
+    
+    // Allocate eviltwin entries array
+    sd_cache->eviltwin_capacity = SD_CACHE_INITIAL_CAPACITY;
+    sd_cache->eviltwin_entries = (char **)heap_caps_calloc(sd_cache->eviltwin_capacity, sizeof(char *), MALLOC_CAP_SPIRAM);
+    if (sd_cache->eviltwin_entries == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate eviltwin entries array");
+        return ESP_ERR_NO_MEM;
+    }
+    
+    // Allocate portals entries array
+    sd_cache->portals_capacity = SD_CACHE_INITIAL_CAPACITY;
+    sd_cache->portals_entries = (char **)heap_caps_calloc(sd_cache->portals_capacity, sizeof(char *), MALLOC_CAP_SPIRAM);
+    if (sd_cache->portals_entries == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate portals entries array");
+        return ESP_ERR_NO_MEM;
+    }
+    
+    // Allocate HTML filenames array
+    sd_cache->html_filenames = (char **)heap_caps_calloc(SD_CACHE_MAX_HTML_FILES, sizeof(char *), MALLOC_CAP_SPIRAM);
+    if (sd_cache->html_filenames == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate HTML filenames array");
+        return ESP_ERR_NO_MEM;
+    }
+    
+    // Allocate handshake names array
+    sd_cache->handshake_names = (char **)heap_caps_calloc(SD_CACHE_MAX_HANDSHAKES, sizeof(char *), MALLOC_CAP_SPIRAM);
+    if (sd_cache->handshake_names == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate handshake names array");
+        return ESP_ERR_NO_MEM;
+    }
+    
+    sd_cache->loaded = false;
+    ESP_LOGI(TAG, "SD cache initialized in PSRAM");
+    return ESP_OK;
+}
+
+// Add entry to eviltwin cache (dynamically grows if needed)
+void sd_cache_add_eviltwin_entry(const char *entry) {
+    if (sd_cache == NULL || entry == NULL) return;
+    
+    // Grow array if needed
+    if (sd_cache->eviltwin_count >= sd_cache->eviltwin_capacity) {
+        int new_capacity = sd_cache->eviltwin_capacity * 2;
+        char **new_array = (char **)heap_caps_realloc(sd_cache->eviltwin_entries, 
+                                                       new_capacity * sizeof(char *), MALLOC_CAP_SPIRAM);
+        if (new_array == NULL) {
+            ESP_LOGW(TAG, "Failed to grow eviltwin cache");
+            return;
+        }
+        sd_cache->eviltwin_entries = new_array;
+        sd_cache->eviltwin_capacity = new_capacity;
+    }
+    
+    // Allocate and copy entry
+    size_t len = strlen(entry);
+    if (len > SD_CACHE_MAX_ENTRY_LEN - 1) len = SD_CACHE_MAX_ENTRY_LEN - 1;
+    
+    char *copy = (char *)heap_caps_malloc(len + 1, MALLOC_CAP_SPIRAM);
+    if (copy == NULL) {
+        ESP_LOGW(TAG, "Failed to allocate eviltwin entry");
+        return;
+    }
+    memcpy(copy, entry, len);
+    copy[len] = '\0';
+    
+    sd_cache->eviltwin_entries[sd_cache->eviltwin_count++] = copy;
+}
+
+// Add entry to portals cache (dynamically grows if needed)
+void sd_cache_add_portal_entry(const char *entry) {
+    if (sd_cache == NULL || entry == NULL) return;
+    
+    // Grow array if needed
+    if (sd_cache->portals_count >= sd_cache->portals_capacity) {
+        int new_capacity = sd_cache->portals_capacity * 2;
+        char **new_array = (char **)heap_caps_realloc(sd_cache->portals_entries, 
+                                                       new_capacity * sizeof(char *), MALLOC_CAP_SPIRAM);
+        if (new_array == NULL) {
+            ESP_LOGW(TAG, "Failed to grow portals cache");
+            return;
+        }
+        sd_cache->portals_entries = new_array;
+        sd_cache->portals_capacity = new_capacity;
+    }
+    
+    // Allocate and copy entry
+    size_t len = strlen(entry);
+    if (len > SD_CACHE_MAX_ENTRY_LEN - 1) len = SD_CACHE_MAX_ENTRY_LEN - 1;
+    
+    char *copy = (char *)heap_caps_malloc(len + 1, MALLOC_CAP_SPIRAM);
+    if (copy == NULL) {
+        ESP_LOGW(TAG, "Failed to allocate portal entry");
+        return;
+    }
+    memcpy(copy, entry, len);
+    copy[len] = '\0';
+    
+    sd_cache->portals_entries[sd_cache->portals_count++] = copy;
+}
+
+// Add handshake filename to cache
+void sd_cache_add_handshake_name(const char *name) {
+    if (sd_cache == NULL || name == NULL) return;
+    if (sd_cache->handshake_count >= SD_CACHE_MAX_HANDSHAKES) {
+        ESP_LOGW(TAG, "Handshake cache full");
+        return;
+    }
+    
+    size_t len = strlen(name);
+    if (len > SD_CACHE_MAX_FILENAME_LEN - 1) len = SD_CACHE_MAX_FILENAME_LEN - 1;
+    
+    char *copy = (char *)heap_caps_malloc(len + 1, MALLOC_CAP_SPIRAM);
+    if (copy == NULL) {
+        ESP_LOGW(TAG, "Failed to allocate handshake name");
+        return;
+    }
+    memcpy(copy, name, len);
+    copy[len] = '\0';
+    
+    sd_cache->handshake_names[sd_cache->handshake_count++] = copy;
+}
+
+// Add HTML filename to cache
+static void sd_cache_add_html_filename(const char *name) {
+    if (sd_cache == NULL || name == NULL) return;
+    if (sd_cache->html_count >= SD_CACHE_MAX_HTML_FILES) {
+        ESP_LOGW(TAG, "HTML filenames cache full");
+        return;
+    }
+    
+    size_t len = strlen(name);
+    if (len > SD_CACHE_MAX_FILENAME_LEN - 1) len = SD_CACHE_MAX_FILENAME_LEN - 1;
+    
+    char *copy = (char *)heap_caps_malloc(len + 1, MALLOC_CAP_SPIRAM);
+    if (copy == NULL) {
+        ESP_LOGW(TAG, "Failed to allocate HTML filename");
+        return;
+    }
+    memcpy(copy, name, len);
+    copy[len] = '\0';
+    
+    sd_cache->html_filenames[sd_cache->html_count++] = copy;
+}
+
+// Getter functions for SD cache
+int sd_cache_get_eviltwin_count(void) {
+    return sd_cache ? sd_cache->eviltwin_count : 0;
+}
+
+const char* sd_cache_get_eviltwin_entry(int index) {
+    if (sd_cache == NULL || index < 0 || index >= sd_cache->eviltwin_count) return NULL;
+    return sd_cache->eviltwin_entries[index];
+}
+
+int sd_cache_get_portal_count(void) {
+    return sd_cache ? sd_cache->portals_count : 0;
+}
+
+const char* sd_cache_get_portal_entry(int index) {
+    if (sd_cache == NULL || index < 0 || index >= sd_cache->portals_count) return NULL;
+    return sd_cache->portals_entries[++index];
+}
+
+int sd_cache_get_handshake_count(void) {
+    return sd_cache ? sd_cache->handshake_count : 0;
+}
+
+const char* sd_cache_get_handshake_name(int index) {
+    if (sd_cache == NULL || index < 0 || index >= sd_cache->handshake_count) return NULL;
+    return sd_cache->handshake_names[index];
+}
+
+int sd_cache_get_html_count(void) {
+    return sd_cache ? sd_cache->html_count : 0;
+}
+
+const char* sd_cache_get_html_filename(int index) {
+    if (sd_cache == NULL || index < 0 || index >= sd_cache->html_count) return NULL;
+    return sd_cache->html_filenames[index];
+}
+
+// ============================================================================
+// SD Loading Popup Functions
+// ============================================================================
+
+static void show_sd_loading_popup(const char *text) {
+    if (sd_loading_popup != NULL) {
+        // Already showing, just update text
+        if (sd_loading_label) {
+            lv_label_set_text(sd_loading_label, text);
+        }
+        return;
+    }
+    
+    // Create modal background (semi-transparent overlay)
+    sd_loading_popup = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(sd_loading_popup, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(sd_loading_popup, 0, 0);
+    lv_obj_set_style_bg_color(sd_loading_popup, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_bg_opa(sd_loading_popup, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(sd_loading_popup, 0, 0);
+    lv_obj_clear_flag(sd_loading_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(sd_loading_popup, LV_OBJ_FLAG_CLICKABLE);  // Block touch through
+    
+    // Create centered dialog box
+    lv_obj_t *dialog = lv_obj_create(sd_loading_popup);
+    lv_obj_set_size(dialog, 280, 100);
+    lv_obj_center(dialog);
+    lv_obj_set_style_bg_color(dialog, lv_color_make(30, 30, 30), 0);
+    lv_obj_set_style_border_color(dialog, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_border_width(dialog, 2, 0);
+    lv_obj_set_style_radius(dialog, 10, 0);
+    lv_obj_clear_flag(dialog, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Create label
+    sd_loading_label = lv_label_create(dialog);
+    lv_label_set_text(sd_loading_label, text);
+    lv_obj_set_style_text_color(sd_loading_label, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_text_font(sd_loading_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_align(sd_loading_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_center(sd_loading_label);
+    
+    // Force immediate refresh
+    lv_obj_invalidate(lv_scr_act());
+    lv_refr_now(NULL);
+    
+    ESP_LOGI(TAG, "SD loading popup shown: %s", text);
+}
+
+static void update_sd_loading_popup(const char *text) {
+    if (sd_loading_label != NULL) {
+        lv_label_set_text(sd_loading_label, text);
+        lv_obj_invalidate(lv_scr_act());
+        lv_refr_now(NULL);
+        ESP_LOGI(TAG, "SD loading popup updated: %s", text);
+    }
+}
+
+static void hide_sd_loading_popup(void) {
+    if (sd_loading_popup != NULL) {
+        lv_obj_del(sd_loading_popup);
+        sd_loading_popup = NULL;
+        sd_loading_label = NULL;
+        lv_obj_invalidate(lv_scr_act());
+        lv_refr_now(NULL);
+        ESP_LOGI(TAG, "SD loading popup hidden");
+    }
+}
+
+// ============================================================================
+// SD Cache Load All Data
+// ============================================================================
+
+static bool is_html_file(const char *name) {
+    if (!name) return false;
+    const char *dot = strrchr(name, '.');
+    if (!dot) return false;
+    return (strcasecmp(dot, ".html") == 0 || strcasecmp(dot, ".htm") == 0);
+}
+
+static esp_err_t sd_cache_load_all(void) {
+    if (sd_cache == NULL) {
+        ESP_LOGE(TAG, "SD cache not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    ESP_LOGI(TAG, "Loading SD card data into cache...");
+    
+    // 1. Load whitelist (uses existing function)
+    load_whitelist_from_sd();
+    ESP_LOGI(TAG, "  Whitelist: %d entries", whitelistedBssidsCount);
+    
+    // 2. Load eviltwin.txt
+    FILE *file = fopen("/sdcard/lab/eviltwin.txt", "r");
+    if (file != NULL) {
+        char line[SD_CACHE_MAX_ENTRY_LEN];
+        while (fgets(line, sizeof(line), file) != NULL) {
+            // Remove trailing newline
+            line[strcspn(line, "\r\n")] = '\0';
+            if (strlen(line) > 0) {
+                sd_cache_add_eviltwin_entry(line);
+            }
+        }
+        fclose(file);
+        ESP_LOGI(TAG, "  Evil Twin passwords: %d entries", sd_cache->eviltwin_count);
+    } else {
+        ESP_LOGI(TAG, "  Evil Twin passwords: 0 (file not found)");
+    }
+    
+    // 3. Load portals.txt
+    file = fopen("/sdcard/lab/portals.txt", "r");
+    if (file != NULL) {
+        char line[SD_CACHE_MAX_ENTRY_LEN];
+        while (fgets(line, sizeof(line), file) != NULL) {
+            // Remove trailing newline
+            line[strcspn(line, "\r\n")] = '\0';
+            if (strlen(line) > 0) {
+                sd_cache_add_portal_entry(line);
+            }
+        }
+        fclose(file);
+        ESP_LOGI(TAG, "  Portal data: %d entries", sd_cache->portals_count);
+    } else {
+        ESP_LOGI(TAG, "  Portal data: 0 (file not found)");
+    }
+    
+    // 4. Load HTML filenames from /sdcard/lab/htmls/
+    DIR *dir = opendir("/sdcard/lab/htmls");
+    if (dir != NULL) {
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL && sd_cache->html_count < SD_CACHE_MAX_HTML_FILES) {
+            if (entry->d_name[0] == '.') continue;
+            if (!is_html_file(entry->d_name)) continue;
+            
+            // Verify it's a regular file
+            char full_path[280];  // 18 bytes prefix + up to 255 bytes d_name + null
+            snprintf(full_path, sizeof(full_path), "/sdcard/lab/htmls/%s", entry->d_name);
+            struct stat st;
+            if (stat(full_path, &st) == 0 && S_ISREG(st.st_mode)) {
+                sd_cache_add_html_filename(entry->d_name);
+            }
+        }
+        closedir(dir);
+        
+        // Sort HTML filenames alphabetically
+        if (sd_cache->html_count > 1) {
+            for (int i = 0; i < sd_cache->html_count - 1; i++) {
+                for (int j = i + 1; j < sd_cache->html_count; j++) {
+                    if (strcasecmp(sd_cache->html_filenames[i], sd_cache->html_filenames[j]) > 0) {
+                        char *tmp = sd_cache->html_filenames[i];
+                        sd_cache->html_filenames[i] = sd_cache->html_filenames[j];
+                        sd_cache->html_filenames[j] = tmp;
+                    }
+                }
+            }
+        }
+        ESP_LOGI(TAG, "  HTML templates: %d files", sd_cache->html_count);
+    } else {
+        ESP_LOGI(TAG, "  HTML templates: 0 (directory not found)");
+    }
+    
+    // 5. Load handshake filenames from /sdcard/lab/handshakes/
+    dir = opendir("/sdcard/lab/handshakes");
+    if (dir != NULL) {
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL && sd_cache->handshake_count < SD_CACHE_MAX_HANDSHAKES) {
+            // Only include .pcap files (skip .hccapx)
+            if (strstr(entry->d_name, ".pcap") != NULL && strstr(entry->d_name, ".hccapx") == NULL) {
+                sd_cache_add_handshake_name(entry->d_name);
+            }
+        }
+        closedir(dir);
+        ESP_LOGI(TAG, "  Handshakes: %d files", sd_cache->handshake_count);
+    } else {
+        ESP_LOGI(TAG, "  Handshakes: 0 (directory not found)");
+    }
+    
+    sd_cache->loaded = true;
+    ESP_LOGI(TAG, "SD cache loading complete");
+    return ESP_OK;
+}
+
 void app_main(void)
 {
 	//Initialize GPS UART and start background monitor task
@@ -2137,9 +2559,6 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_timer_create(&periodic_timer_args, &periodic_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(periodic_timer, 10 * 1000));
     
-    // Skip loading whitelist on startup - will be loaded lazily if needed
-    // load_whitelist_from_sd();  // DISABLED - no blocking on startup
-    
     // Initialize portal HTML buffer (1MB in PSRAM for large HTML files up to 900KB)
     ESP_LOGI(TAG, "Initializing portal HTML buffer in PSRAM...");
     esp_err_t html_ret = wifi_attacks_init_portal_html_buffer();
@@ -2148,6 +2567,71 @@ void app_main(void)
     } else {
         ESP_LOGW(TAG, "Portal HTML buffer allocation failed - large HTML files may not work");
     }
+    
+    // ========================================================================
+    // SD Card Initialization with Modal Popup
+    // ========================================================================
+    
+    // Initialize SD cache structure in PSRAM
+    esp_err_t cache_ret = sd_cache_init();
+    if (cache_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize SD cache - halting");
+        show_sd_loading_popup("PSRAM Error!\nCannot allocate cache");
+        while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+    }
+    
+    // Show loading popup
+    show_sd_loading_popup("Reading SD card...");
+    
+    // Try to mount SD card - retry until successful
+    bool sd_mounted = false;
+    int mount_attempts = 0;
+    while (!sd_mounted) {
+        mount_attempts++;
+        ESP_LOGI(TAG, "[SD] Mount attempt %d...", mount_attempts);
+        
+        // Take SD/SPI mutex before mounting
+        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+            esp_err_t sd_ret = wifi_wardrive_init_sd();
+            xSemaphoreGive(sd_spi_mutex);
+            
+            if (sd_ret == ESP_OK) {
+                sd_mounted_lazy = true;
+                sd_mounted = true;
+                ESP_LOGI(TAG, "[SD] Card mounted successfully");
+            } else {
+                ESP_LOGW(TAG, "[SD] Mount failed: %s", esp_err_to_name(sd_ret));
+                update_sd_loading_popup("Insert SD Card");
+                
+                // Wait and retry - process LVGL to keep UI responsive
+                for (int i = 0; i < 20; i++) {  // 2 second delay with LVGL processing
+                    if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                        lv_task_handler();
+                        xSemaphoreGive(lvgl_mutex);
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+            }
+        } else {
+            ESP_LOGW(TAG, "[SD] Could not take SPI mutex");
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+    }
+    
+    // Load all data from SD into cache
+    update_sd_loading_popup("Loading data...");
+    if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        lv_task_handler();
+        xSemaphoreGive(lvgl_mutex);
+    }
+    
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(10000)) == pdTRUE) {
+        sd_cache_load_all();
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    
+    // Hide popup
+    hide_sd_loading_popup();
     
     ESP_LOGI(TAG, "System ready!");
     ESP_LOGI(TAG, "[DIAG] System ready - final memory state");
@@ -7204,15 +7688,9 @@ static void wifi_monitor_tile_event_cb(lv_event_t *e)
     }
 }
 
-// Evil Twin Passwords screen - reads /sdcard/lab/eviltwin.txt
+// Evil Twin Passwords screen - uses cached data from PSRAM
 static void show_eviltwin_passwords_screen(void)
 {
-    // Ensure SD card is mounted before trying to read files
-    esp_err_t sd_ret = ensure_sd_mounted();
-    if (sd_ret != ESP_OK) {
-        ESP_LOGW(TAG, "[EVIL_TWIN] SD card not available: %s", esp_err_to_name(sd_ret));
-    }
-    
     create_function_page_base("Evil Twin Passwords");
     
     // Scrollable list container
@@ -7226,40 +7704,21 @@ static void show_eviltwin_passwords_screen(void)
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
     
-    // Take SD/SPI mutex before filesystem operations
-    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
-        lv_obj_t *err_label = lv_label_create(list);
-        lv_label_set_text(err_label, "SD card busy");
-        lv_obj_set_style_text_color(err_label, COLOR_MATERIAL_RED, 0);
-        return;
-    }
+    int count = sd_cache_get_eviltwin_count();
     
-    FILE *file = fopen("/sdcard/lab/eviltwin.txt", "r");
-    if (file == NULL) {
-        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
-        lv_obj_t *msg_label = lv_label_create(list);
-        lv_label_set_text(msg_label, "No eviltwin.txt found\nor file is empty.");
-        lv_obj_set_style_text_color(msg_label, COLOR_MATERIAL_BLUE, 0);
-        lv_obj_set_style_text_font(msg_label, &lv_font_montserrat_14, 0);
-        return;
-    }
-    
-    char line[256];
-    int count = 0;
-    while (fgets(line, sizeof(line), file) != NULL && count < 50) {
-        // Remove trailing newline
-        line[strcspn(line, "\r\n")] = '\0';
-        if (strlen(line) == 0) continue;
+    for (int i = 0; i < count && i < 50; i++) {
+        const char *line = sd_cache_get_eviltwin_entry(i);
+        if (line == NULL || strlen(line) == 0) continue;
         
         // Parse: "SSID", "password"
         char ssid[64] = {0};
         char password[64] = {0};
-        char *p = line;
+        const char *p = line;
         
         // Find first opening quote for SSID
         while (*p && *p != '"') p++;
         if (*p == '"') p++;  // Skip opening quote
-        char *ssid_start = p;
+        const char *ssid_start = p;
         while (*p && *p != '"') p++;
         size_t ssid_len = p - ssid_start;
         if (ssid_len > sizeof(ssid) - 1) ssid_len = sizeof(ssid) - 1;
@@ -7269,7 +7728,7 @@ static void show_eviltwin_passwords_screen(void)
         if (*p == '"') p++;  // Skip closing quote of SSID
         while (*p && *p != '"') p++;  // Skip comma, spaces until next quote
         if (*p == '"') p++;  // Skip opening quote of password
-        char *pass_start = p;
+        const char *pass_start = p;
         while (*p && *p != '"') p++;
         size_t pass_len = p - pass_start;
         if (pass_len > sizeof(password) - 1) pass_len = sizeof(password) - 1;
@@ -7293,12 +7752,7 @@ static void show_eviltwin_passwords_screen(void)
         lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 5, 0);
         lv_label_set_long_mode(lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
         lv_obj_set_width(lbl, lv_pct(90));
-        
-        count++;
     }
-    
-    fclose(file);
-    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
     
     if (count == 0) {
         lv_obj_t *msg_label = lv_label_create(list);
@@ -7308,15 +7762,9 @@ static void show_eviltwin_passwords_screen(void)
     }
 }
 
-// Portal Data screen - reads /sdcard/lab/portals.txt
+// Portal Data screen - uses cached data from PSRAM
 static void show_portal_data_screen(void)
 {
-    // Ensure SD card is mounted before trying to read files
-    esp_err_t sd_ret = ensure_sd_mounted();
-    if (sd_ret != ESP_OK) {
-        ESP_LOGW(TAG, "[PORTAL_DATA] SD card not available: %s", esp_err_to_name(sd_ret));
-    }
-    
     create_function_page_base("Portal Data");
     
     // Scrollable list container
@@ -7330,30 +7778,11 @@ static void show_portal_data_screen(void)
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
     
-    // Take SD/SPI mutex before filesystem operations
-    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
-        lv_obj_t *err_label = lv_label_create(list);
-        lv_label_set_text(err_label, "SD card busy");
-        lv_obj_set_style_text_color(err_label, COLOR_MATERIAL_RED, 0);
-        return;
-    }
+    int count = sd_cache_get_portal_count();
     
-    FILE *file = fopen("/sdcard/lab/portals.txt", "r");
-    if (file == NULL) {
-        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
-        lv_obj_t *msg_label = lv_label_create(list);
-        lv_label_set_text(msg_label, "No portals.txt found\nor file is empty.");
-        lv_obj_set_style_text_color(msg_label, COLOR_MATERIAL_BLUE, 0);
-        lv_obj_set_style_text_font(msg_label, &lv_font_montserrat_14, 0);
-        return;
-    }
-    
-    char line[512];
-    int count = 0;
-    while (fgets(line, sizeof(line), file) != NULL && count < 50) {
-        // Remove trailing newline
-        line[strcspn(line, "\r\n")] = '\0';
-        if (strlen(line) == 0) continue;
+    for (int i = 0; i < count && i < 50; i++) {
+        const char *line = sd_cache_get_portal_entry(i);
+        if (line == NULL || strlen(line) == 0) continue;
         
         // Display the whole line (already in readable format from portals.txt)
         // Format: "SSID", "field1=value1", "field2=value2", ...
@@ -7374,12 +7803,7 @@ static void show_portal_data_screen(void)
         lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 5, 0);
         lv_label_set_long_mode(lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
         lv_obj_set_width(lbl, lv_pct(90));
-        
-        count++;
     }
-    
-    fclose(file);
-    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
     
     if (count == 0) {
         lv_obj_t *msg_label = lv_label_create(list);
@@ -7389,15 +7813,9 @@ static void show_portal_data_screen(void)
     }
 }
 
-// Handshakes list screen - lists .pcap files from /sdcard/lab/handshakes/
+// Handshakes list screen - uses cached data from PSRAM
 static void show_handshakes_list_screen(void)
 {
-    // Ensure SD card is mounted before trying to read files
-    esp_err_t sd_ret = ensure_sd_mounted();
-    if (sd_ret != ESP_OK) {
-        ESP_LOGW(TAG, "[HANDSHAKES] SD card not available: %s", esp_err_to_name(sd_ret));
-    }
-    
     create_function_page_base("Handshakes");
     
     // Scrollable list container
@@ -7411,41 +7829,11 @@ static void show_handshakes_list_screen(void)
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
     
-    // Take SD/SPI mutex before filesystem operations
-    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
-        lv_obj_t *err_label = lv_label_create(list);
-        lv_label_set_text(err_label, "SD card busy");
-        lv_obj_set_style_text_color(err_label, COLOR_MATERIAL_RED, 0);
-        return;
-    }
+    int count = sd_cache_get_handshake_count();
     
-    // Check if directory exists
-    struct stat st;
-    if (stat("/sdcard/lab/handshakes", &st) != 0) {
-        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
-        lv_obj_t *msg_label = lv_label_create(list);
-        lv_label_set_text(msg_label, "No handshakes directory found.");
-        lv_obj_set_style_text_color(msg_label, COLOR_MATERIAL_BLUE, 0);
-        lv_obj_set_style_text_font(msg_label, &lv_font_montserrat_14, 0);
-        return;
-    }
-    
-    DIR *dir = opendir("/sdcard/lab/handshakes");
-    if (!dir) {
-        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
-        lv_obj_t *msg_label = lv_label_create(list);
-        lv_label_set_text(msg_label, "Cannot open handshakes directory.");
-        lv_obj_set_style_text_color(msg_label, COLOR_MATERIAL_RED, 0);
-        lv_obj_set_style_text_font(msg_label, &lv_font_montserrat_14, 0);
-        return;
-    }
-    
-    struct dirent *entry;
-    int count = 0;
-    while ((entry = readdir(dir)) != NULL && count < 50) {
-        // Only show .pcap files (skip .hccapx)
-        if (strstr(entry->d_name, ".pcap") == NULL) continue;
-        if (strstr(entry->d_name, ".hccapx") != NULL) continue;
+    for (int i = 0; i < count && i < 50; i++) {
+        const char *name = sd_cache_get_handshake_name(i);
+        if (name == NULL) continue;
         
         // Create clickable button for each pcap file
         lv_obj_t *btn = lv_btn_create(list);
@@ -7457,18 +7845,13 @@ static void show_handshakes_list_screen(void)
         lv_obj_set_style_radius(btn, 4, 0);
         
         lv_obj_t *lbl = lv_label_create(btn);
-        lv_label_set_text(lbl, entry->d_name);
+        lv_label_set_text(lbl, name);
         lv_obj_set_style_text_color(lbl, COLOR_MATERIAL_BLUE, 0);
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
         lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 5, 0);
         lv_label_set_long_mode(lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
         lv_obj_set_width(lbl, lv_pct(90));
-        
-        count++;
     }
-    
-    closedir(dir);
-    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
     
     if (count == 0) {
         lv_obj_t *msg_label = lv_label_create(list);
@@ -10147,10 +10530,10 @@ static void deauth_monitor_promiscuous_callback(void *buf, wifi_promiscuous_pkt_
     
     portEXIT_CRITICAL(&deauth_monitor_spin);
     
-    ESP_LOGI(TAG, "[DEAUTH] CH: %d | %s | RSSI: %d", 
+    /*ESP_LOGI(TAG, "[DEAUTH] CH: %d | %s | RSSI: %d", 
              deauth_monitor_current_channel,
              deauth_monitor_attacks[idx].ssid,
-             rssi);
+             rssi);*/
 }
 
 // Channel hopping task for deauth monitor

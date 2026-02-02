@@ -35,6 +35,9 @@
 // Used to prevent SPI conflicts when writing handshake files to SD card
 extern SemaphoreHandle_t sd_spi_mutex;
 
+// External SD cache function from main.c
+extern void sd_cache_add_handshake_name(const char *name);
+
 static const char *TAG = "attack_handshake";
 static attack_handshake_methods_t method = -1;
 static wifi_ap_record_t current_ap_record;
@@ -793,6 +796,13 @@ bool attack_handshake_save_to_sd() {
     printf(" HCCAPX saved: %s (%zu bytes)\n", filename, sizeof(hccapx_t));
     printf(" Complete 4-way handshake saved for SSID: %s (MAC: %s, message_pair: %d)\n", 
              ssid_safe, mac_suffix, hccapx->message_pair);
+    
+    // Add PCAP filename to SD cache for immediate UI visibility
+    // Extract just the filename from the full path for cache
+    char pcap_filename[128];
+    snprintf(pcap_filename, sizeof(pcap_filename), "%s_%s_%llu.pcap", 
+             ssid_safe, mac_suffix, (unsigned long long)timestamp);
+    sd_cache_add_handshake_name(pcap_filename);
     
     // Release SD/SPI mutex
     if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);

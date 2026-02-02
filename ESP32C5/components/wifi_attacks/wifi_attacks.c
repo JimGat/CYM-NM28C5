@@ -99,9 +99,16 @@ void wifi_attacks_set_evil_twin_event_cb(evil_twin_event_cb_t cb) {
     evil_twin_event_callback = cb;
 }
 
-// Portal HTML files
+// Portal HTML files - populated from SD cache on refresh
 static char sd_html_files[MAX_HTML_FILES][MAX_HTML_FILENAME];
 static int sd_html_count = 0;
+
+// External SD cache functions from main.c
+extern int sd_cache_get_html_count(void);
+extern const char* sd_cache_get_html_filename(int index);
+extern void sd_cache_add_eviltwin_entry(const char *entry);
+extern void sd_cache_add_portal_entry(const char *entry);
+
 // Portal HTML buffer - dynamically allocated from PSRAM (1MB for large HTML files)
 #define PORTAL_HTML_MAX_SIZE (1024 * 1024)  // 1 MB
 static char *custom_portal_html = NULL;
@@ -155,54 +162,26 @@ static int compare_html_names(const void *a, const void *b)
 
 void wifi_attacks_refresh_sd_html_list(void)
 {
+    // Populate local array from SD cache (already loaded at startup)
     sd_html_count = 0;
-
-    DIR *dir = opendir(PORTAL_HTML_DIR);
-    if (!dir) {
-        ESP_LOGW(TAG, "Portal HTML directory not found: %s", PORTAL_HTML_DIR);
-        return;
-    }
-
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL && sd_html_count < MAX_HTML_FILES) {
-        if (entry->d_name[0] == '.') {
-            continue;
-        }
-
-        char full_path[256];
-        int path_len = snprintf(full_path, sizeof(full_path), "%s/%s", PORTAL_HTML_DIR, entry->d_name);
-        if (path_len < 0 || path_len >= (int)sizeof(full_path)) {
-            ESP_LOGW(TAG, "Skipped HTML template (path too long): %s", entry->d_name);
-            continue;
-        }
-
-        struct stat st = {0};
-        if (stat(full_path, &st) != 0 || !S_ISREG(st.st_mode)) {
-            continue;
-        }
-
-        if (!is_html_extension(entry->d_name)) {
-            continue;
-        }
-
-        size_t name_len = strnlen(entry->d_name, sizeof(entry->d_name));
+    
+    int cache_count = sd_cache_get_html_count();
+    for (int i = 0; i < cache_count && sd_html_count < MAX_HTML_FILES; i++) {
+        const char *name = sd_cache_get_html_filename(i);
+        if (name == NULL) continue;
+        
+        size_t name_len = strlen(name);
         if (name_len >= MAX_HTML_FILENAME) {
-            ESP_LOGW(TAG, "Skipped HTML template (name too long): %s", entry->d_name);
+            ESP_LOGW(TAG, "Skipped HTML template (name too long): %s", name);
             continue;
         }
-
-        strncpy(sd_html_files[sd_html_count], entry->d_name, MAX_HTML_FILENAME - 1);
+        
+        strncpy(sd_html_files[sd_html_count], name, MAX_HTML_FILENAME - 1);
         sd_html_files[sd_html_count][MAX_HTML_FILENAME - 1] = '\0';
         sd_html_count++;
     }
-
-    closedir(dir);
-
-    if (sd_html_count > 1) {
-        qsort(sd_html_files, sd_html_count, sizeof(sd_html_files[0]), compare_html_names);
-    }
-
-    ESP_LOGI(TAG, "Portal HTML templates available: %d", sd_html_count);
+    
+    ESP_LOGI(TAG, "Portal HTML templates available: %d (from cache)", sd_html_count);
 }
 
 // ============================================================================
@@ -2048,7 +2027,12 @@ static void save_evil_twin_password(const char* ssid, const char* password) {
     fflush(file);
     fclose(file);
     
-    ESP_LOGI(TAG, "Password saved to eviltwin.txt");
+    // Also add to PSRAM cache for immediate UI visibility
+    char cache_entry[256];
+    snprintf(cache_entry, sizeof(cache_entry), "\"%s\", \"%s\"", ssid, password);
+    sd_cache_add_eviltwin_entry(cache_entry);
+    
+    ESP_LOGI(TAG, "Password saved to eviltwin.txt and cache");
 }
 
 static void save_portal_data(const char* ssid, const char* form_data) {
@@ -2091,6 +2075,10 @@ static void save_portal_data(const char* ssid, const char* form_data) {
     // Write SSID as first field
     fprintf(file, "\"%s\", ", ssid ? ssid : "Unknown");
     
+    // Build cache entry in parallel
+    char cache_entry[512];
+    int cache_pos = snprintf(cache_entry, sizeof(cache_entry), "\"%s\", ", ssid ? ssid : "Unknown");
+    
     // Parse form data and extract all fields
     // Form data is in format: field1=value1&field2=value2&...
     char *data_copy = strdup(form_data);
@@ -2118,8 +2106,14 @@ static void save_portal_data(const char* ssid, const char* form_data) {
             // Write to file
             if (!first_field) {
                 fprintf(file, ", ");
+                if (cache_pos < (int)sizeof(cache_entry) - 2) {
+                    cache_pos += snprintf(cache_entry + cache_pos, sizeof(cache_entry) - cache_pos, ", ");
+                }
             }
             fprintf(file, "\"%s\"", decoded_value);
+            if (cache_pos < (int)sizeof(cache_entry) - 1) {
+                cache_pos += snprintf(cache_entry + cache_pos, sizeof(cache_entry) - cache_pos, "\"%s\"", decoded_value);
+            }
             first_field = false;
         }
         
@@ -2133,7 +2127,10 @@ static void save_portal_data(const char* ssid, const char* form_data) {
     fflush(file);
     fclose(file);
     
-    ESP_LOGI(TAG, "Portal data saved to portals.txt");
+    // Add to PSRAM cache for immediate UI visibility
+    sd_cache_add_portal_entry(cache_entry);
+    
+    ESP_LOGI(TAG, "Portal data saved to portals.txt and cache");
 }
 
 // Queue karma data for deferred save (called from HTTP handler - can't access SD directly due to SPI conflicts)
@@ -2242,6 +2239,10 @@ void wifi_attacks_process_pending_saves(void) {
     // Write SSID as first field
     fprintf(file, "\"%s\", ", pending_karma_save.ssid);
     
+    // Build cache entry in parallel
+    char cache_entry[512];
+    int cache_pos = snprintf(cache_entry, sizeof(cache_entry), "\"%s\", ", pending_karma_save.ssid);
+    
     // Parse form data and extract all fields
     char *data_copy = strdup(pending_karma_save.form_data);
     if (data_copy) {
@@ -2260,8 +2261,14 @@ void wifi_attacks_process_pending_saves(void) {
                 
                 if (!first_field) {
                     fprintf(file, ", ");
+                    if (cache_pos < (int)sizeof(cache_entry) - 2) {
+                        cache_pos += snprintf(cache_entry + cache_pos, sizeof(cache_entry) - cache_pos, ", ");
+                    }
                 }
                 fprintf(file, "\"%s\"", decoded_value);
+                if (cache_pos < (int)sizeof(cache_entry) - 1) {
+                    cache_pos += snprintf(cache_entry + cache_pos, sizeof(cache_entry) - cache_pos, "\"%s\"", decoded_value);
+                }
                 first_field = false;
             }
             field = strtok_r(NULL, "&", &saveptr);
@@ -2273,7 +2280,10 @@ void wifi_attacks_process_pending_saves(void) {
     fflush(file);
     fclose(file);
     
-    ESP_LOGI(TAG, "Karma data saved to eviltwin.txt");
+    // Add to PSRAM cache for immediate UI visibility
+    sd_cache_add_eviltwin_entry(cache_entry);
+    
+    ESP_LOGI(TAG, "Karma data saved to eviltwin.txt and cache");
     pending_karma_save.pending = false;
 }
 
