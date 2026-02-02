@@ -1716,7 +1716,7 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
             }
         }
         *p = '\0';
-        ESP_LOGI(TAG, "[SNIFFERDOG] DEAUTH RAW: %s", hexbuf);
+        //ESP_LOGI(TAG, "[SNIFFERDOG] DEAUTH RAW: %s", hexbuf);
     }
 
     esp_wifi_80211_tx(WIFI_IF_AP, deauth_frame, sizeof(deauth_frame_default), false);

