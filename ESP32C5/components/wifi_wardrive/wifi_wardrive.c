@@ -213,6 +213,105 @@ float wifi_wardrive_get_longitude(void) {
 // SD CARD FUNCTIONS
 // ============================================================================
 
+// Probe if SD card is physically present before attempting full mount
+// This avoids triggering ESP-IDF's buggy cleanup path when no card is present
+static bool probe_sd_card_present(void) {
+    ESP_LOGI(TAG, "[SD] Probing for SD card presence...");
+    
+    // Add a temporary SPI device on the shared bus for probing
+    // Use spics_io_num = -1 so we can manually control CS for proper SD init sequence
+    spi_device_handle_t probe_handle = NULL;
+    spi_device_interface_config_t dev_config = {
+        .command_bits = 0,
+        .address_bits = 0,
+        .dummy_bits = 0,
+        .mode = 0,                      // SPI mode 0 for SD cards
+        .clock_speed_hz = 400000,       // 400kHz for initialization
+        .spics_io_num = -1,             // Manual CS control
+        .queue_size = 1,
+        .flags = 0,
+    };
+    
+    esp_err_t ret = spi_bus_add_device(SPI2_HOST, &dev_config, &probe_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "[SD] Failed to add probe device: %s", esp_err_to_name(ret));
+        return false;
+    }
+    
+    bool card_present = false;
+    uint8_t dummy[10] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    
+    // Ensure CS is configured as output and start high
+    gpio_set_direction(SD_CS_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(SD_CS_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(10));  // Power stabilization
+    
+    // Send 80+ clock pulses with CS HIGH to put card in native mode
+    spi_transaction_t init_trans = {
+        .length = 80,           // 80 bits = 10 bytes
+        .tx_buffer = dummy,
+        .rx_buffer = NULL,
+    };
+    ret = spi_device_transmit(probe_handle, &init_trans);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "[SD] Failed to send init clocks");
+        goto cleanup;
+    }
+    
+    // Assert CS (low) for command
+    gpio_set_level(SD_CS_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(1));
+    
+    // Send CMD0 (GO_IDLE_STATE) to reset card
+    // CMD0 = 0x40 | 0x00, arg = 0x00000000, CRC = 0x95
+    uint8_t cmd0[6] = {0x40, 0x00, 0x00, 0x00, 0x00, 0x95};
+    spi_transaction_t cmd_trans = {
+        .length = 48,           // 6 bytes command
+        .tx_buffer = cmd0,
+        .rx_buffer = NULL,
+    };
+    
+    ret = spi_device_transmit(probe_handle, &cmd_trans);
+    if (ret == ESP_OK) {
+        // Read response bytes (R1 response should come within 8 bytes)
+        uint8_t response[8];
+        spi_transaction_t read_trans = {
+            .length = 64,       // 8 bytes
+            .tx_buffer = dummy, // Send 0xFF while reading
+            .rx_buffer = response,
+            .rxlength = 64,
+        };
+        
+        ret = spi_device_transmit(probe_handle, &read_trans);
+        if (ret == ESP_OK) {
+            // Check if any response byte is not 0xFF (card responded)
+            // Valid R1 response is 0x01 (idle state) or other non-0xFF values
+            for (int i = 0; i < 8; i++) {
+                if (response[i] != 0xFF) {
+                    ESP_LOGI(TAG, "[SD] Card responded with byte 0x%02X at position %d", response[i], i);
+                    card_present = true;
+                    break;
+                }
+            }
+        }
+    }
+
+cleanup:
+    // Deassert CS (high)
+    gpio_set_level(SD_CS_PIN, 1);
+    
+    // Remove the probe device - this should not crash since we added it ourselves
+    spi_bus_remove_device(probe_handle);
+    
+    if (card_present) {
+        ESP_LOGI(TAG, "[SD] Card detected!");
+    } else {
+        ESP_LOGW(TAG, "[SD] No card detected (no response to CMD0)");
+    }
+    
+    return card_present;
+}
+
 esp_err_t wifi_wardrive_init_sd(void) {
     // Check if already mounted
     if (sd_card_mounted) {
@@ -221,6 +320,13 @@ esp_err_t wifi_wardrive_init_sd(void) {
     }
     
     ESP_LOGI(TAG, "[SD] Starting SD card initialization...");
+    
+    // First probe if card is physically present to avoid ESP-IDF mount crash
+    // when no card is inserted (bug in ESP-IDF's error cleanup path)
+    if (!probe_sd_card_present()) {
+        ESP_LOGW(TAG, "[SD] No SD card detected - skipping mount to avoid crash");
+        return ESP_ERR_NOT_FOUND;
+    }
     
     // Detailed memory diagnostics BEFORE mount
     ESP_LOGI(TAG, "[SD] Memory before mount:");
