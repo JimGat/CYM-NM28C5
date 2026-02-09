@@ -21,6 +21,10 @@ int g_shared_selected_count = 0;
 static target_bssid_t target_bssids[MAX_TARGET_BSSIDS];
 static int target_bssid_count = 0;
 
+// Configurable active scan time per channel (set via wifi_scanner_set_scan_time)
+static uint16_t g_scan_time_min = 100;  // default
+static uint16_t g_scan_time_max = 300;  // default
+
 // WiFi event handler (for scan completion)
 static void wifi_scanner_event_handler(void *arg, esp_event_base_t event_base,
                                       int32_t event_id, void *event_data) {
@@ -58,8 +62,8 @@ esp_err_t wifi_scanner_start_scan(void) {
         .channel = 0,
         .show_hidden = true,
         .scan_type = WIFI_SCAN_TYPE_ACTIVE,
-        .scan_time.active.min = 100,
-        .scan_time.active.max = 300,
+        .scan_time.active.min = g_scan_time_min,
+        .scan_time.active.max = g_scan_time_max,
     };
     
     g_scan_in_progress = true;
@@ -273,5 +277,15 @@ const wifi_ap_record_t *wifi_scanner_get_results_ptr(void)
 const uint16_t *wifi_scanner_get_count_ptr(void)
 {
     return &g_shared_scan_count;
+}
+
+void wifi_scanner_set_scan_time(uint16_t min_ms, uint16_t max_ms)
+{
+    if (min_ms < 50)  min_ms = 50;
+    if (max_ms > 1000) max_ms = 1000;
+    if (min_ms > max_ms) min_ms = max_ms;
+    g_scan_time_min = min_ms;
+    g_scan_time_max = max_ms;
+    ESP_LOGI(TAG, "Scan time set: min=%u max=%u ms", min_ms, max_ms);
 }
 

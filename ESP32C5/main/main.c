@@ -36,6 +36,8 @@
 #include <sys/stat.h>
 #include "esp_rom_sys.h"
 #include "esp_task_wdt.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
 // GPS
 #include "driver/uart.h"
@@ -174,6 +176,20 @@ static volatile int64_t last_input_ms = 0;
 static volatile bool screen_dimmed = false;
 static volatile bool ignore_touch_until_release = false;
 static lv_timer_t *screen_idle_timer = NULL;
+
+// Screen settings (loaded from NVS)
+static int32_t screen_timeout_ms = 0;       // 0 = stays on (default)
+static uint8_t screen_brightness_pct = 80;  // 10-100% (default 80)
+static lv_obj_t *brightness_overlay = NULL; // Software brightness overlay on lv_layer_top()
+static uint16_t scan_time_min_ms = 100;     // Active scan min time per channel (default 100)
+static uint16_t scan_time_max_ms = 300;     // Active scan max time per channel (default 300)
+
+// NVS settings keys
+#define NVS_NAMESPACE       "settings"
+#define NVS_KEY_TIMEOUT     "scr_timeout"
+#define NVS_KEY_BRIGHTNESS  "scr_bright"
+#define NVS_KEY_SCAN_MIN    "scan_min"
+#define NVS_KEY_SCAN_MAX    "scan_max"
 
 static esp_lcd_panel_handle_t panel_handle;
 static ft6336_handle_t touch_handle;
@@ -1436,15 +1452,104 @@ static void init_display(void)
     vTaskDelay(pdMS_TO_TICKS(50));
 }
 
+// ============================================================================
+// NVS Settings Helpers
+// ============================================================================
+
+static void nvs_settings_load(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
+    if (err == ESP_OK) {
+        int32_t t = 0;
+        if (nvs_get_i32(h, NVS_KEY_TIMEOUT, &t) == ESP_OK) {
+            screen_timeout_ms = t;
+        } else {
+            screen_timeout_ms = 0; // stays on
+        }
+        uint8_t b = 80;
+        if (nvs_get_u8(h, NVS_KEY_BRIGHTNESS, &b) == ESP_OK) {
+            screen_brightness_pct = b;
+        } else {
+            screen_brightness_pct = 80;
+        }
+        uint16_t smin = 100, smax = 300;
+        if (nvs_get_u16(h, NVS_KEY_SCAN_MIN, &smin) == ESP_OK) {
+            scan_time_min_ms = smin;
+        }
+        if (nvs_get_u16(h, NVS_KEY_SCAN_MAX, &smax) == ESP_OK) {
+            scan_time_max_ms = smax;
+        }
+        nvs_close(h);
+        ESP_LOGI(TAG, "NVS settings loaded: timeout=%ldms, brightness=%u%%, scan=%u-%ums",
+                 (long)screen_timeout_ms, screen_brightness_pct, scan_time_min_ms, scan_time_max_ms);
+    } else {
+        ESP_LOGW(TAG, "NVS settings not found (first boot), using defaults");
+        screen_timeout_ms = 0;
+        screen_brightness_pct = 80;
+        scan_time_min_ms = 100;
+        scan_time_max_ms = 300;
+    }
+    // Apply scan time to wifi_scanner
+    wifi_scanner_set_scan_time(scan_time_min_ms, scan_time_max_ms);
+}
+
+static void nvs_settings_save_timeout(int32_t ms)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, NVS_KEY_TIMEOUT, ms);
+        nvs_commit(h);
+        nvs_close(h);
+        ESP_LOGI(TAG, "NVS: saved timeout = %ldms", (long)ms);
+    }
+}
+
+static void nvs_settings_save_brightness(uint8_t pct)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, NVS_KEY_BRIGHTNESS, pct);
+        nvs_commit(h);
+        nvs_close(h);
+        ESP_LOGI(TAG, "NVS: saved brightness = %u%%", pct);
+    }
+}
+
+static void nvs_settings_save_scan_time(uint16_t min_ms, uint16_t max_ms)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u16(h, NVS_KEY_SCAN_MIN, min_ms);
+        nvs_set_u16(h, NVS_KEY_SCAN_MAX, max_ms);
+        nvs_commit(h);
+        nvs_close(h);
+        ESP_LOGI(TAG, "NVS: saved scan time = %u-%ums", min_ms, max_ms);
+    }
+}
+
+// ============================================================================
+// Backlight / Brightness / Screen Dimming
+// ============================================================================
+
 static void init_backlight(void)
 {
-    // No backlight GPIO configured; keep display always on.
+    // No backlight GPIO configured (LED tied to 3V3).
+    // Brightness is controlled via a software overlay on lv_layer_top().
     (void)0;
 }
 
 static void set_backlight_percent(uint8_t percent)
 {
-    (void)percent;
+    // Software brightness: a black overlay on lv_layer_top() with variable opacity.
+    // 100% brightness = fully transparent overlay (OPA_TRANSP).
+    // 10% brightness  = nearly opaque overlay.
+    if (!brightness_overlay) return;
+    if (percent > 100) percent = 100;
+    if (percent < 10)  percent = 10;
+    // Map 10-100% to opacity 230-0  (linear)
+    lv_opa_t opa = (lv_opa_t)(255 - (uint16_t)percent * 255 / 100);
+    lv_obj_set_style_bg_opa(brightness_overlay, opa, 0);
 }
 
 static void screen_set_dimmed(bool dimmed)
@@ -1456,7 +1561,10 @@ static void screen_set_dimmed(bool dimmed)
     ignore_touch_until_release = true;
 
     if (dimmed) {
-        set_backlight_percent(SCREEN_BACKLIGHT_DIM_PERCENT);
+        // Hide brightness overlay (not needed when display is off)
+        if (brightness_overlay) {
+            lv_obj_add_flag(brightness_overlay, LV_OBJ_FLAG_HIDDEN);
+        }
         if (panel_handle) {
             esp_lcd_panel_disp_on_off(panel_handle, false);
         }
@@ -1464,7 +1572,16 @@ static void screen_set_dimmed(bool dimmed)
         if (panel_handle) {
             esp_lcd_panel_disp_on_off(panel_handle, true);
         }
-        set_backlight_percent(SCREEN_BACKLIGHT_ACTIVE_PERCENT);
+        // Restore brightness overlay
+        if (brightness_overlay) {
+            lv_obj_clear_flag(brightness_overlay, LV_OBJ_FLAG_HIDDEN);
+        }
+        set_backlight_percent(screen_brightness_pct);
+        // Reset idle timer when waking up
+        last_input_ms = esp_timer_get_time() / 1000;
+        if (screen_idle_timer && screen_timeout_ms > 0) {
+            lv_timer_resume(screen_idle_timer);
+        }
     }
 }
 
@@ -1472,7 +1589,7 @@ static void screen_idle_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
     const int64_t now_ms = esp_timer_get_time() / 1000;
-    if (!screen_dimmed && (now_ms - last_input_ms) >= SCREEN_INACTIVITY_TIMEOUT_MS) {
+    if (!screen_dimmed && (now_ms - last_input_ms) >= screen_timeout_ms) {
         screen_set_dimmed(true);
     }
 }
@@ -2384,6 +2501,10 @@ void app_main(void)
         // wifi_cli_start_console();
     }
 
+    // Load screen settings (timeout, brightness) from NVS
+    // NVS is already initialized by wifi_cli_init()
+    nvs_settings_load();
+
     
     // Init scanner and register event handler
     wifi_scanner_init();
@@ -2535,7 +2656,19 @@ void app_main(void)
     
     // Now that UI is fully created, turn on display (prevents boot flash)
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
-    set_backlight_percent(SCREEN_BACKLIGHT_ACTIVE_PERCENT);
+
+    // Create software brightness overlay on lv_layer_top()
+    // This sits above all content but does NOT intercept touch events
+    brightness_overlay = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(brightness_overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(brightness_overlay, 0, 0);
+    lv_obj_set_style_bg_color(brightness_overlay, lv_color_black(), 0);
+    lv_obj_set_style_border_width(brightness_overlay, 0, 0);
+    lv_obj_set_style_radius(brightness_overlay, 0, 0);
+    lv_obj_clear_flag(brightness_overlay, LV_OBJ_FLAG_CLICKABLE);   // Touch passes through
+    lv_obj_clear_flag(brightness_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    set_backlight_percent(screen_brightness_pct);
+
     last_input_ms = esp_timer_get_time() / 1000;
     
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -2549,6 +2682,13 @@ void app_main(void)
 
     if (screen_idle_timer == NULL) {
         screen_idle_timer = lv_timer_create(screen_idle_timer_cb, SCREEN_INACTIVITY_CHECK_MS, NULL);
+        // If "Stays on" (timeout == 0), pause the timer immediately
+        if (screen_timeout_ms == 0) {
+            lv_timer_pause(screen_idle_timer);
+            ESP_LOGI(TAG, "Screen timeout: Stays on (timer paused)");
+        } else {
+            ESP_LOGI(TAG, "Screen timeout: %ldms", (long)screen_timeout_ms);
+        }
     }
 
     const esp_timer_create_args_t periodic_timer_args = {
@@ -7952,6 +8092,488 @@ static void show_download_mode_screen(void)
     lv_obj_add_event_cb(confirm_btn, download_mode_confirm_cb, LV_EVENT_CLICKED, NULL);
 }
 
+// ============================================================================
+// Scan Time Popup (min/max active scan time per channel)
+// ============================================================================
+
+static lv_obj_t *scantime_popup = NULL;
+static lv_obj_t *scantime_min_slider = NULL;
+static lv_obj_t *scantime_max_slider = NULL;
+static lv_obj_t *scantime_min_label = NULL;
+static lv_obj_t *scantime_max_label = NULL;
+
+static void scantime_min_slider_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!scantime_min_slider || !scantime_min_label || !scantime_max_slider) return;
+    int32_t min_val = lv_slider_get_value(scantime_min_slider);
+    int32_t max_val = lv_slider_get_value(scantime_max_slider);
+    // Enforce min < max
+    if (min_val >= max_val) {
+        min_val = max_val - 10;
+        if (min_val < 50) min_val = 50;
+        lv_slider_set_value(scantime_min_slider, min_val, LV_ANIM_OFF);
+    }
+    char buf[24];
+    snprintf(buf, sizeof(buf), "Min: %ldms", (long)min_val);
+    lv_label_set_text(scantime_min_label, buf);
+}
+
+static void scantime_max_slider_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!scantime_max_slider || !scantime_max_label || !scantime_min_slider) return;
+    int32_t max_val = lv_slider_get_value(scantime_max_slider);
+    int32_t min_val = lv_slider_get_value(scantime_min_slider);
+    // Enforce max > min
+    if (max_val <= min_val) {
+        max_val = min_val + 10;
+        if (max_val > 1000) max_val = 1000;
+        lv_slider_set_value(scantime_max_slider, max_val, LV_ANIM_OFF);
+    }
+    char buf[24];
+    snprintf(buf, sizeof(buf), "Max: %ldms", (long)max_val);
+    lv_label_set_text(scantime_max_label, buf);
+}
+
+static void scantime_popup_save_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!scantime_min_slider || !scantime_max_slider || !scantime_popup) return;
+
+    uint16_t min_val = (uint16_t)lv_slider_get_value(scantime_min_slider);
+    uint16_t max_val = (uint16_t)lv_slider_get_value(scantime_max_slider);
+    if (min_val >= max_val) { min_val = max_val > 50 ? max_val - 10 : 50; }
+
+    scan_time_min_ms = min_val;
+    scan_time_max_ms = max_val;
+    nvs_settings_save_scan_time(min_val, max_val);
+    wifi_scanner_set_scan_time(min_val, max_val);
+
+    lv_obj_del(scantime_popup);
+    scantime_popup = NULL;
+    scantime_min_slider = NULL;
+    scantime_max_slider = NULL;
+    scantime_min_label = NULL;
+    scantime_max_label = NULL;
+}
+
+static void scantime_popup_close_cb(lv_event_t *e)
+{
+    (void)e;
+    if (scantime_popup) {
+        lv_obj_del(scantime_popup);
+        scantime_popup = NULL;
+        scantime_min_slider = NULL;
+        scantime_max_slider = NULL;
+        scantime_min_label = NULL;
+        scantime_max_label = NULL;
+    }
+}
+
+static void show_scan_time_popup(void)
+{
+    if (scantime_popup) return;
+
+    // Modal overlay
+    scantime_popup = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(scantime_popup, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(scantime_popup, 0, 0);
+    lv_obj_set_style_bg_color(scantime_popup, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(scantime_popup, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(scantime_popup, 0, 0);
+    lv_obj_set_style_radius(scantime_popup, 0, 0);
+    lv_obj_clear_flag(scantime_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(scantime_popup, LV_OBJ_FLAG_CLICKABLE);
+
+    // Dialog box
+    lv_obj_t *dialog = lv_obj_create(scantime_popup);
+    lv_obj_set_size(dialog, 340, 250);
+    lv_obj_center(dialog);
+    lv_obj_set_style_bg_color(dialog, lv_color_make(30, 30, 30), 0);
+    lv_obj_set_style_border_color(dialog, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_border_width(dialog, 2, 0);
+    lv_obj_set_style_radius(dialog, 12, 0);
+    lv_obj_clear_flag(dialog, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(dialog, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(dialog, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(dialog, 12, 0);
+    lv_obj_set_style_pad_gap(dialog, 8, 0);
+
+    // Title
+    lv_obj_t *title = lv_label_create(dialog);
+    lv_label_set_text(title, "Scan Time per Channel");
+    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+
+    // Min label
+    scantime_min_label = lv_label_create(dialog);
+    char buf_min[16];
+    snprintf(buf_min, sizeof(buf_min), "Min: %ums", scan_time_min_ms);
+    lv_label_set_text(scantime_min_label, buf_min);
+    lv_obj_set_style_text_color(scantime_min_label, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_text_font(scantime_min_label, &lv_font_montserrat_14, 0);
+
+    // Min slider
+    scantime_min_slider = lv_slider_create(dialog);
+    lv_obj_set_width(scantime_min_slider, 280);
+    lv_slider_set_range(scantime_min_slider, 50, 1000);
+    lv_slider_set_value(scantime_min_slider, scan_time_min_ms, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(scantime_min_slider, lv_color_make(80, 80, 80), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(scantime_min_slider, COLOR_MATERIAL_PURPLE, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(scantime_min_slider, COLOR_MATERIAL_PURPLE, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(scantime_min_slider, 4, LV_PART_KNOB);
+    lv_obj_add_event_cb(scantime_min_slider, scantime_min_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    // Max label
+    scantime_max_label = lv_label_create(dialog);
+    char buf_max[16];
+    snprintf(buf_max, sizeof(buf_max), "Max: %ums", scan_time_max_ms);
+    lv_label_set_text(scantime_max_label, buf_max);
+    lv_obj_set_style_text_color(scantime_max_label, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_text_font(scantime_max_label, &lv_font_montserrat_14, 0);
+
+    // Max slider
+    scantime_max_slider = lv_slider_create(dialog);
+    lv_obj_set_width(scantime_max_slider, 280);
+    lv_slider_set_range(scantime_max_slider, 50, 1000);
+    lv_slider_set_value(scantime_max_slider, scan_time_max_ms, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(scantime_max_slider, lv_color_make(80, 80, 80), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(scantime_max_slider, COLOR_MATERIAL_PURPLE, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(scantime_max_slider, COLOR_MATERIAL_PURPLE, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(scantime_max_slider, 4, LV_PART_KNOB);
+    lv_obj_add_event_cb(scantime_max_slider, scantime_max_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    // Button row
+    lv_obj_t *btn_row = lv_obj_create(dialog);
+    lv_obj_set_size(btn_row, 280, 42);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    // Cancel button
+    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel_btn, 120, 36);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_make(80, 80, 80), 0);
+    lv_obj_set_style_radius(cancel_btn, 8, 0);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, "Cancel");
+    lv_obj_set_style_text_color(cancel_lbl, lv_color_white(), 0);
+    lv_obj_center(cancel_lbl);
+    lv_obj_add_event_cb(cancel_btn, scantime_popup_close_cb, LV_EVENT_CLICKED, NULL);
+
+    // Save button
+    lv_obj_t *save_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(save_btn, 120, 36);
+    lv_obj_set_style_bg_color(save_btn, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_bg_color(save_btn, lv_color_lighten(COLOR_MATERIAL_PURPLE, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(save_btn, 8, 0);
+    lv_obj_t *save_lbl = lv_label_create(save_btn);
+    lv_label_set_text(save_lbl, "Save");
+    lv_obj_set_style_text_color(save_lbl, lv_color_white(), 0);
+    lv_obj_center(save_lbl);
+    lv_obj_add_event_cb(save_btn, scantime_popup_save_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// ============================================================================
+// Screen Timeout Popup
+// ============================================================================
+
+static lv_obj_t *timeout_popup = NULL;
+static lv_obj_t *timeout_dropdown = NULL;
+
+// Map dropdown index to milliseconds: 0=10s, 1=30s, 2=1min, 3=5min, 4=stays on
+static int32_t timeout_index_to_ms(uint16_t idx)
+{
+    switch (idx) {
+        case 0: return 10000;
+        case 1: return 30000;
+        case 2: return 60000;
+        case 3: return 300000;
+        case 4: return 0;      // Stays on
+        default: return 0;
+    }
+}
+
+static uint16_t timeout_ms_to_index(int32_t ms)
+{
+    switch (ms) {
+        case 10000:  return 0;
+        case 30000:  return 1;
+        case 60000:  return 2;
+        case 300000: return 3;
+        case 0:      return 4;  // Stays on
+        default:     return 4;
+    }
+}
+
+static void timeout_popup_save_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!timeout_dropdown || !timeout_popup) return;
+
+    uint16_t sel = lv_dropdown_get_selected(timeout_dropdown);
+    screen_timeout_ms = timeout_index_to_ms(sel);
+    nvs_settings_save_timeout(screen_timeout_ms);
+
+    // Pause or resume idle timer
+    if (screen_idle_timer) {
+        if (screen_timeout_ms == 0) {
+            lv_timer_pause(screen_idle_timer);
+            ESP_LOGI(TAG, "Screen timeout: Stays on (timer paused)");
+        } else {
+            last_input_ms = esp_timer_get_time() / 1000;
+            lv_timer_resume(screen_idle_timer);
+            ESP_LOGI(TAG, "Screen timeout set to %ldms", (long)screen_timeout_ms);
+        }
+    }
+
+    // Close popup
+    lv_obj_del(timeout_popup);
+    timeout_popup = NULL;
+    timeout_dropdown = NULL;
+}
+
+static void timeout_popup_close_cb(lv_event_t *e)
+{
+    (void)e;
+    if (timeout_popup) {
+        lv_obj_del(timeout_popup);
+        timeout_popup = NULL;
+        timeout_dropdown = NULL;
+    }
+}
+
+static void show_screen_timeout_popup(void)
+{
+    if (timeout_popup) return;
+
+    // Modal overlay
+    timeout_popup = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(timeout_popup, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(timeout_popup, 0, 0);
+    lv_obj_set_style_bg_color(timeout_popup, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(timeout_popup, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(timeout_popup, 0, 0);
+    lv_obj_set_style_radius(timeout_popup, 0, 0);
+    lv_obj_clear_flag(timeout_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(timeout_popup, LV_OBJ_FLAG_CLICKABLE);
+
+    // Dialog box
+    lv_obj_t *dialog = lv_obj_create(timeout_popup);
+    lv_obj_set_size(dialog, 300, 200);
+    lv_obj_center(dialog);
+    lv_obj_set_style_bg_color(dialog, lv_color_make(30, 30, 30), 0);
+    lv_obj_set_style_border_color(dialog, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_border_width(dialog, 2, 0);
+    lv_obj_set_style_radius(dialog, 12, 0);
+    lv_obj_clear_flag(dialog, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(dialog, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(dialog, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(dialog, 15, 0);
+    lv_obj_set_style_pad_gap(dialog, 12, 0);
+
+    // Title
+    lv_obj_t *title = lv_label_create(dialog);
+    lv_label_set_text(title, "Screen Timeout");
+    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+
+    // Dropdown
+    timeout_dropdown = lv_dropdown_create(dialog);
+    lv_dropdown_set_options(timeout_dropdown,
+        "10 seconds\n30 seconds\n1 minute\n5 minutes\nStays on");
+    lv_obj_set_width(timeout_dropdown, 250);
+    lv_obj_set_style_bg_color(timeout_dropdown, lv_color_make(50, 50, 50), 0);
+    lv_obj_set_style_text_color(timeout_dropdown, lv_color_white(), 0);
+    lv_obj_set_style_border_color(timeout_dropdown, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_border_width(timeout_dropdown, 1, 0);
+    lv_obj_set_style_radius(timeout_dropdown, 8, 0);
+    // Style the dropdown list (opened part)
+    lv_obj_set_style_bg_color(lv_dropdown_get_list(timeout_dropdown), lv_color_make(40, 40, 40), 0);
+    lv_obj_set_style_text_color(lv_dropdown_get_list(timeout_dropdown), lv_color_white(), 0);
+    lv_obj_set_style_border_color(lv_dropdown_get_list(timeout_dropdown), COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_bg_color(lv_dropdown_get_list(timeout_dropdown), COLOR_MATERIAL_TEAL, LV_PART_SELECTED | LV_STATE_CHECKED);
+
+    // Set current value
+    lv_dropdown_set_selected(timeout_dropdown, timeout_ms_to_index(screen_timeout_ms));
+
+    // Button row
+    lv_obj_t *btn_row = lv_obj_create(dialog);
+    lv_obj_set_size(btn_row, 250, 42);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    // Cancel button
+    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel_btn, 110, 36);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_make(80, 80, 80), 0);
+    lv_obj_set_style_radius(cancel_btn, 8, 0);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, "Cancel");
+    lv_obj_set_style_text_color(cancel_lbl, lv_color_white(), 0);
+    lv_obj_center(cancel_lbl);
+    lv_obj_add_event_cb(cancel_btn, timeout_popup_close_cb, LV_EVENT_CLICKED, NULL);
+
+    // Save button
+    lv_obj_t *save_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(save_btn, 110, 36);
+    lv_obj_set_style_bg_color(save_btn, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_bg_color(save_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(save_btn, 8, 0);
+    lv_obj_t *save_lbl = lv_label_create(save_btn);
+    lv_label_set_text(save_lbl, "Save");
+    lv_obj_set_style_text_color(save_lbl, lv_color_white(), 0);
+    lv_obj_center(save_lbl);
+    lv_obj_add_event_cb(save_btn, timeout_popup_save_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// ============================================================================
+// Screen Brightness Popup
+// ============================================================================
+
+static lv_obj_t *brightness_popup = NULL;
+static lv_obj_t *brightness_slider = NULL;
+static lv_obj_t *brightness_value_label = NULL;
+static uint8_t brightness_before_popup = 80;  // To restore on cancel
+
+static void brightness_slider_event_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!brightness_slider || !brightness_value_label) return;
+    int32_t val = lv_slider_get_value(brightness_slider);
+    // Update label
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%ld%%", (long)val);
+    lv_label_set_text(brightness_value_label, buf);
+    // Live preview
+    set_backlight_percent((uint8_t)val);
+}
+
+static void brightness_popup_save_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!brightness_slider || !brightness_popup) return;
+    screen_brightness_pct = (uint8_t)lv_slider_get_value(brightness_slider);
+    nvs_settings_save_brightness(screen_brightness_pct);
+    set_backlight_percent(screen_brightness_pct);
+
+    lv_obj_del(brightness_popup);
+    brightness_popup = NULL;
+    brightness_slider = NULL;
+    brightness_value_label = NULL;
+}
+
+static void brightness_popup_close_cb(lv_event_t *e)
+{
+    (void)e;
+    // Restore previous brightness
+    set_backlight_percent(brightness_before_popup);
+    if (brightness_popup) {
+        lv_obj_del(brightness_popup);
+        brightness_popup = NULL;
+        brightness_slider = NULL;
+        brightness_value_label = NULL;
+    }
+}
+
+static void show_screen_brightness_popup(void)
+{
+    if (brightness_popup) return;
+    brightness_before_popup = screen_brightness_pct;
+
+    // Modal overlay
+    brightness_popup = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(brightness_popup, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(brightness_popup, 0, 0);
+    lv_obj_set_style_bg_color(brightness_popup, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(brightness_popup, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(brightness_popup, 0, 0);
+    lv_obj_set_style_radius(brightness_popup, 0, 0);
+    lv_obj_clear_flag(brightness_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(brightness_popup, LV_OBJ_FLAG_CLICKABLE);
+
+    // Dialog box
+    lv_obj_t *dialog = lv_obj_create(brightness_popup);
+    lv_obj_set_size(dialog, 320, 190);
+    lv_obj_center(dialog);
+    lv_obj_set_style_bg_color(dialog, lv_color_make(30, 30, 30), 0);
+    lv_obj_set_style_border_color(dialog, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_border_width(dialog, 2, 0);
+    lv_obj_set_style_radius(dialog, 12, 0);
+    lv_obj_clear_flag(dialog, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(dialog, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(dialog, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(dialog, 15, 0);
+    lv_obj_set_style_pad_gap(dialog, 10, 0);
+
+    // Title
+    lv_obj_t *title = lv_label_create(dialog);
+    lv_label_set_text(title, "Screen Brightness");
+    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+
+    // Value label
+    brightness_value_label = lv_label_create(dialog);
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%u%%", screen_brightness_pct);
+    lv_label_set_text(brightness_value_label, buf);
+    lv_obj_set_style_text_color(brightness_value_label, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_text_font(brightness_value_label, &lv_font_montserrat_20, 0);
+
+    // Slider
+    brightness_slider = lv_slider_create(dialog);
+    lv_obj_set_width(brightness_slider, 260);
+    lv_slider_set_range(brightness_slider, 10, 100);
+    lv_slider_set_value(brightness_slider, screen_brightness_pct, LV_ANIM_OFF);
+    // Slider knob style
+    lv_obj_set_style_bg_color(brightness_slider, lv_color_make(80, 80, 80), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(brightness_slider, COLOR_MATERIAL_ORANGE, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(brightness_slider, COLOR_MATERIAL_ORANGE, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(brightness_slider, 4, LV_PART_KNOB);
+    lv_obj_add_event_cb(brightness_slider, brightness_slider_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    // Button row
+    lv_obj_t *btn_row = lv_obj_create(dialog);
+    lv_obj_set_size(btn_row, 260, 42);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    // Cancel button
+    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel_btn, 110, 36);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_make(80, 80, 80), 0);
+    lv_obj_set_style_radius(cancel_btn, 8, 0);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, "Cancel");
+    lv_obj_set_style_text_color(cancel_lbl, lv_color_white(), 0);
+    lv_obj_center(cancel_lbl);
+    lv_obj_add_event_cb(cancel_btn, brightness_popup_close_cb, LV_EVENT_CLICKED, NULL);
+
+    // Save button
+    lv_obj_t *save_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(save_btn, 110, 36);
+    lv_obj_set_style_bg_color(save_btn, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_bg_color(save_btn, lv_color_lighten(COLOR_MATERIAL_ORANGE, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(save_btn, 8, 0);
+    lv_obj_t *save_lbl = lv_label_create(save_btn);
+    lv_label_set_text(save_lbl, "Save");
+    lv_obj_set_style_text_color(save_lbl, lv_color_white(), 0);
+    lv_obj_center(save_lbl);
+    lv_obj_add_event_cb(save_btn, brightness_popup_save_cb, LV_EVENT_CLICKED, NULL);
+}
+
 // Settings sub-menu tile event callback
 static void settings_tile_event_cb(lv_event_t *e)
 {
@@ -7961,13 +8583,15 @@ static void settings_tile_event_cb(lv_event_t *e)
     if (strcmp(tile_name, "Compromised Data") == 0) {
         show_wifi_monitor_screen();
     } else if (strcmp(tile_name, "Scan Time") == 0) {
-        // No-op: just close the settings menu and go back
-        show_settings_screen();
+        show_scan_time_popup();
     } else if (strcmp(tile_name, "RedTeam mode") == 0) {
-        // No-op: just close the settings menu and go back
         show_settings_screen();
     } else if (strcmp(tile_name, "Download Mode") == 0) {
         show_download_mode_screen();
+    } else if (strcmp(tile_name, "Screen Timeout") == 0) {
+        show_screen_timeout_popup();
+    } else if (strcmp(tile_name, "Screen Brightness") == 0) {
+        show_screen_brightness_popup();
     }
 }
 
@@ -7997,6 +8621,12 @@ static void show_settings_screen(void)
     
     // Download Mode - Red
     create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Download\nMode", COLOR_MATERIAL_RED, settings_tile_event_cb, "Download Mode");
+    
+    // Screen Timeout - Teal
+    create_tile(tiles, LV_SYMBOL_BELL, "Screen\nTimeout", COLOR_MATERIAL_TEAL, settings_tile_event_cb, "Screen Timeout");
+    
+    // Screen Brightness - Orange
+    create_tile(tiles, LV_SYMBOL_IMAGE, "Screen\nBrightness", COLOR_MATERIAL_ORANGE, settings_tile_event_cb, "Screen Brightness");
 }
 
 // WiFi Monitor screen

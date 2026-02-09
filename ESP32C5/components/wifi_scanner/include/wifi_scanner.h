@@ -107,6 +107,13 @@ void wifi_scanner_clear_targets(void);
  */
 void wifi_scanner_clear_selections(void);
 
+/**
+ * @brief Set active scan time parameters (min/max per channel in ms)
+ * @param min_ms Minimum active scan time (50-1000)
+ * @param max_ms Maximum active scan time (50-1000, must be >= min_ms)
+ */
+void wifi_scanner_set_scan_time(uint16_t min_ms, uint16_t max_ms);
+
 #ifdef __cplusplus
 }
 #endif
