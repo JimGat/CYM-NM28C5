@@ -85,6 +85,12 @@ static sniffer_ap_t* find_or_add_ap(const uint8_t *bssid) {
         ap->ssid[0] = '\0';
         ap->rssi = -100;
         sniffer_ap_count++;
+        
+        // Notify UI about new AP
+        if (sniffer_new_client_cb) {
+            sniffer_new_client_cb();
+        }
+        
         return ap;
     }
     
@@ -189,8 +195,13 @@ static void wifi_sniffer_packet_handler(void *buff, wifi_promiscuous_pkt_type_t 
                 if (body_len > 2 && body[0] == 0) { // SSID element
                     uint8_t ssid_len = body[1];
                     if (ssid_len <= 32 && body_len >= (2 + ssid_len)) {
+                        bool was_empty = (ap->ssid[0] == '\0');
                         memcpy(ap->ssid, &body[2], ssid_len);
                         ap->ssid[ssid_len] = '\0';
+                        // Notify UI when SSID is first discovered
+                        if (was_empty && ssid_len > 0 && sniffer_new_client_cb) {
+                            sniffer_new_client_cb();
+                        }
                     }
                 }
             }
