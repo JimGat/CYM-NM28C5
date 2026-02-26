@@ -514,6 +514,23 @@ static bool portal_log_capture_enabled = false;
 static volatile bool portal_ui_active = false;
 static char portal_selected_html_name[64] = "";
 
+// WiFi Connect screen state (for ARP Poison, Rogue AP, WPA-SEC Upload)
+#define PENDING_ATTACK_ARP_POISON   0
+#define PENDING_ATTACK_ROGUE_AP     1
+#define PENDING_ATTACK_WPA_SEC      2
+static int pending_attack_type = 0;
+static char wifi_connect_ssid[33] = "";
+static char wifi_connect_password[64] = "";
+static lv_obj_t *wifi_connect_ta = NULL;
+static lv_obj_t *wifi_connect_keyboard = NULL;
+static lv_obj_t *wifi_connect_status_label = NULL;
+static lv_obj_t *wifi_connect_btn = NULL;
+static lv_obj_t *wifi_connect_next_btn = NULL;
+static volatile bool sta_connect_success = false;
+static volatile bool sta_connect_failed = false;
+static volatile int sta_connect_attempt_count = 0;
+static lv_timer_t *sta_connect_check_timer = NULL;
+
 // BLE Scan UI state
 static lv_obj_t *ble_scan_content = NULL;
 static lv_obj_t *ble_scan_list = NULL;
@@ -734,6 +751,15 @@ static void reset_function_page_children(void) {
     bt_locator_rssi_label = NULL;
     bt_locator_mac_label = NULL;
     bt_locator_exit_btn = NULL;
+    wifi_connect_ta = NULL;
+    wifi_connect_keyboard = NULL;
+    wifi_connect_status_label = NULL;
+    wifi_connect_btn = NULL;
+    wifi_connect_next_btn = NULL;
+    if (sta_connect_check_timer) {
+        lv_timer_del(sta_connect_check_timer);
+        sta_connect_check_timer = NULL;
+    }
 }
 
 static void create_function_page_base(const char *name);
@@ -804,6 +830,12 @@ static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode);
 static bool wait_for_gps_fix(int timeout_seconds);
 void load_whitelist_from_sd(void);
 bool is_bssid_whitelisted(const uint8_t *bssid);
+
+// WiFi Connect screen (ARP Poison, Rogue AP, WPA-SEC Upload)
+static void show_wifi_connect_screen(void);
+static void show_arp_poison_page(void);
+static void show_rogue_ap_page(void);
+static void show_wpa_sec_upload_page(void);
 
 // Radio mode switching (WiFi <-> BLE)
 static bool ensure_wifi_mode(void);
@@ -7571,7 +7603,7 @@ static lv_obj_t *create_tile(lv_obj_t *parent, const char *icon, const char *tex
 static lv_obj_t *create_small_tile(lv_obj_t *parent, const char *icon, const char *text, lv_color_t bg_color, lv_event_cb_t callback, const char *user_data)
 {
     lv_obj_t *tile = lv_btn_create(parent);
-    lv_obj_set_size(tile, 85, 55);  // Smaller tile size for single row
+    lv_obj_set_size(tile, 100, 55);  // Smaller tile size for single row
     lv_obj_set_style_bg_color(tile, bg_color, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(tile, lv_color_lighten(bg_color, 50), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(tile, 0, 0);
@@ -7696,6 +7728,62 @@ static void attack_tile_event_cb(lv_event_t *e)
     } else if (strcmp(attack_name, "Sniffer") == 0) {
         // Auto-start Network Observer directly (no confirmation)
         sniffer_yes_btn_cb(NULL);
+    } else if (strcmp(attack_name, "ARP Poison") == 0 ||
+               strcmp(attack_name, "Rogue AP") == 0 ||
+               strcmp(attack_name, "WPA-SEC Upload") == 0) {
+        // These attacks require exactly one selected network
+        int selected_indices[SCAN_RESULTS_MAX_DISPLAY];
+        int selected_count = wifi_scanner_get_selected(selected_indices, SCAN_RESULTS_MAX_DISPLAY);
+        
+        if (selected_count != 1) {
+            // Show popup: "Select only one network"
+            lv_obj_t *overlay = lv_obj_create(lv_scr_act());
+            lv_obj_set_size(overlay, LCD_H_RES, LCD_V_RES);
+            lv_obj_set_pos(overlay, 0, 0);
+            lv_obj_set_style_bg_color(overlay, lv_color_make(0, 0, 0), 0);
+            lv_obj_set_style_bg_opa(overlay, LV_OPA_70, 0);
+            lv_obj_set_style_border_width(overlay, 0, 0);
+            lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
+            
+            lv_obj_t *dialog = lv_obj_create(overlay);
+            lv_obj_set_size(dialog, 280, 120);
+            lv_obj_center(dialog);
+            lv_obj_set_style_bg_color(dialog, lv_color_make(30, 30, 30), 0);
+            lv_obj_set_style_border_color(dialog, COLOR_MATERIAL_ORANGE, 0);
+            lv_obj_set_style_border_width(dialog, 2, 0);
+            lv_obj_set_style_radius(dialog, 10, 0);
+            lv_obj_clear_flag(dialog, LV_OBJ_FLAG_SCROLLABLE);
+            
+            lv_obj_t *msg = lv_label_create(dialog);
+            lv_label_set_text(msg, "Select only one network");
+            lv_obj_set_style_text_color(msg, COLOR_MATERIAL_BLUE, 0);
+            lv_obj_set_style_text_font(msg, &lv_font_montserrat_16, 0);
+            lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_align(msg, LV_ALIGN_TOP_MID, 0, 15);
+            
+            lv_obj_t *ok_btn = lv_btn_create(dialog);
+            lv_obj_set_size(ok_btn, 80, 30);
+            lv_obj_align(ok_btn, LV_ALIGN_BOTTOM_MID, 0, -5);
+            lv_obj_set_style_bg_color(ok_btn, COLOR_MATERIAL_ORANGE, LV_STATE_DEFAULT);
+            lv_obj_set_style_border_width(ok_btn, 0, 0);
+            lv_obj_set_style_radius(ok_btn, 8, 0);
+            lv_obj_t *ok_lbl = lv_label_create(ok_btn);
+            lv_label_set_text(ok_lbl, "OK");
+            lv_obj_set_style_text_color(ok_lbl, lv_color_make(255, 255, 255), 0);
+            lv_obj_center(ok_lbl);
+            lv_obj_add_event_cb(ok_btn, close_popup_overlay_cb, LV_EVENT_CLICKED, NULL);
+        } else {
+            // Exactly one network selected - proceed to WiFi Connect screen
+            if (strcmp(attack_name, "ARP Poison") == 0) {
+                pending_attack_type = PENDING_ATTACK_ARP_POISON;
+            } else if (strcmp(attack_name, "Rogue AP") == 0) {
+                pending_attack_type = PENDING_ATTACK_ROGUE_AP;
+            } else {
+                pending_attack_type = PENDING_ATTACK_WPA_SEC;
+            }
+            show_wifi_connect_screen();
+        }
     }
 }
 
@@ -7797,34 +7885,489 @@ static void show_wifi_scan_attack_screen(void)
     wifi_scanner_start_scan();
 }
 
+// ============================================================================
+// WiFi Connect screen + ARP Poison / Rogue AP / WPA-SEC Upload placeholders
+// ============================================================================
+
+// STA connection event handler (runs in WiFi task context, NOT LVGL thread)
+static void sta_connect_event_handler(void *arg, esp_event_base_t event_base,
+                                      int32_t event_id, void *event_data)
+{
+    (void)arg;
+    (void)event_data;
+    if (event_id == WIFI_EVENT_STA_CONNECTED) {
+        sta_connect_success = true;
+    } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        sta_connect_attempt_count++;
+        if (sta_connect_attempt_count >= 3) {
+            sta_connect_failed = true;
+        } else {
+            esp_wifi_connect();
+        }
+    }
+}
+
+// LVGL timer callback - polls STA connect flags and updates UI
+static void sta_connect_check_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    
+    if (sta_connect_success) {
+        sta_connect_success = false;
+        
+        // Unregister event handler
+        esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_STA_CONNECTED, &sta_connect_event_handler);
+        esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &sta_connect_event_handler);
+        
+        // Stop timer
+        if (sta_connect_check_timer) {
+            lv_timer_del(sta_connect_check_timer);
+            sta_connect_check_timer = NULL;
+        }
+        
+        // Update status
+        if (wifi_connect_status_label) {
+            lv_label_set_text(wifi_connect_status_label, "Connected!");
+            lv_obj_set_style_text_color(wifi_connect_status_label, COLOR_MATERIAL_GREEN, 0);
+        }
+        
+        // Hide Connect button
+        if (wifi_connect_btn) {
+            lv_obj_add_flag(wifi_connect_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+        
+        // Show Next> button
+        if (wifi_connect_next_btn) {
+            lv_obj_clear_flag(wifi_connect_next_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+        
+    } else if (sta_connect_failed) {
+        sta_connect_failed = false;
+        
+        // Unregister event handler
+        esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_STA_CONNECTED, &sta_connect_event_handler);
+        esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &sta_connect_event_handler);
+        
+        // Stop timer
+        if (sta_connect_check_timer) {
+            lv_timer_del(sta_connect_check_timer);
+            sta_connect_check_timer = NULL;
+        }
+        
+        // Update status
+        if (wifi_connect_status_label) {
+            lv_label_set_text(wifi_connect_status_label, "");
+        }
+        
+        // Re-enable Connect button
+        if (wifi_connect_btn) {
+            lv_obj_clear_state(wifi_connect_btn, LV_STATE_DISABLED);
+        }
+        
+        // Show failure popup
+        lv_obj_t *overlay = lv_obj_create(lv_scr_act());
+        lv_obj_set_size(overlay, LCD_H_RES, LCD_V_RES);
+        lv_obj_set_pos(overlay, 0, 0);
+        lv_obj_set_style_bg_color(overlay, lv_color_make(0, 0, 0), 0);
+        lv_obj_set_style_bg_opa(overlay, LV_OPA_70, 0);
+        lv_obj_set_style_border_width(overlay, 0, 0);
+        lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
+        
+        lv_obj_t *dialog = lv_obj_create(overlay);
+        lv_obj_set_size(dialog, 300, 120);
+        lv_obj_center(dialog);
+        lv_obj_set_style_bg_color(dialog, lv_color_make(30, 30, 30), 0);
+        lv_obj_set_style_border_color(dialog, COLOR_MATERIAL_RED, 0);
+        lv_obj_set_style_border_width(dialog, 2, 0);
+        lv_obj_set_style_radius(dialog, 10, 0);
+        lv_obj_clear_flag(dialog, LV_OBJ_FLAG_SCROLLABLE);
+        
+        char fail_msg[96];
+        snprintf(fail_msg, sizeof(fail_msg), "Failed to connect to\n%s", wifi_connect_ssid);
+        lv_obj_t *msg = lv_label_create(dialog);
+        lv_label_set_text(msg, fail_msg);
+        lv_obj_set_style_text_color(msg, COLOR_MATERIAL_RED, 0);
+        lv_obj_set_style_text_font(msg, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align(msg, LV_ALIGN_TOP_MID, 0, 10);
+        
+        lv_obj_t *ok_btn = lv_btn_create(dialog);
+        lv_obj_set_size(ok_btn, 80, 30);
+        lv_obj_align(ok_btn, LV_ALIGN_BOTTOM_MID, 0, -5);
+        lv_obj_set_style_bg_color(ok_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+        lv_obj_set_style_border_width(ok_btn, 0, 0);
+        lv_obj_set_style_radius(ok_btn, 8, 0);
+        lv_obj_t *ok_lbl = lv_label_create(ok_btn);
+        lv_label_set_text(ok_lbl, "OK");
+        lv_obj_set_style_text_color(ok_lbl, lv_color_make(255, 255, 255), 0);
+        lv_obj_center(ok_lbl);
+        lv_obj_add_event_cb(ok_btn, close_popup_overlay_cb, LV_EVENT_CLICKED, NULL);
+    }
+}
+
+// Connect button callback
+static void wifi_connect_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    // If textarea exists, read password from it
+    if (wifi_connect_ta) {
+        const char *txt = lv_textarea_get_text(wifi_connect_ta);
+        if (txt) {
+            strncpy(wifi_connect_password, txt, sizeof(wifi_connect_password) - 1);
+            wifi_connect_password[sizeof(wifi_connect_password) - 1] = '\0';
+        }
+    }
+    
+    // Ensure WiFi mode is active
+    if (!ensure_wifi_mode()) {
+        ESP_LOGE(TAG, "Failed to switch to WiFi mode for STA connect");
+        return;
+    }
+    
+    // Disable Connect button while connecting
+    if (wifi_connect_btn) {
+        lv_obj_add_state(wifi_connect_btn, LV_STATE_DISABLED);
+    }
+    
+    // Show connecting status
+    if (wifi_connect_status_label) {
+        lv_label_set_text(wifi_connect_status_label, "Connecting...");
+        lv_obj_set_style_text_color(wifi_connect_status_label, COLOR_MATERIAL_BLUE, 0);
+    }
+    
+    // Reset flags
+    sta_connect_success = false;
+    sta_connect_failed = false;
+    sta_connect_attempt_count = 0;
+    
+    // Configure STA
+    wifi_config_t sta_config = {0};
+    strncpy((char *)sta_config.sta.ssid, wifi_connect_ssid, sizeof(sta_config.sta.ssid));
+    sta_config.sta.ssid[sizeof(sta_config.sta.ssid) - 1] = '\0';
+    strncpy((char *)sta_config.sta.password, wifi_connect_password, sizeof(sta_config.sta.password));
+    sta_config.sta.password[sizeof(sta_config.sta.password) - 1] = '\0';
+    
+    // Ensure STA mode
+    wifi_mode_t mode;
+    esp_wifi_get_mode(&mode);
+    if (mode != WIFI_MODE_STA && mode != WIFI_MODE_APSTA) {
+        esp_wifi_set_mode(WIFI_MODE_STA);
+    }
+    
+    esp_wifi_set_config(WIFI_IF_STA, &sta_config);
+    
+    // Register event handlers
+    esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_CONNECTED, &sta_connect_event_handler, NULL);
+    esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &sta_connect_event_handler, NULL);
+    
+    // Start LVGL timer to poll connection state (every 200ms)
+    if (sta_connect_check_timer) {
+        lv_timer_del(sta_connect_check_timer);
+    }
+    sta_connect_check_timer = lv_timer_create(sta_connect_check_timer_cb, 200, NULL);
+    
+    // Start connection
+    ESP_LOGI(TAG, "Connecting to '%s'...", wifi_connect_ssid);
+    esp_wifi_connect();
+}
+
+// WiFi connect keyboard event callback
+static void wifi_connect_keyboard_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    
+    if (code == LV_EVENT_VALUE_CHANGED) {
+        // Update buffer when text changes
+        if (wifi_connect_ta) {
+            const char *txt = lv_textarea_get_text(wifi_connect_ta);
+            if (txt) {
+                strncpy(wifi_connect_password, txt, sizeof(wifi_connect_password) - 1);
+                wifi_connect_password[sizeof(wifi_connect_password) - 1] = '\0';
+            }
+        }
+    }
+    else if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
+        // Hide keyboard on Close
+        if (wifi_connect_keyboard) {
+            lv_obj_add_flag(wifi_connect_keyboard, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+// WiFi connect textarea click callback - show keyboard
+static void wifi_connect_ta_event_cb(lv_event_t *e)
+{
+    (void)e;
+    if (wifi_connect_keyboard) {
+        lv_obj_clear_flag(wifi_connect_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// Next> button callback - navigate to the actual attack screen
+static void wifi_connect_next_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    switch (pending_attack_type) {
+        case PENDING_ATTACK_ARP_POISON:
+            show_arp_poison_page();
+            break;
+        case PENDING_ATTACK_ROGUE_AP:
+            show_rogue_ap_page();
+            break;
+        case PENDING_ATTACK_WPA_SEC:
+            show_wpa_sec_upload_page();
+            break;
+        default:
+            break;
+    }
+}
+
+// Connect to WiFi screen - lookup password from eviltwin cache or show input
+static void show_wifi_connect_screen(void)
+{
+    create_function_page_base("Connect to WiFi");
+    
+    // Get the selected network SSID
+    int selected_indices[SCAN_RESULTS_MAX_DISPLAY];
+    int selected_count = wifi_scanner_get_selected(selected_indices, SCAN_RESULTS_MAX_DISPLAY);
+    const wifi_ap_record_t *records = wifi_scanner_get_results_ptr();
+    const uint16_t *count_ptr = wifi_scanner_get_count_ptr();
+    uint16_t total_count = count_ptr ? *count_ptr : 0;
+    
+    if (selected_count < 1 || !records || total_count == 0) return;
+    
+    int idx = selected_indices[0];
+    if (idx < 0 || idx >= (int)total_count) return;
+    
+    const wifi_ap_record_t *ap = &records[idx];
+    strncpy(wifi_connect_ssid, (const char *)ap->ssid, sizeof(wifi_connect_ssid) - 1);
+    wifi_connect_ssid[sizeof(wifi_connect_ssid) - 1] = '\0';
+    
+    // Search eviltwin cache for password
+    bool password_found = false;
+    wifi_connect_password[0] = '\0';
+    
+    int et_count = sd_cache_get_eviltwin_count();
+    for (int i = 0; i < et_count; i++) {
+        const char *line = sd_cache_get_eviltwin_entry(i);
+        if (line == NULL || strlen(line) == 0) continue;
+        
+        // Parse: "SSID", "password"
+        char parsed_ssid[64] = {0};
+        char parsed_pass[64] = {0};
+        const char *p = line;
+        
+        while (*p && *p != '"') p++;
+        if (*p == '"') p++;
+        const char *ssid_start = p;
+        while (*p && *p != '"') p++;
+        size_t ssid_len = p - ssid_start;
+        if (ssid_len > sizeof(parsed_ssid) - 1) ssid_len = sizeof(parsed_ssid) - 1;
+        strncpy(parsed_ssid, ssid_start, ssid_len);
+        
+        if (*p == '"') p++;
+        while (*p && *p != '"') p++;
+        if (*p == '"') p++;
+        const char *pass_start = p;
+        while (*p && *p != '"') p++;
+        size_t pass_len = p - pass_start;
+        if (pass_len > sizeof(parsed_pass) - 1) pass_len = sizeof(parsed_pass) - 1;
+        strncpy(parsed_pass, pass_start, pass_len);
+        
+        if (strcmp(parsed_ssid, wifi_connect_ssid) == 0) {
+            strncpy(wifi_connect_password, parsed_pass, sizeof(wifi_connect_password) - 1);
+            wifi_connect_password[sizeof(wifi_connect_password) - 1] = '\0';
+            password_found = true;
+            break;
+        }
+    }
+    
+    // Content container
+    lv_obj_t *content = lv_obj_create(function_page);
+    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_pad_all(content, 15, 0);
+    lv_obj_set_style_pad_gap(content, 10, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    
+    // SSID label
+    lv_obj_t *ssid_title = lv_label_create(content);
+    lv_label_set_text(ssid_title, "Network:");
+    lv_obj_set_style_text_font(ssid_title, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ssid_title, COLOR_LABEL_DEFAULT, 0);
+    
+    lv_obj_t *ssid_val = lv_label_create(content);
+    lv_label_set_text(ssid_val, wifi_connect_ssid);
+    lv_obj_set_style_text_font(ssid_val, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(ssid_val, COLOR_MATERIAL_BLUE, 0);
+    
+    if (password_found) {
+        // Show password as label
+        lv_obj_t *pass_title = lv_label_create(content);
+        lv_label_set_text(pass_title, "Password:");
+        lv_obj_set_style_text_font(pass_title, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(pass_title, COLOR_LABEL_DEFAULT, 0);
+        
+        lv_obj_t *pass_val = lv_label_create(content);
+        lv_label_set_text(pass_val, wifi_connect_password);
+        lv_obj_set_style_text_font(pass_val, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(pass_val, COLOR_MATERIAL_GREEN, 0);
+    } else {
+        // Show password input textarea
+        lv_obj_t *pass_title = lv_label_create(content);
+        lv_label_set_text(pass_title, "Password:");
+        lv_obj_set_style_text_font(pass_title, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(pass_title, COLOR_LABEL_DEFAULT, 0);
+        
+        wifi_connect_ta = lv_textarea_create(content);
+        lv_obj_set_width(wifi_connect_ta, lv_pct(100));
+        lv_textarea_set_one_line(wifi_connect_ta, true);
+        lv_textarea_set_text(wifi_connect_ta, "");
+        lv_textarea_set_placeholder_text(wifi_connect_ta, "Enter password...");
+        lv_obj_set_style_bg_color(wifi_connect_ta, lv_color_make(0, 0, 0), 0);
+        lv_obj_set_style_text_color(wifi_connect_ta, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_border_color(wifi_connect_ta, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_add_event_cb(wifi_connect_ta, wifi_connect_ta_event_cb, LV_EVENT_CLICKED, NULL);
+        
+        // Keyboard (on function_page, not content, so it overlays properly)
+        wifi_connect_keyboard = lv_keyboard_create(function_page);
+        lv_keyboard_set_textarea(wifi_connect_keyboard, wifi_connect_ta);
+        lv_keyboard_set_mode(wifi_connect_keyboard, LV_KEYBOARD_MODE_TEXT_LOWER);
+        lv_obj_set_size(wifi_connect_keyboard, lv_pct(100), lv_pct(40));
+        lv_obj_align(wifi_connect_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+        
+        // Keyboard styling
+        lv_obj_set_style_bg_color(wifi_connect_keyboard, lv_color_make(0, 0, 0), LV_PART_MAIN);
+        lv_obj_set_style_text_color(wifi_connect_keyboard, COLOR_MATERIAL_BLUE, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(wifi_connect_keyboard, lv_color_make(0, 100, 0), LV_PART_ITEMS);
+        lv_obj_set_style_bg_color(wifi_connect_keyboard, lv_color_make(0, 150, 0), LV_PART_ITEMS | LV_STATE_PRESSED);
+        lv_obj_set_style_text_color(wifi_connect_keyboard, COLOR_MATERIAL_BLUE, LV_PART_ITEMS);
+        lv_obj_set_style_border_color(wifi_connect_keyboard, COLOR_MATERIAL_BLUE, LV_PART_ITEMS);
+        lv_obj_set_style_border_width(wifi_connect_keyboard, 1, LV_PART_ITEMS);
+        
+        lv_obj_add_event_cb(wifi_connect_keyboard, wifi_connect_keyboard_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+        lv_obj_add_event_cb(wifi_connect_keyboard, wifi_connect_keyboard_event_cb, LV_EVENT_READY, NULL);
+        lv_obj_add_event_cb(wifi_connect_keyboard, wifi_connect_keyboard_event_cb, LV_EVENT_CANCEL, NULL);
+        
+        // Start with keyboard hidden
+        lv_obj_add_flag(wifi_connect_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+    
+    // Status label (for "Connecting..." / "Connected!")
+    wifi_connect_status_label = lv_label_create(content);
+    lv_label_set_text(wifi_connect_status_label, "");
+    lv_obj_set_style_text_font(wifi_connect_status_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(wifi_connect_status_label, COLOR_MATERIAL_BLUE, 0);
+    
+    // Connect button
+    wifi_connect_btn = lv_btn_create(content);
+    lv_obj_set_size(wifi_connect_btn, 120, 40);
+    lv_obj_set_style_bg_color(wifi_connect_btn, COLOR_MATERIAL_BLUE, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(wifi_connect_btn, lv_color_lighten(COLOR_MATERIAL_BLUE, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_bg_color(wifi_connect_btn, lv_color_make(60, 60, 60), LV_STATE_DISABLED);
+    lv_obj_set_style_border_width(wifi_connect_btn, 0, 0);
+    lv_obj_set_style_radius(wifi_connect_btn, 8, 0);
+    lv_obj_t *conn_lbl = lv_label_create(wifi_connect_btn);
+    lv_label_set_text(conn_lbl, "Connect");
+    lv_obj_set_style_text_color(conn_lbl, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_text_font(conn_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(conn_lbl);
+    lv_obj_add_event_cb(wifi_connect_btn, wifi_connect_btn_cb, LV_EVENT_CLICKED, NULL);
+    
+    // Next> button (hidden until connected)
+    wifi_connect_next_btn = lv_btn_create(content);
+    lv_obj_set_size(wifi_connect_next_btn, 120, 40);
+    lv_obj_set_style_bg_color(wifi_connect_next_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(wifi_connect_next_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(wifi_connect_next_btn, 0, 0);
+    lv_obj_set_style_radius(wifi_connect_next_btn, 8, 0);
+    lv_obj_t *next_lbl = lv_label_create(wifi_connect_next_btn);
+    lv_label_set_text(next_lbl, "Next >");
+    lv_obj_set_style_text_color(next_lbl, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_text_font(next_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(next_lbl);
+    lv_obj_add_event_cb(wifi_connect_next_btn, wifi_connect_next_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(wifi_connect_next_btn, LV_OBJ_FLAG_HIDDEN);
+}
+
+// ============================================================================
+// Placeholder attack screens
+// ============================================================================
+
+static void show_arp_poison_page(void)
+{
+    create_function_page_base("ARP Poison");
+    
+    lv_obj_t *title = lv_label_create(function_page);
+    lv_label_set_text(title, "ARP Poison");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_center(title);
+}
+
+static void show_rogue_ap_page(void)
+{
+    create_function_page_base("Rogue AP");
+    
+    lv_obj_t *title = lv_label_create(function_page);
+    lv_label_set_text(title, "Rogue AP");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_INDIGO, 0);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_center(title);
+}
+
+static void show_wpa_sec_upload_page(void)
+{
+    create_function_page_base("WPA-SEC Upload");
+    
+    lv_obj_t *title = lv_label_create(function_page);
+    lv_label_set_text(title, "WPA-SEC Upload");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_CYAN, 0);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_center(title);
+}
+
 // Attack tiles screen - shown after selecting networks
 static void show_attack_tiles_screen(void)
 {
     create_function_page_base("Select Attack");
     
-    // Create small tiles container at top (single row) with extra spacing
+    // Create small tiles container at top (2 rows of 4) with extra spacing
     lv_obj_t *attack_tiles = lv_obj_create(function_page);
-    lv_obj_set_size(attack_tiles, lv_pct(100), 70);
-    lv_obj_align(attack_tiles, LV_ALIGN_TOP_MID, 0, 40);  // Extra 10px spacing above tiles
+    lv_obj_set_size(attack_tiles, lv_pct(100), 130);
+    lv_obj_align(attack_tiles, LV_ALIGN_TOP_MID, 0, 40);
     lv_obj_set_style_bg_color(attack_tiles, lv_color_make(0, 0, 0), 0);
     lv_obj_set_style_border_width(attack_tiles, 0, 0);
     lv_obj_set_style_pad_all(attack_tiles, 5, 0);
     lv_obj_set_style_pad_gap(attack_tiles, 5, 0);
-    lv_obj_set_flex_flow(attack_tiles, LV_FLEX_FLOW_ROW);  // Single row, no wrap
+    lv_obj_set_flex_flow(attack_tiles, LV_FLEX_FLOW_ROW_WRAP);  // 2 rows, wrap
     lv_obj_set_flex_align(attack_tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(attack_tiles, LV_OBJ_FLAG_SCROLLABLE);
     
-    // Create smaller attack tiles in single row
+    // Row 1: Deauth, Evil Twin, SAE, Handshake
     create_small_tile(attack_tiles, LV_SYMBOL_CHARGE, "Deauth", COLOR_MATERIAL_RED, attack_tile_event_cb, "Deauth");
     create_small_tile(attack_tiles, LV_SYMBOL_WARNING, "Evil Twin", COLOR_MATERIAL_ORANGE, attack_tile_event_cb, "Evil Twin");
     create_small_tile(attack_tiles, LV_SYMBOL_POWER, "SAE", COLOR_MATERIAL_PINK, attack_tile_event_cb, "SAE Overflow");
     create_small_tile(attack_tiles, LV_SYMBOL_DOWNLOAD, "Handshake", COLOR_MATERIAL_AMBER, attack_tile_event_cb, "Handshaker");
+    // Row 2: ARP Poison, Rogue AP, WPA-SEC Upload, Observer
+    create_small_tile(attack_tiles, LV_SYMBOL_SHUFFLE, "ARP Poison", COLOR_MATERIAL_TEAL, attack_tile_event_cb, "ARP Poison");
+    create_small_tile(attack_tiles, LV_SYMBOL_WIFI, "Rogue AP", COLOR_MATERIAL_INDIGO, attack_tile_event_cb, "Rogue AP");
+    create_small_tile(attack_tiles, LV_SYMBOL_UPLOAD, "WPA-SEC", COLOR_MATERIAL_CYAN, attack_tile_event_cb, "WPA-SEC Upload");
     create_small_tile(attack_tiles, LV_SYMBOL_EYE_OPEN, "Observer", COLOR_MATERIAL_PURPLE, attack_tile_event_cb, "Sniffer");
     
     // Horizontal separator line above Selected Networks
     lv_obj_t *separator = lv_obj_create(function_page);
     lv_obj_set_size(separator, lv_pct(90), 2);
-    lv_obj_align(separator, LV_ALIGN_TOP_MID, 0, 115);
+    lv_obj_align(separator, LV_ALIGN_TOP_MID, 0, 175);
     lv_obj_set_style_bg_color(separator, COLOR_MATERIAL_BLUE, 0);
     lv_obj_set_style_bg_opa(separator, LV_OPA_50, 0);
     lv_obj_set_style_border_width(separator, 0, 0);
@@ -7835,11 +8378,11 @@ static void show_attack_tiles_screen(void)
     lv_label_set_text(header_label, "Selected Networks:");
     lv_obj_set_style_text_font(header_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(header_label, COLOR_MATERIAL_BLUE, 0);
-    lv_obj_align(header_label, LV_ALIGN_TOP_LEFT, 10, 122);
+    lv_obj_align(header_label, LV_ALIGN_TOP_LEFT, 10, 182);
     
     // Selected networks list
     lv_obj_t *network_list = lv_obj_create(function_page);
-    lv_obj_set_size(network_list, lv_pct(100), LCD_V_RES - 30 - 70 - 40);  // Remaining height (extra 10px for header)
+    lv_obj_set_size(network_list, lv_pct(100), LCD_V_RES - 30 - 130 - 40);  // Remaining height
     lv_obj_align(network_list, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(network_list, lv_color_make(0, 0, 0), 0);
     lv_obj_set_style_border_width(network_list, 0, 0);
