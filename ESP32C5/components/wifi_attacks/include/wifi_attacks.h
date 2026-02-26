@@ -42,6 +42,8 @@ typedef enum {
     EVIL_TWIN_EVENT_PASSWORD_PROVIDED,
     EVIL_TWIN_EVENT_PASSWORD_FAILED,
     EVIL_TWIN_EVENT_PASSWORD_VERIFIED,
+    EVIL_TWIN_EVENT_PORTAL_OPENED,
+    EVIL_TWIN_EVENT_FORM_DATA,
 } evil_twin_event_t;
 
 /**
@@ -50,7 +52,8 @@ typedef enum {
 typedef struct {
     evil_twin_event_t event;
     char ssid[33];
-    char password[256];  // Increased to hold captured form data
+    char password[256];
+    char mac[18];
 } evil_twin_event_data_t;
 
 /**
@@ -165,6 +168,13 @@ bool wifi_attacks_is_karma_active(void);
  * @param ssid SSID for portal AP (optional, NULL for default)
  */
 esp_err_t wifi_attacks_start_portal(const char *ssid);
+
+/**
+ * @brief Start Rogue AP (WPA2 clone of a real network with captive portal)
+ * @param ssid SSID to clone
+ * @param password WPA2 password for the AP
+ */
+esp_err_t wifi_attacks_start_rogue_ap(const char *ssid, const char *password);
 
 /**
  * @brief Stop captive portal

