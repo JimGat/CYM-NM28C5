@@ -107,6 +107,7 @@ typedef struct {
     float longitude;
     float altitude;
     float accuracy;
+    int satellites;
     bool valid;
 } gps_data_t;
 

@@ -174,7 +174,8 @@ esp_err_t wifi_attacks_start_portal(const char *ssid);
  * @param ssid SSID to clone
  * @param password WPA2 password for the AP
  */
-esp_err_t wifi_attacks_start_rogue_ap(const char *ssid, const char *password);
+esp_err_t wifi_attacks_start_rogue_ap(const char *ssid, const char *password,
+                                     const uint8_t *target_bssid, uint8_t channel);
 
 /**
  * @brief Stop captive portal

