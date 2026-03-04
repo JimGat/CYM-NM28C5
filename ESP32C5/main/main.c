@@ -1092,6 +1092,7 @@ static void wpasec_upload_timer_cb(lv_timer_t *timer);
 // Radio mode switching (WiFi <-> BLE)
 static bool ensure_wifi_mode(void);
 static bool ensure_ble_mode(void);
+static void radio_reset_to_idle(void);
 
 // NimBLE BLE scanner functions
 static esp_err_t bt_nimble_init(void);
@@ -9167,8 +9168,129 @@ static void create_function_page_base(const char *name)
     lv_obj_align(battery_label, LV_ALIGN_RIGHT_MID, -8, 0);
 }
 
+// ============================================================================
+// Radio Reset: full WiFi/BT cleanup on every return to main menu
+// ============================================================================
+
+static void radio_reset_to_idle(void)
+{
+    ESP_LOGI(TAG, "radio_reset_to_idle: stopping all attacks, resetting radio...");
+
+    // ---- 1. Component-level attacks (wifi_attacks module) ----
+    wifi_attacks_stop_all();
+    wifi_attacks_stop_evil_twin();
+
+    // ---- 2. main.c-level attacks not covered by stop_all ----
+
+    // Handshake
+    if (handshake_attack_active) {
+        g_operation_stop_requested = true;
+        handshake_attack_active = false;
+        attack_handshake_stop();
+        TaskHandle_t h = handshake_attack_task_handle;
+        if (h != NULL) {
+            for (int i = 0; i < 30 && handshake_attack_task_handle != NULL; i++)
+                vTaskDelay(pdMS_TO_TICKS(100));
+            if (handshake_attack_task_handle != NULL) {
+                vTaskDelete(handshake_attack_task_handle);
+                handshake_attack_task_handle = NULL;
+            }
+        }
+        handshake_cleanup();
+    }
+
+    // Sniffer
+    if (sniffer_task_active) {
+        sniffer_task_active = false;
+        for (int i = 0; i < 30 && sniffer_task_handle != NULL; i++)
+            vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    // Snifferdog
+    if (sniffer_dog_active) {
+        sniffer_dog_active = false;
+        for (int i = 0; i < 30 && sniffer_dog_task_handle != NULL; i++)
+            vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    // Wardrive
+    if (wardrive_active) {
+        wardrive_active = false;
+        for (int i = 0; i < 10 && wardrive_task_handle != NULL; i++)
+            vTaskDelay(pdMS_TO_TICKS(100));
+        if (wardrive_task_handle != NULL) {
+            vTaskDelete(wardrive_task_handle);
+            wardrive_task_handle = NULL;
+        }
+    }
+
+    // Targeted deauth
+    targeted_deauth_active = false;
+    if (targeted_deauth_timer) {
+        lv_timer_del(targeted_deauth_timer);
+        targeted_deauth_timer = NULL;
+    }
+
+    // Deauth rescan timer
+    deauth_rescan_timer_stop();
+
+    // Deauth monitor
+    if (deauth_monitor_active) {
+        deauth_monitor_active = false;
+        esp_wifi_set_promiscuous(false);
+        for (int i = 0; i < 20 && deauth_monitor_task_handle != NULL; i++)
+            vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    // ARP poison
+    stop_arp_ban();
+
+    // WPA-SEC upload
+    wpasec_upload_active = false;
+
+    // ---- 3. BLE cleanup ----
+    if (current_radio_mode == RADIO_MODE_BLE) {
+        bt_nimble_deinit();
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+
+    // ---- 4. WiFi reset ----
+    if (!wifi_initialized || current_radio_mode == RADIO_MODE_NONE) {
+        // WiFi driver was fully deinited (BLE switch or exit callback already ran);
+        // reinitialize from scratch.
+        ensure_wifi_mode();
+    } else {
+        // WiFi driver is alive — just cycle stop/start to clear AP, promisc, etc.
+        esp_wifi_set_promiscuous(false);
+        esp_wifi_stop();
+        esp_wifi_set_mode(WIFI_MODE_STA);
+        esp_wifi_start();
+
+        wifi_country_t wifi_country = {
+            .cc = "PH",
+            .schan = 1,
+            .nchan = 14,
+            .policy = WIFI_COUNTRY_POLICY_AUTO,
+        };
+        esp_wifi_set_country(&wifi_country);
+
+        current_radio_mode = RADIO_MODE_WIFI;
+        wifi_initialized = true;
+    }
+
+    // ---- 5. Reset misc state ----
+    g_operation_stop_requested = false;
+    g_handshaker_global_mode = false;
+    scan_done_ui_flag = false;
+    sniffer_return_pending = false;
+
+    ESP_LOGI(TAG, "radio_reset_to_idle: complete");
+}
+
 void show_menu(void)
 {
+    radio_reset_to_idle();
+
     evil_twin_log_capture_enabled = false;
     evil_twin_log_ta = NULL;
     evil_twin_ssid_label = NULL;
@@ -9238,10 +9360,7 @@ static void home_btn_event_cb(lv_event_t *e)
     uart_write_bytes(GPS_UART_NUM, reboot_cmd, strlen(reboot_cmd));
     ESP_LOGI(TAG, "UART reboot command sent");
     
-    // Stop all active attacks
-    wifi_attacks_stop_all();
-    
-    // Navigate back to main tiles
+    // Navigate back to main tiles (radio_reset_to_idle called from show_menu)
     nav_to_menu_flag = true;
 }
 
