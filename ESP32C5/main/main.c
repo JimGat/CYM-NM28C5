@@ -316,6 +316,9 @@ typedef struct {
     char **handshake_names;  // Array of .pcap filenames
     int handshake_count;
     
+    // WPA-SEC API key from wpa-sec.txt
+    char wpasec_key[WPASEC_KEY_MAX_LEN];
+    
     bool loaded;  // True when all data is loaded
 } sd_cache_t;
 
@@ -2757,6 +2760,30 @@ static esp_err_t sd_cache_load_all(void) {
         ESP_LOGI(TAG, "  Handshakes: %d files", sd_cache->handshake_count);
     } else {
         ESP_LOGI(TAG, "  Handshakes: 0 (directory not found)");
+    }
+    
+    // 6. Load WPA-SEC API key from wpa-sec.txt
+    sd_cache->wpasec_key[0] = '\0';
+    file = fopen(WPASEC_KEY_PATH, "r");
+    if (file != NULL) {
+        char buf[WPASEC_KEY_MAX_LEN + 8];
+        if (fgets(buf, sizeof(buf), file) != NULL) {
+            size_t len = strlen(buf);
+            while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r' ||
+                   buf[len - 1] == ' ' || buf[len - 1] == '\t')) {
+                buf[--len] = '\0';
+            }
+            char *start = buf;
+            while (*start == ' ' || *start == '\t') start++;
+            if (strlen(start) > 0 && strlen(start) < WPASEC_KEY_MAX_LEN) {
+                strncpy(sd_cache->wpasec_key, start, WPASEC_KEY_MAX_LEN - 1);
+                sd_cache->wpasec_key[WPASEC_KEY_MAX_LEN - 1] = '\0';
+            }
+        }
+        fclose(file);
+        ESP_LOGI(TAG, "  WPA-SEC key: %.4s****", sd_cache->wpasec_key);
+    } else {
+        ESP_LOGI(TAG, "  WPA-SEC key: not found");
     }
     
     sd_cache->loaded = true;
@@ -6201,71 +6228,33 @@ static void sae_overflow_stop_btn_cb(lv_event_t *e)
 }
 
 static bool check_handshake_file_exists(const char *ssid) {
-    if (!ssid || strlen(ssid) == 0) {
-        return false;
-    }
-    
-    // Take SD/SPI mutex before any filesystem operations
-    // SD card and display share the same SPI bus!
-    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
-        ESP_LOGW(TAG, "Failed to take SD/SPI mutex in check_handshake_file_exists");
-        return false;
-    }
-    
-    bool found = false;
-    
-    // Check if /sdcard/lab/handshakes exists
-    struct stat st;
-    if (stat("/sdcard/lab/handshakes", &st) != 0) {
-        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
-        return false; // Directory doesn't exist
-    }
-    
-    // Open directory and check for files starting with SSID
-    DIR *dir = opendir("/sdcard/lab/handshakes");
-    if (!dir) {
-        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
-        return false;
-    }
-    
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (strncmp(entry->d_name, ssid, strlen(ssid)) == 0 && strstr(entry->d_name, ".pcap") != NULL) {
-            found = true;
-            break;
+    if (!ssid || strlen(ssid) == 0) return false;
+    if (sd_cache == NULL || !sd_cache->loaded) return false;
+
+    size_t ssid_len = strlen(ssid);
+    for (int i = 0; i < sd_cache->handshake_count; i++) {
+        const char *name = sd_cache->handshake_names[i];
+        if (name && strncmp(name, ssid, ssid_len) == 0 && strstr(name, ".pcap") != NULL) {
+            return true;
         }
     }
-    
-    closedir(dir);
-    
-    // Release SD/SPI mutex
-    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
-    
-    return found;
+    return false;
 }
 
 static bool check_handshake_file_exists_by_bssid(const uint8_t *bssid) {
     if (!bssid) return false;
+    if (sd_cache == NULL || !sd_cache->loaded) return false;
+
     char mac_suffix[7];
     snprintf(mac_suffix, sizeof(mac_suffix), "%02X%02X%02X", bssid[3], bssid[4], bssid[5]);
 
-    if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
-    DIR *dir = opendir("/sdcard/lab/handshakes");
-    if (!dir) {
-        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
-        return false;
-    }
-    bool found = false;
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (strstr(entry->d_name, mac_suffix) != NULL && strstr(entry->d_name, ".pcap") != NULL) {
-            found = true;
-            break;
+    for (int i = 0; i < sd_cache->handshake_count; i++) {
+        const char *name = sd_cache->handshake_names[i];
+        if (name && strstr(name, mac_suffix) != NULL && strstr(name, ".pcap") != NULL) {
+            return true;
         }
     }
-    closedir(dir);
-    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
-    return found;
+    return false;
 }
 
 // ============================================================================
@@ -6628,6 +6617,12 @@ static bool hs_save_handshake_to_sd(int ap_idx) {
         return false;
     }
     ESP_LOGI(TAG, "[HS-SAVE] PCAP saved: %s (%u bytes)", filename, pcap_size);
+
+    // Keep PSRAM cache in sync with newly saved .pcap
+    char pcap_basename[96];
+    snprintf(pcap_basename, sizeof(pcap_basename), "%s_%s_%llu.pcap",
+             ssid_safe, mac_suffix, (unsigned long long)timestamp);
+    sd_cache_add_handshake_name(pcap_basename);
 
     if (hccapx) {
         snprintf(filename, sizeof(filename), "/sdcard/lab/handshakes/%s_%s_%llu.hccapx",
@@ -10652,28 +10647,9 @@ static bool wpasec_read_key_from_sd(void)
 {
     wpasec_api_key[0] = '\0';
 
-    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
-        FILE *f = fopen(WPASEC_KEY_PATH, "r");
-        if (f) {
-            char buf[WPASEC_KEY_MAX_LEN + 8];
-            if (fgets(buf, sizeof(buf), f) != NULL) {
-                // Trim trailing newline / whitespace
-                size_t len = strlen(buf);
-                while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r' ||
-                       buf[len - 1] == ' ' || buf[len - 1] == '\t')) {
-                    buf[--len] = '\0';
-                }
-                // Trim leading whitespace
-                char *start = buf;
-                while (*start == ' ' || *start == '\t') start++;
-                if (strlen(start) > 0 && strlen(start) < WPASEC_KEY_MAX_LEN) {
-                    strncpy(wpasec_api_key, start, WPASEC_KEY_MAX_LEN - 1);
-                    wpasec_api_key[WPASEC_KEY_MAX_LEN - 1] = '\0';
-                }
-            }
-            fclose(f);
-        }
-        xSemaphoreGive(sd_spi_mutex);
+    if (sd_cache != NULL && sd_cache->loaded && sd_cache->wpasec_key[0] != '\0') {
+        strncpy(wpasec_api_key, sd_cache->wpasec_key, WPASEC_KEY_MAX_LEN - 1);
+        wpasec_api_key[WPASEC_KEY_MAX_LEN - 1] = '\0';
     }
 
     return wpasec_api_key[0] != '\0';
