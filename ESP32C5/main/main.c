@@ -503,9 +503,10 @@ static int handshake_current_index = 0;
 #define HS_MAX_CLIENTS  128
 #define DUCB_GAMMA      0.99
 #define DUCB_C          1.0
-#define HS_DEAUTH_COOLDOWN_US  (10 * 1000000LL)
+#define HS_DEAUTH_COOLDOWN_US  (3 * 1000000LL)
 #define HS_DWELL_TIME_MS       400
 #define HS_STATS_INTERVAL_US   (30 * 1000000LL)
+#define HS_AP_STALE_US         (30 * 1000000LL)
 
 typedef struct {
     int channel;
@@ -525,6 +526,7 @@ typedef struct {
     bool beacon_captured;
     bool has_existing_file;
     int64_t last_deauth_us;
+    int64_t last_seen_us;
     int target_index;
 } hs_ap_target_t;
 
@@ -6417,6 +6419,7 @@ static int hs_add_or_update_ap(const uint8_t *bssid, const char *ssid, uint8_t c
         if (ssid && ssid[0]) strncpy(hs_ap_targets[idx].ssid, ssid, 32);
         hs_ap_targets[idx].channel = channel;
         hs_ap_targets[idx].rssi = rssi;
+        hs_ap_targets[idx].last_seen_us = esp_timer_get_time();
         if (authmode != WIFI_AUTH_OPEN) hs_ap_targets[idx].authmode = authmode;
         return idx;
     }
@@ -6435,6 +6438,7 @@ static int hs_add_or_update_ap(const uint8_t *bssid, const char *ssid, uint8_t c
     hs_ap_targets[idx].complete = false;
     hs_ap_targets[idx].beacon_captured = false;
     hs_ap_targets[idx].last_deauth_us = 0;
+    hs_ap_targets[idx].last_seen_us = esp_timer_get_time();
     hs_ap_targets[idx].target_index = -1;
     hs_ap_targets[idx].has_existing_file =
         check_handshake_file_exists(ssid ? ssid : "") ||
@@ -7086,6 +7090,18 @@ static void handshake_attack_task_selected(void) {
                     }
                     hs_listening_after_deauth = false;
                     hs_ui_update_flag = true;
+
+                    // If partial progress (some M captured but not complete), reset
+                    // client cooldowns so we re-deauth immediately next round
+                    if (ap_idx >= 0 && !hs_ap_targets[ap_idx].complete &&
+                        (hs_ap_targets[ap_idx].captured_m1 || hs_ap_targets[ap_idx].captured_m2 ||
+                         hs_ap_targets[ap_idx].captured_m3)) {
+                        for (int c2 = 0; c2 < hs_client_count; c2++) {
+                            if (hs_clients[c2].hs_ap_index == ap_idx) {
+                                hs_clients[c2].last_deauth_us = 0;
+                            }
+                        }
+                    }
                 } else {
                     rounds_without_client++;
                 }
@@ -7181,10 +7197,12 @@ static void handshake_attack_task_sniffer(void) {
 
         // Show best AP on this channel in the UI immediately
         bool found_target = false;
+        int64_t ui_now = esp_timer_get_time();
         for (int i = 0; i < hs_ap_count; i++) {
             if (hs_ap_targets[i].channel == channel &&
                 !hs_ap_targets[i].complete && !hs_ap_targets[i].has_existing_file &&
-                hs_ap_targets[i].authmode != WIFI_AUTH_OPEN) {
+                hs_ap_targets[i].authmode != WIFI_AUTH_OPEN &&
+                (hs_ap_targets[i].last_seen_us == 0 || (ui_now - hs_ap_targets[i].last_seen_us) < HS_AP_STALE_US)) {
                 snprintf(hs_current_target_ssid, sizeof(hs_current_target_ssid), "%s", hs_ap_targets[i].ssid);
                 found_target = true;
                 break;
@@ -7223,6 +7241,7 @@ static void handshake_attack_task_sniffer(void) {
             if (ap->complete || ap->has_existing_file) continue;
             if (ap->channel != channel) continue;
             if (ap->authmode == WIFI_AUTH_OPEN) continue;
+            if (ap->last_seen_us > 0 && (now - ap->last_seen_us) > HS_AP_STALE_US) continue;
             if (cl->last_deauth_us > 0 &&
                 (now - cl->last_deauth_us) < HS_DEAUTH_COOLDOWN_US) continue;
 
@@ -7256,6 +7275,19 @@ static void handshake_attack_task_sniffer(void) {
             vTaskDelay(pdMS_TO_TICKS(2000));
             hs_listening_after_deauth = false;
             hs_ui_update_flag = true;
+
+            // Reset cooldowns for APs with partial EAPOL progress on this channel
+            for (int a = 0; a < hs_ap_count; a++) {
+                hs_ap_target_t *pa = &hs_ap_targets[a];
+                if (pa->channel == channel && !pa->complete &&
+                    (pa->captured_m1 || pa->captured_m2 || pa->captured_m3)) {
+                    for (int c2 = 0; c2 < hs_client_count; c2++) {
+                        if (hs_clients[c2].hs_ap_index == a) {
+                            hs_clients[c2].last_deauth_us = 0;
+                        }
+                    }
+                }
+            }
         }
 
         double reward = (double)hs_dwell_new_clients + 3.0 * (double)hs_dwell_eapol_frames;
@@ -7315,11 +7347,15 @@ static void handshake_attack_task(void *pvParameters) {
     }
 
     ESP_LOGI(TAG, "Handshake attack task finished.");
-    // Lightweight shutdown: stop radio but preserve UI data (M1-M4 flags, counters)
-    // so the timer can keep displaying the final capture state.
-    // Full cleanup happens when user presses "Stop & Exit" or navigates away.
     handshake_attack_active = false;
     esp_wifi_set_promiscuous(false);
+    // Stay alive in idle loop until the stop callback signals us.
+    // The stop callback sets g_operation_stop_requested=true, then waits
+    // for us to delete ourselves safely (no race on the stack).
+    while (!g_operation_stop_requested) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    // Signal that we are about to exit, then self-delete
     handshake_attack_task_handle = NULL;
     vTaskDelete(NULL);
 }
@@ -7328,6 +7364,58 @@ static void handshake_attack_task(void *pvParameters) {
 static void hs_ui_timer_cb(lv_timer_t *timer) {
     (void)timer;
     if (!handshake_ui_active) return;
+
+    // When attack finished naturally, show clear completion status
+    if (!handshake_attack_active) {
+        if (hs_ui_target_label) {
+            if (hs_total_handshakes_captured > 0) {
+                char done_buf[48];
+                snprintf(done_buf, sizeof(done_buf), LV_SYMBOL_OK " CAPTURED: %d", hs_total_handshakes_captured);
+                lv_label_set_text(hs_ui_target_label, done_buf);
+                lv_obj_set_style_text_color(hs_ui_target_label, COLOR_MATERIAL_GREEN, 0);
+            } else {
+                lv_label_set_text(hs_ui_target_label, LV_SYMBOL_CLOSE " Stopped");
+                lv_obj_set_style_text_color(hs_ui_target_label, COLOR_MATERIAL_ORANGE, 0);
+            }
+        }
+        if (hs_ui_status_label) {
+            lv_label_set_text(hs_ui_status_label, "Press Stop & Exit");
+            lv_obj_set_style_text_color(hs_ui_status_label, lv_color_make(180,180,180), 0);
+        }
+        // Keep showing the last channel and M1-M4 state (data preserved)
+        // Find best_ap for final display
+        int best_ap = -1;
+        if (hs_ap_count > 0) {
+            for (int i = 0; i < hs_ap_count; i++) {
+                if (hs_ap_targets[i].complete && !hs_ap_targets[i].has_existing_file) { best_ap = i; break; }
+            }
+            if (best_ap < 0) {
+                for (int i = 0; i < hs_ap_count; i++) {
+                    if (!hs_ap_targets[i].has_existing_file) { best_ap = i; break; }
+                }
+            }
+        }
+        bool m1 = false, m2 = false, m3 = false, m4 = false, has_beacon = false;
+        if (best_ap >= 0) {
+            has_beacon = hs_ap_targets[best_ap].beacon_captured;
+            m1 = hs_ap_targets[best_ap].captured_m1;
+            m2 = hs_ap_targets[best_ap].captured_m2;
+            m3 = hs_ap_targets[best_ap].captured_m3;
+            m4 = hs_ap_targets[best_ap].captured_m4;
+        }
+        if (hs_ui_beacon_label) lv_obj_set_style_text_color(hs_ui_beacon_label, has_beacon ? COLOR_MATERIAL_GREEN : lv_color_make(80,80,80), 0);
+        if (hs_ui_m1_label) lv_obj_set_style_text_color(hs_ui_m1_label, m1 ? COLOR_MATERIAL_GREEN : lv_color_make(80,80,80), 0);
+        if (hs_ui_m2_label) lv_obj_set_style_text_color(hs_ui_m2_label, m2 ? COLOR_MATERIAL_GREEN : lv_color_make(80,80,80), 0);
+        if (hs_ui_m3_label) lv_obj_set_style_text_color(hs_ui_m3_label, m3 ? COLOR_MATERIAL_GREEN : lv_color_make(80,80,80), 0);
+        if (hs_ui_m4_label) lv_obj_set_style_text_color(hs_ui_m4_label, m4 ? COLOR_MATERIAL_GREEN : lv_color_make(80,80,80), 0);
+        if (hs_ui_stats_label) {
+            char stats_buf[128];
+            snprintf(stats_buf, sizeof(stats_buf), "APs: %d   Clients: %d   Captured: %d",
+                     hs_ap_count, hs_client_count, hs_total_handshakes_captured);
+            lv_label_set_text(hs_ui_stats_label, stats_buf);
+        }
+        return;
+    }
 
     // Channel indicator
     if (hs_ui_channel_label) {
@@ -7340,8 +7428,10 @@ static void hs_ui_timer_cb(lv_timer_t *timer) {
     if (hs_ui_target_label) {
         if (hs_current_target_ssid[0]) {
             lv_label_set_text(hs_ui_target_label, hs_current_target_ssid);
+            lv_obj_set_style_text_color(hs_ui_target_label, lv_color_white(), 0);
         } else {
             lv_label_set_text(hs_ui_target_label, "Scanning...");
+            lv_obj_set_style_text_color(hs_ui_target_label, lv_color_white(), 0);
         }
     }
 
@@ -7627,46 +7717,32 @@ static void handshake_stop_btn_cb(lv_event_t *e)
 {
     (void)e;
     
-    // Set stop flag
     g_operation_stop_requested = true;
-    
-    // Stop current attack if running
+    handshake_attack_active = false;
     attack_handshake_stop();
     
-    // Wait for task to finish
-    if (handshake_attack_task_handle != NULL) {
+    // Wait for task to self-delete (it sets handle to NULL before vTaskDelete)
+    TaskHandle_t h = handshake_attack_task_handle;
+    if (h != NULL) {
         ESP_LOGI(TAG, "Stopping handshake attack task...");
-        
-        // Wait for task to finish naturally (max 10 seconds)
-        int wait_count = 0;
-        while (wait_count < 100) {  // 10 seconds max
-            // Check if task still exists
-            eTaskState task_state = eTaskGetState(handshake_attack_task_handle);
-            if (task_state == eDeleted || task_state == eInvalid) {
-                ESP_LOGI(TAG, "Handshake attack task finished naturally.");
+        for (int i = 0; i < 50; i++) {
+            if (handshake_attack_task_handle == NULL) {
+                ESP_LOGI(TAG, "Handshake attack task exited cleanly.");
                 break;
             }
             vTaskDelay(pdMS_TO_TICKS(100));
-            wait_count++;
         }
-        
-        // If task still running, force delete it
-        eTaskState task_state = eTaskGetState(handshake_attack_task_handle);
-        if (task_state != eDeleted && task_state != eInvalid) {
-            ESP_LOGW(TAG, "Handshake attack task forcefully stopped.");
-            vTaskDelete(handshake_attack_task_handle);
+        // If still alive after 5s, force kill
+        h = handshake_attack_task_handle;
+        if (h != NULL) {
+            ESP_LOGW(TAG, "Force-deleting handshake attack task.");
+            vTaskDelete(h);
+            handshake_attack_task_handle = NULL;
         }
-        
-        // Always clear handle after task is deleted
-        handshake_attack_task_handle = NULL;
-        
-        // Give extra time for task resources to be fully released
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
     
-    // Free PSRAM stack (only after task is completely done)
     if (handshake_attack_task_stack != NULL) {
-        ESP_LOGI(TAG, "Freeing handshake task PSRAM stack...");
         heap_caps_free(handshake_attack_task_stack);
         handshake_attack_task_stack = NULL;
     }
