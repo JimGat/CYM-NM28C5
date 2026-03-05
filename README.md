@@ -120,6 +120,9 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 | **LED** | WS2812 NeoPixel (single) | RMT / GPIO |
 | **Battery** | LiPo with voltage divider (ADC monitoring) | ADC |
 
+Screen link: https://pl.aliexpress.com/item/1005009570156903.html - remember to select 3.5" 
+
+
 ---
 
 ## Pinout
