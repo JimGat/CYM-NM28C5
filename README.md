@@ -2,7 +2,7 @@
  
 </p>
 
-<h1 align="center">JANOS v0.5.1 — Pancake</h1>
+<h1 align="center">JANOS on Pancake</h1>
 
 <p align="center">
   <b>WiFi 6 security toolkit & wardriving device built on ESP32-C5</b>
