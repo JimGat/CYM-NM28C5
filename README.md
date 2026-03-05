@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/43d0d5c4-ad16-4cdb-ac1d-4b280001fa37" width="700" alt="JANOS Pancake"/>
+ 
 </p>
 
 <h1 align="center">JANOS v0.5.1 — Pancake</h1>
