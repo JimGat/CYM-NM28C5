@@ -70,33 +70,31 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 <!-- Add your screenshots here -->
 
 <p align="center">
-  <img src="" width="400" alt="Main Menu"/>
+  <img width="480" height="271" alt="image" src="https://github.com/user-attachments/assets/0200719c-85b7-4977-9a38-1ecb4defad9a" />
+
   <br/>
   <em>Main Menu</em>
 </p>
 
 <p align="center">
-  <img src="" width="400" alt="WiFi Scan"/>
-  <br/>
-  <em>WiFi Scan Results</em>
-</p>
+<img width="474" height="280" alt="image" src="https://github.com/user-attachments/assets/9df03b0c-f25b-4cb1-a049-0591c389a645" />
 
-<p align="center">
-  <img src="" width="400" alt="Attack Panel"/>
   <br/>
   <em>Attack Panel</em>
 </p>
 
 <p align="center">
-  <img src="" width="400" alt="BLE Scanner"/>
+  <img width="486" height="321" alt="image" src="https://github.com/user-attachments/assets/ad768a74-ae52-4888-b43b-aab25ebc3222" />
+
   <br/>
-  <em>Bluetooth Scanner</em>
+  <em>Handshaker</em>
 </p>
 
 <p align="center">
-  <img src="" width="400" alt="Settings"/>
+<img width="485" height="317" alt="image" src="https://github.com/user-attachments/assets/8a7baecc-a08c-403f-bb76-f79dd3fe8b30" />
+
   <br/>
-  <em>Settings</em>
+  <em>Kismet-style network observer & Karma attack</em>
 </p>
 
 ---
