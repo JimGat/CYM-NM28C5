@@ -9634,7 +9634,7 @@ static void show_main_tiles(void)
     // Create 6 main tiles with Material colors
     create_tile(tiles_container, LV_SYMBOL_WIFI, "WiFi Scan\n& Attack", COLOR_TILE_BLUE, main_tile_event_cb, "WiFi Scan & Attack");
     create_tile(tiles_container, LV_SYMBOL_WARNING, "Global WiFi\nAttacks", COLOR_MATERIAL_RED, main_tile_event_cb, "Global WiFi Attacks");
-    create_tile(tiles_container, LV_SYMBOL_EYE_OPEN, "WiFi Sniff\n& Karma", COLOR_MATERIAL_PURPLE, main_tile_event_cb, "WiFi Sniff&Karma");
+    create_tile(tiles_container, LV_SYMBOL_EYE_OPEN, "Network Observer\n& Karma", COLOR_MATERIAL_PURPLE, main_tile_event_cb, "WiFi Sniff&Karma");
     create_tile(tiles_container, LV_SYMBOL_SETTINGS, "Settings", COLOR_MATERIAL_GREEN, main_tile_event_cb, "Settings");
     create_tile(tiles_container, LV_SYMBOL_GPS, "Deauth\nMonitor", COLOR_MATERIAL_AMBER, main_tile_event_cb, "Deauth Monitor");
     create_tile(tiles_container, LV_SYMBOL_BLUETOOTH, "Bluetooth", COLOR_MATERIAL_CYAN, main_tile_event_cb, "Bluetooth");
@@ -12226,7 +12226,7 @@ static void show_settings_screen(void)
     create_tile(tiles, LV_SYMBOL_LOOP, "Scan\nTime", COLOR_MATERIAL_PURPLE, settings_tile_event_cb, "Scan Time");
     
     // RedTeam mode - Amber/Orange
-    create_tile(tiles, LV_SYMBOL_WARNING, "RedTeam\nMode", COLOR_MATERIAL_AMBER, settings_tile_event_cb, "RedTeam mode");
+    // create_tile(tiles, LV_SYMBOL_WARNING, "RedTeam\nMode", COLOR_MATERIAL_AMBER, settings_tile_event_cb, "RedTeam mode");
     
     // Download Mode - Red
     create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Download\nMode", COLOR_MATERIAL_RED, settings_tile_event_cb, "Download Mode");
