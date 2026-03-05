@@ -80,7 +80,14 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 <img width="474" height="280" alt="image" src="https://github.com/user-attachments/assets/9df03b0c-f25b-4cb1-a049-0591c389a645" />
 
   <br/>
-  <em>Attack Panel</em>
+  <em>Selected Network Attack Panel</em>
+</p>
+
+
+<p align="center">
+<img width="486" height="326" alt="image" src="https://github.com/user-attachments/assets/7e815b7b-0fa9-475e-91b2-4d14344a7f86" />
+  <br/>
+  <em>Global attacks</em>
 </p>
 
 <p align="center">
@@ -96,6 +103,7 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
   <br/>
   <em>Kismet-style network observer & Karma attack</em>
 </p>
+
 
 ---
 
