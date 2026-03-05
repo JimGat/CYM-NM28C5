@@ -4,8 +4,6 @@ build/
 # IDE files
 .vscode/
 
-# Binaries (can be regenerated)
-binaries-esp32c5/
 
 # Managed components (downloaded automatically by idf.py)
 managed_components/
