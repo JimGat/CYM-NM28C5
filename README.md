@@ -4,6 +4,9 @@
 
 <h1 align="center">JANOS on Pancake</h1>
 
+<img width="1200" height="848" alt="image" src="https://github.com/user-attachments/assets/85c42338-14af-4657-bb06-fee8f34061de" />
+
+
 <p align="center">
   <b>WiFi 6 security toolkit & wardriving device built on ESP32-C5</b>
 </p>
@@ -355,9 +358,10 @@ idf.py -p /dev/ttyACM0 flash monitor
 </p>
 
 <p align="center">
-<img width="731" height="482" alt="image" src="https://github.com/user-attachments/assets/560fe1d4-17a5-4a8d-be43-930798a4d2d8" />
+<img width="796" height="840" alt="image" src="https://github.com/user-attachments/assets/4a31ff44-e238-4f86-bf9c-5b0079c676f9" />
+
   <br/>
-  <em>Device in Action</em>
+  <em>Home-made waveshare build</em>
 </p>
 
 ---
