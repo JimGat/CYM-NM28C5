@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/43d0d5c4-ad16-4cdb-ac1d-4b280001fa37" width="700" alt="JANOS Pancake"/>
+ 
 </p>
 
-<h1 align="center">JANOS v0.5.1 — Pancake</h1>
+<h1 align="center">JANOS on Pancake</h1>
 
 <p align="center">
   <b>WiFi 6 security toolkit & wardriving device built on ESP32-C5</b>
@@ -70,34 +70,40 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 <!-- Add your screenshots here -->
 
 <p align="center">
-  <img src="" width="400" alt="Main Menu"/>
+  <img width="480" height="271" alt="image" src="https://github.com/user-attachments/assets/0200719c-85b7-4977-9a38-1ecb4defad9a" />
+
   <br/>
   <em>Main Menu</em>
 </p>
 
 <p align="center">
-  <img src="" width="400" alt="WiFi Scan"/>
+<img width="474" height="280" alt="image" src="https://github.com/user-attachments/assets/9df03b0c-f25b-4cb1-a049-0591c389a645" />
+
   <br/>
-  <em>WiFi Scan Results</em>
+  <em>Selected Network Attack Panel</em>
+</p>
+
+
+<p align="center">
+<img width="486" height="326" alt="image" src="https://github.com/user-attachments/assets/7e815b7b-0fa9-475e-91b2-4d14344a7f86" />
+  <br/>
+  <em>Global attacks</em>
 </p>
 
 <p align="center">
-  <img src="" width="400" alt="Attack Panel"/>
+  <img width="486" height="321" alt="image" src="https://github.com/user-attachments/assets/ad768a74-ae52-4888-b43b-aab25ebc3222" />
+
   <br/>
-  <em>Attack Panel</em>
+  <em>Handshaker</em>
 </p>
 
 <p align="center">
-  <img src="" width="400" alt="BLE Scanner"/>
+<img width="485" height="317" alt="image" src="https://github.com/user-attachments/assets/8a7baecc-a08c-403f-bb76-f79dd3fe8b30" />
+
   <br/>
-  <em>Bluetooth Scanner</em>
+  <em>Kismet-style network observer & Karma attack</em>
 </p>
 
-<p align="center">
-  <img src="" width="400" alt="Settings"/>
-  <br/>
-  <em>Settings</em>
-</p>
 
 ---
 
@@ -113,6 +119,9 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 | **GPS** | UART NMEA module (GGA, RMC) | UART @ 9600 baud |
 | **LED** | WS2812 NeoPixel (single) | RMT / GPIO |
 | **Battery** | LiPo with voltage divider (ADC monitoring) | ADC |
+
+Screen link: https://pl.aliexpress.com/item/1005009570156903.html - remember to select 3.5" 
+
 
 ---
 
@@ -332,19 +341,21 @@ idf.py -p /dev/ttyACM0 flash monitor
 <!-- Add your hardware photos here -->
 
 <p align="center">
-  <img src="" width="500" alt="Device — Front"/>
+ <img width="737" height="470" alt="image" src="https://github.com/user-attachments/assets/3e6a371b-d864-4081-92d1-ef023e0059fe" />
+
   <br/>
   <em>Device — Front View</em>
 </p>
 
 <p align="center">
-  <img src="" width="500" alt="Device — Back"/>
+ <img width="734" height="424" alt="image" src="https://github.com/user-attachments/assets/d4498e30-c57c-4880-84b1-27252bd06779" />
+
   <br/>
   <em>Device — Back / Wiring</em>
 </p>
 
 <p align="center">
-  <img src="" width="500" alt="Device — In Action"/>
+<img width="731" height="482" alt="image" src="https://github.com/user-attachments/assets/560fe1d4-17a5-4a8d-be43-930798a4d2d8" />
   <br/>
   <em>Device in Action</em>
 </p>
