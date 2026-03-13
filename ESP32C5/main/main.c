@@ -214,6 +214,7 @@ static uint16_t scan_time_max_ms = 300;     // Active scan max time per channel 
 #define NVS_KEY_SCAN_MAX    "scan_max"
 
 static esp_lcd_panel_handle_t panel_handle;
+static esp_lcd_panel_io_handle_t lcd_io_handle;
 static ft6336_handle_t touch_handle;
 static lv_obj_t *touch_dot;  // DEBUG: visual touch indicator
 static lv_obj_t *title_bar;
@@ -782,6 +783,8 @@ static mitm_host_entry_t *mitm_hosts = NULL;
 static int mitm_host_count = 0;
 static volatile bool mitm_arp_active = false;
 static volatile bool mitm_capture_active = false;
+static volatile bool mitm_display_window = false;
+static volatile bool mitm_spi_owned_by_display = false;
 static FILE *mitm_pcap_file = NULL;
 static QueueHandle_t mitm_packet_queue = NULL;
 static volatile uint32_t mitm_frame_count = 0;
@@ -1739,7 +1742,6 @@ static void init_display(void)
     };
     
     ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
-    esp_lcd_panel_io_handle_t io_handle;
     esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num = LCD_DC,
         .cs_gpio_num = LCD_CS,
@@ -1754,7 +1756,7 @@ static void init_display(void)
         },
     };
 
-    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(LCD_HOST, &io_config, &io_handle));
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(LCD_HOST, &io_config, &lcd_io_handle));
     
     const esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = LCD_RST,
@@ -1778,7 +1780,7 @@ static void init_display(void)
     gpio_set_level(LCD_RST, 1);
     vTaskDelay(pdMS_TO_TICKS(120));
 
-    ESP_ERROR_CHECK(esp_lcd_new_panel_ili9341(io_handle, &panel_config, &panel_handle));
+    ESP_ERROR_CHECK(esp_lcd_new_panel_ili9341(lcd_io_handle, &panel_config, &panel_handle));
     
     // Memory barrier and heap validation AFTER
     asm volatile("fence" ::: "memory");
@@ -3201,6 +3203,42 @@ void app_main(void)
         // Thread-safe LVGL handling
         uint32_t sleep_ms = 10;
         if (xSemaphoreTake(lvgl_mutex, portMAX_DELAY) == pdTRUE) {
+            // During MITM capture, only refresh display every 5 seconds.
+            // Acquire sd_spi_mutex BEFORE lv_timer_handler to guarantee
+            // exclusive SPI bus access (no SD traffic during display flush).
+            if (mitm_capture_active) {
+                static int64_t mitm_last_display_ms = 0;
+                int64_t now_ms = esp_timer_get_time() / 1000;
+                if (now_ms - mitm_last_display_ms < 5000) {
+                    xSemaphoreGive(lvgl_mutex);
+                    esp_task_wdt_reset();
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                    continue;
+                }
+                ESP_LOGI(TAG, "MITM display: opening window, requesting sd_spi_mutex...");
+                mitm_display_window = true;
+                xSemaphoreGive(lvgl_mutex);
+                TickType_t mutex_start = xTaskGetTickCount();
+                if (!sd_spi_mutex || xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
+                    ESP_LOGW(TAG, "MITM display: sd_spi_mutex timeout after 3s!");
+                    mitm_display_window = false;
+                    continue;
+                }
+                uint32_t mutex_wait_ms = (xTaskGetTickCount() - mutex_start) * portTICK_PERIOD_MS;
+                ESP_LOGI(TAG, "MITM display: got sd_spi_mutex in %lu ms", (unsigned long)mutex_wait_ms);
+                mitm_spi_owned_by_display = true;
+                if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+                    ESP_LOGW(TAG, "MITM display: lvgl_mutex timeout!");
+                    mitm_spi_owned_by_display = false;
+                    xSemaphoreGive(sd_spi_mutex);
+                    mitm_display_window = false;
+                    continue;
+                }
+                mitm_last_display_ms = now_ms;
+                ESP_LOGI(TAG, "MITM display: rendering (frames=%lu, drops=%lu)",
+                         (unsigned long)mitm_frame_count, (unsigned long)mitm_drop_count);
+            }
+
             // Apply touch indicator changes outside indev callback
             if (touch_dot && show_touch_dot) {
                 if (touch_pressed_flag) {
@@ -4343,12 +4381,24 @@ void app_main(void)
                 }
             }
 
+            if (mitm_spi_owned_by_display) {
+                lv_obj_invalidate(lv_scr_act());
+            }
+
             sleep_ms = lv_timer_handler();
             
             // Reset watchdog INSIDE mutex to catch long rendering operations
             esp_task_wdt_reset();
             
             xSemaphoreGive(lvgl_mutex);
+        }
+
+        // Release SPI bus exclusivity after MITM display refresh
+        if (mitm_spi_owned_by_display) {
+            ESP_LOGI(TAG, "MITM display: window done, releasing sd_spi_mutex");
+            mitm_spi_owned_by_display = false;
+            xSemaphoreGive(sd_spi_mutex);
+            mitm_display_window = false;
         }
         
         // Reset watchdog again after releasing mutex
@@ -4389,6 +4439,21 @@ void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_
         return;
     }
     
+    // During MITM display window, SPI bus is already exclusively owned
+    // by the main loop -- draw directly without mutex overhead
+    if (mitm_spi_owned_by_display) {
+        static uint32_t mitm_flush_count = 0;
+        mitm_flush_count++;
+        if (mitm_flush_count <= 3 || mitm_flush_count % 20 == 0) {
+            ESP_LOGI(TAG, "[FLUSH-MITM] #%lu area=(%d,%d)-(%d,%d) %dx%d",
+                     (unsigned long)mitm_flush_count,
+                     area->x1, area->y1, area->x2, area->y2, width, height);
+        }
+        esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
+        lv_disp_flush_ready(drv);
+        return;
+    }
+
     // CRITICAL: Take SD/SPI mutex before drawing to display
     // Display and SD card share the same SPI bus (SPI2_HOST)
     if (sd_spi_mutex) {
@@ -10618,10 +10683,14 @@ static void show_arp_poison_page(void)
 
 static void mitm_enqueue_frame(const uint8_t *data, uint16_t len)
 {
+    static uint32_t enqueue_count = 0;
     if (!mitm_capture_active || !mitm_packet_queue || len == 0) return;
 
     mitm_queued_frame_t *frame = heap_caps_malloc(sizeof(mitm_queued_frame_t) + len, MALLOC_CAP_SPIRAM);
-    if (!frame) return;
+    if (!frame) {
+        mitm_drop_count++;
+        return;
+    }
 
     frame->len = len;
     frame->timestamp_us = esp_timer_get_time();
@@ -10630,6 +10699,13 @@ static void mitm_enqueue_frame(const uint8_t *data, uint16_t len)
     if (xQueueSend(mitm_packet_queue, &frame, 0) != pdTRUE) {
         heap_caps_free(frame);
         mitm_drop_count++;
+    } else {
+        enqueue_count++;
+        if (enqueue_count <= 5 || enqueue_count % 50 == 0) {
+            ESP_LOGI(TAG, "MITM enqueue: #%lu len=%d qfree=%d",
+                     (unsigned long)enqueue_count, len,
+                     (int)uxQueueSpacesAvailable(mitm_packet_queue));
+        }
     }
 }
 
@@ -10724,61 +10800,90 @@ static void mitm_pcap_writer_task(void *pvParameters)
 
     ESP_LOGI(TAG, "MITM writer: started, file=%s", mitm_pcap_filepath);
 
-    int flush_counter = 0;
     mitm_queued_frame_t *frame = NULL;
+    uint32_t batch_count = 0;
 
     while (mitm_capture_active) {
-        if (xQueueReceive(mitm_packet_queue, &frame, pdMS_TO_TICKS(200)) == pdTRUE) {
+        if (mitm_display_window) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        if (xQueuePeek(mitm_packet_queue, &frame, pdMS_TO_TICKS(200)) != pdTRUE)
+            continue;
+
+        TickType_t mutex_start = xTaskGetTickCount();
+        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            uint32_t mutex_wait_ms = (xTaskGetTickCount() - mutex_start) * portTICK_PERIOD_MS;
+            int written = 0;
+            size_t total_bytes = 0;
+            while (!mitm_display_window &&
+                   xQueueReceive(mitm_packet_queue, &frame, 0) == pdTRUE) {
+                pcap_record_header_t rec = {
+                    .ts_sec  = (uint32_t)(frame->timestamp_us / 1000000),
+                    .ts_usec = (uint32_t)(frame->timestamp_us % 1000000),
+                    .incl_len = frame->len,
+                    .orig_len = frame->len
+                };
+                size_t w1 = fwrite(&rec, 1, sizeof(rec), mitm_pcap_file);
+                size_t w2 = fwrite(frame->data, 1, frame->len, mitm_pcap_file);
+                total_bytes += w1 + w2;
+                if (w1 != sizeof(rec) || w2 != frame->len) {
+                    ESP_LOGE(TAG, "MITM writer: fwrite SHORT! rec=%d/%d data=%d/%d",
+                             (int)w1, (int)sizeof(rec), (int)w2, (int)frame->len);
+                }
+                heap_caps_free(frame);
+                mitm_frame_count++;
+                written++;
+            }
+            if (written > 0) {
+                int flush_ret = fflush(mitm_pcap_file);
+                batch_count++;
+                ESP_LOGI(TAG, "MITM writer: batch #%lu: %d frames, %lu bytes, "
+                         "fflush=%d, mutex_wait=%lu ms, display_window=%d",
+                         (unsigned long)batch_count, written, (unsigned long)total_bytes,
+                         flush_ret, (unsigned long)mutex_wait_ms, (int)mitm_display_window);
+                if (flush_ret != 0) {
+                    ESP_LOGE(TAG, "MITM writer: fflush FAILED (errno=%d)", errno);
+                }
+            }
+            xSemaphoreGive(sd_spi_mutex);
+        } else {
+            ESP_LOGW(TAG, "MITM writer: sd_spi_mutex timeout (100ms), display_window=%d",
+                     (int)mitm_display_window);
+        }
+    }
+
+    // Drain remaining queue (capture stopped)
+    ESP_LOGI(TAG, "MITM writer: draining queue...");
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        int drained = 0;
+        while (xQueueReceive(mitm_packet_queue, &frame, 0) == pdTRUE) {
             pcap_record_header_t rec = {
                 .ts_sec  = (uint32_t)(frame->timestamp_us / 1000000),
                 .ts_usec = (uint32_t)(frame->timestamp_us % 1000000),
                 .incl_len = frame->len,
                 .orig_len = frame->len
             };
-
-            if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                fwrite(&rec, 1, sizeof(rec), mitm_pcap_file);
-                fwrite(frame->data, 1, frame->len, mitm_pcap_file);
-                flush_counter++;
-                if (flush_counter >= 50) {
-                    fflush(mitm_pcap_file);
-                    flush_counter = 0;
-                }
-                xSemaphoreGive(sd_spi_mutex);
-            }
-
-            heap_caps_free(frame);
-            frame = NULL;
-            mitm_frame_count++;
-        }
-    }
-
-    // Drain remaining queue
-    while (xQueueReceive(mitm_packet_queue, &frame, 0) == pdTRUE) {
-        pcap_record_header_t rec = {
-            .ts_sec  = (uint32_t)(frame->timestamp_us / 1000000),
-            .ts_usec = (uint32_t)(frame->timestamp_us % 1000000),
-            .incl_len = frame->len,
-            .orig_len = frame->len
-        };
-        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             fwrite(&rec, 1, sizeof(rec), mitm_pcap_file);
             fwrite(frame->data, 1, frame->len, mitm_pcap_file);
-            xSemaphoreGive(sd_spi_mutex);
+            heap_caps_free(frame);
+            mitm_frame_count++;
+            drained++;
         }
-        heap_caps_free(frame);
-        mitm_frame_count++;
-    }
-
-    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-        fflush(mitm_pcap_file);
-        fclose(mitm_pcap_file);
-        mitm_pcap_file = NULL;
+        if (mitm_pcap_file) {
+            fflush(mitm_pcap_file);
+            fclose(mitm_pcap_file);
+            mitm_pcap_file = NULL;
+        }
         xSemaphoreGive(sd_spi_mutex);
+        ESP_LOGI(TAG, "MITM writer: drained %d frames", drained);
+    } else {
+        ESP_LOGE(TAG, "MITM writer: drain mutex timeout!");
     }
 
-    ESP_LOGI(TAG, "MITM writer: stopped, %u frames written, %u dropped",
-             mitm_frame_count, mitm_drop_count);
+    ESP_LOGI(TAG, "MITM writer: stopped, %lu frames written, %lu dropped",
+             (unsigned long)mitm_frame_count, (unsigned long)mitm_drop_count);
     mitm_writer_task_handle = NULL;
     vTaskDelete(NULL);
 }
@@ -11041,6 +11146,7 @@ static void mitm_show_active_screen(void)
     snprintf(mitm_pcap_filepath, sizeof(mitm_pcap_filepath),
              "/sdcard/lab/pcaps/mitm_%d.pcap", file_num);
 
+    ESP_LOGI(TAG, "MITM: opening %s, taking sd_spi_mutex...", mitm_pcap_filepath);
     if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
     mitm_pcap_file = fopen(mitm_pcap_filepath, "wb");
     if (mitm_pcap_file) {
@@ -11053,10 +11159,15 @@ static void mitm_show_active_screen(void)
             .snaplen = 65535,
             .network = LINKTYPE_ETHERNET
         };
-        fwrite(&ghdr, 1, sizeof(ghdr), mitm_pcap_file);
-        fflush(mitm_pcap_file);
+        size_t hdr_w = fwrite(&ghdr, 1, sizeof(ghdr), mitm_pcap_file);
+        int hdr_flush = fflush(mitm_pcap_file);
+        ESP_LOGI(TAG, "MITM: PCAP header write=%d/%d, fflush=%d",
+                 (int)hdr_w, (int)sizeof(ghdr), hdr_flush);
+    } else {
+        ESP_LOGE(TAG, "MITM: fopen failed! errno=%d", errno);
     }
     if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+    ESP_LOGI(TAG, "MITM: sd_spi_mutex released after header write");
 
     if (!mitm_pcap_file) {
         ESP_LOGE(TAG, "MITM: Failed to open %s", mitm_pcap_filepath);
@@ -11161,7 +11272,7 @@ static void mitm_show_active_screen(void)
     lv_obj_add_event_cb(stop_btn, mitm_stop_btn_cb, LV_EVENT_CLICKED, NULL);
 
     // Update timer for packet counter
-    mitm_update_timer = lv_timer_create(mitm_update_timer_cb, 500, NULL);
+    mitm_update_timer = lv_timer_create(mitm_update_timer_cb, 5000, NULL);
 }
 
 static void mitm_scan_check_timer_cb(lv_timer_t *timer)
