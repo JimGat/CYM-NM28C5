@@ -3203,40 +3203,40 @@ void app_main(void)
         // Thread-safe LVGL handling
         uint32_t sleep_ms = 10;
         if (xSemaphoreTake(lvgl_mutex, portMAX_DELAY) == pdTRUE) {
-            // During MITM capture, only refresh display every 5 seconds.
-            // Acquire sd_spi_mutex BEFORE lv_timer_handler to guarantee
-            // exclusive SPI bus access (no SD traffic during display flush).
+            // During MITM capture, open a display window every 5 seconds
+            // to actually flush pixels. Between windows, lv_timer_handler()
+            // still runs for input processing; lvgl_flush_cb silently drops
+            // any draws so there is no SPI bus contention.
             if (mitm_capture_active) {
                 static int64_t mitm_last_display_ms = 0;
                 int64_t now_ms = esp_timer_get_time() / 1000;
-                if (now_ms - mitm_last_display_ms < 5000) {
+                if (now_ms - mitm_last_display_ms >= 5000) {
+                    ESP_LOGI(TAG, "MITM display: opening window, requesting sd_spi_mutex...");
+                    mitm_display_window = true;
                     xSemaphoreGive(lvgl_mutex);
-                    esp_task_wdt_reset();
-                    vTaskDelay(pdMS_TO_TICKS(50));
-                    continue;
+                    TickType_t mutex_start = xTaskGetTickCount();
+                    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+                        uint32_t mutex_wait_ms = (xTaskGetTickCount() - mutex_start) * portTICK_PERIOD_MS;
+                        ESP_LOGI(TAG, "MITM display: got sd_spi_mutex in %lu ms", (unsigned long)mutex_wait_ms);
+                        mitm_spi_owned_by_display = true;
+                        if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+                            ESP_LOGW(TAG, "MITM display: lvgl_mutex timeout!");
+                            mitm_spi_owned_by_display = false;
+                            xSemaphoreGive(sd_spi_mutex);
+                            mitm_display_window = false;
+                            continue;
+                        }
+                        mitm_last_display_ms = now_ms;
+                        ESP_LOGI(TAG, "MITM display: rendering (frames=%lu, drops=%lu)",
+                                 (unsigned long)mitm_frame_count, (unsigned long)mitm_drop_count);
+                    } else {
+                        ESP_LOGW(TAG, "MITM display: sd_spi_mutex timeout after 3s!");
+                        mitm_display_window = false;
+                        if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+                            continue;
+                        }
+                    }
                 }
-                ESP_LOGI(TAG, "MITM display: opening window, requesting sd_spi_mutex...");
-                mitm_display_window = true;
-                xSemaphoreGive(lvgl_mutex);
-                TickType_t mutex_start = xTaskGetTickCount();
-                if (!sd_spi_mutex || xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
-                    ESP_LOGW(TAG, "MITM display: sd_spi_mutex timeout after 3s!");
-                    mitm_display_window = false;
-                    continue;
-                }
-                uint32_t mutex_wait_ms = (xTaskGetTickCount() - mutex_start) * portTICK_PERIOD_MS;
-                ESP_LOGI(TAG, "MITM display: got sd_spi_mutex in %lu ms", (unsigned long)mutex_wait_ms);
-                mitm_spi_owned_by_display = true;
-                if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
-                    ESP_LOGW(TAG, "MITM display: lvgl_mutex timeout!");
-                    mitm_spi_owned_by_display = false;
-                    xSemaphoreGive(sd_spi_mutex);
-                    mitm_display_window = false;
-                    continue;
-                }
-                mitm_last_display_ms = now_ms;
-                ESP_LOGI(TAG, "MITM display: rendering (frames=%lu, drops=%lu)",
-                         (unsigned long)mitm_frame_count, (unsigned long)mitm_drop_count);
             }
 
             // Apply touch indicator changes outside indev callback
@@ -4454,6 +4454,14 @@ void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_
         return;
     }
 
+    // During MITM capture gap (between display windows), silently drop
+    // the flush to avoid SPI bus contention with the PCAP writer task.
+    // The screen will be properly refreshed during the next display window.
+    if (mitm_capture_active) {
+        lv_disp_flush_ready(drv);
+        return;
+    }
+
     // CRITICAL: Take SD/SPI mutex before drawing to display
     // Display and SD card share the same SPI bus (SPI2_HOST)
     if (sd_spi_mutex) {
@@ -4472,11 +4480,10 @@ void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_
                 TickType_t elapsed = xTaskGetTickCount() - start;
                 
                 if (elapsed > pdMS_TO_TICKS(5000)) {
-                    ESP_LOGW(TAG, "[FLUSH] ⚠️ Mutex stuck >5s (attempt %d)! Forcing draw (may glitch)",
+                    ESP_LOGW(TAG, "[FLUSH] SPI mutex stuck >5s (attempt %d), skipping flush",
                              wait_attempt);
-                    // Force draw without mutex (risky but better than black screen)
-                    esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
-                    drawn = true;
+                    lv_disp_flush_ready(drv);
+                    return;
                 }
                 
                 esp_task_wdt_reset();
@@ -10954,8 +10961,17 @@ static void mitm_scan_task(void *pvParameters)
     }
 
     esp_netif_ip_info_t ip_info;
-    if (esp_netif_get_ip_info(sta_netif, &ip_info) != ESP_OK || ip_info.ip.addr == 0) {
-        ESP_LOGE(TAG, "MITM scan: No IP assigned");
+    bool got_ip = false;
+    for (int attempt = 0; attempt < 20; attempt++) {
+        if (esp_netif_get_ip_info(sta_netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
+            got_ip = true;
+            break;
+        }
+        ESP_LOGI(TAG, "MITM scan: waiting for DHCP... (%d/20)", attempt + 1);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    if (!got_ip) {
+        ESP_LOGE(TAG, "MITM scan: No IP assigned after 10s");
         mitm_scan_done = true;
         vTaskDelete(NULL);
         return;
