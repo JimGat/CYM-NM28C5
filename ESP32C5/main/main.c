@@ -9857,6 +9857,59 @@ static void sta_connect_check_timer_cb(lv_timer_t *timer)
             lv_obj_clear_flag(wifi_connect_next_btn, LV_OBJ_FLAG_HIDDEN);
         }
         
+        // Save manually-entered password to eviltwin.txt if not already cached
+        if (wifi_connect_ta && wifi_connect_password[0] != '\0') {
+            bool already_cached = false;
+            int et_count = sd_cache_get_eviltwin_count();
+            for (int i = 0; i < et_count; i++) {
+                const char *line = sd_cache_get_eviltwin_entry(i);
+                if (line == NULL || strlen(line) == 0) continue;
+                char parsed_ssid[64] = {0}, parsed_pass[64] = {0};
+                const char *p = line;
+                while (*p && *p != '"') p++;
+                if (*p == '"') p++;
+                const char *s = p;
+                while (*p && *p != '"') p++;
+                size_t slen = p - s;
+                if (slen > sizeof(parsed_ssid) - 1) slen = sizeof(parsed_ssid) - 1;
+                strncpy(parsed_ssid, s, slen);
+                if (*p == '"') p++;
+                while (*p && *p != '"') p++;
+                if (*p == '"') p++;
+                const char *ps = p;
+                while (*p && *p != '"') p++;
+                size_t plen = p - ps;
+                if (plen > sizeof(parsed_pass) - 1) plen = sizeof(parsed_pass) - 1;
+                strncpy(parsed_pass, ps, plen);
+                if (strcmp(parsed_ssid, wifi_connect_ssid) == 0 &&
+                    strcmp(parsed_pass, wifi_connect_password) == 0) {
+                    already_cached = true;
+                    break;
+                }
+            }
+            if (!already_cached) {
+                struct stat st;
+                if (stat("/sdcard/lab", &st) != 0) {
+                    mkdir("/sdcard/lab", 0777);
+                }
+                FILE *file = fopen("/sdcard/lab/eviltwin.txt", "a");
+                if (file == NULL) {
+                    file = fopen("/sdcard/lab/eviltwin.txt", "w");
+                    if (file) { fclose(file); file = fopen("/sdcard/lab/eviltwin.txt", "a"); }
+                }
+                if (file) {
+                    fprintf(file, "\"%s\", \"%s\"\n", wifi_connect_ssid, wifi_connect_password);
+                    fflush(file);
+                    fclose(file);
+                    char cache_entry[256];
+                    snprintf(cache_entry, sizeof(cache_entry), "\"%s\", \"%s\"",
+                             wifi_connect_ssid, wifi_connect_password);
+                    sd_cache_add_eviltwin_entry(cache_entry);
+                    ESP_LOGI(TAG, "WiFi password saved to eviltwin.txt for SSID: %s", wifi_connect_ssid);
+                }
+            }
+        }
+        
     } else if (sta_connect_failed) {
         sta_connect_failed = false;
         
@@ -9995,7 +10048,6 @@ static void wifi_connect_keyboard_event_cb(lv_event_t *e)
     lv_event_code_t code = lv_event_get_code(e);
     
     if (code == LV_EVENT_VALUE_CHANGED) {
-        // Update buffer when text changes
         if (wifi_connect_ta) {
             const char *txt = lv_textarea_get_text(wifi_connect_ta);
             if (txt) {
@@ -10005,19 +10057,29 @@ static void wifi_connect_keyboard_event_cb(lv_event_t *e)
         }
     }
     else if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
-        // Hide keyboard on Close
         if (wifi_connect_keyboard) {
             lv_obj_add_flag(wifi_connect_keyboard, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (wifi_connect_btn) {
+            const char *txt = wifi_connect_ta ? lv_textarea_get_text(wifi_connect_ta) : NULL;
+            if (txt && strlen(txt) > 0) {
+                lv_obj_clear_flag(wifi_connect_btn, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_add_flag(wifi_connect_btn, LV_OBJ_FLAG_HIDDEN);
+            }
         }
     }
 }
 
-// WiFi connect textarea click callback - show keyboard
+// WiFi connect textarea click callback - show keyboard, hide connect button
 static void wifi_connect_ta_event_cb(lv_event_t *e)
 {
     (void)e;
     if (wifi_connect_keyboard) {
         lv_obj_clear_flag(wifi_connect_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (wifi_connect_btn) {
+        lv_obj_add_flag(wifi_connect_btn, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -10193,6 +10255,9 @@ static void show_wifi_connect_screen(void)
     lv_obj_set_style_text_font(conn_lbl, &lv_font_montserrat_14, 0);
     lv_obj_center(conn_lbl);
     lv_obj_add_event_cb(wifi_connect_btn, wifi_connect_btn_cb, LV_EVENT_CLICKED, NULL);
+    if (!password_found) {
+        lv_obj_add_flag(wifi_connect_btn, LV_OBJ_FLAG_HIDDEN);
+    }
 
     wifi_connect_next_btn = lv_btn_create(function_page);
     lv_obj_set_size(wifi_connect_next_btn, 120, 40);
@@ -10681,6 +10746,15 @@ static void show_arp_poison_page(void)
 // MITM Capture (ARP spoof all hosts + LwIP packet capture to SD)
 // ============================================================================
 
+static void sd_sync(void) {
+    int fd = open("/sdcard/.sync", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        fsync(fd);
+        close(fd);
+        unlink("/sdcard/.sync");
+    }
+}
+
 static void mitm_enqueue_frame(const uint8_t *data, uint16_t len)
 {
     static uint32_t enqueue_count = 0;
@@ -10801,63 +10875,38 @@ static void mitm_pcap_writer_task(void *pvParameters)
     ESP_LOGI(TAG, "MITM writer: started, file=%s", mitm_pcap_filepath);
 
     mitm_queued_frame_t *frame = NULL;
-    uint32_t batch_count = 0;
+    uint32_t flush_counter = 0;
 
     while (mitm_capture_active) {
-        if (mitm_display_window) {
-            vTaskDelay(pdMS_TO_TICKS(20));
-            continue;
-        }
-
-        if (xQueuePeek(mitm_packet_queue, &frame, pdMS_TO_TICKS(200)) != pdTRUE)
+        if (xQueueReceive(mitm_packet_queue, &frame, pdMS_TO_TICKS(200)) != pdTRUE)
             continue;
 
-        TickType_t mutex_start = xTaskGetTickCount();
-        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            uint32_t mutex_wait_ms = (xTaskGetTickCount() - mutex_start) * portTICK_PERIOD_MS;
-            int written = 0;
-            size_t total_bytes = 0;
-            while (!mitm_display_window &&
-                   xQueueReceive(mitm_packet_queue, &frame, 0) == pdTRUE) {
-                pcap_record_header_t rec = {
-                    .ts_sec  = (uint32_t)(frame->timestamp_us / 1000000),
-                    .ts_usec = (uint32_t)(frame->timestamp_us % 1000000),
-                    .incl_len = frame->len,
-                    .orig_len = frame->len
-                };
-                size_t w1 = fwrite(&rec, 1, sizeof(rec), mitm_pcap_file);
-                size_t w2 = fwrite(frame->data, 1, frame->len, mitm_pcap_file);
-                total_bytes += w1 + w2;
-                if (w1 != sizeof(rec) || w2 != frame->len) {
-                    ESP_LOGE(TAG, "MITM writer: fwrite SHORT! rec=%d/%d data=%d/%d",
-                             (int)w1, (int)sizeof(rec), (int)w2, (int)frame->len);
-                }
-                heap_caps_free(frame);
-                mitm_frame_count++;
-                written++;
-            }
-            if (written > 0) {
-                int flush_ret = fflush(mitm_pcap_file);
-                batch_count++;
-                ESP_LOGI(TAG, "MITM writer: batch #%lu: %d frames, %lu bytes, "
-                         "fflush=%d, mutex_wait=%lu ms, display_window=%d",
-                         (unsigned long)batch_count, written, (unsigned long)total_bytes,
-                         flush_ret, (unsigned long)mutex_wait_ms, (int)mitm_display_window);
-                if (flush_ret != 0) {
-                    ESP_LOGE(TAG, "MITM writer: fflush FAILED (errno=%d)", errno);
-                }
-            }
-            xSemaphoreGive(sd_spi_mutex);
-        } else {
-            ESP_LOGW(TAG, "MITM writer: sd_spi_mutex timeout (100ms), display_window=%d",
-                     (int)mitm_display_window);
+        if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
+
+        do {
+            pcap_record_header_t rec = {
+                .ts_sec  = (uint32_t)(frame->timestamp_us / 1000000),
+                .ts_usec = (uint32_t)(frame->timestamp_us % 1000000),
+                .incl_len = frame->len,
+                .orig_len = frame->len
+            };
+            fwrite(&rec, 1, sizeof(rec), mitm_pcap_file);
+            fwrite(frame->data, 1, frame->len, mitm_pcap_file);
+            heap_caps_free(frame);
+            mitm_frame_count++;
+            flush_counter++;
+        } while (xQueueReceive(mitm_packet_queue, &frame, 0) == pdTRUE);
+
+        if (flush_counter >= 50) {
+            fflush(mitm_pcap_file);
+            flush_counter = 0;
         }
+
+        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
     }
 
-    // Drain remaining queue (capture stopped)
-    ESP_LOGI(TAG, "MITM writer: draining queue...");
-    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
-        int drained = 0;
+    // Drain remaining queue
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
         while (xQueueReceive(mitm_packet_queue, &frame, 0) == pdTRUE) {
             pcap_record_header_t rec = {
                 .ts_sec  = (uint32_t)(frame->timestamp_us / 1000000),
@@ -10869,17 +10918,20 @@ static void mitm_pcap_writer_task(void *pvParameters)
             fwrite(frame->data, 1, frame->len, mitm_pcap_file);
             heap_caps_free(frame);
             mitm_frame_count++;
-            drained++;
         }
         if (mitm_pcap_file) {
             fflush(mitm_pcap_file);
             fclose(mitm_pcap_file);
             mitm_pcap_file = NULL;
+            sd_sync();
         }
         xSemaphoreGive(sd_spi_mutex);
-        ESP_LOGI(TAG, "MITM writer: drained %d frames", drained);
     } else {
-        ESP_LOGE(TAG, "MITM writer: drain mutex timeout!");
+        // Cannot get mutex (held by display/stop caller) -- free frames only;
+        // mitm_stop() will close the file.
+        while (xQueueReceive(mitm_packet_queue, &frame, 0) == pdTRUE) {
+            heap_caps_free(frame);
+        }
     }
 
     ESP_LOGI(TAG, "MITM writer: stopped, %lu frames written, %lu dropped",
@@ -11042,30 +11094,7 @@ static void mitm_stop(void)
     mitm_capture_active = false;
     mitm_arp_active = false;
 
-    // Wait for ARP spoof task
-    for (int i = 0; i < 80 && mitm_arp_task_handle != NULL; i++) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-    if (mitm_arp_task_handle != NULL) {
-        vTaskDelete(mitm_arp_task_handle);
-        mitm_arp_task_handle = NULL;
-    }
-
-    // Wait for writer task
-    for (int i = 0; i < 40 && mitm_writer_task_handle != NULL; i++) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-    if (mitm_writer_task_handle != NULL) {
-        vTaskDelete(mitm_writer_task_handle);
-        mitm_writer_task_handle = NULL;
-        if (mitm_pcap_file) {
-            fflush(mitm_pcap_file);
-            fclose(mitm_pcap_file);
-            mitm_pcap_file = NULL;
-        }
-    }
-
-    // Restore LwIP hooks
+    // Restore LwIP hooks first so no new frames are enqueued
     esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (sta_netif) {
         struct netif *lwip_netif = esp_netif_get_netif_impl(sta_netif);
@@ -11079,6 +11108,34 @@ static void mitm_stop(void)
                 mitm_original_linkoutput = NULL;
             }
         }
+    }
+
+    // Wait for ARP spoof task
+    for (int i = 0; i < 80 && mitm_arp_task_handle != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (mitm_arp_task_handle != NULL) {
+        vTaskDelete(mitm_arp_task_handle);
+        mitm_arp_task_handle = NULL;
+    }
+
+    // Wait for writer task (up to 5s)
+    for (int i = 0; i < 100 && mitm_writer_task_handle != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (mitm_writer_task_handle != NULL) {
+        vTaskDelete(mitm_writer_task_handle);
+        mitm_writer_task_handle = NULL;
+    }
+
+    // Close pcap file if writer didn't (e.g. mutex deadlock on drain).
+    // This runs in the display-window context which already holds sd_spi_mutex,
+    // so direct file access is safe.
+    if (mitm_pcap_file) {
+        fflush(mitm_pcap_file);
+        fclose(mitm_pcap_file);
+        mitm_pcap_file = NULL;
+        sd_sync();
     }
 
     // Drain and delete queue
