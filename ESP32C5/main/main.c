@@ -783,12 +783,15 @@ static mitm_host_entry_t *mitm_hosts = NULL;
 static int mitm_host_count = 0;
 static volatile bool mitm_arp_active = false;
 static volatile bool mitm_capture_active = false;
-static volatile bool mitm_display_window = false;
-static volatile bool mitm_spi_owned_by_display = false;
 static FILE *mitm_pcap_file = NULL;
 static QueueHandle_t mitm_packet_queue = NULL;
 static volatile uint32_t mitm_frame_count = 0;
 static volatile uint32_t mitm_drop_count = 0;
+static volatile uint32_t mitm_tcp_count = 0;
+static volatile uint32_t mitm_udp_count = 0;
+static volatile uint32_t mitm_icmp_count = 0;
+static volatile uint32_t mitm_arp_pkt_count = 0;
+static volatile uint32_t mitm_other_proto_count = 0;
 static TaskHandle_t mitm_arp_task_handle = NULL;
 static TaskHandle_t mitm_writer_task_handle = NULL;
 static netif_input_fn mitm_original_input = NULL;
@@ -797,11 +800,9 @@ static uint32_t mitm_gateway_ip = 0;
 static uint8_t mitm_gateway_mac[6] = {0};
 static uint8_t mitm_own_mac[6] = {0};
 static volatile bool mitm_scan_done = false;
-static lv_obj_t *mitm_counter_label = NULL;
 static lv_obj_t *mitm_status_label = NULL;
 static lv_obj_t *mitm_hosts_label = NULL;
 static lv_timer_t *mitm_scan_check_timer = NULL;
-static lv_timer_t *mitm_update_timer = NULL;
 static char mitm_pcap_filepath[64] = "";
 
 // BLE Scan UI state
@@ -3203,42 +3204,6 @@ void app_main(void)
         // Thread-safe LVGL handling
         uint32_t sleep_ms = 10;
         if (xSemaphoreTake(lvgl_mutex, portMAX_DELAY) == pdTRUE) {
-            // During MITM capture, open a display window every 5 seconds
-            // to actually flush pixels. Between windows, lv_timer_handler()
-            // still runs for input processing; lvgl_flush_cb silently drops
-            // any draws so there is no SPI bus contention.
-            if (mitm_capture_active) {
-                static int64_t mitm_last_display_ms = 0;
-                int64_t now_ms = esp_timer_get_time() / 1000;
-                if (now_ms - mitm_last_display_ms >= 5000) {
-                    ESP_LOGI(TAG, "MITM display: opening window, requesting sd_spi_mutex...");
-                    mitm_display_window = true;
-                    xSemaphoreGive(lvgl_mutex);
-                    TickType_t mutex_start = xTaskGetTickCount();
-                    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
-                        uint32_t mutex_wait_ms = (xTaskGetTickCount() - mutex_start) * portTICK_PERIOD_MS;
-                        ESP_LOGI(TAG, "MITM display: got sd_spi_mutex in %lu ms", (unsigned long)mutex_wait_ms);
-                        mitm_spi_owned_by_display = true;
-                        if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
-                            ESP_LOGW(TAG, "MITM display: lvgl_mutex timeout!");
-                            mitm_spi_owned_by_display = false;
-                            xSemaphoreGive(sd_spi_mutex);
-                            mitm_display_window = false;
-                            continue;
-                        }
-                        mitm_last_display_ms = now_ms;
-                        ESP_LOGI(TAG, "MITM display: rendering (frames=%lu, drops=%lu)",
-                                 (unsigned long)mitm_frame_count, (unsigned long)mitm_drop_count);
-                    } else {
-                        ESP_LOGW(TAG, "MITM display: sd_spi_mutex timeout after 3s!");
-                        mitm_display_window = false;
-                        if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
-                            continue;
-                        }
-                    }
-                }
-            }
-
             // Apply touch indicator changes outside indev callback
             if (touch_dot && show_touch_dot) {
                 if (touch_pressed_flag) {
@@ -4381,10 +4346,6 @@ void app_main(void)
                 }
             }
 
-            if (mitm_spi_owned_by_display) {
-                lv_obj_invalidate(lv_scr_act());
-            }
-
             sleep_ms = lv_timer_handler();
             
             // Reset watchdog INSIDE mutex to catch long rendering operations
@@ -4393,14 +4354,6 @@ void app_main(void)
             xSemaphoreGive(lvgl_mutex);
         }
 
-        // Release SPI bus exclusivity after MITM display refresh
-        if (mitm_spi_owned_by_display) {
-            ESP_LOGI(TAG, "MITM display: window done, releasing sd_spi_mutex");
-            mitm_spi_owned_by_display = false;
-            xSemaphoreGive(sd_spi_mutex);
-            mitm_display_window = false;
-        }
-        
         // Reset watchdog again after releasing mutex
         esp_task_wdt_reset();
         
@@ -4439,24 +4392,9 @@ void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_
         return;
     }
     
-    // During MITM display window, SPI bus is already exclusively owned
-    // by the main loop -- draw directly without mutex overhead
-    if (mitm_spi_owned_by_display) {
-        static uint32_t mitm_flush_count = 0;
-        mitm_flush_count++;
-        if (mitm_flush_count <= 3 || mitm_flush_count % 20 == 0) {
-            ESP_LOGI(TAG, "[FLUSH-MITM] #%lu area=(%d,%d)-(%d,%d) %dx%d",
-                     (unsigned long)mitm_flush_count,
-                     area->x1, area->y1, area->x2, area->y2, width, height);
-        }
-        esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
-        lv_disp_flush_ready(drv);
-        return;
-    }
-
-    // During MITM capture gap (between display windows), silently drop
-    // the flush to avoid SPI bus contention with the PCAP writer task.
-    // The screen will be properly refreshed during the next display window.
+    // During MITM capture, silently drop flushes to avoid SPI bus
+    // contention with the PCAP writer task. The screen was rendered
+    // once before capture started and stays static until user stops.
     if (mitm_capture_active) {
         lv_disp_flush_ready(drv);
         return;
@@ -10762,6 +10700,23 @@ static void sd_sync(void) {
     }
 }
 
+static void mitm_classify_frame(const uint8_t *data, uint16_t len)
+{
+    if (len < 14) { mitm_other_proto_count++; return; }
+    uint16_t ethertype = ((uint16_t)data[12] << 8) | data[13];
+    if (ethertype == 0x0806) {
+        mitm_arp_pkt_count++;
+    } else if (ethertype == 0x0800 && len >= 24) {
+        uint8_t ip_proto = data[23];
+        if (ip_proto == 6)       mitm_tcp_count++;
+        else if (ip_proto == 17) mitm_udp_count++;
+        else if (ip_proto == 1)  mitm_icmp_count++;
+        else                     mitm_other_proto_count++;
+    } else {
+        mitm_other_proto_count++;
+    }
+}
+
 static void mitm_enqueue_frame(const uint8_t *data, uint16_t len)
 {
     static uint32_t enqueue_count = 0;
@@ -10781,6 +10736,7 @@ static void mitm_enqueue_frame(const uint8_t *data, uint16_t len)
         heap_caps_free(frame);
         mitm_drop_count++;
     } else {
+        mitm_classify_frame(data, len);
         enqueue_count++;
         if (enqueue_count <= 5 || enqueue_count % 50 == 0) {
             ESP_LOGI(TAG, "MITM enqueue: #%lu len=%d qfree=%d",
@@ -11144,17 +11100,16 @@ static void mitm_stop(void)
         mitm_writer_task_handle = NULL;
     }
 
-    // Close pcap file if writer didn't (e.g. mutex deadlock on drain).
-    // This runs in the display-window context which already holds sd_spi_mutex,
-    // so direct file access is safe.
+    // Writer task has exited; safe to close the file and take the mutex
     if (mitm_pcap_file) {
+        if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
         fflush(mitm_pcap_file);
         fclose(mitm_pcap_file);
         mitm_pcap_file = NULL;
         sd_sync();
+        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
     }
 
-    // Drain and delete queue
     if (mitm_packet_queue) {
         mitm_queued_frame_t *frame = NULL;
         while (xQueueReceive(mitm_packet_queue, &frame, 0) == pdTRUE) {
@@ -11164,51 +11119,94 @@ static void mitm_stop(void)
         mitm_packet_queue = NULL;
     }
 
-    if (mitm_update_timer) {
-        lv_timer_del(mitm_update_timer);
-        mitm_update_timer = NULL;
-    }
-
-    if (mitm_hosts) {
-        heap_caps_free(mitm_hosts);
-        mitm_hosts = NULL;
-    }
-
-    mitm_counter_label = NULL;
     mitm_status_label = NULL;
     mitm_hosts_label = NULL;
+
+    ESP_LOGI(TAG, "MITM: Stopped. frames=%lu drops=%lu file=%s",
+             (unsigned long)mitm_frame_count, (unsigned long)mitm_drop_count,
+             mitm_pcap_filepath);
 }
+
+static void mitm_show_results_screen(void);
 
 static void mitm_stop_btn_cb(lv_event_t *e)
 {
     (void)e;
     mitm_stop();
-    nav_to_menu_flag = true;
-}
-
-static void mitm_update_timer_cb(lv_timer_t *timer)
-{
-    (void)timer;
-    if (mitm_counter_label) {
-        char buf[48];
-        snprintf(buf, sizeof(buf), "Packets: %lu", (unsigned long)mitm_frame_count);
-        lv_label_set_text(mitm_counter_label, buf);
-    }
+    mitm_show_results_screen();
 }
 
 static void mitm_show_active_screen(void)
 {
     create_function_page_base("MITM Capture");
 
-    // Mount SD and open PCAP file
+    // Build static UI FIRST and render it before any SD operations.
+    // This clears the old scanning screen immediately and avoids
+    // recursive lv_timer_handler() (this function is called from
+    // mitm_scan_check_timer_cb which itself runs inside lv_timer_handler).
+
+    lv_obj_t *content = lv_obj_create(function_page);
+    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(content, lv_color_make(18, 18, 18), 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(content, 10, 0);
+
+    lv_obj_t *icon_lbl = lv_label_create(content);
+    lv_label_set_text(icon_lbl, LV_SYMBOL_LOOP);
+    lv_obj_set_style_text_color(icon_lbl, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_text_font(icon_lbl, &lv_font_montserrat_20, 0);
+
+    mitm_status_label = lv_label_create(content);
+    lv_label_set_text(mitm_status_label, "MITM Capture in Progress");
+    lv_obj_set_style_text_color(mitm_status_label, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_text_font(mitm_status_label, &lv_font_montserrat_16, 0);
+
+    mitm_hosts_label = lv_label_create(content);
+    char hosts_buf[48];
+    snprintf(hosts_buf, sizeof(hosts_buf), "Spoofing %d hosts", mitm_host_count);
+    lv_label_set_text(mitm_hosts_label, hosts_buf);
+    lv_obj_set_style_text_color(mitm_hosts_label, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_text_font(mitm_hosts_label, &lv_font_montserrat_14, 0);
+
+    lv_obj_t *file_label = lv_label_create(content);
+    lv_label_set_text(file_label, "Preparing SD card...");
+    lv_obj_set_style_text_color(file_label, lv_color_make(150, 150, 150), 0);
+    lv_obj_set_style_text_font(file_label, &lv_font_montserrat_12, 0);
+
+    lv_obj_t *hint_label = lv_label_create(content);
+    lv_label_set_text(hint_label, "Screen paused during capture\nPress STOP to see results");
+    lv_obj_set_style_text_color(hint_label, lv_color_make(120, 120, 120), 0);
+    lv_obj_set_style_text_font(hint_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_align(hint_label, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *stop_btn = lv_btn_create(content);
+    lv_obj_set_size(stop_btn, 160, 44);
+    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(stop_btn, 0, 0);
+    lv_obj_set_style_radius(stop_btn, 8, 0);
+    lv_obj_t *stop_lbl = lv_label_create(stop_btn);
+    lv_label_set_text(stop_lbl, LV_SYMBOL_STOP " STOP");
+    lv_obj_set_style_text_color(stop_lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(stop_lbl);
+    lv_obj_add_event_cb(stop_btn, mitm_stop_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_refr_now(NULL);
+
+    // --- SD operations (screen is already visible) ---
+
     esp_err_t sd_ret = ensure_sd_mounted();
     if (sd_ret != ESP_OK) {
         ESP_LOGE(TAG, "MITM: SD mount failed");
-        lv_obj_t *err_lbl = lv_label_create(function_page);
-        lv_label_set_text(err_lbl, "SD card mount failed!");
-        lv_obj_set_style_text_color(err_lbl, COLOR_MATERIAL_RED, 0);
-        lv_obj_set_style_text_font(err_lbl, &lv_font_montserrat_16, 0);
-        lv_obj_center(err_lbl);
+        lv_label_set_text(mitm_status_label, "SD card mount failed!");
+        lv_obj_set_style_text_color(mitm_status_label, COLOR_MATERIAL_RED, 0);
+        lv_label_set_text(file_label, "");
+        lv_refr_now(NULL);
         return;
     }
 
@@ -11244,22 +11242,30 @@ static void mitm_show_active_screen(void)
 
     if (!mitm_pcap_file) {
         ESP_LOGE(TAG, "MITM: Failed to open %s", mitm_pcap_filepath);
-        lv_obj_t *err_lbl = lv_label_create(function_page);
-        lv_label_set_text(err_lbl, "Failed to create PCAP file!");
-        lv_obj_set_style_text_color(err_lbl, COLOR_MATERIAL_RED, 0);
-        lv_obj_set_style_text_font(err_lbl, &lv_font_montserrat_16, 0);
-        lv_obj_center(err_lbl);
+        lv_label_set_text(mitm_status_label, "Failed to create PCAP file!");
+        lv_obj_set_style_text_color(mitm_status_label, COLOR_MATERIAL_RED, 0);
+        lv_label_set_text(file_label, "");
+        lv_refr_now(NULL);
         return;
     }
 
-    // Create packet queue
+    char file_buf[80];
+    snprintf(file_buf, sizeof(file_buf), "Writing to: mitm_%d.pcap", file_num);
+    lv_label_set_text(file_label, file_buf);
+
+    // --- Start capture (screen already drawn) ---
+
     mitm_packet_queue = xQueueCreate(MITM_QUEUE_SIZE, sizeof(mitm_queued_frame_t *));
     mitm_frame_count = 0;
     mitm_drop_count = 0;
+    mitm_tcp_count = 0;
+    mitm_udp_count = 0;
+    mitm_icmp_count = 0;
+    mitm_arp_pkt_count = 0;
+    mitm_other_proto_count = 0;
     mitm_capture_active = true;
     mitm_arp_active = true;
 
-    // Hook LwIP
     esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     struct netif *lwip_netif = esp_netif_get_netif_impl(sta_netif);
     if (lwip_netif) {
@@ -11269,7 +11275,6 @@ static void mitm_show_active_screen(void)
         lwip_netif->linkoutput = mitm_netif_linkoutput_hook;
     }
 
-    // Start ARP spoof task (stack in PSRAM)
     StackType_t *mitm_arp_stack = heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
     static StaticTask_t mitm_arp_tcb;
     if (mitm_arp_stack) {
@@ -11279,7 +11284,6 @@ static void mitm_show_active_screen(void)
         xTaskCreate(mitm_arp_spoof_task, "mitm_arp", 4096, NULL, 5, &mitm_arp_task_handle);
     }
 
-    // Start PCAP writer task (stack in PSRAM)
     StackType_t *mitm_wr_stack = heap_caps_malloc(8192 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
     static StaticTask_t mitm_wr_tcb;
     if (mitm_wr_stack) {
@@ -11290,8 +11294,30 @@ static void mitm_show_active_screen(void)
     }
 
     ESP_LOGI(TAG, "MITM: Capture active, %d hosts, file=%s", mitm_host_count, mitm_pcap_filepath);
+}
 
-    // Build active UI
+static void mitm_results_resume_cb(lv_event_t *e)
+{
+    (void)e;
+    mitm_show_active_screen();
+}
+
+static void mitm_results_back_cb(lv_event_t *e)
+{
+    (void)e;
+    if (mitm_hosts) {
+        heap_caps_free(mitm_hosts);
+        mitm_hosts = NULL;
+    }
+    mitm_host_count = 0;
+    radio_reset_to_idle();
+    nav_to_menu_flag = true;
+}
+
+static void mitm_show_results_screen(void)
+{
+    create_function_page_base("MITM Results");
+
     lv_obj_t *content = lv_obj_create(function_page);
     lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30);
     lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
@@ -11302,50 +11328,99 @@ static void mitm_show_active_screen(void)
     lv_obj_set_flex_align(content, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_gap(content, 8, 0);
 
-    // Status
-    mitm_status_label = lv_label_create(content);
-    lv_label_set_text(mitm_status_label, "MITM Active");
-    lv_obj_set_style_text_color(mitm_status_label, COLOR_MATERIAL_GREEN, 0);
-    lv_obj_set_style_text_font(mitm_status_label, &lv_font_montserrat_16, 0);
+    lv_obj_t *title_lbl = lv_label_create(content);
+    lv_label_set_text(title_lbl, "Capture Complete");
+    lv_obj_set_style_text_color(title_lbl, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_text_font(title_lbl, &lv_font_montserrat_20, 0);
 
-    // Hosts count
-    mitm_hosts_label = lv_label_create(content);
+    lv_obj_t *packets_lbl = lv_label_create(content);
+    char pkt_buf[64];
+    snprintf(pkt_buf, sizeof(pkt_buf), "Packets captured: %lu", (unsigned long)mitm_frame_count);
+    lv_label_set_text(packets_lbl, pkt_buf);
+    lv_obj_set_style_text_color(packets_lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(packets_lbl, &lv_font_montserrat_16, 0);
+
+    // Packet type breakdown
+    char stats_buf[128];
+    int pos = 0;
+    if (mitm_tcp_count > 0)
+        pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos, "TCP: %lu  ", (unsigned long)mitm_tcp_count);
+    if (mitm_udp_count > 0)
+        pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos, "UDP: %lu  ", (unsigned long)mitm_udp_count);
+    if (mitm_icmp_count > 0)
+        pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos, "ICMP: %lu  ", (unsigned long)mitm_icmp_count);
+    if (mitm_arp_pkt_count > 0)
+        pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos, "ARP: %lu  ", (unsigned long)mitm_arp_pkt_count);
+    if (mitm_other_proto_count > 0)
+        pos += snprintf(stats_buf + pos, sizeof(stats_buf) - pos, "Other: %lu", (unsigned long)mitm_other_proto_count);
+    if (pos > 0) {
+        lv_obj_t *proto_lbl = lv_label_create(content);
+        lv_label_set_text(proto_lbl, stats_buf);
+        lv_obj_set_style_text_color(proto_lbl, lv_color_make(180, 180, 180), 0);
+        lv_obj_set_style_text_font(proto_lbl, &lv_font_montserrat_12, 0);
+    }
+
+    if (mitm_drop_count > 0) {
+        lv_obj_t *drops_lbl = lv_label_create(content);
+        char drop_buf[64];
+        snprintf(drop_buf, sizeof(drop_buf), "Dropped: %lu (queue full)", (unsigned long)mitm_drop_count);
+        lv_label_set_text(drops_lbl, drop_buf);
+        lv_obj_set_style_text_color(drops_lbl, COLOR_MATERIAL_ORANGE, 0);
+        lv_obj_set_style_text_font(drops_lbl, &lv_font_montserrat_14, 0);
+    }
+
+    lv_obj_t *hosts_lbl = lv_label_create(content);
     char hosts_buf[48];
-    snprintf(hosts_buf, sizeof(hosts_buf), "Spoofing %d hosts", mitm_host_count);
-    lv_label_set_text(mitm_hosts_label, hosts_buf);
-    lv_obj_set_style_text_color(mitm_hosts_label, COLOR_MATERIAL_TEAL, 0);
-    lv_obj_set_style_text_font(mitm_hosts_label, &lv_font_montserrat_14, 0);
+    snprintf(hosts_buf, sizeof(hosts_buf), "Hosts spoofed: %d", mitm_host_count);
+    lv_label_set_text(hosts_lbl, hosts_buf);
+    lv_obj_set_style_text_color(hosts_lbl, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_text_font(hosts_lbl, &lv_font_montserrat_14, 0);
 
-    // Packet counter (big)
-    mitm_counter_label = lv_label_create(content);
-    lv_label_set_text(mitm_counter_label, "Packets: 0");
-    lv_obj_set_style_text_color(mitm_counter_label, lv_color_white(), 0);
-    lv_obj_set_style_text_font(mitm_counter_label, &lv_font_montserrat_20, 0);
-
-    // File path
-    lv_obj_t *file_label = lv_label_create(content);
+    lv_obj_t *file_lbl = lv_label_create(content);
     char file_buf[80];
-    snprintf(file_buf, sizeof(file_buf), "File: mitm_%d.pcap", file_num);
-    lv_label_set_text(file_label, file_buf);
-    lv_obj_set_style_text_color(file_label, lv_color_make(150, 150, 150), 0);
-    lv_obj_set_style_text_font(file_label, &lv_font_montserrat_12, 0);
+    const char *fname = strrchr(mitm_pcap_filepath, '/');
+    snprintf(file_buf, sizeof(file_buf), "Saved: %s", fname ? fname + 1 : mitm_pcap_filepath);
+    lv_label_set_text(file_lbl, file_buf);
+    lv_obj_set_style_text_color(file_lbl, lv_color_make(150, 150, 150), 0);
+    lv_obj_set_style_text_font(file_lbl, &lv_font_montserrat_12, 0);
 
-    // Stop button
-    lv_obj_t *stop_btn = lv_btn_create(content);
-    lv_obj_set_size(stop_btn, 140, 40);
-    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(stop_btn, 0, 0);
-    lv_obj_set_style_radius(stop_btn, 8, 0);
-    lv_obj_t *stop_lbl = lv_label_create(stop_btn);
-    lv_label_set_text(stop_lbl, LV_SYMBOL_STOP " STOP");
-    lv_obj_set_style_text_color(stop_lbl, lv_color_white(), 0);
-    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_16, 0);
-    lv_obj_center(stop_lbl);
-    lv_obj_add_event_cb(stop_btn, mitm_stop_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *btn_row = lv_obj_create(content);
+    lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(btn_row, 16, 0);
 
-    // Update timer for packet counter
-    mitm_update_timer = lv_timer_create(mitm_update_timer_cb, 5000, NULL);
+    lv_obj_t *resume_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(resume_btn, 140, 44);
+    lv_obj_set_style_bg_color(resume_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(resume_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(resume_btn, 0, 0);
+    lv_obj_set_style_radius(resume_btn, 8, 0);
+    lv_obj_t *resume_lbl = lv_label_create(resume_btn);
+    lv_label_set_text(resume_lbl, LV_SYMBOL_PLAY " Resume");
+    lv_obj_set_style_text_color(resume_lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(resume_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(resume_lbl);
+    lv_obj_add_event_cb(resume_btn, mitm_results_resume_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *back_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(back_btn, 140, 44);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(80, 80, 80), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(110, 110, 110), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " Back");
+    lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(back_lbl);
+    lv_obj_add_event_cb(back_btn, mitm_results_back_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_refr_now(NULL);
 }
 
 static void mitm_scan_check_timer_cb(lv_timer_t *timer)
