@@ -908,6 +908,9 @@ static const uint8_t deauth_frame_default[] = {
 
 static void scan_checkbox_event_cb(lv_event_t *e);
 void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_p);
+static bool on_color_trans_done(esp_lcd_panel_io_handle_t io,
+                                esp_lcd_panel_io_event_data_t *edata,
+                                void *user_ctx);
 void lvgl_touch_read_cb(lv_indev_drv_t *indev_drv, lv_indev_data_t *data);
 void attack_event_cb(lv_event_t *e);
 void menu_event_cb(lv_event_t *e);
@@ -1725,79 +1728,43 @@ static void check_heap_integrity(const char* location) {
 }
 
 static void init_display(void)
-{    
-    // Configure pull-ups on shared SPI pins BEFORE bus initialization
-    // This prevents race conditions with SD card init which shares the same SPI bus
-    gpio_set_pull_mode(LCD_MOSI, GPIO_PULLUP_ONLY);
-    gpio_set_pull_mode(LCD_MISO, GPIO_PULLUP_ONLY);
-    gpio_set_pull_mode(LCD_CLK, GPIO_PULLUP_ONLY);
-    gpio_set_pull_mode(LCD_CS, GPIO_PULLUP_ONLY);
-    
+{
     spi_bus_config_t buscfg = {
         .mosi_io_num = LCD_MOSI,
         .miso_io_num = LCD_MISO,
         .sclk_io_num = LCD_CLK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = LCD_H_RES * 64 * sizeof(uint16_t),  // 64 lines instead of full screen (60KB vs 300KB)
+        .max_transfer_sz = LCD_H_RES * 15 * sizeof(uint16_t),
     };
-    
+
     ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
+
     esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num = LCD_DC,
         .cs_gpio_num = LCD_CS,
-        .pclk_hz = 40 * 1000 * 1000,
+        .pclk_hz = 20 * 1000 * 1000,
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
         .spi_mode = 0,
         .trans_queue_depth = 10,
-        .flags = {
-            .dc_low_on_data = 0,
-            .lsb_first = 0,
-        },
     };
 
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(LCD_HOST, &io_config, &lcd_io_handle));
-    
+
     const esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = LCD_RST,
-        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR, 
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,
         .bits_per_pixel = 16,
     };
 
-    // CRITICAL FIX for Waveshare ESP32-C5:
-    // GPIO 2 and 3 are strapping pins - must reset and configure before use
-    gpio_reset_pin(LCD_RST);
-    gpio_reset_pin(LCD_DC);
-    gpio_reset_pin(LCD_CS);
-    
-    gpio_set_direction(LCD_RST, GPIO_MODE_OUTPUT);
-    gpio_set_direction(LCD_DC, GPIO_MODE_OUTPUT);
-    gpio_set_direction(LCD_CS, GPIO_MODE_OUTPUT);
-    
-    // Hardware reset LCD
-    gpio_set_level(LCD_RST, 0);
-    vTaskDelay(pdMS_TO_TICKS(100));
-    gpio_set_level(LCD_RST, 1);
-    vTaskDelay(pdMS_TO_TICKS(120));
-
     ESP_ERROR_CHECK(esp_lcd_new_panel_ili9341(lcd_io_handle, &panel_config, &panel_handle));
-    
-    // Memory barrier and heap validation AFTER
-    asm volatile("fence" ::: "memory");
-        
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
-    
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
-
-    asm volatile("fence" ::: "memory");
-    
-    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));  // Enable color inversion to fix RGB/BGR swap
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
     ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, true, true));
     ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel_handle, true));
-    
-    // Display will be turned on after UI is fully created (prevents boot flash)
-    
+
     vTaskDelay(pdMS_TO_TICKS(50));
 }
 
@@ -2964,9 +2931,8 @@ void app_main(void)
     // For 32-bit color depth, we need to reduce buffer size due to memory constraints
     // 15 lines * 480 pixels * 4 bytes = 28.8 KB per buffer (vs 28.8 KB for 30 lines @ 16-bit)
     const size_t buf_size = LCD_H_RES * 15 * sizeof(lv_color_t);
-    // Allocate display draw buffers strictly from internal DMA-capable memory
-    buf1 = heap_caps_malloc(buf_size, MALLOC_CAP_DMA);
-    buf2 = heap_caps_malloc(buf_size, MALLOC_CAP_DMA);
+    buf1 = spi_bus_dma_memory_alloc(LCD_HOST, buf_size, 0);
+    buf2 = spi_bus_dma_memory_alloc(LCD_HOST, buf_size, 0);
     if (buf1 == NULL || buf2 == NULL) {
         ESP_LOGE(TAG, "Failed to allocate draw buffers!");
         return;
@@ -2982,6 +2948,11 @@ void app_main(void)
     disp_drv.draw_buf = &draw_buf;
     disp_drv.user_data = panel_handle;
     lv_disp_drv_register(&disp_drv);
+
+    const esp_lcd_panel_io_callbacks_t cbs = {
+        .on_color_trans_done = on_color_trans_done,
+    };
+    ESP_ERROR_CHECK(esp_lcd_panel_io_register_event_callbacks(lcd_io_handle, &cbs, &disp_drv));
 
     uint16_t black = 0x0000;
     for (int i = 0; i < LCD_H_RES * 30; i++) {
@@ -4370,6 +4341,15 @@ void app_main(void)
 static uint32_t flush_call_count = 0;
 static uint32_t flush_mutex_wait_count = 0;
 
+static bool IRAM_ATTR on_color_trans_done(esp_lcd_panel_io_handle_t io,
+                                          esp_lcd_panel_io_event_data_t *edata,
+                                          void *user_ctx)
+{
+    lv_disp_drv_t *drv = (lv_disp_drv_t *)user_ctx;
+    lv_disp_flush_ready(drv);
+    return false;
+}
+
 void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_p)
 {
     lvgl_flush_counter++;
@@ -4404,37 +4384,30 @@ void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_
     // Display and SD card share the same SPI bus (SPI2_HOST)
     if (sd_spi_mutex) {
         TickType_t start = xTaskGetTickCount();
-        bool drawn = false;
         int wait_attempt = 0;
-        
-        while (!drawn) {
+
+        while (true) {
             if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                // ✅ Mutex acquired - draw immediately
                 esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
                 xSemaphoreGive(sd_spi_mutex);
-                drawn = true;
-            } else {
-                wait_attempt++;
-                TickType_t elapsed = xTaskGetTickCount() - start;
-                
-                if (elapsed > pdMS_TO_TICKS(5000)) {
-                    ESP_LOGW(TAG, "[FLUSH] SPI mutex stuck >5s (attempt %d), skipping flush",
-                             wait_attempt);
-                    lv_disp_flush_ready(drv);
-                    return;
-                }
-                
-                esp_task_wdt_reset();
-                flush_mutex_wait_count++;
+                return;
             }
+
+            wait_attempt++;
+            TickType_t elapsed = xTaskGetTickCount() - start;
+            if (elapsed > pdMS_TO_TICKS(5000)) {
+                ESP_LOGW(TAG, "[FLUSH] SPI mutex stuck >5s (attempt %d), skipping flush",
+                         wait_attempt);
+                lv_disp_flush_ready(drv);
+                return;
+            }
+
+            esp_task_wdt_reset();
+            flush_mutex_wait_count++;
         }
     } else {
-        // Mutex not initialized yet (early boot) - draw without protection
-        ESP_LOGW(TAG, "[FLUSH] WARNING: sd_spi_mutex not initialized, drawing without protection");
         esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
     }
-    
-    lv_disp_flush_ready(drv);
 }
 
 void lvgl_touch_read_cb(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
