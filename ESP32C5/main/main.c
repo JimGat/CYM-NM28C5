@@ -802,7 +802,10 @@ static uint8_t mitm_own_mac[6] = {0};
 static volatile bool mitm_scan_done = false;
 static lv_obj_t *mitm_status_label = NULL;
 static lv_obj_t *mitm_hosts_label = NULL;
+static lv_obj_t *mitm_stats_label = NULL;
+static lv_obj_t *mitm_file_label = NULL;
 static lv_timer_t *mitm_scan_check_timer = NULL;
+static lv_timer_t *mitm_update_timer = NULL;
 static char mitm_pcap_filepath[64] = "";
 
 // BLE Scan UI state
@@ -4372,14 +4375,6 @@ void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_
         return;
     }
     
-    // During MITM capture, silently drop flushes to avoid SPI bus
-    // contention with the PCAP writer task. The screen was rendered
-    // once before capture started and stays static until user stops.
-    if (mitm_capture_active) {
-        lv_disp_flush_ready(drv);
-        return;
-    }
-
     // CRITICAL: Take SD/SPI mutex before drawing to display
     // Display and SD card share the same SPI bus (SPI2_HOST)
     if (sd_spi_mutex) {
@@ -11092,8 +11087,15 @@ static void mitm_stop(void)
         mitm_packet_queue = NULL;
     }
 
+    if (mitm_update_timer) {
+        lv_timer_del(mitm_update_timer);
+        mitm_update_timer = NULL;
+    }
+
     mitm_status_label = NULL;
     mitm_hosts_label = NULL;
+    mitm_stats_label = NULL;
+    mitm_file_label = NULL;
 
     ESP_LOGI(TAG, "MITM: Stopped. frames=%lu drops=%lu file=%s",
              (unsigned long)mitm_frame_count, (unsigned long)mitm_drop_count,
@@ -11109,14 +11111,37 @@ static void mitm_stop_btn_cb(lv_event_t *e)
     mitm_show_results_screen();
 }
 
+static void mitm_update_stats_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    if (!mitm_stats_label) return;
+
+    char buf[128];
+    int pos = 0;
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "Packets: %lu\n",
+                    (unsigned long)mitm_frame_count);
+
+    if (mitm_tcp_count > 0)
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "TCP: %lu  ", (unsigned long)mitm_tcp_count);
+    if (mitm_udp_count > 0)
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "UDP: %lu  ", (unsigned long)mitm_udp_count);
+    if (mitm_icmp_count > 0)
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "ICMP: %lu  ", (unsigned long)mitm_icmp_count);
+    if (mitm_arp_pkt_count > 0)
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "ARP: %lu  ", (unsigned long)mitm_arp_pkt_count);
+    if (mitm_other_proto_count > 0)
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "Other: %lu", (unsigned long)mitm_other_proto_count);
+
+    if (mitm_drop_count > 0) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "\nDropped: %lu", (unsigned long)mitm_drop_count);
+    }
+
+    lv_label_set_text(mitm_stats_label, buf);
+}
+
 static void mitm_show_active_screen(void)
 {
     create_function_page_base("MITM Capture");
-
-    // Build static UI FIRST and render it before any SD operations.
-    // This clears the old scanning screen immediately and avoids
-    // recursive lv_timer_handler() (this function is called from
-    // mitm_scan_check_timer_cb which itself runs inside lv_timer_handler).
 
     lv_obj_t *content = lv_obj_create(function_page);
     lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30);
@@ -11145,16 +11170,16 @@ static void mitm_show_active_screen(void)
     lv_obj_set_style_text_color(mitm_hosts_label, COLOR_MATERIAL_TEAL, 0);
     lv_obj_set_style_text_font(mitm_hosts_label, &lv_font_montserrat_14, 0);
 
-    lv_obj_t *file_label = lv_label_create(content);
-    lv_label_set_text(file_label, "Preparing SD card...");
-    lv_obj_set_style_text_color(file_label, lv_color_make(150, 150, 150), 0);
-    lv_obj_set_style_text_font(file_label, &lv_font_montserrat_12, 0);
+    mitm_file_label = lv_label_create(content);
+    lv_label_set_text(mitm_file_label, "Preparing SD card...");
+    lv_obj_set_style_text_color(mitm_file_label, lv_color_make(150, 150, 150), 0);
+    lv_obj_set_style_text_font(mitm_file_label, &lv_font_montserrat_12, 0);
 
-    lv_obj_t *hint_label = lv_label_create(content);
-    lv_label_set_text(hint_label, "Screen paused during capture\nPress STOP to see results");
-    lv_obj_set_style_text_color(hint_label, lv_color_make(120, 120, 120), 0);
-    lv_obj_set_style_text_font(hint_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_align(hint_label, LV_TEXT_ALIGN_CENTER, 0);
+    mitm_stats_label = lv_label_create(content);
+    lv_label_set_text(mitm_stats_label, "Packets: 0");
+    lv_obj_set_style_text_color(mitm_stats_label, lv_color_make(200, 200, 200), 0);
+    lv_obj_set_style_text_font(mitm_stats_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_align(mitm_stats_label, LV_TEXT_ALIGN_CENTER, 0);
 
     lv_obj_t *stop_btn = lv_btn_create(content);
     lv_obj_set_size(stop_btn, 160, 44);
@@ -11178,7 +11203,7 @@ static void mitm_show_active_screen(void)
         ESP_LOGE(TAG, "MITM: SD mount failed");
         lv_label_set_text(mitm_status_label, "SD card mount failed!");
         lv_obj_set_style_text_color(mitm_status_label, COLOR_MATERIAL_RED, 0);
-        lv_label_set_text(file_label, "");
+        lv_label_set_text(mitm_file_label, "");
         lv_refr_now(NULL);
         return;
     }
@@ -11217,14 +11242,14 @@ static void mitm_show_active_screen(void)
         ESP_LOGE(TAG, "MITM: Failed to open %s", mitm_pcap_filepath);
         lv_label_set_text(mitm_status_label, "Failed to create PCAP file!");
         lv_obj_set_style_text_color(mitm_status_label, COLOR_MATERIAL_RED, 0);
-        lv_label_set_text(file_label, "");
+        lv_label_set_text(mitm_file_label, "");
         lv_refr_now(NULL);
         return;
     }
 
     char file_buf[80];
     snprintf(file_buf, sizeof(file_buf), "Writing to: mitm_%d.pcap", file_num);
-    lv_label_set_text(file_label, file_buf);
+    lv_label_set_text(mitm_file_label, file_buf);
 
     // --- Start capture (screen already drawn) ---
 
@@ -11265,6 +11290,8 @@ static void mitm_show_active_screen(void)
     } else {
         xTaskCreate(mitm_pcap_writer_task, "mitm_wr", 8192, NULL, 5, &mitm_writer_task_handle);
     }
+
+    mitm_update_timer = lv_timer_create(mitm_update_stats_cb, 1000, NULL);
 
     ESP_LOGI(TAG, "MITM: Capture active, %d hosts, file=%s", mitm_host_count, mitm_pcap_filepath);
 }
