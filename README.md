@@ -83,20 +83,22 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 <!-- Add your screenshots here -->
 
 <p align="center">
-![screen_1](https://github.com/user-attachments/assets/bc67e3cc-0c2f-4787-9857-0a6db18a35b5)
+  <img width="480" height="271" alt="image" src="https://github.com/user-attachments/assets/0200719c-85b7-4977-9a38-1ecb4defad9a" />
+
   <br/>
   <em>Main Menu</em>
 </p>
 
 <p align="center">
- ![screen_3](https://github.com/user-attachments/assets/8911998c-fd1d-4f90-8f0f-47af2f56b629)
+<img width="474" height="280" alt="image" src="https://github.com/user-attachments/assets/9df03b0c-f25b-4cb1-a049-0591c389a645" />
+
   <br/>
   <em>Selected Network Attack Panel</em>
 </p>
 
 
 <p align="center">
-![screen_2](https://github.com/user-attachments/assets/8a711042-17b1-4897-b59f-3ef45deac38c)
+<img width="486" height="326" alt="image" src="https://github.com/user-attachments/assets/7e815b7b-0fa9-475e-91b2-4d14344a7f86" />
   <br/>
   <em>Global attacks</em>
 </p>
@@ -113,13 +115,6 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 
   <br/>
   <em>Kismet-style network observer & Karma attack</em>
-</p>
-
-<p align="center">
- ![screen_6](https://github.com/user-attachments/assets/03cd1676-0ef1-4f67-a7ab-91e0343fe15a)
-
-  <br/>
-  <em>Wardrive</em>
 </p>
 
 
