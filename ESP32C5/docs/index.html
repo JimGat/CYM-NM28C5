@@ -1,0 +1,470 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>pancake Web Flasher</title>
+    <meta name="description" content="Browser flasher and serial monitor for pancake ESP32-C5 firmware.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
+    <style>
+      :root { --bg:#0a0f1c; --card:#10182a; --accent:#40f0ff; --accent2:#ff7bd4; --text:#e8f1ff; --muted:#9db2d4; --border:rgba(255,255,255,.08); --error:#ff6b6b; --ok:#5af29e; }
+      * { box-sizing:border-box; }
+      body { margin:0; min-height:100vh; padding:32px 18px 64px; font-family:"Space Grotesk",system-ui,sans-serif; color:var(--text); background:radial-gradient(circle at 20% 20%, rgba(64,240,255,.06), transparent 30%), radial-gradient(circle at 80% 0%, rgba(255,123,212,.08), transparent 30%), var(--bg); }
+      a { color:inherit; }
+      code, .mono, .log { font-family:Consolas,"Liberation Mono",monospace; }
+      .container { max-width:1200px; margin:0 auto; display:grid; gap:18px; }
+      header, .card { border:1px solid var(--border); box-shadow:0 12px 36px rgba(0,0,0,.35); }
+      header { border-radius:20px; padding:24px 24px 28px; background:linear-gradient(135deg, rgba(64,240,255,.08), rgba(255,123,212,.05)); box-shadow:0 20px 60px rgba(0,0,0,.45); }
+      .eyebrow, .pill { display:inline-flex; align-items:center; gap:6px; border:1px solid var(--border); color:var(--muted); background:rgba(255,255,255,.04); }
+      .eyebrow { padding:6px 12px; border-radius:999px; font-size:12px; letter-spacing:.06em; text-transform:uppercase; }
+      h1 { margin:12px 0 10px; font-size:clamp(32px, 4vw, 44px); letter-spacing:-.02em; }
+      p { margin:0; color:var(--muted); line-height:1.55; }
+      .hero-meta, .status-line, .actions { display:flex; flex-wrap:wrap; gap:10px; }
+      .hero-meta { margin-top:14px; }
+      .pill { padding:6px 10px; border-radius:10px; font-size:13px; background:rgba(255,255,255,.03); }
+      .pill strong { color:var(--text); }
+      .split { display:grid; grid-template-columns:1.3fr 1fr; gap:14px; }
+      .stack { display:grid; gap:14px; align-content:start; }
+      .card { border-radius:16px; padding:18px; background:var(--card); }
+      .card h2 { margin:0 0 10px; font-size:18px; }
+      .controls { display:flex; flex-direction:column; gap:14px; }
+      button, .button-link { display:inline-flex; align-items:center; justify-content:center; min-height:44px; padding:12px 18px; border-radius:12px; font-size:14px; font-weight:600; text-decoration:none; transition:transform .08s ease, opacity .2s; }
+      button { border:none; cursor:pointer; color:#0a0f1c; background:linear-gradient(135deg, var(--accent), #56a0ff); box-shadow:0 12px 32px rgba(64,240,255,.3); }
+      button:hover:not(:disabled), .button-link:hover { transform:translateY(-1px); }
+      button:disabled { opacity:.6; cursor:not-allowed; box-shadow:none; }
+      .ghost, .button-link { color:var(--text); background:rgba(255,255,255,.04); box-shadow:inset 0 0 0 1px var(--border); }
+      .check, select, .text-input { border:1px solid rgba(255,255,255,.14); background:rgba(255,255,255,.04); color:var(--text); border-radius:12px; }
+      .check { display:inline-flex; align-items:center; gap:10px; padding:10px 12px; font-size:13px; font-weight:600; user-select:none; cursor:pointer; }
+      .check input { width:16px; height:16px; accent-color:var(--accent); }
+      select, .text-input { padding:10px 12px; font-size:13px; }
+      .text-input { flex:1; min-width:220px; }
+      select:focus, .text-input:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 2px rgba(64,240,255,.2); }
+      .hint, .steps li, .link-grid a { border:1px solid rgba(255,255,255,.1); background:rgba(255,255,255,.03); }
+      .hint { padding:10px 12px; border-radius:12px; font-size:12.5px; line-height:1.45; }
+      .hint strong { color:var(--text); }
+      .log { min-height:140px; max-height:240px; overflow-y:auto; padding:12px; border-radius:12px; border:1px solid var(--border); background:rgba(0,0,0,.35); color:#b8c7e6; font-size:13px; line-height:1.45; white-space:pre-wrap; word-break:break-word; }
+      .progress { width:100%; height:10px; overflow:hidden; border-radius:999px; border:1px solid var(--border); background:rgba(255,255,255,.05); }
+      .progress span { display:block; width:0%; height:100%; background:linear-gradient(90deg, var(--accent), var(--accent2)); transition:width .12s ease; }
+      .steps { display:grid; gap:8px; margin:12px 0 0; padding:0; }
+      .steps li { list-style:none; padding:10px 12px; border-radius:12px; line-height:1.5; }
+      .badge { display:inline-block; padding:2px 10px; border-radius:999px; border:1px solid rgba(90,242,158,.4); background:rgba(90,242,158,.12); color:var(--ok); font-size:12px; }
+      .link-grid { display:grid; gap:10px; margin-top:12px; }
+      .link-grid a { display:flex; justify-content:space-between; gap:12px; min-height:46px; padding:12px 14px; border-radius:12px; text-decoration:none; }
+      .link-grid a span { color:var(--muted); font-size:13px; }
+      .error { color:var(--error); }
+      footer { margin-top:18px; color:var(--muted); font-size:13px; text-align:center; }
+      footer a { text-decoration:none; border-bottom:1px solid transparent; }
+      footer a:hover { border-bottom-color:currentColor; }
+      @media (max-width:980px) { body { padding:20px 14px 60px; } .split { grid-template-columns:1fr; } }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <div class="eyebrow">pancake  ESP32-C5</div>
+        <h1>Flash pancake straight from your browser</h1>
+        <p>Web Serial flasher powered by esptool-js. Flash the current release assets from GitHub Pages or use the built-in UART monitor as a separate mode.</p>
+        <div class="hero-meta">
+          <span class="pill"><strong>Chip</strong> ESP32-C5</span>
+          <span class="pill"><strong>Offsets</strong> 0x2000 / 0x8000 / 0x10000</span>
+          <span class="pill" id="versionPill"><strong>Version</strong> loading</span>
+        </div>
+      </header>
+
+      <div class="split">
+        <div class="stack">
+          <div class="card">
+            <h2>Control</h2>
+            <div class="controls">
+              <div class="actions">
+                <button id="connectBtn">Connect</button>
+                <button id="flashBtn" class="ghost" disabled>Flash</button>
+                <label class="check"><input id="eraseAll" type="checkbox">Erase</label>
+                <select id="baudSelect" aria-label="Baud rate">
+                  <option value="460800">460800 baud</option>
+                  <option value="921600">921600 baud</option>
+                  <option value="115200">115200 baud</option>
+                </select>
+              </div>
+              <div class="status-line">
+                <span id="statusText">Ready to connect.</span>
+                <span id="chipText" class="pill" style="display:none;"></span>
+                <span id="manifestText" class="pill" style="display:none;"></span>
+              </div>
+              <div class="hint"><strong>Erase</strong> does a full flash erase before writing the images from <code>manifest.json</code>. Use it only when you need a clean recovery from bad partitions, bootloops or stale config.</div>
+              <div class="progress"><span id="progressBar"></span></div>
+              <div class="log" id="log"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2>Serial monitor</h2>
+            <p>Independent UART terminal mode for reading and writing serial data directly from the browser.</p>
+            <div class="controls" style="margin-top:12px;">
+              <div class="actions">
+                <button id="monitorBtn" class="ghost">Monitor</button>
+                <select id="monitorBaudSelect" aria-label="Monitor baud rate">
+                  <option value="115200">115200 baud</option>
+                  <option value="460800">460800 baud</option>
+                  <option value="921600">921600 baud</option>
+                </select>
+                <button id="clearMonitorBtn" class="ghost">Clear</button>
+              </div>
+              <div class="status-line"><span id="monitorStatusText">Monitor disconnected.</span></div>
+              <div class="log" id="monitorLog"></div>
+              <div class="actions">
+                <input id="monitorInput" class="text-input" type="text" placeholder="Type text to send over UART">
+                <button id="monitorSendBtn" class="ghost" disabled>Send</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="stack">
+          <div class="card">
+            <h2>Release info</h2>
+            <p id="releaseInfo">Loading manifest.</p>
+            <ul class="steps">
+              <li><strong>ROM mode:</strong> hold BOOT, plug the board in, then release.</li>
+              <li><strong>Close serial hogs:</strong> quit qFlipper, terminal monitors or anything holding the COM port.</li>
+              <li><strong>Stuck?</strong> Unplug, re-run Connect, then plug again while holding BOOT.</li>
+              <li><strong>Reset:</strong> after flashing, press RESET if the board does not auto-reboot.</li>
+            </ul>
+          </div>
+
+          <div class="card">
+            <h2>Direct downloads</h2>
+            <p>Same files as the Pages build and Release assets.</p>
+            <div class="link-grid">
+              <a href="firmware/pancake-esp32c5-full.bin"><code>pancake-esp32c5-full.bin</code><span>Full image</span></a>
+              <a href="firmware/pancake-esp32c5.bin"><code>pancake-esp32c5.bin</code><span>App binary</span></a>
+              <a href="firmware/bootloader.bin"><code>bootloader.bin</code><span>Bootloader</span></a>
+              <a href="firmware/partition-table.bin"><code>partition-table.bin</code><span>Partition table</span></a>
+              <a href="firmware/flash_board.py"><code>flash_board.py</code><span>Python flasher</span></a>
+              <a href="manifest.json"><code>manifest.json</code><span>Web manifest</span></a>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2>Need offline?</h2>
+            <p>Download the binaries and <code>flash_board.py</code>, keep them in one folder, then use the Python flasher locally if your browser blocks Web Serial.</p>
+          </div>
+
+          <div class="card">
+            <h2>Browser support</h2>
+            <p>Chrome or Edge on desktop over HTTPS. Web Serial is required for both flashing and monitor mode.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <footer>
+      Product of <a id="repoLink" href="https://github.com/C5Lab/pancake">C5Lab/pancake</a> -
+      <span id="pageVersion" class="mono">Web flasher v1.1.0</span>.
+    </footer>
+
+    <script type="module">
+      import { ESPLoader, Transport } from "https://unpkg.com/esptool-js/bundle.js";
+
+      const ui = {
+        status: document.getElementById("statusText"),
+        chip: document.getElementById("chipText"),
+        manifest: document.getElementById("manifestText"),
+        version: document.getElementById("versionPill"),
+        release: document.getElementById("releaseInfo"),
+        log: document.getElementById("log"),
+        progress: document.getElementById("progressBar"),
+        connectBtn: document.getElementById("connectBtn"),
+        flashBtn: document.getElementById("flashBtn"),
+        eraseAll: document.getElementById("eraseAll"),
+        baud: document.getElementById("baudSelect"),
+        repoLink: document.getElementById("repoLink"),
+        pageVersion: document.getElementById("pageVersion"),
+        monitorBtn: document.getElementById("monitorBtn"),
+        monitorBaud: document.getElementById("monitorBaudSelect"),
+        clearMonitorBtn: document.getElementById("clearMonitorBtn"),
+        monitorStatus: document.getElementById("monitorStatusText"),
+        monitorLog: document.getElementById("monitorLog"),
+        monitorInput: document.getElementById("monitorInput"),
+        monitorSendBtn: document.getElementById("monitorSendBtn"),
+      };
+
+      const state = { manifest:null, port:null, onDisconnect:null, transport:null, esploader:null, chip:null, connected:false, flashing:false, monitorPort:null, monitorReader:null, monitorWriter:null, monitorPipe:null, monitorDisconnect:null, monitorConnected:false };
+      const PAGE_VERSION = "1.1.0";
+      const CONNECT_TIMEOUT_MS = 20000;
+      const CONNECT_RETRY_DELAY_MS = 500;
+      const monitorEncoder = new TextEncoder();
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+      const repoInfo = () => {
+        const host = window.location.hostname || "";
+        const parts = window.location.pathname.split("/").filter(Boolean);
+        if (host.endsWith(".github.io") && parts.length) return { owner: host.replace(/\.github\.io$/, ""), repo: parts[0] };
+        return { owner: "C5Lab", repo: "pancake" };
+      };
+
+      const setRepoLink = () => {
+        const repo = repoInfo();
+        ui.repoLink.href = `https://github.com/${repo.owner}/${repo.repo}`;
+        ui.repoLink.textContent = `${repo.owner}/${repo.repo}`;
+      };
+
+      const log = (msg) => {
+        const time = new Date().toLocaleTimeString();
+        for (const line of (Array.isArray(msg) ? msg : [msg])) ui.log.textContent += `[${time}] ${line}\n`;
+        ui.log.scrollTop = ui.log.scrollHeight;
+      };
+
+      const setStatus = (text, level = "info") => {
+        ui.status.textContent = text;
+        ui.status.classList.toggle("error", level === "error");
+      };
+
+      const setMonitorStatus = (text, level = "info") => {
+        ui.monitorStatus.textContent = text;
+        ui.monitorStatus.classList.toggle("error", level === "error");
+      };
+
+      const monitorLine = (msg) => {
+        const time = new Date().toLocaleTimeString();
+        ui.monitorLog.textContent += `[${time}] ${msg}\n`;
+        ui.monitorLog.scrollTop = ui.monitorLog.scrollHeight;
+      };
+
+      const bufferToBinaryString = (buffer) => {
+        const bytes = new Uint8Array(buffer);
+        let result = "";
+        for (let i = 0; i < bytes.length; i += 0x8000) result += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+        return result;
+      };
+
+      const normalizeManifest = (raw) => {
+        const parts = Array.isArray(raw?.parts) && raw.parts.length ? raw.parts : (raw?.builds?.[0]?.parts || []);
+        return { name: raw?.name || "pancake ESP32-C5", version: raw?.version || "n/a", build: raw?.build || raw?.version || "n/a", chipFamily: raw?.chipFamily || raw?.builds?.[0]?.chipFamily || "ESP32-C5", parts };
+      };
+
+      const loadManifest = async () => {
+        const url = new URL("manifest.json", window.location.href).toString();
+        const res = await fetch(url, { cache: "no-store" });
+        if (!res.ok) throw new Error(`Manifest fetch failed: ${res.status} ${res.statusText}`);
+        state.manifest = normalizeManifest(await res.json());
+        if (!state.manifest.parts.length) throw new Error("Manifest has no flash parts.");
+        ui.manifest.style.display = "inline-flex";
+        ui.manifest.textContent = `${state.manifest.parts.length} image(s)`;
+        ui.version.innerHTML = `<strong>Version</strong> ${state.manifest.version}`;
+        ui.release.innerHTML = `<span class="badge">Manifest loaded</span> ${state.manifest.name} - ${state.manifest.version} - ${state.manifest.parts.length} file(s) - chip ${state.manifest.chipFamily}`;
+        ui.pageVersion.textContent = `Web flasher v${PAGE_VERSION} - build ${state.manifest.build}`;
+        document.title = `${state.manifest.name} ${state.manifest.version}`;
+        setStatus("Manifest loaded.");
+        log(`Manifest: ${url}`);
+      };
+
+      const ensureSupport = () => {
+        if ("serial" in navigator) return;
+        setStatus("Web Serial not available. Use Chrome or Edge over HTTPS.", "error");
+        throw new Error("Web Serial unavailable");
+      };
+
+      const connect = async () => {
+        ensureSupport();
+        if (state.connected) return disconnect();
+        if (state.monitorConnected) await disconnectMonitor();
+        ui.connectBtn.disabled = true;
+        ui.flashBtn.disabled = true;
+        setStatus("Requesting serial port");
+        log("Requesting port access");
+        try {
+          state.port = await navigator.serial.requestPort({});
+          state.onDisconnect = () => { disconnect().catch(() => {}); setStatus("Device disconnected. Reconnect to flash.", "error"); };
+          try { state.port.addEventListener("disconnect", state.onDisconnect); } catch {}
+          state.transport = new Transport(state.port, true);
+          const loaderOptions = { transport: state.transport, baudrate: parseInt(ui.baud.value, 10), terminal: { clean() {}, writeLine: log, write: log }, debugLogging: false };
+          setStatus(`Syncing with chip (hold BOOT + RESET). Timeout ${Math.round(CONNECT_TIMEOUT_MS / 1000)}s`);
+          log("Syncing with chip");
+          const start = Date.now();
+          let lastErr = null;
+          while (Date.now() - start < CONNECT_TIMEOUT_MS) {
+            try {
+              state.esploader = new ESPLoader(loaderOptions);
+              state.chip = await state.esploader.main();
+              lastErr = null;
+              break;
+            } catch (err) {
+              lastErr = err;
+              const remaining = Math.ceil(Math.max(0, CONNECT_TIMEOUT_MS - (Date.now() - start)) / 1000);
+              setStatus(`Failed to connect. Hold BOOT + tap RESET, retrying... (${remaining}s)`);
+              log(`Error: ${err?.message || err}`);
+              await sleep(CONNECT_RETRY_DELAY_MS);
+            }
+          }
+          if (lastErr) throw lastErr;
+          state.connected = true;
+          ui.chip.style.display = "inline-flex";
+          ui.chip.textContent = `Chip ${state.chip}`;
+          ui.connectBtn.textContent = "Disconnect";
+          ui.flashBtn.disabled = false;
+          setStatus(`Connected to ${state.chip}. Ready to flash.`);
+          log(`Connected: ${state.chip}`);
+        } catch (err) {
+          setStatus(err.message || "Connection failed", "error");
+          log(`Error: ${err.message || err}`);
+          await disconnect();
+          throw err;
+        } finally {
+          ui.connectBtn.disabled = false;
+        }
+      };
+
+      const fetchFiles = async () => {
+        if (!state.manifest) await loadManifest();
+        const files = [];
+        for (const part of state.manifest.parts) {
+          const url = new URL(part.path, window.location.href).toString();
+          setStatus(`Downloading ${part.path}...`);
+          log(`Fetching ${url} @ 0x${part.offset.toString(16)}`);
+          const res = await fetch(url, { cache: "no-store", redirect: "follow" });
+          if (!res.ok) throw new Error(`Fetch failed for ${part.path}: ${res.status} ${res.statusText}`);
+          files.push({ data: bufferToBinaryString(await res.arrayBuffer()), address: part.offset });
+        }
+        return files;
+      };
+
+      const flash = async () => {
+        ensureSupport();
+        if (!state.esploader) await connect();
+        ui.flashBtn.disabled = true;
+        ui.connectBtn.disabled = true;
+        state.flashing = true;
+        ui.progress.style.width = "0%";
+        try {
+          const files = await fetchFiles();
+          setStatus("Uploading stub and flashing");
+          log("Preparing flash writes");
+          await state.esploader.writeFlash({
+            fileArray: files,
+            flashSize: "8MB",
+            eraseAll: !!ui.eraseAll.checked,
+            compress: true,
+            reportProgress: (fileIndex, written, total) => {
+              const pct = Math.min(100, Math.round((written / total) * 100));
+              ui.progress.style.width = `${pct}%`;
+              setStatus(`Flashing ${fileIndex + 1}/${files.length} - ${pct}%`);
+            },
+            calculateMD5Hash: (image) => CryptoJS.MD5(CryptoJS.enc.Latin1.parse(image)),
+          });
+          await state.esploader.after();
+          ui.progress.style.width = "100%";
+          setStatus("Flash complete. Press RESET if the board does not reboot.");
+          log("Flash complete.");
+        } catch (err) {
+          setStatus(err.message || "Flash failed", "error");
+          log(`Error: ${err.message || err}`);
+        } finally {
+          state.flashing = false;
+          ui.flashBtn.disabled = !state.connected;
+          ui.connectBtn.disabled = false;
+        }
+      };
+
+      const disconnect = async () => {
+        if (state.port && state.onDisconnect) try { state.port.removeEventListener("disconnect", state.onDisconnect); } catch {}
+        try {
+          if (state.transport) await state.transport.disconnect();
+          else if (state.port?.close) await state.port.close();
+        } catch {}
+        state.port = null; state.onDisconnect = null; state.transport = null; state.esploader = null; state.chip = null; state.connected = false;
+        ui.chip.style.display = "none";
+        ui.flashBtn.disabled = true;
+        ui.connectBtn.textContent = "Connect";
+        setStatus("Disconnected.");
+      };
+
+      const disconnectMonitor = async () => {
+        if (state.monitorPort && state.monitorDisconnect) try { state.monitorPort.removeEventListener("disconnect", state.monitorDisconnect); } catch {}
+        try { if (state.monitorReader) await state.monitorReader.cancel(); } catch {}
+        try { if (state.monitorReader) state.monitorReader.releaseLock(); } catch {}
+        try { if (state.monitorWriter) state.monitorWriter.releaseLock(); } catch {}
+        try { if (state.monitorPipe) await state.monitorPipe; } catch {}
+        try { if (state.monitorPort) await state.monitorPort.close(); } catch {}
+        state.monitorPort = null; state.monitorReader = null; state.monitorWriter = null; state.monitorPipe = null; state.monitorDisconnect = null; state.monitorConnected = false;
+        ui.monitorBtn.textContent = "Monitor";
+        ui.monitorSendBtn.disabled = true;
+        setMonitorStatus("Monitor disconnected.");
+      };
+
+      const connectMonitor = async () => {
+        ensureSupport();
+        if (state.monitorConnected) return disconnectMonitor();
+        if (state.flashing) throw new Error("Cannot start monitor while flashing is in progress.");
+        if (state.connected) await disconnect();
+        ui.monitorBtn.disabled = true;
+        setMonitorStatus("Requesting serial port...");
+        try {
+          state.monitorPort = await navigator.serial.requestPort({});
+          state.monitorDisconnect = () => { disconnectMonitor().catch(() => {}); setMonitorStatus("Monitor disconnected by device.", "error"); };
+          try { state.monitorPort.addEventListener("disconnect", state.monitorDisconnect); } catch {}
+          await state.monitorPort.open({ baudRate: parseInt(ui.monitorBaud.value, 10) || 115200 });
+          const decoder = new TextDecoderStream();
+          state.monitorPipe = state.monitorPort.readable.pipeTo(decoder.writable).catch(() => {});
+          state.monitorReader = decoder.readable.getReader();
+          state.monitorWriter = state.monitorPort.writable.getWriter();
+          state.monitorConnected = true;
+          ui.monitorBtn.textContent = "Stop monitor";
+          ui.monitorSendBtn.disabled = false;
+          setMonitorStatus(`Monitor connected @ ${ui.monitorBaud.value} baud.`);
+          monitorLine(`Monitor connected @ ${ui.monitorBaud.value} baud.`);
+          (async () => {
+            try {
+              while (state.monitorConnected && state.monitorReader) {
+                const { value, done } = await state.monitorReader.read();
+                if (done) break;
+                if (value) { ui.monitorLog.textContent += value; ui.monitorLog.scrollTop = ui.monitorLog.scrollHeight; }
+              }
+            } catch (err) {
+              monitorLine(`Read error: ${err?.message || err}`);
+            }
+          })();
+        } catch (err) {
+          await disconnectMonitor();
+          setMonitorStatus(err.message || "Monitor connection failed.", "error");
+          monitorLine(`Error: ${err?.message || err}`);
+          throw err;
+        } finally {
+          ui.monitorBtn.disabled = false;
+        }
+      };
+
+      const sendMonitor = async () => {
+        if (!state.monitorConnected || !state.monitorWriter) return;
+        const text = ui.monitorInput.value;
+        if (!text) return;
+        await state.monitorWriter.write(monitorEncoder.encode(`${text}\r\n`));
+        monitorLine(`> ${text}`);
+        ui.monitorInput.value = "";
+        ui.monitorInput.focus();
+      };
+
+      ui.connectBtn.addEventListener("click", () => connect().catch(() => {}));
+      ui.flashBtn.addEventListener("click", () => flash().catch(() => {}));
+      ui.monitorBtn.addEventListener("click", () => connectMonitor().catch(() => {}));
+      ui.clearMonitorBtn.addEventListener("click", () => { ui.monitorLog.textContent = ""; });
+      ui.monitorSendBtn.addEventListener("click", () => sendMonitor().catch((err) => { setMonitorStatus(err.message || "Send failed.", "error"); monitorLine(`Error: ${err?.message || err}`); }));
+      ui.monitorInput.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter") return;
+        event.preventDefault();
+        sendMonitor().catch((err) => { setMonitorStatus(err.message || "Send failed.", "error"); monitorLine(`Error: ${err?.message || err}`); });
+      });
+
+      setRepoLink();
+      loadManifest().catch((err) => {
+        ui.release.textContent = "Manifest not available yet.";
+        ui.version.innerHTML = "<strong>Version</strong> unavailable";
+        ui.pageVersion.textContent = `Web flasher v${PAGE_VERSION} - manifest unavailable`;
+        setStatus(err.message || "Manifest load failed", "error");
+      });
+    </script>
+  </body>
+</html>

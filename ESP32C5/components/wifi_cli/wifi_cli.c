@@ -104,7 +104,7 @@ static esp_err_t init_led(void) {
     };
     
     led_strip_rmt_config_t rmt_cfg = {
-        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .clk_src = LED_STRIP_RMT_CLK_SRC_DEFAULT,
         .resolution_hz = RMT_RES_HZ,
         .flags.with_dma = false,
     };
