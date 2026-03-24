@@ -562,6 +562,7 @@ static int *sniffer_sorted_indices = NULL;  // PSRAM allocated
 static int sniffer_sorted_count = 0;        // How many entries in sorted array
 static bool sniffer_initial_sort_done = false;
 static uint32_t sniffer_start_time = 0;     // Time when sniffer started (for delayed sorting)
+static uint32_t sniffer_last_sort_time = 0;  // Time of last RSSI re-sort
 
 // Sniffer task state
 static TaskHandle_t sniffer_task_handle = NULL;
@@ -5553,6 +5554,7 @@ static void sniffer_refresh_ap_list(void) {
         }
         sniffer_sorted_count = max_display;
         sniffer_initial_sort_done = true;
+        sniffer_last_sort_time = now;
         ESP_LOGI(TAG, "Sorted %d networks by RSSI after 10s scan", max_display);
     } else if (!sniffer_initial_sort_done && ap_count > 0) {
         // Before 10s: just show networks in discovery order (unsorted)
@@ -5560,8 +5562,25 @@ static void sniffer_refresh_ap_list(void) {
             sniffer_sorted_indices[i] = i;
         }
         sniffer_sorted_count = max_display;
+    } else if (sniffer_initial_sort_done && (now - sniffer_last_sort_time > 60000)) {
+        // Re-sort all networks by RSSI every 60 seconds
+        for (int i = sniffer_sorted_count; i < max_display; i++) {
+            sniffer_sorted_indices[i] = i;
+        }
+        sniffer_sorted_count = max_display;
+        for (int i = 0; i < sniffer_sorted_count - 1; i++) {
+            for (int j = i + 1; j < sniffer_sorted_count; j++) {
+                if (aps[sniffer_sorted_indices[j]].rssi > aps[sniffer_sorted_indices[i]].rssi) {
+                    int tmp = sniffer_sorted_indices[i];
+                    sniffer_sorted_indices[i] = sniffer_sorted_indices[j];
+                    sniffer_sorted_indices[j] = tmp;
+                }
+            }
+        }
+        sniffer_last_sort_time = now;
+        ESP_LOGI(TAG, "Re-sorted %d networks by RSSI", sniffer_sorted_count);
     } else if (ap_count > sniffer_sorted_count) {
-        // After initial sort: new networks append to end (no re-sort)
+        // Between re-sorts: new networks append to end
         for (int i = sniffer_sorted_count; i < max_display; i++) {
             sniffer_sorted_indices[i] = i;
         }
@@ -5639,6 +5658,9 @@ static void sniffer_refresh_observe_view(void) {
     
     const sniffer_ap_t *ap = &aps[sniffer_observe_ap_index];
     
+    // Save scroll position before refresh
+    lv_coord_t scroll_y = lv_obj_get_scroll_y(sniffer_observe_client_list);
+
     // Clear and rebuild client list
     lv_obj_clean(sniffer_observe_client_list);
     
@@ -5683,6 +5705,9 @@ static void sniffer_refresh_observe_view(void) {
             lv_obj_add_event_cb(client_row, sniffer_client_click_cb, LV_EVENT_CLICKED, (void*)(intptr_t)user_data);
         }
     }
+
+    // Restore scroll position after refresh
+    lv_obj_scroll_to_y(sniffer_observe_client_list, scroll_y, LV_ANIM_OFF);
 }
 
 // Handle AP click - enter observation mode
