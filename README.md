@@ -2,23 +2,10 @@
  
 </p>
 
-<h1 align="center">JANOS on Pancake</h1>
-
-<img width="1200" height="848" alt="image" src="https://github.com/user-attachments/assets/85c42338-14af-4657-bb06-fee8f34061de" />
-
-
-
-
-https://github.com/user-attachments/assets/301628c6-4c11-4e10-a403-cb5d9c381999
-
-
-
-https://github.com/user-attachments/assets/6bf33578-6061-4c2f-9e6e-b6fd76367569
-
-
+<h1 align="center">JANOS on NM-CYD-C5</h1>
 
 <p align="center">
-  <b>WiFi 6 security toolkit & wardriving device built on ESP32-C5</b>
+  <b>WiFi 6 security toolkit & wardriving device built on NerdMiner ESP32-C5 CYD</b>
 </p>
 
 <p align="center">
@@ -34,7 +21,7 @@ https://github.com/user-attachments/assets/6bf33578-6061-4c2f-9e6e-b6fd76367569
 
 ## Introduction
 
-**Pancake** is a portable, touchscreen-driven WiFi security toolkit running on the **Waveshare ESP32-C5-WIFI6-KIT**. Inspired by Pwnagotchi-style devices, it combines a rich set of offensive and defensive WiFi tools with BLE scanning, GPS wardriving, and a beautiful Material-style dark UI — all packed into a handheld form factor with a 3.5" capacitive touch display.
+**Cheap Yellow Monster** is a portable, touchscreen-driven WiFi security toolkit running on the **NM-CYD-C5 ESP32-C5-WIFI6-KIT**. Inspired by Pwnagotchi-style devices, it combines a rich set of offensive and defensive WiFi tools with BLE scanning, GPS wardriving, and a beautiful Material-style dark UI — all packed into a handheld form factor with a 2.8" resistive touch display.
 
 Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware leverages the ESP32-C5's RISC-V core and WiFi 6 capabilities for modern wireless security research and education.
 
