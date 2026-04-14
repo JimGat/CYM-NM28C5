@@ -341,21 +341,21 @@ idf.py -p /dev/ttyACM0 flash monitor
 <!-- Add your hardware photos here -->
 
 <p align="center">
- <img width="737" height="470" alt="image" src="https://github.com/user-attachments/assets/3e6a371b-d864-4081-92d1-ef023e0059fe" />
+
 
   <br/>
   <em>Device — Front View</em>
 </p>
 
 <p align="center">
- <img width="734" height="424" alt="image" src="https://github.com/user-attachments/assets/d4498e30-c57c-4880-84b1-27252bd06779" />
+
 
   <br/>
   <em>Device — Back / Wiring</em>
 </p>
 
 <p align="center">
-<img width="796" height="840" alt="image" src="https://github.com/user-attachments/assets/4a31ff44-e238-4f86-bf9c-5b0079c676f9" />
+
 
   <br/>
   <em>Home-made waveshare build</em>
