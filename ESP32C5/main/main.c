@@ -3,10 +3,8 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
-#include "esp_lcd_ili9341.h"
-#include "ft6336.h"
+#include "xpt2046.h"
 #include "driver/spi_master.h"
-#include "driver/i2c.h"
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -123,30 +121,29 @@ static int bt_device_count = 0;
 
 // ============================================================================
 
-// Pin configuration
-#define LCD_MOSI 24
-#define LCD_MISO 4
-#define LCD_CLK  23
-#define LCD_CS   5  // Changed from 6 - GPIO6 is now used for battery ADC
-#define LCD_DC   3
-#define LCD_RST  2  
+// Pin configuration — NM-CYD-C5 (RockBase-iot/NM-CYD-C5, User_Setup-NM-CYD-C5.h)
+#define LCD_MOSI 7
+#define LCD_MISO 2
+#define LCD_CLK  6
+#define LCD_CS   23
+#define LCD_DC   24
+#define LCD_RST  -1   // Tied to board RST/EN — not a GPIO
 
-// Capacitive touch I2C pins (FT6336U)
-#define CTP_SDA  9
-#define CTP_SCL  10
-#define CTP_INT  25
-#define CTP_RST  8
+// XPT2046 resistive touch — SPI shared bus (T_IRQ not connected, polling only)
+#define TOUCH_CS  1
 
-// Backlight control (set to -1 if LED is tied to 3V3 / no GPIO)
-#define LCD_BL_IO -1
+// Backlight GPIO (HIGH = on; GPIO 25 is strapping pin but safe after boot)
+#define LCD_BL_IO 25
 #define LCD_BL_ACTIVE_LEVEL 1
+
+// NOTE: No battery ADC on NM-CYD-C5 — GPIO6 is SPI SCK, not battery monitor.
 
 #define SCREEN_INACTIVITY_TIMEOUT_MS 30000
 #define SCREEN_INACTIVITY_CHECK_MS 1000
 #define SCREEN_BACKLIGHT_ACTIVE_PERCENT 80
 #define SCREEN_BACKLIGHT_DIM_PERCENT 0
 
-#define LCD_H_RES 480
+#define LCD_H_RES 240
 #define LCD_V_RES 320
 #define LCD_HOST SPI2_HOST
 
@@ -326,7 +323,7 @@ static void style_neutral_button(lv_obj_t *btn) {
 
 static esp_lcd_panel_handle_t panel_handle;
 static esp_lcd_panel_io_handle_t lcd_io_handle;
-static ft6336_handle_t touch_handle;
+static xpt2046_handle_t touch_handle;
 static lv_obj_t *touch_dot;  // DEBUG: visual touch indicator
 static lv_obj_t *title_bar;
 static lv_obj_t *function_page = NULL;
@@ -1858,7 +1855,7 @@ static void init_display(void)
     esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num = LCD_DC,
         .cs_gpio_num = LCD_CS,
-        .pclk_hz = 20 * 1000 * 1000,
+        .pclk_hz = 40 * 1000 * 1000,
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
         .spi_mode = 0,
@@ -1869,16 +1866,15 @@ static void init_display(void)
 
     const esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = LCD_RST,
-        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
         .bits_per_pixel = 16,
     };
 
-    ESP_ERROR_CHECK(esp_lcd_new_panel_ili9341(lcd_io_handle, &panel_config, &panel_handle));
+    ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(lcd_io_handle, &panel_config, &panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
-    ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, true, true));
-    ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel_handle, true));
+    // Portrait 240x320 — no mirror or swap_xy needed
 
     vTaskDelay(pdMS_TO_TICKS(50));
 }
@@ -1981,9 +1977,12 @@ static void nvs_settings_save_dark_mode(bool enabled)
 
 static void init_backlight(void)
 {
-    // No backlight GPIO configured (LED tied to 3V3).
-    // Brightness is controlled via a software overlay on lv_layer_top().
-    (void)0;
+    // NM-CYD-C5: backlight is GPIO 25 (HIGH = on).
+    // Brightness dimming is handled via a software overlay on lv_layer_top().
+    gpio_reset_pin(LCD_BL_IO);
+    gpio_set_direction(LCD_BL_IO, GPIO_MODE_OUTPUT);
+    gpio_set_level(LCD_BL_IO, LCD_BL_ACTIVE_LEVEL);
+    ESP_LOGI(TAG, "Backlight ON (GPIO %d)", LCD_BL_IO);
 }
 
 static void set_backlight_percent(uint8_t percent)
@@ -2322,44 +2321,17 @@ static void sniffer_task(void *pvParameters) {
     vTaskDelete(NULL);
 }
 
-static void init_i2c(void)
-{
-    // Use OLD I2C API (more stable, less memory overhead)
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = CTP_SDA,
-        .scl_io_num = CTP_SCL,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = 400000,  // 400kHz
-    };
-    
-
-    ESP_LOGI(TAG, "Initializing I2C (old API) on SDA=%d, SCL=%d", CTP_SDA, CTP_SCL);
-
-    esp_err_t ret = i2c_param_config(I2C_NUM_0, &conf);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "I2C param config failed: %s", esp_err_to_name(ret));
-        return;
-    }
-    
-    ret = i2c_driver_install(I2C_NUM_0, conf.mode, 0, 0, 0);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "I2C driver install failed: %s", esp_err_to_name(ret));
-        return;
-    }
-    
-    ESP_LOGI(TAG, "I2C bus initialized successfully");
-}
-
 static void init_touch(void)
 {
-    esp_err_t ret = ft6336_init(&touch_handle, I2C_NUM_0, CTP_INT, CTP_RST,
-                                LCD_H_RES, LCD_V_RES);
+    // XPT2046 resistive touch on SPI2_HOST (shared with display + SD card).
+    // Must be called AFTER init_display() so the SPI bus is already initialised.
+    // T_IRQ is not connected on NM-CYD-C5 — touch is detected via Z1 pressure polling.
+    esp_err_t ret = xpt2046_init(&touch_handle, LCD_HOST, TOUCH_CS,
+                                  LCD_H_RES, LCD_V_RES);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Touch init failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "XPT2046 touch init failed: %s", esp_err_to_name(ret));
     } else {
-        ESP_LOGI(TAG, "FT6336U touch initialized");
+        ESP_LOGI(TAG, "XPT2046 touch initialised (SPI polling mode, CS=GPIO%d)", TOUCH_CS);
     }
 }
 
@@ -3101,22 +3073,17 @@ void app_main(void)
     ESP_LOGI(TAG, "LVGL INIT");
     lvgl_memory_init();
     
-    // Initialize I2C BEFORE LVGL GUI to avoid memory fragmentation
-    ESP_LOGI(TAG, "Initializing I2C for capacitive touch...");
-    init_i2c();
-    init_touch();
-
-    // ✅ Initialize display FIRST so SPI2_HOST is ready for SD card
-    // This must happen BEFORE SD init task to prevent "host_id not initialized" errors
+    // ✅ Display first — SPI2_HOST must be up before XPT2046 touch (shared bus)
     ESP_LOGI(TAG, "[INIT] Stage 0: About to initialize LVGL");
     ESP_LOGI(TAG, "[INIT] Heap free before LVGL: %u bytes", esp_get_free_heap_size());
-    
+
     lv_init();
     ESP_LOGI(TAG, "[INIT] Stage 1: LVGL initialized");
-    
+
     init_display();
-    ESP_LOGI(TAG, "[INIT] Stage 2: Display hardware initialized, SPI bus ready");
-    ESP_LOGI(TAG, "[DISPLAY] Hardware init complete, panel ready for drawing");
+    ESP_LOGI(TAG, "[INIT] Stage 2: Display (ST7789) + SPI bus ready");
+
+    init_touch();   // XPT2046 — must follow init_display() (shared SPI bus)
     init_backlight();
 
     ESP_LOGI(TAG, "=== SD CARD INIT DISABLED ===");
@@ -4617,14 +4584,14 @@ void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_
 void lvgl_touch_read_cb(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
 {
     static int call_count = 0;
-    ft6336_handle_t *touch = (ft6336_handle_t *)indev_drv->user_data;
-    ft6336_touch_point_t point;
+    xpt2046_handle_t *touch = (xpt2046_handle_t *)indev_drv->user_data;
+    xpt2046_touch_point_t point;
     const int64_t now_ms = esp_timer_get_time() / 1000;
     bool touched = false;
     
     // Debug counter kept but no console prints (avoid VFS write during draw)
     call_count++;
-    if (ft6336_read_touch(touch, &point) && point.touched) {
+    if (xpt2046_read_touch(touch, &point) && point.touched) {
         touched = true;
         last_input_ms = now_ms;
     }
@@ -7855,7 +7822,7 @@ static void handshake_yes_btn_cb(lv_event_t *e)
 
     // ─── Beacon + M1-M4 Progress row ──────────────────────────────
     lv_obj_t *progress_box = lv_obj_create(function_page);
-    lv_obj_set_size(progress_box, 464, 60);
+    lv_obj_set_size(progress_box, lv_pct(97), 60);
     lv_obj_align(progress_box, LV_ALIGN_TOP_MID, 0, 90);
     lv_obj_set_style_bg_color(progress_box, lv_color_make(20, 20, 30), 0);
     lv_obj_set_style_border_color(progress_box, lv_color_make(76, 175, 80), 0);
@@ -8327,7 +8294,7 @@ static void wardrive_start_btn_cb(lv_event_t *e)
 
     // ─── Recent networks table (main area) ───────────────────────
     wd_ui_table = lv_table_create(function_page);
-    lv_obj_set_size(wd_ui_table, 464, LCD_V_RES - 80 - 56);
+    lv_obj_set_size(wd_ui_table, lv_pct(97), LCD_V_RES - 80 - 56);
     lv_obj_align(wd_ui_table, LV_ALIGN_TOP_MID, 0, 82);
     lv_obj_set_style_bg_color(wd_ui_table, lv_color_make(15, 15, 15), 0);
     lv_obj_set_style_border_color(wd_ui_table, lv_color_make(50, 50, 50), 0);
