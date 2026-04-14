@@ -2,7 +2,7 @@
  
 </p>
 
-<h1 align="center">Warning This Project is just starting! /n JANOS on NM-CYD-C5</h1>
+<h1 align="center">Warning This Project is just starting! Not Working! JANOS on NM-CYD-C5</h1>
 
 <p align="center">
   <b>WiFi 6 security toolkit & wardriving device built on NerdMiner ESP32-C5 CYD</b>
