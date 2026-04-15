@@ -33,17 +33,17 @@ extern "C" {
 #define LED_COUNT 1
 #define RMT_RES_HZ (10 * 1000 * 1000)
 
-// GPS UART pins
+// GPS UART pins — NM-CYD-C5 LP-UART
 #define GPS_UART_NUM UART_NUM_1
-#define GPS_TX_PIN 13
-#define GPS_RX_PIN 14
+#define GPS_TX_PIN 5
+#define GPS_RX_PIN 4
 #define GPS_BUF_SIZE 1024
 
-// SD Card SPI pins
-#define SD_MISO_PIN 4
-#define SD_MOSI_PIN 24
-#define SD_CLK_PIN 23
-#define SD_CS_PIN 7
+// SD Card SPI pins — NM-CYD-C5 (shares SPI2_HOST with display + touch)
+#define SD_MISO_PIN 2
+#define SD_MOSI_PIN 7
+#define SD_CLK_PIN  6
+#define SD_CS_PIN   10
 
 // Application states
 typedef enum {

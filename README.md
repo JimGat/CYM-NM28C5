@@ -12,7 +12,7 @@
   <img src="https://img.shields.io/badge/ESP--IDF-6.0-blue?logo=espressif" alt="ESP-IDF 6.0"/>
   <img src="https://img.shields.io/badge/MCU-ESP32--C5-red?logo=espressif" alt="ESP32-C5"/>
   <img src="https://img.shields.io/badge/UI-LVGL%208.x-green" alt="LVGL 8"/>
-  <img src="https://img.shields.io/badge/Display-ILI9341%203.5%22-orange" alt="ILI9341"/>
+  <img src="https://img.shields.io/badge/Display-ST7789%202.8%22-orange" alt="ST7789"/>
   <img src="https://img.shields.io/badge/WiFi-802.11ax%20(WiFi%206)-blueviolet" alt="WiFi 6"/>
   <img src="https://img.shields.io/badge/BLE-5.0-informational" alt="BLE 5"/>
 </p>
@@ -111,16 +111,15 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 
 | Component | Model | Interface |
 |-----------|-------|-----------|
-| **MCU** | ESP32-C5 (RISC-V, WiFi 6, BLE 5) | — |
-| **Board** | Waveshare ESP32-C5-WIFI6-KIT | — |
-| **Display** | 3.5" ILI9341 TFT (480×320, 16-bit RGB565) | SPI @ 40 MHz |
-| **Touch** | FT6336U Capacitive Touch | I2C @ 0x38 |
-| **SD Card** | MicroSD (shared SPI bus with display) | SPI |
+| **MCU** | ESP32-C5-WROOM-1-N168R (RISC-V 240 MHz, 16 MB flash, 8 MB PSRAM) | — |
+| **Board** | NM-CYD-C5 (RockBase-iot NerdMiner CYD) | — |
+| **Display** | 2.8" ST7789 TFT (240×320 portrait, 16-bit RGB565) | SPI @ 40 MHz |
+| **Touch** | XPT2046 Resistive Touch (polling, T_IRQ not connected) | SPI @ 2 MHz |
+| **SD Card** | MicroSD (shared SPI2 bus with display and touch) | SPI @ 20 MHz |
 | **GPS** | UART NMEA module (GGA, RMC) | UART @ 9600 baud |
-| **LED** | WS2812 NeoPixel (single) | RMT / GPIO |
-| **Battery** | LiPo with voltage divider (ADC monitoring) | ADC |
+| **LED** | WS2812 NeoPixel (single, GPIO 27) | RMT / GPIO |
 
-Screen link: https://pl.aliexpress.com/item/1005009570156903.html - remember to select 3.5" 
+Board reference: https://github.com/RockBase-iot/NM-CYD-C5
 
 
 ---
@@ -130,87 +129,65 @@ Screen link: https://pl.aliexpress.com/item/1005009570156903.html - remember to 
 ### Wiring Diagram
 
 ```
-                     ESP32-C5 Waveshare
-                    ┌──────────────────┐
-                    │                  │
-    Display ────────┤ GPIO 24  (MOSI)  │──────── SD Card
-    (shared SPI)    │ GPIO 4   (MISO)  │         (shared SPI)
-                    │ GPIO 23  (CLK)   │
-                    │                  │
-    LCD CS ─────────┤ GPIO 5           │
-    LCD DC ─────────┤ GPIO 3   ⚠️      │
-    LCD RST ────────┤ GPIO 2   ⚠️      │
-                    │                  │
-    BAT ADC ────────┤ GPIO 6   (ADC)   │──── Battery voltage divider
-                    │                  │
-    SD CS ──────────┤ GPIO 7           │
-                    │                  │
-    Touch SDA ──────┤ GPIO 9           │
-    Touch SCL ──────┤ GPIO 10          │
-    Touch INT ──────┤ GPIO 25          │
-    Touch RST ──────┤ GPIO 8           │
-                    │                  │
-    GPS TX ─────────┤ GPIO 13          │
-    GPS RX ─────────┤ GPIO 14          │
-                    │                  │
-    NeoPixel ───────┤ GPIO 27          │
-                    │                  │
-    Console ────────┤ GPIO 11/12 (USB) │
-                    └──────────────────┘
+                       ESP32-C5 NM-CYD-C5
+                      ┌──────────────────┐
+                      │                  │
+    Display ──────────┤ GPIO 7   (MOSI)  │──────── Touch / SD Card
+    (shared SPI2)     │ GPIO 2   (MISO)  │         (shared SPI2)
+                      │ GPIO 6   (SCK)   │⚠️
+                      │                  │
+    LCD CS ───────────┤ GPIO 23          │
+    LCD DC ───────────┤ GPIO 24          │
+    LCD BL ───────────┤ GPIO 25          │⚠️ strapping, safe after boot
+                      │                  │
+    Touch CS ─────────┤ GPIO 1           │
+                      │                  │
+    SD CS ────────────┤ GPIO 10          │
+                      │                  │
+    GPS TX (ESP→GPS) ─┤ GPIO 5           │
+    GPS RX (GPS→ESP) ─┤ GPIO 4           │
+                      │                  │
+    NeoPixel ─────────┤ GPIO 27          │
+                      │                  │
+    Console ──────────┤ USB (JTAG/CDC)   │
+                      └──────────────────┘
 
-    ⚠️ = Strapping pins — require gpio_reset_pin() before use
+    ⚠️ = Strapping pins — safe after boot completes
+    GPIO 16–22 (excl. 21) = Flash/PSRAM — never use
 ```
 
 ### Complete GPIO Table
 
 | GPIO | Function | Interface | Notes |
 |------|----------|-----------|-------|
-| 2 | LCD Reset | Output | ⚠️ Strapping pin |
-| 3 | LCD Data/Command | Output | ⚠️ Strapping pin |
-| 4 | SPI MISO | SPI | Shared: LCD + SD |
-| 5 | LCD Chip Select | SPI | Active LOW |
-| 6 | Battery ADC | ADC1_CH5 | Voltage divider (ratio 3.2) |
-| 7 | SD Card Chip Select | SPI | Active LOW |
-| 8 | Touch Reset | Output | Active LOW |
-| 9 | Touch SDA | I2C | FT6336U data |
-| 10 | Touch SCL | I2C | FT6336U clock |
-| 11 | Console TX | UART0 | USB serial |
-| 12 | Console RX | UART0 | USB serial |
-| 13 | GPS TX | UART1 | ESP → GPS |
-| 14 | GPS RX | UART1 | GPS → ESP |
-| 23 | SPI Clock | SPI | Shared: LCD + SD |
-| 24 | SPI MOSI | SPI | Shared: LCD + SD |
-| 25 | Touch Interrupt | Input | Touch detected |
+| 1 | XPT2046 Touch CS | SPI | Active LOW |
+| 2 | SPI MISO | SPI2 | Shared: display + touch + SD |
+| 4 | GPS RX (GPS→ESP) | UART | LP-UART |
+| 5 | GPS TX (ESP→GPS) | UART | LP-UART |
+| 6 | SPI SCK | SPI2 | ⚠️ Strapping pin, safe after boot |
+| 7 | SPI MOSI | SPI2 | ⚠️ Strapping pin, safe after boot |
+| 10 | SD Card CS | SPI | Active LOW |
+| 16–22 (excl. 21) | Flash/PSRAM | — | **Never use** |
+| 23 | ST7789 Display CS | SPI | Active LOW |
+| 24 | ST7789 DC (Data/Cmd) | Output | |
+| 25 | Backlight | Output | ⚠️ Strapping, HIGH=on |
 | 27 | NeoPixel Data | RMT/GPIO | WS2812 LED |
 
 ### SPI Bus Architecture
 
 ```
-SPI2_HOST (40 MHz)
-├── LCD ILI9341     (CS = GPIO 5)
-│   ├── MOSI = GPIO 24
-│   ├── MISO = GPIO 4
-│   ├── CLK  = GPIO 23
-│   └── DC = GPIO 3, RST = GPIO 2
+SPI2_HOST
+├── ST7789 Display  (CS = GPIO 23, 40 MHz)
+│   ├── MOSI = GPIO 7
+│   ├── MISO = GPIO 2
+│   ├── SCK  = GPIO 6
+│   └── DC = GPIO 24
 │
-└── SD Card         (CS = GPIO 7)
-    ├── MOSI = GPIO 24
-    ├── MISO = GPIO 4
-    └── CLK  = GPIO 23
+├── XPT2046 Touch   (CS = GPIO 1, 2 MHz)
+│
+└── SD Card         (CS = GPIO 10, 20 MHz)
 
 Mutual exclusion via sd_spi_mutex
-```
-
-### Battery Monitoring
-
-```
-VBAT ──┤ R10 (200kΩ) ├──┬── GPIO 6 (ADC1_CH5)
-                        │
-                   R16 (100kΩ)
-                        │
-                       GND
-
-Divider ratio: 3.0 (calibrated: 3.2)
 ```
 
 ---
@@ -291,8 +268,7 @@ All settings are persisted via **NVS** (Non-Volatile Storage) across reboots.
 | **6-Tile Main Menu** | Quick access to all feature categories |
 | **Screenshot Capture** | Save screen to SD card (`/sdcard/screenshots/`) |
 | **WPA-SEC Upload** | Upload captured handshakes to wpa-sec.stanev.org via HTTPS |
-| **NeoPixel Status LED** | Visual feedback via WS2812 LED |
-| **Battery Monitor** | Real-time battery voltage reading |
+| **NeoPixel Status LED** | Visual feedback via WS2812 LED (GPIO 27) |
 
 ---
 
@@ -317,8 +293,8 @@ All data is stored on the SD card:
 
 ### Prerequisites
 
-- **ESP-IDF v6.0** (with ESP32-C5 support)
-- **Waveshare ESP32-C5-WIFI6-KIT** (or compatible)
+- **ESP-IDF release/v6.0** branch tip (NOT the `v6.0` tag — it's missing critical post-release fixes)
+- **NM-CYD-C5** board (ESP32-C5-WROOM-1-N168R)
 
 ### Build
 
@@ -329,6 +305,14 @@ idf.py build
 ```
 
 ### Flash
+
+Flash manually at address `0x10000`:
+
+```bash
+esptool.py --chip esp32c5 write_flash 0x10000 build/pancake.bin
+```
+
+Or via idf.py if connected directly:
 
 ```bash
 idf.py -p /dev/ttyACM0 flash monitor
@@ -371,7 +355,7 @@ pancake/
 │   ├── main/
 │   │   ├── main.c                # Core application, UI, init
 │   │   ├── attack_handshake.c    # Handshake capture logic
-│   │   ├── ft6336.c              # FT6336U touch driver
+│   │   ├── xpt2046.c             # XPT2046 resistive touch driver
 │   │   └── lvgl_memory.c         # PSRAM allocator for LVGL
 │   ├── components/
 │   │   ├── wifi_cli/             # CLI, WiFi init, LED control

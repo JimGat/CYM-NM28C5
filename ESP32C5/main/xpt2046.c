@@ -1,4 +1,5 @@
 #include "xpt2046.h"
+#include "freertos/FreeRTOS.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include <string.h>

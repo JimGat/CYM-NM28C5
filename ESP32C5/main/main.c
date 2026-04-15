@@ -249,6 +249,7 @@ static lv_color_t *buf1 = NULL;
 static lv_color_t *buf2 = NULL;
 static SemaphoreHandle_t lvgl_mutex = NULL;
 SemaphoreHandle_t sd_spi_mutex = NULL;  // Mutex for SD/SPI access (shared with display) - used by attack_handshake.c
+static SemaphoreHandle_t flush_done_sem = NULL;  // Binary semaphore: ISR signals DMA done, task calls lv_disp_flush_ready
 static volatile bool touch_pressed_flag = false;
 static volatile uint16_t touch_x_flag = 0;
 static volatile uint16_t touch_y_flag = 0;
@@ -1841,6 +1842,10 @@ static void check_heap_integrity(const char* location) {
 
 static void init_display(void)
 {
+    ESP_LOGE(TAG, "[DISP] SPI pins: MOSI=%d MISO=%d CLK=%d CS=%d DC=%d RST=%d",
+             LCD_MOSI, LCD_MISO, LCD_CLK, LCD_CS, LCD_DC, LCD_RST);
+    vTaskDelay(pdMS_TO_TICKS(20));
+
     spi_bus_config_t buscfg = {
         .mosi_io_num = LCD_MOSI,
         .miso_io_num = LCD_MISO,
@@ -1850,7 +1855,12 @@ static void init_display(void)
         .max_transfer_sz = LCD_H_RES * 15 * sizeof(uint16_t),
     };
 
-    ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
+    ESP_LOGE(TAG, "[DISP] calling spi_bus_initialize...");
+    vTaskDelay(pdMS_TO_TICKS(20));
+    esp_err_t spi_ret = spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    ESP_LOGE(TAG, "[DISP] spi_bus_initialize ret=%d (%s)", spi_ret, esp_err_to_name(spi_ret));
+    vTaskDelay(pdMS_TO_TICKS(20));
+    if (spi_ret != ESP_OK) { ESP_LOGE(TAG, "[DISP] SPI INIT FAILED — halting"); while(1) vTaskDelay(pdMS_TO_TICKS(500)); }
 
     esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num = LCD_DC,
@@ -1862,6 +1872,8 @@ static void init_display(void)
         .trans_queue_depth = 10,
     };
 
+    ESP_LOGE(TAG, "[DISP] creating panel IO...");
+    vTaskDelay(pdMS_TO_TICKS(20));
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(LCD_HOST, &io_config, &lcd_io_handle));
 
     const esp_lcd_panel_dev_config_t panel_config = {
@@ -1870,12 +1882,19 @@ static void init_display(void)
         .bits_per_pixel = 16,
     };
 
+    ESP_LOGE(TAG, "[DISP] creating ST7789 panel...");
+    vTaskDelay(pdMS_TO_TICKS(20));
     ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(lcd_io_handle, &panel_config, &panel_handle));
+    ESP_LOGE(TAG, "[DISP] resetting panel...");
+    vTaskDelay(pdMS_TO_TICKS(20));
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
+    ESP_LOGE(TAG, "[DISP] init panel...");
+    vTaskDelay(pdMS_TO_TICKS(20));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
+    ESP_LOGE(TAG, "[DISP] invert color...");
+    vTaskDelay(pdMS_TO_TICKS(20));
     ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
-    // Portrait 240x320 — no mirror or swap_xy needed
-
+    ESP_LOGE(TAG, "[DISP] display init complete");
     vTaskDelay(pdMS_TO_TICKS(50));
 }
 
@@ -2913,6 +2932,7 @@ static void create_home_ui(void);
 static void detection_complete_cb(lv_timer_t *timer)
 {
     (void)timer;
+    esp_rom_printf(">>> detection_complete_cb CALLED, glitch_frame=%d <<<\n", glitch_frame);
     if (splash_timer) { lv_timer_del(splash_timer); splash_timer = NULL; }
     if (splash_screen) { lv_obj_del(splash_screen); splash_screen = NULL; }
     splash_loading_label = NULL;
@@ -2924,6 +2944,7 @@ static void splash_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
     glitch_frame++;
+    esp_rom_printf(">>> splash_timer_cb frame=%d <<<\n", glitch_frame);
 
     if (splash_loading_label) {
         static const char *frames[] = {
@@ -2989,6 +3010,7 @@ static void show_splash_screen(void)
 
 static void create_home_ui(void)
 {
+    esp_rom_printf(">>> create_home_ui CALLED <<<\n");
     title_bar = lv_obj_create(lv_scr_act());
     lv_obj_set_size(title_bar, lv_pct(100), 30);
     lv_obj_align(title_bar, LV_ALIGN_TOP_MID, 0, 0);
@@ -3037,28 +3059,35 @@ void app_main(void)
 		ESP_LOGE(TAG, "GPS UART init failed");
 	}
     
+    // ── DEBUG: flush helper ──────────────────────────────────────────────────
+    // vTaskDelay after each checkpoint gives UART time to drain before a crash
+#define DBG(n) do { ESP_LOGE(TAG, ">>> DBG-%02d heap=%u", (n), esp_get_free_heap_size()); vTaskDelay(pdMS_TO_TICKS(50)); } while(0)
+
+    DBG(1); // just after GPS+wifi stack inits
+
     // Initialize WiFi CLI system (WiFi, LED, all components)
     esp_err_t ret = wifi_cli_init();
+    DBG(2); // wifi_cli_init() returned
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "WiFi CLI init failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "WiFi CLI init FAILED: %s", esp_err_to_name(ret));
+        vTaskDelay(pdMS_TO_TICKS(50));
     } else {
-        ESP_LOGI(TAG, "WiFi CLI system initialized");
-        // Set radio mode to WiFi after successful init
+        ESP_LOGI(TAG, "WiFi CLI system initialized OK");
+        vTaskDelay(pdMS_TO_TICKS(50));
         current_radio_mode = RADIO_MODE_WIFI;
         wifi_initialized = true;
-        // Start console in background (optional)
-        // wifi_cli_start_console();
     }
 
+    DBG(3); // before nvs_settings_load
     // Load screen settings (timeout, brightness) from NVS
-    // NVS is already initialized by wifi_cli_init()
     nvs_settings_load();
 
-    
+    DBG(4); // before wifi_scanner_init
     // Init scanner and register event handler
     wifi_scanner_init();
     esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE, &wifi_scan_done_cb, NULL);
 
+    DBG(5); // before PSRAM allocs
     // Allocate sniffer handshake + wardrive promisc arrays in PSRAM
     hs_ap_targets = (hs_ap_target_t *)heap_caps_calloc(HS_MAX_APS, sizeof(hs_ap_target_t), MALLOC_CAP_SPIRAM);
     hs_clients = (hs_client_entry_t *)heap_caps_calloc(HS_MAX_CLIENTS, sizeof(hs_client_entry_t), MALLOC_CAP_SPIRAM);
@@ -3066,25 +3095,23 @@ void app_main(void)
     wdp_seen_networks = (wdp_network_t *)heap_caps_calloc(WDP_INITIAL_CAPACITY, sizeof(wdp_network_t), MALLOC_CAP_SPIRAM);
     wdp_seen_capacity = WDP_INITIAL_CAPACITY;
     if (!hs_ap_targets || !hs_clients || !ducb_channels || !wdp_seen_networks) {
-        ESP_LOGE(TAG, "Failed to allocate PSRAM for sniffer/wardrive arrays!");
+        ESP_LOGE(TAG, "PSRAM alloc FAILED!");
     }
 
-    // Initialize custom LVGL memory allocator EARLY
-    ESP_LOGI(TAG, "LVGL INIT");
+    DBG(6); // before lvgl_memory_init
     lvgl_memory_init();
-    
-    // ✅ Display first — SPI2_HOST must be up before XPT2046 touch (shared bus)
-    ESP_LOGI(TAG, "[INIT] Stage 0: About to initialize LVGL");
-    ESP_LOGI(TAG, "[INIT] Heap free before LVGL: %u bytes", esp_get_free_heap_size());
 
+    DBG(7); // before lv_init
     lv_init();
-    ESP_LOGI(TAG, "[INIT] Stage 1: LVGL initialized");
 
+    DBG(8); // before init_display (SPI bus init)
     init_display();
-    ESP_LOGI(TAG, "[INIT] Stage 2: Display (ST7789) + SPI bus ready");
 
-    init_touch();   // XPT2046 — must follow init_display() (shared SPI bus)
+    DBG(9); // after init_display — SPI bus + ST7789 up
+    init_touch();
+    DBG(10);
     init_backlight();
+    DBG(11);
 
     ESP_LOGI(TAG, "=== SD CARD INIT DISABLED ===");
     ESP_LOGI(TAG, "[INIT] SD card will be mounted lazily on first use");
@@ -3152,6 +3179,12 @@ void app_main(void)
     disp_drv.draw_buf = &draw_buf;
     disp_drv.user_data = panel_handle;
     lv_disp_drv_register(&disp_drv);
+
+    flush_done_sem = xSemaphoreCreateBinary();
+    if (flush_done_sem == NULL) {
+        ESP_LOGE(TAG, "Failed to create flush_done_sem!");
+        return;
+    }
 
     const esp_lcd_panel_io_callbacks_t cbs = {
         .on_color_trans_done = on_color_trans_done,
@@ -3256,39 +3289,44 @@ void app_main(void)
     // Show loading popup
     show_sd_loading_popup("Reading SD card...");
     
-    // Try to mount SD card - retry until successful
+    // Try to mount SD card - 3 attempts, then continue without it
     bool sd_mounted = false;
-    int mount_attempts = 0;
-    while (!sd_mounted) {
-        mount_attempts++;
-        ESP_LOGI(TAG, "[SD] Mount attempt %d...", mount_attempts);
-        
+    const int SD_MAX_ATTEMPTS = 3;
+    for (int mount_attempts = 1; mount_attempts <= SD_MAX_ATTEMPTS && !sd_mounted; mount_attempts++) {
+        ESP_LOGI(TAG, "[SD] Mount attempt %d/%d...", mount_attempts, SD_MAX_ATTEMPTS);
+
         // Take SD/SPI mutex before mounting
         if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
             esp_err_t sd_ret = wifi_wardrive_init_sd();
             xSemaphoreGive(sd_spi_mutex);
-            
+
             if (sd_ret == ESP_OK) {
                 sd_mounted_lazy = true;
                 sd_mounted = true;
                 ESP_LOGI(TAG, "[SD] Card mounted successfully");
             } else {
-                ESP_LOGW(TAG, "[SD] Mount failed: %s", esp_err_to_name(sd_ret));
-                update_sd_loading_popup("Insert SD Card");
-                
-                // Wait and retry - process LVGL to keep UI responsive
-                for (int i = 0; i < 20; i++) {  // 2 second delay with LVGL processing
-                    if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                        lv_task_handler();
-                        xSemaphoreGive(lvgl_mutex);
+                ESP_LOGW(TAG, "[SD] Mount failed (%d/%d): %s", mount_attempts, SD_MAX_ATTEMPTS, esp_err_to_name(sd_ret));
+                if (mount_attempts < SD_MAX_ATTEMPTS) {
+                    update_sd_loading_popup("No SD Card...");
+                    // Brief delay with LVGL processing
+                    for (int i = 0; i < 10; i++) {
+                        if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                            lv_task_handler();
+                            xSemaphoreGive(lvgl_mutex);
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(100));
                     }
-                    vTaskDelay(pdMS_TO_TICKS(100));
                 }
             }
         } else {
             ESP_LOGW(TAG, "[SD] Could not take SPI mutex");
             vTaskDelay(pdMS_TO_TICKS(500));
         }
+    }
+    if (!sd_mounted) {
+        ESP_LOGW(TAG, "[SD] No SD card - continuing without storage");
+        update_sd_loading_popup("No SD - Continuing...");
+        vTaskDelay(pdMS_TO_TICKS(1500));
     }
     
     // Load all data from SD into cache
@@ -3343,13 +3381,15 @@ void app_main(void)
     while (1) {
         loop_counter++;
         
-        // Log co ~5 sekund aby zobaczyć czy pętla żyje
-        // TickType_t now = xTaskGetTickCount();
-        // if ((now - last_log) > pdMS_TO_TICKS(5000)) {
-        //     ESP_LOGI(TAG, "[MAIN LOOP] Alive - iteration #%u, heap: %u bytes", 
-        //              loop_counter, esp_get_free_heap_size());
-        //     last_log = now;
-        // }
+        // Log every 5 seconds to confirm loop is alive
+        TickType_t now = xTaskGetTickCount();
+        if ((now - last_log) > pdMS_TO_TICKS(5000)) {
+            lv_disp_t *disp = lv_disp_get_default();
+            uint8_t flushing = disp ? disp->driver->draw_buf->flushing : 0xFF;
+            ESP_LOGI(TAG, "[MAIN LOOP] Alive - iteration #%u, heap: %u bytes, frame=%d, flushing=%d",
+                     loop_counter, esp_get_free_heap_size(), glitch_frame, flushing);
+            last_log = now;
+        }
         
         // Thread-safe LVGL handling
         uint32_t sleep_ms = 10;
@@ -4524,8 +4564,17 @@ static bool IRAM_ATTR on_color_trans_done(esp_lcd_panel_io_handle_t io,
                                           esp_lcd_panel_io_event_data_t *edata,
                                           void *user_ctx)
 {
-    lv_disp_drv_t *drv = (lv_disp_drv_t *)user_ctx;
-    lv_disp_flush_ready(drv);
+    static uint32_t trans_count = 0;
+    trans_count++;
+    if (trans_count <= 3 || trans_count % 500 == 0) {
+        esp_rom_printf(">>> on_color_trans_done #%u <<<\n", trans_count);
+    }
+    // Signal the flush task — lv_disp_flush_ready() must be called from task context,
+    // NOT from this ISR. Calling it here invokes _lv_disp_refr_timer() from ISR which
+    // corrupts LVGL's already_running guard and silently kills all timer processing.
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xSemaphoreGiveFromISR(flush_done_sem, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
     return false;
 }
 
@@ -4561,6 +4610,9 @@ void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_
             if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                 esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
                 xSemaphoreGive(sd_spi_mutex);
+                // Wait for DMA completion ISR, then signal LVGL from task context
+                xSemaphoreTake(flush_done_sem, pdMS_TO_TICKS(1000));
+                lv_disp_flush_ready(drv);
                 return;
             }
 
@@ -4578,6 +4630,8 @@ void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_
         }
     } else {
         esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
+        xSemaphoreTake(flush_done_sem, pdMS_TO_TICKS(1000));
+        lv_disp_flush_ready(drv);
     }
 }
 
@@ -4720,7 +4774,7 @@ static esp_err_t save_snapshot_bmp(lv_img_dsc_t *shot, const char *filepath)
             lv_color_t c = src[(uint32_t)y * w + x];
 #if LV_COLOR_DEPTH == 16
             uint8_t r = (c.ch.red << 3) | (c.ch.red >> 2);
-            uint8_t g6 = (c.ch.green_h << 3) | c.ch.green_l;  // 6-bit green
+            uint8_t g6 = LV_COLOR_GET_G16(c);   // 6-bit green (swap-safe macro)
             uint8_t g = (g6 << 2) | (g6 >> 4);  // expand to 8-bit
             uint8_t b = (c.ch.blue << 3) | (c.ch.blue >> 2);
 #else
