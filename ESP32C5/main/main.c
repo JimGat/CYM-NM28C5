@@ -1893,7 +1893,7 @@ static void init_display(void)
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
     ESP_LOGE(TAG, "[DISP] invert color...");
     vTaskDelay(pdMS_TO_TICKS(20));
-    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, false));
     ESP_LOGE(TAG, "[DISP] display init complete");
     vTaskDelay(pdMS_TO_TICKS(50));
 }
@@ -9636,7 +9636,7 @@ static void home_btn_event_cb(lv_event_t *e)
 static lv_obj_t *create_tile(lv_obj_t *parent, const char *icon, const char *text, lv_color_t accent, lv_event_cb_t callback, const char *user_data)
 {
     lv_obj_t *tile = lv_btn_create(parent);
-    lv_obj_set_size(tile, 145, 85);
+    lv_obj_set_size(tile, 105, 85);
     lv_obj_set_style_bg_color(tile, ui_card_color(), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(tile, ui_card_pressed_color(), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(tile, 1, 0);
@@ -9663,7 +9663,7 @@ static lv_obj_t *create_tile(lv_obj_t *parent, const char *icon, const char *tex
         lv_obj_set_style_text_color(text_label, ui_text_color(), 0);
         lv_obj_set_style_text_align(text_label, LV_TEXT_ALIGN_CENTER, 0);
         lv_label_set_long_mode(text_label, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(text_label, 130);
+        lv_obj_set_width(text_label, 89);
     }
 
     if (callback && user_data) {
