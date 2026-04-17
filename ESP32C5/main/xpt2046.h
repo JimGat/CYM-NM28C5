@@ -17,8 +17,10 @@ extern "C" {
 #define XPT2046_CMD_Z1   0xB3   // Read Z1 pressure
 #define XPT2046_CMD_Z2   0xC3   // Read Z2 pressure
 
-// Touch is considered active when Z1 raw ADC > this threshold
-#define XPT2046_Z_THRESHOLD  400
+// Touch is considered active when Z1 raw ADC > this threshold.
+// Resting panel contact reads ~0–80; a real touch reads 200–2000+.
+// Raise if ghost touches persist; lower if light touches are missed.
+#define XPT2046_Z_THRESHOLD  200
 
 // ─── Calibration defaults for NM-CYD-C5 2.8" 240×320 (portrait) ─────────────
 // Adjust these via xpt2046_set_calibration() after running a calibration sketch.
@@ -37,6 +39,13 @@ typedef struct {
     // Calibration (raw ADC units)
     int                 x_min, x_max;
     int                 y_min, y_max;
+    // Resting-state dead zone: readings within null_radius of (null_x, null_y) are rejected
+    int                 null_x, null_y;
+    int                 null_radius;  // 0 = disabled
+    // Orientation
+    bool                swap_xy;    // swap X and Y axes
+    bool                invert_x;   // mirror X axis
+    bool                invert_y;   // mirror Y axis
 } xpt2046_handle_t;
 
 typedef struct {
@@ -83,6 +92,19 @@ void xpt2046_set_calibration(xpt2046_handle_t *handle,
  * @return true if screen is being touched, false otherwise
  */
 bool xpt2046_read_touch(xpt2046_handle_t *handle, xpt2046_touch_point_t *point);
+
+/**
+ * @brief Read raw (uncalibrated) X/Y ADC values for use during calibration.
+ *        Discards the first sample per axis (ADC settling artifact) and
+ *        averages 4 subsequent samples.  Does NOT apply calibration mapping,
+ *        orientation flags, or null-zone rejection.
+ *
+ * @param handle   Handle from xpt2046_init()
+ * @param raw_x    Output: averaged raw X ADC value (0–4095)
+ * @param raw_y    Output: averaged raw Y ADC value (0–4095)
+ * @return true if values are in the plausible touch range (100–4000)
+ */
+bool xpt2046_read_raw_point(xpt2046_handle_t *handle, uint16_t *raw_x, uint16_t *raw_y);
 
 #ifdef __cplusplus
 }

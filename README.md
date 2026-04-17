@@ -2,7 +2,7 @@
  
 </p>
 
-<h1 align="center">Warning This Project is just starting! Not Working! JANOS on NM-CYD-C5</h1>
+<h1 align="center">JANOS on NM-CYD-C5</h1>
 
 <p align="center">
   <b>WiFi 6 security toolkit & wardriving device built on NerdMiner ESP32-C5 CYD</b>
@@ -42,6 +42,7 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
   - [Wardriving](#6-wardriving)
   - [Settings](#7-settings)
 - [Data & Storage](#data--storage)
+- [Touch Calibration](#touch-calibration)
 - [Building & Flashing](#building--flashing)
 - [Photos](#photos)
 - [Disclaimer](#disclaimer)
@@ -164,7 +165,7 @@ Board reference: https://github.com/RockBase-iot/NM-CYD-C5
 | 2 | SPI MISO | SPI2 | Shared: display + touch + SD |
 | 4 | GPS RX (GPS→ESP) | UART | LP-UART |
 | 5 | GPS TX (ESP→GPS) | UART | LP-UART |
-| 6 | SPI SCK | SPI2 | ⚠️ Strapping pin, safe after boot |
+| 6 | SPI SCK | SPI2 | ⚠️ Strapping pin; also ADC1_CH5 — **do not configure as ADC** (breaks SPI clock) |
 | 7 | SPI MOSI | SPI2 | ⚠️ Strapping pin, safe after boot |
 | 10 | SD Card CS | SPI | Active LOW |
 | 16–22 (excl. 21) | Flash/PSRAM | — | **Never use** |
@@ -172,6 +173,10 @@ Board reference: https://github.com/RockBase-iot/NM-CYD-C5
 | 24 | ST7789 DC (Data/Cmd) | Output | |
 | 25 | Backlight | Output | ⚠️ Strapping, HIGH=on |
 | 27 | NeoPixel Data | RMT/GPIO | WS2812 LED |
+
+> **GPIO 6 / ADC1_CH5 conflict:** The battery voltage ADC (`BATTERY_ADC_CHANNEL ADC_CHANNEL_5`) maps to GPIO 6, which is also SPI SCK. Calling `adc_oneshot_config_channel` on this pin silently reconfigures it away from SPI, killing SPI clock for display and touch. The battery ADC is **permanently disabled** in firmware for this board revision (`if (false && init_battery_adc()...)`).
+
+> **XPT2046 Z1 pressure:** The NM-CYD-C5 panel does not expose Z electrode connections, so Z1 always reads 0. Touch detection uses X/Y range validation and a calibrated null zone instead of pressure threshold.
 
 ### SPI Bus Architecture
 
@@ -279,13 +284,56 @@ All data is stored on the SD card:
 ```
 /sdcard/
 ├── lab/
-│   └── handshakes/       # Captured WPA handshakes
-│       ├── *.pcap        # Wireshark-compatible captures
-│       └── *.hccapx      # Hashcat-compatible format
+│   ├── white.txt         # MAC/SSID whitelist (one per line)
+│   ├── handshakes/       # Captured WPA handshakes
+│   │   ├── *.pcap        # Wireshark-compatible captures
+│   │   └── *.hccapx      # Hashcat-compatible format (hashcat)
+│   └── portal/           # Captive portal credential files
 ├── wardrive/             # GPS + WiFi logs (CSV)
 ├── screenshots/          # UI screenshots (BMP)
-└── portal/               # Captured portal credentials
+└── calibrate.txt         # ← Create this file to trigger touch re-calibration on next boot
 ```
+
+---
+
+## Touch Calibration
+
+The XPT2046 resistive touch panel requires one-time calibration to map raw ADC values to screen coordinates. Calibration data is saved in NVS and survives reboots.
+
+### First Boot
+
+Calibration runs automatically the first time the firmware boots (when no NVS calibration is found). The sequence appears after the splash screen:
+
+1. **"Do NOT touch screen"** — holds for 2 seconds while measuring the panel's resting (null) position.
+2. **"Touch the [+] Top-Left (1/3)"** — a white crosshair appears at the top-left corner. Press it firmly and hold until the screen advances.
+3. **"Touch the [+] Top-Right (2/3)"** — press the top-right crosshair.
+4. **"Touch the [+] Bottom-Left (3/3)"** — press the bottom-left crosshair.
+5. **"Calibration done!"** — calculated values are saved to NVS namespace `touch_cal` and applied immediately.
+
+### Re-Calibrating
+
+To re-run calibration after first boot, create a **trigger file** on the SD card:
+
+```
+/sdcard/calibrate.txt
+```
+
+The file content does not matter. On the next boot, the firmware detects it, deletes it, and runs the calibration UI before showing the home screen.
+
+### What Is Stored (NVS namespace `touch_cal`)
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `x_min` / `x_max` | i32 | Raw ADC X range mapped to screen edges |
+| `y_min` / `y_max` | i32 | Raw ADC Y range mapped to screen edges |
+| `null_x` / `null_y` | i32 | Resting panel position (false-touch dead zone center) |
+| `invert_x` / `invert_y` | u8 | Axis inversion flags (NM-CYD-C5: both typically `1`) |
+| `swap_xy` | u8 | Axis swap (typically `0` for portrait) |
+| `magic` | u16 | `0xCA11` — marks calibration as valid |
+
+### Default Fallback
+
+If NVS has no calibration (i.e., `magic` ≠ `0xCA11`), the firmware applies hardware-observed defaults for the NM-CYD-C5: **both axes inverted** (`invert_x = true`, `invert_y = true`). These are good enough for initial boot but may be off by ~20 pixels. Run calibration for accurate touch.
 
 ---
 
@@ -306,16 +354,14 @@ idf.py build
 
 ### Flash
 
-Flash manually at address `0x10000`:
-
-```bash
-esptool.py --chip esp32c5 write_flash 0x10000 build/pancake.bin
-```
-
-Or via idf.py if connected directly:
-
 ```bash
 idf.py -p /dev/ttyACM0 flash monitor
+```
+
+Or manually:
+
+```bash
+esptool.py --chip esp32c5 write_flash 0x10000 build/CYM-NM28C5.bin
 ```
 
 ---
@@ -350,25 +396,28 @@ idf.py -p /dev/ttyACM0 flash monitor
 ## Project Structure
 
 ```
-pancake/
+CYM-NM28C5/
 ├── ESP32C5/
 │   ├── main/
-│   │   ├── main.c                # Core application, UI, init
+│   │   ├── main.c                # Core application, all UI screens, boot sequence,
+│   │   │                         #   touch calibration routine (run_touch_calibration)
 │   │   ├── attack_handshake.c    # Handshake capture logic
-│   │   ├── xpt2046.c             # XPT2046 resistive touch driver
+│   │   ├── xpt2046.c/h           # XPT2046 SPI touch driver (polling, null-zone, calibration reads)
 │   │   └── lvgl_memory.c         # PSRAM allocator for LVGL
 │   ├── components/
 │   │   ├── wifi_cli/             # CLI, WiFi init, LED control
 │   │   ├── wifi_scanner/         # WiFi scanning engine
 │   │   ├── wifi_sniffer/         # Promiscuous mode sniffer
 │   │   ├── wifi_attacks/         # Deauth, Evil Twin, Captive Portal, Karma
-│   │   ├── wifi_wardrive/        # GPS + WiFi wardriving
+│   │   ├── wifi_wardrive/        # SD card, GPS + WiFi wardriving
 │   │   ├── sniffer/              # Raw 802.11 frame capture
 │   │   ├── frame_analyzer/       # EAPOL / beacon parsing
 │   │   ├── pcap_serializer/      # PCAP file writer
 │   │   └── hccapx_serializer/    # HCCAPX file writer (hashcat)
+│   ├── partitions.csv            # nvs(24K) phy_init(4K) factory(7MB) storage(960K)
 │   ├── sdkconfig
 │   └── CMakeLists.txt
+├── NM-CYD-C5-pinmap.md          # Full pin map with migration notes
 └── README.md
 ```
 

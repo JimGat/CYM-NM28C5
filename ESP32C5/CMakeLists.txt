@@ -12,7 +12,7 @@ idf_build_set_property(LINK_OPTIONS "-Wl,-zmuldefs" APPEND)
 # Make 'main' headers (e.g., lvgl_memory.h) visible globally for components that include by name
 idf_build_set_property(COMPILE_OPTIONS "-I${CMAKE_SOURCE_DIR}/main" APPEND)
 
-project(projectZero)
+project(CYM-NM28C5)
 
 # ===== MITM: allow lwIP to forward packets back out the same WiFi interface =====
 idf_component_get_property(lwip_lib lwip COMPONENT_LIB)
