@@ -1857,10 +1857,6 @@ static void check_heap_integrity(const char* location) {
 
 static void init_display(void)
 {
-    ESP_LOGE(TAG, "[DISP] SPI pins: MOSI=%d MISO=%d CLK=%d CS=%d DC=%d RST=%d",
-             LCD_MOSI, LCD_MISO, LCD_CLK, LCD_CS, LCD_DC, LCD_RST);
-    vTaskDelay(pdMS_TO_TICKS(20));
-
     spi_bus_config_t buscfg = {
         .mosi_io_num = LCD_MOSI,
         .miso_io_num = LCD_MISO,
@@ -1870,12 +1866,8 @@ static void init_display(void)
         .max_transfer_sz = LCD_H_RES * 15 * sizeof(uint16_t),
     };
 
-    ESP_LOGE(TAG, "[DISP] calling spi_bus_initialize...");
-    vTaskDelay(pdMS_TO_TICKS(20));
     esp_err_t spi_ret = spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO);
-    ESP_LOGE(TAG, "[DISP] spi_bus_initialize ret=%d (%s)", spi_ret, esp_err_to_name(spi_ret));
-    vTaskDelay(pdMS_TO_TICKS(20));
-    if (spi_ret != ESP_OK) { ESP_LOGE(TAG, "[DISP] SPI INIT FAILED — halting"); while(1) vTaskDelay(pdMS_TO_TICKS(500)); }
+    if (spi_ret != ESP_OK) { ESP_LOGE(TAG, "SPI INIT FAILED — halting"); while(1) vTaskDelay(pdMS_TO_TICKS(500)); }
 
     esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num = LCD_DC,
@@ -1887,8 +1879,6 @@ static void init_display(void)
         .trans_queue_depth = 10,
     };
 
-    ESP_LOGE(TAG, "[DISP] creating panel IO...");
-    vTaskDelay(pdMS_TO_TICKS(20));
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(LCD_HOST, &io_config, &lcd_io_handle));
 
     const esp_lcd_panel_dev_config_t panel_config = {
@@ -1897,20 +1887,10 @@ static void init_display(void)
         .bits_per_pixel = 16,
     };
 
-    ESP_LOGE(TAG, "[DISP] creating ST7789 panel...");
-    vTaskDelay(pdMS_TO_TICKS(20));
     ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(lcd_io_handle, &panel_config, &panel_handle));
-    ESP_LOGE(TAG, "[DISP] resetting panel...");
-    vTaskDelay(pdMS_TO_TICKS(20));
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
-    ESP_LOGE(TAG, "[DISP] init panel...");
-    vTaskDelay(pdMS_TO_TICKS(20));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
-    ESP_LOGE(TAG, "[DISP] invert color...");
-    vTaskDelay(pdMS_TO_TICKS(20));
     ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, false));
-    ESP_LOGE(TAG, "[DISP] display init complete");
-    vTaskDelay(pdMS_TO_TICKS(50));
 }
 
 // ============================================================================
@@ -3193,7 +3173,6 @@ static void create_home_ui(void);
 static void detection_complete_cb(lv_timer_t *timer)
 {
     (void)timer;
-    esp_rom_printf(">>> detection_complete_cb CALLED, glitch_frame=%d <<<\n", glitch_frame);
     if (splash_timer) { lv_timer_del(splash_timer); splash_timer = NULL; }
     if (splash_screen) { lv_obj_del(splash_screen); splash_screen = NULL; }
     splash_loading_label = NULL;
@@ -3645,24 +3624,10 @@ void app_main(void)
     esp_task_wdt_add(NULL);
     ESP_LOGI(TAG, "Main task subscribed to watchdog");
 
-    // ✅ Main loop diagnostics
-    ESP_LOGI(TAG, "[MAIN LOOP] Starting main event loop...");
-    uint32_t loop_counter = 0;
-    TickType_t last_log = xTaskGetTickCount();
+    ESP_LOGI(TAG, "Main event loop started");
 
     while (1) {
-        loop_counter++;
-        
-        // Log every 5 seconds to confirm loop is alive
-        TickType_t now = xTaskGetTickCount();
-        if ((now - last_log) > pdMS_TO_TICKS(5000)) {
-            lv_disp_t *disp = lv_disp_get_default();
-            uint8_t flushing = disp ? disp->driver->draw_buf->flushing : 0xFF;
-            ESP_LOGI(TAG, "[MAIN LOOP] Alive - iteration #%u, heap: %u bytes, frame=%d, flushing=%d, flushes=%u",
-                     loop_counter, esp_get_free_heap_size(), glitch_frame, flushing, lvgl_flush_counter);
-            last_log = now;
-        }
-        
+
         // Thread-safe LVGL handling
         uint32_t sleep_ms = 10;
         if (xSemaphoreTake(lvgl_mutex, portMAX_DELAY) == pdTRUE) {
