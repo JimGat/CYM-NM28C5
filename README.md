@@ -273,7 +273,21 @@ All settings are persisted via **NVS** (Non-Volatile Storage) across reboots.
 | **6-Tile Main Menu** | Quick access to all feature categories |
 | **Screenshot Capture** | Save screen to SD card (`/sdcard/screenshots/`) |
 | **WPA-SEC Upload** | Upload captured handshakes to wpa-sec.stanev.org via HTTPS |
-| **NeoPixel Status LED** | Visual feedback via WS2812 LED (GPIO 27) |
+| **NeoPixel Status LED** | Mode-based color indicator via WS2812 LED (GPIO 27) |
+
+### NeoPixel LED Color Reference
+
+| Color | Mode |
+|-------|------|
+| Dim white | Idle / system ready |
+| Blue | WiFi scanning |
+| Green | Passive sniffer / SnifferDog |
+| Cyan | Wardrive |
+| Purple | BLE scan / AirTag / BT locator |
+| Yellow | WPA handshake capture |
+| Amber | Deauth monitor / MITM ARP |
+| Orange | Karma attack / captive portal |
+| Red | Deauth / blackout / SAE overflow |
 
 ---
 
