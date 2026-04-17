@@ -276,6 +276,21 @@ static uint16_t scan_time_max_ms = 300;     // Active scan max time per channel 
 #define NVS_KEY_SCAN_MAX    "scan_max"
 #define NVS_KEY_DARK_MODE   "dark_mode"
 
+// Touch calibration NVS
+#define TOUCH_CAL_NVS_NS      "touch_cal"
+#define TOUCH_CAL_MAGIC       ((uint16_t)0xCA11)
+#define TOUCH_CAL_NULL_RADIUS 250   // raw ADC units — reject within this radius of null point
+
+typedef struct {
+    int32_t  x_min, x_max;
+    int32_t  y_min, y_max;
+    int32_t  null_x, null_y;
+    uint8_t  invert_x, invert_y, swap_xy;
+} touch_cal_t;
+
+static bool touch_cal_loaded = false;
+static bool touch_cal_needed = false;
+
 // ============================================================================
 // Theme-aware style helpers
 // ============================================================================
@@ -2340,17 +2355,263 @@ static void sniffer_task(void *pvParameters) {
     vTaskDelete(NULL);
 }
 
+// ============================================================================
+// Touch Calibration
+// ============================================================================
+
+static bool touch_cal_nvs_load(touch_cal_t *cal)
+{
+    nvs_handle_t h;
+    if (nvs_open(TOUCH_CAL_NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
+    uint16_t magic = 0;
+    nvs_get_u16(h, "magic", &magic);
+    bool ok = (magic == TOUCH_CAL_MAGIC);
+    if (ok) {
+        nvs_get_i32(h, "x_min",    &cal->x_min);
+        nvs_get_i32(h, "x_max",    &cal->x_max);
+        nvs_get_i32(h, "y_min",    &cal->y_min);
+        nvs_get_i32(h, "y_max",    &cal->y_max);
+        nvs_get_i32(h, "null_x",   &cal->null_x);
+        nvs_get_i32(h, "null_y",   &cal->null_y);
+        nvs_get_u8(h,  "invert_x", &cal->invert_x);
+        nvs_get_u8(h,  "invert_y", &cal->invert_y);
+        nvs_get_u8(h,  "swap_xy",  &cal->swap_xy);
+    }
+    nvs_close(h);
+    return ok;
+}
+
+static void touch_cal_nvs_save(const touch_cal_t *cal)
+{
+    nvs_handle_t h;
+    if (nvs_open(TOUCH_CAL_NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGE(TAG, "touch_cal: nvs_open failed");
+        return;
+    }
+    nvs_set_i32(h, "x_min",    cal->x_min);
+    nvs_set_i32(h, "x_max",    cal->x_max);
+    nvs_set_i32(h, "y_min",    cal->y_min);
+    nvs_set_i32(h, "y_max",    cal->y_max);
+    nvs_set_i32(h, "null_x",   cal->null_x);
+    nvs_set_i32(h, "null_y",   cal->null_y);
+    nvs_set_u8(h,  "invert_x", cal->invert_x);
+    nvs_set_u8(h,  "invert_y", cal->invert_y);
+    nvs_set_u8(h,  "swap_xy",  cal->swap_xy);
+    nvs_set_u16(h, "magic",    TOUCH_CAL_MAGIC);
+    nvs_commit(h);
+    nvs_close(h);
+    ESP_LOGI(TAG, "Touch calibration saved to NVS");
+}
+
+static void touch_cal_apply(const touch_cal_t *cal)
+{
+    xpt2046_set_calibration(&touch_handle,
+                             (int)cal->x_min, (int)cal->x_max,
+                             (int)cal->y_min, (int)cal->y_max);
+    touch_handle.invert_x    = (bool)cal->invert_x;
+    touch_handle.invert_y    = (bool)cal->invert_y;
+    touch_handle.swap_xy     = (bool)cal->swap_xy;
+    touch_handle.null_x      = (int)cal->null_x;
+    touch_handle.null_y      = (int)cal->null_y;
+    touch_handle.null_radius = (cal->null_x > 0 && cal->null_y > 0) ? TOUCH_CAL_NULL_RADIUS : 0;
+    ESP_LOGI(TAG, "Touch cal: X%ld-%ld Y%ld-%ld inv(%d,%d) null(%ld,%ld)",
+             cal->x_min, cal->x_max, cal->y_min, cal->y_max,
+             cal->invert_x, cal->invert_y, cal->null_x, cal->null_y);
+}
+
+// --- Calibration UI (blocking; drives LVGL manually) ---
+
+static void cal_tick(void)
+{
+    if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        lv_timer_handler();
+        xSemaphoreGive(lvgl_mutex);
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+}
+
+static bool cal_in_null(int x, int y, int nx, int ny)
+{
+    if (nx <= 0 || ny <= 0) return false;
+    int dx = x - nx, dy = y - ny;
+    return (dx * dx + dy * dy) < (TOUCH_CAL_NULL_RADIUS * TOUCH_CAL_NULL_RADIUS);
+}
+
+// Wait for 8 consecutive stable reads not in the null zone; timeout_ms = 0 → wait forever
+static bool cal_wait_touch(int nx, int ny, uint16_t *rx, uint16_t *ry, int timeout_ms)
+{
+    int64_t t0 = esp_timer_get_time() / 1000;
+    uint16_t lx = 0, ly = 0;
+    int stable = 0;
+    for (;;) {
+        cal_tick();
+        if (timeout_ms > 0 && (esp_timer_get_time() / 1000 - t0) > timeout_ms) return false;
+        uint16_t x, y;
+        if (!xpt2046_read_raw_point(&touch_handle, &x, &y) || cal_in_null(x, y, nx, ny)) {
+            stable = 0; lx = ly = 0;
+            continue;
+        }
+        if (lx > 0 && abs((int)x - (int)lx) < 80 && abs((int)y - (int)ly) < 80) {
+            if (++stable >= 8) { *rx = x; *ry = y; return true; }
+        } else { stable = 1; }
+        lx = x; ly = y;
+    }
+}
+
+// Wait until touch is gone (readings absent or in null zone) for 8 polls
+static void cal_wait_release(int nx, int ny)
+{
+    int count = 0;
+    while (count < 8) {
+        cal_tick();
+        uint16_t x, y;
+        bool t = xpt2046_read_raw_point(&touch_handle, &x, &y);
+        count = (!t || cal_in_null(x, y, nx, ny)) ? count + 1 : 0;
+    }
+}
+
+// Calibration target points [screen_x, screen_y]: TL, TR, BL
+static const int16_t CAL_PTS[3][2] = { {20, 20}, {220, 20}, {20, 300} };
+
+static void run_touch_calibration(void)
+{
+    ESP_LOGI(TAG, "Starting touch calibration");
+
+    lv_obj_t *scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(scr, 0, 0);
+    lv_obj_set_style_pad_all(scr, 0, 0);
+
+    lv_obj_t *lbl = lv_label_create(scr);
+    lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lbl, 200);
+    lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 50);
+
+    lv_obj_t *hbar = lv_obj_create(scr);
+    lv_obj_set_size(hbar, 32, 2);
+    lv_obj_set_style_bg_color(hbar, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(hbar, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(hbar, 0, 0);
+    lv_obj_set_style_radius(hbar, 0, 0);
+
+    lv_obj_t *vbar = lv_obj_create(scr);
+    lv_obj_set_size(vbar, 2, 32);
+    lv_obj_set_style_bg_color(vbar, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(vbar, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(vbar, 0, 0);
+    lv_obj_set_style_radius(vbar, 0, 0);
+    lv_obj_add_flag(hbar, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(vbar, LV_OBJ_FLAG_HIDDEN);
+
+    lv_scr_load(scr);
+    for (int i = 0; i < 5; i++) cal_tick();
+
+    // Step 0: measure resting null zone (2 s, do not touch)
+    lv_label_set_text(lbl, "Calibrating...\nDo NOT touch screen.");
+    for (int i = 0; i < 3; i++) cal_tick();
+
+    int64_t t_end = esp_timer_get_time() / 1000 + 2000;
+    int32_t nxs = 0, nys = 0; int nn = 0;
+    while (esp_timer_get_time() / 1000 < t_end) {
+        cal_tick();
+        uint16_t x, y;
+        if (xpt2046_read_raw_point(&touch_handle, &x, &y)) {
+            nxs += x; nys += y; nn++;
+        }
+    }
+    int null_x = (nn > 0) ? (int)(nxs / nn) : 0;
+    int null_y = (nn > 0) ? (int)(nys / nn) : 0;
+    ESP_LOGI(TAG, "Null zone raw=(%d,%d) n=%d", null_x, null_y, nn);
+
+    // Steps 1–3: collect 3 calibration points
+    uint16_t raw_x[3], raw_y[3];
+    const char *pt_lbl[3] = {
+        "Touch the [+]\nTop-Left  (1/3)",
+        "Touch the [+]\nTop-Right (2/3)",
+        "Touch the [+]\nBottom-Left (3/3)"
+    };
+
+    for (int pt = 0; pt < 3; pt++) {
+        int tx = CAL_PTS[pt][0], ty = CAL_PTS[pt][1];
+        lv_obj_set_pos(hbar, tx - 16, ty - 1);
+        lv_obj_set_pos(vbar, tx - 1,  ty - 16);
+        lv_obj_clear_flag(hbar, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(vbar, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(lbl, pt_lbl[pt]);
+        for (int i = 0; i < 3; i++) cal_tick();
+
+        cal_wait_release(null_x, null_y);
+
+        if (!cal_wait_touch(null_x, null_y, &raw_x[pt], &raw_y[pt], 15000)) {
+            ESP_LOGW(TAG, "Calibration timeout at point %d — aborting", pt + 1);
+            lv_obj_del(scr);
+            return;
+        }
+        ESP_LOGI(TAG, "Cal[%d] screen(%d,%d) → raw(%u,%u)", pt+1, tx, ty, raw_x[pt], raw_y[pt]);
+    }
+
+    // Derive calibration from two X points (TL,TR) and two Y points (TL,BL)
+    float xscale = (float)((int)raw_x[1] - (int)raw_x[0]) / (CAL_PTS[1][0] - CAL_PTS[0][0]);
+    int x_at_0   = (int)raw_x[0] - (int)(CAL_PTS[0][0] * xscale);
+    int x_at_239 = (int)raw_x[1] + (int)((LV_HOR_RES - 1 - CAL_PTS[1][0]) * xscale);
+
+    float yscale = (float)((int)raw_y[2] - (int)raw_y[0]) / (CAL_PTS[2][1] - CAL_PTS[0][1]);
+    int y_at_0   = (int)raw_y[0] - (int)(CAL_PTS[0][1] * yscale);
+    int y_at_319 = (int)raw_y[2] + (int)((LV_VER_RES - 1 - CAL_PTS[2][1]) * yscale);
+
+    touch_cal_t cal;
+    cal.invert_x = (uint8_t)(x_at_0 > x_at_239);
+    cal.x_min    = (int32_t)(cal.invert_x ? x_at_239 : x_at_0);
+    cal.x_max    = (int32_t)(cal.invert_x ? x_at_0   : x_at_239);
+    cal.invert_y = (uint8_t)(y_at_0 > y_at_319);
+    cal.y_min    = (int32_t)(cal.invert_y ? y_at_319 : y_at_0);
+    cal.y_max    = (int32_t)(cal.invert_y ? y_at_0   : y_at_319);
+    cal.swap_xy  = 0;
+    cal.null_x   = (int32_t)null_x;
+    cal.null_y   = (int32_t)null_y;
+
+    ESP_LOGI(TAG, "Cal: X%ld-%ld(inv=%d) Y%ld-%ld(inv=%d) null(%ld,%ld)",
+             cal.x_min, cal.x_max, cal.invert_x,
+             cal.y_min, cal.y_max, cal.invert_y,
+             cal.null_x, cal.null_y);
+
+    touch_cal_nvs_save(&cal);
+    touch_cal_apply(&cal);
+
+    lv_label_set_text(lbl, "Calibration done!");
+    lv_obj_add_flag(hbar, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(vbar, LV_OBJ_FLAG_HIDDEN);
+    int64_t t_done = esp_timer_get_time() / 1000 + 1500;
+    while (esp_timer_get_time() / 1000 < t_done) cal_tick();
+
+    lv_obj_del(scr);
+    ESP_LOGI(TAG, "Touch calibration complete");
+}
+
 static void init_touch(void)
 {
-    // XPT2046 resistive touch on SPI2_HOST (shared with display + SD card).
-    // Must be called AFTER init_display() so the SPI bus is already initialised.
-    // T_IRQ is not connected on NM-CYD-C5 — touch is detected via Z1 pressure polling.
-    esp_err_t ret = xpt2046_init(&touch_handle, LCD_HOST, TOUCH_CS,
-                                  LCD_H_RES, LCD_V_RES);
+    esp_err_t ret = xpt2046_init(&touch_handle, LCD_HOST, TOUCH_CS, LCD_H_RES, LCD_V_RES);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "XPT2046 touch init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(TAG, "XPT2046 touch initialised (SPI polling mode, CS=GPIO%d)", TOUCH_CS);
+
+    // Load calibration from NVS; if absent use hardware-observed defaults for NM-CYD-C5
+    touch_cal_t cal;
+    if (touch_cal_nvs_load(&cal)) {
+        touch_cal_apply(&cal);
+        touch_cal_loaded = true;
+        ESP_LOGI(TAG, "Touch calibration loaded from NVS");
     } else {
-        ESP_LOGI(TAG, "XPT2046 touch initialised (SPI polling mode, CS=GPIO%d)", TOUCH_CS);
+        // Default orientation observed on NM-CYD-C5: both axes inverted
+        touch_handle.invert_x = true;
+        touch_handle.invert_y = true;
+        touch_handle.swap_xy  = false;
+        ESP_LOGI(TAG, "No NVS touch cal — using default invert_x/y; calibration needed");
     }
 }
 
@@ -2740,7 +3001,7 @@ static void show_sd_loading_popup(const char *text) {
     style_modal_overlay(sd_loading_popup, dark_mode_enabled ? LV_OPA_50 : LV_OPA_30);
 
     lv_obj_t *dialog = lv_obj_create(sd_loading_popup);
-    lv_obj_set_size(dialog, 280, 100);
+    lv_obj_set_size(dialog, LCD_H_RES - 20, 100);
     lv_obj_center(dialog);
     style_popup_card(dialog, 10, ui_accent_color());
     lv_obj_clear_flag(dialog, LV_OBJ_FLAG_SCROLLABLE);
@@ -2938,13 +3199,13 @@ static void detection_complete_cb(lv_timer_t *timer)
     splash_loading_label = NULL;
     splash_detecting_label = NULL;
     create_home_ui();
+    lv_obj_invalidate(lv_scr_act());
 }
 
 static void splash_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
     glitch_frame++;
-    esp_rom_printf(">>> splash_timer_cb frame=%d <<<\n", glitch_frame);
 
     if (splash_loading_label) {
         static const char *frames[] = {
@@ -2955,13 +3216,13 @@ static void splash_timer_cb(lv_timer_t *timer)
             (glitch_frame % 10 < 6) ? LV_OPA_100 : LV_OPA_60, 0);
     }
 
-    if (glitch_frame >= 22 && splash_detecting_label) {
+    if (glitch_frame >= 8 && splash_detecting_label) {
         lv_obj_clear_flag(splash_detecting_label, LV_OBJ_FLAG_HIDDEN);
     }
 
-    if (!splash_detection_started && glitch_frame >= 28) {
+    if (!splash_detection_started && glitch_frame >= 10) {
         splash_detection_started = true;
-        lv_timer_t *det = lv_timer_create(detection_complete_cb, 700, NULL);
+        lv_timer_t *det = lv_timer_create(detection_complete_cb, 200, NULL);
         lv_timer_set_repeat_count(det, 1);
     }
 }
@@ -3010,7 +3271,6 @@ static void show_splash_screen(void)
 
 static void create_home_ui(void)
 {
-    esp_rom_printf(">>> create_home_ui CALLED <<<\n");
     title_bar = lv_obj_create(lv_scr_act());
     lv_obj_set_size(title_bar, lv_pct(100), 30);
     lv_obj_align(title_bar, LV_ALIGN_TOP_MID, 0, 0);
@@ -3059,35 +3319,23 @@ void app_main(void)
 		ESP_LOGE(TAG, "GPS UART init failed");
 	}
     
-    // ── DEBUG: flush helper ──────────────────────────────────────────────────
-    // vTaskDelay after each checkpoint gives UART time to drain before a crash
-#define DBG(n) do { ESP_LOGE(TAG, ">>> DBG-%02d heap=%u", (n), esp_get_free_heap_size()); vTaskDelay(pdMS_TO_TICKS(50)); } while(0)
-
-    DBG(1); // just after GPS+wifi stack inits
-
     // Initialize WiFi CLI system (WiFi, LED, all components)
     esp_err_t ret = wifi_cli_init();
-    DBG(2); // wifi_cli_init() returned
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "WiFi CLI init FAILED: %s", esp_err_to_name(ret));
-        vTaskDelay(pdMS_TO_TICKS(50));
     } else {
         ESP_LOGI(TAG, "WiFi CLI system initialized OK");
-        vTaskDelay(pdMS_TO_TICKS(50));
         current_radio_mode = RADIO_MODE_WIFI;
         wifi_initialized = true;
     }
 
-    DBG(3); // before nvs_settings_load
     // Load screen settings (timeout, brightness) from NVS
     nvs_settings_load();
 
-    DBG(4); // before wifi_scanner_init
     // Init scanner and register event handler
     wifi_scanner_init();
     esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE, &wifi_scan_done_cb, NULL);
 
-    DBG(5); // before PSRAM allocs
     // Allocate sniffer handshake + wardrive promisc arrays in PSRAM
     hs_ap_targets = (hs_ap_target_t *)heap_caps_calloc(HS_MAX_APS, sizeof(hs_ap_target_t), MALLOC_CAP_SPIRAM);
     hs_clients = (hs_client_entry_t *)heap_caps_calloc(HS_MAX_CLIENTS, sizeof(hs_client_entry_t), MALLOC_CAP_SPIRAM);
@@ -3098,20 +3346,11 @@ void app_main(void)
         ESP_LOGE(TAG, "PSRAM alloc FAILED!");
     }
 
-    DBG(6); // before lvgl_memory_init
     lvgl_memory_init();
-
-    DBG(7); // before lv_init
     lv_init();
-
-    DBG(8); // before init_display (SPI bus init)
     init_display();
-
-    DBG(9); // after init_display — SPI bus + ST7789 up
     init_touch();
-    DBG(10);
     init_backlight();
-    DBG(11);
 
     ESP_LOGI(TAG, "=== SD CARD INIT DISABLED ===");
     ESP_LOGI(TAG, "[INIT] SD card will be mounted lazily on first use");
@@ -3343,14 +3582,47 @@ void app_main(void)
     
     // Hide popup
     hide_sd_loading_popup();
-    
+
+    // Check for calibration reset trigger file on SD card
+    if (sd_mounted_lazy) {
+        struct stat st;
+        if (stat("/sdcard/calibrate.txt", &st) == 0) {
+            ESP_LOGI(TAG, "Found /sdcard/calibrate.txt — scheduling touch calibration");
+            remove("/sdcard/calibrate.txt");
+            touch_cal_needed = true;
+        }
+    }
+    // Also calibrate on first boot (no NVS calibration saved yet)
+    if (!touch_cal_loaded) {
+        touch_cal_needed = true;
+    }
+
+    // Brief splash hold so user can read the boot screen, then transition
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    // Transition splash → home UI directly (deterministic — no LVGL timer dependency)
+    if (splash_timer) { lv_timer_del(splash_timer); splash_timer = NULL; }
+    if (splash_screen) { lv_obj_del(splash_screen); splash_screen = NULL; }
+    splash_loading_label = NULL;
+    splash_detecting_label = NULL;
+
+    // Run calibration if needed (first boot or SD trigger file found)
+    if (touch_cal_needed) {
+        touch_cal_needed = false;
+        run_touch_calibration();
+    }
+
+    create_home_ui();
+    lv_obj_invalidate(lv_scr_act());
+    lv_refr_now(NULL);
+
     ESP_LOGI(TAG, "System ready!");
     ESP_LOGI(TAG, "[DIAG] System ready - final memory state");
     check_heap_integrity("Before main loop");
     print_memory_stats();
     
-    //Battery voltage monitor disabled - chip changed from Waveshare to regular C5
-    if (init_battery_adc() == ESP_OK) {
+    // Battery ADC disabled: GPIO6 = SPI SCK on NM-CYD-C5, ADC would reconfigure it
+    if (false && init_battery_adc() == ESP_OK) {
         battery_task_stack = (StackType_t *)heap_caps_malloc(2048 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
         if (battery_task_stack != NULL) {
             battery_task_handle = xTaskCreateStatic(battery_monitor_task, "bat_mon", 2048, NULL,
@@ -3386,8 +3658,8 @@ void app_main(void)
         if ((now - last_log) > pdMS_TO_TICKS(5000)) {
             lv_disp_t *disp = lv_disp_get_default();
             uint8_t flushing = disp ? disp->driver->draw_buf->flushing : 0xFF;
-            ESP_LOGI(TAG, "[MAIN LOOP] Alive - iteration #%u, heap: %u bytes, frame=%d, flushing=%d",
-                     loop_counter, esp_get_free_heap_size(), glitch_frame, flushing);
+            ESP_LOGI(TAG, "[MAIN LOOP] Alive - iteration #%u, heap: %u bytes, frame=%d, flushing=%d, flushes=%u",
+                     loop_counter, esp_get_free_heap_size(), glitch_frame, flushing, lvgl_flush_counter);
             last_log = now;
         }
         
@@ -4012,7 +4284,7 @@ void app_main(void)
                                              records[i].bssid[3], records[i].bssid[4], records[i].bssid[5], band);
                                 }
                                 lv_label_set_text(ssid_lbl, name_buf);
-                                lv_label_set_long_mode(ssid_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+                                lv_label_set_long_mode(ssid_lbl, LV_LABEL_LONG_DOT);
                                 lv_obj_set_style_text_font(ssid_lbl, &lv_font_montserrat_14, 0);
                                 lv_obj_set_style_text_color(ssid_lbl, ui_text_color(), 0);
                                 lv_obj_align(ssid_lbl, LV_ALIGN_LEFT_MID, 0, 5);  // 5px down for better alignment
@@ -4564,11 +4836,6 @@ static bool IRAM_ATTR on_color_trans_done(esp_lcd_panel_io_handle_t io,
                                           esp_lcd_panel_io_event_data_t *edata,
                                           void *user_ctx)
 {
-    static uint32_t trans_count = 0;
-    trans_count++;
-    if (trans_count <= 3 || trans_count % 500 == 0) {
-        esp_rom_printf(">>> on_color_trans_done #%u <<<\n", trans_count);
-    }
     // Signal the flush task — lv_disp_flush_ready() must be called from task context,
     // NOT from this ISR. Calling it here invokes _lv_disp_refr_timer() from ISR which
     // corrupts LVGL's already_running guard and silently kills all timer processing.
@@ -9662,7 +9929,7 @@ static lv_obj_t *create_tile(lv_obj_t *parent, const char *icon, const char *tex
         lv_obj_set_style_text_font(text_label, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(text_label, ui_text_color(), 0);
         lv_obj_set_style_text_align(text_label, LV_TEXT_ALIGN_CENTER, 0);
-        lv_label_set_long_mode(text_label, LV_LABEL_LONG_WRAP);
+        lv_label_set_long_mode(text_label, LV_LABEL_LONG_DOT);
         lv_obj_set_width(text_label, 89);
     }
 
@@ -9893,11 +10160,11 @@ static void show_main_tiles(void)
     lv_obj_set_flex_align(tiles_container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(tiles_container, LV_OBJ_FLAG_SCROLLABLE);
 
-    create_tile(tiles_container, LV_SYMBOL_WIFI, "WiFi Scan\n& Attack", UI_ACCENT_BLUE, main_tile_event_cb, "WiFi Scan & Attack");
-    create_tile(tiles_container, LV_SYMBOL_WARNING, "Global WiFi\nAttacks", UI_ACCENT_RED, main_tile_event_cb, "Global WiFi Attacks");
-    create_tile(tiles_container, LV_SYMBOL_EYE_OPEN, "Network Observer\n& Karma", UI_ACCENT_PURPLE, main_tile_event_cb, "WiFi Sniff&Karma");
+    create_tile(tiles_container, LV_SYMBOL_WIFI, "WiFi Scan", UI_ACCENT_BLUE, main_tile_event_cb, "WiFi Scan & Attack");
+    create_tile(tiles_container, LV_SYMBOL_WARNING, "WiFi Attacks", UI_ACCENT_RED, main_tile_event_cb, "Global WiFi Attacks");
+    create_tile(tiles_container, LV_SYMBOL_EYE_OPEN, "Observer", UI_ACCENT_PURPLE, main_tile_event_cb, "WiFi Sniff&Karma");
     create_tile(tiles_container, LV_SYMBOL_SETTINGS, "Settings", UI_ACCENT_GREEN, main_tile_event_cb, "Settings");
-    create_tile(tiles_container, LV_SYMBOL_GPS, "Deauth\nMonitor", UI_ACCENT_AMBER, main_tile_event_cb, "Deauth Monitor");
+    create_tile(tiles_container, LV_SYMBOL_GPS, "Deauth Mon.", UI_ACCENT_AMBER, main_tile_event_cb, "Deauth Monitor");
     create_tile(tiles_container, LV_SYMBOL_BLUETOOTH, "Bluetooth", UI_ACCENT_CYAN, main_tile_event_cb, "Bluetooth");
     
     // Show title bar
@@ -13295,7 +13562,7 @@ static void show_screen_brightness_popup(void)
 
     // Slider
     brightness_slider = lv_slider_create(dialog);
-    lv_obj_set_width(brightness_slider, 260);
+    lv_obj_set_width(brightness_slider, 200);
     lv_slider_set_range(brightness_slider, 10, 100);
     lv_slider_set_value(brightness_slider, screen_brightness_pct, LV_ANIM_OFF);
     // Slider knob style

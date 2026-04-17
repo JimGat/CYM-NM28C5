@@ -81,35 +81,19 @@ static esp_err_t init_wifi(void) {
     // Initialize in STA-only mode (uses less memory, avoids AP netif issues)
     // AP mode will be enabled dynamically when needed (Evil Twin, etc.)
     wifi_config_t wifi_config = {0};
-    ESP_LOGE(TAG, "[WIFI] set_mode STA...");
-    vTaskDelay(pdMS_TO_TICKS(50));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_LOGE(TAG, "[WIFI] set_config...");
-    vTaskDelay(pdMS_TO_TICKS(50));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_LOGE(TAG, "[WIFI] esp_wifi_start calling...");
-    vTaskDelay(pdMS_TO_TICKS(50));
     ESP_ERROR_CHECK(esp_wifi_start());
-    // esp_rom_printf writes directly to UART hardware — survives any immediate crash
-    esp_rom_printf("\n>>> esp_wifi_start RETURNED <<<\n");
-    vTaskDelay(pdMS_TO_TICKS(200));   // let background tasks run
-    esp_rom_printf(">>> ALIVE after 200ms <<<\n");
-    vTaskDelay(pdMS_TO_TICKS(200));
-    esp_rom_printf(">>> ALIVE after 400ms <<<\n");
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(400));   // let background tasks run after start
 
     uint8_t mac[6];
     esp_err_t ret = esp_wifi_get_mac(WIFI_IF_STA, mac);
-    ESP_LOGE(TAG, "[WIFI] get_mac ret=%d", ret);
-    vTaskDelay(pdMS_TO_TICKS(50));
     if (ret == ESP_OK) {
         MY_LOG_INFO(TAG, "JanOS version: " JANOS_VERSION);
         MY_LOG_INFO(TAG, "MAC: %02X:%02X:%02X:%02X:%02X:%02X",
                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
 
-    ESP_LOGE(TAG, "[WIFI] init_wifi returning OK");
-    vTaskDelay(pdMS_TO_TICKS(50));
     return ESP_OK;
 }
 

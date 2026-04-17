@@ -103,7 +103,7 @@ jobs:
           )
 
           out_dir="release_artifacts/firmware"
-          app_src="${out_dir}/projectZero.bin"
+          app_src="${out_dir}/CYM-NM28C5.bin"
           if [ ! -f "$app_src" ]; then
             echo "Missing firmware: $app_src" >&2
             exit 1
@@ -128,7 +128,7 @@ jobs:
             --flash_mode dio --flash_freq 80m --flash_size 8MB \
             0x2000 "${out_dir}/bootloader.bin" \
             0x8000 "${out_dir}/partition-table.bin" \
-            0x10000 "${out_dir}/projectZero.bin"
+            0x10000 "${out_dir}/CYM-NM28C5.bin"
           cp "${out_dir}/${FW_BASENAME}-full-${{ steps.prepare.outputs.version }}.bin" \
             "${out_dir}/${FW_BASENAME}-full.bin"
 
@@ -145,7 +145,7 @@ jobs:
             bootloader-esp32c5.bin \
             partition-table.bin \
             partition-table-esp32c5.bin \
-            projectZero.bin \
+            CYM-NM28C5.bin \
             "${FW_BASENAME}.bin" \
             "${FW_BASENAME}-${{ steps.prepare.outputs.version }}.bin" \
             "${FW_BASENAME}-full.bin" \
@@ -198,7 +198,7 @@ jobs:
             release_artifacts/firmware/bootloader-esp32c5.bin
             release_artifacts/firmware/partition-table.bin
             release_artifacts/firmware/partition-table-esp32c5.bin
-            release_artifacts/firmware/projectZero.bin
+            release_artifacts/firmware/CYM-NM28C5.bin
             release_artifacts/firmware/${{ env.FW_BASENAME }}.bin
             release_artifacts/firmware/${{ env.FW_BASENAME }}-${{ needs.package.outputs.fw_version }}.bin
             release_artifacts/firmware/${{ env.FW_BASENAME }}-full.bin

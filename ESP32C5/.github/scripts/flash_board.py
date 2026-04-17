@@ -27,7 +27,7 @@ def pick_first(base_dir: Path, names: list[str]) -> Path | None:
 def default_files(base_dir: Path) -> tuple[Path, Path, Path]:
     bootloader = pick_first(base_dir, ["bootloader.bin", "bootloader-esp32c5.bin"])
     partition = pick_first(base_dir, ["partition-table.bin", "partition-table-esp32c5.bin"])
-    firmware = pick_first(base_dir, ["pancake-esp32c5.bin", "projectZero.bin"])
+    firmware = pick_first(base_dir, ["CYM-NM28C5.bin", "pancake-esp32c5.bin"])
 
     missing = []
     if bootloader is None:
@@ -35,7 +35,7 @@ def default_files(base_dir: Path) -> tuple[Path, Path, Path]:
     if partition is None:
         missing.append("partition-table.bin")
     if firmware is None:
-        missing.append("pancake-esp32c5.bin or projectZero.bin")
+        missing.append("CYM-NM28C5.bin")
     if missing:
         raise FileNotFoundError(f"Missing required files next to flash_board.py: {', '.join(missing)}")
 
