@@ -22,6 +22,7 @@
 #include "esp_system.h"
 #include "soc/lp_aon_reg.h"
 #include "wifi_cli.h"
+#include "led_strip.h"
 #include "wifi_scanner.h"
 #include "wifi_sniffer.h"
 #include "wifi_attacks.h"
@@ -2012,6 +2013,66 @@ static void set_backlight_percent(uint8_t percent)
     lv_obj_set_style_bg_opa(brightness_overlay, opa, 0);
 }
 
+// ============================================================================
+// NeoPixel LED (WS2812 on GPIO 27) — mode-based status indicator
+// ============================================================================
+// Brightness kept low (≤40/255) so the single LED is visible but not blinding.
+// Priority (highest first): attacks → passive/monitoring → scanning → idle
+
+static void led_set(uint8_t r, uint8_t g, uint8_t b)
+{
+    if (!g_led_strip) return;
+    led_strip_set_pixel(g_led_strip, 0, r, g, b);
+    led_strip_refresh(g_led_strip);
+}
+
+static void led_update_mode(void)
+{
+    // ── Aggressive attacks (red family) ──────────────────────────────────────
+    if (wifi_attacks_is_deauth_active() || targeted_deauth_active ||
+        wifi_attacks_is_blackout_active() || wifi_attacks_is_sae_overflow_active()) {
+        led_set(40, 0, 0);   // red — denial-of-service
+        return;
+    }
+    // ── Rogue AP / captive deception (orange) ─────────────────────────────
+    if (wifi_attacks_is_karma_active() || wifi_attacks_is_portal_active()) {
+        led_set(40, 15, 0);  // orange — fake AP running
+        return;
+    }
+    // ── Handshake capture (yellow) ────────────────────────────────────────
+    if (handshake_attack_active) {
+        led_set(35, 35, 0);  // yellow — WPA capture in progress
+        return;
+    }
+    // ── Deauth monitor / MITM (amber) ─────────────────────────────────────
+    if (deauth_monitor_active || mitm_arp_active) {
+        led_set(40, 20, 0);  // amber — watching/intercepting
+        return;
+    }
+    // ── Passive sniffing (green) ──────────────────────────────────────────
+    if (sniffer_task_active || sniffer_dog_active) {
+        led_set(0, 40, 0);   // green — listening passively
+        return;
+    }
+    // ── Wardriving (cyan) ────────────────────────────────────────────────
+    if (wardrive_active) {
+        led_set(0, 25, 25);  // cyan — geo-mapping
+        return;
+    }
+    // ── BLE / AirTag / BT locator (purple) ──────────────────────────────
+    if (ble_scan_ui_active || airtag_scan_active || bt_locator_tracking_active) {
+        led_set(20, 0, 40);  // purple — Bluetooth active
+        return;
+    }
+    // ── WiFi scanning (blue) ─────────────────────────────────────────────
+    if (wifi_scanner_is_scanning()) {
+        led_set(0, 0, 40);   // blue — scanning for APs
+        return;
+    }
+    // ── Idle (dim white) ─────────────────────────────────────────────────
+    led_set(8, 8, 8);        // dim white — system ready, no operation active
+}
+
 static void screen_set_dimmed(bool dimmed)
 {
     if (screen_dimmed == dimmed) {
@@ -3626,7 +3687,20 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Main event loop started");
 
+    // Initial LED state
+    led_update_mode();
+    uint32_t last_led_update_ms = esp_timer_get_time() / 1000;
+
     while (1) {
+
+        // Update NeoPixel LED color to reflect current mode (~2 Hz)
+        {
+            uint32_t now_ms = esp_timer_get_time() / 1000;
+            if (now_ms - last_led_update_ms >= 500) {
+                led_update_mode();
+                last_led_update_ms = now_ms;
+            }
+        }
 
         // Thread-safe LVGL handling
         uint32_t sleep_ms = 10;
