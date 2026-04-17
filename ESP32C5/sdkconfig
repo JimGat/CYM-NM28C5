@@ -4517,7 +4517,7 @@ CONFIG_LV_COLOR_DEPTH_16=y
 # default:
 CONFIG_LV_COLOR_DEPTH=16
 # default:
-# CONFIG_LV_COLOR_16_SWAP is not set
+CONFIG_LV_COLOR_16_SWAP=y
 # default:
 # CONFIG_LV_COLOR_SCREEN_TRANSP is not set
 # default:

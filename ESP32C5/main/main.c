@@ -2006,8 +2006,8 @@ static void set_backlight_percent(uint8_t percent)
     // 10% brightness  = nearly opaque overlay.
     if (!brightness_overlay) return;
     if (percent > 100) percent = 100;
-    if (percent < 10)  percent = 10;
-    // Map 10-100% to opacity 230-0  (linear)
+    if (percent < 30)  percent = 30;   // floor at 30% — below this the screen is unreadable
+    // Map 30-100% to opacity 178-0 (linear): at 30% overlay is 70% opaque (dim but visible)
     lv_opa_t opa = (lv_opa_t)(255 - (uint16_t)percent * 255 / 100);
     lv_obj_set_style_bg_opa(brightness_overlay, opa, 0);
 }
