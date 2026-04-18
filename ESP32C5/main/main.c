@@ -3602,7 +3602,13 @@ void app_main(void)
     
     // Show loading popup
     show_sd_loading_popup("Reading SD card...");
-    
+
+    // Cancel splash auto-transition — SD init controls the splash timing
+    if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        if (splash_timer) { lv_timer_del(splash_timer); splash_timer = NULL; }
+        xSemaphoreGive(lvgl_mutex);
+    }
+
     // Try to mount SD card - 3 attempts, then continue without it
     bool sd_mounted = false;
     const int SD_MAX_ATTEMPTS = 3;
