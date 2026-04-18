@@ -1,4 +1,6 @@
 #include <stdio.h>
+#include <time.h>
+#include <sys/statvfs.h>
 #include "lvgl.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
@@ -846,6 +848,15 @@ static volatile bool wpasec_upload_done = false;
 static volatile bool wpasec_upload_active = false;
 static TaskHandle_t wpasec_upload_task_handle = NULL;
 
+// SD Card settings screen state
+typedef struct { char line[96]; } sd_prov_update_t;
+static lv_obj_t    *sd_provision_log_ta       = NULL;
+static lv_obj_t    *sd_provision_status_label = NULL;
+static lv_obj_t    *sd_prov_back_btn          = NULL;
+static volatile bool sd_provision_active      = false;
+static StackType_t *sd_provision_task_stack   = NULL;
+static StaticTask_t sd_provision_task_buf;
+
 typedef struct {
     char text[192];
     lv_color_t color;
@@ -1069,6 +1080,9 @@ static void attack_tile_event_cb(lv_event_t *e);
 static void update_sniffer_button_ui(void);
 static void show_settings_screen(void);
 static void settings_tile_event_cb(lv_event_t *e);
+static void show_sd_card_screen(void);
+static void show_sd_provision_confirm(bool after_format);
+static void show_sd_provision_running_screen(bool after_format);
 static void home_btn_event_cb(lv_event_t *e);
 static void wifi_scan_next_btn_cb(lv_event_t *e);
 static void deauth_quit_event_cb(lv_event_t *e);
@@ -13722,6 +13736,8 @@ static void settings_tile_event_cb(lv_event_t *e)
         show_screen_timeout_popup();
     } else if (strcmp(tile_name, "Screen Brightness") == 0) {
         show_screen_brightness_popup();
+    } else if (strcmp(tile_name, "SD Card") == 0) {
+        show_sd_card_screen();
     }
 }
 
@@ -13757,9 +13773,554 @@ static void show_settings_screen(void)
     
     // Screen Brightness - Orange
     create_tile(tiles, LV_SYMBOL_IMAGE, "Screen\nBrightness", COLOR_MATERIAL_ORANGE, settings_tile_event_cb, "Screen Brightness");
+
+    // SD Card - Green
+    create_tile(tiles, LV_SYMBOL_SD_CARD, "SD\nCard", COLOR_MATERIAL_GREEN, settings_tile_event_cb, "SD Card");
 }
 
 // WiFi Monitor screen
+// ============================================================================
+// SD Card Settings — Validate & Provision / Free Space / Format
+// ============================================================================
+
+// ─── Provision directory/file table ──────────────────────────────────────────
+
+typedef enum { SD_ITEM_DIR, SD_ITEM_FILE } sd_item_type_t;
+
+typedef struct {
+    sd_item_type_t type;
+    const char    *path;
+    const char    *content;  // NULL → empty; non-NULL → write only on creation
+} sd_provision_item_t;
+
+static const sd_provision_item_t SD_ITEMS[] = {
+    { SD_ITEM_DIR,  "/sdcard/lab",                           NULL },
+    { SD_ITEM_DIR,  "/sdcard/lab/handshakes",                NULL },
+    { SD_ITEM_DIR,  "/sdcard/lab/portal",                    NULL },
+    { SD_ITEM_DIR,  "/sdcard/lab/wardrive",                  NULL },
+    { SD_ITEM_DIR,  "/sdcard/lab/cellular",                  NULL },
+    { SD_ITEM_DIR,  "/sdcard/lab/pcap",                      NULL },
+    { SD_ITEM_DIR,  "/sdcard/lab/alerts",                    NULL },
+    { SD_ITEM_DIR,  "/sdcard/lab/config",                    NULL },
+    { SD_ITEM_FILE, "/sdcard/lab/white.txt",                 "" },
+    { SD_ITEM_FILE, "/sdcard/lab/cellular/tower_baseline.csv",
+      "arfcn,bsic,lac,cell_id,mcc,mnc,rxlev,gps_lat,gps_lon,first_seen,last_seen\n" },
+    { SD_ITEM_FILE, "/sdcard/lab/cellular/tower_anomalies.csv",
+      "timestamp,gps_lat,gps_lon,arfcn,lac,cell_id,anomaly_type,rssi,details\n" },
+    { SD_ITEM_FILE, "/sdcard/lab/cellular/raw_at.log",       "" },
+    { SD_ITEM_FILE, "/sdcard/lab/alerts/proximity.csv",
+      "timestamp,gps_lat,gps_lon,mac,label,rssi,alert_type\n" },
+    { SD_ITEM_FILE, "/sdcard/lab/alerts/css_alerts.csv",
+      "timestamp,gps_lat,gps_lon,arfcn,lac,cell_id,anomaly_type,rssi,details\n" },
+    { SD_ITEM_FILE, "/sdcard/lab/config/janos_override.cfg",
+      "go_dark_on_boot=false\nvibrate_on_alert=true\nrssi_alert_threshold=-70\n"
+      "pcap_enabled=false\ncss_detection_enabled=true\nwardrive_enabled=true\n"
+      "screen_timeout_sec=60\nbrightness_pct=80\n" },
+    { SD_ITEM_FILE, "/sdcard/lab/config/detection.cfg",
+      "lac_change_alert=true\nneighbor_suppression_alert=true\nrssi_spike_threshold=20\n"
+      "band_downgrade_alert=true\nunknown_tower_alert=true\n"
+      "ble_unknown_device_alert=false\nwifi_unknown_oui_alert=false\n" },
+};
+#define SD_ITEMS_COUNT  (sizeof(SD_ITEMS) / sizeof(SD_ITEMS[0]))
+
+// ─── Async progress / completion callbacks (run in LVGL context) ─────────────
+
+static void sd_prov_line_cb(void *arg)
+{
+    sd_prov_update_t *upd = (sd_prov_update_t *)arg;
+    if (sd_provision_log_ta) {
+        lv_textarea_add_text(sd_provision_log_ta, upd->line);
+        lv_textarea_add_text(sd_provision_log_ta, "\n");
+    }
+    free(upd);
+}
+
+static void sd_prov_done_cb(void *arg)
+{
+    char *summary = (char *)arg;
+    if (sd_provision_status_label) {
+        lv_label_set_text(sd_provision_status_label, summary ? summary : "Done");
+        lv_obj_set_style_text_color(sd_provision_status_label, COLOR_MATERIAL_GREEN, 0);
+    }
+    if (sd_prov_back_btn) {
+        lv_obj_clear_state(sd_prov_back_btn, LV_STATE_DISABLED);
+        lv_obj_set_style_bg_color(sd_prov_back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
+    }
+    free(summary);
+    sd_provision_active = false;
+    if (sd_provision_task_stack) {
+        heap_caps_free(sd_provision_task_stack);
+        sd_provision_task_stack = NULL;
+    }
+}
+
+// ─── Provision background task ───────────────────────────────────────────────
+
+#define PROV_POST(fmt, ...) do { \
+    sd_prov_update_t *_u = malloc(sizeof(sd_prov_update_t)); \
+    if (_u) { snprintf(_u->line, sizeof(_u->line), fmt, ##__VA_ARGS__); \
+               lv_async_call(sd_prov_line_cb, _u); } \
+} while (0)
+
+static void sd_provision_task(void *pvParams)
+{
+    bool after_format = (bool)(uintptr_t)pvParams;
+    int  created = 0, ok_count = 0;
+
+    if (!sd_spi_mutex || xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(15000)) != pdTRUE) {
+        PROV_POST("ERR: cannot take SPI mutex");
+        goto done;
+    }
+
+    if (after_format) {
+        PROV_POST("Formatting SD card...");
+        esp_err_t fr = wifi_wardrive_format_sd();
+        if (fr != ESP_OK) {
+            PROV_POST("Format FAILED: %s", esp_err_to_name(fr));
+            xSemaphoreGive(sd_spi_mutex);
+            goto done;
+        }
+        PROV_POST("Format OK");
+    }
+
+    for (int i = 0; i < (int)SD_ITEMS_COUNT; i++) {
+        const sd_provision_item_t *item = &SD_ITEMS[i];
+        struct stat st;
+        bool exists = (stat(item->path, &st) == 0);
+
+        if (item->type == SD_ITEM_DIR) {
+            if (exists) {
+                PROV_POST("  OK  %s/", item->path + 8);
+                ok_count++;
+            } else {
+                int r = mkdir(item->path, 0755);
+                if (r == 0) {
+                    PROV_POST("  ++  %s/", item->path + 8);
+                    created++;
+                } else {
+                    PROV_POST("  !!  %s/ (err %d)", item->path + 8, errno);
+                }
+            }
+        } else {
+            if (exists) {
+                PROV_POST("  OK  %s", item->path + 8);
+                ok_count++;
+            } else {
+                FILE *f = fopen(item->path, "w");
+                if (f) {
+                    if (item->content && item->content[0])
+                        fwrite(item->content, 1, strlen(item->content), f);
+                    fclose(f);
+                    PROV_POST("  ++  %s", item->path + 8);
+                    created++;
+                } else {
+                    PROV_POST("  !!  %s (errno %d)", item->path + 8, errno);
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));  // yield so async calls are processed
+    }
+
+    // Append to provision.log
+    time_t now = 0;
+    time(&now);
+    struct tm *tm_info = localtime(&now);
+    char ts[32] = "unknown-time";
+    if (tm_info) strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm_info);
+
+    FILE *log = fopen("/sdcard/lab/config/provision.log", "a");
+    if (log) {
+        fprintf(log, "\n=== Provision run %s ===\n", ts);
+        fprintf(log, "Created: %d  OK: %d\n", created, ok_count);
+        fclose(log);
+    }
+
+    xSemaphoreGive(sd_spi_mutex);
+
+done: ;
+    char *summary = malloc(64);
+    if (summary) snprintf(summary, 64, "Done — %d created, %d OK", created, ok_count);
+    lv_async_call(sd_prov_done_cb, summary);
+    vTaskDelete(NULL);
+}
+
+// ─── Provision running screen ─────────────────────────────────────────────────
+
+static void sd_prov_back_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    show_sd_card_screen();
+}
+
+static void show_sd_provision_running_screen(bool after_format)
+{
+    sd_provision_active = true;
+    const char *title = after_format ? "Format + Provision" : "Validate & Provision";
+    create_function_page_base(title);
+
+    // Log text area — scrollable, monospace-ish
+    sd_provision_log_ta = lv_textarea_create(function_page);
+    lv_obj_set_size(sd_provision_log_ta, lv_pct(100), LCD_V_RES - 30 - 50);
+    lv_obj_align(sd_provision_log_ta, LV_ALIGN_TOP_MID, 0, 30);
+    lv_textarea_set_max_length(sd_provision_log_ta, 4096);
+    lv_textarea_set_one_line(sd_provision_log_ta, false);
+    lv_obj_set_style_text_font(sd_provision_log_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sd_provision_log_ta, ui_text_color(), 0);
+    lv_obj_set_style_bg_color(sd_provision_log_ta, lv_color_hex(0x0d1b2a), 0);
+    lv_obj_set_style_border_width(sd_provision_log_ta, 1, 0);
+    lv_obj_set_style_border_color(sd_provision_log_ta, ui_border_color(), 0);
+    lv_obj_set_style_pad_all(sd_provision_log_ta, 4, 0);
+    lv_obj_clear_flag(sd_provision_log_ta, LV_OBJ_FLAG_CLICKABLE);
+
+    // Status / summary label
+    sd_provision_status_label = lv_label_create(function_page);
+    lv_label_set_text(sd_provision_status_label, "Running...");
+    lv_obj_set_style_text_color(sd_provision_status_label, ui_muted_color(), 0);
+    lv_obj_set_style_text_font(sd_provision_status_label, &lv_font_montserrat_14, 0);
+    lv_obj_align(sd_provision_status_label, LV_ALIGN_BOTTOM_LEFT, 8, -8);
+
+    // Back button — disabled until task completes
+    sd_prov_back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(sd_prov_back_btn, 60, 32);
+    lv_obj_align(sd_prov_back_btn, LV_ALIGN_BOTTOM_RIGHT, -8, -6);
+    lv_obj_set_style_bg_color(sd_prov_back_btn, lv_color_hex(0x333333), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(sd_prov_back_btn, 0, 0);
+    lv_obj_set_style_radius(sd_prov_back_btn, 8, 0);
+    lv_obj_add_state(sd_prov_back_btn, LV_STATE_DISABLED);
+    lv_obj_add_event_cb(sd_prov_back_btn, sd_prov_back_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *back_lbl = lv_label_create(sd_prov_back_btn);
+    lv_label_set_text(back_lbl, "Back");
+    lv_obj_set_style_text_color(back_lbl, ui_muted_color(), 0);
+    lv_obj_center(back_lbl);
+
+    // Launch background task in PSRAM stack
+    sd_provision_task_stack = heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    if (sd_provision_task_stack) {
+        xTaskCreateStatic(sd_provision_task, "sd_prov", 4096,
+                          (void *)(uintptr_t)after_format, 3,
+                          sd_provision_task_stack, &sd_provision_task_buf);
+    } else {
+        lv_label_set_text(sd_provision_status_label, "ERR: no PSRAM for task");
+        sd_provision_active = false;
+        lv_obj_clear_state(sd_prov_back_btn, LV_STATE_DISABLED);
+        lv_obj_set_style_bg_color(sd_prov_back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
+    }
+}
+
+// ─── Validate & Provision confirm ────────────────────────────────────────────
+
+static void sd_prov_confirm_yes_cb(lv_event_t *e)
+{
+    bool after_fmt = (bool)(uintptr_t)lv_event_get_user_data(e);
+    show_sd_provision_running_screen(after_fmt);
+}
+
+static void sd_prov_confirm_no_cb(lv_event_t *e)
+{
+    (void)e;
+    show_sd_card_screen();
+}
+
+static void show_sd_provision_confirm(bool after_format)
+{
+    create_function_page_base("Validate & Provision");
+
+    lv_obj_t *msg = lv_label_create(function_page);
+    lv_label_set_text(msg,
+        "Create missing directories\nand config files?\n\n"
+        "Existing files are never\noverwritten.");
+    lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(msg, ui_text_color(), 0);
+    lv_obj_set_style_text_font(msg, &lv_font_montserrat_16, 0);
+    lv_obj_align(msg, LV_ALIGN_CENTER, 0, -20);
+
+    lv_obj_t *btn_bar = lv_obj_create(function_page);
+    lv_obj_set_size(btn_bar, lv_pct(100), 50);
+    lv_obj_align(btn_bar, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(btn_bar, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(btn_bar, 0, 0);
+    lv_obj_clear_flag(btn_bar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(btn_bar, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_bar, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(btn_bar, 12, 0);
+
+    lv_obj_t *no_btn = lv_btn_create(btn_bar);
+    lv_obj_set_size(no_btn, 90, 34);
+    lv_obj_set_style_bg_color(no_btn, ui_panel_color(), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(no_btn, 1, 0);
+    lv_obj_set_style_border_color(no_btn, ui_border_color(), 0);
+    lv_obj_set_style_radius(no_btn, 8, 0);
+    lv_obj_add_event_cb(no_btn, sd_prov_confirm_no_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *no_lbl = lv_label_create(no_btn);
+    lv_label_set_text(no_lbl, "NO");
+    lv_obj_set_style_text_color(no_lbl, ui_text_color(), 0);
+    lv_obj_center(no_lbl);
+
+    lv_obj_t *yes_btn = lv_btn_create(btn_bar);
+    lv_obj_set_size(yes_btn, 90, 34);
+    lv_obj_set_style_bg_color(yes_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(yes_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(yes_btn, 0, 0);
+    lv_obj_set_style_radius(yes_btn, 8, 0);
+    lv_obj_add_event_cb(yes_btn, sd_prov_confirm_yes_cb, LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)after_format);
+    lv_obj_t *yes_lbl = lv_label_create(yes_btn);
+    lv_label_set_text(yes_lbl, "YES");
+    lv_obj_set_style_text_color(yes_lbl, ui_text_color(), 0);
+    lv_obj_center(yes_lbl);
+}
+
+// ─── Shared back-to-menu callback (used by Free Space and Format screens) ────
+
+static void sd_back_to_menu_cb(lv_event_t *e)
+{
+    (void)e;
+    show_sd_card_screen();
+}
+
+// ─── Free Space screen ───────────────────────────────────────────────────────
+
+static void show_sd_free_space_screen(void)
+{
+    create_function_page_base("SD Free Space");
+
+    struct statvfs vfs;
+    bool ok = (statvfs("/sdcard", &vfs) == 0);
+
+    lv_obj_t *card = lv_obj_create(function_page);
+    lv_obj_set_size(card, 200, 160);
+    lv_obj_align(card, LV_ALIGN_CENTER, 0, -10);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_border_color(card, ui_border_color(), 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 10, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    if (!ok) {
+        lv_obj_t *err = lv_label_create(card);
+        lv_label_set_text(err, "SD not available");
+        lv_obj_set_style_text_color(err, COLOR_MATERIAL_RED, 0);
+        lv_obj_center(err);
+    } else {
+        uint64_t total_b = (uint64_t)vfs.f_blocks * vfs.f_frsize;
+        uint64_t free_b  = (uint64_t)vfs.f_bfree  * vfs.f_frsize;
+        uint64_t used_b  = total_b - free_b;
+        uint32_t total_mb = (uint32_t)(total_b / (1024 * 1024));
+        uint32_t free_mb  = (uint32_t)(free_b  / (1024 * 1024));
+        uint32_t used_mb  = (uint32_t)(used_b  / (1024 * 1024));
+        bool low = free_mb < 50;
+
+        lv_obj_t *lbl_total = lv_label_create(card);
+        char buf[48];
+        snprintf(buf, sizeof(buf), "Total:  %lu MB", (unsigned long)total_mb);
+        lv_label_set_text(lbl_total, buf);
+        lv_obj_set_style_text_font(lbl_total, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(lbl_total, ui_text_color(), 0);
+        lv_obj_align(lbl_total, LV_ALIGN_TOP_LEFT, 0, 0);
+
+        lv_obj_t *lbl_used = lv_label_create(card);
+        snprintf(buf, sizeof(buf), "Used:   %lu MB", (unsigned long)used_mb);
+        lv_label_set_text(lbl_used, buf);
+        lv_obj_set_style_text_font(lbl_used, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(lbl_used, ui_text_color(), 0);
+        lv_obj_align(lbl_used, LV_ALIGN_TOP_LEFT, 0, 22);
+
+        lv_obj_t *lbl_free = lv_label_create(card);
+        snprintf(buf, sizeof(buf), "Free:   %lu MB", (unsigned long)free_mb);
+        lv_label_set_text(lbl_free, buf);
+        lv_obj_set_style_text_font(lbl_free, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(lbl_free, low ? COLOR_MATERIAL_RED : COLOR_MATERIAL_GREEN, 0);
+        lv_obj_align(lbl_free, LV_ALIGN_TOP_LEFT, 0, 44);
+
+        if (low) {
+            lv_obj_t *warn = lv_label_create(card);
+            lv_label_set_text(warn, LV_SYMBOL_WARNING " Low space!");
+            lv_obj_set_style_text_color(warn, COLOR_MATERIAL_RED, 0);
+            lv_obj_set_style_text_font(warn, &lv_font_montserrat_14, 0);
+            lv_obj_align(warn, LV_ALIGN_TOP_LEFT, 0, 66);
+        }
+
+        // Bar indicator
+        int pct_used = (total_mb > 0) ? (int)((used_mb * 100) / total_mb) : 0;
+        lv_obj_t *bar_bg = lv_obj_create(card);
+        lv_obj_set_size(bar_bg, 170, 14);
+        lv_obj_align(bar_bg, LV_ALIGN_BOTTOM_MID, 0, 0);
+        lv_obj_set_style_bg_color(bar_bg, lv_color_hex(0x333333), 0);
+        lv_obj_set_style_border_width(bar_bg, 0, 0);
+        lv_obj_set_style_radius(bar_bg, 4, 0);
+        lv_obj_clear_flag(bar_bg, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *bar_fill = lv_obj_create(bar_bg);
+        int fill_w = (170 * pct_used) / 100;
+        if (fill_w < 2) fill_w = 2;
+        lv_obj_set_size(bar_fill, fill_w, 14);
+        lv_obj_align(bar_fill, LV_ALIGN_LEFT_MID, 0, 0);
+        lv_obj_set_style_bg_color(bar_fill, low ? COLOR_MATERIAL_RED : COLOR_MATERIAL_TEAL, 0);
+        lv_obj_set_style_border_width(bar_fill, 0, 0);
+        lv_obj_set_style_radius(bar_fill, 4, 0);
+        lv_obj_clear_flag(bar_fill, LV_OBJ_FLAG_SCROLLABLE);
+    }
+
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 90, 34);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_add_event_cb(back_btn, sd_back_to_menu_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, "Back");
+    lv_obj_set_style_text_color(back_lbl, ui_text_color(), 0);
+    lv_obj_center(back_lbl);
+}
+
+// ─── Format — two-stage confirmation ─────────────────────────────────────────
+
+static void sd_format_confirm2_yes_cb(lv_event_t *e)
+{
+    (void)e;
+    show_sd_provision_running_screen(true);
+}
+
+static void show_sd_format_confirm2(void)
+{
+    create_function_page_base("Format SD Card");
+
+    lv_obj_t *msg = lv_label_create(function_page);
+    lv_label_set_text(msg,
+        LV_SYMBOL_WARNING " Are you really sure?\n\n"
+        "Because you are not\ngetting your stuff back!");
+    lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(msg, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_text_font(msg, &lv_font_montserrat_16, 0);
+    lv_obj_align(msg, LV_ALIGN_CENTER, 0, -20);
+
+    lv_obj_t *btn_bar = lv_obj_create(function_page);
+    lv_obj_set_size(btn_bar, lv_pct(100), 50);
+    lv_obj_align(btn_bar, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(btn_bar, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(btn_bar, 0, 0);
+    lv_obj_clear_flag(btn_bar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(btn_bar, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_bar, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(btn_bar, 12, 0);
+
+    lv_obj_t *no_btn = lv_btn_create(btn_bar);
+    lv_obj_set_size(no_btn, 90, 34);
+    lv_obj_set_style_bg_color(no_btn, ui_panel_color(), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(no_btn, 1, 0);
+    lv_obj_set_style_border_color(no_btn, ui_border_color(), 0);
+    lv_obj_set_style_radius(no_btn, 8, 0);
+    lv_obj_add_event_cb(no_btn, sd_back_to_menu_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *no_lbl = lv_label_create(no_btn);
+    lv_label_set_text(no_lbl, "NO");
+    lv_obj_set_style_text_color(no_lbl, ui_text_color(), 0);
+    lv_obj_center(no_lbl);
+
+    lv_obj_t *yes_btn = lv_btn_create(btn_bar);
+    lv_obj_set_size(yes_btn, 90, 34);
+    lv_obj_set_style_bg_color(yes_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(yes_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(yes_btn, 0, 0);
+    lv_obj_set_style_radius(yes_btn, 8, 0);
+    lv_obj_add_event_cb(yes_btn, sd_format_confirm2_yes_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *yes_lbl = lv_label_create(yes_btn);
+    lv_label_set_text(yes_lbl, "FORMAT");
+    lv_obj_set_style_text_color(yes_lbl, ui_text_color(), 0);
+    lv_obj_center(yes_lbl);
+}
+
+static void sd_format_confirm1_yes_cb(lv_event_t *e)
+{
+    (void)e;
+    show_sd_format_confirm2();
+}
+
+static void show_sd_format_confirm1(void)
+{
+    create_function_page_base("Format SD Card");
+
+    lv_obj_t *msg = lv_label_create(function_page);
+    lv_label_set_text(msg, "Format SD Card?\n\nAll data will be erased.\nThis cannot be undone.");
+    lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(msg, ui_text_color(), 0);
+    lv_obj_set_style_text_font(msg, &lv_font_montserrat_16, 0);
+    lv_obj_align(msg, LV_ALIGN_CENTER, 0, -20);
+
+    lv_obj_t *btn_bar = lv_obj_create(function_page);
+    lv_obj_set_size(btn_bar, lv_pct(100), 50);
+    lv_obj_align(btn_bar, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(btn_bar, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(btn_bar, 0, 0);
+    lv_obj_clear_flag(btn_bar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(btn_bar, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_bar, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(btn_bar, 12, 0);
+
+    lv_obj_t *no_btn = lv_btn_create(btn_bar);
+    lv_obj_set_size(no_btn, 90, 34);
+    lv_obj_set_style_bg_color(no_btn, ui_panel_color(), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(no_btn, 1, 0);
+    lv_obj_set_style_border_color(no_btn, ui_border_color(), 0);
+    lv_obj_set_style_radius(no_btn, 8, 0);
+    lv_obj_add_event_cb(no_btn, sd_back_to_menu_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *no_lbl = lv_label_create(no_btn);
+    lv_label_set_text(no_lbl, "NO");
+    lv_obj_set_style_text_color(no_lbl, ui_text_color(), 0);
+    lv_obj_center(no_lbl);
+
+    lv_obj_t *yes_btn = lv_btn_create(btn_bar);
+    lv_obj_set_size(yes_btn, 90, 34);
+    lv_obj_set_style_bg_color(yes_btn, COLOR_MATERIAL_AMBER, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(yes_btn, lv_color_lighten(COLOR_MATERIAL_AMBER, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(yes_btn, 0, 0);
+    lv_obj_set_style_radius(yes_btn, 8, 0);
+    lv_obj_add_event_cb(yes_btn, sd_format_confirm1_yes_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *yes_lbl = lv_label_create(yes_btn);
+    lv_label_set_text(yes_lbl, "YES");
+    lv_obj_set_style_text_color(yes_lbl, ui_text_color(), 0);
+    lv_obj_center(yes_lbl);
+}
+
+// ─── SD Card sub-menu ────────────────────────────────────────────────────────
+
+static void sd_card_tile_event_cb(lv_event_t *e)
+{
+    const char *name = (const char *)lv_event_get_user_data(e);
+    if (!name) return;
+    if      (strcmp(name, "Validate") == 0)   show_sd_provision_confirm(false);
+    else if (strcmp(name, "Free Space") == 0) show_sd_free_space_screen();
+    else if (strcmp(name, "Format") == 0)     show_sd_format_confirm1();
+}
+
+static void show_sd_card_screen(void)
+{
+    create_function_page_base("SD Card");
+
+    lv_obj_t *tiles = lv_obj_create(function_page);
+    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(tiles, 0, 0);
+    lv_obj_set_style_pad_all(tiles, 10, 0);
+    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    create_tile(tiles, LV_SYMBOL_OK,      "Validate &\nProvision", COLOR_MATERIAL_TEAL,
+                sd_card_tile_event_cb, "Validate");
+    create_tile(tiles, LV_SYMBOL_DRIVE,   "Free\nSpace",            COLOR_TILE_BLUE,
+                sd_card_tile_event_cb, "Free Space");
+    create_tile(tiles, LV_SYMBOL_WARNING, "Format\nSD Card",        COLOR_MATERIAL_RED,
+                sd_card_tile_event_cb, "Format");
+}
+
+// ============================================================================
+// WiFi Monitor screen
+// ============================================================================
+
 static void show_wifi_monitor_screen(void)
 {
     create_function_page_base("Compromised Data");
