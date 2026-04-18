@@ -52,6 +52,19 @@ esptool.py --chip esp32c5 --port /dev/ttyACM0 \
 
 ---
 
+## BMorcelli Launcher Compatibility
+
+The firmware is **not currently compatible** with [bmorcelli/Launcher](https://github.com/bmorcelli/Launcher).
+
+- **ESP32-C5 not yet supported** — tracked in [Issue #300](https://github.com/bmorcelli/Launcher/issues/300) (opened April 2026, pending merge)
+- The Launcher uses a custom bootloader that switches between a Launcher partition and OTA app slots based on reset reason; this firmware has no awareness of that scheme
+- The Launcher expects OTA-style partition slots; this build uses a single 7 MB `factory` partition at `0x10000`
+- The Launcher is Arduino-based; this firmware is ESP-IDF 6.0 — hardware init sequences would conflict
+
+Flash this binary standalone. Launcher integration can be revisited once Issue #300 lands and an official NM-CYD-C5 board target is available upstream.
+
+---
+
 ## SD Card Requirement
 
 The firmware requires a **FAT32-formatted MicroSD card, 32 GB or smaller**. exFAT (used on most cards >32 GB out of the box) is not supported. If no compatible SD card is detected after 3 attempts, the device halts and displays an error — insert a correct card and reset.
