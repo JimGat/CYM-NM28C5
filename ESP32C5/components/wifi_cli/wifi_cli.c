@@ -115,7 +115,15 @@ static esp_err_t init_led(void) {
     
     ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &g_led_strip));
     ESP_LOGI(TAG, "LED strip initialized");
-    
+
+    // DEBUG: white for 10s at boot so we can confirm the LED works before display/WiFi init
+    led_strip_set_pixel(g_led_strip, 0, 128, 128, 128);
+    led_strip_refresh(g_led_strip);
+    ESP_LOGI(TAG, "LED boot test: white 50%% for 10 s...");
+    vTaskDelay(pdMS_TO_TICKS(10000));
+    led_strip_clear(g_led_strip);
+    ESP_LOGI(TAG, "LED boot test done");
+
     return ESP_OK;
 }
 

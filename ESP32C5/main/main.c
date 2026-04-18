@@ -8609,8 +8609,10 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     wd_ui_gps_label = lv_label_create(function_page);
     lv_label_set_text(wd_ui_gps_label, "Waiting for GPS fix...  Sats: 0");
     lv_obj_set_style_text_color(wd_ui_gps_label, COLOR_MATERIAL_ORANGE, 0);
-    lv_obj_set_style_text_font(wd_ui_gps_label, &lv_font_montserrat_12, 0);
-    lv_obj_align(wd_ui_gps_label, LV_ALIGN_TOP_LEFT, 8, 34);
+    lv_obj_set_style_text_font(wd_ui_gps_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_align(wd_ui_gps_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(wd_ui_gps_label, lv_pct(100));
+    lv_obj_align(wd_ui_gps_label, LV_ALIGN_TOP_MID, 0, 35);
 
     // ─── D-UCB Channel indicator (top, next to GPS) ───────────────
     lv_obj_t *wd_ch_box = lv_obj_create(function_page);
