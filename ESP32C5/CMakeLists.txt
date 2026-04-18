@@ -18,36 +18,22 @@ project(CYM-NM28C5)
 idf_component_get_property(lwip_lib lwip COMPONENT_LIB)
 target_compile_definitions(${lwip_lib} PRIVATE IP_FORWARD_ALLOW_TX_ON_RX_NETIF=1)
 
-# ===== POST-BUILD: copy binaries to binaries-esp32c5 =====
+# ===== POST-BUILD: copy binaries to binaries-esp32c5 every build =====
 set(EXPORT_DIR "${CMAKE_SOURCE_DIR}/binaries-esp32c5")
 file(MAKE_DIRECTORY "${EXPORT_DIR}")
 
-set(COPY_STAMP "${CMAKE_BINARY_DIR}/copy_bins.stamp")
-set(GEN_APP_BIN_TARGET "gen_${CMAKE_PROJECT_NAME}_binary")
-set(_copy_base_dep "")
-if(TARGET ${GEN_APP_BIN_TARGET})
-  set(_copy_base_dep ${GEN_APP_BIN_TARGET})
-elseif(TARGET app)
-  set(_copy_base_dep app)
-else()
-  message(WARNING "copy_firmware: no binary generation target found; disabling auto copy")
-endif()
-
-if(_copy_base_dep)
-  set(COPY_DEPS ${_copy_base_dep})
-
-  add_custom_command(
-    OUTPUT "${COPY_STAMP}"
-    COMMAND ${CMAKE_COMMAND}
-            -DDEST="${EXPORT_DIR}"
-            -DBLD="${CMAKE_BINARY_DIR}"
-            -DAPP="${PROJECT_NAME}.bin"
-            -P "${CMAKE_SOURCE_DIR}/post_build.cmake"
-    COMMAND ${CMAKE_COMMAND} -E touch "${COPY_STAMP}"
-    DEPENDS ${COPY_DEPS}
-    COMMENT "Copying firmware binaries to ${EXPORT_DIR}"
-  )
-
-  add_custom_target(copy_firmware ALL DEPENDS "${COPY_STAMP}")
-  add_dependencies(copy_firmware ${COPY_DEPS})
-endif()
+# gen_<PROJECT>_binary is the ESP-IDF target that produces the .bin file.
+# POST_BUILD on it fires unconditionally after every successful binary generation.
+add_custom_command(
+    TARGET "gen_${CMAKE_PROJECT_NAME}_binary" POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy
+            "${CMAKE_BINARY_DIR}/${CMAKE_PROJECT_NAME}.bin"
+            "${EXPORT_DIR}/${CMAKE_PROJECT_NAME}.bin"
+    COMMAND ${CMAKE_COMMAND} -E copy
+            "${CMAKE_BINARY_DIR}/bootloader/bootloader.bin"
+            "${EXPORT_DIR}/bootloader.bin"
+    COMMAND ${CMAKE_COMMAND} -E copy
+            "${CMAKE_BINARY_DIR}/partition_table/partition-table.bin"
+            "${EXPORT_DIR}/partition-table.bin"
+    COMMENT "Copying firmware to ${EXPORT_DIR}"
+)
