@@ -3088,6 +3088,35 @@ static void hide_sd_loading_popup(void) {
     }
 }
 
+static void show_sd_fatal_error_and_halt(void) {
+    // Build a fresh screen so this works regardless of splash/home UI state
+    if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        lv_obj_t *err_scr = lv_obj_create(NULL);
+        lv_obj_set_style_bg_color(err_scr, lv_color_hex(0x1a0000), 0);
+        lv_obj_set_style_bg_opa(err_scr, LV_OPA_COVER, 0);
+
+        lv_obj_t *lbl = lv_label_create(err_scr);
+        lv_label_set_text(lbl, "SD Card Failed!\n\nRequires FAT32\n(<= 32 GB)\n\nReset to retry");
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0xff4444), 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(lbl, LV_PCT(90));
+        lv_obj_center(lbl);
+
+        lv_scr_load(err_scr);
+        lv_refr_now(NULL);
+        xSemaphoreGive(lvgl_mutex);
+    }
+    // Keep display alive; halt until hardware reset
+    while (1) {
+        if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            lv_task_handler();
+            xSemaphoreGive(lvgl_mutex);
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
 // ============================================================================
 // SD Cache Load All Data
 // ============================================================================
@@ -3616,8 +3645,7 @@ void app_main(void)
     }
     if (!sd_mounted) {
         ESP_LOGW(TAG, "[SD] No SD card after %d attempts - halting", SD_MAX_ATTEMPTS);
-        update_sd_loading_popup("SD Failed!\nRequires FAT32 (<32GB)\n\nReset to retry");
-        while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+        show_sd_fatal_error_and_halt();
     }
     
     // Load all data from SD into cache
