@@ -458,6 +458,21 @@ CYM-NM28C5/
 
 ---
 
+## BMorcelli Launcher Compatibility
+
+This firmware is **not currently compatible** with [bmorcelli/Launcher](https://github.com/bmorcelli/Launcher).
+
+| Issue | Detail |
+|-------|--------|
+| **ESP32-C5 not supported** | Tracked in [Issue #300](https://github.com/bmorcelli/Launcher/issues/300) — pending merge as of April 2026 |
+| **Partition layout mismatch** | Launcher requires OTA-style partition slots; this build uses a single 7 MB `factory` partition at `0x10000` |
+| **Custom bootloader conflict** | Launcher's bootloader switches apps via reset-reason detection; this firmware has no handoff logic |
+| **Framework mismatch** | Launcher is Arduino; this firmware is ESP-IDF 6.0 — display/touch init sequences would conflict |
+
+Flash this firmware standalone (see [Building & Flashing](#building--flashing)). Launcher integration can be revisited once Issue #300 is merged and an official NM-CYD-C5 board target exists upstream.
+
+---
+
 ## Disclaimer
 
 This project is intended for **educational and authorized security research purposes only**. Unauthorized access to computer networks is illegal. Always obtain proper authorization before testing on any network you do not own. The author assumes no liability for misuse of this software.
