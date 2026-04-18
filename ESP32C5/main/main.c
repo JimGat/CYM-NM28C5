@@ -1118,6 +1118,12 @@ static void reset_function_page_children(void) {
     handshake_status_list = NULL;
     wardrive_log_ta = NULL;
     wardrive_stop_btn = NULL;
+    wardrive_ui_active = false;
+    if (wd_ui_timer) { lv_timer_del(wd_ui_timer); wd_ui_timer = NULL; }
+    wd_ui_gps_label = NULL;
+    wd_ui_counter_label = NULL;
+    wd_ui_channel_label = NULL;
+    wd_ui_table = NULL;
     karma_log_ta = NULL;
     karma_stop_btn = NULL;
     karma_content = NULL;
@@ -2016,14 +2022,14 @@ static void set_backlight_percent(uint8_t percent)
 // ============================================================================
 // NeoPixel LED (WS2812 on GPIO 27) — mode-based status indicator
 // ============================================================================
-// Brightness kept low (≤40/255) so the single LED is visible but not blinding.
+// Brightness ~25-80/255 — visible without being blinding at arm's length.
 // Priority (highest first): attacks → passive/monitoring → scanning → idle
 
 static void led_set(uint8_t r, uint8_t g, uint8_t b)
 {
     if (!g_led_strip) return;
-    led_strip_set_pixel(g_led_strip, 0, r, g, b);
-    led_strip_refresh(g_led_strip);
+    if (led_strip_set_pixel(g_led_strip, 0, r, g, b) == ESP_OK)
+        led_strip_refresh(g_led_strip);
 }
 
 static void led_update_mode(void)
@@ -2031,46 +2037,46 @@ static void led_update_mode(void)
     // ── Aggressive attacks (red family) ──────────────────────────────────────
     if (wifi_attacks_is_deauth_active() || targeted_deauth_active ||
         wifi_attacks_is_blackout_active() || wifi_attacks_is_sae_overflow_active()) {
-        led_set(40, 0, 0);   // red — denial-of-service
+        led_set(80, 0, 0);   // red — denial-of-service
         return;
     }
     // ── Rogue AP / captive deception (orange) ─────────────────────────────
     if (wifi_attacks_is_karma_active() || wifi_attacks_is_portal_active()) {
-        led_set(40, 15, 0);  // orange — fake AP running
+        led_set(80, 30, 0);  // orange — fake AP running
         return;
     }
     // ── Handshake capture (yellow) ────────────────────────────────────────
     if (handshake_attack_active) {
-        led_set(35, 35, 0);  // yellow — WPA capture in progress
+        led_set(70, 70, 0);  // yellow — WPA capture in progress
         return;
     }
     // ── Deauth monitor / MITM (amber) ─────────────────────────────────────
     if (deauth_monitor_active || mitm_arp_active) {
-        led_set(40, 20, 0);  // amber — watching/intercepting
+        led_set(80, 40, 0);  // amber — watching/intercepting
         return;
     }
     // ── Passive sniffing (green) ──────────────────────────────────────────
     if (sniffer_task_active || sniffer_dog_active) {
-        led_set(0, 40, 0);   // green — listening passively
+        led_set(0, 80, 0);   // green — listening passively
         return;
     }
     // ── Wardriving (cyan) ────────────────────────────────────────────────
     if (wardrive_active) {
-        led_set(0, 25, 25);  // cyan — geo-mapping
+        led_set(0, 50, 50);  // cyan — geo-mapping
         return;
     }
     // ── BLE / AirTag / BT locator (purple) ──────────────────────────────
     if (ble_scan_ui_active || airtag_scan_active || bt_locator_tracking_active) {
-        led_set(20, 0, 40);  // purple — Bluetooth active
+        led_set(40, 0, 80);  // purple — Bluetooth active
         return;
     }
     // ── WiFi scanning (blue) ─────────────────────────────────────────────
     if (wifi_scanner_is_scanning()) {
-        led_set(0, 0, 40);   // blue — scanning for APs
+        led_set(0, 0, 80);   // blue — scanning for APs
         return;
     }
-    // ── Idle (dim white) ─────────────────────────────────────────────────
-    led_set(8, 8, 8);        // dim white — system ready, no operation active
+    // ── Idle (white) ─────────────────────────────────────────────────────
+    led_set(25, 25, 25);     // white — system ready, no operation active
 }
 
 static void screen_set_dimmed(bool dimmed)
