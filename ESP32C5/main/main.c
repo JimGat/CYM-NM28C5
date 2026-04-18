@@ -3628,8 +3628,8 @@ void app_main(void)
                     char fail_msg[48];
                     snprintf(fail_msg, sizeof(fail_msg), "Attempt %d/%d failed\nRetrying...", mount_attempts, SD_MAX_ATTEMPTS);
                     update_sd_loading_popup(fail_msg);
-                    // 1.5 second delay with LVGL processing before retry
-                    for (int i = 0; i < 15; i++) {
+                    // 2 second delay with LVGL processing before retry
+                    for (int i = 0; i < 20; i++) {
                         if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                             lv_task_handler();
                             xSemaphoreGive(lvgl_mutex);
