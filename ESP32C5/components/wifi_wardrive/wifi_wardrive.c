@@ -12,6 +12,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "ff.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -339,21 +340,28 @@ esp_err_t wifi_wardrive_format_sd(void) {
         ESP_LOGW(TAG, "[SD] format: card not mounted");
         return ESP_ERR_INVALID_STATE;
     }
-    ESP_LOGI(TAG, "[SD] Formatting FAT filesystem (32KB clusters)...");
-    // 32KB allocation units keep the FAT table small (~4MB vs ~228MB for 512B)
-    // and reduce format time from minutes to seconds on large cards
-    esp_vfs_fat_mount_config_t fmt_cfg = {
-        .format_if_mount_failed = false,
-        .max_files = 3,
-        .allocation_unit_size = 32 * 1024,
-    };
-    esp_err_t ret = esp_vfs_fat_sdcard_format_cfg("/sdcard", sd_card, &fmt_cfg);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "[SD] Format failed: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "[SD] Format complete");
+    ESP_LOGI(TAG, "[SD] Formatting FAT32 (16KB clusters)...");
+    uint8_t *work = heap_caps_malloc(4096, MALLOC_CAP_INTERNAL);
+    if (!work) {
+        ESP_LOGE(TAG, "[SD] format: no memory for work buffer");
+        return ESP_ERR_NO_MEM;
     }
-    return ret;
+    // FM_FAT32|FM_SFD forces FAT32 SFD (no MBR); 16KB clusters for fast format
+    // FM_ANY=0x07 includes FM_EXFAT=0x04 which would be chosen on large cards
+    // but FF_FS_EXFAT=0 in this build → corrupt filesystem. Never use FM_ANY.
+    MKFS_PARM opt = { .fmt = FM_FAT32 | FM_SFD, .n_fat = 1, .align = 0, .n_root = 512, .au_size = 16 * 1024 };
+    FRESULT res = f_mkfs("0:", &opt, work, 4096);
+    heap_caps_free(work);
+    if (res != FR_OK) {
+        ESP_LOGE(TAG, "[SD] f_mkfs failed: %d", (int)res);
+        return ESP_FAIL;
+    }
+    // Unmount VFS so the next wifi_wardrive_init_sd() does a clean remount
+    esp_vfs_fat_sdcard_unmount("/sdcard", sd_card);
+    sd_card_mounted = false;
+    sd_card = NULL;
+    ESP_LOGI(TAG, "[SD] Format complete — card unmounted, ready for remount");
+    return ESP_OK;
 }
 
 // ============================================================================
