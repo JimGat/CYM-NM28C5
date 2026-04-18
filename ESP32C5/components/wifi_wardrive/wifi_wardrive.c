@@ -334,6 +334,21 @@ bool wifi_wardrive_is_sd_mounted(void) {
     return sd_card_mounted;
 }
 
+esp_err_t wifi_wardrive_format_sd(void) {
+    if (!sd_card_mounted || !sd_card) {
+        ESP_LOGW(TAG, "[SD] format: card not mounted");
+        return ESP_ERR_INVALID_STATE;
+    }
+    ESP_LOGI(TAG, "[SD] Formatting FAT filesystem...");
+    esp_err_t ret = esp_vfs_fat_sdcard_format("/sdcard", sd_card);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "[SD] Format failed: %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "[SD] Format complete");
+    }
+    return ret;
+}
+
 // ============================================================================
 // WARDRIVE FUNCTIONS
 // ============================================================================

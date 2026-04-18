@@ -51,6 +51,11 @@ esp_err_t wifi_wardrive_init_sd(void);
  */
 bool wifi_wardrive_is_sd_mounted(void);
 
+/**
+ * @brief Format the SD card FAT filesystem (card must be mounted)
+ */
+esp_err_t wifi_wardrive_format_sd(void);
+
 // ============================================================================
 // WARDRIVE FUNCTIONS
 // ============================================================================
