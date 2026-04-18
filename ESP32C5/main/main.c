@@ -3596,6 +3596,9 @@ void app_main(void)
             } else {
                 ESP_LOGW(TAG, "[SD] Mount failed (%d/%d): %s", mount_attempts, SD_MAX_ATTEMPTS, esp_err_to_name(sd_ret));
                 if (mount_attempts < SD_MAX_ATTEMPTS) {
+                    char fail_msg[48];
+                    snprintf(fail_msg, sizeof(fail_msg), "Attempt %d/%d failed\nRetrying...", mount_attempts, SD_MAX_ATTEMPTS);
+                    update_sd_loading_popup(fail_msg);
                     // Brief delay with LVGL processing before retry
                     for (int i = 0; i < 10; i++) {
                         if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
