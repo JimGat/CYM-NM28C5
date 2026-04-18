@@ -370,16 +370,33 @@ idf.py set-target esp32c5
 idf.py build
 ```
 
-### Flash
+After each build the compiled binaries are automatically copied to `ESP32C5/binaries-esp32c5/`.
+
+### Flash — Web Browser (No Install Required)
+
+Use **[ESPConnect](https://thelastoutpostworkshop.github.io/ESPConnect/)** to flash directly from Chrome or Edge via WebSerial. Flash each file at the address shown below.
+
+| File | Address |
+|------|---------|
+| `bootloader.bin` | `0x2000` |
+| `partition-table.bin` | `0x8000` |
+| `CYM-NM28C5.bin` | `0x10000` |
+
+> **[ESPTerminator](https://espterminator.com/)** is a newer web flash/terminal tool but does not yet identify the NM-CYD-C5 correctly and fails to flash the board reliably. Check back for future support.
+
+### Flash — Command Line
 
 ```bash
 idf.py -p /dev/ttyACM0 flash monitor
 ```
 
-Or manually:
+Or with esptool directly:
 
 ```bash
-esptool.py --chip esp32c5 write_flash 0x10000 build/CYM-NM28C5.bin
+esptool.py --chip esp32c5 --port /dev/ttyACM0 --baud 460800 \
+  --before default-reset --after hard-reset \
+  write_flash --flash-mode dio --flash-freq 80m --flash-size 16MB \
+  0x2000 bootloader.bin 0x8000 partition-table.bin 0x10000 CYM-NM28C5.bin
 ```
 
 ---
