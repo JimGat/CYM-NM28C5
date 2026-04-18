@@ -477,6 +477,8 @@ Flash this firmware standalone (see [Building & Flashing](#building--flashing)).
 
 This project is intended for **educational and authorized security research purposes only**. Unauthorized access to computer networks is illegal. Always obtain proper authorization before testing on any network you do not own. The author assumes no liability for misuse of this software.
 
+# **Don't Be A Skid!**
+
 ---
 
 <p align="center">
