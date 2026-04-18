@@ -3601,14 +3601,23 @@ void app_main(void)
         while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
     }
     
-    // Show loading popup
-    show_sd_loading_popup("Reading SD card...");
-
     // Cancel splash auto-transition — SD init controls the splash timing
     if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
         if (splash_timer) { lv_timer_del(splash_timer); splash_timer = NULL; }
         xSemaphoreGive(lvgl_mutex);
     }
+
+    // Hold splash screen for 2 seconds so user can see it
+    for (int i = 0; i < 20; i++) {
+        if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            lv_task_handler();
+            xSemaphoreGive(lvgl_mutex);
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    // Show loading popup
+    show_sd_loading_popup("Reading SD card...");
 
     // Try to mount SD card - 3 attempts, then continue without it
     bool sd_mounted = false;
