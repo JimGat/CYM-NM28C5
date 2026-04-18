@@ -118,7 +118,7 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 | **Board** | NM-CYD-C5 (RockBase-iot NerdMiner CYD) | — |
 | **Display** | 2.8" ST7789 TFT (240×320 portrait, 16-bit RGB565) | SPI @ 40 MHz |
 | **Touch** | XPT2046 Resistive Touch (polling, T_IRQ not connected) | SPI @ 2 MHz |
-| **SD Card** | MicroSD (shared SPI2 bus with display and touch) | SPI @ 20 MHz |
+| **SD Card** | MicroSD **FAT32, max 32 GB** (shared SPI2 bus with display and touch) | SPI @ 20 MHz |
 | **GPS** | UART NMEA module (GGA, RMC) | UART @ 9600 baud |
 | **LED** | WS2812 NeoPixel (single, GPIO 27) | RMT / GPIO |
 
@@ -294,6 +294,8 @@ All settings are persisted via **NVS** (Non-Volatile Storage) across reboots.
 ---
 
 ## Data & Storage
+
+> **SD card requirement:** MicroSD formatted as **FAT32, 32 GB or smaller**. exFAT and NTFS are not supported. SDXC cards (>32 GB) require manual FAT32 formatting before use.
 
 All data is stored on the SD card:
 

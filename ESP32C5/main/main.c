@@ -3574,11 +3574,15 @@ void app_main(void)
     // Show loading popup
     show_sd_loading_popup("Reading SD card...");
     
-    // Try to mount SD card - 1 attempt, then continue without it
+    // Try to mount SD card - 3 attempts, then continue without it
     bool sd_mounted = false;
-    const int SD_MAX_ATTEMPTS = 1;
+    const int SD_MAX_ATTEMPTS = 3;
     for (int mount_attempts = 1; mount_attempts <= SD_MAX_ATTEMPTS && !sd_mounted; mount_attempts++) {
         ESP_LOGI(TAG, "[SD] Mount attempt %d/%d...", mount_attempts, SD_MAX_ATTEMPTS);
+
+        char attempt_msg[40];
+        snprintf(attempt_msg, sizeof(attempt_msg), "Reading SD... (%d/%d)", mount_attempts, SD_MAX_ATTEMPTS);
+        update_sd_loading_popup(attempt_msg);
 
         // Take SD/SPI mutex before mounting
         if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
@@ -3592,8 +3596,7 @@ void app_main(void)
             } else {
                 ESP_LOGW(TAG, "[SD] Mount failed (%d/%d): %s", mount_attempts, SD_MAX_ATTEMPTS, esp_err_to_name(sd_ret));
                 if (mount_attempts < SD_MAX_ATTEMPTS) {
-                    update_sd_loading_popup("No SD Card...");
-                    // Brief delay with LVGL processing
+                    // Brief delay with LVGL processing before retry
                     for (int i = 0; i < 10; i++) {
                         if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                             lv_task_handler();
@@ -3609,9 +3612,9 @@ void app_main(void)
         }
     }
     if (!sd_mounted) {
-        ESP_LOGW(TAG, "[SD] No SD card - continuing without storage");
-        update_sd_loading_popup("No SD - Continuing...");
-        vTaskDelay(pdMS_TO_TICKS(1500));
+        ESP_LOGW(TAG, "[SD] No SD card after %d attempts - continuing without storage", SD_MAX_ATTEMPTS);
+        update_sd_loading_popup("SD Failed!\nRequires FAT32 (<32GB)");
+        vTaskDelay(pdMS_TO_TICKS(3000));
     }
     
     // Load all data from SD into cache

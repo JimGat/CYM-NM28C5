@@ -250,7 +250,7 @@ esp_err_t wifi_wardrive_init_sd(void) {
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
     host.slot = SPI2_HOST;  // Same as LCD (already initialized by display)
     host.max_freq_khz = 20000;  // 20 MHz (increased from 400kHz after init)
-    host.flags = SDMMC_HOST_FLAG_SPI;  // ✅ Tell driver to NOT reinitialize SPI bus
+    host.flags = SDMMC_HOST_FLAG_SPI | SDMMC_HOST_FLAG_DEINIT_ARG;  // DEINIT_ARG required: cleanup calls deinit_p(handle), not deinit()
     ESP_LOGI(TAG, "[SD]   SPI Host: %d, Frequency: %d kHz, Flags: 0x%x", host.slot, host.max_freq_khz, host.flags);
 
     ESP_LOGI(TAG, "[SD] Configuring slot (CS=%d)...", SD_CS_PIN);
