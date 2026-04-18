@@ -3089,6 +3089,7 @@ static void hide_sd_loading_popup(void) {
 }
 
 static void show_sd_fatal_error_and_halt(void) {
+    led_set(0, 0, 0);  // LED off on fatal halt
     // Build a fresh screen so this works regardless of splash/home UI state
     if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
         lv_obj_t *err_scr = lv_obj_create(NULL);
