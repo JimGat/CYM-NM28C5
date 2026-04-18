@@ -3612,9 +3612,9 @@ void app_main(void)
         }
     }
     if (!sd_mounted) {
-        ESP_LOGW(TAG, "[SD] No SD card after %d attempts - continuing without storage", SD_MAX_ATTEMPTS);
-        update_sd_loading_popup("SD Failed!\nRequires FAT32 (<32GB)");
-        vTaskDelay(pdMS_TO_TICKS(3000));
+        ESP_LOGW(TAG, "[SD] No SD card after %d attempts - halting", SD_MAX_ATTEMPTS);
+        update_sd_loading_popup("SD Failed!\nRequires FAT32 (<32GB)\n\nReset to retry");
+        while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
     }
     
     // Load all data from SD into cache
