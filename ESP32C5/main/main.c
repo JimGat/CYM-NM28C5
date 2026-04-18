@@ -13885,6 +13885,18 @@ static void sd_provision_task(void *pvParams)
             PROV_POST("Format FAILED: %s", esp_err_to_name(fr));
             goto done;
         }
+        PROV_POST("Remounting SD card...");
+        // Format unmounted the card — remount before provisioning files
+        if (!PROV_TAKE_MUTEX()) {
+            PROV_POST("ERR: mutex timeout before remount");
+            goto done;
+        }
+        esp_err_t mr = wifi_wardrive_init_sd();
+        xSemaphoreGive(sd_spi_mutex);
+        if (mr != ESP_OK) {
+            PROV_POST("Remount FAILED: %s", esp_err_to_name(mr));
+            goto done;
+        }
         PROV_POST("Format OK — rebuilding structure...");
     }
 
