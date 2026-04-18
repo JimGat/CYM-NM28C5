@@ -3574,9 +3574,9 @@ void app_main(void)
     // Show loading popup
     show_sd_loading_popup("Reading SD card...");
     
-    // Try to mount SD card - 3 attempts, then continue without it
+    // Try to mount SD card - 1 attempt, then continue without it
     bool sd_mounted = false;
-    const int SD_MAX_ATTEMPTS = 3;
+    const int SD_MAX_ATTEMPTS = 1;
     for (int mount_attempts = 1; mount_attempts <= SD_MAX_ATTEMPTS && !sd_mounted; mount_attempts++) {
         ESP_LOGI(TAG, "[SD] Mount attempt %d/%d...", mount_attempts, SD_MAX_ATTEMPTS);
 
