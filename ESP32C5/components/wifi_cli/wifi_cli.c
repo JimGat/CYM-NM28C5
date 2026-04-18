@@ -98,6 +98,7 @@ static esp_err_t init_wifi(void) {
 }
 
 static esp_err_t init_led(void) {
+    if (g_led_strip != NULL) return ESP_OK;  // already initialised (e.g. after BLE→WiFi switch)
     led_strip_config_t strip_cfg = {
         .strip_gpio_num = NEOPIXEL_GPIO,
         .max_leds = LED_COUNT,
