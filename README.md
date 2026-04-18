@@ -66,7 +66,9 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 
 ---
 
-## Screenshots
+## Screenshots  
+## Thease are from pancake my version is Portrate to fit the CYD form better. 
+## Updates Comming Soon
 
 <!-- Add your screenshots here -->
 
