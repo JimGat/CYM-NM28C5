@@ -339,8 +339,15 @@ esp_err_t wifi_wardrive_format_sd(void) {
         ESP_LOGW(TAG, "[SD] format: card not mounted");
         return ESP_ERR_INVALID_STATE;
     }
-    ESP_LOGI(TAG, "[SD] Formatting FAT filesystem...");
-    esp_err_t ret = esp_vfs_fat_sdcard_format("/sdcard", sd_card);
+    ESP_LOGI(TAG, "[SD] Formatting FAT filesystem (32KB clusters)...");
+    // 32KB allocation units keep the FAT table small (~4MB vs ~228MB for 512B)
+    // and reduce format time from minutes to seconds on large cards
+    esp_vfs_fat_mount_config_t fmt_cfg = {
+        .format_if_mount_failed = false,
+        .max_files = 3,
+        .allocation_unit_size = 32 * 1024,
+    };
+    esp_err_t ret = esp_vfs_fat_sdcard_format_cfg("/sdcard", sd_card, &fmt_cfg);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "[SD] Format failed: %s", esp_err_to_name(ret));
     } else {

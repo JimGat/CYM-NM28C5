@@ -13862,29 +13862,41 @@ static void sd_prov_done_cb(void *arg)
                lv_async_call(sd_prov_line_cb, _u); } \
 } while (0)
 
+// Helper: take sd_spi_mutex with 10s timeout; returns false and posts error on failure
+#define PROV_TAKE_MUTEX() \
+    (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(10000)) == pdTRUE)
+
 static void sd_provision_task(void *pvParams)
 {
     bool after_format = (bool)(uintptr_t)pvParams;
     int  created = 0, ok_count = 0;
 
-    if (!sd_spi_mutex || xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(15000)) != pdTRUE) {
-        PROV_POST("ERR: cannot take SPI mutex");
-        goto done;
-    }
-
+    // Format must hold the mutex for its entire duration (many SPI transactions)
     if (after_format) {
         PROV_POST("Formatting SD card...");
-        esp_err_t fr = wifi_wardrive_format_sd();
-        if (fr != ESP_OK) {
-            PROV_POST("Format FAILED: %s", esp_err_to_name(fr));
-            xSemaphoreGive(sd_spi_mutex);
+        if (!PROV_TAKE_MUTEX()) {
+            PROV_POST("ERR: mutex timeout during format");
             goto done;
         }
-        PROV_POST("Format OK");
+        esp_err_t fr = wifi_wardrive_format_sd();
+        xSemaphoreGive(sd_spi_mutex);
+        vTaskDelay(pdMS_TO_TICKS(100));  // let display refresh after long hold
+        if (fr != ESP_OK) {
+            PROV_POST("Format FAILED: %s", esp_err_to_name(fr));
+            goto done;
+        }
+        PROV_POST("Format OK — rebuilding structure...");
     }
 
+    // Process each item with per-item mutex acquire/release so display stays live
     for (int i = 0; i < (int)SD_ITEMS_COUNT; i++) {
         const sd_provision_item_t *item = &SD_ITEMS[i];
+
+        if (!PROV_TAKE_MUTEX()) {
+            PROV_POST("ERR: mutex timeout at item %d", i);
+            goto done;
+        }
+
         struct stat st;
         bool exists = (stat(item->path, &st) == 0);
 
@@ -13893,8 +13905,7 @@ static void sd_provision_task(void *pvParams)
                 PROV_POST("  OK  %s/", item->path + 8);
                 ok_count++;
             } else {
-                int r = mkdir(item->path, 0755);
-                if (r == 0) {
+                if (mkdir(item->path, 0755) == 0) {
                     PROV_POST("  ++  %s/", item->path + 8);
                     created++;
                 } else {
@@ -13918,24 +13929,20 @@ static void sd_provision_task(void *pvParams)
                 }
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(10));  // yield so async calls are processed
+
+        xSemaphoreGive(sd_spi_mutex);
+        vTaskDelay(pdMS_TO_TICKS(30));  // yield — lets LVGL flush the new log line
     }
 
-    // Append to provision.log
-    time_t now = 0;
-    time(&now);
-    struct tm *tm_info = localtime(&now);
-    char ts[32] = "unknown-time";
-    if (tm_info) strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm_info);
-
-    FILE *log = fopen("/sdcard/lab/config/provision.log", "a");
-    if (log) {
-        fprintf(log, "\n=== Provision run %s ===\n", ts);
-        fprintf(log, "Created: %d  OK: %d\n", created, ok_count);
-        fclose(log);
+    // Append run summary to provision.log
+    if (PROV_TAKE_MUTEX()) {
+        FILE *log = fopen("/sdcard/lab/config/provision.log", "a");
+        if (log) {
+            fprintf(log, "Created: %d  OK: %d\n", created, ok_count);
+            fclose(log);
+        }
+        xSemaphoreGive(sd_spi_mutex);
     }
-
-    xSemaphoreGive(sd_spi_mutex);
 
 done: ;
     char *summary = malloc(64);
@@ -14085,7 +14092,11 @@ static void show_sd_free_space_screen(void)
     create_function_page_base("SD Free Space");
 
     struct statvfs vfs;
-    bool ok = (statvfs("/sdcard", &vfs) == 0);
+    bool ok = false;
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        ok = (statvfs("/sdcard", &vfs) == 0);
+        xSemaphoreGive(sd_spi_mutex);
+    }
 
     lv_obj_t *card = lv_obj_create(function_page);
     lv_obj_set_size(card, 200, 160);
