@@ -2066,7 +2066,7 @@ static void led_update_mode(void)
         return;
     }
     // ── BLE / AirTag / BT locator (purple) ──────────────────────────────
-    if (ble_scan_ui_active || airtag_scan_active || bt_locator_tracking_active) {
+    if (ble_scan_ui_active || bt_scan_active || airtag_scan_active || bt_locator_tracking_active) {
         led_set(40, 0, 80);  // purple — Bluetooth active
         return;
     }
@@ -3702,7 +3702,7 @@ void app_main(void)
         // Update NeoPixel LED color to reflect current mode (~2 Hz)
         {
             uint32_t now_ms = esp_timer_get_time() / 1000;
-            if (now_ms - last_led_update_ms >= 500) {
+            if (now_ms - last_led_update_ms >= 100) {
                 led_update_mode();
                 last_led_update_ms = now_ms;
             }
