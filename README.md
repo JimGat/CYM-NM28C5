@@ -176,7 +176,7 @@ Board reference: https://github.com/RockBase-iot/NM-CYD-C5
 
 > **GPIO 6 / ADC1_CH5 conflict:** The battery voltage ADC (`BATTERY_ADC_CHANNEL ADC_CHANNEL_5`) maps to GPIO 6, which is also SPI SCK. Calling `adc_oneshot_config_channel` on this pin silently reconfigures it away from SPI, killing SPI clock for display and touch. The battery ADC is **permanently disabled** in firmware for this board revision (`if (false && init_battery_adc()...)`).
 
-> **XPT2046 Z1 pressure:** The NM-CYD-C5 panel does not expose Z electrode connections, so Z1 always reads 0. Touch detection uses X/Y range validation and a calibrated null zone instead of pressure threshold.
+> **XPT2046 Z1 pressure:** Touch detection uses Z1 pressure threshold (`> 400` raw counts). Z1 reads near 0 when untouched and rises above threshold when pressed — providing reliable touch detection even though explicit Z electrode PCB traces are not exposed.
 
 ### SPI Bus Architecture
 
@@ -279,7 +279,7 @@ All settings are persisted via **NVS** (Non-Volatile Storage) across reboots.
 
 | Color | Mode |
 |-------|------|
-| Dim white | Idle / system ready |
+| White | Idle / system ready |
 | Blue | WiFi scanning |
 | Green | Passive sniffer / SnifferDog |
 | Cyan | Wardrive |

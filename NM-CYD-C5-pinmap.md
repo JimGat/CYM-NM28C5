@@ -318,6 +318,10 @@ Touch detection (no IRQ):
 | 2026-04-14 | Cross-checked against `User_Setup-NM-CYD-C5.h` — all TBDs resolved:     |
 |            | TFT_DC = GPIO 24, TFT_RST = -1, TFT_BL = GPIO 25, T_IRQ = NC (polling)  |
 | 2026-04-14 | RGB LED confirmed: GPIO 27, module pin 18 on ESP32-C5-WROOM-1-N168R      |
+| 2026-04-18 | All hardware confirmed working on real NM-CYD-C5 unit: WiFi 6 dual-band, |
+|            | SD card, ST7789 display, XPT2046 touch (Z1 threshold 400 works), WS2812  |
+|            | LED via RMT driver (GPIO 27). Battery ADC permanently disabled (GPIO 6    |
+|            | conflict with SPI SCK). GPS UART wired (GPIO 4/5), no module attached yet.|
 
 ---
 
