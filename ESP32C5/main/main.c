@@ -3349,6 +3349,12 @@ static void show_splash_screen(void)
     lv_obj_set_style_text_letter_space(subtitle, 2, 0);
     lv_obj_align(subtitle, LV_ALIGN_CENTER, 0, 46);
 
+    lv_obj_t *version_label = lv_label_create(splash_screen);
+    lv_label_set_text(version_label, JANOS_VERSION);
+    lv_obj_set_style_text_font(version_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(version_label, lv_color_hex(0x4A5568), 0);
+    lv_obj_align(version_label, LV_ALIGN_CENTER, 0, 62);
+
     splash_loading_label = lv_label_create(splash_screen);
     lv_label_set_text(splash_loading_label, "LOADING...");
     lv_obj_set_style_text_font(splash_loading_label, &lv_font_montserrat_14, 0);
@@ -13785,6 +13791,12 @@ static void show_settings_screen(void)
 
     // SD Card - Green
     create_tile(tiles, LV_SYMBOL_SD_CARD, "SD\nCard", COLOR_MATERIAL_GREEN, settings_tile_event_cb, "SD Card");
+
+    lv_obj_t *ver = lv_label_create(function_page);
+    lv_label_set_text(ver, "JANOS " JANOS_VERSION);
+    lv_obj_set_style_text_font(ver, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ver, ui_muted_color(), 0);
+    lv_obj_align(ver, LV_ALIGN_BOTTOM_MID, 0, -4);
 }
 
 // WiFi Monitor screen
