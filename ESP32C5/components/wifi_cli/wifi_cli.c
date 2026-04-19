@@ -89,7 +89,7 @@ static esp_err_t init_wifi(void) {
     uint8_t mac[6];
     esp_err_t ret = esp_wifi_get_mac(WIFI_IF_STA, mac);
     if (ret == ESP_OK) {
-        MY_LOG_INFO(TAG, "JanOS version: " JANOS_VERSION);
+        MY_LOG_INFO(TAG, "Firmware version: " FW_VERSION);
         MY_LOG_INFO(TAG, "MAC: %02X:%02X:%02X:%02X:%02X:%02X",
                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
