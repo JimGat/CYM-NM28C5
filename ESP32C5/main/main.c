@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <time.h>
 #include "ff.h"
+#include "dexter_img.h"
 #include "lvgl.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"

@@ -484,3 +484,5 @@ This project is intended for **educational and authorized security research purp
 <p align="center">
   <b>Made with ☕ and ESP-IDF</b>
 </p>
+
+I love your Face!
