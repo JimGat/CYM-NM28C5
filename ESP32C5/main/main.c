@@ -3350,7 +3350,7 @@ static void show_splash_screen(void)
     lv_obj_align(subtitle, LV_ALIGN_CENTER, 0, 46);
 
     lv_obj_t *version_label = lv_label_create(splash_screen);
-    lv_label_set_text(version_label, JANOS_VERSION);
+    lv_label_set_text(version_label, FW_VERSION);
     lv_obj_set_style_text_font(version_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(version_label, lv_color_hex(0x4A5568), 0);
     lv_obj_align(version_label, LV_ALIGN_CENTER, 0, 62);
@@ -13793,7 +13793,7 @@ static void show_settings_screen(void)
     create_tile(tiles, LV_SYMBOL_SD_CARD, "SD\nCard", COLOR_MATERIAL_GREEN, settings_tile_event_cb, "SD Card");
 
     lv_obj_t *ver = lv_label_create(function_page);
-    lv_label_set_text(ver, "JANOS " JANOS_VERSION);
+    lv_label_set_text(ver, "LAB5 " FW_VERSION);
     lv_obj_set_style_text_font(ver, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(ver, ui_muted_color(), 0);
     lv_obj_align(ver, LV_ALIGN_BOTTOM_MID, 0, -4);
@@ -13833,7 +13833,7 @@ static const sd_provision_item_t SD_ITEMS[] = {
       "timestamp,gps_lat,gps_lon,mac,label,rssi,alert_type\n" },
     { SD_ITEM_FILE, "/sdcard/lab/alerts/css_alerts.csv",
       "timestamp,gps_lat,gps_lon,arfcn,lac,cell_id,anomaly_type,rssi,details\n" },
-    { SD_ITEM_FILE, "/sdcard/lab/config/janos_override.cfg",
+    { SD_ITEM_FILE, "/sdcard/lab/config/lab5_override.cfg",
       "go_dark_on_boot=false\nvibrate_on_alert=true\nrssi_alert_threshold=-70\n"
       "pcap_enabled=false\ncss_detection_enabled=true\nwardrive_enabled=true\n"
       "screen_timeout_sec=60\nbrightness_pct=80\n" },
