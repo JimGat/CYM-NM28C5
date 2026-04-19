@@ -14105,8 +14105,15 @@ static void show_sd_free_space_screen(void)
 
     struct statvfs vfs;
     bool ok = false;
-    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
-        ok = (statvfs("/sdcard", &vfs) == 0);
+    ESP_LOGI(TAG, "[FREE_SPACE] mounted=%d mutex=%p", (int)wifi_wardrive_is_sd_mounted(), (void*)sd_spi_mutex);
+    if (!sd_spi_mutex) {
+        ESP_LOGE(TAG, "[FREE_SPACE] sd_spi_mutex is NULL");
+    } else if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        ESP_LOGE(TAG, "[FREE_SPACE] mutex take timed out after 3s");
+    } else {
+        int rc = statvfs("/sdcard", &vfs);
+        ESP_LOGI(TAG, "[FREE_SPACE] statvfs rc=%d errno=%d", rc, errno);
+        ok = (rc == 0);
         xSemaphoreGive(sd_spi_mutex);
     }
 
