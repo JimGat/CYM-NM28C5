@@ -1,6 +1,6 @@
 #include <stdio.h>
 #include <time.h>
-#include <sys/statvfs.h>
+#include "ff.h"
 #include "lvgl.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
@@ -14103,17 +14103,22 @@ static void show_sd_free_space_screen(void)
 {
     create_function_page_base("SD Free Space");
 
-    struct statvfs vfs;
     bool ok = false;
-    ESP_LOGI(TAG, "[FREE_SPACE] mounted=%d mutex=%p", (int)wifi_wardrive_is_sd_mounted(), (void*)sd_spi_mutex);
-    if (!sd_spi_mutex) {
-        ESP_LOGE(TAG, "[FREE_SPACE] sd_spi_mutex is NULL");
-    } else if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
-        ESP_LOGE(TAG, "[FREE_SPACE] mutex take timed out after 3s");
-    } else {
-        int rc = statvfs("/sdcard", &vfs);
-        ESP_LOGI(TAG, "[FREE_SPACE] statvfs rc=%d errno=%d", rc, errno);
-        ok = (rc == 0);
+    uint64_t total_b = 0, free_b = 0, used_b = 0;
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        FATFS *fs_p;
+        DWORD fre_clust;
+        FRESULT res = f_getfree("0:", &fre_clust, &fs_p);
+        if (res == FR_OK) {
+            uint64_t clust_sz = (uint64_t)fs_p->csize * 512ULL;
+            uint64_t total_clust = (uint64_t)(fs_p->n_fatent - 2);
+            total_b = total_clust * clust_sz;
+            free_b  = (uint64_t)fre_clust * clust_sz;
+            used_b  = total_b - free_b;
+            ok = true;
+        } else {
+            ESP_LOGE(TAG, "[FREE_SPACE] f_getfree failed: %d", (int)res);
+        }
         xSemaphoreGive(sd_spi_mutex);
     }
 
@@ -14133,12 +14138,9 @@ static void show_sd_free_space_screen(void)
         lv_obj_set_style_text_color(err, COLOR_MATERIAL_RED, 0);
         lv_obj_center(err);
     } else {
-        uint64_t total_b = (uint64_t)vfs.f_blocks * vfs.f_frsize;
-        uint64_t free_b  = (uint64_t)vfs.f_bfree  * vfs.f_frsize;
-        uint64_t used_b  = total_b - free_b;
-        uint32_t total_mb = (uint32_t)(total_b / (1024 * 1024));
-        uint32_t free_mb  = (uint32_t)(free_b  / (1024 * 1024));
-        uint32_t used_mb  = (uint32_t)(used_b  / (1024 * 1024));
+        uint32_t total_mb = (uint32_t)(total_b / (1024ULL * 1024ULL));
+        uint32_t free_mb  = (uint32_t)(free_b  / (1024ULL * 1024ULL));
+        uint32_t used_mb  = (uint32_t)(used_b  / (1024ULL * 1024ULL));
         bool low = free_mb < 50;
 
         lv_obj_t *lbl_total = lv_label_create(card);
