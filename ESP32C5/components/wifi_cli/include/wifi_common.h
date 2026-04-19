@@ -12,7 +12,7 @@ extern "C" {
 #endif
 
 // Version
-#define JANOS_VERSION "0.5.2"
+#define JANOS_VERSION "V1.0.0"
 
 // Maximum limits
 #define MAX_AP_CNT 64
