@@ -1015,7 +1015,7 @@ static bool bt_tracking_mode = false;
 
 // Battery voltage monitor state (DISABLED - using regular C5 chip)
 static lv_obj_t *battery_label = NULL;  // Keep for UI layout
-static char last_voltage_str[32] = "-.--V";  // Persisted across screen changes
+static char last_voltage_str[32] = "";  // Empty = no valid reading, hide label
 static adc_oneshot_unit_handle_t battery_adc_handle = NULL;
 static adc_cali_handle_t battery_adc_cali_handle = NULL;
 static StaticTask_t battery_task_buffer;
@@ -3387,6 +3387,7 @@ static void create_home_ui(void)
     lv_obj_set_style_text_color(battery_label, ui_muted_color(), 0);
     lv_obj_set_style_text_font(battery_label, &lv_font_montserrat_12, 0);
     lv_obj_align(battery_label, LV_ALIGN_RIGHT_MID, -8, 0);
+    if (last_voltage_str[0] == '\0') lv_obj_add_flag(battery_label, LV_OBJ_FLAG_HIDDEN);
 
     show_main_tiles();
 }
@@ -6578,7 +6579,8 @@ static void sniffer_yes_btn_cb(lv_event_t *e)
     lv_obj_set_style_text_color(battery_label, ui_muted_color(), 0);
     lv_obj_set_style_text_font(battery_label, &lv_font_montserrat_12, 0);
     lv_obj_align(battery_label, LV_ALIGN_RIGHT_MID, -8, 0);
-    
+    if (last_voltage_str[0] == '\0') lv_obj_add_flag(battery_label, LV_OBJ_FLAG_HIDDEN);
+
     // Set sniffer UI active flag
     sniffer_ui_active = true;
     sniffer_observe_mode = false;
@@ -9818,6 +9820,7 @@ static void create_function_page_base(const char *name)
     lv_obj_set_style_text_color(battery_label, ui_muted_color(), 0);
     lv_obj_set_style_text_font(battery_label, &lv_font_montserrat_12, 0);
     lv_obj_align(battery_label, LV_ALIGN_RIGHT_MID, -8, 0);
+    if (last_voltage_str[0] == '\0') lv_obj_add_flag(battery_label, LV_OBJ_FLAG_HIDDEN);
 }
 
 // ============================================================================
@@ -15750,26 +15753,26 @@ static void battery_monitor_task(void *arg)
     for (;;) {
         float voltage = read_battery_voltage();
         
-        // Format battery indicator based on voltage using LVGL symbols
+        // Format battery indicator; hide label entirely when no valid reading
         if (voltage < BATTERY_VOLTAGE_CRITICAL) {
-            // No battery / critical: empty battery symbol
-            snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_BATTERY_EMPTY);
+            voltage_str[0] = '\0';  // No battery — hide label
         } else if (voltage > BATTERY_VOLTAGE_CHARGING) {
-            // Charging: charging symbol
             snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_CHARGE "");
         } else {
-            // Normal battery: show battery with voltage
             snprintf(voltage_str, sizeof(voltage_str), LV_SYMBOL_BATTERY_FULL " %.2fV", voltage);
         }
-        
-        // Save to global buffer so new screens can show it immediately
+
         strncpy(last_voltage_str, voltage_str, sizeof(last_voltage_str) - 1);
         last_voltage_str[sizeof(last_voltage_str) - 1] = '\0';
-        
-        // Update label with LVGL mutex protection
+
         if (lvgl_mutex && xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             if (battery_label != NULL && lv_obj_is_valid(battery_label)) {
-                lv_label_set_text(battery_label, voltage_str);
+                if (voltage_str[0] == '\0') {
+                    lv_obj_add_flag(battery_label, LV_OBJ_FLAG_HIDDEN);
+                } else {
+                    lv_obj_clear_flag(battery_label, LV_OBJ_FLAG_HIDDEN);
+                    lv_label_set_text(battery_label, voltage_str);
+                }
             }
             xSemaphoreGive(lvgl_mutex);
         }
