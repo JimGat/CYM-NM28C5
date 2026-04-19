@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <time.h>
 #include "ff.h"
+#include "dexter_img.h"
 #include "lvgl.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
@@ -3329,19 +3330,23 @@ static void show_splash_screen(void)
     lv_obj_set_style_bg_opa(splash_screen, LV_OPA_COVER, 0);
     lv_obj_clear_flag(splash_screen, LV_OBJ_FLAG_SCROLLABLE);
 
+    lv_obj_t *dexter = lv_img_create(splash_screen);
+    lv_img_set_src(dexter, &dexter_img);
+    lv_obj_align(dexter, LV_ALIGN_TOP_MID, 0, 5);
+
     lv_obj_t *title = lv_label_create(splash_screen);
     lv_label_set_text(title, "LAB5");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(title, COLOR_MAGENTA, 0);
     lv_obj_set_style_text_letter_space(title, 4, 0);
-    lv_obj_align(title, LV_ALIGN_CENTER, 0, -30);
+    lv_obj_align(title, LV_ALIGN_CENTER, 0, 20);
 
     lv_obj_t *subtitle = lv_label_create(splash_screen);
     lv_label_set_text(subtitle, "LABORATORIUM");
     lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(subtitle, lv_color_hex(0x93A6BC), 0);
     lv_obj_set_style_text_letter_space(subtitle, 2, 0);
-    lv_obj_align(subtitle, LV_ALIGN_CENTER, 0, 4);
+    lv_obj_align(subtitle, LV_ALIGN_CENTER, 0, 46);
 
     splash_loading_label = lv_label_create(splash_screen);
     lv_label_set_text(splash_loading_label, "LOADING...");
