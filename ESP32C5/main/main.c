@@ -2166,21 +2166,28 @@ static void init_boot_button(void)
 void go_dark_enable(void)
 {
     if (go_dark_active) return;
+    ESP_LOGI(TAG, "[GO_DARK] Entering dark mode — screen off, LED off, touch suspended");
+    ESP_LOGI(TAG, "[GO_DARK] BOOT button GPIO%d level before dark: %d", BOOT_BTN_GPIO, gpio_get_level(BOOT_BTN_GPIO));
     go_dark_active = true;
+    boot_btn_prev_state = (gpio_get_level(BOOT_BTN_GPIO) == 0);
+    boot_btn_click_count = 0;
     led_set(0, 0, 0);
     gpio_set_level(LCD_BL_IO, 0);
     if (panel_handle) esp_lcd_panel_disp_on_off(panel_handle, false);
+    ESP_LOGI(TAG, "[GO_DARK] Dark mode active. Double-click BOOT button to wake.");
 }
 
 void go_dark_disable(void)
 {
     if (!go_dark_active) return;
+    ESP_LOGI(TAG, "[GO_DARK] Waking from dark mode");
     go_dark_active = false;
     if (panel_handle) esp_lcd_panel_disp_on_off(panel_handle, true);
     gpio_set_level(LCD_BL_IO, LCD_BL_ACTIVE_LEVEL);
     set_backlight_percent(screen_brightness_pct);
     led_update_mode();
     last_input_ms = esp_timer_get_time() / 1000;
+    ESP_LOGI(TAG, "[GO_DARK] Wake complete");
 }
 
 
@@ -3825,22 +3832,52 @@ void app_main(void)
 
         // Wake from Go Dark: poll BOOT button for double-click
         if (go_dark_active) {
+            static uint32_t dark_heartbeat_ms = 0;
+            static int      last_gpio_level   = -1;
+            uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+            // Heartbeat every 2s to confirm loop is running
+            if (now_ms - dark_heartbeat_ms >= 2000) {
+                int lvl = gpio_get_level(BOOT_BTN_GPIO);
+                ESP_LOGI(TAG, "[GO_DARK] Loop alive — GPIO%d=%d prev=%d clicks=%u",
+                         BOOT_BTN_GPIO, lvl, boot_btn_prev_state, boot_btn_click_count);
+                dark_heartbeat_ms = now_ms;
+            }
+
             bool btn_pressed = (gpio_get_level(BOOT_BTN_GPIO) == 0);
+
+            // Log every GPIO state change
+            int cur_lvl = btn_pressed ? 0 : 1;
+            if (cur_lvl != last_gpio_level) {
+                ESP_LOGI(TAG, "[GO_DARK] GPIO%d changed: %d → %d  (clicks=%u)",
+                         BOOT_BTN_GPIO, last_gpio_level, cur_lvl, boot_btn_click_count);
+                last_gpio_level = cur_lvl;
+            }
+
             if (btn_pressed && !boot_btn_prev_state) {
-                uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+                // Falling edge — button press
+                ESP_LOGI(TAG, "[GO_DARK] Falling edge detected (press #%u)", boot_btn_click_count + 1);
                 if (boot_btn_click_count == 0) {
                     boot_btn_click_count = 1;
                     boot_btn_first_click_ms = now_ms;
+                    ESP_LOGI(TAG, "[GO_DARK] First click — waiting for second within %dms", GO_DARK_DBL_CLICK_MS);
                 } else if ((now_ms - boot_btn_first_click_ms) <= GO_DARK_DBL_CLICK_MS) {
+                    ESP_LOGI(TAG, "[GO_DARK] Double-click confirmed (%ums gap) — waking",
+                             (unsigned)(now_ms - boot_btn_first_click_ms));
                     go_dark_disable();
                     boot_btn_click_count = 0;
                 } else {
+                    ESP_LOGI(TAG, "[GO_DARK] Second click too late (%ums) — resetting",
+                             (unsigned)(now_ms - boot_btn_first_click_ms));
                     boot_btn_click_count = 1;
                     boot_btn_first_click_ms = now_ms;
                 }
             }
+
+            // Timeout: reset if first click wasn't followed in time
             if (boot_btn_click_count > 0 &&
-                ((uint32_t)(esp_timer_get_time() / 1000) - boot_btn_first_click_ms) > GO_DARK_DBL_CLICK_MS) {
+                (now_ms - boot_btn_first_click_ms) > GO_DARK_DBL_CLICK_MS) {
+                ESP_LOGI(TAG, "[GO_DARK] Click timeout — resetting count");
                 boot_btn_click_count = 0;
             }
             boot_btn_prev_state = btn_pressed;
