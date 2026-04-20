@@ -9808,10 +9808,98 @@ static void portal_stop_btn_cb(lv_event_t *e)
     nav_to_menu_flag = true;
 }
 
+// ── Go Dark confirmation dialog ───────────────────────────────────────────────
+
+static lv_obj_t *go_dark_confirm_overlay = NULL;
+
+static void go_dark_confirm_yes_cb(lv_event_t *e)
+{
+    (void)e;
+    if (go_dark_confirm_overlay) {
+        lv_obj_del(go_dark_confirm_overlay);
+        go_dark_confirm_overlay = NULL;
+    }
+    go_dark_enable();
+}
+
+static void go_dark_confirm_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    if (go_dark_confirm_overlay) {
+        lv_obj_del(go_dark_confirm_overlay);
+        go_dark_confirm_overlay = NULL;
+    }
+}
+
+static void show_go_dark_confirm(void)
+{
+    if (go_dark_confirm_overlay) return;  // already showing
+
+    go_dark_confirm_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(go_dark_confirm_overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(go_dark_confirm_overlay, 0, 0);
+    style_modal_overlay(go_dark_confirm_overlay, LV_OPA_60);
+
+    lv_obj_t *card = lv_obj_create(go_dark_confirm_overlay);
+    lv_obj_set_size(card, 200, LV_SIZE_CONTENT);
+    lv_obj_center(card);
+    style_popup_card(card, 10, lv_color_hex(0x8A8FA8));
+    lv_obj_set_style_pad_all(card, 14, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(card, 10, 0);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, LV_SYMBOL_POWER "  Go Dark");
+    lv_obj_set_style_text_color(title, ui_text_color(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+
+    lv_obj_t *hint = lv_label_create(card);
+    lv_label_set_text(hint, "Screen & LED off.\nAll ops continue.\n\nDouble-click BOOT\nto resume.");
+    lv_obj_set_style_text_color(hint, ui_muted_color(), 0);
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(hint, 170);
+
+    lv_obj_t *btn_row = lv_obj_create(card);
+    lv_obj_set_size(btn_row, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel_btn, 72, 32);
+    lv_obj_set_style_bg_color(cancel_btn, ui_panel_color(), 0);
+    lv_obj_set_style_radius(cancel_btn, 6, 0);
+    lv_obj_add_event_cb(cancel_btn, go_dark_confirm_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, "Cancel");
+    lv_obj_set_style_text_color(cancel_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(cancel_lbl);
+
+    lv_obj_t *yes_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(yes_btn, 72, 32);
+    lv_obj_set_style_bg_color(yes_btn, lv_color_hex(0x8A8FA8), 0);
+    lv_obj_set_style_bg_color(yes_btn, lv_color_hex(0xAAB0C0), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(yes_btn, 6, 0);
+    lv_obj_add_event_cb(yes_btn, go_dark_confirm_yes_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *yes_lbl = lv_label_create(yes_btn);
+    lv_label_set_text(yes_lbl, "Go Dark");
+    lv_obj_set_style_text_color(yes_lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(yes_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(yes_lbl);
+}
+
 static void go_dark_mini_btn_cb(lv_event_t *e)
 {
     (void)e;
-    go_dark_enable();
+    show_go_dark_confirm();
 }
 
 static void create_function_page_base(const char *name)
@@ -10284,7 +10372,7 @@ static void main_tile_event_cb(lv_event_t *e)
     } else if (strcmp(tile_name, "Bluetooth") == 0) {
         show_bluetooth_screen();
     } else if (strcmp(tile_name, "Go Dark") == 0) {
-        go_dark_enable();
+        show_go_dark_confirm();
     }
 }
 
