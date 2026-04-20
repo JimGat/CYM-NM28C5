@@ -140,6 +140,8 @@ static int bt_device_count = 0;
 // Backlight GPIO (HIGH = on; GPIO 25 is strapping pin but safe after boot)
 #define LCD_BL_IO 25
 #define LCD_BL_ACTIVE_LEVEL 1
+#define BOOT_BTN_GPIO        0
+#define GO_DARK_DBL_CLICK_MS 400
 
 // NOTE: No battery ADC on NM-CYD-C5 — GPIO6 is SPI SCK, not battery monitor.
 
@@ -265,6 +267,9 @@ static volatile int64_t last_input_ms = 0;
 static volatile bool screen_dimmed = false;
 static volatile bool ignore_touch_until_release = false;
 static lv_timer_t *screen_idle_timer = NULL;
+static volatile bool    go_dark_active         = false;
+static volatile bool    go_dark_wake_pending   = false;
+static volatile int64_t boot_btn_last_press_us = 0;
 
 // Screen settings (loaded from NVS)
 static int32_t screen_timeout_ms = 0;       // 0 = stays on (default)
@@ -389,6 +394,9 @@ static void init_backlight(void);
 static void set_backlight_percent(uint8_t percent);
 static void screen_set_dimmed(bool dimmed);
 static void screen_idle_timer_cb(lv_timer_t *timer);
+static void go_dark_enable(void);
+static void go_dark_disable(void);
+static void init_boot_button(void);
 
 // Route ESP logging directly to ROM UART to avoid VFS write paths during GUI/ISR contexts
 static int rom_vprintf(const char *fmt, va_list ap)
@@ -2050,6 +2058,7 @@ static void led_set(uint8_t r, uint8_t g, uint8_t b)
 
 static void led_update_mode(void)
 {
+    if (go_dark_active) return;
     // ── Aggressive attacks (red family) ──────────────────────────────────────
     if (wifi_attacks_is_deauth_active() || targeted_deauth_active ||
         wifi_attacks_is_blackout_active() || wifi_attacks_is_sae_overflow_active()) {
@@ -2135,6 +2144,58 @@ static void screen_idle_timer_cb(lv_timer_t *timer)
     if (!screen_dimmed && (now_ms - last_input_ms) >= screen_timeout_ms) {
         screen_set_dimmed(true);
     }
+}
+
+// ── Go Dark ──────────────────────────────────────────────────────────────────
+// LED off, screen off, touch suspended; all background ops continue.
+// Wake: double-click BOOT button (GPIO 0). Clean API — callable via I2C later.
+
+static void IRAM_ATTR boot_btn_isr_handler(void *arg)
+{
+    (void)arg;
+    const int64_t now_us = esp_timer_get_time();
+    if (go_dark_active &&
+        (now_us - boot_btn_last_press_us) < ((int64_t)GO_DARK_DBL_CLICK_MS * 1000LL)) {
+        go_dark_wake_pending = true;
+    }
+    boot_btn_last_press_us = now_us;
+}
+
+static void init_boot_button(void)
+{
+    gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << BOOT_BTN_GPIO),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_NEGEDGE,
+    };
+    gpio_config(&cfg);
+    esp_err_t err = gpio_install_isr_service(0);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "GPIO ISR service: %s", esp_err_to_name(err));
+    }
+    gpio_isr_handler_add(BOOT_BTN_GPIO, boot_btn_isr_handler, NULL);
+}
+
+void go_dark_enable(void)
+{
+    if (go_dark_active) return;
+    go_dark_active = true;
+    led_set(0, 0, 0);
+    gpio_set_level(LCD_BL_IO, 0);
+    if (panel_handle) esp_lcd_panel_disp_on_off(panel_handle, false);
+}
+
+void go_dark_disable(void)
+{
+    if (!go_dark_active) return;
+    go_dark_active = false;
+    if (panel_handle) esp_lcd_panel_disp_on_off(panel_handle, true);
+    gpio_set_level(LCD_BL_IO, LCD_BL_ACTIVE_LEVEL);
+    set_backlight_percent(screen_brightness_pct);
+    led_update_mode();
+    last_input_ms = esp_timer_get_time() / 1000;
 }
 
 
@@ -3454,6 +3515,7 @@ void app_main(void)
     init_display();
     init_touch();
     init_backlight();
+    init_boot_button();
 
     ESP_LOGI(TAG, "=== SD CARD INIT DISABLED ===");
     ESP_LOGI(TAG, "[INIT] SD card will be mounted lazily on first use");
@@ -3775,6 +3837,12 @@ void app_main(void)
     uint32_t last_led_update_ms = esp_timer_get_time() / 1000;
 
     while (1) {
+
+        // Wake from Go Dark on boot-button double-click (set by ISR)
+        if (go_dark_wake_pending) {
+            go_dark_wake_pending = false;
+            go_dark_disable();
+        }
 
         // Update NeoPixel LED color to reflect current mode (~2 Hz)
         {
@@ -5026,6 +5094,10 @@ void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_
 
 void lvgl_touch_read_cb(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
 {
+    if (go_dark_active) {
+        data->state = LV_INDEV_STATE_RELEASED;
+        return;
+    }
     static int call_count = 0;
     xpt2046_handle_t *touch = (xpt2046_handle_t *)indev_drv->user_data;
     xpt2046_touch_point_t point;
@@ -9671,6 +9743,12 @@ static void portal_stop_btn_cb(lv_event_t *e)
     nav_to_menu_flag = true;
 }
 
+static void go_dark_mini_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    go_dark_enable();
+}
+
 static void create_function_page_base(const char *name)
 {
     // Print memory stats when opening new page
@@ -9812,6 +9890,21 @@ static void create_function_page_base(const char *name)
     lv_obj_set_style_text_font(home_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(home_label, ui_text_color(), 0);
     lv_obj_center(home_label);
+
+    // Mini Go Dark button — power off screen without leaving the current op
+    lv_obj_t *dark_btn = lv_btn_create(page_title_bar);
+    lv_obj_set_size(dark_btn, 24, 24);
+    lv_obj_align(dark_btn, LV_ALIGN_LEFT_MID, 34, 0);
+    lv_obj_set_style_bg_color(dark_btn, lv_color_hex(0x0D1117), 0);
+    lv_obj_set_style_bg_color(dark_btn, lv_color_hex(0x1A2332), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(dark_btn, 4, 0);
+    lv_obj_set_style_shadow_width(dark_btn, 0, 0);
+    lv_obj_add_event_cb(dark_btn, go_dark_mini_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *dark_lbl = lv_label_create(dark_btn);
+    lv_label_set_text(dark_lbl, LV_SYMBOL_POWER);
+    lv_obj_set_style_text_font(dark_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(dark_lbl, lv_color_hex(0x4A90D9), 0);
+    lv_obj_center(dark_lbl);
 
     lv_obj_t *page_title_label = lv_label_create(page_title_bar);
     lv_label_set_text(page_title_label, name ? name : "");
@@ -10125,6 +10218,8 @@ static void main_tile_event_cb(lv_event_t *e)
         show_deauth_monitor_screen();
     } else if (strcmp(tile_name, "Bluetooth") == 0) {
         show_bluetooth_screen();
+    } else if (strcmp(tile_name, "Go Dark") == 0) {
+        go_dark_enable();
     }
 }
 
@@ -10292,6 +10387,7 @@ static void show_main_tiles(void)
     create_tile(tiles_container, LV_SYMBOL_SETTINGS, "Settings", UI_ACCENT_GREEN, main_tile_event_cb, "Settings");
     create_tile(tiles_container, LV_SYMBOL_GPS, "Deauth Mon.", UI_ACCENT_AMBER, main_tile_event_cb, "Deauth Monitor");
     create_tile(tiles_container, LV_SYMBOL_BLUETOOTH, "Bluetooth", UI_ACCENT_CYAN, main_tile_event_cb, "Bluetooth");
+    create_tile(tiles_container, LV_SYMBOL_POWER, "Go Dark", lv_color_hex(0x0D1117), main_tile_event_cb, "Go Dark");
     
     // Show title bar
     lv_obj_clear_flag(title_bar, LV_OBJ_FLAG_HIDDEN);
