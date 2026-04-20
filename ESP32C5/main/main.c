@@ -140,7 +140,7 @@ static int bt_device_count = 0;
 // Backlight GPIO (HIGH = on; GPIO 25 is strapping pin but safe after boot)
 #define LCD_BL_IO 25
 #define LCD_BL_ACTIVE_LEVEL 1
-#define BOOT_BTN_GPIO        0
+#define BOOT_BTN_GPIO        28   // NM-CYD-C5 BOOT button = IO28 (strapping pin, input-safe)
 #define GO_DARK_DBL_CLICK_MS 800
 
 // NOTE: No battery ADC on NM-CYD-C5 — GPIO6 is SPI SCK, not battery monitor.
