@@ -12,7 +12,7 @@ extern "C" {
 #endif
 
 // Version
-#define FW_VERSION "v0.4.0"
+#define FW_VERSION "v0.4.1"
 
 // Maximum limits
 #define MAX_AP_CNT 64
