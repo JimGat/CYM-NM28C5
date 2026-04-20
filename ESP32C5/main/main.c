@@ -2161,6 +2161,10 @@ static void init_boot_button(void)
         .intr_type    = GPIO_INTR_DISABLE,
     };
     gpio_config(&cfg);
+    // Prevent sleep_gpio from isolating this pin during light sleep.
+    // Without this, FreeRTOS tickless idle freezes the GPIO at its last
+    // state (HIGH) so button presses are invisible during dark mode polling.
+    gpio_sleep_sel_dis(BOOT_BTN_GPIO);
 }
 
 void go_dark_enable(void)
@@ -2703,6 +2707,9 @@ static void run_touch_calibration(void)
     int64_t t_done = esp_timer_get_time() / 1000 + 1500;
     while (esp_timer_get_time() / 1000 < t_done) cal_tick();
 
+    // Switch back to the default screen before deleting the calibration screen,
+    // otherwise lv_scr_act() returns a dangling pointer and create_home_ui() faults.
+    lv_scr_load(lv_scr_act() == scr ? lv_obj_create(NULL) : lv_scr_act());
     lv_obj_del(scr);
     ESP_LOGI(TAG, "Touch calibration complete");
 }
