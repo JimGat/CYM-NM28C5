@@ -2667,7 +2667,7 @@ static void run_touch_calibration(void)
 
         if (!cal_wait_touch(null_x, null_y, &raw_x[pt], &raw_y[pt], 15000)) {
             ESP_LOGW(TAG, "Calibration timeout at point %d — aborting", pt + 1);
-            lv_obj_del(scr);
+            lv_obj_clean(scr);  // strip cal widgets; scr stays active for create_home_ui
             return;
         }
         ESP_LOGI(TAG, "Cal[%d] screen(%d,%d) → raw(%u,%u)", pt+1, tx, ty, raw_x[pt], raw_y[pt]);
@@ -2707,10 +2707,11 @@ static void run_touch_calibration(void)
     int64_t t_done = esp_timer_get_time() / 1000 + 1500;
     while (esp_timer_get_time() / 1000 < t_done) cal_tick();
 
-    // Switch back to the default screen before deleting the calibration screen,
-    // otherwise lv_scr_act() returns a dangling pointer and create_home_ui() faults.
-    lv_scr_load(lv_scr_act() == scr ? lv_obj_create(NULL) : lv_scr_act());
-    lv_obj_del(scr);
+    // Strip cal widgets off the screen without deleting it — lv_scr_load sets
+    // disp->prev_scr which remains a dangling pointer after lv_obj_del(scr),
+    // causing a load-access fault in the next lv_timer_handler call.
+    // lv_obj_clean leaves scr as the active screen; create_home_ui() populates it.
+    lv_obj_clean(scr);
     ESP_LOGI(TAG, "Touch calibration complete");
 }
 
