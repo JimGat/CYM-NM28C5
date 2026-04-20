@@ -2162,10 +2162,14 @@ static void init_boot_button(void)
         .intr_type    = GPIO_INTR_DISABLE,
     };
     gpio_config(&cfg);
-    // Prevent sleep_gpio from isolating this pin during light sleep.
-    // Without this, FreeRTOS tickless idle freezes the GPIO at its last
-    // state (HIGH) so button presses are invisible during dark mode polling.
+    // GPIO0-7 on ESP32-C5 are LP GPIOs. The sleep_gpio subsystem enables
+    // LP GPIO hold (latching the pad state) which freezes the value at whatever
+    // the pin was when hold was set — always HIGH after a normal boot.
+    // gpio_hold_dis() releases the latch so gpio_get_level() reads the real pad.
+    gpio_hold_dis(BOOT_BTN_GPIO);
     gpio_sleep_sel_dis(BOOT_BTN_GPIO);
+    ESP_LOGI(TAG, "[BOOT_BTN] GPIO%d configured, level=%d",
+             BOOT_BTN_GPIO, gpio_get_level(BOOT_BTN_GPIO));
 }
 
 void go_dark_enable(void)
