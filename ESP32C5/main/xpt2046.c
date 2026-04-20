@@ -189,6 +189,10 @@ bool xpt2046_read_raw_point(xpt2046_handle_t *handle, uint16_t *out_x, uint16_t 
 {
     if (!handle || !out_x || !out_y) return false;
 
+    // Z1 pressure gate — same as xpt2046_read_touch; prevents floating-panel
+    // noise from looking like a valid touch during calibration.
+    if (xpt2046_read_raw(handle, XPT2046_CMD_Z1) < XPT2046_Z_THRESHOLD) return false;
+
     // Discard first sample per axis (ADC settling), then average 4 samples
     xpt2046_read_raw(handle, XPT2046_CMD_X);
     uint32_t sx = 0;

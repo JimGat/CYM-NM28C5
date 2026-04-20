@@ -140,8 +140,8 @@ static int bt_device_count = 0;
 // Backlight GPIO (HIGH = on; GPIO 25 is strapping pin but safe after boot)
 #define LCD_BL_IO 25
 #define LCD_BL_ACTIVE_LEVEL 1
-#define BOOT_BTN_GPIO        0
-#define GO_DARK_DBL_CLICK_MS 400
+#define BOOT_BTN_GPIO        28   // NM-CYD-C5 BOOT button = IO28 (strapping pin, input-safe)
+#define GO_DARK_DBL_CLICK_MS 800
 
 // NOTE: No battery ADC on NM-CYD-C5 — GPIO6 is SPI SCK, not battery monitor.
 
@@ -267,10 +267,11 @@ static volatile int64_t last_input_ms = 0;
 static volatile bool screen_dimmed = false;
 static volatile bool ignore_touch_until_release = false;
 static lv_timer_t *screen_idle_timer = NULL;
-static volatile bool go_dark_active       = false;
-static bool          boot_btn_prev_state  = true;   // true = released (pull-up HIGH)
-static uint8_t       boot_btn_click_count = 0;
-static uint32_t      boot_btn_first_click_ms = 0;
+static volatile bool go_dark_active          = false;
+static bool          boot_btn_prev_pressed   = false; // true = was pressed last poll
+static uint8_t       boot_btn_click_count    = 0;
+static uint32_t      boot_btn_last_release_ms = 0;   // timestamp of most recent release
+static uint32_t      boot_btn_hold_start_ms  = 0;    // timestamp when hold began
 
 // Screen settings (loaded from NVS)
 static int32_t screen_timeout_ms = 0;       // 0 = stays on (default)
@@ -2161,12 +2162,22 @@ static void init_boot_button(void)
         .intr_type    = GPIO_INTR_DISABLE,
     };
     gpio_config(&cfg);
+    // GPIO0-7 on ESP32-C5 are LP GPIOs. The sleep_gpio subsystem enables
+    // LP GPIO hold (latching the pad state) which freezes the value at whatever
+    // the pin was when hold was set — always HIGH after a normal boot.
+    // gpio_hold_dis() releases the latch so gpio_get_level() reads the real pad.
+    gpio_hold_dis(BOOT_BTN_GPIO);
+    gpio_sleep_sel_dis(BOOT_BTN_GPIO);
 }
 
 void go_dark_enable(void)
 {
     if (go_dark_active) return;
-    go_dark_active = true;
+    go_dark_active         = true;
+    boot_btn_prev_pressed  = (gpio_get_level(BOOT_BTN_GPIO) == 0);
+    boot_btn_click_count   = 0;
+    boot_btn_last_release_ms = 0;
+    boot_btn_hold_start_ms = 0;
     led_set(0, 0, 0);
     gpio_set_level(LCD_BL_IO, 0);
     if (panel_handle) esp_lcd_panel_disp_on_off(panel_handle, false);
@@ -2656,7 +2667,7 @@ static void run_touch_calibration(void)
 
         if (!cal_wait_touch(null_x, null_y, &raw_x[pt], &raw_y[pt], 15000)) {
             ESP_LOGW(TAG, "Calibration timeout at point %d — aborting", pt + 1);
-            lv_obj_del(scr);
+            lv_obj_clean(scr);  // strip cal widgets; scr stays active for create_home_ui
             return;
         }
         ESP_LOGI(TAG, "Cal[%d] screen(%d,%d) → raw(%u,%u)", pt+1, tx, ty, raw_x[pt], raw_y[pt]);
@@ -2696,7 +2707,11 @@ static void run_touch_calibration(void)
     int64_t t_done = esp_timer_get_time() / 1000 + 1500;
     while (esp_timer_get_time() / 1000 < t_done) cal_tick();
 
-    lv_obj_del(scr);
+    // Strip cal widgets off the screen without deleting it — lv_scr_load sets
+    // disp->prev_scr which remains a dangling pointer after lv_obj_del(scr),
+    // causing a load-access fault in the next lv_timer_handler call.
+    // lv_obj_clean leaves scr as the active screen; create_home_ui() populates it.
+    lv_obj_clean(scr);
     ESP_LOGI(TAG, "Touch calibration complete");
 }
 
@@ -3823,27 +3838,43 @@ void app_main(void)
 
     while (1) {
 
-        // Wake from Go Dark: poll BOOT button for double-click
+        // Wake from Go Dark: poll BOOT button
+        // Double-click (window starts at first RELEASE, not first press) or 2s hold.
         if (go_dark_active) {
+            uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
             bool btn_pressed = (gpio_get_level(BOOT_BTN_GPIO) == 0);
-            if (btn_pressed && !boot_btn_prev_state) {
-                uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-                if (boot_btn_click_count == 0) {
-                    boot_btn_click_count = 1;
-                    boot_btn_first_click_ms = now_ms;
-                } else if ((now_ms - boot_btn_first_click_ms) <= GO_DARK_DBL_CLICK_MS) {
+
+            // Falling edge: start hold timer
+            if (btn_pressed && !boot_btn_prev_pressed) {
+                boot_btn_hold_start_ms = now_ms;
+            }
+
+            // Rising edge: count the click; window is from first RELEASE
+            if (!btn_pressed && boot_btn_prev_pressed) {
+                boot_btn_hold_start_ms = 0;
+                boot_btn_click_count++;
+                boot_btn_last_release_ms = now_ms;
+                if (boot_btn_click_count >= 2) {
                     go_dark_disable();
                     boot_btn_click_count = 0;
-                } else {
-                    boot_btn_click_count = 1;
-                    boot_btn_first_click_ms = now_ms;
                 }
             }
-            if (boot_btn_click_count > 0 &&
-                ((uint32_t)(esp_timer_get_time() / 1000) - boot_btn_first_click_ms) > GO_DARK_DBL_CLICK_MS) {
+
+            // Long-press fallback: hold ≥ 2s
+            if (btn_pressed && boot_btn_hold_start_ms > 0 &&
+                (now_ms - boot_btn_hold_start_ms) >= 2000) {
+                go_dark_disable();
+                boot_btn_hold_start_ms = 0;
+                boot_btn_click_count   = 0;
+            }
+
+            // Timeout: if no second click within 800ms of first release, reset
+            if (boot_btn_click_count > 0 && !btn_pressed &&
+                (now_ms - boot_btn_last_release_ms) > GO_DARK_DBL_CLICK_MS) {
                 boot_btn_click_count = 0;
             }
-            boot_btn_prev_state = btn_pressed;
+
+            boot_btn_prev_pressed = btn_pressed;
         }
 
         // Update NeoPixel LED color to reflect current mode (~2 Hz)
@@ -9745,10 +9776,98 @@ static void portal_stop_btn_cb(lv_event_t *e)
     nav_to_menu_flag = true;
 }
 
+// ── Go Dark confirmation dialog ───────────────────────────────────────────────
+
+static lv_obj_t *go_dark_confirm_overlay = NULL;
+
+static void go_dark_confirm_yes_cb(lv_event_t *e)
+{
+    (void)e;
+    if (go_dark_confirm_overlay) {
+        lv_obj_del(go_dark_confirm_overlay);
+        go_dark_confirm_overlay = NULL;
+    }
+    go_dark_enable();
+}
+
+static void go_dark_confirm_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    if (go_dark_confirm_overlay) {
+        lv_obj_del(go_dark_confirm_overlay);
+        go_dark_confirm_overlay = NULL;
+    }
+}
+
+static void show_go_dark_confirm(void)
+{
+    if (go_dark_confirm_overlay) return;  // already showing
+
+    go_dark_confirm_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(go_dark_confirm_overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(go_dark_confirm_overlay, 0, 0);
+    style_modal_overlay(go_dark_confirm_overlay, LV_OPA_60);
+
+    lv_obj_t *card = lv_obj_create(go_dark_confirm_overlay);
+    lv_obj_set_size(card, 200, LV_SIZE_CONTENT);
+    lv_obj_center(card);
+    style_popup_card(card, 10, lv_color_hex(0x8A8FA8));
+    lv_obj_set_style_pad_all(card, 14, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(card, 10, 0);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, LV_SYMBOL_POWER "  Go Dark");
+    lv_obj_set_style_text_color(title, ui_text_color(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+
+    lv_obj_t *hint = lv_label_create(card);
+    lv_label_set_text(hint, "Screen & LED off.\nAll ops continue.\n\nDouble-click BOOT\nto resume.");
+    lv_obj_set_style_text_color(hint, ui_muted_color(), 0);
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(hint, 170);
+
+    lv_obj_t *btn_row = lv_obj_create(card);
+    lv_obj_set_size(btn_row, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel_btn, 72, 32);
+    lv_obj_set_style_bg_color(cancel_btn, ui_panel_color(), 0);
+    lv_obj_set_style_radius(cancel_btn, 6, 0);
+    lv_obj_add_event_cb(cancel_btn, go_dark_confirm_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, "Cancel");
+    lv_obj_set_style_text_color(cancel_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(cancel_lbl);
+
+    lv_obj_t *yes_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(yes_btn, 72, 32);
+    lv_obj_set_style_bg_color(yes_btn, lv_color_hex(0x8A8FA8), 0);
+    lv_obj_set_style_bg_color(yes_btn, lv_color_hex(0xAAB0C0), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(yes_btn, 6, 0);
+    lv_obj_add_event_cb(yes_btn, go_dark_confirm_yes_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *yes_lbl = lv_label_create(yes_btn);
+    lv_label_set_text(yes_lbl, "Go Dark");
+    lv_obj_set_style_text_color(yes_lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(yes_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(yes_lbl);
+}
+
 static void go_dark_mini_btn_cb(lv_event_t *e)
 {
     (void)e;
-    go_dark_enable();
+    show_go_dark_confirm();
 }
 
 static void create_function_page_base(const char *name)
@@ -10221,7 +10340,7 @@ static void main_tile_event_cb(lv_event_t *e)
     } else if (strcmp(tile_name, "Bluetooth") == 0) {
         show_bluetooth_screen();
     } else if (strcmp(tile_name, "Go Dark") == 0) {
-        go_dark_enable();
+        show_go_dark_confirm();
     }
 }
 
