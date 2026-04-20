@@ -267,9 +267,10 @@ static volatile int64_t last_input_ms = 0;
 static volatile bool screen_dimmed = false;
 static volatile bool ignore_touch_until_release = false;
 static lv_timer_t *screen_idle_timer = NULL;
-static volatile bool    go_dark_active         = false;
-static volatile bool    go_dark_wake_pending   = false;
-static volatile int64_t boot_btn_last_press_us = 0;
+static volatile bool go_dark_active       = false;
+static bool          boot_btn_prev_state  = true;   // true = released (pull-up HIGH)
+static uint8_t       boot_btn_click_count = 0;
+static uint32_t      boot_btn_first_click_ms = 0;
 
 // Screen settings (loaded from NVS)
 static int32_t screen_timeout_ms = 0;       // 0 = stays on (default)
@@ -2150,17 +2151,6 @@ static void screen_idle_timer_cb(lv_timer_t *timer)
 // LED off, screen off, touch suspended; all background ops continue.
 // Wake: double-click BOOT button (GPIO 0). Clean API — callable via I2C later.
 
-static void IRAM_ATTR boot_btn_isr_handler(void *arg)
-{
-    (void)arg;
-    const int64_t now_us = esp_timer_get_time();
-    if (go_dark_active &&
-        (now_us - boot_btn_last_press_us) < ((int64_t)GO_DARK_DBL_CLICK_MS * 1000LL)) {
-        go_dark_wake_pending = true;
-    }
-    boot_btn_last_press_us = now_us;
-}
-
 static void init_boot_button(void)
 {
     gpio_config_t cfg = {
@@ -2168,14 +2158,9 @@ static void init_boot_button(void)
         .mode         = GPIO_MODE_INPUT,
         .pull_up_en   = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_NEGEDGE,
+        .intr_type    = GPIO_INTR_DISABLE,
     };
     gpio_config(&cfg);
-    esp_err_t err = gpio_install_isr_service(0);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "GPIO ISR service: %s", esp_err_to_name(err));
-    }
-    gpio_isr_handler_add(BOOT_BTN_GPIO, boot_btn_isr_handler, NULL);
 }
 
 void go_dark_enable(void)
@@ -3838,10 +3823,27 @@ void app_main(void)
 
     while (1) {
 
-        // Wake from Go Dark on boot-button double-click (set by ISR)
-        if (go_dark_wake_pending) {
-            go_dark_wake_pending = false;
-            go_dark_disable();
+        // Wake from Go Dark: poll BOOT button for double-click
+        if (go_dark_active) {
+            bool btn_pressed = (gpio_get_level(BOOT_BTN_GPIO) == 0);
+            if (btn_pressed && !boot_btn_prev_state) {
+                uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+                if (boot_btn_click_count == 0) {
+                    boot_btn_click_count = 1;
+                    boot_btn_first_click_ms = now_ms;
+                } else if ((now_ms - boot_btn_first_click_ms) <= GO_DARK_DBL_CLICK_MS) {
+                    go_dark_disable();
+                    boot_btn_click_count = 0;
+                } else {
+                    boot_btn_click_count = 1;
+                    boot_btn_first_click_ms = now_ms;
+                }
+            }
+            if (boot_btn_click_count > 0 &&
+                ((uint32_t)(esp_timer_get_time() / 1000) - boot_btn_first_click_ms) > GO_DARK_DBL_CLICK_MS) {
+                boot_btn_click_count = 0;
+            }
+            boot_btn_prev_state = btn_pressed;
         }
 
         // Update NeoPixel LED color to reflect current mode (~2 Hz)
@@ -10122,7 +10124,7 @@ static void home_btn_event_cb(lv_event_t *e)
 static lv_obj_t *create_tile(lv_obj_t *parent, const char *icon, const char *text, lv_color_t accent, lv_event_cb_t callback, const char *user_data)
 {
     lv_obj_t *tile = lv_btn_create(parent);
-    lv_obj_set_size(tile, 105, 85);
+    lv_obj_set_size(tile, 70, 87);
     lv_obj_set_style_bg_color(tile, ui_card_color(), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(tile, ui_card_pressed_color(), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(tile, 1, 0);
@@ -10132,8 +10134,8 @@ static lv_obj_t *create_tile(lv_obj_t *parent, const char *icon, const char *tex
     lv_obj_set_style_shadow_width(tile, 0, 0);
     lv_obj_set_flex_flow(tile, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(tile, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_all(tile, 8, 0);
-    lv_obj_set_style_pad_row(tile, 4, 0);
+    lv_obj_set_style_pad_all(tile, 4, 0);
+    lv_obj_set_style_pad_row(tile, 3, 0);
 
     if (icon) {
         lv_obj_t *icon_label = lv_label_create(tile);
@@ -10149,7 +10151,7 @@ static lv_obj_t *create_tile(lv_obj_t *parent, const char *icon, const char *tex
         lv_obj_set_style_text_color(text_label, ui_text_color(), 0);
         lv_obj_set_style_text_align(text_label, LV_TEXT_ALIGN_CENTER, 0);
         lv_label_set_long_mode(text_label, LV_LABEL_LONG_DOT);
-        lv_obj_set_width(text_label, 89);
+        lv_obj_set_width(text_label, 62);
     }
 
     if (callback && user_data) {
@@ -10375,19 +10377,19 @@ static void show_main_tiles(void)
     lv_obj_set_style_bg_color(tiles_container, ui_bg_color(), 0);
     lv_obj_set_style_border_width(tiles_container, 0, 0);
     lv_obj_set_style_radius(tiles_container, 0, 0);
-    lv_obj_set_style_pad_all(tiles_container, 10, 0);
-    lv_obj_set_style_pad_gap(tiles_container, 10, 0);
+    lv_obj_set_style_pad_all(tiles_container, 8, 0);
+    lv_obj_set_style_pad_gap(tiles_container, 6, 0);
     lv_obj_set_flex_flow(tiles_container, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles_container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(tiles_container, LV_OBJ_FLAG_SCROLLABLE);
 
-    create_tile(tiles_container, LV_SYMBOL_WIFI, "WiFi Scan", UI_ACCENT_BLUE, main_tile_event_cb, "WiFi Scan & Attack");
-    create_tile(tiles_container, LV_SYMBOL_WARNING, "WiFi Attacks", UI_ACCENT_RED, main_tile_event_cb, "Global WiFi Attacks");
-    create_tile(tiles_container, LV_SYMBOL_EYE_OPEN, "Observer", UI_ACCENT_PURPLE, main_tile_event_cb, "WiFi Sniff&Karma");
-    create_tile(tiles_container, LV_SYMBOL_SETTINGS, "Settings", UI_ACCENT_GREEN, main_tile_event_cb, "Settings");
-    create_tile(tiles_container, LV_SYMBOL_GPS, "Deauth Mon.", UI_ACCENT_AMBER, main_tile_event_cb, "Deauth Monitor");
-    create_tile(tiles_container, LV_SYMBOL_BLUETOOTH, "Bluetooth", UI_ACCENT_CYAN, main_tile_event_cb, "Bluetooth");
-    create_tile(tiles_container, LV_SYMBOL_POWER, "Go Dark", lv_color_hex(0x0D1117), main_tile_event_cb, "Go Dark");
+    create_tile(tiles_container, LV_SYMBOL_WIFI,      "WiFi\nScan",    UI_ACCENT_BLUE,   main_tile_event_cb, "WiFi Scan & Attack");
+    create_tile(tiles_container, LV_SYMBOL_WARNING,   "WiFi\nAttacks", UI_ACCENT_RED,    main_tile_event_cb, "Global WiFi Attacks");
+    create_tile(tiles_container, LV_SYMBOL_EYE_OPEN,  "Observer",      UI_ACCENT_PURPLE, main_tile_event_cb, "WiFi Sniff&Karma");
+    create_tile(tiles_container, LV_SYMBOL_SETTINGS,  "Settings",      UI_ACCENT_GREEN,  main_tile_event_cb, "Settings");
+    create_tile(tiles_container, LV_SYMBOL_GPS,       "Deauth\nMon.",  UI_ACCENT_AMBER,  main_tile_event_cb, "Deauth Monitor");
+    create_tile(tiles_container, LV_SYMBOL_BLUETOOTH, "Bluetooth",     UI_ACCENT_CYAN,   main_tile_event_cb, "Bluetooth");
+    create_tile(tiles_container, LV_SYMBOL_POWER,     "Go Dark",       lv_color_hex(0x8A8FA8), main_tile_event_cb, "Go Dark");
     
     // Show title bar
     lv_obj_clear_flag(title_bar, LV_OBJ_FLAG_HIDDEN);
