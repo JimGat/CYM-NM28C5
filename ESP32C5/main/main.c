@@ -13991,34 +13991,20 @@ static void show_settings_screen(void)
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
-    lv_obj_set_style_pad_all(tiles, 10, 0);
-    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    // pad_all=4, pad_gap=4 → inner width=232, 3×70+2×4=218 ≤ 232, fits 3 tiles per row
+    lv_obj_set_style_pad_all(tiles, 4, 0);
+    lv_obj_set_style_pad_gap(tiles, 4, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    
-    // Compromised Data - Blue
-    create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Compromised\nData", COLOR_TILE_BLUE, settings_tile_event_cb, "Compromised Data");
-    
-    // Scan Time - Purple
-    create_tile(tiles, LV_SYMBOL_LOOP, "Scan\nTime", COLOR_MATERIAL_PURPLE, settings_tile_event_cb, "Scan Time");
-    
-    // RedTeam mode - Amber/Orange
-    // create_tile(tiles, LV_SYMBOL_WARNING, "RedTeam\nMode", COLOR_MATERIAL_AMBER, settings_tile_event_cb, "RedTeam mode");
-    
-    // Download Mode - Red
-    create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Download\nMode", COLOR_MATERIAL_RED, settings_tile_event_cb, "Download Mode");
-    
-    // Screen Timeout - Teal
-    create_tile(tiles, LV_SYMBOL_BELL, "Screen\nTimeout", COLOR_MATERIAL_TEAL, settings_tile_event_cb, "Screen Timeout");
-    
-    // Screen Brightness - Orange
-    create_tile(tiles, LV_SYMBOL_IMAGE, "Screen\nBrightness", COLOR_MATERIAL_ORANGE, settings_tile_event_cb, "Screen Brightness");
 
-    // SD Card - Green
-    create_tile(tiles, LV_SYMBOL_SD_CARD, "SD\nCard", COLOR_MATERIAL_GREEN, settings_tile_event_cb, "SD Card");
-
-    // GPS Info - Cyan
-    create_tile(tiles, LV_SYMBOL_GPS, "GPS\nInfo", lv_color_hex(0x00BCD4), settings_tile_event_cb, "GPS Info");
+    create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Compromised\nData", COLOR_TILE_BLUE,         settings_tile_event_cb, "Compromised Data");
+    create_tile(tiles, LV_SYMBOL_LOOP,     "Scan\nTime",         COLOR_MATERIAL_PURPLE,   settings_tile_event_cb, "Scan Time");
+    create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Download\nMode",     COLOR_MATERIAL_RED,      settings_tile_event_cb, "Download Mode");
+    create_tile(tiles, LV_SYMBOL_BELL,     "Screen\nTimeout",    COLOR_MATERIAL_TEAL,     settings_tile_event_cb, "Screen Timeout");
+    create_tile(tiles, LV_SYMBOL_IMAGE,    "Screen\nBrightness", COLOR_MATERIAL_ORANGE,   settings_tile_event_cb, "Screen Brightness");
+    create_tile(tiles, LV_SYMBOL_SD_CARD,  "SD\nCard",           COLOR_MATERIAL_GREEN,    settings_tile_event_cb, "SD Card");
+    // LV_SYMBOL_WIFI (signal arcs) is the closest built-in to a satellite dish — FA 4.7 has no dish glyph
+    create_tile(tiles, LV_SYMBOL_WIFI,     "GPS\nInfo",          lv_color_hex(0x00BCD4),  settings_tile_event_cb, "GPS Info");
 
     lv_obj_t *ver = lv_label_create(function_page);
     lv_label_set_text(ver, "LAB5 " FW_VERSION);
