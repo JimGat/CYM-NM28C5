@@ -5008,7 +5008,7 @@ void app_main(void)
                     lv_table_set_cell_value(wd_ui_table, 0, 1, "Ch");
                     lv_table_set_cell_value(wd_ui_table, 0, 2, "RSSI");
                     lv_table_set_cell_value(wd_ui_table, 0, 3, "Auth");
-                    lv_table_set_cell_value(wd_ui_table, 0, 4, "Coords");
+                    lv_table_set_cell_value(wd_ui_table, 0, 4, "Lat");
                     for (int i = 0; i < show; i++) {
                         wdp_network_t *net = &wdp_seen_networks[start + show - 1 - i];
                         char ssid_trunc[20];
@@ -5024,7 +5024,7 @@ void app_main(void)
                         lv_table_set_cell_value(wd_ui_table, i + 1, 3, auth_short);
                         char coord_str[24];
                         if (net->latitude != 0.0f || net->longitude != 0.0f) {
-                            snprintf(coord_str, sizeof(coord_str), "%.4f,%.4f", net->latitude, net->longitude);
+                            snprintf(coord_str, sizeof(coord_str), "%.2f", (double)net->latitude);
                         } else {
                             snprintf(coord_str, sizeof(coord_str), "--");
                         }
@@ -8747,7 +8747,7 @@ static void wd_ui_timer_cb(lv_timer_t *timer) {
         lv_table_set_cell_value(wd_ui_table, 0, 1, "Ch");
         lv_table_set_cell_value(wd_ui_table, 0, 2, "RSSI");
         lv_table_set_cell_value(wd_ui_table, 0, 3, "Auth");
-        lv_table_set_cell_value(wd_ui_table, 0, 4, "Coords");
+        lv_table_set_cell_value(wd_ui_table, 0, 4, "Lat");
 
         for (int i = 0; i < show; i++) {
             wdp_network_t *net = &wdp_seen_networks[start + show - 1 - i];
@@ -8772,7 +8772,7 @@ static void wd_ui_timer_cb(lv_timer_t *timer) {
 
             char coord_str[24];
             if (net->latitude != 0.0f || net->longitude != 0.0f) {
-                snprintf(coord_str, sizeof(coord_str), "%.4f,%.4f", net->latitude, net->longitude);
+                snprintf(coord_str, sizeof(coord_str), "%.2f", (double)net->latitude);
             } else {
                 snprintf(coord_str, sizeof(coord_str), "--");
             }
@@ -8802,10 +8802,10 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_set_width(wd_ui_gps_label, LCD_H_RES);
     lv_obj_align(wd_ui_gps_label, LV_ALIGN_TOP_MID, 0, 35);
 
-    // ─── D-UCB Channel indicator (top, next to GPS) ───────────────
+    // ─── D-UCB Channel indicator (below GPS label) ───────────────
     lv_obj_t *wd_ch_box = lv_obj_create(function_page);
-    lv_obj_set_size(wd_ch_box, 90, 46);
-    lv_obj_align(wd_ch_box, LV_ALIGN_TOP_RIGHT, -126, 32);
+    lv_obj_set_size(wd_ch_box, 90, 42);
+    lv_obj_align(wd_ch_box, LV_ALIGN_TOP_RIGHT, -126, 55);
     lv_obj_set_style_bg_color(wd_ch_box, lv_color_make(30, 30, 45), 0);
     lv_obj_set_style_border_color(wd_ch_box, lv_color_make(76, 175, 80), 0);
     lv_obj_set_style_border_width(wd_ch_box, 2, 0);
@@ -8825,10 +8825,10 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_set_style_text_font(wd_ui_channel_label, &lv_font_montserrat_16, 0);
     lv_obj_align(wd_ui_channel_label, LV_ALIGN_BOTTOM_MID, 0, -2);
 
-    // ─── Network counter (prominent, top right) ──────────────────
+    // ─── Network counter (below GPS label) ───────────────────────
     lv_obj_t *cnt_box = lv_obj_create(function_page);
-    lv_obj_set_size(cnt_box, 110, 46);
-    lv_obj_align(cnt_box, LV_ALIGN_TOP_RIGHT, -8, 32);
+    lv_obj_set_size(cnt_box, 110, 42);
+    lv_obj_align(cnt_box, LV_ALIGN_TOP_RIGHT, -8, 55);
     lv_obj_set_style_bg_color(cnt_box, lv_color_make(30, 30, 45), 0);
     lv_obj_set_style_border_color(cnt_box, lv_color_make(0, 188, 212), 0);
     lv_obj_set_style_border_width(cnt_box, 2, 0);
@@ -8848,10 +8848,11 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_set_style_text_font(wd_ui_counter_label, &lv_font_montserrat_20, 0);
     lv_obj_align(wd_ui_counter_label, LV_ALIGN_BOTTOM_MID, 0, -2);
 
-    // ─── Recent networks table (main area) ───────────────────────
+    // ─── Recent networks table ────────────────────────────────────
+    // y=101: boxes end at 55+42=97, 4px gap. height=164: stops 4px above stop btn.
     wd_ui_table = lv_table_create(function_page);
-    lv_obj_set_size(wd_ui_table, lv_pct(97), LCD_V_RES - 80 - 56);
-    lv_obj_align(wd_ui_table, LV_ALIGN_TOP_MID, 0, 82);
+    lv_obj_set_size(wd_ui_table, lv_pct(97), 164);
+    lv_obj_align(wd_ui_table, LV_ALIGN_TOP_MID, 0, 101);
     lv_obj_set_style_bg_color(wd_ui_table, lv_color_make(15, 15, 15), 0);
     lv_obj_set_style_border_color(wd_ui_table, lv_color_make(50, 50, 50), 0);
     lv_obj_set_style_border_width(wd_ui_table, 1, 0);
@@ -8863,19 +8864,22 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_set_style_pad_left(wd_ui_table, 4, LV_PART_ITEMS);
     lv_obj_set_style_pad_right(wd_ui_table, 2, LV_PART_ITEMS);
 
+    // Column widths sum to 233 px (= lv_pct(97) of 240). Vertical scroll only.
     lv_table_set_col_cnt(wd_ui_table, 5);
-    lv_table_set_col_width(wd_ui_table, 0, 130);
-    lv_table_set_col_width(wd_ui_table, 1, 32);
-    lv_table_set_col_width(wd_ui_table, 2, 42);
-    lv_table_set_col_width(wd_ui_table, 3, 65);
-    lv_table_set_col_width(wd_ui_table, 4, 130);
+    lv_table_set_col_width(wd_ui_table, 0, 82);   // SSID
+    lv_table_set_col_width(wd_ui_table, 1, 26);   // Ch
+    lv_table_set_col_width(wd_ui_table, 2, 36);   // RSSI
+    lv_table_set_col_width(wd_ui_table, 3, 44);   // Auth
+    lv_table_set_col_width(wd_ui_table, 4, 45);   // Lat
+    lv_obj_set_scroll_dir(wd_ui_table, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(wd_ui_table, LV_SCROLLBAR_MODE_AUTO);
 
     lv_table_set_row_cnt(wd_ui_table, 1);
     lv_table_set_cell_value(wd_ui_table, 0, 0, "SSID");
     lv_table_set_cell_value(wd_ui_table, 0, 1, "Ch");
     lv_table_set_cell_value(wd_ui_table, 0, 2, "RSSI");
     lv_table_set_cell_value(wd_ui_table, 0, 3, "Auth");
-    lv_table_set_cell_value(wd_ui_table, 0, 4, "Coords");
+    lv_table_set_cell_value(wd_ui_table, 0, 4, "Lat");
 
     // ─── Stop button (bottom center) ─────────────────────────────
     wardrive_stop_btn = lv_btn_create(function_page);
