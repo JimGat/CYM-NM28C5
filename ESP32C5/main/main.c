@@ -1093,6 +1093,7 @@ static void update_sniffer_button_ui(void);
 static void show_settings_screen(void);
 static void settings_tile_event_cb(lv_event_t *e);
 static void show_sd_card_screen(void);
+static void show_gps_info_screen(void);
 static void show_sd_provision_confirm(bool after_format);
 static void show_sd_provision_running_screen(bool after_format);
 static void home_btn_event_cb(lv_event_t *e);
@@ -1146,6 +1147,7 @@ static void reset_function_page_children(void) {
     wardrive_stop_btn = NULL;
     wardrive_ui_active = false;
     if (wd_ui_timer) { lv_timer_del(wd_ui_timer); wd_ui_timer = NULL; }
+    if (wd_ui_gps_label && lv_obj_is_valid(wd_ui_gps_label)) lv_obj_del(wd_ui_gps_label);
     wd_ui_gps_label = NULL;
     wd_ui_counter_label = NULL;
     wd_ui_channel_label = NULL;
@@ -5006,7 +5008,7 @@ void app_main(void)
                     lv_table_set_cell_value(wd_ui_table, 0, 1, "Ch");
                     lv_table_set_cell_value(wd_ui_table, 0, 2, "RSSI");
                     lv_table_set_cell_value(wd_ui_table, 0, 3, "Auth");
-                    lv_table_set_cell_value(wd_ui_table, 0, 4, "Coords");
+                    lv_table_set_cell_value(wd_ui_table, 0, 4, "Lat");
                     for (int i = 0; i < show; i++) {
                         wdp_network_t *net = &wdp_seen_networks[start + show - 1 - i];
                         char ssid_trunc[20];
@@ -5022,7 +5024,7 @@ void app_main(void)
                         lv_table_set_cell_value(wd_ui_table, i + 1, 3, auth_short);
                         char coord_str[24];
                         if (net->latitude != 0.0f || net->longitude != 0.0f) {
-                            snprintf(coord_str, sizeof(coord_str), "%.4f,%.4f", net->latitude, net->longitude);
+                            snprintf(coord_str, sizeof(coord_str), "%.2f", (double)net->latitude);
                         } else {
                             snprintf(coord_str, sizeof(coord_str), "--");
                         }
@@ -8745,7 +8747,7 @@ static void wd_ui_timer_cb(lv_timer_t *timer) {
         lv_table_set_cell_value(wd_ui_table, 0, 1, "Ch");
         lv_table_set_cell_value(wd_ui_table, 0, 2, "RSSI");
         lv_table_set_cell_value(wd_ui_table, 0, 3, "Auth");
-        lv_table_set_cell_value(wd_ui_table, 0, 4, "Coords");
+        lv_table_set_cell_value(wd_ui_table, 0, 4, "Lat");
 
         for (int i = 0; i < show; i++) {
             wdp_network_t *net = &wdp_seen_networks[start + show - 1 - i];
@@ -8770,7 +8772,7 @@ static void wd_ui_timer_cb(lv_timer_t *timer) {
 
             char coord_str[24];
             if (net->latitude != 0.0f || net->longitude != 0.0f) {
-                snprintf(coord_str, sizeof(coord_str), "%.4f,%.4f", net->latitude, net->longitude);
+                snprintf(coord_str, sizeof(coord_str), "%.2f", (double)net->latitude);
             } else {
                 snprintf(coord_str, sizeof(coord_str), "--");
             }
@@ -8789,18 +8791,21 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     wardrive_ui_active = true;
 
     // ─── GPS status bar (top) ─────────────────────────────────────
-    wd_ui_gps_label = lv_label_create(function_page);
+    // Parent to lv_layer_top() so this label renders above the D-UCB and
+    // Networks boxes regardless of child creation order.
+    wd_ui_gps_label = lv_label_create(lv_layer_top());
     lv_label_set_text(wd_ui_gps_label, "Waiting for GPS fix...  Sats: 0");
     lv_obj_set_style_text_color(wd_ui_gps_label, COLOR_MATERIAL_ORANGE, 0);
     lv_obj_set_style_text_font(wd_ui_gps_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_align(wd_ui_gps_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(wd_ui_gps_label, lv_pct(100));
+    lv_obj_set_style_bg_opa(wd_ui_gps_label, LV_OPA_TRANSP, 0);
+    lv_obj_set_width(wd_ui_gps_label, LCD_H_RES);
     lv_obj_align(wd_ui_gps_label, LV_ALIGN_TOP_MID, 0, 35);
 
-    // ─── D-UCB Channel indicator (top, next to GPS) ───────────────
+    // ─── D-UCB Channel indicator (below GPS label) ───────────────
     lv_obj_t *wd_ch_box = lv_obj_create(function_page);
-    lv_obj_set_size(wd_ch_box, 90, 46);
-    lv_obj_align(wd_ch_box, LV_ALIGN_TOP_RIGHT, -126, 32);
+    lv_obj_set_size(wd_ch_box, 90, 42);
+    lv_obj_align(wd_ch_box, LV_ALIGN_TOP_RIGHT, -126, 55);
     lv_obj_set_style_bg_color(wd_ch_box, lv_color_make(30, 30, 45), 0);
     lv_obj_set_style_border_color(wd_ch_box, lv_color_make(76, 175, 80), 0);
     lv_obj_set_style_border_width(wd_ch_box, 2, 0);
@@ -8820,10 +8825,10 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_set_style_text_font(wd_ui_channel_label, &lv_font_montserrat_16, 0);
     lv_obj_align(wd_ui_channel_label, LV_ALIGN_BOTTOM_MID, 0, -2);
 
-    // ─── Network counter (prominent, top right) ──────────────────
+    // ─── Network counter (below GPS label) ───────────────────────
     lv_obj_t *cnt_box = lv_obj_create(function_page);
-    lv_obj_set_size(cnt_box, 110, 46);
-    lv_obj_align(cnt_box, LV_ALIGN_TOP_RIGHT, -8, 32);
+    lv_obj_set_size(cnt_box, 110, 42);
+    lv_obj_align(cnt_box, LV_ALIGN_TOP_RIGHT, -8, 55);
     lv_obj_set_style_bg_color(cnt_box, lv_color_make(30, 30, 45), 0);
     lv_obj_set_style_border_color(cnt_box, lv_color_make(0, 188, 212), 0);
     lv_obj_set_style_border_width(cnt_box, 2, 0);
@@ -8843,10 +8848,11 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_set_style_text_font(wd_ui_counter_label, &lv_font_montserrat_20, 0);
     lv_obj_align(wd_ui_counter_label, LV_ALIGN_BOTTOM_MID, 0, -2);
 
-    // ─── Recent networks table (main area) ───────────────────────
+    // ─── Recent networks table ────────────────────────────────────
+    // y=101: boxes end at 55+42=97, 4px gap. height=164: stops 4px above stop btn.
     wd_ui_table = lv_table_create(function_page);
-    lv_obj_set_size(wd_ui_table, lv_pct(97), LCD_V_RES - 80 - 56);
-    lv_obj_align(wd_ui_table, LV_ALIGN_TOP_MID, 0, 82);
+    lv_obj_set_size(wd_ui_table, lv_pct(97), 164);
+    lv_obj_align(wd_ui_table, LV_ALIGN_TOP_MID, 0, 101);
     lv_obj_set_style_bg_color(wd_ui_table, lv_color_make(15, 15, 15), 0);
     lv_obj_set_style_border_color(wd_ui_table, lv_color_make(50, 50, 50), 0);
     lv_obj_set_style_border_width(wd_ui_table, 1, 0);
@@ -8858,19 +8864,22 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_set_style_pad_left(wd_ui_table, 4, LV_PART_ITEMS);
     lv_obj_set_style_pad_right(wd_ui_table, 2, LV_PART_ITEMS);
 
+    // Column widths sum to 233 px (= lv_pct(97) of 240). Vertical scroll only.
     lv_table_set_col_cnt(wd_ui_table, 5);
-    lv_table_set_col_width(wd_ui_table, 0, 130);
-    lv_table_set_col_width(wd_ui_table, 1, 32);
-    lv_table_set_col_width(wd_ui_table, 2, 42);
-    lv_table_set_col_width(wd_ui_table, 3, 65);
-    lv_table_set_col_width(wd_ui_table, 4, 130);
+    lv_table_set_col_width(wd_ui_table, 0, 82);   // SSID
+    lv_table_set_col_width(wd_ui_table, 1, 26);   // Ch
+    lv_table_set_col_width(wd_ui_table, 2, 36);   // RSSI
+    lv_table_set_col_width(wd_ui_table, 3, 44);   // Auth
+    lv_table_set_col_width(wd_ui_table, 4, 45);   // Lat
+    lv_obj_set_scroll_dir(wd_ui_table, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(wd_ui_table, LV_SCROLLBAR_MODE_AUTO);
 
     lv_table_set_row_cnt(wd_ui_table, 1);
     lv_table_set_cell_value(wd_ui_table, 0, 0, "SSID");
     lv_table_set_cell_value(wd_ui_table, 0, 1, "Ch");
     lv_table_set_cell_value(wd_ui_table, 0, 2, "RSSI");
     lv_table_set_cell_value(wd_ui_table, 0, 3, "Auth");
-    lv_table_set_cell_value(wd_ui_table, 0, 4, "Coords");
+    lv_table_set_cell_value(wd_ui_table, 0, 4, "Lat");
 
     // ─── Stop button (bottom center) ─────────────────────────────
     wardrive_stop_btn = lv_btn_create(function_page);
@@ -8958,6 +8967,7 @@ static void wardrive_stop_btn_cb(lv_event_t *e)
     scan_done_ui_flag = false;
 
     if (wd_ui_timer) { lv_timer_del(wd_ui_timer); wd_ui_timer = NULL; }
+    if (wd_ui_gps_label && lv_obj_is_valid(wd_ui_gps_label)) lv_obj_del(wd_ui_gps_label);
     wd_ui_gps_label = NULL;
     wd_ui_counter_label = NULL;
     wd_ui_channel_label = NULL;
@@ -13970,6 +13980,8 @@ static void settings_tile_event_cb(lv_event_t *e)
         show_screen_brightness_popup();
     } else if (strcmp(tile_name, "SD Card") == 0) {
         show_sd_card_screen();
+    } else if (strcmp(tile_name, "GPS Info") == 0) {
+        show_gps_info_screen();
     }
 }
 
@@ -13983,31 +13995,20 @@ static void show_settings_screen(void)
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
-    lv_obj_set_style_pad_all(tiles, 10, 0);
-    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    // pad_all=4, pad_gap=4 → inner width=232, 3×70+2×4=218 ≤ 232, fits 3 tiles per row
+    lv_obj_set_style_pad_all(tiles, 4, 0);
+    lv_obj_set_style_pad_gap(tiles, 4, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    
-    // Compromised Data - Blue
-    create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Compromised\nData", COLOR_TILE_BLUE, settings_tile_event_cb, "Compromised Data");
-    
-    // Scan Time - Purple
-    create_tile(tiles, LV_SYMBOL_LOOP, "Scan\nTime", COLOR_MATERIAL_PURPLE, settings_tile_event_cb, "Scan Time");
-    
-    // RedTeam mode - Amber/Orange
-    // create_tile(tiles, LV_SYMBOL_WARNING, "RedTeam\nMode", COLOR_MATERIAL_AMBER, settings_tile_event_cb, "RedTeam mode");
-    
-    // Download Mode - Red
-    create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Download\nMode", COLOR_MATERIAL_RED, settings_tile_event_cb, "Download Mode");
-    
-    // Screen Timeout - Teal
-    create_tile(tiles, LV_SYMBOL_BELL, "Screen\nTimeout", COLOR_MATERIAL_TEAL, settings_tile_event_cb, "Screen Timeout");
-    
-    // Screen Brightness - Orange
-    create_tile(tiles, LV_SYMBOL_IMAGE, "Screen\nBrightness", COLOR_MATERIAL_ORANGE, settings_tile_event_cb, "Screen Brightness");
 
-    // SD Card - Green
-    create_tile(tiles, LV_SYMBOL_SD_CARD, "SD\nCard", COLOR_MATERIAL_GREEN, settings_tile_event_cb, "SD Card");
+    create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Compromised\nData", COLOR_TILE_BLUE,         settings_tile_event_cb, "Compromised Data");
+    create_tile(tiles, LV_SYMBOL_LOOP,     "Scan\nTime",         COLOR_MATERIAL_PURPLE,   settings_tile_event_cb, "Scan Time");
+    create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Download\nMode",     COLOR_MATERIAL_RED,      settings_tile_event_cb, "Download Mode");
+    create_tile(tiles, LV_SYMBOL_BELL,     "Screen\nTimeout",    COLOR_MATERIAL_TEAL,     settings_tile_event_cb, "Screen Timeout");
+    create_tile(tiles, LV_SYMBOL_IMAGE,    "Screen\nBrightness", COLOR_MATERIAL_ORANGE,   settings_tile_event_cb, "Screen Brightness");
+    create_tile(tiles, LV_SYMBOL_SD_CARD,  "SD\nCard",           COLOR_MATERIAL_GREEN,    settings_tile_event_cb, "SD Card");
+    // LV_SYMBOL_WIFI (signal arcs) is the closest built-in to a satellite dish — FA 4.7 has no dish glyph
+    create_tile(tiles, LV_SYMBOL_WIFI,     "GPS\nInfo",          lv_color_hex(0x00BCD4),  settings_tile_event_cb, "GPS Info");
 
     lv_obj_t *ver = lv_label_create(function_page);
     lv_label_set_text(ver, "LAB5 " FW_VERSION);
@@ -14585,6 +14586,133 @@ static void show_sd_card_screen(void)
                 sd_card_tile_event_cb, "Free Space");
     create_tile(tiles, LV_SYMBOL_WARNING, "Format\nSD Card",        COLOR_MATERIAL_RED,
                 sd_card_tile_event_cb, "Format");
+}
+
+// ============================================================================
+// GPS Info screen
+// ============================================================================
+
+static void gps_back_to_settings_cb(lv_event_t *e)
+{
+    (void)e;
+    show_settings_screen();
+}
+
+static void show_gps_info_screen(void)
+{
+    create_function_page_base("GPS Info");
+
+    lv_obj_t *card = lv_obj_create(function_page);
+    lv_obj_set_size(card, 220, 230);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 35);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_border_color(card, ui_border_color(), 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 10, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    char buf[64];
+    int y = 0;
+
+    // Fix status
+    lv_obj_t *fix_lbl = lv_label_create(card);
+    if (current_gps.valid) {
+        lv_label_set_text(fix_lbl, LV_SYMBOL_GPS " Fix: YES");
+        lv_obj_set_style_text_color(fix_lbl, COLOR_MATERIAL_GREEN, 0);
+    } else {
+        lv_label_set_text(fix_lbl, LV_SYMBOL_GPS " Fix: NO");
+        lv_obj_set_style_text_color(fix_lbl, COLOR_MATERIAL_ORANGE, 0);
+    }
+    lv_obj_set_style_text_font(fix_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_align(fix_lbl, LV_ALIGN_TOP_LEFT, 0, y);
+    y += 26;
+
+    // Satellites
+    lv_obj_t *sat_lbl = lv_label_create(card);
+    snprintf(buf, sizeof(buf), "Satellites: %d", current_gps.satellites);
+    lv_label_set_text(sat_lbl, buf);
+    lv_obj_set_style_text_font(sat_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(sat_lbl, ui_text_color(), 0);
+    lv_obj_align(sat_lbl, LV_ALIGN_TOP_LEFT, 0, y);
+    y += 22;
+
+    // Latitude
+    lv_obj_t *lat_lbl = lv_label_create(card);
+    if (current_gps.valid)
+        snprintf(buf, sizeof(buf), "Lat:  %.6f", (double)current_gps.latitude);
+    else
+        snprintf(buf, sizeof(buf), "Lat:  --");
+    lv_label_set_text(lat_lbl, buf);
+    lv_obj_set_style_text_font(lat_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lat_lbl, ui_text_color(), 0);
+    lv_obj_align(lat_lbl, LV_ALIGN_TOP_LEFT, 0, y);
+    y += 22;
+
+    // Longitude
+    lv_obj_t *lon_lbl = lv_label_create(card);
+    if (current_gps.valid)
+        snprintf(buf, sizeof(buf), "Lon:  %.6f", (double)current_gps.longitude);
+    else
+        snprintf(buf, sizeof(buf), "Lon:  --");
+    lv_label_set_text(lon_lbl, buf);
+    lv_obj_set_style_text_font(lon_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lon_lbl, ui_text_color(), 0);
+    lv_obj_align(lon_lbl, LV_ALIGN_TOP_LEFT, 0, y);
+    y += 22;
+
+    // Altitude
+    lv_obj_t *alt_lbl = lv_label_create(card);
+    if (current_gps.valid)
+        snprintf(buf, sizeof(buf), "Alt:  %.1f m", (double)current_gps.altitude);
+    else
+        snprintf(buf, sizeof(buf), "Alt:  --");
+    lv_label_set_text(alt_lbl, buf);
+    lv_obj_set_style_text_font(alt_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(alt_lbl, ui_text_color(), 0);
+    lv_obj_align(alt_lbl, LV_ALIGN_TOP_LEFT, 0, y);
+    y += 22;
+
+    // Accuracy
+    lv_obj_t *acc_lbl = lv_label_create(card);
+    if (current_gps.valid)
+        snprintf(buf, sizeof(buf), "Accuracy: %.1f m", (double)current_gps.accuracy);
+    else
+        snprintf(buf, sizeof(buf), "Accuracy: --");
+    lv_label_set_text(acc_lbl, buf);
+    lv_obj_set_style_text_font(acc_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(acc_lbl, ui_text_color(), 0);
+    lv_obj_align(acc_lbl, LV_ALIGN_TOP_LEFT, 0, y);
+    y += 28;
+
+    // Divider
+    lv_obj_t *div = lv_obj_create(card);
+    lv_obj_set_size(div, 190, 1);
+    lv_obj_align(div, LV_ALIGN_TOP_LEFT, 0, y);
+    lv_obj_set_style_bg_color(div, ui_border_color(), 0);
+    lv_obj_set_style_border_width(div, 0, 0);
+    lv_obj_clear_flag(div, LV_OBJ_FLAG_SCROLLABLE);
+    y += 8;
+
+    // UART config (static — hardware reference)
+    lv_obj_t *uart_lbl = lv_label_create(card);
+    lv_label_set_text(uart_lbl, "UART1  IO4=RX  IO5=TX\n9600 baud  ATGM336");
+    lv_obj_set_style_text_font(uart_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(uart_lbl, ui_muted_color(), 0);
+    lv_obj_align(uart_lbl, LV_ALIGN_TOP_LEFT, 0, y);
+
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 90, 34);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_add_event_cb(back_btn, gps_back_to_settings_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *back_lbl2 = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl2, "Back");
+    lv_obj_set_style_text_color(back_lbl2, ui_text_color(), 0);
+    lv_obj_center(back_lbl2);
 }
 
 // ============================================================================
