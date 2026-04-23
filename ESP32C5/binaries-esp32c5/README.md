@@ -70,3 +70,9 @@ Flash this binary standalone. Launcher integration can be revisited once Issue #
 ## SD Card Requirement
 
 The firmware requires a **FAT32-formatted MicroSD card, 32 GB or smaller**. exFAT (used on most cards >32 GB out of the box) is not supported. If no compatible SD card is detected after 3 attempts, the device halts and displays an error — insert a correct card and reset.
+
+---
+
+## Power Requirements
+
+The NM-CYD-C5 runs most reliably at **5.2 V @ 250 mA** (no peripherals attached, WiFi and Bluetooth transmit power at maximum). Use a clean, regulated 5 V USB supply capable of at least 500 mA to leave headroom for peripheral current spikes. Undervoltage at the USB input is the most common cause of random resets during active WiFi scanning.
