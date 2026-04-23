@@ -1146,6 +1146,7 @@ static void reset_function_page_children(void) {
     wardrive_stop_btn = NULL;
     wardrive_ui_active = false;
     if (wd_ui_timer) { lv_timer_del(wd_ui_timer); wd_ui_timer = NULL; }
+    if (wd_ui_gps_label && lv_obj_is_valid(wd_ui_gps_label)) lv_obj_del(wd_ui_gps_label);
     wd_ui_gps_label = NULL;
     wd_ui_counter_label = NULL;
     wd_ui_channel_label = NULL;
@@ -8789,12 +8790,15 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     wardrive_ui_active = true;
 
     // ─── GPS status bar (top) ─────────────────────────────────────
-    wd_ui_gps_label = lv_label_create(function_page);
+    // Parent to lv_layer_top() so this label renders above the D-UCB and
+    // Networks boxes regardless of child creation order.
+    wd_ui_gps_label = lv_label_create(lv_layer_top());
     lv_label_set_text(wd_ui_gps_label, "Waiting for GPS fix...  Sats: 0");
     lv_obj_set_style_text_color(wd_ui_gps_label, COLOR_MATERIAL_ORANGE, 0);
     lv_obj_set_style_text_font(wd_ui_gps_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_align(wd_ui_gps_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(wd_ui_gps_label, lv_pct(100));
+    lv_obj_set_style_bg_opa(wd_ui_gps_label, LV_OPA_TRANSP, 0);
+    lv_obj_set_width(wd_ui_gps_label, LCD_H_RES);
     lv_obj_align(wd_ui_gps_label, LV_ALIGN_TOP_MID, 0, 35);
 
     // ─── D-UCB Channel indicator (top, next to GPS) ───────────────
@@ -8958,6 +8962,7 @@ static void wardrive_stop_btn_cb(lv_event_t *e)
     scan_done_ui_flag = false;
 
     if (wd_ui_timer) { lv_timer_del(wd_ui_timer); wd_ui_timer = NULL; }
+    if (wd_ui_gps_label && lv_obj_is_valid(wd_ui_gps_label)) lv_obj_del(wd_ui_gps_label);
     wd_ui_gps_label = NULL;
     wd_ui_counter_label = NULL;
     wd_ui_channel_label = NULL;
