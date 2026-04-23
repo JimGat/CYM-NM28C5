@@ -33,6 +33,7 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 - [Screenshots](#screenshots)
 - [Hardware](#hardware)
 - [Pinout](#pinout)
+  - [GPS Wiring — ATGM336H](#gps-wiring--atgm336h)
 - [Software Features — Detailed](#software-features--detailed)
   - [WiFi Scan & Attack](#1-wifi-scan--attack)
   - [Global WiFi Attacks](#2-global-wifi-attacks)
@@ -66,9 +67,9 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 
 ---
 
-## Screenshots  
-## Thease are from pancake my version is Portrate to fit the CYD form better. 
-## Updates Comming Soon
+## Screenshots
+
+> These are from Pancake — this port is portrait-oriented to fit the CYD form factor. Updated screenshots coming soon.
 
 <!-- Add your screenshots here -->
 
@@ -119,7 +120,7 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 | **Display** | 2.8" ST7789 TFT (240×320 portrait, 16-bit RGB565) | SPI @ 40 MHz |
 | **Touch** | XPT2046 Resistive Touch (polling, T_IRQ not connected) | SPI @ 2 MHz |
 | **SD Card** | MicroSD **FAT32, max 32 GB** (shared SPI2 bus with display and touch) | SPI @ 20 MHz |
-| **GPS** | UART NMEA module (GGA, RMC) | UART @ 9600 baud |
+| **GPS** | ATGM336H NMEA module (GGA, RMC sentences) | UART1 @ 9600 baud |
 | **LED** | WS2812 NeoPixel (single, GPIO 27) | RMT / GPIO |
 
 Board reference: https://github.com/RockBase-iot/NM-CYD-C5
@@ -197,6 +198,33 @@ SPI2_HOST
 Mutual exclusion via sd_spi_mutex
 ```
 
+### GPS Wiring — ATGM336H
+
+The ATGM336H is a compact GPS/GNSS module that outputs standard NMEA 0183 sentences (GGA, RMC) at 9600 baud. It is wired directly to the NM-CYD-C5 LP-UART pins — no level shifter required as the module operates at 3.3 V.
+
+```
+ATGM336H Module          NM-CYD-C5 (ESP32-C5)
+┌────────────┐           ┌──────────────────┐
+│        VCC ├───────────┤ 3.3 V            │
+│        GND ├───────────┤ GND              │
+│         TX ├───────────┤ IO4  (UART1 RX)  │
+│         RX ├───────────┤ IO5  (UART1 TX)  │
+│        PPS │  (unused) │                  │
+└────────────┘           └──────────────────┘
+```
+
+| Signal | ATGM336H pin | ESP32-C5 pin | Notes |
+|--------|-------------|-------------|-------|
+| Power | VCC | 3.3 V | Do **not** connect to 5 V — module is 3.3 V only |
+| Ground | GND | GND | Common ground required |
+| Data to ESP | TX | IO4 (UART1 RX) | Module transmits NMEA sentences |
+| Data from ESP | RX | IO5 (UART1 TX) | Optional — only needed to send config commands |
+| Timing pulse | PPS | — | Not connected; not used by firmware |
+
+**Settings:** UART1 · 9600 baud · 8N1 · no flow control
+
+The firmware parses GGA sentences for latitude, longitude, altitude, and satellite count, and RMC sentences for fix validity. Cold start to first fix typically takes 30–60 seconds with a clear sky view.
+
 ---
 
 ## Software Features — Detailed
@@ -251,11 +279,12 @@ BLE scanning features leveraging the ESP32-C5's BLE 5.0 radio.
 
 ### 6. Wardriving
 
-GPS-enabled WiFi logging for mapping wireless networks.
+GPS-enabled WiFi logging for mapping wireless networks. Requires an **ATGM336H** (or compatible NMEA module) wired to IO4/IO5 — see [GPS Wiring](#gps-wiring--atgm336h).
 
 - Combines GPS coordinates (NMEA GGA/RMC) with WiFi scan results
-- Logs to CSV files on the SD card
-- Compatible with standard wardriving visualization tools
+- Uses D-UCB channel hopping for thorough band coverage
+- Logs SSID, BSSID, channel, RSSI, auth mode, and GPS coordinates to CSV on the SD card
+- Compatible with standard wardriving visualization tools (Wigle, etc.)
 
 ### 7. Settings
 
@@ -264,6 +293,8 @@ GPS-enabled WiFi logging for mapping wireless networks.
 | **Screen Timeout** | Inactivity timer before display dimming |
 | **Brightness** | Software brightness overlay (10–100%) |
 | **Scan Duration** | Configurable WiFi scan time |
+| **SD Card** | Validate/provision, check free space, format |
+| **GPS Info** | Live GPS fix status, latitude, longitude, altitude, satellite count, and UART config reference (IO4/IO5, 9600 baud, ATGM336H) |
 
 All settings are persisted via **NVS** (Non-Volatile Storage) across reboots.
 
