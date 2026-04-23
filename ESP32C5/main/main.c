@@ -1093,6 +1093,7 @@ static void update_sniffer_button_ui(void);
 static void show_settings_screen(void);
 static void settings_tile_event_cb(lv_event_t *e);
 static void show_sd_card_screen(void);
+static void show_gps_info_screen(void);
 static void show_sd_provision_confirm(bool after_format);
 static void show_sd_provision_running_screen(bool after_format);
 static void home_btn_event_cb(lv_event_t *e);
@@ -13975,6 +13976,8 @@ static void settings_tile_event_cb(lv_event_t *e)
         show_screen_brightness_popup();
     } else if (strcmp(tile_name, "SD Card") == 0) {
         show_sd_card_screen();
+    } else if (strcmp(tile_name, "GPS Info") == 0) {
+        show_gps_info_screen();
     }
 }
 
@@ -14013,6 +14016,9 @@ static void show_settings_screen(void)
 
     // SD Card - Green
     create_tile(tiles, LV_SYMBOL_SD_CARD, "SD\nCard", COLOR_MATERIAL_GREEN, settings_tile_event_cb, "SD Card");
+
+    // GPS Info - Cyan
+    create_tile(tiles, LV_SYMBOL_GPS, "GPS\nInfo", lv_color_hex(0x00BCD4), settings_tile_event_cb, "GPS Info");
 
     lv_obj_t *ver = lv_label_create(function_page);
     lv_label_set_text(ver, "LAB5 " FW_VERSION);
@@ -14590,6 +14596,133 @@ static void show_sd_card_screen(void)
                 sd_card_tile_event_cb, "Free Space");
     create_tile(tiles, LV_SYMBOL_WARNING, "Format\nSD Card",        COLOR_MATERIAL_RED,
                 sd_card_tile_event_cb, "Format");
+}
+
+// ============================================================================
+// GPS Info screen
+// ============================================================================
+
+static void gps_back_to_settings_cb(lv_event_t *e)
+{
+    (void)e;
+    show_settings_screen();
+}
+
+static void show_gps_info_screen(void)
+{
+    create_function_page_base("GPS Info");
+
+    lv_obj_t *card = lv_obj_create(function_page);
+    lv_obj_set_size(card, 220, 230);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 35);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_border_color(card, ui_border_color(), 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 10, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    char buf[64];
+    int y = 0;
+
+    // Fix status
+    lv_obj_t *fix_lbl = lv_label_create(card);
+    if (current_gps.valid) {
+        lv_label_set_text(fix_lbl, LV_SYMBOL_GPS " Fix: YES");
+        lv_obj_set_style_text_color(fix_lbl, COLOR_MATERIAL_GREEN, 0);
+    } else {
+        lv_label_set_text(fix_lbl, LV_SYMBOL_GPS " Fix: NO");
+        lv_obj_set_style_text_color(fix_lbl, COLOR_MATERIAL_ORANGE, 0);
+    }
+    lv_obj_set_style_text_font(fix_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_align(fix_lbl, LV_ALIGN_TOP_LEFT, 0, y);
+    y += 26;
+
+    // Satellites
+    lv_obj_t *sat_lbl = lv_label_create(card);
+    snprintf(buf, sizeof(buf), "Satellites: %d", current_gps.satellites);
+    lv_label_set_text(sat_lbl, buf);
+    lv_obj_set_style_text_font(sat_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(sat_lbl, ui_text_color(), 0);
+    lv_obj_align(sat_lbl, LV_ALIGN_TOP_LEFT, 0, y);
+    y += 22;
+
+    // Latitude
+    lv_obj_t *lat_lbl = lv_label_create(card);
+    if (current_gps.valid)
+        snprintf(buf, sizeof(buf), "Lat:  %.6f", (double)current_gps.latitude);
+    else
+        snprintf(buf, sizeof(buf), "Lat:  --");
+    lv_label_set_text(lat_lbl, buf);
+    lv_obj_set_style_text_font(lat_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lat_lbl, ui_text_color(), 0);
+    lv_obj_align(lat_lbl, LV_ALIGN_TOP_LEFT, 0, y);
+    y += 22;
+
+    // Longitude
+    lv_obj_t *lon_lbl = lv_label_create(card);
+    if (current_gps.valid)
+        snprintf(buf, sizeof(buf), "Lon:  %.6f", (double)current_gps.longitude);
+    else
+        snprintf(buf, sizeof(buf), "Lon:  --");
+    lv_label_set_text(lon_lbl, buf);
+    lv_obj_set_style_text_font(lon_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lon_lbl, ui_text_color(), 0);
+    lv_obj_align(lon_lbl, LV_ALIGN_TOP_LEFT, 0, y);
+    y += 22;
+
+    // Altitude
+    lv_obj_t *alt_lbl = lv_label_create(card);
+    if (current_gps.valid)
+        snprintf(buf, sizeof(buf), "Alt:  %.1f m", (double)current_gps.altitude);
+    else
+        snprintf(buf, sizeof(buf), "Alt:  --");
+    lv_label_set_text(alt_lbl, buf);
+    lv_obj_set_style_text_font(alt_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(alt_lbl, ui_text_color(), 0);
+    lv_obj_align(alt_lbl, LV_ALIGN_TOP_LEFT, 0, y);
+    y += 22;
+
+    // Accuracy
+    lv_obj_t *acc_lbl = lv_label_create(card);
+    if (current_gps.valid)
+        snprintf(buf, sizeof(buf), "Accuracy: %.1f m", (double)current_gps.accuracy);
+    else
+        snprintf(buf, sizeof(buf), "Accuracy: --");
+    lv_label_set_text(acc_lbl, buf);
+    lv_obj_set_style_text_font(acc_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(acc_lbl, ui_text_color(), 0);
+    lv_obj_align(acc_lbl, LV_ALIGN_TOP_LEFT, 0, y);
+    y += 28;
+
+    // Divider
+    lv_obj_t *div = lv_obj_create(card);
+    lv_obj_set_size(div, 190, 1);
+    lv_obj_align(div, LV_ALIGN_TOP_LEFT, 0, y);
+    lv_obj_set_style_bg_color(div, ui_border_color(), 0);
+    lv_obj_set_style_border_width(div, 0, 0);
+    lv_obj_clear_flag(div, LV_OBJ_FLAG_SCROLLABLE);
+    y += 8;
+
+    // UART config (static — hardware reference)
+    lv_obj_t *uart_lbl = lv_label_create(card);
+    lv_label_set_text(uart_lbl, "UART1  IO4=RX  IO5=TX\n9600 baud  ATGM336");
+    lv_obj_set_style_text_font(uart_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(uart_lbl, ui_muted_color(), 0);
+    lv_obj_align(uart_lbl, LV_ALIGN_TOP_LEFT, 0, y);
+
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 90, 34);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_add_event_cb(back_btn, gps_back_to_settings_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *back_lbl2 = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl2, "Back");
+    lv_obj_set_style_text_color(back_lbl2, ui_text_color(), 0);
+    lv_obj_center(back_lbl2);
 }
 
 // ============================================================================
