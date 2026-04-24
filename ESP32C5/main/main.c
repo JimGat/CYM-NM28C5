@@ -3435,9 +3435,9 @@ static void show_splash_screen(void)
 
     lv_obj_t *version_label = lv_label_create(splash_screen);
     lv_label_set_text(version_label, FW_VERSION);
-    lv_obj_set_style_text_font(version_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(version_label, lv_color_hex(0x4A5568), 0);
-    lv_obj_align(version_label, LV_ALIGN_CENTER, 0, 62);
+    lv_obj_set_style_text_font(version_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(version_label, lv_color_hex(0xD8D8D8), 0);
+    lv_obj_align(version_label, LV_ALIGN_CENTER, 0, 64);
 
     splash_loading_label = lv_label_create(splash_screen);
     lv_label_set_text(splash_loading_label, "LOADING...");
@@ -8096,9 +8096,6 @@ static void handshake_attack_task_sniffer(void) {
             if (!ap->complete || ap->has_existing_file) continue;
 
             ESP_LOGI(TAG, "Saving complete handshake for '%s'...", ap->ssid);
-            size_t ssid_len = strlen(ap->ssid);
-            hccapx_serializer_init((const uint8_t *)ap->ssid, ssid_len);
-
             if (hs_save_handshake_to_sd(a)) {
                 ap->has_existing_file = true;
                 hs_total_handshakes_captured++;
