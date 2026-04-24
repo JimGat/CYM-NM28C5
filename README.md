@@ -70,11 +70,11 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 ## Screenshots
 
 <p align="center">
-  <img width="360" alt="AirTag detection — close range (on top of AirTag)" src="docs/screenshots/airtag_detection_close.jpg" />
+  <img width="360" alt="AirTag Scanner — close range" src="docs/screenshots/airtag_detection_close.jpg" />
   &nbsp;&nbsp;
-  <img width="360" alt="AirTag detection — far range (away from AirTag)" src="docs/screenshots/airtag_detection_far.jpg" />
+  <img width="360" alt="AirTag Scanner — far range" src="docs/screenshots/airtag_detection_far.jpg" />
   <br/>
-  <em>AirTag Scanner — close range (left) vs. far range (right). RSSI updates live every 10 s via the BT Locator tracking task.</em>
+  <em>AirTag Tag Locator — close range on top of the AirTag (left) vs. far range away from it (right).</em>
 </p>
 
 
@@ -261,10 +261,62 @@ BLE scanning features leveraging the ESP32-C5's BLE 5.0 radio.
 
 | Feature | Description |
 |---------|-------------|
-| **AirTag Scanner** | Detects Apple Find My network devices and Samsung SmartTags; tap **View Found Tags** to see a list of detected devices with MAC, RSSI, and a **Track** button that launches live RSSI tracking for that specific tag |
-| **BLE Locator** | Generic BLE device scanner with signal strength — scan all nearby devices and select any one to track |
+| **AirTag Scanner** | Passive BLE scan — detects Apple AirTags and Samsung SmartTags by manufacturer ID |
+| **Tag Locator** | Per-tag RSSI tracking launched from the Found Tags list; updates every 10 s |
+| **BLE Locator** | Generic BLE device scanner — scan all nearby devices and select any one to track by signal strength |
 
 > **Note:** WiFi and BLE share the same radio. The firmware automatically switches between `RADIO_MODE_WIFI` and `RADIO_MODE_BLE` as needed.
+
+#### AirTag / SmartTag Locator — How It Works
+
+The AirTag Scanner and Tag Locator work together to let you find a hidden tracking device using only the NM-CYD-C5 — no phone required.
+
+**Step 1 — Scan**
+
+Open **AirTag Scan** from the Bluetooth tile. The device switches the radio to BLE and begins a passive scan. Detected Apple AirTags and Samsung SmartTags are counted on screen, separated from general BLE traffic:
+
+```
+Air Tags:   2
+Smart Tags: 1
+
+Other BT Devices: 14
+Total BT devices: 17
+```
+
+Once at least one tag is found the **View Found Tags** button appears.
+
+**Step 2 — View Found Tags**
+
+Tap **View Found Tags** to open a scrollable list of every detected AirTag and SmartTag. Each entry shows:
+
+- Type badge (orange **AirTag** or cyan **SmartTag**)
+- MAC address
+- Device name (if advertised)
+- Last seen RSSI in dBm
+- A blue **Track** button
+
+**Step 3 — Track**
+
+Tap **Track** on any device. The firmware locks onto that device's MAC address and starts the BT Locator tracking task, which rescans for that specific MAC every 10 seconds and updates the live RSSI reading on screen.
+
+Use the RSSI value to home in on the tag — a higher (less negative) number means you are closer:
+
+| RSSI | Approximate distance |
+|------|----------------------|
+| −40 to −55 dBm | Very close (within ~1 m) |
+| −55 to −70 dBm | Nearby (~1–5 m) |
+| −70 to −85 dBm | In the same room (~5–15 m) |
+| Below −85 dBm | Far away or obstructed |
+
+<p align="center">
+  <img width="340" alt="AirTag Tag Locator — close range (on top of AirTag)" src="docs/screenshots/airtag_detection_close.jpg" />
+  &nbsp;&nbsp;
+  <img width="340" alt="AirTag Tag Locator — far range (away from AirTag)" src="docs/screenshots/airtag_detection_far.jpg" />
+  <br/>
+  <em>Tag Locator in action — on top of the AirTag (left) vs. several meters away (right). Higher RSSI = closer.</em>
+</p>
+
+Tap **Exit** at any time to stop tracking and return to the main menu. The radio switches back to WiFi mode automatically.
 
 ### 6. Wardriving
 
