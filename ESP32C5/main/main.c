@@ -10186,6 +10186,7 @@ static void radio_reset_to_idle(void)
         esp_wifi_stop();
         esp_wifi_set_mode(WIFI_MODE_STA);
         esp_wifi_start();
+        vTaskDelay(pdMS_TO_TICKS(300));  // let STA task finish starting before scan is allowed
 
         wifi_country_t wifi_country = {
             .cc = "PH",
