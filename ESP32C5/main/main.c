@@ -14481,6 +14481,125 @@ static void show_sd_free_space_screen(void)
     lv_obj_center(back_lbl);
 }
 
+// ─── File Tree screen ────────────────────────────────────────────────────────
+
+static void sd_tree_walk(char *buf, size_t bufsz, const char *path, int depth, size_t *pos)
+{
+    if (depth > 8) return;
+    DIR *dir = opendir(path);
+    if (!dir) return;
+    struct dirent *entry;
+    char child[300];
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        if (*pos + 128 >= bufsz) {
+            if (bufsz - *pos > 20)
+                *pos += snprintf(buf + *pos, bufsz - *pos, "...(truncated)\n");
+            break;
+        }
+        snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+        struct stat st;
+        bool have_stat = (stat(child, &st) == 0);
+        bool is_dir    = have_stat && S_ISDIR(st.st_mode);
+
+        for (int i = 0; i < depth * 2 && *pos + 1 < bufsz; i++)
+            buf[(*pos)++] = ' ';
+
+        if (is_dir) {
+            *pos += snprintf(buf + *pos, bufsz - *pos, "%s/\n", entry->d_name);
+            sd_tree_walk(buf, bufsz, child, depth + 1, pos);
+        } else {
+            if (have_stat) {
+                uint32_t sz = (uint32_t)st.st_size;
+                char sz_str[12];
+                if (sz >= 1024 * 1024)
+                    snprintf(sz_str, sizeof(sz_str), "%luM", (unsigned long)(sz / (1024 * 1024)));
+                else if (sz >= 1024)
+                    snprintf(sz_str, sizeof(sz_str), "%luK", (unsigned long)(sz / 1024));
+                else
+                    snprintf(sz_str, sizeof(sz_str), "%luB", (unsigned long)sz);
+                *pos += snprintf(buf + *pos, bufsz - *pos, "%s [%s]\n", entry->d_name, sz_str);
+            } else {
+                *pos += snprintf(buf + *pos, bufsz - *pos, "%s\n", entry->d_name);
+            }
+        }
+    }
+    closedir(dir);
+}
+
+static void show_sd_tree_screen(void)
+{
+    create_function_page_base("SD File Tree");
+
+    const size_t bufsz = 16 * 1024;
+    char *tree_buf = heap_caps_malloc(bufsz, MALLOC_CAP_SPIRAM);
+    if (!tree_buf) tree_buf = malloc(4096);
+
+    if (!tree_buf) {
+        lv_obj_t *err = lv_label_create(function_page);
+        lv_label_set_text(err, "Out of memory");
+        lv_obj_set_style_text_color(err, COLOR_MATERIAL_RED, 0);
+        lv_obj_align(err, LV_ALIGN_CENTER, 0, 0);
+    } else {
+        size_t pos = 0;
+        tree_buf[0] = '\0';
+
+        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+            sd_tree_walk(tree_buf, bufsz, "/sdcard", 0, &pos);
+            xSemaphoreGive(sd_spi_mutex);
+        } else {
+            pos += snprintf(tree_buf, bufsz, "SD not available");
+        }
+        if (pos == 0) pos += snprintf(tree_buf, bufsz, "(empty)");
+        tree_buf[pos < bufsz ? pos : bufsz - 1] = '\0';
+
+        lv_obj_t *scroll_cont = lv_obj_create(function_page);
+        lv_obj_set_size(scroll_cont, lv_pct(100), LCD_V_RES - 35 - 43);
+        lv_obj_align(scroll_cont, LV_ALIGN_TOP_MID, 0, 35);
+        lv_obj_set_style_bg_color(scroll_cont, ui_bg_color(), 0);
+        lv_obj_set_style_border_color(scroll_cont, ui_border_color(), 0);
+        lv_obj_set_style_border_width(scroll_cont, 1, 0);
+        lv_obj_set_style_radius(scroll_cont, 6, 0);
+        lv_obj_set_style_pad_all(scroll_cont, 6, 0);
+
+        lv_obj_t *tree_label = lv_label_create(scroll_cont);
+        lv_label_set_long_mode(tree_label, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(tree_label, lv_pct(100));
+        lv_obj_set_style_text_font(tree_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(tree_label, ui_text_color(), 0);
+        lv_label_set_text(tree_label, tree_buf);
+        free(tree_buf);
+    }
+
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 28);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_style_shadow_width(back_btn, 4, 0);
+    lv_obj_set_style_shadow_color(back_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(back_btn, LV_OPA_40, 0);
+    lv_obj_set_style_pad_ver(back_btn, 4, 0);
+    lv_obj_set_style_pad_hor(back_btn, 8, 0);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(back_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(back_icon, ui_text_color(), 0);
+
+    lv_obj_t *back_text = lv_label_create(back_btn);
+    lv_label_set_text(back_text, "Back");
+    lv_obj_set_style_text_font(back_text, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(back_text, ui_text_color(), 0);
+
+    lv_obj_add_event_cb(back_btn, sd_back_to_menu_cb, LV_EVENT_CLICKED, NULL);
+}
+
 // ─── Format — two-stage confirmation ─────────────────────────────────────────
 
 static void sd_format_confirm2_yes_cb(lv_event_t *e)
@@ -14597,6 +14716,7 @@ static void sd_card_tile_event_cb(lv_event_t *e)
     if (!name) return;
     if      (strcmp(name, "Validate") == 0)   show_sd_provision_confirm(false);
     else if (strcmp(name, "Free Space") == 0) show_sd_free_space_screen();
+    else if (strcmp(name, "Tree") == 0)       show_sd_tree_screen();
     else if (strcmp(name, "Format") == 0)     show_sd_format_confirm1();
 }
 
@@ -14618,6 +14738,8 @@ static void show_sd_card_screen(void)
                 sd_card_tile_event_cb, "Validate");
     create_tile(tiles, LV_SYMBOL_DRIVE,   "Free\nSpace",            COLOR_TILE_BLUE,
                 sd_card_tile_event_cb, "Free Space");
+    create_tile(tiles, LV_SYMBOL_LIST,    "File\nTree",             COLOR_MATERIAL_ORANGE,
+                sd_card_tile_event_cb, "Tree");
     create_tile(tiles, LV_SYMBOL_WARNING, "Format\nSD Card",        COLOR_MATERIAL_RED,
                 sd_card_tile_event_cb, "Format");
 }
