@@ -4993,7 +4993,7 @@ void app_main(void)
 
                 if (hs_ui_stats_label && lv_obj_is_valid(hs_ui_stats_label)) {
                     char stats_buf[128];
-                    snprintf(stats_buf, sizeof(stats_buf), "APs: %d   Clients: %d   Captured: %d",
+                    snprintf(stats_buf, sizeof(stats_buf), "APs: %d  Cli: %d  Cap: %d",
                              hs_ap_count, hs_client_count, hs_total_handshakes_captured);
                     lv_label_set_text(hs_ui_stats_label, stats_buf);
                 }
@@ -8207,7 +8207,7 @@ static void hs_ui_timer_cb(lv_timer_t *timer) {
         if (hs_ui_m4_label) lv_obj_set_style_text_color(hs_ui_m4_label, m4 ? COLOR_MATERIAL_GREEN : lv_color_make(80,80,80), 0);
         if (hs_ui_stats_label) {
             char stats_buf[128];
-            snprintf(stats_buf, sizeof(stats_buf), "APs: %d   Clients: %d   Captured: %d",
+            snprintf(stats_buf, sizeof(stats_buf), "APs: %d  Cli: %d  Cap: %d",
                      hs_ap_count, hs_client_count, hs_total_handshakes_captured);
             lv_label_set_text(hs_ui_stats_label, stats_buf);
         }
@@ -8302,7 +8302,7 @@ static void hs_ui_timer_cb(lv_timer_t *timer) {
     // Stats
     if (hs_ui_stats_label) {
         char stats_buf[128];
-        snprintf(stats_buf, sizeof(stats_buf), "APs: %d   Clients: %d   Captured: %d",
+        snprintf(stats_buf, sizeof(stats_buf), "APs: %d  Cli: %d  Cap: %d",
                  hs_ap_count, hs_client_count, hs_total_handshakes_captured);
         lv_label_set_text(hs_ui_stats_label, stats_buf);
     }
@@ -8347,8 +8347,8 @@ static void handshake_yes_btn_cb(lv_event_t *e)
 
     // ─── D-UCB Channel indicator (top left) ────────────────────────
     lv_obj_t *ch_box = lv_obj_create(function_page);
-    lv_obj_set_size(ch_box, 100, 50);
-    lv_obj_align(ch_box, LV_ALIGN_TOP_LEFT, 8, 34);
+    lv_obj_set_size(ch_box, 80, 52);
+    lv_obj_align(ch_box, LV_ALIGN_TOP_LEFT, 4, 38);
     lv_obj_set_style_bg_color(ch_box, lv_color_make(30, 30, 45), 0);
     lv_obj_set_style_border_color(ch_box, lv_color_make(0, 188, 212), 0);
     lv_obj_set_style_border_width(ch_box, 2, 0);
@@ -8365,13 +8365,13 @@ static void handshake_yes_btn_cb(lv_event_t *e)
     hs_ui_channel_label = lv_label_create(ch_box);
     lv_label_set_text(hs_ui_channel_label, "CH --");
     lv_obj_set_style_text_color(hs_ui_channel_label, ui_text_color(), 0);
-    lv_obj_set_style_text_font(hs_ui_channel_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(hs_ui_channel_label, &lv_font_montserrat_14, 0);
     lv_obj_align(hs_ui_channel_label, LV_ALIGN_BOTTOM_MID, 0, -4);
 
-    // ─── Current target SSID + client status (top center-right) ───
+    // ─── Current target SSID + client status (top right) ──────────
     lv_obj_t *target_box = lv_obj_create(function_page);
-    lv_obj_set_size(target_box, 362, 50);
-    lv_obj_align(target_box, LV_ALIGN_TOP_LEFT, 116, 34);
+    lv_obj_set_size(target_box, 152, 52);
+    lv_obj_align(target_box, LV_ALIGN_TOP_LEFT, 88, 38);
     lv_obj_set_style_bg_color(target_box, lv_color_make(30, 30, 45), 0);
     lv_obj_set_style_border_color(target_box, lv_color_make(63, 81, 181), 0);
     lv_obj_set_style_border_width(target_box, 2, 0);
@@ -8383,28 +8383,35 @@ static void handshake_yes_btn_cb(lv_event_t *e)
     lv_label_set_text(tgt_title, "TARGET");
     lv_obj_set_style_text_color(tgt_title, lv_color_make(63, 81, 181), 0);
     lv_obj_set_style_text_font(tgt_title, &lv_font_montserrat_12, 0);
-    lv_obj_align(tgt_title, LV_ALIGN_TOP_LEFT, 8, 4);
+    lv_obj_align(tgt_title, LV_ALIGN_TOP_LEFT, 6, 3);
 
     hs_ui_target_label = lv_label_create(target_box);
     lv_label_set_text(hs_ui_target_label, "Scanning...");
     lv_obj_set_style_text_color(hs_ui_target_label, ui_text_color(), 0);
-    lv_obj_set_style_text_font(hs_ui_target_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_width(hs_ui_target_label, 260);
+    lv_obj_set_style_text_font(hs_ui_target_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_width(hs_ui_target_label, 130);
     lv_label_set_long_mode(hs_ui_target_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_align(hs_ui_target_label, LV_ALIGN_LEFT_MID, 8, -2);
+    lv_obj_align(hs_ui_target_label, LV_ALIGN_TOP_LEFT, 6, 18);
 
     hs_ui_status_label = lv_label_create(target_box);
     lv_label_set_text(hs_ui_status_label, "");
     lv_obj_set_style_text_color(hs_ui_status_label, COLOR_MATERIAL_ORANGE, 0);
     lv_obj_set_style_text_font(hs_ui_status_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_width(hs_ui_status_label, 340);
+    lv_obj_set_width(hs_ui_status_label, 130);
     lv_label_set_long_mode(hs_ui_status_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_align(hs_ui_status_label, LV_ALIGN_BOTTOM_LEFT, 8, -2);
+    lv_obj_align(hs_ui_status_label, LV_ALIGN_BOTTOM_LEFT, 6, -3);
+
+    // ─── "HANDSHAKE PROGRESS" header (above progress box) ─────────
+    lv_obj_t *hdr_progress = lv_label_create(function_page);
+    lv_label_set_text(hdr_progress, "HANDSHAKE PROGRESS");
+    lv_obj_set_style_text_color(hdr_progress, lv_color_make(76, 175, 80), 0);
+    lv_obj_set_style_text_font(hdr_progress, &lv_font_montserrat_12, 0);
+    lv_obj_align(hdr_progress, LV_ALIGN_TOP_MID, 0, 96);
 
     // ─── Beacon + M1-M4 Progress row ──────────────────────────────
     lv_obj_t *progress_box = lv_obj_create(function_page);
-    lv_obj_set_size(progress_box, lv_pct(97), 60);
-    lv_obj_align(progress_box, LV_ALIGN_TOP_MID, 0, 90);
+    lv_obj_set_size(progress_box, lv_pct(97), 42);
+    lv_obj_align(progress_box, LV_ALIGN_TOP_MID, 0, 112);
     lv_obj_set_style_bg_color(progress_box, lv_color_make(20, 20, 30), 0);
     lv_obj_set_style_border_color(progress_box, lv_color_make(76, 175, 80), 0);
     lv_obj_set_style_border_width(progress_box, 2, 0);
@@ -8414,63 +8421,62 @@ static void handshake_yes_btn_cb(lv_event_t *e)
     lv_obj_set_flex_flow(progress_box, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(progress_box, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    lv_obj_t *hdr_progress = lv_label_create(progress_box);
-    lv_label_set_text(hdr_progress, "HANDSHAKE PROGRESS");
-    lv_obj_set_style_text_color(hdr_progress, lv_color_make(76, 175, 80), 0);
-    lv_obj_set_style_text_font(hdr_progress, &lv_font_montserrat_12, 0);
-    lv_obj_align(hdr_progress, LV_ALIGN_TOP_MID, 0, 2);
-
     // Beacon icon
     hs_ui_beacon_label = lv_label_create(progress_box);
     lv_label_set_text(hs_ui_beacon_label, LV_SYMBOL_WARNING);
     lv_obj_set_style_text_color(hs_ui_beacon_label, lv_color_make(80, 80, 80), 0);
-    lv_obj_set_style_text_font(hs_ui_beacon_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(hs_ui_beacon_label, &lv_font_montserrat_14, 0);
 
     // M1-M4 indicators
     hs_ui_m1_label = lv_label_create(progress_box);
     lv_label_set_text(hs_ui_m1_label, "M1");
     lv_obj_set_style_text_color(hs_ui_m1_label, lv_color_make(80, 80, 80), 0);
-    lv_obj_set_style_text_font(hs_ui_m1_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(hs_ui_m1_label, &lv_font_montserrat_14, 0);
 
     hs_ui_m2_label = lv_label_create(progress_box);
     lv_label_set_text(hs_ui_m2_label, "M2");
     lv_obj_set_style_text_color(hs_ui_m2_label, lv_color_make(80, 80, 80), 0);
-    lv_obj_set_style_text_font(hs_ui_m2_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(hs_ui_m2_label, &lv_font_montserrat_14, 0);
 
     hs_ui_m3_label = lv_label_create(progress_box);
     lv_label_set_text(hs_ui_m3_label, "M3");
     lv_obj_set_style_text_color(hs_ui_m3_label, lv_color_make(80, 80, 80), 0);
-    lv_obj_set_style_text_font(hs_ui_m3_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(hs_ui_m3_label, &lv_font_montserrat_14, 0);
 
     hs_ui_m4_label = lv_label_create(progress_box);
     lv_label_set_text(hs_ui_m4_label, "M4");
     lv_obj_set_style_text_color(hs_ui_m4_label, lv_color_make(80, 80, 80), 0);
-    lv_obj_set_style_text_font(hs_ui_m4_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(hs_ui_m4_label, &lv_font_montserrat_14, 0);
 
     // ─── Stats bar ────────────────────────────────────────────────
     hs_ui_stats_label = lv_label_create(function_page);
-    lv_label_set_text(hs_ui_stats_label, "APs: 0   Clients: 0   Captured: 0");
+    lv_label_set_text(hs_ui_stats_label, "APs: 0  Cli: 0  Cap: 0");
     lv_obj_set_style_text_color(hs_ui_stats_label, ui_muted_color(), 0);
-    lv_obj_set_style_text_font(hs_ui_stats_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(hs_ui_stats_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_width(hs_ui_stats_label, lv_pct(95));
+    lv_label_set_long_mode(hs_ui_stats_label, LV_LABEL_LONG_WRAP);
     lv_obj_align(hs_ui_stats_label, LV_ALIGN_TOP_MID, 0, 160);
 
-    // ─── Stop & Exit button (bottom center) ───────────────────────
+    // ─── Stop & Exit button (compact row) ─────────────────────────
     handshake_stop_btn = lv_btn_create(function_page);
-    lv_obj_set_size(handshake_stop_btn, 120, 55);
+    lv_obj_set_size(handshake_stop_btn, 110, 28);
     lv_obj_align(handshake_stop_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
     lv_obj_set_style_bg_color(handshake_stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(handshake_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(handshake_stop_btn, 0, 0);
-    lv_obj_set_style_radius(handshake_stop_btn, 10, 0);
-    lv_obj_set_style_shadow_width(handshake_stop_btn, 6, 0);
+    lv_obj_set_style_radius(handshake_stop_btn, 8, 0);
+    lv_obj_set_style_shadow_width(handshake_stop_btn, 4, 0);
     lv_obj_set_style_shadow_color(handshake_stop_btn, lv_color_make(0, 0, 0), 0);
     lv_obj_set_style_shadow_opa(handshake_stop_btn, LV_OPA_40, 0);
-    lv_obj_set_flex_flow(handshake_stop_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_ver(handshake_stop_btn, 4, 0);
+    lv_obj_set_style_pad_hor(handshake_stop_btn, 8, 0);
+    lv_obj_set_style_pad_column(handshake_stop_btn, 4, 0);
+    lv_obj_set_flex_flow(handshake_stop_btn, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(handshake_stop_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
     lv_obj_t *x_icon = lv_label_create(handshake_stop_btn);
     lv_label_set_text(x_icon, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_font(x_icon, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(x_icon, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(x_icon, ui_text_color(), 0);
 
     lv_obj_t *stop_text = lv_label_create(handshake_stop_btn);
