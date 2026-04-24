@@ -10055,7 +10055,11 @@ static void create_function_page_base(const char *name)
     lv_obj_t *page_title_label = lv_label_create(page_title_bar);
     lv_label_set_text(page_title_label, name ? name : "");
     lv_obj_set_style_text_color(page_title_label, ui_text_color(), 0);
-    lv_obj_center(page_title_label);
+    // Constrain to space right of both left buttons (home 30px + dark btn 24px + gaps = 62px)
+    lv_obj_set_width(page_title_label, 170);
+    lv_obj_align(page_title_label, LV_ALIGN_LEFT_MID, 62, 0);
+    lv_obj_set_style_text_align(page_title_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(page_title_label, LV_LABEL_LONG_DOT);
 
     lv_obj_add_flag(page_title_label, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(page_title_label, screenshot_btn_event_cb, LV_EVENT_CLICKED, NULL);
