@@ -14940,20 +14940,20 @@ static void show_bt_locator_screen(void)
     
     // Content container - positioned below title bar (30px)
     bt_locator_content = lv_obj_create(function_page);
-    lv_obj_set_size(bt_locator_content, lv_pct(100), LCD_V_RES - 30 - 50);  // Leave space for title and exit btn
+    lv_obj_set_size(bt_locator_content, lv_pct(100), LCD_V_RES - 30 - 43);  // Leave space for title and exit btn
     lv_obj_align(bt_locator_content, LV_ALIGN_TOP_MID, 0, 30);  // Start below title bar
     lv_obj_set_style_bg_opa(bt_locator_content, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(bt_locator_content, 0, 0);
     lv_obj_set_style_pad_all(bt_locator_content, 5, 0);
     lv_obj_clear_flag(bt_locator_content, LV_OBJ_FLAG_SCROLLABLE);
-    
+
     // Status label centered - "BT scanning..." (will be hidden when list/tracking shown)
     bt_locator_status_label = lv_label_create(bt_locator_content);
     lv_label_set_text(bt_locator_status_label, "BT scanning...");
     lv_obj_set_style_text_color(bt_locator_status_label, ui_text_color(), 0);
     lv_obj_set_style_text_font(bt_locator_status_label, &lv_font_montserrat_16, 0);
     lv_obj_center(bt_locator_status_label);
-    
+
     // Header label above list (hidden until scan complete)
     lv_obj_t *list_header = lv_label_create(bt_locator_content);
     lv_label_set_text(list_header, "Select BT Target:");
@@ -14962,10 +14962,10 @@ static void show_bt_locator_screen(void)
     lv_obj_align(list_header, LV_ALIGN_TOP_LEFT, 5, 0);
     lv_obj_add_flag(list_header, LV_OBJ_FLAG_HIDDEN);  // Hidden until scan done
     lv_obj_set_user_data(bt_locator_content, list_header);  // Store for later access
-    
+
     // Scrollable list for devices (hidden until scan complete)
     bt_locator_list = lv_obj_create(bt_locator_content);
-    lv_obj_set_size(bt_locator_list, lv_pct(100), LCD_V_RES - 30 - 70 - 25);  // Same height as BLE Scan list
+    lv_obj_set_size(bt_locator_list, lv_pct(100), LCD_V_RES - 30 - 48 - 25);  // Same height as BLE Scan list
     lv_obj_align(bt_locator_list, LV_ALIGN_TOP_MID, 0, 20);  // Below header
     lv_obj_set_style_bg_color(bt_locator_list, ui_bg_color(), 0);
     lv_obj_set_style_border_color(bt_locator_list, ui_accent_color(), 0);
@@ -14992,30 +14992,33 @@ static void show_bt_locator_screen(void)
     lv_obj_align(bt_locator_mac_label, LV_ALIGN_CENTER, 0, 20);
     lv_obj_add_flag(bt_locator_mac_label, LV_OBJ_FLAG_HIDDEN);
     
-    // Red Exit button at bottom (like AirTag scanner)
+    // Red Exit button at bottom (compact row)
     bt_locator_exit_btn = lv_btn_create(function_page);
-    lv_obj_set_size(bt_locator_exit_btn, 120, 55);
+    lv_obj_set_size(bt_locator_exit_btn, 110, 28);
     lv_obj_align(bt_locator_exit_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
     lv_obj_set_style_bg_color(bt_locator_exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(bt_locator_exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(bt_locator_exit_btn, 0, 0);
-    lv_obj_set_style_radius(bt_locator_exit_btn, 10, 0);
-    lv_obj_set_style_shadow_width(bt_locator_exit_btn, 6, 0);
+    lv_obj_set_style_radius(bt_locator_exit_btn, 8, 0);
+    lv_obj_set_style_shadow_width(bt_locator_exit_btn, 4, 0);
     lv_obj_set_style_shadow_color(bt_locator_exit_btn, lv_color_make(0, 0, 0), 0);
     lv_obj_set_style_shadow_opa(bt_locator_exit_btn, LV_OPA_40, 0);
-    lv_obj_set_flex_flow(bt_locator_exit_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_ver(bt_locator_exit_btn, 4, 0);
+    lv_obj_set_style_pad_hor(bt_locator_exit_btn, 8, 0);
+    lv_obj_set_style_pad_column(bt_locator_exit_btn, 4, 0);
+    lv_obj_set_flex_flow(bt_locator_exit_btn, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(bt_locator_exit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    
+
     lv_obj_t *exit_icon = lv_label_create(bt_locator_exit_btn);
     lv_label_set_text(exit_icon, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_font(exit_icon, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(exit_icon, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(exit_icon, ui_text_color(), 0);
-    
+
     lv_obj_t *exit_lbl = lv_label_create(bt_locator_exit_btn);
     lv_label_set_text(exit_lbl, "Exit");
     lv_obj_set_style_text_font(exit_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(exit_lbl, ui_text_color(), 0);
-    
+
     lv_obj_add_event_cb(bt_locator_exit_btn, bt_locator_exit_cb, LV_EVENT_CLICKED, NULL);
     
     // Switch to BLE mode
@@ -17789,7 +17792,7 @@ static void show_found_tags_screen(void)
 
     // Scrollable list container
     lv_obj_t *list = lv_obj_create(function_page);
-    lv_obj_set_size(list, lv_pct(100), LCD_V_RES - 30 - 65);
+    lv_obj_set_size(list, lv_pct(100), LCD_V_RES - 30 - 43);
     lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 30);
     lv_obj_set_style_bg_color(list, ui_bg_color(), 0);
     lv_obj_set_style_border_width(list, 0, 0);
@@ -17872,19 +17875,30 @@ static void show_found_tags_screen(void)
         lv_obj_center(empty);
     }
 
-    // Back button
+    // Back button (compact row)
     lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 120, 50);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_size(back_btn, 110, 28);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
     lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(back_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_set_style_radius(back_btn, 10, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_style_shadow_width(back_btn, 4, 0);
+    lv_obj_set_style_shadow_color(back_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(back_btn, LV_OPA_40, 0);
+    lv_obj_set_style_pad_ver(back_btn, 4, 0);
+    lv_obj_set_style_pad_hor(back_btn, 8, 0);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(back_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(back_icon, lv_color_white(), 0);
     lv_obj_t *back_lbl = lv_label_create(back_btn);
-    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT "  Back");
-    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_14, 0);
+    lv_label_set_text(back_lbl, "Back");
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
-    lv_obj_center(back_lbl);
     lv_obj_add_event_cb(back_btn, found_tags_back_btn_cb, LV_EVENT_CLICKED, NULL);
 }
 
@@ -17928,7 +17942,7 @@ static void show_tag_tracker_screen(int dev_idx)
 
     // Content container
     bt_locator_content = lv_obj_create(function_page);
-    lv_obj_set_size(bt_locator_content, lv_pct(100), LCD_V_RES - 30 - 65);
+    lv_obj_set_size(bt_locator_content, lv_pct(100), LCD_V_RES - 30 - 43);
     lv_obj_align(bt_locator_content, LV_ALIGN_TOP_MID, 0, 30);
     lv_obj_set_style_bg_opa(bt_locator_content, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(bt_locator_content, 0, 0);
@@ -17969,19 +17983,25 @@ static void show_tag_tracker_screen(int dev_idx)
     lv_obj_set_style_text_font(bt_locator_status_label, &lv_font_montserrat_14, 0);
     lv_obj_align(bt_locator_status_label, LV_ALIGN_CENTER, 0, -60);
 
-    // Exit button
+    // Exit button (compact row)
     bt_locator_exit_btn = lv_btn_create(function_page);
-    lv_obj_set_size(bt_locator_exit_btn, 120, 50);
-    lv_obj_align(bt_locator_exit_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_size(bt_locator_exit_btn, 110, 28);
+    lv_obj_align(bt_locator_exit_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
     lv_obj_set_style_bg_color(bt_locator_exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(bt_locator_exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(bt_locator_exit_btn, 0, 0);
-    lv_obj_set_style_radius(bt_locator_exit_btn, 10, 0);
-    lv_obj_set_flex_flow(bt_locator_exit_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_radius(bt_locator_exit_btn, 8, 0);
+    lv_obj_set_style_shadow_width(bt_locator_exit_btn, 4, 0);
+    lv_obj_set_style_shadow_color(bt_locator_exit_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(bt_locator_exit_btn, LV_OPA_40, 0);
+    lv_obj_set_style_pad_ver(bt_locator_exit_btn, 4, 0);
+    lv_obj_set_style_pad_hor(bt_locator_exit_btn, 8, 0);
+    lv_obj_set_style_pad_column(bt_locator_exit_btn, 4, 0);
+    lv_obj_set_flex_flow(bt_locator_exit_btn, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(bt_locator_exit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_t *exit_icon2 = lv_label_create(bt_locator_exit_btn);
     lv_label_set_text(exit_icon2, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_font(exit_icon2, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(exit_icon2, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(exit_icon2, lv_color_white(), 0);
     lv_obj_t *exit_text2 = lv_label_create(bt_locator_exit_btn);
     lv_label_set_text(exit_text2, "Exit");
@@ -18076,30 +18096,33 @@ static void show_airtag_scan_screen(void)
     lv_obj_add_event_cb(airtag_view_tags_btn, airtag_view_tags_btn_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_flag(airtag_view_tags_btn, LV_OBJ_FLAG_HIDDEN);
 
-    // Red Exit button at bottom
+    // Exit button (compact row)
     lv_obj_t *exit_btn = lv_btn_create(function_page);
-    lv_obj_set_size(exit_btn, 120, 55);
+    lv_obj_set_size(exit_btn, 110, 28);
     lv_obj_align(exit_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
     lv_obj_set_style_bg_color(exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(exit_btn, 0, 0);
-    lv_obj_set_style_radius(exit_btn, 10, 0);
-    lv_obj_set_style_shadow_width(exit_btn, 6, 0);
+    lv_obj_set_style_radius(exit_btn, 8, 0);
+    lv_obj_set_style_shadow_width(exit_btn, 4, 0);
     lv_obj_set_style_shadow_color(exit_btn, lv_color_make(0, 0, 0), 0);
     lv_obj_set_style_shadow_opa(exit_btn, LV_OPA_40, 0);
-    lv_obj_set_flex_flow(exit_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_ver(exit_btn, 4, 0);
+    lv_obj_set_style_pad_hor(exit_btn, 8, 0);
+    lv_obj_set_style_pad_column(exit_btn, 4, 0);
+    lv_obj_set_flex_flow(exit_btn, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(exit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    
+
     lv_obj_t *exit_icon = lv_label_create(exit_btn);
     lv_label_set_text(exit_icon, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_font(exit_icon, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(exit_icon, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(exit_icon, ui_text_color(), 0);
-    
+
     lv_obj_t *exit_text = lv_label_create(exit_btn);
     lv_label_set_text(exit_text, "Exit");
     lv_obj_set_style_text_font(exit_text, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(exit_text, ui_text_color(), 0);
-    
+
     lv_obj_add_event_cb(exit_btn, airtag_scan_exit_cb, LV_EVENT_CLICKED, NULL);
     
     // Set UI active and start scanning
