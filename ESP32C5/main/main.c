@@ -915,7 +915,8 @@ static lv_timer_t *arp_scan_check_timer = NULL;
 #define MITM_MAX_HOSTS    64
 #define MITM_QUEUE_SIZE   256
 #define MITM_MAX_FRAME    1600
-#define LINKTYPE_ETHERNET 1
+#define LINKTYPE_ETHERNET   1
+#define LINKTYPE_IEEE80211  105
 
 typedef struct {
     uint16_t len;
@@ -991,9 +992,22 @@ static portMUX_TYPE deauth_monitor_spin = portMUX_INITIALIZER_UNLOCKED;
 // Deauth Monitor UI state
 static lv_obj_t *deauth_monitor_list = NULL;
 static lv_obj_t *deauth_monitor_status_label = NULL;
+static lv_obj_t *deauth_monitor_rec_label = NULL;
 static volatile bool deauth_monitor_ui_active = false;
 static volatile bool deauth_monitor_update_flag = false;
 static volatile bool deauth_monitor_scan_pending = false;  // Waiting for initial scan to complete
+
+// Deauth Monitor PCAP capture to SD
+typedef struct {
+    uint8_t  frame[512];    // raw 802.11 frame bytes
+    uint16_t len;
+    int8_t   rssi;
+    int64_t  timestamp_us;
+} deauth_pcap_frame_t;
+
+static QueueHandle_t deauth_pcap_queue = NULL;
+static FILE         *deauth_pcap_file  = NULL;
+static char          deauth_pcap_path[64] = "";
 
 // AirTag Scanner state
 static TaskHandle_t airtag_scan_task_handle = NULL;
@@ -1181,6 +1195,7 @@ static void reset_function_page_children(void) {
     airtag_scan_stats_label2 = NULL;
     airtag_scan_stats_label3 = NULL;
     airtag_view_tags_btn = NULL;
+    deauth_monitor_rec_label = NULL;
     bt_locator_content = NULL;
     bt_locator_list = NULL;
     bt_locator_status_label = NULL;
@@ -17218,8 +17233,19 @@ static void deauth_monitor_promiscuous_callback(void *buf, wifi_promiscuous_pkt_
     deauth_monitor_update_flag = true;
     
     portEXIT_CRITICAL(&deauth_monitor_spin);
-    
-    /*ESP_LOGI(TAG, "[DEAUTH] CH: %d | %s | RSSI: %d", 
+
+    // Enqueue raw frame for PCAP write (non-blocking — never stall the WiFi task)
+    if (deauth_pcap_queue) {
+        deauth_pcap_frame_t pf;
+        int copy_len = len < (int)sizeof(pf.frame) ? len : (int)sizeof(pf.frame);
+        memcpy(pf.frame, frame, copy_len);
+        pf.len          = (uint16_t)copy_len;
+        pf.rssi         = rssi;
+        pf.timestamp_us = esp_timer_get_time();
+        xQueueSend(deauth_pcap_queue, &pf, 0);
+    }
+
+    /*ESP_LOGI(TAG, "[DEAUTH] CH: %d | %s | RSSI: %d",
              deauth_monitor_current_channel,
              deauth_monitor_attacks[idx].ssid,
              rssi);*/
@@ -17234,15 +17260,32 @@ static void deauth_monitor_task(void *pvParameters)
     
     while (deauth_monitor_active) {
         vTaskDelay(pdMS_TO_TICKS(50)); // Check every 50ms
-        
+
         if (!deauth_monitor_active) {
             break;
         }
-        
+
+        // Drain queued raw frames to PCAP file
+        if (deauth_pcap_queue && deauth_pcap_file && sd_spi_mutex &&
+            xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+            deauth_pcap_frame_t pf;
+            while (xQueueReceive(deauth_pcap_queue, &pf, 0) == pdTRUE) {
+                pcap_record_header_t rh;
+                rh.ts_sec  = (uint32_t)(pf.timestamp_us / 1000000);
+                rh.ts_usec = (uint32_t)(pf.timestamp_us % 1000000);
+                rh.incl_len = pf.len;
+                rh.orig_len = pf.len;
+                fwrite(&rh, sizeof(rh), 1, deauth_pcap_file);
+                fwrite(pf.frame, 1, pf.len, deauth_pcap_file);
+            }
+            fflush(deauth_pcap_file);
+            xSemaphoreGive(sd_spi_mutex);
+        }
+
         // Force channel hop if 250ms passed
         int64_t current_time = esp_timer_get_time() / 1000;
         bool time_expired = (current_time - deauth_monitor_last_channel_hop >= sniffer_channel_hop_delay_ms);
-        
+
         if (time_expired) {
             deauth_monitor_channel_hop();
         }
@@ -17259,31 +17302,60 @@ static void deauth_monitor_exit_cb(lv_event_t *e)
     (void)e;
     
     ESP_LOGI(TAG, "Stopping deauth monitor...");
-    
-    // Stop monitoring
+
+    // Stop monitoring (task will stop enqueuing frames)
     deauth_monitor_active = false;
     deauth_monitor_ui_active = false;
     deauth_monitor_scan_pending = false;
-    
+
     // Disable promiscuous mode
     esp_wifi_set_promiscuous(false);
-    
-    // Wait for task to finish
+
+    // Wait for task to do one final drain cycle then exit
     if (deauth_monitor_task_handle != NULL) {
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(150));
     }
-    
+
+    // Flush and close PCAP file
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        if (deauth_pcap_file) {
+            // Drain any remaining queued frames
+            if (deauth_pcap_queue) {
+                deauth_pcap_frame_t pf;
+                while (xQueueReceive(deauth_pcap_queue, &pf, 0) == pdTRUE) {
+                    pcap_record_header_t rh;
+                    rh.ts_sec  = (uint32_t)(pf.timestamp_us / 1000000);
+                    rh.ts_usec = (uint32_t)(pf.timestamp_us % 1000000);
+                    rh.incl_len = pf.len;
+                    rh.orig_len = pf.len;
+                    fwrite(&rh, sizeof(rh), 1, deauth_pcap_file);
+                    fwrite(pf.frame, 1, pf.len, deauth_pcap_file);
+                }
+            }
+            fflush(deauth_pcap_file);
+            fclose(deauth_pcap_file);
+            deauth_pcap_file = NULL;
+            ESP_LOGI(TAG, "Deauth PCAP saved: %s", deauth_pcap_path);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    if (deauth_pcap_queue) {
+        vQueueDelete(deauth_pcap_queue);
+        deauth_pcap_queue = NULL;
+    }
+    deauth_pcap_path[0] = '\0';
+
     // Free task stack
     if (deauth_monitor_task_stack != NULL) {
         heap_caps_free(deauth_monitor_task_stack);
         deauth_monitor_task_stack = NULL;
     }
-    
+
     // Reset state
     deauth_monitor_attack_count = 0;
     deauth_monitor_channel_index = 0;
     deauth_monitor_current_channel = 1;
-    
+
     // Navigate to menu
     nav_to_menu_flag = true;
 }
@@ -17330,6 +17402,50 @@ static void deauth_monitor_start_monitoring(void)
         ESP_LOGE(TAG, "Failed to allocate deauth monitor task stack");
     }
     
+    // Open PCAP file on SD for raw frame capture
+    deauth_pcap_queue = xQueueCreate(16, sizeof(deauth_pcap_frame_t));
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        struct stat st = {0};
+        if (stat("/sdcard/lab/deauths", &st) == -1) {
+            mkdir("/sdcard/lab", 0777);
+            mkdir("/sdcard/lab/deauths", 0700);
+        }
+        snprintf(deauth_pcap_path, sizeof(deauth_pcap_path),
+                 "/sdcard/lab/deauths/deauth_%llu.pcap",
+                 (unsigned long long)(esp_timer_get_time() / 1000));
+        deauth_pcap_file = fopen(deauth_pcap_path, "wb");
+        if (deauth_pcap_file) {
+            pcap_global_header_t gh = {
+                .magic_number  = 0xa1b2c3d4,
+                .version_major = 2,
+                .version_minor = 4,
+                .thiszone      = 0,
+                .sigfigs       = 0,
+                .snaplen       = 65535,
+                .network       = LINKTYPE_IEEE80211
+            };
+            fwrite(&gh, sizeof(gh), 1, deauth_pcap_file);
+            fflush(deauth_pcap_file);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    // Update recording status label
+    if (deauth_monitor_rec_label && lv_obj_is_valid(deauth_monitor_rec_label)) {
+        if (deauth_pcap_file) {
+            // Show just the filename portion to fit the bar
+            const char *fname = strrchr(deauth_pcap_path, '/');
+            fname = fname ? fname + 1 : deauth_pcap_path;
+            char rec_buf[80];
+            snprintf(rec_buf, sizeof(rec_buf), LV_SYMBOL_SD_CARD " %s", fname);
+            lv_label_set_text(deauth_monitor_rec_label, rec_buf);
+            lv_obj_set_style_text_color(deauth_monitor_rec_label, COLOR_MATERIAL_RED, 0);
+        } else {
+            lv_label_set_text(deauth_monitor_rec_label, LV_SYMBOL_SD_CARD " SD unavailable");
+            lv_obj_set_style_text_color(deauth_monitor_rec_label, lv_color_make(150, 150, 150), 0);
+        }
+    }
+
     ESP_LOGI(TAG, "Deauth monitor started after scan");
 }
 
@@ -17396,7 +17512,16 @@ static void show_deauth_monitor_screen(void)
     lv_obj_set_style_text_color(exit_text, ui_text_color(), 0);
     
     lv_obj_add_event_cb(exit_btn, deauth_monitor_exit_cb, LV_EVENT_CLICKED, NULL);
-    
+
+    // Recording status label — updated once monitoring starts
+    deauth_monitor_rec_label = lv_label_create(function_page);
+    lv_label_set_text(deauth_monitor_rec_label, LV_SYMBOL_SD_CARD " Waiting for scan...");
+    lv_obj_set_style_text_font(deauth_monitor_rec_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(deauth_monitor_rec_label, lv_color_make(150, 150, 150), 0);
+    lv_obj_set_style_text_align(deauth_monitor_rec_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(deauth_monitor_rec_label, lv_pct(100));
+    lv_obj_align(deauth_monitor_rec_label, LV_ALIGN_BOTTOM_MID, 0, -70);
+
     // Set UI active but not monitoring yet (waiting for scan)
     deauth_monitor_ui_active = true;
     deauth_monitor_active = false;  // Will be set true after scan
