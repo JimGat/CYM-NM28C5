@@ -17772,7 +17772,7 @@ static void show_airtag_scan_screen(void)
     lv_obj_set_style_text_align(airtag_scan_status_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(airtag_scan_status_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(airtag_scan_status_label, ui_text_color(), 0);
-    lv_obj_align(airtag_scan_status_label, LV_ALIGN_CENTER, 0, -70);
+    lv_obj_align(airtag_scan_status_label, LV_ALIGN_CENTER, 0, -105);
 
     // Stats label 1: "Air Tags: X\nSmart Tags: X" (two lines, large font)
     airtag_scan_stats_label1 = lv_label_create(function_page);
@@ -17780,7 +17780,7 @@ static void show_airtag_scan_screen(void)
     lv_obj_set_style_text_align(airtag_scan_stats_label1, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(airtag_scan_stats_label1, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(airtag_scan_stats_label1, ui_text_color(), 0);
-    lv_obj_align(airtag_scan_stats_label1, LV_ALIGN_CENTER, 0, -50);
+    lv_obj_align(airtag_scan_stats_label1, LV_ALIGN_CENTER, 0, -85);
     lv_obj_add_flag(airtag_scan_stats_label1, LV_OBJ_FLAG_HIDDEN);
 
     // Stats label 2: "Other BT Devices: X"
@@ -17789,7 +17789,7 @@ static void show_airtag_scan_screen(void)
     lv_obj_set_style_text_align(airtag_scan_stats_label2, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(airtag_scan_stats_label2, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(airtag_scan_stats_label2, lv_color_make(176, 176, 176), 0);
-    lv_obj_align(airtag_scan_stats_label2, LV_ALIGN_CENTER, 0, 15);
+    lv_obj_align(airtag_scan_stats_label2, LV_ALIGN_CENTER, 0, -20);
     lv_obj_add_flag(airtag_scan_stats_label2, LV_OBJ_FLAG_HIDDEN);
 
     // Stats label 3: "Total BT devices: X"
@@ -17798,13 +17798,13 @@ static void show_airtag_scan_screen(void)
     lv_obj_set_style_text_align(airtag_scan_stats_label3, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(airtag_scan_stats_label3, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(airtag_scan_stats_label3, lv_color_make(176, 176, 176), 0);
-    lv_obj_align(airtag_scan_stats_label3, LV_ALIGN_CENTER, 0, 40);
+    lv_obj_align(airtag_scan_stats_label3, LV_ALIGN_CENTER, 0, 5);
     lv_obj_add_flag(airtag_scan_stats_label3, LV_OBJ_FLAG_HIDDEN);
 
     // "View Found Tags" button — shown when at least one AirTag or SmartTag detected
     airtag_view_tags_btn = lv_btn_create(function_page);
     lv_obj_set_size(airtag_view_tags_btn, 160, 44);
-    lv_obj_align(airtag_view_tags_btn, LV_ALIGN_CENTER, 0, 90);
+    lv_obj_align(airtag_view_tags_btn, LV_ALIGN_CENTER, 0, 55);
     lv_obj_set_style_bg_color(airtag_view_tags_btn, COLOR_MATERIAL_BLUE, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(airtag_view_tags_btn, lv_color_lighten(COLOR_MATERIAL_BLUE, 50), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(airtag_view_tags_btn, 0, 0);
