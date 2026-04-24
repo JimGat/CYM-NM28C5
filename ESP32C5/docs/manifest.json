@@ -1,7 +1,7 @@
 {
   "name": "JANOS CYM-NM28C5",
-  "version": "v0.4.4",
-  "build": "v0.4.4",
+  "version": "v0.4.5",
+  "build": "v0.4.5",
   "chipFamily": "ESP32-C5",
   "parts": [
     { "path": "../binaries-esp32c5/bootloader.bin",      "offset": 8192   },
