@@ -69,22 +69,12 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 
 ## Screenshots
 
-> These are from Pancake — this port is portrait-oriented to fit the CYD form factor. Updated screenshots coming soon.
-
-<!-- Add your screenshots here -->
-
 <p align="center">
-  <img width="480" height="271" alt="image" src="https://github.com/user-attachments/assets/0200719c-85b7-4977-9a38-1ecb4defad9a" />
-
+  <img width="360" alt="AirTag detection — close range (on top of AirTag)" src="docs/screenshots/airtag_detection_close.jpg" />
+  &nbsp;&nbsp;
+  <img width="360" alt="AirTag detection — far range (away from AirTag)" src="docs/screenshots/airtag_detection_far.jpg" />
   <br/>
-  <em>Main Menu</em>
-</p>
-
-<p align="center">
-<img width="474" height="280" alt="image" src="https://github.com/user-attachments/assets/9df03b0c-f25b-4cb1-a049-0591c389a645" />
-
-  <br/>
-  <em>Selected Network Attack Panel</em>
+  <em>AirTag Scanner — close range (left) vs. far range (right). RSSI updates live every 10 s via the BT Locator tracking task.</em>
 </p>
 
 
@@ -271,9 +261,8 @@ BLE scanning features leveraging the ESP32-C5's BLE 5.0 radio.
 
 | Feature | Description |
 |---------|-------------|
-| **AirTag Scanner** | Detects Apple Find My network devices |
-| **SmartTag Scanner** | Detects Samsung SmartTag devices |
-| **BLE Locator** | Generic BLE device scanner with signal strength |
+| **AirTag Scanner** | Detects Apple Find My network devices and Samsung SmartTags; tap **View Found Tags** to see a list of detected devices with MAC, RSSI, and a **Track** button that launches live RSSI tracking for that specific tag |
+| **BLE Locator** | Generic BLE device scanner with signal strength — scan all nearby devices and select any one to track |
 
 > **Note:** WiFi and BLE share the same radio. The firmware automatically switches between `RADIO_MODE_WIFI` and `RADIO_MODE_BLE` as needed.
 
