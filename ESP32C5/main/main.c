@@ -2463,7 +2463,7 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
     portENTER_CRITICAL(&snifferdog_stats_spin);
     snifferdog_kick_count++;
     snprintf(snifferdog_last_pair, sizeof(snifferdog_last_pair),
-             "%02X:%02X:%02X:%02X:%02X:%02X -> %02X:%02X:%02X:%02X:%02X:%02X",
+             "%02X:%02X:%02X:%02X:%02X:%02X\n->%02X:%02X:%02X:%02X:%02X:%02X",
              ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5],
              sta_mac[0], sta_mac[1], sta_mac[2], sta_mac[3], sta_mac[4], sta_mac[5]);
     portEXIT_CRITICAL(&snifferdog_stats_spin);
@@ -4073,12 +4073,12 @@ void app_main(void)
 
                 if (snifferdog_kick_label) {
                     char buf[48];
-                    snprintf(buf, sizeof(buf), "Stations kicked out: %lu", (unsigned long)kicks);
+                    snprintf(buf, sizeof(buf), "Kicked out: %lu", (unsigned long)kicks);
                     lv_label_set_text(snifferdog_kick_label, buf);
                 }
                 if (snifferdog_recent_label) {
                     char buf[96];
-                    snprintf(buf, sizeof(buf), "Recent kick: %s", recent_buf);
+                    snprintf(buf, sizeof(buf), "Last kick:\n%s", recent_buf);
                     lv_label_set_text(snifferdog_recent_label, buf);
                 }
             }
@@ -5673,62 +5673,61 @@ static void snifferdog_yes_btn_cb(lv_event_t *e)
     snifferdog_last_pair[sizeof(snifferdog_last_pair) - 1] = '\0';
     portEXIT_CRITICAL(&snifferdog_stats_spin);
     
-    // Title label (white, centered)
-    lv_obj_t *title_lbl = lv_label_create(function_page);
-    lv_label_set_text(title_lbl, "Snifferdog");
-    lv_obj_set_style_text_color(title_lbl, ui_text_color(), 0);
-    lv_obj_set_style_text_font(title_lbl, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_align(title_lbl, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(title_lbl, LV_ALIGN_TOP_MID, 0, 35);
-    
-    // Create compact status panel
+    // Status panel
     lv_obj_t *content = lv_obj_create(function_page);
-    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 70);
+    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 35 - 43);
     lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 35);
     lv_obj_set_style_bg_color(content, ui_bg_color(), 0);
     lv_obj_set_style_border_width(content, 0, 0);
     lv_obj_set_style_radius(content, 0, 0);
     lv_obj_set_style_pad_all(content, 12, 0);
-    lv_obj_set_style_pad_row(content, 10, 0);
+    lv_obj_set_style_pad_row(content, 12, 0);
     lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(content, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    
+
     snifferdog_kick_label = lv_label_create(content);
-    lv_label_set_text(snifferdog_kick_label, "Stations kicked out: 0");
-    lv_obj_set_style_text_font(snifferdog_kick_label, &lv_font_montserrat_16, 0);
+    lv_label_set_text(snifferdog_kick_label, "Kicked out: 0");
+    lv_obj_set_style_text_font(snifferdog_kick_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(snifferdog_kick_label, COLOR_MATERIAL_RED, 0);
     lv_obj_set_style_text_align(snifferdog_kick_label, LV_TEXT_ALIGN_CENTER, 0);
-    
+    lv_obj_set_width(snifferdog_kick_label, lv_pct(95));
+    lv_label_set_long_mode(snifferdog_kick_label, LV_LABEL_LONG_WRAP);
+
     snifferdog_recent_label = lv_label_create(content);
-    lv_label_set_text(snifferdog_recent_label, "Recent kick: N/A");
-    lv_obj_set_style_text_font(snifferdog_recent_label, &lv_font_montserrat_16, 0);
+    lv_label_set_text(snifferdog_recent_label, "Last kick:\nN/A");
+    lv_obj_set_style_text_font(snifferdog_recent_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(snifferdog_recent_label, COLOR_MATERIAL_RED, 0);
     lv_obj_set_style_text_align(snifferdog_recent_label, LV_TEXT_ALIGN_CENTER, 0);
-    
-    // Stop & Exit button (handshaker style)
+    lv_obj_set_width(snifferdog_recent_label, lv_pct(95));
+    lv_label_set_long_mode(snifferdog_recent_label, LV_LABEL_LONG_WRAP);
+
+    // Exit button (compact row)
     snifferdog_stop_btn = lv_btn_create(function_page);
-    lv_obj_set_size(snifferdog_stop_btn, 120, 55);
+    lv_obj_set_size(snifferdog_stop_btn, 110, 28);
     lv_obj_align(snifferdog_stop_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
     lv_obj_set_style_bg_color(snifferdog_stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(snifferdog_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(snifferdog_stop_btn, 0, 0);
-    lv_obj_set_style_radius(snifferdog_stop_btn, 10, 0);
-    lv_obj_set_style_shadow_width(snifferdog_stop_btn, 6, 0);
+    lv_obj_set_style_radius(snifferdog_stop_btn, 8, 0);
+    lv_obj_set_style_shadow_width(snifferdog_stop_btn, 4, 0);
     lv_obj_set_style_shadow_color(snifferdog_stop_btn, lv_color_make(0, 0, 0), 0);
     lv_obj_set_style_shadow_opa(snifferdog_stop_btn, LV_OPA_40, 0);
-    lv_obj_set_flex_flow(snifferdog_stop_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_ver(snifferdog_stop_btn, 4, 0);
+    lv_obj_set_style_pad_hor(snifferdog_stop_btn, 8, 0);
+    lv_obj_set_style_pad_column(snifferdog_stop_btn, 4, 0);
+    lv_obj_set_flex_flow(snifferdog_stop_btn, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(snifferdog_stop_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    
+
     lv_obj_t *x_icon = lv_label_create(snifferdog_stop_btn);
     lv_label_set_text(x_icon, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_font(x_icon, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(x_icon, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(x_icon, ui_text_color(), 0);
-    
+
     lv_obj_t *stop_text = lv_label_create(snifferdog_stop_btn);
     lv_label_set_text(stop_text, "Exit");
     lv_obj_set_style_text_font(stop_text, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(stop_text, ui_text_color(), 0);
-    
+
     lv_obj_add_event_cb(snifferdog_stop_btn, snifferdog_stop_btn_cb, LV_EVENT_CLICKED, NULL);
     
     // Start snifferdog attack (custom implementation)
