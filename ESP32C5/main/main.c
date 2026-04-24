@@ -17476,7 +17476,7 @@ static void show_deauth_monitor_screen(void)
     
     // Create attack list (hidden initially)
     deauth_monitor_list = lv_list_create(function_page);
-    lv_obj_set_size(deauth_monitor_list, lv_pct(100), LCD_V_RES - 30 - 70);  // Leave space for title and exit button
+    lv_obj_set_size(deauth_monitor_list, lv_pct(100), LCD_V_RES - 30 - 95);  // Leave space for title, rec label, and exit button
     lv_obj_align(deauth_monitor_list, LV_ALIGN_TOP_MID, 0, 35);
     lv_obj_set_style_bg_color(deauth_monitor_list, ui_bg_color(), 0);
     lv_obj_set_style_border_width(deauth_monitor_list, 0, LV_PART_ITEMS);
@@ -17487,30 +17487,33 @@ static void show_deauth_monitor_screen(void)
     lv_obj_set_style_text_color(list_title, COLOR_MATERIAL_RED, 0);
     lv_obj_set_style_text_font(list_title, &lv_font_montserrat_14, 0);
     
-    // Red Exit button at bottom
+    // Red Exit button at bottom — compact single-row size leaves room for a second button
     lv_obj_t *exit_btn = lv_btn_create(function_page);
-    lv_obj_set_size(exit_btn, 120, 55);
+    lv_obj_set_size(exit_btn, 110, 28);
     lv_obj_align(exit_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
     lv_obj_set_style_bg_color(exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(exit_btn, 0, 0);
-    lv_obj_set_style_radius(exit_btn, 10, 0);
-    lv_obj_set_style_shadow_width(exit_btn, 6, 0);
+    lv_obj_set_style_radius(exit_btn, 8, 0);
+    lv_obj_set_style_shadow_width(exit_btn, 4, 0);
     lv_obj_set_style_shadow_color(exit_btn, lv_color_make(0, 0, 0), 0);
     lv_obj_set_style_shadow_opa(exit_btn, LV_OPA_40, 0);
-    lv_obj_set_flex_flow(exit_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_ver(exit_btn, 4, 0);
+    lv_obj_set_style_pad_hor(exit_btn, 8, 0);
+    lv_obj_set_style_pad_column(exit_btn, 4, 0);
+    lv_obj_set_flex_flow(exit_btn, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(exit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    
+
     lv_obj_t *exit_icon = lv_label_create(exit_btn);
     lv_label_set_text(exit_icon, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_font(exit_icon, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(exit_icon, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(exit_icon, ui_text_color(), 0);
-    
+
     lv_obj_t *exit_text = lv_label_create(exit_btn);
     lv_label_set_text(exit_text, "Exit");
     lv_obj_set_style_text_font(exit_text, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(exit_text, ui_text_color(), 0);
-    
+
     lv_obj_add_event_cb(exit_btn, deauth_monitor_exit_cb, LV_EVENT_CLICKED, NULL);
 
     // Recording status label — updated once monitoring starts
@@ -17520,7 +17523,7 @@ static void show_deauth_monitor_screen(void)
     lv_obj_set_style_text_color(deauth_monitor_rec_label, lv_color_make(150, 150, 150), 0);
     lv_obj_set_style_text_align(deauth_monitor_rec_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(deauth_monitor_rec_label, lv_pct(100));
-    lv_obj_align(deauth_monitor_rec_label, LV_ALIGN_BOTTOM_MID, 0, -70);
+    lv_obj_align(deauth_monitor_rec_label, LV_ALIGN_BOTTOM_MID, 0, -46);
 
     // Set UI active but not monitoring yet (waiting for scan)
     deauth_monitor_ui_active = true;
