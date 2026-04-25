@@ -508,25 +508,38 @@ esptool.py --chip esp32c5 --port /dev/ttyACM0 --baud 460800 \
 CYM-NM28C5/
 ├── ESP32C5/
 │   ├── main/
-│   │   ├── main.c                # Core application, all UI screens, boot sequence,
-│   │   │                         #   touch calibration routine (run_touch_calibration)
-│   │   ├── attack_handshake.c    # Handshake capture logic
-│   │   ├── xpt2046.c/h           # XPT2046 SPI touch driver (polling, null-zone, calibration reads)
-│   │   └── lvgl_memory.c         # PSRAM allocator for LVGL
+│   │   ├── main.c                # Core application — all UI screens, boot sequence,
+│   │   │                         #   WiFi/BLE logic, touch calibration, GPS, wardriving
+│   │   ├── attack_handshake.c/h  # WPA handshake capture (PCAP & HCCAPX)
+│   │   ├── xpt2046.c/h           # XPT2046 SPI touch driver (polling, null-zone, calibration)
+│   │   ├── lvgl_memory.c/h       # PSRAM allocator for LVGL
+│   │   ├── dexter_img.c/h        # Dexter mascot image data (splash screen, RGB565)
+│   │   └── ft6336.c/h            # FT6336 capacitive touch driver (unused — not compiled)
 │   ├── components/
-│   │   ├── wifi_cli/             # CLI, WiFi init, LED control
-│   │   ├── wifi_scanner/         # WiFi scanning engine
-│   │   ├── wifi_sniffer/         # Promiscuous mode sniffer
-│   │   ├── wifi_attacks/         # Deauth, Evil Twin, Captive Portal, Karma
-│   │   ├── wifi_wardrive/        # SD card, GPS + WiFi wardriving
+│   │   ├── wifi_cli/             # CLI, WiFi init, LED control; wifi_common.c/h (shared constants)
+│   │   ├── wifi_scanner/         # Active WiFi scan engine, target BSSID tracking
+│   │   ├── wifi_sniffer/         # Promiscuous sniffer, SnifferDog, probe request logging
+│   │   ├── wifi_attacks/         # Deauth, Evil Twin, Captive Portal, Karma, SAE Overflow
+│   │   ├── wifi_wardrive/        # GPS + WiFi wardriving, SD card CSV logging
 │   │   ├── sniffer/              # Raw 802.11 frame capture
-│   │   ├── frame_analyzer/       # EAPOL / beacon parsing
-│   │   ├── pcap_serializer/      # PCAP file writer
-│   │   └── hccapx_serializer/    # HCCAPX file writer (hashcat)
+│   │   ├── frame_analyzer/       # EAPOL / beacon / probe frame parsing
+│   │   ├── pcap_serializer/      # PCAP file writer (Wireshark-compatible)
+│   │   ├── hccapx_serializer/    # HCCAPX file writer (hashcat)
+│   │   ├── led_strip/            # Local WS2812 RMT driver (replaces legacy managed component)
+│   │   └── espressif__esp_lcd_ili9341/  # ST7789 LCD panel driver (Espressif component, local copy)
+│   ├── binaries-esp32c5/         # Pre-built flashable binaries (bootloader, partition-table, app)
+│   ├── docs/
+│   │   ├── index.html            # Web flasher UI
+│   │   └── manifest.json         # OTA / web flash manifest
 │   ├── partitions.csv            # nvs(24K) phy_init(4K) factory(7MB) storage(960K)
+│   ├── sdkconfig.defaults        # Default Kconfig values (PSRAM, dual-band WiFi, LVGL)
+│   ├── post_build.cmake          # Copies build artifacts → binaries-esp32c5/ after each build
 │   ├── sdkconfig
 │   └── CMakeLists.txt
-├── NM-CYD-C5-pinmap.md          # Full pin map with migration notes
+├── docs/
+│   └── screenshots/              # Screenshot assets used in this README
+├── NM-CYD-C5-pinmap.md          # Full GPIO pin map with migration notes
+├── CLAUDE.md                     # Claude Code project instructions
 └── README.md
 ```
 
