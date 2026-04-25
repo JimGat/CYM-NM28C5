@@ -62,8 +62,8 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 | **BLE** | AirTag scanner, SmartTag detection, BLE Locator |
 | **Deauth Monitor** | Passive detection of nearby deauth attacks |
 | **Credentials** | Captive portal credential capture, WPA-SEC upload |
-| **UI** | Material dark theme, touch gestures, screen dimming, screenshots |
-| **Storage** | SD card for handshakes, wardrive logs, screenshots |
+| **UI** | Material dark theme, touch gestures, screen dimming, screenshots — all screens portrait 240×320 |
+| **Storage** | SD card for handshakes, wardrive logs, screenshots, file tree browser |
 
 ---
 
@@ -232,7 +232,7 @@ Attacks that operate on **all nearby networks** simultaneously.
 | Feature | Description |
 |---------|-------------|
 | **Blackout** | Mass deauthentication of all detected networks in range |
-| **Snifferdog** | Channel-hopping sniffer with automatic client deauthentication |
+| **Snifferdog** | Channel-hopping sniffer with automatic client deauthentication; exits cleanly and returns radio to normal WiFi scan mode |
 | **SAE Overflow** | WPA3 SAE authentication flood attack |
 
 ### 3. Network Observer & Karma
@@ -331,7 +331,7 @@ GPS-enabled WiFi logging for mapping wireless networks. Requires an **ATGM336H**
 | **Screen Timeout** | Inactivity timer before display dimming |
 | **Brightness** | Software brightness overlay (10–100%) |
 | **Scan Duration** | Configurable WiFi scan time |
-| **SD Card** | Validate/provision, check free space, format |
+| **SD Card** | Validate/provision (creates `/sdcard/lab/` structure, shows completion status); browse file tree; check free space |
 | **GPS Info** | Live GPS fix status, latitude, longitude, altitude, satellite count, and UART config reference (IO4/IO5, 9600 baud, ATGM336H) |
 
 All settings are persisted via **NVS** (Non-Volatile Storage) across reboots.
@@ -341,6 +341,7 @@ All settings are persisted via **NVS** (Non-Volatile Storage) across reboots.
 | Feature | Description |
 |---------|-------------|
 | **LVGL Material Dark Theme** | Modern, touch-friendly dark UI |
+| **Portrait 240×320 Layout** | All screens designed and reflowed for the NM-CYD-C5's 240×320 portrait display |
 | **6-Tile Main Menu** | Quick access to all feature categories |
 | **Screenshot Capture** | Save screen to SD card (`/sdcard/screenshots/`) |
 | **WPA-SEC Upload** | Upload captured handshakes to wpa-sec.stanev.org via HTTPS |
@@ -380,6 +381,10 @@ All data is stored on the SD card:
 ├── screenshots/          # UI screenshots (BMP)
 └── calibrate.txt         # ← Create this file to trigger touch re-calibration on next boot
 ```
+
+The **SD Card → File Tree** utility (Settings menu) lets you browse the SD card's directory tree directly on the device — useful for confirming handshakes and wardrive logs were saved without needing to remove the card.
+
+**SD Card Provision** (Settings → SD Card → Provision) creates the full `/sdcard/lab/` folder structure in one tap. When complete, the screen shows a "Done — N created, M OK" summary in a status bar above the Back button.
 
 ---
 
