@@ -1,12 +1,31 @@
 // wifi_common.c - Common helper functions
 #include "wifi_common.h"
 #include "esp_wifi.h"
+#include "esp_log.h"
 #include <string.h>
+
+static const char *TAG_PWR = "power";
 
 // Global variables (defined once, extern in header)
 led_strip_handle_t g_led_strip = NULL;
 volatile app_state_t g_app_state = APP_STATE_IDLE;
 volatile bool g_operation_stop_requested = false;
+bool g_max_power_mode = false;  // default Normal; persisted in NVS by main.c
+
+void apply_wifi_power_settings(void)
+{
+    if (g_max_power_mode) {
+        // 82 is the highest TX power value accepted by the IDF API (~20.5 dBm nominal).
+        // Actual radiated EIRP is still bounded by PHY calibration, antenna design, and
+        // country/regulatory settings loaded at runtime.
+        esp_wifi_set_max_tx_power(82);
+        esp_wifi_set_ps(WIFI_PS_NONE);   // disable modem sleep for continuous TX capability
+        ESP_LOGI(TAG_PWR, "WiFi TX power set to 82 (~20.5 dBm max), power save OFF");
+    } else {
+        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);  // restore default modem-sleep power save
+        ESP_LOGI(TAG_PWR, "WiFi TX power normal, power save MIN_MODEM");
+    }
+}
 
 const char* authmode_to_string(wifi_auth_mode_t mode) {
     switch (mode) {

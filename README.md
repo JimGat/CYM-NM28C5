@@ -64,6 +64,7 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 | **BLE** | AirTag scanner, SmartTag detection, BLE Locator |
 | **Deauth Monitor** | Passive detection of nearby deauth attacks |
 | **Credentials** | Captive portal credential capture, WPA-SEC upload |
+| **TX Power Mode** | Selectable Normal / Max Power for WiFi and BLE — persisted across reboots |
 | **UI** | Material dark theme, touch gestures, screen dimming, screenshots — all screens portrait 240×320 |
 | **Storage** | SD card for handshakes, wardrive logs, screenshots, file tree browser |
 
@@ -335,8 +336,22 @@ GPS-enabled WiFi logging for mapping wireless networks. Requires an **ATGM336H**
 | **Scan Duration** | Configurable WiFi scan time |
 | **SD Card** | Validate/provision (creates `/sdcard/lab/` structure, shows completion status); browse file tree; check free space |
 | **GPS Info** | Live GPS fix status, latitude, longitude, altitude, satellite count, and UART config reference (IO4/IO5, 9600 baud, ATGM336H) |
+| **Power Mode** | TX Power Mode selector — Normal or Max Power (see below) |
 
 All settings are persisted via **NVS** (Non-Volatile Storage) across reboots.
+
+#### TX Power Mode
+
+Accessible via **Settings → Power Mode**. Defaults to **Normal** on first boot.
+
+| Mode | WiFi | BLE |
+|------|------|-----|
+| **Normal** | Default IDF TX power, modem-sleep enabled (`WIFI_PS_MIN_MODEM`) | Default controller TX power |
+| **Max Power** | TX cap set to 82 (~20.5 dBm nominal), modem-sleep disabled (`WIFI_PS_NONE`) | All BLE power types set to P9 (+9 dBm) |
+
+Switching modes takes effect immediately on the active radio and is re-applied automatically every time WiFi or BLE is started — including on attack start/stop and radio mode switches.
+
+> **Note:** Actual radiated power (EIRP) is still bounded by the NM-CYD-C5's PCB antenna, PHY calibration data, and the country/regulatory settings loaded at boot. Max Power increases effective range but does not bypass regulatory limits enforced by the PHY layer.
 
 ### UI & System Features
 
