@@ -14253,9 +14253,9 @@ static void show_sd_provision_running_screen(bool after_format)
     const char *title = after_format ? "Format + Provision" : "Validate & Provision";
     create_function_page_base(title);
 
-    // Log text area — scrollable, monospace-ish
+    // Log text area — scrollable, monospace-ish; shortened to leave room for bottom bar
     sd_provision_log_ta = lv_textarea_create(function_page);
-    lv_obj_set_size(sd_provision_log_ta, lv_pct(100), LCD_V_RES - 30 - 50);
+    lv_obj_set_size(sd_provision_log_ta, lv_pct(100), LCD_V_RES - 30 - 44);
     lv_obj_align(sd_provision_log_ta, LV_ALIGN_TOP_MID, 0, 30);
     lv_textarea_set_max_length(sd_provision_log_ta, 4096);
     lv_textarea_set_one_line(sd_provision_log_ta, false);
@@ -14267,17 +14267,31 @@ static void show_sd_provision_running_screen(bool after_format)
     lv_obj_set_style_pad_all(sd_provision_log_ta, 4, 0);
     lv_obj_clear_flag(sd_provision_log_ta, LV_OBJ_FLAG_CLICKABLE);
 
-    // Status / summary label
-    sd_provision_status_label = lv_label_create(function_page);
+    // Bottom bar: status label (left) + back button (right), flex row
+    lv_obj_t *bottom_bar = lv_obj_create(function_page);
+    lv_obj_set_size(bottom_bar, lv_pct(100), 38);
+    lv_obj_align(bottom_bar, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(bottom_bar, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(bottom_bar, 0, 0);
+    lv_obj_set_style_radius(bottom_bar, 0, 0);
+    lv_obj_set_style_pad_hor(bottom_bar, 8, 0);
+    lv_obj_set_style_pad_ver(bottom_bar, 4, 0);
+    lv_obj_set_style_pad_column(bottom_bar, 6, 0);
+    lv_obj_clear_flag(bottom_bar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(bottom_bar, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(bottom_bar, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    // Status / summary label — grows to fill left side
+    sd_provision_status_label = lv_label_create(bottom_bar);
     lv_label_set_text(sd_provision_status_label, "Running...");
     lv_obj_set_style_text_color(sd_provision_status_label, ui_muted_color(), 0);
     lv_obj_set_style_text_font(sd_provision_status_label, &lv_font_montserrat_14, 0);
-    lv_obj_align(sd_provision_status_label, LV_ALIGN_BOTTOM_LEFT, 8, -8);
+    lv_label_set_long_mode(sd_provision_status_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_flex_grow(sd_provision_status_label, 1);
 
     // Back button — disabled until task completes
-    sd_prov_back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(sd_prov_back_btn, 60, 32);
-    lv_obj_align(sd_prov_back_btn, LV_ALIGN_BOTTOM_RIGHT, -8, -6);
+    sd_prov_back_btn = lv_btn_create(bottom_bar);
+    lv_obj_set_size(sd_prov_back_btn, 60, 30);
     lv_obj_set_style_bg_color(sd_prov_back_btn, lv_color_hex(0x333333), LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(sd_prov_back_btn, 0, 0);
     lv_obj_set_style_radius(sd_prov_back_btn, 8, 0);
