@@ -915,7 +915,8 @@ static lv_timer_t *arp_scan_check_timer = NULL;
 #define MITM_MAX_HOSTS    64
 #define MITM_QUEUE_SIZE   256
 #define MITM_MAX_FRAME    1600
-#define LINKTYPE_ETHERNET 1
+#define LINKTYPE_ETHERNET   1
+#define LINKTYPE_IEEE80211  105
 
 typedef struct {
     uint16_t len;
@@ -991,9 +992,22 @@ static portMUX_TYPE deauth_monitor_spin = portMUX_INITIALIZER_UNLOCKED;
 // Deauth Monitor UI state
 static lv_obj_t *deauth_monitor_list = NULL;
 static lv_obj_t *deauth_monitor_status_label = NULL;
+static lv_obj_t *deauth_monitor_rec_label = NULL;
 static volatile bool deauth_monitor_ui_active = false;
 static volatile bool deauth_monitor_update_flag = false;
 static volatile bool deauth_monitor_scan_pending = false;  // Waiting for initial scan to complete
+
+// Deauth Monitor PCAP capture to SD
+typedef struct {
+    uint8_t  frame[512];    // raw 802.11 frame bytes
+    uint16_t len;
+    int8_t   rssi;
+    int64_t  timestamp_us;
+} deauth_pcap_frame_t;
+
+static QueueHandle_t deauth_pcap_queue = NULL;
+static FILE         *deauth_pcap_file  = NULL;
+static char          deauth_pcap_path[64] = "";
 
 // AirTag Scanner state
 static TaskHandle_t airtag_scan_task_handle = NULL;
@@ -1181,6 +1195,7 @@ static void reset_function_page_children(void) {
     airtag_scan_stats_label2 = NULL;
     airtag_scan_stats_label3 = NULL;
     airtag_view_tags_btn = NULL;
+    deauth_monitor_rec_label = NULL;
     bt_locator_content = NULL;
     bt_locator_list = NULL;
     bt_locator_status_label = NULL;
@@ -2448,7 +2463,7 @@ static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_typ
     portENTER_CRITICAL(&snifferdog_stats_spin);
     snifferdog_kick_count++;
     snprintf(snifferdog_last_pair, sizeof(snifferdog_last_pair),
-             "%02X:%02X:%02X:%02X:%02X:%02X -> %02X:%02X:%02X:%02X:%02X:%02X",
+             "%02X:%02X:%02X:%02X:%02X:%02X\n->%02X:%02X:%02X:%02X:%02X:%02X",
              ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5],
              sta_mac[0], sta_mac[1], sta_mac[2], sta_mac[3], sta_mac[4], sta_mac[5]);
     portEXIT_CRITICAL(&snifferdog_stats_spin);
@@ -3420,9 +3435,9 @@ static void show_splash_screen(void)
 
     lv_obj_t *version_label = lv_label_create(splash_screen);
     lv_label_set_text(version_label, FW_VERSION);
-    lv_obj_set_style_text_font(version_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(version_label, lv_color_hex(0x4A5568), 0);
-    lv_obj_align(version_label, LV_ALIGN_CENTER, 0, 62);
+    lv_obj_set_style_text_font(version_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(version_label, lv_color_hex(0xD8D8D8), 0);
+    lv_obj_align(version_label, LV_ALIGN_CENTER, 0, 64);
 
     splash_loading_label = lv_label_create(splash_screen);
     lv_label_set_text(splash_loading_label, "LOADING...");
@@ -4058,12 +4073,12 @@ void app_main(void)
 
                 if (snifferdog_kick_label) {
                     char buf[48];
-                    snprintf(buf, sizeof(buf), "Stations kicked out: %lu", (unsigned long)kicks);
+                    snprintf(buf, sizeof(buf), "Kicked out: %lu", (unsigned long)kicks);
                     lv_label_set_text(snifferdog_kick_label, buf);
                 }
                 if (snifferdog_recent_label) {
                     char buf[96];
-                    snprintf(buf, sizeof(buf), "Recent kick: %s", recent_buf);
+                    snprintf(buf, sizeof(buf), "Last kick:\n%s", recent_buf);
                     lv_label_set_text(snifferdog_recent_label, buf);
                 }
             }
@@ -4978,7 +4993,7 @@ void app_main(void)
 
                 if (hs_ui_stats_label && lv_obj_is_valid(hs_ui_stats_label)) {
                     char stats_buf[128];
-                    snprintf(stats_buf, sizeof(stats_buf), "APs: %d   Clients: %d   Captured: %d",
+                    snprintf(stats_buf, sizeof(stats_buf), "APs: %d  Cli: %d  Cap: %d",
                              hs_ap_count, hs_client_count, hs_total_handshakes_captured);
                     lv_label_set_text(hs_ui_stats_label, stats_buf);
                 }
@@ -5658,62 +5673,61 @@ static void snifferdog_yes_btn_cb(lv_event_t *e)
     snifferdog_last_pair[sizeof(snifferdog_last_pair) - 1] = '\0';
     portEXIT_CRITICAL(&snifferdog_stats_spin);
     
-    // Title label (white, centered)
-    lv_obj_t *title_lbl = lv_label_create(function_page);
-    lv_label_set_text(title_lbl, "Snifferdog");
-    lv_obj_set_style_text_color(title_lbl, ui_text_color(), 0);
-    lv_obj_set_style_text_font(title_lbl, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_align(title_lbl, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(title_lbl, LV_ALIGN_TOP_MID, 0, 35);
-    
-    // Create compact status panel
+    // Status panel
     lv_obj_t *content = lv_obj_create(function_page);
-    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 70);
+    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 35 - 43);
     lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 35);
     lv_obj_set_style_bg_color(content, ui_bg_color(), 0);
     lv_obj_set_style_border_width(content, 0, 0);
     lv_obj_set_style_radius(content, 0, 0);
     lv_obj_set_style_pad_all(content, 12, 0);
-    lv_obj_set_style_pad_row(content, 10, 0);
+    lv_obj_set_style_pad_row(content, 12, 0);
     lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(content, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    
+
     snifferdog_kick_label = lv_label_create(content);
-    lv_label_set_text(snifferdog_kick_label, "Stations kicked out: 0");
-    lv_obj_set_style_text_font(snifferdog_kick_label, &lv_font_montserrat_16, 0);
+    lv_label_set_text(snifferdog_kick_label, "Kicked out: 0");
+    lv_obj_set_style_text_font(snifferdog_kick_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(snifferdog_kick_label, COLOR_MATERIAL_RED, 0);
     lv_obj_set_style_text_align(snifferdog_kick_label, LV_TEXT_ALIGN_CENTER, 0);
-    
+    lv_obj_set_width(snifferdog_kick_label, lv_pct(95));
+    lv_label_set_long_mode(snifferdog_kick_label, LV_LABEL_LONG_WRAP);
+
     snifferdog_recent_label = lv_label_create(content);
-    lv_label_set_text(snifferdog_recent_label, "Recent kick: N/A");
-    lv_obj_set_style_text_font(snifferdog_recent_label, &lv_font_montserrat_16, 0);
+    lv_label_set_text(snifferdog_recent_label, "Last kick:\nN/A");
+    lv_obj_set_style_text_font(snifferdog_recent_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(snifferdog_recent_label, COLOR_MATERIAL_RED, 0);
     lv_obj_set_style_text_align(snifferdog_recent_label, LV_TEXT_ALIGN_CENTER, 0);
-    
-    // Stop & Exit button (handshaker style)
+    lv_obj_set_width(snifferdog_recent_label, lv_pct(95));
+    lv_label_set_long_mode(snifferdog_recent_label, LV_LABEL_LONG_WRAP);
+
+    // Exit button (compact row)
     snifferdog_stop_btn = lv_btn_create(function_page);
-    lv_obj_set_size(snifferdog_stop_btn, 120, 55);
+    lv_obj_set_size(snifferdog_stop_btn, 110, 28);
     lv_obj_align(snifferdog_stop_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
     lv_obj_set_style_bg_color(snifferdog_stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(snifferdog_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(snifferdog_stop_btn, 0, 0);
-    lv_obj_set_style_radius(snifferdog_stop_btn, 10, 0);
-    lv_obj_set_style_shadow_width(snifferdog_stop_btn, 6, 0);
+    lv_obj_set_style_radius(snifferdog_stop_btn, 8, 0);
+    lv_obj_set_style_shadow_width(snifferdog_stop_btn, 4, 0);
     lv_obj_set_style_shadow_color(snifferdog_stop_btn, lv_color_make(0, 0, 0), 0);
     lv_obj_set_style_shadow_opa(snifferdog_stop_btn, LV_OPA_40, 0);
-    lv_obj_set_flex_flow(snifferdog_stop_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_ver(snifferdog_stop_btn, 4, 0);
+    lv_obj_set_style_pad_hor(snifferdog_stop_btn, 8, 0);
+    lv_obj_set_style_pad_column(snifferdog_stop_btn, 4, 0);
+    lv_obj_set_flex_flow(snifferdog_stop_btn, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(snifferdog_stop_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    
+
     lv_obj_t *x_icon = lv_label_create(snifferdog_stop_btn);
     lv_label_set_text(x_icon, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_font(x_icon, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(x_icon, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(x_icon, ui_text_color(), 0);
-    
+
     lv_obj_t *stop_text = lv_label_create(snifferdog_stop_btn);
     lv_label_set_text(stop_text, "Exit");
     lv_obj_set_style_text_font(stop_text, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(stop_text, ui_text_color(), 0);
-    
+
     lv_obj_add_event_cb(snifferdog_stop_btn, snifferdog_stop_btn_cb, LV_EVENT_CLICKED, NULL);
     
     // Start snifferdog attack (custom implementation)
@@ -8081,9 +8095,6 @@ static void handshake_attack_task_sniffer(void) {
             if (!ap->complete || ap->has_existing_file) continue;
 
             ESP_LOGI(TAG, "Saving complete handshake for '%s'...", ap->ssid);
-            size_t ssid_len = strlen(ap->ssid);
-            hccapx_serializer_init((const uint8_t *)ap->ssid, ssid_len);
-
             if (hs_save_handshake_to_sd(a)) {
                 ap->has_existing_file = true;
                 hs_total_handshakes_captured++;
@@ -8192,7 +8203,7 @@ static void hs_ui_timer_cb(lv_timer_t *timer) {
         if (hs_ui_m4_label) lv_obj_set_style_text_color(hs_ui_m4_label, m4 ? COLOR_MATERIAL_GREEN : lv_color_make(80,80,80), 0);
         if (hs_ui_stats_label) {
             char stats_buf[128];
-            snprintf(stats_buf, sizeof(stats_buf), "APs: %d   Clients: %d   Captured: %d",
+            snprintf(stats_buf, sizeof(stats_buf), "APs: %d  Cli: %d  Cap: %d",
                      hs_ap_count, hs_client_count, hs_total_handshakes_captured);
             lv_label_set_text(hs_ui_stats_label, stats_buf);
         }
@@ -8287,7 +8298,7 @@ static void hs_ui_timer_cb(lv_timer_t *timer) {
     // Stats
     if (hs_ui_stats_label) {
         char stats_buf[128];
-        snprintf(stats_buf, sizeof(stats_buf), "APs: %d   Clients: %d   Captured: %d",
+        snprintf(stats_buf, sizeof(stats_buf), "APs: %d  Cli: %d  Cap: %d",
                  hs_ap_count, hs_client_count, hs_total_handshakes_captured);
         lv_label_set_text(hs_ui_stats_label, stats_buf);
     }
@@ -8332,8 +8343,8 @@ static void handshake_yes_btn_cb(lv_event_t *e)
 
     // ─── D-UCB Channel indicator (top left) ────────────────────────
     lv_obj_t *ch_box = lv_obj_create(function_page);
-    lv_obj_set_size(ch_box, 100, 50);
-    lv_obj_align(ch_box, LV_ALIGN_TOP_LEFT, 8, 34);
+    lv_obj_set_size(ch_box, 80, 52);
+    lv_obj_align(ch_box, LV_ALIGN_TOP_LEFT, 4, 38);
     lv_obj_set_style_bg_color(ch_box, lv_color_make(30, 30, 45), 0);
     lv_obj_set_style_border_color(ch_box, lv_color_make(0, 188, 212), 0);
     lv_obj_set_style_border_width(ch_box, 2, 0);
@@ -8350,13 +8361,13 @@ static void handshake_yes_btn_cb(lv_event_t *e)
     hs_ui_channel_label = lv_label_create(ch_box);
     lv_label_set_text(hs_ui_channel_label, "CH --");
     lv_obj_set_style_text_color(hs_ui_channel_label, ui_text_color(), 0);
-    lv_obj_set_style_text_font(hs_ui_channel_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(hs_ui_channel_label, &lv_font_montserrat_14, 0);
     lv_obj_align(hs_ui_channel_label, LV_ALIGN_BOTTOM_MID, 0, -4);
 
-    // ─── Current target SSID + client status (top center-right) ───
+    // ─── Current target SSID + client status (top right) ──────────
     lv_obj_t *target_box = lv_obj_create(function_page);
-    lv_obj_set_size(target_box, 362, 50);
-    lv_obj_align(target_box, LV_ALIGN_TOP_LEFT, 116, 34);
+    lv_obj_set_size(target_box, 152, 52);
+    lv_obj_align(target_box, LV_ALIGN_TOP_LEFT, 88, 38);
     lv_obj_set_style_bg_color(target_box, lv_color_make(30, 30, 45), 0);
     lv_obj_set_style_border_color(target_box, lv_color_make(63, 81, 181), 0);
     lv_obj_set_style_border_width(target_box, 2, 0);
@@ -8368,28 +8379,35 @@ static void handshake_yes_btn_cb(lv_event_t *e)
     lv_label_set_text(tgt_title, "TARGET");
     lv_obj_set_style_text_color(tgt_title, lv_color_make(63, 81, 181), 0);
     lv_obj_set_style_text_font(tgt_title, &lv_font_montserrat_12, 0);
-    lv_obj_align(tgt_title, LV_ALIGN_TOP_LEFT, 8, 4);
+    lv_obj_align(tgt_title, LV_ALIGN_TOP_LEFT, 6, 3);
 
     hs_ui_target_label = lv_label_create(target_box);
     lv_label_set_text(hs_ui_target_label, "Scanning...");
     lv_obj_set_style_text_color(hs_ui_target_label, ui_text_color(), 0);
-    lv_obj_set_style_text_font(hs_ui_target_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_width(hs_ui_target_label, 260);
+    lv_obj_set_style_text_font(hs_ui_target_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_width(hs_ui_target_label, 130);
     lv_label_set_long_mode(hs_ui_target_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_align(hs_ui_target_label, LV_ALIGN_LEFT_MID, 8, -2);
+    lv_obj_align(hs_ui_target_label, LV_ALIGN_TOP_LEFT, 6, 18);
 
     hs_ui_status_label = lv_label_create(target_box);
     lv_label_set_text(hs_ui_status_label, "");
     lv_obj_set_style_text_color(hs_ui_status_label, COLOR_MATERIAL_ORANGE, 0);
     lv_obj_set_style_text_font(hs_ui_status_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_width(hs_ui_status_label, 340);
+    lv_obj_set_width(hs_ui_status_label, 130);
     lv_label_set_long_mode(hs_ui_status_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_align(hs_ui_status_label, LV_ALIGN_BOTTOM_LEFT, 8, -2);
+    lv_obj_align(hs_ui_status_label, LV_ALIGN_BOTTOM_LEFT, 6, -3);
+
+    // ─── "HANDSHAKE PROGRESS" header (above progress box) ─────────
+    lv_obj_t *hdr_progress = lv_label_create(function_page);
+    lv_label_set_text(hdr_progress, "HANDSHAKE PROGRESS");
+    lv_obj_set_style_text_color(hdr_progress, lv_color_make(76, 175, 80), 0);
+    lv_obj_set_style_text_font(hdr_progress, &lv_font_montserrat_12, 0);
+    lv_obj_align(hdr_progress, LV_ALIGN_TOP_MID, 0, 96);
 
     // ─── Beacon + M1-M4 Progress row ──────────────────────────────
     lv_obj_t *progress_box = lv_obj_create(function_page);
-    lv_obj_set_size(progress_box, lv_pct(97), 60);
-    lv_obj_align(progress_box, LV_ALIGN_TOP_MID, 0, 90);
+    lv_obj_set_size(progress_box, lv_pct(97), 42);
+    lv_obj_align(progress_box, LV_ALIGN_TOP_MID, 0, 112);
     lv_obj_set_style_bg_color(progress_box, lv_color_make(20, 20, 30), 0);
     lv_obj_set_style_border_color(progress_box, lv_color_make(76, 175, 80), 0);
     lv_obj_set_style_border_width(progress_box, 2, 0);
@@ -8399,63 +8417,62 @@ static void handshake_yes_btn_cb(lv_event_t *e)
     lv_obj_set_flex_flow(progress_box, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(progress_box, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    lv_obj_t *hdr_progress = lv_label_create(progress_box);
-    lv_label_set_text(hdr_progress, "HANDSHAKE PROGRESS");
-    lv_obj_set_style_text_color(hdr_progress, lv_color_make(76, 175, 80), 0);
-    lv_obj_set_style_text_font(hdr_progress, &lv_font_montserrat_12, 0);
-    lv_obj_align(hdr_progress, LV_ALIGN_TOP_MID, 0, 2);
-
     // Beacon icon
     hs_ui_beacon_label = lv_label_create(progress_box);
     lv_label_set_text(hs_ui_beacon_label, LV_SYMBOL_WARNING);
     lv_obj_set_style_text_color(hs_ui_beacon_label, lv_color_make(80, 80, 80), 0);
-    lv_obj_set_style_text_font(hs_ui_beacon_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(hs_ui_beacon_label, &lv_font_montserrat_14, 0);
 
     // M1-M4 indicators
     hs_ui_m1_label = lv_label_create(progress_box);
     lv_label_set_text(hs_ui_m1_label, "M1");
     lv_obj_set_style_text_color(hs_ui_m1_label, lv_color_make(80, 80, 80), 0);
-    lv_obj_set_style_text_font(hs_ui_m1_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(hs_ui_m1_label, &lv_font_montserrat_14, 0);
 
     hs_ui_m2_label = lv_label_create(progress_box);
     lv_label_set_text(hs_ui_m2_label, "M2");
     lv_obj_set_style_text_color(hs_ui_m2_label, lv_color_make(80, 80, 80), 0);
-    lv_obj_set_style_text_font(hs_ui_m2_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(hs_ui_m2_label, &lv_font_montserrat_14, 0);
 
     hs_ui_m3_label = lv_label_create(progress_box);
     lv_label_set_text(hs_ui_m3_label, "M3");
     lv_obj_set_style_text_color(hs_ui_m3_label, lv_color_make(80, 80, 80), 0);
-    lv_obj_set_style_text_font(hs_ui_m3_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(hs_ui_m3_label, &lv_font_montserrat_14, 0);
 
     hs_ui_m4_label = lv_label_create(progress_box);
     lv_label_set_text(hs_ui_m4_label, "M4");
     lv_obj_set_style_text_color(hs_ui_m4_label, lv_color_make(80, 80, 80), 0);
-    lv_obj_set_style_text_font(hs_ui_m4_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(hs_ui_m4_label, &lv_font_montserrat_14, 0);
 
     // ─── Stats bar ────────────────────────────────────────────────
     hs_ui_stats_label = lv_label_create(function_page);
-    lv_label_set_text(hs_ui_stats_label, "APs: 0   Clients: 0   Captured: 0");
+    lv_label_set_text(hs_ui_stats_label, "APs: 0  Cli: 0  Cap: 0");
     lv_obj_set_style_text_color(hs_ui_stats_label, ui_muted_color(), 0);
-    lv_obj_set_style_text_font(hs_ui_stats_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(hs_ui_stats_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_width(hs_ui_stats_label, lv_pct(95));
+    lv_label_set_long_mode(hs_ui_stats_label, LV_LABEL_LONG_WRAP);
     lv_obj_align(hs_ui_stats_label, LV_ALIGN_TOP_MID, 0, 160);
 
-    // ─── Stop & Exit button (bottom center) ───────────────────────
+    // ─── Stop & Exit button (compact row) ─────────────────────────
     handshake_stop_btn = lv_btn_create(function_page);
-    lv_obj_set_size(handshake_stop_btn, 120, 55);
+    lv_obj_set_size(handshake_stop_btn, 110, 28);
     lv_obj_align(handshake_stop_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
     lv_obj_set_style_bg_color(handshake_stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(handshake_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(handshake_stop_btn, 0, 0);
-    lv_obj_set_style_radius(handshake_stop_btn, 10, 0);
-    lv_obj_set_style_shadow_width(handshake_stop_btn, 6, 0);
+    lv_obj_set_style_radius(handshake_stop_btn, 8, 0);
+    lv_obj_set_style_shadow_width(handshake_stop_btn, 4, 0);
     lv_obj_set_style_shadow_color(handshake_stop_btn, lv_color_make(0, 0, 0), 0);
     lv_obj_set_style_shadow_opa(handshake_stop_btn, LV_OPA_40, 0);
-    lv_obj_set_flex_flow(handshake_stop_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_ver(handshake_stop_btn, 4, 0);
+    lv_obj_set_style_pad_hor(handshake_stop_btn, 8, 0);
+    lv_obj_set_style_pad_column(handshake_stop_btn, 4, 0);
+    lv_obj_set_flex_flow(handshake_stop_btn, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(handshake_stop_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
     lv_obj_t *x_icon = lv_label_create(handshake_stop_btn);
     lv_label_set_text(x_icon, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_font(x_icon, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(x_icon, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(x_icon, ui_text_color(), 0);
 
     lv_obj_t *stop_text = lv_label_create(handshake_stop_btn);
@@ -10055,7 +10072,11 @@ static void create_function_page_base(const char *name)
     lv_obj_t *page_title_label = lv_label_create(page_title_bar);
     lv_label_set_text(page_title_label, name ? name : "");
     lv_obj_set_style_text_color(page_title_label, ui_text_color(), 0);
-    lv_obj_center(page_title_label);
+    // Constrain to space right of both left buttons (home 30px + dark btn 24px + gaps = 62px)
+    lv_obj_set_width(page_title_label, 170);
+    lv_obj_align(page_title_label, LV_ALIGN_LEFT_MID, 62, 0);
+    lv_obj_set_style_text_align(page_title_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(page_title_label, LV_LABEL_LONG_DOT);
 
     lv_obj_add_flag(page_title_label, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(page_title_label, screenshot_btn_event_cb, LV_EVENT_CLICKED, NULL);
@@ -10165,6 +10186,7 @@ static void radio_reset_to_idle(void)
         esp_wifi_stop();
         esp_wifi_set_mode(WIFI_MODE_STA);
         esp_wifi_start();
+        vTaskDelay(pdMS_TO_TICKS(300));  // let STA task finish starting before scan is allowed
 
         wifi_country_t wifi_country = {
             .cc = "PH",
@@ -14231,9 +14253,9 @@ static void show_sd_provision_running_screen(bool after_format)
     const char *title = after_format ? "Format + Provision" : "Validate & Provision";
     create_function_page_base(title);
 
-    // Log text area — scrollable, monospace-ish
+    // Log text area — scrollable, monospace-ish; shortened to leave room for bottom bar
     sd_provision_log_ta = lv_textarea_create(function_page);
-    lv_obj_set_size(sd_provision_log_ta, lv_pct(100), LCD_V_RES - 30 - 50);
+    lv_obj_set_size(sd_provision_log_ta, lv_pct(100), LCD_V_RES - 30 - 44);
     lv_obj_align(sd_provision_log_ta, LV_ALIGN_TOP_MID, 0, 30);
     lv_textarea_set_max_length(sd_provision_log_ta, 4096);
     lv_textarea_set_one_line(sd_provision_log_ta, false);
@@ -14245,17 +14267,31 @@ static void show_sd_provision_running_screen(bool after_format)
     lv_obj_set_style_pad_all(sd_provision_log_ta, 4, 0);
     lv_obj_clear_flag(sd_provision_log_ta, LV_OBJ_FLAG_CLICKABLE);
 
-    // Status / summary label
-    sd_provision_status_label = lv_label_create(function_page);
+    // Bottom bar: status label (left) + back button (right), flex row
+    lv_obj_t *bottom_bar = lv_obj_create(function_page);
+    lv_obj_set_size(bottom_bar, lv_pct(100), 38);
+    lv_obj_align(bottom_bar, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(bottom_bar, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(bottom_bar, 0, 0);
+    lv_obj_set_style_radius(bottom_bar, 0, 0);
+    lv_obj_set_style_pad_hor(bottom_bar, 8, 0);
+    lv_obj_set_style_pad_ver(bottom_bar, 4, 0);
+    lv_obj_set_style_pad_column(bottom_bar, 6, 0);
+    lv_obj_clear_flag(bottom_bar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(bottom_bar, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(bottom_bar, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    // Status / summary label — grows to fill left side
+    sd_provision_status_label = lv_label_create(bottom_bar);
     lv_label_set_text(sd_provision_status_label, "Running...");
     lv_obj_set_style_text_color(sd_provision_status_label, ui_muted_color(), 0);
     lv_obj_set_style_text_font(sd_provision_status_label, &lv_font_montserrat_14, 0);
-    lv_obj_align(sd_provision_status_label, LV_ALIGN_BOTTOM_LEFT, 8, -8);
+    lv_label_set_long_mode(sd_provision_status_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_flex_grow(sd_provision_status_label, 1);
 
     // Back button — disabled until task completes
-    sd_prov_back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(sd_prov_back_btn, 60, 32);
-    lv_obj_align(sd_prov_back_btn, LV_ALIGN_BOTTOM_RIGHT, -8, -6);
+    sd_prov_back_btn = lv_btn_create(bottom_bar);
+    lv_obj_set_size(sd_prov_back_btn, 60, 30);
     lv_obj_set_style_bg_color(sd_prov_back_btn, lv_color_hex(0x333333), LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(sd_prov_back_btn, 0, 0);
     lv_obj_set_style_radius(sd_prov_back_btn, 8, 0);
@@ -14462,6 +14498,125 @@ static void show_sd_free_space_screen(void)
     lv_obj_center(back_lbl);
 }
 
+// ─── File Tree screen ────────────────────────────────────────────────────────
+
+static void sd_tree_walk(char *buf, size_t bufsz, const char *path, int depth, size_t *pos)
+{
+    if (depth > 8) return;
+    DIR *dir = opendir(path);
+    if (!dir) return;
+    struct dirent *entry;
+    char child[300];
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        if (*pos + 128 >= bufsz) {
+            if (bufsz - *pos > 20)
+                *pos += snprintf(buf + *pos, bufsz - *pos, "...(truncated)\n");
+            break;
+        }
+        snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+        struct stat st;
+        bool have_stat = (stat(child, &st) == 0);
+        bool is_dir    = have_stat && S_ISDIR(st.st_mode);
+
+        for (int i = 0; i < depth * 2 && *pos + 1 < bufsz; i++)
+            buf[(*pos)++] = ' ';
+
+        if (is_dir) {
+            *pos += snprintf(buf + *pos, bufsz - *pos, "%s/\n", entry->d_name);
+            sd_tree_walk(buf, bufsz, child, depth + 1, pos);
+        } else {
+            if (have_stat) {
+                uint32_t sz = (uint32_t)st.st_size;
+                char sz_str[12];
+                if (sz >= 1024 * 1024)
+                    snprintf(sz_str, sizeof(sz_str), "%luM", (unsigned long)(sz / (1024 * 1024)));
+                else if (sz >= 1024)
+                    snprintf(sz_str, sizeof(sz_str), "%luK", (unsigned long)(sz / 1024));
+                else
+                    snprintf(sz_str, sizeof(sz_str), "%luB", (unsigned long)sz);
+                *pos += snprintf(buf + *pos, bufsz - *pos, "%s [%s]\n", entry->d_name, sz_str);
+            } else {
+                *pos += snprintf(buf + *pos, bufsz - *pos, "%s\n", entry->d_name);
+            }
+        }
+    }
+    closedir(dir);
+}
+
+static void show_sd_tree_screen(void)
+{
+    create_function_page_base("SD File Tree");
+
+    const size_t bufsz = 16 * 1024;
+    char *tree_buf = heap_caps_malloc(bufsz, MALLOC_CAP_SPIRAM);
+    if (!tree_buf) tree_buf = malloc(4096);
+
+    if (!tree_buf) {
+        lv_obj_t *err = lv_label_create(function_page);
+        lv_label_set_text(err, "Out of memory");
+        lv_obj_set_style_text_color(err, COLOR_MATERIAL_RED, 0);
+        lv_obj_align(err, LV_ALIGN_CENTER, 0, 0);
+    } else {
+        size_t pos = 0;
+        tree_buf[0] = '\0';
+
+        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+            sd_tree_walk(tree_buf, bufsz, "/sdcard", 0, &pos);
+            xSemaphoreGive(sd_spi_mutex);
+        } else {
+            pos += snprintf(tree_buf, bufsz, "SD not available");
+        }
+        if (pos == 0) pos += snprintf(tree_buf, bufsz, "(empty)");
+        tree_buf[pos < bufsz ? pos : bufsz - 1] = '\0';
+
+        lv_obj_t *scroll_cont = lv_obj_create(function_page);
+        lv_obj_set_size(scroll_cont, lv_pct(100), LCD_V_RES - 35 - 43);
+        lv_obj_align(scroll_cont, LV_ALIGN_TOP_MID, 0, 35);
+        lv_obj_set_style_bg_color(scroll_cont, ui_bg_color(), 0);
+        lv_obj_set_style_border_color(scroll_cont, ui_border_color(), 0);
+        lv_obj_set_style_border_width(scroll_cont, 1, 0);
+        lv_obj_set_style_radius(scroll_cont, 6, 0);
+        lv_obj_set_style_pad_all(scroll_cont, 6, 0);
+
+        lv_obj_t *tree_label = lv_label_create(scroll_cont);
+        lv_label_set_long_mode(tree_label, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(tree_label, lv_pct(100));
+        lv_obj_set_style_text_font(tree_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(tree_label, ui_text_color(), 0);
+        lv_label_set_text(tree_label, tree_buf);
+        free(tree_buf);
+    }
+
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 28);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_style_shadow_width(back_btn, 4, 0);
+    lv_obj_set_style_shadow_color(back_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(back_btn, LV_OPA_40, 0);
+    lv_obj_set_style_pad_ver(back_btn, 4, 0);
+    lv_obj_set_style_pad_hor(back_btn, 8, 0);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(back_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(back_icon, ui_text_color(), 0);
+
+    lv_obj_t *back_text = lv_label_create(back_btn);
+    lv_label_set_text(back_text, "Back");
+    lv_obj_set_style_text_font(back_text, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(back_text, ui_text_color(), 0);
+
+    lv_obj_add_event_cb(back_btn, sd_back_to_menu_cb, LV_EVENT_CLICKED, NULL);
+}
+
 // ─── Format — two-stage confirmation ─────────────────────────────────────────
 
 static void sd_format_confirm2_yes_cb(lv_event_t *e)
@@ -14578,6 +14733,7 @@ static void sd_card_tile_event_cb(lv_event_t *e)
     if (!name) return;
     if      (strcmp(name, "Validate") == 0)   show_sd_provision_confirm(false);
     else if (strcmp(name, "Free Space") == 0) show_sd_free_space_screen();
+    else if (strcmp(name, "Tree") == 0)       show_sd_tree_screen();
     else if (strcmp(name, "Format") == 0)     show_sd_format_confirm1();
 }
 
@@ -14599,6 +14755,8 @@ static void show_sd_card_screen(void)
                 sd_card_tile_event_cb, "Validate");
     create_tile(tiles, LV_SYMBOL_DRIVE,   "Free\nSpace",            COLOR_TILE_BLUE,
                 sd_card_tile_event_cb, "Free Space");
+    create_tile(tiles, LV_SYMBOL_LIST,    "File\nTree",             COLOR_MATERIAL_ORANGE,
+                sd_card_tile_event_cb, "Tree");
     create_tile(tiles, LV_SYMBOL_WARNING, "Format\nSD Card",        COLOR_MATERIAL_RED,
                 sd_card_tile_event_cb, "Format");
 }
@@ -14797,20 +14955,20 @@ static void show_bt_locator_screen(void)
     
     // Content container - positioned below title bar (30px)
     bt_locator_content = lv_obj_create(function_page);
-    lv_obj_set_size(bt_locator_content, lv_pct(100), LCD_V_RES - 30 - 50);  // Leave space for title and exit btn
+    lv_obj_set_size(bt_locator_content, lv_pct(100), LCD_V_RES - 30 - 43);  // Leave space for title and exit btn
     lv_obj_align(bt_locator_content, LV_ALIGN_TOP_MID, 0, 30);  // Start below title bar
     lv_obj_set_style_bg_opa(bt_locator_content, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(bt_locator_content, 0, 0);
     lv_obj_set_style_pad_all(bt_locator_content, 5, 0);
     lv_obj_clear_flag(bt_locator_content, LV_OBJ_FLAG_SCROLLABLE);
-    
+
     // Status label centered - "BT scanning..." (will be hidden when list/tracking shown)
     bt_locator_status_label = lv_label_create(bt_locator_content);
     lv_label_set_text(bt_locator_status_label, "BT scanning...");
     lv_obj_set_style_text_color(bt_locator_status_label, ui_text_color(), 0);
     lv_obj_set_style_text_font(bt_locator_status_label, &lv_font_montserrat_16, 0);
     lv_obj_center(bt_locator_status_label);
-    
+
     // Header label above list (hidden until scan complete)
     lv_obj_t *list_header = lv_label_create(bt_locator_content);
     lv_label_set_text(list_header, "Select BT Target:");
@@ -14819,10 +14977,10 @@ static void show_bt_locator_screen(void)
     lv_obj_align(list_header, LV_ALIGN_TOP_LEFT, 5, 0);
     lv_obj_add_flag(list_header, LV_OBJ_FLAG_HIDDEN);  // Hidden until scan done
     lv_obj_set_user_data(bt_locator_content, list_header);  // Store for later access
-    
+
     // Scrollable list for devices (hidden until scan complete)
     bt_locator_list = lv_obj_create(bt_locator_content);
-    lv_obj_set_size(bt_locator_list, lv_pct(100), LCD_V_RES - 30 - 70 - 25);  // Same height as BLE Scan list
+    lv_obj_set_size(bt_locator_list, lv_pct(100), LCD_V_RES - 30 - 48 - 25);  // Same height as BLE Scan list
     lv_obj_align(bt_locator_list, LV_ALIGN_TOP_MID, 0, 20);  // Below header
     lv_obj_set_style_bg_color(bt_locator_list, ui_bg_color(), 0);
     lv_obj_set_style_border_color(bt_locator_list, ui_accent_color(), 0);
@@ -14849,30 +15007,33 @@ static void show_bt_locator_screen(void)
     lv_obj_align(bt_locator_mac_label, LV_ALIGN_CENTER, 0, 20);
     lv_obj_add_flag(bt_locator_mac_label, LV_OBJ_FLAG_HIDDEN);
     
-    // Red Exit button at bottom (like AirTag scanner)
+    // Red Exit button at bottom (compact row)
     bt_locator_exit_btn = lv_btn_create(function_page);
-    lv_obj_set_size(bt_locator_exit_btn, 120, 55);
+    lv_obj_set_size(bt_locator_exit_btn, 110, 28);
     lv_obj_align(bt_locator_exit_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
     lv_obj_set_style_bg_color(bt_locator_exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(bt_locator_exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(bt_locator_exit_btn, 0, 0);
-    lv_obj_set_style_radius(bt_locator_exit_btn, 10, 0);
-    lv_obj_set_style_shadow_width(bt_locator_exit_btn, 6, 0);
+    lv_obj_set_style_radius(bt_locator_exit_btn, 8, 0);
+    lv_obj_set_style_shadow_width(bt_locator_exit_btn, 4, 0);
     lv_obj_set_style_shadow_color(bt_locator_exit_btn, lv_color_make(0, 0, 0), 0);
     lv_obj_set_style_shadow_opa(bt_locator_exit_btn, LV_OPA_40, 0);
-    lv_obj_set_flex_flow(bt_locator_exit_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_ver(bt_locator_exit_btn, 4, 0);
+    lv_obj_set_style_pad_hor(bt_locator_exit_btn, 8, 0);
+    lv_obj_set_style_pad_column(bt_locator_exit_btn, 4, 0);
+    lv_obj_set_flex_flow(bt_locator_exit_btn, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(bt_locator_exit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    
+
     lv_obj_t *exit_icon = lv_label_create(bt_locator_exit_btn);
     lv_label_set_text(exit_icon, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_font(exit_icon, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(exit_icon, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(exit_icon, ui_text_color(), 0);
-    
+
     lv_obj_t *exit_lbl = lv_label_create(bt_locator_exit_btn);
     lv_label_set_text(exit_lbl, "Exit");
     lv_obj_set_style_text_font(exit_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(exit_lbl, ui_text_color(), 0);
-    
+
     lv_obj_add_event_cb(bt_locator_exit_btn, bt_locator_exit_cb, LV_EVENT_CLICKED, NULL);
     
     // Switch to BLE mode
@@ -17214,8 +17375,19 @@ static void deauth_monitor_promiscuous_callback(void *buf, wifi_promiscuous_pkt_
     deauth_monitor_update_flag = true;
     
     portEXIT_CRITICAL(&deauth_monitor_spin);
-    
-    /*ESP_LOGI(TAG, "[DEAUTH] CH: %d | %s | RSSI: %d", 
+
+    // Enqueue raw frame for PCAP write (non-blocking — never stall the WiFi task)
+    if (deauth_pcap_queue) {
+        deauth_pcap_frame_t pf;
+        int copy_len = len < (int)sizeof(pf.frame) ? len : (int)sizeof(pf.frame);
+        memcpy(pf.frame, frame, copy_len);
+        pf.len          = (uint16_t)copy_len;
+        pf.rssi         = rssi;
+        pf.timestamp_us = esp_timer_get_time();
+        xQueueSend(deauth_pcap_queue, &pf, 0);
+    }
+
+    /*ESP_LOGI(TAG, "[DEAUTH] CH: %d | %s | RSSI: %d",
              deauth_monitor_current_channel,
              deauth_monitor_attacks[idx].ssid,
              rssi);*/
@@ -17230,15 +17402,32 @@ static void deauth_monitor_task(void *pvParameters)
     
     while (deauth_monitor_active) {
         vTaskDelay(pdMS_TO_TICKS(50)); // Check every 50ms
-        
+
         if (!deauth_monitor_active) {
             break;
         }
-        
+
+        // Drain queued raw frames to PCAP file
+        if (deauth_pcap_queue && deauth_pcap_file && sd_spi_mutex &&
+            xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+            deauth_pcap_frame_t pf;
+            while (xQueueReceive(deauth_pcap_queue, &pf, 0) == pdTRUE) {
+                pcap_record_header_t rh;
+                rh.ts_sec  = (uint32_t)(pf.timestamp_us / 1000000);
+                rh.ts_usec = (uint32_t)(pf.timestamp_us % 1000000);
+                rh.incl_len = pf.len;
+                rh.orig_len = pf.len;
+                fwrite(&rh, sizeof(rh), 1, deauth_pcap_file);
+                fwrite(pf.frame, 1, pf.len, deauth_pcap_file);
+            }
+            fflush(deauth_pcap_file);
+            xSemaphoreGive(sd_spi_mutex);
+        }
+
         // Force channel hop if 250ms passed
         int64_t current_time = esp_timer_get_time() / 1000;
         bool time_expired = (current_time - deauth_monitor_last_channel_hop >= sniffer_channel_hop_delay_ms);
-        
+
         if (time_expired) {
             deauth_monitor_channel_hop();
         }
@@ -17255,31 +17444,60 @@ static void deauth_monitor_exit_cb(lv_event_t *e)
     (void)e;
     
     ESP_LOGI(TAG, "Stopping deauth monitor...");
-    
-    // Stop monitoring
+
+    // Stop monitoring (task will stop enqueuing frames)
     deauth_monitor_active = false;
     deauth_monitor_ui_active = false;
     deauth_monitor_scan_pending = false;
-    
+
     // Disable promiscuous mode
     esp_wifi_set_promiscuous(false);
-    
-    // Wait for task to finish
+
+    // Wait for task to do one final drain cycle then exit
     if (deauth_monitor_task_handle != NULL) {
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(150));
     }
-    
+
+    // Flush and close PCAP file
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        if (deauth_pcap_file) {
+            // Drain any remaining queued frames
+            if (deauth_pcap_queue) {
+                deauth_pcap_frame_t pf;
+                while (xQueueReceive(deauth_pcap_queue, &pf, 0) == pdTRUE) {
+                    pcap_record_header_t rh;
+                    rh.ts_sec  = (uint32_t)(pf.timestamp_us / 1000000);
+                    rh.ts_usec = (uint32_t)(pf.timestamp_us % 1000000);
+                    rh.incl_len = pf.len;
+                    rh.orig_len = pf.len;
+                    fwrite(&rh, sizeof(rh), 1, deauth_pcap_file);
+                    fwrite(pf.frame, 1, pf.len, deauth_pcap_file);
+                }
+            }
+            fflush(deauth_pcap_file);
+            fclose(deauth_pcap_file);
+            deauth_pcap_file = NULL;
+            ESP_LOGI(TAG, "Deauth PCAP saved: %s", deauth_pcap_path);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    if (deauth_pcap_queue) {
+        vQueueDelete(deauth_pcap_queue);
+        deauth_pcap_queue = NULL;
+    }
+    deauth_pcap_path[0] = '\0';
+
     // Free task stack
     if (deauth_monitor_task_stack != NULL) {
         heap_caps_free(deauth_monitor_task_stack);
         deauth_monitor_task_stack = NULL;
     }
-    
+
     // Reset state
     deauth_monitor_attack_count = 0;
     deauth_monitor_channel_index = 0;
     deauth_monitor_current_channel = 1;
-    
+
     // Navigate to menu
     nav_to_menu_flag = true;
 }
@@ -17326,6 +17544,50 @@ static void deauth_monitor_start_monitoring(void)
         ESP_LOGE(TAG, "Failed to allocate deauth monitor task stack");
     }
     
+    // Open PCAP file on SD for raw frame capture
+    deauth_pcap_queue = xQueueCreate(16, sizeof(deauth_pcap_frame_t));
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        struct stat st = {0};
+        if (stat("/sdcard/lab/deauths", &st) == -1) {
+            mkdir("/sdcard/lab", 0777);
+            mkdir("/sdcard/lab/deauths", 0700);
+        }
+        snprintf(deauth_pcap_path, sizeof(deauth_pcap_path),
+                 "/sdcard/lab/deauths/deauth_%llu.pcap",
+                 (unsigned long long)(esp_timer_get_time() / 1000));
+        deauth_pcap_file = fopen(deauth_pcap_path, "wb");
+        if (deauth_pcap_file) {
+            pcap_global_header_t gh = {
+                .magic_number  = 0xa1b2c3d4,
+                .version_major = 2,
+                .version_minor = 4,
+                .thiszone      = 0,
+                .sigfigs       = 0,
+                .snaplen       = 65535,
+                .network       = LINKTYPE_IEEE80211
+            };
+            fwrite(&gh, sizeof(gh), 1, deauth_pcap_file);
+            fflush(deauth_pcap_file);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    // Update recording status label
+    if (deauth_monitor_rec_label && lv_obj_is_valid(deauth_monitor_rec_label)) {
+        if (deauth_pcap_file) {
+            // Show just the filename portion to fit the bar
+            const char *fname = strrchr(deauth_pcap_path, '/');
+            fname = fname ? fname + 1 : deauth_pcap_path;
+            char rec_buf[80];
+            snprintf(rec_buf, sizeof(rec_buf), LV_SYMBOL_SD_CARD " %s", fname);
+            lv_label_set_text(deauth_monitor_rec_label, rec_buf);
+            lv_obj_set_style_text_color(deauth_monitor_rec_label, COLOR_MATERIAL_RED, 0);
+        } else {
+            lv_label_set_text(deauth_monitor_rec_label, LV_SYMBOL_SD_CARD " SD unavailable");
+            lv_obj_set_style_text_color(deauth_monitor_rec_label, lv_color_make(150, 150, 150), 0);
+        }
+    }
+
     ESP_LOGI(TAG, "Deauth monitor started after scan");
 }
 
@@ -17356,7 +17618,7 @@ static void show_deauth_monitor_screen(void)
     
     // Create attack list (hidden initially)
     deauth_monitor_list = lv_list_create(function_page);
-    lv_obj_set_size(deauth_monitor_list, lv_pct(100), LCD_V_RES - 30 - 70);  // Leave space for title and exit button
+    lv_obj_set_size(deauth_monitor_list, lv_pct(100), LCD_V_RES - 30 - 95);  // Leave space for title, rec label, and exit button
     lv_obj_align(deauth_monitor_list, LV_ALIGN_TOP_MID, 0, 35);
     lv_obj_set_style_bg_color(deauth_monitor_list, ui_bg_color(), 0);
     lv_obj_set_style_border_width(deauth_monitor_list, 0, LV_PART_ITEMS);
@@ -17367,32 +17629,44 @@ static void show_deauth_monitor_screen(void)
     lv_obj_set_style_text_color(list_title, COLOR_MATERIAL_RED, 0);
     lv_obj_set_style_text_font(list_title, &lv_font_montserrat_14, 0);
     
-    // Red Exit button at bottom
+    // Red Exit button at bottom — compact single-row size leaves room for a second button
     lv_obj_t *exit_btn = lv_btn_create(function_page);
-    lv_obj_set_size(exit_btn, 120, 55);
+    lv_obj_set_size(exit_btn, 110, 28);
     lv_obj_align(exit_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
     lv_obj_set_style_bg_color(exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(exit_btn, 0, 0);
-    lv_obj_set_style_radius(exit_btn, 10, 0);
-    lv_obj_set_style_shadow_width(exit_btn, 6, 0);
+    lv_obj_set_style_radius(exit_btn, 8, 0);
+    lv_obj_set_style_shadow_width(exit_btn, 4, 0);
     lv_obj_set_style_shadow_color(exit_btn, lv_color_make(0, 0, 0), 0);
     lv_obj_set_style_shadow_opa(exit_btn, LV_OPA_40, 0);
-    lv_obj_set_flex_flow(exit_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_ver(exit_btn, 4, 0);
+    lv_obj_set_style_pad_hor(exit_btn, 8, 0);
+    lv_obj_set_style_pad_column(exit_btn, 4, 0);
+    lv_obj_set_flex_flow(exit_btn, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(exit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    
+
     lv_obj_t *exit_icon = lv_label_create(exit_btn);
     lv_label_set_text(exit_icon, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_font(exit_icon, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(exit_icon, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(exit_icon, ui_text_color(), 0);
-    
+
     lv_obj_t *exit_text = lv_label_create(exit_btn);
     lv_label_set_text(exit_text, "Exit");
     lv_obj_set_style_text_font(exit_text, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(exit_text, ui_text_color(), 0);
-    
+
     lv_obj_add_event_cb(exit_btn, deauth_monitor_exit_cb, LV_EVENT_CLICKED, NULL);
-    
+
+    // Recording status label — updated once monitoring starts
+    deauth_monitor_rec_label = lv_label_create(function_page);
+    lv_label_set_text(deauth_monitor_rec_label, LV_SYMBOL_SD_CARD " Waiting for scan...");
+    lv_obj_set_style_text_font(deauth_monitor_rec_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(deauth_monitor_rec_label, lv_color_make(150, 150, 150), 0);
+    lv_obj_set_style_text_align(deauth_monitor_rec_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(deauth_monitor_rec_label, lv_pct(100));
+    lv_obj_align(deauth_monitor_rec_label, LV_ALIGN_BOTTOM_MID, 0, -46);
+
     // Set UI active but not monitoring yet (waiting for scan)
     deauth_monitor_ui_active = true;
     deauth_monitor_active = false;  // Will be set true after scan
@@ -17533,7 +17807,7 @@ static void show_found_tags_screen(void)
 
     // Scrollable list container
     lv_obj_t *list = lv_obj_create(function_page);
-    lv_obj_set_size(list, lv_pct(100), LCD_V_RES - 30 - 65);
+    lv_obj_set_size(list, lv_pct(100), LCD_V_RES - 30 - 43);
     lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 30);
     lv_obj_set_style_bg_color(list, ui_bg_color(), 0);
     lv_obj_set_style_border_width(list, 0, 0);
@@ -17616,19 +17890,30 @@ static void show_found_tags_screen(void)
         lv_obj_center(empty);
     }
 
-    // Back button
+    // Back button (compact row)
     lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 120, 50);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_size(back_btn, 110, 28);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
     lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(back_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_set_style_radius(back_btn, 10, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_style_shadow_width(back_btn, 4, 0);
+    lv_obj_set_style_shadow_color(back_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(back_btn, LV_OPA_40, 0);
+    lv_obj_set_style_pad_ver(back_btn, 4, 0);
+    lv_obj_set_style_pad_hor(back_btn, 8, 0);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(back_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(back_icon, lv_color_white(), 0);
     lv_obj_t *back_lbl = lv_label_create(back_btn);
-    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT "  Back");
-    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_14, 0);
+    lv_label_set_text(back_lbl, "Back");
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
-    lv_obj_center(back_lbl);
     lv_obj_add_event_cb(back_btn, found_tags_back_btn_cb, LV_EVENT_CLICKED, NULL);
 }
 
@@ -17672,7 +17957,7 @@ static void show_tag_tracker_screen(int dev_idx)
 
     // Content container
     bt_locator_content = lv_obj_create(function_page);
-    lv_obj_set_size(bt_locator_content, lv_pct(100), LCD_V_RES - 30 - 65);
+    lv_obj_set_size(bt_locator_content, lv_pct(100), LCD_V_RES - 30 - 43);
     lv_obj_align(bt_locator_content, LV_ALIGN_TOP_MID, 0, 30);
     lv_obj_set_style_bg_opa(bt_locator_content, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(bt_locator_content, 0, 0);
@@ -17713,19 +17998,25 @@ static void show_tag_tracker_screen(int dev_idx)
     lv_obj_set_style_text_font(bt_locator_status_label, &lv_font_montserrat_14, 0);
     lv_obj_align(bt_locator_status_label, LV_ALIGN_CENTER, 0, -60);
 
-    // Exit button
+    // Exit button (compact row)
     bt_locator_exit_btn = lv_btn_create(function_page);
-    lv_obj_set_size(bt_locator_exit_btn, 120, 50);
-    lv_obj_align(bt_locator_exit_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_size(bt_locator_exit_btn, 110, 28);
+    lv_obj_align(bt_locator_exit_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
     lv_obj_set_style_bg_color(bt_locator_exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(bt_locator_exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(bt_locator_exit_btn, 0, 0);
-    lv_obj_set_style_radius(bt_locator_exit_btn, 10, 0);
-    lv_obj_set_flex_flow(bt_locator_exit_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_radius(bt_locator_exit_btn, 8, 0);
+    lv_obj_set_style_shadow_width(bt_locator_exit_btn, 4, 0);
+    lv_obj_set_style_shadow_color(bt_locator_exit_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(bt_locator_exit_btn, LV_OPA_40, 0);
+    lv_obj_set_style_pad_ver(bt_locator_exit_btn, 4, 0);
+    lv_obj_set_style_pad_hor(bt_locator_exit_btn, 8, 0);
+    lv_obj_set_style_pad_column(bt_locator_exit_btn, 4, 0);
+    lv_obj_set_flex_flow(bt_locator_exit_btn, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(bt_locator_exit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_t *exit_icon2 = lv_label_create(bt_locator_exit_btn);
     lv_label_set_text(exit_icon2, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_font(exit_icon2, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(exit_icon2, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(exit_icon2, lv_color_white(), 0);
     lv_obj_t *exit_text2 = lv_label_create(bt_locator_exit_btn);
     lv_label_set_text(exit_text2, "Exit");
@@ -17820,30 +18111,33 @@ static void show_airtag_scan_screen(void)
     lv_obj_add_event_cb(airtag_view_tags_btn, airtag_view_tags_btn_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_flag(airtag_view_tags_btn, LV_OBJ_FLAG_HIDDEN);
 
-    // Red Exit button at bottom
+    // Exit button (compact row)
     lv_obj_t *exit_btn = lv_btn_create(function_page);
-    lv_obj_set_size(exit_btn, 120, 55);
+    lv_obj_set_size(exit_btn, 110, 28);
     lv_obj_align(exit_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
     lv_obj_set_style_bg_color(exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(exit_btn, 0, 0);
-    lv_obj_set_style_radius(exit_btn, 10, 0);
-    lv_obj_set_style_shadow_width(exit_btn, 6, 0);
+    lv_obj_set_style_radius(exit_btn, 8, 0);
+    lv_obj_set_style_shadow_width(exit_btn, 4, 0);
     lv_obj_set_style_shadow_color(exit_btn, lv_color_make(0, 0, 0), 0);
     lv_obj_set_style_shadow_opa(exit_btn, LV_OPA_40, 0);
-    lv_obj_set_flex_flow(exit_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_ver(exit_btn, 4, 0);
+    lv_obj_set_style_pad_hor(exit_btn, 8, 0);
+    lv_obj_set_style_pad_column(exit_btn, 4, 0);
+    lv_obj_set_flex_flow(exit_btn, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(exit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    
+
     lv_obj_t *exit_icon = lv_label_create(exit_btn);
     lv_label_set_text(exit_icon, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_font(exit_icon, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(exit_icon, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(exit_icon, ui_text_color(), 0);
-    
+
     lv_obj_t *exit_text = lv_label_create(exit_btn);
     lv_label_set_text(exit_text, "Exit");
     lv_obj_set_style_text_font(exit_text, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(exit_text, ui_text_color(), 0);
-    
+
     lv_obj_add_event_cb(exit_btn, airtag_scan_exit_cb, LV_EVENT_CLICKED, NULL);
     
     // Set UI active and start scanning
