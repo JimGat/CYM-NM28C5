@@ -70,6 +70,8 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
+// BLE controller TX power API — controller-level, works with NimBLE host
+#include "esp_bt.h"
 #include "dexter_img.h"
 
 #define TAG "WiFi_Hacker"
@@ -287,6 +289,7 @@ static uint16_t scan_time_max_ms = 300;     // Active scan max time per channel 
 #define NVS_KEY_SCAN_MIN    "scan_min"
 #define NVS_KEY_SCAN_MAX    "scan_max"
 #define NVS_KEY_DARK_MODE   "dark_mode"
+#define NVS_KEY_POWER_MODE  "pwr_mode"
 
 // Touch calibration NVS
 #define TOUCH_CAL_NVS_NS      "touch_cal"
@@ -1330,6 +1333,7 @@ static void radio_reset_to_idle(void);
 // NimBLE BLE scanner functions
 static esp_err_t bt_nimble_init(void);
 static void bt_nimble_deinit(void);
+static void apply_ble_power_settings(void);
 static void bt_scan_stop(void);
 static void bt_scan_task(void *pvParameters);
 static int bt_gap_event_callback(struct ble_gap_event *event, void *arg);
@@ -1981,10 +1985,14 @@ static void nvs_settings_load(void)
         if (nvs_get_u8(h, NVS_KEY_DARK_MODE, &dm) == ESP_OK) {
             dark_mode_enabled = (dm != 0);
         }
+        uint8_t pm = 0;
+        if (nvs_get_u8(h, NVS_KEY_POWER_MODE, &pm) == ESP_OK) {
+            g_max_power_mode = (pm != 0);
+        }
         nvs_close(h);
-        ESP_LOGI(TAG, "NVS settings loaded: timeout=%ldms, brightness=%u%%, scan=%u-%ums, dark=%d",
+        ESP_LOGI(TAG, "NVS settings loaded: timeout=%ldms, brightness=%u%%, scan=%u-%ums, dark=%d, max_power=%d",
                  (long)screen_timeout_ms, screen_brightness_pct, scan_time_min_ms, scan_time_max_ms,
-                 dark_mode_enabled);
+                 dark_mode_enabled, g_max_power_mode);
     } else {
         ESP_LOGW(TAG, "NVS settings not found (first boot), using defaults");
         screen_timeout_ms = 0;
@@ -1992,6 +2000,7 @@ static void nvs_settings_load(void)
         scan_time_min_ms = 100;
         scan_time_max_ms = 300;
         dark_mode_enabled = true;
+        g_max_power_mode = false;
     }
     wifi_scanner_set_scan_time(scan_time_min_ms, scan_time_max_ms);
 }
@@ -2038,6 +2047,17 @@ static void nvs_settings_save_dark_mode(bool enabled)
         nvs_commit(h);
         nvs_close(h);
         ESP_LOGI(TAG, "NVS: saved dark_mode = %d", enabled);
+    }
+}
+
+static void nvs_settings_save_power_mode(bool max_power)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, NVS_KEY_POWER_MODE, max_power ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+        ESP_LOGI(TAG, "NVS: saved power_mode = %s", max_power ? "MAX" : "Normal");
     }
 }
 
@@ -10187,6 +10207,7 @@ static void radio_reset_to_idle(void)
         esp_wifi_set_mode(WIFI_MODE_STA);
         esp_wifi_start();
         vTaskDelay(pdMS_TO_TICKS(300));  // let STA task finish starting before scan is allowed
+        apply_wifi_power_settings();
 
         wifi_country_t wifi_country = {
             .cc = "PH",
@@ -13997,6 +14018,143 @@ static void show_screen_brightness_popup(void)
     lv_obj_add_event_cb(save_btn, brightness_popup_save_cb, LV_EVENT_CLICKED, NULL);
 }
 
+// ============================================================================
+// Power Mode Popup
+// ============================================================================
+
+static lv_obj_t *powermode_popup       = NULL;
+static lv_obj_t *powermode_normal_btn  = NULL;
+static lv_obj_t *powermode_max_btn     = NULL;
+
+static void powermode_refresh_buttons(void)
+{
+    if (!powermode_normal_btn || !powermode_max_btn) return;
+    if (g_max_power_mode) {
+        lv_obj_set_style_bg_color(powermode_normal_btn, lv_color_make(80, 80, 80), 0);
+        lv_obj_set_style_bg_color(powermode_max_btn,    COLOR_MATERIAL_RED, 0);
+    } else {
+        lv_obj_set_style_bg_color(powermode_normal_btn, lv_color_hex(0x2E7D32), 0);
+        lv_obj_set_style_bg_color(powermode_max_btn,    lv_color_make(80, 80, 80), 0);
+    }
+}
+
+static void powermode_close_cb(lv_event_t *e)
+{
+    (void)e;
+    if (powermode_popup) {
+        lv_obj_del(powermode_popup);
+        powermode_popup      = NULL;
+        powermode_normal_btn = NULL;
+        powermode_max_btn    = NULL;
+    }
+}
+
+static void powermode_normal_cb(lv_event_t *e)
+{
+    (void)e;
+    g_max_power_mode = false;
+    nvs_settings_save_power_mode(false);
+    if (current_radio_mode == RADIO_MODE_WIFI) apply_wifi_power_settings();
+    powermode_refresh_buttons();
+}
+
+static void powermode_max_cb(lv_event_t *e)
+{
+    (void)e;
+    g_max_power_mode = true;
+    nvs_settings_save_power_mode(true);
+    if (current_radio_mode == RADIO_MODE_WIFI) apply_wifi_power_settings();
+    if (current_radio_mode == RADIO_MODE_BLE)  apply_ble_power_settings();
+    powermode_refresh_buttons();
+}
+
+static void show_power_mode_popup(void)
+{
+    if (powermode_popup) return;
+
+    powermode_popup = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(powermode_popup, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(powermode_popup, 0, 0);
+    lv_obj_set_style_bg_color(powermode_popup, ui_bg_color(), 0);
+    lv_obj_set_style_bg_opa(powermode_popup, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(powermode_popup, 0, 0);
+    lv_obj_set_style_radius(powermode_popup, 0, 0);
+    lv_obj_clear_flag(powermode_popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *dialog = lv_obj_create(powermode_popup);
+    lv_obj_set_size(dialog, 210, 195);
+    lv_obj_center(dialog);
+    lv_obj_set_style_bg_color(dialog, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(dialog, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_border_width(dialog, 2, 0);
+    lv_obj_set_style_radius(dialog, 12, 0);
+    lv_obj_clear_flag(dialog, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(dialog, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(dialog, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(dialog, 14, 0);
+    lv_obj_set_style_pad_gap(dialog, 10, 0);
+
+    lv_obj_t *title = lv_label_create(dialog);
+    lv_label_set_text(title, LV_SYMBOL_CHARGE " TX Power Mode");
+    lv_obj_set_style_text_color(title, ui_text_color(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+
+    lv_obj_t *sub = lv_label_create(dialog);
+    lv_label_set_text(sub, "Applies to WiFi & BLE");
+    lv_obj_set_style_text_color(sub, ui_muted_color(), 0);
+    lv_obj_set_style_text_font(sub, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_align(sub, LV_TEXT_ALIGN_CENTER, 0);
+
+    // Mode selector row
+    lv_obj_t *mode_row = lv_obj_create(dialog);
+    lv_obj_set_size(mode_row, 175, 44);
+    lv_obj_set_style_bg_opa(mode_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(mode_row, 0, 0);
+    lv_obj_set_style_pad_all(mode_row, 0, 0);
+    lv_obj_clear_flag(mode_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(mode_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(mode_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    powermode_normal_btn = lv_btn_create(mode_row);
+    lv_obj_set_size(powermode_normal_btn, 82, 38);
+    lv_obj_set_style_radius(powermode_normal_btn, 8, 0);
+    lv_obj_t *nl = lv_label_create(powermode_normal_btn);
+    lv_label_set_text(nl, "Normal");
+    lv_obj_set_style_text_font(nl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(nl, ui_text_color(), 0);
+    lv_obj_center(nl);
+    lv_obj_add_event_cb(powermode_normal_btn, powermode_normal_cb, LV_EVENT_CLICKED, NULL);
+
+    powermode_max_btn = lv_btn_create(mode_row);
+    lv_obj_set_size(powermode_max_btn, 82, 38);
+    lv_obj_set_style_radius(powermode_max_btn, 8, 0);
+    lv_obj_t *ml = lv_label_create(powermode_max_btn);
+    lv_label_set_text(ml, "Max Power");
+    lv_obj_set_style_text_font(ml, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ml, ui_text_color(), 0);
+    lv_obj_center(ml);
+    lv_obj_add_event_cb(powermode_max_btn, powermode_max_cb, LV_EVENT_CLICKED, NULL);
+
+    powermode_refresh_buttons();
+
+    lv_obj_t *warn = lv_label_create(dialog);
+    lv_label_set_text(warn, "Max power increases range &\nattack effectiveness.");
+    lv_obj_set_style_text_color(warn, ui_muted_color(), 0);
+    lv_obj_set_style_text_font(warn, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_align(warn, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *close_btn = lv_btn_create(dialog);
+    lv_obj_set_size(close_btn, 80, 30);
+    lv_obj_set_style_bg_color(close_btn, lv_color_make(80, 80, 80), 0);
+    lv_obj_set_style_radius(close_btn, 8, 0);
+    lv_obj_t *cl = lv_label_create(close_btn);
+    lv_label_set_text(cl, "Close");
+    lv_obj_set_style_text_font(cl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(cl, ui_text_color(), 0);
+    lv_obj_center(cl);
+    lv_obj_add_event_cb(close_btn, powermode_close_cb, LV_EVENT_CLICKED, NULL);
+}
+
 // Settings sub-menu tile event callback
 static void settings_tile_event_cb(lv_event_t *e)
 {
@@ -14019,6 +14177,8 @@ static void settings_tile_event_cb(lv_event_t *e)
         show_sd_card_screen();
     } else if (strcmp(tile_name, "GPS Info") == 0) {
         show_gps_info_screen();
+    } else if (strcmp(tile_name, "Power Mode") == 0) {
+        show_power_mode_popup();
     }
 }
 
@@ -14046,6 +14206,7 @@ static void show_settings_screen(void)
     create_tile(tiles, LV_SYMBOL_SD_CARD,  "SD\nCard",           COLOR_MATERIAL_GREEN,    settings_tile_event_cb, "SD Card");
     // LV_SYMBOL_WIFI (signal arcs) is the closest built-in to a satellite dish — FA 4.7 has no dish glyph
     create_tile(tiles, LV_SYMBOL_WIFI,     "GPS\nInfo",          lv_color_hex(0x00BCD4),  settings_tile_event_cb, "GPS Info");
+    create_tile(tiles, LV_SYMBOL_CHARGE,   "Power\nMode",        COLOR_MATERIAL_RED,      settings_tile_event_cb, "Power Mode");
 
     lv_obj_t *ver = lv_label_create(function_page);
     lv_label_set_text(ver, "LAB5 " FW_VERSION);
@@ -16533,7 +16694,8 @@ static bool ensure_wifi_mode(void)
                 .policy = WIFI_COUNTRY_POLICY_AUTO,
             };
             esp_wifi_set_country(&wifi_country);
-            
+            apply_wifi_power_settings();
+
             current_radio_mode = RADIO_MODE_WIFI;
             wifi_initialized = true;
             ESP_LOGI(TAG, "WiFi initialized OK");
@@ -16841,6 +17003,22 @@ static void nimble_host_task(void *param)
     nimble_port_freertos_deinit();
 }
 
+// Apply BLE TX power for the current power mode.
+// Call only after NimBLE host sync (nimble_initialized == true); the controller
+// must be running before esp_ble_tx_power_set() is valid.
+// esp_ble_tx_power_set() is a controller-level API in esp_bt.h — it works
+// regardless of whether the host stack is NimBLE or Bluedroid.
+static void apply_ble_power_settings(void)
+{
+    if (!g_max_power_mode) return;
+    // ESP_PWR_LVL_P9 = +9 dBm — highest level for ESP32-C5 BLE controller.
+    // Set DEFAULT (connections), ADV (advertising), and SCAN (scan requests).
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV,     ESP_PWR_LVL_P9);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN,    ESP_PWR_LVL_P9);
+    ESP_LOGI(TAG, "BLE TX power set to P9 (+9 dBm max)");
+}
+
 /**
  * Initialize NimBLE stack
  */
@@ -16872,7 +17050,8 @@ static esp_err_t bt_nimble_init(void)
         ESP_LOGE(TAG, "NimBLE failed to sync");
         return ESP_FAIL;
     }
-    
+    apply_ble_power_settings();
+
     return ESP_OK;
 }
 

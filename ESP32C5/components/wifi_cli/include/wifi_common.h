@@ -129,6 +129,13 @@ extern volatile app_state_t g_app_state;
 // Global stop flag (shared across components)
 extern volatile bool g_operation_stop_requested;
 
+// Global TX power mode flag (shared across all WiFi/BLE components)
+extern bool g_max_power_mode;
+
+// Apply WiFi TX power and power-save settings for the current mode.
+// Call after every esp_wifi_start() — safe to call in both Normal and Max Power modes.
+void apply_wifi_power_settings(void);
+
 // Shared scan results (from wifi_scanner, used by attacks/sniffer)
 extern wifi_ap_record_t g_shared_scan_results[MAX_SCAN_RESULTS];
 extern uint16_t g_shared_scan_count;

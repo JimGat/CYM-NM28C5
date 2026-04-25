@@ -572,10 +572,12 @@ esp_err_t wifi_attacks_start_evil_twin(const char *ssid, const char *password) {
         if (!ap_netif) {
             ESP_LOGE(TAG, "Failed to create AP netif");
             esp_wifi_start();
+            apply_wifi_power_settings();
             return ESP_FAIL;
         }
         esp_wifi_set_mode(WIFI_MODE_APSTA);
         esp_wifi_start();
+        apply_wifi_power_settings();
         vTaskDelay(pdMS_TO_TICKS(500));
     } else {
         // AP netif exists - ensure we're in APSTA mode for raw frame transmission
@@ -690,7 +692,8 @@ esp_err_t wifi_attacks_stop_evil_twin(void) {
     esp_wifi_stop();
     esp_wifi_set_mode(WIFI_MODE_APSTA);
     esp_wifi_start();
-    
+    apply_wifi_power_settings();
+
     ESP_LOGI(TAG, "Evil Twin stopped");
     return ESP_OK;
 }
@@ -1860,10 +1863,12 @@ esp_err_t wifi_attacks_start_portal(const char *ssid) {
         if (!ap_netif) {
             ESP_LOGE(TAG, "Failed to create AP netif");
             esp_wifi_start();
+            apply_wifi_power_settings();
             return ESP_FAIL;
         }
         esp_wifi_set_mode(WIFI_MODE_APSTA);
         esp_wifi_start();
+        apply_wifi_power_settings();
         vTaskDelay(pdMS_TO_TICKS(500));
     } else {
         // AP netif exists - ensure we're in APSTA mode
@@ -1958,10 +1963,12 @@ esp_err_t wifi_attacks_start_rogue_ap(const char *ssid, const char *password,
         if (!ap_netif) {
             ESP_LOGE(TAG, "Failed to create AP netif");
             esp_wifi_start();
+            apply_wifi_power_settings();
             return ESP_FAIL;
         }
         esp_wifi_set_mode(WIFI_MODE_APSTA);
         esp_wifi_start();
+        apply_wifi_power_settings();
         vTaskDelay(pdMS_TO_TICKS(500));
     } else {
         wifi_mode_t mode;
@@ -2057,7 +2064,8 @@ esp_err_t wifi_attacks_stop_portal(void) {
     esp_wifi_stop();
     esp_wifi_set_mode(WIFI_MODE_APSTA);
     esp_wifi_start();
-    
+    apply_wifi_power_settings();
+
     ESP_LOGI(TAG, "Captive portal stopped");
     return ESP_OK;
 }
