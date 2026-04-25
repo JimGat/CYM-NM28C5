@@ -21,9 +21,11 @@
 
 ## Introduction
 
-**Cheap Yellow Monster** is a portable, touchscreen-driven WiFi security toolkit running on the **NM-CYD-C5 ESP32-C5-WIFI6-KIT**. Inspired by Pancake, it combines a rich set of offensive and defensive WiFi tools with BLE scanning, GPS wardriving, and a beautiful Material-style dark UI — all packed into a handheld form factor with a 2.8" resistive touch display.
+**Cheap Yellow Monster** is a portable, touchscreen-driven WiFi security toolkit running on the **NM-CYD-C5 ESP32-C5-WIFI6-KIT**. Originally inspired by Pancake, it combines a rich set of offensive and defensive WiFi tools with BLE scanning, GPS wardriving, and a beautiful Material-style dark UI — all packed into a handheld form factor with a 2.8" resistive touch display.
 
 Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware leverages the ESP32-C5's RISC-V core and WiFi 6 capabilities for modern wireless security research and education.
+
+> **Note:** While Pancake provided the original inspiration, this project has diverged substantially in target hardware (ESP32-C5 / NM-CYD-C5), build system (ESP-IDF vs Arduino), UI framework (LVGL 8), feature set, and architecture. It is a standalone project, not a fork.
 
 ---
 
@@ -62,20 +64,13 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 | **BLE** | AirTag scanner, SmartTag detection, BLE Locator |
 | **Deauth Monitor** | Passive detection of nearby deauth attacks |
 | **Credentials** | Captive portal credential capture, WPA-SEC upload |
-| **UI** | Material dark theme, touch gestures, screen dimming, screenshots |
-| **Storage** | SD card for handshakes, wardrive logs, screenshots |
+| **UI** | Material dark theme, touch gestures, screen dimming, screenshots — all screens portrait 240×320 |
+| **Storage** | SD card for handshakes, wardrive logs, screenshots, file tree browser |
 
 ---
 
 ## Screenshots
 
-<p align="center">
-  <img width="360" alt="AirTag Scanner — close range" src="docs/screenshots/airtag_detection_close.jpg" />
-  &nbsp;&nbsp;
-  <img width="360" alt="AirTag Scanner — far range" src="docs/screenshots/airtag_detection_far.jpg" />
-  <br/>
-  <em>AirTag Tag Locator — close range on top of the AirTag (left) vs. far range away from it (right).</em>
-</p>
 
 
 <p align="center">
@@ -239,7 +234,7 @@ Attacks that operate on **all nearby networks** simultaneously.
 | Feature | Description |
 |---------|-------------|
 | **Blackout** | Mass deauthentication of all detected networks in range |
-| **Snifferdog** | Channel-hopping sniffer with automatic client deauthentication |
+| **Snifferdog** | Channel-hopping sniffer with automatic client deauthentication; exits cleanly and returns radio to normal WiFi scan mode |
 | **SAE Overflow** | WPA3 SAE authentication flood attack |
 
 ### 3. Network Observer & Karma
@@ -309,11 +304,15 @@ Use the RSSI value to home in on the tag — a higher (less negative) number mea
 | Below −85 dBm | Far away or obstructed |
 
 <p align="center">
-  <img width="340" alt="AirTag Tag Locator — close range (on top of AirTag)" src="docs/screenshots/airtag_detection_close.jpg" />
-  &nbsp;&nbsp;
-  <img width="340" alt="AirTag Tag Locator — far range (away from AirTag)" src="docs/screenshots/airtag_detection_far.jpg" />
+  <img width="340" alt="AirTag Far Away" src="docs/screenshots/airtag_detection_far.jpg" />
   <br/>
-  <em>Tag Locator in action — on top of the AirTag (left) vs. several meters away (right). Higher RSSI = closer.</em>
+  <em>AirTag Far Away</em>
+</p>
+
+<p align="center">
+  <img width="340" alt="AirTag Found" src="docs/screenshots/airtag_detection_close.jpg" />
+  <br/>
+  <em>AirTag Found</em>
 </p>
 
 Tap **Exit** at any time to stop tracking and return to the main menu. The radio switches back to WiFi mode automatically.
@@ -334,7 +333,7 @@ GPS-enabled WiFi logging for mapping wireless networks. Requires an **ATGM336H**
 | **Screen Timeout** | Inactivity timer before display dimming |
 | **Brightness** | Software brightness overlay (10–100%) |
 | **Scan Duration** | Configurable WiFi scan time |
-| **SD Card** | Validate/provision, check free space, format |
+| **SD Card** | Validate/provision (creates `/sdcard/lab/` structure, shows completion status); browse file tree; check free space |
 | **GPS Info** | Live GPS fix status, latitude, longitude, altitude, satellite count, and UART config reference (IO4/IO5, 9600 baud, ATGM336H) |
 
 All settings are persisted via **NVS** (Non-Volatile Storage) across reboots.
@@ -344,6 +343,7 @@ All settings are persisted via **NVS** (Non-Volatile Storage) across reboots.
 | Feature | Description |
 |---------|-------------|
 | **LVGL Material Dark Theme** | Modern, touch-friendly dark UI |
+| **Portrait 240×320 Layout** | All screens designed and reflowed for the NM-CYD-C5's 240×320 portrait display |
 | **6-Tile Main Menu** | Quick access to all feature categories |
 | **Screenshot Capture** | Save screen to SD card (`/sdcard/screenshots/`) |
 | **WPA-SEC Upload** | Upload captured handshakes to wpa-sec.stanev.org via HTTPS |
@@ -383,6 +383,10 @@ All data is stored on the SD card:
 ├── screenshots/          # UI screenshots (BMP)
 └── calibrate.txt         # ← Create this file to trigger touch re-calibration on next boot
 ```
+
+The **SD Card → File Tree** utility (Settings menu) lets you browse the SD card's directory tree directly on the device — useful for confirming handshakes and wardrive logs were saved without needing to remove the card.
+
+**SD Card Provision** (Settings → SD Card → Provision) creates the full `/sdcard/lab/` folder structure in one tap. When complete, the screen shows a "Done — N created, M OK" summary in a status bar above the Back button.
 
 ---
 
@@ -506,25 +510,38 @@ esptool.py --chip esp32c5 --port /dev/ttyACM0 --baud 460800 \
 CYM-NM28C5/
 ├── ESP32C5/
 │   ├── main/
-│   │   ├── main.c                # Core application, all UI screens, boot sequence,
-│   │   │                         #   touch calibration routine (run_touch_calibration)
-│   │   ├── attack_handshake.c    # Handshake capture logic
-│   │   ├── xpt2046.c/h           # XPT2046 SPI touch driver (polling, null-zone, calibration reads)
-│   │   └── lvgl_memory.c         # PSRAM allocator for LVGL
+│   │   ├── main.c                # Core application — all UI screens, boot sequence,
+│   │   │                         #   WiFi/BLE logic, touch calibration, GPS, wardriving
+│   │   ├── attack_handshake.c/h  # WPA handshake capture (PCAP & HCCAPX)
+│   │   ├── xpt2046.c/h           # XPT2046 SPI touch driver (polling, null-zone, calibration)
+│   │   ├── lvgl_memory.c/h       # PSRAM allocator for LVGL
+│   │   ├── dexter_img.c/h        # Dexter mascot image data (splash screen, RGB565)
+│   │   └── ft6336.c/h            # FT6336 capacitive touch driver (unused — not compiled)
 │   ├── components/
-│   │   ├── wifi_cli/             # CLI, WiFi init, LED control
-│   │   ├── wifi_scanner/         # WiFi scanning engine
-│   │   ├── wifi_sniffer/         # Promiscuous mode sniffer
-│   │   ├── wifi_attacks/         # Deauth, Evil Twin, Captive Portal, Karma
-│   │   ├── wifi_wardrive/        # SD card, GPS + WiFi wardriving
+│   │   ├── wifi_cli/             # CLI, WiFi init, LED control; wifi_common.c/h (shared constants)
+│   │   ├── wifi_scanner/         # Active WiFi scan engine, target BSSID tracking
+│   │   ├── wifi_sniffer/         # Promiscuous sniffer, SnifferDog, probe request logging
+│   │   ├── wifi_attacks/         # Deauth, Evil Twin, Captive Portal, Karma, SAE Overflow
+│   │   ├── wifi_wardrive/        # GPS + WiFi wardriving, SD card CSV logging
 │   │   ├── sniffer/              # Raw 802.11 frame capture
-│   │   ├── frame_analyzer/       # EAPOL / beacon parsing
-│   │   ├── pcap_serializer/      # PCAP file writer
-│   │   └── hccapx_serializer/    # HCCAPX file writer (hashcat)
+│   │   ├── frame_analyzer/       # EAPOL / beacon / probe frame parsing
+│   │   ├── pcap_serializer/      # PCAP file writer (Wireshark-compatible)
+│   │   ├── hccapx_serializer/    # HCCAPX file writer (hashcat)
+│   │   ├── led_strip/            # Local WS2812 RMT driver (replaces legacy managed component)
+│   │   └── espressif__esp_lcd_ili9341/  # ST7789 LCD panel driver (Espressif component, local copy)
+│   ├── binaries-esp32c5/         # Pre-built flashable binaries (bootloader, partition-table, app)
+│   ├── docs/
+│   │   ├── index.html            # Web flasher UI
+│   │   └── manifest.json         # OTA / web flash manifest
 │   ├── partitions.csv            # nvs(24K) phy_init(4K) factory(7MB) storage(960K)
+│   ├── sdkconfig.defaults        # Default Kconfig values (PSRAM, dual-band WiFi, LVGL)
+│   ├── post_build.cmake          # Copies build artifacts → binaries-esp32c5/ after each build
 │   ├── sdkconfig
 │   └── CMakeLists.txt
-├── NM-CYD-C5-pinmap.md          # Full pin map with migration notes
+├── docs/
+│   └── screenshots/              # Screenshot assets used in this README
+├── NM-CYD-C5-pinmap.md          # Full GPIO pin map with migration notes
+├── CLAUDE.md                     # Claude Code project instructions
 └── README.md
 ```
 
