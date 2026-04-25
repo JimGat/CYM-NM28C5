@@ -69,13 +69,6 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 
 ## Screenshots
 
-<p align="center">
-  <img width="360" alt="AirTag Scanner — close range" src="docs/screenshots/airtag_detection_close.jpg" />
-  &nbsp;&nbsp;
-  <img width="360" alt="AirTag Scanner — far range" src="docs/screenshots/airtag_detection_far.jpg" />
-  <br/>
-  <em>AirTag Tag Locator — close range on top of the AirTag (left) vs. far range away from it (right).</em>
-</p>
 
 
 <p align="center">
@@ -309,11 +302,15 @@ Use the RSSI value to home in on the tag — a higher (less negative) number mea
 | Below −85 dBm | Far away or obstructed |
 
 <p align="center">
-  <img width="340" alt="AirTag Tag Locator — close range (on top of AirTag)" src="docs/screenshots/airtag_detection_close.jpg" />
-  &nbsp;&nbsp;
-  <img width="340" alt="AirTag Tag Locator — far range (away from AirTag)" src="docs/screenshots/airtag_detection_far.jpg" />
+  <img width="340" alt="AirTag Far Away" src="docs/screenshots/airtag_detection_far.jpg" />
   <br/>
-  <em>Tag Locator in action — on top of the AirTag (left) vs. several meters away (right). Higher RSSI = closer.</em>
+  <em>AirTag Far Away</em>
+</p>
+
+<p align="center">
+  <img width="340" alt="AirTag Found" src="docs/screenshots/airtag_detection_close.jpg" />
+  <br/>
+  <em>AirTag Found</em>
 </p>
 
 Tap **Exit** at any time to stop tracking and return to the main menu. The radio switches back to WiFi mode automatically.
