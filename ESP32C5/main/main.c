@@ -13939,7 +13939,7 @@ static void show_screen_brightness_popup(void)
 
     // Title
     lv_obj_t *title = lv_label_create(dialog);
-    lv_label_set_text(title, "Screen Brightness");
+    lv_label_set_text(title, "Screen Level");
     lv_obj_set_style_text_color(title, ui_text_color(), 0);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
 
@@ -14013,7 +14013,7 @@ static void settings_tile_event_cb(lv_event_t *e)
         show_download_mode_screen();
     } else if (strcmp(tile_name, "Screen Timeout") == 0) {
         show_screen_timeout_popup();
-    } else if (strcmp(tile_name, "Screen Brightness") == 0) {
+    } else if (strcmp(tile_name, "Screen Level") == 0) {
         show_screen_brightness_popup();
     } else if (strcmp(tile_name, "SD Card") == 0) {
         show_sd_card_screen();
@@ -14042,7 +14042,7 @@ static void show_settings_screen(void)
     create_tile(tiles, LV_SYMBOL_LOOP,     "Scan\nTime",         COLOR_MATERIAL_PURPLE,   settings_tile_event_cb, "Scan Time");
     create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Download\nMode",     COLOR_MATERIAL_RED,      settings_tile_event_cb, "Download Mode");
     create_tile(tiles, LV_SYMBOL_BELL,     "Screen\nTimeout",    COLOR_MATERIAL_TEAL,     settings_tile_event_cb, "Screen Timeout");
-    create_tile(tiles, LV_SYMBOL_IMAGE,    "Screen\nBrightness", COLOR_MATERIAL_ORANGE,   settings_tile_event_cb, "Screen Brightness");
+    create_tile(tiles, LV_SYMBOL_IMAGE,    "Screen\nLevel",      COLOR_MATERIAL_ORANGE,   settings_tile_event_cb, "Screen Level");
     create_tile(tiles, LV_SYMBOL_SD_CARD,  "SD\nCard",           COLOR_MATERIAL_GREEN,    settings_tile_event_cb, "SD Card");
     // LV_SYMBOL_WIFI (signal arcs) is the closest built-in to a satellite dish — FA 4.7 has no dish glyph
     create_tile(tiles, LV_SYMBOL_WIFI,     "GPS\nInfo",          lv_color_hex(0x00BCD4),  settings_tile_event_cb, "GPS Info");
