@@ -85,6 +85,7 @@ static esp_err_t init_wifi(void) {
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
     vTaskDelay(pdMS_TO_TICKS(400));   // let background tasks run after start
+    apply_wifi_power_settings();
 
     uint8_t mac[6];
     esp_err_t ret = esp_wifi_get_mac(WIFI_IF_STA, mac);
