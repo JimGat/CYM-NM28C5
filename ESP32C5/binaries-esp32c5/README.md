@@ -1,6 +1,6 @@
 # CYM-NM28C5 Pre-built Firmware Binaries
 
-**Firmware version: v0.5.0**
+**Firmware version: v0.5.5**
 
 This folder contains the latest compiled firmware for the **NM-CYD-C5 (ESP32-C5)** board.
 
