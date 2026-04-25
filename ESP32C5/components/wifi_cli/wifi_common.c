@@ -1,7 +1,10 @@
 // wifi_common.c - Common helper functions
 #include "wifi_common.h"
 #include "esp_wifi.h"
+#include "esp_log.h"
 #include <string.h>
+
+static const char *TAG_PWR = "power";
 
 // Global variables (defined once, extern in header)
 led_strip_handle_t g_led_strip = NULL;
@@ -17,8 +20,10 @@ void apply_wifi_power_settings(void)
         // country/regulatory settings loaded at runtime.
         esp_wifi_set_max_tx_power(82);
         esp_wifi_set_ps(WIFI_PS_NONE);   // disable modem sleep for continuous TX capability
+        ESP_LOGI(TAG_PWR, "WiFi TX power set to 82 (~20.5 dBm max), power save OFF");
     } else {
         esp_wifi_set_ps(WIFI_PS_MIN_MODEM);  // restore default modem-sleep power save
+        ESP_LOGI(TAG_PWR, "WiFi TX power normal, power save MIN_MODEM");
     }
 }
 
