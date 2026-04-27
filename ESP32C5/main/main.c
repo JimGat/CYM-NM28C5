@@ -6163,8 +6163,7 @@ static void sniffer_refresh_ap_list(void) {
             snprintf(ap_text, sizeof(ap_text), LV_SYMBOL_WIFI " %s (%d) Ch:%d %ddBm " LV_SYMBOL_RIGHT,
                      ap->ssid, ap->client_count, ap->channel, ap->rssi);
         } else {
-            snprintf(ap_text, sizeof(ap_text), LV_SYMBOL_WIFI " [Hidden] %02X:%02X:%02X (%d) Ch:%d %ddBm " LV_SYMBOL_RIGHT,
-                     ap->bssid[0], ap->bssid[1], ap->bssid[2],
+            snprintf(ap_text, sizeof(ap_text), LV_SYMBOL_WIFI " [Hidden] (%d) Ch:%d %ddBm " LV_SYMBOL_RIGHT,
                      ap->client_count, ap->channel, ap->rssi);
         }
         
@@ -6173,7 +6172,7 @@ static void sniffer_refresh_ap_list(void) {
         lv_obj_set_style_bg_color(ap_row, lv_color_make(40, 40, 60), LV_STATE_PRESSED);
         lv_obj_set_style_bg_opa(ap_row, LV_OPA_COVER, 0);
         lv_obj_set_style_text_color(ap_row, ui_text_color(), 0);
-        lv_obj_set_style_text_font(ap_row, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_font(ap_row, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_decor(ap_row, LV_TEXT_DECOR_UNDERLINE, 0);
         lv_obj_set_style_min_height(ap_row, 36, 0);  // Larger touch target
         lv_obj_add_flag(ap_row, LV_OBJ_FLAG_CLICKABLE);
@@ -6183,11 +6182,8 @@ static void sniffer_refresh_ap_list(void) {
         for (int j = 0; j < ap->client_count && j < 5; j++) {
             const sniffer_client_t *client = &ap->clients[j];
             
-            char client_text[80];
-            snprintf(client_text, sizeof(client_text), "%02X:%02X:%02X:%02X:%02X:%02X  %ddBm",
-                     client->mac[0], client->mac[1], client->mac[2],
-                     client->mac[3], client->mac[4], client->mac[5],
-                     client->rssi);
+            char client_text[24];
+            snprintf(client_text, sizeof(client_text), LV_SYMBOL_BULLET " %ddBm", client->rssi);
             
             lv_obj_t *client_row = lv_list_add_text(sniffer_ap_list, client_text);
             lv_obj_set_style_bg_color(client_row, ui_bg_color(), 0);
