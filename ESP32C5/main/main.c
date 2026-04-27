@@ -6182,8 +6182,10 @@ static void sniffer_refresh_ap_list(void) {
         for (int j = 0; j < ap->client_count && j < 5; j++) {
             const sniffer_client_t *client = &ap->clients[j];
             
-            char client_text[24];
-            snprintf(client_text, sizeof(client_text), LV_SYMBOL_BULLET " %ddBm", client->rssi);
+            char client_text[40];
+            snprintf(client_text, sizeof(client_text), LV_SYMBOL_BULLET " %02X:%02X:%02X:%02X:%02X:%02X  %ddBm",
+                     client->mac[0], client->mac[1], client->mac[2],
+                     client->mac[3], client->mac[4], client->mac[5], client->rssi);
             
             lv_obj_t *client_row = lv_list_add_text(sniffer_ap_list, client_text);
             lv_obj_set_style_bg_color(client_row, ui_bg_color(), 0);
