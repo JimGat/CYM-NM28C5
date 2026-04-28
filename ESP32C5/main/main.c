@@ -1082,7 +1082,7 @@ static int bt_sas_selected_idx = -1;
 static uint8_t bt_sas_target_addr[6];
 static char bt_sas_target_name[32];
 
-// ── Dee Dee Detector (BT Lookout) UI state ─────────────────────
+// ── BT Lookout (Dee Dee Detector) UI state ──────────────────────
 static bool        bt_lookout_ui_active       = false;
 static lv_obj_t   *bt_lookout_status_lbl       = NULL;
 static lv_obj_t   *bt_lookout_count_lbl        = NULL;
@@ -1453,7 +1453,7 @@ static void show_bt_attack_tiles_screen(void);
 static void bt_sas_refresh_list(void);
 static void show_bt_locator_direct_track(void);
 
-// Dee Dee Detector
+// BT Lookout
 static void show_bt_lookout_screen(void);
 static void bt_lookout_update_ui(void);
 static void show_lookout_alert_popup(const char *name, const char *mac_str, int rssi);
@@ -4033,7 +4033,7 @@ void app_main(void)
             led_set(disco_led_r, disco_led_g, disco_led_b);
         }
 
-        // Dee Dee Detector LED alert (runs even during go_dark/blackout)
+        // BT Lookout LED alert (runs even during go_dark/blackout)
         bool lookout_led_active = (!disco_mode_active && bt_lookout_tick(led_set));
 
         // Update NeoPixel LED color to reflect current mode (~2 Hz)
@@ -4976,7 +4976,7 @@ void app_main(void)
                 }
             }
 
-            // Dee Dee Detector — poll for new detection, wake from blackout and show popup
+            // BT Lookout — poll for new detection, wake from blackout and show popup
             {
                 bt_lookout_detection_t det;
                 if (bt_lookout_poll_detection(&det)) {
@@ -15513,7 +15513,7 @@ static void show_wifi_monitor_screen(void)
     create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Handshakes", COLOR_MATERIAL_AMBER, wifi_monitor_tile_event_cb, "Handshakes");
 }
 
-// ── Dee Dee Detector ──────────────────────────────────────────────────────────
+// ── BT Lookout ────────────────────────────────────────────────────────────────
 
 static void lookout_popup_dismiss_cb(lv_event_t *e)
 {
@@ -15653,7 +15653,7 @@ static void bt_lookout_scan_loop_task(void *pv)
         bt_reset_counters();
         int rc = bt_start_scan();
         if (rc != 0) {
-            ESP_LOGE(TAG, "Dee Dee: scan failed %d, retry 5s", rc);
+            ESP_LOGE(TAG, "BT Lookout: scan failed %d, retry 5s", rc);
             vTaskDelay(pdMS_TO_TICKS(5000));
             continue;
         }
@@ -15675,7 +15675,7 @@ static void lookout_start_btn_cb(lv_event_t *e)
     } else {
         bt_lookout_start();
         if (bt_lookout_scan_loop_handle == NULL) {
-            xTaskCreate(bt_lookout_scan_loop_task, "deedee_scan", 4096, NULL, 3,
+            xTaskCreate(bt_lookout_scan_loop_task, "btlookout_scan", 4096, NULL, 3,
                         &bt_lookout_scan_loop_handle);
         }
     }
@@ -15685,7 +15685,7 @@ static void lookout_start_btn_cb(lv_event_t *e)
 static void lookout_dark_btn_cb(lv_event_t *e)
 {
     (void)e;
-    if (bt_lookout_is_active()) go_dark_enable();
+    go_dark_enable();
 }
 
 static void lookout_back_btn_cb(lv_event_t *e)
@@ -16333,8 +16333,8 @@ static void show_bt_attack_tiles_screen(void)
     lv_obj_add_event_cb(gatt_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"GATT Walker");
 
     // Add to BT Lookout watchlist
-    lv_obj_t *add_deedee_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Add to\nBT Lookout", COLOR_MATERIAL_RED, NULL, NULL);
-    lv_obj_add_event_cb(add_deedee_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Add to Lookout");
+    lv_obj_t *add_lookout_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Add to\nBT Lookout", COLOR_MATERIAL_RED, NULL, NULL);
+    lv_obj_add_event_cb(add_lookout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Add to Lookout");
 }
 
 // Stub screen for not-yet-implemented features
@@ -17370,25 +17370,29 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
 
-    // Dee Dee Detector screen
+    // BT Lookout screen
     if (strcmp(attack_name, "Dee Dee Detector") == 0) {
         show_bt_lookout_screen();
         return;
     }
 
-    // Add BT Scan & Select target to Dee Dee Detector watchlist
+    // Add BT Scan & Select target to BT Lookout watchlist
     if (strcmp(attack_name, "Add to Lookout") == 0) {
+        char mac_str[18];
+        snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 bt_sas_target_addr[0], bt_sas_target_addr[1], bt_sas_target_addr[2],
+                 bt_sas_target_addr[3], bt_sas_target_addr[4], bt_sas_target_addr[5]);
+        const char *disp_name = bt_sas_target_name[0] ? bt_sas_target_name : mac_str;
         ensure_sd_mounted();
-        if (bt_lookout_append(BT_LOOKOUT_CSV_PATH, bt_sas_target_addr,
-                              bt_sas_target_name[0] ? bt_sas_target_name : NULL,
-                              BT_LOOKOUT_RSSI_ANY)) {
-            char mac_str[18];
-            snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
-                     bt_sas_target_addr[0], bt_sas_target_addr[1], bt_sas_target_addr[2],
-                     bt_sas_target_addr[3], bt_sas_target_addr[4], bt_sas_target_addr[5]);
-            show_lookout_alert_popup(bt_sas_target_name[0] ? bt_sas_target_name : mac_str,
-                                     "Added to watchlist", 0);
+        bool saved = false;
+        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+            saved = bt_lookout_append(BT_LOOKOUT_CSV_PATH, bt_sas_target_addr,
+                                      bt_sas_target_name[0] ? bt_sas_target_name : NULL,
+                                      BT_LOOKOUT_RSSI_ANY);
+            xSemaphoreGive(sd_spi_mutex);
         }
+        show_lookout_alert_popup(disp_name,
+                                 saved ? "Added to BT Lookout" : "Save failed (no SD?)", 0);
         return;
     }
 
