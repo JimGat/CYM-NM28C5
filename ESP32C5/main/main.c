@@ -1088,6 +1088,7 @@ static lv_obj_t   *bt_lookout_status_lbl       = NULL;
 static lv_obj_t   *bt_lookout_count_lbl        = NULL;
 static lv_obj_t   *bt_lookout_last_lbl         = NULL;
 static lv_obj_t   *bt_lookout_start_btn        = NULL;
+static lv_obj_t   *bt_lookout_edit_btn         = NULL;
 static lv_obj_t   *bt_lookout_popup_obj        = NULL;
 static lv_timer_t *bt_lookout_popup_tmr        = NULL;
 static TaskHandle_t bt_lookout_scan_loop_handle = NULL;
@@ -1459,6 +1460,8 @@ static void bt_lookout_update_ui(void);
 static void show_lookout_alert_popup(const char *name, const char *mac_str, int rssi);
 static void lookout_popup_dismiss_cb(lv_event_t *e);
 static void lookout_popup_auto_dismiss_cb(lv_timer_t *t);
+static void show_lookout_editor_screen(void);
+static void lookout_edit_btn_cb(lv_event_t *e);
 
 // Deauth Monitor functions
 static void show_deauth_monitor_screen(void);
@@ -15644,6 +15647,13 @@ static void bt_lookout_update_ui(void)
         lv_obj_set_style_bg_color(bt_lookout_start_btn,
             active ? COLOR_MATERIAL_RED : COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
     }
+
+    if (bt_lookout_edit_btn && lv_obj_is_valid(bt_lookout_edit_btn)) {
+        if (bt_lookout_is_active())
+            lv_obj_add_flag(bt_lookout_edit_btn, LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_clear_flag(bt_lookout_edit_btn, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 static void bt_lookout_scan_loop_task(void *pv)
@@ -15696,6 +15706,7 @@ static void lookout_back_btn_cb(lv_event_t *e)
     bt_lookout_count_lbl  = NULL;
     bt_lookout_last_lbl   = NULL;
     bt_lookout_start_btn  = NULL;
+    bt_lookout_edit_btn   = NULL;
     if (!bt_lookout_is_active() && current_radio_mode == RADIO_MODE_BLE) {
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
@@ -15708,12 +15719,13 @@ static void show_bt_lookout_screen(void)
     if (function_page) { lv_obj_del(function_page); function_page = NULL; }
     reset_function_page_children();
 
-    create_function_page_base("Dee Dee Detector");
+    create_function_page_base("Bluetooth Lookout");
     bt_lookout_ui_active  = true;
     bt_lookout_status_lbl = NULL;
     bt_lookout_count_lbl  = NULL;
     bt_lookout_last_lbl   = NULL;
     bt_lookout_start_btn  = NULL;
+    bt_lookout_edit_btn   = NULL;
 
     ensure_sd_mounted();
     if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
@@ -15814,6 +15826,28 @@ static void show_bt_lookout_screen(void)
 
     lv_obj_add_event_cb(dark_btn, lookout_dark_btn_cb, LV_EVENT_CLICKED, NULL);
 
+    // Edit Watchlist button — only visible when monitoring is stopped
+    bt_lookout_edit_btn = lv_btn_create(function_page);
+    lv_obj_set_size(bt_lookout_edit_btn, 110, 28);
+    lv_obj_align(bt_lookout_edit_btn, LV_ALIGN_TOP_MID, 0, 235);
+    lv_obj_set_style_bg_color(bt_lookout_edit_btn, lv_color_make(30, 80, 140), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(bt_lookout_edit_btn, lv_color_make(50, 110, 180), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(bt_lookout_edit_btn, 0, 0);
+    lv_obj_set_style_radius(bt_lookout_edit_btn, 8, 0);
+    lv_obj_set_flex_flow(bt_lookout_edit_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(bt_lookout_edit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(bt_lookout_edit_btn, 4, 0);
+    lv_obj_t *ed_icon = lv_label_create(bt_lookout_edit_btn);
+    lv_label_set_text(ed_icon, LV_SYMBOL_EDIT);
+    lv_obj_set_style_text_font(ed_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ed_icon, lv_color_white(), 0);
+    lv_obj_t *ed_lbl = lv_label_create(bt_lookout_edit_btn);
+    lv_label_set_text(ed_lbl, "Edit List");
+    lv_obj_set_style_text_font(ed_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ed_lbl, lv_color_white(), 0);
+    lv_obj_add_event_cb(bt_lookout_edit_btn, lookout_edit_btn_cb, LV_EVENT_CLICKED, NULL);
+    if (is_active) lv_obj_add_flag(bt_lookout_edit_btn, LV_OBJ_FLAG_HIDDEN);
+
     // Back button
     lv_obj_t *back_btn = lv_btn_create(function_page);
     lv_obj_set_size(back_btn, 110, 28);
@@ -15837,6 +15871,218 @@ static void show_bt_lookout_screen(void)
     lv_obj_set_style_text_color(b_lbl, ui_text_color(), 0);
 
     lv_obj_add_event_cb(back_btn, lookout_back_btn_cb, LV_EVENT_CLICKED, NULL);
+}
+
+/* ── Watchlist editor ─────────────────────────────────────────────── */
+
+static bool s_editor_delete[BT_LOOKOUT_MAX_ENTRIES];
+static int  s_editor_count  = 0;
+static lv_obj_t *s_editor_rows[BT_LOOKOUT_MAX_ENTRIES];
+
+static void lookout_edit_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    show_lookout_editor_screen();
+}
+
+static void lookout_editor_toggle_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_editor_count) return;
+    s_editor_delete[idx] = !s_editor_delete[idx];
+    bool del = s_editor_delete[idx];
+
+    if (s_editor_rows[idx] && lv_obj_is_valid(s_editor_rows[idx]))
+        lv_obj_set_style_bg_color(s_editor_rows[idx],
+            del ? lv_color_make(80, 20, 20) : lv_color_make(40, 40, 40), 0);
+
+    lv_obj_t *btn = lv_event_get_target(e);
+    lv_obj_set_style_bg_color(btn,
+        del ? COLOR_MATERIAL_RED : lv_color_make(70, 70, 70), LV_STATE_DEFAULT);
+    lv_obj_t *lbl = lv_obj_get_child(btn, 0);
+    if (lbl) lv_label_set_text(lbl, del ? LV_SYMBOL_TRASH : LV_SYMBOL_CLOSE);
+}
+
+static void lookout_editor_save_cb(lv_event_t *ev)
+{
+    (void)ev;
+    ensure_sd_mounted();
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        FILE *fp = fopen(BT_LOOKOUT_CSV_PATH, "w");
+        if (fp) {
+            fwrite(BT_LOOKOUT_CSV_HEADER, 1, strlen(BT_LOOKOUT_CSV_HEADER), fp);
+            for (int i = 0; i < s_editor_count; i++) {
+                if (s_editor_delete[i]) continue;
+                const bt_lookout_entry_t *ent = bt_lookout_get(i);
+                if (!ent) continue;
+                fprintf(fp, "%02X:%02X:%02X:%02X:%02X:%02X,%s,%d\n",
+                        ent->mac[0], ent->mac[1], ent->mac[2],
+                        ent->mac[3], ent->mac[4], ent->mac[5],
+                        ent->name, ent->rssi_threshold);
+            }
+            fclose(fp);
+        }
+        bt_lookout_load(BT_LOOKOUT_CSV_PATH);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    show_bt_lookout_screen();
+}
+
+static void lookout_editor_back_cb(lv_event_t *ev)
+{
+    (void)ev;
+    show_bt_lookout_screen();
+}
+
+static void show_lookout_editor_screen(void)
+{
+    s_editor_count = bt_lookout_count();
+    memset(s_editor_delete, 0, sizeof(s_editor_delete));
+    memset(s_editor_rows,   0, sizeof(s_editor_rows));
+
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+    bt_lookout_ui_active = false;
+    bt_lookout_status_lbl = NULL;
+    bt_lookout_count_lbl  = NULL;
+    bt_lookout_last_lbl   = NULL;
+    bt_lookout_start_btn  = NULL;
+    bt_lookout_edit_btn   = NULL;
+
+    create_function_page_base("Edit Watchlist");
+
+    /* Scrollable list — leaves room for the bottom buttons */
+    lv_obj_t *scroll = lv_obj_create(function_page);
+    lv_obj_set_size(scroll, 228, 220);
+    lv_obj_align(scroll, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_set_style_bg_color(scroll, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(scroll, 0, 0);
+    lv_obj_set_style_pad_all(scroll, 4, 0);
+    lv_obj_set_style_pad_row(scroll, 4, 0);
+    lv_obj_set_flex_flow(scroll, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(scroll, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+    if (s_editor_count == 0) {
+        lv_obj_t *empty = lv_label_create(scroll);
+        lv_label_set_text(empty, "Watchlist is empty.\nAdd devices via BT Scan & Select.");
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(empty, lv_color_make(176, 176, 176), 0);
+        lv_obj_center(empty);
+    }
+
+    for (int i = 0; i < s_editor_count; i++) {
+        const bt_lookout_entry_t *ent = bt_lookout_get(i);
+        if (!ent) continue;
+
+        /* Row container */
+        lv_obj_t *row = lv_obj_create(scroll);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(row, lv_color_make(40, 40, 40), 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_radius(row, 6, 0);
+        lv_obj_set_style_pad_all(row, 6, 0);
+        lv_obj_set_style_pad_column(row, 6, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        s_editor_rows[i] = row;
+
+        /* Name + MAC column */
+        lv_obj_t *info = lv_obj_create(row);
+        lv_obj_set_flex_grow(info, 1);
+        lv_obj_set_height(info, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(info, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(info, 0, 0);
+        lv_obj_set_style_pad_all(info, 0, 0);
+        lv_obj_set_flex_flow(info, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(info, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+        lv_obj_clear_flag(info, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *name_lbl = lv_label_create(info);
+        lv_label_set_text(name_lbl, ent->name[0] ? ent->name : "Unknown");
+        lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(name_lbl, ui_text_color(), 0);
+        lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(name_lbl, 150);
+
+        char mac_str[18];
+        snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 ent->mac[0], ent->mac[1], ent->mac[2],
+                 ent->mac[3], ent->mac[4], ent->mac[5]);
+        lv_obj_t *mac_lbl = lv_label_create(info);
+        lv_label_set_text(mac_lbl, mac_str);
+        lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(mac_lbl, lv_color_make(140, 140, 140), 0);
+
+        /* Delete toggle button */
+        lv_obj_t *del_btn = lv_btn_create(row);
+        lv_obj_set_size(del_btn, 40, 40);
+        lv_obj_set_style_bg_color(del_btn, lv_color_make(70, 70, 70), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(del_btn, lv_color_make(100, 100, 100), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(del_btn, 0, 0);
+        lv_obj_set_style_radius(del_btn, 6, 0);
+        lv_obj_set_style_pad_all(del_btn, 4, 0);
+        lv_obj_t *del_icon = lv_label_create(del_btn);
+        lv_label_set_text(del_icon, LV_SYMBOL_CLOSE);
+        lv_obj_set_style_text_font(del_icon, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(del_icon, lv_color_make(200, 200, 200), 0);
+        lv_obj_center(del_icon);
+        lv_obj_add_event_cb(del_btn, lookout_editor_toggle_cb, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)i);
+    }
+
+    /* Bottom button row: [Back]  [Save] */
+    lv_obj_t *btn_row = lv_obj_create(function_page);
+    lv_obj_set_size(btn_row, 228, 36);
+    lv_obj_align(btn_row, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_style_pad_column(btn_row, 8, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Back button */
+    lv_obj_t *back_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(back_btn, 106, 32);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_t *bk_icon = lv_label_create(back_btn);
+    lv_label_set_text(bk_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(bk_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bk_icon, ui_text_color(), 0);
+    lv_obj_t *bk_lbl = lv_label_create(back_btn);
+    lv_label_set_text(bk_lbl, "Back");
+    lv_obj_set_style_text_font(bk_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bk_lbl, ui_text_color(), 0);
+    lv_obj_add_event_cb(back_btn, lookout_editor_back_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Save button */
+    lv_obj_t *save_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(save_btn, 106, 32);
+    lv_obj_set_style_bg_color(save_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(save_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 40), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(save_btn, 0, 0);
+    lv_obj_set_style_radius(save_btn, 8, 0);
+    lv_obj_set_flex_flow(save_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(save_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(save_btn, 4, 0);
+    lv_obj_t *sv_icon = lv_label_create(save_btn);
+    lv_label_set_text(sv_icon, LV_SYMBOL_SAVE);
+    lv_obj_set_style_text_font(sv_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(sv_icon, lv_color_white(), 0);
+    lv_obj_t *sv_lbl = lv_label_create(save_btn);
+    lv_label_set_text(sv_lbl, "Save");
+    lv_obj_set_style_text_font(sv_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(sv_lbl, lv_color_white(), 0);
+    lv_obj_add_event_cb(save_btn, lookout_editor_save_cb, LV_EVENT_CLICKED, NULL);
 }
 
 // Bluetooth screen
