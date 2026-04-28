@@ -1367,6 +1367,9 @@ static bool bt_is_samsung_smarttag(const uint8_t *data, uint8_t len);
 static void ble_scan_back_btn_cb(lv_event_t *e);
 static void ble_scan_update_list(void);
 
+// WiFi menu screen
+static void show_wifi_menu_screen(void);
+
 // Deauth Monitor functions
 static void show_deauth_monitor_screen(void);
 static void deauth_monitor_exit_cb(lv_event_t *e);
@@ -10408,18 +10411,22 @@ static void main_tile_event_cb(lv_event_t *e)
     const char *tile_name = (const char *)lv_event_get_user_data(e);
     if (!tile_name) return;
     
-    if (strcmp(tile_name, "WiFi Scan & Attack") == 0) {
+    if (strcmp(tile_name, "WiFi Menu") == 0) {
+        show_wifi_menu_screen();
+    } else if (strcmp(tile_name, "WiFi Scan & Attack") == 0) {
         show_wifi_scan_attack_screen();
     } else if (strcmp(tile_name, "Global WiFi Attacks") == 0) {
         show_global_attacks_screen();
     } else if (strcmp(tile_name, "WiFi Sniff&Karma") == 0) {
-        sniffer_yes_btn_cb(NULL);  // Skip intermediate screen, go directly to Network Observer
+        sniffer_yes_btn_cb(NULL);
     } else if (strcmp(tile_name, "Settings") == 0) {
         show_settings_screen();
     } else if (strcmp(tile_name, "Deauth Monitor") == 0) {
         show_deauth_monitor_screen();
     } else if (strcmp(tile_name, "Bluetooth") == 0) {
         show_bluetooth_screen();
+    } else if (strcmp(tile_name, "Wardrive") == 0) {
+        wardrive_start_btn_cb(NULL);
     } else if (strcmp(tile_name, "Go Dark") == 0) {
         show_go_dark_confirm();
     }
@@ -10583,13 +10590,11 @@ static void show_main_tiles(void)
     lv_obj_set_flex_align(tiles_container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(tiles_container, LV_OBJ_FLAG_SCROLLABLE);
 
-    create_tile(tiles_container, LV_SYMBOL_WIFI,      "WiFi\nScan",    UI_ACCENT_BLUE,   main_tile_event_cb, "WiFi Scan & Attack");
-    create_tile(tiles_container, LV_SYMBOL_WARNING,   "WiFi\nAttacks", UI_ACCENT_RED,    main_tile_event_cb, "Global WiFi Attacks");
-    create_tile(tiles_container, LV_SYMBOL_EYE_OPEN,  "Observer",      UI_ACCENT_PURPLE, main_tile_event_cb, "WiFi Sniff&Karma");
-    create_tile(tiles_container, LV_SYMBOL_SETTINGS,  "Settings",      UI_ACCENT_GREEN,  main_tile_event_cb, "Settings");
-    create_tile(tiles_container, MY_SYMBOL_SATELLITE,  "Deauth\nMon.",  UI_ACCENT_AMBER,  main_tile_event_cb, "Deauth Monitor");
-    create_tile(tiles_container, MY_SYMBOL_BLUETOOTH_B, "Bluetooth",   UI_ACCENT_CYAN,   main_tile_event_cb, "Bluetooth");
-    create_tile(tiles_container, LV_SYMBOL_POWER,     "Go Dark",       lv_color_hex(0x8A8FA8), main_tile_event_cb, "Go Dark");
+    create_tile(tiles_container, LV_SYMBOL_WIFI,        "WiFi",          UI_ACCENT_BLUE,         main_tile_event_cb, "WiFi Menu");
+    create_tile(tiles_container, MY_SYMBOL_BLUETOOTH_B, "Bluetooth",    UI_ACCENT_CYAN,         main_tile_event_cb, "Bluetooth");
+    create_tile(tiles_container, MY_SYMBOL_CAR,         "Wardrive",     COLOR_MATERIAL_RED,     main_tile_event_cb, "Wardrive");
+    create_tile(tiles_container, LV_SYMBOL_SETTINGS,    "Settings",     UI_ACCENT_GREEN,        main_tile_event_cb, "Settings");
+    create_tile(tiles_container, LV_SYMBOL_POWER,       "Go Dark",      lv_color_hex(0x8A8FA8), main_tile_event_cb, "Go Dark");
     
     // Show title bar
     lv_obj_clear_flag(title_bar, LV_OBJ_FLAG_HIDDEN);
@@ -13238,10 +13243,35 @@ static void show_global_attacks_screen(void)
     lv_obj_add_event_cb(wardrive_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Start Wardrive");
 }
 
+// WiFi menu screen — sub-menu grouping all WiFi functions
+static void show_wifi_menu_screen(void)
+{
+    create_function_page_base("WiFi");
+
+    lv_obj_t *tiles = lv_obj_create(function_page);
+    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(tiles, 0, 0);
+    lv_obj_set_style_pad_all(tiles, 10, 0);
+    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *scan_tile = create_tile(tiles, LV_SYMBOL_WIFI,       "Scan &\nAttack",   UI_ACCENT_BLUE,   main_tile_event_cb, "WiFi Scan & Attack");
+    (void)scan_tile;
+    lv_obj_t *atk_tile  = create_tile(tiles, LV_SYMBOL_WARNING,    "WiFi\nAttacks",    UI_ACCENT_RED,    main_tile_event_cb, "Global WiFi Attacks");
+    (void)atk_tile;
+    lv_obj_t *dm_tile   = create_tile(tiles, MY_SYMBOL_SATELLITE,  "Deauth\nMon.",     UI_ACCENT_AMBER,  main_tile_event_cb, "Deauth Monitor");
+    (void)dm_tile;
+    lv_obj_t *obs_tile  = create_tile(tiles, LV_SYMBOL_EYE_OPEN,   "WiFi\nObserver",   UI_ACCENT_PURPLE, main_tile_event_cb, "WiFi Sniff&Karma");
+    (void)obs_tile;
+}
+
 // WiFi Sniff & Karma screen
 static void show_sniff_karma_screen(void)
 {
-    create_function_page_base("WiFi Sniff & Karma");
+    create_function_page_base("WiFi Observer");
     
     lv_obj_t *tiles = lv_obj_create(function_page);
     lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
@@ -13254,7 +13284,7 @@ static void show_sniff_karma_screen(void)
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
     
     // Network Observer tile - Purple
-    lv_obj_t *sniffer_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Network\nObserver", COLOR_MATERIAL_PURPLE, NULL, NULL);
+    lv_obj_t *sniffer_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "WiFi\nObserver", COLOR_MATERIAL_PURPLE, NULL, NULL);
     lv_obj_add_event_cb(sniffer_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Sniffer");
     
     // Browse Clients tile - Indigo (REMOVED - integrated into Sniffer)
