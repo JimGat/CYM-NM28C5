@@ -130,14 +130,23 @@ int bt_lookout_load(const char *csv_path)
     s_count = 0;
     ensure_parent_dir(csv_path);
 
+    /* Use stat() to distinguish "file missing" from a transient read error.
+     * Never overwrite an existing file just because fopen("r") failed. */
+    struct stat st;
+    bool file_exists = (stat(csv_path, &st) == 0);
+
     FILE *f = fopen(csv_path, "r");
     if (!f) {
-        /* create with header */
-        f = fopen(csv_path, "w");
-        if (!f) { ESP_LOGE(TAG, "Cannot create %s", csv_path); return -1; }
-        fwrite(BT_LOOKOUT_CSV_HEADER, 1, strlen(BT_LOOKOUT_CSV_HEADER), f);
-        fclose(f);
-        ESP_LOGI(TAG, "Created empty watchlist: %s", csv_path);
+        if (!file_exists) {
+            /* File genuinely absent — seed with header only */
+            f = fopen(csv_path, "w");
+            if (!f) { ESP_LOGE(TAG, "Cannot create %s", csv_path); return -1; }
+            fwrite(BT_LOOKOUT_CSV_HEADER, 1, strlen(BT_LOOKOUT_CSV_HEADER), f);
+            fclose(f);
+            ESP_LOGI(TAG, "Created empty watchlist: %s", csv_path);
+        } else {
+            ESP_LOGE(TAG, "Cannot read %s (exists but fopen failed)", csv_path);
+        }
         return 0;
     }
 
