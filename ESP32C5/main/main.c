@@ -3,6 +3,13 @@
 #include "ff.h"
 #include "dexter_img.h"
 #include "lvgl.h"
+
+LV_FONT_DECLARE(lv_extra_symbols);
+#define MY_SYMBOL_BLUETOOTH_B     "\xEF\x8A\x94"   /* fa-bluetooth-b   U+F294 */
+#define MY_SYMBOL_SEARCH          "\xEF\x8F\xAE"   /* fa-search        U+F3EE */
+#define MY_SYMBOL_USB             "\xEF\x8A\x87"   /* fa-usb           U+F287 */
+#define MY_SYMBOL_SATELLITE       "\xEF\x9E\xBF"   /* fa-satellite     U+F7BF */
+#define MY_SYMBOL_SATELLITE_DISH  "\xEF\x9F\x80"   /* fa-satellite-dish U+F7C0 */
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
@@ -10325,7 +10332,7 @@ static lv_obj_t *create_tile(lv_obj_t *parent, const char *icon, const char *tex
     if (icon) {
         lv_obj_t *icon_label = lv_label_create(tile);
         lv_label_set_text(icon_label, icon);
-        lv_obj_set_style_text_font(icon_label, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_font(icon_label, &lv_extra_symbols, 0);
         lv_obj_set_style_text_color(icon_label, accent, 0);
     }
 
@@ -10572,8 +10579,8 @@ static void show_main_tiles(void)
     create_tile(tiles_container, LV_SYMBOL_WARNING,   "WiFi\nAttacks", UI_ACCENT_RED,    main_tile_event_cb, "Global WiFi Attacks");
     create_tile(tiles_container, LV_SYMBOL_EYE_OPEN,  "Observer",      UI_ACCENT_PURPLE, main_tile_event_cb, "WiFi Sniff&Karma");
     create_tile(tiles_container, LV_SYMBOL_SETTINGS,  "Settings",      UI_ACCENT_GREEN,  main_tile_event_cb, "Settings");
-    create_tile(tiles_container, LV_SYMBOL_GPS,       "Deauth\nMon.",  UI_ACCENT_AMBER,  main_tile_event_cb, "Deauth Monitor");
-    create_tile(tiles_container, LV_SYMBOL_BLUETOOTH, "Bluetooth",     UI_ACCENT_CYAN,   main_tile_event_cb, "Bluetooth");
+    create_tile(tiles_container, MY_SYMBOL_SATELLITE,  "Deauth\nMon.",  UI_ACCENT_AMBER,  main_tile_event_cb, "Deauth Monitor");
+    create_tile(tiles_container, MY_SYMBOL_BLUETOOTH_B, "Bluetooth",   UI_ACCENT_CYAN,   main_tile_event_cb, "Bluetooth");
     create_tile(tiles_container, LV_SYMBOL_POWER,     "Go Dark",       lv_color_hex(0x8A8FA8), main_tile_event_cb, "Go Dark");
     
     // Show title bar
@@ -13219,7 +13226,7 @@ static void show_global_attacks_screen(void)
     lv_obj_add_event_cb(snifferdog_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Snifferdog");
     
     // Wardrive tile - Teal
-    lv_obj_t *wardrive_tile = create_tile(tiles, LV_SYMBOL_GPS, "Wardrive", COLOR_MATERIAL_TEAL, NULL, NULL);
+    lv_obj_t *wardrive_tile = create_tile(tiles, MY_SYMBOL_SATELLITE, "Wardrive", COLOR_MATERIAL_TEAL, NULL, NULL);
     lv_obj_add_event_cb(wardrive_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Start Wardrive");
 }
 
@@ -14203,7 +14210,7 @@ static void show_settings_screen(void)
     create_tile(tiles, LV_SYMBOL_IMAGE,    "Screen\nLevel",      COLOR_MATERIAL_ORANGE,   settings_tile_event_cb, "Screen Level");
     create_tile(tiles, LV_SYMBOL_SD_CARD,  "SD\nCard",           COLOR_MATERIAL_GREEN,    settings_tile_event_cb, "SD Card");
     // LV_SYMBOL_WIFI (signal arcs) is the closest built-in to a satellite dish — FA 4.7 has no dish glyph
-    create_tile(tiles, LV_SYMBOL_WIFI,     "GPS\nInfo",          lv_color_hex(0x00BCD4),  settings_tile_event_cb, "GPS Info");
+    create_tile(tiles, MY_SYMBOL_SATELLITE_DISH, "GPS\nInfo",    lv_color_hex(0x00BCD4),  settings_tile_event_cb, "GPS Info");
     create_tile(tiles, LV_SYMBOL_CHARGE,   "Power\nMode",        COLOR_MATERIAL_RED,      settings_tile_event_cb, "Power Mode");
 
     lv_obj_t *ver = lv_label_create(function_page);
@@ -15091,11 +15098,11 @@ static void show_bluetooth_screen(void)
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     
     // AirTag scan - stub - Apple-like gray
-    lv_obj_t *airtag_tile = create_tile(tiles, LV_SYMBOL_GPS, "AirTag\nscan", lv_color_make(142, 142, 147), NULL, NULL);
+    lv_obj_t *airtag_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "AirTag\nscan", lv_color_make(142, 142, 147), NULL, NULL);
     lv_obj_add_event_cb(airtag_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"AirTag scan");
     
     // BT Locator - Blue
-    lv_obj_t *locator_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "BT Locator", COLOR_TILE_BLUE, NULL, NULL);
+    lv_obj_t *locator_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BT Locator", COLOR_TILE_BLUE, NULL, NULL);
     lv_obj_add_event_cb(locator_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Locator");
 }
 
