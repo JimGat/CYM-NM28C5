@@ -15716,7 +15716,10 @@ static void show_bt_lookout_screen(void)
     bt_lookout_start_btn  = NULL;
 
     ensure_sd_mounted();
-    bt_lookout_load(BT_LOOKOUT_CSV_PATH);
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        bt_lookout_load(BT_LOOKOUT_CSV_PATH);
+        xSemaphoreGive(sd_spi_mutex);
+    }
 
     if (!ensure_ble_mode()) {
         lv_obj_t *err = lv_label_create(function_page);
@@ -17391,8 +17394,11 @@ void attack_event_cb(lv_event_t *e)
                                       BT_LOOKOUT_RSSI_ANY);
             xSemaphoreGive(sd_spi_mutex);
         }
-        show_lookout_alert_popup(disp_name,
-                                 saved ? "Added to BT Lookout" : "Save failed (no SD?)", 0);
+        if (saved) {
+            show_bt_lookout_screen();   /* navigate directly to BT Lookout */
+        } else {
+            show_lookout_alert_popup(disp_name, "Save failed — check SD card", 0);
+        }
         return;
     }
 
