@@ -5,11 +5,15 @@
 #include "lvgl.h"
 
 LV_FONT_DECLARE(lv_extra_symbols);
-#define MY_SYMBOL_BLUETOOTH_B     "\xEF\x8A\x94"   /* fa-bluetooth-b   U+F294 */
-#define MY_SYMBOL_SEARCH          "\xEF\x8F\xAE"   /* fa-search        U+F3EE */
-#define MY_SYMBOL_USB             "\xEF\x8A\x87"   /* fa-usb           U+F287 */
-#define MY_SYMBOL_SATELLITE       "\xEF\x9E\xBF"   /* fa-satellite     U+F7BF */
+#define MY_SYMBOL_BLUETOOTH_B     "\xEF\x8A\x94"   /* fa-bluetooth-b    U+F294 */
+#define MY_SYMBOL_SEARCH          "\xEF\x8F\xAE"   /* fa-search         U+F3EE */
+#define MY_SYMBOL_USB             "\xEF\x8A\x87"   /* fa-usb            U+F287 */
+#define MY_SYMBOL_SATELLITE       "\xEF\x9E\xBF"   /* fa-satellite      U+F7BF */
 #define MY_SYMBOL_SATELLITE_DISH  "\xEF\x9F\x80"   /* fa-satellite-dish U+F7C0 */
+#define MY_SYMBOL_CAR             "\xEF\x86\xB9"   /* fa-car            U+F1B9 */
+#define MY_SYMBOL_XRAY            "\xEF\x92\x97"   /* fa-x-ray          U+F497 */
+#define MY_SYMBOL_JET_FIGHTER     "\xEE\x94\x98"   /* jet-fighter       U+E518 */
+#define MY_SYMBOL_PERSON_WALKING  "\xEE\x95\x93"   /* person-walking    U+E553 */
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
@@ -13226,7 +13230,7 @@ static void show_global_attacks_screen(void)
     lv_obj_add_event_cb(snifferdog_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Snifferdog");
     
     // Wardrive tile - Teal
-    lv_obj_t *wardrive_tile = create_tile(tiles, MY_SYMBOL_SATELLITE, "Wardrive", COLOR_MATERIAL_TEAL, NULL, NULL);
+    lv_obj_t *wardrive_tile = create_tile(tiles, MY_SYMBOL_CAR, "Wardrive", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(wardrive_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Start Wardrive");
 }
 
