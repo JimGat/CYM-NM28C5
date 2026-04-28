@@ -9,8 +9,8 @@
 static const char *TAG = "bt_lookout";
 
 /* ── Alert timing ──────────────────────────────────────────────── */
-#define FLASH_ON_US   500000LL          /* 500 ms LED on  */
-#define FLASH_OFF_US  2500000LL         /* 2500 ms LED off → 3 s per cycle */
+#define FLASH_ON_US   250000LL          /* 250 ms LED on  */
+#define FLASH_OFF_US  250000LL          /* 250 ms LED off → 0.5 s per blink */
 #define FLASH_COUNT   3                 /* three flashes per alert */
 #define COOLDOWN_US   (30LL * 1000000LL)/* 30 s per-device cooldown */
 
