@@ -394,7 +394,7 @@ Switching modes takes effect immediately on the active radio and is re-applied a
 | **LVGL Material Dark Theme** | Modern, touch-friendly dark UI |
 | **Portrait 240×320 Layout** | All screens designed and reflowed for the NM-CYD-C5's 240×320 portrait display |
 | **5-Tile Main Menu** | WiFi, Bluetooth, Wardrive, Settings, Go Dark — WiFi expands to sub-menu |
-| **Screenshot Capture** | Save screen to SD card (`/sdcard/screenshots/`) |
+| **Screenshot Capture** | Tap the **title bar** on any screen to save a BMP to `/sdcard/screenshots/` — works on every screen including all menus, feature pages, and live data views |
 | **WPA-SEC Upload** | Upload captured handshakes to wpa-sec.stanev.org via HTTPS |
 | **NeoPixel Status LED** | Mode-based color indicator via WS2812 LED (GPIO 27) |
 
@@ -432,6 +432,14 @@ All data is stored on the SD card:
 ├── screenshots/          # UI screenshots (BMP)
 └── calibrate.txt         # ← Create this file to trigger touch re-calibration on next boot
 ```
+
+### Screenshot Capture
+
+Tap the **title bar on any screen** to capture a screenshot. The image is saved as an uncompressed 24-bit BMP to `/sdcard/screenshots/screen_N.bmp` with an auto-incrementing index. The write runs in a background task so the UI stays responsive, and the title bar is briefly disabled while the save is in progress to prevent double-captures. Requires a mounted SD card — a warning is logged if the card is unavailable.
+
+Screenshots are captured at full 240×320 resolution and can be opened directly in any image viewer or graphics application.
+
+---
 
 The **SD Card → File Tree** utility (Settings menu) lets you browse the SD card's directory tree directly on the device — useful for confirming handshakes and wardrive logs were saved without needing to remove the card.
 
