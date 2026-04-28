@@ -794,6 +794,7 @@ static volatile bool wardrive_ui_active = false;
 // Wardrive UI dashboard widgets
 static lv_obj_t *wd_ui_gps_label = NULL;
 static lv_obj_t *wd_ui_counter_label = NULL;
+static lv_obj_t *wd_ui_header = NULL;
 static lv_obj_t *wd_ui_table = NULL;
 static lv_obj_t *wd_ui_channel_label = NULL;
 static lv_timer_t *wd_ui_timer = NULL;
@@ -1235,6 +1236,7 @@ static void reset_function_page_children(void) {
     wd_ui_gps_label = NULL;
     wd_ui_counter_label = NULL;
     wd_ui_channel_label = NULL;
+    wd_ui_header = NULL;
     wd_ui_table = NULL;
     karma_log_ta = NULL;
     karma_stop_btn = NULL;
@@ -5177,33 +5179,28 @@ void app_main(void)
                     int total = wdp_seen_count;
                     int show = (total > 50) ? 50 : total;
                     int start = total - show;
-                    lv_table_set_row_cnt(wd_ui_table, show + 1);
+                    lv_table_set_row_cnt(wd_ui_table, show > 0 ? show : 1);
                     lv_table_set_col_cnt(wd_ui_table, 5);
-                    lv_table_set_cell_value(wd_ui_table, 0, 0, "SSID");
-                    lv_table_set_cell_value(wd_ui_table, 0, 1, "Ch");
-                    lv_table_set_cell_value(wd_ui_table, 0, 2, "RSSI");
-                    lv_table_set_cell_value(wd_ui_table, 0, 3, "Auth");
-                    lv_table_set_cell_value(wd_ui_table, 0, 4, "Lat");
                     for (int i = 0; i < show; i++) {
                         wdp_network_t *net = &wdp_seen_networks[start + show - 1 - i];
                         char ssid_trunc[20];
                         strncpy(ssid_trunc, net->ssid[0] ? net->ssid : "[hidden]", 19);
                         ssid_trunc[19] = '\0';
-                        lv_table_set_cell_value(wd_ui_table, i + 1, 0, ssid_trunc);
+                        lv_table_set_cell_value(wd_ui_table, i, 0, ssid_trunc);
                         char ch_str[4]; snprintf(ch_str, sizeof(ch_str), "%d", net->channel);
-                        lv_table_set_cell_value(wd_ui_table, i + 1, 1, ch_str);
+                        lv_table_set_cell_value(wd_ui_table, i, 1, ch_str);
                         char rssi_str[8]; snprintf(rssi_str, sizeof(rssi_str), "%d", net->rssi);
-                        lv_table_set_cell_value(wd_ui_table, i + 1, 2, rssi_str);
+                        lv_table_set_cell_value(wd_ui_table, i, 2, rssi_str);
                         const char *auth = get_auth_mode_wiggle(net->authmode);
                         char auth_short[8]; strncpy(auth_short, auth, 7); auth_short[7] = '\0';
-                        lv_table_set_cell_value(wd_ui_table, i + 1, 3, auth_short);
+                        lv_table_set_cell_value(wd_ui_table, i, 3, auth_short);
                         char coord_str[24];
                         if (net->latitude != 0.0f || net->longitude != 0.0f) {
                             snprintf(coord_str, sizeof(coord_str), "%.2f", (double)net->latitude);
                         } else {
                             snprintf(coord_str, sizeof(coord_str), "--");
                         }
-                        lv_table_set_cell_value(wd_ui_table, i + 1, 4, coord_str);
+                        lv_table_set_cell_value(wd_ui_table, i, 4, coord_str);
                     }
                 }
             }
@@ -8915,35 +8912,29 @@ static void wd_ui_timer_cb(lv_timer_t *timer) {
         int total = wdp_seen_count;
         int show = (total > 50) ? 50 : total;
         int start = total - show;
-        lv_table_set_row_cnt(wd_ui_table, show + 1);
+        lv_table_set_row_cnt(wd_ui_table, show > 0 ? show : 1);
         lv_table_set_col_cnt(wd_ui_table, 5);
-
-        lv_table_set_cell_value(wd_ui_table, 0, 0, "SSID");
-        lv_table_set_cell_value(wd_ui_table, 0, 1, "Ch");
-        lv_table_set_cell_value(wd_ui_table, 0, 2, "RSSI");
-        lv_table_set_cell_value(wd_ui_table, 0, 3, "Auth");
-        lv_table_set_cell_value(wd_ui_table, 0, 4, "Lat");
 
         for (int i = 0; i < show; i++) {
             wdp_network_t *net = &wdp_seen_networks[start + show - 1 - i];
             char ssid_trunc[20];
             strncpy(ssid_trunc, net->ssid[0] ? net->ssid : "[hidden]", 19);
             ssid_trunc[19] = '\0';
-            lv_table_set_cell_value(wd_ui_table, i + 1, 0, ssid_trunc);
+            lv_table_set_cell_value(wd_ui_table, i, 0, ssid_trunc);
 
             char ch_str[4];
             snprintf(ch_str, sizeof(ch_str), "%d", net->channel);
-            lv_table_set_cell_value(wd_ui_table, i + 1, 1, ch_str);
+            lv_table_set_cell_value(wd_ui_table, i, 1, ch_str);
 
             char rssi_str[8];
             snprintf(rssi_str, sizeof(rssi_str), "%d", net->rssi);
-            lv_table_set_cell_value(wd_ui_table, i + 1, 2, rssi_str);
+            lv_table_set_cell_value(wd_ui_table, i, 2, rssi_str);
 
             const char *auth = get_auth_mode_wiggle(net->authmode);
             char auth_short[8];
             strncpy(auth_short, auth, 7);
             auth_short[7] = '\0';
-            lv_table_set_cell_value(wd_ui_table, i + 1, 3, auth_short);
+            lv_table_set_cell_value(wd_ui_table, i, 3, auth_short);
 
             char coord_str[24];
             if (net->latitude != 0.0f || net->longitude != 0.0f) {
@@ -8951,7 +8942,7 @@ static void wd_ui_timer_cb(lv_timer_t *timer) {
             } else {
                 snprintf(coord_str, sizeof(coord_str), "--");
             }
-            lv_table_set_cell_value(wd_ui_table, i + 1, 4, coord_str);
+            lv_table_set_cell_value(wd_ui_table, i, 4, coord_str);
         }
     }
 }
@@ -9025,12 +9016,45 @@ static void wardrive_start_btn_cb(lv_event_t *e)
 
     // ─── Recent networks table ────────────────────────────────────
     // y=101: boxes end at 55+42=97, 4px gap. height=164: stops 4px above stop btn.
+    // Frozen header row — 1-row table, no scrolling
+    wd_ui_header = lv_table_create(function_page);
+    lv_obj_set_size(wd_ui_header, lv_pct(97), LV_SIZE_CONTENT);
+    lv_obj_align(wd_ui_header, LV_ALIGN_TOP_MID, 0, 101);
+    lv_obj_set_style_bg_color(wd_ui_header, lv_color_make(30, 30, 30), 0);
+    lv_obj_set_style_border_color(wd_ui_header, lv_color_make(50, 50, 50), 0);
+    lv_obj_set_style_border_width(wd_ui_header, 1, 0);
+    lv_obj_set_style_border_side(wd_ui_header, LV_BORDER_SIDE_LEFT | LV_BORDER_SIDE_RIGHT | LV_BORDER_SIDE_TOP, 0);
+    lv_obj_set_style_radius(wd_ui_header, 6, 0);
+    lv_obj_set_style_text_font(wd_ui_header, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wd_ui_header, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_bg_color(wd_ui_header, lv_color_make(40, 60, 40), LV_PART_ITEMS);
+    lv_obj_set_style_pad_top(wd_ui_header, 2, LV_PART_ITEMS);
+    lv_obj_set_style_pad_bottom(wd_ui_header, 2, LV_PART_ITEMS);
+    lv_obj_set_style_pad_left(wd_ui_header, 4, LV_PART_ITEMS);
+    lv_obj_set_style_pad_right(wd_ui_header, 2, LV_PART_ITEMS);
+    lv_obj_set_scroll_dir(wd_ui_header, LV_DIR_NONE);
+    lv_obj_set_scrollbar_mode(wd_ui_header, LV_SCROLLBAR_MODE_OFF);
+    lv_table_set_col_cnt(wd_ui_header, 5);
+    lv_table_set_col_width(wd_ui_header, 0, 82);
+    lv_table_set_col_width(wd_ui_header, 1, 26);
+    lv_table_set_col_width(wd_ui_header, 2, 36);
+    lv_table_set_col_width(wd_ui_header, 3, 44);
+    lv_table_set_col_width(wd_ui_header, 4, 45);
+    lv_table_set_row_cnt(wd_ui_header, 1);
+    lv_table_set_cell_value(wd_ui_header, 0, 0, "SSID");
+    lv_table_set_cell_value(wd_ui_header, 0, 1, "Ch");
+    lv_table_set_cell_value(wd_ui_header, 0, 2, "RSSI");
+    lv_table_set_cell_value(wd_ui_header, 0, 3, "Auth");
+    lv_table_set_cell_value(wd_ui_header, 0, 4, "Lat");
+
+    // Scrollable data table — sits below the frozen header
     wd_ui_table = lv_table_create(function_page);
-    lv_obj_set_size(wd_ui_table, lv_pct(97), 164);
-    lv_obj_align(wd_ui_table, LV_ALIGN_TOP_MID, 0, 101);
+    lv_obj_set_size(wd_ui_table, lv_pct(97), 144);
+    lv_obj_align(wd_ui_table, LV_ALIGN_TOP_MID, 0, 121);
     lv_obj_set_style_bg_color(wd_ui_table, lv_color_make(15, 15, 15), 0);
     lv_obj_set_style_border_color(wd_ui_table, lv_color_make(50, 50, 50), 0);
     lv_obj_set_style_border_width(wd_ui_table, 1, 0);
+    lv_obj_set_style_border_side(wd_ui_table, LV_BORDER_SIDE_LEFT | LV_BORDER_SIDE_RIGHT | LV_BORDER_SIDE_BOTTOM, 0);
     lv_obj_set_style_radius(wd_ui_table, 6, 0);
     lv_obj_set_style_text_font(wd_ui_table, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(wd_ui_table, lv_color_make(200, 200, 200), 0);
@@ -9048,13 +9072,7 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_table_set_col_width(wd_ui_table, 4, 45);   // Lat
     lv_obj_set_scroll_dir(wd_ui_table, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(wd_ui_table, LV_SCROLLBAR_MODE_AUTO);
-
     lv_table_set_row_cnt(wd_ui_table, 1);
-    lv_table_set_cell_value(wd_ui_table, 0, 0, "SSID");
-    lv_table_set_cell_value(wd_ui_table, 0, 1, "Ch");
-    lv_table_set_cell_value(wd_ui_table, 0, 2, "RSSI");
-    lv_table_set_cell_value(wd_ui_table, 0, 3, "Auth");
-    lv_table_set_cell_value(wd_ui_table, 0, 4, "Lat");
 
     // ─── Stop button (bottom center) ─────────────────────────────
     wardrive_stop_btn = lv_btn_create(function_page);
@@ -9146,6 +9164,7 @@ static void wardrive_stop_btn_cb(lv_event_t *e)
     wd_ui_gps_label = NULL;
     wd_ui_counter_label = NULL;
     wd_ui_channel_label = NULL;
+    wd_ui_header = NULL;
     wd_ui_table = NULL;
     wdp_current_channel = 0;
 
