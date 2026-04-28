@@ -5,6 +5,7 @@
 #include "lvgl.h"
 
 LV_FONT_DECLARE(lv_extra_symbols);
+LV_IMG_DECLARE(lab_bg);
 #define MY_SYMBOL_BLUETOOTH_B     "\xEF\x8A\x94"   /* fa-bluetooth-b    U+F294 */
 #define MY_SYMBOL_SEARCH          "\xEF\x8F\xAE"   /* fa-search         U+F3EE */
 #define MY_SYMBOL_USB             "\xEF\x8A\x87"   /* fa-usb            U+F287 */
@@ -1114,6 +1115,7 @@ void back_to_menu_cb(lv_event_t *e);
 
 // Tile-based navigation system
 static lv_obj_t *tiles_container = NULL;
+static lv_obj_t *home_bg_img = NULL;
 static lv_obj_t *create_tile(lv_obj_t *parent, const char *icon, const char *text, lv_color_t bg_color, lv_event_cb_t callback, const char *user_data);
 static void show_main_tiles(void);
 static void show_wifi_scan_attack_screen(void);
@@ -3518,6 +3520,7 @@ static void create_home_ui(void)
     lv_obj_set_size(title_bar, lv_pct(100), 30);
     lv_obj_align(title_bar, LV_ALIGN_TOP_MID, 0, 0);
     lv_obj_set_style_bg_color(title_bar, ui_panel_color(), 0);
+    lv_obj_set_style_bg_opa(title_bar, LV_OPA_70, 0);
     lv_obj_set_style_border_width(title_bar, 0, 0);
     lv_obj_set_style_radius(title_bar, 0, 0);
     lv_obj_clear_flag(title_bar, LV_OBJ_FLAG_SCROLLABLE);
@@ -10606,18 +10609,30 @@ static void show_main_tiles(void)
         lv_obj_del(tiles_container);
         tiles_container = NULL;
     }
-    
+    if (home_bg_img) {
+        lv_obj_del(home_bg_img);
+        home_bg_img = NULL;
+    }
+
     // Delete function page if present
     if (function_page) {
         lv_obj_del(function_page);
         function_page = NULL;
     }
     reset_function_page_children();
-    
+
+    // Lab background image — created first so it sits below the title bar and tiles
+    home_bg_img = lv_img_create(lv_scr_act());
+    lv_img_set_src(home_bg_img, &lab_bg);
+    lv_obj_align(home_bg_img, LV_ALIGN_CENTER, 0, 0);
+    // Dark recolor overlay: 65% black fade so tiles remain readable
+    lv_obj_set_style_img_recolor(home_bg_img, lv_color_black(), 0);
+    lv_obj_set_style_img_recolor_opa(home_bg_img, LV_OPA_60, 0);
+
     tiles_container = lv_obj_create(lv_scr_act());
     lv_obj_set_size(tiles_container, lv_pct(100), 290);
     lv_obj_align(tiles_container, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(tiles_container, ui_bg_color(), 0);
+    lv_obj_set_style_bg_opa(tiles_container, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles_container, 0, 0);
     lv_obj_set_style_radius(tiles_container, 0, 0);
     lv_obj_set_style_pad_all(tiles_container, 8, 0);
