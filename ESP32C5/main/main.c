@@ -1178,7 +1178,7 @@ static void show_portal_data_screen(void);
 static void show_handshakes_list_screen(void);
 static void wifi_monitor_tile_event_cb(lv_event_t *e);
 static void show_bluetooth_screen(void);
-static void show_stub_screen(const char *name);
+static void show_stub_screen(const char *name, void (*back_fn)(void));
 static void main_tile_event_cb(lv_event_t *e);
 static void attack_tile_event_cb(lv_event_t *e);
 static void update_sniffer_button_ui(void);
@@ -15939,7 +15939,7 @@ static void show_bt_locator_screen(void)
     lv_obj_align(bt_locator_mac_label, LV_ALIGN_CENTER, 0, 20);
     lv_obj_add_flag(bt_locator_mac_label, LV_OBJ_FLAG_HIDDEN);
     
-    // Red Exit button at bottom (compact row)
+    // Back button at bottom (compact row)
     bt_locator_exit_btn = lv_btn_create(function_page);
     lv_obj_set_size(bt_locator_exit_btn, 110, 28);
     lv_obj_align(bt_locator_exit_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
@@ -15957,17 +15957,17 @@ static void show_bt_locator_screen(void)
     lv_obj_set_flex_align(bt_locator_exit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
     lv_obj_t *exit_icon = lv_label_create(bt_locator_exit_btn);
-    lv_label_set_text(exit_icon, LV_SYMBOL_CLOSE);
+    lv_label_set_text(exit_icon, LV_SYMBOL_LEFT);
     lv_obj_set_style_text_font(exit_icon, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(exit_icon, ui_text_color(), 0);
 
     lv_obj_t *exit_lbl = lv_label_create(bt_locator_exit_btn);
-    lv_label_set_text(exit_lbl, "Exit");
+    lv_label_set_text(exit_lbl, "Back");
     lv_obj_set_style_text_font(exit_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(exit_lbl, ui_text_color(), 0);
 
     lv_obj_add_event_cb(bt_locator_exit_btn, bt_locator_exit_cb, LV_EVENT_CLICKED, NULL);
-    
+
     // Switch to BLE mode
     if (!ensure_ble_mode()) {
         lv_label_set_text(bt_locator_status_label, "BLE init failed!");
@@ -16246,7 +16246,7 @@ static void show_bt_locator_direct_track(void)
     lv_obj_set_style_text_font(bt_locator_mac_label, &lv_font_montserrat_14, 0);
     lv_obj_align(bt_locator_mac_label, LV_ALIGN_CENTER, 0, 10);
 
-    // Exit button
+    // Back button
     bt_locator_exit_btn = lv_btn_create(function_page);
     lv_obj_set_size(bt_locator_exit_btn, 110, 28);
     lv_obj_align(bt_locator_exit_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
@@ -16264,12 +16264,12 @@ static void show_bt_locator_direct_track(void)
     lv_obj_set_flex_align(bt_locator_exit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
     lv_obj_t *exit_icon = lv_label_create(bt_locator_exit_btn);
-    lv_label_set_text(exit_icon, LV_SYMBOL_CLOSE);
+    lv_label_set_text(exit_icon, LV_SYMBOL_LEFT);
     lv_obj_set_style_text_font(exit_icon, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(exit_icon, ui_text_color(), 0);
 
     lv_obj_t *exit_lbl = lv_label_create(bt_locator_exit_btn);
-    lv_label_set_text(exit_lbl, "Exit");
+    lv_label_set_text(exit_lbl, "Back");
     lv_obj_set_style_text_font(exit_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(exit_lbl, ui_text_color(), 0);
 
@@ -16340,22 +16340,52 @@ static void show_bt_attack_tiles_screen(void)
     lv_obj_add_event_cb(add_lookout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Add to Lookout");
 }
 
+static void stub_back_btn_cb(lv_event_t *e)
+{
+    void (*fn)(void) = (void (*)(void))lv_obj_get_user_data(lv_event_get_target(e));
+    if (fn) fn(); else nav_to_menu_flag = true;
+}
+
 // Stub screen for not-yet-implemented features
-static void show_stub_screen(const char *name)
+static void show_stub_screen(const char *name, void (*back_fn)(void))
 {
     create_function_page_base(name);
-    
+
     lv_obj_t *label = lv_label_create(function_page);
     lv_label_set_text(label, "Coming Soon");
     lv_obj_set_style_text_font(label, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(label, ui_text_color(), 0);
     lv_obj_center(label);
-    
+
     lv_obj_t *sublabel = lv_label_create(function_page);
     lv_label_set_text(sublabel, "This feature is under development");
     lv_obj_set_style_text_font(sublabel, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(sublabel, lv_color_make(176, 176, 176), 0);  // Light gray #B0B0B0
+    lv_obj_set_style_text_color(sublabel, lv_color_make(176, 176, 176), 0);
     lv_obj_align(sublabel, LV_ALIGN_CENTER, 0, 40);
+
+    /* Back button */
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 28);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_style_pad_ver(back_btn, 4, 0);
+    lv_obj_set_style_pad_hor(back_btn, 8, 0);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(back_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(back_icon, lv_color_white(), 0);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, "Back");
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
+    lv_obj_set_user_data(back_btn, (void *)back_fn);
+    lv_obj_add_event_cb(back_btn, stub_back_btn_cb, LV_EVENT_CLICKED, NULL);
 }
 
 // ============================================================================
@@ -17369,7 +17399,7 @@ void attack_event_cb(lv_event_t *e)
 
     // GATT Walker (future)
     if (strcmp(attack_name, "GATT Walker") == 0) {
-        show_stub_screen("GATT Walker");
+        show_stub_screen("GATT Walker", show_bt_attack_tiles_screen);
         return;
     }
 
@@ -17405,7 +17435,7 @@ void attack_event_cb(lv_event_t *e)
     // Stub screens for not-yet-implemented features
     if (strcmp(attack_name, "Package Monitor") == 0 ||
         strcmp(attack_name, "Channel View") == 0) {
-        show_stub_screen(attack_name);
+        show_stub_screen(attack_name, NULL);
         return;
     }
 
@@ -18421,8 +18451,8 @@ static void bt_locator_exit_cb(lv_event_t *e)
         current_radio_mode = RADIO_MODE_NONE;
     }
     
-    // Return to menu
-    nav_to_menu_flag = true;
+    // Return to Bluetooth screen
+    show_bluetooth_screen();
 }
 
 /**
@@ -19386,11 +19416,11 @@ static void show_tag_tracker_screen(int dev_idx)
     lv_obj_set_flex_flow(bt_locator_exit_btn, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(bt_locator_exit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_t *exit_icon2 = lv_label_create(bt_locator_exit_btn);
-    lv_label_set_text(exit_icon2, LV_SYMBOL_CLOSE);
+    lv_label_set_text(exit_icon2, LV_SYMBOL_LEFT);
     lv_obj_set_style_text_font(exit_icon2, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(exit_icon2, lv_color_white(), 0);
     lv_obj_t *exit_text2 = lv_label_create(bt_locator_exit_btn);
-    lv_label_set_text(exit_text2, "Exit");
+    lv_label_set_text(exit_text2, "Back");
     lv_obj_set_style_text_font(exit_text2, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(exit_text2, lv_color_white(), 0);
     lv_obj_add_event_cb(bt_locator_exit_btn, bt_locator_exit_cb, LV_EVENT_CLICKED, NULL);
