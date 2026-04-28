@@ -1,8 +1,33 @@
 # CYM-NM28C5 Pre-built Firmware Binaries
 
-**Firmware version: v0.5.5**
+**Firmware version: v0.6.2**
 
 This folder contains the latest compiled firmware for the **NM-CYD-C5 (ESP32-C5)** board.
+
+---
+
+## Release Notes — v0.6.2
+
+### New Feature: Bluetooth Lookout
+
+A new BLE watchlist monitor has been added to the Bluetooth menu. Load a watchlist of target MAC addresses from an SD card CSV (`/sdcard/lab/bluetooth/lookout.csv`), start monitoring, and the device will alert on any detected match — flashing the RGB LED with three rapid red bursts and displaying a popup with the device name, MAC, and RSSI. The screen supports:
+
+- **Start / Stop** monitoring toggle
+- **Blackout** — extinguishes the display while monitoring continues silently; LED alert breaks blackout on detection
+- **Edit List** — opens a scrollable watchlist editor when stopped; tap any entry to mark it for deletion, then Save to rewrite the CSV or Back to discard
+- **Add to BT Lookout** — available from BT Scan & Select; adds the currently selected device to the watchlist and navigates directly to the Bluetooth Lookout screen
+- A conflict warning popup appears if another Bluetooth feature (AirTag Scan, BT Scan & Select, BT Locator) is launched while Lookout is actively monitoring — choose Cancel to keep monitoring or Stop & Go to halt Lookout and open the new feature
+
+### Wardrive Improvements
+
+- Column headers are now frozen — they remain visible while the scan data table scrolls independently
+- Stop button and data table layout corrected to eliminate overlap on the 240 px portrait display
+
+### Navigation Fixes
+
+- BT Locator: Exit button replaced with Back — returns to the Bluetooth screen instead of the main menu
+- AirTag Scanner: Back button now returns to the Bluetooth screen instead of the main menu
+- GATT Walker "Coming Soon" screen now has a Back button
 
 ---
 

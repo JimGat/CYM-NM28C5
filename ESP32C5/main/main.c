@@ -3,6 +3,19 @@
 #include "ff.h"
 #include "dexter_img.h"
 #include "lvgl.h"
+
+LV_FONT_DECLARE(lv_extra_symbols);
+LV_IMG_DECLARE(lab_bg);
+LV_IMG_DECLARE(deedee_img);
+#define MY_SYMBOL_BLUETOOTH_B     "\xEF\x8A\x94"   /* fa-bluetooth-b    U+F294 */
+#define MY_SYMBOL_SEARCH          "\xEF\x8F\xAE"   /* fa-search         U+F3EE */
+#define MY_SYMBOL_USB             "\xEF\x8A\x87"   /* fa-usb            U+F287 */
+#define MY_SYMBOL_SATELLITE       "\xEF\x9E\xBF"   /* fa-satellite      U+F7BF */
+#define MY_SYMBOL_SATELLITE_DISH  "\xEF\x9F\x80"   /* fa-satellite-dish U+F7C0 */
+#define MY_SYMBOL_CAR             "\xEF\x86\xB9"   /* fa-car            U+F1B9 */
+#define MY_SYMBOL_XRAY            "\xEF\x92\x97"   /* fa-x-ray          U+F497 */
+#define MY_SYMBOL_JET_FIGHTER     "\xEE\x94\x98"   /* jet-fighter       U+E518 */
+#define MY_SYMBOL_PERSON_WALKING  "\xEE\x95\x93"   /* person-walking    U+E553 */
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
@@ -73,6 +86,7 @@
 // BLE controller TX power API — controller-level, works with NimBLE host
 #include "esp_bt.h"
 #include "dexter_img.h"
+#include "bt_lookout.h"
 
 #define TAG "WiFi_Hacker"
 
@@ -781,6 +795,7 @@ static volatile bool wardrive_ui_active = false;
 // Wardrive UI dashboard widgets
 static lv_obj_t *wd_ui_gps_label = NULL;
 static lv_obj_t *wd_ui_counter_label = NULL;
+static lv_obj_t *wd_ui_header = NULL;
 static lv_obj_t *wd_ui_table = NULL;
 static lv_obj_t *wd_ui_channel_label = NULL;
 static lv_timer_t *wd_ui_timer = NULL;
@@ -995,6 +1010,7 @@ static portMUX_TYPE deauth_monitor_spin = portMUX_INITIALIZER_UNLOCKED;
 // Deauth Monitor UI state
 static lv_obj_t *deauth_monitor_list = NULL;
 static lv_obj_t *deauth_monitor_status_label = NULL;
+static lv_obj_t *deauth_monitor_known_label = NULL;
 static lv_obj_t *deauth_monitor_rec_label = NULL;
 static volatile bool deauth_monitor_ui_active = false;
 static volatile bool deauth_monitor_update_flag = false;
@@ -1055,6 +1071,27 @@ static volatile bool bt_tracking_found = false;
 static char bt_tracking_name[32] = "";
 static TaskHandle_t bt_locator_task_handle = NULL;
 static volatile bool airtag_scan_update_flag = false;
+
+// BT Scan & Select UI state
+static lv_obj_t *bt_sas_list = NULL;
+static lv_obj_t *bt_sas_status_label = NULL;
+static lv_obj_t *bt_sas_next_btn = NULL;
+static volatile bool bt_sas_ui_active = false;
+static volatile bool bt_sas_needs_update = false;
+static int bt_sas_selected_idx = -1;
+static uint8_t bt_sas_target_addr[6];
+static char bt_sas_target_name[32];
+
+// ── BT Lookout (Dee Dee Detector) UI state ──────────────────────
+static bool        bt_lookout_ui_active       = false;
+static lv_obj_t   *bt_lookout_status_lbl       = NULL;
+static lv_obj_t   *bt_lookout_count_lbl        = NULL;
+static lv_obj_t   *bt_lookout_last_lbl         = NULL;
+static lv_obj_t   *bt_lookout_start_btn        = NULL;
+static lv_obj_t   *bt_lookout_edit_btn         = NULL;
+static lv_obj_t   *bt_lookout_popup_obj        = NULL;
+static lv_timer_t *bt_lookout_popup_tmr        = NULL;
+static TaskHandle_t bt_lookout_scan_loop_handle = NULL;
 // Snapshot values for UI (copied before reset)
 static volatile int airtag_scan_snapshot_airtag = 0;
 static volatile int airtag_scan_snapshot_smarttag = 0;
@@ -1092,6 +1129,44 @@ void back_to_menu_cb(lv_event_t *e);
 
 // Tile-based navigation system
 static lv_obj_t *tiles_container = NULL;
+static lv_obj_t *home_bg_img = NULL;
+
+// ── Disco mode Easter egg ──────────────────────────────────────────────────
+typedef struct { uint8_t r, g, b; } disco_rgb_t;
+// 70s tie-dye screen palette (full brightness for display)
+static const disco_rgb_t DISCO_PALETTE[8] = {
+    {255,  20, 147},  // hot pink
+    {255, 140,   0},  // orange
+    {255, 230,   0},  // yellow
+    { 80, 255,   0},  // lime
+    {  0, 220, 255},  // cyan
+    {160,   0, 255},  // purple
+    { 30, 100, 255},  // electric blue
+    {255,  60,   0},  // red-orange
+};
+// LED values at 60% brightness for the WS2812
+static const disco_rgb_t DISCO_LED_PAL[8] = {
+    {153,  12,  88},
+    {153,  84,   0},
+    {153, 138,   0},
+    { 48, 153,   0},
+    {  0, 132, 153},
+    { 96,   0, 153},
+    { 18,  60, 153},
+    {153,  36,   0},
+};
+#define DISCO_NC 8
+
+static int            settings_tap_count  = 0;
+static lv_timer_t    *settings_nav_timer  = NULL;
+static volatile bool  disco_mode_active   = false;
+static TaskHandle_t   disco_task_handle   = NULL;
+static lv_obj_t      *disco_screen_obj    = NULL;
+static lv_obj_t      *disco_layers[4]     = {NULL};
+static volatile uint8_t disco_color_idx   = 0;
+static volatile bool  disco_needs_update  = false;
+static volatile uint8_t disco_led_r = 0, disco_led_g = 0, disco_led_b = 0;
+static volatile bool  disco_led_needs_update = false;
 static lv_obj_t *create_tile(lv_obj_t *parent, const char *icon, const char *text, lv_color_t bg_color, lv_event_cb_t callback, const char *user_data);
 static void show_main_tiles(void);
 static void show_wifi_scan_attack_screen(void);
@@ -1104,7 +1179,7 @@ static void show_portal_data_screen(void);
 static void show_handshakes_list_screen(void);
 static void wifi_monitor_tile_event_cb(lv_event_t *e);
 static void show_bluetooth_screen(void);
-static void show_stub_screen(const char *name);
+static void show_stub_screen(const char *name, void (*back_fn)(void));
 static void main_tile_event_cb(lv_event_t *e);
 static void attack_tile_event_cb(lv_event_t *e);
 static void update_sniffer_button_ui(void);
@@ -1173,6 +1248,7 @@ static void reset_function_page_children(void) {
     wd_ui_gps_label = NULL;
     wd_ui_counter_label = NULL;
     wd_ui_channel_label = NULL;
+    wd_ui_header = NULL;
     wd_ui_table = NULL;
     karma_log_ta = NULL;
     karma_stop_btn = NULL;
@@ -1193,6 +1269,12 @@ static void reset_function_page_children(void) {
     screenshot_btn = NULL;
     deauth_monitor_list = NULL;
     deauth_monitor_status_label = NULL;
+    deauth_monitor_known_label = NULL;
+    bt_sas_list = NULL;
+    bt_sas_status_label = NULL;
+    bt_sas_next_btn = NULL;
+    bt_sas_ui_active = false;
+    bt_sas_selected_idx = -1;
     airtag_scan_status_label = NULL;
     airtag_scan_stats_label1 = NULL;
     airtag_scan_stats_label2 = NULL;
@@ -1353,6 +1435,33 @@ static bool bt_is_samsung_smarttag(const uint8_t *data, uint8_t len);
 // BLE Scan UI
 static void ble_scan_back_btn_cb(lv_event_t *e);
 static void ble_scan_update_list(void);
+
+// WiFi menu screen
+static void show_wifi_menu_screen(void);
+
+// Disco mode Easter egg
+static void show_disco_mode(void);
+static void settings_nav_timer_cb(lv_timer_t *t);
+static void disco_pre_pause_end(lv_timer_t *t);
+static void disco_touch_exit(lv_event_t *e);
+static void disco_check_task_done(lv_timer_t *t);
+static void disco_post_pause_end(lv_timer_t *t);
+static void disco_task(void *arg);
+
+// BT Scan & Select
+static void show_bt_scan_select_screen(void);
+static void show_bt_attack_tiles_screen(void);
+static void bt_sas_refresh_list(void);
+static void show_bt_locator_direct_track(void);
+
+// BT Lookout
+static void show_bt_lookout_screen(void);
+static void bt_lookout_update_ui(void);
+static void show_lookout_alert_popup(const char *name, const char *mac_str, int rssi);
+static void lookout_popup_dismiss_cb(lv_event_t *e);
+static void lookout_popup_auto_dismiss_cb(lv_timer_t *t);
+static void show_lookout_editor_screen(void);
+static void lookout_edit_btn_cb(lv_event_t *e);
 
 // Deauth Monitor functions
 static void show_deauth_monitor_screen(void);
@@ -2136,7 +2245,7 @@ static void led_update_mode(void)
         return;
     }
     // ── BLE / AirTag / BT locator (purple) ──────────────────────────────
-    if (ble_scan_ui_active || bt_scan_active || airtag_scan_active || bt_locator_tracking_active) {
+    if (ble_scan_ui_active || bt_scan_active || airtag_scan_active || bt_locator_tracking_active || bt_sas_ui_active) {
         led_set(40, 0, 80);  // purple — Bluetooth active
         return;
     }
@@ -3481,6 +3590,7 @@ static void create_home_ui(void)
     lv_obj_set_size(title_bar, lv_pct(100), 30);
     lv_obj_align(title_bar, LV_ALIGN_TOP_MID, 0, 0);
     lv_obj_set_style_bg_color(title_bar, ui_panel_color(), 0);
+    lv_obj_set_style_bg_opa(title_bar, LV_OPA_70, 0);
     lv_obj_set_style_border_width(title_bar, 0, 0);
     lv_obj_set_style_radius(title_bar, 0, 0);
     lv_obj_clear_flag(title_bar, LV_OBJ_FLAG_SCROLLABLE);
@@ -3920,8 +4030,17 @@ void app_main(void)
             boot_btn_prev_pressed = btn_pressed;
         }
 
+        // Disco LED update — driven from main task to keep RMT calls single-threaded
+        if (disco_led_needs_update) {
+            disco_led_needs_update = false;
+            led_set(disco_led_r, disco_led_g, disco_led_b);
+        }
+
+        // BT Lookout LED alert (runs even during go_dark/blackout)
+        bool lookout_led_active = (!disco_mode_active && bt_lookout_tick(led_set));
+
         // Update NeoPixel LED color to reflect current mode (~2 Hz)
-        {
+        if (!disco_mode_active && !lookout_led_active) {
             uint32_t now_ms = esp_timer_get_time() / 1000;
             if (now_ms - last_led_update_ms >= 100) {
                 led_update_mode();
@@ -4830,6 +4949,55 @@ void app_main(void)
                 }
             }
 
+            // BT Scan & Select UI update
+            if (bt_sas_needs_update && bt_sas_ui_active) {
+                bt_sas_needs_update = false;
+                if (bt_sas_status_label && lv_obj_is_valid(bt_sas_status_label)) {
+                    lv_label_set_text(bt_sas_status_label, ble_scan_status_text);
+                }
+                bt_sas_refresh_list();
+                // If scan finished show Next prompt if device selected
+                if (ble_scan_finished && bt_sas_selected_idx < 0 &&
+                    bt_sas_status_label && lv_obj_is_valid(bt_sas_status_label)) {
+                    lv_label_set_text(bt_sas_status_label,
+                        bt_device_count > 0 ? "Tap a device to select" : "No devices found");
+                }
+            }
+
+            // Disco mode screen update (driven by disco_task flag)
+            if (disco_needs_update && disco_mode_active && disco_screen_obj) {
+                disco_needs_update = false;
+                uint8_t c = disco_color_idx;
+                lv_obj_set_style_bg_color(disco_screen_obj,
+                    lv_color_make(DISCO_PALETTE[c].r, DISCO_PALETTE[c].g, DISCO_PALETTE[c].b), 0);
+                for (int i = 0; i < 4; i++) {
+                    if (disco_layers[i]) {
+                        uint8_t lc = (c + i * 2 + 1) % DISCO_NC;
+                        lv_obj_set_style_bg_color(disco_layers[i],
+                            lv_color_make(DISCO_PALETTE[lc].r, DISCO_PALETTE[lc].g, DISCO_PALETTE[lc].b), 0);
+                    }
+                }
+            }
+
+            // BT Lookout — poll for new detection, wake from blackout and show popup
+            {
+                bt_lookout_detection_t det;
+                if (bt_lookout_poll_detection(&det)) {
+                    go_dark_disable();
+                    char mac_str[18];
+                    snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                             det.mac[0], det.mac[1], det.mac[2],
+                             det.mac[3], det.mac[4], det.mac[5]);
+                    show_lookout_alert_popup(det.name, mac_str, det.rssi);
+                    if (bt_lookout_last_lbl && lv_obj_is_valid(bt_lookout_last_lbl)) {
+                        char last_buf[64];
+                        snprintf(last_buf, sizeof(last_buf), "%s  %s", det.name, mac_str);
+                        lv_label_set_text(bt_lookout_last_lbl, last_buf);
+                    }
+                    bt_lookout_update_ui();
+                }
+            }
+
             // Deauth Monitor UI update
             if (deauth_monitor_update_flag && deauth_monitor_ui_active) {
                 deauth_monitor_update_flag = false;
@@ -4840,8 +5008,10 @@ void app_main(void)
                 portEXIT_CRITICAL(&deauth_monitor_spin);
                 
                 if (attack_count > 0 && deauth_monitor_list && deauth_monitor_status_label) {
-                    // Hide status label, show list
+                    // Hide status labels, show list
                     lv_obj_add_flag(deauth_monitor_status_label, LV_OBJ_FLAG_HIDDEN);
+                    if (deauth_monitor_known_label && lv_obj_is_valid(deauth_monitor_known_label))
+                        lv_obj_add_flag(deauth_monitor_known_label, LV_OBJ_FLAG_HIDDEN);
                     lv_obj_clear_flag(deauth_monitor_list, LV_OBJ_FLAG_HIDDEN);
                     
                     // Rebuild attack list (keep title, clear rest)
@@ -5052,33 +5222,28 @@ void app_main(void)
                     int total = wdp_seen_count;
                     int show = (total > 50) ? 50 : total;
                     int start = total - show;
-                    lv_table_set_row_cnt(wd_ui_table, show + 1);
+                    lv_table_set_row_cnt(wd_ui_table, show > 0 ? show : 1);
                     lv_table_set_col_cnt(wd_ui_table, 5);
-                    lv_table_set_cell_value(wd_ui_table, 0, 0, "SSID");
-                    lv_table_set_cell_value(wd_ui_table, 0, 1, "Ch");
-                    lv_table_set_cell_value(wd_ui_table, 0, 2, "RSSI");
-                    lv_table_set_cell_value(wd_ui_table, 0, 3, "Auth");
-                    lv_table_set_cell_value(wd_ui_table, 0, 4, "Lat");
                     for (int i = 0; i < show; i++) {
                         wdp_network_t *net = &wdp_seen_networks[start + show - 1 - i];
                         char ssid_trunc[20];
                         strncpy(ssid_trunc, net->ssid[0] ? net->ssid : "[hidden]", 19);
                         ssid_trunc[19] = '\0';
-                        lv_table_set_cell_value(wd_ui_table, i + 1, 0, ssid_trunc);
+                        lv_table_set_cell_value(wd_ui_table, i, 0, ssid_trunc);
                         char ch_str[4]; snprintf(ch_str, sizeof(ch_str), "%d", net->channel);
-                        lv_table_set_cell_value(wd_ui_table, i + 1, 1, ch_str);
+                        lv_table_set_cell_value(wd_ui_table, i, 1, ch_str);
                         char rssi_str[8]; snprintf(rssi_str, sizeof(rssi_str), "%d", net->rssi);
-                        lv_table_set_cell_value(wd_ui_table, i + 1, 2, rssi_str);
+                        lv_table_set_cell_value(wd_ui_table, i, 2, rssi_str);
                         const char *auth = get_auth_mode_wiggle(net->authmode);
                         char auth_short[8]; strncpy(auth_short, auth, 7); auth_short[7] = '\0';
-                        lv_table_set_cell_value(wd_ui_table, i + 1, 3, auth_short);
+                        lv_table_set_cell_value(wd_ui_table, i, 3, auth_short);
                         char coord_str[24];
                         if (net->latitude != 0.0f || net->longitude != 0.0f) {
                             snprintf(coord_str, sizeof(coord_str), "%.2f", (double)net->latitude);
                         } else {
                             snprintf(coord_str, sizeof(coord_str), "--");
                         }
-                        lv_table_set_cell_value(wd_ui_table, i + 1, 4, coord_str);
+                        lv_table_set_cell_value(wd_ui_table, i, 4, coord_str);
                     }
                 }
             }
@@ -6163,8 +6328,7 @@ static void sniffer_refresh_ap_list(void) {
             snprintf(ap_text, sizeof(ap_text), LV_SYMBOL_WIFI " %s (%d) Ch:%d %ddBm " LV_SYMBOL_RIGHT,
                      ap->ssid, ap->client_count, ap->channel, ap->rssi);
         } else {
-            snprintf(ap_text, sizeof(ap_text), LV_SYMBOL_WIFI " [Hidden] %02X:%02X:%02X (%d) Ch:%d %ddBm " LV_SYMBOL_RIGHT,
-                     ap->bssid[0], ap->bssid[1], ap->bssid[2],
+            snprintf(ap_text, sizeof(ap_text), LV_SYMBOL_WIFI " [Hidden] (%d) Ch:%d %ddBm " LV_SYMBOL_RIGHT,
                      ap->client_count, ap->channel, ap->rssi);
         }
         
@@ -6173,7 +6337,7 @@ static void sniffer_refresh_ap_list(void) {
         lv_obj_set_style_bg_color(ap_row, lv_color_make(40, 40, 60), LV_STATE_PRESSED);
         lv_obj_set_style_bg_opa(ap_row, LV_OPA_COVER, 0);
         lv_obj_set_style_text_color(ap_row, ui_text_color(), 0);
-        lv_obj_set_style_text_font(ap_row, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_font(ap_row, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_decor(ap_row, LV_TEXT_DECOR_UNDERLINE, 0);
         lv_obj_set_style_min_height(ap_row, 36, 0);  // Larger touch target
         lv_obj_add_flag(ap_row, LV_OBJ_FLAG_CLICKABLE);
@@ -6183,11 +6347,10 @@ static void sniffer_refresh_ap_list(void) {
         for (int j = 0; j < ap->client_count && j < 5; j++) {
             const sniffer_client_t *client = &ap->clients[j];
             
-            char client_text[80];
-            snprintf(client_text, sizeof(client_text), "%02X:%02X:%02X:%02X:%02X:%02X  %ddBm",
+            char client_text[40];
+            snprintf(client_text, sizeof(client_text), LV_SYMBOL_BULLET " %02X:%02X:%02X:%02X:%02X:%02X  %ddBm",
                      client->mac[0], client->mac[1], client->mac[2],
-                     client->mac[3], client->mac[4], client->mac[5],
-                     client->rssi);
+                     client->mac[3], client->mac[4], client->mac[5], client->rssi);
             
             lv_obj_t *client_row = lv_list_add_text(sniffer_ap_list, client_text);
             lv_obj_set_style_bg_color(client_row, ui_bg_color(), 0);
@@ -8792,35 +8955,29 @@ static void wd_ui_timer_cb(lv_timer_t *timer) {
         int total = wdp_seen_count;
         int show = (total > 50) ? 50 : total;
         int start = total - show;
-        lv_table_set_row_cnt(wd_ui_table, show + 1);
+        lv_table_set_row_cnt(wd_ui_table, show > 0 ? show : 1);
         lv_table_set_col_cnt(wd_ui_table, 5);
-
-        lv_table_set_cell_value(wd_ui_table, 0, 0, "SSID");
-        lv_table_set_cell_value(wd_ui_table, 0, 1, "Ch");
-        lv_table_set_cell_value(wd_ui_table, 0, 2, "RSSI");
-        lv_table_set_cell_value(wd_ui_table, 0, 3, "Auth");
-        lv_table_set_cell_value(wd_ui_table, 0, 4, "Lat");
 
         for (int i = 0; i < show; i++) {
             wdp_network_t *net = &wdp_seen_networks[start + show - 1 - i];
             char ssid_trunc[20];
             strncpy(ssid_trunc, net->ssid[0] ? net->ssid : "[hidden]", 19);
             ssid_trunc[19] = '\0';
-            lv_table_set_cell_value(wd_ui_table, i + 1, 0, ssid_trunc);
+            lv_table_set_cell_value(wd_ui_table, i, 0, ssid_trunc);
 
             char ch_str[4];
             snprintf(ch_str, sizeof(ch_str), "%d", net->channel);
-            lv_table_set_cell_value(wd_ui_table, i + 1, 1, ch_str);
+            lv_table_set_cell_value(wd_ui_table, i, 1, ch_str);
 
             char rssi_str[8];
             snprintf(rssi_str, sizeof(rssi_str), "%d", net->rssi);
-            lv_table_set_cell_value(wd_ui_table, i + 1, 2, rssi_str);
+            lv_table_set_cell_value(wd_ui_table, i, 2, rssi_str);
 
             const char *auth = get_auth_mode_wiggle(net->authmode);
             char auth_short[8];
             strncpy(auth_short, auth, 7);
             auth_short[7] = '\0';
-            lv_table_set_cell_value(wd_ui_table, i + 1, 3, auth_short);
+            lv_table_set_cell_value(wd_ui_table, i, 3, auth_short);
 
             char coord_str[24];
             if (net->latitude != 0.0f || net->longitude != 0.0f) {
@@ -8828,7 +8985,7 @@ static void wd_ui_timer_cb(lv_timer_t *timer) {
             } else {
                 snprintf(coord_str, sizeof(coord_str), "--");
             }
-            lv_table_set_cell_value(wd_ui_table, i + 1, 4, coord_str);
+            lv_table_set_cell_value(wd_ui_table, i, 4, coord_str);
         }
     }
 }
@@ -8902,12 +9059,48 @@ static void wardrive_start_btn_cb(lv_event_t *e)
 
     // ─── Recent networks table ────────────────────────────────────
     // y=101: boxes end at 55+42=97, 4px gap. height=164: stops 4px above stop btn.
+    // Frozen header row — 1-row table, no scrolling
+    wd_ui_header = lv_table_create(function_page);
+    lv_obj_set_size(wd_ui_header, lv_pct(97), LV_SIZE_CONTENT);
+    lv_obj_align(wd_ui_header, LV_ALIGN_TOP_MID, 0, 101);
+    lv_obj_set_style_bg_color(wd_ui_header, lv_color_make(30, 30, 30), 0);
+    lv_obj_set_style_border_color(wd_ui_header, lv_color_make(50, 50, 50), 0);
+    lv_obj_set_style_border_width(wd_ui_header, 1, 0);
+    lv_obj_set_style_border_side(wd_ui_header, LV_BORDER_SIDE_LEFT | LV_BORDER_SIDE_RIGHT | LV_BORDER_SIDE_TOP, 0);
+    lv_obj_set_style_radius(wd_ui_header, 6, 0);
+    lv_obj_set_style_text_font(wd_ui_header, &lv_font_montserrat_12, 0);
+    // Cell styles must target LV_PART_ITEMS — base-state text/bg don't reach cells in LVGL 8
+    lv_obj_set_style_bg_color(wd_ui_header, lv_color_white(), LV_PART_ITEMS);
+    lv_obj_set_style_bg_opa(wd_ui_header, LV_OPA_COVER, LV_PART_ITEMS);
+    lv_obj_set_style_text_color(wd_ui_header, lv_color_make(20, 20, 20), LV_PART_ITEMS);
+    lv_obj_set_style_text_font(wd_ui_header, &lv_font_montserrat_12, LV_PART_ITEMS);
+    lv_obj_set_style_pad_top(wd_ui_header, 2, LV_PART_ITEMS);
+    lv_obj_set_style_pad_bottom(wd_ui_header, 2, LV_PART_ITEMS);
+    lv_obj_set_style_pad_left(wd_ui_header, 4, LV_PART_ITEMS);
+    lv_obj_set_style_pad_right(wd_ui_header, 2, LV_PART_ITEMS);
+    lv_obj_set_scroll_dir(wd_ui_header, LV_DIR_NONE);
+    lv_obj_set_scrollbar_mode(wd_ui_header, LV_SCROLLBAR_MODE_OFF);
+    lv_table_set_col_cnt(wd_ui_header, 5);
+    lv_table_set_col_width(wd_ui_header, 0, 82);
+    lv_table_set_col_width(wd_ui_header, 1, 26);
+    lv_table_set_col_width(wd_ui_header, 2, 36);
+    lv_table_set_col_width(wd_ui_header, 3, 44);
+    lv_table_set_col_width(wd_ui_header, 4, 45);
+    lv_table_set_row_cnt(wd_ui_header, 1);
+    lv_table_set_cell_value(wd_ui_header, 0, 0, "SSID");
+    lv_table_set_cell_value(wd_ui_header, 0, 1, "Ch");
+    lv_table_set_cell_value(wd_ui_header, 0, 2, "RSSI");
+    lv_table_set_cell_value(wd_ui_header, 0, 3, "Auth");
+    lv_table_set_cell_value(wd_ui_header, 0, 4, "Lat");
+
+    // Scrollable data table — sits below the frozen header
     wd_ui_table = lv_table_create(function_page);
-    lv_obj_set_size(wd_ui_table, lv_pct(97), 164);
-    lv_obj_align(wd_ui_table, LV_ALIGN_TOP_MID, 0, 101);
+    lv_obj_set_size(wd_ui_table, lv_pct(97), 160);
+    lv_obj_align(wd_ui_table, LV_ALIGN_TOP_MID, 0, 121);
     lv_obj_set_style_bg_color(wd_ui_table, lv_color_make(15, 15, 15), 0);
     lv_obj_set_style_border_color(wd_ui_table, lv_color_make(50, 50, 50), 0);
     lv_obj_set_style_border_width(wd_ui_table, 1, 0);
+    lv_obj_set_style_border_side(wd_ui_table, LV_BORDER_SIDE_LEFT | LV_BORDER_SIDE_RIGHT | LV_BORDER_SIDE_BOTTOM, 0);
     lv_obj_set_style_radius(wd_ui_table, 6, 0);
     lv_obj_set_style_text_font(wd_ui_table, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(wd_ui_table, lv_color_make(200, 200, 200), 0);
@@ -8925,33 +9118,28 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_table_set_col_width(wd_ui_table, 4, 45);   // Lat
     lv_obj_set_scroll_dir(wd_ui_table, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(wd_ui_table, LV_SCROLLBAR_MODE_AUTO);
-
     lv_table_set_row_cnt(wd_ui_table, 1);
-    lv_table_set_cell_value(wd_ui_table, 0, 0, "SSID");
-    lv_table_set_cell_value(wd_ui_table, 0, 1, "Ch");
-    lv_table_set_cell_value(wd_ui_table, 0, 2, "RSSI");
-    lv_table_set_cell_value(wd_ui_table, 0, 3, "Auth");
-    lv_table_set_cell_value(wd_ui_table, 0, 4, "Lat");
 
     // ─── Stop button (bottom center) ─────────────────────────────
     wardrive_stop_btn = lv_btn_create(function_page);
-    lv_obj_set_size(wardrive_stop_btn, 120, 46);
+    lv_obj_set_size(wardrive_stop_btn, 110, 30);
     lv_obj_align(wardrive_stop_btn, LV_ALIGN_BOTTOM_MID, 0, -5);
     lv_obj_set_style_bg_color(wardrive_stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(wardrive_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(wardrive_stop_btn, 0, 0);
-    lv_obj_set_style_radius(wardrive_stop_btn, 10, 0);
-    lv_obj_set_style_shadow_width(wardrive_stop_btn, 6, 0);
+    lv_obj_set_style_radius(wardrive_stop_btn, 8, 0);
+    lv_obj_set_style_shadow_width(wardrive_stop_btn, 4, 0);
     lv_obj_set_style_shadow_color(wardrive_stop_btn, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_flex_flow(wardrive_stop_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_flow(wardrive_stop_btn, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(wardrive_stop_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(wardrive_stop_btn, 6, 0);
     lv_obj_t *x_icon2 = lv_label_create(wardrive_stop_btn);
     lv_label_set_text(x_icon2, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_font(x_icon2, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(x_icon2, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(x_icon2, ui_text_color(), 0);
     lv_obj_t *stop_lbl = lv_label_create(wardrive_stop_btn);
     lv_label_set_text(stop_lbl, "Stop");
-    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(stop_lbl, ui_text_color(), 0);
     lv_obj_add_event_cb(wardrive_stop_btn, wardrive_stop_btn_cb, LV_EVENT_CLICKED, NULL);
 
@@ -9023,6 +9211,7 @@ static void wardrive_stop_btn_cb(lv_event_t *e)
     wd_ui_gps_label = NULL;
     wd_ui_counter_label = NULL;
     wd_ui_channel_label = NULL;
+    wd_ui_header = NULL;
     wd_ui_table = NULL;
     wdp_current_channel = 0;
 
@@ -9932,6 +10121,166 @@ static void go_dark_mini_btn_cb(lv_event_t *e)
     show_go_dark_confirm();
 }
 
+// ============================================================================
+// DISCO MODE — secret Easter egg (tap Settings tile 5× rapidly)
+// Le Freak / Chic — 120 BPM, 500ms per beat
+// ============================================================================
+
+static void settings_nav_timer_cb(lv_timer_t *t)
+{
+    lv_timer_del(t);
+    settings_nav_timer = NULL;
+    settings_tap_count = 0;
+    show_settings_screen();
+}
+
+static void disco_task(void *arg)
+{
+    (void)arg;
+    uint8_t beat = 0;
+
+    while (disco_mode_active) {
+        uint8_t c  = beat % DISCO_NC;
+        uint8_t nc = (c + 1) % DISCO_NC;
+
+        // ── Full beat: bright LED + screen flash ──────────────────────────
+        disco_led_r = DISCO_LED_PAL[c].r;
+        disco_led_g = DISCO_LED_PAL[c].g;
+        disco_led_b = DISCO_LED_PAL[c].b;
+        disco_led_needs_update = true;
+        disco_color_idx   = c;
+        disco_needs_update = true;
+
+        // 3/4 beat = 370ms (37 × 10ms ticks — FreeRTOS at 100Hz, 1 tick = 10ms)
+        for (int i = 0; i < 37 && disco_mode_active; i++)
+            vTaskDelay(1);
+        if (!disco_mode_active) break;
+
+        // ── Offbeat: dim flash to next color (8th-note groove) ────────────
+        disco_led_r = DISCO_LED_PAL[nc].r / 3;
+        disco_led_g = DISCO_LED_PAL[nc].g / 3;
+        disco_led_b = DISCO_LED_PAL[nc].b / 3;
+        disco_led_needs_update = true;
+        disco_color_idx   = nc;
+        disco_needs_update = true;
+
+        // 1/4 beat = 130ms (13 × 10ms ticks)
+        for (int i = 0; i < 13 && disco_mode_active; i++)
+            vTaskDelay(1);
+
+        beat++;
+    }
+
+    // Signal LED off via main loop
+    disco_led_r = 0; disco_led_g = 0; disco_led_b = 0;
+    disco_led_needs_update = true;
+    disco_needs_update = false;
+    disco_task_handle  = NULL;
+    vTaskDelete(NULL);
+}
+
+static void disco_post_pause_end(lv_timer_t *t)
+{
+    lv_timer_del(t);
+    if (disco_screen_obj) {
+        lv_obj_del(disco_screen_obj);
+        disco_screen_obj = NULL;
+    }
+    for (int i = 0; i < 4; i++) disco_layers[i] = NULL;
+    show_main_tiles();
+    lv_obj_clear_flag(title_bar, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void disco_check_task_done(lv_timer_t *t)
+{
+    if (disco_task_handle != NULL) return;   // still running; poll again next tick
+    lv_timer_del(t);
+    lv_timer_create(disco_post_pause_end, 5000, NULL);
+}
+
+static void disco_touch_exit(lv_event_t *e)
+{
+    (void)e;
+    if (!disco_mode_active) return;
+
+    disco_mode_active = false;
+    led_set(0, 0, 0);
+
+    // Hide colour layers; leave disco_screen_obj as solid black
+    for (int i = 0; i < 4; i++) {
+        if (disco_layers[i]) lv_obj_add_flag(disco_layers[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_set_style_bg_color(disco_screen_obj, lv_color_black(), 0);
+    lv_obj_clear_flag(disco_screen_obj, LV_OBJ_FLAG_CLICKABLE);
+
+    // Poll until task exits, then do the 5s post-pause
+    lv_timer_create(disco_check_task_done, 50, NULL);
+}
+
+static void disco_pre_pause_end(lv_timer_t *t)
+{
+    lv_timer_del(t);
+
+    // Four overlapping rounded blobs — tie-dye overlap in the centre
+    // Positions kept within parent bounds (0,0)-(240,320) to avoid clipping
+    static const struct { int16_t x, y, w, h; } BLOB[4] = {
+        {  0,   0, 190, 210},   // top-left
+        { 50,   0, 190, 210},   // top-right
+        {  0, 110, 190, 210},   // bottom-left
+        { 50, 110, 190, 210},   // bottom-right
+    };
+    for (int i = 0; i < 4; i++) {
+        disco_layers[i] = lv_obj_create(disco_screen_obj);
+        lv_obj_set_pos(disco_layers[i],  BLOB[i].x, BLOB[i].y);
+        lv_obj_set_size(disco_layers[i], BLOB[i].w, BLOB[i].h);
+        lv_obj_set_style_radius(disco_layers[i], 95, 0);
+        lv_obj_set_style_bg_color(disco_layers[i],
+            lv_color_make(DISCO_PALETTE[(i * 2) % DISCO_NC].r,
+                          DISCO_PALETTE[(i * 2) % DISCO_NC].g,
+                          DISCO_PALETTE[(i * 2) % DISCO_NC].b), 0);
+        lv_obj_set_style_opa(disco_layers[i], LV_OPA_70, 0);
+        lv_obj_set_style_border_width(disco_layers[i], 0, 0);
+        lv_obj_clear_flag(disco_layers[i], LV_OBJ_FLAG_SCROLLABLE);
+        // CRITICAL: blobs must not eat touch — let it fall through to disco_screen_obj
+        lv_obj_clear_flag(disco_layers[i], LV_OBJ_FLAG_CLICKABLE);
+    }
+
+    // DeeDee on top — centered, transparent PNG (120×180)
+    lv_obj_t *dd = lv_img_create(disco_screen_obj);
+    lv_img_set_src(dd, &deedee_img);
+    lv_obj_align(dd, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(dd, LV_OBJ_FLAG_CLICKABLE);
+
+    // Touch anywhere on the background to exit (blobs are non-clickable so touch falls through)
+    lv_obj_add_event_cb(disco_screen_obj, disco_touch_exit, LV_EVENT_CLICKED, NULL);
+
+    disco_mode_active = true;
+    xTaskCreate(disco_task, "disco_task", 4096, NULL, 1, &disco_task_handle);
+}
+
+static void show_disco_mode(void)
+{
+    // Take over the screen — hide instead of delete; we're inside a click event on a
+    // tiles_container child, so deleting the parent here hangs the board.
+    // show_main_tiles() will safely delete both when disco ends.
+    if (settings_nav_timer) { lv_timer_del(settings_nav_timer); settings_nav_timer = NULL; }
+    if (home_bg_img)     lv_obj_add_flag(home_bg_img,     LV_OBJ_FLAG_HIDDEN);
+    if (tiles_container) lv_obj_add_flag(tiles_container, LV_OBJ_FLAG_HIDDEN);
+    if (function_page)   { lv_obj_del(function_page);   function_page = NULL; }
+    lv_obj_add_flag(title_bar, LV_OBJ_FLAG_HIDDEN);
+
+    disco_screen_obj = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(disco_screen_obj, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(disco_screen_obj, lv_color_black(), 0);
+    lv_obj_set_style_border_width(disco_screen_obj, 0, 0);
+    lv_obj_set_style_radius(disco_screen_obj, 0, 0);
+    lv_obj_set_style_pad_all(disco_screen_obj, 0, 0);
+    lv_obj_clear_flag(disco_screen_obj, LV_OBJ_FLAG_SCROLLABLE);
+
+    // 5-second black pre-pause, then start the show
+    lv_timer_create(disco_pre_pause_end, 5000, NULL);
+}
+
 static void create_function_page_base(const char *name)
 {
     // Print memory stats when opening new page
@@ -10036,6 +10385,12 @@ static void create_function_page_base(const char *name)
         function_page = NULL;
     }
     reset_function_page_children();
+
+    // Clean up home bg image when leaving a menu screen
+    if (home_bg_img) {
+        lv_obj_del(home_bg_img);
+        home_bg_img = NULL;
+    }
 
     // Hide tiles container and title bar while the function page is active
     if (tiles_container) {
@@ -10327,7 +10682,7 @@ static lv_obj_t *create_tile(lv_obj_t *parent, const char *icon, const char *tex
     if (icon) {
         lv_obj_t *icon_label = lv_label_create(tile);
         lv_label_set_text(icon_label, icon);
-        lv_obj_set_style_text_font(icon_label, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_font(icon_label, &lv_extra_symbols, 0);
         lv_obj_set_style_text_color(icon_label, accent, 0);
     }
 
@@ -10394,19 +10749,44 @@ static void main_tile_event_cb(lv_event_t *e)
 {
     const char *tile_name = (const char *)lv_event_get_user_data(e);
     if (!tile_name) return;
-    
-    if (strcmp(tile_name, "WiFi Scan & Attack") == 0) {
+
+    // Reset disco tap counter on any non-Settings tile
+    if (strcmp(tile_name, "Settings") != 0) {
+        settings_tap_count = 0;
+        if (settings_nav_timer) {
+            lv_timer_del(settings_nav_timer);
+            settings_nav_timer = NULL;
+        }
+    }
+
+    if (strcmp(tile_name, "WiFi Menu") == 0) {
+        show_wifi_menu_screen();
+    } else if (strcmp(tile_name, "WiFi Scan & Attack") == 0) {
         show_wifi_scan_attack_screen();
     } else if (strcmp(tile_name, "Global WiFi Attacks") == 0) {
         show_global_attacks_screen();
     } else if (strcmp(tile_name, "WiFi Sniff&Karma") == 0) {
-        sniffer_yes_btn_cb(NULL);  // Skip intermediate screen, go directly to Network Observer
+        sniffer_yes_btn_cb(NULL);
     } else if (strcmp(tile_name, "Settings") == 0) {
-        show_settings_screen();
+        // Secret disco code: tap Settings 5 times rapidly
+        if (settings_nav_timer) {
+            lv_timer_del(settings_nav_timer);
+            settings_nav_timer = NULL;
+        }
+        settings_tap_count++;
+        if (settings_tap_count >= 5) {
+            settings_tap_count = 0;
+            show_disco_mode();
+            return;
+        }
+        // Deferred navigation — fires if no follow-up tap within 800ms
+        settings_nav_timer = lv_timer_create(settings_nav_timer_cb, 800, NULL);
     } else if (strcmp(tile_name, "Deauth Monitor") == 0) {
         show_deauth_monitor_screen();
     } else if (strcmp(tile_name, "Bluetooth") == 0) {
         show_bluetooth_screen();
+    } else if (strcmp(tile_name, "Wardrive") == 0) {
+        wardrive_start_btn_cb(NULL);
     } else if (strcmp(tile_name, "Go Dark") == 0) {
         show_go_dark_confirm();
     }
@@ -10542,6 +10922,29 @@ static void attack_tile_event_cb(lv_event_t *e)
     }
 }
 
+// Layer the lab background behind any menu/tile screen.
+// Call after create_function_page_base() (which clears any old bg) or after
+// tiles_container is set up for the home screen.
+static void apply_menu_bg(void)
+{
+    if (home_bg_img) {
+        lv_obj_del(home_bg_img);
+        home_bg_img = NULL;
+    }
+    home_bg_img = lv_img_create(lv_scr_act());
+    lv_img_set_src(home_bg_img, &lab_bg);
+    lv_obj_align(home_bg_img, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_img_recolor(home_bg_img, lv_color_black(), 0);
+    lv_obj_set_style_img_recolor_opa(home_bg_img, LV_OPA_50, 0);
+    // Push to back so everything else renders on top
+    lv_obj_move_to_index(home_bg_img, 0);
+
+    // Make function_page see-through so the bg image shows between tiles
+    if (function_page) {
+        lv_obj_set_style_bg_opa(function_page, LV_OPA_TRANSP, 0);
+    }
+}
+
 // Show main tiles screen (6 tiles)
 static void show_main_tiles(void)
 {
@@ -10550,18 +10953,22 @@ static void show_main_tiles(void)
         lv_obj_del(tiles_container);
         tiles_container = NULL;
     }
-    
+    if (home_bg_img) {
+        lv_obj_del(home_bg_img);
+        home_bg_img = NULL;
+    }
+
     // Delete function page if present
     if (function_page) {
         lv_obj_del(function_page);
         function_page = NULL;
     }
     reset_function_page_children();
-    
+
     tiles_container = lv_obj_create(lv_scr_act());
     lv_obj_set_size(tiles_container, lv_pct(100), 290);
     lv_obj_align(tiles_container, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(tiles_container, ui_bg_color(), 0);
+    lv_obj_set_style_bg_opa(tiles_container, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles_container, 0, 0);
     lv_obj_set_style_radius(tiles_container, 0, 0);
     lv_obj_set_style_pad_all(tiles_container, 8, 0);
@@ -10570,14 +10977,14 @@ static void show_main_tiles(void)
     lv_obj_set_flex_align(tiles_container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(tiles_container, LV_OBJ_FLAG_SCROLLABLE);
 
-    create_tile(tiles_container, LV_SYMBOL_WIFI,      "WiFi\nScan",    UI_ACCENT_BLUE,   main_tile_event_cb, "WiFi Scan & Attack");
-    create_tile(tiles_container, LV_SYMBOL_WARNING,   "WiFi\nAttacks", UI_ACCENT_RED,    main_tile_event_cb, "Global WiFi Attacks");
-    create_tile(tiles_container, LV_SYMBOL_EYE_OPEN,  "Observer",      UI_ACCENT_PURPLE, main_tile_event_cb, "WiFi Sniff&Karma");
-    create_tile(tiles_container, LV_SYMBOL_SETTINGS,  "Settings",      UI_ACCENT_GREEN,  main_tile_event_cb, "Settings");
-    create_tile(tiles_container, LV_SYMBOL_GPS,       "Deauth\nMon.",  UI_ACCENT_AMBER,  main_tile_event_cb, "Deauth Monitor");
-    create_tile(tiles_container, LV_SYMBOL_BLUETOOTH, "Bluetooth",     UI_ACCENT_CYAN,   main_tile_event_cb, "Bluetooth");
-    create_tile(tiles_container, LV_SYMBOL_POWER,     "Go Dark",       lv_color_hex(0x8A8FA8), main_tile_event_cb, "Go Dark");
-    
+    create_tile(tiles_container, LV_SYMBOL_WIFI,        "WiFi",          UI_ACCENT_BLUE,         main_tile_event_cb, "WiFi Menu");
+    create_tile(tiles_container, MY_SYMBOL_BLUETOOTH_B, "Bluetooth",    UI_ACCENT_CYAN,         main_tile_event_cb, "Bluetooth");
+    create_tile(tiles_container, MY_SYMBOL_CAR,         "Wardrive",     COLOR_MATERIAL_RED,     main_tile_event_cb, "Wardrive");
+    create_tile(tiles_container, LV_SYMBOL_SETTINGS,    "Settings",     UI_ACCENT_GREEN,        main_tile_event_cb, "Settings");
+    create_tile(tiles_container, LV_SYMBOL_POWER,       "Go Dark",      lv_color_hex(0x8A8FA8), main_tile_event_cb, "Go Dark");
+
+    apply_menu_bg();
+
     // Show title bar
     lv_obj_clear_flag(title_bar, LV_OBJ_FLAG_HIDDEN);
 }
@@ -13221,19 +13628,46 @@ static void show_global_attacks_screen(void)
     lv_obj_add_event_cb(snifferdog_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Snifferdog");
     
     // Wardrive tile - Teal
-    lv_obj_t *wardrive_tile = create_tile(tiles, LV_SYMBOL_GPS, "Wardrive", COLOR_MATERIAL_TEAL, NULL, NULL);
+    lv_obj_t *wardrive_tile = create_tile(tiles, MY_SYMBOL_CAR, "Wardrive", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(wardrive_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Start Wardrive");
+}
+
+// WiFi menu screen — sub-menu grouping all WiFi functions
+static void show_wifi_menu_screen(void)
+{
+    create_function_page_base("WiFi");
+    apply_menu_bg();
+
+    lv_obj_t *tiles = lv_obj_create(function_page);
+    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(tiles, 0, 0);
+    lv_obj_set_style_pad_all(tiles, 10, 0);
+    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *scan_tile = create_tile(tiles, LV_SYMBOL_WIFI,       "Scan &\nAttack",   UI_ACCENT_BLUE,   main_tile_event_cb, "WiFi Scan & Attack");
+    (void)scan_tile;
+    lv_obj_t *atk_tile  = create_tile(tiles, LV_SYMBOL_WARNING,    "WiFi\nAttacks",    UI_ACCENT_RED,    main_tile_event_cb, "Global WiFi Attacks");
+    (void)atk_tile;
+    lv_obj_t *dm_tile   = create_tile(tiles, MY_SYMBOL_SATELLITE,  "Deauth\nMon.",     UI_ACCENT_AMBER,  main_tile_event_cb, "Deauth Monitor");
+    (void)dm_tile;
+    lv_obj_t *obs_tile  = create_tile(tiles, LV_SYMBOL_EYE_OPEN,   "WiFi\nObserver",   UI_ACCENT_PURPLE, main_tile_event_cb, "WiFi Sniff&Karma");
+    (void)obs_tile;
 }
 
 // WiFi Sniff & Karma screen
 static void show_sniff_karma_screen(void)
 {
-    create_function_page_base("WiFi Sniff & Karma");
-    
+    create_function_page_base("WiFi Observer");
+    apply_menu_bg();
+
     lv_obj_t *tiles = lv_obj_create(function_page);
     lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
+    lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
     lv_obj_set_style_pad_all(tiles, 10, 0);
     lv_obj_set_style_pad_gap(tiles, 10, 0);
@@ -13241,7 +13675,7 @@ static void show_sniff_karma_screen(void)
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
     
     // Network Observer tile - Purple
-    lv_obj_t *sniffer_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Network\nObserver", COLOR_MATERIAL_PURPLE, NULL, NULL);
+    lv_obj_t *sniffer_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "WiFi\nObserver", COLOR_MATERIAL_PURPLE, NULL, NULL);
     lv_obj_add_event_cb(sniffer_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Sniffer");
     
     // Browse Clients tile - Indigo (REMOVED - integrated into Sniffer)
@@ -13630,9 +14064,9 @@ static void show_scan_time_popup(void)
     lv_obj_clear_flag(scantime_popup, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(scantime_popup, LV_OBJ_FLAG_CLICKABLE);
 
-    // Dialog box
+    // Dialog box — 220px wide to fit 240px portrait display
     lv_obj_t *dialog = lv_obj_create(scantime_popup);
-    lv_obj_set_size(dialog, 340, 250);
+    lv_obj_set_size(dialog, 220, LV_SIZE_CONTENT);
     lv_obj_center(dialog);
     lv_obj_set_style_bg_color(dialog, ui_panel_color(), 0);
     lv_obj_set_style_border_color(dialog, COLOR_MATERIAL_PURPLE, 0);
@@ -13641,14 +14075,14 @@ static void show_scan_time_popup(void)
     lv_obj_clear_flag(dialog, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_flex_flow(dialog, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(dialog, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_all(dialog, 12, 0);
-    lv_obj_set_style_pad_gap(dialog, 8, 0);
+    lv_obj_set_style_pad_all(dialog, 10, 0);
+    lv_obj_set_style_pad_gap(dialog, 6, 0);
 
     // Title
     lv_obj_t *title = lv_label_create(dialog);
-    lv_label_set_text(title, "Scan Time per Channel");
+    lv_label_set_text(title, "Scan Time / Channel");
     lv_obj_set_style_text_color(title, ui_text_color(), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
 
     // Min label
     scantime_min_label = lv_label_create(dialog);
@@ -13656,11 +14090,11 @@ static void show_scan_time_popup(void)
     snprintf(buf_min, sizeof(buf_min), "Min: %ums", scan_time_min_ms);
     lv_label_set_text(scantime_min_label, buf_min);
     lv_obj_set_style_text_color(scantime_min_label, COLOR_MATERIAL_PURPLE, 0);
-    lv_obj_set_style_text_font(scantime_min_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(scantime_min_label, &lv_font_montserrat_12, 0);
 
-    // Min slider
+    // Min slider — 196px: dialog content width (220 - 2×10 padding - 4px slider knob margin)
     scantime_min_slider = lv_slider_create(dialog);
-    lv_obj_set_width(scantime_min_slider, 280);
+    lv_obj_set_width(scantime_min_slider, 196);
     lv_slider_set_range(scantime_min_slider, 50, 1000);
     lv_slider_set_value(scantime_min_slider, scan_time_min_ms, LV_ANIM_OFF);
     lv_obj_set_style_bg_color(scantime_min_slider, lv_color_make(80, 80, 80), LV_PART_MAIN);
@@ -13675,11 +14109,11 @@ static void show_scan_time_popup(void)
     snprintf(buf_max, sizeof(buf_max), "Max: %ums", scan_time_max_ms);
     lv_label_set_text(scantime_max_label, buf_max);
     lv_obj_set_style_text_color(scantime_max_label, COLOR_MATERIAL_PURPLE, 0);
-    lv_obj_set_style_text_font(scantime_max_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(scantime_max_label, &lv_font_montserrat_12, 0);
 
     // Max slider
     scantime_max_slider = lv_slider_create(dialog);
-    lv_obj_set_width(scantime_max_slider, 280);
+    lv_obj_set_width(scantime_max_slider, 196);
     lv_slider_set_range(scantime_max_slider, 50, 1000);
     lv_slider_set_value(scantime_max_slider, scan_time_max_ms, LV_ANIM_OFF);
     lv_obj_set_style_bg_color(scantime_max_slider, lv_color_make(80, 80, 80), LV_PART_MAIN);
@@ -13688,9 +14122,9 @@ static void show_scan_time_popup(void)
     lv_obj_set_style_pad_all(scantime_max_slider, 4, LV_PART_KNOB);
     lv_obj_add_event_cb(scantime_max_slider, scantime_max_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-    // Button row
+    // Button row — 196px, 90px buttons
     lv_obj_t *btn_row = lv_obj_create(dialog);
-    lv_obj_set_size(btn_row, 280, 42);
+    lv_obj_set_size(btn_row, 196, 36);
     lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(btn_row, 0, 0);
     lv_obj_set_style_pad_all(btn_row, 0, 0);
@@ -13700,24 +14134,26 @@ static void show_scan_time_popup(void)
 
     // Cancel button
     lv_obj_t *cancel_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(cancel_btn, 120, 36);
+    lv_obj_set_size(cancel_btn, 90, 30);
     lv_obj_set_style_bg_color(cancel_btn, lv_color_make(80, 80, 80), 0);
     lv_obj_set_style_radius(cancel_btn, 8, 0);
     lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
     lv_label_set_text(cancel_lbl, "Cancel");
     lv_obj_set_style_text_color(cancel_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_12, 0);
     lv_obj_center(cancel_lbl);
     lv_obj_add_event_cb(cancel_btn, scantime_popup_close_cb, LV_EVENT_CLICKED, NULL);
 
     // Save button
     lv_obj_t *save_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(save_btn, 120, 36);
+    lv_obj_set_size(save_btn, 90, 30);
     lv_obj_set_style_bg_color(save_btn, COLOR_MATERIAL_PURPLE, 0);
     lv_obj_set_style_bg_color(save_btn, lv_color_lighten(COLOR_MATERIAL_PURPLE, 30), LV_STATE_PRESSED);
     lv_obj_set_style_radius(save_btn, 8, 0);
     lv_obj_t *save_lbl = lv_label_create(save_btn);
     lv_label_set_text(save_lbl, "Save");
     lv_obj_set_style_text_color(save_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(save_lbl, &lv_font_montserrat_12, 0);
     lv_obj_center(save_lbl);
     lv_obj_add_event_cb(save_btn, scantime_popup_save_cb, LV_EVENT_CLICKED, NULL);
 }
@@ -14186,11 +14622,12 @@ static void settings_tile_event_cb(lv_event_t *e)
 static void show_settings_screen(void)
 {
     create_function_page_base("Settings");
-    
+    apply_menu_bg();
+
     lv_obj_t *tiles = lv_obj_create(function_page);
     lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
+    lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
     // pad_all=4, pad_gap=4 → inner width=232, 3×70+2×4=218 ≤ 232, fits 3 tiles per row
     lv_obj_set_style_pad_all(tiles, 4, 0);
@@ -14205,7 +14642,7 @@ static void show_settings_screen(void)
     create_tile(tiles, LV_SYMBOL_IMAGE,    "Screen\nLevel",      COLOR_MATERIAL_ORANGE,   settings_tile_event_cb, "Screen Level");
     create_tile(tiles, LV_SYMBOL_SD_CARD,  "SD\nCard",           COLOR_MATERIAL_GREEN,    settings_tile_event_cb, "SD Card");
     // LV_SYMBOL_WIFI (signal arcs) is the closest built-in to a satellite dish — FA 4.7 has no dish glyph
-    create_tile(tiles, LV_SYMBOL_WIFI,     "GPS\nInfo",          lv_color_hex(0x00BCD4),  settings_tile_event_cb, "GPS Info");
+    create_tile(tiles, MY_SYMBOL_SATELLITE_DISH, "GPS\nInfo",    lv_color_hex(0x00BCD4),  settings_tile_event_cb, "GPS Info");
     create_tile(tiles, LV_SYMBOL_CHARGE,   "Power\nMode",        COLOR_MATERIAL_RED,      settings_tile_event_cb, "Power Mode");
 
     lv_obj_t *ver = lv_label_create(function_page);
@@ -14239,6 +14676,7 @@ static const sd_provision_item_t SD_ITEMS[] = {
     { SD_ITEM_DIR,  "/sdcard/lab/pcap",                      NULL },
     { SD_ITEM_DIR,  "/sdcard/lab/alerts",                    NULL },
     { SD_ITEM_DIR,  "/sdcard/lab/config",                    NULL },
+    { SD_ITEM_DIR,  "/sdcard/lab/bluetooth",                 NULL },
     { SD_ITEM_FILE, "/sdcard/lab/white.txt",                 "" },
     { SD_ITEM_FILE, "/sdcard/lab/cellular/tower_baseline.csv",
       "arfcn,bsic,lac,cell_id,mcc,mnc,rxlev,gps_lat,gps_lon,first_seen,last_seen\n" },
@@ -14257,6 +14695,7 @@ static const sd_provision_item_t SD_ITEMS[] = {
       "lac_change_alert=true\nneighbor_suppression_alert=true\nrssi_spike_threshold=20\n"
       "band_downgrade_alert=true\nunknown_tower_alert=true\n"
       "ble_unknown_device_alert=false\nwifi_unknown_oui_alert=false\n" },
+    { SD_ITEM_FILE, "/sdcard/lab/bluetooth/lookout.csv",     BT_LOOKOUT_CSV_HEADER },
 };
 #define SD_ITEMS_COUNT  (sizeof(SD_ITEMS) / sizeof(SD_ITEMS[0]))
 
@@ -15077,28 +15516,606 @@ static void show_wifi_monitor_screen(void)
     create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Handshakes", COLOR_MATERIAL_AMBER, wifi_monitor_tile_event_cb, "Handshakes");
 }
 
+// ── BT Lookout ────────────────────────────────────────────────────────────────
+
+static void lookout_popup_dismiss_cb(lv_event_t *e)
+{
+    (void)e;
+    if (bt_lookout_popup_tmr) {
+        lv_timer_del(bt_lookout_popup_tmr);
+        bt_lookout_popup_tmr = NULL;
+    }
+    if (bt_lookout_popup_obj && lv_obj_is_valid(bt_lookout_popup_obj)) {
+        lv_obj_del(bt_lookout_popup_obj);
+        bt_lookout_popup_obj = NULL;
+    }
+}
+
+static void lookout_popup_auto_dismiss_cb(lv_timer_t *t)
+{
+    (void)t;
+    bt_lookout_popup_tmr = NULL;
+    if (bt_lookout_popup_obj && lv_obj_is_valid(bt_lookout_popup_obj)) {
+        lv_obj_del(bt_lookout_popup_obj);
+        bt_lookout_popup_obj = NULL;
+    }
+}
+
+static void show_lookout_alert_popup(const char *name, const char *mac_str, int rssi)
+{
+    if (bt_lookout_popup_obj && lv_obj_is_valid(bt_lookout_popup_obj)) {
+        lv_obj_del(bt_lookout_popup_obj);
+        bt_lookout_popup_obj = NULL;
+    }
+    if (bt_lookout_popup_tmr) {
+        lv_timer_del(bt_lookout_popup_tmr);
+        bt_lookout_popup_tmr = NULL;
+    }
+
+    lv_obj_t *overlay = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_style_bg_color(overlay, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_60, 0);
+    lv_obj_set_style_border_width(overlay, 0, 0);
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_all(overlay, 0, 0);
+    bt_lookout_popup_obj = overlay;
+
+    lv_obj_t *card = lv_obj_create(overlay);
+    lv_obj_set_size(card, 220, 160);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, lv_color_make(30, 30, 30), 0);
+    lv_obj_set_style_border_color(card, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 12, 0);
+    lv_obj_set_style_pad_all(card, 10, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, LV_SYMBOL_WARNING " Dee Dee Detected!");
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *name_lbl = lv_label_create(card);
+    lv_label_set_text(name_lbl, name ? name : "Unknown");
+    lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(name_lbl, 200);
+    lv_obj_set_style_text_color(name_lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_align(name_lbl, LV_ALIGN_TOP_MID, 0, 22);
+
+    lv_obj_t *mac_lbl = lv_label_create(card);
+    lv_label_set_text(mac_lbl, mac_str ? mac_str : "");
+    lv_obj_set_style_text_color(mac_lbl, lv_color_make(176, 176, 176), 0);
+    lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_align(mac_lbl, LV_ALIGN_TOP_MID, 0, 44);
+
+    if (rssi != 0) {
+        lv_obj_t *rssi_lbl = lv_label_create(card);
+        char rssi_buf[24];
+        snprintf(rssi_buf, sizeof(rssi_buf), "RSSI: %d dBm", rssi);
+        lv_label_set_text(rssi_lbl, rssi_buf);
+        lv_obj_set_style_text_color(rssi_lbl, lv_color_make(100, 220, 100), 0);
+        lv_obj_set_style_text_font(rssi_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_align(rssi_lbl, LV_ALIGN_TOP_MID, 0, 60);
+    }
+
+    lv_obj_t *btn = lv_btn_create(card);
+    lv_obj_set_size(btn, 100, 28);
+    lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(btn, 0, 0);
+    lv_obj_set_style_radius(btn, 6, 0);
+    lv_obj_add_event_cb(btn, lookout_popup_dismiss_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *btn_lbl = lv_label_create(btn);
+    lv_label_set_text(btn_lbl, "Dismiss");
+    lv_obj_set_style_text_font(btn_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(btn_lbl, lv_color_white(), 0);
+    lv_obj_center(btn_lbl);
+
+    bt_lookout_popup_tmr = lv_timer_create(lookout_popup_auto_dismiss_cb, 15000, NULL);
+    lv_timer_set_repeat_count(bt_lookout_popup_tmr, 1);
+}
+
+static void bt_lookout_update_ui(void)
+{
+    if (!bt_lookout_ui_active) return;
+
+    if (bt_lookout_status_lbl && lv_obj_is_valid(bt_lookout_status_lbl)) {
+        bool active = bt_lookout_is_active();
+        lv_label_set_text(bt_lookout_status_lbl, active ? "MONITORING" : "Stopped");
+        lv_obj_set_style_text_color(bt_lookout_status_lbl,
+            active ? COLOR_MATERIAL_GREEN : lv_color_make(176, 176, 176), 0);
+    }
+
+    if (bt_lookout_count_lbl && lv_obj_is_valid(bt_lookout_count_lbl)) {
+        char buf[32];
+        int cnt = bt_lookout_count();
+        snprintf(buf, sizeof(buf), "Watching: %d device%s", cnt, cnt == 1 ? "" : "s");
+        lv_label_set_text(bt_lookout_count_lbl, buf);
+    }
+
+    if (bt_lookout_start_btn && lv_obj_is_valid(bt_lookout_start_btn)) {
+        bool active = bt_lookout_is_active();
+        lv_obj_t *icon = lv_obj_get_child(bt_lookout_start_btn, 0);
+        lv_obj_t *lbl  = lv_obj_get_child(bt_lookout_start_btn, 1);
+        if (icon) lv_label_set_text(icon, active ? LV_SYMBOL_STOP : LV_SYMBOL_PLAY);
+        if (lbl)  lv_label_set_text(lbl,  active ? "Stop" : "Start");
+        lv_obj_set_style_bg_color(bt_lookout_start_btn,
+            active ? COLOR_MATERIAL_RED : COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+    }
+
+    if (bt_lookout_edit_btn && lv_obj_is_valid(bt_lookout_edit_btn)) {
+        if (bt_lookout_is_active())
+            lv_obj_add_flag(bt_lookout_edit_btn, LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_clear_flag(bt_lookout_edit_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void bt_lookout_scan_loop_task(void *pv)
+{
+    (void)pv;
+    while (bt_lookout_is_active()) {
+        bt_reset_counters();
+        int rc = bt_start_scan();
+        if (rc != 0) {
+            ESP_LOGE(TAG, "BT Lookout: scan failed %d, retry 5s", rc);
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+        for (int i = 0; i < 200 && bt_lookout_is_active(); i++)
+            vTaskDelay(pdMS_TO_TICKS(100));
+        bt_stop_scan();
+        if (bt_lookout_is_active())
+            vTaskDelay(pdMS_TO_TICKS(300));
+    }
+    bt_lookout_scan_loop_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void lookout_start_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    if (bt_lookout_is_active()) {
+        bt_lookout_stop();
+    } else {
+        bt_lookout_start();
+        if (bt_lookout_scan_loop_handle == NULL) {
+            xTaskCreate(bt_lookout_scan_loop_task, "btlookout_scan", 4096, NULL, 3,
+                        &bt_lookout_scan_loop_handle);
+        }
+    }
+    bt_lookout_update_ui();
+}
+
+static void lookout_dark_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    go_dark_enable();
+}
+
+static void lookout_back_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    bt_lookout_ui_active  = false;
+    bt_lookout_status_lbl = NULL;
+    bt_lookout_count_lbl  = NULL;
+    bt_lookout_last_lbl   = NULL;
+    bt_lookout_start_btn  = NULL;
+    bt_lookout_edit_btn   = NULL;
+    if (!bt_lookout_is_active() && current_radio_mode == RADIO_MODE_BLE) {
+        bt_nimble_deinit();
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+    show_bluetooth_screen();
+}
+
+static void show_bt_lookout_screen(void)
+{
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+
+    create_function_page_base("Bluetooth Lookout");
+    bt_lookout_ui_active  = true;
+    bt_lookout_status_lbl = NULL;
+    bt_lookout_count_lbl  = NULL;
+    bt_lookout_last_lbl   = NULL;
+    bt_lookout_start_btn  = NULL;
+    bt_lookout_edit_btn   = NULL;
+
+    ensure_sd_mounted();
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        bt_lookout_load(BT_LOOKOUT_CSV_PATH);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    if (!ensure_ble_mode()) {
+        lv_obj_t *err = lv_label_create(function_page);
+        lv_label_set_text(err, "BLE init failed!");
+        lv_obj_set_style_text_color(err, COLOR_MATERIAL_RED, 0);
+        lv_obj_center(err);
+        bt_lookout_ui_active = false;
+        return;
+    }
+
+    // Status card
+    lv_obj_t *card = lv_obj_create(function_page);
+    lv_obj_set_size(card, 220, 105);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 38);
+    lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+    lv_obj_set_style_border_color(card, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 8, 0);
+    lv_obj_set_style_pad_all(card, 8, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    bool is_active = bt_lookout_is_active();
+    bt_lookout_status_lbl = lv_label_create(card);
+    lv_label_set_text(bt_lookout_status_lbl, is_active ? "MONITORING" : "Stopped");
+    lv_obj_set_style_text_color(bt_lookout_status_lbl,
+        is_active ? COLOR_MATERIAL_GREEN : lv_color_make(176, 176, 176), 0);
+    lv_obj_set_style_text_font(bt_lookout_status_lbl, &lv_font_montserrat_20, 0);
+    lv_obj_align(bt_lookout_status_lbl, LV_ALIGN_TOP_MID, 0, 0);
+
+    bt_lookout_count_lbl = lv_label_create(card);
+    char cnt_buf[40];
+    int n = bt_lookout_count();
+    snprintf(cnt_buf, sizeof(cnt_buf), "Watching: %d device%s", n, n == 1 ? "" : "s");
+    lv_label_set_text(bt_lookout_count_lbl, cnt_buf);
+    lv_obj_set_style_text_color(bt_lookout_count_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(bt_lookout_count_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_align(bt_lookout_count_lbl, LV_ALIGN_TOP_MID, 0, 30);
+
+    bt_lookout_last_lbl = lv_label_create(card);
+    lv_label_set_text(bt_lookout_last_lbl, "No detection yet");
+    lv_label_set_long_mode(bt_lookout_last_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(bt_lookout_last_lbl, 200);
+    lv_obj_set_style_text_color(bt_lookout_last_lbl, lv_color_make(176, 176, 176), 0);
+    lv_obj_set_style_text_font(bt_lookout_last_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_align(bt_lookout_last_lbl, LV_ALIGN_TOP_MID, 0, 54);
+
+    // Start/Stop button
+    bt_lookout_start_btn = lv_btn_create(function_page);
+    lv_obj_set_size(bt_lookout_start_btn, 110, 30);
+    lv_obj_align(bt_lookout_start_btn, LV_ALIGN_TOP_MID, 0, 155);
+    lv_obj_set_style_bg_color(bt_lookout_start_btn,
+        is_active ? COLOR_MATERIAL_RED : COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(bt_lookout_start_btn, 0, 0);
+    lv_obj_set_style_radius(bt_lookout_start_btn, 8, 0);
+    lv_obj_set_flex_flow(bt_lookout_start_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(bt_lookout_start_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(bt_lookout_start_btn, 4, 0);
+
+    lv_obj_t *s_icon = lv_label_create(bt_lookout_start_btn);
+    lv_label_set_text(s_icon, is_active ? LV_SYMBOL_STOP : LV_SYMBOL_PLAY);
+    lv_obj_set_style_text_font(s_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_icon, lv_color_white(), 0);
+
+    lv_obj_t *s_lbl = lv_label_create(bt_lookout_start_btn);
+    lv_label_set_text(s_lbl, is_active ? "Stop" : "Start");
+    lv_obj_set_style_text_font(s_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_lbl, lv_color_white(), 0);
+
+    lv_obj_add_event_cb(bt_lookout_start_btn, lookout_start_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    // Blackout button
+    lv_obj_t *dark_btn = lv_btn_create(function_page);
+    lv_obj_set_size(dark_btn, 110, 30);
+    lv_obj_align(dark_btn, LV_ALIGN_TOP_MID, 0, 195);
+    lv_obj_set_style_bg_color(dark_btn, lv_color_make(50, 50, 50), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(dark_btn, lv_color_make(80, 80, 80), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(dark_btn, 0, 0);
+    lv_obj_set_style_radius(dark_btn, 8, 0);
+    lv_obj_set_flex_flow(dark_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(dark_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(dark_btn, 4, 0);
+
+    lv_obj_t *d_icon = lv_label_create(dark_btn);
+    lv_label_set_text(d_icon, LV_SYMBOL_EYE_CLOSE);
+    lv_obj_set_style_text_font(d_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(d_icon, lv_color_white(), 0);
+
+    lv_obj_t *d_lbl = lv_label_create(dark_btn);
+    lv_label_set_text(d_lbl, "Blackout");
+    lv_obj_set_style_text_font(d_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(d_lbl, lv_color_white(), 0);
+
+    lv_obj_add_event_cb(dark_btn, lookout_dark_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    // Edit Watchlist button — only visible when monitoring is stopped
+    bt_lookout_edit_btn = lv_btn_create(function_page);
+    lv_obj_set_size(bt_lookout_edit_btn, 110, 28);
+    lv_obj_align(bt_lookout_edit_btn, LV_ALIGN_TOP_MID, 0, 235);
+    lv_obj_set_style_bg_color(bt_lookout_edit_btn, lv_color_make(30, 80, 140), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(bt_lookout_edit_btn, lv_color_make(50, 110, 180), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(bt_lookout_edit_btn, 0, 0);
+    lv_obj_set_style_radius(bt_lookout_edit_btn, 8, 0);
+    lv_obj_set_flex_flow(bt_lookout_edit_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(bt_lookout_edit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(bt_lookout_edit_btn, 4, 0);
+    lv_obj_t *ed_icon = lv_label_create(bt_lookout_edit_btn);
+    lv_label_set_text(ed_icon, LV_SYMBOL_EDIT);
+    lv_obj_set_style_text_font(ed_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ed_icon, lv_color_white(), 0);
+    lv_obj_t *ed_lbl = lv_label_create(bt_lookout_edit_btn);
+    lv_label_set_text(ed_lbl, "Edit List");
+    lv_obj_set_style_text_font(ed_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ed_lbl, lv_color_white(), 0);
+    lv_obj_add_event_cb(bt_lookout_edit_btn, lookout_edit_btn_cb, LV_EVENT_CLICKED, NULL);
+    if (is_active) lv_obj_add_flag(bt_lookout_edit_btn, LV_OBJ_FLAG_HIDDEN);
+
+    // Back button
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 28);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+
+    lv_obj_t *b_icon = lv_label_create(back_btn);
+    lv_label_set_text(b_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(b_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(b_icon, ui_text_color(), 0);
+
+    lv_obj_t *b_lbl = lv_label_create(back_btn);
+    lv_label_set_text(b_lbl, "Back");
+    lv_obj_set_style_text_font(b_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(b_lbl, ui_text_color(), 0);
+
+    lv_obj_add_event_cb(back_btn, lookout_back_btn_cb, LV_EVENT_CLICKED, NULL);
+}
+
+/* ── Watchlist editor ─────────────────────────────────────────────── */
+
+static bool s_editor_delete[BT_LOOKOUT_MAX_ENTRIES];
+static int  s_editor_count  = 0;
+static lv_obj_t *s_editor_rows[BT_LOOKOUT_MAX_ENTRIES];
+
+static void lookout_edit_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    show_lookout_editor_screen();
+}
+
+static void lookout_editor_toggle_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_editor_count) return;
+    s_editor_delete[idx] = !s_editor_delete[idx];
+    bool del = s_editor_delete[idx];
+
+    if (s_editor_rows[idx] && lv_obj_is_valid(s_editor_rows[idx]))
+        lv_obj_set_style_bg_color(s_editor_rows[idx],
+            del ? lv_color_make(80, 20, 20) : lv_color_make(40, 40, 40), 0);
+
+    lv_obj_t *btn = lv_event_get_target(e);
+    lv_obj_set_style_bg_color(btn,
+        del ? COLOR_MATERIAL_RED : lv_color_make(70, 70, 70), LV_STATE_DEFAULT);
+    lv_obj_t *lbl = lv_obj_get_child(btn, 0);
+    if (lbl) lv_label_set_text(lbl, del ? LV_SYMBOL_TRASH : LV_SYMBOL_CLOSE);
+}
+
+static void lookout_editor_save_cb(lv_event_t *ev)
+{
+    (void)ev;
+    ensure_sd_mounted();
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        FILE *fp = fopen(BT_LOOKOUT_CSV_PATH, "w");
+        if (fp) {
+            fwrite(BT_LOOKOUT_CSV_HEADER, 1, strlen(BT_LOOKOUT_CSV_HEADER), fp);
+            for (int i = 0; i < s_editor_count; i++) {
+                if (s_editor_delete[i]) continue;
+                const bt_lookout_entry_t *ent = bt_lookout_get(i);
+                if (!ent) continue;
+                fprintf(fp, "%02X:%02X:%02X:%02X:%02X:%02X,%s,%d\n",
+                        ent->mac[0], ent->mac[1], ent->mac[2],
+                        ent->mac[3], ent->mac[4], ent->mac[5],
+                        ent->name, ent->rssi_threshold);
+            }
+            fclose(fp);
+        }
+        bt_lookout_load(BT_LOOKOUT_CSV_PATH);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    show_bt_lookout_screen();
+}
+
+static void lookout_editor_back_cb(lv_event_t *ev)
+{
+    (void)ev;
+    show_bt_lookout_screen();
+}
+
+static void show_lookout_editor_screen(void)
+{
+    s_editor_count = bt_lookout_count();
+    memset(s_editor_delete, 0, sizeof(s_editor_delete));
+    memset(s_editor_rows,   0, sizeof(s_editor_rows));
+
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+    bt_lookout_ui_active = false;
+    bt_lookout_status_lbl = NULL;
+    bt_lookout_count_lbl  = NULL;
+    bt_lookout_last_lbl   = NULL;
+    bt_lookout_start_btn  = NULL;
+    bt_lookout_edit_btn   = NULL;
+
+    create_function_page_base("Edit Watchlist");
+
+    /* Scrollable list — leaves room for the bottom buttons */
+    lv_obj_t *scroll = lv_obj_create(function_page);
+    lv_obj_set_size(scroll, 228, 220);
+    lv_obj_align(scroll, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_set_style_bg_color(scroll, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(scroll, 0, 0);
+    lv_obj_set_style_pad_all(scroll, 4, 0);
+    lv_obj_set_style_pad_row(scroll, 4, 0);
+    lv_obj_set_flex_flow(scroll, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(scroll, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+    if (s_editor_count == 0) {
+        lv_obj_t *empty = lv_label_create(scroll);
+        lv_label_set_text(empty, "Watchlist is empty.\nAdd devices via BT Scan & Select.");
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(empty, lv_color_make(176, 176, 176), 0);
+        lv_obj_center(empty);
+    }
+
+    for (int i = 0; i < s_editor_count; i++) {
+        const bt_lookout_entry_t *ent = bt_lookout_get(i);
+        if (!ent) continue;
+
+        /* Row container */
+        lv_obj_t *row = lv_obj_create(scroll);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(row, lv_color_make(40, 40, 40), 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_radius(row, 6, 0);
+        lv_obj_set_style_pad_all(row, 6, 0);
+        lv_obj_set_style_pad_column(row, 6, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        s_editor_rows[i] = row;
+
+        /* Name + MAC column */
+        lv_obj_t *info = lv_obj_create(row);
+        lv_obj_set_flex_grow(info, 1);
+        lv_obj_set_height(info, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(info, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(info, 0, 0);
+        lv_obj_set_style_pad_all(info, 0, 0);
+        lv_obj_set_flex_flow(info, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(info, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+        lv_obj_clear_flag(info, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *name_lbl = lv_label_create(info);
+        lv_label_set_text(name_lbl, ent->name[0] ? ent->name : "Unknown");
+        lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(name_lbl, ui_text_color(), 0);
+        lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(name_lbl, 150);
+
+        char mac_str[18];
+        snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 ent->mac[0], ent->mac[1], ent->mac[2],
+                 ent->mac[3], ent->mac[4], ent->mac[5]);
+        lv_obj_t *mac_lbl = lv_label_create(info);
+        lv_label_set_text(mac_lbl, mac_str);
+        lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(mac_lbl, lv_color_make(140, 140, 140), 0);
+
+        /* Delete toggle button */
+        lv_obj_t *del_btn = lv_btn_create(row);
+        lv_obj_set_size(del_btn, 40, 40);
+        lv_obj_set_style_bg_color(del_btn, lv_color_make(70, 70, 70), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(del_btn, lv_color_make(100, 100, 100), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(del_btn, 0, 0);
+        lv_obj_set_style_radius(del_btn, 6, 0);
+        lv_obj_set_style_pad_all(del_btn, 4, 0);
+        lv_obj_t *del_icon = lv_label_create(del_btn);
+        lv_label_set_text(del_icon, LV_SYMBOL_CLOSE);
+        lv_obj_set_style_text_font(del_icon, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(del_icon, lv_color_make(200, 200, 200), 0);
+        lv_obj_center(del_icon);
+        lv_obj_add_event_cb(del_btn, lookout_editor_toggle_cb, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)i);
+    }
+
+    /* Bottom button row: [Back]  [Save] */
+    lv_obj_t *btn_row = lv_obj_create(function_page);
+    lv_obj_set_size(btn_row, 228, 36);
+    lv_obj_align(btn_row, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_style_pad_column(btn_row, 8, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Back button */
+    lv_obj_t *back_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(back_btn, 106, 32);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_t *bk_icon = lv_label_create(back_btn);
+    lv_label_set_text(bk_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(bk_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bk_icon, ui_text_color(), 0);
+    lv_obj_t *bk_lbl = lv_label_create(back_btn);
+    lv_label_set_text(bk_lbl, "Back");
+    lv_obj_set_style_text_font(bk_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bk_lbl, ui_text_color(), 0);
+    lv_obj_add_event_cb(back_btn, lookout_editor_back_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Save button */
+    lv_obj_t *save_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(save_btn, 106, 32);
+    lv_obj_set_style_bg_color(save_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(save_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 40), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(save_btn, 0, 0);
+    lv_obj_set_style_radius(save_btn, 8, 0);
+    lv_obj_set_flex_flow(save_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(save_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(save_btn, 4, 0);
+    lv_obj_t *sv_icon = lv_label_create(save_btn);
+    lv_label_set_text(sv_icon, LV_SYMBOL_SAVE);
+    lv_obj_set_style_text_font(sv_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(sv_icon, lv_color_white(), 0);
+    lv_obj_t *sv_lbl = lv_label_create(save_btn);
+    lv_label_set_text(sv_lbl, "Save");
+    lv_obj_set_style_text_font(sv_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(sv_lbl, lv_color_white(), 0);
+    lv_obj_add_event_cb(save_btn, lookout_editor_save_cb, LV_EVENT_CLICKED, NULL);
+}
+
 // Bluetooth screen
 static void show_bluetooth_screen(void)
 {
     create_function_page_base("Bluetooth");
-    
+    apply_menu_bg();
+
     lv_obj_t *tiles = lv_obj_create(function_page);
     lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
+    lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
     lv_obj_set_style_pad_all(tiles, 10, 0);
     lv_obj_set_style_pad_gap(tiles, 10, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     
-    // AirTag scan - stub - Apple-like gray
-    lv_obj_t *airtag_tile = create_tile(tiles, LV_SYMBOL_GPS, "AirTag\nscan", lv_color_make(142, 142, 147), NULL, NULL);
+    // BT Scan & Select - first tile, cyan
+    lv_obj_t *btsas_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BT Scan\n& Select", UI_ACCENT_CYAN, NULL, NULL);
+    lv_obj_add_event_cb(btsas_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Scan & Select");
+
+    // AirTag scan - Apple-like gray
+    lv_obj_t *airtag_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "AirTag\nScan", lv_color_make(142, 142, 147), NULL, NULL);
     lv_obj_add_event_cb(airtag_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"AirTag scan");
-    
+
     // BT Locator - Blue
-    lv_obj_t *locator_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "BT Locator", COLOR_TILE_BLUE, NULL, NULL);
+    lv_obj_t *locator_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BT Locator", COLOR_TILE_BLUE, NULL, NULL);
     lv_obj_add_event_cb(locator_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Locator");
+
+    // BT Lookout - Red
+    lv_obj_t *lookout_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BT\nLookout", COLOR_MATERIAL_RED, NULL, NULL);
+    lv_obj_add_event_cb(lookout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Dee Dee Detector");
 }
 
 // BT Locator screen - scan BT devices, select one, then track RSSI every 10s
@@ -15168,7 +16185,7 @@ static void show_bt_locator_screen(void)
     lv_obj_align(bt_locator_mac_label, LV_ALIGN_CENTER, 0, 20);
     lv_obj_add_flag(bt_locator_mac_label, LV_OBJ_FLAG_HIDDEN);
     
-    // Red Exit button at bottom (compact row)
+    // Back button at bottom (compact row)
     bt_locator_exit_btn = lv_btn_create(function_page);
     lv_obj_set_size(bt_locator_exit_btn, 110, 28);
     lv_obj_align(bt_locator_exit_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
@@ -15186,17 +16203,17 @@ static void show_bt_locator_screen(void)
     lv_obj_set_flex_align(bt_locator_exit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
     lv_obj_t *exit_icon = lv_label_create(bt_locator_exit_btn);
-    lv_label_set_text(exit_icon, LV_SYMBOL_CLOSE);
+    lv_label_set_text(exit_icon, LV_SYMBOL_LEFT);
     lv_obj_set_style_text_font(exit_icon, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(exit_icon, ui_text_color(), 0);
 
     lv_obj_t *exit_lbl = lv_label_create(bt_locator_exit_btn);
-    lv_label_set_text(exit_lbl, "Exit");
+    lv_label_set_text(exit_lbl, "Back");
     lv_obj_set_style_text_font(exit_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(exit_lbl, ui_text_color(), 0);
 
     lv_obj_add_event_cb(bt_locator_exit_btn, bt_locator_exit_cb, LV_EVENT_CLICKED, NULL);
-    
+
     // Switch to BLE mode
     if (!ensure_ble_mode()) {
         lv_label_set_text(bt_locator_status_label, "BLE init failed!");
@@ -15226,22 +16243,395 @@ static void show_bt_locator_screen(void)
     ui_locked = false;
 }
 
+// ============================================================================
+// BT SCAN & SELECT
+// ============================================================================
+
+static void bt_sas_exit_cb(lv_event_t *e)
+{
+    (void)e;
+    if (bt_scan_active) {
+        bt_scan_active = false;
+        bt_stop_scan();
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    bt_sas_ui_active = false;
+    bt_sas_selected_idx = -1;
+    show_bluetooth_screen();
+}
+
+static void bt_sas_device_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= bt_device_count) return;
+
+    if (bt_sas_selected_idx == idx) {
+        // Deselect
+        bt_sas_selected_idx = -1;
+        if (bt_sas_next_btn && lv_obj_is_valid(bt_sas_next_btn))
+            lv_obj_add_flag(bt_sas_next_btn, LV_OBJ_FLAG_HIDDEN);
+        if (bt_sas_status_label && lv_obj_is_valid(bt_sas_status_label))
+            lv_label_set_text(bt_sas_status_label, "Tap a device to select");
+    } else {
+        bt_sas_selected_idx = idx;
+        memcpy(bt_sas_target_addr, bt_devices[idx].addr, 6);
+        if (bt_devices[idx].name[0] != '\0')
+            snprintf(bt_sas_target_name, sizeof(bt_sas_target_name), "%s", bt_devices[idx].name);
+        else
+            snprintf(bt_sas_target_name, sizeof(bt_sas_target_name), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     bt_devices[idx].addr[5], bt_devices[idx].addr[4], bt_devices[idx].addr[3],
+                     bt_devices[idx].addr[2], bt_devices[idx].addr[1], bt_devices[idx].addr[0]);
+
+        if (bt_sas_status_label && lv_obj_is_valid(bt_sas_status_label)) {
+            char sel_text[48];
+            snprintf(sel_text, sizeof(sel_text), "Selected: %s", bt_sas_target_name);
+            lv_label_set_text(bt_sas_status_label, sel_text);
+        }
+        if (bt_sas_next_btn && lv_obj_is_valid(bt_sas_next_btn))
+            lv_obj_clear_flag(bt_sas_next_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+    bt_sas_refresh_list();
+}
+
+static void bt_sas_next_cb(lv_event_t *e)
+{
+    (void)e;
+    if (bt_sas_selected_idx < 0) return;
+    // Stop scan before leaving
+    if (bt_scan_active) {
+        bt_scan_active = false;
+        bt_stop_scan();
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    bt_sas_ui_active = false;
+    show_bt_attack_tiles_screen();
+}
+
+static void bt_sas_refresh_list(void)
+{
+    if (!bt_sas_list || !lv_obj_is_valid(bt_sas_list)) return;
+    lv_obj_clean(bt_sas_list);
+
+    for (int i = 0; i < bt_device_count; i++) {
+        bt_device_info_t *dev = &bt_devices[i];
+        bool selected = (i == bt_sas_selected_idx);
+
+        char item_text[64];
+        char short_name[14];
+        if (dev->name[0] != '\0') {
+            strncpy(short_name, dev->name, 13);
+            short_name[13] = '\0';
+            snprintf(item_text, sizeof(item_text), "%s  %d dBm  %02X:%02X:%02X",
+                     short_name, dev->rssi,
+                     dev->addr[2], dev->addr[1], dev->addr[0]);
+        } else {
+            const char *tag = dev->is_airtag ? " [AirTag]" : dev->is_smarttag ? " [SmartTag]" : "";
+            snprintf(item_text, sizeof(item_text), "[Unknown]%s  %d dBm  %02X:%02X:%02X",
+                     tag, dev->rssi, dev->addr[2], dev->addr[1], dev->addr[0]);
+        }
+
+        lv_obj_t *btn = lv_btn_create(bt_sas_list);
+        lv_obj_set_size(btn, lv_pct(100), 30);
+        lv_obj_set_style_bg_color(btn, selected ? UI_ACCENT_CYAN : ui_card_color(), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(btn, lv_color_lighten(UI_ACCENT_CYAN, 30), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(btn, selected ? 1 : 0, 0);
+        lv_obj_set_style_border_color(btn, UI_ACCENT_CYAN, 0);
+        lv_obj_set_style_radius(btn, 4, 0);
+
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, item_text);
+        lv_obj_set_style_text_color(lbl, selected ? lv_color_black() : ui_text_color(), 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 4, 0);
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
+
+        lv_obj_add_event_cb(btn, bt_sas_device_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+    }
+}
+
+static void show_bt_scan_select_screen(void)
+{
+    ui_locked = true;
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+
+    create_function_page_base("BT Scan & Select");
+    bt_sas_ui_active = true;
+    bt_sas_selected_idx = -1;
+
+    // Status label
+    bt_sas_status_label = lv_label_create(function_page);
+    lv_label_set_text(bt_sas_status_label, "Initializing BLE...");
+    lv_obj_set_style_text_color(bt_sas_status_label, ui_text_color(), 0);
+    lv_obj_set_style_text_font(bt_sas_status_label, &lv_font_montserrat_12, 0);
+    lv_obj_align(bt_sas_status_label, LV_ALIGN_TOP_LEFT, 5, 35);
+
+    // Scrollable device list
+    bt_sas_list = lv_obj_create(function_page);
+    lv_obj_set_size(bt_sas_list, lv_pct(100), LCD_V_RES - 30 - 18 - 50);
+    lv_obj_align(bt_sas_list, LV_ALIGN_TOP_MID, 0, 52);
+    lv_obj_set_style_bg_color(bt_sas_list, ui_bg_color(), 0);
+    lv_obj_set_style_border_color(bt_sas_list, UI_ACCENT_CYAN, 0);
+    lv_obj_set_style_border_width(bt_sas_list, 1, 0);
+    lv_obj_set_flex_flow(bt_sas_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(bt_sas_list, 3, 0);
+    lv_obj_set_style_pad_gap(bt_sas_list, 3, 0);
+    lv_obj_set_scrollbar_mode(bt_sas_list, LV_SCROLLBAR_MODE_AUTO);
+
+    // Bottom button row: Exit | Next →
+    lv_obj_t *btn_row = lv_obj_create(function_page);
+    lv_obj_set_size(btn_row, lv_pct(100), 38);
+    lv_obj_align(btn_row, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_hor(btn_row, 6, 0);
+    lv_obj_set_style_pad_ver(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *exit_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(exit_btn, 100, 30);
+    lv_obj_set_style_bg_color(exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 40), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(exit_btn, 0, 0);
+    lv_obj_set_style_radius(exit_btn, 8, 0);
+    lv_obj_t *exit_lbl = lv_label_create(exit_btn);
+    lv_label_set_text(exit_lbl, LV_SYMBOL_CLOSE "  Exit");
+    lv_obj_set_style_text_font(exit_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(exit_lbl, lv_color_white(), 0);
+    lv_obj_center(exit_lbl);
+    lv_obj_add_event_cb(exit_btn, bt_sas_exit_cb, LV_EVENT_CLICKED, NULL);
+
+    bt_sas_next_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(bt_sas_next_btn, 110, 30);
+    lv_obj_set_style_bg_color(bt_sas_next_btn, UI_ACCENT_CYAN, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(bt_sas_next_btn, lv_color_lighten(UI_ACCENT_CYAN, 40), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(bt_sas_next_btn, 0, 0);
+    lv_obj_set_style_radius(bt_sas_next_btn, 8, 0);
+    lv_obj_t *next_lbl = lv_label_create(bt_sas_next_btn);
+    lv_label_set_text(next_lbl, "Actions " LV_SYMBOL_RIGHT);
+    lv_obj_set_style_text_font(next_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(next_lbl, lv_color_black(), 0);
+    lv_obj_center(next_lbl);
+    lv_obj_add_event_cb(bt_sas_next_btn, bt_sas_next_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(bt_sas_next_btn, LV_OBJ_FLAG_HIDDEN);  // shown after selection
+
+    // Switch to BLE and start scan
+    if (!ensure_ble_mode()) {
+        lv_label_set_text(bt_sas_status_label, "BLE init failed!");
+        ui_locked = false;
+        return;
+    }
+
+    bt_scan_active = true;
+    ble_scan_finished = false;
+    BaseType_t ret = xTaskCreate(bt_scan_task, "bt_scan_task", 4096, NULL, 5, &bt_scan_task_handle);
+    if (ret != pdPASS) {
+        bt_scan_active = false;
+        lv_label_set_text(bt_sas_status_label, "Scan start failed!");
+    } else {
+        lv_label_set_text(bt_sas_status_label, "Scanning... 0 (10s)");
+    }
+    ui_locked = false;
+}
+
+// Direct-track BT Locator: skip scan, jump straight to tracking the SAS-selected device
+static void show_bt_locator_direct_track(void)
+{
+    ui_locked = true;
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+
+    char title[48];
+    snprintf(title, sizeof(title), "Locating: %.22s", bt_sas_target_name[0] ? bt_sas_target_name : "Unknown");
+    create_function_page_base(title);
+
+    bt_locator_ui_active = true;
+    bt_locator_tracking_active = false;
+    bt_tracking_mode = false;
+
+    // Pre-load tracking target from SAS selection
+    memcpy(bt_tracking_mac, bt_sas_target_addr, 6);
+    strncpy(bt_tracking_name, bt_sas_target_name, sizeof(bt_tracking_name) - 1);
+    bt_tracking_name[sizeof(bt_tracking_name) - 1] = '\0';
+    bt_tracking_found = false;
+    bt_tracking_rssi = 0;
+
+    // Content container
+    bt_locator_content = lv_obj_create(function_page);
+    lv_obj_set_size(bt_locator_content, lv_pct(100), LCD_V_RES - 30 - 43);
+    lv_obj_align(bt_locator_content, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(bt_locator_content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(bt_locator_content, 0, 0);
+    lv_obj_set_style_pad_all(bt_locator_content, 5, 0);
+    lv_obj_clear_flag(bt_locator_content, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Status label: scanning in progress
+    bt_locator_status_label = lv_label_create(bt_locator_content);
+    lv_label_set_text(bt_locator_status_label, "Scanning...");
+    lv_obj_set_style_text_color(bt_locator_status_label, ui_text_color(), 0);
+    lv_obj_set_style_text_font(bt_locator_status_label, &lv_font_montserrat_16, 0);
+    lv_obj_align(bt_locator_status_label, LV_ALIGN_CENTER, 0, 40);
+
+    // RSSI display - large, centered, green
+    bt_locator_rssi_label = lv_label_create(bt_locator_content);
+    lv_label_set_text(bt_locator_rssi_label, "RSSI: ---");
+    lv_obj_set_style_text_color(bt_locator_rssi_label, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_text_font(bt_locator_rssi_label, &lv_font_montserrat_20, 0);
+    lv_obj_align(bt_locator_rssi_label, LV_ALIGN_CENTER, 0, -30);
+
+    // MAC label showing what we're tracking
+    bt_locator_mac_label = lv_label_create(bt_locator_content);
+    char mac_disp[48];
+    snprintf(mac_disp, sizeof(mac_disp), "%02X:%02X:%02X:%02X:%02X:%02X",
+             bt_sas_target_addr[0], bt_sas_target_addr[1], bt_sas_target_addr[2],
+             bt_sas_target_addr[3], bt_sas_target_addr[4], bt_sas_target_addr[5]);
+    lv_label_set_text(bt_locator_mac_label, mac_disp);
+    lv_obj_set_style_text_color(bt_locator_mac_label, ui_text_color(), 0);
+    lv_obj_set_style_text_font(bt_locator_mac_label, &lv_font_montserrat_14, 0);
+    lv_obj_align(bt_locator_mac_label, LV_ALIGN_CENTER, 0, 10);
+
+    // Back button
+    bt_locator_exit_btn = lv_btn_create(function_page);
+    lv_obj_set_size(bt_locator_exit_btn, 110, 28);
+    lv_obj_align(bt_locator_exit_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(bt_locator_exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(bt_locator_exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(bt_locator_exit_btn, 0, 0);
+    lv_obj_set_style_radius(bt_locator_exit_btn, 8, 0);
+    lv_obj_set_style_shadow_width(bt_locator_exit_btn, 4, 0);
+    lv_obj_set_style_shadow_color(bt_locator_exit_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(bt_locator_exit_btn, LV_OPA_40, 0);
+    lv_obj_set_style_pad_ver(bt_locator_exit_btn, 4, 0);
+    lv_obj_set_style_pad_hor(bt_locator_exit_btn, 8, 0);
+    lv_obj_set_style_pad_column(bt_locator_exit_btn, 4, 0);
+    lv_obj_set_flex_flow(bt_locator_exit_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(bt_locator_exit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *exit_icon = lv_label_create(bt_locator_exit_btn);
+    lv_label_set_text(exit_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(exit_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(exit_icon, ui_text_color(), 0);
+
+    lv_obj_t *exit_lbl = lv_label_create(bt_locator_exit_btn);
+    lv_label_set_text(exit_lbl, "Back");
+    lv_obj_set_style_text_font(exit_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(exit_lbl, ui_text_color(), 0);
+
+    lv_obj_add_event_cb(bt_locator_exit_btn, bt_locator_exit_cb, LV_EVENT_CLICKED, NULL);
+
+    // Switch to BLE mode
+    if (!ensure_ble_mode()) {
+        lv_label_set_text(bt_locator_status_label, "BLE init failed!");
+        ui_locked = false;
+        return;
+    }
+
+    // Start tracking directly — no scan-and-select step
+    bt_locator_tracking_active = true;
+    bt_tracking_mode = true;
+    BaseType_t task_ret = xTaskCreate(
+        bt_locator_tracking_task,
+        "bt_loc_track",
+        4096,
+        NULL,
+        5,
+        &bt_locator_task_handle
+    );
+
+    if (task_ret != pdPASS) {
+        bt_locator_tracking_active = false;
+        bt_tracking_mode = false;
+        lv_label_set_text(bt_locator_status_label, "Failed to start tracking!");
+    } else {
+        snprintf(bt_locator_status_text, sizeof(bt_locator_status_text), "Scanning (10s)...");
+        lv_label_set_text(bt_locator_status_label, bt_locator_status_text);
+    }
+
+    ui_locked = false;
+}
+
+// Attack tile screen after device selection
+static void show_bt_attack_tiles_screen(void)
+{
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+
+    char title[48];
+    snprintf(title, sizeof(title), "BT: %.28s", bt_sas_target_name);
+    create_function_page_base(title);
+    apply_menu_bg();
+
+    lv_obj_t *tiles = lv_obj_create(function_page);
+    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(tiles, 0, 0);
+    lv_obj_set_style_pad_all(tiles, 10, 0);
+    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+
+    // BT Locator tile — routes directly to tracking the SAS-selected device
+    lv_obj_t *loc_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BT\nLocator", COLOR_TILE_BLUE, NULL, NULL);
+    lv_obj_add_event_cb(loc_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Locator Direct");
+
+    // GATT Walker tile (placeholder - coming soon)
+    lv_obj_t *gatt_tile = create_tile(tiles, MY_SYMBOL_PERSON_WALKING, "GATT\nWalker", COLOR_MATERIAL_PURPLE, NULL, NULL);
+    lv_obj_add_event_cb(gatt_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"GATT Walker");
+
+    // Add to BT Lookout watchlist
+    lv_obj_t *add_lookout_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Add to\nBT Lookout", COLOR_MATERIAL_RED, NULL, NULL);
+    lv_obj_add_event_cb(add_lookout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Add to Lookout");
+}
+
+static void stub_back_btn_cb(lv_event_t *e)
+{
+    void (*fn)(void) = (void (*)(void))lv_obj_get_user_data(lv_event_get_target(e));
+    if (fn) fn(); else nav_to_menu_flag = true;
+}
+
 // Stub screen for not-yet-implemented features
-static void show_stub_screen(const char *name)
+static void show_stub_screen(const char *name, void (*back_fn)(void))
 {
     create_function_page_base(name);
-    
+
     lv_obj_t *label = lv_label_create(function_page);
     lv_label_set_text(label, "Coming Soon");
     lv_obj_set_style_text_font(label, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(label, ui_text_color(), 0);
     lv_obj_center(label);
-    
+
     lv_obj_t *sublabel = lv_label_create(function_page);
     lv_label_set_text(sublabel, "This feature is under development");
     lv_obj_set_style_text_font(sublabel, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(sublabel, lv_color_make(176, 176, 176), 0);  // Light gray #B0B0B0
+    lv_obj_set_style_text_color(sublabel, lv_color_make(176, 176, 176), 0);
     lv_obj_align(sublabel, LV_ALIGN_CENTER, 0, 40);
+
+    /* Back button */
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 28);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_style_pad_ver(back_btn, 4, 0);
+    lv_obj_set_style_pad_hor(back_btn, 8, 0);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(back_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(back_icon, lv_color_white(), 0);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, "Back");
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
+    lv_obj_set_user_data(back_btn, (void *)back_fn);
+    lv_obj_add_event_cb(back_btn, stub_back_btn_cb, LV_EVENT_CLICKED, NULL);
 }
 
 // ============================================================================
@@ -15460,6 +16850,110 @@ void menu_event_cb(lv_event_t *e)
             show_function_page(name);
         }
     }
+}
+
+/* ── BT Lookout conflict warning ──────────────────────────────── */
+
+static lv_obj_t *s_bt_conflict_popup = NULL;
+
+static void bt_conflict_dismiss_cb(lv_event_t *ev)
+{
+    (void)ev;
+    if (s_bt_conflict_popup && lv_obj_is_valid(s_bt_conflict_popup)) {
+        lv_obj_del(s_bt_conflict_popup);
+        s_bt_conflict_popup = NULL;
+    }
+}
+
+static void bt_conflict_proceed_cb(lv_event_t *ev)
+{
+    void (*fn)(void) = (void (*)(void))lv_event_get_user_data(ev);
+    if (s_bt_conflict_popup && lv_obj_is_valid(s_bt_conflict_popup)) {
+        lv_obj_del(s_bt_conflict_popup);
+        s_bt_conflict_popup = NULL;
+    }
+    bt_lookout_stop();
+    bt_lookout_ui_active  = false;
+    bt_lookout_status_lbl = NULL;
+    bt_lookout_count_lbl  = NULL;
+    bt_lookout_last_lbl   = NULL;
+    bt_lookout_start_btn  = NULL;
+    bt_lookout_edit_btn   = NULL;
+    if (fn) fn();
+}
+
+static void show_bt_conflict_warning(const char *fname, void (*proceed_fn)(void))
+{
+    if (s_bt_conflict_popup && lv_obj_is_valid(s_bt_conflict_popup)) {
+        lv_obj_del(s_bt_conflict_popup);
+    }
+
+    /* Full-screen dimming overlay on lv_layer_top() */
+    s_bt_conflict_popup = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_bt_conflict_popup, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(s_bt_conflict_popup, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_bt_conflict_popup, LV_OPA_60, 0);
+    lv_obj_set_style_border_width(s_bt_conflict_popup, 0, 0);
+    lv_obj_clear_flag(s_bt_conflict_popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Warning card */
+    lv_obj_t *card = lv_obj_create(s_bt_conflict_popup);
+    lv_obj_set_size(card, 220, 185);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+    lv_obj_set_style_border_color(card, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, LV_SYMBOL_WARNING "  BT Lookout Active");
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    char msg[100];
+    snprintf(msg, sizeof(msg),
+             "BT Lookout is still\nmonitoring. Starting\n\"%s\" will stop it.", fname);
+    lv_obj_t *msg_lbl = lv_label_create(card);
+    lv_label_set_text(msg_lbl, msg);
+    lv_obj_set_style_text_font(msg_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(msg_lbl, ui_text_color(), 0);
+    lv_label_set_long_mode(msg_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(msg_lbl, 196);
+    lv_obj_align(msg_lbl, LV_ALIGN_TOP_MID, 0, 30);
+
+    /* Cancel button */
+    lv_obj_t *cancel_btn = lv_btn_create(card);
+    lv_obj_set_size(cancel_btn, 90, 32);
+    lv_obj_align(cancel_btn, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_make(70, 70, 70), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_make(100, 100, 100), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(cancel_btn, 0, 0);
+    lv_obj_set_style_radius(cancel_btn, 8, 0);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, "Cancel");
+    lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(cancel_lbl, lv_color_white(), 0);
+    lv_obj_center(cancel_lbl);
+    lv_obj_add_event_cb(cancel_btn, bt_conflict_dismiss_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Stop & Go button */
+    lv_obj_t *proceed_btn = lv_btn_create(card);
+    lv_obj_set_size(proceed_btn, 90, 32);
+    lv_obj_align(proceed_btn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(proceed_btn, COLOR_MATERIAL_ORANGE, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(proceed_btn, lv_color_lighten(COLOR_MATERIAL_ORANGE, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(proceed_btn, 0, 0);
+    lv_obj_set_style_radius(proceed_btn, 8, 0);
+    lv_obj_t *proceed_lbl = lv_label_create(proceed_btn);
+    lv_label_set_text(proceed_lbl, "Stop & Go");
+    lv_obj_set_style_text_font(proceed_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(proceed_lbl, lv_color_white(), 0);
+    lv_obj_center(proceed_lbl);
+    lv_obj_add_event_cb(proceed_btn, bt_conflict_proceed_cb, LV_EVENT_CLICKED,
+                        (void *)proceed_fn);
 }
 
 void attack_event_cb(lv_event_t *e)
@@ -16231,20 +17725,79 @@ void attack_event_cb(lv_event_t *e)
 
     // AirTag scan
     if (strcmp(attack_name, "AirTag scan") == 0) {
-        show_airtag_scan_screen();
+        if (bt_lookout_is_active())
+            show_bt_conflict_warning("AirTag Scan", show_airtag_scan_screen);
+        else
+            show_airtag_scan_screen();
         return;
     }
 
-    // BT Locator
+    // BT Scan & Select
+    if (strcmp(attack_name, "BT Scan & Select") == 0) {
+        if (bt_lookout_is_active())
+            show_bt_conflict_warning("BT Scan & Select", show_bt_scan_select_screen);
+        else
+            show_bt_scan_select_screen();
+        return;
+    }
+
+    // BT Locator (standalone scan-then-select flow)
     if (strcmp(attack_name, "BT Locator") == 0) {
-        show_bt_locator_screen();
+        if (bt_lookout_is_active())
+            show_bt_conflict_warning("BT Locator", show_bt_locator_screen);
+        else
+            show_bt_locator_screen();
+        return;
+    }
+
+    // BT Locator Direct (skip scan, track SAS-selected device immediately)
+    if (strcmp(attack_name, "BT Locator Direct") == 0) {
+        if (bt_lookout_is_active())
+            show_bt_conflict_warning("BT Locator", show_bt_locator_direct_track);
+        else
+            show_bt_locator_direct_track();
+        return;
+    }
+
+    // GATT Walker (future)
+    if (strcmp(attack_name, "GATT Walker") == 0) {
+        show_stub_screen("GATT Walker", show_bt_attack_tiles_screen);
+        return;
+    }
+
+    // BT Lookout screen
+    if (strcmp(attack_name, "Dee Dee Detector") == 0) {
+        show_bt_lookout_screen();
+        return;
+    }
+
+    // Add BT Scan & Select target to BT Lookout watchlist
+    if (strcmp(attack_name, "Add to Lookout") == 0) {
+        char mac_str[18];
+        snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 bt_sas_target_addr[0], bt_sas_target_addr[1], bt_sas_target_addr[2],
+                 bt_sas_target_addr[3], bt_sas_target_addr[4], bt_sas_target_addr[5]);
+        const char *disp_name = bt_sas_target_name[0] ? bt_sas_target_name : mac_str;
+        ensure_sd_mounted();
+        bool saved = false;
+        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+            saved = bt_lookout_append(BT_LOOKOUT_CSV_PATH, bt_sas_target_addr,
+                                      bt_sas_target_name[0] ? bt_sas_target_name : NULL,
+                                      BT_LOOKOUT_RSSI_ANY);
+            xSemaphoreGive(sd_spi_mutex);
+        }
+        if (saved) {
+            show_bt_lookout_screen();   /* navigate directly to BT Lookout */
+        } else {
+            show_lookout_alert_popup(disp_name, "Save failed — check SD card", 0);
+        }
         return;
     }
 
     // Stub screens for not-yet-implemented features
     if (strcmp(attack_name, "Package Monitor") == 0 ||
         strcmp(attack_name, "Channel View") == 0) {
-        show_stub_screen(attack_name);
+        show_stub_screen(attack_name, NULL);
         return;
     }
 
@@ -16870,7 +18423,21 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
     }
     
     struct ble_gap_disc_desc *desc = &event->disc;
-    
+
+    // Dee Dee Detector — check every advertisement against watchlist,
+    // regardless of whether BT Locator is also running.
+    if (bt_lookout_is_active()) {
+        char adv_name_buf[32] = "";
+        struct ble_hs_adv_fields lk_fields;
+        if (ble_hs_adv_parse_fields(&lk_fields, desc->data, desc->length_data) == 0
+            && lk_fields.name && lk_fields.name_len > 0) {
+            int nl = lk_fields.name_len < 31 ? lk_fields.name_len : 31;
+            memcpy(adv_name_buf, lk_fields.name, nl);
+        }
+        bt_lookout_on_adv(desc->addr.val, desc->rssi,
+                          adv_name_buf[0] ? adv_name_buf : NULL);
+    }
+
     // MAC tracking mode - update RSSI for tracked device (BT Locator)
     if (bt_tracking_mode) {
         if (memcmp(desc->addr.val, bt_tracking_mac, 6) == 0) {
@@ -17246,8 +18813,8 @@ static void bt_locator_exit_cb(lv_event_t *e)
         current_radio_mode = RADIO_MODE_NONE;
     }
     
-    // Return to menu
-    nav_to_menu_flag = true;
+    // Return to Bluetooth screen
+    show_bluetooth_screen();
 }
 
 /**
@@ -17412,10 +18979,11 @@ static void bt_scan_task(void *pvParameters)
         
         // Update UI every 500ms via flag (thread-safe)
         if (i % 5 == 0) {
-            snprintf(ble_scan_status_text, sizeof(ble_scan_status_text), 
+            snprintf(ble_scan_status_text, sizeof(ble_scan_status_text),
                      "Scanning... %d (%ds)", bt_device_count, (100 - i) / 10);
             ble_scan_needs_ui_update = true;
-            bt_locator_needs_ui_update = true;  // Also update BT Locator if active
+            bt_locator_needs_ui_update = true;
+            bt_sas_needs_update = true;
         }
     }
     
@@ -17427,7 +18995,8 @@ static void bt_scan_task(void *pvParameters)
              "%d devices (%d AT, %d ST)", bt_device_count, bt_airtag_count, bt_smarttag_count);
     ble_scan_finished = true;
     ble_scan_needs_ui_update = true;
-    bt_locator_needs_ui_update = true;  // Also update BT Locator if active
+    bt_locator_needs_ui_update = true;
+    bt_sas_needs_update = true;
     
     ESP_LOGI(TAG, "BLE scan complete: %d devices found", bt_device_count);
     
@@ -17684,12 +19253,18 @@ static void deauth_monitor_exit_cb(lv_event_t *e)
 // Helper to start deauth monitoring after scan completes
 static void deauth_monitor_start_monitoring(void)
 {
-    // Update status label
+    // Update status labels
     if (deauth_monitor_status_label && lv_obj_is_valid(deauth_monitor_status_label)) {
+        lv_label_set_text(deauth_monitor_status_label, "MONITORING");
+        lv_obj_set_style_text_font(deauth_monitor_status_label, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(deauth_monitor_status_label, COLOR_MATERIAL_RED, 0);
+    }
+    if (deauth_monitor_known_label && lv_obj_is_valid(deauth_monitor_known_label)) {
         uint16_t scan_count = wifi_scanner_get_count();
-        char status_text[64];
-        snprintf(status_text, sizeof(status_text), "Monitoring... (%d networks known)\n\nNo attacks recorded yet", scan_count);
-        lv_label_set_text(deauth_monitor_status_label, status_text);
+        char known_text[48];
+        snprintf(known_text, sizeof(known_text), "%d networks known\n\nNo attacks recorded yet", scan_count);
+        lv_label_set_text(deauth_monitor_known_label, known_text);
+        lv_obj_clear_flag(deauth_monitor_known_label, LV_OBJ_FLAG_HIDDEN);
     }
     
     // Start deauth monitor
@@ -17787,13 +19362,22 @@ static void show_deauth_monitor_screen(void)
     deauth_monitor_update_flag = false;
     portEXIT_CRITICAL(&deauth_monitor_spin);
     
-    // Status label - centered - show scanning status first
+    // Status label - "MONITORING" header (red, bold) or scanning notice
     deauth_monitor_status_label = lv_label_create(function_page);
     lv_label_set_text(deauth_monitor_status_label, LV_SYMBOL_WIFI "  Scanning networks...\n\nPlease wait");
     lv_obj_set_style_text_align(deauth_monitor_status_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(deauth_monitor_status_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(deauth_monitor_status_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(deauth_monitor_status_label, ui_text_color(), 0);
-    lv_obj_align(deauth_monitor_status_label, LV_ALIGN_CENTER, 0, -20);
+    lv_obj_align(deauth_monitor_status_label, LV_ALIGN_CENTER, 0, -30);
+
+    // Known networks sub-label (grey, shown once monitoring starts)
+    deauth_monitor_known_label = lv_label_create(function_page);
+    lv_label_set_text(deauth_monitor_known_label, "");
+    lv_obj_set_style_text_align(deauth_monitor_known_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(deauth_monitor_known_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(deauth_monitor_known_label, lv_color_make(176, 176, 176), 0);
+    lv_obj_align(deauth_monitor_known_label, LV_ALIGN_CENTER, 0, -4);
+    lv_obj_add_flag(deauth_monitor_known_label, LV_OBJ_FLAG_HIDDEN);
     
     // Create attack list (hidden initially)
     deauth_monitor_list = lv_list_create(function_page);
@@ -17939,8 +19523,8 @@ static void airtag_scan_exit_cb(lv_event_t *e)
         current_radio_mode = RADIO_MODE_NONE;
     }
     
-    // Navigate to menu
-    nav_to_menu_flag = true;
+    // Return to Bluetooth screen
+    show_bluetooth_screen();
 }
 
 /**
@@ -18194,11 +19778,11 @@ static void show_tag_tracker_screen(int dev_idx)
     lv_obj_set_flex_flow(bt_locator_exit_btn, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(bt_locator_exit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_t *exit_icon2 = lv_label_create(bt_locator_exit_btn);
-    lv_label_set_text(exit_icon2, LV_SYMBOL_CLOSE);
+    lv_label_set_text(exit_icon2, LV_SYMBOL_LEFT);
     lv_obj_set_style_text_font(exit_icon2, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(exit_icon2, lv_color_white(), 0);
     lv_obj_t *exit_text2 = lv_label_create(bt_locator_exit_btn);
-    lv_label_set_text(exit_text2, "Exit");
+    lv_label_set_text(exit_text2, "Back");
     lv_obj_set_style_text_font(exit_text2, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(exit_text2, lv_color_white(), 0);
     lv_obj_add_event_cb(bt_locator_exit_btn, bt_locator_exit_cb, LV_EVENT_CLICKED, NULL);
