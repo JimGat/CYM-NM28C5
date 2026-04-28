@@ -10092,6 +10092,12 @@ static void create_function_page_base(const char *name)
     }
     reset_function_page_children();
 
+    // Clean up home bg image when leaving a menu screen
+    if (home_bg_img) {
+        lv_obj_del(home_bg_img);
+        home_bg_img = NULL;
+    }
+
     // Hide tiles container and title bar while the function page is active
     if (tiles_container) {
         lv_obj_add_flag(tiles_container, LV_OBJ_FLAG_HIDDEN);
@@ -10601,6 +10607,29 @@ static void attack_tile_event_cb(lv_event_t *e)
     }
 }
 
+// Layer the lab background behind any menu/tile screen.
+// Call after create_function_page_base() (which clears any old bg) or after
+// tiles_container is set up for the home screen.
+static void apply_menu_bg(void)
+{
+    if (home_bg_img) {
+        lv_obj_del(home_bg_img);
+        home_bg_img = NULL;
+    }
+    home_bg_img = lv_img_create(lv_scr_act());
+    lv_img_set_src(home_bg_img, &lab_bg);
+    lv_obj_align(home_bg_img, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_img_recolor(home_bg_img, lv_color_black(), 0);
+    lv_obj_set_style_img_recolor_opa(home_bg_img, LV_OPA_50, 0);
+    // Push to back so everything else renders on top
+    lv_obj_move_to_index(home_bg_img, 0);
+
+    // Make function_page see-through so the bg image shows between tiles
+    if (function_page) {
+        lv_obj_set_style_bg_opa(function_page, LV_OPA_TRANSP, 0);
+    }
+}
+
 // Show main tiles screen (6 tiles)
 static void show_main_tiles(void)
 {
@@ -10621,14 +10650,6 @@ static void show_main_tiles(void)
     }
     reset_function_page_children();
 
-    // Lab background image — created first so it sits below the title bar and tiles
-    home_bg_img = lv_img_create(lv_scr_act());
-    lv_img_set_src(home_bg_img, &lab_bg);
-    lv_obj_align(home_bg_img, LV_ALIGN_CENTER, 0, 0);
-    // Dark recolor overlay: 65% black fade so tiles remain readable
-    lv_obj_set_style_img_recolor(home_bg_img, lv_color_black(), 0);
-    lv_obj_set_style_img_recolor_opa(home_bg_img, LV_OPA_60, 0);
-
     tiles_container = lv_obj_create(lv_scr_act());
     lv_obj_set_size(tiles_container, lv_pct(100), 290);
     lv_obj_align(tiles_container, LV_ALIGN_BOTTOM_MID, 0, 0);
@@ -10646,7 +10667,9 @@ static void show_main_tiles(void)
     create_tile(tiles_container, MY_SYMBOL_CAR,         "Wardrive",     COLOR_MATERIAL_RED,     main_tile_event_cb, "Wardrive");
     create_tile(tiles_container, LV_SYMBOL_SETTINGS,    "Settings",     UI_ACCENT_GREEN,        main_tile_event_cb, "Settings");
     create_tile(tiles_container, LV_SYMBOL_POWER,       "Go Dark",      lv_color_hex(0x8A8FA8), main_tile_event_cb, "Go Dark");
-    
+
+    apply_menu_bg();
+
     // Show title bar
     lv_obj_clear_flag(title_bar, LV_OBJ_FLAG_HIDDEN);
 }
@@ -13298,11 +13321,12 @@ static void show_global_attacks_screen(void)
 static void show_wifi_menu_screen(void)
 {
     create_function_page_base("WiFi");
+    apply_menu_bg();
 
     lv_obj_t *tiles = lv_obj_create(function_page);
     lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
+    lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
     lv_obj_set_style_pad_all(tiles, 10, 0);
     lv_obj_set_style_pad_gap(tiles, 10, 0);
@@ -13323,11 +13347,12 @@ static void show_wifi_menu_screen(void)
 static void show_sniff_karma_screen(void)
 {
     create_function_page_base("WiFi Observer");
-    
+    apply_menu_bg();
+
     lv_obj_t *tiles = lv_obj_create(function_page);
     lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
+    lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
     lv_obj_set_style_pad_all(tiles, 10, 0);
     lv_obj_set_style_pad_gap(tiles, 10, 0);
@@ -14280,11 +14305,12 @@ static void settings_tile_event_cb(lv_event_t *e)
 static void show_settings_screen(void)
 {
     create_function_page_base("Settings");
-    
+    apply_menu_bg();
+
     lv_obj_t *tiles = lv_obj_create(function_page);
     lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
+    lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
     // pad_all=4, pad_gap=4 → inner width=232, 3×70+2×4=218 ≤ 232, fits 3 tiles per row
     lv_obj_set_style_pad_all(tiles, 4, 0);
@@ -15175,11 +15201,12 @@ static void show_wifi_monitor_screen(void)
 static void show_bluetooth_screen(void)
 {
     create_function_page_base("Bluetooth");
-    
+    apply_menu_bg();
+
     lv_obj_t *tiles = lv_obj_create(function_page);
     lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
+    lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
     lv_obj_set_style_pad_all(tiles, 10, 0);
     lv_obj_set_style_pad_gap(tiles, 10, 0);
@@ -15642,11 +15669,12 @@ static void show_bt_attack_tiles_screen(void)
     char title[48];
     snprintf(title, sizeof(title), "BT: %.28s", bt_sas_target_name);
     create_function_page_base(title);
+    apply_menu_bg();
 
     lv_obj_t *tiles = lv_obj_create(function_page);
     lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
+    lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
     lv_obj_set_style_pad_all(tiles, 10, 0);
     lv_obj_set_style_pad_gap(tiles, 10, 0);
