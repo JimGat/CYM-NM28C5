@@ -1006,6 +1006,7 @@ static portMUX_TYPE deauth_monitor_spin = portMUX_INITIALIZER_UNLOCKED;
 // Deauth Monitor UI state
 static lv_obj_t *deauth_monitor_list = NULL;
 static lv_obj_t *deauth_monitor_status_label = NULL;
+static lv_obj_t *deauth_monitor_known_label = NULL;
 static lv_obj_t *deauth_monitor_rec_label = NULL;
 static volatile bool deauth_monitor_ui_active = false;
 static volatile bool deauth_monitor_update_flag = false;
@@ -1204,6 +1205,7 @@ static void reset_function_page_children(void) {
     screenshot_btn = NULL;
     deauth_monitor_list = NULL;
     deauth_monitor_status_label = NULL;
+    deauth_monitor_known_label = NULL;
     airtag_scan_status_label = NULL;
     airtag_scan_stats_label1 = NULL;
     airtag_scan_stats_label2 = NULL;
@@ -4851,8 +4853,10 @@ void app_main(void)
                 portEXIT_CRITICAL(&deauth_monitor_spin);
                 
                 if (attack_count > 0 && deauth_monitor_list && deauth_monitor_status_label) {
-                    // Hide status label, show list
+                    // Hide status labels, show list
                     lv_obj_add_flag(deauth_monitor_status_label, LV_OBJ_FLAG_HIDDEN);
+                    if (deauth_monitor_known_label && lv_obj_is_valid(deauth_monitor_known_label))
+                        lv_obj_add_flag(deauth_monitor_known_label, LV_OBJ_FLAG_HIDDEN);
                     lv_obj_clear_flag(deauth_monitor_list, LV_OBJ_FLAG_HIDDEN);
                     
                     // Rebuild attack list (keep title, clear rest)
@@ -17693,12 +17697,18 @@ static void deauth_monitor_exit_cb(lv_event_t *e)
 // Helper to start deauth monitoring after scan completes
 static void deauth_monitor_start_monitoring(void)
 {
-    // Update status label
+    // Update status labels
     if (deauth_monitor_status_label && lv_obj_is_valid(deauth_monitor_status_label)) {
+        lv_label_set_text(deauth_monitor_status_label, "MONITORING");
+        lv_obj_set_style_text_font(deauth_monitor_status_label, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(deauth_monitor_status_label, COLOR_MATERIAL_RED, 0);
+    }
+    if (deauth_monitor_known_label && lv_obj_is_valid(deauth_monitor_known_label)) {
         uint16_t scan_count = wifi_scanner_get_count();
-        char status_text[64];
-        snprintf(status_text, sizeof(status_text), "Monitoring... (%d networks known)\n\nNo attacks recorded yet", scan_count);
-        lv_label_set_text(deauth_monitor_status_label, status_text);
+        char known_text[48];
+        snprintf(known_text, sizeof(known_text), "%d networks known\n\nNo attacks recorded yet", scan_count);
+        lv_label_set_text(deauth_monitor_known_label, known_text);
+        lv_obj_clear_flag(deauth_monitor_known_label, LV_OBJ_FLAG_HIDDEN);
     }
     
     // Start deauth monitor
@@ -17796,13 +17806,22 @@ static void show_deauth_monitor_screen(void)
     deauth_monitor_update_flag = false;
     portEXIT_CRITICAL(&deauth_monitor_spin);
     
-    // Status label - centered - show scanning status first
+    // Status label - "MONITORING" header (red, bold) or scanning notice
     deauth_monitor_status_label = lv_label_create(function_page);
     lv_label_set_text(deauth_monitor_status_label, LV_SYMBOL_WIFI "  Scanning networks...\n\nPlease wait");
     lv_obj_set_style_text_align(deauth_monitor_status_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(deauth_monitor_status_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(deauth_monitor_status_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(deauth_monitor_status_label, ui_text_color(), 0);
-    lv_obj_align(deauth_monitor_status_label, LV_ALIGN_CENTER, 0, -20);
+    lv_obj_align(deauth_monitor_status_label, LV_ALIGN_CENTER, 0, -30);
+
+    // Known networks sub-label (grey, shown once monitoring starts)
+    deauth_monitor_known_label = lv_label_create(function_page);
+    lv_label_set_text(deauth_monitor_known_label, "");
+    lv_obj_set_style_text_align(deauth_monitor_known_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(deauth_monitor_known_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(deauth_monitor_known_label, lv_color_make(176, 176, 176), 0);
+    lv_obj_align(deauth_monitor_known_label, LV_ALIGN_CENTER, 0, -4);
+    lv_obj_add_flag(deauth_monitor_known_label, LV_OBJ_FLAG_HIDDEN);
     
     // Create attack list (hidden initially)
     deauth_monitor_list = lv_list_create(function_page);
