@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include "esp_timer.h"
 #include "esp_log.h"
 
@@ -32,6 +33,20 @@ static volatile bool      s_detection_pending = false;
 static bt_lookout_detection_t s_detection;
 
 /* ── Helpers ───────────────────────────────────────────────────── */
+
+/* Ensure the directory containing csv_path exists (creates it if needed). */
+static void ensure_parent_dir(const char *path)
+{
+    char dir[64];
+    const char *slash = strrchr(path, '/');
+    if (!slash || slash == path) return;
+    size_t len = (size_t)(slash - path);
+    if (len >= sizeof(dir)) return;
+    memcpy(dir, path, len);
+    dir[len] = '\0';
+    mkdir(dir, 0755);   /* ignore error — EEXIST is fine */
+}
+
 static bool mac_eq(const uint8_t a[6], const uint8_t b[6])
 {
     return memcmp(a, b, 6) == 0;
@@ -113,6 +128,7 @@ bool bt_lookout_is_active(void) { return s_active; }
 int bt_lookout_load(const char *csv_path)
 {
     s_count = 0;
+    ensure_parent_dir(csv_path);
 
     FILE *f = fopen(csv_path, "r");
     if (!f) {
@@ -171,6 +187,7 @@ bool bt_lookout_append(const char   *csv_path,
     }
 
     /* append row to CSV (create with header if absent) */
+    ensure_parent_dir(csv_path);
     FILE *f = fopen(csv_path, "a");
     if (!f) {
         f = fopen(csv_path, "w");
