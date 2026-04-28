@@ -6,6 +6,7 @@
 
 LV_FONT_DECLARE(lv_extra_symbols);
 LV_IMG_DECLARE(lab_bg);
+LV_IMG_DECLARE(deedee_img);
 #define MY_SYMBOL_BLUETOOTH_B     "\xEF\x8A\x94"   /* fa-bluetooth-b    U+F294 */
 #define MY_SYMBOL_SEARCH          "\xEF\x8F\xAE"   /* fa-search         U+F3EE */
 #define MY_SYMBOL_USB             "\xEF\x8A\x87"   /* fa-usb            U+F287 */
@@ -1151,6 +1152,8 @@ static lv_obj_t      *disco_screen_obj    = NULL;
 static lv_obj_t      *disco_layers[4]     = {NULL};
 static volatile uint8_t disco_color_idx   = 0;
 static volatile bool  disco_needs_update  = false;
+static volatile uint8_t disco_led_r = 0, disco_led_g = 0, disco_led_b = 0;
+static volatile bool  disco_led_needs_update = false;
 static lv_obj_t *create_tile(lv_obj_t *parent, const char *icon, const char *text, lv_color_t bg_color, lv_event_cb_t callback, const char *user_data);
 static void show_main_tiles(void);
 static void show_wifi_scan_attack_screen(void);
@@ -4002,6 +4005,12 @@ void app_main(void)
             }
 
             boot_btn_prev_pressed = btn_pressed;
+        }
+
+        // Disco LED update — driven from main task to keep RMT calls single-threaded
+        if (disco_led_needs_update) {
+            disco_led_needs_update = false;
+            led_set(disco_led_r, disco_led_g, disco_led_b);
         }
 
         // Update NeoPixel LED color to reflect current mode (~2 Hz)
@@ -10069,7 +10078,10 @@ static void disco_task(void *arg)
         uint8_t nc = (c + 1) % DISCO_NC;
 
         // ── Full beat: bright LED + screen flash ──────────────────────────
-        led_set(DISCO_LED_PAL[c].r, DISCO_LED_PAL[c].g, DISCO_LED_PAL[c].b);
+        disco_led_r = DISCO_LED_PAL[c].r;
+        disco_led_g = DISCO_LED_PAL[c].g;
+        disco_led_b = DISCO_LED_PAL[c].b;
+        disco_led_needs_update = true;
         disco_color_idx   = c;
         disco_needs_update = true;
 
@@ -10079,9 +10091,10 @@ static void disco_task(void *arg)
         if (!disco_mode_active) break;
 
         // ── Offbeat: dim flash to next color (8th-note groove) ────────────
-        led_set(DISCO_LED_PAL[nc].r / 3,
-                DISCO_LED_PAL[nc].g / 3,
-                DISCO_LED_PAL[nc].b / 3);
+        disco_led_r = DISCO_LED_PAL[nc].r / 3;
+        disco_led_g = DISCO_LED_PAL[nc].g / 3;
+        disco_led_b = DISCO_LED_PAL[nc].b / 3;
+        disco_led_needs_update = true;
         disco_color_idx   = nc;
         disco_needs_update = true;
 
@@ -10092,7 +10105,9 @@ static void disco_task(void *arg)
         beat++;
     }
 
-    led_set(0, 0, 0);
+    // Signal LED off via main loop
+    disco_led_r = 0; disco_led_g = 0; disco_led_b = 0;
+    disco_led_needs_update = true;
     disco_needs_update = false;
     disco_task_handle  = NULL;
     vTaskDelete(NULL);
@@ -10141,17 +10156,18 @@ static void disco_pre_pause_end(lv_timer_t *t)
     lv_timer_del(t);
 
     // Four overlapping rounded blobs — tie-dye overlap in the centre
+    // Positions kept within parent bounds (0,0)-(240,320) to avoid clipping
     static const struct { int16_t x, y, w, h; } BLOB[4] = {
-        {-20, -20, 200, 220},   // top-left
-        { 60, -20, 200, 220},   // top-right
-        {-20, 120, 200, 220},   // bottom-left
-        { 60, 120, 200, 220},   // bottom-right
+        {  0,   0, 190, 210},   // top-left
+        { 50,   0, 190, 210},   // top-right
+        {  0, 110, 190, 210},   // bottom-left
+        { 50, 110, 190, 210},   // bottom-right
     };
     for (int i = 0; i < 4; i++) {
         disco_layers[i] = lv_obj_create(disco_screen_obj);
         lv_obj_set_pos(disco_layers[i],  BLOB[i].x, BLOB[i].y);
         lv_obj_set_size(disco_layers[i], BLOB[i].w, BLOB[i].h);
-        lv_obj_set_style_radius(disco_layers[i], 100, 0);
+        lv_obj_set_style_radius(disco_layers[i], 95, 0);
         lv_obj_set_style_bg_color(disco_layers[i],
             lv_color_make(DISCO_PALETTE[(i * 2) % DISCO_NC].r,
                           DISCO_PALETTE[(i * 2) % DISCO_NC].g,
@@ -10159,10 +10175,17 @@ static void disco_pre_pause_end(lv_timer_t *t)
         lv_obj_set_style_opa(disco_layers[i], LV_OPA_70, 0);
         lv_obj_set_style_border_width(disco_layers[i], 0, 0);
         lv_obj_clear_flag(disco_layers[i], LV_OBJ_FLAG_SCROLLABLE);
+        // CRITICAL: blobs must not eat touch — let it fall through to disco_screen_obj
+        lv_obj_clear_flag(disco_layers[i], LV_OBJ_FLAG_CLICKABLE);
     }
 
-    // Touch anywhere to exit
-    lv_obj_add_flag(disco_screen_obj, LV_OBJ_FLAG_CLICKABLE);
+    // DeeDee on top — centered, transparent PNG (120×180)
+    lv_obj_t *dd = lv_img_create(disco_screen_obj);
+    lv_img_set_src(dd, &deedee_img);
+    lv_obj_align(dd, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(dd, LV_OBJ_FLAG_CLICKABLE);
+
+    // Touch anywhere on the background to exit (blobs are non-clickable so touch falls through)
     lv_obj_add_event_cb(disco_screen_obj, disco_touch_exit, LV_EVENT_CLICKED, NULL);
 
     disco_mode_active = true;
@@ -13973,9 +13996,9 @@ static void show_scan_time_popup(void)
     lv_obj_clear_flag(scantime_popup, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(scantime_popup, LV_OBJ_FLAG_CLICKABLE);
 
-    // Dialog box
+    // Dialog box — 220px wide to fit 240px portrait display
     lv_obj_t *dialog = lv_obj_create(scantime_popup);
-    lv_obj_set_size(dialog, 340, 250);
+    lv_obj_set_size(dialog, 220, LV_SIZE_CONTENT);
     lv_obj_center(dialog);
     lv_obj_set_style_bg_color(dialog, ui_panel_color(), 0);
     lv_obj_set_style_border_color(dialog, COLOR_MATERIAL_PURPLE, 0);
@@ -13984,14 +14007,14 @@ static void show_scan_time_popup(void)
     lv_obj_clear_flag(dialog, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_flex_flow(dialog, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(dialog, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_all(dialog, 12, 0);
-    lv_obj_set_style_pad_gap(dialog, 8, 0);
+    lv_obj_set_style_pad_all(dialog, 10, 0);
+    lv_obj_set_style_pad_gap(dialog, 6, 0);
 
     // Title
     lv_obj_t *title = lv_label_create(dialog);
-    lv_label_set_text(title, "Scan Time per Channel");
+    lv_label_set_text(title, "Scan Time / Channel");
     lv_obj_set_style_text_color(title, ui_text_color(), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
 
     // Min label
     scantime_min_label = lv_label_create(dialog);
@@ -13999,11 +14022,11 @@ static void show_scan_time_popup(void)
     snprintf(buf_min, sizeof(buf_min), "Min: %ums", scan_time_min_ms);
     lv_label_set_text(scantime_min_label, buf_min);
     lv_obj_set_style_text_color(scantime_min_label, COLOR_MATERIAL_PURPLE, 0);
-    lv_obj_set_style_text_font(scantime_min_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(scantime_min_label, &lv_font_montserrat_12, 0);
 
-    // Min slider
+    // Min slider — 196px: dialog content width (220 - 2×10 padding - 4px slider knob margin)
     scantime_min_slider = lv_slider_create(dialog);
-    lv_obj_set_width(scantime_min_slider, 280);
+    lv_obj_set_width(scantime_min_slider, 196);
     lv_slider_set_range(scantime_min_slider, 50, 1000);
     lv_slider_set_value(scantime_min_slider, scan_time_min_ms, LV_ANIM_OFF);
     lv_obj_set_style_bg_color(scantime_min_slider, lv_color_make(80, 80, 80), LV_PART_MAIN);
@@ -14018,11 +14041,11 @@ static void show_scan_time_popup(void)
     snprintf(buf_max, sizeof(buf_max), "Max: %ums", scan_time_max_ms);
     lv_label_set_text(scantime_max_label, buf_max);
     lv_obj_set_style_text_color(scantime_max_label, COLOR_MATERIAL_PURPLE, 0);
-    lv_obj_set_style_text_font(scantime_max_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(scantime_max_label, &lv_font_montserrat_12, 0);
 
     // Max slider
     scantime_max_slider = lv_slider_create(dialog);
-    lv_obj_set_width(scantime_max_slider, 280);
+    lv_obj_set_width(scantime_max_slider, 196);
     lv_slider_set_range(scantime_max_slider, 50, 1000);
     lv_slider_set_value(scantime_max_slider, scan_time_max_ms, LV_ANIM_OFF);
     lv_obj_set_style_bg_color(scantime_max_slider, lv_color_make(80, 80, 80), LV_PART_MAIN);
@@ -14031,9 +14054,9 @@ static void show_scan_time_popup(void)
     lv_obj_set_style_pad_all(scantime_max_slider, 4, LV_PART_KNOB);
     lv_obj_add_event_cb(scantime_max_slider, scantime_max_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-    // Button row
+    // Button row — 196px, 90px buttons
     lv_obj_t *btn_row = lv_obj_create(dialog);
-    lv_obj_set_size(btn_row, 280, 42);
+    lv_obj_set_size(btn_row, 196, 36);
     lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(btn_row, 0, 0);
     lv_obj_set_style_pad_all(btn_row, 0, 0);
@@ -14043,24 +14066,26 @@ static void show_scan_time_popup(void)
 
     // Cancel button
     lv_obj_t *cancel_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(cancel_btn, 120, 36);
+    lv_obj_set_size(cancel_btn, 90, 30);
     lv_obj_set_style_bg_color(cancel_btn, lv_color_make(80, 80, 80), 0);
     lv_obj_set_style_radius(cancel_btn, 8, 0);
     lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
     lv_label_set_text(cancel_lbl, "Cancel");
     lv_obj_set_style_text_color(cancel_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_12, 0);
     lv_obj_center(cancel_lbl);
     lv_obj_add_event_cb(cancel_btn, scantime_popup_close_cb, LV_EVENT_CLICKED, NULL);
 
     // Save button
     lv_obj_t *save_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(save_btn, 120, 36);
+    lv_obj_set_size(save_btn, 90, 30);
     lv_obj_set_style_bg_color(save_btn, COLOR_MATERIAL_PURPLE, 0);
     lv_obj_set_style_bg_color(save_btn, lv_color_lighten(COLOR_MATERIAL_PURPLE, 30), LV_STATE_PRESSED);
     lv_obj_set_style_radius(save_btn, 8, 0);
     lv_obj_t *save_lbl = lv_label_create(save_btn);
     lv_label_set_text(save_lbl, "Save");
     lv_obj_set_style_text_color(save_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(save_lbl, &lv_font_montserrat_12, 0);
     lv_obj_center(save_lbl);
     lv_obj_add_event_cb(save_btn, scantime_popup_save_cb, LV_EVENT_CLICKED, NULL);
 }
