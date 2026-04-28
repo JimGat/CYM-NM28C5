@@ -10085,9 +10085,9 @@ static void disco_task(void *arg)
         disco_color_idx   = c;
         disco_needs_update = true;
 
-        // 3/4 beat = 375ms (5ms steps for responsive exit)
-        for (int i = 0; i < 75 && disco_mode_active; i++)
-            vTaskDelay(pdMS_TO_TICKS(5));
+        // 3/4 beat = 370ms (37 × 10ms ticks — FreeRTOS at 100Hz, 1 tick = 10ms)
+        for (int i = 0; i < 37 && disco_mode_active; i++)
+            vTaskDelay(1);
         if (!disco_mode_active) break;
 
         // ── Offbeat: dim flash to next color (8th-note groove) ────────────
@@ -10098,9 +10098,9 @@ static void disco_task(void *arg)
         disco_color_idx   = nc;
         disco_needs_update = true;
 
-        // 1/4 beat = 125ms
-        for (int i = 0; i < 25 && disco_mode_active; i++)
-            vTaskDelay(pdMS_TO_TICKS(5));
+        // 1/4 beat = 130ms (13 × 10ms ticks)
+        for (int i = 0; i < 13 && disco_mode_active; i++)
+            vTaskDelay(1);
 
         beat++;
     }
@@ -10189,7 +10189,7 @@ static void disco_pre_pause_end(lv_timer_t *t)
     lv_obj_add_event_cb(disco_screen_obj, disco_touch_exit, LV_EVENT_CLICKED, NULL);
 
     disco_mode_active = true;
-    xTaskCreate(disco_task, "disco_task", 4096, NULL, 4, &disco_task_handle);
+    xTaskCreate(disco_task, "disco_task", 4096, NULL, 1, &disco_task_handle);
 }
 
 static void show_disco_mode(void)
