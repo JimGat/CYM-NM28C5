@@ -1389,6 +1389,7 @@ static void show_wifi_menu_screen(void);
 static void show_bt_scan_select_screen(void);
 static void show_bt_attack_tiles_screen(void);
 static void bt_sas_refresh_list(void);
+static void show_bt_locator_direct_track(void);
 
 // Deauth Monitor functions
 static void show_deauth_monitor_screen(void);
@@ -15501,6 +15502,122 @@ static void show_bt_scan_select_screen(void)
     ui_locked = false;
 }
 
+// Direct-track BT Locator: skip scan, jump straight to tracking the SAS-selected device
+static void show_bt_locator_direct_track(void)
+{
+    ui_locked = true;
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+
+    char title[48];
+    snprintf(title, sizeof(title), "Locating: %.22s", bt_sas_target_name[0] ? bt_sas_target_name : "Unknown");
+    create_function_page_base(title);
+
+    bt_locator_ui_active = true;
+    bt_locator_tracking_active = false;
+    bt_tracking_mode = false;
+
+    // Pre-load tracking target from SAS selection
+    memcpy(bt_tracking_mac, bt_sas_target_addr, 6);
+    strncpy(bt_tracking_name, bt_sas_target_name, sizeof(bt_tracking_name) - 1);
+    bt_tracking_name[sizeof(bt_tracking_name) - 1] = '\0';
+    bt_tracking_found = false;
+    bt_tracking_rssi = 0;
+
+    // Content container
+    bt_locator_content = lv_obj_create(function_page);
+    lv_obj_set_size(bt_locator_content, lv_pct(100), LCD_V_RES - 30 - 43);
+    lv_obj_align(bt_locator_content, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(bt_locator_content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(bt_locator_content, 0, 0);
+    lv_obj_set_style_pad_all(bt_locator_content, 5, 0);
+    lv_obj_clear_flag(bt_locator_content, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Status label: scanning in progress
+    bt_locator_status_label = lv_label_create(bt_locator_content);
+    lv_label_set_text(bt_locator_status_label, "Scanning...");
+    lv_obj_set_style_text_color(bt_locator_status_label, ui_text_color(), 0);
+    lv_obj_set_style_text_font(bt_locator_status_label, &lv_font_montserrat_16, 0);
+    lv_obj_align(bt_locator_status_label, LV_ALIGN_CENTER, 0, 40);
+
+    // RSSI display - large, centered, green
+    bt_locator_rssi_label = lv_label_create(bt_locator_content);
+    lv_label_set_text(bt_locator_rssi_label, "RSSI: ---");
+    lv_obj_set_style_text_color(bt_locator_rssi_label, lv_color_make(0, 255, 0), 0);
+    lv_obj_set_style_text_font(bt_locator_rssi_label, &lv_font_montserrat_20, 0);
+    lv_obj_align(bt_locator_rssi_label, LV_ALIGN_CENTER, 0, -30);
+
+    // MAC label showing what we're tracking
+    bt_locator_mac_label = lv_label_create(bt_locator_content);
+    char mac_disp[48];
+    snprintf(mac_disp, sizeof(mac_disp), "%02X:%02X:%02X:%02X:%02X:%02X",
+             bt_sas_target_addr[0], bt_sas_target_addr[1], bt_sas_target_addr[2],
+             bt_sas_target_addr[3], bt_sas_target_addr[4], bt_sas_target_addr[5]);
+    lv_label_set_text(bt_locator_mac_label, mac_disp);
+    lv_obj_set_style_text_color(bt_locator_mac_label, ui_text_color(), 0);
+    lv_obj_set_style_text_font(bt_locator_mac_label, &lv_font_montserrat_14, 0);
+    lv_obj_align(bt_locator_mac_label, LV_ALIGN_CENTER, 0, 10);
+
+    // Exit button
+    bt_locator_exit_btn = lv_btn_create(function_page);
+    lv_obj_set_size(bt_locator_exit_btn, 110, 28);
+    lv_obj_align(bt_locator_exit_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(bt_locator_exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(bt_locator_exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(bt_locator_exit_btn, 0, 0);
+    lv_obj_set_style_radius(bt_locator_exit_btn, 8, 0);
+    lv_obj_set_style_shadow_width(bt_locator_exit_btn, 4, 0);
+    lv_obj_set_style_shadow_color(bt_locator_exit_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(bt_locator_exit_btn, LV_OPA_40, 0);
+    lv_obj_set_style_pad_ver(bt_locator_exit_btn, 4, 0);
+    lv_obj_set_style_pad_hor(bt_locator_exit_btn, 8, 0);
+    lv_obj_set_style_pad_column(bt_locator_exit_btn, 4, 0);
+    lv_obj_set_flex_flow(bt_locator_exit_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(bt_locator_exit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *exit_icon = lv_label_create(bt_locator_exit_btn);
+    lv_label_set_text(exit_icon, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_font(exit_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(exit_icon, ui_text_color(), 0);
+
+    lv_obj_t *exit_lbl = lv_label_create(bt_locator_exit_btn);
+    lv_label_set_text(exit_lbl, "Exit");
+    lv_obj_set_style_text_font(exit_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(exit_lbl, ui_text_color(), 0);
+
+    lv_obj_add_event_cb(bt_locator_exit_btn, bt_locator_exit_cb, LV_EVENT_CLICKED, NULL);
+
+    // Switch to BLE mode
+    if (!ensure_ble_mode()) {
+        lv_label_set_text(bt_locator_status_label, "BLE init failed!");
+        ui_locked = false;
+        return;
+    }
+
+    // Start tracking directly — no scan-and-select step
+    bt_locator_tracking_active = true;
+    bt_tracking_mode = true;
+    BaseType_t task_ret = xTaskCreate(
+        bt_locator_tracking_task,
+        "bt_loc_track",
+        4096,
+        NULL,
+        5,
+        &bt_locator_task_handle
+    );
+
+    if (task_ret != pdPASS) {
+        bt_locator_tracking_active = false;
+        bt_tracking_mode = false;
+        lv_label_set_text(bt_locator_status_label, "Failed to start tracking!");
+    } else {
+        snprintf(bt_locator_status_text, sizeof(bt_locator_status_text), "Scanning (10s)...");
+        lv_label_set_text(bt_locator_status_label, bt_locator_status_text);
+    }
+
+    ui_locked = false;
+}
+
 // Attack tile screen after device selection
 static void show_bt_attack_tiles_screen(void)
 {
@@ -15521,9 +15638,9 @@ static void show_bt_attack_tiles_screen(void)
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
 
-    // BT Locator tile
+    // BT Locator tile — routes directly to tracking the SAS-selected device
     lv_obj_t *loc_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BT\nLocator", COLOR_TILE_BLUE, NULL, NULL);
-    lv_obj_add_event_cb(loc_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Locator");
+    lv_obj_add_event_cb(loc_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Locator Direct");
 
     // GATT Walker tile (placeholder - coming soon)
     lv_obj_t *gatt_tile = create_tile(tiles, MY_SYMBOL_PERSON_WALKING, "GATT\nWalker", COLOR_MATERIAL_PURPLE, NULL, NULL);
@@ -16545,9 +16662,15 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
 
-    // BT Locator
+    // BT Locator (standalone scan-then-select flow)
     if (strcmp(attack_name, "BT Locator") == 0) {
         show_bt_locator_screen();
+        return;
+    }
+
+    // BT Locator Direct (skip scan, track SAS-selected device immediately)
+    if (strcmp(attack_name, "BT Locator Direct") == 0) {
+        show_bt_locator_direct_track();
         return;
     }
 
