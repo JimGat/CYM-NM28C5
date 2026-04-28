@@ -16852,6 +16852,110 @@ void menu_event_cb(lv_event_t *e)
     }
 }
 
+/* ── BT Lookout conflict warning ──────────────────────────────── */
+
+static lv_obj_t *s_bt_conflict_popup = NULL;
+
+static void bt_conflict_dismiss_cb(lv_event_t *ev)
+{
+    (void)ev;
+    if (s_bt_conflict_popup && lv_obj_is_valid(s_bt_conflict_popup)) {
+        lv_obj_del(s_bt_conflict_popup);
+        s_bt_conflict_popup = NULL;
+    }
+}
+
+static void bt_conflict_proceed_cb(lv_event_t *ev)
+{
+    void (*fn)(void) = (void (*)(void))lv_event_get_user_data(ev);
+    if (s_bt_conflict_popup && lv_obj_is_valid(s_bt_conflict_popup)) {
+        lv_obj_del(s_bt_conflict_popup);
+        s_bt_conflict_popup = NULL;
+    }
+    bt_lookout_stop();
+    bt_lookout_ui_active  = false;
+    bt_lookout_status_lbl = NULL;
+    bt_lookout_count_lbl  = NULL;
+    bt_lookout_last_lbl   = NULL;
+    bt_lookout_start_btn  = NULL;
+    bt_lookout_edit_btn   = NULL;
+    if (fn) fn();
+}
+
+static void show_bt_conflict_warning(const char *fname, void (*proceed_fn)(void))
+{
+    if (s_bt_conflict_popup && lv_obj_is_valid(s_bt_conflict_popup)) {
+        lv_obj_del(s_bt_conflict_popup);
+    }
+
+    /* Full-screen dimming overlay on lv_layer_top() */
+    s_bt_conflict_popup = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_bt_conflict_popup, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(s_bt_conflict_popup, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_bt_conflict_popup, LV_OPA_60, 0);
+    lv_obj_set_style_border_width(s_bt_conflict_popup, 0, 0);
+    lv_obj_clear_flag(s_bt_conflict_popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Warning card */
+    lv_obj_t *card = lv_obj_create(s_bt_conflict_popup);
+    lv_obj_set_size(card, 220, 185);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+    lv_obj_set_style_border_color(card, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, LV_SYMBOL_WARNING "  BT Lookout Active");
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    char msg[100];
+    snprintf(msg, sizeof(msg),
+             "BT Lookout is still\nmonitoring. Starting\n\"%s\" will stop it.", fname);
+    lv_obj_t *msg_lbl = lv_label_create(card);
+    lv_label_set_text(msg_lbl, msg);
+    lv_obj_set_style_text_font(msg_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(msg_lbl, ui_text_color(), 0);
+    lv_label_set_long_mode(msg_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(msg_lbl, 196);
+    lv_obj_align(msg_lbl, LV_ALIGN_TOP_MID, 0, 30);
+
+    /* Cancel button */
+    lv_obj_t *cancel_btn = lv_btn_create(card);
+    lv_obj_set_size(cancel_btn, 90, 32);
+    lv_obj_align(cancel_btn, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_make(70, 70, 70), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_make(100, 100, 100), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(cancel_btn, 0, 0);
+    lv_obj_set_style_radius(cancel_btn, 8, 0);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, "Cancel");
+    lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(cancel_lbl, lv_color_white(), 0);
+    lv_obj_center(cancel_lbl);
+    lv_obj_add_event_cb(cancel_btn, bt_conflict_dismiss_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Stop & Go button */
+    lv_obj_t *proceed_btn = lv_btn_create(card);
+    lv_obj_set_size(proceed_btn, 90, 32);
+    lv_obj_align(proceed_btn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(proceed_btn, COLOR_MATERIAL_ORANGE, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(proceed_btn, lv_color_lighten(COLOR_MATERIAL_ORANGE, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(proceed_btn, 0, 0);
+    lv_obj_set_style_radius(proceed_btn, 8, 0);
+    lv_obj_t *proceed_lbl = lv_label_create(proceed_btn);
+    lv_label_set_text(proceed_lbl, "Stop & Go");
+    lv_obj_set_style_text_font(proceed_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(proceed_lbl, lv_color_white(), 0);
+    lv_obj_center(proceed_lbl);
+    lv_obj_add_event_cb(proceed_btn, bt_conflict_proceed_cb, LV_EVENT_CLICKED,
+                        (void *)proceed_fn);
+}
+
 void attack_event_cb(lv_event_t *e)
 {
     const char *attack_name = (const char *)lv_event_get_user_data(e);
@@ -17621,25 +17725,37 @@ void attack_event_cb(lv_event_t *e)
 
     // AirTag scan
     if (strcmp(attack_name, "AirTag scan") == 0) {
-        show_airtag_scan_screen();
+        if (bt_lookout_is_active())
+            show_bt_conflict_warning("AirTag Scan", show_airtag_scan_screen);
+        else
+            show_airtag_scan_screen();
         return;
     }
 
     // BT Scan & Select
     if (strcmp(attack_name, "BT Scan & Select") == 0) {
-        show_bt_scan_select_screen();
+        if (bt_lookout_is_active())
+            show_bt_conflict_warning("BT Scan & Select", show_bt_scan_select_screen);
+        else
+            show_bt_scan_select_screen();
         return;
     }
 
     // BT Locator (standalone scan-then-select flow)
     if (strcmp(attack_name, "BT Locator") == 0) {
-        show_bt_locator_screen();
+        if (bt_lookout_is_active())
+            show_bt_conflict_warning("BT Locator", show_bt_locator_screen);
+        else
+            show_bt_locator_screen();
         return;
     }
 
     // BT Locator Direct (skip scan, track SAS-selected device immediately)
     if (strcmp(attack_name, "BT Locator Direct") == 0) {
-        show_bt_locator_direct_track();
+        if (bt_lookout_is_active())
+            show_bt_conflict_warning("BT Locator", show_bt_locator_direct_track);
+        else
+            show_bt_locator_direct_track();
         return;
     }
 
@@ -19407,8 +19523,8 @@ static void airtag_scan_exit_cb(lv_event_t *e)
         current_radio_mode = RADIO_MODE_NONE;
     }
     
-    // Navigate to menu
-    nav_to_menu_flag = true;
+    // Return to Bluetooth screen
+    show_bluetooth_screen();
 }
 
 /**
