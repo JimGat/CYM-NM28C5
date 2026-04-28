@@ -15864,8 +15864,8 @@ static void show_bluetooth_screen(void)
     lv_obj_t *locator_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BT Locator", COLOR_TILE_BLUE, NULL, NULL);
     lv_obj_add_event_cb(locator_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Locator");
 
-    // Dee Dee Detector - Red
-    lv_obj_t *lookout_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Dee Dee\nDetector", COLOR_MATERIAL_RED, NULL, NULL);
+    // BT Lookout - Red
+    lv_obj_t *lookout_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BT\nLookout", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(lookout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Dee Dee Detector");
 }
 
@@ -16332,8 +16332,8 @@ static void show_bt_attack_tiles_screen(void)
     lv_obj_t *gatt_tile = create_tile(tiles, MY_SYMBOL_PERSON_WALKING, "GATT\nWalker", COLOR_MATERIAL_PURPLE, NULL, NULL);
     lv_obj_add_event_cb(gatt_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"GATT Walker");
 
-    // Add to Dee Dee Detector watchlist
-    lv_obj_t *add_deedee_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Add to\nDee Dee", COLOR_MATERIAL_RED, NULL, NULL);
+    // Add to BT Lookout watchlist
+    lv_obj_t *add_deedee_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Add to\nBT Lookout", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(add_deedee_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Add to Lookout");
 }
 
