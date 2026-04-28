@@ -37,13 +37,14 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 - [Pinout](#pinout)
   - [GPS Wiring — ATGM336H](#gps-wiring--atgm336h)
 - [Software Features — Detailed](#software-features--detailed)
-  - [WiFi Scan & Attack](#1-wifi-scan--attack)
-  - [Global WiFi Attacks](#2-global-wifi-attacks)
-  - [Network Observer & Karma](#3-network-observer--karma)
-  - [Deauth Monitor](#4-deauth-monitor)
-  - [Bluetooth](#5-bluetooth)
-  - [Wardriving](#6-wardriving)
-  - [Settings](#7-settings)
+  - [WiFi](#1-wifi)
+    - [WiFi Scan & Attack](#wifi-scan--attack)
+    - [Global WiFi Attacks](#global-wifi-attacks)
+    - [WiFi Observer & Karma](#wifi-observer--karma)
+    - [Deauth Monitor](#deauth-monitor)
+  - [Bluetooth](#2-bluetooth)
+  - [Wardriving](#3-wardriving)
+  - [Settings](#4-settings)
 - [Data & Storage](#data--storage)
 - [Touch Calibration](#touch-calibration)
 - [Building & Flashing](#building--flashing)
@@ -215,7 +216,20 @@ The firmware parses GGA sentences for latitude, longitude, altitude, and satelli
 
 ## Software Features — Detailed
 
-### 1. WiFi Scan & Attack
+### 1. WiFi
+
+The **WiFi** tile opens a sub-menu grouping all WiFi functions:
+
+```
+Main Menu
+└── WiFi
+    ├── Scan & Attack
+    ├── WiFi Attacks
+    ├── Deauth Mon.
+    └── WiFi Observer
+```
+
+#### WiFi Scan & Attack
 
 **Active WiFi scanning** with per-network details, followed by targeted attacks on selected networks.
 
@@ -228,7 +242,7 @@ The firmware parses GGA sentences for latitude, longitude, altitude, and satelli
 | **Handshake Capture** | Captures WPA/WPA2 4-way handshakes and saves as PCAP/HCCAPX |
 | **ARP Poisoning** | LwIP-based ARP spoofing for MitM scenarios |
 
-### 2. Global WiFi Attacks
+#### Global WiFi Attacks
 
 Attacks that operate on **all nearby networks** simultaneously.
 
@@ -238,20 +252,20 @@ Attacks that operate on **all nearby networks** simultaneously.
 | **Snifferdog** | Channel-hopping sniffer with automatic client deauthentication; exits cleanly and returns radio to normal WiFi scan mode |
 | **SAE Overflow** | WPA3 SAE authentication flood attack |
 
-### 3. Network Observer & Karma
+#### WiFi Observer & Karma
 
 Passive network intelligence and rogue AP capabilities.
 
 | Feature | Description |
 |---------|-------------|
-| **Network Observer** | Passive 802.11 sniffing in promiscuous mode |
+| **WiFi Observer** | Passive 802.11 sniffing in promiscuous mode — shows APs, associated clients, and probe requests |
 | **Karma AP** | Automatically responds to client probe requests, creating matching rogue APs |
 
-### 4. Deauth Monitor
+#### Deauth Monitor
 
 **Passive detection** of deauthentication attacks happening in the area. Alerts when deauth frames are detected on nearby channels — useful for detecting hostile activity.
 
-### 5. Bluetooth
+### 2. Bluetooth
 
 BLE scanning features leveraging the ESP32-C5's BLE 5.0 radio.
 
@@ -318,7 +332,7 @@ Use the RSSI value to home in on the tag — a higher (less negative) number mea
 
 Tap **Exit** at any time to stop tracking and return to the main menu. The radio switches back to WiFi mode automatically.
 
-### 6. Wardriving
+### 3. Wardriving
 
 GPS-enabled WiFi logging for mapping wireless networks. Requires an **ATGM336H** (or compatible NMEA module) wired to IO4/IO5 — see [GPS Wiring](#gps-wiring--atgm336h).
 
@@ -327,7 +341,7 @@ GPS-enabled WiFi logging for mapping wireless networks. Requires an **ATGM336H**
 - Logs SSID, BSSID, channel, RSSI, auth mode, and GPS coordinates to CSV on the SD card
 - Compatible with standard wardriving visualization tools (Wigle, etc.)
 
-### 7. Settings
+### 4. Settings
 
 | Setting | Description |
 |---------|-------------|
@@ -359,7 +373,7 @@ Switching modes takes effect immediately on the active radio and is re-applied a
 |---------|-------------|
 | **LVGL Material Dark Theme** | Modern, touch-friendly dark UI |
 | **Portrait 240×320 Layout** | All screens designed and reflowed for the NM-CYD-C5's 240×320 portrait display |
-| **6-Tile Main Menu** | Quick access to all feature categories |
+| **5-Tile Main Menu** | WiFi, Bluetooth, Wardrive, Settings, Go Dark — WiFi expands to sub-menu |
 | **Screenshot Capture** | Save screen to SD card (`/sdcard/screenshots/`) |
 | **WPA-SEC Upload** | Upload captured handshakes to wpa-sec.stanev.org via HTTPS |
 | **NeoPixel Status LED** | Mode-based color indicator via WS2812 LED (GPIO 27) |
