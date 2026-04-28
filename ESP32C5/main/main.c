@@ -10194,10 +10194,12 @@ static void disco_pre_pause_end(lv_timer_t *t)
 
 static void show_disco_mode(void)
 {
-    // Take over the screen
+    // Take over the screen — hide instead of delete; we're inside a click event on a
+    // tiles_container child, so deleting the parent here hangs the board.
+    // show_main_tiles() will safely delete both when disco ends.
     if (settings_nav_timer) { lv_timer_del(settings_nav_timer); settings_nav_timer = NULL; }
-    if (home_bg_img)     { lv_obj_del(home_bg_img);     home_bg_img = NULL; }
-    if (tiles_container) { lv_obj_del(tiles_container); tiles_container = NULL; }
+    if (home_bg_img)     lv_obj_add_flag(home_bg_img,     LV_OBJ_FLAG_HIDDEN);
+    if (tiles_container) lv_obj_add_flag(tiles_container, LV_OBJ_FLAG_HIDDEN);
     if (function_page)   { lv_obj_del(function_page);   function_page = NULL; }
     lv_obj_add_flag(title_bar, LV_OBJ_FLAG_HIDDEN);
 
