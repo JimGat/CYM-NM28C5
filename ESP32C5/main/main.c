@@ -9052,7 +9052,7 @@ static void wardrive_start_btn_cb(lv_event_t *e)
 
     // Scrollable data table — sits below the frozen header
     wd_ui_table = lv_table_create(function_page);
-    lv_obj_set_size(wd_ui_table, lv_pct(97), 164);
+    lv_obj_set_size(wd_ui_table, lv_pct(97), 160);
     lv_obj_align(wd_ui_table, LV_ALIGN_TOP_MID, 0, 121);
     lv_obj_set_style_bg_color(wd_ui_table, lv_color_make(15, 15, 15), 0);
     lv_obj_set_style_border_color(wd_ui_table, lv_color_make(50, 50, 50), 0);
@@ -9079,23 +9079,24 @@ static void wardrive_start_btn_cb(lv_event_t *e)
 
     // ─── Stop button (bottom center) ─────────────────────────────
     wardrive_stop_btn = lv_btn_create(function_page);
-    lv_obj_set_size(wardrive_stop_btn, 120, 46);
+    lv_obj_set_size(wardrive_stop_btn, 110, 30);
     lv_obj_align(wardrive_stop_btn, LV_ALIGN_BOTTOM_MID, 0, -5);
     lv_obj_set_style_bg_color(wardrive_stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(wardrive_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(wardrive_stop_btn, 0, 0);
-    lv_obj_set_style_radius(wardrive_stop_btn, 10, 0);
-    lv_obj_set_style_shadow_width(wardrive_stop_btn, 6, 0);
+    lv_obj_set_style_radius(wardrive_stop_btn, 8, 0);
+    lv_obj_set_style_shadow_width(wardrive_stop_btn, 4, 0);
     lv_obj_set_style_shadow_color(wardrive_stop_btn, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_flex_flow(wardrive_stop_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_flow(wardrive_stop_btn, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(wardrive_stop_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(wardrive_stop_btn, 6, 0);
     lv_obj_t *x_icon2 = lv_label_create(wardrive_stop_btn);
     lv_label_set_text(x_icon2, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_font(x_icon2, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(x_icon2, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(x_icon2, ui_text_color(), 0);
     lv_obj_t *stop_lbl = lv_label_create(wardrive_stop_btn);
     lv_label_set_text(stop_lbl, "Stop");
-    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(stop_lbl, ui_text_color(), 0);
     lv_obj_add_event_cb(wardrive_stop_btn, wardrive_stop_btn_cb, LV_EVENT_CLICKED, NULL);
 
