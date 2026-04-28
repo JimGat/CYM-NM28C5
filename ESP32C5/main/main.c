@@ -1067,6 +1067,16 @@ static volatile bool bt_tracking_found = false;
 static char bt_tracking_name[32] = "";
 static TaskHandle_t bt_locator_task_handle = NULL;
 static volatile bool airtag_scan_update_flag = false;
+
+// BT Scan & Select UI state
+static lv_obj_t *bt_sas_list = NULL;
+static lv_obj_t *bt_sas_status_label = NULL;
+static lv_obj_t *bt_sas_next_btn = NULL;
+static volatile bool bt_sas_ui_active = false;
+static volatile bool bt_sas_needs_update = false;
+static int bt_sas_selected_idx = -1;
+static uint8_t bt_sas_target_addr[6];
+static char bt_sas_target_name[32];
 // Snapshot values for UI (copied before reset)
 static volatile int airtag_scan_snapshot_airtag = 0;
 static volatile int airtag_scan_snapshot_smarttag = 0;
@@ -1206,6 +1216,11 @@ static void reset_function_page_children(void) {
     deauth_monitor_list = NULL;
     deauth_monitor_status_label = NULL;
     deauth_monitor_known_label = NULL;
+    bt_sas_list = NULL;
+    bt_sas_status_label = NULL;
+    bt_sas_next_btn = NULL;
+    bt_sas_ui_active = false;
+    bt_sas_selected_idx = -1;
     airtag_scan_status_label = NULL;
     airtag_scan_stats_label1 = NULL;
     airtag_scan_stats_label2 = NULL;
@@ -1369,6 +1384,11 @@ static void ble_scan_update_list(void);
 
 // WiFi menu screen
 static void show_wifi_menu_screen(void);
+
+// BT Scan & Select
+static void show_bt_scan_select_screen(void);
+static void show_bt_attack_tiles_screen(void);
+static void bt_sas_refresh_list(void);
 
 // Deauth Monitor functions
 static void show_deauth_monitor_screen(void);
@@ -2152,7 +2172,7 @@ static void led_update_mode(void)
         return;
     }
     // ── BLE / AirTag / BT locator (purple) ──────────────────────────────
-    if (ble_scan_ui_active || bt_scan_active || airtag_scan_active || bt_locator_tracking_active) {
+    if (ble_scan_ui_active || bt_scan_active || airtag_scan_active || bt_locator_tracking_active || bt_sas_ui_active) {
         led_set(40, 0, 80);  // purple — Bluetooth active
         return;
     }
@@ -4843,6 +4863,21 @@ void app_main(void)
                         lv_obj_clear_flag(bt_locator_list, LV_OBJ_FLAG_HIDDEN);
                         bt_locator_update_list();
                     }
+                }
+            }
+
+            // BT Scan & Select UI update
+            if (bt_sas_needs_update && bt_sas_ui_active) {
+                bt_sas_needs_update = false;
+                if (bt_sas_status_label && lv_obj_is_valid(bt_sas_status_label)) {
+                    lv_label_set_text(bt_sas_status_label, ble_scan_status_text);
+                }
+                bt_sas_refresh_list();
+                // If scan finished show Next prompt if device selected
+                if (ble_scan_finished && bt_sas_selected_idx < 0 &&
+                    bt_sas_status_label && lv_obj_is_valid(bt_sas_status_label)) {
+                    lv_label_set_text(bt_sas_status_label,
+                        bt_device_count > 0 ? "Tap a device to select" : "No devices found");
                 }
             }
 
@@ -15135,10 +15170,14 @@ static void show_bluetooth_screen(void)
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     
-    // AirTag scan - stub - Apple-like gray
-    lv_obj_t *airtag_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "AirTag\nscan", lv_color_make(142, 142, 147), NULL, NULL);
+    // BT Scan & Select - first tile, cyan
+    lv_obj_t *btsas_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BT Scan\n& Select", UI_ACCENT_CYAN, NULL, NULL);
+    lv_obj_add_event_cb(btsas_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Scan & Select");
+
+    // AirTag scan - Apple-like gray
+    lv_obj_t *airtag_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "AirTag\nScan", lv_color_make(142, 142, 147), NULL, NULL);
     lv_obj_add_event_cb(airtag_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"AirTag scan");
-    
+
     // BT Locator - Blue
     lv_obj_t *locator_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BT Locator", COLOR_TILE_BLUE, NULL, NULL);
     lv_obj_add_event_cb(locator_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Locator");
@@ -15267,6 +15306,228 @@ static void show_bt_locator_screen(void)
     }
     
     ui_locked = false;
+}
+
+// ============================================================================
+// BT SCAN & SELECT
+// ============================================================================
+
+static void bt_sas_exit_cb(lv_event_t *e)
+{
+    (void)e;
+    if (bt_scan_active) {
+        bt_scan_active = false;
+        bt_stop_scan();
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    bt_sas_ui_active = false;
+    bt_sas_selected_idx = -1;
+    show_bluetooth_screen();
+}
+
+static void bt_sas_device_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= bt_device_count) return;
+
+    if (bt_sas_selected_idx == idx) {
+        // Deselect
+        bt_sas_selected_idx = -1;
+        if (bt_sas_next_btn && lv_obj_is_valid(bt_sas_next_btn))
+            lv_obj_add_flag(bt_sas_next_btn, LV_OBJ_FLAG_HIDDEN);
+        if (bt_sas_status_label && lv_obj_is_valid(bt_sas_status_label))
+            lv_label_set_text(bt_sas_status_label, "Tap a device to select");
+    } else {
+        bt_sas_selected_idx = idx;
+        memcpy(bt_sas_target_addr, bt_devices[idx].addr, 6);
+        if (bt_devices[idx].name[0] != '\0')
+            snprintf(bt_sas_target_name, sizeof(bt_sas_target_name), "%s", bt_devices[idx].name);
+        else
+            snprintf(bt_sas_target_name, sizeof(bt_sas_target_name), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     bt_devices[idx].addr[5], bt_devices[idx].addr[4], bt_devices[idx].addr[3],
+                     bt_devices[idx].addr[2], bt_devices[idx].addr[1], bt_devices[idx].addr[0]);
+
+        if (bt_sas_status_label && lv_obj_is_valid(bt_sas_status_label)) {
+            char sel_text[48];
+            snprintf(sel_text, sizeof(sel_text), "Selected: %s", bt_sas_target_name);
+            lv_label_set_text(bt_sas_status_label, sel_text);
+        }
+        if (bt_sas_next_btn && lv_obj_is_valid(bt_sas_next_btn))
+            lv_obj_clear_flag(bt_sas_next_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+    bt_sas_refresh_list();
+}
+
+static void bt_sas_next_cb(lv_event_t *e)
+{
+    (void)e;
+    if (bt_sas_selected_idx < 0) return;
+    // Stop scan before leaving
+    if (bt_scan_active) {
+        bt_scan_active = false;
+        bt_stop_scan();
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    bt_sas_ui_active = false;
+    show_bt_attack_tiles_screen();
+}
+
+static void bt_sas_refresh_list(void)
+{
+    if (!bt_sas_list || !lv_obj_is_valid(bt_sas_list)) return;
+    lv_obj_clean(bt_sas_list);
+
+    for (int i = 0; i < bt_device_count; i++) {
+        bt_device_info_t *dev = &bt_devices[i];
+        bool selected = (i == bt_sas_selected_idx);
+
+        char item_text[64];
+        char short_name[14];
+        if (dev->name[0] != '\0') {
+            strncpy(short_name, dev->name, 13);
+            short_name[13] = '\0';
+            snprintf(item_text, sizeof(item_text), "%s  %d dBm  %02X:%02X:%02X",
+                     short_name, dev->rssi,
+                     dev->addr[2], dev->addr[1], dev->addr[0]);
+        } else {
+            const char *tag = dev->is_airtag ? " [AirTag]" : dev->is_smarttag ? " [SmartTag]" : "";
+            snprintf(item_text, sizeof(item_text), "[Unknown]%s  %d dBm  %02X:%02X:%02X",
+                     tag, dev->rssi, dev->addr[2], dev->addr[1], dev->addr[0]);
+        }
+
+        lv_obj_t *btn = lv_btn_create(bt_sas_list);
+        lv_obj_set_size(btn, lv_pct(100), 30);
+        lv_obj_set_style_bg_color(btn, selected ? UI_ACCENT_CYAN : ui_card_color(), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(btn, lv_color_lighten(UI_ACCENT_CYAN, 30), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(btn, selected ? 1 : 0, 0);
+        lv_obj_set_style_border_color(btn, UI_ACCENT_CYAN, 0);
+        lv_obj_set_style_radius(btn, 4, 0);
+
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, item_text);
+        lv_obj_set_style_text_color(lbl, selected ? lv_color_black() : ui_text_color(), 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 4, 0);
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
+
+        lv_obj_add_event_cb(btn, bt_sas_device_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+    }
+}
+
+static void show_bt_scan_select_screen(void)
+{
+    ui_locked = true;
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+
+    create_function_page_base("BT Scan & Select");
+    bt_sas_ui_active = true;
+    bt_sas_selected_idx = -1;
+
+    // Status label
+    bt_sas_status_label = lv_label_create(function_page);
+    lv_label_set_text(bt_sas_status_label, "Initializing BLE...");
+    lv_obj_set_style_text_color(bt_sas_status_label, ui_text_color(), 0);
+    lv_obj_set_style_text_font(bt_sas_status_label, &lv_font_montserrat_12, 0);
+    lv_obj_align(bt_sas_status_label, LV_ALIGN_TOP_LEFT, 5, 35);
+
+    // Scrollable device list
+    bt_sas_list = lv_obj_create(function_page);
+    lv_obj_set_size(bt_sas_list, lv_pct(100), LCD_V_RES - 30 - 18 - 50);
+    lv_obj_align(bt_sas_list, LV_ALIGN_TOP_MID, 0, 52);
+    lv_obj_set_style_bg_color(bt_sas_list, ui_bg_color(), 0);
+    lv_obj_set_style_border_color(bt_sas_list, UI_ACCENT_CYAN, 0);
+    lv_obj_set_style_border_width(bt_sas_list, 1, 0);
+    lv_obj_set_flex_flow(bt_sas_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(bt_sas_list, 3, 0);
+    lv_obj_set_style_pad_gap(bt_sas_list, 3, 0);
+    lv_obj_set_scrollbar_mode(bt_sas_list, LV_SCROLLBAR_MODE_AUTO);
+
+    // Bottom button row: Exit | Next →
+    lv_obj_t *btn_row = lv_obj_create(function_page);
+    lv_obj_set_size(btn_row, lv_pct(100), 38);
+    lv_obj_align(btn_row, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_hor(btn_row, 6, 0);
+    lv_obj_set_style_pad_ver(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *exit_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(exit_btn, 100, 30);
+    lv_obj_set_style_bg_color(exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 40), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(exit_btn, 0, 0);
+    lv_obj_set_style_radius(exit_btn, 8, 0);
+    lv_obj_t *exit_lbl = lv_label_create(exit_btn);
+    lv_label_set_text(exit_lbl, LV_SYMBOL_CLOSE "  Exit");
+    lv_obj_set_style_text_font(exit_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(exit_lbl, lv_color_white(), 0);
+    lv_obj_center(exit_lbl);
+    lv_obj_add_event_cb(exit_btn, bt_sas_exit_cb, LV_EVENT_CLICKED, NULL);
+
+    bt_sas_next_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(bt_sas_next_btn, 110, 30);
+    lv_obj_set_style_bg_color(bt_sas_next_btn, UI_ACCENT_CYAN, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(bt_sas_next_btn, lv_color_lighten(UI_ACCENT_CYAN, 40), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(bt_sas_next_btn, 0, 0);
+    lv_obj_set_style_radius(bt_sas_next_btn, 8, 0);
+    lv_obj_t *next_lbl = lv_label_create(bt_sas_next_btn);
+    lv_label_set_text(next_lbl, "Actions " LV_SYMBOL_RIGHT);
+    lv_obj_set_style_text_font(next_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(next_lbl, lv_color_black(), 0);
+    lv_obj_center(next_lbl);
+    lv_obj_add_event_cb(bt_sas_next_btn, bt_sas_next_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(bt_sas_next_btn, LV_OBJ_FLAG_HIDDEN);  // shown after selection
+
+    // Switch to BLE and start scan
+    if (!ensure_ble_mode()) {
+        lv_label_set_text(bt_sas_status_label, "BLE init failed!");
+        ui_locked = false;
+        return;
+    }
+
+    bt_scan_active = true;
+    ble_scan_finished = false;
+    BaseType_t ret = xTaskCreate(bt_scan_task, "bt_scan_task", 4096, NULL, 5, &bt_scan_task_handle);
+    if (ret != pdPASS) {
+        bt_scan_active = false;
+        lv_label_set_text(bt_sas_status_label, "Scan start failed!");
+    } else {
+        lv_label_set_text(bt_sas_status_label, "Scanning... 0 (10s)");
+    }
+    ui_locked = false;
+}
+
+// Attack tile screen after device selection
+static void show_bt_attack_tiles_screen(void)
+{
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+
+    char title[48];
+    snprintf(title, sizeof(title), "BT: %.28s", bt_sas_target_name);
+    create_function_page_base(title);
+
+    lv_obj_t *tiles = lv_obj_create(function_page);
+    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(tiles, 0, 0);
+    lv_obj_set_style_pad_all(tiles, 10, 0);
+    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+
+    // BT Locator tile
+    lv_obj_t *loc_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BT\nLocator", COLOR_TILE_BLUE, NULL, NULL);
+    lv_obj_add_event_cb(loc_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Locator");
+
+    // GATT Walker tile (placeholder - coming soon)
+    lv_obj_t *gatt_tile = create_tile(tiles, MY_SYMBOL_PERSON_WALKING, "GATT\nWalker", COLOR_MATERIAL_PURPLE, NULL, NULL);
+    lv_obj_add_event_cb(gatt_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"GATT Walker");
 }
 
 // Stub screen for not-yet-implemented features
@@ -16278,9 +16539,21 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
 
+    // BT Scan & Select
+    if (strcmp(attack_name, "BT Scan & Select") == 0) {
+        show_bt_scan_select_screen();
+        return;
+    }
+
     // BT Locator
     if (strcmp(attack_name, "BT Locator") == 0) {
         show_bt_locator_screen();
+        return;
+    }
+
+    // GATT Walker (future)
+    if (strcmp(attack_name, "GATT Walker") == 0) {
+        show_stub_screen("GATT Walker");
         return;
     }
 
@@ -17455,10 +17728,11 @@ static void bt_scan_task(void *pvParameters)
         
         // Update UI every 500ms via flag (thread-safe)
         if (i % 5 == 0) {
-            snprintf(ble_scan_status_text, sizeof(ble_scan_status_text), 
+            snprintf(ble_scan_status_text, sizeof(ble_scan_status_text),
                      "Scanning... %d (%ds)", bt_device_count, (100 - i) / 10);
             ble_scan_needs_ui_update = true;
-            bt_locator_needs_ui_update = true;  // Also update BT Locator if active
+            bt_locator_needs_ui_update = true;
+            bt_sas_needs_update = true;
         }
     }
     
@@ -17470,7 +17744,8 @@ static void bt_scan_task(void *pvParameters)
              "%d devices (%d AT, %d ST)", bt_device_count, bt_airtag_count, bt_smarttag_count);
     ble_scan_finished = true;
     ble_scan_needs_ui_update = true;
-    bt_locator_needs_ui_update = true;  // Also update BT Locator if active
+    bt_locator_needs_ui_update = true;
+    bt_sas_needs_update = true;
     
     ESP_LOGI(TAG, "BLE scan complete: %d devices found", bt_device_count);
     
