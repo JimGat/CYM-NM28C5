@@ -1116,6 +1116,41 @@ void back_to_menu_cb(lv_event_t *e);
 // Tile-based navigation system
 static lv_obj_t *tiles_container = NULL;
 static lv_obj_t *home_bg_img = NULL;
+
+// ── Disco mode Easter egg ──────────────────────────────────────────────────
+typedef struct { uint8_t r, g, b; } disco_rgb_t;
+// 70s tie-dye screen palette (full brightness for display)
+static const disco_rgb_t DISCO_PALETTE[8] = {
+    {255,  20, 147},  // hot pink
+    {255, 140,   0},  // orange
+    {255, 230,   0},  // yellow
+    { 80, 255,   0},  // lime
+    {  0, 220, 255},  // cyan
+    {160,   0, 255},  // purple
+    { 30, 100, 255},  // electric blue
+    {255,  60,   0},  // red-orange
+};
+// LED values at 60% brightness for the WS2812
+static const disco_rgb_t DISCO_LED_PAL[8] = {
+    {153,  12,  88},
+    {153,  84,   0},
+    {153, 138,   0},
+    { 48, 153,   0},
+    {  0, 132, 153},
+    { 96,   0, 153},
+    { 18,  60, 153},
+    {153,  36,   0},
+};
+#define DISCO_NC 8
+
+static int            settings_tap_count  = 0;
+static lv_timer_t    *settings_nav_timer  = NULL;
+static volatile bool  disco_mode_active   = false;
+static TaskHandle_t   disco_task_handle   = NULL;
+static lv_obj_t      *disco_screen_obj    = NULL;
+static lv_obj_t      *disco_layers[4]     = {NULL};
+static volatile uint8_t disco_color_idx   = 0;
+static volatile bool  disco_needs_update  = false;
 static lv_obj_t *create_tile(lv_obj_t *parent, const char *icon, const char *text, lv_color_t bg_color, lv_event_cb_t callback, const char *user_data);
 static void show_main_tiles(void);
 static void show_wifi_scan_attack_screen(void);
@@ -1386,6 +1421,15 @@ static void ble_scan_update_list(void);
 
 // WiFi menu screen
 static void show_wifi_menu_screen(void);
+
+// Disco mode Easter egg
+static void show_disco_mode(void);
+static void settings_nav_timer_cb(lv_timer_t *t);
+static void disco_pre_pause_end(lv_timer_t *t);
+static void disco_touch_exit(lv_event_t *e);
+static void disco_check_task_done(lv_timer_t *t);
+static void disco_post_pause_end(lv_timer_t *t);
+static void disco_task(void *arg);
 
 // BT Scan & Select
 static void show_bt_scan_select_screen(void);
@@ -3961,7 +4005,7 @@ void app_main(void)
         }
 
         // Update NeoPixel LED color to reflect current mode (~2 Hz)
-        {
+        if (!disco_mode_active) {
             uint32_t now_ms = esp_timer_get_time() / 1000;
             if (now_ms - last_led_update_ms >= 100) {
                 led_update_mode();
@@ -4882,6 +4926,21 @@ void app_main(void)
                     bt_sas_status_label && lv_obj_is_valid(bt_sas_status_label)) {
                     lv_label_set_text(bt_sas_status_label,
                         bt_device_count > 0 ? "Tap a device to select" : "No devices found");
+                }
+            }
+
+            // Disco mode screen update (driven by disco_task flag)
+            if (disco_needs_update && disco_mode_active && disco_screen_obj) {
+                disco_needs_update = false;
+                uint8_t c = disco_color_idx;
+                lv_obj_set_style_bg_color(disco_screen_obj,
+                    lv_color_make(DISCO_PALETTE[c].r, DISCO_PALETTE[c].g, DISCO_PALETTE[c].b), 0);
+                for (int i = 0; i < 4; i++) {
+                    if (disco_layers[i]) {
+                        uint8_t lc = (c + i * 2 + 1) % DISCO_NC;
+                        lv_obj_set_style_bg_color(disco_layers[i],
+                            lv_color_make(DISCO_PALETTE[lc].r, DISCO_PALETTE[lc].g, DISCO_PALETTE[lc].b), 0);
+                    }
                 }
             }
 
@@ -9987,6 +10046,150 @@ static void go_dark_mini_btn_cb(lv_event_t *e)
     show_go_dark_confirm();
 }
 
+// ============================================================================
+// DISCO MODE — secret Easter egg (tap Settings tile 5× rapidly)
+// Le Freak / Chic — 120 BPM, 500ms per beat
+// ============================================================================
+
+static void settings_nav_timer_cb(lv_timer_t *t)
+{
+    lv_timer_del(t);
+    settings_nav_timer = NULL;
+    settings_tap_count = 0;
+    show_settings_screen();
+}
+
+static void disco_task(void *arg)
+{
+    (void)arg;
+    uint8_t beat = 0;
+
+    while (disco_mode_active) {
+        uint8_t c  = beat % DISCO_NC;
+        uint8_t nc = (c + 1) % DISCO_NC;
+
+        // ── Full beat: bright LED + screen flash ──────────────────────────
+        led_set(DISCO_LED_PAL[c].r, DISCO_LED_PAL[c].g, DISCO_LED_PAL[c].b);
+        disco_color_idx   = c;
+        disco_needs_update = true;
+
+        // 3/4 beat = 375ms (5ms steps for responsive exit)
+        for (int i = 0; i < 75 && disco_mode_active; i++)
+            vTaskDelay(pdMS_TO_TICKS(5));
+        if (!disco_mode_active) break;
+
+        // ── Offbeat: dim flash to next color (8th-note groove) ────────────
+        led_set(DISCO_LED_PAL[nc].r / 3,
+                DISCO_LED_PAL[nc].g / 3,
+                DISCO_LED_PAL[nc].b / 3);
+        disco_color_idx   = nc;
+        disco_needs_update = true;
+
+        // 1/4 beat = 125ms
+        for (int i = 0; i < 25 && disco_mode_active; i++)
+            vTaskDelay(pdMS_TO_TICKS(5));
+
+        beat++;
+    }
+
+    led_set(0, 0, 0);
+    disco_needs_update = false;
+    disco_task_handle  = NULL;
+    vTaskDelete(NULL);
+}
+
+static void disco_post_pause_end(lv_timer_t *t)
+{
+    lv_timer_del(t);
+    if (disco_screen_obj) {
+        lv_obj_del(disco_screen_obj);
+        disco_screen_obj = NULL;
+    }
+    for (int i = 0; i < 4; i++) disco_layers[i] = NULL;
+    show_main_tiles();
+    lv_obj_clear_flag(title_bar, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void disco_check_task_done(lv_timer_t *t)
+{
+    if (disco_task_handle != NULL) return;   // still running; poll again next tick
+    lv_timer_del(t);
+    lv_timer_create(disco_post_pause_end, 5000, NULL);
+}
+
+static void disco_touch_exit(lv_event_t *e)
+{
+    (void)e;
+    if (!disco_mode_active) return;
+
+    disco_mode_active = false;
+    led_set(0, 0, 0);
+
+    // Hide colour layers; leave disco_screen_obj as solid black
+    for (int i = 0; i < 4; i++) {
+        if (disco_layers[i]) lv_obj_add_flag(disco_layers[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_set_style_bg_color(disco_screen_obj, lv_color_black(), 0);
+    lv_obj_clear_flag(disco_screen_obj, LV_OBJ_FLAG_CLICKABLE);
+
+    // Poll until task exits, then do the 5s post-pause
+    lv_timer_create(disco_check_task_done, 50, NULL);
+}
+
+static void disco_pre_pause_end(lv_timer_t *t)
+{
+    lv_timer_del(t);
+
+    // Four overlapping rounded blobs — tie-dye overlap in the centre
+    static const struct { int16_t x, y, w, h; } BLOB[4] = {
+        {-20, -20, 200, 220},   // top-left
+        { 60, -20, 200, 220},   // top-right
+        {-20, 120, 200, 220},   // bottom-left
+        { 60, 120, 200, 220},   // bottom-right
+    };
+    for (int i = 0; i < 4; i++) {
+        disco_layers[i] = lv_obj_create(disco_screen_obj);
+        lv_obj_set_pos(disco_layers[i],  BLOB[i].x, BLOB[i].y);
+        lv_obj_set_size(disco_layers[i], BLOB[i].w, BLOB[i].h);
+        lv_obj_set_style_radius(disco_layers[i], 100, 0);
+        lv_obj_set_style_bg_color(disco_layers[i],
+            lv_color_make(DISCO_PALETTE[(i * 2) % DISCO_NC].r,
+                          DISCO_PALETTE[(i * 2) % DISCO_NC].g,
+                          DISCO_PALETTE[(i * 2) % DISCO_NC].b), 0);
+        lv_obj_set_style_opa(disco_layers[i], LV_OPA_70, 0);
+        lv_obj_set_style_border_width(disco_layers[i], 0, 0);
+        lv_obj_clear_flag(disco_layers[i], LV_OBJ_FLAG_SCROLLABLE);
+    }
+
+    // Touch anywhere to exit
+    lv_obj_add_flag(disco_screen_obj, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(disco_screen_obj, disco_touch_exit, LV_EVENT_CLICKED, NULL);
+
+    disco_mode_active = true;
+    xTaskCreate(disco_task, "disco_task", 4096, NULL, 4, &disco_task_handle);
+}
+
+static void show_disco_mode(void)
+{
+    // Take over the screen
+    if (settings_nav_timer) { lv_timer_del(settings_nav_timer); settings_nav_timer = NULL; }
+    if (home_bg_img)     { lv_obj_del(home_bg_img);     home_bg_img = NULL; }
+    if (tiles_container) { lv_obj_del(tiles_container); tiles_container = NULL; }
+    if (function_page)   { lv_obj_del(function_page);   function_page = NULL; }
+    lv_obj_add_flag(title_bar, LV_OBJ_FLAG_HIDDEN);
+
+    disco_screen_obj = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(disco_screen_obj, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(disco_screen_obj, lv_color_black(), 0);
+    lv_obj_set_style_border_width(disco_screen_obj, 0, 0);
+    lv_obj_set_style_radius(disco_screen_obj, 0, 0);
+    lv_obj_set_style_pad_all(disco_screen_obj, 0, 0);
+    lv_obj_clear_flag(disco_screen_obj, LV_OBJ_FLAG_SCROLLABLE);
+
+    // 5-second black pre-pause, then start the show
+    lv_timer_create(disco_pre_pause_end, 5000, NULL);
+}
+
 static void create_function_page_base(const char *name)
 {
     // Print memory stats when opening new page
@@ -10455,7 +10658,16 @@ static void main_tile_event_cb(lv_event_t *e)
 {
     const char *tile_name = (const char *)lv_event_get_user_data(e);
     if (!tile_name) return;
-    
+
+    // Reset disco tap counter on any non-Settings tile
+    if (strcmp(tile_name, "Settings") != 0) {
+        settings_tap_count = 0;
+        if (settings_nav_timer) {
+            lv_timer_del(settings_nav_timer);
+            settings_nav_timer = NULL;
+        }
+    }
+
     if (strcmp(tile_name, "WiFi Menu") == 0) {
         show_wifi_menu_screen();
     } else if (strcmp(tile_name, "WiFi Scan & Attack") == 0) {
@@ -10465,7 +10677,19 @@ static void main_tile_event_cb(lv_event_t *e)
     } else if (strcmp(tile_name, "WiFi Sniff&Karma") == 0) {
         sniffer_yes_btn_cb(NULL);
     } else if (strcmp(tile_name, "Settings") == 0) {
-        show_settings_screen();
+        // Secret disco code: tap Settings 5 times rapidly
+        if (settings_nav_timer) {
+            lv_timer_del(settings_nav_timer);
+            settings_nav_timer = NULL;
+        }
+        settings_tap_count++;
+        if (settings_tap_count >= 5) {
+            settings_tap_count = 0;
+            show_disco_mode();
+            return;
+        }
+        // Deferred navigation — fires if no follow-up tap within 800ms
+        settings_nav_timer = lv_timer_create(settings_nav_timer_cb, 800, NULL);
     } else if (strcmp(tile_name, "Deauth Monitor") == 0) {
         show_deauth_monitor_screen();
     } else if (strcmp(tile_name, "Bluetooth") == 0) {
