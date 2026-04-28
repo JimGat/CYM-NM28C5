@@ -267,15 +267,35 @@ Passive network intelligence and rogue AP capabilities.
 
 ### 2. Bluetooth
 
-BLE scanning features leveraging the ESP32-C5's BLE 5.0 radio.
+BLE scanning and fingerprinting features leveraging the ESP32-C5's BLE 5.0 radio.
+
+```
+Bluetooth
+├── BT Scan & Select    ← start here
+│   └── (select device) → Actions
+│       ├── BT Locator  (RSSI tracking)
+│       └── GATT Walker (fingerprinting — coming soon)
+├── AirTag Scan
+└── BT Locator
+```
 
 | Feature | Description |
 |---------|-------------|
+| **BT Scan & Select** | Active BLE scan — discovers all nearby devices, displays name, RSSI, partial MAC; tap to select a target |
+| **BT Locator** | RSSI-based proximity tracking of a selected BLE device; updates every 10 s |
+| **GATT Walker** | GATT service/characteristic enumeration for device fingerprinting *(planned — stub tile present)* |
 | **AirTag Scanner** | Passive BLE scan — detects Apple AirTags and Samsung SmartTags by manufacturer ID |
-| **Tag Locator** | Per-tag RSSI tracking launched from the Found Tags list; updates every 10 s |
-| **BLE Locator** | Generic BLE device scanner — scan all nearby devices and select any one to track by signal strength |
+| **Tag Locator** | Per-tag RSSI tracking launched from the AirTag Scan found-tags list |
 
 > **Note:** WiFi and BLE share the same radio. The firmware automatically switches between `RADIO_MODE_WIFI` and `RADIO_MODE_BLE` as needed.
+
+#### BT Scan & Select — How It Works
+
+**Step 1 — Scan:** Open **BT Scan & Select** from the Bluetooth menu. A 10-second active BLE scan runs, collecting all advertising devices. Each row shows device name (or `[Unknown]`), RSSI, and the last 3 octets of the MAC address. The list updates live every 500 ms during the scan.
+
+**Step 2 — Select:** Tap any row to select a target device. The row highlights in cyan and the status bar shows the selection. Tap again to deselect. Only one device can be selected at a time.
+
+**Step 3 — Actions:** Once a device is selected, tap **Actions →** to open the action tile screen, which shows **BT Locator** and **GATT Walker** (stub). The target name is shown in the screen title.
 
 #### AirTag / SmartTag Locator — How It Works
 
