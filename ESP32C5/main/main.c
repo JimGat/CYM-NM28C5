@@ -9026,8 +9026,11 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_set_style_border_side(wd_ui_header, LV_BORDER_SIDE_LEFT | LV_BORDER_SIDE_RIGHT | LV_BORDER_SIDE_TOP, 0);
     lv_obj_set_style_radius(wd_ui_header, 6, 0);
     lv_obj_set_style_text_font(wd_ui_header, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(wd_ui_header, lv_color_make(255, 255, 255), 0);
-    lv_obj_set_style_bg_color(wd_ui_header, lv_color_make(40, 60, 40), LV_PART_ITEMS);
+    // Cell styles must target LV_PART_ITEMS — base-state text/bg don't reach cells in LVGL 8
+    lv_obj_set_style_bg_color(wd_ui_header, lv_color_white(), LV_PART_ITEMS);
+    lv_obj_set_style_bg_opa(wd_ui_header, LV_OPA_COVER, LV_PART_ITEMS);
+    lv_obj_set_style_text_color(wd_ui_header, lv_color_make(20, 20, 20), LV_PART_ITEMS);
+    lv_obj_set_style_text_font(wd_ui_header, &lv_font_montserrat_12, LV_PART_ITEMS);
     lv_obj_set_style_pad_top(wd_ui_header, 2, LV_PART_ITEMS);
     lv_obj_set_style_pad_bottom(wd_ui_header, 2, LV_PART_ITEMS);
     lv_obj_set_style_pad_left(wd_ui_header, 4, LV_PART_ITEMS);
@@ -9049,7 +9052,7 @@ static void wardrive_start_btn_cb(lv_event_t *e)
 
     // Scrollable data table — sits below the frozen header
     wd_ui_table = lv_table_create(function_page);
-    lv_obj_set_size(wd_ui_table, lv_pct(97), 144);
+    lv_obj_set_size(wd_ui_table, lv_pct(97), 164);
     lv_obj_align(wd_ui_table, LV_ALIGN_TOP_MID, 0, 121);
     lv_obj_set_style_bg_color(wd_ui_table, lv_color_make(15, 15, 15), 0);
     lv_obj_set_style_border_color(wd_ui_table, lv_color_make(50, 50, 50), 0);
