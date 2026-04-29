@@ -349,6 +349,18 @@ Use the RSSI value to home in on the tag — a higher (less negative) number mea
 | −70 to −85 dBm | In the same room (~5–15 m) |
 | Below −85 dBm | Far away or obstructed |
 
+<p align="center">
+  <img width="340" alt="AirTag Far Away" src="docs/screenshots/airtag_detection_far.jpg" />
+  <br/>
+  <em>AirTag Far Away</em>
+</p>
+
+<p align="center">
+  <img width="340" alt="AirTag Found" src="docs/screenshots/airtag_detection_close.jpg" />
+  <br/>
+  <em>AirTag Found</em>
+</p>
+
 Tap **Exit** at any time to stop tracking and return to the main menu. The radio switches back to WiFi mode automatically.
 
 #### GATT Walker — How It Works
