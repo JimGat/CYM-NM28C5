@@ -103,6 +103,14 @@ bool wifi_scanner_is_done(void) {
     return g_scan_done;
 }
 
+void wifi_scanner_abort(void) {
+    if (g_scan_in_progress) {
+        esp_wifi_scan_stop();
+        g_scan_in_progress = false;
+    }
+    g_scan_done = false;
+}
+
 esp_err_t wifi_scanner_select_network(int index, bool selected) {
     if (index < 0 || index >= g_shared_scan_count) {
         return ESP_ERR_INVALID_ARG;

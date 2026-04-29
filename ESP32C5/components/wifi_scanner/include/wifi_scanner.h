@@ -114,6 +114,13 @@ void wifi_scanner_clear_selections(void);
  */
 void wifi_scanner_set_scan_time(uint16_t min_ms, uint16_t max_ms);
 
+/**
+ * @brief Forcefully abort any in-progress scan and reset scan state.
+ * Call before esp_wifi_stop() to prevent g_scan_in_progress from getting
+ * stuck true when WIFI_EVENT_SCAN_DONE never fires (e.g. after promiscuous mode).
+ */
+void wifi_scanner_abort(void);
+
 #ifdef __cplusplus
 }
 #endif
