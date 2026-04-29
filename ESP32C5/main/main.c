@@ -1472,9 +1472,11 @@ static void show_bt_locator_direct_track(void);
 // GATT Walker
 static void show_gatt_walker_screen(void);
 static void gw_update_screen_ui(void);
+static void gw_deferred_start_cb(lv_timer_t *t);
 
 // BT Lookout
 static void show_bt_lookout_screen(void);
+static void show_add_oui_entry_screen(void);
 static void bt_lookout_update_ui(void);
 static void show_lookout_alert_popup(const char *name, const char *mac_str, int rssi);
 static void lookout_popup_dismiss_cb(lv_event_t *e);
@@ -15978,6 +15980,12 @@ static void lookout_edit_btn_cb(lv_event_t *e)
     show_lookout_editor_screen();
 }
 
+static void lookout_add_oui_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    show_add_oui_entry_screen();
+}
+
 static void lookout_editor_toggle_cb(lv_event_t *e)
 {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
@@ -16145,27 +16153,35 @@ static void show_lookout_editor_screen(void)
 
     /* Back button */
     lv_obj_t *back_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(back_btn, 106, 32);
+    lv_obj_set_size(back_btn, 68, 32);
     lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(back_btn, 0, 0);
     lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(back_btn, 4, 0);
-    lv_obj_t *bk_icon = lv_label_create(back_btn);
-    lv_label_set_text(bk_icon, LV_SYMBOL_LEFT);
-    lv_obj_set_style_text_font(bk_icon, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(bk_icon, ui_text_color(), 0);
     lv_obj_t *bk_lbl = lv_label_create(back_btn);
-    lv_label_set_text(bk_lbl, "Back");
-    lv_obj_set_style_text_font(bk_lbl, &lv_font_montserrat_14, 0);
+    lv_label_set_text(bk_lbl, LV_SYMBOL_LEFT " Back");
+    lv_obj_set_style_text_font(bk_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(bk_lbl, ui_text_color(), 0);
+    lv_obj_center(bk_lbl);
     lv_obj_add_event_cb(back_btn, lookout_editor_back_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Add OUI button */
+    lv_obj_t *add_oui_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(add_oui_btn, 80, 32);
+    lv_obj_set_style_bg_color(add_oui_btn, lv_color_make(30, 80, 160), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(add_oui_btn, lv_color_make(50, 110, 200), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(add_oui_btn, 0, 0);
+    lv_obj_set_style_radius(add_oui_btn, 8, 0);
+    lv_obj_t *ao_lbl = lv_label_create(add_oui_btn);
+    lv_label_set_text(ao_lbl, LV_SYMBOL_PLUS " OUI");
+    lv_obj_set_style_text_font(ao_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ao_lbl, lv_color_white(), 0);
+    lv_obj_center(ao_lbl);
+    lv_obj_add_event_cb(add_oui_btn, lookout_add_oui_btn_cb, LV_EVENT_CLICKED, NULL);
 
     /* Save button */
     lv_obj_t *save_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(save_btn, 106, 32);
+    lv_obj_set_size(save_btn, 68, 32);
     lv_obj_set_style_bg_color(save_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(save_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 40), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(save_btn, 0, 0);
@@ -16182,6 +16198,168 @@ static void show_lookout_editor_screen(void)
     lv_obj_set_style_text_font(sv_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(sv_lbl, lv_color_white(), 0);
     lv_obj_add_event_cb(save_btn, lookout_editor_save_cb, LV_EVENT_CLICKED, NULL);
+}
+
+/* ── Add OUI Entry screen ─────────────────────────────────────────── */
+
+static lv_obj_t *add_oui_ta      = NULL;   /* OUI text area */
+static lv_obj_t *add_oui_name_ta = NULL;   /* label text area */
+static lv_obj_t *add_oui_kb      = NULL;   /* shared keyboard */
+
+static void add_oui_ta_focus_cb(lv_event_t *e)
+{
+    lv_obj_t *ta = lv_event_get_target(e);
+    if (add_oui_kb && lv_obj_is_valid(add_oui_kb))
+        lv_keyboard_set_textarea(add_oui_kb, ta);
+}
+
+static void add_oui_back_cb(lv_event_t *e)
+{
+    (void)e;
+    add_oui_ta      = NULL;
+    add_oui_name_ta = NULL;
+    add_oui_kb      = NULL;
+    show_lookout_editor_screen();
+}
+
+static void add_oui_confirm_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!add_oui_ta || !lv_obj_is_valid(add_oui_ta)) return;
+
+    const char *oui_str  = lv_textarea_get_text(add_oui_ta);
+    const char *name_str = (add_oui_name_ta && lv_obj_is_valid(add_oui_name_ta))
+                           ? lv_textarea_get_text(add_oui_name_ta) : "";
+
+    uint8_t oui[3] = {0, 0, 0};
+    bool ok = false;
+
+    /* Accept "AA:BB:CC", "AA-BB-CC", or raw "AABBCC" */
+    if (sscanf(oui_str, "%hhx:%hhx:%hhx", &oui[0], &oui[1], &oui[2]) == 3)
+        ok = true;
+    else if (sscanf(oui_str, "%hhx-%hhx-%hhx", &oui[0], &oui[1], &oui[2]) == 3)
+        ok = true;
+    else if (strlen(oui_str) >= 6) {
+        char tmp[7]; strncpy(tmp, oui_str, 6); tmp[6] = '\0';
+        if (sscanf(tmp, "%2hhx%2hhx%2hhx", &oui[0], &oui[1], &oui[2]) == 3)
+            ok = true;
+    }
+
+    if (!ok) {
+        lv_textarea_set_text(add_oui_ta, "");
+        lv_textarea_set_placeholder_text(add_oui_ta, "Bad format — try AA:BB:CC");
+        return;
+    }
+
+    uint8_t oui_mac[6] = { oui[0], oui[1], oui[2], 0, 0, 0 };
+    bt_lookout_append(BT_LOOKOUT_CSV_PATH, oui_mac,
+                      (name_str && name_str[0]) ? name_str : NULL,
+                      BT_LOOKOUT_RSSI_ANY, true);
+
+    add_oui_ta      = NULL;
+    add_oui_name_ta = NULL;
+    add_oui_kb      = NULL;
+    show_lookout_editor_screen();
+}
+
+static void show_add_oui_entry_screen(void)
+{
+    add_oui_ta      = NULL;
+    add_oui_name_ta = NULL;
+    add_oui_kb      = NULL;
+
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+    bt_lookout_ui_active  = false;
+    bt_lookout_status_lbl = NULL;
+    bt_lookout_count_lbl  = NULL;
+    bt_lookout_last_lbl   = NULL;
+    bt_lookout_start_btn  = NULL;
+    bt_lookout_edit_btn   = NULL;
+    bt_lookout_oui_btn    = NULL;
+
+    create_function_page_base("Add OUI Entry");
+
+    /* Hint label */
+    lv_obj_t *hint = lv_label_create(function_page);
+    lv_label_set_text(hint, "OUI prefix  e.g.  AA:BB:CC");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint, lv_color_make(140, 140, 140), 0);
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 36);
+
+    /* OUI text area */
+    add_oui_ta = lv_textarea_create(function_page);
+    lv_obj_set_size(add_oui_ta, 210, 38);
+    lv_obj_align(add_oui_ta, LV_ALIGN_TOP_MID, 0, 52);
+    lv_textarea_set_one_line(add_oui_ta, true);
+    lv_textarea_set_max_length(add_oui_ta, 8);   /* "AA:BB:CC" */
+    lv_textarea_set_placeholder_text(add_oui_ta, "AA:BB:CC");
+    lv_obj_set_style_text_font(add_oui_ta, &lv_font_montserrat_16, 0);
+    lv_obj_add_event_cb(add_oui_ta, add_oui_ta_focus_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Label / name text area */
+    add_oui_name_ta = lv_textarea_create(function_page);
+    lv_obj_set_size(add_oui_name_ta, 210, 36);
+    lv_obj_align(add_oui_name_ta, LV_ALIGN_TOP_MID, 0, 98);
+    lv_textarea_set_one_line(add_oui_name_ta, true);
+    lv_textarea_set_max_length(add_oui_name_ta, 31);
+    lv_textarea_set_placeholder_text(add_oui_name_ta, "Label (optional)");
+    lv_obj_set_style_text_font(add_oui_name_ta, &lv_font_montserrat_14, 0);
+    lv_obj_add_event_cb(add_oui_name_ta, add_oui_ta_focus_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Button row */
+    lv_obj_t *btn_row = lv_obj_create(function_page);
+    lv_obj_set_size(btn_row, 228, 36);
+    lv_obj_align(btn_row, LV_ALIGN_TOP_MID, 0, 142);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_style_pad_column(btn_row, 8, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(back_btn, 104, 34);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_t *bk_lbl = lv_label_create(back_btn);
+    lv_label_set_text(bk_lbl, LV_SYMBOL_LEFT " Back");
+    lv_obj_set_style_text_font(bk_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bk_lbl, ui_text_color(), 0);
+    lv_obj_center(bk_lbl);
+    lv_obj_add_event_cb(back_btn, add_oui_back_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *add_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(add_btn, 104, 34);
+    lv_obj_set_style_bg_color(add_btn, lv_color_make(30, 100, 180), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(add_btn, lv_color_make(50, 130, 220), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(add_btn, 0, 0);
+    lv_obj_set_style_radius(add_btn, 8, 0);
+    lv_obj_t *add_lbl = lv_label_create(add_btn);
+    lv_label_set_text(add_lbl, LV_SYMBOL_PLUS " Add OUI");
+    lv_obj_set_style_text_font(add_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(add_lbl, lv_color_white(), 0);
+    lv_obj_center(add_lbl);
+    lv_obj_add_event_cb(add_btn, add_oui_confirm_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Keyboard — upper case for hex, anchored to bottom */
+    add_oui_kb = lv_keyboard_create(function_page);
+    lv_keyboard_set_textarea(add_oui_kb, add_oui_ta);
+    lv_keyboard_set_mode(add_oui_kb, LV_KEYBOARD_MODE_TEXT_UPPER);
+    lv_obj_set_size(add_oui_kb, lv_pct(100), lv_pct(40));
+    lv_obj_align(add_oui_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(add_oui_kb, ui_bg_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(add_oui_kb, ui_text_color(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(add_oui_kb, lv_color_make(40, 40, 60), LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(add_oui_kb, lv_color_make(70, 70, 100),
+                               LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(add_oui_kb, ui_text_color(), LV_PART_ITEMS);
+    lv_obj_set_style_border_color(add_oui_kb, ui_border_color(), LV_PART_ITEMS);
+    lv_obj_set_style_border_width(add_oui_kb, 1, LV_PART_ITEMS);
 }
 
 /* ── OUI Groups screen ────────────────────────────────────────────── */
@@ -16829,6 +17007,28 @@ static void show_bt_locator_direct_track(void)
 
 // ── GATT Walker ──────────────────────────────────────────────────
 
+static void gw_deferred_start_cb(lv_timer_t *t)
+{
+    lv_timer_del(t);
+    if (!gw_screen_active) return;
+
+    double lat    = current_gps.valid ? (double)current_gps.latitude  : 0.0;
+    double lon    = current_gps.valid ? (double)current_gps.longitude : 0.0;
+    bool   gps_ok = current_gps.valid;
+    int8_t rssi   = (bt_sas_selected_idx >= 0)
+                    ? bt_devices[bt_sas_selected_idx].rssi : -80;
+
+    if (!gw_walk(bt_sas_target_addr, bt_sas_target_addr_type,
+                 bt_sas_target_name, rssi, lat, lon, gps_ok)) {
+        if (gw_status_lbl && lv_obj_is_valid(gw_status_lbl))
+            lv_label_set_text(gw_status_lbl, "Failed to start walk");
+        if (gw_cancel_btn && lv_obj_is_valid(gw_cancel_btn))
+            lv_obj_add_flag(gw_cancel_btn, LV_OBJ_FLAG_HIDDEN);
+        if (gw_back_btn && lv_obj_is_valid(gw_back_btn))
+            lv_obj_clear_flag(gw_back_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 static void gw_back_btn_cb(lv_event_t *e)
 {
     gw_screen_active = false;
@@ -16989,25 +17189,12 @@ static void show_gatt_walker_screen(void)
     lv_obj_center(blbl);
     lv_obj_add_flag(gw_back_btn, LV_OBJ_FLAG_HIDDEN);
 
-    /* Mark screen active and start the walk */
-    gw_screen_active = true;
+    /* Mark screen active — walk starts after a brief timer to let NimBLE
+     * finish processing the disc_cancel before we call ble_gap_connect(). */
+    gw_screen_active   = true;
     gw_ui_needs_update = false;
 
-    /* GPS snapshot */
-    double lat    = current_gps.valid ? (double)current_gps.latitude  : 0.0;
-    double lon    = current_gps.valid ? (double)current_gps.longitude : 0.0;
-    bool   gps_ok = current_gps.valid;
-
-    if (!gw_walk(bt_sas_target_addr, bt_sas_target_addr_type,
-                 bt_sas_target_name, (int8_t)bt_devices[bt_sas_selected_idx].rssi,
-                 lat, lon, gps_ok)) {
-        if (gw_status_lbl && lv_obj_is_valid(gw_status_lbl))
-            lv_label_set_text(gw_status_lbl, "Failed to start walk");
-        if (gw_cancel_btn && lv_obj_is_valid(gw_cancel_btn))
-            lv_obj_add_flag(gw_cancel_btn, LV_OBJ_FLAG_HIDDEN);
-        if (gw_back_btn && lv_obj_is_valid(gw_back_btn))
-            lv_obj_clear_flag(gw_back_btn, LV_OBJ_FLAG_HIDDEN);
-    }
+    lv_timer_create(gw_deferred_start_cb, 250, NULL);
 }
 
 // Attack tile screen after device selection
