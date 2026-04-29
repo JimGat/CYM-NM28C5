@@ -17202,6 +17202,12 @@ static void show_gatt_walker_screen(void)
 }
 
 // Attack tile screen after device selection
+static void bt_attack_tiles_back_cb(lv_event_t *e)
+{
+    (void)e;
+    show_bt_scan_select_screen();
+}
+
 static void show_bt_attack_tiles_screen(void)
 {
     if (function_page) { lv_obj_del(function_page); function_page = NULL; }
@@ -17213,8 +17219,8 @@ static void show_bt_attack_tiles_screen(void)
     apply_menu_bg();
 
     lv_obj_t *tiles = lv_obj_create(function_page);
-    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
-    lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30 - 44);
+    lv_obj_align(tiles, LV_ALIGN_TOP_MID, 0, 30);
     lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
     lv_obj_set_style_pad_all(tiles, 10, 0);
@@ -17226,13 +17232,34 @@ static void show_bt_attack_tiles_screen(void)
     lv_obj_t *loc_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BT\nLocator", COLOR_TILE_BLUE, NULL, NULL);
     lv_obj_add_event_cb(loc_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Locator Direct");
 
-    // GATT Walker tile (placeholder - coming soon)
+    // GATT Walker tile
     lv_obj_t *gatt_tile = create_tile(tiles, MY_SYMBOL_PERSON_WALKING, "GATT\nWalker", COLOR_MATERIAL_PURPLE, NULL, NULL);
     lv_obj_add_event_cb(gatt_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"GATT Walker");
 
     // Add to BT Lookout watchlist
     lv_obj_t *add_lookout_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Add to\nBT Lookout", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(add_lookout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Add to Lookout");
+
+    /* Back button — return to BT Scan & Select */
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 30);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(back_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(back_icon, lv_color_white(), 0);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, "BT Scan");
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
+    lv_obj_add_event_cb(back_btn, bt_attack_tiles_back_cb, LV_EVENT_CLICKED, NULL);
 }
 
 static void stub_back_btn_cb(lv_event_t *e)
@@ -17504,6 +17531,7 @@ void menu_event_cb(lv_event_t *e)
 /* ── BT Lookout conflict warning ──────────────────────────────── */
 
 static lv_obj_t *s_bt_conflict_popup = NULL;
+static void (*s_conflict_deferred_fn)(void) = NULL;
 
 static void bt_conflict_dismiss_cb(lv_event_t *ev)
 {
@@ -17514,21 +17542,35 @@ static void bt_conflict_dismiss_cb(lv_event_t *ev)
     }
 }
 
+/* Called 250 ms after Stop&Go to let the lookout scan task finish its
+   current bt_stop_scan() call before we start a fresh scan. */
+static void bt_conflict_deferred_cb(lv_timer_t *t)
+{
+    lv_timer_del(t);
+    if (s_conflict_deferred_fn) {
+        void (*fn)(void) = s_conflict_deferred_fn;
+        s_conflict_deferred_fn = NULL;
+        fn();
+    }
+}
+
 static void bt_conflict_proceed_cb(lv_event_t *ev)
 {
-    void (*fn)(void) = (void (*)(void))lv_event_get_user_data(ev);
+    s_conflict_deferred_fn = (void (*)(void))lv_event_get_user_data(ev);
     if (s_bt_conflict_popup && lv_obj_is_valid(s_bt_conflict_popup)) {
         lv_obj_del(s_bt_conflict_popup);
         s_bt_conflict_popup = NULL;
     }
     bt_lookout_stop();
+    ble_gap_disc_cancel();   /* stop active scan now; lookout task's later bt_stop_scan() becomes a no-op */
     bt_lookout_ui_active  = false;
     bt_lookout_status_lbl = NULL;
     bt_lookout_count_lbl  = NULL;
     bt_lookout_last_lbl   = NULL;
     bt_lookout_start_btn  = NULL;
     bt_lookout_edit_btn   = NULL;
-    if (fn) fn();
+    bt_lookout_oui_btn    = NULL;
+    lv_timer_create(bt_conflict_deferred_cb, 250, NULL);
 }
 
 static void show_bt_conflict_warning(const char *fname, void (*proceed_fn)(void))
