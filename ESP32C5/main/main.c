@@ -87,6 +87,7 @@ LV_IMG_DECLARE(deedee_img);
 #include "esp_bt.h"
 #include "dexter_img.h"
 #include "bt_lookout.h"
+#include "oui_lookup.h"
 
 #define TAG "WiFi_Hacker"
 
@@ -1089,6 +1090,7 @@ static lv_obj_t   *bt_lookout_count_lbl        = NULL;
 static lv_obj_t   *bt_lookout_last_lbl         = NULL;
 static lv_obj_t   *bt_lookout_start_btn        = NULL;
 static lv_obj_t   *bt_lookout_edit_btn         = NULL;
+static lv_obj_t   *bt_lookout_oui_btn          = NULL;
 static lv_obj_t   *bt_lookout_popup_obj        = NULL;
 static lv_timer_t *bt_lookout_popup_tmr        = NULL;
 static TaskHandle_t bt_lookout_scan_loop_handle = NULL;
@@ -1462,6 +1464,8 @@ static void lookout_popup_dismiss_cb(lv_event_t *e);
 static void lookout_popup_auto_dismiss_cb(lv_timer_t *t);
 static void show_lookout_editor_screen(void);
 static void lookout_edit_btn_cb(lv_event_t *e);
+static void show_oui_groups_screen(void);
+static void lookout_oui_btn_cb(lv_event_t *e);
 
 // Deauth Monitor functions
 static void show_deauth_monitor_screen(void);
@@ -5977,10 +5981,12 @@ static void snifferdog_stop_btn_cb(lv_event_t *e)
         }
         
         esp_wifi_set_promiscuous(false);
+        esp_wifi_set_promiscuous_rx_cb(NULL);   /* clear stale callback */
+        wifi_scanner_abort();                   /* un-stick g_scan_in_progress */
         sniffer_dog_channel_index = 0;
         sniffer_dog_current_channel = dual_band_channels[0];
         sniffer_dog_last_channel_hop = 0;
-        
+
         ESP_LOGI(TAG, "Snifferdog stopped");
     }
     snifferdog_disable_log_capture();
@@ -10558,6 +10564,8 @@ static void radio_reset_to_idle(void)
     } else {
         // WiFi driver is alive — just cycle stop/start to clear AP, promisc, etc.
         esp_wifi_set_promiscuous(false);
+        esp_wifi_set_promiscuous_rx_cb(NULL);
+        wifi_scanner_abort();   /* clear any stuck scan state before stop */
         esp_wifi_stop();
         esp_wifi_set_mode(WIFI_MODE_STA);
         esp_wifi_start();
@@ -15562,7 +15570,7 @@ static void show_lookout_alert_popup(const char *name, const char *mac_str, int 
     bt_lookout_popup_obj = overlay;
 
     lv_obj_t *card = lv_obj_create(overlay);
-    lv_obj_set_size(card, 220, 160);
+    lv_obj_set_size(card, 220, 175);
     lv_obj_center(card);
     lv_obj_set_style_bg_color(card, lv_color_make(30, 30, 30), 0);
     lv_obj_set_style_border_color(card, COLOR_MATERIAL_RED, 0);
@@ -15591,6 +15599,29 @@ static void show_lookout_alert_popup(const char *name, const char *mac_str, int 
     lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
     lv_obj_align(mac_lbl, LV_ALIGN_TOP_MID, 0, 44);
 
+    /* Vendor lookup: mac_str is NimBLE LE order; raw[5..3] = OUI standard notation */
+    int next_y = 60;
+    if (oui_lookup_is_loaded() && mac_str && strlen(mac_str) == 17) {
+        uint8_t raw[6];
+        if (sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                   &raw[0], &raw[1], &raw[2], &raw[3], &raw[4], &raw[5]) == 6) {
+            uint8_t oui[3] = {raw[5], raw[4], raw[3]};
+            const char *vendor = oui_lookup(oui);
+            if (vendor && vendor[0]) {
+                lv_obj_t *vend_lbl = lv_label_create(card);
+                char vend_buf[32];
+                snprintf(vend_buf, sizeof(vend_buf), "%s", vendor);
+                lv_label_set_text(vend_lbl, vend_buf);
+                lv_label_set_long_mode(vend_lbl, LV_LABEL_LONG_DOT);
+                lv_obj_set_width(vend_lbl, 200);
+                lv_obj_set_style_text_color(vend_lbl, lv_color_make(150, 150, 255), 0);
+                lv_obj_set_style_text_font(vend_lbl, &lv_font_montserrat_12, 0);
+                lv_obj_align(vend_lbl, LV_ALIGN_TOP_MID, 0, next_y);
+                next_y += 16;
+            }
+        }
+    }
+
     if (rssi != 0) {
         lv_obj_t *rssi_lbl = lv_label_create(card);
         char rssi_buf[24];
@@ -15598,7 +15629,8 @@ static void show_lookout_alert_popup(const char *name, const char *mac_str, int 
         lv_label_set_text(rssi_lbl, rssi_buf);
         lv_obj_set_style_text_color(rssi_lbl, lv_color_make(100, 220, 100), 0);
         lv_obj_set_style_text_font(rssi_lbl, &lv_font_montserrat_12, 0);
-        lv_obj_align(rssi_lbl, LV_ALIGN_TOP_MID, 0, 60);
+        lv_obj_align(rssi_lbl, LV_ALIGN_TOP_MID, 0, next_y);
+        next_y += 16;
     }
 
     lv_obj_t *btn = lv_btn_create(card);
@@ -15654,6 +15686,12 @@ static void bt_lookout_update_ui(void)
         else
             lv_obj_clear_flag(bt_lookout_edit_btn, LV_OBJ_FLAG_HIDDEN);
     }
+    if (bt_lookout_oui_btn && lv_obj_is_valid(bt_lookout_oui_btn)) {
+        if (bt_lookout_is_active())
+            lv_obj_add_flag(bt_lookout_oui_btn, LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_clear_flag(bt_lookout_oui_btn, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 static void bt_lookout_scan_loop_task(void *pv)
@@ -15707,6 +15745,7 @@ static void lookout_back_btn_cb(lv_event_t *e)
     bt_lookout_last_lbl   = NULL;
     bt_lookout_start_btn  = NULL;
     bt_lookout_edit_btn   = NULL;
+    bt_lookout_oui_btn    = NULL;
     if (!bt_lookout_is_active() && current_radio_mode == RADIO_MODE_BLE) {
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
@@ -15726,8 +15765,10 @@ static void show_bt_lookout_screen(void)
     bt_lookout_last_lbl   = NULL;
     bt_lookout_start_btn  = NULL;
     bt_lookout_edit_btn   = NULL;
+    bt_lookout_oui_btn    = NULL;
 
     ensure_sd_mounted();
+    if (!oui_lookup_is_loaded()) oui_lookup_init(OUI_DEFAULT_PATH);
     if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
         bt_lookout_load(BT_LOOKOUT_CSV_PATH);
         xSemaphoreGive(sd_spi_mutex);
@@ -15826,10 +15867,10 @@ static void show_bt_lookout_screen(void)
 
     lv_obj_add_event_cb(dark_btn, lookout_dark_btn_cb, LV_EVENT_CLICKED, NULL);
 
-    // Edit Watchlist button — only visible when monitoring is stopped
+    // Edit Watchlist + OUI Groups buttons — side by side, only visible when stopped
     bt_lookout_edit_btn = lv_btn_create(function_page);
-    lv_obj_set_size(bt_lookout_edit_btn, 110, 28);
-    lv_obj_align(bt_lookout_edit_btn, LV_ALIGN_TOP_MID, 0, 235);
+    lv_obj_set_size(bt_lookout_edit_btn, 106, 28);
+    lv_obj_align(bt_lookout_edit_btn, LV_ALIGN_TOP_MID, -58, 235);
     lv_obj_set_style_bg_color(bt_lookout_edit_btn, lv_color_make(30, 80, 140), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(bt_lookout_edit_btn, lv_color_make(50, 110, 180), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(bt_lookout_edit_btn, 0, 0);
@@ -15847,6 +15888,27 @@ static void show_bt_lookout_screen(void)
     lv_obj_set_style_text_color(ed_lbl, lv_color_white(), 0);
     lv_obj_add_event_cb(bt_lookout_edit_btn, lookout_edit_btn_cb, LV_EVENT_CLICKED, NULL);
     if (is_active) lv_obj_add_flag(bt_lookout_edit_btn, LV_OBJ_FLAG_HIDDEN);
+
+    bt_lookout_oui_btn = lv_btn_create(function_page);
+    lv_obj_set_size(bt_lookout_oui_btn, 106, 28);
+    lv_obj_align(bt_lookout_oui_btn, LV_ALIGN_TOP_MID, 58, 235);
+    lv_obj_set_style_bg_color(bt_lookout_oui_btn, lv_color_make(70, 30, 120), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(bt_lookout_oui_btn, lv_color_make(100, 50, 160), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(bt_lookout_oui_btn, 0, 0);
+    lv_obj_set_style_radius(bt_lookout_oui_btn, 8, 0);
+    lv_obj_set_flex_flow(bt_lookout_oui_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(bt_lookout_oui_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(bt_lookout_oui_btn, 4, 0);
+    lv_obj_t *og_icon = lv_label_create(bt_lookout_oui_btn);
+    lv_label_set_text(og_icon, LV_SYMBOL_WIFI);
+    lv_obj_set_style_text_font(og_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(og_icon, lv_color_white(), 0);
+    lv_obj_t *og_lbl = lv_label_create(bt_lookout_oui_btn);
+    lv_label_set_text(og_lbl, "OUI Groups");
+    lv_obj_set_style_text_font(og_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(og_lbl, lv_color_white(), 0);
+    lv_obj_add_event_cb(bt_lookout_oui_btn, lookout_oui_btn_cb, LV_EVENT_CLICKED, NULL);
+    if (is_active) lv_obj_add_flag(bt_lookout_oui_btn, LV_OBJ_FLAG_HIDDEN);
 
     // Back button
     lv_obj_t *back_btn = lv_btn_create(function_page);
@@ -15878,6 +15940,12 @@ static void show_bt_lookout_screen(void)
 static bool s_editor_delete[BT_LOOKOUT_MAX_ENTRIES];
 static int  s_editor_count  = 0;
 static lv_obj_t *s_editor_rows[BT_LOOKOUT_MAX_ENTRIES];
+
+static void lookout_oui_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    show_oui_groups_screen();
+}
 
 static void lookout_edit_btn_cb(lv_event_t *e)
 {
@@ -15915,10 +15983,10 @@ static void lookout_editor_save_cb(lv_event_t *ev)
                 if (s_editor_delete[i]) continue;
                 const bt_lookout_entry_t *ent = bt_lookout_get(i);
                 if (!ent) continue;
-                fprintf(fp, "%02X:%02X:%02X:%02X:%02X:%02X,%s,%d\n",
+                fprintf(fp, "%02X:%02X:%02X:%02X:%02X:%02X,%s,%d,%d\n",
                         ent->mac[0], ent->mac[1], ent->mac[2],
                         ent->mac[3], ent->mac[4], ent->mac[5],
-                        ent->name, ent->rssi_threshold);
+                        ent->name, ent->rssi_threshold, (int)ent->oui_only);
             }
             fclose(fp);
         }
@@ -15948,6 +16016,7 @@ static void show_lookout_editor_screen(void)
     bt_lookout_last_lbl   = NULL;
     bt_lookout_start_btn  = NULL;
     bt_lookout_edit_btn   = NULL;
+    bt_lookout_oui_btn    = NULL;
 
     create_function_page_base("Edit Watchlist");
 
@@ -16006,10 +16075,15 @@ static void show_lookout_editor_screen(void)
         lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
         lv_obj_set_width(name_lbl, 150);
 
-        char mac_str[18];
-        snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
-                 ent->mac[0], ent->mac[1], ent->mac[2],
-                 ent->mac[3], ent->mac[4], ent->mac[5]);
+        char mac_str[24];
+        if (ent->oui_only) {
+            snprintf(mac_str, sizeof(mac_str), "OUI: %02X:%02X:%02X:*",
+                     ent->mac[0], ent->mac[1], ent->mac[2]);
+        } else {
+            snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     ent->mac[0], ent->mac[1], ent->mac[2],
+                     ent->mac[3], ent->mac[4], ent->mac[5]);
+        }
         lv_obj_t *mac_lbl = lv_label_create(info);
         lv_label_set_text(mac_lbl, mac_str);
         lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
@@ -16083,6 +16157,161 @@ static void show_lookout_editor_screen(void)
     lv_obj_set_style_text_font(sv_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(sv_lbl, lv_color_white(), 0);
     lv_obj_add_event_cb(save_btn, lookout_editor_save_cb, LV_EVENT_CLICKED, NULL);
+}
+
+/* ── OUI Groups screen ────────────────────────────────────────────── */
+
+typedef struct {
+    const char *name;
+    const char *description;
+    uint8_t     ouis[4][3];
+    int         oui_count;
+} oui_group_def_t;
+
+static const oui_group_def_t OUI_GROUPS[] = {
+    { "Axon Body Cam",      "Law enforcement body cameras",
+      {{0x00, 0x25, 0xDF}}, 1 },
+    { "Flock Safety ALPR",  "License plate reader cameras",
+      {{0x70, 0xC9, 0x4E}, {0x3C, 0x91, 0x80}, {0xD8, 0xF3, 0xBC}}, 3 },
+    { "Motorola Solutions", "Two-way radio / body cam",
+      {{0x4C, 0xCC, 0x34}}, 1 },
+    { "Samsung SmartTag",   "Bluetooth tracker",
+      {{0x64, 0x1B, 0x2F}}, 1 },
+};
+static const int OUI_GROUPS_COUNT = (int)(sizeof(OUI_GROUPS) / sizeof(OUI_GROUPS[0]));
+
+static void oui_group_add_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= OUI_GROUPS_COUNT) return;
+    const oui_group_def_t *grp = &OUI_GROUPS[idx];
+
+    ensure_sd_mounted();
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        for (int i = 0; i < grp->oui_count; i++) {
+            uint8_t oui_mac[6] = {grp->ouis[i][0], grp->ouis[i][1], grp->ouis[i][2], 0, 0, 0};
+            bt_lookout_append(BT_LOOKOUT_CSV_PATH, oui_mac, grp->name,
+                              BT_LOOKOUT_RSSI_ANY, true);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    /* Visual feedback on the tapped button */
+    lv_obj_t *btn = lv_event_get_target(e);
+    lv_obj_set_style_bg_color(btn, lv_color_make(50, 50, 50), LV_STATE_DEFAULT);
+    lv_obj_t *lbl = lv_obj_get_child(btn, 0);
+    if (lbl && lv_obj_is_valid(lbl)) lv_label_set_text(lbl, "Added!");
+}
+
+static void oui_groups_back_cb(lv_event_t *e)
+{
+    (void)e;
+    show_bt_lookout_screen();
+}
+
+static void show_oui_groups_screen(void)
+{
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+    bt_lookout_ui_active = false;
+    bt_lookout_status_lbl = NULL;
+    bt_lookout_count_lbl  = NULL;
+    bt_lookout_last_lbl   = NULL;
+    bt_lookout_start_btn  = NULL;
+    bt_lookout_edit_btn   = NULL;
+    bt_lookout_oui_btn    = NULL;
+
+    create_function_page_base("OUI Groups");
+
+    /* Scrollable group list */
+    lv_obj_t *scroll = lv_obj_create(function_page);
+    lv_obj_set_size(scroll, 228, LCD_V_RES - 30 - 6 - 38 - 6);
+    lv_obj_align(scroll, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_set_style_bg_color(scroll, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(scroll, 0, 0);
+    lv_obj_set_style_pad_all(scroll, 4, 0);
+    lv_obj_set_style_pad_row(scroll, 6, 0);
+    lv_obj_set_flex_flow(scroll, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(scroll, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+    for (int g = 0; g < OUI_GROUPS_COUNT; g++) {
+        const oui_group_def_t *grp = &OUI_GROUPS[g];
+
+        lv_obj_t *card = lv_obj_create(scroll);
+        lv_obj_set_width(card, lv_pct(100));
+        lv_obj_set_height(card, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+        lv_obj_set_style_border_color(card, lv_color_make(70, 30, 120), 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_radius(card, 6, 0);
+        lv_obj_set_style_pad_all(card, 6, 0);
+        lv_obj_set_style_pad_row(card, 3, 0);
+        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+        /* Group name */
+        lv_obj_t *name_lbl = lv_label_create(card);
+        lv_label_set_text(name_lbl, grp->name);
+        lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(name_lbl, ui_text_color(), 0);
+
+        /* Description */
+        lv_obj_t *desc_lbl = lv_label_create(card);
+        lv_label_set_text(desc_lbl, grp->description);
+        lv_obj_set_style_text_font(desc_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(desc_lbl, lv_color_make(140, 140, 140), 0);
+
+        /* OUI prefix list */
+        char oui_buf[64];
+        int  off = 0;
+        for (int i = 0; i < grp->oui_count && off < (int)sizeof(oui_buf) - 12; i++) {
+            if (i > 0) { oui_buf[off++] = ' '; }
+            off += snprintf(oui_buf + off, sizeof(oui_buf) - (size_t)off,
+                            "%02X:%02X:%02X:*",
+                            grp->ouis[i][0], grp->ouis[i][1], grp->ouis[i][2]);
+        }
+        lv_obj_t *oui_lbl = lv_label_create(card);
+        lv_label_set_text(oui_lbl, oui_buf);
+        lv_obj_set_style_text_font(oui_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(oui_lbl, lv_color_make(100, 200, 100), 0);
+        lv_label_set_long_mode(oui_lbl, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(oui_lbl, lv_pct(100));
+
+        /* Add to Watchlist button */
+        lv_obj_t *add_btn = lv_btn_create(card);
+        lv_obj_set_size(add_btn, 150, 26);
+        lv_obj_set_style_bg_color(add_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(add_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 40), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(add_btn, 0, 0);
+        lv_obj_set_style_radius(add_btn, 6, 0);
+        lv_obj_t *add_lbl = lv_label_create(add_btn);
+        lv_label_set_text(add_lbl, "+ Add to Watchlist");
+        lv_obj_set_style_text_font(add_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(add_lbl, lv_color_white(), 0);
+        lv_obj_center(add_lbl);
+        lv_obj_add_event_cb(add_btn, oui_group_add_cb, LV_EVENT_CLICKED, (void *)(intptr_t)g);
+    }
+
+    /* Back button */
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 30);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_t *b_icon = lv_label_create(back_btn);
+    lv_label_set_text(b_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(b_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(b_icon, ui_text_color(), 0);
+    lv_obj_t *b_lbl = lv_label_create(back_btn);
+    lv_label_set_text(b_lbl, "Back");
+    lv_obj_set_style_text_font(b_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(b_lbl, ui_text_color(), 0);
+    lv_obj_add_event_cb(back_btn, oui_groups_back_cb, LV_EVENT_CLICKED, NULL);
 }
 
 // Bluetooth screen
@@ -16316,7 +16545,11 @@ static void bt_sas_refresh_list(void)
         bt_device_info_t *dev = &bt_devices[i];
         bool selected = (i == bt_sas_selected_idx);
 
-        char item_text[64];
+        /* OUI vendor lookup (addr is NimBLE LE: addr[5]:addr[4]:addr[3] = OUI) */
+        uint8_t oui[3] = {dev->addr[5], dev->addr[4], dev->addr[3]};
+        const char *vendor = oui_lookup(oui);
+
+        char item_text[72];
         char short_name[14];
         if (dev->name[0] != '\0') {
             strncpy(short_name, dev->name, 13);
@@ -16324,10 +16557,21 @@ static void bt_sas_refresh_list(void)
             snprintf(item_text, sizeof(item_text), "%s  %d dBm  %02X:%02X:%02X",
                      short_name, dev->rssi,
                      dev->addr[2], dev->addr[1], dev->addr[0]);
+        } else if (dev->is_airtag) {
+            snprintf(item_text, sizeof(item_text), "[AirTag]  %d dBm  %02X:%02X:%02X",
+                     dev->rssi, dev->addr[2], dev->addr[1], dev->addr[0]);
+        } else if (dev->is_smarttag) {
+            snprintf(item_text, sizeof(item_text), "[SmartTag]  %d dBm  %02X:%02X:%02X",
+                     dev->rssi, dev->addr[2], dev->addr[1], dev->addr[0]);
+        } else if (vendor) {
+            char vend_short[13];
+            strncpy(vend_short, vendor, 12);
+            vend_short[12] = '\0';
+            snprintf(item_text, sizeof(item_text), "[%s]  %d dBm  %02X:%02X:%02X",
+                     vend_short, dev->rssi, dev->addr[2], dev->addr[1], dev->addr[0]);
         } else {
-            const char *tag = dev->is_airtag ? " [AirTag]" : dev->is_smarttag ? " [SmartTag]" : "";
-            snprintf(item_text, sizeof(item_text), "[Unknown]%s  %d dBm  %02X:%02X:%02X",
-                     tag, dev->rssi, dev->addr[2], dev->addr[1], dev->addr[0]);
+            snprintf(item_text, sizeof(item_text), "[Unknown]  %d dBm  %02X:%02X:%02X",
+                     dev->rssi, dev->addr[2], dev->addr[1], dev->addr[0]);
         }
 
         lv_obj_t *btn = lv_btn_create(bt_sas_list);
@@ -16354,6 +16598,11 @@ static void show_bt_scan_select_screen(void)
     ui_locked = true;
     if (function_page) { lv_obj_del(function_page); function_page = NULL; }
     reset_function_page_children();
+
+    if (!oui_lookup_is_loaded()) {
+        ensure_sd_mounted();
+        oui_lookup_init(OUI_DEFAULT_PATH);
+    }
 
     create_function_page_base("BT Scan & Select");
     bt_sas_ui_active = true;
@@ -17783,7 +18032,7 @@ void attack_event_cb(lv_event_t *e)
         if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
             saved = bt_lookout_append(BT_LOOKOUT_CSV_PATH, bt_sas_target_addr,
                                       bt_sas_target_name[0] ? bt_sas_target_name : NULL,
-                                      BT_LOOKOUT_RSSI_ANY);
+                                      BT_LOOKOUT_RSSI_ANY, false);
             xSemaphoreGive(sd_spi_mutex);
         }
         if (saved) {

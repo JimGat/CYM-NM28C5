@@ -23,16 +23,17 @@
 #define BT_LOOKOUT_MAX_ENTRIES    64
 #define BT_LOOKOUT_MAX_COOLDOWN   16
 #define BT_LOOKOUT_CSV_PATH       "/sdcard/lab/bluetooth/lookout.csv"
-#define BT_LOOKOUT_CSV_HEADER     "mac,name,rssi_threshold\n"
+#define BT_LOOKOUT_CSV_HEADER     "mac,name,rssi_threshold,oui_only\n"
 #define BT_LOOKOUT_RSSI_ANY       (-99)  /* trigger regardless of measured RSSI */
 
 /* ── Types ─────────────────────────────────────────────────────── */
 
 /** One entry in the watchlist. */
 typedef struct {
-    uint8_t mac[6];           /**< 6-byte BLE MAC (little-endian, as from NimBLE) */
+    uint8_t mac[6];           /**< 6-byte BLE MAC (NimBLE LE order) or OUI prefix in mac[0..2] */
     char    name[32];         /**< human-readable label from CSV or advertisement  */
     int     rssi_threshold;   /**< trigger when RSSI >= this; BT_LOOKOUT_RSSI_ANY = any */
+    bool    oui_only;         /**< if true, match only on mac[0..2] OUI prefix (NimBLE mac[5..3]) */
 } bt_lookout_entry_t;
 
 /** Snapshot of the most-recent detection, consumed by the caller once. */
@@ -60,12 +61,15 @@ int  bt_lookout_load(const char *csv_path);
 
 /**
  * Append one entry to csv_path and the in-memory list.
+ * For OUI-only entries: set oui_only=true and pass 3 OUI bytes in mac[0..2]
+ * (standard notation order) with mac[3..5]=0x00.
  * Safe to call at any time; opens/closes the file each call.
  */
 bool bt_lookout_append(const char   *csv_path,
                        const uint8_t mac[6],
                        const char   *name,
-                       int           rssi_threshold);
+                       int           rssi_threshold,
+                       bool          oui_only);
 
 /* ── Scan-result integration ───────────────────────────────────── */
 /**
