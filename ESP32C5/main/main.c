@@ -59,6 +59,7 @@ LV_IMG_DECLARE(deedee_img);
 #include "esp_task_wdt.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "esp_http_server.h"
 
 // GPS
 #include "driver/uart.h"
@@ -298,6 +299,9 @@ static uint8_t screen_brightness_pct = 80;  // 10-100% (default 80)
 static lv_obj_t *brightness_overlay = NULL; // Software brightness overlay on lv_layer_top()
 static uint16_t scan_time_min_ms = 100;     // Active scan min time per channel (default 100)
 static uint16_t scan_time_max_ms = 300;     // Active scan max time per channel (default 300)
+static uint32_t g_gatt_timeout_ms = 30000; // GATT connect timeout (NVS-persisted)
+static char     g_saved_wifi_ssid[33] = ""; // Home network SSID for file server STA mode
+static char     g_saved_wifi_pass[65] = ""; // Home network password
 
 // NVS settings keys
 #define NVS_NAMESPACE       "settings"
@@ -305,8 +309,11 @@ static uint16_t scan_time_max_ms = 300;     // Active scan max time per channel 
 #define NVS_KEY_BRIGHTNESS  "scr_bright"
 #define NVS_KEY_SCAN_MIN    "scan_min"
 #define NVS_KEY_SCAN_MAX    "scan_max"
-#define NVS_KEY_DARK_MODE   "dark_mode"
-#define NVS_KEY_POWER_MODE  "pwr_mode"
+#define NVS_KEY_DARK_MODE    "dark_mode"
+#define NVS_KEY_POWER_MODE   "pwr_mode"
+#define NVS_KEY_GATT_TIMEOUT "gatt_tmo"
+#define NVS_KEY_WIFI_SSID    "wifi_ssid"
+#define NVS_KEY_WIFI_PASS    "wifi_pass"
 
 // Touch calibration NVS
 #define TOUCH_CAL_NVS_NS      "touch_cal"
@@ -1467,6 +1474,11 @@ static void disco_task(void *arg);
 static void show_bt_scan_select_screen(void);
 static void show_bt_attack_tiles_screen(void);
 static void bt_sas_refresh_list(void);
+
+// Data Transfer screens
+static void show_data_transfer_screen(void);
+static void show_ap_file_server_screen(void);
+static void show_wifi_client_server_screen(void);
 static void show_bt_locator_direct_track(void);
 
 // GATT Walker
@@ -2121,10 +2133,18 @@ static void nvs_settings_load(void)
         if (nvs_get_u8(h, NVS_KEY_POWER_MODE, &pm) == ESP_OK) {
             g_max_power_mode = (pm != 0);
         }
+        uint32_t gatt_tmo = 30000;
+        if (nvs_get_u32(h, NVS_KEY_GATT_TIMEOUT, &gatt_tmo) == ESP_OK) {
+            g_gatt_timeout_ms = gatt_tmo;
+        }
+        size_t ssid_len = sizeof(g_saved_wifi_ssid);
+        nvs_get_str(h, NVS_KEY_WIFI_SSID, g_saved_wifi_ssid, &ssid_len);
+        size_t pass_len = sizeof(g_saved_wifi_pass);
+        nvs_get_str(h, NVS_KEY_WIFI_PASS, g_saved_wifi_pass, &pass_len);
         nvs_close(h);
-        ESP_LOGI(TAG, "NVS settings loaded: timeout=%ldms, brightness=%u%%, scan=%u-%ums, dark=%d, max_power=%d",
+        ESP_LOGI(TAG, "NVS settings loaded: timeout=%ldms, brightness=%u%%, scan=%u-%ums, dark=%d, max_power=%d, gatt_tmo=%ums",
                  (long)screen_timeout_ms, screen_brightness_pct, scan_time_min_ms, scan_time_max_ms,
-                 dark_mode_enabled, g_max_power_mode);
+                 dark_mode_enabled, g_max_power_mode, (unsigned)g_gatt_timeout_ms);
     } else {
         ESP_LOGW(TAG, "NVS settings not found (first boot), using defaults");
         screen_timeout_ms = 0;
@@ -2133,8 +2153,12 @@ static void nvs_settings_load(void)
         scan_time_max_ms = 300;
         dark_mode_enabled = true;
         g_max_power_mode = false;
+        g_gatt_timeout_ms = 30000;
+        g_saved_wifi_ssid[0] = '\0';
+        g_saved_wifi_pass[0] = '\0';
     }
     wifi_scanner_set_scan_time(scan_time_min_ms, scan_time_max_ms);
+    gw_set_timeout(g_gatt_timeout_ms);
 }
 
 static void nvs_settings_save_timeout(int32_t ms)
@@ -2190,6 +2214,29 @@ static void nvs_settings_save_power_mode(bool max_power)
         nvs_commit(h);
         nvs_close(h);
         ESP_LOGI(TAG, "NVS: saved power_mode = %s", max_power ? "MAX" : "Normal");
+    }
+}
+
+static void nvs_settings_save_gatt_timeout(uint32_t ms)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u32(h, NVS_KEY_GATT_TIMEOUT, ms);
+        nvs_commit(h);
+        nvs_close(h);
+        ESP_LOGI(TAG, "NVS: saved gatt_timeout = %ums", (unsigned)ms);
+    }
+}
+
+static void nvs_settings_save_wifi_creds(const char *ssid, const char *pass)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_str(h, NVS_KEY_WIFI_SSID, ssid ? ssid : "");
+        nvs_set_str(h, NVS_KEY_WIFI_PASS, pass ? pass : "");
+        nvs_commit(h);
+        nvs_close(h);
+        ESP_LOGI(TAG, "NVS: saved wifi creds ssid=%s", ssid ? ssid : "");
     }
 }
 
@@ -14006,6 +14053,615 @@ static void show_download_mode_screen(void)
 }
 
 // ============================================================================
+// GATT Connect Timeout Popup
+// ============================================================================
+
+static lv_obj_t *gatt_tmo_popup  = NULL;
+static lv_obj_t *gatt_tmo_slider = NULL;
+static lv_obj_t *gatt_tmo_label  = NULL;
+
+static void gatt_tmo_slider_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!gatt_tmo_slider || !gatt_tmo_label) return;
+    int32_t val = lv_slider_get_value(gatt_tmo_slider);
+    char buf[36];
+    snprintf(buf, sizeof(buf), "Timeout: %ldms", (long)val);
+    lv_label_set_text(gatt_tmo_label, buf);
+}
+
+static void gatt_tmo_popup_close_cb(lv_event_t *e)
+{
+    (void)e;
+    if (gatt_tmo_popup) { lv_obj_del(gatt_tmo_popup); gatt_tmo_popup = NULL; }
+    gatt_tmo_slider = NULL;
+    gatt_tmo_label  = NULL;
+}
+
+static void gatt_tmo_popup_save_cb(lv_event_t *e)
+{
+    if (!gatt_tmo_slider) return;
+    uint32_t val = (uint32_t)lv_slider_get_value(gatt_tmo_slider);
+    g_gatt_timeout_ms = val;
+    gw_set_timeout(val);
+    nvs_settings_save_gatt_timeout(val);
+    gatt_tmo_popup_close_cb(e);
+}
+
+static void show_gatt_timeout_popup(void)
+{
+    if (gatt_tmo_popup) return;
+
+    gatt_tmo_popup = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(gatt_tmo_popup, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(gatt_tmo_popup, 0, 0);
+    lv_obj_set_style_bg_color(gatt_tmo_popup, ui_bg_color(), 0);
+    lv_obj_set_style_bg_opa(gatt_tmo_popup, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(gatt_tmo_popup, 0, 0);
+    lv_obj_set_style_radius(gatt_tmo_popup, 0, 0);
+    lv_obj_clear_flag(gatt_tmo_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(gatt_tmo_popup, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *dialog = lv_obj_create(gatt_tmo_popup);
+    lv_obj_set_size(dialog, 220, LV_SIZE_CONTENT);
+    lv_obj_center(dialog);
+    lv_obj_set_style_bg_color(dialog, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(dialog, UI_ACCENT_CYAN, 0);
+    lv_obj_set_style_border_width(dialog, 2, 0);
+    lv_obj_set_style_radius(dialog, 12, 0);
+    lv_obj_clear_flag(dialog, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(dialog, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(dialog, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(dialog, 10, 0);
+    lv_obj_set_style_pad_gap(dialog, 6, 0);
+
+    lv_obj_t *title = lv_label_create(dialog);
+    lv_label_set_text(title, "GATT Connect Timeout");
+    lv_obj_set_style_text_color(title, ui_text_color(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+
+    gatt_tmo_label = lv_label_create(dialog);
+    char buf[36];
+    snprintf(buf, sizeof(buf), "Timeout: %ums", (unsigned)g_gatt_timeout_ms);
+    lv_label_set_text(gatt_tmo_label, buf);
+    lv_obj_set_style_text_color(gatt_tmo_label, UI_ACCENT_CYAN, 0);
+    lv_obj_set_style_text_font(gatt_tmo_label, &lv_font_montserrat_12, 0);
+
+    gatt_tmo_slider = lv_slider_create(dialog);
+    lv_obj_set_width(gatt_tmo_slider, 196);
+    lv_slider_set_range(gatt_tmo_slider, 3000, 30000);
+    lv_slider_set_value(gatt_tmo_slider, (int32_t)g_gatt_timeout_ms, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(gatt_tmo_slider, lv_color_make(80, 80, 80), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(gatt_tmo_slider, UI_ACCENT_CYAN, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(gatt_tmo_slider, UI_ACCENT_CYAN, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(gatt_tmo_slider, 4, LV_PART_KNOB);
+    lv_obj_add_event_cb(gatt_tmo_slider, gatt_tmo_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *note = lv_label_create(dialog);
+    lv_label_set_text(note, "3s = fast  |  30s = patient");
+    lv_obj_set_style_text_color(note, ui_muted_color(), 0);
+    lv_obj_set_style_text_font(note, &lv_font_montserrat_12, 0);
+
+    lv_obj_t *btn_row = lv_obj_create(dialog);
+    lv_obj_set_size(btn_row, 196, 36);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel_btn, 90, 30);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_make(80, 80, 80), 0);
+    lv_obj_set_style_radius(cancel_btn, 8, 0);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, "Cancel");
+    lv_obj_set_style_text_color(cancel_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(cancel_lbl);
+    lv_obj_add_event_cb(cancel_btn, gatt_tmo_popup_close_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *save_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(save_btn, 90, 30);
+    lv_obj_set_style_bg_color(save_btn, UI_ACCENT_CYAN, 0);
+    lv_obj_set_style_bg_color(save_btn, lv_color_lighten(UI_ACCENT_CYAN, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(save_btn, 8, 0);
+    lv_obj_t *save_lbl = lv_label_create(save_btn);
+    lv_label_set_text(save_lbl, "Save");
+    lv_obj_set_style_text_color(save_lbl, lv_color_black(), 0);
+    lv_obj_set_style_text_font(save_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(save_lbl);
+    lv_obj_add_event_cb(save_btn, gatt_tmo_popup_save_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// ============================================================================
+// WiFi File Server — HTTP handlers (AP and STA modes)
+// ============================================================================
+
+static httpd_handle_t s_fileserv_httpd  = NULL;
+static bool           s_fileserv_active = false;
+static lv_obj_t      *s_fileserv_ip_lbl = NULL;
+static lv_obj_t      *s_fileserv_status_lbl = NULL;
+static lv_timer_t    *s_fileserv_poll_timer = NULL;
+
+/* Stream a file from SD to HTTP response in 4 KB chunks. */
+static void s_fileserv_send_file(httpd_req_t *req, const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) { httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File not found"); return; }
+
+    const char *ext = strrchr(path, '.');
+    if      (ext && strcasecmp(ext, ".json") == 0) httpd_resp_set_type(req, "application/json");
+    else if (ext && strcasecmp(ext, ".csv")  == 0) httpd_resp_set_type(req, "text/csv");
+    else if (ext && strcasecmp(ext, ".txt")  == 0) httpd_resp_set_type(req, "text/plain");
+    else if (ext && strcasecmp(ext, ".html") == 0) httpd_resp_set_type(req, "text/html");
+    else                                            httpd_resp_set_type(req, "application/octet-stream");
+    httpd_resp_set_hdr(req, "Content-Disposition", "inline");
+
+    char *buf = malloc(4096);
+    if (!buf) { fclose(f); httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return; }
+    size_t n;
+    while ((n = fread(buf, 1, 4096, f)) > 0) {
+        if (httpd_resp_send_chunk(req, buf, n) != ESP_OK) break;
+    }
+    httpd_resp_send_chunk(req, NULL, 0);
+    free(buf);
+    fclose(f);
+}
+
+/* Send an HTML directory listing for sd_path, with URL base url_path. */
+static void s_fileserv_send_dir(httpd_req_t *req, const char *sd_path, const char *url_path)
+{
+    DIR *d = opendir(sd_path);
+    if (!d) { httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Directory not found"); return; }
+
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+
+    char chunk[512];
+    snprintf(chunk, sizeof(chunk),
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width'>"
+        "<title>JANOS</title></head>"
+        "<body style='font-family:monospace;background:#111;color:#0f0;padding:8px'>"
+        "<h2 style='color:#0ff'>%s</h2><hr>", url_path);
+    httpd_resp_send_chunk(req, chunk, strlen(chunk));
+
+    if (strlen(url_path) > 1) {
+        char parent[128];
+        strncpy(parent, url_path, sizeof(parent) - 1);
+        parent[sizeof(parent)-1] = '\0';
+        char *sl = strrchr(parent, '/');
+        if (sl && sl != parent) *sl = '\0'; else strcpy(parent, "/");
+        int n = snprintf(chunk, sizeof(chunk),
+            "<p><a href='/files%s' style='color:#0ff'>[..] Parent</a></p>", parent);
+        if (n > 0 && n < (int)sizeof(chunk)) httpd_resp_send_chunk(req, chunk, n);
+    }
+
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        char entry_sd[260];
+        snprintf(entry_sd, sizeof(entry_sd), "%s/%.200s", sd_path, e->d_name);
+        const char *sep = (url_path[strlen(url_path)-1] == '/') ? "" : "/";
+        struct stat st;
+        memset(&st, 0, sizeof(st));
+        stat(entry_sd, &st);
+        int n;
+        if (S_ISDIR(st.st_mode)) {
+            n = snprintf(chunk, sizeof(chunk),
+                "<p><a href='/files%s%s%.100s' style='color:#ff0'>[DIR] %.100s</a></p>",
+                url_path, sep, e->d_name, e->d_name);
+        } else {
+            n = snprintf(chunk, sizeof(chunk),
+                "<p><a href='/files%s%s%.100s' style='color:#0f0'>%.100s</a>"
+                " <span style='color:#888'>(%ld B)</span></p>",
+                url_path, sep, e->d_name, e->d_name, (long)st.st_size);
+        }
+        if (n > 0 && n < (int)sizeof(chunk)) httpd_resp_send_chunk(req, chunk, n);
+    }
+    closedir(d);
+    const char *foot = "<hr><small style='color:#555'>JANOS CYM-NM28C5</small></body></html>";
+    httpd_resp_send_chunk(req, foot, strlen(foot));
+    httpd_resp_send_chunk(req, NULL, 0);
+}
+
+static esp_err_t fileserv_root_handler(httpd_req_t *req)
+{
+    /* Strip /files prefix; everything else is treated as a path under /sdcard */
+    const char *uri = req->uri;
+    const char *url_path = uri;
+    if (strncmp(uri, "/files", 6) == 0) url_path = uri + 6;
+    if (*url_path == '\0') url_path = "/";
+
+    char sd_path[256];
+    snprintf(sd_path, sizeof(sd_path), "/sdcard%.240s", url_path);
+    size_t pl = strlen(sd_path);
+    if (pl > 1 && sd_path[pl-1] == '/') sd_path[pl-1] = '\0';
+
+    struct stat st;
+    memset(&st, 0, sizeof(st));
+    if (stat(sd_path, &st) != 0) {
+        if (strcmp(url_path, "/") == 0) {
+            strcpy(sd_path, "/sdcard");
+            stat(sd_path, &st);
+        } else {
+            httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Not found");
+            return ESP_OK;
+        }
+    }
+    if (S_ISDIR(st.st_mode)) s_fileserv_send_dir(req, sd_path, url_path);
+    else                      s_fileserv_send_file(req, sd_path);
+    return ESP_OK;
+}
+
+static bool s_fileserv_httpd_start(void)
+{
+    if (s_fileserv_httpd) return true;
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.server_port      = 80;
+    cfg.max_open_sockets = 5;
+    cfg.max_uri_handlers = 4;
+    cfg.uri_match_fn     = httpd_uri_match_wildcard;
+    cfg.lru_purge_enable = true;
+    if (httpd_start(&s_fileserv_httpd, &cfg) != ESP_OK) return false;
+    httpd_uri_t handler = { .uri="/*", .method=HTTP_GET,
+                            .handler=fileserv_root_handler, .user_ctx=NULL };
+    httpd_register_uri_handler(s_fileserv_httpd, &handler);
+    s_fileserv_active = true;
+    return true;
+}
+
+static void s_fileserv_httpd_stop(void)
+{
+    if (s_fileserv_httpd) { httpd_stop(s_fileserv_httpd); s_fileserv_httpd = NULL; }
+    s_fileserv_active = false;
+}
+
+/* Poll timer: update IP label once STA gets an address. */
+static void s_fileserv_poll_ip_cb(lv_timer_t *t)
+{
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!netif) return;
+    esp_netif_ip_info_t ip;
+    if (esp_netif_get_ip_info(netif, &ip) == ESP_OK && ip.ip.addr != 0) {
+        char ip_str[64];
+        snprintf(ip_str, sizeof(ip_str), "IP: " IPSTR " => http://" IPSTR,
+                 IP2STR(&ip.ip), IP2STR(&ip.ip));
+        if (s_fileserv_ip_lbl)     lv_label_set_text(s_fileserv_ip_lbl, ip_str);
+        if (s_fileserv_status_lbl) lv_label_set_text(s_fileserv_status_lbl, "Server active");
+        s_fileserv_httpd_start();
+        lv_timer_del(t);
+        s_fileserv_poll_timer = NULL;
+    }
+}
+
+/* Shared stop callback — stops HTTP server and optionally rejoins WiFi scan mode. */
+static void s_fileserv_stop_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_fileserv_poll_timer) { lv_timer_del(s_fileserv_poll_timer); s_fileserv_poll_timer = NULL; }
+    s_fileserv_httpd_stop();
+    show_settings_screen();
+}
+
+// ── AP File Server screen ────────────────────────────────────────────────────
+
+static void show_ap_file_server_screen(void)
+{
+    create_function_page_base("AP File Server");
+    apply_menu_bg();
+
+    // Info card
+    lv_obj_t *card = lv_obj_create(function_page);
+    lv_obj_set_size(card, 220, LV_SIZE_CONTENT);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(card, UI_ACCENT_CYAN, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 8, 0);
+    lv_obj_set_style_pad_all(card, 8, 0);
+    lv_obj_set_style_pad_gap(card, 4, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+
+    /* Row helper — label on left, value on right */
+    #define AP_INFO_ROW(parent, ltext, vtext, vcol) do { \
+        lv_obj_t *row = lv_obj_create(parent); \
+        lv_obj_set_width(row, lv_pct(100)); \
+        lv_obj_set_height(row, LV_SIZE_CONTENT); \
+        lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0); \
+        lv_obj_set_style_border_width(row, 0, 0); \
+        lv_obj_set_style_pad_all(row, 2, 0); \
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE); \
+        lv_obj_t *_ll = lv_label_create(row); \
+        lv_label_set_text(_ll, ltext); \
+        lv_obj_set_style_text_font(_ll, &lv_font_montserrat_12, 0); \
+        lv_obj_set_style_text_color(_ll, lv_color_make(150,150,150), 0); \
+        lv_obj_align(_ll, LV_ALIGN_LEFT_MID, 0, 0); \
+        lv_obj_t *_vl = lv_label_create(row); \
+        lv_label_set_text(_vl, vtext); \
+        lv_obj_set_style_text_font(_vl, &lv_font_montserrat_12, 0); \
+        lv_obj_set_style_text_color(_vl, vcol, 0); \
+        lv_obj_align(_vl, LV_ALIGN_RIGHT_MID, 0, 0); \
+    } while(0)
+
+    AP_INFO_ROW(card, "SSID:",     "TheLab",            lv_color_make(0,255,0));
+    AP_INFO_ROW(card, "Pass:",     "Do not touch!",     lv_color_make(255,200,0));
+    AP_INFO_ROW(card, "URL:",      "http://192.168.4.1", UI_ACCENT_CYAN);
+    #undef AP_INFO_ROW
+
+    s_fileserv_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_fileserv_status_lbl, "Starting AP...");
+    lv_obj_set_style_text_color(s_fileserv_status_lbl, UI_ACCENT_CYAN, 0);
+    lv_obj_set_style_text_font(s_fileserv_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_align(s_fileserv_status_lbl, LV_ALIGN_TOP_MID, 0, 175);
+
+    lv_obj_t *stop_btn = lv_btn_create(function_page);
+    lv_obj_set_size(stop_btn, 110, 34);
+    lv_obj_align(stop_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(stop_btn, 8, 0);
+    lv_obj_t *stop_lbl = lv_label_create(stop_btn);
+    lv_label_set_text(stop_lbl, LV_SYMBOL_CLOSE "  Stop");
+    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(stop_lbl, lv_color_white(), 0);
+    lv_obj_center(stop_lbl);
+    lv_obj_add_event_cb(stop_btn, s_fileserv_stop_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Start the AP and HTTP server */
+    ensure_wifi_mode();
+    wifi_mode_t wmode;
+    esp_wifi_get_mode(&wmode);
+    if (wmode != WIFI_MODE_APSTA && wmode != WIFI_MODE_AP) {
+        esp_wifi_set_mode(WIFI_MODE_APSTA);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    wifi_config_t ap_cfg = {
+        .ap = {
+            .ssid         = "TheLab",
+            .ssid_len     = 6,
+            .password     = "Do not touch!",
+            .channel      = 6,
+            .max_connection = 4,
+            .authmode     = WIFI_AUTH_WPA2_PSK,
+        }
+    };
+    esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    if (s_fileserv_httpd_start()) {
+        lv_label_set_text(s_fileserv_status_lbl, "Active — connect to TheLab");
+    } else {
+        lv_label_set_text(s_fileserv_status_lbl, "HTTP start failed");
+    }
+}
+
+// ── WiFi Client File Server screen ───────────────────────────────────────────
+
+static lv_obj_t *s_wcs_ssid_ta   = NULL;
+static lv_obj_t *s_wcs_pass_ta   = NULL;
+static lv_obj_t *s_wcs_keyboard  = NULL;
+static lv_obj_t *s_wcs_active_ta = NULL;
+
+static void s_wcs_ta_focus_cb(lv_event_t *e)
+{
+    lv_obj_t *ta = lv_event_get_target(e);
+    s_wcs_active_ta = ta;
+    if (s_wcs_keyboard) {
+        lv_keyboard_set_textarea(s_wcs_keyboard, ta);
+        lv_obj_clear_flag(s_wcs_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void s_wcs_kb_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
+        if (s_wcs_keyboard) lv_obj_add_flag(s_wcs_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void s_wcs_connect_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!s_wcs_ssid_ta || !s_wcs_pass_ta) return;
+    const char *ssid = lv_textarea_get_text(s_wcs_ssid_ta);
+    const char *pass = lv_textarea_get_text(s_wcs_pass_ta);
+
+    strncpy(g_saved_wifi_ssid, ssid, sizeof(g_saved_wifi_ssid) - 1);
+    strncpy(g_saved_wifi_pass, pass, sizeof(g_saved_wifi_pass) - 1);
+    nvs_settings_save_wifi_creds(ssid, pass);
+
+    if (s_fileserv_status_lbl) lv_label_set_text(s_fileserv_status_lbl, "Connecting...");
+    if (s_fileserv_ip_lbl)     lv_label_set_text(s_fileserv_ip_lbl, "Waiting for IP...");
+
+    ensure_wifi_mode();
+    wifi_config_t sta_cfg = {};
+    strncpy((char *)sta_cfg.sta.ssid,     ssid, sizeof(sta_cfg.sta.ssid) - 1);
+    strncpy((char *)sta_cfg.sta.password, pass, sizeof(sta_cfg.sta.password) - 1);
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
+    esp_wifi_connect();
+
+    /* Poll every 1s for IP */
+    if (s_fileserv_poll_timer) lv_timer_del(s_fileserv_poll_timer);
+    s_fileserv_poll_timer = lv_timer_create(s_fileserv_poll_ip_cb, 1000, NULL);
+}
+
+static void show_wifi_client_server_screen(void)
+{
+    create_function_page_base("WiFi File Server");
+    apply_menu_bg();
+
+    lv_obj_t *content = lv_obj_create(function_page);
+    lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 50);
+    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_pad_all(content, 6, 0);
+    lv_obj_set_style_pad_gap(content, 4, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* SSID label + textarea */
+    lv_obj_t *ssid_lbl = lv_label_create(content);
+    lv_label_set_text(ssid_lbl, "Network SSID:");
+    lv_obj_set_style_text_font(ssid_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ssid_lbl, ui_text_color(), 0);
+
+    s_wcs_ssid_ta = lv_textarea_create(content);
+    lv_obj_set_width(s_wcs_ssid_ta, lv_pct(100));
+    lv_textarea_set_one_line(s_wcs_ssid_ta, true);
+    lv_textarea_set_placeholder_text(s_wcs_ssid_ta, "Enter SSID");
+    if (g_saved_wifi_ssid[0]) lv_textarea_set_text(s_wcs_ssid_ta, g_saved_wifi_ssid);
+    lv_obj_set_style_bg_color(s_wcs_ssid_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(s_wcs_ssid_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(s_wcs_ssid_ta, UI_ACCENT_CYAN, 0);
+    lv_obj_set_style_text_font(s_wcs_ssid_ta, &lv_font_montserrat_12, 0);
+    lv_obj_add_event_cb(s_wcs_ssid_ta, s_wcs_ta_focus_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Password label + textarea */
+    lv_obj_t *pass_lbl = lv_label_create(content);
+    lv_label_set_text(pass_lbl, "Password:");
+    lv_obj_set_style_text_font(pass_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(pass_lbl, ui_text_color(), 0);
+
+    s_wcs_pass_ta = lv_textarea_create(content);
+    lv_obj_set_width(s_wcs_pass_ta, lv_pct(100));
+    lv_textarea_set_one_line(s_wcs_pass_ta, true);
+    lv_textarea_set_placeholder_text(s_wcs_pass_ta, "Enter password");
+    if (g_saved_wifi_pass[0]) lv_textarea_set_text(s_wcs_pass_ta, g_saved_wifi_pass);
+    lv_obj_set_style_bg_color(s_wcs_pass_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(s_wcs_pass_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(s_wcs_pass_ta, UI_ACCENT_CYAN, 0);
+    lv_obj_set_style_text_font(s_wcs_pass_ta, &lv_font_montserrat_12, 0);
+    lv_textarea_set_password_mode(s_wcs_pass_ta, true);
+    lv_obj_add_event_cb(s_wcs_pass_ta, s_wcs_ta_focus_cb, LV_EVENT_CLICKED, NULL);
+
+    s_fileserv_status_lbl = lv_label_create(content);
+    lv_label_set_text(s_fileserv_status_lbl, "Not connected");
+    lv_obj_set_style_text_font(s_fileserv_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_fileserv_status_lbl, ui_muted_color(), 0);
+
+    s_fileserv_ip_lbl = lv_label_create(content);
+    lv_label_set_text(s_fileserv_ip_lbl, "");
+    lv_obj_set_style_text_font(s_fileserv_ip_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_fileserv_ip_lbl, UI_ACCENT_CYAN, 0);
+    lv_label_set_long_mode(s_fileserv_ip_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_fileserv_ip_lbl, lv_pct(100));
+
+    /* Bottom button row: Stop | Connect */
+    lv_obj_t *btn_row = lv_obj_create(function_page);
+    lv_obj_set_size(btn_row, lv_pct(100), 40);
+    lv_obj_align(btn_row, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_hor(btn_row, 6, 0);
+    lv_obj_set_style_pad_ver(btn_row, 0, 0);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *stop_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(stop_btn, 100, 32);
+    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(stop_btn, 8, 0);
+    lv_obj_t *stop_lbl = lv_label_create(stop_btn);
+    lv_label_set_text(stop_lbl, LV_SYMBOL_CLOSE " Back");
+    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(stop_lbl, lv_color_white(), 0);
+    lv_obj_center(stop_lbl);
+    lv_obj_add_event_cb(stop_btn, s_fileserv_stop_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *conn_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(conn_btn, 110, 32);
+    lv_obj_set_style_bg_color(conn_btn, UI_ACCENT_CYAN, 0);
+    lv_obj_set_style_bg_color(conn_btn, lv_color_lighten(UI_ACCENT_CYAN, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(conn_btn, 8, 0);
+    lv_obj_t *conn_lbl = lv_label_create(conn_btn);
+    lv_label_set_text(conn_lbl, LV_SYMBOL_WIFI " Connect");
+    lv_obj_set_style_text_font(conn_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(conn_lbl, lv_color_black(), 0);
+    lv_obj_center(conn_lbl);
+    lv_obj_add_event_cb(conn_btn, s_wcs_connect_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Keyboard — hidden until a text area is tapped */
+    s_wcs_keyboard = lv_keyboard_create(function_page);
+    lv_keyboard_set_textarea(s_wcs_keyboard, s_wcs_ssid_ta);
+    lv_keyboard_set_mode(s_wcs_keyboard, LV_KEYBOARD_MODE_TEXT_LOWER);
+    lv_obj_set_size(s_wcs_keyboard, lv_pct(100), lv_pct(40));
+    lv_obj_align(s_wcs_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(s_wcs_keyboard, ui_bg_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_wcs_keyboard, ui_text_color(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_wcs_keyboard, lv_color_make(0, 80, 40), LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(s_wcs_keyboard, lv_color_make(0, 140, 80), LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(s_wcs_keyboard, ui_text_color(), LV_PART_ITEMS);
+    lv_obj_add_event_cb(s_wcs_keyboard, s_wcs_kb_event_cb, LV_EVENT_READY,  NULL);
+    lv_obj_add_event_cb(s_wcs_keyboard, s_wcs_kb_event_cb, LV_EVENT_CANCEL, NULL);
+    lv_obj_add_flag(s_wcs_keyboard, LV_OBJ_FLAG_HIDDEN);
+
+    s_wcs_active_ta = s_wcs_ssid_ta;
+}
+
+// ── Data Transfer sub-menu screen ────────────────────────────────────────────
+
+static void data_transfer_tile_cb(lv_event_t *e)
+{
+    const char *key = (const char *)lv_event_get_user_data(e);
+    if (!key) return;
+    if (strcmp(key, "AP File Server") == 0)      show_ap_file_server_screen();
+    else if (strcmp(key, "WiFi Client") == 0)    show_wifi_client_server_screen();
+    else if (strcmp(key, "Wardrive Upload") == 0) {
+        // Placeholder
+        if (s_fileserv_status_lbl) return;
+        lv_obj_t *msg = lv_msgbox_create(lv_scr_act(), "Coming Soon",
+            "Wardrive data upload to WiGLE\nand other services will be\nadded in a future update.", NULL, true);
+        lv_obj_center(msg);
+    }
+}
+
+static void data_transfer_back_cb(lv_event_t *e)
+{
+    (void)e;
+    show_settings_screen();
+}
+
+static void show_data_transfer_screen(void)
+{
+    create_function_page_base("Data Transfer");
+    apply_menu_bg();
+
+    lv_obj_t *tiles = lv_obj_create(function_page);
+    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30 - 44);
+    lv_obj_align(tiles, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(tiles, 0, 0);
+    lv_obj_set_style_pad_all(tiles, 4, 0);
+    lv_obj_set_style_pad_gap(tiles, 4, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    create_tile(tiles, LV_SYMBOL_UPLOAD,  "AP File\nServer",   UI_ACCENT_CYAN,          data_transfer_tile_cb, "AP File Server");
+    create_tile(tiles, LV_SYMBOL_WIFI,    "WiFi\nClient",      COLOR_MATERIAL_GREEN,     data_transfer_tile_cb, "WiFi Client");
+    create_tile(tiles, LV_SYMBOL_UPLOAD,  "Wardrive\nUpload",  lv_color_hex(0xE91E63),  data_transfer_tile_cb, "Wardrive Upload");
+
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 30);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), 0);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " Settings");
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(back_lbl, ui_text_color(), 0);
+    lv_obj_center(back_lbl);
+    lv_obj_add_event_cb(back_btn, data_transfer_back_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// ============================================================================
 // Scan Time Popup (min/max active scan time per channel)
 // ============================================================================
 
@@ -14490,6 +15146,347 @@ static void show_screen_brightness_popup(void)
 }
 
 // ============================================================================
+// Timing Popup — WiFi scan per channel + GATT connect timeout combined
+// ============================================================================
+
+static lv_obj_t *timing_popup = NULL;
+
+static void timing_popup_close_cb(lv_event_t *e)
+{
+    (void)e;
+    if (timing_popup) { lv_obj_del(timing_popup); timing_popup = NULL; }
+    scantime_min_slider = scantime_max_slider = NULL;
+    scantime_min_label  = scantime_max_label  = NULL;
+    gatt_tmo_slider = NULL;
+    gatt_tmo_label  = NULL;
+}
+
+static void timing_popup_save_cb(lv_event_t *e)
+{
+    if (!scantime_min_slider || !scantime_max_slider || !gatt_tmo_slider) return;
+
+    int32_t min_val  = lv_slider_get_value(scantime_min_slider);
+    int32_t max_val  = lv_slider_get_value(scantime_max_slider);
+    uint32_t gatt_ms = (uint32_t)lv_slider_get_value(gatt_tmo_slider);
+
+    if (min_val >= max_val) max_val = min_val + 10;
+    scan_time_min_ms  = (uint16_t)min_val;
+    scan_time_max_ms  = (uint16_t)max_val;
+    g_gatt_timeout_ms = gatt_ms;
+
+    wifi_scanner_set_scan_time(scan_time_min_ms, scan_time_max_ms);
+    nvs_settings_save_scan_time(scan_time_min_ms, scan_time_max_ms);
+    gw_set_timeout(gatt_ms);
+    nvs_settings_save_gatt_timeout(gatt_ms);
+
+    timing_popup_close_cb(e);
+}
+
+static void show_timing_popup(void)
+{
+    if (timing_popup) return;
+
+    timing_popup = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(timing_popup, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(timing_popup, 0, 0);
+    lv_obj_set_style_bg_color(timing_popup, ui_bg_color(), 0);
+    lv_obj_set_style_bg_opa(timing_popup, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(timing_popup, 0, 0);
+    lv_obj_set_style_radius(timing_popup, 0, 0);
+    lv_obj_clear_flag(timing_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(timing_popup, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *dialog = lv_obj_create(timing_popup);
+    lv_obj_set_size(dialog, 220, LV_SIZE_CONTENT);
+    lv_obj_center(dialog);
+    lv_obj_set_style_bg_color(dialog, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(dialog, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_border_width(dialog, 2, 0);
+    lv_obj_set_style_radius(dialog, 12, 0);
+    lv_obj_clear_flag(dialog, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(dialog, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(dialog, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(dialog, 10, 0);
+    lv_obj_set_style_pad_gap(dialog, 5, 0);
+
+    lv_obj_t *title = lv_label_create(dialog);
+    lv_label_set_text(title, "Timing Settings");
+    lv_obj_set_style_text_color(title, ui_text_color(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+
+    /* ── WiFi scan section ────────────────────────── */
+    lv_obj_t *wifi_hdr = lv_label_create(dialog);
+    lv_label_set_text(wifi_hdr, "WiFi Scan / Channel");
+    lv_obj_set_style_text_color(wifi_hdr, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_text_font(wifi_hdr, &lv_font_montserrat_12, 0);
+
+    char buf[32];
+    scantime_min_label = lv_label_create(dialog);
+    snprintf(buf, sizeof(buf), "Min: %ums", scan_time_min_ms);
+    lv_label_set_text(scantime_min_label, buf);
+    lv_obj_set_style_text_color(scantime_min_label, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_text_font(scantime_min_label, &lv_font_montserrat_12, 0);
+
+    scantime_min_slider = lv_slider_create(dialog);
+    lv_obj_set_width(scantime_min_slider, 196);
+    lv_slider_set_range(scantime_min_slider, 50, 1000);
+    lv_slider_set_value(scantime_min_slider, scan_time_min_ms, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(scantime_min_slider, lv_color_make(80,80,80), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(scantime_min_slider, COLOR_MATERIAL_PURPLE, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(scantime_min_slider, COLOR_MATERIAL_PURPLE, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(scantime_min_slider, 4, LV_PART_KNOB);
+    lv_obj_add_event_cb(scantime_min_slider, scantime_min_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    scantime_max_label = lv_label_create(dialog);
+    snprintf(buf, sizeof(buf), "Max: %ums", scan_time_max_ms);
+    lv_label_set_text(scantime_max_label, buf);
+    lv_obj_set_style_text_color(scantime_max_label, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_text_font(scantime_max_label, &lv_font_montserrat_12, 0);
+
+    scantime_max_slider = lv_slider_create(dialog);
+    lv_obj_set_width(scantime_max_slider, 196);
+    lv_slider_set_range(scantime_max_slider, 50, 1000);
+    lv_slider_set_value(scantime_max_slider, scan_time_max_ms, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(scantime_max_slider, lv_color_make(80,80,80), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(scantime_max_slider, COLOR_MATERIAL_PURPLE, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(scantime_max_slider, COLOR_MATERIAL_PURPLE, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(scantime_max_slider, 4, LV_PART_KNOB);
+    lv_obj_add_event_cb(scantime_max_slider, scantime_max_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    /* ── Divider ──────────────────────────────────── */
+    lv_obj_t *div = lv_obj_create(dialog);
+    lv_obj_set_size(div, 196, 1);
+    lv_obj_set_style_bg_color(div, lv_color_make(70,70,70), 0);
+    lv_obj_set_style_border_width(div, 0, 0);
+    lv_obj_set_style_pad_all(div, 0, 0);
+
+    /* ── GATT connect timeout section ─────────────── */
+    lv_obj_t *gatt_hdr = lv_label_create(dialog);
+    lv_label_set_text(gatt_hdr, "GATT Connect Timeout");
+    lv_obj_set_style_text_color(gatt_hdr, UI_ACCENT_CYAN, 0);
+    lv_obj_set_style_text_font(gatt_hdr, &lv_font_montserrat_12, 0);
+
+    gatt_tmo_label = lv_label_create(dialog);
+    snprintf(buf, sizeof(buf), "Timeout: %ums", (unsigned)g_gatt_timeout_ms);
+    lv_label_set_text(gatt_tmo_label, buf);
+    lv_obj_set_style_text_color(gatt_tmo_label, UI_ACCENT_CYAN, 0);
+    lv_obj_set_style_text_font(gatt_tmo_label, &lv_font_montserrat_12, 0);
+
+    gatt_tmo_slider = lv_slider_create(dialog);
+    lv_obj_set_width(gatt_tmo_slider, 196);
+    lv_slider_set_range(gatt_tmo_slider, 3000, 30000);
+    lv_slider_set_value(gatt_tmo_slider, (int32_t)g_gatt_timeout_ms, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(gatt_tmo_slider, lv_color_make(80,80,80), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(gatt_tmo_slider, UI_ACCENT_CYAN, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(gatt_tmo_slider, UI_ACCENT_CYAN, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(gatt_tmo_slider, 4, LV_PART_KNOB);
+    lv_obj_add_event_cb(gatt_tmo_slider, gatt_tmo_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *note = lv_label_create(dialog);
+    lv_label_set_text(note, "3s = fast  |  30s = patient");
+    lv_obj_set_style_text_color(note, ui_muted_color(), 0);
+    lv_obj_set_style_text_font(note, &lv_font_montserrat_12, 0);
+
+    /* ── Buttons ──────────────────────────────────── */
+    lv_obj_t *btn_row = lv_obj_create(dialog);
+    lv_obj_set_size(btn_row, 196, 36);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel_btn, 90, 30);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_make(80,80,80), 0);
+    lv_obj_set_style_radius(cancel_btn, 8, 0);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, "Cancel");
+    lv_obj_set_style_text_color(cancel_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(cancel_lbl);
+    lv_obj_add_event_cb(cancel_btn, timing_popup_close_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *save_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(save_btn, 90, 30);
+    lv_obj_set_style_bg_color(save_btn, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_bg_color(save_btn, lv_color_lighten(COLOR_MATERIAL_PURPLE, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(save_btn, 8, 0);
+    lv_obj_t *save_lbl = lv_label_create(save_btn);
+    lv_label_set_text(save_lbl, "Save");
+    lv_obj_set_style_text_color(save_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(save_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(save_lbl);
+    lv_obj_add_event_cb(save_btn, timing_popup_save_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// ============================================================================
+// Screen Popup — timeout + brightness combined
+// ============================================================================
+
+static lv_obj_t *screen_popup = NULL;
+
+static void screen_popup_close_cb(lv_event_t *e)
+{
+    (void)e;
+    set_backlight_percent(brightness_before_popup);
+    if (screen_popup) { lv_obj_del(screen_popup); screen_popup = NULL; }
+    timeout_dropdown      = NULL;
+    brightness_slider     = NULL;
+    brightness_value_label = NULL;
+}
+
+static void screen_popup_save_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!timeout_dropdown || !brightness_slider) return;
+
+    uint16_t sel = lv_dropdown_get_selected(timeout_dropdown);
+    screen_timeout_ms = timeout_index_to_ms(sel);
+    nvs_settings_save_timeout(screen_timeout_ms);
+    if (screen_idle_timer) {
+        if (screen_timeout_ms == 0) lv_timer_pause(screen_idle_timer);
+        else {
+            last_input_ms = esp_timer_get_time() / 1000;
+            lv_timer_resume(screen_idle_timer);
+        }
+    }
+
+    screen_brightness_pct = (uint8_t)lv_slider_get_value(brightness_slider);
+    nvs_settings_save_brightness(screen_brightness_pct);
+    set_backlight_percent(screen_brightness_pct);
+
+    if (screen_popup) { lv_obj_del(screen_popup); screen_popup = NULL; }
+    timeout_dropdown      = NULL;
+    brightness_slider     = NULL;
+    brightness_value_label = NULL;
+}
+
+static void show_screen_popup(void)
+{
+    if (screen_popup) return;
+    brightness_before_popup = screen_brightness_pct;
+
+    screen_popup = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(screen_popup, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(screen_popup, 0, 0);
+    lv_obj_set_style_bg_color(screen_popup, ui_bg_color(), 0);
+    lv_obj_set_style_bg_opa(screen_popup, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(screen_popup, 0, 0);
+    lv_obj_set_style_radius(screen_popup, 0, 0);
+    lv_obj_clear_flag(screen_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(screen_popup, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *dialog = lv_obj_create(screen_popup);
+    lv_obj_set_size(dialog, 220, LV_SIZE_CONTENT);
+    lv_obj_center(dialog);
+    lv_obj_set_style_bg_color(dialog, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(dialog, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_border_width(dialog, 2, 0);
+    lv_obj_set_style_radius(dialog, 12, 0);
+    lv_obj_clear_flag(dialog, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(dialog, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(dialog, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(dialog, 10, 0);
+    lv_obj_set_style_pad_gap(dialog, 5, 0);
+
+    lv_obj_t *title = lv_label_create(dialog);
+    lv_label_set_text(title, "Screen Settings");
+    lv_obj_set_style_text_color(title, ui_text_color(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+
+    /* ── Timeout section ──────────────────────────── */
+    lv_obj_t *tmo_hdr = lv_label_create(dialog);
+    lv_label_set_text(tmo_hdr, "Timeout");
+    lv_obj_set_style_text_color(tmo_hdr, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_text_font(tmo_hdr, &lv_font_montserrat_12, 0);
+
+    timeout_dropdown = lv_dropdown_create(dialog);
+    lv_dropdown_set_options(timeout_dropdown,
+        "10 seconds\n30 seconds\n1 minute\n5 minutes\nStays on");
+    lv_obj_set_width(timeout_dropdown, 196);
+    lv_obj_set_style_bg_color(timeout_dropdown, lv_color_make(50,50,50), 0);
+    lv_obj_set_style_text_color(timeout_dropdown, ui_text_color(), 0);
+    lv_obj_set_style_border_color(timeout_dropdown, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_border_width(timeout_dropdown, 1, 0);
+    lv_obj_set_style_radius(timeout_dropdown, 8, 0);
+    lv_obj_set_style_text_font(timeout_dropdown, &lv_font_montserrat_12, 0);
+    lv_obj_t *dd_list = lv_dropdown_get_list(timeout_dropdown);
+    if (dd_list) {
+        lv_obj_set_style_bg_color(dd_list, lv_color_make(40,40,40), 0);
+        lv_obj_set_style_text_color(dd_list, ui_text_color(), 0);
+        lv_obj_set_style_border_color(dd_list, COLOR_MATERIAL_TEAL, 0);
+        lv_obj_set_style_bg_color(dd_list, COLOR_MATERIAL_TEAL,
+            LV_PART_SELECTED | LV_STATE_CHECKED);
+    }
+    lv_dropdown_set_selected(timeout_dropdown, timeout_ms_to_index(screen_timeout_ms));
+
+    /* ── Divider ──────────────────────────────────── */
+    lv_obj_t *div = lv_obj_create(dialog);
+    lv_obj_set_size(div, 196, 1);
+    lv_obj_set_style_bg_color(div, lv_color_make(70,70,70), 0);
+    lv_obj_set_style_border_width(div, 0, 0);
+    lv_obj_set_style_pad_all(div, 0, 0);
+
+    /* ── Brightness section ───────────────────────── */
+    lv_obj_t *brt_hdr = lv_label_create(dialog);
+    lv_label_set_text(brt_hdr, "Brightness");
+    lv_obj_set_style_text_color(brt_hdr, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_text_font(brt_hdr, &lv_font_montserrat_12, 0);
+
+    brightness_value_label = lv_label_create(dialog);
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%u%%", screen_brightness_pct);
+    lv_label_set_text(brightness_value_label, buf);
+    lv_obj_set_style_text_color(brightness_value_label, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_text_font(brightness_value_label, &lv_font_montserrat_12, 0);
+
+    brightness_slider = lv_slider_create(dialog);
+    lv_obj_set_width(brightness_slider, 196);
+    lv_slider_set_range(brightness_slider, 10, 100);
+    lv_slider_set_value(brightness_slider, screen_brightness_pct, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(brightness_slider, lv_color_make(80,80,80), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(brightness_slider, COLOR_MATERIAL_ORANGE, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(brightness_slider, COLOR_MATERIAL_ORANGE, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(brightness_slider, 4, LV_PART_KNOB);
+    lv_obj_add_event_cb(brightness_slider, brightness_slider_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    /* ── Buttons ──────────────────────────────────── */
+    lv_obj_t *btn_row = lv_obj_create(dialog);
+    lv_obj_set_size(btn_row, 196, 36);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel_btn, 90, 30);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_make(80,80,80), 0);
+    lv_obj_set_style_radius(cancel_btn, 8, 0);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, "Cancel");
+    lv_obj_set_style_text_color(cancel_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(cancel_lbl);
+    lv_obj_add_event_cb(cancel_btn, screen_popup_close_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *save_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(save_btn, 90, 30);
+    lv_obj_set_style_bg_color(save_btn, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_bg_color(save_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(save_btn, 8, 0);
+    lv_obj_t *save_lbl = lv_label_create(save_btn);
+    lv_label_set_text(save_lbl, "Save");
+    lv_obj_set_style_text_color(save_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(save_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(save_lbl);
+    lv_obj_add_event_cb(save_btn, screen_popup_save_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// ============================================================================
 // Power Mode Popup
 // ============================================================================
 
@@ -14634,16 +15631,16 @@ static void settings_tile_event_cb(lv_event_t *e)
     
     if (strcmp(tile_name, "Compromised Data") == 0) {
         show_wifi_monitor_screen();
-    } else if (strcmp(tile_name, "Scan Time") == 0) {
-        show_scan_time_popup();
+    } else if (strcmp(tile_name, "Timing") == 0) {
+        show_timing_popup();
+    } else if (strcmp(tile_name, "Screen") == 0) {
+        show_screen_popup();
+    } else if (strcmp(tile_name, "Data Transfer") == 0) {
+        show_data_transfer_screen();
     } else if (strcmp(tile_name, "RedTeam mode") == 0) {
         show_settings_screen();
     } else if (strcmp(tile_name, "Download Mode") == 0) {
         show_download_mode_screen();
-    } else if (strcmp(tile_name, "Screen Timeout") == 0) {
-        show_screen_timeout_popup();
-    } else if (strcmp(tile_name, "Screen Level") == 0) {
-        show_screen_brightness_popup();
     } else if (strcmp(tile_name, "SD Card") == 0) {
         show_sd_card_screen();
     } else if (strcmp(tile_name, "GPS Info") == 0) {
@@ -14670,15 +15667,14 @@ static void show_settings_screen(void)
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Compromised\nData", COLOR_TILE_BLUE,         settings_tile_event_cb, "Compromised Data");
-    create_tile(tiles, LV_SYMBOL_LOOP,     "Scan\nTime",         COLOR_MATERIAL_PURPLE,   settings_tile_event_cb, "Scan Time");
-    create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Download\nMode",     COLOR_MATERIAL_RED,      settings_tile_event_cb, "Download Mode");
-    create_tile(tiles, LV_SYMBOL_BELL,     "Screen\nTimeout",    COLOR_MATERIAL_TEAL,     settings_tile_event_cb, "Screen Timeout");
-    create_tile(tiles, LV_SYMBOL_IMAGE,    "Screen\nLevel",      COLOR_MATERIAL_ORANGE,   settings_tile_event_cb, "Screen Level");
-    create_tile(tiles, LV_SYMBOL_SD_CARD,  "SD\nCard",           COLOR_MATERIAL_GREEN,    settings_tile_event_cb, "SD Card");
-    // LV_SYMBOL_WIFI (signal arcs) is the closest built-in to a satellite dish — FA 4.7 has no dish glyph
-    create_tile(tiles, MY_SYMBOL_SATELLITE_DISH, "GPS\nInfo",    lv_color_hex(0x00BCD4),  settings_tile_event_cb, "GPS Info");
-    create_tile(tiles, LV_SYMBOL_CHARGE,   "Power\nMode",        COLOR_MATERIAL_RED,      settings_tile_event_cb, "Power Mode");
+    create_tile(tiles, LV_SYMBOL_EYE_OPEN,       "Compromised\nData",  COLOR_TILE_BLUE,         settings_tile_event_cb, "Compromised Data");
+    create_tile(tiles, LV_SYMBOL_LOOP,           "Timing",             COLOR_MATERIAL_PURPLE,   settings_tile_event_cb, "Timing");
+    create_tile(tiles, LV_SYMBOL_DOWNLOAD,       "Download\nMode",     COLOR_MATERIAL_RED,      settings_tile_event_cb, "Download Mode");
+    create_tile(tiles, LV_SYMBOL_IMAGE,          "Screen",             COLOR_MATERIAL_TEAL,     settings_tile_event_cb, "Screen");
+    create_tile(tiles, LV_SYMBOL_SD_CARD,        "SD\nCard",           COLOR_MATERIAL_GREEN,    settings_tile_event_cb, "SD Card");
+    create_tile(tiles, MY_SYMBOL_SATELLITE_DISH, "GPS\nInfo",          lv_color_hex(0x00BCD4),  settings_tile_event_cb, "GPS Info");
+    create_tile(tiles, LV_SYMBOL_CHARGE,         "Power\nMode",        COLOR_MATERIAL_RED,      settings_tile_event_cb, "Power Mode");
+    create_tile(tiles, LV_SYMBOL_UPLOAD,         "Data\nTransfer",     lv_color_hex(0xE91E63),  settings_tile_event_cb, "Data Transfer");
 
     lv_obj_t *ver = lv_label_create(function_page);
     lv_label_set_text(ver, "LAB5 " FW_VERSION);
@@ -16797,7 +17793,7 @@ static void bt_sas_refresh_list(void)
         lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 4, 0);
         lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
 
-        lv_obj_add_event_cb(btn, bt_sas_device_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        lv_obj_add_event_cb(btn, bt_sas_device_cb, LV_EVENT_SHORT_CLICKED, (void*)(intptr_t)i);
     }
 }
 

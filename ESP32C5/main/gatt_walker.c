@@ -21,6 +21,7 @@ volatile char       gw_ui_status[96]   = "";
 volatile bool       gw_ui_needs_update = false;
 
 /* ── Internal state ──────────────────────────────────────────────── */
+static uint32_t           s_connect_timeout_ms = 30000;
 static SemaphoreHandle_t  s_sd_mutex    = NULL;
 static gw_event_cb_t      s_callback    = NULL;
 static gw_result_t       *s_result      = NULL;
@@ -602,6 +603,8 @@ void gw_init(SemaphoreHandle_t sd_mutex)
 
 void gw_set_callback(gw_event_cb_t cb) { s_callback = cb; }
 
+void gw_set_timeout(uint32_t ms) { s_connect_timeout_ms = (ms < 1000) ? 1000 : ms; }
+
 gw_state_t gw_get_state(void) { return s_state; }
 
 const gw_result_t *gw_get_result(void) { return s_result; }
@@ -662,7 +665,7 @@ bool gw_walk(const uint8_t mac[6], uint8_t addr_type, const char *name,
     memcpy(peer.val, mac, 6);
 
     int rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &peer,
-                             30000 /* ms timeout */, NULL,
+                             (int32_t)s_connect_timeout_ms, NULL,
                              s_gap_cb, NULL);
     if (rc != 0) {
         char msg[96]; snprintf(msg, sizeof(msg), "Init failed (%d)\n%s",
