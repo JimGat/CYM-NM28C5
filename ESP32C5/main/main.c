@@ -5977,10 +5977,12 @@ static void snifferdog_stop_btn_cb(lv_event_t *e)
         }
         
         esp_wifi_set_promiscuous(false);
+        esp_wifi_set_promiscuous_rx_cb(NULL);   /* clear stale callback */
+        wifi_scanner_abort();                   /* un-stick g_scan_in_progress */
         sniffer_dog_channel_index = 0;
         sniffer_dog_current_channel = dual_band_channels[0];
         sniffer_dog_last_channel_hop = 0;
-        
+
         ESP_LOGI(TAG, "Snifferdog stopped");
     }
     snifferdog_disable_log_capture();
@@ -10558,6 +10560,8 @@ static void radio_reset_to_idle(void)
     } else {
         // WiFi driver is alive — just cycle stop/start to clear AP, promisc, etc.
         esp_wifi_set_promiscuous(false);
+        esp_wifi_set_promiscuous_rx_cb(NULL);
+        wifi_scanner_abort();   /* clear any stuck scan state before stop */
         esp_wifi_stop();
         esp_wifi_set_mode(WIFI_MODE_STA);
         esp_wifi_start();
