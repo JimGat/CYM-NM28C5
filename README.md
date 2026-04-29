@@ -21,6 +21,10 @@
   <img src="https://img.shields.io/badge/BLE-5.0-informational" alt="BLE 5"/>
 </p>
 
+<p align="center">
+  <img src="docs/screenshots/Cheep%20Yellow%20Monster.jpg" alt="Cheap Yellow Monster" width="50%"/>
+</p>
+
 ---
 
 ## Introduction
