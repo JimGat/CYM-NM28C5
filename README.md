@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  WiFi 6 security toolkit &amp; wardriving device built on NerdMiner ESP32-C5 CYD
+  WiFi 6 &amp; BLE security toolkit with SigInt &amp; Wardriving built on NerdMiner ESP32-C5 CYD
 </p>
 
 <p align="center">
@@ -228,11 +228,40 @@ The **WiFi** tile opens a sub-menu grouping all WiFi functions:
 
 ```
 Main Menu
-└── WiFi
-    ├── Scan & Attack
-    ├── WiFi Attacks
-    ├── Deauth Mon.
-    └── WiFi Observer
+├── WiFi
+│   ├── Scan & Attack
+│   ├── WiFi Attacks
+│   ├── Deauth Mon.
+│   └── WiFi Observer
+├── Bluetooth
+│   ├── BT Scan & Select
+│   │   └── (select device) → Actions
+│   │       ├── BT Locator
+│   │       ├── GATT Walker
+│   │       └── Add to BT Lookout
+│   ├── AirTag Scan
+│   ├── BT Locator
+│   └── Bluetooth Lookout
+│       ├── Edit Watchlist
+│       └── OUI Groups
+├── Wardrive
+├── Settings
+│   ├── Compromised Data
+│   ├── Timing
+│   │   ├── WiFi Scan/Ch  (min/max dwell sliders)
+│   │   └── GATT Timeout  (3–30 s slider)
+│   ├── Download Mode
+│   ├── Screen
+│   │   ├── Timeout       (inactivity timer)
+│   │   └── Brightness    (10–100% overlay)
+│   ├── SD Card
+│   ├── GPS Info
+│   ├── Power Mode
+│   └── Data Transfer
+│       ├── AP File Server
+│       ├── WiFi Client
+│       └── Wardrive Upload
+└── Go Dark
 ```
 
 #### WiFi Scan & Attack
@@ -442,7 +471,7 @@ Walk complete
 
 **Limits:** Up to 20 services, 10 characteristics per service, 4 descriptors per characteristic, 48 bytes read per attribute. PSRAM-allocated (~50 KB result struct + 64 KB JSON buffer).
 
-**Connect timeout:** Configurable via **Settings → GATT Timeout** (3 s – 30 s slider, NVS-persisted). The default is 30 s. Use a shorter value for fast nearby devices; leave it long for distant or slow-to-respond targets. The same timeout variable is shared with the upcoming BT Observer feature.
+**Connect timeout:** Configurable via **Settings → Timing → GATT Timeout** (3 s – 30 s slider, NVS-persisted). The default is 30 s. Use a shorter value for fast nearby devices; leave it long for distant or slow-to-respond targets. The same timeout variable is shared with the upcoming BT Observer feature.
 
 > **Note:** GATT Walker connects to the target — it is an active, deliberate inspection, not passive. The target device will see an incoming connection. Cancel at any time with the **Cancel Walk** button; the connection is cleanly terminated.
 
@@ -500,31 +529,31 @@ GPS-enabled WiFi logging for mapping wireless networks. Requires an **ATGM336H**
 ```
 Settings
 ├── Compromised Data    (WiFi credential monitor)
-├── WiFi scan per ch    (min/max dwell time per channel — slider)
+├── Timing              (WiFi scan dwell + GATT connect timeout — combined popup)
+│   ├── WiFi Scan/Ch    (min/max dwell time per channel — 50–1000 ms sliders)
+│   └── GATT Timeout    (BLE connect timeout — 3–30 s slider)
 ├── Download Mode       (reboot into bootloader)
-├── Screen Timeout      (inactivity timer)
-├── Screen Level        (brightness overlay)
+├── Screen              (screen timeout + brightness — combined popup)
+│   ├── Timeout         (inactivity timer before dimming)
+│   └── Brightness      (software brightness overlay 10–100%)
 ├── SD Card             (provision / file tree / free space)
 ├── GPS Info            (live fix status)
 ├── Power Mode          (Normal / Max TX power)
-├── GATT Timeout        (BLE connect timeout — slider, 3–30 s)
 └── Data Transfer       (file server sub-menu)
     ├── AP File Server  (start TheLab AP, serve /sdcard/ on 192.168.4.1)
     ├── WiFi Client     (join a saved network, serve /sdcard/ on DHCP IP)
     └── Wardrive Upload (coming soon)
 ```
 
-All settings are persisted via **NVS** (Non-Volatile Storage) across reboots.
+All settings are persisted via **NVS** (Non-Volatile Storage) across reboots. The settings menu fits on a single screen (8 tiles, 3-column grid, no scrolling).
 
 | Setting | Description |
 |---------|-------------|
-| **Screen Timeout** | Inactivity timer before display dimming |
-| **Screen Level** | Software brightness overlay (10–100%) |
-| **WiFi scan per ch** | Min/max dwell time per channel during active WiFi scan (50–1000 ms sliders) |
+| **Timing** | Combined timing popup — WiFi scan dwell time sliders and GATT connect timeout slider |
+| **Screen** | Combined screen popup — inactivity timeout dropdown and brightness overlay slider |
 | **SD Card** | Validate/provision (creates `/sdcard/lab/` structure, shows completion status); browse file tree; check free space |
 | **GPS Info** | Live GPS fix status, latitude, longitude, altitude, satellite count, and UART config reference (IO4/IO5, 9600 baud, ATGM336H) |
 | **Power Mode** | TX Power Mode selector — Normal or Max Power (see below) |
-| **GATT Timeout** | BLE connect timeout for GATT Walker (3 s – 30 s, NVS-persisted) |
 | **Data Transfer** | File server sub-menu — AP mode or WiFi client mode (see below) |
 
 #### TX Power Mode
@@ -540,9 +569,13 @@ Switching modes takes effect immediately on the active radio and is re-applied a
 
 > **Note:** Actual radiated power (EIRP) is still bounded by the NM-CYD-C5's PCB antenna, PHY calibration data, and the country/regulatory settings loaded at boot. Max Power increases effective range but does not bypass regulatory limits enforced by the PHY layer.
 
-#### GATT Connect Timeout
+#### Timing Settings
 
-Accessible via **Settings → GATT Timeout**. A single slider sets the BLE connection timeout used by GATT Walker (and the upcoming BT Observer feature).
+Accessible via **Settings → Timing**. A single popup contains two sections:
+
+**WiFi Scan / Channel** — min and max dwell time sliders (50–1000 ms) control how long the WiFi scanner dwells on each channel during active scans. Both values are NVS-persisted.
+
+**GATT Connect Timeout** — a single slider sets the BLE connection timeout used by GATT Walker (and the upcoming BT Observer feature).
 
 | Slider position | Timeout | Best for |
 |-----------------|---------|----------|
