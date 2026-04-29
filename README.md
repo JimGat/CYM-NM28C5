@@ -365,6 +365,12 @@ Tap **Exit** at any time to stop tracking and return to the main menu. The radio
 
 #### GATT Walker — How It Works
 
+<p align="center">
+  <img width="200" src="docs/screenshots/GATT_Walker.bmp" alt="GATT Walker" />
+  <br/>
+  <em>GATT Walker — live progress during a BLE inspection walk</em>
+</p>
+
 **GATT Walker** connects to a selected BLE device and performs a full GATT inspection — enumerating every service, characteristic, and descriptor, reading all readable attribute values, and saving the result as a structured JSON file on the SD card.
 
 **Workflow:**
