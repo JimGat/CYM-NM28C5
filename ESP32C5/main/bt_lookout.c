@@ -158,7 +158,7 @@ int bt_lookout_load(const char *csv_path)
         if (len == 0) continue;
         if (first) { first = false; continue; }   /* skip header row */
 
-        /* mac,name,rssi_threshold */
+        /* mac,name,rssi_threshold[,oui_only] */
         char *tok = strtok(line, ",");
         if (!tok) continue;
         uint8_t mac[6];
@@ -170,11 +170,15 @@ int bt_lookout_load(const char *csv_path)
         tok = strtok(NULL, ",");
         int threshold = tok ? atoi(tok) : BT_LOOKOUT_RSSI_ANY;
 
+        tok = strtok(NULL, ",");
+        bool oui_only = tok ? (atoi(tok) != 0) : false;
+
         bt_lookout_entry_t *e = &s_entries[s_count++];
         memcpy(e->mac, mac, 6);
         strncpy(e->name, name, sizeof(e->name) - 1);
         e->name[sizeof(e->name) - 1] = '\0';
         e->rssi_threshold = threshold;
+        e->oui_only = oui_only;
     }
     fclose(f);
     ESP_LOGI(TAG, "Loaded %d watchlist entries from %s", s_count, csv_path);
@@ -184,7 +188,8 @@ int bt_lookout_load(const char *csv_path)
 bool bt_lookout_append(const char   *csv_path,
                        const uint8_t mac[6],
                        const char   *name,
-                       int           rssi_threshold)
+                       int           rssi_threshold,
+                       bool          oui_only)
 {
     /* update in-memory list */
     if (s_count < BT_LOOKOUT_MAX_ENTRIES) {
@@ -193,6 +198,7 @@ bool bt_lookout_append(const char   *csv_path,
         strncpy(e->name, name ? name : "", sizeof(e->name) - 1);
         e->name[sizeof(e->name) - 1] = '\0';
         e->rssi_threshold = rssi_threshold;
+        e->oui_only = oui_only;
     }
 
     /* append row to CSV (create with header if absent) */
@@ -208,10 +214,10 @@ bool bt_lookout_append(const char   *csv_path,
     }
     char mac_str[18];
     mac_fmt(mac, mac_str, sizeof(mac_str));
-    fprintf(f, "%s,%s,%d\n", mac_str, name ? name : "", rssi_threshold);
+    fprintf(f, "%s,%s,%d,%d\n", mac_str, name ? name : "", rssi_threshold, (int)oui_only);
     fclose(f);
-    ESP_LOGI(TAG, "Appended %s (%s) thr=%d to %s",
-             mac_str, name ? name : "", rssi_threshold, csv_path);
+    ESP_LOGI(TAG, "Appended %s (%s) thr=%d oui_only=%d to %s",
+             mac_str, name ? name : "", rssi_threshold, (int)oui_only, csv_path);
     return true;
 }
 
@@ -221,7 +227,15 @@ bool bt_lookout_on_adv(const uint8_t mac[6], int rssi, const char *adv_name)
 
     for (int i = 0; i < s_count; i++) {
         const bt_lookout_entry_t *e = &s_entries[i];
-        if (!mac_eq(e->mac, mac)) continue;
+        bool match;
+        if (e->oui_only) {
+            /* OUI stored in e->mac[0..2] (standard order).
+             * NimBLE address: mac[5]:mac[4]:mac[3] = OUI in standard order. */
+            match = (mac[5] == e->mac[0] && mac[4] == e->mac[1] && mac[3] == e->mac[2]);
+        } else {
+            match = mac_eq(e->mac, mac);
+        }
+        if (!match) continue;
         /* RSSI check — BT_LOOKOUT_RSSI_ANY (-99) always passes */
         if (e->rssi_threshold != BT_LOOKOUT_RSSI_ANY && rssi < e->rssi_threshold)
             continue;
