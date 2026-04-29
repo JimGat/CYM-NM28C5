@@ -276,22 +276,26 @@ Bluetooth
 │       ├── BT Locator  (RSSI tracking)
 │       └── GATT Walker (fingerprinting — coming soon)
 ├── AirTag Scan
-└── BT Locator
+├── BT Locator
+└── Bluetooth Lookout   ← continuous watchlist monitor
+    ├── Edit Watchlist
+    └── OUI Groups
 ```
 
 | Feature | Description |
 |---------|-------------|
-| **BT Scan & Select** | Active BLE scan — discovers all nearby devices, displays name, RSSI, partial MAC; tap to select a target |
+| **BT Scan & Select** | Active BLE scan — discovers all nearby devices; shows name or vendor (from OUI lookup), RSSI, partial MAC; tap to select a target |
 | **BT Locator** | RSSI-based proximity tracking of a selected BLE device; updates every 10 s |
 | **GATT Walker** | GATT service/characteristic enumeration for device fingerprinting *(planned — stub tile present)* |
 | **AirTag Scanner** | Passive BLE scan — detects Apple AirTags and Samsung SmartTags by manufacturer ID |
 | **Tag Locator** | Per-tag RSSI tracking launched from the AirTag Scan found-tags list |
+| **Bluetooth Lookout** | Continuous BLE monitor that alerts when a watchlisted device (by full MAC or OUI prefix) is detected nearby |
 
 > **Note:** WiFi and BLE share the same radio. The firmware automatically switches between `RADIO_MODE_WIFI` and `RADIO_MODE_BLE` as needed.
 
 #### BT Scan & Select — How It Works
 
-**Step 1 — Scan:** Open **BT Scan & Select** from the Bluetooth menu. A 10-second active BLE scan runs, collecting all advertising devices. Each row shows device name (or `[Unknown]`), RSSI, and the last 3 octets of the MAC address. The list updates live every 500 ms during the scan.
+**Step 1 — Scan:** Open **BT Scan & Select** from the Bluetooth menu. A 10-second active BLE scan runs, collecting all advertising devices. Each row shows device name (or vendor from OUI lookup, or `[Unknown]`), RSSI, and the last 3 octets of the MAC address. The list updates live every 500 ms during the scan.
 
 **Step 2 — Select:** Tap any row to select a target device. The row highlights in cyan and the status bar shows the selection. Tap again to deselect. Only one device can be selected at a time.
 
@@ -352,6 +356,45 @@ Use the RSSI value to home in on the tag — a higher (less negative) number mea
 
 Tap **Exit** at any time to stop tracking and return to the main menu. The radio switches back to WiFi mode automatically.
 
+#### Bluetooth Lookout — How It Works
+
+**Bluetooth Lookout** runs a continuous background BLE scan and alerts you — visually and via NeoPixel LED — any time a watchlisted device is seen nearby. Useful for detecting known surveillance hardware, trackers, or specific devices by MAC address or manufacturer OUI prefix.
+
+**Watchlist:** Devices are stored in `/sdcard/lab/bluetooth/lookout.csv`. The file is auto-created on first use. Add devices two ways:
+
+- **BT Scan & Select → Add to Lookout** — scans for BLE devices, select one, choose "Add to Lookout". The exact MAC is added.
+- **OUI Groups** (see below) — adds all devices from a known manufacturer OUI prefix.
+
+**Matching modes:**
+- **Full MAC** — triggers only when that exact 6-byte address is seen. Best for tracking a specific known device.
+- **OUI prefix** — triggers when *any* device from that manufacturer's OUI block (`AA:BB:CC:*:*:*`) is seen. Best for detecting a category of hardware (e.g., any Axon body camera in range).
+
+**Alert:** When a match is found the NeoPixel flashes red (3 × 250 ms on/off) and a popup appears on screen showing the device name, MAC address, vendor (if OUI database is loaded), and RSSI. A 30-second per-device cooldown prevents repeated alerts for the same device.
+
+**Controls on the Lookout screen:**
+
+| Button | Action |
+|--------|--------|
+| Start / Stop | Toggle the continuous BLE scan loop |
+| Blackout | Dim the screen to black while monitoring continues in the background |
+| Edit List | Open the watchlist editor — mark entries for deletion, then Save |
+| OUI Groups | Add predefined law-enforcement / tracking hardware groups to the watchlist |
+
+#### OUI Groups
+
+**OUI Groups** (accessible from the Bluetooth Lookout screen) lets you add entire manufacturer OUI blocks to the watchlist in one tap. The firmware will then alert whenever *any* BLE device from that manufacturer is detected.
+
+Pre-loaded groups:
+
+| Group | OUI Prefix(es) | Category |
+|-------|---------------|----------|
+| **Axon Body Cam** | `00:25:DF` | Law enforcement body-worn cameras |
+| **Flock Safety ALPR** | `70:C9:4E`, `3C:91:80`, `D8:F3:BC` | Automated license plate readers |
+| **Motorola Solutions** | `4C:CC:34` | Two-way radio / body cameras |
+| **Samsung SmartTag** | `64:1B:2F` | Bluetooth trackers |
+
+Tap **+ Add to Watchlist** on any group card. Each OUI is written to `lookout.csv` as an OUI-only entry (visible in the editor as `OUI: AA:BB:CC:*`). Entries added this way are preserved across reboots and editable via **Edit List**.
+
 ### 3. Wardriving
 
 GPS-enabled WiFi logging for mapping wireless networks. Requires an **ATGM336H** (or compatible NMEA module) wired to IO4/IO5 — see [GPS Wiring](#gps-wiring--atgm336h).
@@ -394,7 +437,7 @@ Switching modes takes effect immediately on the active radio and is re-applied a
 | **LVGL Material Dark Theme** | Modern, touch-friendly dark UI |
 | **Portrait 240×320 Layout** | All screens designed and reflowed for the NM-CYD-C5's 240×320 portrait display |
 | **5-Tile Main Menu** | WiFi, Bluetooth, Wardrive, Settings, Go Dark — WiFi expands to sub-menu |
-| **Screenshot Capture** | Save screen to SD card (`/sdcard/screenshots/`) |
+| **Screenshot Capture** | Tap the **title bar** on any screen to save a BMP to `/sdcard/screenshots/` — works on every screen including all menus, feature pages, and live data views |
 | **WPA-SEC Upload** | Upload captured handshakes to wpa-sec.stanev.org via HTTPS |
 | **NeoPixel Status LED** | Mode-based color indicator via WS2812 LED (GPIO 27) |
 
@@ -424,14 +467,49 @@ All data is stored on the SD card:
 /sdcard/
 ├── lab/
 │   ├── white.txt         # MAC/SSID whitelist (one per line)
+│   ├── ouilist.bin       # OUI vendor table — adds manufacturer names to BLE scan results
 │   ├── handshakes/       # Captured WPA handshakes
 │   │   ├── *.pcap        # Wireshark-compatible captures
 │   │   └── *.hccapx      # Hashcat-compatible format (hashcat)
+│   ├── bluetooth/
+│   │   └── lookout.csv   # Bluetooth Lookout watchlist
 │   └── portal/           # Captive portal credential files
 ├── wardrive/             # GPS + WiFi logs (CSV)
 ├── screenshots/          # UI screenshots (BMP)
 └── calibrate.txt         # ← Create this file to trigger touch re-calibration on next boot
 ```
+
+### Screenshot Capture
+
+Tap the **title bar on any screen** to capture a screenshot. The image is saved as an uncompressed 24-bit BMP to `/sdcard/screenshots/screen_N.bmp` with an auto-incrementing index. The write runs in a background task so the UI stays responsive, and the title bar is briefly disabled while the save is in progress to prevent double-captures. Requires a mounted SD card — a warning is logged if the card is unavailable.
+
+Screenshots are captured at full 240×320 resolution and can be opened directly in any image viewer or graphics application.
+
+### OUI Vendor Lookup
+
+Adds manufacturer names to BLE scan results by matching each device's MAC OUI prefix against a compact vendor table loaded from SD card. Results appear as vendor names in the **BT Scan & Select** list (replacing `[Unknown]` for unidentified devices) and as an additional line in **Bluetooth Lookout** detection popups.
+
+Requires a curated binary table at `/sdcard/lab/ouilist.bin`. Generate or refresh it whenever the IEEE OUI list changes:
+
+1. Download the latest OUI CSV from IEEE Standards:
+   ```
+   https://standards-oui.ieee.org/oui/oui.csv
+   ```
+   Place it in the repository root (or any convenient location).
+
+2. Run the converter:
+   ```bash
+   python tools/oui_convert.py oui.csv ouilist.bin
+   ```
+
+3. Copy `ouilist.bin` onto the SD card under `/lab/`:
+   ```
+   /sdcard/lab/ouilist.bin
+   ```
+
+The firmware loads the binary into PSRAM on first entry to any BT feature and searches it with binary search — no large stack allocations. If the file is missing, vendor lookup is skipped transparently and scan results show `[Unknown]` as before.
+
+---
 
 The **SD Card → File Tree** utility (Settings menu) lets you browse the SD card's directory tree directly on the device — useful for confirming handshakes and wardrive logs were saved without needing to remove the card.
 
