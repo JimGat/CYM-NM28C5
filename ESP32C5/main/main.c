@@ -16390,20 +16390,24 @@ static void oui_group_add_cb(lv_event_t *e)
     const oui_group_def_t *grp = &OUI_GROUPS[idx];
 
     ensure_sd_mounted();
-    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+    bool ok = false;
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        ok = true;
         for (int i = 0; i < grp->oui_count; i++) {
             uint8_t oui_mac[6] = {grp->ouis[i][0], grp->ouis[i][1], grp->ouis[i][2], 0, 0, 0};
-            bt_lookout_append(BT_LOOKOUT_CSV_PATH, oui_mac, grp->name,
-                              BT_LOOKOUT_RSSI_ANY, true);
+            if (!bt_lookout_append(BT_LOOKOUT_CSV_PATH, oui_mac, grp->name,
+                                   BT_LOOKOUT_RSSI_ANY, true)) ok = false;
         }
         xSemaphoreGive(sd_spi_mutex);
     }
 
     /* Visual feedback on the tapped button */
     lv_obj_t *btn = lv_event_get_target(e);
-    lv_obj_set_style_bg_color(btn, lv_color_make(50, 50, 50), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(btn,
+        ok ? lv_color_make(20, 80, 20) : lv_color_make(80, 20, 20), LV_STATE_DEFAULT);
     lv_obj_t *lbl = lv_obj_get_child(btn, 0);
-    if (lbl && lv_obj_is_valid(lbl)) lv_label_set_text(lbl, "Added!");
+    if (lbl && lv_obj_is_valid(lbl))
+        lv_label_set_text(lbl, ok ? "Added!" : "Failed!");
 }
 
 static void oui_groups_back_cb(lv_event_t *e)
@@ -17102,7 +17106,7 @@ static void gw_update_screen_ui(void)
             lv_label_set_text(gw_result_lbl, t);
             lv_obj_clear_flag(gw_result_lbl, LV_OBJ_FLAG_HIDDEN);
         } else if (st == GW_STATE_FAILED) {
-            lv_label_set_text(gw_result_lbl, "Walk failed — see log");
+            lv_label_set_text(gw_result_lbl, (const char *)gw_ui_status);
             lv_obj_clear_flag(gw_result_lbl, LV_OBJ_FLAG_HIDDEN);
         } else {
             lv_obj_add_flag(gw_result_lbl, LV_OBJ_FLAG_HIDDEN);
