@@ -436,10 +436,11 @@ Walk complete
 
 **Bluetooth Lookout** runs a continuous background BLE scan and alerts you — visually and via NeoPixel LED — any time a watchlisted device is seen nearby. Useful for detecting known surveillance hardware, trackers, or specific devices by MAC address or manufacturer OUI prefix.
 
-**Watchlist:** Devices are stored in `/sdcard/lab/bluetooth/lookout.csv`. The file is auto-created on first use. Add devices two ways:
+**Watchlist:** Devices are stored in `/sdcard/lab/bluetooth/lookout.csv`. The file is auto-created on first use (parent directories created automatically). Add devices three ways:
 
 - **BT Scan & Select → Add to Lookout** — scans for BLE devices, select one, choose "Add to Lookout". The exact MAC is added.
-- **OUI Groups** (see below) — adds all devices from a known manufacturer OUI prefix.
+- **OUI Groups** (see below) — adds all devices from a predefined manufacturer OUI block in one tap.
+- **Edit List → + OUI** — manually type any 3-byte OUI (formats `AA:BB:CC`, `AABBCC`, or `AA-BB-CC`) and an optional label. Saved as an OUI-prefix entry that matches any device from that manufacturer.
 
 **Matching modes:**
 - **Full MAC** — triggers only when that exact 6-byte address is seen. Best for tracking a specific known device.
