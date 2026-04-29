@@ -102,6 +102,9 @@ bool gw_walk(const uint8_t mac[6], uint8_t addr_type, const char *name,
 /* Request cancellation of an in-progress walk (async). */
 void gw_cancel(void);
 
+/* Set BLE connect timeout (ms). Default 30000. Call before gw_walk(). */
+void gw_set_timeout(uint32_t ms_timeout);
+
 /* Current state (atomic read). */
 gw_state_t gw_get_state(void);
 
