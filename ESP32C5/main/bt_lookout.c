@@ -34,17 +34,25 @@ static bt_lookout_detection_t s_detection;
 
 /* ── Helpers ───────────────────────────────────────────────────── */
 
-/* Ensure the directory containing csv_path exists (creates it if needed). */
+/* Recursively create all directories in the path leading to csv_path. */
 static void ensure_parent_dir(const char *path)
 {
-    char dir[64];
+    char tmp[80];
     const char *slash = strrchr(path, '/');
     if (!slash || slash == path) return;
     size_t len = (size_t)(slash - path);
-    if (len >= sizeof(dir)) return;
-    memcpy(dir, path, len);
-    dir[len] = '\0';
-    mkdir(dir, 0755);   /* ignore error — EEXIST is fine */
+    if (len >= sizeof(tmp)) return;
+    memcpy(tmp, path, len);
+    tmp[len] = '\0';
+    /* Walk the path creating each component */
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            mkdir(tmp, 0755);   /* EEXIST is fine */
+            *p = '/';
+        }
+    }
+    mkdir(tmp, 0755);
 }
 
 static bool mac_eq(const uint8_t a[6], const uint8_t b[6])
@@ -138,7 +146,8 @@ int bt_lookout_load(const char *csv_path)
     FILE *f = fopen(csv_path, "r");
     if (!f) {
         if (!file_exists) {
-            /* File genuinely absent — seed with header only */
+            /* File genuinely absent — ensure parent dir exists, then seed */
+            ensure_parent_dir(csv_path);
             f = fopen(csv_path, "w");
             if (!f) { ESP_LOGE(TAG, "Cannot create %s", csv_path); return -1; }
             fwrite(BT_LOOKOUT_CSV_HEADER, 1, strlen(BT_LOOKOUT_CSV_HEADER), f);
