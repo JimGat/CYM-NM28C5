@@ -39,6 +39,7 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 - [Software Features — Detailed](#software-features--detailed)
   - [WiFi](#1-wifi)
     - [WiFi Scan & Attack](#wifi-scan--attack)
+    - [Evil Portal Resources](#evil-portal-resources)
     - [Global WiFi Attacks](#global-wifi-attacks)
     - [WiFi Observer & Karma](#wifi-observer--karma)
     - [Deauth Monitor](#deauth-monitor)
@@ -62,39 +63,32 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 | **Handshake Capture** | WPA/WPA2 4-way handshake capture (PCAP & HCCAPX) |
 | **Karma AP** | Respond to probe requests, rogue access point |
 | **Wardriving** | GPS + WiFi logging to SD card (CSV) |
-| **BLE** | AirTag scanner, SmartTag detection, BLE Locator |
+| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, Bluetooth Lookout |
 | **Deauth Monitor** | Passive detection of nearby deauth attacks |
 | **Credentials** | Captive portal credential capture, WPA-SEC upload |
 | **TX Power Mode** | Selectable Normal / Max Power for WiFi and BLE — persisted across reboots |
 | **UI** | Material dark theme, touch gestures, screen dimming, screenshots — all screens portrait 240×320 |
-| **Storage** | SD card for handshakes, wardrive logs, screenshots, file tree browser |
+| **Storage** | SD card for handshakes, wardrive logs, GATT Walker JSON, screenshots, file tree browser |
 
 ---
 
 ## Screenshots
 
-
-
 <p align="center">
-<img width="486" height="326" alt="image" src="https://github.com/user-attachments/assets/7e815b7b-0fa9-475e-91b2-4d14344a7f86" />
-  <br/>
-  <em>Global attacks</em>
+  <img width="150" src="docs/screenshots/Main_Menu.bmp" alt="Main Menu" />
+  &nbsp;
+  <img width="150" src="docs/screenshots/WiFi_Menu.bmp" alt="WiFi Menu" />
+  &nbsp;
+  <img width="150" src="docs/screenshots/WiFi_ScanAttack.bmp" alt="WiFi Scan & Attack" />
 </p>
-
 <p align="center">
-  <img width="486" height="321" alt="image" src="https://github.com/user-attachments/assets/ad768a74-ae52-4888-b43b-aab25ebc3222" />
-
-  <br/>
-  <em>Handshaker</em>
+  <img width="150" src="docs/screenshots/WiFi_Select_Attack.bmp" alt="Select Attack Target" />
+  &nbsp;
+  <img width="150" src="docs/screenshots/WiFi_WarDrive.bmp" alt="Wardrive" />
 </p>
-
 <p align="center">
-<img width="485" height="317" alt="image" src="https://github.com/user-attachments/assets/8a7baecc-a08c-403f-bb76-f79dd3fe8b30" />
-
-  <br/>
-  <em>Kismet-style network observer & Karma attack</em>
+  <em>Main Menu &nbsp;·&nbsp; WiFi Menu &nbsp;·&nbsp; Scan & Attack &nbsp;·&nbsp; Select Target &nbsp;·&nbsp; Wardrive</em>
 </p>
-
 
 ---
 
@@ -238,9 +232,21 @@ Main Menu
 | **WiFi Scan** | Scans all channels, shows SSID, BSSID, RSSI, channel, encryption |
 | **Deauth Attack** | Sends deauthentication frames to disconnect clients from selected AP |
 | **Evil Twin** | Creates a rogue AP cloning the target SSID to lure clients |
-| **Captive Portal** | HTTP server presenting a fake login page to capture credentials |
+| **Captive Portal** | HTTP server presenting a custom HTML login page to capture credentials |
 | **Handshake Capture** | Captures WPA/WPA2 4-way handshakes and saves as PCAP/HCCAPX |
 | **ARP Poisoning** | LwIP-based ARP spoofing for MitM scenarios |
+
+#### Evil Portal Resources
+
+The Captive Portal feature serves a single HTML file from `/sdcard/lab/portal/` as the login page. Any valid HTML file dropped there will be served — no recompilation needed. The community has built extensive collections of pre-made portals styled to look like ISP login pages, hotel WiFi gates, popular service sign-ins, and more.
+
+| Repository | Description |
+|------------|-------------|
+| [D3h420/Evil-Portals-Collection](https://github.com/D3h420/Evil-Portals-Collection) | Large multi-target collection of portal HTML files — ISPs, hotels, and brands |
+| [saintcrossbow/Evil-Cardputer-Portals](https://github.com/saintcrossbow/Evil-Cardputer-Portals) | Portal pages adapted for M5Stack Cardputer; most transfer directly |
+| [DoobTheGoober/EvilPortalGenerator](https://github.com/DoobTheGoober/EvilPortalGenerator) | Generator tool for quickly creating custom portal pages from templates |
+
+Drop the desired `index.html` (or rename your file to `index.html`) into `/sdcard/lab/portal/` and launch **Captive Portal** from the Scan & Attack menu. Credentials entered on the page are logged to `/sdcard/lab/portal/credentials.txt`.
 
 #### Global WiFi Attacks
 
@@ -274,7 +280,8 @@ Bluetooth
 ├── BT Scan & Select    ← start here
 │   └── (select device) → Actions
 │       ├── BT Locator  (RSSI tracking)
-│       └── GATT Walker (fingerprinting — coming soon)
+│       ├── GATT Walker (full GATT fingerprint + JSON output)
+│       └── Add to BT Lookout
 ├── AirTag Scan
 ├── BT Locator
 └── Bluetooth Lookout   ← continuous watchlist monitor
@@ -286,7 +293,7 @@ Bluetooth
 |---------|-------------|
 | **BT Scan & Select** | Active BLE scan — discovers all nearby devices; shows name or vendor (from OUI lookup), RSSI, partial MAC; tap to select a target |
 | **BT Locator** | RSSI-based proximity tracking of a selected BLE device; updates every 10 s |
-| **GATT Walker** | GATT service/characteristic enumeration for device fingerprinting *(planned — stub tile present)* |
+| **GATT Walker** | Full BLE GATT inspection — walks all services, characteristics, and descriptors; reads attribute values; computes FNV-32 device fingerprint; saves structured JSON to SD card with optional GPS geotag |
 | **AirTag Scanner** | Passive BLE scan — detects Apple AirTags and Samsung SmartTags by manufacturer ID |
 | **Tag Locator** | Per-tag RSSI tracking launched from the AirTag Scan found-tags list |
 | **Bluetooth Lookout** | Continuous BLE monitor that alerts when a watchlisted device (by full MAC or OUI prefix) is detected nearby |
@@ -299,7 +306,7 @@ Bluetooth
 
 **Step 2 — Select:** Tap any row to select a target device. The row highlights in cyan and the status bar shows the selection. Tap again to deselect. Only one device can be selected at a time.
 
-**Step 3 — Actions:** Once a device is selected, tap **Actions →** to open the action tile screen, which shows **BT Locator** and **GATT Walker** (stub). The target name is shown in the screen title.
+**Step 3 — Actions:** Once a device is selected, tap **Actions →** to open the action tile screen. Available actions: **BT Locator** (RSSI proximity tracking), **GATT Walker** (full GATT inspection and JSON output), and **Add to BT Lookout** (add the device MAC to the continuous watchlist). The target name or MAC is shown in the screen title.
 
 #### AirTag / SmartTag Locator — How It Works
 
@@ -356,14 +363,84 @@ Use the RSSI value to home in on the tag — a higher (less negative) number mea
 
 Tap **Exit** at any time to stop tracking and return to the main menu. The radio switches back to WiFi mode automatically.
 
+#### GATT Walker — How It Works
+
+<p align="center">
+  <img width="200" src="docs/screenshots/GATT_Walker.bmp" alt="GATT Walker" />
+  <br/>
+  <em>GATT Walker — live progress during a BLE inspection walk</em>
+</p>
+
+**GATT Walker** connects to a selected BLE device and performs a full GATT inspection — enumerating every service, characteristic, and descriptor, reading all readable attribute values, and saving the result as a structured JSON file on the SD card.
+
+**Workflow:**
+
+1. Open **BT Scan & Select**, let the scan run, tap a device to select it.
+2. Tap **Actions →**, then **GATT Walker**.
+3. The active BLE scan stops automatically and a GATT connection is initiated to the target.
+4. The screen shows live progress through the walk stages:
+
+```
+Connecting...
+Connected, discovering services...
+Chr discovery: svc 2/5
+Discovering descriptors...
+Reading characteristics...
+Saving results...
+Walk complete
+```
+
+5. When done, the screen shows the service count, characteristic count, FNV-32 fingerprint, and the file path. Tap **Back** to return to the action menu.
+
+**Output file:** `/sdcard/gattwalker/YYYYMMDD_HHMMSS_AABBCCDDEEFF_gattwalk.json`
+
+```json
+{
+  "version": 1,
+  "timestamp": "20260429_142233",
+  "mac": "AA:BB:CC:DD:EE:FF",
+  "addr_type": 0,
+  "name": "My BLE Device",
+  "rssi": -67,
+  "gps": { "valid": true, "lat": 37.1234567, "lon": -122.4567890 },
+  "fingerprint": "0xA3F1C2B0",
+  "services": [
+    {
+      "uuid": "0x1800",
+      "start_handle": 1,
+      "end_handle": 8,
+      "characteristics": [
+        {
+          "uuid": "0x2A00",
+          "def_handle": 2,
+          "val_handle": 3,
+          "properties": 2,
+          "read_data": "4D7920446576696365",
+          "descriptors": []
+        }
+      ]
+    }
+  ]
+}
+```
+
+**Fingerprint:** An FNV-32 hash computed over all service UUIDs, characteristic UUIDs, and property flags in walk order. Identical device models typically produce the same fingerprint, making it useful for passive device-type identification across multiple captures.
+
+**GPS geotagging:** If a GPS fix is active when GATT Walker starts, the coordinates are embedded in the JSON. This enables later mapping of device sightings.
+
+**Limits:** Up to 20 services, 10 characteristics per service, 4 descriptors per characteristic, 48 bytes read per attribute. PSRAM-allocated (~50 KB result struct + 64 KB JSON buffer).
+
+> **Note:** GATT Walker connects to the target — it is an active, deliberate inspection, not passive. The target device will see an incoming connection. Cancel at any time with the **Cancel Walk** button; the connection is cleanly terminated.
+
 #### Bluetooth Lookout — How It Works
 
 **Bluetooth Lookout** runs a continuous background BLE scan and alerts you — visually and via NeoPixel LED — any time a watchlisted device is seen nearby. Useful for detecting known surveillance hardware, trackers, or specific devices by MAC address or manufacturer OUI prefix.
 
-**Watchlist:** Devices are stored in `/sdcard/lab/bluetooth/lookout.csv`. The file is auto-created on first use. Add devices two ways:
+**Watchlist:** Devices are stored in `/sdcard/lab/bluetooth/lookout.csv`. The file is auto-created on first use (parent directories created automatically). Add devices three ways:
 
 - **BT Scan & Select → Add to Lookout** — scans for BLE devices, select one, choose "Add to Lookout". The exact MAC is added.
-- **OUI Groups** (see below) — adds all devices from a known manufacturer OUI prefix.
+- **OUI Groups** (see below) — adds all devices from a predefined manufacturer OUI block in one tap.
+- **Edit List → + OUI** — manually type any 3-byte OUI (formats `AA:BB:CC`, `AABBCC`, or `AA-BB-CC`) and an optional label. Saved as an OUI-prefix entry that matches any device from that manufacturer.
 
 **Matching modes:**
 - **Full MAC** — triggers only when that exact 6-byte address is seen. Best for tracking a specific known device.
@@ -473,8 +550,12 @@ All data is stored on the SD card:
 │   │   └── *.hccapx      # Hashcat-compatible format (hashcat)
 │   ├── bluetooth/
 │   │   └── lookout.csv   # Bluetooth Lookout watchlist
-│   └── portal/           # Captive portal credential files
+│   └── portal/           # Captive portal files
+│       ├── index.html    # Custom portal page — drop any HTML file here
+│       └── credentials.txt  # Captured login credentials (appended on each submit)
 ├── wardrive/             # GPS + WiFi logs (CSV)
+├── gattwalker/           # GATT Walker JSON fingerprints
+│   └── YYYYMMDD_HHMMSS_AABBCCDDEEFF_gattwalk.json
 ├── screenshots/          # UI screenshots (BMP)
 └── calibrate.txt         # ← Create this file to trigger touch re-calibration on next boot
 ```
@@ -640,10 +721,12 @@ CYM-NM28C5/
 │   │   ├── main.c                # Core application — all UI screens, boot sequence,
 │   │   │                         #   WiFi/BLE logic, touch calibration, GPS, wardriving
 │   │   ├── attack_handshake.c/h  # WPA handshake capture (PCAP & HCCAPX)
+│   │   ├── bt_lookout.c/h        # Bluetooth Lookout — CSV watchlist, LED alerts, OUI matching
+│   │   ├── oui_lookup.c/h        # OUI vendor lookup — PSRAM binary search over ouilist.bin
+│   │   ├── gatt_walker.c/h       # GATT Walker — NimBLE GATT client, JSON output, FNV-32 fingerprint
 │   │   ├── xpt2046.c/h           # XPT2046 SPI touch driver (polling, null-zone, calibration)
 │   │   ├── lvgl_memory.c/h       # PSRAM allocator for LVGL
-│   │   ├── dexter_img.c/h        # Dexter mascot image data (splash screen, RGB565)
-│   │   └── ft6336.c/h            # FT6336 capacitive touch driver (unused — not compiled)
+│   │   └── dexter_img.c/h        # Dexter mascot image data (splash screen, RGB565)
 │   ├── components/
 │   │   ├── wifi_cli/             # CLI, WiFi init, LED control; wifi_common.c/h (shared constants)
 │   │   ├── wifi_scanner/         # Active WiFi scan engine, target BSSID tracking
