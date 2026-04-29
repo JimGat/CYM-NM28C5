@@ -2,10 +2,14 @@
  
 </p>
 
-<h1 align="center">JANOS on NM-CYD-C5</h1>
+<h1 align="center">Cheap Yellow Monster</h1>
 
 <p align="center">
-  <b>WiFi 6 security toolkit & wardriving device built on NerdMiner ESP32-C5 CYD</b>
+  <b>JanOS on NM-CYD-C5</b>
+</p>
+
+<p align="center">
+  WiFi 6 security toolkit &amp; wardriving device built on NerdMiner ESP32-C5 CYD
 </p>
 
 <p align="center">
