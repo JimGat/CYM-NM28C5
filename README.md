@@ -2,10 +2,14 @@
  
 </p>
 
-<h1 align="center">JANOS on NM-CYD-C5</h1>
+<h1 align="center">Cheap Yellow Monster</h1>
 
 <p align="center">
-  <b>WiFi 6 security toolkit & wardriving device built on NerdMiner ESP32-C5 CYD</b>
+  <b>JanOS on NM-CYD-C5</b>
+</p>
+
+<p align="center">
+  WiFi 6 &amp; BLE security toolkit with SigInt &amp; Wardriving built on NerdMiner ESP32-C5 CYD
 </p>
 
 <p align="center">
@@ -15,6 +19,10 @@
   <img src="https://img.shields.io/badge/Display-ST7789%202.8%22-orange" alt="ST7789"/>
   <img src="https://img.shields.io/badge/WiFi-802.11ax%20(WiFi%206)-blueviolet" alt="WiFi 6"/>
   <img src="https://img.shields.io/badge/BLE-5.0-informational" alt="BLE 5"/>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/Cheep%20Yellow%20Monster.jpg" alt="Cheap Yellow Monster" width="50%"/>
 </p>
 
 ---
@@ -46,6 +54,9 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
   - [Bluetooth](#2-bluetooth)
   - [Wardriving](#3-wardriving)
   - [Settings](#4-settings)
+    - [TX Power Mode](#tx-power-mode)
+    - [GATT Connect Timeout](#gatt-connect-timeout)
+    - [Data Transfer](#data-transfer)
 - [Data & Storage](#data--storage)
 - [Touch Calibration](#touch-calibration)
 - [Building & Flashing](#building--flashing)
@@ -67,6 +78,7 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 | **Deauth Monitor** | Passive detection of nearby deauth attacks |
 | **Credentials** | Captive portal credential capture, WPA-SEC upload |
 | **TX Power Mode** | Selectable Normal / Max Power for WiFi and BLE — persisted across reboots |
+| **Data Transfer** | Self-hosted AP file server (TheLab) and WiFi client file server — browse & download SD card contents from any browser; IP shown on screen |
 | **UI** | Material dark theme, touch gestures, screen dimming, screenshots — all screens portrait 240×320 |
 | **Storage** | SD card for handshakes, wardrive logs, GATT Walker JSON, screenshots, file tree browser |
 
@@ -216,11 +228,40 @@ The **WiFi** tile opens a sub-menu grouping all WiFi functions:
 
 ```
 Main Menu
-└── WiFi
-    ├── Scan & Attack
-    ├── WiFi Attacks
-    ├── Deauth Mon.
-    └── WiFi Observer
+├── WiFi
+│   ├── Scan & Attack
+│   ├── WiFi Attacks
+│   ├── Deauth Mon.
+│   └── WiFi Observer
+├── Bluetooth
+│   ├── BT Scan & Select
+│   │   └── (select device) → Actions
+│   │       ├── BT Locator
+│   │       ├── GATT Walker
+│   │       └── Add to BT Lookout
+│   ├── AirTag Scan
+│   ├── BT Locator
+│   └── Bluetooth Lookout
+│       ├── Edit Watchlist
+│       └── OUI Groups
+├── Wardrive
+├── Settings
+│   ├── Compromised Data
+│   ├── Timing
+│   │   ├── WiFi Scan/Ch  (min/max dwell sliders)
+│   │   └── GATT Timeout  (3–30 s slider)
+│   ├── Download Mode
+│   ├── Screen
+│   │   ├── Timeout       (inactivity timer)
+│   │   └── Brightness    (10–100% overlay)
+│   ├── SD Card
+│   ├── GPS Info
+│   ├── Power Mode
+│   └── Data Transfer
+│       ├── AP File Server
+│       ├── WiFi Client
+│       └── Wardrive Upload
+└── Go Dark
 ```
 
 #### WiFi Scan & Attack
@@ -304,7 +345,7 @@ Bluetooth
 
 **Step 1 — Scan:** Open **BT Scan & Select** from the Bluetooth menu. A 10-second active BLE scan runs, collecting all advertising devices. Each row shows device name (or vendor from OUI lookup, or `[Unknown]`), RSSI, and the last 3 octets of the MAC address. The list updates live every 500 ms during the scan.
 
-**Step 2 — Select:** Tap any row to select a target device. The row highlights in cyan and the status bar shows the selection. Tap again to deselect. Only one device can be selected at a time.
+**Step 2 — Select:** Tap any row to select a target device. The row highlights in cyan and the status bar shows the selection. Tap again to deselect. Only one device can be selected at a time. **Scrolling the list does not select a device** — only a clean tap (no scroll movement) counts as a selection.
 
 **Step 3 — Actions:** Once a device is selected, tap **Actions →** to open the action tile screen. Available actions: **BT Locator** (RSSI proximity tracking), **GATT Walker** (full GATT inspection and JSON output), and **Add to BT Lookout** (add the device MAC to the continuous watchlist). The target name or MAC is shown in the screen title.
 
@@ -430,6 +471,8 @@ Walk complete
 
 **Limits:** Up to 20 services, 10 characteristics per service, 4 descriptors per characteristic, 48 bytes read per attribute. PSRAM-allocated (~50 KB result struct + 64 KB JSON buffer).
 
+**Connect timeout:** Configurable via **Settings → Timing → GATT Timeout** (3 s – 30 s slider, NVS-persisted). The default is 30 s. Use a shorter value for fast nearby devices; leave it long for distant or slow-to-respond targets. The same timeout variable is shared with the upcoming BT Observer feature.
+
 > **Note:** GATT Walker connects to the target — it is an active, deliberate inspection, not passive. The target device will see an incoming connection. Cancel at any time with the **Cancel Walk** button; the connection is cleanly terminated.
 
 #### Bluetooth Lookout — How It Works
@@ -483,16 +526,35 @@ GPS-enabled WiFi logging for mapping wireless networks. Requires an **ATGM336H**
 
 ### 4. Settings
 
+```
+Settings
+├── Compromised Data    (WiFi credential monitor)
+├── Timing              (WiFi scan dwell + GATT connect timeout — combined popup)
+│   ├── WiFi Scan/Ch    (min/max dwell time per channel — 50–1000 ms sliders)
+│   └── GATT Timeout    (BLE connect timeout — 3–30 s slider)
+├── Download Mode       (reboot into bootloader)
+├── Screen              (screen timeout + brightness — combined popup)
+│   ├── Timeout         (inactivity timer before dimming)
+│   └── Brightness      (software brightness overlay 10–100%)
+├── SD Card             (provision / file tree / free space)
+├── GPS Info            (live fix status)
+├── Power Mode          (Normal / Max TX power)
+└── Data Transfer       (file server sub-menu)
+    ├── AP File Server  (start TheLab AP, serve /sdcard/ on 192.168.4.1)
+    ├── WiFi Client     (join a saved network, serve /sdcard/ on DHCP IP)
+    └── Wardrive Upload (coming soon)
+```
+
+All settings are persisted via **NVS** (Non-Volatile Storage) across reboots. The settings menu fits on a single screen (8 tiles, 3-column grid, no scrolling).
+
 | Setting | Description |
 |---------|-------------|
-| **Screen Timeout** | Inactivity timer before display dimming |
-| **Brightness** | Software brightness overlay (10–100%) |
-| **Scan Duration** | Configurable WiFi scan time |
+| **Timing** | Combined timing popup — WiFi scan dwell time sliders and GATT connect timeout slider |
+| **Screen** | Combined screen popup — inactivity timeout dropdown and brightness overlay slider |
 | **SD Card** | Validate/provision (creates `/sdcard/lab/` structure, shows completion status); browse file tree; check free space |
 | **GPS Info** | Live GPS fix status, latitude, longitude, altitude, satellite count, and UART config reference (IO4/IO5, 9600 baud, ATGM336H) |
 | **Power Mode** | TX Power Mode selector — Normal or Max Power (see below) |
-
-All settings are persisted via **NVS** (Non-Volatile Storage) across reboots.
+| **Data Transfer** | File server sub-menu — AP mode or WiFi client mode (see below) |
 
 #### TX Power Mode
 
@@ -506,6 +568,60 @@ Accessible via **Settings → Power Mode**. Defaults to **Normal** on first boot
 Switching modes takes effect immediately on the active radio and is re-applied automatically every time WiFi or BLE is started — including on attack start/stop and radio mode switches.
 
 > **Note:** Actual radiated power (EIRP) is still bounded by the NM-CYD-C5's PCB antenna, PHY calibration data, and the country/regulatory settings loaded at boot. Max Power increases effective range but does not bypass regulatory limits enforced by the PHY layer.
+
+#### Timing Settings
+
+Accessible via **Settings → Timing**. A single popup contains two sections:
+
+**WiFi Scan / Channel** — min and max dwell time sliders (50–1000 ms) control how long the WiFi scanner dwells on each channel during active scans. Both values are NVS-persisted.
+
+**GATT Connect Timeout** — a single slider sets the BLE connection timeout used by GATT Walker (and the upcoming BT Observer feature).
+
+| Slider position | Timeout | Best for |
+|-----------------|---------|----------|
+| Far left (3 s) | 3 000 ms | Fast, nearby devices that respond immediately |
+| Default / far right (30 s) | 30 000 ms | Distant, intermittent, or slow-to-respond targets |
+
+The value is saved to NVS key `gatt_tmo` and applied on every subsequent GATT Walker walk without needing a reboot.
+
+> **Error descriptions:** When a connection fails, GATT Walker now shows a human-readable reason (e.g. *"No response — needs pairing or asleep"* for BLE timeout code 13, *"Radio busy — stop scan first"* for code 15) instead of a raw numeric code.
+
+#### Data Transfer
+
+Accessible via **Settings → Data Transfer**. Turns the device into an HTTP file server so you can browse and download anything on the SD card from a phone or laptop — no cables or card reader needed.
+
+```
+Settings → Data Transfer
+├── AP File Server      ← device creates its own WiFi network
+├── WiFi Client         ← device joins your existing network
+└── Wardrive Upload     (placeholder — coming in a future update)
+```
+
+**AP File Server**
+
+The device starts a WPA2-secured access point and immediately serves `/sdcard/` on its default gateway address.
+
+| Detail | Value |
+|--------|-------|
+| **SSID** | `TheLab` |
+| **Password** | `Do not touch!` |
+| **Server URL** | `http://192.168.4.1` |
+| **Channel** | 6 |
+
+Connect your phone or laptop to the `TheLab` network, then open `http://192.168.4.1` in a browser. You get a directory listing of the SD card. Click any folder to navigate, click any file to download it. Tap **Stop** on the device to shut the server down and restore normal operation.
+
+**WiFi Client Server**
+
+The device joins an existing WiFi network as a station (STA) and serves files on the IP address assigned by your router's DHCP server. The IP is displayed prominently on screen as soon as a lease is obtained.
+
+1. Tap **WiFi Client** — the screen shows pre-filled SSID and password fields (populated from the last saved connection).
+2. Edit SSID / password if needed — tap either field to bring up the on-screen keyboard.
+3. Tap **Connect** — the device connects to your network. Credentials are saved to NVS so next time the fields are pre-filled.
+4. Once connected the screen shows the assigned IP: `IP: 192.168.x.x => http://192.168.x.x`
+5. Open that URL on any device on the same network to browse and download SD card files.
+6. Tap **Back** to disconnect and stop the server.
+
+> **Note:** The WiFi radio must be available (not in BLE mode) to use the file server. If BLE is active, the firmware switches radio modes automatically.
 
 ### UI & System Features
 
