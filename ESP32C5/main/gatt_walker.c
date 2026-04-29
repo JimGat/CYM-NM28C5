@@ -17,7 +17,7 @@ static const char *TAG = "gatt_walker";
 volatile gw_state_t gw_ui_state        = GW_STATE_IDLE;
 volatile int        gw_ui_svc_count    = 0;
 volatile int        gw_ui_chr_count    = 0;
-volatile char       gw_ui_status[64]   = "";
+volatile char       gw_ui_status[96]   = "";
 volatile bool       gw_ui_needs_update = false;
 
 /* ── Internal state ──────────────────────────────────────────────── */
@@ -51,6 +51,36 @@ static void s_notify_ui(const char *msg)
 static void s_fire_event(gw_event_t evt)
 {
     if (s_callback) s_callback(evt, s_result);
+}
+
+/* ── BLE error descriptions ──────────────────────────────────────── */
+
+static const char *s_ble_error_desc(int rc)
+{
+    /* NimBLE host-layer errors */
+    switch (rc) {
+    case 2:  return "Already connecting";
+    case 6:  return "Out of memory — restart device";
+    case 7:  return "Not connected";
+    case 13: return "No response — needs pairing or asleep";
+    case 15: return "Radio busy — stop scan first";
+    case 21: return "No local BLE address";
+    case 22: return "BLE stack not ready — restart BT";
+    }
+    /* HCI controller errors: BLE_HS_ERR_HCI_BASE = 0x200 */
+    if (rc >= 0x200 && rc < 0x300) {
+        switch (rc - 0x200) {
+        case 0x05: return "Auth failure — device requires bonding";
+        case 0x06: return "PIN missing — device requires pairing";
+        case 0x08: return "Connection timeout — out of range";
+        case 0x12: return "LMP timeout — not responding";
+        case 0x16: return "Terminated by local host";
+        case 0x22: return "LL timeout — link layer lost";
+        case 0x3B: return "Failed to establish connection";
+        case 0x3E: return "Connection rejected by device";
+        }
+    }
+    return "Unknown error";
 }
 
 static void s_disconnect(void)
@@ -484,7 +514,8 @@ static int s_svc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
         return 0;
     }
     if (error->status != 0) {
-        char msg[32]; snprintf(msg, sizeof(msg), "Svc error: %d", error->status);
+        char msg[96]; snprintf(msg, sizeof(msg), "Svc error (%d)\n%s",
+                               error->status, s_ble_error_desc(error->status));
         s_fail(msg);
         return 0;
     }
@@ -509,8 +540,10 @@ static int s_gap_cb(struct ble_gap_event *event, void *arg)
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status != 0) {
-            char msg[32];
-            snprintf(msg, sizeof(msg), "Connect failed: %d", event->connect.status);
+            char msg[96];
+            snprintf(msg, sizeof(msg), "Connect failed (%d)\n%s",
+                     event->connect.status,
+                     s_ble_error_desc(event->connect.status));
             s_fail(msg);
             return 0;
         }
@@ -625,7 +658,8 @@ bool gw_walk(const uint8_t mac[6], uint8_t addr_type, const char *name,
                              30000 /* ms timeout */, NULL,
                              s_gap_cb, NULL);
     if (rc != 0) {
-        char msg[32]; snprintf(msg, sizeof(msg), "Connect init fail: %d", rc);
+        char msg[96]; snprintf(msg, sizeof(msg), "Init failed (%d)\n%s",
+                               rc, s_ble_error_desc(rc));
         s_fail(msg);
         return false;
     }

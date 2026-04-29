@@ -79,7 +79,7 @@ typedef struct {
 extern volatile gw_state_t gw_ui_state;
 extern volatile int        gw_ui_svc_count;
 extern volatile int        gw_ui_chr_count;
-extern volatile char       gw_ui_status[64];
+extern volatile char       gw_ui_status[96];
 extern volatile bool       gw_ui_needs_update;
 
 /* ── Callback — called from NimBLE context; NO LVGL calls here! ─── */
