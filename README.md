@@ -74,28 +74,21 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 
 ## Screenshots
 
-
-
 <p align="center">
-<img width="486" height="326" alt="image" src="https://github.com/user-attachments/assets/7e815b7b-0fa9-475e-91b2-4d14344a7f86" />
-  <br/>
-  <em>Global attacks</em>
+  <img width="150" src="docs/screenshots/Main_Menu.bmp" alt="Main Menu" />
+  &nbsp;
+  <img width="150" src="docs/screenshots/WiFi_Menu.bmp" alt="WiFi Menu" />
+  &nbsp;
+  <img width="150" src="docs/screenshots/WiFi_ScanAttack.bmp" alt="WiFi Scan & Attack" />
 </p>
-
 <p align="center">
-  <img width="486" height="321" alt="image" src="https://github.com/user-attachments/assets/ad768a74-ae52-4888-b43b-aab25ebc3222" />
-
-  <br/>
-  <em>Handshaker</em>
+  <img width="150" src="docs/screenshots/WiFi_Select_Attack.bmp" alt="Select Attack Target" />
+  &nbsp;
+  <img width="150" src="docs/screenshots/WiFi_WarDrive.bmp" alt="Wardrive" />
 </p>
-
 <p align="center">
-<img width="485" height="317" alt="image" src="https://github.com/user-attachments/assets/8a7baecc-a08c-403f-bb76-f79dd3fe8b30" />
-
-  <br/>
-  <em>Kismet-style network observer & Karma attack</em>
+  <em>Main Menu &nbsp;·&nbsp; WiFi Menu &nbsp;·&nbsp; Scan & Attack &nbsp;·&nbsp; Select Target &nbsp;·&nbsp; Wardrive</em>
 </p>
-
 
 ---
 
@@ -355,18 +348,6 @@ Use the RSSI value to home in on the tag — a higher (less negative) number mea
 | −55 to −70 dBm | Nearby (~1–5 m) |
 | −70 to −85 dBm | In the same room (~5–15 m) |
 | Below −85 dBm | Far away or obstructed |
-
-<p align="center">
-  <img width="340" alt="AirTag Far Away" src="docs/screenshots/airtag_detection_far.jpg" />
-  <br/>
-  <em>AirTag Far Away</em>
-</p>
-
-<p align="center">
-  <img width="340" alt="AirTag Found" src="docs/screenshots/airtag_detection_close.jpg" />
-  <br/>
-  <em>AirTag Found</em>
-</p>
 
 Tap **Exit** at any time to stop tracking and return to the main menu. The radio switches back to WiFi mode automatically.
 
