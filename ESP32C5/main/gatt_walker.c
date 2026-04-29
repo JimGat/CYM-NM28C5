@@ -609,6 +609,13 @@ const gw_result_t *gw_get_result(void) { return s_result; }
 bool gw_walk(const uint8_t mac[6], uint8_t addr_type, const char *name,
              int8_t rssi, double lat, double lon, bool gps_valid)
 {
+    /* Allow restart from any terminal state */
+    if (s_state == GW_STATE_COMPLETE ||
+        s_state == GW_STATE_FAILED   ||
+        s_state == GW_STATE_CANCELLED) {
+        s_state     = GW_STATE_IDLE;
+        gw_ui_state = GW_STATE_IDLE;
+    }
     if (s_state != GW_STATE_IDLE) {
         ESP_LOGW(TAG, "Walk already in progress (state=%d)", (int)s_state);
         return false;
