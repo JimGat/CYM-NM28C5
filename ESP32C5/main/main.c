@@ -88,6 +88,7 @@ LV_IMG_DECLARE(deedee_img);
 #include "dexter_img.h"
 #include "bt_lookout.h"
 #include "oui_lookup.h"
+#include "gatt_walker.h"
 
 #define TAG "WiFi_Hacker"
 
@@ -131,6 +132,7 @@ static int bt_smarttag_count = 0;
 // Generic BT device storage for scan_bt command
 typedef struct {
     uint8_t addr[6];
+    uint8_t addr_type;   /* BLE_ADDR_PUBLIC=0 or BLE_ADDR_RANDOM=1 */
     int8_t rssi;
     char name[32];
     uint16_t company_id;
@@ -1081,6 +1083,7 @@ static volatile bool bt_sas_ui_active = false;
 static volatile bool bt_sas_needs_update = false;
 static int bt_sas_selected_idx = -1;
 static uint8_t bt_sas_target_addr[6];
+static uint8_t bt_sas_target_addr_type = 0;
 static char bt_sas_target_name[32];
 
 // ── BT Lookout (Dee Dee Detector) UI state ──────────────────────
@@ -1094,6 +1097,16 @@ static lv_obj_t   *bt_lookout_oui_btn          = NULL;
 static lv_obj_t   *bt_lookout_popup_obj        = NULL;
 static lv_timer_t *bt_lookout_popup_tmr        = NULL;
 static TaskHandle_t bt_lookout_scan_loop_handle = NULL;
+
+// ── GATT Walker UI state ─────────────────────────────────────────
+static bool       gw_screen_active   = false;
+static lv_obj_t  *gw_status_lbl      = NULL;
+static lv_obj_t  *gw_svc_lbl         = NULL;
+static lv_obj_t  *gw_chr_lbl         = NULL;
+static lv_obj_t  *gw_result_lbl      = NULL;
+static lv_obj_t  *gw_cancel_btn      = NULL;
+static lv_obj_t  *gw_back_btn        = NULL;
+
 // Snapshot values for UI (copied before reset)
 static volatile int airtag_scan_snapshot_airtag = 0;
 static volatile int airtag_scan_snapshot_smarttag = 0;
@@ -1455,6 +1468,10 @@ static void show_bt_scan_select_screen(void);
 static void show_bt_attack_tiles_screen(void);
 static void bt_sas_refresh_list(void);
 static void show_bt_locator_direct_track(void);
+
+// GATT Walker
+static void show_gatt_walker_screen(void);
+static void gw_update_screen_ui(void);
 
 // BT Lookout
 static void show_bt_lookout_screen(void);
@@ -3692,6 +3709,8 @@ void app_main(void)
         return;
     }
 
+    gw_init(sd_spi_mutex);
+
     // Screenshot worker (queue + background saver task)
     screenshot_queue = xQueueCreate(1, sizeof(screenshot_msg_t));
     if (screenshot_queue == NULL) {
@@ -5000,6 +5019,12 @@ void app_main(void)
                     }
                     bt_lookout_update_ui();
                 }
+            }
+
+            // GATT Walker UI update
+            if (gw_ui_needs_update && gw_screen_active) {
+                gw_ui_needs_update = false;
+                gw_update_screen_ui();
             }
 
             // Deauth Monitor UI update
@@ -16504,6 +16529,7 @@ static void bt_sas_device_cb(lv_event_t *e)
     } else {
         bt_sas_selected_idx = idx;
         memcpy(bt_sas_target_addr, bt_devices[idx].addr, 6);
+        bt_sas_target_addr_type = bt_devices[idx].addr_type;
         if (bt_devices[idx].name[0] != '\0')
             snprintf(bt_sas_target_name, sizeof(bt_sas_target_name), "%s", bt_devices[idx].name);
         else
@@ -16799,6 +16825,189 @@ static void show_bt_locator_direct_track(void)
     }
 
     ui_locked = false;
+}
+
+// ── GATT Walker ──────────────────────────────────────────────────
+
+static void gw_back_btn_cb(lv_event_t *e)
+{
+    gw_screen_active = false;
+    gw_status_lbl    = NULL;
+    gw_svc_lbl       = NULL;
+    gw_chr_lbl       = NULL;
+    gw_result_lbl    = NULL;
+    gw_cancel_btn    = NULL;
+    gw_back_btn      = NULL;
+    show_bt_attack_tiles_screen();
+}
+
+static void gw_cancel_btn_cb(lv_event_t *e)
+{
+    gw_cancel();
+    if (gw_cancel_btn && lv_obj_is_valid(gw_cancel_btn)) {
+        lv_obj_t *lbl = lv_obj_get_child(gw_cancel_btn, 0);
+        if (lbl) lv_label_set_text(lbl, "Cancelling...");
+        lv_obj_add_state(gw_cancel_btn, LV_STATE_DISABLED);
+    }
+}
+
+/* Called from main loop (inside lvgl_mutex) when gw_ui_needs_update is set. */
+static void gw_update_screen_ui(void)
+{
+    if (!gw_screen_active || !function_page || !lv_obj_is_valid(function_page)) return;
+
+    gw_state_t st   = (gw_state_t)gw_ui_state;
+    int        nsvc = (int)gw_ui_svc_count;
+    int        nchr = (int)gw_ui_chr_count;
+    char       stat[64];
+    strncpy(stat, (const char *)gw_ui_status, sizeof(stat) - 1);
+    stat[sizeof(stat) - 1] = '\0';
+
+    if (gw_status_lbl && lv_obj_is_valid(gw_status_lbl))
+        lv_label_set_text(gw_status_lbl, stat);
+
+    if (gw_svc_lbl && lv_obj_is_valid(gw_svc_lbl)) {
+        char t[24]; snprintf(t, sizeof(t), "Services: %d", nsvc);
+        lv_label_set_text(gw_svc_lbl, t);
+    }
+    if (gw_chr_lbl && lv_obj_is_valid(gw_chr_lbl)) {
+        char t[24]; snprintf(t, sizeof(t), "Characteristics: %d", nchr);
+        lv_label_set_text(gw_chr_lbl, t);
+    }
+
+    bool done = (st == GW_STATE_COMPLETE || st == GW_STATE_FAILED || st == GW_STATE_CANCELLED);
+
+    /* Show/hide cancel vs back */
+    if (gw_cancel_btn && lv_obj_is_valid(gw_cancel_btn)) {
+        if (done) lv_obj_add_flag(gw_cancel_btn, LV_OBJ_FLAG_HIDDEN);
+        else      lv_obj_clear_flag(gw_cancel_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (gw_back_btn && lv_obj_is_valid(gw_back_btn)) {
+        if (done) lv_obj_clear_flag(gw_back_btn, LV_OBJ_FLAG_HIDDEN);
+        else      lv_obj_add_flag(gw_back_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    /* Result summary when complete */
+    if (gw_result_lbl && lv_obj_is_valid(gw_result_lbl)) {
+        if (st == GW_STATE_COMPLETE) {
+            const gw_result_t *r = gw_get_result();
+            char t[80];
+            if (r) {
+                snprintf(t, sizeof(t), "%d svcs  %d chrs\nFP: 0x%08X\n%s",
+                         r->svc_count, (int)gw_ui_chr_count,
+                         r->fingerprint, r->filepath + 9 /* skip /sdcard/ */);
+            } else {
+                snprintf(t, sizeof(t), "Done");
+            }
+            lv_label_set_text(gw_result_lbl, t);
+            lv_obj_clear_flag(gw_result_lbl, LV_OBJ_FLAG_HIDDEN);
+        } else if (st == GW_STATE_FAILED) {
+            lv_label_set_text(gw_result_lbl, "Walk failed — see log");
+            lv_obj_clear_flag(gw_result_lbl, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(gw_result_lbl, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+static void show_gatt_walker_screen(void)
+{
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+
+    /* Stop any active scan — we'll need the radio for connecting */
+    ble_gap_disc_cancel();
+
+    char title[48];
+    snprintf(title, sizeof(title), "GATT: %.26s", bt_sas_target_name);
+    create_function_page_base(title);
+    apply_menu_bg();
+
+    /* Target MAC line */
+    char mac_str[18];
+    snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+             bt_sas_target_addr[5], bt_sas_target_addr[4], bt_sas_target_addr[3],
+             bt_sas_target_addr[2], bt_sas_target_addr[1], bt_sas_target_addr[0]);
+
+    lv_obj_t *mac_lbl = lv_label_create(function_page);
+    lv_label_set_text(mac_lbl, mac_str);
+    lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(mac_lbl, lv_color_make(160, 160, 160), 0);
+    lv_obj_align(mac_lbl, LV_ALIGN_TOP_MID, 0, 35);
+
+    /* Status label */
+    gw_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(gw_status_lbl, "Starting...");
+    lv_obj_set_style_text_font(gw_status_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(gw_status_lbl, ui_text_color(), 0);
+    lv_label_set_long_mode(gw_status_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(gw_status_lbl, 220);
+    lv_obj_align(gw_status_lbl, LV_ALIGN_TOP_MID, 0, 60);
+
+    /* Service count */
+    gw_svc_lbl = lv_label_create(function_page);
+    lv_label_set_text(gw_svc_lbl, "Services: 0");
+    lv_obj_set_style_text_font(gw_svc_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(gw_svc_lbl, lv_color_make(100, 200, 255), 0);
+    lv_obj_align(gw_svc_lbl, LV_ALIGN_TOP_MID, 0, 110);
+
+    /* Char count */
+    gw_chr_lbl = lv_label_create(function_page);
+    lv_label_set_text(gw_chr_lbl, "Characteristics: 0");
+    lv_obj_set_style_text_font(gw_chr_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(gw_chr_lbl, lv_color_make(100, 200, 255), 0);
+    lv_obj_align(gw_chr_lbl, LV_ALIGN_TOP_MID, 0, 135);
+
+    /* Result label (hidden until done) */
+    gw_result_lbl = lv_label_create(function_page);
+    lv_label_set_text(gw_result_lbl, "");
+    lv_obj_set_style_text_font(gw_result_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(gw_result_lbl, lv_color_make(140, 220, 140), 0);
+    lv_label_set_long_mode(gw_result_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(gw_result_lbl, 220);
+    lv_obj_align(gw_result_lbl, LV_ALIGN_TOP_MID, 0, 165);
+    lv_obj_add_flag(gw_result_lbl, LV_OBJ_FLAG_HIDDEN);
+
+    /* Cancel button */
+    gw_cancel_btn = lv_btn_create(function_page);
+    lv_obj_set_size(gw_cancel_btn, 140, 36);
+    lv_obj_align(gw_cancel_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(gw_cancel_btn, lv_color_make(180, 40, 40), 0);
+    lv_obj_add_event_cb(gw_cancel_btn, gw_cancel_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *clbl = lv_label_create(gw_cancel_btn);
+    lv_label_set_text(clbl, "Cancel Walk");
+    lv_obj_center(clbl);
+
+    /* Back button (hidden until done) */
+    gw_back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(gw_back_btn, 140, 36);
+    lv_obj_align(gw_back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(gw_back_btn, lv_color_make(50, 50, 60), 0);
+    lv_obj_add_event_cb(gw_back_btn, gw_back_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *blbl = lv_label_create(gw_back_btn);
+    lv_label_set_text(blbl, "Back");
+    lv_obj_center(blbl);
+    lv_obj_add_flag(gw_back_btn, LV_OBJ_FLAG_HIDDEN);
+
+    /* Mark screen active and start the walk */
+    gw_screen_active = true;
+    gw_ui_needs_update = false;
+
+    /* GPS snapshot */
+    double lat    = current_gps.valid ? (double)current_gps.latitude  : 0.0;
+    double lon    = current_gps.valid ? (double)current_gps.longitude : 0.0;
+    bool   gps_ok = current_gps.valid;
+
+    if (!gw_walk(bt_sas_target_addr, bt_sas_target_addr_type,
+                 bt_sas_target_name, (int8_t)bt_devices[bt_sas_selected_idx].rssi,
+                 lat, lon, gps_ok)) {
+        if (gw_status_lbl && lv_obj_is_valid(gw_status_lbl))
+            lv_label_set_text(gw_status_lbl, "Failed to start walk");
+        if (gw_cancel_btn && lv_obj_is_valid(gw_cancel_btn))
+            lv_obj_add_flag(gw_cancel_btn, LV_OBJ_FLAG_HIDDEN);
+        if (gw_back_btn && lv_obj_is_valid(gw_back_btn))
+            lv_obj_clear_flag(gw_back_btn, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 // Attack tile screen after device selection
@@ -18008,9 +18217,9 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
 
-    // GATT Walker (future)
+    // GATT Walker — BLE GATT inspector
     if (strcmp(attack_name, "GATT Walker") == 0) {
-        show_stub_screen("GATT Walker", show_bt_attack_tiles_screen);
+        show_gatt_walker_screen();
         return;
     }
 
@@ -18730,6 +18939,7 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
     if (bt_device_count < BT_MAX_DEVICES) {
         bt_device_info_t *dev = &bt_devices[bt_device_count];
         memcpy(dev->addr, desc->addr.val, 6);
+        dev->addr_type = desc->addr.type;
         dev->rssi = desc->rssi;
         dev->name[0] = '\0';
         dev->company_id = 0;
