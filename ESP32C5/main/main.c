@@ -1113,6 +1113,7 @@ typedef struct {
     int              svc_count;
     int              chr_count;
     uint32_t         fingerprint;
+    char             filepath[80];   /* JSON path on SD — populated after walk */
 } bto_device_t;
 
 typedef enum {
@@ -1517,6 +1518,7 @@ static void show_bt_attack_tiles_screen(void);
 static void bt_sas_refresh_list(void);
 static void show_bt_observer_screen(void);
 static void bt_observer_task(void *pvParameters);
+static void show_bto_device_detail(int dev_idx);
 
 // Data Transfer screens
 static void show_data_transfer_screen(void);
@@ -17979,6 +17981,235 @@ static void show_bt_scan_select_screen(void)
 // BT Observer — scan once, then sequentially GATT-walk every device found
 // ============================================================================
 
+/* ── Known GATT UUID name table ──────────────────────────────────── */
+typedef struct { uint16_t uuid16; const char *name; } gatt_uuid_name_t;
+static const gatt_uuid_name_t s_gatt_uuid_names[] = {
+    /* Services */
+    { 0x1800, "Generic Access"       }, { 0x1801, "Generic Attribute"    },
+    { 0x180A, "Device Information"   }, { 0x180F, "Battery"              },
+    { 0x1810, "Blood Pressure"       }, { 0x1812, "HID"                  },
+    { 0x1816, "Cycling Speed"        }, { 0x1818, "Cycling Power"        },
+    { 0x181A, "Environmental Sensing"}, { 0x181C, "User Data"            },
+    { 0x1820, "Internet Protocol"    }, { 0x1823, "HTTP Proxy"           },
+    { 0x183A, "Insulin Delivery"     }, { 0x183E, "Physical Activity"    },
+    { 0x1803, "Link Loss"            }, { 0x1804, "TX Power"             },
+    { 0x1805, "Current Time"         }, { 0x1806, "Reference Time"       },
+    { 0x1807, "Next DST Change"      }, { 0x180D, "Heart Rate"           },
+    { 0x180E, "Phone Alert"          }, { 0x1813, "Scan Parameters"      },
+    /* Characteristics */
+    { 0x2A00, "Device Name"          }, { 0x2A01, "Appearance"           },
+    { 0x2A04, "Peripheral Pref Conn" }, { 0x2A05, "Service Changed"      },
+    { 0x2A06, "Alert Level"          }, { 0x2A07, "TX Power Level"       },
+    { 0x2A08, "Date Time"            }, { 0x2A19, "Battery Level"        },
+    { 0x2A24, "Model Number"         }, { 0x2A25, "Serial Number"        },
+    { 0x2A26, "Firmware Revision"    }, { 0x2A27, "Hardware Revision"    },
+    { 0x2A28, "Software Revision"    }, { 0x2A29, "Manufacturer Name"    },
+    { 0x2A2A, "IEEE 11073"           }, { 0x2A37, "Heart Rate Measurement"},
+    { 0x2A38, "Body Sensor Location" }, { 0x2A39, "Heart Rate Control"   },
+    { 0x2A3F, "Alert Status"         }, { 0x2A46, "New Alert"            },
+    { 0x2A4D, "HID Report"           }, { 0x2A4E, "HID Protocol Mode"    },
+    { 0x2A6E, "Temperature"          }, { 0x2A6F, "Humidity"             },
+    { 0x2A6D, "Pressure"             }, { 0x2A76, "UV Index"             },
+    { 0x2A9B, "Body Composition Feat"}, { 0x2AA6, "MAC Address"          },
+    { 0x2B29, "Client Support Feat"  }, { 0x2B2A, "Database Hash"        },
+    /* Descriptors */
+    { 0x2900, "Ext Properties"       }, { 0x2901, "User Description"     },
+    { 0x2902, "CCCD"                 }, { 0x2903, "SCCD"                 },
+    { 0x2904, "Presentation Format"  }, { 0x2905, "Aggregate Format"     },
+};
+#define S_GATT_UUID_NAME_COUNT (sizeof(s_gatt_uuid_names)/sizeof(s_gatt_uuid_names[0]))
+
+static const char *gatt_uuid_name(const char *uuid_str)
+{
+    /* uuid_str from ble_uuid_to_str: short form "0x1800" or full 128-bit */
+    if (!uuid_str) return NULL;
+    unsigned u = 0;
+    if (strncmp(uuid_str, "0x", 2) == 0 || strncmp(uuid_str, "0X", 2) == 0)
+        sscanf(uuid_str + 2, "%x", &u);
+    else
+        return NULL;
+    for (size_t i = 0; i < S_GATT_UUID_NAME_COUNT; i++)
+        if (s_gatt_uuid_names[i].uuid16 == (uint16_t)u)
+            return s_gatt_uuid_names[i].name;
+    return NULL;
+}
+
+/* ── BT Observer device detail screen ───────────────────────────── */
+
+static void bto_detail_back_cb(lv_event_t *e)
+{
+    (void)e;
+    show_bluetooth_screen();
+}
+
+static void show_bto_device_detail(int dev_idx)
+{
+    bto_device_t *d = &bto_devices[dev_idx];
+
+    char title[40];
+    snprintf(title, sizeof(title), "%.38s", d->name[0] ? d->name : "GATT Detail");
+    create_function_page_base(title);
+
+    /* Scrollable container */
+    lv_obj_t *scrl = lv_obj_create(function_page);
+    lv_obj_set_size(scrl, lv_pct(100), LCD_V_RES - 30 - 44);
+    lv_obj_align(scrl, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_color(scrl, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(scrl, 0, 0);
+    lv_obj_set_style_pad_all(scrl, 6, 0);
+    lv_obj_set_style_pad_gap(scrl, 3, 0);
+    lv_obj_set_flex_flow(scrl, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scrollbar_mode(scrl, LV_SCROLLBAR_MODE_AUTO);
+
+#define DET_ROW(parent, txt, font, col) do { \
+    lv_obj_t *_l = lv_label_create(parent); \
+    lv_label_set_text(_l, txt); \
+    lv_obj_set_style_text_font(_l, font, 0); \
+    lv_obj_set_style_text_color(_l, col, 0); \
+    lv_label_set_long_mode(_l, LV_LABEL_LONG_WRAP); \
+    lv_obj_set_width(_l, lv_pct(100)); \
+} while(0)
+
+    /* ── Header ── */
+    char hdr[80];
+    snprintf(hdr, sizeof(hdr), "%02X:%02X:%02X:%02X:%02X:%02X  %ddBm",
+             d->addr[5], d->addr[4], d->addr[3],
+             d->addr[2], d->addr[1], d->addr[0], d->rssi);
+    DET_ROW(scrl, hdr, &lv_font_montserrat_12, ui_text_color());
+
+    snprintf(hdr, sizeof(hdr), "FP: 0x%08lX   %d svc / %d chr",
+             (unsigned long)d->fingerprint, d->svc_count, d->chr_count);
+    DET_ROW(scrl, hdr, &lv_font_montserrat_12, UI_ACCENT_CYAN);
+
+    if (!d->walk_ok || d->filepath[0] == '\0') {
+        DET_ROW(scrl, "No GATT data captured.", &lv_font_montserrat_14, COLOR_MATERIAL_RED);
+        goto done;
+    }
+
+    /* ── Read JSON from SD and parse into display rows ── */
+    ensure_sd_mounted();
+    FILE *f = NULL;
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        f = fopen(d->filepath, "r");
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    if (!f) {
+        DET_ROW(scrl, "Cannot open JSON file.", &lv_font_montserrat_12, COLOR_MATERIAL_RED);
+        goto done;
+    }
+
+    /* Read file into PSRAM buffer (max 32KB) */
+    #define BTO_DET_BUF 32768
+    char *jbuf = heap_caps_malloc(BTO_DET_BUF, MALLOC_CAP_SPIRAM);
+    if (!jbuf) {
+        fclose(f);
+        DET_ROW(scrl, "Not enough memory.", &lv_font_montserrat_12, COLOR_MATERIAL_RED);
+        goto done;
+    }
+    size_t jlen = fread(jbuf, 1, BTO_DET_BUF - 1, f);
+    fclose(f);
+    jbuf[jlen] = '\0';
+
+    /* Walk the JSON rendering human-readable rows.
+     * We don't need a full JSON parser — just look for known patterns line by line. */
+    char *line = strtok(jbuf, "\n");
+    bool in_chr = false;
+    char prop_buf[24];
+
+    while (line) {
+        /* Trim leading whitespace */
+        while (*line == ' ' || *line == '\t') line++;
+
+        /* Service UUID */
+        if (strncmp(line, "\"uuid\": \"", 9) == 0) {
+            char uuid[40] = {0};
+            sscanf(line + 9, "%38[^\"]", uuid);
+            const char *known = gatt_uuid_name(uuid);
+            char row[80];
+            if (known)
+                snprintf(row, sizeof(row), "%s  %s", uuid, known);
+            else
+                snprintf(row, sizeof(row), "%s", uuid);
+            lv_color_t col = in_chr ? ui_text_color() : UI_ACCENT_CYAN;
+            lv_obj_t *_l = lv_label_create(scrl);
+            lv_label_set_text(_l, row);
+            lv_obj_set_style_text_font(_l, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(_l, col, 0);
+            lv_label_set_long_mode(_l, LV_LABEL_LONG_WRAP);
+            lv_obj_set_width(_l, lv_pct(100));
+            if (!in_chr) {
+                /* service separator */
+                lv_obj_t *sep = lv_obj_create(scrl);
+                lv_obj_set_size(sep, lv_pct(100), 1);
+                lv_obj_set_style_bg_color(sep, ui_border_color(), 0);
+                lv_obj_set_style_border_width(sep, 0, 0);
+                lv_obj_move_to_index(sep, lv_obj_get_child_cnt(scrl) - 2);
+            }
+            in_chr = false;
+        }
+        /* Properties */
+        else if (strncmp(line, "\"properties\": ", 14) == 0) {
+            int props = 0; sscanf(line + 14, "%d", &props);
+            gw_chr_props_str((uint8_t)props, prop_buf, sizeof(prop_buf));
+            char row[40];
+            snprintf(row, sizeof(row), "  Props: %s", prop_buf);
+            DET_ROW(scrl, row, &lv_font_montserrat_12, COLOR_MATERIAL_ORANGE);
+            in_chr = true;
+        }
+        /* Read data */
+        else if (strncmp(line, "\"read_data\": \"", 14) == 0) {
+            char hexraw[260] = {0};
+            sscanf(line + 14, "%255[^\"]", hexraw);
+            /* Convert hex pairs to ASCII preview */
+            char ascii[65] = {0};
+            int hlen = strlen(hexraw) / 2;
+            if (hlen > 64) hlen = 64;
+            for (int hi = 0; hi < hlen; hi++) {
+                unsigned byte = 0;
+                sscanf(hexraw + hi * 2, "%02x", &byte);
+                ascii[hi] = (byte >= 0x20 && byte < 0x7F) ? (char)byte : '.';
+            }
+            char row[340];
+            snprintf(row, sizeof(row), "  Data: %.255s\n  ASCII: %.64s", hexraw, ascii);
+            DET_ROW(scrl, row, &lv_font_montserrat_12, COLOR_MATERIAL_GREEN);
+        }
+        /* Descriptors */
+        else if (strncmp(line, "\"descriptors\":", 14) == 0) {
+            DET_ROW(scrl, "  Descriptors:", &lv_font_montserrat_12, ui_muted_color());
+        }
+
+        line = strtok(NULL, "\n");
+    }
+    heap_caps_free(jbuf);
+#undef BTO_DET_BUF
+
+done:
+    /* Back button */
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 32);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x7B1FA2), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_lighten(lv_color_hex(0x7B1FA2), 40), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT "  Back");
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
+    lv_obj_center(back_lbl);
+    lv_obj_add_event_cb(back_btn, bto_detail_back_cb, LV_EVENT_CLICKED, NULL);
+}
+#undef DET_ROW
+
+static void bto_card_tap_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= bto_device_count) return;
+    if (bto_refresh_timer) { lv_timer_del(bto_refresh_timer); bto_refresh_timer = NULL; }
+    bto_list = NULL; bto_status_lbl = NULL;
+    show_bto_device_detail(idx);
+}
+
 static void bto_stop_cb(lv_event_t *e)
 {
     (void)e;
@@ -18056,8 +18287,8 @@ static void bto_rebuild_list(void)
                 break;
             case BTO_DEV_DONE:
                 if (d->walk_ok)
-                    snprintf(r3, sizeof(r3), LV_SYMBOL_OK " %d svc / %d chr  [%08X]",
-                             d->svc_count, d->chr_count, (unsigned)d->fingerprint);
+                    snprintf(r3, sizeof(r3), LV_SYMBOL_OK " %d svc / %d chr  [%08lX]  " LV_SYMBOL_RIGHT,
+                             d->svc_count, d->chr_count, (unsigned long)d->fingerprint);
                 else
                     snprintf(r3, sizeof(r3), LV_SYMBOL_CLOSE " No GATT response");
                 break;
@@ -18075,6 +18306,12 @@ static void bto_rebuild_list(void)
         lv_obj_set_style_text_color(l3, sc, 0);
         lv_label_set_long_mode(l3, LV_LABEL_LONG_CLIP);
         lv_obj_set_width(l3, lv_pct(100));
+
+        /* Tappable only for successful walks */
+        if (d->status == BTO_DEV_DONE && d->walk_ok) {
+            lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(card, bto_card_tap_cb, LV_EVENT_SHORT_CLICKED, (void*)(intptr_t)i);
+        }
     }
 }
 
@@ -18263,6 +18500,7 @@ static void bt_observer_task(void *pvParameters)
             const gw_result_t *res = gw_get_result();
             bto_devices[i].svc_count   = res->svc_count;
             bto_devices[i].fingerprint = res->fingerprint;
+            strncpy(bto_devices[i].filepath, res->filepath, sizeof(bto_devices[i].filepath) - 1);
             int chrs = 0;
             for (int s = 0; s < res->svc_count; s++) chrs += res->svcs[s].chr_count;
             bto_devices[i].chr_count = chrs;

@@ -6,9 +6,9 @@
 
 /* ── Limits ─────────────────────────────────────────────────────── */
 #define GW_MAX_SVCS   20   /* max services per device */
-#define GW_MAX_CHRS   10   /* max characteristics per service */
-#define GW_MAX_DSCS    4   /* max descriptors per characteristic */
-#define GW_READ_MAX   48   /* max bytes read per characteristic */
+#define GW_MAX_CHRS   16   /* max characteristics per service */
+#define GW_MAX_DSCS    6   /* max descriptors per characteristic */
+#define GW_READ_MAX  128   /* max bytes read per characteristic */
 
 /* ── State ──────────────────────────────────────────────────────── */
 typedef enum {
@@ -110,3 +110,7 @@ gw_state_t gw_get_state(void);
 
 /* Last completed result — valid after GW_STATE_COMPLETE. */
 const gw_result_t *gw_get_result(void);
+
+/* Decode properties bitmask into a compact string, e.g. "R W N".
+ * buf must be at least 20 bytes. Returns buf. */
+char *gw_chr_props_str(uint8_t props, char *buf, size_t bufsz);
