@@ -18332,7 +18332,7 @@ static void bto_refresh_cb(lv_timer_t *t)
                          bto_current_idx + 1, bto_device_count);
                 break;
             case BTO_STATE_DONE:
-                snprintf(buf, sizeof(buf), "Done — %d devices enumerated", bto_device_count);
+                snprintf(buf, sizeof(buf), "Done - %d devices enumerated", bto_device_count);
                 break;
             case BTO_STATE_STOPPED:
                 snprintf(buf, sizeof(buf), "Stopped");
