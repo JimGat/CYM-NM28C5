@@ -14476,7 +14476,7 @@ static void show_ap_file_server_screen(void)
     vTaskDelay(pdMS_TO_TICKS(200));
 
     if (s_fileserv_httpd_start()) {
-        lv_label_set_text(s_fileserv_status_lbl, "Active — connect to TheLab");
+        lv_label_set_text(s_fileserv_status_lbl, "Active - connect to TheLab");
     } else {
         lv_label_set_text(s_fileserv_status_lbl, "HTTP start failed");
     }
@@ -15849,7 +15849,7 @@ static void sd_provision_task(void *pvParams)
             PROV_POST("Remount FAILED: %s", esp_err_to_name(mr));
             goto done;
         }
-        PROV_POST("Format OK — rebuilding structure...");
+        PROV_POST("Format OK - rebuilding structure...");
     }
 
     // Process each item with per-item mutex acquire/release so display stays live
@@ -15910,7 +15910,7 @@ static void sd_provision_task(void *pvParams)
 
 done: ;
     char *summary = malloc(64);
-    if (summary) snprintf(summary, 64, "Done — %d created, %d OK", created, ok_count);
+    if (summary) snprintf(summary, 64, "Done - %d created, %d OK", created, ok_count);
     lv_async_call(sd_prov_done_cb, summary);
     vTaskDelete(NULL);
 }
@@ -17327,7 +17327,7 @@ static void add_oui_confirm_cb(lv_event_t *e)
 
     if (!ok) {
         lv_textarea_set_text(add_oui_ta, "");
-        lv_textarea_set_placeholder_text(add_oui_ta, "Bad format — try AA:BB:CC");
+        lv_textarea_set_placeholder_text(add_oui_ta, "Bad format - try AA:BB:CC");
         return;
     }
 
@@ -20122,7 +20122,7 @@ void attack_event_cb(lv_event_t *e)
         if (saved) {
             show_bt_lookout_screen();   /* navigate directly to BT Lookout */
         } else {
-            show_lookout_alert_popup(disp_name, "Save failed — check SD card", 0);
+            show_lookout_alert_popup(disp_name, "Save failed - check SD card", 0);
         }
         return;
     }
