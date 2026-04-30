@@ -18185,7 +18185,10 @@ static void show_bto_device_detail(int dev_idx)
         }
         /* Read data */
         else if (strncmp(line, "\"read_data\": \"", 14) == 0) {
-            char hexraw[1028] = {0};
+            static char hexraw[1028];
+            static char ascii[516];
+            static char row[620];
+            hexraw[0] = '\0';
             sscanf(line + 14, "%1027[^\"]", hexraw);
             int total_bytes = (int)strlen(hexraw) / 2;
             /* Show first 32 bytes of hex with total byte count annotation */
@@ -18194,13 +18197,12 @@ static void show_bto_device_detail(int dev_idx)
             memcpy(hex_preview, hexraw, show_b * 2);
             /* ASCII of all captured bytes */
             int ascii_len = (total_bytes < 512) ? total_bytes : 512;
-            char ascii[516] = {0};
             for (int hi = 0; hi < ascii_len; hi++) {
                 unsigned byte = 0;
                 sscanf(hexraw + hi * 2, "%02x", &byte);
                 ascii[hi] = (byte >= 0x20 && byte < 0x7F) ? (char)byte : '.';
             }
-            char row[620];
+            ascii[ascii_len] = '\0';
             if (total_bytes > 32)
                 snprintf(row, sizeof(row), "  Hex(%dB): %.64s...\n  ASCII: %.*s",
                          total_bytes, hex_preview, ascii_len, ascii);
@@ -18852,7 +18854,7 @@ static void show_gw_result_screen(void)
                                          "%02X", chr->read_data[bi]);
 
                     /* Full ASCII up to GW_READ_MAX */
-                    char ascii[GW_READ_MAX + 4];
+                    static char ascii[GW_READ_MAX + 4];
                     int alen = chr->read_len;
                     for (int bi = 0; bi < alen; bi++) {
                         uint8_t b = chr->read_data[bi];
@@ -18860,7 +18862,7 @@ static void show_gw_result_screen(void)
                     }
                     ascii[alen] = '\0';
 
-                    char data_row[GW_READ_MAX + 120];
+                    static char data_row[GW_READ_MAX + 120];
                     if (chr->read_len > 32)
                         snprintf(data_row, sizeof(data_row),
                                  "    Hex(%dB): %.64s...\n    ASCII: %.*s",
