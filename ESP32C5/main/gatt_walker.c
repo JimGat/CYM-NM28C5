@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 #include "host/ble_hs.h"
 #include "os/os_mbuf.h"
+#include "oui_lookup.h"
 
 static const char *TAG = "gatt_walker";
 
@@ -126,6 +127,57 @@ static uint32_t s_compute_fingerprint(void)
     return h;
 }
 
+/* ── Local UUID name table ───────────────────────────────────────── */
+typedef struct { uint16_t uuid16; const char *name; } s_uuid_entry_t;
+static const s_uuid_entry_t s_uuid_table[] = {
+    /* Services */
+    { 0x1800, "Generic Access"       }, { 0x1801, "Generic Attribute"    },
+    { 0x180A, "Device Information"   }, { 0x180F, "Battery"              },
+    { 0x1810, "Blood Pressure"       }, { 0x1812, "HID"                  },
+    { 0x1816, "Cycling Speed"        }, { 0x1818, "Cycling Power"        },
+    { 0x181A, "Environmental Sensing"}, { 0x181C, "User Data"            },
+    { 0x1820, "Internet Protocol"    }, { 0x1823, "HTTP Proxy"           },
+    { 0x183A, "Insulin Delivery"     }, { 0x183E, "Physical Activity"    },
+    { 0x1803, "Link Loss"            }, { 0x1804, "TX Power"             },
+    { 0x1805, "Current Time"         }, { 0x1806, "Reference Time"       },
+    { 0x1807, "Next DST Change"      }, { 0x180D, "Heart Rate"           },
+    { 0x180E, "Phone Alert"          }, { 0x1813, "Scan Parameters"      },
+    /* Characteristics */
+    { 0x2A00, "Device Name"          }, { 0x2A01, "Appearance"           },
+    { 0x2A04, "Peripheral Pref Conn" }, { 0x2A05, "Service Changed"      },
+    { 0x2A06, "Alert Level"          }, { 0x2A07, "TX Power Level"       },
+    { 0x2A08, "Date Time"            }, { 0x2A19, "Battery Level"        },
+    { 0x2A24, "Model Number"         }, { 0x2A25, "Serial Number"        },
+    { 0x2A26, "Firmware Revision"    }, { 0x2A27, "Hardware Revision"    },
+    { 0x2A28, "Software Revision"    }, { 0x2A29, "Manufacturer Name"    },
+    { 0x2A2A, "IEEE 11073"           }, { 0x2A37, "Heart Rate Measurement"},
+    { 0x2A38, "Body Sensor Location" }, { 0x2A39, "Heart Rate Control"   },
+    { 0x2A3F, "Alert Status"         }, { 0x2A46, "New Alert"            },
+    { 0x2A4D, "HID Report"           }, { 0x2A4E, "HID Protocol Mode"    },
+    { 0x2A6E, "Temperature"          }, { 0x2A6F, "Humidity"             },
+    { 0x2A6D, "Pressure"             }, { 0x2A76, "UV Index"             },
+    { 0x2A9B, "Body Composition Feat"}, { 0x2AA6, "MAC Address"          },
+    { 0x2B29, "Client Support Feat"  }, { 0x2B2A, "Database Hash"        },
+    /* Descriptors */
+    { 0x2900, "Ext Properties"       }, { 0x2901, "User Description"     },
+    { 0x2902, "CCCD"                 }, { 0x2903, "SCCD"                 },
+    { 0x2904, "Presentation Format"  }, { 0x2905, "Aggregate Format"     },
+};
+
+static const char *s_uuid_name(const char *uuid_str)
+{
+    if (!uuid_str) return NULL;
+    unsigned u = 0;
+    if (strncmp(uuid_str, "0x", 2) == 0 || strncmp(uuid_str, "0X", 2) == 0)
+        sscanf(uuid_str + 2, "%x", &u);
+    else
+        return NULL;
+    for (size_t i = 0; i < sizeof(s_uuid_table) / sizeof(s_uuid_table[0]); i++)
+        if (s_uuid_table[i].uuid16 == (uint16_t)u)
+            return s_uuid_table[i].name;
+    return NULL;
+}
+
 /* ── JSON builder ────────────────────────────────────────────────── */
 typedef struct { char *buf; size_t size; size_t pos; bool overflow; } jb_t;
 
@@ -206,12 +258,16 @@ static bool s_write_json(void)
              r->mac[5], r->mac[4], r->mac[3],
              r->mac[2], r->mac[1], r->mac[0]);
 
+    uint8_t oui3[3] = { r->mac[5], r->mac[4], r->mac[3] };
+    const char *vendor = oui_lookup_is_loaded() ? oui_lookup(oui3) : NULL;
+
     jb_raw(&j, "{\n");
     jb_int(&j, "version", 1);              jb_comma(&j);
     jb_str(&j, "timestamp", r->timestamp); jb_comma(&j);
     jb_str(&j, "mac", mac_str);            jb_comma(&j);
     jb_int(&j, "addr_type", r->addr_type); jb_comma(&j);
     jb_str(&j, "name", r->name);           jb_comma(&j);
+    jb_str(&j, "manufacturer", vendor ? vendor : ""); jb_comma(&j);
     jb_int(&j, "rssi", r->rssi);           jb_comma(&j);
 
     jb_key(&j, "gps"); jb_raw(&j, "{ ");
@@ -232,6 +288,9 @@ static bool s_write_json(void)
         jb_raw(&j, "  {\n  ");
         jb_str(&j, "uuid", svc->uuid_str);               jb_comma(&j);
         jb_raw(&j, "  ");
+        const char *svc_name = s_uuid_name(svc->uuid_str);
+        jb_str(&j, "name", svc_name ? svc_name : "");    jb_comma(&j);
+        jb_raw(&j, "  ");
         jb_int(&j, "start_handle", svc->start_handle);   jb_comma(&j);
         jb_raw(&j, "  ");
         jb_int(&j, "end_handle",   svc->end_handle);     jb_comma(&j);
@@ -242,18 +301,35 @@ static bool s_write_json(void)
             const gw_chr_t *chr = &svc->chrs[ci];
             if (ci > 0) jb_raw(&j, ",\n");
             jb_raw(&j, "    {\n    ");
-            jb_str(&j, "uuid",       chr->uuid_str);  jb_comma(&j);
+            jb_str(&j, "uuid", chr->uuid_str);           jb_comma(&j);
             jb_raw(&j, "    ");
-            jb_int(&j, "def_handle", chr->def_handle); jb_comma(&j);
+            const char *chr_name = s_uuid_name(chr->uuid_str);
+            jb_str(&j, "name", chr_name ? chr_name : ""); jb_comma(&j);
             jb_raw(&j, "    ");
-            jb_int(&j, "val_handle", chr->val_handle); jb_comma(&j);
+            jb_int(&j, "def_handle", chr->def_handle);   jb_comma(&j);
             jb_raw(&j, "    ");
-            jb_int(&j, "properties", chr->properties); jb_comma(&j);
+            jb_int(&j, "val_handle", chr->val_handle);   jb_comma(&j);
             jb_raw(&j, "    ");
-            if (chr->read_ok && chr->read_len > 0)
+            jb_int(&j, "properties", chr->properties);   jb_comma(&j);
+            jb_raw(&j, "    ");
+            char pstr[24];
+            gw_chr_props_str(chr->properties, pstr, sizeof(pstr));
+            jb_str(&j, "props_str", pstr);               jb_comma(&j);
+            jb_raw(&j, "    ");
+            if (chr->read_ok && chr->read_len > 0) {
                 jb_hex(&j, "read_data", chr->read_data, chr->read_len);
-            else {
+                jb_comma(&j); jb_raw(&j, "    ");
+                jb_key(&j, "ascii"); jb_rawc(&j, '"');
+                for (int bi = 0; bi < chr->read_len; bi++) {
+                    uint8_t b = chr->read_data[bi];
+                    if (b >= 0x20 && b < 0x7F) jb_rawc(&j, (char)b);
+                    else jb_rawc(&j, '.');
+                }
+                jb_rawc(&j, '"');
+            } else {
                 jb_key(&j, "read_data"); jb_raw(&j, "null");
+                jb_comma(&j); jb_raw(&j, "    ");
+                jb_key(&j, "ascii"); jb_raw(&j, "null");
             }
 
             if (chr->desc_count > 0) {
@@ -264,6 +340,8 @@ static bool s_write_json(void)
                     jb_raw(&j, "{ ");
                     jb_str(&j, "uuid", chr->descs[di].uuid_str);
                     jb_raw(&j, ", ");
+                    const char *dsc_name = s_uuid_name(chr->descs[di].uuid_str);
+                    if (dsc_name) { jb_str(&j, "name", dsc_name); jb_raw(&j, ", "); }
                     jb_int(&j, "handle", chr->descs[di].handle);
                     jb_raw(&j, " }");
                 }
