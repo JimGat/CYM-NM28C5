@@ -18091,7 +18091,7 @@ static void bto_refresh_cb(lv_timer_t *t)
                 snprintf(buf, sizeof(buf), "Scanning... %d found", bt_device_count);
                 break;
             case BTO_STATE_WALKING:
-                snprintf(buf, sizeof(buf), "Walking %d / %d  (3s timeout)",
+                snprintf(buf, sizeof(buf), "Walking %d / %d  (5s timeout)",
                          bto_current_idx + 1, bto_device_count);
                 break;
             case BTO_STATE_DONE:
@@ -18229,9 +18229,9 @@ static void bt_observer_task(void *pvParameters)
         return;
     }
 
-    // ── Phase 3: sequential GATT walk, 3s hardcoded timeout ───────
+    // ── Phase 3: sequential GATT walk, 5s hardcoded timeout ───────
     bto_state = BTO_STATE_WALKING;
-    gw_set_timeout(3000);
+    gw_set_timeout(5000);
 
     for (int i = 0; i < n && bto_active; i++) {
         bto_current_idx = i;
@@ -18249,8 +18249,8 @@ static void bt_observer_task(void *pvParameters)
             continue;
         }
 
-        // Poll until GATT walk completes (3s connect + 2s enum buffer = 50 * 100ms)
-        for (int w = 0; w < 50 && bto_active; w++) {
+        // Poll until GATT walk completes (5s connect + 3s enum buffer = 80 * 100ms)
+        for (int w = 0; w < 80 && bto_active; w++) {
             gw_state_t st = gw_get_state();
             if (st == GW_STATE_COMPLETE || st == GW_STATE_FAILED ||
                 st == GW_STATE_CANCELLED || st == GW_STATE_IDLE)
