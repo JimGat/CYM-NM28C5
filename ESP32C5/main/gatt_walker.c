@@ -243,7 +243,7 @@ static void jb_hex(jb_t *j, const char *k, const uint8_t *data, int len)
 }
 
 /* ── JSON serialiser ─────────────────────────────────────────────── */
-#define GW_JSON_BUF  65536
+#define GW_JSON_BUF  131072
 
 static bool s_write_json(void)
 {
@@ -381,6 +381,8 @@ static void s_disc_chrs_for_svc(int svc_idx);
 static void s_disc_dscs_advance(void);
 static void s_read_next(void);
 static void s_finish(void);
+static int  s_mtu_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                     uint16_t mtu, void *arg);
 
 /* ── Finish / save ───────────────────────────────────────────────── */
 
@@ -408,6 +410,7 @@ static void s_finish(void)
 
 /* ── Read phase ──────────────────────────────────────────────────── */
 
+/* read_long callback — called once per chunk, then once with BLE_HS_EDONE */
 static int s_read_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
                      struct ble_gatt_attr *attr, void *arg)
 {
@@ -416,13 +419,19 @@ static int s_read_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
     gw_chr_t *chr = &s_result->svcs[s_cur_svc].chrs[s_cur_chr];
 
     if (error->status == 0 && attr && attr->om) {
-        uint16_t len = OS_MBUF_PKTLEN(attr->om);
-        if (len > GW_READ_MAX) len = GW_READ_MAX;
-        os_mbuf_copydata(attr->om, 0, len, chr->read_data);
-        chr->read_len = (uint8_t)len;
-        chr->read_ok  = true;
+        /* Accumulate this chunk into read_data */
+        uint16_t chunk = OS_MBUF_PKTLEN(attr->om);
+        uint16_t space = GW_READ_MAX - chr->read_len;
+        if (chunk > space) chunk = space;
+        if (chunk > 0) {
+            os_mbuf_copydata(attr->om, 0, chunk, chr->read_data + chr->read_len);
+            chr->read_len += chunk;
+            chr->read_ok   = true;
+        }
+        return 0; /* wait for BLE_HS_EDONE */
     }
 
+    /* BLE_HS_EDONE or read error — advance to next characteristic */
     s_cur_chr++;
     s_read_next();
     return 0;
@@ -439,7 +448,7 @@ static void s_read_next(void)
                 snprintf(msg, sizeof(msg), "Reading chr %d svc %d/%d",
                          s_cur_chr + 1, s_cur_svc + 1, s_result->svc_count);
                 s_notify_ui(msg);
-                int rc = ble_gattc_read(s_conn_handle, chr->val_handle, s_read_cb, NULL);
+                int rc = ble_gattc_read_long(s_conn_handle, chr->val_handle, 0, s_read_cb, NULL);
                 if (rc == 0) return;
                 /* read failed to initiate — skip */
                 ESP_LOGW(TAG, "ble_gattc_read rc=%d, skipping", rc);
@@ -612,6 +621,23 @@ static int s_svc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
     return 0;
 }
 
+/* ── MTU exchange callback — kicks off service discovery ─────────── */
+
+static int s_mtu_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                    uint16_t mtu, void *arg)
+{
+    ESP_LOGI(TAG, "MTU exchange: %d bytes (rc=%d)", mtu, error->status);
+    if (s_state != GW_STATE_DISC_SVCS) return 0;
+    if (s_cancel_req) { s_fail("Cancelled"); return 0; }
+    s_notify_ui("Connected, discovering services...");
+    s_fire_event(GW_EVENT_CONNECTED);
+    s_result->svc_count = 0;
+    gw_ui_svc_count = 0;
+    gw_ui_chr_count = 0;
+    ble_gattc_disc_all_svcs(conn_handle, s_svc_cb, NULL);
+    return 0;
+}
+
 /* ── GAP connection event ────────────────────────────────────────── */
 
 static int s_gap_cb(struct ble_gap_event *event, void *arg)
@@ -629,12 +655,9 @@ static int s_gap_cb(struct ble_gap_event *event, void *arg)
         s_conn_handle = event->connect.conn_handle;
         ESP_LOGI(TAG, "Connected, handle=%d", s_conn_handle);
         s_set_state(GW_STATE_DISC_SVCS);
-        s_notify_ui("Connected, discovering services...");
-        s_fire_event(GW_EVENT_CONNECTED);
-        s_result->svc_count = 0;
-        gw_ui_svc_count = 0;
-        gw_ui_chr_count = 0;
-        ble_gattc_disc_all_svcs(s_conn_handle, s_svc_cb, NULL);
+        s_notify_ui("Connected, MTU exchange...");
+        /* Negotiate larger MTU before discovery so reads can return up to 511 bytes */
+        ble_gattc_exchange_mtu(s_conn_handle, s_mtu_cb, NULL);
         return 0;
 
     case BLE_GAP_EVENT_DISCONNECT:
@@ -738,6 +761,9 @@ bool gw_walk(const uint8_t mac[6], uint8_t addr_type, const char *name,
     s_set_state(GW_STATE_CONNECTING);
     s_notify_ui("Connecting...");
     s_fire_event(GW_EVENT_STARTED);
+
+    /* Request 512-byte ATT MTU so reads can return full BLE attribute payloads */
+    ble_att_set_preferred_mtu(512);
 
     ble_addr_t peer = { .type = addr_type };
     memcpy(peer.val, mac, 6);

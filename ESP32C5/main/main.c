@@ -18158,19 +18158,28 @@ static void show_bto_device_detail(int dev_idx)
         }
         /* Read data */
         else if (strncmp(line, "\"read_data\": \"", 14) == 0) {
-            char hexraw[260] = {0};
-            sscanf(line + 14, "%255[^\"]", hexraw);
-            /* Convert hex pairs to ASCII preview */
-            char ascii[65] = {0};
-            int hlen = strlen(hexraw) / 2;
-            if (hlen > 64) hlen = 64;
-            for (int hi = 0; hi < hlen; hi++) {
+            char hexraw[1028] = {0};
+            sscanf(line + 14, "%1027[^\"]", hexraw);
+            int total_bytes = (int)strlen(hexraw) / 2;
+            /* Show first 32 bytes of hex with total byte count annotation */
+            int show_b = (total_bytes < 32) ? total_bytes : 32;
+            char hex_preview[68] = {0};
+            memcpy(hex_preview, hexraw, show_b * 2);
+            /* ASCII of all captured bytes */
+            int ascii_len = (total_bytes < 512) ? total_bytes : 512;
+            char ascii[516] = {0};
+            for (int hi = 0; hi < ascii_len; hi++) {
                 unsigned byte = 0;
                 sscanf(hexraw + hi * 2, "%02x", &byte);
                 ascii[hi] = (byte >= 0x20 && byte < 0x7F) ? (char)byte : '.';
             }
-            char row[340];
-            snprintf(row, sizeof(row), "  Data: %.255s\n  ASCII: %.64s", hexraw, ascii);
+            char row[620];
+            if (total_bytes > 32)
+                snprintf(row, sizeof(row), "  Hex(%dB): %.64s...\n  ASCII: %.*s",
+                         total_bytes, hex_preview, ascii_len, ascii);
+            else
+                snprintf(row, sizeof(row), "  Hex: %.64s\n  ASCII: %.*s",
+                         hex_preview, ascii_len, ascii);
             DET_ROW(scrl, row, &lv_font_montserrat_12, COLOR_MATERIAL_GREEN);
         }
         /* Descriptors */
@@ -18804,23 +18813,32 @@ static void show_gw_result_screen(void)
 
                 /* Read data + ASCII */
                 if (chr->read_ok && chr->read_len > 0) {
-                    char hex_str[GW_READ_MAX * 2 + 4];
+                    /* Show first 32 bytes as hex, annotate total if more */
+                    int show_b = (chr->read_len < 32) ? chr->read_len : 32;
+                    char hex_preview[68] = {0};
                     int hpos = 0;
-                    for (int bi = 0; bi < chr->read_len && bi < GW_READ_MAX; bi++)
-                        hpos += snprintf(hex_str + hpos, sizeof(hex_str) - hpos,
+                    for (int bi = 0; bi < show_b; bi++)
+                        hpos += snprintf(hex_preview + hpos, sizeof(hex_preview) - hpos,
                                          "%02X", chr->read_data[bi]);
 
+                    /* Full ASCII up to GW_READ_MAX */
                     char ascii[GW_READ_MAX + 4];
-                    int alen = (chr->read_len < GW_READ_MAX) ? chr->read_len : GW_READ_MAX;
+                    int alen = chr->read_len;
                     for (int bi = 0; bi < alen; bi++) {
                         uint8_t b = chr->read_data[bi];
                         ascii[bi] = (b >= 0x20 && b < 0x7F) ? (char)b : '.';
                     }
                     ascii[alen] = '\0';
 
-                    char data_row[360];
-                    snprintf(data_row, sizeof(data_row),
-                             "    Data: %.255s\n    ASCII: %.64s", hex_str, ascii);
+                    char data_row[GW_READ_MAX + 120];
+                    if (chr->read_len > 32)
+                        snprintf(data_row, sizeof(data_row),
+                                 "    Hex(%dB): %.64s...\n    ASCII: %.*s",
+                                 chr->read_len, hex_preview, alen, ascii);
+                    else
+                        snprintf(data_row, sizeof(data_row),
+                                 "    Hex: %.64s\n    ASCII: %.*s",
+                                 hex_preview, alen, ascii);
                     GW_ROW(scrl, data_row, &lv_font_montserrat_12, COLOR_MATERIAL_GREEN);
                 }
 

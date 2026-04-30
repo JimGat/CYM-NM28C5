@@ -8,7 +8,7 @@
 #define GW_MAX_SVCS   20   /* max services per device */
 #define GW_MAX_CHRS   16   /* max characteristics per service */
 #define GW_MAX_DSCS    6   /* max descriptors per characteristic */
-#define GW_READ_MAX  128   /* max bytes read per characteristic */
+#define GW_READ_MAX  512   /* max bytes read per characteristic (BLE spec max attr length) */
 
 /* ── State ──────────────────────────────────────────────────────── */
 typedef enum {
@@ -44,7 +44,7 @@ typedef struct {
     char     uuid_str[37];   /* ble_uuid_to_str() output */
     uint8_t  properties;
     uint8_t  read_data[GW_READ_MAX];
-    uint8_t  read_len;
+    uint16_t read_len;
     bool     read_ok;
     struct {
         uint16_t handle;
