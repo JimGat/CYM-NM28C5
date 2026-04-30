@@ -1,6 +1,9 @@
 # NM-CYD-C5 project defaults
 # These override the chip defaults and are preserved across set-target/fullclean
 
+# Main task stack — must be large enough for LVGL UI construction + large local buffers
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
 # Bluetooth / NimBLE
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y

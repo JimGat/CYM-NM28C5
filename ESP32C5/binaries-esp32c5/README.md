@@ -1,33 +1,154 @@
 # CYM-NM28C5 Pre-built Firmware Binaries
 
-**Firmware version: v0.6.2**
+**Firmware version: v0.8.9**
 
 This folder contains the latest compiled firmware for the **NM-CYD-C5 (ESP32-C5)** board.
 
 ---
 
+## Release Notes — v0.8.9
+
+### GATT Walker — Full 512-Byte Attribute Capture
+
+The firmware now negotiates the maximum possible BLE ATT MTU on every GATT connection and reads all attributes using chained `ATT_READ_BLOB_REQ` calls, eliminating the 20-byte default truncation. Captured data is now complete up to the BLE spec ceiling.
+
+- MTU exchange added to every GATT connection before discovery begins
+- `ble_gattc_read_long()` replaces single-shot reads — multi-chunk attributes are reassembled automatically
+- Capture buffer raised from 128 B → **512 bytes** (`GW_READ_MAX`) — matches the BLE Core Spec hard limit
+- Both the single-walk GATT Walker and BT Observer benefit from this fix
+
+### GATT Walker — Expanded Properties Display
+
+On-device result screens now decode the characteristic properties bitmask into a full human-readable string alongside the compact flag notation.
+
+- Compact flags: `R N` (raw bitmask notation)
+- Full expansion: `(Read, Notify)` — shown in parentheses on the same line
+- Applies to both the GATT Walker result screen and the BT Observer detail view
+
+### BT Observer — Crash Fix on Device Tap
+
+Fixed a **stack overflow** that caused an immediate reboot when tapping any device row in BT Observer to open the detail view.
+
+- Root cause: main task stack was only 3584 bytes — too small for LVGL UI construction
+- `CONFIG_ESP_MAIN_TASK_STACK_SIZE` raised 3584 → **8192 bytes** (persisted in `sdkconfig.defaults`)
+- Large local buffers in the detail renderer (`hexraw[1028]`, `ascii[516]`, `row[620]`) moved from the call stack to static storage
+- Same fix applied to the GATT Walker result screen to prevent the same class of crash there
+
+### BT Attacks — New Menu Tile
+
+A new **BT Attacks** tile has been added as the sixth tile in the Bluetooth menu (bottom-right position), completing the two-row layout.
+
+- Bluetooth menu now fills both rows: BT Scan & Select · BT Observer · AirTag Scan / BT Locator · BT Lookout · **BT Attacks**
+- Opens a dedicated submenu containing Coming Soon placeholder tiles for future BLE offensive capabilities:
+  - **BLE Spam** — advertising flood attack (in development)
+  - **Device Spoof** — clone BLE device identity (in development)
+  - **BLE Disconnect** — targeted BLE link disruption (in development)
+- Each placeholder shows a "Coming Soon — under development" screen with a back button
+
+### HTTP File Server — Rebranded & Enhanced Directory Listing
+
+The AP File Server and WiFi Client web interface has been updated.
+
+- Page title and footer changed from `JANOS` → **Cheap Yellow Monster**
+- Each file entry now shows its **modification datetime** (`YYYY-MM-DD HH:MM`) in the listing
+- File sizes are now **human-readable**: `512 B`, `1.4 KB`, `3.2 MB` instead of raw byte counts
+- Directories show datetime without size
+
+---
+
+## Release Notes — v0.8.5
+
+### GATT Walker — Full Detail Screen
+
+After a walk completes, the progress screen automatically transitions to a **scrollable GATT tree** view showing the complete inspection result without requiring a file read:
+
+- Header: MAC address, OUI manufacturer name (purple), FP hash, GPS coordinates, timestamp
+- Per service: UUID + human-readable name (cyan separator)
+- Per characteristic: UUID + name, decoded property flags (`R W N I` etc.), hex data + ASCII preview
+- Per descriptor: UUID + name where known
+
+### GATT Walker — Enriched JSON Output
+
+JSON files saved to `/sdcard/gattwalker/` now include:
+
+| New field | Location | Description |
+|-----------|----------|-------------|
+| `"manufacturer"` | device level | OUI vendor name from `ouilist.bin` |
+| `"name"` | each service | Human-readable service name (e.g. `"Generic Access"`) |
+| `"name"` | each characteristic | Human-readable characteristic name |
+| `"props_str"` | each characteristic | Decoded property string (e.g. `"R W N"`) |
+| `"ascii"` | each characteristic | Printable ASCII preview of `read_data` |
+| `"name"` | each descriptor | Human-readable descriptor name where known |
+
+Updated limits: **16 characteristics per service**, **6 descriptors per characteristic**.
+
+### BT Observer
+
+A new tile in the Bluetooth menu that automates the scan-then-walk workflow:
+
+1. Runs a single 10-second active BLE scan, collecting all advertising devices
+2. Attempts a sequential GATT walk on every discovered device (5 s connect timeout per device)
+3. Results appear in a live scrollable list — green with svc/chr counts on success, red on failure
+4. Tap any successful row to open the full GATT detail view
+5. All walks saved as enriched JSON to `/sdcard/gattwalker/`
+
+### BT Observer — Detail View
+
+Tapping a successful row in BT Observer opens the same full GATT tree display used by the single-walk GATT Walker result screen.
+
+---
+
+## Release Notes — v0.7.7
+
+### GPS UTC Time & System Clock Sync
+
+The GPS Info screen now shows a live UTC time field (`HH:MM:SS`) parsed from NMEA RMC sentences, refreshing every second. The first valid GPS fix automatically syncs the device system clock via `settimeofday()` — all subsequent SD card writes (handshakes, wardrive logs, GATT JSON) receive accurate FAT timestamps.
+
+### BT Observer (Initial Release)
+
+Sequential GATT walk session over all devices discovered in one BLE scan. See v0.8.5 notes for the completed feature including the detail view.
+
+### Settings Menu Restructure
+
+Settings reduced from 10 tiles to 8 (fits on one screen, no scrolling required):
+
+- **Timing** — combines WiFi scan dwell sliders + GATT connect timeout slider in one popup
+- **Screen** — combines screen timeout dropdown + brightness slider in one popup
+
+### Data Transfer — AP File Server & WiFi Client
+
+New **Settings → Data Transfer** sub-menu:
+
+- **AP File Server** — device creates `TheLab` WPA2 AP (password: `Do not touch!`) and serves `/sdcard/` at `http://192.168.4.1`
+- **WiFi Client** — device joins an existing network; DHCP IP shown on screen for browser access; SSID/password saved to NVS
+
+### GATT Connect Timeout
+
+Configurable via **Settings → Timing → GATT Timeout** — a 3–30 s slider, NVS-persisted. Human-readable error messages on connection failure (e.g. "No response — needs pairing or asleep").
+
+### OUI Groups
+
+Predefined BLE watchlist groups accessible from the Bluetooth Lookout screen — add entire manufacturer OUI blocks (Axon body cameras, Flock ALPR, Motorola Solutions, Samsung SmartTag) to the lookout watchlist in one tap.
+
+### SD File Tree
+
+New **Settings → SD Card → File Tree** — browse the full SD card directory tree directly on the device.
+
+---
+
 ## Release Notes — v0.6.2
 
-### New Feature: Bluetooth Lookout
+### Bluetooth Lookout
 
-A new BLE watchlist monitor has been added to the Bluetooth menu. Load a watchlist of target MAC addresses from an SD card CSV (`/sdcard/lab/bluetooth/lookout.csv`), start monitoring, and the device will alert on any detected match — flashing the RGB LED with three rapid red bursts and displaying a popup with the device name, MAC, and RSSI. The screen supports:
-
-- **Start / Stop** monitoring toggle
-- **Blackout** — extinguishes the display while monitoring continues silently; LED alert breaks blackout on detection
-- **Edit List** — opens a scrollable watchlist editor when stopped; tap any entry to mark it for deletion, then Save to rewrite the CSV or Back to discard
-- **Add to BT Lookout** — available from BT Scan & Select; adds the currently selected device to the watchlist and navigates directly to the Bluetooth Lookout screen
-- A conflict warning popup appears if another Bluetooth feature (AirTag Scan, BT Scan & Select, BT Locator) is launched while Lookout is actively monitoring — choose Cancel to keep monitoring or Stop & Go to halt Lookout and open the new feature
+Continuous BLE watchlist monitor with CSV persistence, LED alerts (3× red flash), blackout mode, and device-addition from BT Scan & Select. OUI-prefix and full-MAC matching modes.
 
 ### Wardrive Improvements
 
-- Column headers are now frozen — they remain visible while the scan data table scrolls independently
-- Stop button and data table layout corrected to eliminate overlap on the 240 px portrait display
+Frozen column headers; Stop button and table layout corrected for 240 px portrait.
 
 ### Navigation Fixes
 
-- BT Locator: Exit button replaced with Back — returns to the Bluetooth screen instead of the main menu
-- AirTag Scanner: Back button now returns to the Bluetooth screen instead of the main menu
-- GATT Walker "Coming Soon" screen now has a Back button
+BT Locator and AirTag Scanner back buttons return to Bluetooth screen. GATT Walker placeholder has Back button.
 
 ---
 
@@ -75,7 +196,7 @@ esptool.py --chip esp32c5 --port /dev/ttyACM0 \
 
 ### ESPTerminator (espterminator.com)
 
-[ESPTerminator](https://espterminator.com/) is a promising web-based flash and terminal tool but **does not currently support the NM-CYD-C5 correctly** — it fails to identify the ESP32-C5 board and does not flash reliably. This is expected to be resolved in a future release. Use ESPConnect in the meantime.
+[ESPTerminator](https://espterminator.com/) is a promising web-based flash and terminal tool but **does not currently support the NM-CYD-C5 correctly** — it fails to identify the ESP32-C5 board and does not flash reliably. Use ESPConnect in the meantime.
 
 ---
 
@@ -84,11 +205,8 @@ esptool.py --chip esp32c5 --port /dev/ttyACM0 \
 The firmware is **not currently compatible** with [bmorcelli/Launcher](https://github.com/bmorcelli/Launcher).
 
 - **ESP32-C5 not yet supported** — tracked in [Issue #300](https://github.com/bmorcelli/Launcher/issues/300) (opened April 2026, pending merge)
-- The Launcher uses a custom bootloader that switches between a Launcher partition and OTA app slots based on reset reason; this firmware has no awareness of that scheme
-- The Launcher expects OTA-style partition slots; this build uses a single 7 MB `factory` partition at `0x10000`
-- The Launcher is Arduino-based; this firmware is ESP-IDF 6.0 — hardware init sequences would conflict
-
-Flash this binary standalone. Launcher integration can be revisited once Issue #300 lands and an official NM-CYD-C5 board target is available upstream.
+- Single 7 MB `factory` partition at `0x10000` — incompatible with Launcher's OTA slot layout
+- ESP-IDF 6.0 vs Launcher's Arduino framework — hardware init sequences would conflict
 
 ---
 
