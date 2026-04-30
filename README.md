@@ -477,7 +477,18 @@ Walk complete
 
 **GPS geotagging:** If a GPS fix is active when GATT Walker starts, the coordinates are embedded in the JSON. This enables later mapping of device sightings.
 
-**Limits:** Up to 20 services, 16 characteristics per service, 6 descriptors per characteristic, 128 bytes read per attribute. PSRAM-allocated (~50 KB result struct + 64 KB JSON buffer).
+**BLE data limits:** The Bluetooth Core Specification sets a hard ceiling of **512 bytes** per attribute value. The firmware negotiates the maximum possible ATT MTU on every connection so that large attributes are captured in full rather than truncated at the BLE default of 20 bytes.
+
+| Limit | Value | Source |
+|-------|-------|--------|
+| Max attribute value | **512 bytes** | BLE Core Spec — hard ceiling |
+| Default ATT MTU payload | **20 bytes** | BLE spec default (no negotiation) |
+| Max ATT MTU payload | **514 bytes** | BLE spec maximum |
+| Firmware capture buffer | **512 bytes** | `GW_READ_MAX` — matches spec ceiling |
+
+Attributes longer than one MTU are read automatically in multiple chunks (`ATT_READ_BLOB_REQ` chaining). `GW_READ_MAX = 512` is therefore the correct and final limit — no BLE device can legitimately send more than 512 bytes per characteristic.
+
+**Walk limits:** Up to 20 services, 16 characteristics per service, 6 descriptors per characteristic. PSRAM-allocated (~250 KB result struct + 128 KB JSON buffer).
 
 **Connect timeout:** Configurable via **Settings → Timing → GATT Timeout** (3 s – 30 s slider, NVS-persisted). The default is 30 s. Use a shorter value for fast nearby devices; leave it long for distant or slow-to-respond targets. BT Observer uses a fixed 5 s timeout (not user-adjustable).
 
