@@ -693,3 +693,23 @@ void gw_cancel(void)
     }
     /* Other states: cancel_req is checked at next callback entry */
 }
+
+char *gw_chr_props_str(uint8_t p, char *buf, size_t bufsz)
+{
+    /* BLE_GATT_CHR_PROP_* bits: Broadcast=0x01 Read=0x02 WriteNoRsp=0x04
+       Write=0x08 Notify=0x10 Indicate=0x20 AuthSign=0x40 ExtProp=0x80 */
+    snprintf(buf, bufsz, "%s%s%s%s%s%s%s%s",
+             (p & 0x02) ? "R "  : "",
+             (p & 0x08) ? "W "  : "",
+             (p & 0x04) ? "WNR ": "",
+             (p & 0x10) ? "N "  : "",
+             (p & 0x20) ? "I "  : "",
+             (p & 0x01) ? "BC " : "",
+             (p & 0x40) ? "AS " : "",
+             (p & 0x80) ? "EX " : "");
+    /* trim trailing space */
+    size_t len = strlen(buf);
+    while (len > 0 && buf[len-1] == ' ') buf[--len] = '\0';
+    if (len == 0) snprintf(buf, bufsz, "0x%02X", p);
+    return buf;
+}
