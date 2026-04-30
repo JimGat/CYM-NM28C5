@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 #include "host/ble_hs.h"
 #include "os/os_mbuf.h"
+#include "oui_lookup.h"
 
 static const char *TAG = "gatt_walker";
 
@@ -126,6 +127,57 @@ static uint32_t s_compute_fingerprint(void)
     return h;
 }
 
+/* ── Local UUID name table ───────────────────────────────────────── */
+typedef struct { uint16_t uuid16; const char *name; } s_uuid_entry_t;
+static const s_uuid_entry_t s_uuid_table[] = {
+    /* Services */
+    { 0x1800, "Generic Access"       }, { 0x1801, "Generic Attribute"    },
+    { 0x180A, "Device Information"   }, { 0x180F, "Battery"              },
+    { 0x1810, "Blood Pressure"       }, { 0x1812, "HID"                  },
+    { 0x1816, "Cycling Speed"        }, { 0x1818, "Cycling Power"        },
+    { 0x181A, "Environmental Sensing"}, { 0x181C, "User Data"            },
+    { 0x1820, "Internet Protocol"    }, { 0x1823, "HTTP Proxy"           },
+    { 0x183A, "Insulin Delivery"     }, { 0x183E, "Physical Activity"    },
+    { 0x1803, "Link Loss"            }, { 0x1804, "TX Power"             },
+    { 0x1805, "Current Time"         }, { 0x1806, "Reference Time"       },
+    { 0x1807, "Next DST Change"      }, { 0x180D, "Heart Rate"           },
+    { 0x180E, "Phone Alert"          }, { 0x1813, "Scan Parameters"      },
+    /* Characteristics */
+    { 0x2A00, "Device Name"          }, { 0x2A01, "Appearance"           },
+    { 0x2A04, "Peripheral Pref Conn" }, { 0x2A05, "Service Changed"      },
+    { 0x2A06, "Alert Level"          }, { 0x2A07, "TX Power Level"       },
+    { 0x2A08, "Date Time"            }, { 0x2A19, "Battery Level"        },
+    { 0x2A24, "Model Number"         }, { 0x2A25, "Serial Number"        },
+    { 0x2A26, "Firmware Revision"    }, { 0x2A27, "Hardware Revision"    },
+    { 0x2A28, "Software Revision"    }, { 0x2A29, "Manufacturer Name"    },
+    { 0x2A2A, "IEEE 11073"           }, { 0x2A37, "Heart Rate Measurement"},
+    { 0x2A38, "Body Sensor Location" }, { 0x2A39, "Heart Rate Control"   },
+    { 0x2A3F, "Alert Status"         }, { 0x2A46, "New Alert"            },
+    { 0x2A4D, "HID Report"           }, { 0x2A4E, "HID Protocol Mode"    },
+    { 0x2A6E, "Temperature"          }, { 0x2A6F, "Humidity"             },
+    { 0x2A6D, "Pressure"             }, { 0x2A76, "UV Index"             },
+    { 0x2A9B, "Body Composition Feat"}, { 0x2AA6, "MAC Address"          },
+    { 0x2B29, "Client Support Feat"  }, { 0x2B2A, "Database Hash"        },
+    /* Descriptors */
+    { 0x2900, "Ext Properties"       }, { 0x2901, "User Description"     },
+    { 0x2902, "CCCD"                 }, { 0x2903, "SCCD"                 },
+    { 0x2904, "Presentation Format"  }, { 0x2905, "Aggregate Format"     },
+};
+
+static const char *s_uuid_name(const char *uuid_str)
+{
+    if (!uuid_str) return NULL;
+    unsigned u = 0;
+    if (strncmp(uuid_str, "0x", 2) == 0 || strncmp(uuid_str, "0X", 2) == 0)
+        sscanf(uuid_str + 2, "%x", &u);
+    else
+        return NULL;
+    for (size_t i = 0; i < sizeof(s_uuid_table) / sizeof(s_uuid_table[0]); i++)
+        if (s_uuid_table[i].uuid16 == (uint16_t)u)
+            return s_uuid_table[i].name;
+    return NULL;
+}
+
 /* ── JSON builder ────────────────────────────────────────────────── */
 typedef struct { char *buf; size_t size; size_t pos; bool overflow; } jb_t;
 
@@ -191,7 +243,7 @@ static void jb_hex(jb_t *j, const char *k, const uint8_t *data, int len)
 }
 
 /* ── JSON serialiser ─────────────────────────────────────────────── */
-#define GW_JSON_BUF  65536
+#define GW_JSON_BUF  131072
 
 static bool s_write_json(void)
 {
@@ -206,12 +258,16 @@ static bool s_write_json(void)
              r->mac[5], r->mac[4], r->mac[3],
              r->mac[2], r->mac[1], r->mac[0]);
 
+    uint8_t oui3[3] = { r->mac[5], r->mac[4], r->mac[3] };
+    const char *vendor = oui_lookup_is_loaded() ? oui_lookup(oui3) : NULL;
+
     jb_raw(&j, "{\n");
     jb_int(&j, "version", 1);              jb_comma(&j);
     jb_str(&j, "timestamp", r->timestamp); jb_comma(&j);
     jb_str(&j, "mac", mac_str);            jb_comma(&j);
     jb_int(&j, "addr_type", r->addr_type); jb_comma(&j);
     jb_str(&j, "name", r->name);           jb_comma(&j);
+    jb_str(&j, "manufacturer", vendor ? vendor : ""); jb_comma(&j);
     jb_int(&j, "rssi", r->rssi);           jb_comma(&j);
 
     jb_key(&j, "gps"); jb_raw(&j, "{ ");
@@ -232,6 +288,9 @@ static bool s_write_json(void)
         jb_raw(&j, "  {\n  ");
         jb_str(&j, "uuid", svc->uuid_str);               jb_comma(&j);
         jb_raw(&j, "  ");
+        const char *svc_name = s_uuid_name(svc->uuid_str);
+        jb_str(&j, "name", svc_name ? svc_name : "");    jb_comma(&j);
+        jb_raw(&j, "  ");
         jb_int(&j, "start_handle", svc->start_handle);   jb_comma(&j);
         jb_raw(&j, "  ");
         jb_int(&j, "end_handle",   svc->end_handle);     jb_comma(&j);
@@ -242,18 +301,35 @@ static bool s_write_json(void)
             const gw_chr_t *chr = &svc->chrs[ci];
             if (ci > 0) jb_raw(&j, ",\n");
             jb_raw(&j, "    {\n    ");
-            jb_str(&j, "uuid",       chr->uuid_str);  jb_comma(&j);
+            jb_str(&j, "uuid", chr->uuid_str);           jb_comma(&j);
             jb_raw(&j, "    ");
-            jb_int(&j, "def_handle", chr->def_handle); jb_comma(&j);
+            const char *chr_name = s_uuid_name(chr->uuid_str);
+            jb_str(&j, "name", chr_name ? chr_name : ""); jb_comma(&j);
             jb_raw(&j, "    ");
-            jb_int(&j, "val_handle", chr->val_handle); jb_comma(&j);
+            jb_int(&j, "def_handle", chr->def_handle);   jb_comma(&j);
             jb_raw(&j, "    ");
-            jb_int(&j, "properties", chr->properties); jb_comma(&j);
+            jb_int(&j, "val_handle", chr->val_handle);   jb_comma(&j);
             jb_raw(&j, "    ");
-            if (chr->read_ok && chr->read_len > 0)
+            jb_int(&j, "properties", chr->properties);   jb_comma(&j);
+            jb_raw(&j, "    ");
+            char pstr[24];
+            gw_chr_props_str(chr->properties, pstr, sizeof(pstr));
+            jb_str(&j, "props_str", pstr);               jb_comma(&j);
+            jb_raw(&j, "    ");
+            if (chr->read_ok && chr->read_len > 0) {
                 jb_hex(&j, "read_data", chr->read_data, chr->read_len);
-            else {
+                jb_comma(&j); jb_raw(&j, "    ");
+                jb_key(&j, "ascii"); jb_rawc(&j, '"');
+                for (int bi = 0; bi < chr->read_len; bi++) {
+                    uint8_t b = chr->read_data[bi];
+                    if (b >= 0x20 && b < 0x7F) jb_rawc(&j, (char)b);
+                    else jb_rawc(&j, '.');
+                }
+                jb_rawc(&j, '"');
+            } else {
                 jb_key(&j, "read_data"); jb_raw(&j, "null");
+                jb_comma(&j); jb_raw(&j, "    ");
+                jb_key(&j, "ascii"); jb_raw(&j, "null");
             }
 
             if (chr->desc_count > 0) {
@@ -264,6 +340,8 @@ static bool s_write_json(void)
                     jb_raw(&j, "{ ");
                     jb_str(&j, "uuid", chr->descs[di].uuid_str);
                     jb_raw(&j, ", ");
+                    const char *dsc_name = s_uuid_name(chr->descs[di].uuid_str);
+                    if (dsc_name) { jb_str(&j, "name", dsc_name); jb_raw(&j, ", "); }
                     jb_int(&j, "handle", chr->descs[di].handle);
                     jb_raw(&j, " }");
                 }
@@ -303,6 +381,8 @@ static void s_disc_chrs_for_svc(int svc_idx);
 static void s_disc_dscs_advance(void);
 static void s_read_next(void);
 static void s_finish(void);
+static int  s_mtu_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                     uint16_t mtu, void *arg);
 
 /* ── Finish / save ───────────────────────────────────────────────── */
 
@@ -330,6 +410,7 @@ static void s_finish(void)
 
 /* ── Read phase ──────────────────────────────────────────────────── */
 
+/* read_long callback — called once per chunk, then once with BLE_HS_EDONE */
 static int s_read_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
                      struct ble_gatt_attr *attr, void *arg)
 {
@@ -338,13 +419,19 @@ static int s_read_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
     gw_chr_t *chr = &s_result->svcs[s_cur_svc].chrs[s_cur_chr];
 
     if (error->status == 0 && attr && attr->om) {
-        uint16_t len = OS_MBUF_PKTLEN(attr->om);
-        if (len > GW_READ_MAX) len = GW_READ_MAX;
-        os_mbuf_copydata(attr->om, 0, len, chr->read_data);
-        chr->read_len = (uint8_t)len;
-        chr->read_ok  = true;
+        /* Accumulate this chunk into read_data */
+        uint16_t chunk = OS_MBUF_PKTLEN(attr->om);
+        uint16_t space = GW_READ_MAX - chr->read_len;
+        if (chunk > space) chunk = space;
+        if (chunk > 0) {
+            os_mbuf_copydata(attr->om, 0, chunk, chr->read_data + chr->read_len);
+            chr->read_len += chunk;
+            chr->read_ok   = true;
+        }
+        return 0; /* wait for BLE_HS_EDONE */
     }
 
+    /* BLE_HS_EDONE or read error — advance to next characteristic */
     s_cur_chr++;
     s_read_next();
     return 0;
@@ -361,7 +448,7 @@ static void s_read_next(void)
                 snprintf(msg, sizeof(msg), "Reading chr %d svc %d/%d",
                          s_cur_chr + 1, s_cur_svc + 1, s_result->svc_count);
                 s_notify_ui(msg);
-                int rc = ble_gattc_read(s_conn_handle, chr->val_handle, s_read_cb, NULL);
+                int rc = ble_gattc_read_long(s_conn_handle, chr->val_handle, 0, s_read_cb, NULL);
                 if (rc == 0) return;
                 /* read failed to initiate — skip */
                 ESP_LOGW(TAG, "ble_gattc_read rc=%d, skipping", rc);
@@ -534,6 +621,23 @@ static int s_svc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
     return 0;
 }
 
+/* ── MTU exchange callback — kicks off service discovery ─────────── */
+
+static int s_mtu_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                    uint16_t mtu, void *arg)
+{
+    ESP_LOGI(TAG, "MTU exchange: %d bytes (rc=%d)", mtu, error->status);
+    if (s_state != GW_STATE_DISC_SVCS) return 0;
+    if (s_cancel_req) { s_fail("Cancelled"); return 0; }
+    s_notify_ui("Connected, discovering services...");
+    s_fire_event(GW_EVENT_CONNECTED);
+    s_result->svc_count = 0;
+    gw_ui_svc_count = 0;
+    gw_ui_chr_count = 0;
+    ble_gattc_disc_all_svcs(conn_handle, s_svc_cb, NULL);
+    return 0;
+}
+
 /* ── GAP connection event ────────────────────────────────────────── */
 
 static int s_gap_cb(struct ble_gap_event *event, void *arg)
@@ -551,12 +655,9 @@ static int s_gap_cb(struct ble_gap_event *event, void *arg)
         s_conn_handle = event->connect.conn_handle;
         ESP_LOGI(TAG, "Connected, handle=%d", s_conn_handle);
         s_set_state(GW_STATE_DISC_SVCS);
-        s_notify_ui("Connected, discovering services...");
-        s_fire_event(GW_EVENT_CONNECTED);
-        s_result->svc_count = 0;
-        gw_ui_svc_count = 0;
-        gw_ui_chr_count = 0;
-        ble_gattc_disc_all_svcs(s_conn_handle, s_svc_cb, NULL);
+        s_notify_ui("Connected, MTU exchange...");
+        /* Negotiate larger MTU before discovery so reads can return up to 511 bytes */
+        ble_gattc_exchange_mtu(s_conn_handle, s_mtu_cb, NULL);
         return 0;
 
     case BLE_GAP_EVENT_DISCONNECT:
@@ -661,6 +762,9 @@ bool gw_walk(const uint8_t mac[6], uint8_t addr_type, const char *name,
     s_notify_ui("Connecting...");
     s_fire_event(GW_EVENT_STARTED);
 
+    /* Request 512-byte ATT MTU so reads can return full BLE attribute payloads */
+    ble_att_set_preferred_mtu(512);
+
     ble_addr_t peer = { .type = addr_type };
     memcpy(peer.val, mac, 6);
 
@@ -692,4 +796,24 @@ void gw_cancel(void)
         ble_gap_conn_cancel();
     }
     /* Other states: cancel_req is checked at next callback entry */
+}
+
+char *gw_chr_props_str(uint8_t p, char *buf, size_t bufsz)
+{
+    /* BLE_GATT_CHR_PROP_* bits: Broadcast=0x01 Read=0x02 WriteNoRsp=0x04
+       Write=0x08 Notify=0x10 Indicate=0x20 AuthSign=0x40 ExtProp=0x80 */
+    snprintf(buf, bufsz, "%s%s%s%s%s%s%s%s",
+             (p & 0x02) ? "R "  : "",
+             (p & 0x08) ? "W "  : "",
+             (p & 0x04) ? "WNR ": "",
+             (p & 0x10) ? "N "  : "",
+             (p & 0x20) ? "I "  : "",
+             (p & 0x01) ? "BC " : "",
+             (p & 0x40) ? "AS " : "",
+             (p & 0x80) ? "EX " : "");
+    /* trim trailing space */
+    size_t len = strlen(buf);
+    while (len > 0 && buf[len-1] == ' ') buf[--len] = '\0';
+    if (len == 0) snprintf(buf, bufsz, "0x%02X", p);
+    return buf;
 }

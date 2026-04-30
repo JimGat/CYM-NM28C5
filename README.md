@@ -74,7 +74,7 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 | **Handshake Capture** | WPA/WPA2 4-way handshake capture (PCAP & HCCAPX) |
 | **Karma AP** | Respond to probe requests, rogue access point |
 | **Wardriving** | GPS + WiFi logging to SD card (CSV) |
-| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, Bluetooth Lookout |
+| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk, Bluetooth Lookout |
 | **Deauth Monitor** | Passive detection of nearby deauth attacks |
 | **Credentials** | Captive portal credential capture, WPA-SEC upload |
 | **TX Power Mode** | Selectable Normal / Max Power for WiFi and BLE — persisted across reboots |
@@ -239,6 +239,7 @@ Main Menu
 │   │       ├── BT Locator
 │   │       ├── GATT Walker
 │   │       └── Add to BT Lookout
+│   ├── BT Observer          ← scan + auto-GATT all visible devices
 │   ├── AirTag Scan
 │   ├── BT Locator
 │   └── Bluetooth Lookout
@@ -323,6 +324,7 @@ Bluetooth
 │       ├── BT Locator  (RSSI tracking)
 │       ├── GATT Walker (full GATT fingerprint + JSON output)
 │       └── Add to BT Lookout
+├── BT Observer         ← 10 s scan → sequential GATT walk on all found devices
 ├── AirTag Scan
 ├── BT Locator
 └── Bluetooth Lookout   ← continuous watchlist monitor
@@ -333,8 +335,9 @@ Bluetooth
 | Feature | Description |
 |---------|-------------|
 | **BT Scan & Select** | Active BLE scan — discovers all nearby devices; shows name or vendor (from OUI lookup), RSSI, partial MAC; tap to select a target |
+| **BT Observer** | 10-second active BLE scan followed by sequential GATT walks on every discovered device (5 s timeout per device). Results shown in a scrollable live list; tap any row to open the full GATT detail view |
 | **BT Locator** | RSSI-based proximity tracking of a selected BLE device; updates every 10 s |
-| **GATT Walker** | Full BLE GATT inspection — walks all services, characteristics, and descriptors; reads attribute values; computes FNV-32 device fingerprint; saves structured JSON to SD card with optional GPS geotag |
+| **GATT Walker** | Full BLE GATT inspection — walks all services, characteristics, and descriptors; reads attribute values; computes FNV-32 device fingerprint; saves enriched JSON to SD card with service/characteristic names, decoded properties, ASCII data preview, OUI manufacturer, and optional GPS geotag |
 | **AirTag Scanner** | Passive BLE scan — detects Apple AirTags and Samsung SmartTags by manufacturer ID |
 | **Tag Locator** | Per-tag RSSI tracking launched from the AirTag Scan found-tags list |
 | **Bluetooth Lookout** | Continuous BLE monitor that alerts when a watchlisted device (by full MAC or OUI prefix) is detected nearby |
@@ -431,7 +434,7 @@ Saving results...
 Walk complete
 ```
 
-5. When done, the screen shows the service count, characteristic count, FNV-32 fingerprint, and the file path. Tap **Back** to return to the action menu.
+5. When complete, the screen automatically transitions to a **full scrollable detail view** showing the entire GATT tree: MAC + OUI vendor, FP, GPS, per-service UUID + name, per-characteristic UUID + name, decoded property flags, hex data, and ASCII preview.
 
 **Output file:** `/sdcard/gattwalker/YYYYMMDD_HHMMSS_AABBCCDDEEFF_gattwalk.json`
 
@@ -442,21 +445,26 @@ Walk complete
   "mac": "AA:BB:CC:DD:EE:FF",
   "addr_type": 0,
   "name": "My BLE Device",
+  "manufacturer": "Texas Instruments",
   "rssi": -67,
   "gps": { "valid": true, "lat": 37.1234567, "lon": -122.4567890 },
   "fingerprint": "0xA3F1C2B0",
   "services": [
     {
       "uuid": "0x1800",
+      "name": "Generic Access",
       "start_handle": 1,
       "end_handle": 8,
       "characteristics": [
         {
           "uuid": "0x2A00",
+          "name": "Device Name",
           "def_handle": 2,
           "val_handle": 3,
           "properties": 2,
+          "props_str": "R",
           "read_data": "4D7920446576696365",
+          "ascii": "My Device",
           "descriptors": []
         }
       ]
@@ -469,11 +477,76 @@ Walk complete
 
 **GPS geotagging:** If a GPS fix is active when GATT Walker starts, the coordinates are embedded in the JSON. This enables later mapping of device sightings.
 
-**Limits:** Up to 20 services, 10 characteristics per service, 4 descriptors per characteristic, 48 bytes read per attribute. PSRAM-allocated (~50 KB result struct + 64 KB JSON buffer).
+**Characteristic Properties (`props` / `props_str`):** Each characteristic has a bitmask that declares what operations it supports. The JSON includes both the raw integer (`"properties"`) and the decoded string (`"props_str"`). The on-device result screen shows both the compact flag string and the full human-readable expansion, e.g. `Props: R N (Read, Notify)`.
 
-**Connect timeout:** Configurable via **Settings → Timing → GATT Timeout** (3 s – 30 s slider, NVS-persisted). The default is 30 s. Use a shorter value for fast nearby devices; leave it long for distant or slow-to-respond targets. The same timeout variable is shared with the upcoming BT Observer feature.
+<p align="center">
+  <img width="220" src="docs/screenshots/GATT%20Walker%20Info.bmp" alt="GATT Walker detail view showing properties and data" /><br>
+  <em>GATT Walker detail view — service tree with decoded properties and ASCII data</em>
+</p>
+
+| Bit | Hex | Flag | Meaning |
+|-----|-----|------|---------|
+| 0 | `0x01` | **BC** | Broadcast — value can be included in advertising packets |
+| 1 | `0x02` | **R** | Read — current value can be read |
+| 2 | `0x04` | **WNR** | Write No Response — fire-and-forget write, no acknowledgement |
+| 3 | `0x08` | **W** | Write — acknowledged write; server confirms receipt |
+| 4 | `0x10` | **N** | Notify — server pushes updates to subscribed clients (no ACK) |
+| 5 | `0x20` | **I** | Indicate — server pushes updates; client must ACK each one |
+| 6 | `0x40` | **AS** | Authenticated Signed Write — write with MITM-protected signature |
+| 7 | `0x80` | **EX** | Extended Properties — additional properties stored in descriptor `0x2900` |
+
+Common combinations:
+
+| Props string | Raw | Typical use |
+|---|---|---|
+| `R` | `0x02` | Read-only sensor or config value |
+| `R N` | `0x12` | Live sensor — read current value + subscribe for streaming updates |
+| `R I` | `0x22` | Like notify but reliable — server waits for client ACK |
+| `R W` | `0x0A` | Read/write configuration register |
+| `WNR` | `0x04` | Command channel — write commands with no response needed |
+| `R W N` | `0x1A` | Full-featured — read, write, and subscribe |
+
+> **Tip:** To receive live streaming data (e.g. a heart rate sensor), look for characteristics with **N** (Notify) or **I** (Indicate). A **CCCD descriptor** (`0x2902`) is always present alongside these and is what a client writes to in order to enable or disable the subscription.
+
+**BLE data limits:** The Bluetooth Core Specification sets a hard ceiling of **512 bytes** per attribute value. The firmware negotiates the maximum possible ATT MTU on every connection so that large attributes are captured in full rather than truncated at the BLE default of 20 bytes.
+
+| Limit | Value | Source |
+|-------|-------|--------|
+| Max attribute value | **512 bytes** | BLE Core Spec — hard ceiling |
+| Default ATT MTU payload | **20 bytes** | BLE spec default (no negotiation) |
+| Max ATT MTU payload | **514 bytes** | BLE spec maximum |
+| Firmware capture buffer | **512 bytes** | `GW_READ_MAX` — matches spec ceiling |
+
+Attributes longer than one MTU are read automatically in multiple chunks (`ATT_READ_BLOB_REQ` chaining). `GW_READ_MAX = 512` is therefore the correct and final limit — no BLE device can legitimately send more than 512 bytes per characteristic.
+
+**Walk limits:** Up to 20 services, 16 characteristics per service, 6 descriptors per characteristic. PSRAM-allocated (~250 KB result struct + 128 KB JSON buffer).
+
+**Connect timeout:** Configurable via **Settings → Timing → GATT Timeout** (3 s – 30 s slider, NVS-persisted). The default is 30 s. Use a shorter value for fast nearby devices; leave it long for distant or slow-to-respond targets. BT Observer uses a fixed 5 s timeout (not user-adjustable).
 
 > **Note:** GATT Walker connects to the target — it is an active, deliberate inspection, not passive. The target device will see an incoming connection. Cancel at any time with the **Cancel Walk** button; the connection is cleanly terminated.
+
+#### BT Observer — How It Works
+
+**BT Observer** automates the scan-then-walk workflow: it runs a single 10-second active BLE scan, captures all discovered devices, then attempts a sequential GATT walk on each one (5 s connect timeout). Results are displayed in a live scrollable list and saved as JSON files to `/sdcard/gattwalker/` — identical format to manual GATT Walker.
+
+**Workflow:**
+
+1. Open **BT Observer** from the Bluetooth tile.
+2. The device starts a 10-second active BLE scan. Discovered devices appear in the list with name/vendor and RSSI.
+3. After the scan window closes, the observer walks each device in turn. The list updates live as each walk completes: green checkmark with service/chr counts on success, red on failure.
+4. When all devices have been attempted (or the session is stopped), the status bar shows total enumerated count.
+5. Tap any row with a successful walk to open the full GATT detail view (same scrollable tree as the single-walk result screen).
+
+**Key differences from manual GATT Walker:**
+
+| | GATT Walker | BT Observer |
+|--|-------------|-------------|
+| Target | One device (selected) | All devices in one scan session |
+| Connect timeout | Configurable (3–30 s, NVS) | Fixed 5 s per device |
+| Result screen | Auto-navigates to detail on complete | Tap-to-open per device |
+| Scan pass | Continuous (relies on existing scan) | Single 10 s burst, no re-scan |
+
+**Per-device JSON files** are saved using the same `/sdcard/gattwalker/` path and enriched format as single walks (manufacturer, service/chr names, props_str, ascii).
 
 #### Bluetooth Lookout — How It Works
 
@@ -552,7 +625,7 @@ All settings are persisted via **NVS** (Non-Volatile Storage) across reboots. Th
 | **Timing** | Combined timing popup — WiFi scan dwell time sliders and GATT connect timeout slider |
 | **Screen** | Combined screen popup — inactivity timeout dropdown and brightness overlay slider |
 | **SD Card** | Validate/provision (creates `/sdcard/lab/` structure, shows completion status); browse file tree; check free space |
-| **GPS Info** | Live GPS fix status, latitude, longitude, altitude, satellite count, and UART config reference (IO4/IO5, 9600 baud, ATGM336H) |
+| **GPS Info** | Live GPS fix status — latitude, longitude, altitude, satellite count, UTC time (parsed from NMEA RMC), and UART config reference (IO4/IO5, 9600 baud, ATGM336H). Refreshes every second. First active fix syncs the system clock (used for FAT timestamps) |
 | **Power Mode** | TX Power Mode selector — Normal or Max Power (see below) |
 | **Data Transfer** | File server sub-menu — AP mode or WiFi client mode (see below) |
 
@@ -575,7 +648,7 @@ Accessible via **Settings → Timing**. A single popup contains two sections:
 
 **WiFi Scan / Channel** — min and max dwell time sliders (50–1000 ms) control how long the WiFi scanner dwells on each channel during active scans. Both values are NVS-persisted.
 
-**GATT Connect Timeout** — a single slider sets the BLE connection timeout used by GATT Walker (and the upcoming BT Observer feature).
+**GATT Connect Timeout** — a single slider sets the BLE connection timeout used by GATT Walker. BT Observer uses a separate fixed 5 s timeout and is not affected by this setting.
 
 | Slider position | Timeout | Best for |
 |-----------------|---------|----------|
