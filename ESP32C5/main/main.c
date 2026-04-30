@@ -18034,6 +18034,24 @@ static const char *gatt_uuid_name(const char *uuid_str)
     return NULL;
 }
 
+/* Expand property bitmask to human-readable comma list, e.g. "Read, Notify" */
+static void s_chr_props_desc(uint8_t p, char *buf, size_t bufsz)
+{
+    static const struct { uint8_t bit; const char *name; } flags[] = {
+        { 0x02, "Read"      }, { 0x08, "Write"     }, { 0x04, "Write-NR"  },
+        { 0x10, "Notify"    }, { 0x20, "Indicate"  }, { 0x01, "Broadcast" },
+        { 0x40, "Auth-Sign" }, { 0x80, "Ext-Props" },
+    };
+    int pos = 0; buf[0] = '\0';
+    for (size_t i = 0; i < sizeof(flags)/sizeof(flags[0]); i++) {
+        if (p & flags[i].bit) {
+            if (pos > 0) pos += snprintf(buf+pos, bufsz-pos, ", ");
+            pos += snprintf(buf+pos, bufsz-pos, "%s", flags[i].name);
+        }
+    }
+    if (pos == 0) snprintf(buf, bufsz, "None");
+}
+
 /* ── BT Observer device detail screen ───────────────────────────── */
 
 static void bto_detail_back_cb(lv_event_t *e)
@@ -18151,8 +18169,10 @@ static void show_bto_device_detail(int dev_idx)
         else if (strncmp(line, "\"properties\": ", 14) == 0) {
             int props = 0; sscanf(line + 14, "%d", &props);
             gw_chr_props_str((uint8_t)props, prop_buf, sizeof(prop_buf));
-            char row[40];
-            snprintf(row, sizeof(row), "  Props: %s", prop_buf);
+            char prop_desc[96];
+            s_chr_props_desc((uint8_t)props, prop_desc, sizeof(prop_desc));
+            char row[140];
+            snprintf(row, sizeof(row), "  Props: %s (%s)", prop_buf, prop_desc);
             DET_ROW(scrl, row, &lv_font_montserrat_12, COLOR_MATERIAL_ORANGE);
             in_chr = true;
         }
@@ -18808,8 +18828,11 @@ static void show_gw_result_screen(void)
                 /* Decoded properties */
                 char prop_buf[24];
                 gw_chr_props_str(chr->properties, prop_buf, sizeof(prop_buf));
-                snprintf(row, sizeof(row), "    Props: %s", prop_buf);
-                GW_ROW(scrl, row, &lv_font_montserrat_12, COLOR_MATERIAL_ORANGE);
+                char prop_desc[96];
+                s_chr_props_desc(chr->properties, prop_desc, sizeof(prop_desc));
+                char prop_row[140];
+                snprintf(prop_row, sizeof(prop_row), "    Props: %s (%s)", prop_buf, prop_desc);
+                GW_ROW(scrl, prop_row, &lv_font_montserrat_12, COLOR_MATERIAL_ORANGE);
 
                 /* Read data + ASCII */
                 if (chr->read_ok && chr->read_len > 0) {
