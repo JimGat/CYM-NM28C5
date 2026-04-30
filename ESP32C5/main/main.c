@@ -3435,34 +3435,81 @@ static void hide_sd_loading_popup(void) {
     }
 }
 
-static void show_sd_fatal_error_and_halt(void) {
-    led_set(0, 0, 0);  // LED off on fatal halt
-    // Build a fresh screen so this works regardless of splash/home UI state
-    if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
-        lv_obj_t *err_scr = lv_obj_create(NULL);
-        lv_obj_set_style_bg_color(err_scr, lv_color_hex(0x1a0000), 0);
-        lv_obj_set_style_bg_opa(err_scr, LV_OPA_COVER, 0);
+/* SD error screen state — set by button callbacks, read by polling loop */
+static volatile int s_sd_err_choice = 0;   /* 0=waiting, 1=retry, 2=continue */
 
-        lv_obj_t *lbl = lv_label_create(err_scr);
-        lv_label_set_text(lbl, "SD Card Failed!\n\nRequires FAT32\n(<= 32 GB)\n\nReset to retry");
-        lv_obj_set_style_text_color(lbl, lv_color_hex(0xff4444), 0);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+static void s_sd_err_retry_cb(lv_event_t *e)   { (void)e; s_sd_err_choice = 1; }
+static void s_sd_err_cont_cb(lv_event_t *e)    { (void)e; s_sd_err_choice = 2; }
+
+/* Shown after all mount attempts fail.
+   Returns true = user tapped Retry, false = user tapped Continue. */
+static bool show_sd_error_screen(void)
+{
+    s_sd_err_choice = 0;
+
+    if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        lv_obj_t *scr = lv_obj_create(NULL);
+        lv_obj_set_style_bg_color(scr, lv_color_hex(0x1a0000), 0);
+        lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+
+        lv_obj_t *lbl = lv_label_create(scr);
+        lv_label_set_text(lbl,
+            "SD Card Error\n\n"
+            "Card not responding.\n"
+            "Requires FAT32\n"
+            "(<= 32 GB)\n\n"
+            "Reseat card then\ntap Retry, or\ncontinue without SD.");
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0xff6666), 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_width(lbl, LV_PCT(90));
-        lv_obj_center(lbl);
+        lv_obj_align(lbl, LV_ALIGN_CENTER, 0, -30);
 
-        lv_scr_load(err_scr);
+        lv_obj_t *retry_btn = lv_btn_create(scr);
+        lv_obj_set_size(retry_btn, 100, 32);
+        lv_obj_align(retry_btn, LV_ALIGN_BOTTOM_LEFT, 14, -12);
+        lv_obj_set_style_bg_color(retry_btn, COLOR_MATERIAL_GREEN, 0);
+        lv_obj_set_style_border_width(retry_btn, 0, 0);
+        lv_obj_set_style_radius(retry_btn, 8, 0);
+        lv_obj_t *rl = lv_label_create(retry_btn);
+        lv_label_set_text(rl, LV_SYMBOL_REFRESH " Retry");
+        lv_obj_set_style_text_font(rl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(rl, lv_color_white(), 0);
+        lv_obj_center(rl);
+        lv_obj_add_event_cb(retry_btn, s_sd_err_retry_cb, LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t *cont_btn = lv_btn_create(scr);
+        lv_obj_set_size(cont_btn, 100, 32);
+        lv_obj_align(cont_btn, LV_ALIGN_BOTTOM_RIGHT, -14, -12);
+        lv_obj_set_style_bg_color(cont_btn, lv_color_make(80, 80, 80), 0);
+        lv_obj_set_style_border_width(cont_btn, 0, 0);
+        lv_obj_set_style_radius(cont_btn, 8, 0);
+        lv_obj_t *cl = lv_label_create(cont_btn);
+        lv_label_set_text(cl, "Continue");
+        lv_obj_set_style_text_font(cl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(cl, lv_color_white(), 0);
+        lv_obj_center(cl);
+        lv_obj_add_event_cb(cont_btn, s_sd_err_cont_cb, LV_EVENT_CLICKED, NULL);
+
+        lv_scr_load(scr);
         lv_refr_now(NULL);
         xSemaphoreGive(lvgl_mutex);
     }
-    // Keep display alive; halt until hardware reset
-    while (1) {
+
+    while (s_sd_err_choice == 0) {
         if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             lv_task_handler();
             xSemaphoreGive(lvgl_mutex);
         }
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
+    return (s_sd_err_choice == 1);
+}
+
+static void show_sd_fatal_error_and_halt(void)
+{
+    /* Kept for compatibility — now interactive rather than a true halt. */
+    show_sd_error_screen();
 }
 
 // ============================================================================
@@ -3981,49 +4028,72 @@ void app_main(void)
     // Show loading popup
     show_sd_loading_popup("Reading SD card...");
 
-    // Try to mount SD card - 3 attempts, then continue without it
-    bool sd_mounted = false;
+    // Try to mount SD card - progressive SPI speed fallback, then Retry/Continue screen
+    // Attempt 1: 20 MHz, no format | Attempt 2: 10 MHz, no format | Attempt 3: 5 MHz + auto-format
+    static const uint32_t sd_freqs[]     = { 20000, 10000, 5000 };
+    static const bool     sd_formats[]   = { false,  false, true };
+    static const char    *sd_freq_names[]= { "20 MHz", "10 MHz", "5 MHz" };
     const int SD_MAX_ATTEMPTS = 3;
-    for (int mount_attempts = 1; mount_attempts <= SD_MAX_ATTEMPTS && !sd_mounted; mount_attempts++) {
-        ESP_LOGI(TAG, "[SD] Mount attempt %d/%d...", mount_attempts, SD_MAX_ATTEMPTS);
 
-        char attempt_msg[40];
-        snprintf(attempt_msg, sizeof(attempt_msg), "Reading SD... (%d/%d)", mount_attempts, SD_MAX_ATTEMPTS);
-        update_sd_loading_popup(attempt_msg);
+    // 100 ms power-on settle before first attempt
+    vTaskDelay(pdMS_TO_TICKS(100));
 
-        // Take SD/SPI mutex before mounting
-        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
-            esp_err_t sd_ret = wifi_wardrive_init_sd();
-            xSemaphoreGive(sd_spi_mutex);
+    bool sd_mounted = false;
+    bool keep_trying = true;
+    while (!sd_mounted && keep_trying) {
+        for (int att = 0; att < SD_MAX_ATTEMPTS && !sd_mounted; att++) {
+            ESP_LOGI(TAG, "[SD] Mount attempt %d/%d @ %s%s", att+1, SD_MAX_ATTEMPTS,
+                     sd_freq_names[att], sd_formats[att] ? " + format" : "");
 
-            if (sd_ret == ESP_OK) {
-                sd_mounted_lazy = true;
-                sd_mounted = true;
-                ESP_LOGI(TAG, "[SD] Card mounted successfully");
-            } else {
-                ESP_LOGW(TAG, "[SD] Mount failed (%d/%d): %s", mount_attempts, SD_MAX_ATTEMPTS, esp_err_to_name(sd_ret));
-                if (mount_attempts < SD_MAX_ATTEMPTS) {
-                    char fail_msg[48];
-                    snprintf(fail_msg, sizeof(fail_msg), "Attempt %d/%d failed\nRetrying...", mount_attempts, SD_MAX_ATTEMPTS);
-                    update_sd_loading_popup(fail_msg);
-                    // 2 second delay with LVGL processing before retry
-                    for (int i = 0; i < 20; i++) {
-                        if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                            lv_task_handler();
-                            xSemaphoreGive(lvgl_mutex);
+            char attempt_msg[48];
+            snprintf(attempt_msg, sizeof(attempt_msg), "SD attempt %d/%d @ %s...",
+                     att+1, SD_MAX_ATTEMPTS, sd_freq_names[att]);
+            update_sd_loading_popup(attempt_msg);
+
+            if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+                esp_err_t sd_ret = wifi_wardrive_init_sd_ex(sd_freqs[att], sd_formats[att]);
+                xSemaphoreGive(sd_spi_mutex);
+
+                if (sd_ret == ESP_OK) {
+                    sd_mounted_lazy = true;
+                    sd_mounted = true;
+                    ESP_LOGI(TAG, "[SD] Mounted successfully @ %s", sd_freq_names[att]);
+                } else {
+                    ESP_LOGW(TAG, "[SD] Attempt %d failed: %s", att+1, esp_err_to_name(sd_ret));
+                    if (att < SD_MAX_ATTEMPTS - 1) {
+                        char fail_msg[52];
+                        snprintf(fail_msg, sizeof(fail_msg), "Attempt %d failed\nTrying %s...",
+                                 att+1, sd_freq_names[att+1]);
+                        update_sd_loading_popup(fail_msg);
+                        for (int i = 0; i < 10; i++) {
+                            if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                                lv_task_handler();
+                                xSemaphoreGive(lvgl_mutex);
+                            }
+                            vTaskDelay(pdMS_TO_TICKS(100));
                         }
-                        vTaskDelay(pdMS_TO_TICKS(100));
                     }
                 }
+            } else {
+                ESP_LOGW(TAG, "[SD] Could not take SPI mutex");
+                vTaskDelay(pdMS_TO_TICKS(500));
             }
-        } else {
-            ESP_LOGW(TAG, "[SD] Could not take SPI mutex");
-            vTaskDelay(pdMS_TO_TICKS(500));
         }
-    }
-    if (!sd_mounted) {
-        ESP_LOGW(TAG, "[SD] No SD card after %d attempts - halting", SD_MAX_ATTEMPTS);
-        show_sd_fatal_error_and_halt();
+
+        if (!sd_mounted) {
+            ESP_LOGW(TAG, "[SD] All %d attempts failed — showing error screen", SD_MAX_ATTEMPTS);
+            bool retry = show_sd_error_screen();
+            if (retry) {
+                // User tapped Retry — restore the loading popup and try again from 20 MHz
+                show_sd_loading_popup("Retrying SD card...");
+                vTaskDelay(pdMS_TO_TICKS(100));
+            } else {
+                // User tapped Continue — proceed without SD
+                keep_trying = false;
+                sd_mounted_lazy = false;
+                ESP_LOGI(TAG, "[SD] User chose to continue without SD card");
+            }
+        }
     }
     
     // Load all data from SD into cache

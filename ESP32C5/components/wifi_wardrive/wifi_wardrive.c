@@ -214,13 +214,13 @@ float wifi_wardrive_get_longitude(void) {
 // SD CARD FUNCTIONS
 // ============================================================================
 
-esp_err_t wifi_wardrive_init_sd(void) {
+esp_err_t wifi_wardrive_init_sd_ex(uint32_t freq_khz, bool format_if_failed) {
     // Check if already mounted
     if (sd_card_mounted) {
         ESP_LOGI(TAG, "[SD] SD card already mounted");
         return ESP_OK;
     }
-    
+
     ESP_LOGI(TAG, "[SD] Starting SD card initialization...");
 
     // Detailed memory diagnostics BEFORE mount
@@ -230,29 +230,29 @@ esp_err_t wifi_wardrive_init_sd(void) {
     ESP_LOGI(TAG, "[SD]   PSRAM free: %u bytes", (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     ESP_LOGI(TAG, "[SD]   DMA-capable: %u bytes", (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
     ESP_LOGI(TAG, "[SD]   Largest free block: %u bytes", (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    
+
     // Check if we have enough memory for mount operation
-    size_t required_mem = 16384; // Estimate ~16KB needed for FATFS mount
+    size_t required_mem = 16384;
     size_t available = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
     if (available < required_mem) {
-        ESP_LOGW(TAG, "[SD] Low internal memory! Available: %u, recommended: %u", 
+        ESP_LOGW(TAG, "[SD] Low internal memory! Available: %u, recommended: %u",
                  (unsigned)available, (unsigned)required_mem);
     }
-    
-    ESP_LOGI(TAG, "[SD] Configuring mount parameters...");
+
+    ESP_LOGI(TAG, "[SD] Configuring mount parameters (fmt=%d)...", (int)format_if_failed);
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-        .format_if_mount_failed = false,  // Don't auto-format
-        .max_files = 3,  // Increase from 1 to 3
-        .allocation_unit_size = 0,  // Use card's native sector size
-        .disk_status_check_enable = false  // Disable status check to save memory
+        .format_if_mount_failed = format_if_failed,
+        .max_files = 3,
+        .allocation_unit_size = 16 * 1024,  /* 16 KB clusters when formatting */
+        .disk_status_check_enable = false
     };
-    
-    ESP_LOGI(TAG, "[SD] Configuring SPI host...");
+
+    ESP_LOGI(TAG, "[SD] Configuring SPI host at %lu kHz...", (unsigned long)freq_khz);
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.slot = SPI2_HOST;  // Same as LCD (already initialized by display)
-    host.max_freq_khz = 20000;  // 20 MHz (increased from 400kHz after init)
-    host.flags = SDMMC_HOST_FLAG_SPI | SDMMC_HOST_FLAG_DEINIT_ARG;  // DEINIT_ARG required: cleanup calls deinit_p(handle), not deinit()
-    ESP_LOGI(TAG, "[SD]   SPI Host: %d, Frequency: %d kHz, Flags: 0x%x", host.slot, host.max_freq_khz, host.flags);
+    host.slot = SPI2_HOST;
+    host.max_freq_khz = freq_khz;
+    host.flags = SDMMC_HOST_FLAG_SPI | SDMMC_HOST_FLAG_DEINIT_ARG;
+    ESP_LOGI(TAG, "[SD]   SPI Host: %d, Frequency: %lu kHz, Flags: 0x%x", host.slot, (unsigned long)host.max_freq_khz, host.flags);
 
     ESP_LOGI(TAG, "[SD] Configuring slot (CS=%d)...", SD_CS_PIN);
     sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
@@ -329,6 +329,10 @@ esp_err_t wifi_wardrive_init_sd(void) {
 
     ESP_LOGI(TAG, "[SD] Initialization completed successfully!");
     return ESP_OK;
+}
+
+esp_err_t wifi_wardrive_init_sd(void) {
+    return wifi_wardrive_init_sd_ex(20000, false);
 }
 
 bool wifi_wardrive_is_sd_mounted(void) {
