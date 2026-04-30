@@ -1,8 +1,58 @@
 # CYM-NM28C5 Pre-built Firmware Binaries
 
-**Firmware version: v0.8.5**
+**Firmware version: v0.8.9**
 
 This folder contains the latest compiled firmware for the **NM-CYD-C5 (ESP32-C5)** board.
+
+---
+
+## Release Notes — v0.8.9
+
+### GATT Walker — Full 512-Byte Attribute Capture
+
+The firmware now negotiates the maximum possible BLE ATT MTU on every GATT connection and reads all attributes using chained `ATT_READ_BLOB_REQ` calls, eliminating the 20-byte default truncation. Captured data is now complete up to the BLE spec ceiling.
+
+- MTU exchange added to every GATT connection before discovery begins
+- `ble_gattc_read_long()` replaces single-shot reads — multi-chunk attributes are reassembled automatically
+- Capture buffer raised from 128 B → **512 bytes** (`GW_READ_MAX`) — matches the BLE Core Spec hard limit
+- Both the single-walk GATT Walker and BT Observer benefit from this fix
+
+### GATT Walker — Expanded Properties Display
+
+On-device result screens now decode the characteristic properties bitmask into a full human-readable string alongside the compact flag notation.
+
+- Compact flags: `R N` (raw bitmask notation)
+- Full expansion: `(Read, Notify)` — shown in parentheses on the same line
+- Applies to both the GATT Walker result screen and the BT Observer detail view
+
+### BT Observer — Crash Fix on Device Tap
+
+Fixed a **stack overflow** that caused an immediate reboot when tapping any device row in BT Observer to open the detail view.
+
+- Root cause: main task stack was only 3584 bytes — too small for LVGL UI construction
+- `CONFIG_ESP_MAIN_TASK_STACK_SIZE` raised 3584 → **8192 bytes** (persisted in `sdkconfig.defaults`)
+- Large local buffers in the detail renderer (`hexraw[1028]`, `ascii[516]`, `row[620]`) moved from the call stack to static storage
+- Same fix applied to the GATT Walker result screen to prevent the same class of crash there
+
+### BT Attacks — New Menu Tile
+
+A new **BT Attacks** tile has been added as the sixth tile in the Bluetooth menu (bottom-right position), completing the two-row layout.
+
+- Bluetooth menu now fills both rows: BT Scan & Select · BT Observer · AirTag Scan / BT Locator · BT Lookout · **BT Attacks**
+- Opens a dedicated submenu containing Coming Soon placeholder tiles for future BLE offensive capabilities:
+  - **BLE Spam** — advertising flood attack (in development)
+  - **Device Spoof** — clone BLE device identity (in development)
+  - **BLE Disconnect** — targeted BLE link disruption (in development)
+- Each placeholder shows a "Coming Soon — under development" screen with a back button
+
+### HTTP File Server — Rebranded & Enhanced Directory Listing
+
+The AP File Server and WiFi Client web interface has been updated.
+
+- Page title and footer changed from `JANOS` → **Cheap Yellow Monster**
+- Each file entry now shows its **modification datetime** (`YYYY-MM-DD HH:MM`) in the listing
+- File sizes are now **human-readable**: `512 B`, `1.4 KB`, `3.2 MB` instead of raw byte counts
+- Directories show datetime without size
 
 ---
 
@@ -30,7 +80,7 @@ JSON files saved to `/sdcard/gattwalker/` now include:
 | `"ascii"` | each characteristic | Printable ASCII preview of `read_data` |
 | `"name"` | each descriptor | Human-readable descriptor name where known |
 
-Updated limits: **16 characteristics per service**, **6 descriptors per characteristic**, **128 bytes read per attribute**.
+Updated limits: **16 characteristics per service**, **6 descriptors per characteristic**.
 
 ### BT Observer
 
