@@ -247,11 +247,20 @@ esp_err_t wifi_wardrive_init_sd_ex(uint32_t freq_khz, bool format_if_failed) {
         .disk_status_check_enable = false
     };
 
+    /* Assert CS HIGH for 200 ms before touching the bus.
+       This ensures the card is fully deselected and has had time to settle,
+       which is especially important for fresh/blank cards that are slow to
+       respond to CMD0 after power-on. */
+    gpio_set_direction(SD_CS_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(SD_CS_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(200));
+
     ESP_LOGI(TAG, "[SD] Configuring SPI host at %lu kHz...", (unsigned long)freq_khz);
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
     host.slot = SPI2_HOST;
     host.max_freq_khz = freq_khz;
     host.flags = SDMMC_HOST_FLAG_SPI | SDMMC_HOST_FLAG_DEINIT_ARG;
+    host.command_timeout_ms = 2000; /* allow slow/fresh cards up to 2 s for CMD0 response */
     ESP_LOGI(TAG, "[SD]   SPI Host: %d, Frequency: %lu kHz, Flags: 0x%x", host.slot, (unsigned long)host.max_freq_khz, host.flags);
 
     ESP_LOGI(TAG, "[SD] Configuring slot (CS=%d)...", SD_CS_PIN);

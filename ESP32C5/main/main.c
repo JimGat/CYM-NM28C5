@@ -4128,8 +4128,8 @@ void app_main(void)
     static const char    *sd_freq_names[] = { "20 MHz", "10 MHz", "5 MHz" };
     const int SD_MAX_ATTEMPTS = 3;
 
-    // 100 ms power-on settle before first attempt
-    vTaskDelay(pdMS_TO_TICKS(100));
+    // 500 ms power-on settle before first attempt (blank/fresh cards can be slow)
+    vTaskDelay(pdMS_TO_TICKS(500));
 
     bool sd_mounted   = false;
     bool keep_trying  = true;
