@@ -19608,6 +19608,65 @@ static bool parse_gps_nmea(const char *nmea_sentence)
 			return true;
 		}
 	}
+
+	// Parse GPRMC/GNRMC — carries date+time; use to sync system clock once on fix
+	if (strncmp(nmea_sentence, "$GPRMC", 6) == 0 || strncmp(nmea_sentence, "$GNRMC", 6) == 0) {
+		char sentence[256];
+		strncpy(sentence, nmea_sentence, sizeof(sentence) - 1);
+		sentence[sizeof(sentence) - 1] = '\0';
+
+		char *token = strtok(sentence, ",");
+		int field = 0;
+		char status = 'V';
+		int hh = 0, mm = 0, ss = 0, day = 0, mon = 0, yr = 0;
+
+		while (token != NULL) {
+			switch (field) {
+				case 1: // HHMMSS.SS
+					if (strlen(token) >= 6) {
+						hh = (token[0]-'0')*10 + (token[1]-'0');
+						mm = (token[2]-'0')*10 + (token[3]-'0');
+						ss = (token[4]-'0')*10 + (token[5]-'0');
+					}
+					break;
+				case 2: status = token[0]; break; // A=active, V=void
+				case 9: // DDMMYY
+					if (strlen(token) >= 6) {
+						day = (token[0]-'0')*10 + (token[1]-'0');
+						mon = (token[2]-'0')*10 + (token[3]-'0');
+						yr  = (token[4]-'0')*10 + (token[5]-'0');
+					}
+					break;
+			}
+			token = strtok(NULL, ",");
+			field++;
+		}
+
+		if (status == 'A' && yr > 0) {
+			static bool s_clock_synced = false;
+			if (!s_clock_synced) {
+				struct tm t = {0};
+				t.tm_year  = 100 + yr; // 2000+yr, minus 1900
+				t.tm_mon   = mon - 1;
+				t.tm_mday  = day;
+				t.tm_hour  = hh;
+				t.tm_min   = mm;
+				t.tm_sec   = ss;
+				t.tm_isdst = 0;
+				setenv("TZ", "UTC0", 1);
+				tzset();
+				time_t epoch = mktime(&t);
+				if (epoch != (time_t)-1) {
+					struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
+					settimeofday(&tv, NULL);
+					s_clock_synced = true;
+					ESP_LOGI(TAG, "System clock synced from GPS: %04d-%02d-%02d %02d:%02d:%02d UTC",
+					         2000+yr, mon, day, hh, mm, ss);
+				}
+			}
+			return true;
+		}
+	}
 	return false;
 }
 
