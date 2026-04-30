@@ -1531,6 +1531,9 @@ static void show_gatt_walker_screen(void);
 static void gw_update_screen_ui(void);
 static void gw_deferred_start_cb(lv_timer_t *t);
 
+// BT Attacks
+static void show_bt_attacks_screen(void);
+
 // BT Lookout
 static void show_bt_lookout_screen(void);
 static void show_add_oui_entry_screen(void);
@@ -17636,6 +17639,10 @@ static void show_bluetooth_screen(void)
     // BT Lookout - Red
     lv_obj_t *lookout_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BT\nLookout", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(lookout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Dee Dee Detector");
+
+    // BT Attacks - Orange (bottom-right, 6th tile)
+    lv_obj_t *btatk_tile = create_tile(tiles, LV_SYMBOL_WARNING, "BT\nAttacks", COLOR_MATERIAL_ORANGE, NULL, NULL);
+    lv_obj_add_event_cb(btatk_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Attacks");
 }
 
 // BT Locator screen - scan BT devices, select one, then track RSSI every 10s
@@ -19162,6 +19169,54 @@ static void show_stub_screen(const char *name, void (*back_fn)(void))
     lv_obj_add_event_cb(back_btn, stub_back_btn_cb, LV_EVENT_CLICKED, NULL);
 }
 
+// ── BT Attacks menu ──────────────────────────────────────────────────────────
+static void show_bt_attacks_screen(void)
+{
+    create_function_page_base("BT Attacks");
+    apply_menu_bg();
+
+    lv_obj_t *tiles = lv_obj_create(function_page);
+    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 65);
+    lv_obj_align(tiles, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(tiles, 0, 0);
+    lv_obj_set_style_pad_all(tiles, 10, 0);
+    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *spam_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BLE\nSpam", COLOR_MATERIAL_RED, NULL, NULL);
+    lv_obj_add_event_cb(spam_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spam");
+
+    lv_obj_t *spoof_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Device\nSpoof", COLOR_MATERIAL_AMBER, NULL, NULL);
+    lv_obj_add_event_cb(spoof_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spoof");
+
+    lv_obj_t *disc_tile = create_tile(tiles, LV_SYMBOL_CLOSE, "BLE\nDisconnect", COLOR_MATERIAL_ORANGE, NULL, NULL);
+    lv_obj_add_event_cb(disc_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Disconnect");
+
+    /* Back button */
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 28);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(back_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(back_icon, lv_color_white(), 0);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, "Bluetooth");
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
+    lv_obj_set_user_data(back_btn, (void *)show_bluetooth_screen);
+    lv_obj_add_event_cb(back_btn, stub_back_btn_cb, LV_EVENT_CLICKED, NULL);
+}
+
 // ============================================================================
 // END TILE-BASED NAVIGATION SYSTEM
 // ============================================================================
@@ -20320,6 +20375,26 @@ void attack_event_cb(lv_event_t *e)
     // BT Lookout screen
     if (strcmp(attack_name, "Dee Dee Detector") == 0) {
         show_bt_lookout_screen();
+        return;
+    }
+
+    // BT Attacks menu
+    if (strcmp(attack_name, "BT Attacks") == 0) {
+        show_bt_attacks_screen();
+        return;
+    }
+
+    // BT Attacks — Coming Soon stubs
+    if (strcmp(attack_name, "BLE Spam") == 0) {
+        show_stub_screen("BLE Spam", show_bt_attacks_screen);
+        return;
+    }
+    if (strcmp(attack_name, "BLE Spoof") == 0) {
+        show_stub_screen("Device Spoof", show_bt_attacks_screen);
+        return;
+    }
+    if (strcmp(attack_name, "BLE Disconnect") == 0) {
+        show_stub_screen("BLE Disconnect", show_bt_attacks_screen);
         return;
     }
 
