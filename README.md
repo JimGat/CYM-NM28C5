@@ -479,6 +479,11 @@ Walk complete
 
 **Characteristic Properties (`props` / `props_str`):** Each characteristic has a bitmask that declares what operations it supports. The JSON includes both the raw integer (`"properties"`) and the decoded string (`"props_str"`). The on-device result screen shows both the compact flag string and the full human-readable expansion, e.g. `Props: R N (Read, Notify)`.
 
+<p align="center">
+  <img width="220" src="docs/screenshots/GATT%20Walker%20Info.bmp" alt="GATT Walker detail view showing properties and data" /><br>
+  <em>GATT Walker detail view — service tree with decoded properties and ASCII data</em>
+</p>
+
 | Bit | Hex | Flag | Meaning |
 |-----|-----|------|---------|
 | 0 | `0x01` | **BC** | Broadcast — value can be included in advertising packets |
