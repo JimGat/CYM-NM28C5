@@ -16396,9 +16396,74 @@ static void show_sd_card_screen(void)
 // GPS Info screen
 // ============================================================================
 
+static lv_timer_t *gps_info_refresh_timer = NULL;
+static lv_obj_t   *gps_info_fix_lbl  = NULL;
+static lv_obj_t   *gps_info_time_lbl = NULL;
+static lv_obj_t   *gps_info_sat_lbl  = NULL;
+static lv_obj_t   *gps_info_lat_lbl  = NULL;
+static lv_obj_t   *gps_info_lon_lbl  = NULL;
+static lv_obj_t   *gps_info_alt_lbl  = NULL;
+static lv_obj_t   *gps_info_acc_lbl  = NULL;
+
+static void gps_info_refresh_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!gps_info_fix_lbl || !lv_obj_is_valid(gps_info_fix_lbl)) return;
+
+    char buf[64];
+
+    if (current_gps.valid) {
+        lv_label_set_text(gps_info_fix_lbl, LV_SYMBOL_GPS " Fix: YES");
+        lv_obj_set_style_text_color(gps_info_fix_lbl, COLOR_MATERIAL_GREEN, 0);
+    } else {
+        lv_label_set_text(gps_info_fix_lbl, LV_SYMBOL_GPS " Fix: NO");
+        lv_obj_set_style_text_color(gps_info_fix_lbl, COLOR_MATERIAL_ORANGE, 0);
+    }
+
+    if (current_gps.time_utc[0] != '\0')
+        snprintf(buf, sizeof(buf), "UTC:  %s", current_gps.time_utc);
+    else
+        snprintf(buf, sizeof(buf), "UTC:  --");
+    lv_label_set_text(gps_info_time_lbl, buf);
+
+    snprintf(buf, sizeof(buf), "Satellites: %d", current_gps.satellites);
+    lv_label_set_text(gps_info_sat_lbl, buf);
+
+    if (current_gps.valid)
+        snprintf(buf, sizeof(buf), "Lat:  %.6f", (double)current_gps.latitude);
+    else
+        snprintf(buf, sizeof(buf), "Lat:  --");
+    lv_label_set_text(gps_info_lat_lbl, buf);
+
+    if (current_gps.valid)
+        snprintf(buf, sizeof(buf), "Lon:  %.6f", (double)current_gps.longitude);
+    else
+        snprintf(buf, sizeof(buf), "Lon:  --");
+    lv_label_set_text(gps_info_lon_lbl, buf);
+
+    if (current_gps.valid)
+        snprintf(buf, sizeof(buf), "Alt:  %.1f m", (double)current_gps.altitude);
+    else
+        snprintf(buf, sizeof(buf), "Alt:  --");
+    lv_label_set_text(gps_info_alt_lbl, buf);
+
+    if (current_gps.valid)
+        snprintf(buf, sizeof(buf), "Accuracy: %.1f m", (double)current_gps.accuracy);
+    else
+        snprintf(buf, sizeof(buf), "Accuracy: --");
+    lv_label_set_text(gps_info_acc_lbl, buf);
+}
+
 static void gps_back_to_settings_cb(lv_event_t *e)
 {
     (void)e;
+    if (gps_info_refresh_timer) {
+        lv_timer_del(gps_info_refresh_timer);
+        gps_info_refresh_timer = NULL;
+    }
+    gps_info_fix_lbl = gps_info_time_lbl = gps_info_sat_lbl = NULL;
+    gps_info_lat_lbl = gps_info_lon_lbl  = gps_info_alt_lbl = NULL;
+    gps_info_acc_lbl = NULL;
     show_settings_screen();
 }
 
@@ -16416,89 +16481,47 @@ static void show_gps_info_screen(void)
     lv_obj_set_style_pad_all(card, 10, 0);
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
-    char buf[64];
     int y = 0;
 
-    // Fix status
-    lv_obj_t *fix_lbl = lv_label_create(card);
-    if (current_gps.valid) {
-        lv_label_set_text(fix_lbl, LV_SYMBOL_GPS " Fix: YES");
-        lv_obj_set_style_text_color(fix_lbl, COLOR_MATERIAL_GREEN, 0);
-    } else {
-        lv_label_set_text(fix_lbl, LV_SYMBOL_GPS " Fix: NO");
-        lv_obj_set_style_text_color(fix_lbl, COLOR_MATERIAL_ORANGE, 0);
-    }
-    lv_obj_set_style_text_font(fix_lbl, &lv_font_montserrat_16, 0);
-    lv_obj_align(fix_lbl, LV_ALIGN_TOP_LEFT, 0, y);
+    gps_info_fix_lbl = lv_label_create(card);
+    lv_obj_set_style_text_font(gps_info_fix_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_align(gps_info_fix_lbl, LV_ALIGN_TOP_LEFT, 0, y);
     y += 26;
 
-    // UTC Time
-    lv_obj_t *time_lbl = lv_label_create(card);
-    if (current_gps.time_utc[0] != '\0')
-        snprintf(buf, sizeof(buf), "UTC:  %s", current_gps.time_utc);
-    else
-        snprintf(buf, sizeof(buf), "UTC:  --");
-    lv_label_set_text(time_lbl, buf);
-    lv_obj_set_style_text_font(time_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(time_lbl, ui_text_color(), 0);
-    lv_obj_align(time_lbl, LV_ALIGN_TOP_LEFT, 0, y);
+    gps_info_time_lbl = lv_label_create(card);
+    lv_obj_set_style_text_font(gps_info_time_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(gps_info_time_lbl, ui_text_color(), 0);
+    lv_obj_align(gps_info_time_lbl, LV_ALIGN_TOP_LEFT, 0, y);
     y += 22;
 
-    // Satellites
-    lv_obj_t *sat_lbl = lv_label_create(card);
-    snprintf(buf, sizeof(buf), "Satellites: %d", current_gps.satellites);
-    lv_label_set_text(sat_lbl, buf);
-    lv_obj_set_style_text_font(sat_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(sat_lbl, ui_text_color(), 0);
-    lv_obj_align(sat_lbl, LV_ALIGN_TOP_LEFT, 0, y);
+    gps_info_sat_lbl = lv_label_create(card);
+    lv_obj_set_style_text_font(gps_info_sat_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(gps_info_sat_lbl, ui_text_color(), 0);
+    lv_obj_align(gps_info_sat_lbl, LV_ALIGN_TOP_LEFT, 0, y);
     y += 22;
 
-    // Latitude
-    lv_obj_t *lat_lbl = lv_label_create(card);
-    if (current_gps.valid)
-        snprintf(buf, sizeof(buf), "Lat:  %.6f", (double)current_gps.latitude);
-    else
-        snprintf(buf, sizeof(buf), "Lat:  --");
-    lv_label_set_text(lat_lbl, buf);
-    lv_obj_set_style_text_font(lat_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(lat_lbl, ui_text_color(), 0);
-    lv_obj_align(lat_lbl, LV_ALIGN_TOP_LEFT, 0, y);
+    gps_info_lat_lbl = lv_label_create(card);
+    lv_obj_set_style_text_font(gps_info_lat_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(gps_info_lat_lbl, ui_text_color(), 0);
+    lv_obj_align(gps_info_lat_lbl, LV_ALIGN_TOP_LEFT, 0, y);
     y += 22;
 
-    // Longitude
-    lv_obj_t *lon_lbl = lv_label_create(card);
-    if (current_gps.valid)
-        snprintf(buf, sizeof(buf), "Lon:  %.6f", (double)current_gps.longitude);
-    else
-        snprintf(buf, sizeof(buf), "Lon:  --");
-    lv_label_set_text(lon_lbl, buf);
-    lv_obj_set_style_text_font(lon_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(lon_lbl, ui_text_color(), 0);
-    lv_obj_align(lon_lbl, LV_ALIGN_TOP_LEFT, 0, y);
+    gps_info_lon_lbl = lv_label_create(card);
+    lv_obj_set_style_text_font(gps_info_lon_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(gps_info_lon_lbl, ui_text_color(), 0);
+    lv_obj_align(gps_info_lon_lbl, LV_ALIGN_TOP_LEFT, 0, y);
     y += 22;
 
-    // Altitude
-    lv_obj_t *alt_lbl = lv_label_create(card);
-    if (current_gps.valid)
-        snprintf(buf, sizeof(buf), "Alt:  %.1f m", (double)current_gps.altitude);
-    else
-        snprintf(buf, sizeof(buf), "Alt:  --");
-    lv_label_set_text(alt_lbl, buf);
-    lv_obj_set_style_text_font(alt_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(alt_lbl, ui_text_color(), 0);
-    lv_obj_align(alt_lbl, LV_ALIGN_TOP_LEFT, 0, y);
+    gps_info_alt_lbl = lv_label_create(card);
+    lv_obj_set_style_text_font(gps_info_alt_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(gps_info_alt_lbl, ui_text_color(), 0);
+    lv_obj_align(gps_info_alt_lbl, LV_ALIGN_TOP_LEFT, 0, y);
     y += 22;
 
-    // Accuracy
-    lv_obj_t *acc_lbl = lv_label_create(card);
-    if (current_gps.valid)
-        snprintf(buf, sizeof(buf), "Accuracy: %.1f m", (double)current_gps.accuracy);
-    else
-        snprintf(buf, sizeof(buf), "Accuracy: --");
-    lv_label_set_text(acc_lbl, buf);
-    lv_obj_set_style_text_font(acc_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(acc_lbl, ui_text_color(), 0);
-    lv_obj_align(acc_lbl, LV_ALIGN_TOP_LEFT, 0, y);
+    gps_info_acc_lbl = lv_label_create(card);
+    lv_obj_set_style_text_font(gps_info_acc_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(gps_info_acc_lbl, ui_text_color(), 0);
+    lv_obj_align(gps_info_acc_lbl, LV_ALIGN_TOP_LEFT, 0, y);
     y += 28;
 
     // Divider
@@ -16516,6 +16539,10 @@ static void show_gps_info_screen(void)
     lv_obj_set_style_text_font(uart_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(uart_lbl, ui_muted_color(), 0);
     lv_obj_align(uart_lbl, LV_ALIGN_TOP_LEFT, 0, y);
+
+    // Populate immediately then start 1 s refresh timer
+    gps_info_refresh_cb(NULL);
+    gps_info_refresh_timer = lv_timer_create(gps_info_refresh_cb, 1000, NULL);
 
     lv_obj_t *back_btn = lv_btn_create(function_page);
     lv_obj_set_size(back_btn, 90, 34);
