@@ -15965,16 +15965,25 @@ typedef struct {
 } sd_provision_item_t;
 
 static const sd_provision_item_t SD_ITEMS[] = {
+    /* ── Directories ─────────────────────────────────────────────────────── */
     { SD_ITEM_DIR,  "/sdcard/lab",                           NULL },
     { SD_ITEM_DIR,  "/sdcard/lab/handshakes",                NULL },
-    { SD_ITEM_DIR,  "/sdcard/lab/portal",                    NULL },
-    { SD_ITEM_DIR,  "/sdcard/lab/wardrive",                  NULL },
+    { SD_ITEM_DIR,  "/sdcard/lab/wardrives",                 NULL },  /* main.c wardrive task */
+    { SD_ITEM_DIR,  "/sdcard/lab/pcaps",                     NULL },  /* MITM pcap logger */
+    { SD_ITEM_DIR,  "/sdcard/lab/deauths",                   NULL },  /* deauth pcap logger */
+    { SD_ITEM_DIR,  "/sdcard/lab/htmls",                     NULL },  /* captive portal templates */
     { SD_ITEM_DIR,  "/sdcard/lab/cellular",                  NULL },
-    { SD_ITEM_DIR,  "/sdcard/lab/pcap",                      NULL },
     { SD_ITEM_DIR,  "/sdcard/lab/alerts",                    NULL },
     { SD_ITEM_DIR,  "/sdcard/lab/config",                    NULL },
     { SD_ITEM_DIR,  "/sdcard/lab/bluetooth",                 NULL },
+    { SD_ITEM_DIR,  "/sdcard/gattwalker",                    NULL },  /* GATT Walker JSON output */
+    { SD_ITEM_DIR,  "/sdcard/screenshots",                   NULL },  /* screenshot capture */
+    /* ── Seed files (written only on creation; never overwrite existing) ── */
     { SD_ITEM_FILE, "/sdcard/lab/white.txt",                 "" },
+    { SD_ITEM_FILE, "/sdcard/lab/eviltwin.txt",              "" },
+    { SD_ITEM_FILE, "/sdcard/lab/portals.txt",               "" },
+    { SD_ITEM_FILE, "/sdcard/lab/wpa-sec.txt",
+      "# Paste your wpa-sec.org API key on the next line\n" },
     { SD_ITEM_FILE, "/sdcard/lab/cellular/tower_baseline.csv",
       "arfcn,bsic,lac,cell_id,mcc,mnc,rxlev,gps_lat,gps_lon,first_seen,last_seen\n" },
     { SD_ITEM_FILE, "/sdcard/lab/cellular/tower_anomalies.csv",
