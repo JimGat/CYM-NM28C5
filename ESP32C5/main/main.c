@@ -18688,12 +18688,190 @@ static void gw_cancel_btn_cb(lv_event_t *e)
     }
 }
 
+/* ── GATT Walker result detail screen ───────────────────────────── */
+
+static void gw_result_back_cb(lv_event_t *e)
+{
+    (void)e;
+    show_bt_attack_tiles_screen();
+}
+
+static void show_gw_result_screen(void)
+{
+    const gw_result_t *r = gw_get_result();
+
+    /* Kill progress-screen state before rebuilding the page */
+    gw_screen_active = false;
+    gw_status_lbl = NULL; gw_svc_lbl   = NULL;
+    gw_chr_lbl    = NULL; gw_result_lbl = NULL;
+    gw_cancel_btn = NULL; gw_back_btn   = NULL;
+
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+
+    char title[40];
+    snprintf(title, sizeof(title), "%.38s", (r && r->name[0]) ? r->name : "GATT Result");
+    create_function_page_base(title);
+    apply_menu_bg();
+
+    lv_obj_t *scrl = lv_obj_create(function_page);
+    lv_obj_set_size(scrl, lv_pct(100), LCD_V_RES - 30 - 44);
+    lv_obj_align(scrl, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_color(scrl, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(scrl, 0, 0);
+    lv_obj_set_style_pad_all(scrl, 6, 0);
+    lv_obj_set_style_pad_gap(scrl, 3, 0);
+    lv_obj_set_flex_flow(scrl, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scrollbar_mode(scrl, LV_SCROLLBAR_MODE_AUTO);
+
+#define GW_ROW(parent, txt, font, col) do { \
+    lv_obj_t *_l = lv_label_create(parent); \
+    lv_label_set_text(_l, txt); \
+    lv_obj_set_style_text_font(_l, font, 0); \
+    lv_obj_set_style_text_color(_l, col, 0); \
+    lv_label_set_long_mode(_l, LV_LABEL_LONG_WRAP); \
+    lv_obj_set_width(_l, lv_pct(100)); \
+} while(0)
+
+    if (!r) {
+        GW_ROW(scrl, "No result available.", &lv_font_montserrat_14, COLOR_MATERIAL_RED);
+        goto gw_res_done;
+    }
+
+    {
+        /* ── Header ── */
+        char hdr[96];
+        char mac_str[18];
+        snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 r->mac[5], r->mac[4], r->mac[3],
+                 r->mac[2], r->mac[1], r->mac[0]);
+
+        uint8_t oui3[3] = { r->mac[5], r->mac[4], r->mac[3] };
+        const char *vendor = oui_lookup_is_loaded() ? oui_lookup(oui3) : NULL;
+
+        snprintf(hdr, sizeof(hdr), "%s  %ddBm", mac_str, r->rssi);
+        GW_ROW(scrl, hdr, &lv_font_montserrat_12, ui_text_color());
+
+        if (vendor && vendor[0]) {
+            GW_ROW(scrl, vendor, &lv_font_montserrat_12, lv_color_make(180, 140, 255));
+        }
+
+        snprintf(hdr, sizeof(hdr), "FP: 0x%08lX   %d svc / %d chr",
+                 (unsigned long)r->fingerprint, r->svc_count, (int)gw_ui_chr_count);
+        GW_ROW(scrl, hdr, &lv_font_montserrat_12, UI_ACCENT_CYAN);
+
+        if (r->gps_valid) {
+            snprintf(hdr, sizeof(hdr), "GPS: %.5f, %.5f", r->lat, r->lon);
+            GW_ROW(scrl, hdr, &lv_font_montserrat_12, lv_color_make(140, 220, 140));
+        }
+
+        GW_ROW(scrl, r->timestamp, &lv_font_montserrat_12, ui_muted_color());
+
+        /* ── Services ── */
+        for (int i = 0; i < r->svc_count; i++) {
+            const gw_svc_t *svc = &r->svcs[i];
+            const char *svc_name = gatt_uuid_name(svc->uuid_str);
+
+            /* Separator line before each service */
+            lv_obj_t *sep = lv_obj_create(scrl);
+            lv_obj_set_size(sep, lv_pct(100), 1);
+            lv_obj_set_style_bg_color(sep, ui_border_color(), 0);
+            lv_obj_set_style_border_width(sep, 0, 0);
+
+            char row[80];
+            if (svc_name)
+                snprintf(row, sizeof(row), "%s  %s", svc->uuid_str, svc_name);
+            else
+                snprintf(row, sizeof(row), "%s", svc->uuid_str);
+            GW_ROW(scrl, row, &lv_font_montserrat_12, UI_ACCENT_CYAN);
+
+            /* ── Characteristics ── */
+            for (int ci = 0; ci < svc->chr_count; ci++) {
+                const gw_chr_t *chr = &svc->chrs[ci];
+                const char *chr_name = gatt_uuid_name(chr->uuid_str);
+
+                if (chr_name)
+                    snprintf(row, sizeof(row), "  %s  %s", chr->uuid_str, chr_name);
+                else
+                    snprintf(row, sizeof(row), "  %s", chr->uuid_str);
+                GW_ROW(scrl, row, &lv_font_montserrat_12, ui_text_color());
+
+                /* Decoded properties */
+                char prop_buf[24];
+                gw_chr_props_str(chr->properties, prop_buf, sizeof(prop_buf));
+                snprintf(row, sizeof(row), "    Props: %s", prop_buf);
+                GW_ROW(scrl, row, &lv_font_montserrat_12, COLOR_MATERIAL_ORANGE);
+
+                /* Read data + ASCII */
+                if (chr->read_ok && chr->read_len > 0) {
+                    char hex_str[GW_READ_MAX * 2 + 4];
+                    int hpos = 0;
+                    for (int bi = 0; bi < chr->read_len && bi < GW_READ_MAX; bi++)
+                        hpos += snprintf(hex_str + hpos, sizeof(hex_str) - hpos,
+                                         "%02X", chr->read_data[bi]);
+
+                    char ascii[GW_READ_MAX + 4];
+                    int alen = (chr->read_len < GW_READ_MAX) ? chr->read_len : GW_READ_MAX;
+                    for (int bi = 0; bi < alen; bi++) {
+                        uint8_t b = chr->read_data[bi];
+                        ascii[bi] = (b >= 0x20 && b < 0x7F) ? (char)b : '.';
+                    }
+                    ascii[alen] = '\0';
+
+                    char data_row[360];
+                    snprintf(data_row, sizeof(data_row),
+                             "    Data: %.255s\n    ASCII: %.64s", hex_str, ascii);
+                    GW_ROW(scrl, data_row, &lv_font_montserrat_12, COLOR_MATERIAL_GREEN);
+                }
+
+                /* Descriptors */
+                if (chr->desc_count > 0) {
+                    GW_ROW(scrl, "    Descriptors:", &lv_font_montserrat_12, ui_muted_color());
+                    for (int di = 0; di < chr->desc_count; di++) {
+                        const char *dsc_name = gatt_uuid_name(chr->descs[di].uuid_str);
+                        if (dsc_name)
+                            snprintf(row, sizeof(row), "      %s  %s",
+                                     chr->descs[di].uuid_str, dsc_name);
+                        else
+                            snprintf(row, sizeof(row), "      %s  h:%u",
+                                     chr->descs[di].uuid_str, chr->descs[di].handle);
+                        GW_ROW(scrl, row, &lv_font_montserrat_12, ui_muted_color());
+                    }
+                }
+            }
+        }
+    }
+
+gw_res_done:;
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 32);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x7B1FA2), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_lighten(lv_color_hex(0x7B1FA2), 40), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_t *gw_res_lbl = lv_label_create(back_btn);
+    lv_label_set_text(gw_res_lbl, LV_SYMBOL_LEFT "  Back");
+    lv_obj_set_style_text_font(gw_res_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(gw_res_lbl, lv_color_white(), 0);
+    lv_obj_center(gw_res_lbl);
+    lv_obj_add_event_cb(back_btn, gw_result_back_cb, LV_EVENT_CLICKED, NULL);
+#undef GW_ROW
+}
+
 /* Called from main loop (inside lvgl_mutex) when gw_ui_needs_update is set. */
 static void gw_update_screen_ui(void)
 {
     if (!gw_screen_active || !function_page || !lv_obj_is_valid(function_page)) return;
 
     gw_state_t st   = (gw_state_t)gw_ui_state;
+
+    /* Auto-navigate to full detail screen on success */
+    if (st == GW_STATE_COMPLETE) {
+        show_gw_result_screen();
+        return;
+    }
+
     int        nsvc = (int)gw_ui_svc_count;
     int        nchr = (int)gw_ui_chr_count;
     char       stat[64];
