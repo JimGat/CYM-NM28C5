@@ -280,15 +280,23 @@ Main Menu
 
 #### Evil Portal Resources
 
-The Captive Portal feature serves a single HTML file from `/sdcard/lab/portal/` as the login page. Any valid HTML file dropped there will be served — no recompilation needed. The community has built extensive collections of pre-made portals styled to look like ISP login pages, hotel WiFi gates, popular service sign-ins, and more.
+The Captive Portal, Evil Twin, and Karma AP features all serve HTML pages from **`/sdcard/lab/htmls/`** as the captive login page. Drop any number of `.html` or `.htm` files there — each one appears as a selectable option in the portal dropdown when launching an attack. No recompilation needed.
+
+**To add portals:**
+1. Format your SD card and run **SD Card → Provision** to create the directory structure
+2. Copy your `.html` / `.htm` files directly into `/sdcard/lab/htmls/` on the card
+3. Reinsert the card and reboot — all files in that folder appear in the attack portal dropdown
+4. Credentials submitted by victims are appended to `/sdcard/lab/eviltwin.txt`
+
+The community has built extensive collections of pre-made portals styled to look like ISP login pages, hotel WiFi gates, popular service sign-ins, and more:
 
 | Repository | Description |
 |------------|-------------|
 | [D3h420/Evil-Portals-Collection](https://github.com/D3h420/Evil-Portals-Collection) | Large multi-target collection of portal HTML files — ISPs, hotels, and brands |
-| [saintcrossbow/Evil-Cardputer-Portals](https://github.com/saintcrossbow/Evil-Cardputer-Portals) | Portal pages adapted for M5Stack Cardputer; most transfer directly |
 | [DoobTheGoober/EvilPortalGenerator](https://github.com/DoobTheGoober/EvilPortalGenerator) | Generator tool for quickly creating custom portal pages from templates |
+| [saintcrossbow/Evil-Cardputer-Portals](https://github.com/saintcrossbow/Evil-Cardputer-Portals) | Portal pages adapted for M5Stack Cardputer; most transfer directly |
 
-Drop the desired `index.html` (or rename your file to `index.html`) into `/sdcard/lab/portal/` and launch **Captive Portal** from the Scan & Attack menu. Credentials entered on the page are logged to `/sdcard/lab/portal/credentials.txt`.
+> **Note:** Files must have a `.html` or `.htm` extension to appear in the dropdown. Any filename works — you can keep multiple portals on the card and switch between them per-attack.
 
 #### Global WiFi Attacks
 
@@ -734,17 +742,21 @@ All data is stored on the SD card:
 ├── lab/
 │   ├── white.txt         # MAC/SSID whitelist (one per line)
 │   ├── ouilist.bin       # OUI vendor table — adds manufacturer names to BLE scan results
+│   ├── wpa-sec.txt       # wpa-sec.org API key (paste key on line 2, used by WPA-SEC upload)
+│   ├── eviltwin.txt      # Credentials captured by Evil Twin / Captive Portal (auto-appended)
 │   ├── handshakes/       # Captured WPA handshakes
 │   │   ├── *.pcap        # Wireshark-compatible captures
-│   │   └── *.hccapx      # Hashcat-compatible format (hashcat)
+│   │   └── *.hccapx      # Hashcat-compatible format
+│   ├── htmls/            # ← Captive portal HTML pages
+│   │   └── *.html / *.htm   # Drop any portal page here — each file appears in the attack dropdown
+│   ├── pcaps/            # MITM/sniff PCAP captures
+│   ├── wardrives/        # GPS + WiFi wardrive logs
+│   ├── deauths/          # Deauth monitor PCAP captures
 │   ├── bluetooth/
 │   │   └── lookout.csv   # Bluetooth Lookout watchlist
-│   └── portal/           # Captive portal files
-│       ├── index.html    # Custom portal page — drop any HTML file here
-│       └── credentials.txt  # Captured login credentials (appended on each submit)
-├── wardrive/             # GPS + WiFi logs (CSV)
+│   └── config/           # Optional config overrides (created by Provision)
 ├── gattwalker/           # GATT Walker JSON fingerprints
-│   └── YYYYMMDD_HHMMSS_AABBCCDDEEFF_gattwalk.json
+│   └── *_gattwalk.json
 ├── screenshots/          # UI screenshots (BMP)
 └── calibrate.txt         # ← Create this file to trigger touch re-calibration on next boot
 ```
