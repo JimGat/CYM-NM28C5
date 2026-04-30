@@ -1,7 +1,7 @@
 {
-  "name": "JANOS CYM-NM28C5",
-  "version": "v0.7.7",
-  "build": "v0.7.7",
+  "name": "Cheap Yellow Monster — CYM-NM28C5",
+  "version": "v0.8.9",
+  "build": "v0.8.9",
   "chipFamily": "ESP32-C5",
   "parts": [
     { "path": "../binaries-esp32c5/bootloader.bin",      "offset": 8192   },
