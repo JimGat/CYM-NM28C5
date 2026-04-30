@@ -1093,6 +1093,47 @@ static uint8_t bt_sas_target_addr[6];
 static uint8_t bt_sas_target_addr_type = 0;
 static char bt_sas_target_name[32];
 
+// ── BT Observer ─────────────────────────────────────────────────
+#define BTO_MAX_DEVICES 20
+
+typedef enum {
+    BTO_DEV_QUEUED = 0,
+    BTO_DEV_WALKING,
+    BTO_DEV_DONE,
+    BTO_DEV_FAILED,
+} bto_dev_status_t;
+
+typedef struct {
+    uint8_t          addr[6];
+    uint8_t          addr_type;
+    char             name[32];
+    int8_t           rssi;
+    bto_dev_status_t status;
+    bool             walk_ok;
+    int              svc_count;
+    int              chr_count;
+    uint32_t         fingerprint;
+} bto_device_t;
+
+typedef enum {
+    BTO_STATE_IDLE = 0,
+    BTO_STATE_SCANNING,
+    BTO_STATE_WALKING,
+    BTO_STATE_DONE,
+    BTO_STATE_STOPPED,
+} bto_state_t;
+
+static bto_device_t     bto_devices[BTO_MAX_DEVICES];
+static volatile int     bto_device_count    = 0;
+static volatile int     bto_current_idx     = -1;
+static volatile bto_state_t bto_state       = BTO_STATE_IDLE;
+static volatile bool    bto_active          = false;
+static volatile bool    bto_ui_needs_update = false;
+static TaskHandle_t     bto_task_handle     = NULL;
+static lv_obj_t        *bto_list            = NULL;
+static lv_obj_t        *bto_status_lbl      = NULL;
+static lv_timer_t      *bto_refresh_timer   = NULL;
+
 // ── BT Lookout (Dee Dee Detector) UI state ──────────────────────
 static bool        bt_lookout_ui_active       = false;
 static lv_obj_t   *bt_lookout_status_lbl       = NULL;
@@ -1474,6 +1515,8 @@ static void disco_task(void *arg);
 static void show_bt_scan_select_screen(void);
 static void show_bt_attack_tiles_screen(void);
 static void bt_sas_refresh_list(void);
+static void show_bt_observer_screen(void);
+static void bt_observer_task(void *pvParameters);
 
 // Data Transfer screens
 static void show_data_transfer_screen(void);
@@ -17576,6 +17619,10 @@ static void show_bluetooth_screen(void)
     lv_obj_t *btsas_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BT Scan\n& Select", UI_ACCENT_CYAN, NULL, NULL);
     lv_obj_add_event_cb(btsas_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Scan & Select");
 
+    // BT Observer - auto-enumerate all nearby devices
+    lv_obj_t *btobs_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "BT\nObserver", lv_color_hex(0x7B1FA2), NULL, NULL);
+    lv_obj_add_event_cb(btobs_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Observer");
+
     // AirTag scan - Apple-like gray
     lv_obj_t *airtag_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "AirTag\nScan", lv_color_make(142, 142, 147), NULL, NULL);
     lv_obj_add_event_cb(airtag_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"AirTag scan");
@@ -17928,6 +17975,319 @@ static void show_bt_scan_select_screen(void)
     ui_locked = false;
 }
 
+// ============================================================================
+// BT Observer — scan once, then sequentially GATT-walk every device found
+// ============================================================================
+
+static void bto_stop_cb(lv_event_t *e)
+{
+    (void)e;
+    bto_active = false;
+    if (bto_refresh_timer) { lv_timer_del(bto_refresh_timer); bto_refresh_timer = NULL; }
+    bto_list = NULL; bto_status_lbl = NULL;
+    // restore user GATT timeout
+    gw_set_timeout(g_gatt_timeout_ms);
+    // cancel any in-progress walk
+    if (gw_get_state() != GW_STATE_IDLE && gw_get_state() != GW_STATE_COMPLETE &&
+        gw_get_state() != GW_STATE_FAILED && gw_get_state() != GW_STATE_CANCELLED)
+        gw_cancel();
+    bto_state = BTO_STATE_IDLE;
+    show_bluetooth_screen();
+}
+
+static void bto_rebuild_list(void)
+{
+    if (!bto_list || !lv_obj_is_valid(bto_list)) return;
+    lv_obj_clean(bto_list);
+
+    int count = bto_device_count;
+    for (int i = 0; i < count; i++) {
+        bto_device_t *d = &bto_devices[i];
+
+        lv_obj_t *card = lv_obj_create(bto_list);
+        lv_obj_set_size(card, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_pad_all(card, 5, 0);
+        lv_obj_set_style_pad_gap(card, 2, 0);
+        lv_obj_set_style_radius(card, 6, 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+
+        lv_color_t border;
+        switch (d->status) {
+            case BTO_DEV_WALKING: border = UI_ACCENT_CYAN;         break;
+            case BTO_DEV_DONE:    border = d->walk_ok ? COLOR_MATERIAL_GREEN : ui_border_color(); break;
+            case BTO_DEV_FAILED:  border = COLOR_MATERIAL_RED;     break;
+            default:              border = ui_border_color();       break;
+        }
+        lv_obj_set_style_border_color(card, border, 0);
+
+        // Row 1: MAC + RSSI
+        char r1[48];
+        snprintf(r1, sizeof(r1), "%02X:%02X:%02X:%02X:%02X:%02X  %ddBm",
+                 d->addr[5], d->addr[4], d->addr[3],
+                 d->addr[2], d->addr[1], d->addr[0], d->rssi);
+        lv_obj_t *l1 = lv_label_create(card);
+        lv_label_set_text(l1, r1);
+        lv_obj_set_style_text_font(l1, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l1, ui_text_color(), 0);
+        lv_label_set_long_mode(l1, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(l1, lv_pct(100));
+
+        // Row 2: name (if any)
+        if (d->name[0]) {
+            lv_obj_t *l2 = lv_label_create(card);
+            lv_label_set_text(l2, d->name);
+            lv_obj_set_style_text_font(l2, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(l2, UI_ACCENT_CYAN, 0);
+            lv_label_set_long_mode(l2, LV_LABEL_LONG_CLIP);
+            lv_obj_set_width(l2, lv_pct(100));
+        }
+
+        // Row 3: walk status
+        char r3[64];
+        switch (d->status) {
+            case BTO_DEV_QUEUED:
+                snprintf(r3, sizeof(r3), "Queued");
+                break;
+            case BTO_DEV_WALKING:
+                snprintf(r3, sizeof(r3), LV_SYMBOL_REFRESH " Walking...");
+                break;
+            case BTO_DEV_DONE:
+                if (d->walk_ok)
+                    snprintf(r3, sizeof(r3), LV_SYMBOL_OK " %d svc / %d chr  [%08X]",
+                             d->svc_count, d->chr_count, (unsigned)d->fingerprint);
+                else
+                    snprintf(r3, sizeof(r3), LV_SYMBOL_CLOSE " No GATT response");
+                break;
+            case BTO_DEV_FAILED:
+                snprintf(r3, sizeof(r3), LV_SYMBOL_CLOSE " Connect failed");
+                break;
+        }
+        lv_obj_t *l3 = lv_label_create(card);
+        lv_label_set_text(l3, r3);
+        lv_obj_set_style_text_font(l3, &lv_font_montserrat_12, 0);
+        lv_color_t sc = (d->status == BTO_DEV_DONE && d->walk_ok) ? COLOR_MATERIAL_GREEN :
+                        (d->status == BTO_DEV_FAILED)              ? COLOR_MATERIAL_RED   :
+                        (d->status == BTO_DEV_WALKING)             ? UI_ACCENT_CYAN        :
+                        ui_muted_color();
+        lv_obj_set_style_text_color(l3, sc, 0);
+        lv_label_set_long_mode(l3, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(l3, lv_pct(100));
+    }
+}
+
+static void bto_refresh_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!bto_ui_needs_update) return;
+    bto_ui_needs_update = false;
+
+    if (bto_status_lbl && lv_obj_is_valid(bto_status_lbl)) {
+        char buf[64];
+        switch (bto_state) {
+            case BTO_STATE_SCANNING:
+                snprintf(buf, sizeof(buf), "Scanning... %d found", bt_device_count);
+                break;
+            case BTO_STATE_WALKING:
+                snprintf(buf, sizeof(buf), "Walking %d / %d  (3s timeout)",
+                         bto_current_idx + 1, bto_device_count);
+                break;
+            case BTO_STATE_DONE:
+                snprintf(buf, sizeof(buf), "Done — %d devices enumerated", bto_device_count);
+                break;
+            case BTO_STATE_STOPPED:
+                snprintf(buf, sizeof(buf), "Stopped");
+                break;
+            default:
+                snprintf(buf, sizeof(buf), "Initializing...");
+                break;
+        }
+        lv_label_set_text(bto_status_lbl, buf);
+    }
+    bto_rebuild_list();
+}
+
+static void show_bt_observer_screen(void)
+{
+    ui_locked = true;
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+
+    if (!oui_lookup_is_loaded()) {
+        ensure_sd_mounted();
+        oui_lookup_init(OUI_DEFAULT_PATH);
+    }
+
+    create_function_page_base("BT Observer");
+
+    // Status label
+    bto_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(bto_status_lbl, "Initializing BLE...");
+    lv_obj_set_style_text_color(bto_status_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(bto_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_align(bto_status_lbl, LV_ALIGN_TOP_LEFT, 5, 35);
+
+    // Scrollable results list
+    bto_list = lv_obj_create(function_page);
+    lv_obj_set_size(bto_list, lv_pct(100), LCD_V_RES - 30 - 18 - 44);
+    lv_obj_align(bto_list, LV_ALIGN_TOP_MID, 0, 52);
+    lv_obj_set_style_bg_color(bto_list, ui_bg_color(), 0);
+    lv_obj_set_style_border_color(bto_list, lv_color_hex(0x7B1FA2), 0);
+    lv_obj_set_style_border_width(bto_list, 1, 0);
+    lv_obj_set_flex_flow(bto_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(bto_list, 3, 0);
+    lv_obj_set_style_pad_gap(bto_list, 3, 0);
+    lv_obj_set_scrollbar_mode(bto_list, LV_SCROLLBAR_MODE_AUTO);
+
+    // Stop / Exit button
+    lv_obj_t *stop_btn = lv_btn_create(function_page);
+    lv_obj_set_size(stop_btn, 110, 32);
+    lv_obj_align(stop_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 40), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(stop_btn, 0, 0);
+    lv_obj_set_style_radius(stop_btn, 8, 0);
+    lv_obj_t *stop_lbl = lv_label_create(stop_btn);
+    lv_label_set_text(stop_lbl, LV_SYMBOL_CLOSE "  Stop / Exit");
+    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(stop_lbl, lv_color_white(), 0);
+    lv_obj_center(stop_lbl);
+    lv_obj_add_event_cb(stop_btn, bto_stop_cb, LV_EVENT_CLICKED, NULL);
+
+    // Reset state
+    bto_device_count = 0;
+    bto_current_idx  = -1;
+    bto_state        = BTO_STATE_IDLE;
+    bto_active       = true;
+    bto_ui_needs_update = true;
+    memset(bto_devices, 0, sizeof(bto_devices));
+
+    // Start 1s refresh timer
+    bto_refresh_timer = lv_timer_create(bto_refresh_cb, 1000, NULL);
+
+    // Switch radio and launch observer task
+    if (!ensure_ble_mode()) {
+        lv_label_set_text(bto_status_lbl, "BLE init failed!");
+        bto_active = false;
+        ui_locked = false;
+        return;
+    }
+
+    BaseType_t ret = xTaskCreate(bt_observer_task, "bt_obs_task", 4096, NULL, 5, &bto_task_handle);
+    if (ret != pdPASS) {
+        bto_active = false;
+        lv_label_set_text(bto_status_lbl, "Task start failed!");
+    }
+    ui_locked = false;
+}
+
+static void bt_observer_task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    // ── Phase 1: 10s BLE scan ─────────────────────────────────────
+    bto_state = BTO_STATE_SCANNING;
+    bt_reset_counters();
+    bto_ui_needs_update = true;
+
+    int rc = bt_start_scan();
+    if (rc != 0) {
+        bto_state = BTO_STATE_STOPPED;
+        bto_active = false;
+        bto_ui_needs_update = true;
+        bto_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    for (int i = 0; i < 100 && bto_active; i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (i % 5 == 0) bto_ui_needs_update = true;
+    }
+    bt_stop_scan();
+
+    // ── Phase 2: snapshot scanned devices (one-time, no re-scan) ──
+    int n = bt_device_count < BTO_MAX_DEVICES ? bt_device_count : BTO_MAX_DEVICES;
+    for (int i = 0; i < n; i++) {
+        memcpy(bto_devices[i].addr, bt_devices[i].addr, 6);
+        bto_devices[i].addr_type = bt_devices[i].addr_type;
+        strncpy(bto_devices[i].name, bt_devices[i].name, sizeof(bto_devices[i].name) - 1);
+        bto_devices[i].rssi   = bt_devices[i].rssi;
+        bto_devices[i].status = BTO_DEV_QUEUED;
+    }
+    bto_device_count = n;
+    bto_ui_needs_update = true;
+
+    if (n == 0 || !bto_active) {
+        bto_state = bto_active ? BTO_STATE_DONE : BTO_STATE_STOPPED;
+        bto_active = false;
+        bto_ui_needs_update = true;
+        bto_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // ── Phase 3: sequential GATT walk, 3s hardcoded timeout ───────
+    bto_state = BTO_STATE_WALKING;
+    gw_set_timeout(3000);
+
+    for (int i = 0; i < n && bto_active; i++) {
+        bto_current_idx = i;
+        bto_devices[i].status = BTO_DEV_WALKING;
+        bto_ui_needs_update = true;
+
+        bool started = gw_walk(bto_devices[i].addr, bto_devices[i].addr_type,
+                               bto_devices[i].name[0] ? bto_devices[i].name : "Unknown",
+                               bto_devices[i].rssi,
+                               current_gps.latitude, current_gps.longitude, current_gps.valid);
+
+        if (!started) {
+            bto_devices[i].status = BTO_DEV_FAILED;
+            bto_ui_needs_update = true;
+            continue;
+        }
+
+        // Poll until GATT walk completes (3s connect + 2s enum buffer = 50 * 100ms)
+        for (int w = 0; w < 50 && bto_active; w++) {
+            gw_state_t st = gw_get_state();
+            if (st == GW_STATE_COMPLETE || st == GW_STATE_FAILED ||
+                st == GW_STATE_CANCELLED || st == GW_STATE_IDLE)
+                break;
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+
+        gw_state_t final = gw_get_state();
+        if (final == GW_STATE_COMPLETE) {
+            const gw_result_t *res = gw_get_result();
+            bto_devices[i].svc_count   = res->svc_count;
+            bto_devices[i].fingerprint = res->fingerprint;
+            int chrs = 0;
+            for (int s = 0; s < res->svc_count; s++) chrs += res->svcs[s].chr_count;
+            bto_devices[i].chr_count = chrs;
+            bto_devices[i].walk_ok   = true;
+            bto_devices[i].status    = BTO_DEV_DONE;
+        } else {
+            bto_devices[i].walk_ok = false;
+            bto_devices[i].status  = BTO_DEV_DONE;
+        }
+        bto_ui_needs_update = true;
+
+        // Brief gap between connections
+        if (bto_active) vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    // Restore user-configured GATT timeout
+    gw_set_timeout(g_gatt_timeout_ms);
+
+    bto_state  = bto_active ? BTO_STATE_DONE : BTO_STATE_STOPPED;
+    bto_active = false;
+    bto_ui_needs_update = true;
+    bto_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
 // Direct-track BT Locator: skip scan, jump straight to tracking the SAS-selected device
 static void show_bt_locator_direct_track(void)
 {
@@ -18132,7 +18492,7 @@ static void gw_update_screen_ui(void)
             const gw_result_t *r = gw_get_result();
             char t[80];
             if (r) {
-                snprintf(t, sizeof(t), "%d svcs  %d chrs\nFP: 0x%08X\n%s",
+                snprintf(t, sizeof(t), "%d svcs  %d chrs\nFP: 0x%08lX\n%s",
                          r->svc_count, (int)gw_ui_chr_count,
                          r->fingerprint, r->filepath + 9 /* skip /sdcard/ */);
             } else {
@@ -19464,6 +19824,15 @@ void attack_event_cb(lv_event_t *e)
             show_bt_conflict_warning("BT Scan & Select", show_bt_scan_select_screen);
         else
             show_bt_scan_select_screen();
+        return;
+    }
+
+    // BT Observer — auto-enumerate all nearby devices sequentially
+    if (strcmp(attack_name, "BT Observer") == 0) {
+        if (bt_lookout_is_active())
+            show_bt_conflict_warning("BT Observer", show_bt_observer_screen);
+        else
+            show_bt_observer_screen();
         return;
     }
 
