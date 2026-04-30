@@ -109,6 +109,7 @@ typedef struct {
     float accuracy;
     int satellites;
     bool valid;
+    char time_utc[10];  /* "HH:MM:SS" from GGA field 1, empty if no fix */
 } gps_data_t;
 
 // Target BSSID structure
