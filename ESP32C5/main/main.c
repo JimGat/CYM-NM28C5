@@ -14258,6 +14258,18 @@ static void s_fileserv_send_file(httpd_req_t *req, const char *path)
     fclose(f);
 }
 
+/* Human-readable file size: "512 B", "1.4 KB", "3.2 MB". */
+static const char *s_human_size(long bytes, char *buf, size_t bufsz)
+{
+    if (bytes < 1024)
+        snprintf(buf, bufsz, "%ld B", bytes);
+    else if (bytes < 1024L * 1024L)
+        snprintf(buf, bufsz, "%.1f KB", bytes / 1024.0f);
+    else
+        snprintf(buf, bufsz, "%.1f MB", bytes / (1024.0f * 1024.0f));
+    return buf;
+}
+
 /* Send an HTML directory listing for sd_path, with URL base url_path. */
 static void s_fileserv_send_dir(httpd_req_t *req, const char *sd_path, const char *url_path)
 {
@@ -14266,11 +14278,11 @@ static void s_fileserv_send_dir(httpd_req_t *req, const char *sd_path, const cha
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
 
-    char chunk[512];
+    char chunk[640];
     snprintf(chunk, sizeof(chunk),
         "<!DOCTYPE html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width'>"
-        "<title>JANOS</title></head>"
+        "<title>Cheap Yellow Monster</title></head>"
         "<body style='font-family:monospace;background:#111;color:#0f0;padding:8px'>"
         "<h2 style='color:#0ff'>%s</h2><hr>", url_path);
     httpd_resp_send_chunk(req, chunk, strlen(chunk));
@@ -14294,21 +14306,33 @@ static void s_fileserv_send_dir(httpd_req_t *req, const char *sd_path, const cha
         struct stat st;
         memset(&st, 0, sizeof(st));
         stat(entry_sd, &st);
+
+        /* Format modification time */
+        char tmbuf[20] = "";
+        if (st.st_mtime) {
+            struct tm *tm_info = localtime(&st.st_mtime);
+            if (tm_info) strftime(tmbuf, sizeof(tmbuf), "%Y-%m-%d %H:%M", tm_info);
+        }
+
         int n;
         if (S_ISDIR(st.st_mode)) {
             n = snprintf(chunk, sizeof(chunk),
-                "<p><a href='/files%s%s%.100s' style='color:#ff0'>[DIR] %.100s</a></p>",
-                url_path, sep, e->d_name, e->d_name);
+                "<p><a href='/files%s%s%.100s' style='color:#ff0'>[DIR] %.100s</a>"
+                " <span style='color:#555'>%s</span></p>",
+                url_path, sep, e->d_name, e->d_name, tmbuf);
         } else {
+            char szbuf[16];
+            s_human_size((long)st.st_size, szbuf, sizeof(szbuf));
             n = snprintf(chunk, sizeof(chunk),
                 "<p><a href='/files%s%s%.100s' style='color:#0f0'>%.100s</a>"
-                " <span style='color:#888'>(%ld B)</span></p>",
-                url_path, sep, e->d_name, e->d_name, (long)st.st_size);
+                " <span style='color:#888'>%s</span>"
+                " <span style='color:#555'>%s</span></p>",
+                url_path, sep, e->d_name, e->d_name, szbuf, tmbuf);
         }
         if (n > 0 && n < (int)sizeof(chunk)) httpd_resp_send_chunk(req, chunk, n);
     }
     closedir(d);
-    const char *foot = "<hr><small style='color:#555'>JANOS CYM-NM28C5</small></body></html>";
+    const char *foot = "<hr><small style='color:#555'>Cheap Yellow Monster</small></body></html>";
     httpd_resp_send_chunk(req, foot, strlen(foot));
     httpd_resp_send_chunk(req, NULL, 0);
 }
