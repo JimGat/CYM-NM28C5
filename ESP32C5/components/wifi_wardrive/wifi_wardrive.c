@@ -353,7 +353,7 @@ esp_err_t wifi_wardrive_format_sd(void) {
         ESP_LOGW(TAG, "[SD] format: card not mounted");
         return ESP_ERR_INVALID_STATE;
     }
-    ESP_LOGI(TAG, "[SD] Formatting FAT32 (16KB clusters)...");
+    ESP_LOGI(TAG, "[SD] Formatting FAT32 (16KB clusters) — this takes 30-90 s on large cards...");
     uint8_t *work = heap_caps_malloc(4096, MALLOC_CAP_INTERNAL);
     if (!work) {
         ESP_LOGE(TAG, "[SD] format: no memory for work buffer");
@@ -365,14 +365,18 @@ esp_err_t wifi_wardrive_format_sd(void) {
     MKFS_PARM opt = { .fmt = FM_FAT32 | FM_SFD, .n_fat = 1, .align = 0, .n_root = 512, .au_size = 16 * 1024 };
     FRESULT res = f_mkfs("0:", &opt, work, 4096);
     heap_caps_free(work);
-    if (res != FR_OK) {
-        ESP_LOGE(TAG, "[SD] f_mkfs failed: %d", (int)res);
-        return ESP_FAIL;
-    }
-    // Unmount VFS so the next wifi_wardrive_init_sd() does a clean remount
+
+    /* Always unmount after format attempt — whether it succeeded or failed.
+       Leaving the card mounted after a partial write causes the card controller
+       to stay in a write-busy state that blocks ACMD41 on the next boot. */
     esp_vfs_fat_sdcard_unmount("/sdcard", sd_card);
     sd_card_mounted = false;
     sd_card = NULL;
+
+    if (res != FR_OK) {
+        ESP_LOGE(TAG, "[SD] f_mkfs failed: %d — card unmounted cleanly", (int)res);
+        return ESP_FAIL;
+    }
     ESP_LOGI(TAG, "[SD] Format complete — card unmounted, ready for remount");
     return ESP_OK;
 }
