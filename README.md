@@ -477,6 +477,32 @@ Walk complete
 
 **GPS geotagging:** If a GPS fix is active when GATT Walker starts, the coordinates are embedded in the JSON. This enables later mapping of device sightings.
 
+**Characteristic Properties (`props` / `props_str`):** Each characteristic has a bitmask that declares what operations it supports. The JSON includes both the raw integer (`"properties"`) and the decoded string (`"props_str"`). The on-device result screen shows both the compact flag string and the full human-readable expansion, e.g. `Props: R N (Read, Notify)`.
+
+| Bit | Hex | Flag | Meaning |
+|-----|-----|------|---------|
+| 0 | `0x01` | **BC** | Broadcast — value can be included in advertising packets |
+| 1 | `0x02` | **R** | Read — current value can be read |
+| 2 | `0x04` | **WNR** | Write No Response — fire-and-forget write, no acknowledgement |
+| 3 | `0x08` | **W** | Write — acknowledged write; server confirms receipt |
+| 4 | `0x10` | **N** | Notify — server pushes updates to subscribed clients (no ACK) |
+| 5 | `0x20` | **I** | Indicate — server pushes updates; client must ACK each one |
+| 6 | `0x40` | **AS** | Authenticated Signed Write — write with MITM-protected signature |
+| 7 | `0x80` | **EX** | Extended Properties — additional properties stored in descriptor `0x2900` |
+
+Common combinations:
+
+| Props string | Raw | Typical use |
+|---|---|---|
+| `R` | `0x02` | Read-only sensor or config value |
+| `R N` | `0x12` | Live sensor — read current value + subscribe for streaming updates |
+| `R I` | `0x22` | Like notify but reliable — server waits for client ACK |
+| `R W` | `0x0A` | Read/write configuration register |
+| `WNR` | `0x04` | Command channel — write commands with no response needed |
+| `R W N` | `0x1A` | Full-featured — read, write, and subscribe |
+
+> **Tip:** To receive live streaming data (e.g. a heart rate sensor), look for characteristics with **N** (Notify) or **I** (Indicate). A **CCCD descriptor** (`0x2902`) is always present alongside these and is what a client writes to in order to enable or disable the subscription.
+
 **BLE data limits:** The Bluetooth Core Specification sets a hard ceiling of **512 bytes** per attribute value. The firmware negotiates the maximum possible ATT MTU on every connection so that large attributes are captured in full rather than truncated at the BLE default of 20 bytes.
 
 | Limit | Value | Source |
