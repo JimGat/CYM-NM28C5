@@ -15965,16 +15965,25 @@ typedef struct {
 } sd_provision_item_t;
 
 static const sd_provision_item_t SD_ITEMS[] = {
+    /* ── Directories ─────────────────────────────────────────────────────── */
     { SD_ITEM_DIR,  "/sdcard/lab",                           NULL },
     { SD_ITEM_DIR,  "/sdcard/lab/handshakes",                NULL },
-    { SD_ITEM_DIR,  "/sdcard/lab/portal",                    NULL },
-    { SD_ITEM_DIR,  "/sdcard/lab/wardrive",                  NULL },
+    { SD_ITEM_DIR,  "/sdcard/lab/wardrives",                 NULL },  /* main.c wardrive task */
+    { SD_ITEM_DIR,  "/sdcard/lab/pcaps",                     NULL },  /* MITM pcap logger */
+    { SD_ITEM_DIR,  "/sdcard/lab/deauths",                   NULL },  /* deauth pcap logger */
+    { SD_ITEM_DIR,  "/sdcard/lab/htmls",                     NULL },  /* captive portal templates */
     { SD_ITEM_DIR,  "/sdcard/lab/cellular",                  NULL },
-    { SD_ITEM_DIR,  "/sdcard/lab/pcap",                      NULL },
     { SD_ITEM_DIR,  "/sdcard/lab/alerts",                    NULL },
     { SD_ITEM_DIR,  "/sdcard/lab/config",                    NULL },
     { SD_ITEM_DIR,  "/sdcard/lab/bluetooth",                 NULL },
+    { SD_ITEM_DIR,  "/sdcard/gattwalker",                    NULL },  /* GATT Walker JSON output */
+    { SD_ITEM_DIR,  "/sdcard/screenshots",                   NULL },  /* screenshot capture */
+    /* ── Seed files (written only on creation; never overwrite existing) ── */
     { SD_ITEM_FILE, "/sdcard/lab/white.txt",                 "" },
+    { SD_ITEM_FILE, "/sdcard/lab/eviltwin.txt",              "" },
+    { SD_ITEM_FILE, "/sdcard/lab/portals.txt",               "" },
+    { SD_ITEM_FILE, "/sdcard/lab/wpa-sec.txt",
+      "# Paste your wpa-sec.org API key on the next line\n" },
     { SD_ITEM_FILE, "/sdcard/lab/cellular/tower_baseline.csv",
       "arfcn,bsic,lac,cell_id,mcc,mnc,rxlev,gps_lat,gps_lon,first_seen,last_seen\n" },
     { SD_ITEM_FILE, "/sdcard/lab/cellular/tower_anomalies.csv",
@@ -16046,19 +16055,25 @@ static void sd_provision_task(void *pvParams)
 
     // Format must hold the mutex for its entire duration (many SPI transactions)
     if (after_format) {
-        PROV_POST("Formatting SD card...");
+        /* Warn the user BEFORE grabbing the mutex so the screen can update.
+           Once we hold sd_spi_mutex, the display flush is blocked — no UI updates
+           are possible until f_mkfs completes (30-90 s on a large card). */
+        PROV_POST("Formatting SD card...\n\nScreen will freeze\nuntil complete.\nPlease wait...");
+        vTaskDelay(pdMS_TO_TICKS(500)); /* let the message render before SPI lock */
+
         if (!PROV_TAKE_MUTEX()) {
             PROV_POST("ERR: mutex timeout during format");
             goto done;
         }
         esp_err_t fr = wifi_wardrive_format_sd();
         xSemaphoreGive(sd_spi_mutex);
-        vTaskDelay(pdMS_TO_TICKS(100));  // let display refresh after long hold
+        vTaskDelay(pdMS_TO_TICKS(500)); /* card settle time after unmount */
         if (fr != ESP_OK) {
-            PROV_POST("Format FAILED: %s", esp_err_to_name(fr));
+            PROV_POST("Format FAILED.\nCard unmounted cleanly.\nRemove and reinsert\ncard, then retry.");
             goto done;
         }
-        PROV_POST("Remounting SD card...");
+        PROV_POST("Format OK!\nRemounting...");
+        vTaskDelay(pdMS_TO_TICKS(300));
         // Format unmounted the card — remount before provisioning files
         if (!PROV_TAKE_MUTEX()) {
             PROV_POST("ERR: mutex timeout before remount");
@@ -16070,7 +16085,7 @@ static void sd_provision_task(void *pvParams)
             PROV_POST("Remount FAILED: %s", esp_err_to_name(mr));
             goto done;
         }
-        PROV_POST("Format OK - rebuilding structure...");
+        PROV_POST("Remount OK!\nRebuilding structure...");
     }
 
     // Process each item with per-item mutex acquire/release so display stays live

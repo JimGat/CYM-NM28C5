@@ -1,8 +1,30 @@
 # CYM-NM28C5 Pre-built Firmware Binaries
 
-**Firmware version: v0.9.0**
+**Firmware version: v0.9.3**
 
 This folder contains the latest compiled firmware for the **NM-CYD-C5 (ESP32-C5)** board.
+
+---
+
+## Release Notes — v0.9.3
+
+### Evil Portal — Path Fix + Multi-Portal Dropdown
+
+The captive portal HTML directory was corrected from the phantom `/sdcard/lab/portal/` to the live path `/sdcard/lab/htmls/`. Any `.html` or `.htm` file placed in `/sdcard/lab/htmls/` now appears as a selectable option in the portal dropdown for Evil Twin, Karma AP, and Captive Portal attacks — no renaming to `index.html` required.
+
+### SD Card — Provision Table Corrected
+
+The Validate & Provision directory list was aligned with actual firmware file paths:
+
+- `wardrive` corrected to `wardrives` (matches wardrive task output path)
+- `pcap` corrected to `pcaps` (matches MITM logger output path)
+- Phantom `portal/` directory removed
+- Added: `htmls/`, `deauths/`, `gattwalker/`, `screenshots/`
+- Added seed files: `eviltwin.txt`, `portals.txt`, `wpa-sec.txt` (with API key placeholder)
+
+### README — Evil Portal Setup Instructions
+
+Full portal setup guide added to README covering correct directory path, multi-file selection, and links to community portal collections (D3h420/Evil-Portals-Collection, DoobTheGoober/EvilPortalGenerator, saintcrossbow/Evil-Cardputer-Portals). Data & storage tree updated to reflect real directory layout.
 
 ---
 
