@@ -1,8 +1,37 @@
 # CYM-NM28C5 Pre-built Firmware Binaries
 
-**Firmware version: v0.8.9**
+**Firmware version: v0.9.0**
 
 This folder contains the latest compiled firmware for the **NM-CYD-C5 (ESP32-C5)** board.
+
+---
+
+## Release Notes — v0.9.0
+
+### SD Card — Robust Initialization for Blank and Stubborn Cards
+
+Boot-time SD card initialization completely overhauled to handle blank, freshly-formatted, and slow-responding cards without crashing or looping.
+
+- **Progressive SPI frequency fallback**: attempt 1 at 20 MHz → attempt 2 at 10 MHz → attempt 3 at 5 MHz
+- **CMD0 command timeout raised to 2 s** (`command_timeout_ms = 2000`) — cards that are slow to respond after power-on now get enough time
+- **CS pin pre-assert**: GPIO 10 is driven HIGH for 200 ms before each mount attempt, ensuring the card is cleanly deselected before SPI init begins
+- **500 ms power-on settle** at boot before first attempt (was 100 ms)
+- **Interactive error screen** replaces crash loop: after all 3 attempts fail, shows Retry / Continue buttons instead of rebooting
+- **Format confirmation flow**: if the card responded at hardware level but has an unreadable filesystem, a Format button appears; tapping it shows an "Are you sure?" confirmation before erasing anything
+
+### SD Card — Main Task Stack Fix (Critical Crash Fix)
+
+`CONFIG_ESP_MAIN_TASK_STACK_SIZE` raised from 3584 → **8192 bytes** (persisted in `sdkconfig.defaults`). The old stack size caused an immediate stack overflow panic when the SD error screen tried to build its LVGL UI, resulting in a reboot loop whenever SD card init failed.
+
+### BT Attacks — New Submenu
+
+A **BT Attacks** tile has been added to the Bluetooth menu (bottom-right). It opens a Coming Soon screen with placeholder tiles for BLE Spam, Device Spoof, and BLE Disconnect.
+
+### HTTP File Server — Rebrand + Directory Improvements
+
+- Page title and footer updated: **JANOS → Cheap Yellow Monster**
+- File modification datetime shown alongside each entry (`YYYY-MM-DD HH:MM`)
+- File sizes displayed in human-readable form (B / KB / MB)
 
 ---
 
