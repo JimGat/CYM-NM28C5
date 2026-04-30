@@ -16407,8 +16407,8 @@ static void show_gps_info_screen(void)
     create_function_page_base("GPS Info");
 
     lv_obj_t *card = lv_obj_create(function_page);
-    lv_obj_set_size(card, 220, 230);
-    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 35);
+    lv_obj_set_size(card, 220, 252);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 30);
     lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
     lv_obj_set_style_border_width(card, 1, 0);
     lv_obj_set_style_border_color(card, ui_border_color(), 0);
@@ -16431,6 +16431,18 @@ static void show_gps_info_screen(void)
     lv_obj_set_style_text_font(fix_lbl, &lv_font_montserrat_16, 0);
     lv_obj_align(fix_lbl, LV_ALIGN_TOP_LEFT, 0, y);
     y += 26;
+
+    // UTC Time
+    lv_obj_t *time_lbl = lv_label_create(card);
+    if (current_gps.time_utc[0] != '\0')
+        snprintf(buf, sizeof(buf), "UTC:  %s", current_gps.time_utc);
+    else
+        snprintf(buf, sizeof(buf), "UTC:  --");
+    lv_label_set_text(time_lbl, buf);
+    lv_obj_set_style_text_font(time_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(time_lbl, ui_text_color(), 0);
+    lv_obj_align(time_lbl, LV_ALIGN_TOP_LEFT, 0, y);
+    y += 22;
 
     // Satellites
     lv_obj_t *sat_lbl = lv_label_create(card);
@@ -19533,6 +19545,14 @@ static bool parse_gps_nmea(const char *nmea_sentence)
 
 		while (token != NULL) {
 			switch (field) {
+				case 1: // UTC time HHMMSS.SS
+					if (strlen(token) >= 6) {
+						snprintf(current_gps.time_utc, sizeof(current_gps.time_utc),
+						         "%c%c:%c%c:%c%c",
+						         token[0], token[1], token[2],
+						         token[3], token[4], token[5]);
+					}
+					break;
 				case 2: // Latitude DDMM.MMMM
 					if (strlen(token) > 4) { lat_deg = (token[0]-'0')*10 + (token[1]-'0'); lat_min = atof(token+2); }
 					break;
