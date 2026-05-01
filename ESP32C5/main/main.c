@@ -1530,6 +1530,7 @@ static void show_bt_locator_direct_track(void);
 static void show_gatt_walker_screen(void);
 static void gw_update_screen_ui(void);
 static void gw_deferred_start_cb(lv_timer_t *t);
+static void gw_probe_btn_cb(lv_event_t *e);
 
 // BT Attacks
 static void show_bt_attacks_screen(void);
@@ -18967,6 +18968,14 @@ static void gw_result_back_cb(lv_event_t *e)
     show_bt_attack_tiles_screen();
 }
 
+static void gw_probe_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    gw_state_t st = gw_get_state();
+    if (st != GW_STATE_COMPLETE && st != GW_STATE_PROBE_DONE) return;
+    gw_probe_start(3000);
+}
+
 static void show_gw_result_screen(void)
 {
     const gw_result_t *r = gw_get_result();
@@ -19076,6 +19085,12 @@ static void show_gw_result_screen(void)
                 snprintf(prop_row, sizeof(prop_row), "    Props: %s (%s)", prop_buf, prop_desc);
                 GW_ROW(scrl, prop_row, &lv_font_montserrat_12, COLOR_MATERIAL_ORANGE);
 
+                /* Bell indicator for subscribable characteristics */
+                if (chr->properties & (0x10 | 0x20)) {
+                    GW_ROW(scrl, "    " LV_SYMBOL_AUDIO " Subscribable (CCCD)",
+                           &lv_font_montserrat_12, lv_color_make(100, 180, 255));
+                }
+
                 /* Read data + ASCII */
                 if (chr->read_ok && chr->read_len > 0) {
                     /* Show first 32 bytes as hex, annotate total if more */
@@ -19121,14 +19136,51 @@ static void show_gw_result_screen(void)
                         GW_ROW(scrl, row, &lv_font_montserrat_12, ui_muted_color());
                     }
                 }
+
+                /* Probe results (shown after Extended Probe runs) */
+                if (chr->probe_attempted) {
+                    if (chr->probe_cccd_ok && chr->probe_frame_count > 0) {
+                        char prow[64];
+                        snprintf(prow, sizeof(prow), "    Probe: %d frame(s)",
+                                 chr->probe_frame_count);
+                        GW_ROW(scrl, prow, &lv_font_montserrat_12, COLOR_MATERIAL_GREEN);
+                        for (int fi = 0; fi < chr->probe_frame_count && fi < 2; fi++) {
+                            char hex[80] = "      ";
+                            int hpos = 6;
+                            for (int bi = 0; bi < chr->probe_frame_lens[fi] && bi < 16; bi++)
+                                hpos += snprintf(hex + hpos, sizeof(hex) - hpos,
+                                                 "%02X", chr->probe_frames[fi][bi]);
+                            GW_ROW(scrl, hex, &lv_font_montserrat_12,
+                                   lv_color_make(100, 210, 255));
+                        }
+                    } else if (chr->probe_attempted && !chr->probe_cccd_ok) {
+                        GW_ROW(scrl, "    Probe: no response",
+                               &lv_font_montserrat_12, lv_color_make(200, 140, 50));
+                    }
+                }
             }
         }
     }
 
 gw_res_done:;
+    /* ── Bottom bar: [Ext. Probe] [Back] ── */
+    lv_obj_t *probe_btn = lv_btn_create(function_page);
+    lv_obj_set_size(probe_btn, 108, 32);
+    lv_obj_align(probe_btn, LV_ALIGN_BOTTOM_MID, -62, -6);
+    lv_obj_set_style_bg_color(probe_btn, lv_color_hex(0xF57C00), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(probe_btn, lv_color_lighten(lv_color_hex(0xF57C00), 40), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(probe_btn, 0, 0);
+    lv_obj_set_style_radius(probe_btn, 8, 0);
+    lv_obj_t *probe_lbl = lv_label_create(probe_btn);
+    lv_label_set_text(probe_lbl, LV_SYMBOL_AUDIO "  Ext. Probe");
+    lv_obj_set_style_text_font(probe_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(probe_lbl, lv_color_white(), 0);
+    lv_obj_center(probe_lbl);
+    lv_obj_add_event_cb(probe_btn, gw_probe_btn_cb, LV_EVENT_CLICKED, NULL);
+
     lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 110, 32);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_size(back_btn, 108, 32);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 62, -6);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x7B1FA2), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(back_btn, lv_color_lighten(lv_color_hex(0x7B1FA2), 40), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(back_btn, 0, 0);
@@ -19149,8 +19201,9 @@ static void gw_update_screen_ui(void)
 
     gw_state_t st   = (gw_state_t)gw_ui_state;
 
-    /* Auto-navigate to full detail screen on success */
-    if (st == GW_STATE_COMPLETE) {
+    /* Auto-navigate to full detail screen on success or after probe */
+    if (st == GW_STATE_COMPLETE || st == GW_STATE_PROBE_DONE) {
+        if (st == GW_STATE_PROBE_DONE) gw_probe_free_stack();
         show_gw_result_screen();
         return;
     }
@@ -19173,7 +19226,8 @@ static void gw_update_screen_ui(void)
         lv_label_set_text(gw_chr_lbl, t);
     }
 
-    bool done = (st == GW_STATE_COMPLETE || st == GW_STATE_FAILED || st == GW_STATE_CANCELLED);
+    bool done = (st == GW_STATE_COMPLETE || st == GW_STATE_PROBE_DONE ||
+                 st == GW_STATE_FAILED    || st == GW_STATE_CANCELLED);
 
     /* Show/hide cancel vs back */
     if (gw_cancel_btn && lv_obj_is_valid(gw_cancel_btn)) {

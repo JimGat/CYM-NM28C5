@@ -22,6 +22,8 @@ typedef enum {
     GW_STATE_COMPLETE,
     GW_STATE_FAILED,
     GW_STATE_CANCELLED,
+    GW_STATE_PROBING,
+    GW_STATE_PROBE_DONE,
 } gw_state_t;
 
 /* ── Events ─────────────────────────────────────────────────────── */
@@ -35,6 +37,8 @@ typedef enum {
     GW_EVENT_COMPLETE,
     GW_EVENT_FAILED,
     GW_EVENT_CANCELLED,
+    GW_EVENT_PROBE_STARTED,
+    GW_EVENT_PROBE_DONE,
 } gw_event_t;
 
 /* ── Result structures ──────────────────────────────────────────── */
@@ -51,6 +55,12 @@ typedef struct {
         char     uuid_str[37];
     } descs[GW_MAX_DSCS];
     int desc_count;
+    /* ── CCCD Subscription Probe results ── */
+    bool             probe_attempted;
+    bool             probe_cccd_ok;
+    uint8_t          probe_frames[4][32]; /* up to 4 notification frames, 32B each */
+    uint8_t          probe_frame_lens[4];
+    int              probe_frame_count;
 } gw_chr_t;
 
 typedef struct {
@@ -73,6 +83,7 @@ typedef struct {
     uint32_t fingerprint;
     char     timestamp[20];   /* "YYYYMMDD_HHMMSS" */
     char     filepath[80];    /* full SD path */
+    bool     probe_done;
 } gw_result_t;
 
 /* ── Volatile UI state — safe to read from main loop ────────────── */
@@ -114,3 +125,12 @@ const gw_result_t *gw_get_result(void);
 /* Decode properties bitmask into a compact string, e.g. "R W N".
  * buf must be at least 20 bytes. Returns buf. */
 char *gw_chr_props_str(uint8_t props, char *buf, size_t bufsz);
+
+/* Launch CCCD subscription probe against the last completed result.
+ * Reconnects to the device, subscribes to every N/I characteristic,
+ * collects frames for dwell_ms each, then re-saves the JSON.
+ * Returns false if no result is available or probe already running. */
+bool gw_probe_start(uint32_t dwell_ms);
+
+/* Free probe task stack after GW_EVENT_PROBE_DONE fires. */
+void gw_probe_free_stack(void);
