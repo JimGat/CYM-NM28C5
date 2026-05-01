@@ -18596,6 +18596,7 @@ static void bto_spinner_destroy(void)
 
 static void bto_card_tap_cb(lv_event_t *e)
 {
+    if (bto_active) return;   /* scan still running — scroll is fine, selection is not */
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (idx < 0 || idx >= bto_device_count) return;
     if (bto_refresh_timer) { lv_timer_del(bto_refresh_timer); bto_refresh_timer = NULL; }
