@@ -18906,13 +18906,29 @@ static void bt_observer_task(void *pvParameters)
             continue;
         }
 
-        // Poll until GATT walk completes (5s connect + 3s enum buffer = 80 * 100ms)
-        for (int w = 0; w < 80 && bto_active; w++) {
+        // Poll until GATT walk completes (5s connect + 5s enum buffer = 100 * 100ms)
+        for (int w = 0; w < 100 && bto_active; w++) {
             gw_state_t st = gw_get_state();
             if (st == GW_STATE_COMPLETE || st == GW_STATE_FAILED ||
                 st == GW_STATE_CANCELLED || st == GW_STATE_IDLE)
                 break;
             vTaskDelay(pdMS_TO_TICKS(100));
+        }
+
+        // If walk still running after timeout, cancel it and wait for clean state
+        {
+            gw_state_t cs = gw_get_state();
+            if (cs != GW_STATE_COMPLETE && cs != GW_STATE_FAILED &&
+                cs != GW_STATE_CANCELLED && cs != GW_STATE_IDLE) {
+                gw_cancel();
+                for (int c = 0; c < 30 && bto_active; c++) {
+                    cs = gw_get_state();
+                    if (cs == GW_STATE_FAILED || cs == GW_STATE_CANCELLED ||
+                        cs == GW_STATE_IDLE  || cs == GW_STATE_COMPLETE)
+                        break;
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+            }
         }
 
         gw_state_t final = gw_get_state();
