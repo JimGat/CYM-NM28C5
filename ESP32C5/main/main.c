@@ -18329,7 +18329,7 @@ static void bto_probe_btn_cb(lv_event_t *e)
 
     gw_state_t st = gw_get_state();
     if (st != GW_STATE_COMPLETE && st != GW_STATE_PROBE_DONE) return;
-    if (gw_probe_start(3000))
+    if (gw_probe_start(8000))
         show_gw_probe_running_screen();
 }
 
@@ -19245,17 +19245,21 @@ static void show_gw_probe_result_screen(void)
                                  chr->probe_frame_count);
                         PR_ROW(scrl, fr, &lv_font_montserrat_12, COLOR_MATERIAL_GREEN);
                         for (int fi = 0; fi < chr->probe_frame_count; fi++) {
-                            char hex[80];
-                            int hp = snprintf(hex, sizeof(hex), "    [%d] ", fi + 1);
-                            for (int bi = 0; bi < chr->probe_frame_lens[fi] && bi < 16; bi++)
+                            uint8_t flen = chr->probe_frame_lens[fi];
+                            /* Hex — up to 32 bytes shown, "..." if more */
+                            char hex[140];
+                            int hp = snprintf(hex, sizeof(hex), "    [%d] %dB  ", fi + 1, flen);
+                            int show = flen < 32 ? flen : 32;
+                            for (int bi = 0; bi < show; bi++)
                                 hp += snprintf(hex + hp, sizeof(hex) - hp,
                                                "%02X", chr->probe_frames[fi][bi]);
-                            if (chr->probe_frame_lens[fi] > 16)
+                            if (flen > 32)
                                 snprintf(hex + hp, sizeof(hex) - hp, "...");
                             PR_ROW(scrl, hex, &lv_font_montserrat_12, lv_color_make(100, 210, 255));
-                            char asc[48] = "      ";
+                            /* ASCII — all captured bytes */
+                            char asc[80] = "      ";
                             int ap = 6;
-                            for (int bi = 0; bi < chr->probe_frame_lens[fi] && bi < 22; bi++) {
+                            for (int bi = 0; bi < flen && bi < 64; bi++) {
                                 uint8_t b = chr->probe_frames[fi][bi];
                                 asc[ap++] = (b >= 0x20 && b < 0x7F) ? (char)b : '.';
                             }
@@ -19263,7 +19267,7 @@ static void show_gw_probe_result_screen(void)
                             PR_ROW(scrl, asc, &lv_font_montserrat_12, lv_color_make(160, 210, 160));
                         }
                     } else {
-                        PR_ROW(scrl, "  Subscribed: silent (no data in dwell window)",
+                        PR_ROW(scrl, "  Subscribed: no data in 8s window",
                                &lv_font_montserrat_12, lv_color_make(200, 200, 100));
                     }
                 } else {
@@ -19314,7 +19318,7 @@ static void gw_probe_btn_cb(lv_event_t *e)
     gw_state_t st = gw_get_state();
     if (st != GW_STATE_COMPLETE && st != GW_STATE_PROBE_DONE) return;
     g_probe_back = GW_PROBE_BACK_GATT_RESULT;
-    if (gw_probe_start(3000))
+    if (gw_probe_start(8000))
         show_gw_probe_running_screen();
 }
 

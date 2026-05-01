@@ -737,10 +737,10 @@ static int s_gap_cb(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_NOTIFY_RX:
         if (s_state == GW_STATE_PROBING && s_probe_cur_chr) {
             gw_chr_t *chr = (gw_chr_t *)s_probe_cur_chr;
-            if (chr->probe_frame_count < 4) {
+            if (chr->probe_frame_count < 8) {
                 int fi = chr->probe_frame_count;
                 uint16_t len = OS_MBUF_PKTLEN(event->notify_rx.om);
-                if (len > 32) len = 32;
+                if (len > 64) len = 64;
                 os_mbuf_copydata(event->notify_rx.om, 0, len, chr->probe_frames[fi]);
                 chr->probe_frame_lens[fi] = (uint8_t)len;
                 chr->probe_frame_count++;
