@@ -1094,7 +1094,7 @@ static uint8_t bt_sas_target_addr_type = 0;
 static char bt_sas_target_name[32];
 
 // ── BT Observer ─────────────────────────────────────────────────
-#define BTO_MAX_DEVICES 20
+#define BTO_MAX_DEVICES 40
 
 typedef enum {
     BTO_DEV_QUEUED = 0,
@@ -1134,6 +1134,7 @@ static TaskHandle_t     bto_task_handle     = NULL;
 static lv_obj_t        *bto_list            = NULL;
 static lv_obj_t        *bto_status_lbl      = NULL;
 static lv_timer_t      *bto_refresh_timer   = NULL;
+static lv_obj_t        *bto_spinner         = NULL;
 
 // ── BT Lookout (Dee Dee Detector) UI state ──────────────────────
 static bool        bt_lookout_ui_active       = false;
@@ -1146,6 +1147,13 @@ static lv_obj_t   *bt_lookout_oui_btn          = NULL;
 static lv_obj_t   *bt_lookout_popup_obj        = NULL;
 static lv_timer_t *bt_lookout_popup_tmr        = NULL;
 static TaskHandle_t bt_lookout_scan_loop_handle = NULL;
+
+// ── GATT Probe back-navigation target ────────────────────────────
+typedef enum { GW_PROBE_BACK_GATT_RESULT = 0, GW_PROBE_BACK_ATTACK_TILES } gw_probe_back_t;
+static gw_probe_back_t  g_probe_back           = GW_PROBE_BACK_GATT_RESULT;
+static volatile bool    gw_probe_screen_active  = false;
+static lv_obj_t        *gw_probe_status_lbl     = NULL;
+static lv_timer_t      *gw_probe_timer          = NULL;
 
 // ── GATT Walker UI state ─────────────────────────────────────────
 static bool       gw_screen_active   = false;
@@ -1531,6 +1539,10 @@ static void show_gatt_walker_screen(void);
 static void gw_update_screen_ui(void);
 static void gw_deferred_start_cb(lv_timer_t *t);
 static void gw_probe_btn_cb(lv_event_t *e);
+static void show_gw_probe_running_screen(void);
+static void show_gw_probe_result_screen(void);
+static void bto_probe_btn_cb(lv_event_t *e);
+static void show_gw_result_screen(void);
 
 // BT Attacks
 static void show_bt_attacks_screen(void);
@@ -18301,6 +18313,16 @@ static void bto_detail_back_cb(lv_event_t *e)
     show_bluetooth_screen();
 }
 
+static void bto_probe_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    gw_state_t st = gw_get_state();
+    if (st != GW_STATE_COMPLETE && st != GW_STATE_PROBE_DONE) return;
+    g_probe_back = GW_PROBE_BACK_ATTACK_TILES;
+    if (gw_probe_start(3000))
+        show_gw_probe_running_screen();
+}
+
 static void show_bto_device_detail(int dev_idx)
 {
     bto_device_t *d = &bto_devices[dev_idx];
@@ -18455,29 +18477,67 @@ static void show_bto_device_detail(int dev_idx)
     heap_caps_free(jbuf);
 #undef BTO_DET_BUF
 
-done:
-    /* Back button */
-    lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 110, 32);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
-    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x7B1FA2), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(back_btn, lv_color_lighten(lv_color_hex(0x7B1FA2), 40), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_t *back_lbl = lv_label_create(back_btn);
-    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT "  Back");
-    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
-    lv_obj_center(back_lbl);
-    lv_obj_add_event_cb(back_btn, bto_detail_back_cb, LV_EVENT_CLICKED, NULL);
+done:;
+    /* Check if probe is available for this device */
+    {
+        const gw_result_t *gw_r = gw_get_result();
+        gw_state_t gw_st = gw_get_state();
+        bool can_probe = (gw_r != NULL) &&
+                         (gw_st == GW_STATE_COMPLETE || gw_st == GW_STATE_PROBE_DONE) &&
+                         (memcmp(gw_r->mac, d->addr, 6) == 0);
+
+        /* Ext. Probe button (amber if available, grey if not) */
+        lv_obj_t *det_probe_btn = lv_btn_create(function_page);
+        lv_obj_set_size(det_probe_btn, 108, 32);
+        lv_obj_align(det_probe_btn, LV_ALIGN_BOTTOM_MID, -62, -6);
+        lv_obj_set_style_bg_color(det_probe_btn,
+            can_probe ? lv_color_hex(0xF57C00) : lv_color_make(70, 70, 70),
+            LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(det_probe_btn,
+            can_probe ? lv_color_lighten(lv_color_hex(0xF57C00), 40) : lv_color_make(70, 70, 70),
+            LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(det_probe_btn, 0, 0);
+        lv_obj_set_style_radius(det_probe_btn, 8, 0);
+        lv_obj_t *det_probe_lbl = lv_label_create(det_probe_btn);
+        lv_label_set_text(det_probe_lbl, LV_SYMBOL_AUDIO "  Ext. Probe");
+        lv_obj_set_style_text_font(det_probe_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(det_probe_lbl, lv_color_white(), 0);
+        lv_obj_center(det_probe_lbl);
+        if (can_probe)
+            lv_obj_add_event_cb(det_probe_btn, bto_probe_btn_cb, LV_EVENT_CLICKED, NULL);
+
+        /* Back button */
+        lv_obj_t *back_btn = lv_btn_create(function_page);
+        lv_obj_set_size(back_btn, 108, 32);
+        lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 62, -6);
+        lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x7B1FA2), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(back_btn, lv_color_lighten(lv_color_hex(0x7B1FA2), 40), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(back_btn, 0, 0);
+        lv_obj_set_style_radius(back_btn, 8, 0);
+        lv_obj_t *back_lbl = lv_label_create(back_btn);
+        lv_label_set_text(back_lbl, LV_SYMBOL_LEFT "  Back");
+        lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
+        lv_obj_center(back_lbl);
+        lv_obj_add_event_cb(back_btn, bto_detail_back_cb, LV_EVENT_CLICKED, NULL);
+    }
 }
 #undef DET_ROW
+
+static void bto_spinner_destroy(void)
+{
+    if (bto_spinner && lv_obj_is_valid(bto_spinner)) {
+        lv_obj_del(bto_spinner);
+    }
+    bto_spinner = NULL;
+}
 
 static void bto_card_tap_cb(lv_event_t *e)
 {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (idx < 0 || idx >= bto_device_count) return;
     if (bto_refresh_timer) { lv_timer_del(bto_refresh_timer); bto_refresh_timer = NULL; }
+    bto_spinner_destroy();
     bto_list = NULL; bto_status_lbl = NULL;
     show_bto_device_detail(idx);
 }
@@ -18487,6 +18547,7 @@ static void bto_stop_cb(lv_event_t *e)
     (void)e;
     bto_active = false;
     if (bto_refresh_timer) { lv_timer_del(bto_refresh_timer); bto_refresh_timer = NULL; }
+    bto_spinner_destroy();
     bto_list = NULL; bto_status_lbl = NULL;
     // restore user GATT timeout
     gw_set_timeout(g_gatt_timeout_ms);
@@ -18605,9 +18666,11 @@ static void bto_refresh_cb(lv_timer_t *t)
                 break;
             case BTO_STATE_DONE:
                 snprintf(buf, sizeof(buf), "Done - %d devices enumerated", bto_device_count);
+                bto_spinner_destroy();
                 break;
             case BTO_STATE_STOPPED:
                 snprintf(buf, sizeof(buf), "Stopped");
+                bto_spinner_destroy();
                 break;
             default:
                 snprintf(buf, sizeof(buf), "Initializing...");
@@ -18676,6 +18739,19 @@ static void show_bt_observer_screen(void)
     // Start 1s refresh timer
     bto_refresh_timer = lv_timer_create(bto_refresh_cb, 1000, NULL);
 
+    // Spinner overlay on lv_layer_top() — visible while scanning/walking
+    bto_spinner_destroy();
+    bto_spinner = lv_spinner_create(lv_layer_top(), 1000, 60);
+    lv_obj_set_size(bto_spinner, 28, 28);
+    lv_obj_align(bto_spinner, LV_ALIGN_TOP_RIGHT, -5, 32);
+    lv_obj_set_style_bg_opa(bto_spinner, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(bto_spinner, 0, 0);
+    lv_obj_set_style_arc_color(bto_spinner, lv_color_hex(0xAB47BC), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(bto_spinner, 3, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(bto_spinner, lv_color_hex(0x333333), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(bto_spinner, 3, LV_PART_MAIN);
+    lv_obj_set_style_arc_opa(bto_spinner, LV_OPA_40, LV_PART_MAIN);
+
     // Switch radio and launch observer task
     if (!ensure_ble_mode()) {
         lv_label_set_text(bto_status_lbl, "BLE init failed!");
@@ -18727,6 +18803,16 @@ static void bt_observer_task(void *pvParameters)
         bto_devices[i].status = BTO_DEV_QUEUED;
     }
     bto_device_count = n;
+    /* Sort by RSSI descending — strongest signal first */
+    for (int _a = 0; _a < n - 1; _a++) {
+        for (int _b = _a + 1; _b < n; _b++) {
+            if (bto_devices[_b].rssi > bto_devices[_a].rssi) {
+                bto_device_t _tmp = bto_devices[_a];
+                bto_devices[_a]   = bto_devices[_b];
+                bto_devices[_b]   = _tmp;
+            }
+        }
+    }
     bto_ui_needs_update = true;
 
     if (n == 0 || !bto_active) {
@@ -18960,6 +19046,196 @@ static void gw_cancel_btn_cb(lv_event_t *e)
     }
 }
 
+/* ── GATT Probe: running screen + result screen ──────────────────── */
+
+static void gw_probe_result_back_cb(lv_event_t *e)
+{
+    (void)e;
+    if (g_probe_back == GW_PROBE_BACK_GATT_RESULT)
+        show_gw_result_screen();
+    else
+        show_bt_attack_tiles_screen();
+}
+
+static void gw_probe_poll_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!gw_probe_screen_active) return;
+
+    gw_state_t st = gw_get_state();
+
+    if (gw_probe_status_lbl && lv_obj_is_valid(gw_probe_status_lbl))
+        lv_label_set_text(gw_probe_status_lbl, (const char *)gw_ui_status);
+
+    if (st == GW_STATE_PROBE_DONE) {
+        if (gw_probe_timer) { lv_timer_del(gw_probe_timer); gw_probe_timer = NULL; }
+        gw_probe_screen_active = false;
+        gw_probe_free_stack();
+        show_gw_probe_result_screen();
+    } else if (st == GW_STATE_FAILED || st == GW_STATE_CANCELLED) {
+        if (gw_probe_timer) { lv_timer_del(gw_probe_timer); gw_probe_timer = NULL; }
+        gw_probe_screen_active = false;
+        gw_probe_result_back_cb(NULL);
+    }
+}
+
+static void show_gw_probe_running_screen(void)
+{
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+    create_function_page_base("CCCD Probe");
+    apply_menu_bg();
+
+    gw_probe_screen_active = true;
+
+    gw_probe_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(gw_probe_status_lbl, "Connecting...");
+    lv_obj_set_style_text_font(gw_probe_status_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(gw_probe_status_lbl, UI_ACCENT_CYAN, 0);
+    lv_obj_align(gw_probe_status_lbl, LV_ALIGN_CENTER, 0, -30);
+    lv_label_set_long_mode(gw_probe_status_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(gw_probe_status_lbl, lv_pct(90));
+    lv_obj_set_style_text_align(gw_probe_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *spinner = lv_spinner_create(function_page, 1000, 60);
+    lv_obj_set_size(spinner, 44, 44);
+    lv_obj_align(spinner, LV_ALIGN_CENTER, 0, 32);
+    lv_obj_set_style_arc_color(spinner, UI_ACCENT_CYAN, LV_PART_INDICATOR);
+
+    gw_probe_timer = lv_timer_create(gw_probe_poll_cb, 200, NULL);
+}
+
+static void show_gw_probe_result_screen(void)
+{
+    const gw_result_t *r = gw_get_result();
+
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+    create_function_page_base("Probe Results");
+    apply_menu_bg();
+
+    lv_obj_t *scrl = lv_obj_create(function_page);
+    lv_obj_set_size(scrl, lv_pct(100), LCD_V_RES - 30 - 44);
+    lv_obj_align(scrl, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_color(scrl, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(scrl, 0, 0);
+    lv_obj_set_style_pad_all(scrl, 6, 0);
+    lv_obj_set_style_pad_gap(scrl, 4, 0);
+    lv_obj_set_flex_flow(scrl, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scrollbar_mode(scrl, LV_SCROLLBAR_MODE_AUTO);
+
+#define PR_ROW(parent, txt, font, col) do { \
+    lv_obj_t *_l = lv_label_create(parent); \
+    lv_label_set_text(_l, txt); \
+    lv_obj_set_style_text_font(_l, font, 0); \
+    lv_obj_set_style_text_color(_l, col, 0); \
+    lv_label_set_long_mode(_l, LV_LABEL_LONG_WRAP); \
+    lv_obj_set_width(_l, lv_pct(100)); \
+} while(0)
+
+    if (!r) {
+        PR_ROW(scrl, "No probe result.", &lv_font_montserrat_14, COLOR_MATERIAL_RED);
+        goto pr_done;
+    }
+
+    {
+        char hdr[64], mac_str[18];
+        snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 r->mac[5], r->mac[4], r->mac[3], r->mac[2], r->mac[1], r->mac[0]);
+        snprintf(hdr, sizeof(hdr), "%s", mac_str);
+        PR_ROW(scrl, hdr, &lv_font_montserrat_12, ui_text_color());
+
+        int probed = 0, got_data = 0;
+        for (int si = 0; si < r->svc_count; si++) {
+            const gw_svc_t *svc = &r->svcs[si];
+            bool svc_shown = false;
+            for (int ci = 0; ci < svc->chr_count; ci++) {
+                const gw_chr_t *chr = &svc->chrs[ci];
+                if (!chr->probe_attempted) continue;
+                probed++;
+
+                if (!svc_shown) {
+                    lv_obj_t *sep = lv_obj_create(scrl);
+                    lv_obj_set_size(sep, lv_pct(100), 1);
+                    lv_obj_set_style_bg_color(sep, ui_border_color(), 0);
+                    lv_obj_set_style_border_width(sep, 0, 0);
+                    const char *sn = gatt_uuid_name(svc->uuid_str);
+                    char sr[80];
+                    if (sn) snprintf(sr, sizeof(sr), "%s  %s", svc->uuid_str, sn);
+                    else    snprintf(sr, sizeof(sr), "%s", svc->uuid_str);
+                    PR_ROW(scrl, sr, &lv_font_montserrat_12, UI_ACCENT_CYAN);
+                    svc_shown = true;
+                }
+
+                const char *cn = gatt_uuid_name(chr->uuid_str);
+                char cr[80];
+                if (cn) snprintf(cr, sizeof(cr), "  %s  %s", chr->uuid_str, cn);
+                else    snprintf(cr, sizeof(cr), "  %s", chr->uuid_str);
+                PR_ROW(scrl, cr, &lv_font_montserrat_12, ui_text_color());
+
+                if (chr->probe_cccd_ok) {
+                    if (chr->probe_frame_count > 0) {
+                        got_data++;
+                        char fr[48];
+                        snprintf(fr, sizeof(fr), "  Subscribed: %d frame(s)",
+                                 chr->probe_frame_count);
+                        PR_ROW(scrl, fr, &lv_font_montserrat_12, COLOR_MATERIAL_GREEN);
+                        for (int fi = 0; fi < chr->probe_frame_count; fi++) {
+                            char hex[80];
+                            int hp = snprintf(hex, sizeof(hex), "    [%d] ", fi + 1);
+                            for (int bi = 0; bi < chr->probe_frame_lens[fi] && bi < 16; bi++)
+                                hp += snprintf(hex + hp, sizeof(hex) - hp,
+                                               "%02X", chr->probe_frames[fi][bi]);
+                            if (chr->probe_frame_lens[fi] > 16)
+                                snprintf(hex + hp, sizeof(hex) - hp, "...");
+                            PR_ROW(scrl, hex, &lv_font_montserrat_12, lv_color_make(100, 210, 255));
+                            char asc[48] = "      ";
+                            int ap = 6;
+                            for (int bi = 0; bi < chr->probe_frame_lens[fi] && bi < 22; bi++) {
+                                uint8_t b = chr->probe_frames[fi][bi];
+                                asc[ap++] = (b >= 0x20 && b < 0x7F) ? (char)b : '.';
+                            }
+                            asc[ap] = '\0';
+                            PR_ROW(scrl, asc, &lv_font_montserrat_12, lv_color_make(160, 210, 160));
+                        }
+                    } else {
+                        PR_ROW(scrl, "  Subscribed: silent (no data in dwell window)",
+                               &lv_font_montserrat_12, lv_color_make(200, 200, 100));
+                    }
+                } else {
+                    PR_ROW(scrl, "  Subscribe failed (auth required?)",
+                           &lv_font_montserrat_12, lv_color_make(200, 140, 50));
+                }
+            }
+        }
+
+        if (probed == 0) {
+            PR_ROW(scrl, "No subscribable characteristics found.",
+                   &lv_font_montserrat_14, lv_color_make(200, 200, 100));
+        } else {
+            char sum[64];
+            snprintf(sum, sizeof(sum), "Summary: %d probed, %d with data", probed, got_data);
+            PR_ROW(scrl, sum, &lv_font_montserrat_12, ui_muted_color());
+        }
+    }
+
+pr_done:;
+    lv_obj_t *pr_back = lv_btn_create(function_page);
+    lv_obj_set_size(pr_back, 110, 32);
+    lv_obj_align(pr_back, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_bg_color(pr_back, lv_color_hex(0x7B1FA2), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(pr_back, lv_color_lighten(lv_color_hex(0x7B1FA2), 40), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(pr_back, 0, 0);
+    lv_obj_set_style_radius(pr_back, 8, 0);
+    lv_obj_t *pr_bl = lv_label_create(pr_back);
+    lv_label_set_text(pr_bl, LV_SYMBOL_LEFT "  Back");
+    lv_obj_set_style_text_font(pr_bl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(pr_bl, lv_color_white(), 0);
+    lv_obj_center(pr_bl);
+    lv_obj_add_event_cb(pr_back, gw_probe_result_back_cb, LV_EVENT_CLICKED, NULL);
+#undef PR_ROW
+}
+
 /* ── GATT Walker result detail screen ───────────────────────────── */
 
 static void gw_result_back_cb(lv_event_t *e)
@@ -18973,7 +19249,9 @@ static void gw_probe_btn_cb(lv_event_t *e)
     (void)e;
     gw_state_t st = gw_get_state();
     if (st != GW_STATE_COMPLETE && st != GW_STATE_PROBE_DONE) return;
-    gw_probe_start(3000);
+    g_probe_back = GW_PROBE_BACK_GATT_RESULT;
+    if (gw_probe_start(3000))
+        show_gw_probe_running_screen();
 }
 
 static void show_gw_result_screen(void)
@@ -19081,15 +19359,13 @@ static void show_gw_result_screen(void)
                 gw_chr_props_str(chr->properties, prop_buf, sizeof(prop_buf));
                 char prop_desc[96];
                 s_chr_props_desc(chr->properties, prop_desc, sizeof(prop_desc));
-                char prop_row[140];
-                snprintf(prop_row, sizeof(prop_row), "    Props: %s (%s)", prop_buf, prop_desc);
+                char prop_row[180];
+                if (chr->properties & (0x10 | 0x20))
+                    snprintf(prop_row, sizeof(prop_row), "    Props: %s (%s)  [~CCCD]",
+                             prop_buf, prop_desc);
+                else
+                    snprintf(prop_row, sizeof(prop_row), "    Props: %s (%s)", prop_buf, prop_desc);
                 GW_ROW(scrl, prop_row, &lv_font_montserrat_12, COLOR_MATERIAL_ORANGE);
-
-                /* Bell indicator for subscribable characteristics */
-                if (chr->properties & (0x10 | 0x20)) {
-                    GW_ROW(scrl, "    " LV_SYMBOL_AUDIO " Subscribable (CCCD)",
-                           &lv_font_montserrat_12, lv_color_make(100, 180, 255));
-                }
 
                 /* Read data + ASCII */
                 if (chr->read_ok && chr->read_len > 0) {
@@ -19202,8 +19478,7 @@ static void gw_update_screen_ui(void)
     gw_state_t st   = (gw_state_t)gw_ui_state;
 
     /* Auto-navigate to full detail screen on success or after probe */
-    if (st == GW_STATE_COMPLETE || st == GW_STATE_PROBE_DONE) {
-        if (st == GW_STATE_PROBE_DONE) gw_probe_free_stack();
+    if (st == GW_STATE_COMPLETE) {
         show_gw_result_screen();
         return;
     }
@@ -19226,8 +19501,7 @@ static void gw_update_screen_ui(void)
         lv_label_set_text(gw_chr_lbl, t);
     }
 
-    bool done = (st == GW_STATE_COMPLETE || st == GW_STATE_PROBE_DONE ||
-                 st == GW_STATE_FAILED    || st == GW_STATE_CANCELLED);
+    bool done = (st == GW_STATE_COMPLETE || st == GW_STATE_FAILED || st == GW_STATE_CANCELLED);
 
     /* Show/hide cancel vs back */
     if (gw_cancel_btn && lv_obj_is_valid(gw_cancel_btn)) {
