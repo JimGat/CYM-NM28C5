@@ -789,13 +789,21 @@ const gw_result_t *gw_get_result(void) { return s_result; }
 bool gw_walk(const uint8_t mac[6], uint8_t addr_type, const char *name,
              int8_t rssi, double lat, double lon, bool gps_valid)
 {
-    /* Allow restart from any terminal state */
+    /* Allow restart from any terminal state, or force-kill a stuck probe/walk */
     if (s_state == GW_STATE_COMPLETE  ||
         s_state == GW_STATE_PROBE_DONE ||
         s_state == GW_STATE_FAILED    ||
         s_state == GW_STATE_CANCELLED) {
         s_state     = GW_STATE_IDLE;
         gw_ui_state = GW_STATE_IDLE;
+    } else if (s_state == GW_STATE_PROBING) {
+        /* Probe is stuck (e.g. device went silent during MTU exchange) — force-kill it */
+        ESP_LOGW(TAG, "Killing stuck probe to start new walk");
+        if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE)
+            ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        s_state     = GW_STATE_IDLE;
+        gw_ui_state = GW_STATE_IDLE;
+        s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
     }
     if (s_state != GW_STATE_IDLE) {
         ESP_LOGW(TAG, "Walk already in progress (state=%d)", (int)s_state);
@@ -871,8 +879,10 @@ void gw_cancel(void)
 
     if (s_state == GW_STATE_CONNECTING) {
         ble_gap_conn_cancel();
+    } else if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        /* Force disconnect to unblock any hung GATT operation (e.g. MTU exchange timeout) */
+        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     }
-    /* Other states: cancel_req is checked at next callback entry */
 }
 
 /* ── Probe write callback ────────────────────────────────────────── */
