@@ -58,8 +58,8 @@ typedef struct {
     /* ── CCCD Subscription Probe results ── */
     bool             probe_attempted;
     bool             probe_cccd_ok;
-    uint8_t          probe_frames[4][32]; /* up to 4 notification frames, 32B each */
-    uint8_t          probe_frame_lens[4];
+    uint8_t          probe_frames[8][64]; /* up to 8 notification frames, 64B each */
+    uint8_t          probe_frame_lens[8];
     int              probe_frame_count;
 } gw_chr_t;
 
