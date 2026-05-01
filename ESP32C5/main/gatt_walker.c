@@ -34,6 +34,15 @@ static volatile bool      s_cancel_req  = false;
 static int s_cur_svc = 0;
 static int s_cur_chr = 0;
 
+/* ── Probe phase state ───────────────────────────────────────────── */
+static SemaphoreHandle_t  s_probe_conn_sem  = NULL;
+static SemaphoreHandle_t  s_probe_write_sem = NULL;
+static int                s_probe_conn_rc   = 0;
+static int                s_probe_write_rc  = 0;
+static volatile gw_chr_t *s_probe_cur_chr   = NULL;
+static StackType_t       *s_probe_stack     = NULL;
+static StaticTask_t       s_probe_tcb;
+
 /* ── State helpers ───────────────────────────────────────────────── */
 
 static void s_set_state(gw_state_t st)
@@ -176,6 +185,18 @@ static const char *s_uuid_name(const char *uuid_str)
         if (s_uuid_table[i].uuid16 == (uint16_t)u)
             return s_uuid_table[i].name;
     return NULL;
+}
+
+/* Find CCCD handle (0x2902) in a characteristic's descriptor list. Returns 0 if absent. */
+static uint16_t s_find_cccd(const gw_chr_t *chr)
+{
+    for (int i = 0; i < chr->desc_count; i++) {
+        const char *u = chr->descs[i].uuid_str;
+        unsigned v = 0;
+        if (strncmp(u, "0x", 2) == 0) sscanf(u + 2, "%x", &v);
+        if (v == 0x2902) return chr->descs[i].handle;
+    }
+    return 0;
 }
 
 /* ── JSON builder ────────────────────────────────────────────────── */
@@ -346,6 +367,29 @@ static bool s_write_json(void)
                     jb_raw(&j, " }");
                 }
                 jb_rawc(&j, ']');
+            }
+            if (chr->probe_attempted) {
+                jb_comma(&j); jb_raw(&j, "    ");
+                jb_key(&j, "probe"); jb_raw(&j, "{\n      ");
+                jb_bool(&j, "cccd_written", chr->probe_cccd_ok);
+                jb_comma(&j); jb_raw(&j, "      ");
+                jb_int(&j, "notify_count", chr->probe_frame_count);
+                if (chr->probe_frame_count > 0) {
+                    jb_comma(&j); jb_raw(&j, "      ");
+                    jb_key(&j, "notify_data"); jb_raw(&j, "[");
+                    for (int fi = 0; fi < chr->probe_frame_count; fi++) {
+                        if (fi > 0) jb_raw(&j, ", ");
+                        jb_rawc(&j, '"');
+                        for (int bi = 0; bi < chr->probe_frame_lens[fi]; bi++) {
+                            char hx[3];
+                            snprintf(hx, sizeof(hx), "%02X", chr->probe_frames[fi][bi]);
+                            jb_raw(&j, hx);
+                        }
+                        jb_rawc(&j, '"');
+                    }
+                    jb_rawc(&j, ']');
+                }
+                jb_raw(&j, "\n    }");
             }
             jb_raw(&j, "\n    }");
         }
@@ -644,6 +688,13 @@ static int s_gap_cb(struct ble_gap_event *event, void *arg)
 {
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
+        if (s_state == GW_STATE_PROBING) {
+            s_probe_conn_rc = event->connect.status;
+            if (event->connect.status == 0)
+                s_conn_handle = event->connect.conn_handle;
+            xSemaphoreGive(s_probe_conn_sem);
+            return 0;
+        }
         if (event->connect.status != 0) {
             char msg[96];
             snprintf(msg, sizeof(msg), "Connect failed (%d)\n%s",
@@ -661,6 +712,12 @@ static int s_gap_cb(struct ble_gap_event *event, void *arg)
         return 0;
 
     case BLE_GAP_EVENT_DISCONNECT:
+        if (s_state == GW_STATE_PROBING) {
+            s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+            /* Unblock probe task if waiting on write semaphore */
+            xSemaphoreGive(s_probe_write_sem);
+            return 0;
+        }
         ESP_LOGI(TAG, "Disconnected reason=%d state=%d",
                  event->disconnect.reason, (int)s_state);
         if (s_state != GW_STATE_COMPLETE &&
@@ -672,6 +729,20 @@ static int s_gap_cb(struct ble_gap_event *event, void *arg)
                 s_fail("Disconnected unexpectedly");
         }
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        return 0;
+
+    case BLE_GAP_EVENT_NOTIFY_RX:
+        if (s_state == GW_STATE_PROBING && s_probe_cur_chr) {
+            gw_chr_t *chr = (gw_chr_t *)s_probe_cur_chr;
+            if (chr->probe_frame_count < 4) {
+                int fi = chr->probe_frame_count;
+                uint16_t len = OS_MBUF_PKTLEN(event->notify_rx.om);
+                if (len > 32) len = 32;
+                os_mbuf_copydata(event->notify_rx.om, 0, len, chr->probe_frames[fi]);
+                chr->probe_frame_lens[fi] = (uint8_t)len;
+                chr->probe_frame_count++;
+            }
+        }
         return 0;
 
     default:
@@ -699,6 +770,8 @@ static void s_make_timestamp(char *out, size_t len)
 void gw_init(SemaphoreHandle_t sd_mutex)
 {
     s_sd_mutex = sd_mutex;
+    if (!s_probe_conn_sem)  s_probe_conn_sem  = xSemaphoreCreateBinary();
+    if (!s_probe_write_sem) s_probe_write_sem = xSemaphoreCreateBinary();
     ESP_LOGI(TAG, "Initialised (sd_mutex=%s)", sd_mutex ? "yes" : "no");
 }
 
@@ -714,8 +787,9 @@ bool gw_walk(const uint8_t mac[6], uint8_t addr_type, const char *name,
              int8_t rssi, double lat, double lon, bool gps_valid)
 {
     /* Allow restart from any terminal state */
-    if (s_state == GW_STATE_COMPLETE ||
-        s_state == GW_STATE_FAILED   ||
+    if (s_state == GW_STATE_COMPLETE  ||
+        s_state == GW_STATE_PROBE_DONE ||
+        s_state == GW_STATE_FAILED    ||
         s_state == GW_STATE_CANCELLED) {
         s_state     = GW_STATE_IDLE;
         gw_ui_state = GW_STATE_IDLE;
@@ -796,6 +870,151 @@ void gw_cancel(void)
         ble_gap_conn_cancel();
     }
     /* Other states: cancel_req is checked at next callback entry */
+}
+
+/* ── Probe write callback ────────────────────────────────────────── */
+
+static int s_probe_write_cb(uint16_t ch, const struct ble_gatt_error *err,
+                             struct ble_gatt_attr *attr, void *arg)
+{
+    (void)ch; (void)attr; (void)arg;
+    s_probe_write_rc = err->status;
+    xSemaphoreGive(s_probe_write_sem);
+    return 0;
+}
+
+/* ── Probe task ──────────────────────────────────────────────────── */
+
+static void s_probe_task(void *arg)
+{
+    uint32_t dwell_ms = (uint32_t)(uintptr_t)arg;
+    s_notify_ui("Probe: reconnecting...");
+
+    ble_att_set_preferred_mtu(512);
+    ble_addr_t peer = { .type = s_result->addr_type };
+    memcpy(peer.val, s_result->mac, 6);
+
+    int rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &peer, 10000, NULL, s_gap_cb, NULL);
+    if (rc != 0) {
+        s_notify_ui("Probe: connect init failed");
+        goto probe_done;
+    }
+
+    /* Wait for connection result */
+    if (xSemaphoreTake(s_probe_conn_sem, pdMS_TO_TICKS(12000)) != pdTRUE
+        || s_probe_conn_rc != 0) {
+        s_notify_ui("Probe: connect failed");
+        goto probe_done;
+    }
+
+    s_notify_ui("Probe: connected, subscribing...");
+
+    for (int si = 0; si < s_result->svc_count; si++) {
+        gw_svc_t *svc = &s_result->svcs[si];
+        for (int ci = 0; ci < svc->chr_count; ci++) {
+            if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) goto disconnected;
+
+            gw_chr_t *chr = &svc->chrs[ci];
+            if (!(chr->properties & (0x10 | 0x20))) continue; /* not N or I */
+
+            uint16_t cccd = s_find_cccd(chr);
+            if (!cccd) continue;
+
+            chr->probe_attempted = true;
+
+            char msg[64];
+            snprintf(msg, sizeof(msg), "Probe: %.20s", chr->uuid_str);
+            s_notify_ui(msg);
+
+            /* Write CCCD enable — 0x0001 for Notify, 0x0002 for Indicate */
+            uint16_t enable = (chr->properties & 0x10) ? 0x0001 : 0x0002;
+            s_probe_cur_chr = chr;
+            xSemaphoreTake(s_probe_write_sem, 0); /* drain */
+            rc = ble_gattc_write_flat(s_conn_handle, cccd,
+                                       &enable, sizeof(enable), s_probe_write_cb, NULL);
+            if (rc == 0) {
+                xSemaphoreTake(s_probe_write_sem, pdMS_TO_TICKS(2000));
+                if (s_probe_write_rc == 0) {
+                    chr->probe_cccd_ok = true;
+                    vTaskDelay(pdMS_TO_TICKS(dwell_ms)); /* collect frames */
+                }
+            }
+
+            /* Unsubscribe */
+            s_probe_cur_chr = NULL;
+            uint16_t disable = 0x0000;
+            if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+                xSemaphoreTake(s_probe_write_sem, 0);
+                ble_gattc_write_flat(s_conn_handle, cccd,
+                                     &disable, sizeof(disable), s_probe_write_cb, NULL);
+                xSemaphoreTake(s_probe_write_sem, pdMS_TO_TICKS(1000));
+            }
+        }
+    }
+
+disconnected:
+    s_probe_cur_chr = NULL;
+    s_disconnect();
+
+probe_done:
+    s_result->probe_done = true;
+    s_write_json();           /* re-save with probe data */
+    s_set_state(GW_STATE_PROBE_DONE);
+    s_notify_ui("Probe complete");
+    s_fire_event(GW_EVENT_PROBE_DONE);
+    vTaskDelete(NULL);
+}
+
+/* ── Public probe API ────────────────────────────────────────────── */
+
+bool gw_probe_start(uint32_t dwell_ms)
+{
+    if (!s_result || !s_probe_conn_sem || !s_probe_write_sem) return false;
+    gw_state_t st = gw_get_state();
+    if (st != GW_STATE_COMPLETE && st != GW_STATE_PROBE_DONE) return false;
+
+    /* Reset probe fields on every chr so a re-probe starts fresh */
+    for (int si = 0; si < s_result->svc_count; si++) {
+        gw_svc_t *svc = &s_result->svcs[si];
+        for (int ci = 0; ci < svc->chr_count; ci++) {
+            gw_chr_t *chr = &svc->chrs[ci];
+            chr->probe_attempted   = false;
+            chr->probe_cccd_ok     = false;
+            chr->probe_frame_count = 0;
+            memset(chr->probe_frame_lens, 0, sizeof(chr->probe_frame_lens));
+        }
+    }
+    s_result->probe_done = false;
+
+    if (s_probe_stack) {
+        heap_caps_free(s_probe_stack);
+        s_probe_stack = NULL;
+    }
+
+    s_probe_stack = heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    if (!s_probe_stack) return false;
+
+    s_set_state(GW_STATE_PROBING);
+    s_fire_event(GW_EVENT_PROBE_STARTED);
+
+    TaskHandle_t h = xTaskCreateStatic(s_probe_task, "gw_probe", 4096,
+                                        (void *)(uintptr_t)dwell_ms, 5,
+                                        s_probe_stack, &s_probe_tcb);
+    if (!h) {
+        heap_caps_free(s_probe_stack);
+        s_probe_stack = NULL;
+        s_set_state(GW_STATE_COMPLETE);
+        return false;
+    }
+    return true;
+}
+
+void gw_probe_free_stack(void)
+{
+    if (s_probe_stack) {
+        heap_caps_free(s_probe_stack);
+        s_probe_stack = NULL;
+    }
 }
 
 char *gw_chr_props_str(uint8_t p, char *buf, size_t bufsz)
