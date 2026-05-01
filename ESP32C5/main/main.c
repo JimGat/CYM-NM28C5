@@ -1149,8 +1149,10 @@ static lv_timer_t *bt_lookout_popup_tmr        = NULL;
 static TaskHandle_t bt_lookout_scan_loop_handle = NULL;
 
 // ── GATT Probe back-navigation target ────────────────────────────
-typedef enum { GW_PROBE_BACK_GATT_RESULT = 0, GW_PROBE_BACK_ATTACK_TILES } gw_probe_back_t;
+typedef enum { GW_PROBE_BACK_GATT_RESULT = 0, GW_PROBE_BACK_ATTACK_TILES, GW_PROBE_BACK_BTO_DETAIL } gw_probe_back_t;
 static gw_probe_back_t  g_probe_back           = GW_PROBE_BACK_GATT_RESULT;
+static int              g_probe_back_dev_idx   = -1;  /* device index when back target is BTO detail */
+static int              g_bto_rewalk_dev_idx   = -1;  /* ≥0 while re-walking a device before probe */
 static volatile bool    gw_probe_screen_active  = false;
 static lv_obj_t        *gw_probe_status_lbl     = NULL;
 static lv_timer_t      *gw_probe_timer          = NULL;
@@ -1527,6 +1529,9 @@ static void bt_sas_refresh_list(void);
 static void show_bt_observer_screen(void);
 static void bt_observer_task(void *pvParameters);
 static void show_bto_device_detail(int dev_idx);
+static void bto_restore_screen(void);
+static void bto_stop_cb(lv_event_t *e);
+static void bto_rebuild_list(void);
 
 // Data Transfer screens
 static void show_data_transfer_screen(void);
@@ -18310,15 +18315,20 @@ static void s_chr_props_desc(uint8_t p, char *buf, size_t bufsz)
 static void bto_detail_back_cb(lv_event_t *e)
 {
     (void)e;
-    show_bluetooth_screen();
+    bto_restore_screen();
 }
 
 static void bto_probe_btn_cb(lv_event_t *e)
 {
-    (void)e;
+    int dev_idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (dev_idx < 0 || dev_idx >= bto_device_count) return;
+
+    g_probe_back         = GW_PROBE_BACK_BTO_DETAIL;
+    g_probe_back_dev_idx = dev_idx;
+    g_bto_rewalk_dev_idx = -1;
+
     gw_state_t st = gw_get_state();
     if (st != GW_STATE_COMPLETE && st != GW_STATE_PROBE_DONE) return;
-    g_probe_back = GW_PROBE_BACK_ATTACK_TILES;
     if (gw_probe_start(3000))
         show_gw_probe_running_screen();
 }
@@ -18434,8 +18444,11 @@ static void show_bto_device_detail(int dev_idx)
             gw_chr_props_str((uint8_t)props, prop_buf, sizeof(prop_buf));
             char prop_desc[96];
             s_chr_props_desc((uint8_t)props, prop_desc, sizeof(prop_desc));
-            char row[140];
-            snprintf(row, sizeof(row), "  Props: %s (%s)", prop_buf, prop_desc);
+            char row[180];
+            if (props & (0x10 | 0x20))
+                snprintf(row, sizeof(row), "  Props: %s (%s)  [~CCCD]", prop_buf, prop_desc);
+            else
+                snprintf(row, sizeof(row), "  Props: %s (%s)", prop_buf, prop_desc);
             DET_ROW(scrl, row, &lv_font_montserrat_12, COLOR_MATERIAL_ORANGE);
             in_chr = true;
         }
@@ -18504,7 +18517,8 @@ done:;
         lv_obj_set_style_text_color(det_probe_lbl, lv_color_white(), 0);
         lv_obj_center(det_probe_lbl);
         if (can_probe)
-            lv_obj_add_event_cb(det_probe_btn, bto_probe_btn_cb, LV_EVENT_CLICKED, NULL);
+            lv_obj_add_event_cb(det_probe_btn, bto_probe_btn_cb, LV_EVENT_CLICKED,
+                                (void *)(intptr_t)dev_idx);
 
         /* Back button */
         lv_obj_t *back_btn = lv_btn_create(function_page);
@@ -18523,6 +18537,54 @@ done:;
     }
 }
 #undef DET_ROW
+
+/* Restore BT Observer list UI without resetting state or re-scanning */
+static void bto_restore_screen(void)
+{
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+
+    create_function_page_base("BT Observer");
+
+    bto_status_lbl = lv_label_create(function_page);
+    char sbuf[64];
+    switch (bto_state) {
+        case BTO_STATE_DONE:    snprintf(sbuf, sizeof(sbuf), "Done — %d device(s) enumerated", bto_device_count); break;
+        case BTO_STATE_STOPPED: snprintf(sbuf, sizeof(sbuf), "Stopped"); break;
+        default:                snprintf(sbuf, sizeof(sbuf), "%d device(s)", bto_device_count); break;
+    }
+    lv_label_set_text(bto_status_lbl, sbuf);
+    lv_obj_set_style_text_color(bto_status_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(bto_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_align(bto_status_lbl, LV_ALIGN_TOP_LEFT, 5, 35);
+
+    bto_list = lv_obj_create(function_page);
+    lv_obj_set_size(bto_list, lv_pct(100), LCD_V_RES - 30 - 18 - 44);
+    lv_obj_align(bto_list, LV_ALIGN_TOP_MID, 0, 52);
+    lv_obj_set_style_bg_color(bto_list, ui_bg_color(), 0);
+    lv_obj_set_style_border_color(bto_list, lv_color_hex(0x7B1FA2), 0);
+    lv_obj_set_style_border_width(bto_list, 1, 0);
+    lv_obj_set_flex_flow(bto_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(bto_list, 3, 0);
+    lv_obj_set_style_pad_gap(bto_list, 3, 0);
+    lv_obj_set_scrollbar_mode(bto_list, LV_SCROLLBAR_MODE_AUTO);
+
+    lv_obj_t *exit_btn = lv_btn_create(function_page);
+    lv_obj_set_size(exit_btn, 110, 32);
+    lv_obj_align(exit_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_bg_color(exit_btn, lv_color_hex(0x7B1FA2), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(exit_btn, lv_color_lighten(lv_color_hex(0x7B1FA2), 40), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(exit_btn, 0, 0);
+    lv_obj_set_style_radius(exit_btn, 8, 0);
+    lv_obj_t *exit_lbl = lv_label_create(exit_btn);
+    lv_label_set_text(exit_lbl, LV_SYMBOL_LEFT "  Back");
+    lv_obj_set_style_text_font(exit_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(exit_lbl, lv_color_white(), 0);
+    lv_obj_center(exit_lbl);
+    lv_obj_add_event_cb(exit_btn, bto_stop_cb, LV_EVENT_CLICKED, NULL);
+
+    bto_rebuild_list();
+}
 
 static void bto_spinner_destroy(void)
 {
@@ -19053,6 +19115,8 @@ static void gw_probe_result_back_cb(lv_event_t *e)
     (void)e;
     if (g_probe_back == GW_PROBE_BACK_GATT_RESULT)
         show_gw_result_screen();
+    else if (g_probe_back == GW_PROBE_BACK_BTO_DETAIL && g_probe_back_dev_idx >= 0)
+        show_bto_device_detail(g_probe_back_dev_idx);
     else
         show_bt_attack_tiles_screen();
 }

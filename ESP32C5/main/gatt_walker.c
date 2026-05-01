@@ -196,6 +196,9 @@ static uint16_t s_find_cccd(const gw_chr_t *chr)
         if (strncmp(u, "0x", 2) == 0) sscanf(u + 2, "%x", &v);
         if (v == 0x2902) return chr->descs[i].handle;
     }
+    /* CCCD not in descriptor table — fall back to val_handle+1 (BLE spec standard placement) */
+    if (chr->val_handle > 0)
+        return chr->val_handle + 1;
     return 0;
 }
 
