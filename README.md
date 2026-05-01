@@ -425,6 +425,31 @@ Tap **Exit** at any time to stop tracking and return to the main menu. The radio
 
 **GATT Walker** connects to a selected BLE device and performs a full GATT inspection — enumerating every service, characteristic, and descriptor, reading all readable attribute values, and saving the result as a structured JSON file on the SD card.
 
+**Why GATT walk a device?**
+
+Reading a device name is just the surface. A full GATT walk is one of the richest passive fingerprinting and intelligence-gathering techniques in the BLE space.
+
+**Rolling MAC defeat.** Modern BLE devices randomize their advertising MAC every 7–15 minutes (iOS, Android, and Windows all do this). The GATT service/characteristic layout does not rotate — it is fixed per device model and firmware version. The FNV-32 fingerprint computed over the ordered set of service and characteristic UUIDs creates a stable device signature that survives MAC rotation entirely. Two captures with different MACs but matching fingerprints are almost certainly the same physical device. Combined with `System ID (0x2A23)` — which is derived from the Bluetooth address and does not rotate — and `Serial Number (0x2A25)`, you get a tracking signature more robust than the advertising MAC.
+
+**Gratuitous information leakage.** Many devices expose the Device Information Service (0x180A) completely unauthenticated:
+
+| Characteristic | UUID | What leaks |
+|---|---|---|
+| Manufacturer Name | 0x2A29 | Brand + sometimes ODM source |
+| Model Number | 0x2A24 | Exact device model |
+| Serial Number | 0x2A25 | Unit-level identifier — unique per device |
+| Firmware Revision | 0x2A26 | Exact build — maps to known CVEs |
+| System ID | 0x2A23 | Derived from BT address — stable across MAC rotation |
+| PnP ID | 0x2A50 | Bluetooth SIG vendor + product ID |
+
+**Vendor-specific services (0xFF00+)** are where IoT devices hide configuration registers, telemetry, WiFi SSIDs (and on some early/cheap devices, plaintext WiFi passwords), OTA firmware update channels, and debug/diagnostic services left enabled in production firmware. Descriptor labels (`0x2901`) are written by vendors for internal tooling and frequently left in production — strings like `"factory_reset_trigger"` or `"debug_uart_passthrough"` appear in the clear.
+
+**Commercial tracking infrastructure.** Google Fast Pair (`0xFE2C`), Microsoft Swift Pair, Tile, and AirTag-style trackers all have fixed GATT service layouts regardless of rotating MACs. The service layout alone identifies which tracking network a device belongs to and often reveals the device model.
+
+**Security posture assessment.** A GATT walk immediately reveals which characteristics require authentication or encryption versus which are open. A writable control characteristic that requires no pairing is a weak security model regardless of what it controls — useful for auditing devices before deployment.
+
+**Subscription data layer.** A static GATT read only captures what the device holds at that moment. Characteristics with **N (Notify)** or **I (Indicate)** properties only push data to subscribed clients — heart rate sensors, glucose monitors, environmental sensors, and wearables stream live telemetry only after a client writes `0x0001` to the associated CCCD descriptor (`0x2902`). This is the layer a passive walk alone never sees.
+
 **Workflow:**
 
 1. Open **BT Scan & Select**, let the scan run, tap a device to select it.
@@ -555,6 +580,54 @@ Attributes longer than one MTU are read automatically in multiple chunks (`ATT_R
 | Scan pass | Continuous (relies on existing scan) | Single 10 s burst, no re-scan |
 
 **Per-device JSON files** are saved using the same `/sdcard/gattwalker/` path and enriched format as single walks (manufacturer, service/chr names, props_str, ascii).
+
+---
+
+#### GATT Walker — Next Step: CCCD Subscription Probe *(planned)*
+
+The current GATT Walker captures the static snapshot — every readable attribute value at the moment of connection. The next layer is **subscription probing**: after the initial walk completes, identify every characteristic with **N (Notify)** or **I (Indicate)** in its property flags, write `0x0001` to its CCCD descriptor (`0x2902`), and collect whatever the device pushes back. This is the live telemetry layer that a read-only walk never touches.
+
+**Proposed UI behaviour:**
+
+- In the GATT detail view, characteristics with a subscribable CCCD show a **bell icon** (🔔) next to their property flags row — tapping it launches the Extended Probe for that single characteristic
+- A **"Extended Probe"** button at the bottom of the result screen runs all subscribable characteristics in sequence automatically, with a configurable dwell time per characteristic (e.g. 3 s listen window)
+- Writable characteristics (`W` / `WNR` flags) show a **write indicator** — tapping opens a hex input and sends a single probed write, returning the characteristic value immediately after (for `W`, the acknowledged response; for `WNR`, a re-read)
+
+**Safe probe rules (destructive-write avoidance):**
+
+The probe only writes to CCCD descriptors and reads back notify/indicate data — it never writes to value handles directly unless the user explicitly taps the write indicator. Before showing the write indicator, the firmware checks:
+1. Characteristic User Description (`0x2901`) — if present, the label is shown and any descriptor containing `reset`, `erase`, `factory`, `clear`, or `update` suppresses the write indicator entirely (shown greyed-out with a warning icon instead)
+2. CCCD enables only — `0x0001` (Notify) or `0x0002` (Indicate); never combined writes
+
+**JSON enrichment:**
+
+The subscription data is written back into the existing JSON file for that device (matched by MAC + timestamp) as a new `"probe"` key on each characteristic that returned notification data:
+
+```json
+{
+  "uuid": "0x2A37",
+  "name": "Heart Rate Measurement",
+  "props_str": "N",
+  "read_data": "",
+  "probe": {
+    "cccd_written": true,
+    "notify_count": 4,
+    "notify_data": [
+      "0x004C",
+      "0x004F",
+      "0x0051",
+      "0x004E"
+    ],
+    "dwell_ms": 3000
+  }
+}
+```
+
+This keeps all data from a device in a single enriched file — the initial static snapshot plus the live subscription layer — indexed by the same FNV-32 fingerprint for cross-session correlation.
+
+**Handle gap scan *(stretch goal)*:** After the named service walk, probe attribute handles in the gaps between declared service ranges. Some devices hide characteristics from service discovery but still respond to direct handle reads. Any responding handles are appended to the JSON under `"hidden_handles"`.
+
+---
 
 #### Bluetooth Lookout — How It Works
 
