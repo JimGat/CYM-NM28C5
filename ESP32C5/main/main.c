@@ -18499,15 +18499,15 @@ done:;
                          (gw_st == GW_STATE_COMPLETE || gw_st == GW_STATE_PROBE_DONE) &&
                          (memcmp(gw_r->mac, d->addr, 6) == 0);
 
-        /* Ext. Probe button (amber if available, grey if not) */
+        /* Ext. Probe button (red if available, grey if not) */
         lv_obj_t *det_probe_btn = lv_btn_create(function_page);
         lv_obj_set_size(det_probe_btn, 108, 32);
         lv_obj_align(det_probe_btn, LV_ALIGN_BOTTOM_MID, -62, -6);
         lv_obj_set_style_bg_color(det_probe_btn,
-            can_probe ? lv_color_hex(0xF57C00) : lv_color_make(70, 70, 70),
+            can_probe ? lv_color_hex(0xC62828) : lv_color_make(70, 70, 70),
             LV_STATE_DEFAULT);
         lv_obj_set_style_bg_color(det_probe_btn,
-            can_probe ? lv_color_lighten(lv_color_hex(0xF57C00), 40) : lv_color_make(70, 70, 70),
+            can_probe ? lv_color_lighten(lv_color_hex(0xC62828), 40) : lv_color_make(70, 70, 70),
             LV_STATE_PRESSED);
         lv_obj_set_style_border_width(det_probe_btn, 0, 0);
         lv_obj_set_style_radius(det_probe_btn, 8, 0);
@@ -19527,8 +19527,8 @@ gw_res_done:;
     lv_obj_t *probe_btn = lv_btn_create(function_page);
     lv_obj_set_size(probe_btn, 108, 32);
     lv_obj_align(probe_btn, LV_ALIGN_BOTTOM_MID, -62, -6);
-    lv_obj_set_style_bg_color(probe_btn, lv_color_hex(0xF57C00), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(probe_btn, lv_color_lighten(lv_color_hex(0xF57C00), 40), LV_STATE_PRESSED);
+    lv_obj_set_style_bg_color(probe_btn, lv_color_hex(0xC62828), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(probe_btn, lv_color_lighten(lv_color_hex(0xC62828), 40), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(probe_btn, 0, 0);
     lv_obj_set_style_radius(probe_btn, 8, 0);
     lv_obj_t *probe_lbl = lv_label_create(probe_btn);
