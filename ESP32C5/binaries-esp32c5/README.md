@@ -1,10 +1,45 @@
 # CYM-NM28C5 Pre-built Firmware Binaries
 
-**Firmware version: v0.9.5**
+**Firmware version: v1.0.1**
 
 This folder contains the latest compiled firmware for the **NM-CYD-C5 (ESP32-C5)** board.
 
 > **Note:** The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/nm-cyd-c5/). Additional purchase sources and full hardware documentation are available on the [official board repository](https://github.com/RockBase-iot/NM-CYD-C5).
+
+---
+
+## Release Notes — v1.0.1
+
+### BLE Attacks — General Device Spoof with spooflist.csv (new)
+
+A **Device Spoof** tile has been added to the general **BT Attacks** menu (alongside BLE Spam), allowing device spoofing without requiring a prior BT Scan & Select session.
+
+**Flow:** BT Attacks → Device Spoof → authorization warning → selection screen → pick or add device → START → attack.
+
+- Loads `/sdcard/lab/bluetooth/spooflist.csv` on entry. CSV format: `XX:XX:XX:XX:XX:XX,Device Name` one entry per line.
+- Scrollable list with tap-to-select (selected row highlights blue).
+- **+ Add** button opens a full entry screen with MAC and name text areas and an on-screen uppercase keyboard — saves the new entry to `spooflist.csv` immediately.
+- **START** — only active when an entry is selected — routes through the standard authorization warning popup, then launches the existing directed spoof task.
+- Back from the attack returns to the spoof selection screen.
+- File is created automatically (directory already provisioned by SD Provision).
+
+### BLE Attacks — Directed Attack Menu Structure
+
+The BT Attacks structure is now split into two tiers:
+
+**General BT Attacks** (Bluetooth → BT Attacks):
+- BLE Spam — broadcast advertising flood (Apple / Samsung / Google / Windows / All)
+- Device Spoof — select from `spooflist.csv` or add new device
+
+**Directed BT Attacks** (BT Scan & Select → Actions → BT Attacks):
+- Device Spoof — uses the pre-selected BT Scan & Select device; no additional selection step
+- BLE Disconnect — floods the pre-selected target with TERMINATE_IND frames
+
+Both BT Attacks tiles are amber/yellow. All attacks require the authorization warning popup before proceeding.
+
+### Bug Fix — BLE Spam / Spoof Back Without Start (crash)
+
+Fixed a load-access-fault crash that occurred when pressing Back on the BLE Spam or Device Spoof screens without ever pressing START. `ble_gap_adv_stop()` was being called unconditionally even when the BLE stack had never been initialized. The call is now guarded by `current_radio_mode == RADIO_MODE_BLE`.
 
 ---
 
