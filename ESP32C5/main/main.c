@@ -1156,6 +1156,7 @@ static int              g_bto_rewalk_dev_idx   = -1;  /* ≥0 while re-walking a
 static volatile bool    gw_probe_screen_active  = false;
 static lv_obj_t        *gw_probe_status_lbl     = NULL;
 static lv_timer_t      *gw_probe_timer          = NULL;
+static lv_timer_t      *g_bto_prepwalk_timer    = NULL; /* polls walk completion before auto-probe */
 
 // ── GATT Walker UI state ─────────────────────────────────────────
 static bool       gw_screen_active   = false;
@@ -1544,9 +1545,11 @@ static void show_gatt_walker_screen(void);
 static void gw_update_screen_ui(void);
 static void gw_deferred_start_cb(lv_timer_t *t);
 static void gw_probe_btn_cb(lv_event_t *e);
+static void gw_probe_result_back_cb(lv_event_t *e);
 static void show_gw_probe_running_screen(void);
 static void show_gw_probe_result_screen(void);
 static void bto_probe_btn_cb(lv_event_t *e);
+static void bto_prepwalk_poll_cb(lv_timer_t *t);
 static void show_gw_result_screen(void);
 
 // BT Attacks
@@ -18318,19 +18321,59 @@ static void bto_detail_back_cb(lv_event_t *e)
     bto_restore_screen();
 }
 
+/* Polls walk completion when a pre-walk is needed before probing a BTO device */
+static void bto_prepwalk_poll_cb(lv_timer_t *t)
+{
+    gw_state_t st = gw_get_state();
+    if (st == GW_STATE_COMPLETE) {
+        lv_timer_del(t);
+        g_bto_prepwalk_timer = NULL;
+        if (!gw_probe_start(8000)) {
+            /* probe failed to start — go back to detail */
+            gw_probe_result_back_cb(NULL);
+        }
+        /* On success: gw_probe_poll_cb takes over and drives to result screen */
+    } else if (st == GW_STATE_FAILED || st == GW_STATE_CANCELLED || st == GW_STATE_IDLE) {
+        lv_timer_del(t);
+        g_bto_prepwalk_timer = NULL;
+        gw_probe_result_back_cb(NULL);
+    }
+}
+
 static void bto_probe_btn_cb(lv_event_t *e)
 {
     int dev_idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (dev_idx < 0 || dev_idx >= bto_device_count) return;
 
+    bto_device_t *d = &bto_devices[dev_idx];
     g_probe_back         = GW_PROBE_BACK_BTO_DETAIL;
     g_probe_back_dev_idx = dev_idx;
     g_bto_rewalk_dev_idx = -1;
 
+    const gw_result_t *gw_r = gw_get_result();
     gw_state_t st = gw_get_state();
-    if (st != GW_STATE_COMPLETE && st != GW_STATE_PROBE_DONE) return;
-    if (gw_probe_start(8000))
-        show_gw_probe_running_screen();
+    bool mac_match = gw_r && (memcmp(gw_r->mac, d->addr, 6) == 0);
+    bool ready = mac_match && (st == GW_STATE_COMPLETE || st == GW_STATE_PROBE_DONE);
+
+    show_gw_probe_running_screen();
+
+    if (ready) {
+        /* Last walk was this device — probe immediately */
+        if (!gw_probe_start(8000))
+            gw_probe_result_back_cb(NULL);
+    } else {
+        /* Different device — re-walk to get fresh handles, then auto-probe */
+        if (gw_probe_status_lbl && lv_obj_is_valid(gw_probe_status_lbl))
+            lv_label_set_text(gw_probe_status_lbl, "Preparing...");
+        double lat = current_gps.valid ? (double)current_gps.latitude  : 0.0;
+        double lon = current_gps.valid ? (double)current_gps.longitude : 0.0;
+        if (!gw_walk(d->addr, d->addr_type, d->name[0] ? d->name : "Unknown",
+                     d->rssi, lat, lon, current_gps.valid)) {
+            gw_probe_result_back_cb(NULL);
+            return;
+        }
+        g_bto_prepwalk_timer = lv_timer_create(bto_prepwalk_poll_cb, 200, NULL);
+    }
 }
 
 static void show_bto_device_detail(int dev_idx)
@@ -18493,11 +18536,7 @@ static void show_bto_device_detail(int dev_idx)
 done:;
     /* Check if probe is available for this device */
     {
-        const gw_result_t *gw_r = gw_get_result();
-        gw_state_t gw_st = gw_get_state();
-        bool can_probe = (gw_r != NULL) &&
-                         (gw_st == GW_STATE_COMPLETE || gw_st == GW_STATE_PROBE_DONE) &&
-                         (memcmp(gw_r->mac, d->addr, 6) == 0);
+        bool can_probe = d->walk_ok; /* any successfully walked device can be probed */
 
         /* Ext. Probe button (red if available, grey if not) */
         lv_obj_t *det_probe_btn = lv_btn_create(function_page);
@@ -19130,6 +19169,12 @@ static void gw_cancel_btn_cb(lv_event_t *e)
 static void gw_probe_result_back_cb(lv_event_t *e)
 {
     (void)e;
+    /* Cancel any pending pre-walk-then-probe sequence */
+    if (g_bto_prepwalk_timer) {
+        lv_timer_del(g_bto_prepwalk_timer);
+        g_bto_prepwalk_timer = NULL;
+        gw_cancel();
+    }
     if (g_probe_back == GW_PROBE_BACK_GATT_RESULT)
         show_gw_result_screen();
     else if (g_probe_back == GW_PROBE_BACK_BTO_DETAIL && g_probe_back_dev_idx >= 0)

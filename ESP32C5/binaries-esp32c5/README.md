@@ -181,7 +181,7 @@ A new tile in the Bluetooth menu that automates the scan-then-walk workflow:
 1. Runs a single 10-second active BLE scan, collecting all advertising devices
 2. Attempts a sequential GATT walk on every discovered device (5 s connect timeout per device)
 3. Results appear in a live scrollable list — green with svc/chr counts on success, red on failure
-4. Tap any successful row to open the full GATT detail view
+4. Tap any successful row **after the scan completes** to open the full GATT detail view (tapping is blocked while the scan/walk sequence is running)
 5. All walks saved as enriched JSON to `/sdcard/gattwalker/`
 
 ### BT Observer — Detail View
@@ -241,6 +241,93 @@ Frozen column headers; Stop button and table layout corrected for 240 px portrai
 ### Navigation Fixes
 
 BT Locator and AirTag Scanner back buttons return to Bluetooth screen. GATT Walker placeholder has Back button.
+
+---
+
+## Usage Guide — GATT Walker
+
+GATT Walker performs a full Bluetooth GATT inspection of a single target device and saves the result as enriched JSON.
+
+### Navigation path
+
+**Bluetooth menu → BT Scan & Select → tap a device → BT Attack Tiles → tap GATT Walker**
+
+### Walk procedure
+
+1. The scan list shows all advertising BLE devices. Tap one — the BT Attack Tiles screen appears showing tools available for that device.
+2. Tap **GATT Walker**. The progress screen opens, showing the target MAC, live status text, and a running count of discovered services and characteristics.
+3. A **Cancel Walk** button is visible during the walk. It disappears and is replaced by **Back** when the walk finishes.
+4. On completion the screen automatically transitions to the scrollable **GATT tree result view**.
+
+### GATT tree result view
+
+| Section | What is shown |
+|---------|---------------|
+| Header | MAC, OUI manufacturer name (purple), FP hash, GPS coordinates, timestamp |
+| Per service | UUID + human-readable service name (cyan separator) |
+| Per characteristic | UUID + name, decoded property flags (`R W N I` etc.), full expansion in parentheses, `[~CCCD]` indicator if subscribable, hex data + ASCII preview |
+| Per descriptor | UUID + human-readable name where known |
+
+The result is also saved to `/sdcard/gattwalker/` as enriched JSON.
+
+### Extended Probe
+
+The **Ext. Probe** button (red) on the result screen subscribes to every notifiable/indicatable characteristic, collects notification frames for **8 seconds** per characteristic, and re-saves the JSON with the captured frame data.
+
+- Up to **8 frames × 64 bytes** are captured per characteristic.
+- The probe result screen shows byte count, hex dump, and ASCII for each frame received.
+- **Back** from the probe result returns to the GATT tree result screen.
+- **Back** from the result screen returns to the BT Attack Tiles screen.
+
+### GATT connect timeout
+
+Configurable via **Settings → Timing → GATT Timeout** — a 3–30 s slider, NVS-persisted. Default is 10 s. Human-readable error messages are shown on connection failure.
+
+---
+
+## Usage Guide — BT Observer
+
+BT Observer automates the scan-then-walk workflow: it scans for all nearby BLE devices, then attempts a sequential GATT walk on each one, displaying results as a live-updating list.
+
+### Navigation path
+
+**Bluetooth menu → BT Observer tile**
+
+### Phases
+
+| Phase | Duration | What happens |
+|-------|----------|--------------|
+| Scan | 10 s | Active BLE scan; up to 128 devices collected |
+| Walk | ~5–10 s per device | Sequential GATT walks on up to 40 devices, sorted by RSSI (strongest first) |
+
+- **Connect timeout**: 5 s per device (hardcoded for Observer, independent of the Settings slider).
+- **Per-device poll window**: 10 s total (5 s connect + 5 s enumeration buffer). If a device does not complete within that window, the walk is cancelled and the next device starts.
+- A 500 ms gap is inserted between connections.
+- A small purple **spinner** in the top-right corner is visible while any phase is active.
+
+### List display
+
+Each row shows the device name, MAC, RSSI, and walk outcome:
+
+| Colour | Meaning |
+|--------|---------|
+| Green | Walk succeeded — shows service count, characteristic count, FP hash |
+| Red | Walk failed — shows reason (no response, refused, etc.) |
+| Grey / "Queued" | Walk has not started yet |
+| "Walking…" | Walk in progress |
+
+**Scrolling is always available.** Tapping a row is blocked while the scan or walk sequence is running — rows only become selectable after the full sequence completes or **Stop** is pressed.
+
+### After the scan completes
+
+- Tap any **green** row to open the full GATT tree detail view for that device.
+- **Ext. Probe** (red button in the detail view) is available for any successfully walked device.
+- **Back** from the detail view returns to the Observer results list with all results preserved.
+- **Back** from the list returns to the Bluetooth menu.
+
+### Output
+
+All successful walks are saved as enriched JSON to `/sdcard/gattwalker/` using the same format as the single-walk GATT Walker.
 
 ---
 
