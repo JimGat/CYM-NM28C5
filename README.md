@@ -246,7 +246,7 @@ Main Menu
 │   │           └── BLE Disconnect
 │   ├── BT Attacks                       ← general attacks
 │   │   ├── BLE Spam
-│   │   └── Device Spoof                 ← loads spooflist.txt
+│   │   └── Device Spoof                 ← loads spooflist.csv
 │   ├── BT Observer          ← scan + auto-GATT all visible devices
 │   ├── AirTag Scan
 │   ├── BT Locator
@@ -345,7 +345,7 @@ Bluetooth
 │           └── BLE Disconnect  (flood target with TERMINATE_IND)
 ├── BT Attacks          ← general attacks (no target needed)
 │   ├── BLE Spam        (Apple / Samsung / Google / Windows / All broadcast spam)
-│   └── Device Spoof    (select from spooflist.txt or add new entry via keyboard)
+│   └── Device Spoof    (select from spooflist.csv or add new entry via keyboard)
 ├── BT Observer         ← 10 s scan then sequential GATT walk on all found devices
 ├── AirTag Scan
 ├── BT Locator
@@ -365,7 +365,7 @@ Bluetooth
 | **Bluetooth Lookout** | Continuous BLE monitor that alerts when a watchlisted device (by full MAC or OUI prefix) is detected nearby |
 | **BLE Spam** | Broadcasts fake BLE advertisements — Apple (all subtypes), Samsung, Google, Windows Swift Pair, or all simultaneously |
 | **Device Spoof (directed)** | Clones the MAC address and name of a device pre-selected in BT Scan & Select — no additional selection step required |
-| **Device Spoof (general)** | Loads `/sdcard/lab/bluetooth/spooflist.txt`; select an entry or add new devices via on-screen keyboard, then START to begin spoofing |
+| **Device Spoof (general)** | Loads `/sdcard/lab/bluetooth/spooflist.csv`; select an entry or add new devices via on-screen keyboard, then START to begin spoofing |
 | **BLE Disconnect (directed)** | Floods a BT Scan & Select pre-selected target with BLE TERMINATE_IND frames to force disconnection |
 
 > **Note:** WiFi and BLE share the same radio. The firmware automatically switches between `RADIO_MODE_WIFI` and `RADIO_MODE_BLE` as needed.
@@ -845,7 +845,7 @@ All data is stored on the SD card:
 │   ├── deauths/          # Deauth monitor PCAP captures
 │   ├── bluetooth/
 │   │   ├── lookout.csv   # Bluetooth Lookout watchlist
-│   │   └── spooflist.txt # Device Spoof targets — format: MAC,Name (one per line)
+│   │   └── spooflist.csv # Device Spoof targets — CSV: MAC,Name (one per line)
 │   └── config/           # Optional config overrides (created by Provision)
 ├── gattwalker/           # GATT Walker JSON fingerprints
 │   └── *_gattwalk.json

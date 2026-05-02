@@ -174,7 +174,7 @@ static volatile bool ble_spoof_needs_ui_update = false;
 
 // BLE Spoof general list (spooflist.txt)
 #define SPOOF_LIST_MAX  64
-#define SPOOF_LIST_PATH "/sdcard/lab/bluetooth/spooflist.txt"
+#define SPOOF_LIST_PATH "/sdcard/lab/bluetooth/spooflist.csv"
 typedef struct { uint8_t mac[6]; char name[33]; } spoof_list_entry_t;
 static spoof_list_entry_t s_spoof_list[SPOOF_LIST_MAX];
 static int  s_spoof_list_count    = 0;
@@ -21129,7 +21129,7 @@ static void ble_spoof_general_proceed(void) {
 static void spoof_gen_start_cb(lv_event_t *e) {
     (void)e;
     if (s_spoof_list_selected < 0 || s_spoof_list_selected >= s_spoof_list_count) return;
-    show_attack_warning(ble_spoof_general_proceed);
+    ble_spoof_general_proceed();
 }
 
 static void spoof_gen_add_cb(lv_event_t *e) {
@@ -22698,7 +22698,7 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
     if (strcmp(attack_name, "BLE Spoof General") == 0) {
-        show_ble_spoof_general_screen();
+        show_attack_warning(show_ble_spoof_general_screen);
         return;
     }
     if (strcmp(attack_name, "BLE Spoof") == 0) {
