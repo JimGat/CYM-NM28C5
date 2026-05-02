@@ -1,10 +1,30 @@
 # CYM-NM28C5 Pre-built Firmware Binaries
 
-**Firmware version: v0.9.4**
+**Firmware version: v0.9.5**
 
 This folder contains the latest compiled firmware for the **NM-CYD-C5 (ESP32-C5)** board.
 
 > **Note:** The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/nm-cyd-c5/). Additional purchase sources and full hardware documentation are available on the [official board repository](https://github.com/RockBase-iot/NM-CYD-C5).
+
+---
+
+## Release Notes — v0.9.5
+
+### BLE Attacks — BLE Spam, Device Spoof, BLE Disconnect (new)
+
+Three BLE attack screens are now fully implemented under **Bluetooth → BT Attacks**:
+
+- **BLE Spam**: Floods nearby devices with BLE advertisement packets. Five modes: Apple (Sour Apple — triggers iOS pairing popups), Samsung Fast Connect, Google Fast Pair, Windows Swift Pair, All Platforms (cycles all four). Start/Stop toggle with live packet counter.
+
+- **Device Spoof**: Select a device from the last BLE scan, then broadcast an advertisement cloning its manufacturer data and name. Useful for testing device detection and identity.
+
+- **BLE Disconnect**: Select a target connectable device from the last scan, then repeatedly connect and immediately terminate to flood the target's connection handling. Shows attempt counter.
+
+All three attacks — and all WiFi attacks (Deauther, Evil Twin, Handshakes) — are now gated behind an **authorization warning popup** that requires explicit "I Understand" acceptance before proceeding.
+
+### SD Card — All Files Under `/sdcard/lab/`
+
+GATT Walker JSON output moved from `/sdcard/gattwalker/` to `/sdcard/lab/gattwalker/`. Screenshots moved from `/sdcard/screenshots/` to `/sdcard/lab/screenshots/`. All firmware-written files are now consistently under `/sdcard/lab/`.
 
 ---
 
