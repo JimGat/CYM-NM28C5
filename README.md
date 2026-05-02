@@ -1035,16 +1035,17 @@ CYM-NM28C5/
 
 ## BMorcelli Launcher Compatibility
 
-This firmware is **not currently compatible** with [bmorcelli/Launcher](https://github.com/bmorcelli/Launcher).
+This firmware is compatible with [bmorcelli/Launcher](https://github.com/bmorcelli/Launcher) and is available in the **Beta Release channel** for the NM-CYD-C5.
 
-| Issue | Detail |
-|-------|--------|
-| **ESP32-C5 not supported** | Tracked in [Issue #300](https://github.com/bmorcelli/Launcher/issues/300) — pending merge as of April 2026 |
-| **Partition layout mismatch** | Launcher requires OTA-style partition slots; this build uses a single 7 MB `factory` partition at `0x10000` |
-| **Custom bootloader conflict** | Launcher's bootloader switches apps via reset-reason detection; this firmware has no handoff logic |
-| **Framework mismatch** | Launcher is Arduino; this firmware is ESP-IDF 6.0 — display/touch init sequences would conflict |
+### Flashing Launcher via Web Flasher
 
-Flash this firmware standalone (see [Building & Flashing](#building--flashing)). Launcher integration can be revisited once Issue #300 is merged and an official NM-CYD-C5 board target exists upstream.
+1. Open the [Launcher Web Flasher](https://bmorcelli.github.io/Launcher/webflasher.html) in Chrome or Edge
+2. Select **Beta Release** as the release channel
+3. Select **CYD** as the device category
+4. Select **NM-CYD-C5** from the device list
+5. Connect your NM-CYD-C5 via USB-C and follow the on-screen instructions
+
+Once Launcher is running, place `CYM-NM28C5.bin` on the SD card and select it from the Launcher file manager to install this firmware.
 
 ---
 

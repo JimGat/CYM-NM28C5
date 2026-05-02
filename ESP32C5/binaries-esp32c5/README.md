@@ -383,11 +383,11 @@ esptool.py --chip esp32c5 --port /dev/ttyACM0 \
 
 ## BMorcelli Launcher Compatibility
 
-The firmware is **not currently compatible** with [bmorcelli/Launcher](https://github.com/bmorcelli/Launcher).
+This firmware is compatible with [bmorcelli/Launcher](https://github.com/bmorcelli/Launcher) and is available in the **Beta Release channel** for the NM-CYD-C5.
 
-- **ESP32-C5 not yet supported** — tracked in [Issue #300](https://github.com/bmorcelli/Launcher/issues/300) (opened April 2026, pending merge)
-- Single 7 MB `factory` partition at `0x10000` — incompatible with Launcher's OTA slot layout
-- ESP-IDF 6.0 vs Launcher's Arduino framework — hardware init sequences would conflict
+To install Launcher, open the [Launcher Web Flasher](https://bmorcelli.github.io/Launcher/webflasher.html), select **Beta Release** channel, select **CYD**, then select **NM-CYD-C5** from the device list.
+
+Once Launcher is running, place `CYM-NM28C5.bin` on the SD card and select it from the Launcher file manager to install this firmware.
 
 ---
 
