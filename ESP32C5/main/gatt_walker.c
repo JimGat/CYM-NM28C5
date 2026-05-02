@@ -405,7 +405,8 @@ static bool s_write_json(void)
     if (j.overflow) ESP_LOGE(TAG, "JSON buffer overflow");
 
     if (s_sd_mutex && xSemaphoreTake(s_sd_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
-        mkdir("/sdcard/gattwalker", 0755);
+        mkdir("/sdcard/lab", 0755);
+        mkdir("/sdcard/lab/gattwalker", 0755);
         FILE *f = fopen(r->filepath, "w");
         if (f) {
             fwrite(jbuf, 1, j.pos > 0 ? j.pos - 1 : 0, f); /* -1: exclude null */
@@ -831,7 +832,7 @@ bool gw_walk(const uint8_t mac[6], uint8_t addr_type, const char *name,
     s_make_timestamp(s_result->timestamp, sizeof(s_result->timestamp));
 
     snprintf(s_result->filepath, sizeof(s_result->filepath),
-             "/sdcard/gattwalker/%s_%02X%02X%02X%02X%02X%02X_gattwalk.json",
+             "/sdcard/lab/gattwalker/%s_%02X%02X%02X%02X%02X%02X_gattwalk.json",
              s_result->timestamp,
              mac[5], mac[4], mac[3], mac[2], mac[1], mac[0]);
 
