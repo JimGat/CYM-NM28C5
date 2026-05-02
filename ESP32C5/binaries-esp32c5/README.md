@@ -1,8 +1,49 @@
 # CYM-NM28C5 Pre-built Firmware Binaries
 
-**Firmware version: v0.9.3**
+**Firmware version: v0.9.4**
 
 This folder contains the latest compiled firmware for the **NM-CYD-C5 (ESP32-C5)** board.
+
+---
+
+## Release Notes — v0.9.4
+
+### GATT Walker — Screen Lock Fix After Stuck Probe
+
+Fixed a critical screen lock that occurred when a device went silent mid-GATT-operation (typically during MTU exchange) after a GATT walk + Extended Probe sequence.
+
+- `gw_cancel()` now calls `ble_gap_terminate()` on the active connection handle when the state is anything other than `CONNECTING` — this forces the GAP disconnect event that drives state to a terminal value. Previously, cancel only set a flag that nothing would ever check if no GATT callback was firing.
+- `gw_walk()` now explicitly handles `GW_STATE_PROBING`: if a stuck probe is detected when the user selects a new target from the Select screen, the connection is force-killed and state resets to IDLE so the new walk can proceed. Previously, every subsequent walk attempt returned false and the device showed "Failed to start walk" indefinitely until reset.
+
+### BT Observer — Selection Blocked During Scan
+
+Tapping a device row while the scan/walk sequence is still running is now silently ignored. Scrolling the list still works. Device rows become selectable only after the full walk sequence completes or Stop is pressed, preventing accidental navigation to a device that still shows "Queued" status mid-walk.
+
+### BT Observer — Spinner Overlay
+
+A small purple spinning progress indicator now appears in the top-right corner of the BT Observer screen while scanning and walking are in progress. It is placed on the LVGL overlay layer (transparent background) and is destroyed automatically when the scan completes or is stopped.
+
+### BT Observer — Back Button Returns to Observer List
+
+The Back button in the device detail view now returns to the existing BT Observer results list (preserving all walk results) instead of navigating to the Bluetooth menu. The probe result Back button also returns to the device detail rather than jumping to the top-level menu.
+
+### BT Observer — Extended Probe Available for All Walked Devices
+
+The Ext. Probe button in the BT Observer device detail is now enabled (red) for any device whose walk completed successfully — not just the most recently walked device. Previously, the button was greyed out for all but the last device in the list.
+
+### GATT Walker — CCCD Probe Fix ("No subscribable characteristics found")
+
+`s_find_cccd()` now falls back to `val_handle + 1` when no CCCD descriptor (UUID 0x2902) was captured during the walk. This is the standard BLE placement for the CCCD. Previously, devices that placed their CCCD at the spec-default offset but whose descriptor wasn't captured in the walk table would always report "no subscribable characteristics found" even though the `[~CCCD]` indicator appeared correctly on the result screen.
+
+### GATT Walker / BT Observer — Extended Probe Improvements
+
+- Dwell window extended from 3 s → **8 s** per characteristic — gives slow-reporting devices more time to send notification frames
+- Notification frame capture expanded from 4×32 B → **8×64 B** per characteristic
+- Probe result display shows byte count per frame alongside hex and ASCII preview
+
+### UI — Ext. Probe Button Color
+
+The Ext. Probe button is now **red** (`#C62828`) on both the GATT Walker result screen and the BT Observer device detail screen. Previously orange.
 
 ---
 
