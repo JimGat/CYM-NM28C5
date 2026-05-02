@@ -22836,45 +22836,40 @@ static void show_deauth_monitor_screen(void)
 static void airtag_scan_task(void *pvParameters)
 {
     (void)pvParameters;
-    
+
     ESP_LOGI(TAG, "AirTag scanner task started");
-    
+
     while (airtag_scan_active) {
-        // Reset counters for each scan cycle
         bt_reset_counters();
-        
-        // Start BLE scan
+
         int rc = bt_start_scan();
         if (rc != 0) {
             ESP_LOGE(TAG, "BLE scan start failed: %d", rc);
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
-        
-        // Scan for 10 seconds
-        for (int i = 0; i < 100 && airtag_scan_active; i++) {
+
+        /* Scan for 10 seconds, bail early if cancelled */
+        for (int i = 0; i < 100 && airtag_scan_active; i++)
             vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        
-        // Stop scan
-        bt_stop_scan();
-        
-        if (!airtag_scan_active) {
+
+        /* Only stop the scan if we weren't cancelled — the exit callback
+         * already called bt_stop_scan() and we must not race with it */
+        if (airtag_scan_active)
+            bt_stop_scan();
+
+        if (!airtag_scan_active)
             break;
-        }
-        
-        // Save snapshot for UI before reset
-        airtag_scan_snapshot_airtag = bt_airtag_count;
+
+        airtag_scan_snapshot_airtag  = bt_airtag_count;
         airtag_scan_snapshot_smarttag = bt_smarttag_count;
-        airtag_scan_snapshot_total = bt_device_count;
-        
-        // Signal UI update
+        airtag_scan_snapshot_total   = bt_device_count;
         airtag_scan_update_flag = true;
-        
+
         ESP_LOGI(TAG, "AirTag scan cycle: %d AT, %d ST, %d total",
                  airtag_scan_snapshot_airtag, airtag_scan_snapshot_smarttag, airtag_scan_snapshot_total);
     }
-    
+
     ESP_LOGI(TAG, "AirTag scanner task ending");
     airtag_scan_task_handle = NULL;
     vTaskDelete(NULL);
@@ -22884,34 +22879,31 @@ static void airtag_scan_task(void *pvParameters)
 static void airtag_scan_exit_cb(lv_event_t *e)
 {
     (void)e;
-    
+
     ESP_LOGI(TAG, "Stopping AirTag scanner...");
-    
-    // Stop scanning
-    airtag_scan_active = false;
+
+    airtag_scan_active   = false;
     airtag_scan_ui_active = false;
-    
-    // Stop BLE scan
+
+    /* Stop the scan — task will not call bt_stop_scan() again after seeing
+     * airtag_scan_active=false, so there is no race here */
     bt_stop_scan();
-    
-    // Wait for task to finish
-    if (airtag_scan_task_handle != NULL) {
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-    
-    // Free task stack
+
+    /* Wait for the task to self-delete (sets handle to NULL), up to 2 s */
+    for (int i = 0; i < 20 && airtag_scan_task_handle != NULL; i++)
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+    /* Safe to free the stack now that the task has exited */
     if (airtag_scan_task_stack != NULL) {
         heap_caps_free(airtag_scan_task_stack);
         airtag_scan_task_stack = NULL;
     }
-    
-    // Switch back to WiFi mode
+
     if (current_radio_mode == RADIO_MODE_BLE) {
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
     }
-    
-    // Return to Bluetooth screen
+
     show_bluetooth_screen();
 }
 
@@ -22925,11 +22917,19 @@ static void airtag_view_tags_btn_cb(lv_event_t *e)
 }
 
 /**
- * Button callback: return from Found Tags list back to AirTag scan screen
+ * Button callback: return from Found Tags list back to AirTag scan screen.
+ * The scan task is still running — just rebuild the UI, do NOT restart the task.
  */
 static void found_tags_back_btn_cb(lv_event_t *e)
 {
     (void)e;
+    if (airtag_scan_active) {
+        /* Scan already running — rebuild UI only, no new task/stack */
+        if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+        reset_function_page_children();
+        /* Re-enter show_airtag_scan_screen() which now detects active scan
+         * and skips task creation */
+    }
     show_airtag_scan_screen();
 }
 
@@ -23291,26 +23291,30 @@ static void show_airtag_scan_screen(void)
 
     lv_obj_add_event_cb(exit_btn, airtag_scan_exit_cb, LV_EVENT_CLICKED, NULL);
     
-    // Set UI active and start scanning
     airtag_scan_ui_active = true;
-    airtag_scan_active = true;
-    airtag_scan_update_flag = false;
-    
-    // Create scanning task with PSRAM stack
-    airtag_scan_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
-    if (airtag_scan_task_stack) {
-        airtag_scan_task_handle = xTaskCreateStatic(
-            airtag_scan_task,
-            "airtag_scan",
-            4096,
-            NULL,
-            5,
-            airtag_scan_task_stack,
-            &airtag_scan_task_buffer
-        );
+
+    if (!airtag_scan_active) {
+        /* Fresh start — launch the scan task */
+        airtag_scan_active = true;
+        airtag_scan_update_flag = false;
+
+        airtag_scan_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+        if (airtag_scan_task_stack) {
+            airtag_scan_task_handle = xTaskCreateStatic(
+                airtag_scan_task,
+                "airtag_scan",
+                4096,
+                NULL,
+                5,
+                airtag_scan_task_stack,
+                &airtag_scan_task_buffer
+            );
+        } else {
+            ESP_LOGE(TAG, "Failed to allocate AirTag scan task stack");
+        }
+        ESP_LOGI(TAG, "AirTag scanner started");
     } else {
-        ESP_LOGE(TAG, "Failed to allocate AirTag scan task stack");
+        /* Returning from Found Tags — task already running, UI rebuilt only */
+        ESP_LOGI(TAG, "AirTag scanner UI restored (task already running)");
     }
-    
-    ESP_LOGI(TAG, "AirTag scanner started");
 }
