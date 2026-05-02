@@ -389,6 +389,24 @@ To install Launcher, open the [Launcher Web Flasher](https://bmorcelli.github.io
 
 Once Launcher is running, place `CYM-NM28C5.bin` on the SD card and select it from the Launcher file manager to install this firmware.
 
+### Installing via Launcher OTA Favorites
+
+You can also install directly through the Launcher OTA screen without copying the binary manually. Add the following entry to `config.conf` on your SD card (create the file if it does not exist):
+
+```json
+{
+  "favorite": [
+    {
+      "name": "Cheap Yellow Monster",
+      "fid": "",
+      "link": "https://github.com/JimGat/CYM-NM28C5/releases/latest/download/CYM-NM28C5.bin"
+    }
+  ]
+}
+```
+
+This entry will appear in the Launcher OTA favorites list and install the latest release directly to the device.
+
 ---
 
 ## SD Card Requirement
