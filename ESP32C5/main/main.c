@@ -1599,6 +1599,7 @@ static void show_gw_result_screen(void);
 
 // BT Attacks
 static void show_bt_attacks_screen(void);
+static void show_directed_bt_attacks_screen(void);
 static void show_ble_spam_screen(void);
 static void show_ble_spoof_screen(void);
 static void show_ble_disc_screen(void);
@@ -19878,17 +19879,9 @@ static void show_bt_attack_tiles_screen(void)
     lv_obj_t *add_lookout_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Add to\nBT Lookout", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(add_lookout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Add to Lookout");
 
-    // Device Spoof — clone this device's BLE identity (routes through warning)
-    lv_obj_t *spoof_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Device\nSpoof", COLOR_MATERIAL_ORANGE, NULL, NULL);
-    lv_obj_add_event_cb(spoof_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spoof SAS");
-
-    // BLE Disconnect — flood connect/terminate against this device (routes through warning)
-    lv_obj_t *disc_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BLE\nDisconnect", COLOR_MATERIAL_PINK, NULL, NULL);
-    lv_obj_add_event_cb(disc_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Disc SAS");
-
-    // BT Attacks menu — opens the full BLE attack suite (Spam, Spoof, Disconnect)
-    lv_obj_t *attacks_tile = create_tile(tiles, MY_SYMBOL_JET_FIGHTER, "BT\nAttacks", COLOR_MATERIAL_INDIGO, NULL, NULL);
-    lv_obj_add_event_cb(attacks_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Attacks Menu");
+    // BT Attacks — opens directed attack menu (Spoof, Disconnect) targeting selected device
+    lv_obj_t *attacks_tile = create_tile(tiles, LV_SYMBOL_WARNING, "BT\nAttacks", COLOR_MATERIAL_INDIGO, NULL, NULL);
+    lv_obj_add_event_cb(attacks_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Directed BT Attacks");
 
     /* Back button — return to BT Scan & Select */
     lv_obj_t *back_btn = lv_btn_create(function_page);
@@ -20005,14 +19998,14 @@ static const uint8_t s_windows_sp_svc2[] = {0x14,0xFE,0x80,0x01,0x00,0x00,0x00};
 // ── SAS proceed wrappers — pre-set target from BT Scan & Select ──────────────
 static void ble_spoof_proceed_from_sas(void)
 {
-    s_ble_spoof_return_fn = show_bt_attack_tiles_screen;
+    s_ble_spoof_return_fn = show_directed_bt_attacks_screen;
     ble_spoof_target_idx = bt_sas_selected_idx;
     show_ble_spoof_screen();
 }
 
 static void ble_disc_proceed_from_sas(void)
 {
-    s_ble_disc_return_fn = show_bt_attack_tiles_screen;
+    s_ble_disc_return_fn = show_directed_bt_attacks_screen;
     ble_disc_target_idx = bt_sas_selected_idx;
     show_ble_disc_screen();
 }
@@ -20683,6 +20676,56 @@ static void show_ble_disc_screen(void)
 }
 
 // ── BT Attacks menu ──────────────────────────────────────────────────────────
+// ── Directed BT Attacks screen (SAS context — target from Scan & Select) ─────
+static void show_directed_bt_attacks_screen(void)
+{
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+
+    char title[48];
+    snprintf(title, sizeof(title), "Target: %.26s", bt_sas_target_name[0] ? bt_sas_target_name : "Unknown");
+    create_function_page_base(title);
+    apply_menu_bg();
+
+    lv_obj_t *tiles = lv_obj_create(function_page);
+    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30 - 44);
+    lv_obj_align(tiles, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(tiles, 0, 0);
+    lv_obj_set_style_pad_all(tiles, 10, 0);
+    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *spoof_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Device\nSpoof", COLOR_MATERIAL_ORANGE, NULL, NULL);
+    lv_obj_add_event_cb(spoof_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spoof SAS");
+
+    lv_obj_t *disc_tile = create_tile(tiles, LV_SYMBOL_CLOSE, "BLE\nDisconnect", COLOR_MATERIAL_PINK, NULL, NULL);
+    lv_obj_add_event_cb(disc_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Disc SAS");
+
+    /* Back button — return to SAS actions */
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 28);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(back_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(back_icon, lv_color_white(), 0);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, "Actions");
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
+    lv_obj_set_user_data(back_btn, (void *)show_bt_attack_tiles_screen);
+    lv_obj_add_event_cb(back_btn, stub_back_btn_cb, LV_EVENT_CLICKED, NULL);
+}
+
 static void show_bt_attacks_screen(void)
 {
     create_function_page_base("BT Attacks");
@@ -20700,12 +20743,6 @@ static void show_bt_attacks_screen(void)
 
     lv_obj_t *spam_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BLE\nSpam", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(spam_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spam");
-
-    lv_obj_t *spoof_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Device\nSpoof", COLOR_MATERIAL_AMBER, NULL, NULL);
-    lv_obj_add_event_cb(spoof_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spoof");
-
-    lv_obj_t *disc_tile = create_tile(tiles, LV_SYMBOL_CLOSE, "BLE\nDisconnect", COLOR_MATERIAL_ORANGE, NULL, NULL);
-    lv_obj_add_event_cb(disc_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Disconnect");
 
     /* Back button */
     lv_obj_t *back_btn = lv_btn_create(function_page);
@@ -21964,9 +22001,9 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
 
-    // BT Attacks menu from SAS actions screen
-    if (strcmp(attack_name, "BT Attacks Menu") == 0) {
-        show_bt_attacks_screen();
+    // Directed BT Attacks menu — target-specific attacks from SAS actions screen
+    if (strcmp(attack_name, "Directed BT Attacks") == 0) {
+        show_directed_bt_attacks_screen();
         return;
     }
 
