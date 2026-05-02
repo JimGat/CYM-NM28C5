@@ -21029,7 +21029,13 @@ static bool spoof_mac_parse(const char *str, uint8_t *mac) {
     unsigned int b[6];
     if (sscanf(str, "%02X:%02X:%02X:%02X:%02X:%02X",
                &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6) {
-        for (int i = 0; i < 6; i++) mac[i] = (uint8_t)b[i];
+        // BLE addresses are stored LSB-first internally; user types MSB-first
+        mac[0] = (uint8_t)b[5];
+        mac[1] = (uint8_t)b[4];
+        mac[2] = (uint8_t)b[3];
+        mac[3] = (uint8_t)b[2];
+        mac[4] = (uint8_t)b[1];
+        mac[5] = (uint8_t)b[0];
         return true;
     }
     return false;
@@ -21045,6 +21051,8 @@ static void spoof_list_load(void) {
         char line[80];
         while (s_spoof_list_count < SPOOF_LIST_MAX && fgets(line, sizeof(line), fp)) {
             line[strcspn(line, "\r\n")] = '\0';
+            // skip header row
+            if (strncasecmp(line, "mac,", 4) == 0) continue;
             char *comma = strchr(line, ',');
             if (!comma) continue;
             *comma = '\0';
@@ -21069,11 +21077,12 @@ static bool spoof_list_save(void) {
     FILE *fp = fopen(SPOOF_LIST_PATH, "w");
     bool ok = (fp != NULL);
     if (fp) {
+        fprintf(fp, "mac,name\n");
         for (int i = 0; i < s_spoof_list_count; i++) {
             fprintf(fp, "%02X:%02X:%02X:%02X:%02X:%02X,%s\n",
-                    s_spoof_list[i].mac[0], s_spoof_list[i].mac[1],
-                    s_spoof_list[i].mac[2], s_spoof_list[i].mac[3],
-                    s_spoof_list[i].mac[4], s_spoof_list[i].mac[5],
+                    s_spoof_list[i].mac[5], s_spoof_list[i].mac[4],
+                    s_spoof_list[i].mac[3], s_spoof_list[i].mac[2],
+                    s_spoof_list[i].mac[1], s_spoof_list[i].mac[0],
                     s_spoof_list[i].name);
         }
         fclose(fp);
@@ -21118,6 +21127,11 @@ static void ble_spoof_general_proceed(void) {
     if (s_spoof_list_selected < 0 || s_spoof_list_selected >= s_spoof_list_count) return;
     s_ble_spoof_return_fn = show_ble_spoof_general_screen;
     memcpy(ble_spoof_target_mac, s_spoof_list[s_spoof_list_selected].mac, 6);
+    // bt_sas_target_addr/name drive the display card in show_ble_spoof_directed_screen
+    memcpy(bt_sas_target_addr, s_spoof_list[s_spoof_list_selected].mac, 6);
+    strncpy(bt_sas_target_name, s_spoof_list[s_spoof_list_selected].name,
+            sizeof(bt_sas_target_name) - 1);
+    bt_sas_target_name[sizeof(bt_sas_target_name) - 1] = '\0';
     strncpy(ble_spoof_target_name_str, s_spoof_list[s_spoof_list_selected].name,
             sizeof(ble_spoof_target_name_str) - 1);
     ble_spoof_target_name_str[sizeof(ble_spoof_target_name_str) - 1] = '\0';
@@ -21324,8 +21338,8 @@ static void show_ble_spoof_general_screen(void) {
 
         char mac_str[18];
         snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
-                 s_spoof_list[i].mac[0], s_spoof_list[i].mac[1], s_spoof_list[i].mac[2],
-                 s_spoof_list[i].mac[3], s_spoof_list[i].mac[4], s_spoof_list[i].mac[5]);
+                 s_spoof_list[i].mac[5], s_spoof_list[i].mac[4], s_spoof_list[i].mac[3],
+                 s_spoof_list[i].mac[2], s_spoof_list[i].mac[1], s_spoof_list[i].mac[0]);
         lv_obj_t *mac_lbl = lv_label_create(row);
         lv_label_set_text(mac_lbl, mac_str);
         lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
