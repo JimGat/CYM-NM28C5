@@ -184,6 +184,11 @@ static uint16_t ble_disc_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 // Attack authorization warning popup
 static lv_obj_t *s_attack_warning_popup = NULL;
 
+// Return-destination overrides for BLE attacks launched from SAS actions
+// NULL = default (return to show_bt_attacks_screen)
+static void (*s_ble_spoof_return_fn)(void) = NULL;
+static void (*s_ble_disc_return_fn)(void) = NULL;
+
 // ============================================================================
 
 // Pin configuration — NM-CYD-C5 (RockBase-iot/NM-CYD-C5, User_Setup-NM-CYD-C5.h)
@@ -1603,6 +1608,8 @@ static void ble_disc_task(void *pvParameters);
 static void show_attack_warning(void (*proceed_fn)(void));
 static void deauther_proceed(void);
 static void handshakes_proceed(void);
+static void ble_spoof_proceed_from_sas(void);
+static void ble_disc_proceed_from_sas(void);
 
 // BT Lookout
 static void show_bt_lookout_screen(void);
@@ -19871,6 +19878,18 @@ static void show_bt_attack_tiles_screen(void)
     lv_obj_t *add_lookout_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Add to\nBT Lookout", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(add_lookout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Add to Lookout");
 
+    // Device Spoof — clone this device's BLE identity (routes through warning)
+    lv_obj_t *spoof_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Device\nSpoof", COLOR_MATERIAL_ORANGE, NULL, NULL);
+    lv_obj_add_event_cb(spoof_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spoof SAS");
+
+    // BLE Disconnect — flood connect/terminate against this device (routes through warning)
+    lv_obj_t *disc_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BLE\nDisconnect", COLOR_MATERIAL_PINK, NULL, NULL);
+    lv_obj_add_event_cb(disc_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Disc SAS");
+
+    // BT Attacks menu — opens the full BLE attack suite (Spam, Spoof, Disconnect)
+    lv_obj_t *attacks_tile = create_tile(tiles, MY_SYMBOL_JET_FIGHTER, "BT\nAttacks", COLOR_MATERIAL_INDIGO, NULL, NULL);
+    lv_obj_add_event_cb(attacks_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Attacks Menu");
+
     /* Back button — return to BT Scan & Select */
     lv_obj_t *back_btn = lv_btn_create(function_page);
     lv_obj_set_size(back_btn, 110, 30);
@@ -19982,6 +20001,21 @@ static const uint8_t s_google_fp_svc2[] = {0x2C,0xFE,0x00,0xC0,0x57};
 static const uint8_t s_windows_sp_svc[] = {0x14,0xFE,0x80,0x00,0x00,0x00,0x00};
 static const uint8_t s_windows_sp_svc2[] = {0x14,0xFE,0x80,0x01,0x00,0x00,0x00};
 #define WINDOWS_PAYLOAD_COUNT 2
+
+// ── SAS proceed wrappers — pre-set target from BT Scan & Select ──────────────
+static void ble_spoof_proceed_from_sas(void)
+{
+    s_ble_spoof_return_fn = show_bt_attack_tiles_screen;
+    ble_spoof_target_idx = bt_sas_selected_idx;
+    show_ble_spoof_screen();
+}
+
+static void ble_disc_proceed_from_sas(void)
+{
+    s_ble_disc_return_fn = show_bt_attack_tiles_screen;
+    ble_disc_target_idx = bt_sas_selected_idx;
+    show_ble_disc_screen();
+}
 
 // ── BLE Spam task ─────────────────────────────────────────────────────────────
 static void ble_spam_task(void *pvParameters)
@@ -20284,7 +20318,9 @@ static void ble_spoof_back_cb(lv_event_t *e)
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
     }
-    show_bt_attacks_screen();
+    void (*ret)(void) = s_ble_spoof_return_fn;
+    s_ble_spoof_return_fn = NULL;
+    if (ret) ret(); else show_bt_attacks_screen();
 }
 
 static void ble_spoof_device_tap_cb(lv_event_t *e)
@@ -20518,7 +20554,9 @@ static void ble_disc_back_cb(lv_event_t *e)
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
     }
-    show_bt_attacks_screen();
+    void (*ret)(void) = s_ble_disc_return_fn;
+    s_ble_disc_return_fn = NULL;
+    if (ret) ret(); else show_bt_attacks_screen();
 }
 
 static void ble_disc_device_tap_cb(lv_event_t *e)
@@ -21923,6 +21961,24 @@ void attack_event_cb(lv_event_t *e)
     // BT Attacks menu
     if (strcmp(attack_name, "BT Attacks") == 0) {
         show_bt_attacks_screen();
+        return;
+    }
+
+    // BT Attacks menu from SAS actions screen
+    if (strcmp(attack_name, "BT Attacks Menu") == 0) {
+        show_bt_attacks_screen();
+        return;
+    }
+
+    // Device Spoof from SAS actions — pre-loads selected device, returns to actions
+    if (strcmp(attack_name, "BLE Spoof SAS") == 0) {
+        show_attack_warning(ble_spoof_proceed_from_sas);
+        return;
+    }
+
+    // BLE Disconnect from SAS actions — pre-loads selected device, returns to actions
+    if (strcmp(attack_name, "BLE Disc SAS") == 0) {
+        show_attack_warning(ble_disc_proceed_from_sas);
         return;
     }
 
