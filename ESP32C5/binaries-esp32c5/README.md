@@ -4,6 +4,8 @@
 
 This folder contains the latest compiled firmware for the **NM-CYD-C5 (ESP32-C5)** board.
 
+> **Note:** The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/nm-cyd-c5/). Additional purchase sources and full hardware documentation are available on the [official board repository](https://github.com/RockBase-iot/NM-CYD-C5).
+
 ---
 
 ## Release Notes — v0.9.4
