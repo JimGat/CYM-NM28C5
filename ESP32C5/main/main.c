@@ -172,6 +172,18 @@ static char ble_spoof_target_name_str[33];        // authoritative target name f
 static uint16_t ble_spoof_target_company_id = 0; // authoritative company ID for task
 static volatile bool ble_spoof_needs_ui_update = false;
 
+// BLE Spoof general list (spooflist.txt)
+#define SPOOF_LIST_MAX  64
+#define SPOOF_LIST_PATH "/sdcard/lab/bluetooth/spooflist.txt"
+typedef struct { uint8_t mac[6]; char name[33]; } spoof_list_entry_t;
+static spoof_list_entry_t s_spoof_list[SPOOF_LIST_MAX];
+static int  s_spoof_list_count    = 0;
+static int  s_spoof_list_selected = -1;
+static lv_obj_t *s_spoof_add_popup  = NULL;
+static lv_obj_t *s_spoof_mac_ta     = NULL;
+static lv_obj_t *s_spoof_name_ta    = NULL;
+static lv_obj_t *s_spoof_list_scroll = NULL;
+
 // BLE Disconnect attack state
 static volatile bool ble_disc_active = false;
 static TaskHandle_t ble_disc_task_handle = NULL;
@@ -1604,6 +1616,8 @@ static void show_gw_result_screen(void);
 
 // BT Attacks
 static void show_bt_attacks_screen(void);
+static void show_ble_spoof_general_screen(void);
+static void show_spoof_add_entry_screen(void);
 static void show_directed_bt_attacks_screen(void);
 static void show_ble_spoof_directed_screen(void);
 static void show_ble_disc_directed_screen(void);
@@ -21009,6 +21023,379 @@ static void show_directed_bt_attacks_screen(void)
     lv_obj_add_event_cb(back_btn, stub_back_btn_cb, LV_EVENT_CLICKED, NULL);
 }
 
+// -- General BLE Spoof (spooflist.txt) --
+
+static bool spoof_mac_parse(const char *str, uint8_t *mac) {
+    unsigned int b[6];
+    if (sscanf(str, "%02X:%02X:%02X:%02X:%02X:%02X",
+               &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6) {
+        for (int i = 0; i < 6; i++) mac[i] = (uint8_t)b[i];
+        return true;
+    }
+    return false;
+}
+
+static void spoof_list_load(void) {
+    s_spoof_list_count = 0;
+    ensure_sd_mounted();
+    if (!sd_spi_mutex) return;
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return;
+    FILE *fp = fopen(SPOOF_LIST_PATH, "r");
+    if (fp) {
+        char line[80];
+        while (s_spoof_list_count < SPOOF_LIST_MAX && fgets(line, sizeof(line), fp)) {
+            line[strcspn(line, "\r\n")] = '\0';
+            char *comma = strchr(line, ',');
+            if (!comma) continue;
+            *comma = '\0';
+            uint8_t mac[6];
+            if (!spoof_mac_parse(line, mac)) continue;
+            memcpy(s_spoof_list[s_spoof_list_count].mac, mac, 6);
+            strncpy(s_spoof_list[s_spoof_list_count].name, comma + 1,
+                    sizeof(s_spoof_list[0].name) - 1);
+            s_spoof_list[s_spoof_list_count].name[sizeof(s_spoof_list[0].name) - 1] = '\0';
+            s_spoof_list_count++;
+        }
+        fclose(fp);
+    }
+    xSemaphoreGive(sd_spi_mutex);
+}
+
+static bool spoof_list_save(void) {
+    ensure_sd_mounted();
+    if (!sd_spi_mutex) return false;
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
+    mkdir("/sdcard/lab/bluetooth", 0777);
+    FILE *fp = fopen(SPOOF_LIST_PATH, "w");
+    bool ok = (fp != NULL);
+    if (fp) {
+        for (int i = 0; i < s_spoof_list_count; i++) {
+            fprintf(fp, "%02X:%02X:%02X:%02X:%02X:%02X,%s\n",
+                    s_spoof_list[i].mac[0], s_spoof_list[i].mac[1],
+                    s_spoof_list[i].mac[2], s_spoof_list[i].mac[3],
+                    s_spoof_list[i].mac[4], s_spoof_list[i].mac[5],
+                    s_spoof_list[i].name);
+        }
+        fclose(fp);
+    }
+    xSemaphoreGive(sd_spi_mutex);
+    return ok;
+}
+
+static bool spoof_list_append(const uint8_t *mac, const char *name) {
+    if (s_spoof_list_count >= SPOOF_LIST_MAX) return false;
+    memcpy(s_spoof_list[s_spoof_list_count].mac, mac, 6);
+    strncpy(s_spoof_list[s_spoof_list_count].name, name ? name : "",
+            sizeof(s_spoof_list[0].name) - 1);
+    s_spoof_list[s_spoof_list_count].name[sizeof(s_spoof_list[0].name) - 1] = '\0';
+    s_spoof_list_count++;
+    return spoof_list_save();
+}
+
+static void spoof_gen_row_cb(lv_event_t *e) {
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_spoof_list_count) return;
+    s_spoof_list_selected = idx;
+    if (!s_spoof_list_scroll || !lv_obj_is_valid(s_spoof_list_scroll)) return;
+    uint32_t child_cnt = lv_obj_get_child_cnt(s_spoof_list_scroll);
+    for (uint32_t i = 0; i < child_cnt; i++) {
+        lv_obj_t *row = lv_obj_get_child(s_spoof_list_scroll, i);
+        if (!row) continue;
+        int row_idx = (int)(intptr_t)lv_obj_get_user_data(row);
+        lv_obj_set_style_bg_color(row,
+            row_idx == idx ? lv_color_make(30, 80, 160) : lv_color_make(40, 40, 40), 0);
+    }
+}
+
+static void spoof_gen_back_cb(lv_event_t *e) {
+    (void)e;
+    s_spoof_list_scroll = NULL;
+    s_spoof_list_selected = -1;
+    show_bt_attacks_screen();
+}
+
+static void ble_spoof_general_proceed(void) {
+    if (s_spoof_list_selected < 0 || s_spoof_list_selected >= s_spoof_list_count) return;
+    s_ble_spoof_return_fn = show_ble_spoof_general_screen;
+    memcpy(ble_spoof_target_mac, s_spoof_list[s_spoof_list_selected].mac, 6);
+    strncpy(ble_spoof_target_name_str, s_spoof_list[s_spoof_list_selected].name,
+            sizeof(ble_spoof_target_name_str) - 1);
+    ble_spoof_target_name_str[sizeof(ble_spoof_target_name_str) - 1] = '\0';
+    ble_spoof_target_company_id = 0;
+    ble_spoof_target_idx = 0;
+    show_ble_spoof_directed_screen();
+}
+
+static void spoof_gen_start_cb(lv_event_t *e) {
+    (void)e;
+    if (s_spoof_list_selected < 0 || s_spoof_list_selected >= s_spoof_list_count) return;
+    show_attack_warning(ble_spoof_general_proceed);
+}
+
+static void spoof_gen_add_cb(lv_event_t *e) {
+    (void)e;
+    s_spoof_list_scroll = NULL;
+    show_spoof_add_entry_screen();
+}
+
+// -- Add Spoof Entry screen --
+
+static void spoof_add_ta_focus_cb(lv_event_t *e) {
+    lv_obj_t *ta = lv_event_get_target(e);
+    lv_obj_t *kb = (lv_obj_t *)lv_event_get_user_data(e);
+    if (kb && lv_obj_is_valid(kb))
+        lv_keyboard_set_textarea(kb, ta);
+}
+
+static void spoof_add_back_cb(lv_event_t *e) {
+    (void)e;
+    s_spoof_mac_ta    = NULL;
+    s_spoof_name_ta   = NULL;
+    s_spoof_add_popup = NULL;
+    show_ble_spoof_general_screen();
+}
+
+static void spoof_add_save_cb(lv_event_t *e) {
+    (void)e;
+    if (!s_spoof_mac_ta || !lv_obj_is_valid(s_spoof_mac_ta)) return;
+    const char *mac_str  = lv_textarea_get_text(s_spoof_mac_ta);
+    const char *name_str = (s_spoof_name_ta && lv_obj_is_valid(s_spoof_name_ta))
+                           ? lv_textarea_get_text(s_spoof_name_ta) : "";
+    uint8_t mac[6];
+    if (!spoof_mac_parse(mac_str, mac)) return;
+    spoof_list_append(mac, name_str);
+    s_spoof_mac_ta    = NULL;
+    s_spoof_name_ta   = NULL;
+    s_spoof_add_popup = NULL;
+    show_ble_spoof_general_screen();
+}
+
+static void show_spoof_add_entry_screen(void) {
+    s_spoof_mac_ta    = NULL;
+    s_spoof_name_ta   = NULL;
+    s_spoof_add_popup = NULL;
+
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+
+    create_function_page_base("Add Spoof Entry");
+
+    lv_obj_t *hint = lv_label_create(function_page);
+    lv_label_set_text(hint, "MAC  e.g. AA:BB:CC:DD:EE:FF");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint, lv_color_make(140, 140, 140), 0);
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 36);
+
+    s_spoof_mac_ta = lv_textarea_create(function_page);
+    lv_obj_set_size(s_spoof_mac_ta, 210, 38);
+    lv_obj_align(s_spoof_mac_ta, LV_ALIGN_TOP_MID, 0, 52);
+    lv_textarea_set_one_line(s_spoof_mac_ta, true);
+    lv_textarea_set_max_length(s_spoof_mac_ta, 17);
+    lv_textarea_set_placeholder_text(s_spoof_mac_ta, "AA:BB:CC:DD:EE:FF");
+    lv_obj_set_style_text_font(s_spoof_mac_ta, &lv_font_montserrat_14, 0);
+
+    s_spoof_name_ta = lv_textarea_create(function_page);
+    lv_obj_set_size(s_spoof_name_ta, 210, 36);
+    lv_obj_align(s_spoof_name_ta, LV_ALIGN_TOP_MID, 0, 98);
+    lv_textarea_set_one_line(s_spoof_name_ta, true);
+    lv_textarea_set_max_length(s_spoof_name_ta, 32);
+    lv_textarea_set_placeholder_text(s_spoof_name_ta, "Device name (optional)");
+    lv_obj_set_style_text_font(s_spoof_name_ta, &lv_font_montserrat_14, 0);
+
+    lv_obj_t *btn_row = lv_obj_create(function_page);
+    lv_obj_set_size(btn_row, 228, 36);
+    lv_obj_align(btn_row, LV_ALIGN_TOP_MID, 0, 142);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_style_pad_column(btn_row, 8, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(back_btn, 104, 34);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_t *bk_lbl = lv_label_create(back_btn);
+    lv_label_set_text(bk_lbl, LV_SYMBOL_LEFT " Back");
+    lv_obj_set_style_text_font(bk_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bk_lbl, ui_text_color(), 0);
+    lv_obj_center(bk_lbl);
+    lv_obj_add_event_cb(back_btn, spoof_add_back_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *save_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(save_btn, 104, 34);
+    lv_obj_set_style_bg_color(save_btn, lv_color_make(30, 100, 30), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(save_btn, lv_color_make(50, 140, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(save_btn, 0, 0);
+    lv_obj_set_style_radius(save_btn, 8, 0);
+    lv_obj_t *sv_lbl = lv_label_create(save_btn);
+    lv_label_set_text(sv_lbl, LV_SYMBOL_SAVE " Save");
+    lv_obj_set_style_text_font(sv_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(sv_lbl, lv_color_white(), 0);
+    lv_obj_center(sv_lbl);
+    lv_obj_add_event_cb(save_btn, spoof_add_save_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *kb = lv_keyboard_create(function_page);
+    lv_keyboard_set_textarea(kb, s_spoof_mac_ta);
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_UPPER);
+    lv_obj_set_size(kb, lv_pct(100), lv_pct(40));
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(kb, ui_bg_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(kb, ui_text_color(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(kb, lv_color_make(40, 40, 60), LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(kb, lv_color_make(70, 70, 100),
+                               LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(kb, ui_text_color(), LV_PART_ITEMS);
+    lv_obj_set_style_border_color(kb, ui_border_color(), LV_PART_ITEMS);
+    lv_obj_set_style_border_width(kb, 1, LV_PART_ITEMS);
+
+    lv_obj_add_event_cb(s_spoof_mac_ta,  spoof_add_ta_focus_cb, LV_EVENT_CLICKED, kb);
+    lv_obj_add_event_cb(s_spoof_name_ta, spoof_add_ta_focus_cb, LV_EVENT_CLICKED, kb);
+}
+
+static void show_ble_spoof_general_screen(void) {
+    s_spoof_list_selected = -1;
+    s_spoof_list_scroll   = NULL;
+
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+
+    spoof_list_load();
+
+    create_function_page_base("Device Spoof");
+    apply_menu_bg();
+
+    lv_obj_t *sub = lv_label_create(function_page);
+    char sub_buf[32];
+    if (s_spoof_list_count == 0)
+        snprintf(sub_buf, sizeof(sub_buf), "Spoof List - empty");
+    else
+        snprintf(sub_buf, sizeof(sub_buf), "Spoof List (%d)", s_spoof_list_count);
+    lv_label_set_text(sub, sub_buf);
+    lv_obj_set_style_text_font(sub, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sub, lv_color_make(140, 140, 140), 0);
+    lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 34);
+
+    s_spoof_list_scroll = lv_obj_create(function_page);
+    lv_obj_set_size(s_spoof_list_scroll, 228, 190);
+    lv_obj_align(s_spoof_list_scroll, LV_ALIGN_TOP_MID, 0, 52);
+    lv_obj_set_style_bg_color(s_spoof_list_scroll, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(s_spoof_list_scroll, 0, 0);
+    lv_obj_set_style_pad_all(s_spoof_list_scroll, 4, 0);
+    lv_obj_set_style_pad_row(s_spoof_list_scroll, 4, 0);
+    lv_obj_set_flex_flow(s_spoof_list_scroll, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_spoof_list_scroll, LV_FLEX_ALIGN_START,
+                           LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+    if (s_spoof_list_count == 0) {
+        lv_obj_t *empty = lv_label_create(s_spoof_list_scroll);
+        lv_label_set_text(empty, "No devices in spoof list.\nTap + Add to add one.");
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(empty, lv_color_make(176, 176, 176), 0);
+    }
+
+    for (int i = 0; i < s_spoof_list_count; i++) {
+        lv_obj_t *row = lv_obj_create(s_spoof_list_scroll);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(row, lv_color_make(40, 40, 40), 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_radius(row, 6, 0);
+        lv_obj_set_style_pad_all(row, 6, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                               LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_user_data(row, (void *)(intptr_t)i);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+
+        lv_obj_t *name_lbl = lv_label_create(row);
+        lv_label_set_text(name_lbl,
+            s_spoof_list[i].name[0] ? s_spoof_list[i].name : "Unknown");
+        lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(name_lbl, 200);
+        lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(name_lbl, ui_text_color(), 0);
+
+        char mac_str[18];
+        snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 s_spoof_list[i].mac[0], s_spoof_list[i].mac[1], s_spoof_list[i].mac[2],
+                 s_spoof_list[i].mac[3], s_spoof_list[i].mac[4], s_spoof_list[i].mac[5]);
+        lv_obj_t *mac_lbl = lv_label_create(row);
+        lv_label_set_text(mac_lbl, mac_str);
+        lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(mac_lbl, lv_color_make(140, 140, 140), 0);
+
+        lv_obj_add_event_cb(row, spoof_gen_row_cb, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)i);
+    }
+
+    // Bottom buttons: [Back] [+ Add] [START]
+    lv_obj_t *btn_row = lv_obj_create(function_page);
+    lv_obj_set_size(btn_row, 228, 36);
+    lv_obj_align(btn_row, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_style_pad_column(btn_row, 4, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back_btn2 = lv_btn_create(btn_row);
+    lv_obj_set_size(back_btn2, 68, 32);
+    lv_obj_set_style_bg_color(back_btn2, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn2, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn2, 0, 0);
+    lv_obj_set_style_radius(back_btn2, 8, 0);
+    lv_obj_t *bk2_lbl = lv_label_create(back_btn2);
+    lv_label_set_text(bk2_lbl, LV_SYMBOL_LEFT " Back");
+    lv_obj_set_style_text_font(bk2_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(bk2_lbl, ui_text_color(), 0);
+    lv_obj_center(bk2_lbl);
+    lv_obj_add_event_cb(back_btn2, spoof_gen_back_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *add_btn2 = lv_btn_create(btn_row);
+    lv_obj_set_size(add_btn2, 80, 32);
+    lv_obj_set_style_bg_color(add_btn2, lv_color_make(30, 80, 160), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(add_btn2, lv_color_make(50, 110, 200), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(add_btn2, 0, 0);
+    lv_obj_set_style_radius(add_btn2, 8, 0);
+    lv_obj_t *add2_lbl = lv_label_create(add_btn2);
+    lv_label_set_text(add2_lbl, LV_SYMBOL_PLUS " Add");
+    lv_obj_set_style_text_font(add2_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(add2_lbl, lv_color_white(), 0);
+    lv_obj_center(add2_lbl);
+    lv_obj_add_event_cb(add_btn2, spoof_gen_add_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *start_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(start_btn, 72, 32);
+    lv_obj_set_style_bg_color(start_btn, COLOR_MATERIAL_ORANGE, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(start_btn, lv_color_lighten(COLOR_MATERIAL_ORANGE, 30),
+                               LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(start_btn, 0, 0);
+    lv_obj_set_style_radius(start_btn, 8, 0);
+    lv_obj_set_flex_flow(start_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(start_btn, LV_FLEX_ALIGN_CENTER,
+                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(start_btn, 4, 0);
+    lv_obj_t *st_icon = lv_label_create(start_btn);
+    lv_label_set_text(st_icon, LV_SYMBOL_PLAY);
+    lv_obj_set_style_text_font(st_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(st_icon, lv_color_white(), 0);
+    lv_obj_t *st_lbl = lv_label_create(start_btn);
+    lv_label_set_text(st_lbl, "START");
+    lv_obj_set_style_text_font(st_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(st_lbl, lv_color_white(), 0);
+    lv_obj_add_event_cb(start_btn, spoof_gen_start_cb, LV_EVENT_CLICKED, NULL);
+}
+
 static void show_bt_attacks_screen(void)
 {
     create_function_page_base("BT Attacks");
@@ -21026,6 +21413,9 @@ static void show_bt_attacks_screen(void)
 
     lv_obj_t *spam_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BLE\nSpam", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(spam_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spam");
+
+    lv_obj_t *spoof_gen_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Device\nSpoof", COLOR_MATERIAL_ORANGE, NULL, NULL);
+    lv_obj_add_event_cb(spoof_gen_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spoof General");
 
     /* Back button */
     lv_obj_t *back_btn = lv_btn_create(function_page);
@@ -22305,6 +22695,10 @@ void attack_event_cb(lv_event_t *e)
     // BT Attacks — active attacks guarded by authorization warning
     if (strcmp(attack_name, "BLE Spam") == 0) {
         show_attack_warning(show_ble_spam_screen);
+        return;
+    }
+    if (strcmp(attack_name, "BLE Spoof General") == 0) {
+        show_ble_spoof_general_screen();
         return;
     }
     if (strcmp(attack_name, "BLE Spoof") == 0) {
