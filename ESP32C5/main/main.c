@@ -167,6 +167,9 @@ static lv_obj_t *ble_spoof_status_label = NULL;
 static lv_obj_t *ble_spoof_start_btn = NULL;
 static bool ble_spoof_ui_active = false;
 static int ble_spoof_target_idx = -1;
+static uint8_t ble_spoof_target_mac[6];          // authoritative target MAC for task
+static char ble_spoof_target_name_str[33];        // authoritative target name for task
+static uint16_t ble_spoof_target_company_id = 0; // authoritative company ID for task
 static volatile bool ble_spoof_needs_ui_update = false;
 
 // BLE Disconnect attack state
@@ -179,6 +182,8 @@ static bool ble_disc_ui_active = false;
 static volatile int ble_disc_count = 0;
 static volatile bool ble_disc_needs_ui_update = false;
 static int ble_disc_target_idx = -1;
+static uint8_t ble_disc_target_mac[6];      // authoritative target MAC for task
+static uint8_t ble_disc_target_addr_type = 0;
 static uint16_t ble_disc_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 
 // Attack authorization warning popup
@@ -20001,14 +20006,22 @@ static const uint8_t s_windows_sp_svc2[] = {0x14,0xFE,0x80,0x01,0x00,0x00,0x00};
 static void ble_spoof_proceed_from_sas(void)
 {
     s_ble_spoof_return_fn = show_directed_bt_attacks_screen;
-    ble_spoof_target_idx = bt_sas_selected_idx;
+    // bt_sas_selected_idx may be -1 (reset_function_page_children cleared it),
+    // but bt_sas_target_addr/name are preserved — copy them as the authoritative target.
+    memcpy(ble_spoof_target_mac, bt_sas_target_addr, 6);
+    strncpy(ble_spoof_target_name_str, bt_sas_target_name, sizeof(ble_spoof_target_name_str) - 1);
+    ble_spoof_target_name_str[sizeof(ble_spoof_target_name_str) - 1] = '\0';
+    ble_spoof_target_company_id = 0;
+    ble_spoof_target_idx = 0; // dummy non-negative so start_cb passes the check
     show_ble_spoof_directed_screen();
 }
 
 static void ble_disc_proceed_from_sas(void)
 {
     s_ble_disc_return_fn = show_directed_bt_attacks_screen;
-    ble_disc_target_idx = bt_sas_selected_idx;
+    memcpy(ble_disc_target_mac, bt_sas_target_addr, 6);
+    ble_disc_target_addr_type = bt_sas_target_addr_type;
+    ble_disc_target_idx = 0; // dummy non-negative so start_cb passes the check
     show_ble_disc_directed_screen();
 }
 
@@ -20220,22 +20233,23 @@ static void show_ble_spam_screen(void)
 static void ble_spoof_task(void *pvParameters)
 {
     (void)pvParameters;
-    if (ble_spoof_target_idx < 0 || ble_spoof_target_idx >= bt_device_count) {
+    // Use the authoritative MAC array — valid for both list-selected and SAS-directed entry
+    bool mac_valid = false;
+    for (int i = 0; i < 6; i++) if (ble_spoof_target_mac[i]) { mac_valid = true; break; }
+    if (!mac_valid) {
         ble_spoof_active = false;
         ble_spoof_task_handle = NULL;
         vTaskDelete(NULL);
         return;
     }
 
-    bt_device_info_t *tgt = &bt_devices[ble_spoof_target_idx];
-    ESP_LOGI(TAG, "BLE Spoof: cloning device at index %d", ble_spoof_target_idx);
+    char mac_log[18]; bt_format_addr(ble_spoof_target_mac, mac_log);
+    ESP_LOGI(TAG, "BLE Spoof: cloning %s (%s)", ble_spoof_target_name_str, mac_log);
 
-    // Build manufacturer data from the target's company_id if known
     uint8_t spoof_mfg[8];
-    spoof_mfg[0] = tgt->company_id & 0xFF;
-    spoof_mfg[1] = (tgt->company_id >> 8) & 0xFF;
-    // Fill remaining with target MAC bytes for uniqueness
-    memcpy(spoof_mfg + 2, tgt->addr, 6);
+    spoof_mfg[0] = ble_spoof_target_company_id & 0xFF;
+    spoof_mfg[1] = (ble_spoof_target_company_id >> 8) & 0xFF;
+    memcpy(spoof_mfg + 2, ble_spoof_target_mac, 6);
 
     while (ble_spoof_active) {
         ble_gap_adv_stop();
@@ -20245,9 +20259,9 @@ static void ble_spoof_task(void *pvParameters)
         fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
         fields.mfg_data = spoof_mfg;
         fields.mfg_data_len = sizeof(spoof_mfg);
-        if (tgt->name[0]) {
-            fields.name = (const uint8_t *)tgt->name;
-            fields.name_len = strlen(tgt->name);
+        if (ble_spoof_target_name_str[0]) {
+            fields.name = (const uint8_t *)ble_spoof_target_name_str;
+            fields.name_len = strlen(ble_spoof_target_name_str);
             fields.name_is_complete = 1;
         }
 
@@ -20279,7 +20293,9 @@ static void ble_spoof_start_cb(lv_event_t *e)
         lv_obj_set_style_bg_color(ble_spoof_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
         if (ble_spoof_status_label) lv_label_set_text(ble_spoof_status_label, "Stopped.");
     } else {
-        if (ble_spoof_target_idx < 0) {
+        bool mac_ready = false;
+        for (int i = 0; i < 6; i++) if (ble_spoof_target_mac[i]) { mac_ready = true; break; }
+        if (!mac_ready) {
             if (ble_spoof_status_label) lv_label_set_text(ble_spoof_status_label, "Select a device first!");
             return;
         }
@@ -20290,8 +20306,7 @@ static void ble_spoof_start_cb(lv_event_t *e)
         ble_spoof_active = true;
         lv_label_set_text(lv_obj_get_child(ble_spoof_start_btn, 0), "STOP");
         lv_obj_set_style_bg_color(ble_spoof_start_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-        bt_device_info_t *tgt = &bt_devices[ble_spoof_target_idx];
-        char mac_s[18]; bt_format_addr(tgt->addr, mac_s);
+        char mac_s[18]; bt_format_addr(ble_spoof_target_mac, mac_s);
         char sbuf[64]; snprintf(sbuf, sizeof(sbuf), "Spoofing: %s", mac_s);
         if (ble_spoof_status_label) lv_label_set_text(ble_spoof_status_label, sbuf);
         xTaskCreate(ble_spoof_task, "ble_spoof", 4096, NULL, 5, &ble_spoof_task_handle);
@@ -20308,6 +20323,8 @@ static void ble_spoof_back_cb(lv_event_t *e)
     ble_spoof_status_label = NULL;
     ble_spoof_start_btn = NULL;
     ble_spoof_target_idx = -1;
+    memset(ble_spoof_target_mac, 0, 6);
+    memset(ble_spoof_target_name_str, 0, sizeof(ble_spoof_target_name_str));
     if (current_radio_mode == RADIO_MODE_BLE) {
         ble_gap_adv_stop();
         bt_nimble_deinit();
@@ -20323,15 +20340,21 @@ static void ble_spoof_device_tap_cb(lv_event_t *e)
     if (ble_spoof_active) return;
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     ble_spoof_target_idx = idx;
-    if (ble_spoof_status_label && idx >= 0 && idx < bt_device_count) {
+    if (idx >= 0 && idx < bt_device_count) {
         bt_device_info_t *d = &bt_devices[idx];
-        char mac_s[18]; bt_format_addr(d->addr, mac_s);
-        char tbuf[64];
-        if (d->name[0])
-            snprintf(tbuf, sizeof(tbuf), "Target: %s", d->name);
-        else
-            snprintf(tbuf, sizeof(tbuf), "Target: %s", mac_s);
-        lv_label_set_text(ble_spoof_status_label, tbuf);
+        memcpy(ble_spoof_target_mac, d->addr, 6);
+        strncpy(ble_spoof_target_name_str, d->name, sizeof(ble_spoof_target_name_str) - 1);
+        ble_spoof_target_name_str[sizeof(ble_spoof_target_name_str) - 1] = '\0';
+        ble_spoof_target_company_id = d->company_id;
+        if (ble_spoof_status_label) {
+            char mac_s[18]; bt_format_addr(d->addr, mac_s);
+            char tbuf[64];
+            if (d->name[0])
+                snprintf(tbuf, sizeof(tbuf), "Target: %s", d->name);
+            else
+                snprintf(tbuf, sizeof(tbuf), "Target: %s", mac_s);
+            lv_label_set_text(ble_spoof_status_label, tbuf);
+        }
     }
 }
 
@@ -20374,7 +20397,7 @@ static void show_ble_spoof_screen(void)
 
         // Status label
         char status_buf[48];
-        snprintf(status_buf, sizeof(status_buf), "Ready — press START to spoof");
+        snprintf(status_buf, sizeof(status_buf), "Ready - press START SPOOF");
         ble_spoof_status_label = lv_label_create(function_page);
         lv_label_set_text(ble_spoof_status_label, status_buf);
         lv_obj_set_style_text_font(ble_spoof_status_label, &lv_font_montserrat_12, 0);
@@ -20493,21 +20516,22 @@ static int ble_disc_gap_cb(struct ble_gap_event *event, void *arg)
 static void ble_disc_task(void *pvParameters)
 {
     (void)pvParameters;
-    if (ble_disc_target_idx < 0 || ble_disc_target_idx >= bt_device_count) {
+    bool mac_valid = false;
+    for (int i = 0; i < 6; i++) if (ble_disc_target_mac[i]) { mac_valid = true; break; }
+    if (!mac_valid) {
         ble_disc_active = false;
         ble_disc_task_handle = NULL;
         vTaskDelete(NULL);
         return;
     }
 
-    bt_device_info_t *tgt = &bt_devices[ble_disc_target_idx];
     ble_addr_t peer_addr;
-    peer_addr.type = tgt->addr_type;
-    memcpy(peer_addr.val, tgt->addr, 6);
+    peer_addr.type = ble_disc_target_addr_type;
+    memcpy(peer_addr.val, ble_disc_target_mac, 6);
 
     ESP_LOGI(TAG, "BLE Disc: flooding %02X:%02X:%02X:%02X:%02X:%02X",
-             tgt->addr[0],tgt->addr[1],tgt->addr[2],
-             tgt->addr[3],tgt->addr[4],tgt->addr[5]);
+             ble_disc_target_mac[0],ble_disc_target_mac[1],ble_disc_target_mac[2],
+             ble_disc_target_mac[3],ble_disc_target_mac[4],ble_disc_target_mac[5]);
 
     while (ble_disc_active) {
         ble_disc_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -20555,7 +20579,9 @@ static void ble_disc_start_cb(lv_event_t *e)
         lv_label_set_text(lv_obj_get_child(ble_disc_start_btn, 0), "START");
         lv_obj_set_style_bg_color(ble_disc_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
     } else {
-        if (ble_disc_target_idx < 0) {
+        bool mac_ready = false;
+        for (int i = 0; i < 6; i++) if (ble_disc_target_mac[i]) { mac_ready = true; break; }
+        if (!mac_ready) {
             if (ble_disc_status_label) lv_label_set_text(ble_disc_status_label, "Select a target first!");
             return;
         }
@@ -20586,6 +20612,7 @@ static void ble_disc_back_cb(lv_event_t *e)
     ble_disc_counter_label = NULL;
     ble_disc_start_btn = NULL;
     ble_disc_target_idx = -1;
+    memset(ble_disc_target_mac, 0, 6);
     if (current_radio_mode == RADIO_MODE_BLE) {
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
@@ -20600,15 +20627,19 @@ static void ble_disc_device_tap_cb(lv_event_t *e)
     if (ble_disc_active) return;
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     ble_disc_target_idx = idx;
-    if (ble_disc_status_label && idx >= 0 && idx < bt_device_count) {
+    if (idx >= 0 && idx < bt_device_count) {
         bt_device_info_t *d = &bt_devices[idx];
-        char mac_s[18]; bt_format_addr(d->addr, mac_s);
-        char tbuf[56];
-        if (d->name[0])
-            snprintf(tbuf, sizeof(tbuf), "Target: %s", d->name);
-        else
-            snprintf(tbuf, sizeof(tbuf), "Target: %s", mac_s);
-        lv_label_set_text(ble_disc_status_label, tbuf);
+        memcpy(ble_disc_target_mac, d->addr, 6);
+        ble_disc_target_addr_type = d->addr_type;
+        if (ble_disc_status_label) {
+            char mac_s[18]; bt_format_addr(d->addr, mac_s);
+            char tbuf[56];
+            if (d->name[0])
+                snprintf(tbuf, sizeof(tbuf), "Target: %s", d->name);
+            else
+                snprintf(tbuf, sizeof(tbuf), "Target: %s", mac_s);
+            lv_label_set_text(ble_disc_status_label, tbuf);
+        }
     }
 }
 
@@ -20651,7 +20682,7 @@ static void show_ble_disc_screen(void)
         lv_obj_set_style_text_color(mac_lbl, COLOR_MATERIAL_PINK, 0);
 
         ble_disc_status_label = lv_label_create(function_page);
-        lv_label_set_text(ble_disc_status_label, "Ready — press START");
+        lv_label_set_text(ble_disc_status_label, "Ready - press START");
         lv_obj_set_style_text_font(ble_disc_status_label, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(ble_disc_status_label, ui_text_color(), 0);
         lv_obj_align(ble_disc_status_label, LV_ALIGN_TOP_MID, 0, 116);
@@ -20800,7 +20831,7 @@ static void show_ble_spoof_directed_screen(void)
 
     // Status label
     ble_spoof_status_label = lv_label_create(function_page);
-    lv_label_set_text(ble_spoof_status_label, "Ready — press START SPOOF");
+    lv_label_set_text(ble_spoof_status_label, "Ready - press START SPOOF");
     lv_obj_set_style_text_font(ble_spoof_status_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(ble_spoof_status_label, ui_text_color(), 0);
     lv_obj_align(ble_spoof_status_label, LV_ALIGN_TOP_MID, 0, 116);
@@ -20879,7 +20910,7 @@ static void show_ble_disc_directed_screen(void)
 
     // Status label
     ble_disc_status_label = lv_label_create(function_page);
-    lv_label_set_text(ble_disc_status_label, "Ready — press START");
+    lv_label_set_text(ble_disc_status_label, "Ready - press START");
     lv_obj_set_style_text_font(ble_disc_status_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(ble_disc_status_label, ui_text_color(), 0);
     lv_obj_align(ble_disc_status_label, LV_ALIGN_TOP_MID, 0, 116);
