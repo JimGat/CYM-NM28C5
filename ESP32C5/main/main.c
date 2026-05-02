@@ -1600,6 +1600,8 @@ static void show_gw_result_screen(void);
 // BT Attacks
 static void show_bt_attacks_screen(void);
 static void show_directed_bt_attacks_screen(void);
+static void show_ble_spoof_directed_screen(void);
+static void show_ble_disc_directed_screen(void);
 static void show_ble_spam_screen(void);
 static void show_ble_spoof_screen(void);
 static void show_ble_disc_screen(void);
@@ -17982,7 +17984,7 @@ static void show_bluetooth_screen(void)
     lv_obj_add_event_cb(lookout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Dee Dee Detector");
 
     // BT Attacks - Orange (bottom-right, 6th tile)
-    lv_obj_t *btatk_tile = create_tile(tiles, LV_SYMBOL_WARNING, "BT\nAttacks", COLOR_MATERIAL_ORANGE, NULL, NULL);
+    lv_obj_t *btatk_tile = create_tile(tiles, LV_SYMBOL_WARNING, "BT\nAttacks", COLOR_MATERIAL_AMBER, NULL, NULL);
     lv_obj_add_event_cb(btatk_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Attacks");
 }
 
@@ -19880,7 +19882,7 @@ static void show_bt_attack_tiles_screen(void)
     lv_obj_add_event_cb(add_lookout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Add to Lookout");
 
     // BT Attacks — opens directed attack menu (Spoof, Disconnect) targeting selected device
-    lv_obj_t *attacks_tile = create_tile(tiles, LV_SYMBOL_WARNING, "BT\nAttacks", COLOR_MATERIAL_INDIGO, NULL, NULL);
+    lv_obj_t *attacks_tile = create_tile(tiles, LV_SYMBOL_WARNING, "BT\nAttacks", COLOR_MATERIAL_AMBER, NULL, NULL);
     lv_obj_add_event_cb(attacks_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Directed BT Attacks");
 
     /* Back button — return to BT Scan & Select */
@@ -20000,14 +20002,14 @@ static void ble_spoof_proceed_from_sas(void)
 {
     s_ble_spoof_return_fn = show_directed_bt_attacks_screen;
     ble_spoof_target_idx = bt_sas_selected_idx;
-    show_ble_spoof_screen();
+    show_ble_spoof_directed_screen();
 }
 
 static void ble_disc_proceed_from_sas(void)
 {
     s_ble_disc_return_fn = show_directed_bt_attacks_screen;
     ble_disc_target_idx = bt_sas_selected_idx;
-    show_ble_disc_screen();
+    show_ble_disc_directed_screen();
 }
 
 // ── BLE Spam task ─────────────────────────────────────────────────────────────
@@ -20762,6 +20764,170 @@ static void show_ble_disc_screen(void)
 }
 
 // ── BT Attacks menu ──────────────────────────────────────────────────────────
+// ── Device Spoof — directed (SAS pre-selected target, no device list) ────────
+static void show_ble_spoof_directed_screen(void)
+{
+    create_function_page_base("Device Spoof");
+    ble_spoof_ui_active = true;
+
+    char mac_s[18];
+    bt_format_addr(bt_sas_target_addr, mac_s);
+
+    // Target info card
+    lv_obj_t *card = lv_obj_create(function_page);
+    lv_obj_set_size(card, lv_pct(96), 70);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+    lv_obj_set_style_border_color(card, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 8, 0);
+    lv_obj_set_style_pad_all(card, 8, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *name_lbl = lv_label_create(card);
+    lv_label_set_text(name_lbl, bt_sas_target_name[0] ? bt_sas_target_name : "(unnamed)");
+    lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(name_lbl, ui_text_color(), 0);
+    lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(name_lbl, lv_pct(100));
+
+    lv_obj_t *mac_lbl = lv_label_create(card);
+    lv_label_set_text(mac_lbl, mac_s);
+    lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(mac_lbl, COLOR_MATERIAL_ORANGE, 0);
+
+    // Status label
+    ble_spoof_status_label = lv_label_create(function_page);
+    lv_label_set_text(ble_spoof_status_label, "Ready — press START SPOOF");
+    lv_obj_set_style_text_font(ble_spoof_status_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ble_spoof_status_label, ui_text_color(), 0);
+    lv_obj_align(ble_spoof_status_label, LV_ALIGN_TOP_MID, 0, 116);
+
+    // Start/Stop button
+    ble_spoof_start_btn = lv_btn_create(function_page);
+    lv_obj_set_size(ble_spoof_start_btn, 140, 42);
+    lv_obj_align(ble_spoof_start_btn, LV_ALIGN_TOP_MID, 0, 148);
+    lv_obj_set_style_bg_color(ble_spoof_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(ble_spoof_start_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(ble_spoof_start_btn, 0, 0);
+    lv_obj_set_style_radius(ble_spoof_start_btn, 10, 0);
+    lv_obj_t *sl = lv_label_create(ble_spoof_start_btn);
+    lv_label_set_text(sl, "START SPOOF");
+    lv_obj_set_style_text_font(sl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(sl, lv_color_white(), 0);
+    lv_obj_center(sl);
+    lv_obj_add_event_cb(ble_spoof_start_btn, ble_spoof_start_cb, LV_EVENT_CLICKED, NULL);
+
+    // Back button
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 28);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_t *bi = lv_label_create(back_btn);
+    lv_label_set_text(bi, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(bi, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bi, lv_color_white(), 0);
+    lv_obj_t *bl = lv_label_create(back_btn);
+    lv_label_set_text(bl, "Attacks");
+    lv_obj_set_style_text_font(bl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bl, lv_color_white(), 0);
+    lv_obj_add_event_cb(back_btn, ble_spoof_back_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// ── BLE Disconnect — directed (SAS pre-selected target, no device list) ───────
+static void show_ble_disc_directed_screen(void)
+{
+    create_function_page_base("BLE Disconnect");
+    ble_disc_ui_active = true;
+    ble_disc_count = 0;
+
+    char mac_s[18];
+    bt_format_addr(bt_sas_target_addr, mac_s);
+
+    // Target info card
+    lv_obj_t *card = lv_obj_create(function_page);
+    lv_obj_set_size(card, lv_pct(96), 70);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+    lv_obj_set_style_border_color(card, COLOR_MATERIAL_PINK, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 8, 0);
+    lv_obj_set_style_pad_all(card, 8, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *name_lbl = lv_label_create(card);
+    lv_label_set_text(name_lbl, bt_sas_target_name[0] ? bt_sas_target_name : "(unnamed)");
+    lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(name_lbl, ui_text_color(), 0);
+    lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(name_lbl, lv_pct(100));
+
+    lv_obj_t *mac_lbl = lv_label_create(card);
+    lv_label_set_text(mac_lbl, mac_s);
+    lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(mac_lbl, COLOR_MATERIAL_PINK, 0);
+
+    // Status label
+    ble_disc_status_label = lv_label_create(function_page);
+    lv_label_set_text(ble_disc_status_label, "Ready — press START");
+    lv_obj_set_style_text_font(ble_disc_status_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ble_disc_status_label, ui_text_color(), 0);
+    lv_obj_align(ble_disc_status_label, LV_ALIGN_TOP_MID, 0, 116);
+
+    // Attempt counter
+    ble_disc_counter_label = lv_label_create(function_page);
+    lv_label_set_text(ble_disc_counter_label, "Attempts: 0");
+    lv_obj_set_style_text_font(ble_disc_counter_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(ble_disc_counter_label, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_align(ble_disc_counter_label, LV_ALIGN_TOP_MID, 0, 136);
+
+    // Start/Stop button
+    ble_disc_start_btn = lv_btn_create(function_page);
+    lv_obj_set_size(ble_disc_start_btn, 130, 42);
+    lv_obj_align(ble_disc_start_btn, LV_ALIGN_TOP_MID, 0, 170);
+    lv_obj_set_style_bg_color(ble_disc_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(ble_disc_start_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(ble_disc_start_btn, 0, 0);
+    lv_obj_set_style_radius(ble_disc_start_btn, 10, 0);
+    lv_obj_t *dl = lv_label_create(ble_disc_start_btn);
+    lv_label_set_text(dl, "START");
+    lv_obj_set_style_text_font(dl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(dl, lv_color_white(), 0);
+    lv_obj_center(dl);
+    lv_obj_add_event_cb(ble_disc_start_btn, ble_disc_start_cb, LV_EVENT_CLICKED, NULL);
+
+    // Back button
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 28);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_t *dbi = lv_label_create(back_btn);
+    lv_label_set_text(dbi, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(dbi, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(dbi, lv_color_white(), 0);
+    lv_obj_t *dbl = lv_label_create(back_btn);
+    lv_label_set_text(dbl, "Attacks");
+    lv_obj_set_style_text_font(dbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(dbl, lv_color_white(), 0);
+    lv_obj_add_event_cb(back_btn, ble_disc_back_cb, LV_EVENT_CLICKED, NULL);
+}
+
 // ── Directed BT Attacks screen (SAS context — target from Scan & Select) ─────
 static void show_directed_bt_attacks_screen(void)
 {
