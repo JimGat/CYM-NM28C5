@@ -20337,69 +20337,110 @@ static void show_ble_spoof_screen(void)
 {
     create_function_page_base("Device Spoof");
     ble_spoof_ui_active = true;
-    ble_spoof_target_idx = -1;
+    // Do NOT reset ble_spoof_target_idx here — proceed_from_sas may have pre-set it
 
-    // Device list (from last scan)
-    lv_obj_t *list_lbl = lv_label_create(function_page);
-    lv_label_set_text(list_lbl, "Select target device:");
-    lv_obj_set_style_text_font(list_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(list_lbl, ui_text_color(), 0);
-    lv_obj_align(list_lbl, LV_ALIGN_TOP_LEFT, 8, 36);
+    bool directed = (ble_spoof_target_idx >= 0 && ble_spoof_target_idx < bt_device_count);
 
-    lv_obj_t *dev_list = lv_obj_create(function_page);
-    lv_obj_set_size(dev_list, lv_pct(100), 130);
-    lv_obj_align(dev_list, LV_ALIGN_TOP_MID, 0, 52);
-    lv_obj_set_style_bg_color(dev_list, ui_card_color(), 0);
-    lv_obj_set_style_border_width(dev_list, 1, 0);
-    lv_obj_set_style_border_color(dev_list, ui_border_color(), 0);
-    lv_obj_set_style_radius(dev_list, 6, 0);
-    lv_obj_set_flex_flow(dev_list, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_all(dev_list, 4, 0);
-    lv_obj_set_scrollbar_mode(dev_list, LV_SCROLLBAR_MODE_AUTO);
+    if (directed) {
+        // Pre-selected path: show target info card, START immediately
+        bt_device_info_t *d = &bt_devices[ble_spoof_target_idx];
+        char mac_s[18]; bt_format_addr(d->addr, mac_s);
 
-    if (bt_device_count == 0) {
-        lv_obj_t *no_dev = lv_label_create(dev_list);
-        lv_label_set_text(no_dev, "No devices — run BLE Scan first");
-        lv_obj_set_style_text_font(no_dev, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(no_dev, ui_text_color(), 0);
+        lv_obj_t *card = lv_obj_create(function_page);
+        lv_obj_set_size(card, lv_pct(96), 70);
+        lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 36);
+        lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+        lv_obj_set_style_border_color(card, COLOR_MATERIAL_ORANGE, 0);
+        lv_obj_set_style_border_width(card, 2, 0);
+        lv_obj_set_style_radius(card, 8, 0);
+        lv_obj_set_style_pad_all(card, 8, 0);
+        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *name_lbl = lv_label_create(card);
+        lv_label_set_text(name_lbl, d->name[0] ? d->name : "(unnamed)");
+        lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(name_lbl, ui_text_color(), 0);
+        lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(name_lbl, lv_pct(100));
+
+        lv_obj_t *mac_lbl = lv_label_create(card);
+        lv_label_set_text(mac_lbl, mac_s);
+        lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(mac_lbl, COLOR_MATERIAL_ORANGE, 0);
+
+        // Status label
+        char status_buf[48];
+        snprintf(status_buf, sizeof(status_buf), "Ready — press START to spoof");
+        ble_spoof_status_label = lv_label_create(function_page);
+        lv_label_set_text(ble_spoof_status_label, status_buf);
+        lv_obj_set_style_text_font(ble_spoof_status_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(ble_spoof_status_label, ui_text_color(), 0);
+        lv_obj_align(ble_spoof_status_label, LV_ALIGN_TOP_MID, 0, 116);
     } else {
-        for (int i = 0; i < bt_device_count; i++) {
-            bt_device_info_t *d = &bt_devices[i];
-            char mac_s[18]; bt_format_addr(d->addr, mac_s);
-            char row_txt[48];
-            if (d->name[0])
-                snprintf(row_txt, sizeof(row_txt), "%.16s  %s", d->name, mac_s);
-            else
-                snprintf(row_txt, sizeof(row_txt), "%s", mac_s);
-            lv_obj_t *row = lv_btn_create(dev_list);
-            lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
-            lv_obj_set_style_bg_color(row, ui_card_color(), LV_STATE_DEFAULT);
-            lv_obj_set_style_bg_color(row, ui_accent_color(), LV_STATE_PRESSED);
-            lv_obj_set_style_border_width(row, 0, 0);
-            lv_obj_set_style_radius(row, 4, 0);
-            lv_obj_set_style_pad_all(row, 4, 0);
-            lv_obj_t *row_lbl = lv_label_create(row);
-            lv_label_set_text(row_lbl, row_txt);
-            lv_obj_set_style_text_font(row_lbl, &lv_font_montserrat_12, 0);
-            lv_obj_set_style_text_color(row_lbl, ui_text_color(), 0);
-            lv_label_set_long_mode(row_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
-            lv_obj_set_width(row_lbl, lv_pct(100));
-            lv_obj_add_event_cb(row, ble_spoof_device_tap_cb, LV_EVENT_CLICKED,
-                                (void *)(intptr_t)i);
+        // Fallback: device selection list
+        ble_spoof_target_idx = -1;
+        lv_obj_t *list_lbl = lv_label_create(function_page);
+        lv_label_set_text(list_lbl, "Select target device:");
+        lv_obj_set_style_text_font(list_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(list_lbl, ui_text_color(), 0);
+        lv_obj_align(list_lbl, LV_ALIGN_TOP_LEFT, 8, 36);
+
+        lv_obj_t *dev_list = lv_obj_create(function_page);
+        lv_obj_set_size(dev_list, lv_pct(100), 130);
+        lv_obj_align(dev_list, LV_ALIGN_TOP_MID, 0, 52);
+        lv_obj_set_style_bg_color(dev_list, ui_card_color(), 0);
+        lv_obj_set_style_border_width(dev_list, 1, 0);
+        lv_obj_set_style_border_color(dev_list, ui_border_color(), 0);
+        lv_obj_set_style_radius(dev_list, 6, 0);
+        lv_obj_set_flex_flow(dev_list, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_all(dev_list, 4, 0);
+        lv_obj_set_scrollbar_mode(dev_list, LV_SCROLLBAR_MODE_AUTO);
+
+        if (bt_device_count == 0) {
+            lv_obj_t *no_dev = lv_label_create(dev_list);
+            lv_label_set_text(no_dev, "No devices — run BLE Scan first");
+            lv_obj_set_style_text_font(no_dev, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(no_dev, ui_text_color(), 0);
+        } else {
+            for (int i = 0; i < bt_device_count; i++) {
+                bt_device_info_t *d = &bt_devices[i];
+                char mac_s[18]; bt_format_addr(d->addr, mac_s);
+                char row_txt[48];
+                if (d->name[0])
+                    snprintf(row_txt, sizeof(row_txt), "%.16s  %s", d->name, mac_s);
+                else
+                    snprintf(row_txt, sizeof(row_txt), "%s", mac_s);
+                lv_obj_t *row = lv_btn_create(dev_list);
+                lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+                lv_obj_set_style_bg_color(row, ui_card_color(), LV_STATE_DEFAULT);
+                lv_obj_set_style_bg_color(row, ui_accent_color(), LV_STATE_PRESSED);
+                lv_obj_set_style_border_width(row, 0, 0);
+                lv_obj_set_style_radius(row, 4, 0);
+                lv_obj_set_style_pad_all(row, 4, 0);
+                lv_obj_t *row_lbl = lv_label_create(row);
+                lv_label_set_text(row_lbl, row_txt);
+                lv_obj_set_style_text_font(row_lbl, &lv_font_montserrat_12, 0);
+                lv_obj_set_style_text_color(row_lbl, ui_text_color(), 0);
+                lv_label_set_long_mode(row_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+                lv_obj_set_width(row_lbl, lv_pct(100));
+                lv_obj_add_event_cb(row, ble_spoof_device_tap_cb, LV_EVENT_CLICKED,
+                                    (void *)(intptr_t)i);
+            }
         }
+
+        ble_spoof_status_label = lv_label_create(function_page);
+        lv_label_set_text(ble_spoof_status_label, "Tap device to select target");
+        lv_obj_set_style_text_font(ble_spoof_status_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(ble_spoof_status_label, ui_text_color(), 0);
+        lv_obj_align(ble_spoof_status_label, LV_ALIGN_TOP_MID, 0, 190);
     }
 
-    // Status label
-    ble_spoof_status_label = lv_label_create(function_page);
-    lv_label_set_text(ble_spoof_status_label, "Tap device to select target");
-    lv_obj_set_style_text_font(ble_spoof_status_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(ble_spoof_status_label, ui_text_color(), 0);
-    lv_obj_align(ble_spoof_status_label, LV_ALIGN_TOP_MID, 0, 190);
-
-    // Start/Stop button
+    // Start/Stop button — position depends on layout
     ble_spoof_start_btn = lv_btn_create(function_page);
-    lv_obj_set_size(ble_spoof_start_btn, 140, 38);
-    lv_obj_align(ble_spoof_start_btn, LV_ALIGN_TOP_MID, 0, 210);
+    lv_obj_set_size(ble_spoof_start_btn, 140, 42);
+    lv_obj_align(ble_spoof_start_btn, LV_ALIGN_TOP_MID, 0, directed ? 148 : 210);
     lv_obj_set_style_bg_color(ble_spoof_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(ble_spoof_start_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(ble_spoof_start_btn, 0, 0);
@@ -20427,7 +20468,7 @@ static void show_ble_spoof_screen(void)
     lv_obj_set_style_text_font(bi, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(bi, lv_color_white(), 0);
     lv_obj_t *bl = lv_label_create(back_btn);
-    lv_label_set_text(bl, "BT Attacks");
+    lv_label_set_text(bl, directed ? "Attacks" : "BT Attacks");
     lv_obj_set_style_text_font(bl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(bl, lv_color_white(), 0);
     lv_obj_add_event_cb(back_btn, ble_spoof_back_cb, LV_EVENT_CLICKED, NULL);
@@ -20573,75 +20614,120 @@ static void show_ble_disc_screen(void)
 {
     create_function_page_base("BLE Disconnect");
     ble_disc_ui_active = true;
-    ble_disc_target_idx = -1;
+    // Do NOT reset ble_disc_target_idx here — proceed_from_sas may have pre-set it
     ble_disc_count = 0;
 
-    lv_obj_t *list_lbl = lv_label_create(function_page);
-    lv_label_set_text(list_lbl, "Select target:");
-    lv_obj_set_style_text_font(list_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(list_lbl, ui_text_color(), 0);
-    lv_obj_align(list_lbl, LV_ALIGN_TOP_LEFT, 8, 36);
+    bool directed = (ble_disc_target_idx >= 0 && ble_disc_target_idx < bt_device_count);
 
-    lv_obj_t *dev_list = lv_obj_create(function_page);
-    lv_obj_set_size(dev_list, lv_pct(100), 120);
-    lv_obj_align(dev_list, LV_ALIGN_TOP_MID, 0, 52);
-    lv_obj_set_style_bg_color(dev_list, ui_card_color(), 0);
-    lv_obj_set_style_border_width(dev_list, 1, 0);
-    lv_obj_set_style_border_color(dev_list, ui_border_color(), 0);
-    lv_obj_set_style_radius(dev_list, 6, 0);
-    lv_obj_set_flex_flow(dev_list, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_all(dev_list, 4, 0);
-    lv_obj_set_scrollbar_mode(dev_list, LV_SCROLLBAR_MODE_AUTO);
+    if (directed) {
+        // Pre-selected path: show target info card, START immediately
+        bt_device_info_t *d = &bt_devices[ble_disc_target_idx];
+        char mac_s[18]; bt_format_addr(d->addr, mac_s);
 
-    if (bt_device_count == 0) {
-        lv_obj_t *no_dev = lv_label_create(dev_list);
-        lv_label_set_text(no_dev, "No devices — run BLE Scan first");
-        lv_obj_set_style_text_font(no_dev, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(no_dev, ui_text_color(), 0);
+        lv_obj_t *card = lv_obj_create(function_page);
+        lv_obj_set_size(card, lv_pct(96), 70);
+        lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 36);
+        lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+        lv_obj_set_style_border_color(card, COLOR_MATERIAL_PINK, 0);
+        lv_obj_set_style_border_width(card, 2, 0);
+        lv_obj_set_style_radius(card, 8, 0);
+        lv_obj_set_style_pad_all(card, 8, 0);
+        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *name_lbl = lv_label_create(card);
+        lv_label_set_text(name_lbl, d->name[0] ? d->name : "(unnamed)");
+        lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(name_lbl, ui_text_color(), 0);
+        lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(name_lbl, lv_pct(100));
+
+        lv_obj_t *mac_lbl = lv_label_create(card);
+        lv_label_set_text(mac_lbl, mac_s);
+        lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(mac_lbl, COLOR_MATERIAL_PINK, 0);
+
+        ble_disc_status_label = lv_label_create(function_page);
+        lv_label_set_text(ble_disc_status_label, "Ready — press START");
+        lv_obj_set_style_text_font(ble_disc_status_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(ble_disc_status_label, ui_text_color(), 0);
+        lv_obj_align(ble_disc_status_label, LV_ALIGN_TOP_MID, 0, 116);
+
+        ble_disc_counter_label = lv_label_create(function_page);
+        lv_label_set_text(ble_disc_counter_label, "Attempts: 0");
+        lv_obj_set_style_text_font(ble_disc_counter_label, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(ble_disc_counter_label, COLOR_MATERIAL_ORANGE, 0);
+        lv_obj_align(ble_disc_counter_label, LV_ALIGN_TOP_MID, 0, 136);
     } else {
-        for (int i = 0; i < bt_device_count; i++) {
-            bt_device_info_t *d = &bt_devices[i];
-            char mac_s[18]; bt_format_addr(d->addr, mac_s);
-            char row_txt[48];
-            if (d->name[0])
-                snprintf(row_txt, sizeof(row_txt), "%.16s  %s", d->name, mac_s);
-            else
-                snprintf(row_txt, sizeof(row_txt), "%s", mac_s);
-            lv_obj_t *row = lv_btn_create(dev_list);
-            lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
-            lv_obj_set_style_bg_color(row, ui_card_color(), LV_STATE_DEFAULT);
-            lv_obj_set_style_bg_color(row, ui_accent_color(), LV_STATE_PRESSED);
-            lv_obj_set_style_border_width(row, 0, 0);
-            lv_obj_set_style_radius(row, 4, 0);
-            lv_obj_set_style_pad_all(row, 4, 0);
-            lv_obj_t *row_lbl = lv_label_create(row);
-            lv_label_set_text(row_lbl, row_txt);
-            lv_obj_set_style_text_font(row_lbl, &lv_font_montserrat_12, 0);
-            lv_obj_set_style_text_color(row_lbl, ui_text_color(), 0);
-            lv_label_set_long_mode(row_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
-            lv_obj_set_width(row_lbl, lv_pct(100));
-            lv_obj_add_event_cb(row, ble_disc_device_tap_cb, LV_EVENT_CLICKED,
-                                (void *)(intptr_t)i);
+        // Fallback: device selection list
+        ble_disc_target_idx = -1;
+        lv_obj_t *list_lbl = lv_label_create(function_page);
+        lv_label_set_text(list_lbl, "Select target:");
+        lv_obj_set_style_text_font(list_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(list_lbl, ui_text_color(), 0);
+        lv_obj_align(list_lbl, LV_ALIGN_TOP_LEFT, 8, 36);
+
+        lv_obj_t *dev_list = lv_obj_create(function_page);
+        lv_obj_set_size(dev_list, lv_pct(100), 120);
+        lv_obj_align(dev_list, LV_ALIGN_TOP_MID, 0, 52);
+        lv_obj_set_style_bg_color(dev_list, ui_card_color(), 0);
+        lv_obj_set_style_border_width(dev_list, 1, 0);
+        lv_obj_set_style_border_color(dev_list, ui_border_color(), 0);
+        lv_obj_set_style_radius(dev_list, 6, 0);
+        lv_obj_set_flex_flow(dev_list, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_all(dev_list, 4, 0);
+        lv_obj_set_scrollbar_mode(dev_list, LV_SCROLLBAR_MODE_AUTO);
+
+        if (bt_device_count == 0) {
+            lv_obj_t *no_dev = lv_label_create(dev_list);
+            lv_label_set_text(no_dev, "No devices — run BLE Scan first");
+            lv_obj_set_style_text_font(no_dev, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(no_dev, ui_text_color(), 0);
+        } else {
+            for (int i = 0; i < bt_device_count; i++) {
+                bt_device_info_t *d = &bt_devices[i];
+                char mac_s[18]; bt_format_addr(d->addr, mac_s);
+                char row_txt[48];
+                if (d->name[0])
+                    snprintf(row_txt, sizeof(row_txt), "%.16s  %s", d->name, mac_s);
+                else
+                    snprintf(row_txt, sizeof(row_txt), "%s", mac_s);
+                lv_obj_t *row = lv_btn_create(dev_list);
+                lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+                lv_obj_set_style_bg_color(row, ui_card_color(), LV_STATE_DEFAULT);
+                lv_obj_set_style_bg_color(row, ui_accent_color(), LV_STATE_PRESSED);
+                lv_obj_set_style_border_width(row, 0, 0);
+                lv_obj_set_style_radius(row, 4, 0);
+                lv_obj_set_style_pad_all(row, 4, 0);
+                lv_obj_t *row_lbl = lv_label_create(row);
+                lv_label_set_text(row_lbl, row_txt);
+                lv_obj_set_style_text_font(row_lbl, &lv_font_montserrat_12, 0);
+                lv_obj_set_style_text_color(row_lbl, ui_text_color(), 0);
+                lv_label_set_long_mode(row_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+                lv_obj_set_width(row_lbl, lv_pct(100));
+                lv_obj_add_event_cb(row, ble_disc_device_tap_cb, LV_EVENT_CLICKED,
+                                    (void *)(intptr_t)i);
+            }
         }
+
+        ble_disc_status_label = lv_label_create(function_page);
+        lv_label_set_text(ble_disc_status_label, "Tap device to select target");
+        lv_obj_set_style_text_font(ble_disc_status_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(ble_disc_status_label, ui_text_color(), 0);
+        lv_obj_align(ble_disc_status_label, LV_ALIGN_TOP_MID, 0, 180);
+
+        ble_disc_counter_label = lv_label_create(function_page);
+        lv_label_set_text(ble_disc_counter_label, "Attempts: 0");
+        lv_obj_set_style_text_font(ble_disc_counter_label, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(ble_disc_counter_label, COLOR_MATERIAL_ORANGE, 0);
+        lv_obj_align(ble_disc_counter_label, LV_ALIGN_TOP_MID, 0, 198);
     }
 
-    // Status + counter
-    ble_disc_status_label = lv_label_create(function_page);
-    lv_label_set_text(ble_disc_status_label, "Tap device to select target");
-    lv_obj_set_style_text_font(ble_disc_status_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(ble_disc_status_label, ui_text_color(), 0);
-    lv_obj_align(ble_disc_status_label, LV_ALIGN_TOP_MID, 0, 180);
-
-    ble_disc_counter_label = lv_label_create(function_page);
-    lv_label_set_text(ble_disc_counter_label, "Attempts: 0");
-    lv_obj_set_style_text_font(ble_disc_counter_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(ble_disc_counter_label, COLOR_MATERIAL_ORANGE, 0);
-    lv_obj_align(ble_disc_counter_label, LV_ALIGN_TOP_MID, 0, 198);
-
-    // Start/Stop button
+    // Start/Stop button — position depends on layout
     ble_disc_start_btn = lv_btn_create(function_page);
-    lv_obj_set_size(ble_disc_start_btn, 130, 40);
-    lv_obj_align(ble_disc_start_btn, LV_ALIGN_TOP_MID, 0, 232);
+    lv_obj_set_size(ble_disc_start_btn, 130, 42);
+    lv_obj_align(ble_disc_start_btn, LV_ALIGN_TOP_MID, 0, directed ? 170 : 232);
     lv_obj_set_style_bg_color(ble_disc_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(ble_disc_start_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(ble_disc_start_btn, 0, 0);
@@ -20669,7 +20755,7 @@ static void show_ble_disc_screen(void)
     lv_obj_set_style_text_font(dbi, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(dbi, lv_color_white(), 0);
     lv_obj_t *dbl = lv_label_create(back_btn);
-    lv_label_set_text(dbl, "BT Attacks");
+    lv_label_set_text(dbl, directed ? "Attacks" : "BT Attacks");
     lv_obj_set_style_text_font(dbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(dbl, lv_color_white(), 0);
     lv_obj_add_event_cb(back_btn, ble_disc_back_cb, LV_EVENT_CLICKED, NULL);
