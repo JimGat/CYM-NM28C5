@@ -20124,12 +20124,12 @@ static void ble_spam_back_cb(lv_event_t *e)
     ble_spam_active = false;
     for (int i = 0; i < 20 && ble_spam_task_handle != NULL; i++)
         vTaskDelay(pdMS_TO_TICKS(50));
-    ble_gap_adv_stop();
     ble_spam_ui_active = false;
     ble_spam_status_label = NULL;
     ble_spam_counter_label = NULL;
     ble_spam_start_btn = NULL;
     if (current_radio_mode == RADIO_MODE_BLE) {
+        ble_gap_adv_stop();
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
     }
@@ -20309,12 +20309,12 @@ static void ble_spoof_back_cb(lv_event_t *e)
     ble_spoof_active = false;
     for (int i = 0; i < 20 && ble_spoof_task_handle != NULL; i++)
         vTaskDelay(pdMS_TO_TICKS(50));
-    ble_gap_adv_stop();
     ble_spoof_ui_active = false;
     ble_spoof_status_label = NULL;
     ble_spoof_start_btn = NULL;
     ble_spoof_target_idx = -1;
     if (current_radio_mode == RADIO_MODE_BLE) {
+        ble_gap_adv_stop();
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
     }
