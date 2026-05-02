@@ -183,6 +183,7 @@ static lv_obj_t *s_spoof_add_popup  = NULL;
 static lv_obj_t *s_spoof_mac_ta     = NULL;
 static lv_obj_t *s_spoof_name_ta    = NULL;
 static lv_obj_t *s_spoof_list_scroll = NULL;
+static bool       s_spoof_delete[SPOOF_LIST_MAX];
 
 // BLE Disconnect attack state
 static volatile bool ble_disc_active = false;
@@ -21104,6 +21105,7 @@ static bool spoof_list_append(const uint8_t *mac, const char *name) {
 static void spoof_gen_row_cb(lv_event_t *e) {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (idx < 0 || idx >= s_spoof_list_count) return;
+    if (s_spoof_delete[idx]) return;  // don't select rows marked for deletion
     s_spoof_list_selected = idx;
     if (!s_spoof_list_scroll || !lv_obj_is_valid(s_spoof_list_scroll)) return;
     uint32_t child_cnt = lv_obj_get_child_cnt(s_spoof_list_scroll);
@@ -21111,8 +21113,11 @@ static void spoof_gen_row_cb(lv_event_t *e) {
         lv_obj_t *row = lv_obj_get_child(s_spoof_list_scroll, i);
         if (!row) continue;
         int row_idx = (int)(intptr_t)lv_obj_get_user_data(row);
+        if (row_idx < 0 || row_idx >= SPOOF_LIST_MAX) continue;
         lv_obj_set_style_bg_color(row,
-            row_idx == idx ? lv_color_make(30, 80, 160) : lv_color_make(40, 40, 40), 0);
+            s_spoof_delete[row_idx] ? lv_color_make(80, 20, 20) :
+            row_idx == idx         ? lv_color_make(30, 80, 160) :
+                                     lv_color_make(40, 40, 40), 0);
     }
 }
 
@@ -21138,6 +21143,42 @@ static void ble_spoof_general_proceed(void) {
     ble_spoof_target_company_id = 0;
     ble_spoof_target_idx = 0;
     show_ble_spoof_directed_screen();
+}
+
+static void spoof_gen_toggle_del_cb(lv_event_t *e) {
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_spoof_list_count) return;
+    s_spoof_delete[idx] = !s_spoof_delete[idx];
+    bool marked = s_spoof_delete[idx];
+
+    // Update row background via parent (scroll container children)
+    lv_obj_t *btn = lv_event_get_target(e);
+    lv_obj_t *row = lv_obj_get_parent(btn);
+    if (row && lv_obj_is_valid(row))
+        lv_obj_set_style_bg_color(row,
+            marked ? lv_color_make(80, 20, 20) : lv_color_make(40, 40, 40), 0);
+
+    lv_obj_set_style_bg_color(btn,
+        marked ? COLOR_MATERIAL_RED : lv_color_make(70, 70, 70), LV_STATE_DEFAULT);
+    lv_obj_t *lbl = lv_obj_get_child(btn, 0);
+    if (lbl) lv_label_set_text(lbl, marked ? LV_SYMBOL_TRASH : LV_SYMBOL_CLOSE);
+
+    // If selected row is now marked, deselect it
+    if (marked && s_spoof_list_selected == idx)
+        s_spoof_list_selected = -1;
+}
+
+static void spoof_gen_save_cb(lv_event_t *e) {
+    (void)e;
+    int new_count = 0;
+    for (int i = 0; i < s_spoof_list_count; i++) {
+        if (!s_spoof_delete[i])
+            s_spoof_list[new_count++] = s_spoof_list[i];
+    }
+    s_spoof_list_count = new_count;
+    s_spoof_list_scroll = NULL;
+    spoof_list_save();
+    show_ble_spoof_general_screen();
 }
 
 static void spoof_gen_start_cb(lv_event_t *e) {
@@ -21275,6 +21316,7 @@ static void show_spoof_add_entry_screen(void) {
 static void show_ble_spoof_general_screen(void) {
     s_spoof_list_selected = -1;
     s_spoof_list_scroll   = NULL;
+    memset(s_spoof_delete, 0, sizeof(s_spoof_delete));
 
     if (function_page) { lv_obj_del(function_page); function_page = NULL; }
     reset_function_page_children();
@@ -21314,6 +21356,7 @@ static void show_ble_spoof_general_screen(void) {
     }
 
     for (int i = 0; i < s_spoof_list_count; i++) {
+        // Row container — horizontal: info column + X button
         lv_obj_t *row = lv_obj_create(s_spoof_list_scroll);
         lv_obj_set_width(row, lv_pct(100));
         lv_obj_set_height(row, LV_SIZE_CONTENT);
@@ -21321,18 +21364,32 @@ static void show_ble_spoof_general_screen(void) {
         lv_obj_set_style_border_width(row, 0, 0);
         lv_obj_set_style_radius(row, 6, 0);
         lv_obj_set_style_pad_all(row, 6, 0);
-        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_column(row, 6, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
         lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
-                               LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+                               LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_user_data(row, (void *)(intptr_t)i);
-        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
 
-        lv_obj_t *name_lbl = lv_label_create(row);
+        // Info column — tap to select for START
+        lv_obj_t *info = lv_obj_create(row);
+        lv_obj_set_flex_grow(info, 1);
+        lv_obj_set_height(info, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(info, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(info, 0, 0);
+        lv_obj_set_style_pad_all(info, 0, 0);
+        lv_obj_set_flex_flow(info, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(info, LV_FLEX_ALIGN_START,
+                               LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+        lv_obj_clear_flag(info, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(info, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_user_data(info, (void *)(intptr_t)i);
+
+        lv_obj_t *name_lbl = lv_label_create(info);
         lv_label_set_text(name_lbl,
             s_spoof_list[i].name[0] ? s_spoof_list[i].name : "Unknown");
         lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
-        lv_obj_set_width(name_lbl, 200);
+        lv_obj_set_width(name_lbl, 155);
         lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(name_lbl, ui_text_color(), 0);
 
@@ -21340,16 +21397,32 @@ static void show_ble_spoof_general_screen(void) {
         snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
                  s_spoof_list[i].mac[5], s_spoof_list[i].mac[4], s_spoof_list[i].mac[3],
                  s_spoof_list[i].mac[2], s_spoof_list[i].mac[1], s_spoof_list[i].mac[0]);
-        lv_obj_t *mac_lbl = lv_label_create(row);
+        lv_obj_t *mac_lbl = lv_label_create(info);
         lv_label_set_text(mac_lbl, mac_str);
         lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(mac_lbl, lv_color_make(140, 140, 140), 0);
 
-        lv_obj_add_event_cb(row, spoof_gen_row_cb, LV_EVENT_CLICKED,
+        lv_obj_add_event_cb(info, spoof_gen_row_cb, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)i);
+
+        // X toggle button — tap to mark/unmark for deletion
+        lv_obj_t *del_toggle = lv_btn_create(row);
+        lv_obj_set_size(del_toggle, 38, 38);
+        lv_obj_set_style_bg_color(del_toggle, lv_color_make(70, 70, 70), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(del_toggle, lv_color_make(100, 100, 100), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(del_toggle, 0, 0);
+        lv_obj_set_style_radius(del_toggle, 6, 0);
+        lv_obj_set_style_pad_all(del_toggle, 4, 0);
+        lv_obj_t *x_icon = lv_label_create(del_toggle);
+        lv_label_set_text(x_icon, LV_SYMBOL_CLOSE);
+        lv_obj_set_style_text_font(x_icon, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(x_icon, lv_color_make(200, 200, 200), 0);
+        lv_obj_center(x_icon);
+        lv_obj_add_event_cb(del_toggle, spoof_gen_toggle_del_cb, LV_EVENT_CLICKED,
                             (void *)(intptr_t)i);
     }
 
-    // Bottom buttons: [Back] [+ Add] [START]
+    // Bottom buttons: [Back] [+ Add] [Save] [START]
     lv_obj_t *btn_row = lv_obj_create(function_page);
     lv_obj_set_size(btn_row, 228, 36);
     lv_obj_align(btn_row, LV_ALIGN_BOTTOM_MID, 0, -8);
@@ -21363,7 +21436,7 @@ static void show_ble_spoof_general_screen(void) {
     lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *back_btn2 = lv_btn_create(btn_row);
-    lv_obj_set_size(back_btn2, 68, 32);
+    lv_obj_set_size(back_btn2, 52, 32);
     lv_obj_set_style_bg_color(back_btn2, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(back_btn2, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(back_btn2, 0, 0);
@@ -21376,7 +21449,7 @@ static void show_ble_spoof_general_screen(void) {
     lv_obj_add_event_cb(back_btn2, spoof_gen_back_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *add_btn2 = lv_btn_create(btn_row);
-    lv_obj_set_size(add_btn2, 80, 32);
+    lv_obj_set_size(add_btn2, 62, 32);
     lv_obj_set_style_bg_color(add_btn2, lv_color_make(30, 80, 160), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(add_btn2, lv_color_make(50, 110, 200), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(add_btn2, 0, 0);
@@ -21388,8 +21461,21 @@ static void show_ble_spoof_general_screen(void) {
     lv_obj_center(add2_lbl);
     lv_obj_add_event_cb(add_btn2, spoof_gen_add_cb, LV_EVENT_CLICKED, NULL);
 
+    lv_obj_t *save_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(save_btn, 58, 32);
+    lv_obj_set_style_bg_color(save_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(save_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(save_btn, 0, 0);
+    lv_obj_set_style_radius(save_btn, 8, 0);
+    lv_obj_t *sv_lbl = lv_label_create(save_btn);
+    lv_label_set_text(sv_lbl, LV_SYMBOL_SAVE " Save");
+    lv_obj_set_style_text_font(sv_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sv_lbl, lv_color_white(), 0);
+    lv_obj_center(sv_lbl);
+    lv_obj_add_event_cb(save_btn, spoof_gen_save_cb, LV_EVENT_CLICKED, NULL);
+
     lv_obj_t *start_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(start_btn, 72, 32);
+    lv_obj_set_size(start_btn, 56, 32);
     lv_obj_set_style_bg_color(start_btn, COLOR_MATERIAL_ORANGE, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(start_btn, lv_color_lighten(COLOR_MATERIAL_ORANGE, 30),
                                LV_STATE_PRESSED);
@@ -21398,10 +21484,10 @@ static void show_ble_spoof_general_screen(void) {
     lv_obj_set_flex_flow(start_btn, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(start_btn, LV_FLEX_ALIGN_CENTER,
                            LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(start_btn, 4, 0);
+    lv_obj_set_style_pad_column(start_btn, 3, 0);
     lv_obj_t *st_icon = lv_label_create(start_btn);
     lv_label_set_text(st_icon, LV_SYMBOL_PLAY);
-    lv_obj_set_style_text_font(st_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(st_icon, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(st_icon, lv_color_white(), 0);
     lv_obj_t *st_lbl = lv_label_create(start_btn);
     lv_label_set_text(st_lbl, "START");
