@@ -1,8 +1,106 @@
 # CYM-NM28C5 Pre-built Firmware Binaries
 
-**Firmware version: v0.9.3**
+**Firmware version: v1.0.1**
 
 This folder contains the latest compiled firmware for the **NM-CYD-C5 (ESP32-C5)** board.
+
+> **Note:** The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/nm-cyd-c5/). Additional purchase sources and full hardware documentation are available on the [official board repository](https://github.com/RockBase-iot/NM-CYD-C5).
+
+---
+
+## Release Notes — v1.0.1
+
+### BLE Attacks — General Device Spoof with spooflist.csv (new)
+
+A **Device Spoof** tile has been added to the general **BT Attacks** menu (alongside BLE Spam), allowing device spoofing without requiring a prior BT Scan & Select session.
+
+**Flow:** BT Attacks → Device Spoof → authorization warning → selection screen → pick or add device → START → attack.
+
+- Loads `/sdcard/lab/bluetooth/spooflist.csv` on entry. CSV format: `XX:XX:XX:XX:XX:XX,Device Name` one entry per line.
+- Scrollable list with tap-to-select (selected row highlights blue).
+- **+ Add** button opens a full entry screen with MAC and name text areas and an on-screen uppercase keyboard — saves the new entry to `spooflist.csv` immediately.
+- **START** — only active when an entry is selected — routes through the standard authorization warning popup, then launches the existing directed spoof task.
+- Back from the attack returns to the spoof selection screen.
+- File is created automatically (directory already provisioned by SD Provision).
+
+### BLE Attacks — Directed Attack Menu Structure
+
+The BT Attacks structure is now split into two tiers:
+
+**General BT Attacks** (Bluetooth → BT Attacks):
+- BLE Spam — broadcast advertising flood (Apple / Samsung / Google / Windows / All)
+- Device Spoof — select from `spooflist.csv` or add new device
+
+**Directed BT Attacks** (BT Scan & Select → Actions → BT Attacks):
+- Device Spoof — uses the pre-selected BT Scan & Select device; no additional selection step
+- BLE Disconnect — floods the pre-selected target with TERMINATE_IND frames
+
+Both BT Attacks tiles are amber/yellow. All attacks require the authorization warning popup before proceeding.
+
+### Bug Fix — BLE Spam / Spoof Back Without Start (crash)
+
+Fixed a load-access-fault crash that occurred when pressing Back on the BLE Spam or Device Spoof screens without ever pressing START. `ble_gap_adv_stop()` was being called unconditionally even when the BLE stack had never been initialized. The call is now guarded by `current_radio_mode == RADIO_MODE_BLE`.
+
+---
+
+## Release Notes — v0.9.5
+
+### BLE Attacks — BLE Spam, Device Spoof, BLE Disconnect (new)
+
+Three BLE attack screens are now fully implemented under **Bluetooth → BT Attacks**:
+
+- **BLE Spam**: Floods nearby devices with BLE advertisement packets. Five modes: Apple (Sour Apple — triggers iOS pairing popups), Samsung Fast Connect, Google Fast Pair, Windows Swift Pair, All Platforms (cycles all four). Start/Stop toggle with live packet counter.
+
+- **Device Spoof**: Select a device from the last BLE scan, then broadcast an advertisement cloning its manufacturer data and name. Useful for testing device detection and identity.
+
+- **BLE Disconnect**: Select a target connectable device from the last scan, then repeatedly connect and immediately terminate to flood the target's connection handling. Shows attempt counter.
+
+All three attacks — and all WiFi attacks (Deauther, Evil Twin, Handshakes) — are now gated behind an **authorization warning popup** that requires explicit "I Understand" acceptance before proceeding.
+
+### SD Card — All Files Under `/sdcard/lab/`
+
+GATT Walker JSON output moved from `/sdcard/gattwalker/` to `/sdcard/lab/gattwalker/`. Screenshots moved from `/sdcard/screenshots/` to `/sdcard/lab/screenshots/`. All firmware-written files are now consistently under `/sdcard/lab/`.
+
+---
+
+## Release Notes — v0.9.4
+
+### GATT Walker — Screen Lock Fix After Stuck Probe
+
+Fixed a critical screen lock that occurred when a device went silent mid-GATT-operation (typically during MTU exchange) after a GATT walk + Extended Probe sequence.
+
+- `gw_cancel()` now calls `ble_gap_terminate()` on the active connection handle when the state is anything other than `CONNECTING` — this forces the GAP disconnect event that drives state to a terminal value. Previously, cancel only set a flag that nothing would ever check if no GATT callback was firing.
+- `gw_walk()` now explicitly handles `GW_STATE_PROBING`: if a stuck probe is detected when the user selects a new target from the Select screen, the connection is force-killed and state resets to IDLE so the new walk can proceed. Previously, every subsequent walk attempt returned false and the device showed "Failed to start walk" indefinitely until reset.
+
+### BT Observer — Selection Blocked During Scan
+
+Tapping a device row while the scan/walk sequence is still running is now silently ignored. Scrolling the list still works. Device rows become selectable only after the full walk sequence completes or Stop is pressed, preventing accidental navigation to a device that still shows "Queued" status mid-walk.
+
+### BT Observer — Spinner Overlay
+
+A small purple spinning progress indicator now appears in the top-right corner of the BT Observer screen while scanning and walking are in progress. It is placed on the LVGL overlay layer (transparent background) and is destroyed automatically when the scan completes or is stopped.
+
+### BT Observer — Back Button Returns to Observer List
+
+The Back button in the device detail view now returns to the existing BT Observer results list (preserving all walk results) instead of navigating to the Bluetooth menu. The probe result Back button also returns to the device detail rather than jumping to the top-level menu.
+
+### BT Observer — Extended Probe Available for All Walked Devices
+
+The Ext. Probe button in the BT Observer device detail is now enabled (red) for any device whose walk completed successfully — not just the most recently walked device. Previously, the button was greyed out for all but the last device in the list.
+
+### GATT Walker — CCCD Probe Fix ("No subscribable characteristics found")
+
+`s_find_cccd()` now falls back to `val_handle + 1` when no CCCD descriptor (UUID 0x2902) was captured during the walk. This is the standard BLE placement for the CCCD. Previously, devices that placed their CCCD at the spec-default offset but whose descriptor wasn't captured in the walk table would always report "no subscribable characteristics found" even though the `[~CCCD]` indicator appeared correctly on the result screen.
+
+### GATT Walker / BT Observer — Extended Probe Improvements
+
+- Dwell window extended from 3 s → **8 s** per characteristic — gives slow-reporting devices more time to send notification frames
+- Notification frame capture expanded from 4×32 B → **8×64 B** per characteristic
+- Probe result display shows byte count per frame alongside hex and ASCII preview
+
+### UI — Ext. Probe Button Color
+
+The Ext. Probe button is now **red** (`#C62828`) on both the GATT Walker result screen and the BT Observer device detail screen. Previously orange.
 
 ---
 
@@ -140,7 +238,7 @@ A new tile in the Bluetooth menu that automates the scan-then-walk workflow:
 1. Runs a single 10-second active BLE scan, collecting all advertising devices
 2. Attempts a sequential GATT walk on every discovered device (5 s connect timeout per device)
 3. Results appear in a live scrollable list — green with svc/chr counts on success, red on failure
-4. Tap any successful row to open the full GATT detail view
+4. Tap any successful row **after the scan completes** to open the full GATT detail view (tapping is blocked while the scan/walk sequence is running)
 5. All walks saved as enriched JSON to `/sdcard/gattwalker/`
 
 ### BT Observer — Detail View
@@ -203,6 +301,93 @@ BT Locator and AirTag Scanner back buttons return to Bluetooth screen. GATT Walk
 
 ---
 
+## Usage Guide — GATT Walker
+
+GATT Walker performs a full Bluetooth GATT inspection of a single target device and saves the result as enriched JSON.
+
+### Navigation path
+
+**Bluetooth menu → BT Scan & Select → tap a device → BT Attack Tiles → tap GATT Walker**
+
+### Walk procedure
+
+1. The scan list shows all advertising BLE devices. Tap one — the BT Attack Tiles screen appears showing tools available for that device.
+2. Tap **GATT Walker**. The progress screen opens, showing the target MAC, live status text, and a running count of discovered services and characteristics.
+3. A **Cancel Walk** button is visible during the walk. It disappears and is replaced by **Back** when the walk finishes.
+4. On completion the screen automatically transitions to the scrollable **GATT tree result view**.
+
+### GATT tree result view
+
+| Section | What is shown |
+|---------|---------------|
+| Header | MAC, OUI manufacturer name (purple), FP hash, GPS coordinates, timestamp |
+| Per service | UUID + human-readable service name (cyan separator) |
+| Per characteristic | UUID + name, decoded property flags (`R W N I` etc.), full expansion in parentheses, `[~CCCD]` indicator if subscribable, hex data + ASCII preview |
+| Per descriptor | UUID + human-readable name where known |
+
+The result is also saved to `/sdcard/gattwalker/` as enriched JSON.
+
+### Extended Probe
+
+The **Ext. Probe** button (red) on the result screen subscribes to every notifiable/indicatable characteristic, collects notification frames for **8 seconds** per characteristic, and re-saves the JSON with the captured frame data.
+
+- Up to **8 frames × 64 bytes** are captured per characteristic.
+- The probe result screen shows byte count, hex dump, and ASCII for each frame received.
+- **Back** from the probe result returns to the GATT tree result screen.
+- **Back** from the result screen returns to the BT Attack Tiles screen.
+
+### GATT connect timeout
+
+Configurable via **Settings → Timing → GATT Timeout** — a 3–30 s slider, NVS-persisted. Default is 10 s. Human-readable error messages are shown on connection failure.
+
+---
+
+## Usage Guide — BT Observer
+
+BT Observer automates the scan-then-walk workflow: it scans for all nearby BLE devices, then attempts a sequential GATT walk on each one, displaying results as a live-updating list.
+
+### Navigation path
+
+**Bluetooth menu → BT Observer tile**
+
+### Phases
+
+| Phase | Duration | What happens |
+|-------|----------|--------------|
+| Scan | 10 s | Active BLE scan; up to 128 devices collected |
+| Walk | ~5–10 s per device | Sequential GATT walks on up to 40 devices, sorted by RSSI (strongest first) |
+
+- **Connect timeout**: 5 s per device (hardcoded for Observer, independent of the Settings slider).
+- **Per-device poll window**: 10 s total (5 s connect + 5 s enumeration buffer). If a device does not complete within that window, the walk is cancelled and the next device starts.
+- A 500 ms gap is inserted between connections.
+- A small purple **spinner** in the top-right corner is visible while any phase is active.
+
+### List display
+
+Each row shows the device name, MAC, RSSI, and walk outcome:
+
+| Colour | Meaning |
+|--------|---------|
+| Green | Walk succeeded — shows service count, characteristic count, FP hash |
+| Red | Walk failed — shows reason (no response, refused, etc.) |
+| Grey / "Queued" | Walk has not started yet |
+| "Walking…" | Walk in progress |
+
+**Scrolling is always available.** Tapping a row is blocked while the scan or walk sequence is running — rows only become selectable after the full sequence completes or **Stop** is pressed.
+
+### After the scan completes
+
+- Tap any **green** row to open the full GATT tree detail view for that device.
+- **Ext. Probe** (red button in the detail view) is available for any successfully walked device.
+- **Back** from the detail view returns to the Observer results list with all results preserved.
+- **Back** from the list returns to the Bluetooth menu.
+
+### Output
+
+All successful walks are saved as enriched JSON to `/sdcard/gattwalker/` using the same format as the single-walk GATT Walker.
+
+---
+
 ## Flash Addresses
 
 | File | Address | Description |
@@ -253,11 +438,29 @@ esptool.py --chip esp32c5 --port /dev/ttyACM0 \
 
 ## BMorcelli Launcher Compatibility
 
-The firmware is **not currently compatible** with [bmorcelli/Launcher](https://github.com/bmorcelli/Launcher).
+This firmware is compatible with [bmorcelli/Launcher](https://github.com/bmorcelli/Launcher) and is available in the **Beta Release channel** for the NM-CYD-C5.
 
-- **ESP32-C5 not yet supported** — tracked in [Issue #300](https://github.com/bmorcelli/Launcher/issues/300) (opened April 2026, pending merge)
-- Single 7 MB `factory` partition at `0x10000` — incompatible with Launcher's OTA slot layout
-- ESP-IDF 6.0 vs Launcher's Arduino framework — hardware init sequences would conflict
+To install Launcher, open the [Launcher Web Flasher](https://bmorcelli.github.io/Launcher/webflasher.html), select **Beta Release** channel, select **CYD**, then select **NM-CYD-C5** from the device list.
+
+Once Launcher is running, place `CYM-NM28C5.bin` on the SD card and select it from the Launcher file manager to install this firmware.
+
+### Installing via Launcher OTA Favorites
+
+You can also install directly through the Launcher OTA screen without copying the binary manually. Add the following entry to `config.conf` on your SD card (create the file if it does not exist):
+
+```json
+{
+  "favorite": [
+    {
+      "name": "Cheap Yellow Monster",
+      "fid": "",
+      "link": "https://github.com/JimGat/CYM-NM28C5/releases/latest/download/CYM-NM28C5.bin"
+    }
+  ]
+}
+```
+
+This entry will appear in the Launcher OTA favorites list and install the latest release directly to the device.
 
 ---
 
