@@ -76,7 +76,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **Handshake Capture** | WPA/WPA2 4-way handshake capture (PCAP & HCCAPX) |
 | **Karma AP** | Respond to probe requests, rogue access point |
 | **Wardriving** | GPS + WiFi logging to SD card (CSV) |
-| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk, Bluetooth Lookout |
+| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk, Bluetooth Lookout, BLE Spam, Device Spoof (general + directed), BLE Disconnect (directed) |
 | **Deauth Monitor** | Passive detection of nearby deauth attacks |
 | **Credentials** | Captive portal credential capture, WPA-SEC upload |
 | **TX Power Mode** | Selectable Normal / Max Power for WiFi and BLE — persisted across reboots |
@@ -240,7 +240,13 @@ Main Menu
 │   │   └── (select device) → Actions
 │   │       ├── BT Locator
 │   │       ├── GATT Walker
-│   │       └── Add to BT Lookout
+│   │       ├── Add to BT Lookout
+│   │       └── BT Attacks (directed)    ← uses pre-selected device
+│   │           ├── Device Spoof
+│   │           └── BLE Disconnect
+│   ├── BT Attacks                       ← general attacks
+│   │   ├── BLE Spam
+│   │   └── Device Spoof                 ← loads spooflist.txt
 │   ├── BT Observer          ← scan + auto-GATT all visible devices
 │   ├── AirTag Scan
 │   ├── BT Locator
@@ -331,10 +337,16 @@ BLE scanning and fingerprinting features leveraging the ESP32-C5's BLE 5.0 radio
 Bluetooth
 ├── BT Scan & Select    ← start here
 │   └── (select device) → Actions
-│       ├── BT Locator  (RSSI tracking)
-│       ├── GATT Walker (full GATT fingerprint + JSON output)
-│       └── Add to BT Lookout
-├── BT Observer         ← 10 s scan → sequential GATT walk on all found devices
+│       ├── BT Locator      (RSSI tracking)
+│       ├── GATT Walker     (full GATT fingerprint + JSON output)
+│       ├── Add to BT Lookout
+│       └── BT Attacks      ← directed attacks on pre-selected device
+│           ├── Device Spoof    (clones target MAC + name, no selection needed)
+│           └── BLE Disconnect  (flood target with TERMINATE_IND)
+├── BT Attacks          ← general attacks (no target needed)
+│   ├── BLE Spam        (Apple / Samsung / Google / Windows / All broadcast spam)
+│   └── Device Spoof    (select from spooflist.txt or add new entry via keyboard)
+├── BT Observer         ← 10 s scan then sequential GATT walk on all found devices
 ├── AirTag Scan
 ├── BT Locator
 └── Bluetooth Lookout   ← continuous watchlist monitor
@@ -351,6 +363,10 @@ Bluetooth
 | **AirTag Scanner** | Passive BLE scan — detects Apple AirTags and Samsung SmartTags by manufacturer ID |
 | **Tag Locator** | Per-tag RSSI tracking launched from the AirTag Scan found-tags list |
 | **Bluetooth Lookout** | Continuous BLE monitor that alerts when a watchlisted device (by full MAC or OUI prefix) is detected nearby |
+| **BLE Spam** | Broadcasts fake BLE advertisements — Apple (all subtypes), Samsung, Google, Windows Swift Pair, or all simultaneously |
+| **Device Spoof (directed)** | Clones the MAC address and name of a device pre-selected in BT Scan & Select — no additional selection step required |
+| **Device Spoof (general)** | Loads `/sdcard/lab/bluetooth/spooflist.txt`; select an entry or add new devices via on-screen keyboard, then START to begin spoofing |
+| **BLE Disconnect (directed)** | Floods a BT Scan & Select pre-selected target with BLE TERMINATE_IND frames to force disconnection |
 
 > **Note:** WiFi and BLE share the same radio. The firmware automatically switches between `RADIO_MODE_WIFI` and `RADIO_MODE_BLE` as needed.
 
@@ -828,7 +844,8 @@ All data is stored on the SD card:
 │   ├── wardrives/        # GPS + WiFi wardrive logs
 │   ├── deauths/          # Deauth monitor PCAP captures
 │   ├── bluetooth/
-│   │   └── lookout.csv   # Bluetooth Lookout watchlist
+│   │   ├── lookout.csv   # Bluetooth Lookout watchlist
+│   │   └── spooflist.txt # Device Spoof targets — format: MAC,Name (one per line)
 │   └── config/           # Optional config overrides (created by Provision)
 ├── gattwalker/           # GATT Walker JSON fingerprints
 │   └── *_gattwalk.json
