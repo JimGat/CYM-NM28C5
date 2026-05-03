@@ -63,6 +63,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 - [Touch Calibration](#touch-calibration)
 - [Building & Flashing](#building--flashing)
 - [Photos](#photos)
+- [On Signal Jamming](#on-signal-jamming)
 - [Disclaimer](#disclaimer)
 
 ---
@@ -1081,6 +1082,22 @@ You can also install directly through the Launcher OTA screen without copying th
 ```
 
 This entry will appear in the Launcher OTA favorites list and install the latest release directly to the device.
+
+---
+
+## On Signal Jamming
+
+> **This project does not and will never include signal jamming or any feature that deliberately denies or disrupts authorized radio communications. This is a firm, non-negotiable design boundary — not a liability footnote.**
+
+Signal jamming is categorically different from every other capability in this firmware. Attacks like deauth, evil twin, and BLE spam operate at the protocol layer and can be targeted, scoped, and stopped. Jamming operates at the physical RF layer — it is inherently indiscriminate, cannot be aimed, cannot be recalled, and cannot distinguish a test network from a hospital cardiac monitor or an emergency services radio.
+
+The [FCC is explicit](https://www.fcc.gov/enforcement/areas/jammers): *"The Communications Act of 1934, as amended, prohibits the operation, manufacture, importation, marketing, and sale of equipment designed to jam or otherwise interfere with authorized radio communications... These jamming devices pose significant risks to public safety and potentially compromise other radio communications services."*
+
+The consequences are equally clear. Per the [FCC Jammer Enforcement](https://www.fcc.gov/general/jammer-enforcement) page: *"Signal jamming devices can prevent you and others from making 9-1-1 and other emergency calls and pose serious risks to public safety communications... The use or marketing of a jammer in the United States may subject you to substantial monetary penalties, seizure of the unlawful equipment, and criminal sanctions including imprisonment."*
+
+This is not a uniquely American position. Every jurisdiction with a radio communications law — which is effectively every country on Earth — treats jamming as a serious criminal offense precisely because the harm is real and uncontrollable.
+
+The security research community does itself no favors when it conflates "security tool" with "RF jammer." If you are looking for jamming firmware, this is not it, and no future version of this project will be.
 
 ---
 
