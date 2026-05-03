@@ -488,7 +488,7 @@ Walk complete
 
 5. When complete, the screen automatically transitions to a **full scrollable detail view** showing the entire GATT tree: MAC + OUI vendor, FP, GPS, per-service UUID + name, per-characteristic UUID + name, decoded property flags, hex data, and ASCII preview.
 
-**Output file:** `/sdcard/gattwalker/YYYYMMDD_HHMMSS_AABBCCDDEEFF_gattwalk.json`
+**Output file:** `/sdcard/lab/gattwalker/YYYYMMDD_HHMMSS_AABBCCDDEEFF_gattwalk.json`
 
 ```json
 {
@@ -579,7 +579,7 @@ Attributes longer than one MTU are read automatically in multiple chunks (`ATT_R
 
 #### BT Observer — How It Works
 
-**BT Observer** automates the scan-then-walk workflow: it runs a single 10-second active BLE scan, captures all discovered devices, then attempts a sequential GATT walk on each one (5 s connect timeout). Results are displayed in a live scrollable list and saved as JSON files to `/sdcard/gattwalker/` — identical format to manual GATT Walker.
+**BT Observer** automates the scan-then-walk workflow: it runs a single 10-second active BLE scan, captures all discovered devices, then attempts a sequential GATT walk on each one (5 s connect timeout). Results are displayed in a live scrollable list and saved as JSON files to `/sdcard/lab/gattwalker/` — identical format to manual GATT Walker.
 
 **Workflow:**
 
@@ -598,7 +598,7 @@ Attributes longer than one MTU are read automatically in multiple chunks (`ATT_R
 | Result screen | Auto-navigates to detail on complete | Tap-to-open per device |
 | Scan pass | Continuous (relies on existing scan) | Single 10 s burst, no re-scan |
 
-**Per-device JSON files** are saved using the same `/sdcard/gattwalker/` path and enriched format as single walks (manufacturer, service/chr names, props_str, ascii).
+**Per-device JSON files** are saved using the same `/sdcard/lab/gattwalker/` path and enriched format as single walks (manufacturer, service/chr names, props_str, ascii).
 
 ---
 
@@ -847,9 +847,9 @@ All data is stored on the SD card:
 │   ├── bluetooth/
 │   │   ├── lookout.csv   # Bluetooth Lookout watchlist
 │   │   └── spooflist.csv # Device Spoof targets — CSV: MAC,Name (one per line)
+│   ├── gattwalker/       # GATT Walker + BT Observer JSON fingerprints
+│   │   └── YYYYMMDD_HHMMSS_AABBCCDDEEFF_gattwalk.json
 │   └── config/           # Optional config overrides (created by Provision)
-├── gattwalker/           # GATT Walker JSON fingerprints
-│   └── *_gattwalk.json
 ├── screenshots/          # UI screenshots (BMP)
 └── calibrate.txt         # ← Create this file to trigger touch re-calibration on next boot
 ```
