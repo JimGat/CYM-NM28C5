@@ -516,8 +516,7 @@ Walk complete
           "properties": 2,
           "props_str": "R",
           "read_data": "4D7920446576696365",
-          "ascii": "My Device",
-          "descriptors": []
+          "ascii": "My Device"
         }
       ]
     }
@@ -602,45 +601,41 @@ Attributes longer than one MTU are read automatically in multiple chunks (`ATT_R
 
 ---
 
-#### GATT Walker — Next Step: CCCD Subscription Probe *(planned)*
+#### GATT Walker — Extended Probe (CCCD Subscription)
 
-The current GATT Walker captures the static snapshot — every readable attribute value at the moment of connection. The next layer is **subscription probing**: after the initial walk completes, identify every characteristic with **N (Notify)** or **I (Indicate)** in its property flags, write `0x0001` to its CCCD descriptor (`0x2902`), and collect whatever the device pushes back. This is the live telemetry layer that a read-only walk never touches.
+The static walk captures every readable attribute value at the moment of connection. **Extended Probe** goes one layer deeper: after the walk completes, it reconnects to the target and iterates every characteristic with **N (Notify)** or **I (Indicate)** in its property flags, writes `0x0001` (or `0x0002` for Indicate) to the associated CCCD descriptor (`0x2902`), and collects whatever the device pushes back during the listen window. This is the live telemetry layer — heart rate streams, sensor readings, status updates — that a read-only walk never sees.
 
-**Proposed UI behaviour:**
+**How to run it:**
 
-- In the GATT detail view, characteristics with a subscribable CCCD show a **bell icon** (🔔) next to their property flags row — tapping it launches the Extended Probe for that single characteristic
-- A **"Extended Probe"** button at the bottom of the result screen runs all subscribable characteristics in sequence automatically, with a configurable dwell time per characteristic (e.g. 3 s listen window)
-- Writable characteristics (`W` / `WNR` flags) show a **write indicator** — tapping opens a hex input and sends a single probed write, returning the characteristic value immediately after (for `W`, the acknowledged response; for `WNR`, a re-read)
+From the GATT result screen, tap the red **Ext. Probe** button at the bottom. The firmware reconnects to the same device, walks every N/I characteristic in sequence with an 8-second listen window each, then re-saves the JSON with the captured notification frames appended inline. A dedicated probe progress screen shows which characteristic is being subscribed in real time.
 
-**Safe probe rules (destructive-write avoidance):**
-
-The probe only writes to CCCD descriptors and reads back notify/indicate data — it never writes to value handles directly unless the user explicitly taps the write indicator. Before showing the write indicator, the firmware checks:
-1. Characteristic User Description (`0x2901`) — if present, the label is shown and any descriptor containing `reset`, `erase`, `factory`, `clear`, or `update` suppresses the write indicator entirely (shown greyed-out with a warning icon instead)
-2. CCCD enables only — `0x0001` (Notify) or `0x0002` (Indicate); never combined writes
+The probe only writes to CCCD descriptors — it never writes to value handles directly.
 
 **JSON enrichment:**
 
-The subscription data is written back into the existing JSON file for that device (matched by MAC + timestamp) as a new `"probe"` key on each characteristic that returned notification data:
+The subscription data is written back into the same JSON file as a `"probe"` key on each characteristic that was attempted. Characteristics with no N/I flag are unchanged:
 
 ```json
 {
   "uuid": "0x2A37",
   "name": "Heart Rate Measurement",
   "props_str": "N",
-  "read_data": "",
+  "read_data": null,
+  "ascii": null,
   "probe": {
     "cccd_written": true,
     "notify_count": 4,
     "notify_data": [
-      "0x004C",
-      "0x004F",
-      "0x0051",
-      "0x004E"
-    ],
-    "dwell_ms": 3000
+      "0048",
+      "0049",
+      "004B",
+      "004A"
+    ]
   }
 }
 ```
+
+Each string in `notify_data` is the raw bytes of one notification frame, concatenated as hex without separators (e.g. `"0048"` = flags byte `0x00` + heart rate `72 BPM`). `read_data` and `ascii` are `null` for notify/indicate-only characteristics that cannot be directly read.
 
 This keeps all data from a device in a single enriched file — the initial static snapshot plus the live subscription layer — indexed by the same FNV-32 fingerprint for cross-session correlation.
 
