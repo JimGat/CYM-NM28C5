@@ -1040,6 +1040,12 @@ typedef struct { char text[128]; lv_color_t color; } wdup_ui_msg_t;
 static wd_band_t         g_wd_band         = WD_BAND_BOTH;
 static bool              g_wd_pcap         = false;
 static void            (*wdup_back_fn)(void) = NULL;
+static bool              wdup_use_explicit  = false;
+static int               wdup_explicit_indices[64];
+static int               wdup_explicit_count  = 0;
+// wd_manage_paths declared here so wdup_task (explicit mode) can reference it
+#define WD_MANAGE_MAX_FILES 64
+static char              wd_manage_paths[WD_MANAGE_MAX_FILES][320];
 
 // SD Card settings screen state
 typedef struct { char line[96]; } sd_prov_update_t;
@@ -15761,6 +15767,60 @@ static void wdup_task(void *pvParameters)
         goto task_done;
     }
 
+    // Explicit selection mode: upload only user-selected files
+    if (wdup_use_explicit) {
+        int n = wdup_explicit_count;
+        int ok_count2 = 0, dup_count2 = 0, fail_count2 = 0;
+        char xmsg[128];
+        snprintf(xmsg, sizeof(xmsg), "Uploading %d selected file(s)...", n);
+        wdup_push_msg(xmsg, cyan);
+        for (int si = 0; si < n && wdup_active; si++) {
+            int idx = wdup_explicit_indices[si];
+            if (idx < 0 || idx >= 64 || wd_manage_paths[idx][0] == '\0') continue;
+            const char *xfpath = wd_manage_paths[idx];
+            const char *xname  = strrchr(xfpath, '/');
+            xname = xname ? xname + 1 : xfpath;
+            if (do_wigle) {
+                snprintf(xmsg, sizeof(xmsg), "[%d/%d] WiGLE: %.50s...", si+1, n, xname);
+                wdup_push_msg(xmsg, cyan);
+                int r = wdup_upload_one(xfpath, xname, true);
+                const char *ws = (r==0)?"OK":(r==1)?"DUP":"FAIL";
+                lv_color_t wc = (r==0)?green:(r==1)?amber:red;
+                if (r==0) ok_count2++; else if (r==1) dup_count2++; else fail_count2++;
+                snprintf(xmsg, sizeof(xmsg), "[%d/%d] WiGLE: %.50s -> %s", si+1, n, xname, ws);
+                wdup_push_msg(xmsg, wc);
+                if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+                    FILE *lf = fopen(WDUP_LOG_PATH, "a");
+                    if (lf) { fprintf(lf, "%s,WIGLE,%s\n", xname, ws); fclose(lf); }
+                    xSemaphoreGive(sd_spi_mutex);
+                }
+                vTaskDelay(pdMS_TO_TICKS(800));
+            }
+            if (do_wdg && wdup_active) {
+                snprintf(xmsg, sizeof(xmsg), "[%d/%d] WDG: %.50s...", si+1, n, xname);
+                wdup_push_msg(xmsg, cyan);
+                int r = wdup_upload_one(xfpath, xname, false);
+                const char *ws = (r==0)?"OK":(r==1)?"DUP":"FAIL";
+                lv_color_t wc = (r==0)?green:(r==1)?amber:red;
+                if (r==0) ok_count2++; else if (r==1) dup_count2++; else fail_count2++;
+                snprintf(xmsg, sizeof(xmsg), "[%d/%d] WDG: %.50s -> %s", si+1, n, xname, ws);
+                wdup_push_msg(xmsg, wc);
+                if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+                    FILE *lf = fopen(WDUP_LOG_PATH, "a");
+                    if (lf) { fprintf(lf, "%s,WDG,%s\n", xname, ws); fclose(lf); }
+                    xSemaphoreGive(sd_spi_mutex);
+                }
+                vTaskDelay(pdMS_TO_TICKS(800));
+            }
+        }
+        snprintf(xmsg, sizeof(xmsg), "Done: %d OK, %d dup, %d failed",
+                 ok_count2, dup_count2, fail_count2);
+        wdup_push_msg(xmsg, (fail_count2 > 0) ? red : green);
+        wdup_use_explicit = false;
+        wdup_explicit_count = 0;
+        goto task_done;
+    }
+
     // Open wardrives directory
     DIR *dir = NULL;
     if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
@@ -16145,10 +16205,16 @@ static void show_wardrive_options_screen(void)
 
 // --- Wardrive Manage Data screen ---
 
-#define WD_MANAGE_MAX_FILES 64
-static char     wd_manage_paths[WD_MANAGE_MAX_FILES][320];
 static lv_obj_t *wd_manage_rows[WD_MANAGE_MAX_FILES];
 static int       wd_manage_count = 0;
+static bool      wd_manage_selected[WD_MANAGE_MAX_FILES];
+static lv_obj_t *wd_manage_chk[WD_MANAGE_MAX_FILES];   // per-row check indicator
+static long      wd_manage_sizes[WD_MANAGE_MAX_FILES];
+static time_t    wd_manage_times[WD_MANAGE_MAX_FILES];
+static lv_obj_t *wdm_sel_count_lbl  = NULL;
+static lv_obj_t *wdm_del_btn_bottom = NULL;
+static lv_obj_t *wdm_up_btn_bottom  = NULL;
+static lv_obj_t *wdm_confirm_overlay = NULL;
 
 // Returns true if 'filename' has an OK or DUP entry for 'service' in the log buffer
 static bool wdm_log_accepted(const char *log_buf, const char *filename, const char *service)
@@ -16162,7 +16228,6 @@ static bool wdm_log_accepted(const char *log_buf, const char *filename, const ch
         if (len > 0 && len < sizeof(line)) {
             memcpy(line, p, len);
             line[len] = '\0';
-            // format: filename,SERVICE,STATUS
             char *c1 = strchr(line, ',');
             if (c1) {
                 *c1 = '\0';
@@ -16171,8 +16236,8 @@ static bool wdm_log_accepted(const char *log_buf, const char *filename, const ch
                     if (c2) {
                         *c2 = '\0';
                         if (strcmp(c1 + 1, service) == 0) {
-                            const char *status = c2 + 1;
-                            if (strcmp(status, "OK") == 0 || strcmp(status, "DUP") == 0)
+                            const char *st = c2 + 1;
+                            if (strcmp(st, "OK") == 0 || strcmp(st, "DUP") == 0)
                                 return true;
                         }
                     }
@@ -16184,24 +16249,183 @@ static bool wdm_log_accepted(const char *log_buf, const char *filename, const ch
     return false;
 }
 
-static void wdm_delete_cb(lv_event_t *e)
+// Update counter label and enable/disable action buttons based on selection
+static void wdm_update_actions(void)
+{
+    int n = 0;
+    for (int i = 0; i < wd_manage_count; i++)
+        if (wd_manage_selected[i]) n++;
+
+    if (wdm_sel_count_lbl && lv_obj_is_valid(wdm_sel_count_lbl)) {
+        char buf[40];
+        if (n == 0) snprintf(buf, sizeof(buf), "Tap rows to select");
+        else        snprintf(buf, sizeof(buf), "%d of %d selected", n, wd_manage_count);
+        lv_label_set_text(wdm_sel_count_lbl, buf);
+    }
+    if (wdm_del_btn_bottom && lv_obj_is_valid(wdm_del_btn_bottom)) {
+        lv_obj_set_style_opa(wdm_del_btn_bottom, n > 0 ? LV_OPA_COVER : LV_OPA_40, 0);
+        if (n > 0) lv_obj_clear_state(wdm_del_btn_bottom, LV_STATE_DISABLED);
+        else       lv_obj_add_state(wdm_del_btn_bottom,   LV_STATE_DISABLED);
+    }
+    if (wdm_up_btn_bottom && lv_obj_is_valid(wdm_up_btn_bottom)) {
+        lv_obj_set_style_opa(wdm_up_btn_bottom, n > 0 ? LV_OPA_COVER : LV_OPA_40, 0);
+        if (n > 0) lv_obj_clear_state(wdm_up_btn_bottom, LV_STATE_DISABLED);
+        else       lv_obj_add_state(wdm_up_btn_bottom,   LV_STATE_DISABLED);
+    }
+}
+
+// Toggle selection on a row tap
+static void wdm_row_tap_cb(lv_event_t *e)
 {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (idx < 0 || idx >= wd_manage_count) return;
-    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
-        remove(wd_manage_paths[idx]);
-        xSemaphoreGive(sd_spi_mutex);
-    }
-    if (wd_manage_rows[idx] && lv_obj_is_valid(wd_manage_rows[idx])) {
-        lv_obj_del(wd_manage_rows[idx]);
-        wd_manage_rows[idx] = NULL;
-    }
-    wd_manage_paths[idx][0] = '\0';
+    wd_manage_selected[idx] = !wd_manage_selected[idx];
+    bool sel = wd_manage_selected[idx];
+    lv_color_t sel_bg = sel ? lv_color_make(25, 65, 130) : ui_card_color();
+    if (wd_manage_rows[idx] && lv_obj_is_valid(wd_manage_rows[idx]))
+        lv_obj_set_style_bg_color(wd_manage_rows[idx], sel_bg, 0);
+    if (wd_manage_chk[idx] && lv_obj_is_valid(wd_manage_chk[idx]))
+        lv_label_set_text(wd_manage_chk[idx], sel ? LV_SYMBOL_OK : " ");
+    wdm_update_actions();
 }
 
-static void wdm_upload_cb(lv_event_t *e)
+static void wdm_sel_all_cb(lv_event_t *e)
 {
     (void)e;
+    for (int i = 0; i < wd_manage_count; i++) {
+        if (wd_manage_paths[i][0] == '\0') continue;
+        wd_manage_selected[i] = true;
+        if (wd_manage_rows[i] && lv_obj_is_valid(wd_manage_rows[i]))
+            lv_obj_set_style_bg_color(wd_manage_rows[i], lv_color_make(25, 65, 130), 0);
+        if (wd_manage_chk[i] && lv_obj_is_valid(wd_manage_chk[i]))
+            lv_label_set_text(wd_manage_chk[i], LV_SYMBOL_OK);
+    }
+    wdm_update_actions();
+}
+
+static void wdm_sel_none_cb(lv_event_t *e)
+{
+    (void)e;
+    for (int i = 0; i < wd_manage_count; i++) {
+        wd_manage_selected[i] = false;
+        if (wd_manage_rows[i] && lv_obj_is_valid(wd_manage_rows[i]))
+            lv_obj_set_style_bg_color(wd_manage_rows[i], ui_card_color(), 0);
+        if (wd_manage_chk[i] && lv_obj_is_valid(wd_manage_chk[i]))
+            lv_label_set_text(wd_manage_chk[i], " ");
+    }
+    wdm_update_actions();
+}
+
+// Confirm-delete overlay callbacks
+static void wdm_confirm_ok_cb(lv_event_t *e)
+{
+    (void)e;
+    if (wdm_confirm_overlay && lv_obj_is_valid(wdm_confirm_overlay)) {
+        lv_obj_del(wdm_confirm_overlay);
+        wdm_confirm_overlay = NULL;
+    }
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        for (int i = 0; i < wd_manage_count; i++) {
+            if (!wd_manage_selected[i] || wd_manage_paths[i][0] == '\0') continue;
+            remove(wd_manage_paths[i]);
+            wd_manage_paths[i][0] = '\0';
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    for (int i = 0; i < wd_manage_count; i++) {
+        if (!wd_manage_selected[i]) continue;
+        if (wd_manage_rows[i] && lv_obj_is_valid(wd_manage_rows[i])) {
+            lv_obj_del(wd_manage_rows[i]);
+            wd_manage_rows[i] = NULL;
+        }
+        wd_manage_selected[i] = false;
+        wd_manage_chk[i]     = NULL;
+    }
+    wdm_update_actions();
+}
+
+static void wdm_confirm_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    if (wdm_confirm_overlay && lv_obj_is_valid(wdm_confirm_overlay)) {
+        lv_obj_del(wdm_confirm_overlay);
+        wdm_confirm_overlay = NULL;
+    }
+}
+
+static void wdm_delete_selected_cb(lv_event_t *e)
+{
+    (void)e;
+    int n = 0;
+    for (int i = 0; i < wd_manage_count; i++)
+        if (wd_manage_selected[i]) n++;
+    if (n == 0) return;
+
+    // Modal overlay on lv_layer_top()
+    wdm_confirm_overlay = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(wdm_confirm_overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(wdm_confirm_overlay, 0, 0);
+    lv_obj_set_style_bg_color(wdm_confirm_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(wdm_confirm_overlay, LV_OPA_60, 0);
+    lv_obj_set_style_border_width(wdm_confirm_overlay, 0, 0);
+    lv_obj_clear_flag(wdm_confirm_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *card = lv_obj_create(wdm_confirm_overlay);
+    lv_obj_set_size(card, 210, 116);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, lv_color_make(38, 38, 38), 0);
+    lv_obj_set_style_border_color(card, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 10, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    char buf[72];
+    snprintf(buf, sizeof(buf),
+             LV_SYMBOL_WARNING " Delete %d file(s)?\nThis cannot be undone.", n);
+    lv_obj_t *msg = lv_label_create(card);
+    lv_label_set_text(msg, buf);
+    lv_obj_set_style_text_font(msg, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(msg, lv_color_hex(0xFFCC44), 0);
+    lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(msg, 190);
+    lv_obj_align(msg, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *cancel_btn = lv_btn_create(card);
+    lv_obj_set_size(cancel_btn, 84, 30);
+    lv_obj_align(cancel_btn, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_make(70, 70, 70), 0);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_make(100, 100, 100), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(cancel_btn, 6, 0);
+    lv_obj_t *cl = lv_label_create(cancel_btn);
+    lv_label_set_text(cl, LV_SYMBOL_CLOSE "  Cancel");
+    lv_obj_set_style_text_font(cl, &lv_font_montserrat_12, 0);
+    lv_obj_center(cl);
+    lv_obj_add_event_cb(cancel_btn, wdm_confirm_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *del_btn = lv_btn_create(card);
+    lv_obj_set_size(del_btn, 84, 30);
+    lv_obj_align(del_btn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(del_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_bg_color(del_btn, lv_color_make(180, 30, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(del_btn, 6, 0);
+    lv_obj_t *dl = lv_label_create(del_btn);
+    lv_label_set_text(dl, LV_SYMBOL_TRASH "  Delete");
+    lv_obj_set_style_text_font(dl, &lv_font_montserrat_12, 0);
+    lv_obj_center(dl);
+    lv_obj_add_event_cb(del_btn, wdm_confirm_ok_cb, LV_EVENT_CLICKED, NULL);
+}
+
+static void wdm_upload_selected_cb(lv_event_t *e)
+{
+    (void)e;
+    wdup_explicit_count = 0;
+    for (int i = 0; i < wd_manage_count; i++) {
+        if (wd_manage_selected[i] && wd_manage_paths[i][0])
+            wdup_explicit_indices[wdup_explicit_count++] = i;
+    }
+    if (wdup_explicit_count == 0) return;
+    wdup_use_explicit = true;
     wdup_back_fn = show_wardrive_manage_screen;
     show_wardrive_upload_screen();
 }
@@ -16217,29 +16441,33 @@ static void show_wardrive_manage_screen(void)
     create_function_page_base("Manage Data");
 
     wd_manage_count = 0;
-    memset(wd_manage_rows, 0, sizeof(wd_manage_rows));
+    memset(wd_manage_rows,     0, sizeof(wd_manage_rows));
+    memset(wd_manage_selected, 0, sizeof(wd_manage_selected));
+    memset(wd_manage_chk,      0, sizeof(wd_manage_chk));
+    memset(wd_manage_sizes,    0, sizeof(wd_manage_sizes));
+    memset(wd_manage_times,    0, sizeof(wd_manage_times));
+    wdm_sel_count_lbl  = NULL;
+    wdm_del_btn_bottom = NULL;
+    wdm_up_btn_bottom  = NULL;
+    wdm_confirm_overlay = NULL;
 
-    // Load upload log into buffer for status lookup
+    // Load upload log into buffer
     char *log_buf = NULL;
     if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
         FILE *lf = fopen(WDUP_LOG_PATH, "r");
         if (lf) {
             fseek(lf, 0, SEEK_END);
-            long lsz = ftell(lf);
-            rewind(lf);
+            long lsz = ftell(lf); rewind(lf);
             if (lsz > 0 && lsz < 8192) {
                 log_buf = heap_caps_malloc(lsz + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-                if (log_buf) {
-                    fread(log_buf, 1, lsz, lf);
-                    log_buf[lsz] = '\0';
-                }
+                if (log_buf) { fread(log_buf, 1, lsz, lf); log_buf[lsz] = '\0'; }
             }
             fclose(lf);
         }
         xSemaphoreGive(sd_spi_mutex);
     }
 
-    // Enumerate wardrive CSV files
+    // Enumerate wardrive CSV files and stat each for size + mtime
     if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
         DIR *dir = opendir("/sdcard/lab/wardrives");
         if (dir) {
@@ -16251,6 +16479,11 @@ static void show_wardrive_manage_screen(void)
                 if (strcmp(nm, "upload_log.csv") == 0) continue;
                 snprintf(wd_manage_paths[wd_manage_count], sizeof(wd_manage_paths[0]),
                          "/sdcard/lab/wardrives/%s", nm);
+                struct stat st;
+                if (stat(wd_manage_paths[wd_manage_count], &st) == 0) {
+                    wd_manage_sizes[wd_manage_count] = (long)st.st_size;
+                    wd_manage_times[wd_manage_count] = st.st_mtime;
+                }
                 wd_manage_count++;
             }
             closedir(dir);
@@ -16258,118 +16491,206 @@ static void show_wardrive_manage_screen(void)
         xSemaphoreGive(sd_spi_mutex);
     }
 
-    // Scrollable file list area
+    // Scrollable file list — leaves 72px at bottom for action controls
     lv_obj_t *list = lv_obj_create(function_page);
-    lv_obj_set_size(list, LCD_H_RES, LCD_V_RES - 30 - 46);
+    lv_obj_set_size(list, LCD_H_RES, LCD_V_RES - 30 - 72);
     lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 30);
     lv_obj_set_style_bg_color(list, ui_bg_color(), 0);
     lv_obj_set_style_bg_opa(list, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(list, 0, 0);
-    lv_obj_set_style_pad_all(list, 4, 0);
+    lv_obj_set_style_pad_all(list, 3, 0);
     lv_obj_set_style_pad_row(list, 3, 0);
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 
     if (wd_manage_count == 0) {
         lv_obj_t *empty = lv_label_create(list);
-        lv_label_set_text(empty, "No wardrive files found");
+        lv_label_set_text(empty, "No wardrive files found.\nStart a wardrive to create logs.");
         lv_obj_set_style_text_color(empty, lv_color_make(140, 140, 140), 0);
         lv_obj_set_style_text_font(empty, &lv_font_montserrat_12, 0);
-        lv_obj_center(empty);
+        lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align(empty, LV_ALIGN_CENTER, 0, 0);
     }
 
     lv_color_t col_green = lv_color_make(76, 175, 80);
     lv_color_t col_amber = lv_color_make(255, 193, 7);
-    lv_color_t col_white = ui_text_color();
-    lv_color_t col_red   = lv_color_make(244, 67, 54);
+    lv_color_t col_gray  = lv_color_make(160, 160, 160);
 
     for (int i = 0; i < wd_manage_count; i++) {
         const char *fname = strrchr(wd_manage_paths[i], '/');
         fname = fname ? fname + 1 : wd_manage_paths[i];
 
-        // Determine status
         bool wigle_ok = wdm_log_accepted(log_buf, fname, "WIGLE");
         bool wdg_ok   = wdm_log_accepted(log_buf, fname, "WDG");
-        lv_color_t row_color;
-        const char *status_icon;
+        lv_color_t acc_color;    // left-border accent
+        const char *status_txt;  // status badge text
+        lv_color_t status_color;
         if (wigle_ok && wdg_ok) {
-            row_color = col_green; status_icon = LV_SYMBOL_OK;
+            acc_color   = col_green;
+            status_txt  = LV_SYMBOL_OK " Both";
+            status_color = col_green;
         } else if (wigle_ok || wdg_ok) {
-            row_color = col_amber; status_icon = LV_SYMBOL_WARNING;
+            acc_color   = col_amber;
+            status_txt  = LV_SYMBOL_WARNING " Part";
+            status_color = col_amber;
         } else {
-            row_color = col_white; status_icon = LV_SYMBOL_UPLOAD;
+            acc_color   = col_gray;
+            status_txt  = LV_SYMBOL_UPLOAD " New";
+            status_color = col_gray;
         }
 
-        // Row container
+        // Build size string
+        char size_buf[16];
+        long sz = wd_manage_sizes[i];
+        if (sz < 1024)            snprintf(size_buf, sizeof(size_buf), "%ld B", sz);
+        else if (sz < 1024*1024)  snprintf(size_buf, sizeof(size_buf), "%.1f KB", sz / 1024.0f);
+        else                      snprintf(size_buf, sizeof(size_buf), "%.1f MB", sz / (1024.0f*1024.0f));
+
+        // Build date string from mtime
+        char date_buf[20] = "--";
+        if (wd_manage_times[i] > 0) {
+            struct tm tm_info;
+            localtime_r(&wd_manage_times[i], &tm_info);
+            strftime(date_buf, sizeof(date_buf), "%Y-%m-%d %H:%M", &tm_info);
+        }
+
+        char meta_buf[48];
+        snprintf(meta_buf, sizeof(meta_buf), "%s  %s", size_buf, date_buf);
+
+        // Row container (44px tall, full-width minus margin)
         lv_obj_t *row = lv_obj_create(list);
-        lv_obj_set_size(row, LCD_H_RES - 8, 28);
+        lv_obj_set_size(row, LCD_H_RES - 6, 44);
         lv_obj_set_style_bg_color(row, ui_card_color(), 0);
         lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(row, 0, 0);
-        lv_obj_set_style_radius(row, 4, 0);
-        lv_obj_set_style_pad_all(row, 2, 0);
+        lv_obj_set_style_radius(row, 5, 0);
+        lv_obj_set_style_pad_all(row, 0, 0);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
         wd_manage_rows[i] = row;
 
-        // Status icon
-        lv_obj_t *icon = lv_label_create(row);
-        lv_label_set_text(icon, status_icon);
-        lv_obj_set_style_text_color(icon, row_color, 0);
-        lv_obj_set_style_text_font(icon, &lv_font_montserrat_12, 0);
-        lv_obj_align(icon, LV_ALIGN_LEFT_MID, 2, 0);
+        // Left accent strip (upload status color)
+        lv_obj_t *accent = lv_obj_create(row);
+        lv_obj_set_size(accent, 4, 34);
+        lv_obj_align(accent, LV_ALIGN_LEFT_MID, 4, 0);
+        lv_obj_set_style_bg_color(accent, acc_color, 0);
+        lv_obj_set_style_bg_opa(accent, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(accent, 0, 0);
+        lv_obj_set_style_radius(accent, 2, 0);
 
-        // Filename
+        // Filename label (top line)
         lv_obj_t *name_lbl = lv_label_create(row);
         lv_label_set_text(name_lbl, fname);
-        lv_obj_set_style_text_color(name_lbl, row_color, 0);
         lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(name_lbl, ui_text_color(), 0);
         lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
-        lv_obj_set_width(name_lbl, LCD_H_RES - 60);
-        lv_obj_align(name_lbl, LV_ALIGN_LEFT_MID, 18, 0);
+        lv_obj_set_width(name_lbl, 148);
+        lv_obj_align(name_lbl, LV_ALIGN_TOP_LEFT, 14, 5);
 
-        // Delete (X) button
-        lv_obj_t *del_btn = lv_btn_create(row);
-        lv_obj_set_size(del_btn, 24, 22);
-        lv_obj_align(del_btn, LV_ALIGN_RIGHT_MID, -2, 0);
-        lv_obj_set_style_bg_color(del_btn, col_red, 0);
-        lv_obj_set_style_bg_color(del_btn, lv_color_make(180, 30, 30), LV_STATE_PRESSED);
-        lv_obj_set_style_radius(del_btn, 4, 0);
-        lv_obj_set_style_pad_all(del_btn, 2, 0);
-        lv_obj_t *del_lbl = lv_label_create(del_btn);
-        lv_label_set_text(del_lbl, LV_SYMBOL_CLOSE);
-        lv_obj_set_style_text_font(del_lbl, &lv_font_montserrat_12, 0);
-        lv_obj_center(del_lbl);
-        lv_obj_add_event_cb(del_btn, wdm_delete_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        // Meta label (bottom line): size + date
+        lv_obj_t *meta_lbl = lv_label_create(row);
+        lv_label_set_text(meta_lbl, meta_buf);
+        lv_obj_set_style_text_font(meta_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(meta_lbl, lv_color_make(120, 120, 120), 0);
+        lv_label_set_long_mode(meta_lbl, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(meta_lbl, 148);
+        lv_obj_align(meta_lbl, LV_ALIGN_BOTTOM_LEFT, 14, -5);
+
+        // Status badge (right side, upper)
+        lv_obj_t *status_lbl = lv_label_create(row);
+        lv_label_set_text(status_lbl, status_txt);
+        lv_obj_set_style_text_font(status_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(status_lbl, status_color, 0);
+        lv_obj_align(status_lbl, LV_ALIGN_RIGHT_MID, -22, -8);
+
+        // Selected check indicator (right side, lower — shows ✓ when selected)
+        lv_obj_t *chk = lv_label_create(row);
+        lv_label_set_text(chk, " ");
+        lv_obj_set_style_text_font(chk, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(chk, lv_color_make(100, 180, 255), 0);
+        lv_obj_align(chk, LV_ALIGN_RIGHT_MID, -4, 8);
+        wd_manage_chk[i] = chk;
+
+        // Tap the row to toggle selection
+        lv_obj_add_event_cb(row, wdm_row_tap_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
     }
 
     if (log_buf) heap_caps_free(log_buf);
 
-    // Bottom button row
-    lv_obj_t *upload_btn = lv_btn_create(function_page);
-    lv_obj_set_size(upload_btn, 110, 30);
-    lv_obj_align(upload_btn, LV_ALIGN_BOTTOM_MID, 62, -8);
-    lv_obj_set_style_bg_color(upload_btn, lv_color_hex(0xE91E63), 0);
-    lv_obj_set_style_bg_color(upload_btn, lv_color_hex(0xAD1457), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(upload_btn, 8, 0);
-    lv_obj_t *up_lbl = lv_label_create(upload_btn);
-    lv_label_set_text(up_lbl, LV_SYMBOL_UPLOAD "  Upload");
-    lv_obj_set_style_text_font(up_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_center(up_lbl);
-    lv_obj_add_event_cb(upload_btn, wdm_upload_cb, LV_EVENT_CLICKED, NULL);
+    // ── Action area (bottom 72px) ─────────────────────────────────────
 
+    // Row 1: counter label + All / None buttons  (y from bottom = -10 - 30 - 4 - 22 = -66)
+    wdm_sel_count_lbl = lv_label_create(function_page);
+    lv_label_set_text(wdm_sel_count_lbl, "Tap rows to select");
+    lv_obj_set_style_text_font(wdm_sel_count_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wdm_sel_count_lbl, lv_color_make(160, 160, 160), 0);
+    lv_obj_align(wdm_sel_count_lbl, LV_ALIGN_BOTTOM_LEFT, 6, -48);
+
+    lv_obj_t *all_btn = lv_btn_create(function_page);
+    lv_obj_set_size(all_btn, 40, 22);
+    lv_obj_align(all_btn, LV_ALIGN_BOTTOM_RIGHT, -44, -48);
+    lv_obj_set_style_bg_color(all_btn, lv_color_make(50, 80, 50), 0);
+    lv_obj_set_style_bg_color(all_btn, lv_color_make(70, 110, 70), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(all_btn, 4, 0);
+    lv_obj_t *all_lbl = lv_label_create(all_btn);
+    lv_label_set_text(all_lbl, "All");
+    lv_obj_set_style_text_font(all_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(all_lbl);
+    lv_obj_add_event_cb(all_btn, wdm_sel_all_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *none_btn = lv_btn_create(function_page);
+    lv_obj_set_size(none_btn, 40, 22);
+    lv_obj_align(none_btn, LV_ALIGN_BOTTOM_RIGHT, -2, -48);
+    lv_obj_set_style_bg_color(none_btn, lv_color_make(60, 60, 60), 0);
+    lv_obj_set_style_bg_color(none_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(none_btn, 4, 0);
+    lv_obj_t *none_lbl = lv_label_create(none_btn);
+    lv_label_set_text(none_lbl, "None");
+    lv_obj_set_style_text_font(none_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(none_lbl);
+    lv_obj_add_event_cb(none_btn, wdm_sel_none_cb, LV_EVENT_CLICKED, NULL);
+
+    // Row 2: Back / Delete / Upload  (y from bottom = -10)
     lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 110, 30);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, -62, -8);
+    lv_obj_set_size(back_btn, 68, 30);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_LEFT, 4, -10);
     lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), 0);
     lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
     lv_obj_t *back_lbl = lv_label_create(back_btn);
-    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT "  Back");
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " Back");
     lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(back_lbl, ui_text_color(), 0);
     lv_obj_center(back_lbl);
     lv_obj_add_event_cb(back_btn, wdm_back_cb, LV_EVENT_CLICKED, NULL);
+
+    wdm_del_btn_bottom = lv_btn_create(function_page);
+    lv_obj_set_size(wdm_del_btn_bottom, 76, 30);
+    lv_obj_align(wdm_del_btn_bottom, LV_ALIGN_BOTTOM_LEFT, 78, -10);
+    lv_obj_set_style_bg_color(wdm_del_btn_bottom, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_bg_color(wdm_del_btn_bottom, lv_color_make(180, 30, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(wdm_del_btn_bottom, 8, 0);
+    lv_obj_add_state(wdm_del_btn_bottom, LV_STATE_DISABLED);
+    lv_obj_set_style_opa(wdm_del_btn_bottom, LV_OPA_40, 0);
+    lv_obj_t *del_lbl = lv_label_create(wdm_del_btn_bottom);
+    lv_label_set_text(del_lbl, LV_SYMBOL_TRASH " Delete");
+    lv_obj_set_style_text_font(del_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(del_lbl);
+    lv_obj_add_event_cb(wdm_del_btn_bottom, wdm_delete_selected_cb, LV_EVENT_CLICKED, NULL);
+
+    wdm_up_btn_bottom = lv_btn_create(function_page);
+    lv_obj_set_size(wdm_up_btn_bottom, 76, 30);
+    lv_obj_align(wdm_up_btn_bottom, LV_ALIGN_BOTTOM_RIGHT, -4, -10);
+    lv_obj_set_style_bg_color(wdm_up_btn_bottom, lv_color_hex(0xE91E63), 0);
+    lv_obj_set_style_bg_color(wdm_up_btn_bottom, lv_color_hex(0xAD1457), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(wdm_up_btn_bottom, 8, 0);
+    lv_obj_add_state(wdm_up_btn_bottom, LV_STATE_DISABLED);
+    lv_obj_set_style_opa(wdm_up_btn_bottom, LV_OPA_40, 0);
+    lv_obj_t *up_lbl = lv_label_create(wdm_up_btn_bottom);
+    lv_label_set_text(up_lbl, LV_SYMBOL_UPLOAD " Upload");
+    lv_obj_set_style_text_font(up_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(up_lbl);
+    lv_obj_add_event_cb(wdm_up_btn_bottom, wdm_upload_selected_cb, LV_EVENT_CLICKED, NULL);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
