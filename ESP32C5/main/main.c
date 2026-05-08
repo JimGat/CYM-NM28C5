@@ -392,6 +392,9 @@ static char     g_saved_wifi_pass[65] = ""; // Home network password
 #define NVS_KEY_WD_BAND      "wd_band"
 #define NVS_KEY_WD_PCAP      "wd_pcap"
 #define NVS_KEY_WD_BLE       "wd_ble"
+#define NVS_KEY_GPS_LAT      "gps_lat_i"
+#define NVS_KEY_GPS_LON      "gps_lon_i"
+#define NVS_KEY_GPS_ALT      "gps_alt_i"
 
 // Wardrive band selection
 typedef enum { WD_BAND_BOTH = 0, WD_BAND_24G, WD_BAND_5G } wd_band_t;
@@ -489,7 +492,19 @@ typedef struct {
 } screenshot_msg_t;
 
 // Use GPS definitions from wifi_common.h via wifi_cli.h
-static gps_data_t current_gps = {0};
+static gps_data_t current_gps      = {0};
+static gps_data_t g_gps_last_known = {0};  // persists across GPS dropouts; loaded from NVS at boot
+#define GPS_STALE_ACCURACY_M 150.0f         // ~city block; used when position is held from last fix
+
+// Returns the best available GPS reading: live if valid, last-known (stale) if not.
+// Callers that write location data should always use this instead of current_gps directly.
+static const gps_data_t *gps_best(void) {
+    return current_gps.valid ? &current_gps : &g_gps_last_known;
+}
+// Returns the accuracy to report: live accuracy or GPS_STALE_ACCURACY_M for held position.
+static float gps_best_accuracy(void) {
+    return current_gps.valid ? current_gps.accuracy : GPS_STALE_ACCURACY_M;
+}
 static char gps_rx_buffer[GPS_BUF_SIZE];
 static StaticTask_t gps_task_buffer;
 static StackType_t *gps_task_stack = NULL;
@@ -880,6 +895,7 @@ typedef struct {
     bool     written_to_file;
     float    latitude;
     float    longitude;
+    float    accuracy;  // GPS accuracy at time of discovery (m); GPS_STALE_ACCURACY_M if held
 } wdp_network_t;
 
 static wdp_ducb_channel_t wdp_ducb_channels[WDP_TOTAL_CHANNELS];
@@ -2424,6 +2440,20 @@ static void nvs_settings_load(void)
         if (nvs_get_u8(h, NVS_KEY_WD_PCAP, &wp) == ESP_OK) g_wd_pcap = (wp != 0);
         uint8_t wble = 0;
         if (nvs_get_u8(h, NVS_KEY_WD_BLE, &wble) == ESP_OK) g_wd_ble = (wble != 0);
+        // Restore last-known GPS position so functions have a fallback before first fix
+        int32_t gps_lat_i = 0, gps_lon_i = 0, gps_alt_i = 0;
+        if (nvs_get_i32(h, NVS_KEY_GPS_LAT, &gps_lat_i) == ESP_OK &&
+            nvs_get_i32(h, NVS_KEY_GPS_LON, &gps_lon_i) == ESP_OK) {
+            g_gps_last_known.latitude  = (float)gps_lat_i / 1e6f;
+            g_gps_last_known.longitude = (float)gps_lon_i / 1e6f;
+            nvs_get_i32(h, NVS_KEY_GPS_ALT, &gps_alt_i);
+            g_gps_last_known.altitude  = (float)gps_alt_i / 10.0f;
+            g_gps_last_known.accuracy  = GPS_STALE_ACCURACY_M;
+            g_gps_last_known.valid     = true;
+            ESP_LOGI(TAG, "NVS: restored last GPS %.6f, %.6f (stale, %.0fm accuracy)",
+                     (double)g_gps_last_known.latitude, (double)g_gps_last_known.longitude,
+                     (double)GPS_STALE_ACCURACY_M);
+        }
         nvs_close(h);
         ESP_LOGI(TAG, "NVS settings loaded: timeout=%ldms, brightness=%u%%, scan=%u-%ums, dark=%d, max_power=%d, gatt_tmo=%ums",
                  (long)screen_timeout_ms, screen_brightness_pct, scan_time_min_ms, scan_time_max_ms,
@@ -2508,6 +2538,26 @@ static void nvs_settings_save_gatt_timeout(uint32_t ms)
         nvs_commit(h);
         nvs_close(h);
         ESP_LOGI(TAG, "NVS: saved gatt_timeout = %ums", (unsigned)ms);
+    }
+}
+
+// Persist last-known GPS to NVS. Throttled: max once per 5 minutes to protect flash.
+// Coordinates stored as integer μ-degrees (×1e6) to avoid float NVS blobs.
+static void nvs_save_last_gps(const gps_data_t *g)
+{
+    static int64_t s_last_gps_save_us = 0;
+    int64_t now = esp_timer_get_time();
+    if (now - s_last_gps_save_us < (int64_t)5 * 60 * 1000000) return;  // 5-minute minimum interval
+    s_last_gps_save_us = now;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, NVS_KEY_GPS_LAT, (int32_t)(g->latitude  * 1e6f));
+        nvs_set_i32(h, NVS_KEY_GPS_LON, (int32_t)(g->longitude * 1e6f));
+        nvs_set_i32(h, NVS_KEY_GPS_ALT, (int32_t)(g->altitude  * 10.0f));
+        nvs_commit(h);
+        nvs_close(h);
+        ESP_LOGI(TAG, "NVS: GPS last-known saved %.6f, %.6f",
+                 (double)g->latitude, (double)g->longitude);
     }
 }
 
@@ -8402,8 +8452,9 @@ static int wdp_find_bssid(const uint8_t *bssid) {
 
 static void wd_save_mark(const char *note)
 {
-    if (!current_gps.valid) {
-        ESP_LOGW(TAG, "Mark: no GPS fix, skipping");
+    const gps_data_t *g = gps_best();
+    if (!g->valid) {
+        ESP_LOGW(TAG, "Mark: no GPS fix and no last-known position, skipping");
         return;
     }
 
@@ -8454,21 +8505,23 @@ static void wd_save_mark(const char *note)
             "  <ele>%.1f</ele>\n"
             "  <time>%s</time>\n"
             "  <name>WP%d</name>\n"
-            "  <desc>%s</desc>\n"
+            "  <desc>%s%s</desc>\n"
             "</wpt>\n",
-            (double)current_gps.latitude,
-            (double)current_gps.longitude,
-            (double)current_gps.altitude,
+            (double)g->latitude,
+            (double)g->longitude,
+            (double)g->altitude,
             ts,
             wd_mark_count,
-            safe_note);
+            safe_note,
+            current_gps.valid ? "" : " [stale pos]");
         fflush(wd_marks_file);
         xSemaphoreGive(sd_spi_mutex);
     }
 
-    ESP_LOGI(TAG, "Mark WP%d saved: %.6f,%.6f  \"%s\"",
-             wd_mark_count, current_gps.latitude, current_gps.longitude,
-             safe_note[0] ? safe_note : "(quick)");
+    ESP_LOGI(TAG, "Mark WP%d saved: %.6f,%.6f  \"%s\"%s",
+             wd_mark_count, (double)g->latitude, (double)g->longitude,
+             safe_note[0] ? safe_note : "(quick)",
+             current_gps.valid ? "" : " [stale pos]");
 }
 
 // Note dialog: Save button
@@ -8537,12 +8590,19 @@ static void wd_mark_open_note_dialog(void)
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_AMBER, 0);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
 
-    char coord_buf[48];
-    snprintf(coord_buf, sizeof(coord_buf), "%.5f, %.5f",
-             (double)current_gps.latitude, (double)current_gps.longitude);
+    char coord_buf[64];
+    {
+        const gps_data_t *cg = gps_best();
+        if (cg->valid)
+            snprintf(coord_buf, sizeof(coord_buf), "%.5f, %.5f%s",
+                     (double)cg->latitude, (double)cg->longitude,
+                     current_gps.valid ? "" : " [stale]");
+        else
+            snprintf(coord_buf, sizeof(coord_buf), "No GPS");
+    }
     lv_obj_t *coord_lbl = lv_label_create(card);
     lv_label_set_text(coord_lbl, coord_buf);
-    lv_obj_set_style_text_color(coord_lbl, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_text_color(coord_lbl, current_gps.valid ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_AMBER, 0);
     lv_obj_set_style_text_font(coord_lbl, &lv_font_montserrat_12, 0);
 
     // Note text area — linked to keyboard
@@ -8637,8 +8697,11 @@ static int wdp_ble_gap_cb(struct ble_gap_event *event, void *arg)
     wdp_ble_device_t *dev = &wdp_ble_devices[cnt];
     memcpy(dev->mac, desc->addr.val, 6);
     dev->rssi      = desc->rssi;
-    dev->latitude  = current_gps.latitude;
-    dev->longitude = current_gps.longitude;
+    {
+        const gps_data_t *g = gps_best();
+        dev->latitude  = g->latitude;
+        dev->longitude = g->longitude;
+    }
     dev->name[0]   = '\0';
     dev->written   = false;
 
@@ -8716,8 +8779,12 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     wdp_seen_networks[idx].rssi = (int8_t)pkt->rx_ctrl.rssi;
     wdp_seen_networks[idx].authmode = authmode;
     wdp_seen_networks[idx].written_to_file = false;
-    wdp_seen_networks[idx].latitude = current_gps.valid ? current_gps.latitude : 0.0f;
-    wdp_seen_networks[idx].longitude = current_gps.valid ? current_gps.longitude : 0.0f;
+    {
+        const gps_data_t *g = gps_best();
+        wdp_seen_networks[idx].latitude  = g->valid ? g->latitude  : 0.0f;
+        wdp_seen_networks[idx].longitude = g->valid ? g->longitude : 0.0f;
+        wdp_seen_networks[idx].accuracy  = g->valid ? gps_best_accuracy() : 0.0f;
+    }
     wdp_seen_count++;
     wdp_dwell_new_networks++;
 }
@@ -9668,27 +9735,36 @@ static void wardrive_promisc_task(void *pvParameters) {
     wdp_needs_grow = false;
     if (wdp_seen_networks) memset(wdp_seen_networks, 0, (size_t)wdp_seen_capacity * sizeof(wdp_network_t));
 
-    ESP_LOGI(TAG, "Waiting for GPS fix...");
-    while (wardrive_active && !current_gps.valid) {
-        int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(200));
-        if (len > 0) {
-            wardrive_gps_buffer[len] = '\0';
-            char *line = strtok(wardrive_gps_buffer, "\r\n");
-            while (line != NULL) {
-                parse_gps_nmea(line);
-                line = strtok(NULL, "\r\n");
+    if (!current_gps.valid) {
+        if (g_gps_last_known.valid) {
+            ESP_LOGI(TAG, "Wardrive: using last-known GPS (%.6f, %.6f, accuracy %.0fm) while awaiting fix",
+                     (double)g_gps_last_known.latitude, (double)g_gps_last_known.longitude,
+                     (double)GPS_STALE_ACCURACY_M);
+        } else {
+            ESP_LOGI(TAG, "Waiting for GPS fix...");
+            while (wardrive_active && !current_gps.valid) {
+                int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(200));
+                if (len > 0) {
+                    wardrive_gps_buffer[len] = '\0';
+                    char *line = strtok(wardrive_gps_buffer, "\r\n");
+                    while (line != NULL) { parse_gps_nmea(line); line = strtok(NULL, "\r\n"); }
+                }
+                wd_ui_update_flag = true;
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
+            if (!wardrive_active) {
+                wardrive_task_handle = NULL;
+                vTaskDelete(NULL);
+                return;
             }
         }
-        wd_ui_update_flag = true;
-        vTaskDelay(pdMS_TO_TICKS(500));
     }
-    if (!wardrive_active) {
-        wardrive_task_handle = NULL;
-        vTaskDelete(NULL);
-        return;
+    {
+        const gps_data_t *g = gps_best();
+        ESP_LOGI(TAG, "GPS ready: Lat:%.6f Lon:%.6f Sats:%d%s",
+                 (double)g->latitude, (double)g->longitude, current_gps.satellites,
+                 current_gps.valid ? "" : " [STALE]");
     }
-    ESP_LOGI(TAG, "GPS fix obtained! Lat:%.6f Lon:%.6f Sats:%d",
-             current_gps.latitude, current_gps.longitude, current_gps.satellites);
 
     if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
     struct stat st = {0};
@@ -9754,20 +9830,28 @@ static void wardrive_promisc_task(void *pvParameters) {
         }
 
         if (!current_gps.valid) {
-            ESP_LOGI(TAG, "[WDP] GPS fix lost, pausing promisc...");
-            esp_wifi_set_promiscuous(false);
-            while (wardrive_active && !current_gps.valid) {
-                len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(200));
-                if (len > 0) {
-                    wardrive_gps_buffer[len] = '\0';
-                    char *l = strtok(wardrive_gps_buffer, "\r\n");
-                    while (l) { parse_gps_nmea(l); l = strtok(NULL, "\r\n"); }
+            if (g_gps_last_known.valid) {
+                // Hold last-known position — continue scanning without pausing
+                ESP_LOGD(TAG, "[WDP] GPS fix lost; holding last-known (%.6f, %.6f, acc %.0fm)",
+                         (double)g_gps_last_known.latitude, (double)g_gps_last_known.longitude,
+                         (double)GPS_STALE_ACCURACY_M);
+            } else {
+                // No fallback at all — must pause until re-acquired
+                ESP_LOGI(TAG, "[WDP] GPS fix lost (no last-known), pausing promisc...");
+                esp_wifi_set_promiscuous(false);
+                while (wardrive_active && !current_gps.valid) {
+                    len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(200));
+                    if (len > 0) {
+                        wardrive_gps_buffer[len] = '\0';
+                        char *l = strtok(wardrive_gps_buffer, "\r\n");
+                        while (l) { parse_gps_nmea(l); l = strtok(NULL, "\r\n"); }
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(500));
                 }
-                vTaskDelay(pdMS_TO_TICKS(500));
+                if (!wardrive_active) break;
+                ESP_LOGI(TAG, "[WDP] GPS fix re-acquired, resuming promisc.");
+                esp_wifi_set_promiscuous(true);
             }
-            if (!wardrive_active) break;
-            ESP_LOGI(TAG, "[WDP] GPS fix re-acquired, resuming promisc.");
-            esp_wifi_set_promiscuous(true);
         }
 
         if (wdp_needs_grow) wdp_grow_network_buffer();
@@ -9836,9 +9920,10 @@ static void wardrive_promisc_task(void *pvParameters) {
                        2412 + (net->channel - 1) * 5 :
                        (net->channel == 14) ? 2484 :
                        (net->channel >= 36)  ? 5000 + 5 * net->channel : 0;
-            fprintf(file, "%s,%s,[%s],%s,%d,%d,%d,%.7f,%.7f,0.00,0.00,,,WIFI\n",
+            fprintf(file, "%s,%s,[%s],%s,%d,%d,%d,%.7f,%.7f,0.00,%.2f,,,WIFI\n",
                     mac_str, escaped_ssid, auth, timestamp,
-                    net->channel, freq, net->rssi, net->latitude, net->longitude);
+                    net->channel, freq, net->rssi, net->latitude, net->longitude,
+                    (double)net->accuracy);
             net->written_to_file = true;
             networks_since_flush++;
         }
@@ -20630,10 +20715,11 @@ static void bto_probe_btn_cb(lv_event_t *e)
         /* Different device — re-walk to get fresh handles, then auto-probe */
         if (gw_probe_status_lbl && lv_obj_is_valid(gw_probe_status_lbl))
             lv_label_set_text(gw_probe_status_lbl, "Preparing...");
-        double lat = current_gps.valid ? (double)current_gps.latitude  : 0.0;
-        double lon = current_gps.valid ? (double)current_gps.longitude : 0.0;
+        const gps_data_t *gwg = gps_best();
+        double lat = gwg->valid ? (double)gwg->latitude  : 0.0;
+        double lon = gwg->valid ? (double)gwg->longitude : 0.0;
         if (!gw_walk(d->addr, d->addr_type, d->name[0] ? d->name : "Unknown",
-                     d->rssi, lat, lon, current_gps.valid)) {
+                     d->rssi, lat, lon, gwg->valid)) {
             gw_probe_result_back_cb(NULL);
             return;
         }
@@ -25093,6 +25179,8 @@ static bool parse_gps_nmea(const char *nmea_sentence)
 			current_gps.altitude = altitude;
 			current_gps.accuracy = hdop * 4.0f;
 			current_gps.valid = true;
+			g_gps_last_known = current_gps;  // always snapshot every valid fix
+			nvs_save_last_gps(&g_gps_last_known);  // throttled: max once per 5 min
 			return true;
 		}
 	}
