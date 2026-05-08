@@ -459,18 +459,6 @@ static void style_modal_overlay(lv_obj_t *overlay, lv_opa_t opacity) {
     lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
 }
 
-static void style_neutral_button(lv_obj_t *btn) {
-    if (!btn) return;
-    lv_obj_set_style_bg_color(btn,
-        dark_mode_enabled ? lv_color_hex(0x13263C) : lv_color_hex(0xD4DFEA), 0);
-    lv_obj_set_style_bg_color(btn,
-        dark_mode_enabled ? lv_color_hex(0x1E3550) : lv_color_hex(0xC3D1E1),
-        LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(btn, 1, 0);
-    lv_obj_set_style_border_color(btn, ui_border_color(), 0);
-    lv_obj_set_style_border_opa(btn, dark_mode_enabled ? LV_OPA_70 : LV_OPA_100, 0);
-    lv_obj_set_style_radius(btn, 8, 0);
-}
 
 static esp_lcd_panel_handle_t panel_handle;
 static esp_lcd_panel_io_handle_t lcd_io_handle;
@@ -512,10 +500,6 @@ static float gps_best_accuracy(void) {
 static char gps_rx_buffer[GPS_BUF_SIZE];
 static StaticTask_t gps_task_buffer;
 static StackType_t *gps_task_stack = NULL;
-
-// SD init task buffers
-static StaticTask_t sd_init_task_buffer;
-static StackType_t *sd_init_task_stack = NULL;
 
 static esp_err_t init_gps_uart(void);
 static bool parse_gps_nmea(const char *nmea_sentence);
@@ -976,7 +960,6 @@ static int wardrive_file_counter = 1;
 
 // Wardrive buffers (static to avoid stack overflow)
 static char wardrive_gps_buffer[GPS_BUF_SIZE];
-static wifi_ap_record_t wardrive_scan_results[MAX_AP_CNT];
 
 // Karma UI state
 static lv_obj_t *karma_log_ta = NULL;
@@ -1065,6 +1048,9 @@ static void            (*wdup_back_fn)(void) = NULL;
 static bool              wdup_use_explicit  = false;
 static int               wdup_explicit_indices[64];
 static int               wdup_explicit_count  = 0;
+// Set when the upload screen redirects to WiFi Client to get credentials.
+// Cleared once WiFi connects and the upload screen is shown again.
+static bool              s_wdup_pending_after_wifi = false;
 static void            (*wdm_back_fn)(void)   = NULL;
 // wd_manage_paths declared here so wdup_task (explicit mode) can reference it
 #define WD_MANAGE_MAX_FILES 64
@@ -1687,6 +1673,7 @@ static void show_wardrive_menu_screen(void);
 static void show_wardrive_options_screen(void);
 static void show_wardrive_manage_screen(void);
 static void show_wardrive_upload_screen(void);
+static void wdup_start_cb(lv_event_t *e);
 static void wdup_task(void *pvParameters);
 static void wdup_timer_cb(lv_timer_t *timer);
 
@@ -15407,14 +15394,23 @@ static void s_fileserv_poll_ip_cb(lv_timer_t *t)
     if (!netif) return;
     esp_netif_ip_info_t ip;
     if (esp_netif_get_ip_info(netif, &ip) == ESP_OK && ip.ip.addr != 0) {
+        lv_timer_del(t);
+        s_fileserv_poll_timer = NULL;
+
+        if (s_wdup_pending_after_wifi) {
+            // Came from the upload screen — go back and auto-start the upload.
+            s_wdup_pending_after_wifi = false;
+            show_wardrive_upload_screen();
+            wdup_start_cb(NULL);
+            return;
+        }
+
         char ip_str[64];
         snprintf(ip_str, sizeof(ip_str), "IP: " IPSTR " => http://" IPSTR,
                  IP2STR(&ip.ip), IP2STR(&ip.ip));
         if (s_fileserv_ip_lbl)     lv_label_set_text(s_fileserv_ip_lbl, ip_str);
         if (s_fileserv_status_lbl) lv_label_set_text(s_fileserv_status_lbl, "Server active");
         s_fileserv_httpd_start();
-        lv_timer_del(t);
-        s_fileserv_poll_timer = NULL;
     }
 }
 
@@ -15424,6 +15420,11 @@ static void s_fileserv_stop_cb(lv_event_t *e)
     (void)e;
     if (s_fileserv_poll_timer) { lv_timer_del(s_fileserv_poll_timer); s_fileserv_poll_timer = NULL; }
     s_fileserv_httpd_stop();
+    if (s_wdup_pending_after_wifi) {
+        s_wdup_pending_after_wifi = false;
+        show_wardrive_upload_screen();
+        return;
+    }
     show_settings_screen();
 }
 
@@ -15574,7 +15575,7 @@ static void s_wcs_connect_cb(lv_event_t *e)
 
 static void show_wifi_client_server_screen(void)
 {
-    create_function_page_base("WiFi File Server");
+    create_function_page_base(s_wdup_pending_after_wifi ? "WiFi for Upload" : "WiFi File Server");
     apply_menu_bg();
 
     lv_obj_t *content = lv_obj_create(function_page);
@@ -15889,9 +15890,9 @@ static void wdup_task(void *pvParameters)
     wdup_push_msg("Connecting to WiFi...", cyan);
     if (!wdup_ensure_wifi()) {
         if (g_saved_wifi_ssid[0] == '\0')
-            wdup_push_msg("No WiFi saved. Go Back → Settings → Data Transfer → WiFi Client to set SSID.", red);
+            wdup_push_msg("No WiFi saved. Go Back > Settings > Data Transfer > WiFi Client.", red);
         else
-            wdup_push_msg("WiFi connection failed. Check SSID/password in Settings → Data Transfer → WiFi Client.", red);
+            wdup_push_msg("WiFi failed. Check SSID/password in Settings > Data Transfer > WiFi Client.", red);
         goto task_done;
     }
     wdup_push_msg("WiFi connected.", green);
@@ -16133,6 +16134,19 @@ static void wdup_start_cb(lv_event_t *e)
 {
     (void)e;
     if (wdup_active || wdup_task_handle) return;
+
+    // If no routable IP, redirect to WiFi Client screen to get credentials first.
+    esp_netif_t *_sn = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    bool _has_ip = false;
+    if (_sn) {
+        esp_netif_ip_info_t _ip;
+        _has_ip = (esp_netif_get_ip_info(_sn, &_ip) == ESP_OK && _ip.ip.addr != 0);
+    }
+    if (!_has_ip) {
+        s_wdup_pending_after_wifi = true;
+        show_wifi_client_server_screen();
+        return;
+    }
 
     // Save any keys typed on-screen before starting
     wdup_save_key_cb(NULL);
