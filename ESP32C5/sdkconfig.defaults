@@ -25,3 +25,13 @@ CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 # Partition table
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Panic handler in IRAM — must be set so the panic/backtrace handler can execute
+# even when the flash cache is temporarily disabled (e.g. during NVS/flash writes).
+# Without this, any fault that fires during a cache-dark window causes CPU_LOCKUP
+# because the panic handler can't fetch its own code from flash.
+CONFIG_ESP_PANIC_HANDLER_IRAM=y
+
+# Task WDT panic — converts silent watchdog reboot into a full panic with register
+# dump and backtrace so we can see which task/line caused the hang.
+CONFIG_ESP_TASK_WDT_PANIC=y
