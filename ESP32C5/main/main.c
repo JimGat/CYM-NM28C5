@@ -495,6 +495,9 @@ typedef struct {
 static gps_data_t current_gps      = {0};
 static gps_data_t g_gps_last_known = {0};  // persists across GPS dropouts; loaded from NVS at boot
 #define GPS_STALE_ACCURACY_M 150.0f         // ~city block; used when position is held from last fix
+// Set by GPS task when a new valid fix arrives; main loop calls nvs_save_last_gps() from
+// main-task context to avoid nvs_commit() disabling flash cache in a background task.
+static volatile bool g_gps_save_pending = false;
 
 // Returns the best available GPS reading: live if valid, last-known (stale) if not.
 // Callers that write location data should always use this instead of current_gps directly.
@@ -5945,6 +5948,14 @@ void app_main(void)
         if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             wifi_attacks_process_pending_saves();
             xSemaphoreGive(sd_spi_mutex);
+        }
+
+        // Flush GPS position to NVS from main-task context (throttled inside the function).
+        // nvs_commit() briefly disables the flash cache; calling it from a background task
+        // (gps_task) while the panic handler is in flash causes CPU_LOCKUP — do it here instead.
+        if (g_gps_save_pending) {
+            g_gps_save_pending = false;
+            nvs_save_last_gps(&g_gps_last_known);
         }
         
         vTaskDelay(pdMS_TO_TICKS(sleep_ms > 10 ? 10 : sleep_ms));
@@ -25466,7 +25477,7 @@ static bool parse_gps_nmea(const char *nmea_sentence)
 			current_gps.accuracy = hdop * 4.0f;
 			current_gps.valid = true;
 			g_gps_last_known = current_gps;  // always snapshot every valid fix
-			nvs_save_last_gps(&g_gps_last_known);  // throttled: max once per 5 min
+			g_gps_save_pending = true;       // main loop will call nvs_save_last_gps()
 			return true;
 		}
 	}
