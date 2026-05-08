@@ -908,6 +908,15 @@ static lv_timer_t *wd_ui_timer = NULL;
 static volatile bool wd_ui_update_flag = false;
 static volatile int wdp_current_channel = 0;
 
+// Wardrive GPS marks (waypoints)
+static FILE       *wd_marks_file      = NULL;
+static int         wd_mark_count      = 0;
+static char        wd_marks_fname[96] = "";
+static int         wd_mark_tap_count  = 0;
+static lv_timer_t *wd_mark_timer      = NULL;
+static lv_obj_t   *wd_mark_note_overlay = NULL;
+static lv_obj_t   *wd_mark_note_ta      = NULL;
+
 // Wardrive BLE time-slice
 typedef struct {
     uint8_t mac[6];
@@ -1585,6 +1594,10 @@ static void ducb_update(int channel_idx, double reward);
 static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type);
 static void hs_send_targeted_deauth(const uint8_t *station_mac, const uint8_t *ap_bssid, uint8_t channel);
 static bool hs_save_handshake_to_sd(int ap_idx);
+// Wardrive GPS mark helpers
+static void wd_save_mark(const char *note);
+static void wd_mark_tap_cb(lv_event_t *e);
+
 // Wardrive promisc helpers
 static int  wdp_ble_gap_cb(struct ble_gap_event *event, void *arg);
 static void wdp_ducb_init(void);
@@ -8376,6 +8389,226 @@ static int wdp_find_bssid(const uint8_t *bssid) {
     return -1;
 }
 
+// ─── Wardrive GPS mark (waypoint) functions ───────────────────────────────
+
+static void wd_save_mark(const char *note)
+{
+    if (!current_gps.valid) {
+        ESP_LOGW(TAG, "Mark: no GPS fix, skipping");
+        return;
+    }
+
+    // Open file on first mark (GPX header)
+    if (!wd_marks_file) {
+        if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+            wd_marks_file = fopen(wd_marks_fname, "w");
+            if (wd_marks_file) {
+                fprintf(wd_marks_file,
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                    "<gpx version=\"1.1\" creator=\"JANOS NM-CYD-C5 %s\">\n",
+                    FW_VERSION);
+                fflush(wd_marks_file);
+            }
+            xSemaphoreGive(sd_spi_mutex);
+        }
+        if (!wd_marks_file) {
+            ESP_LOGE(TAG, "Mark: cannot open %s", wd_marks_fname);
+            return;
+        }
+    }
+
+    wd_mark_count++;
+
+    // Build timestamp string from GPS UTC if available, otherwise blank
+    char ts[32] = "1970-01-01T00:00:00Z";
+    if (current_gps.time_utc[0]) {
+        // GPS gives HH:MM:SS — use date 0000 placeholder (no date from NMEA here)
+        snprintf(ts, sizeof(ts), "0000-01-01T%sZ", current_gps.time_utc);
+    }
+
+    // Sanitize note for XML (replace < > & with entities)
+    char safe_note[128] = "";
+    if (note && note[0]) {
+        int j = 0;
+        for (int i = 0; note[i] && j < (int)sizeof(safe_note) - 7; i++) {
+            if (note[i] == '<')      { memcpy(safe_note+j, "&lt;",  4); j+=4; }
+            else if (note[i] == '>') { memcpy(safe_note+j, "&gt;",  4); j+=4; }
+            else if (note[i] == '&') { memcpy(safe_note+j, "&amp;", 5); j+=5; }
+            else                     { safe_note[j++] = note[i]; }
+        }
+        safe_note[j] = '\0';
+    }
+
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        fprintf(wd_marks_file,
+            "<wpt lat=\"%.7f\" lon=\"%.7f\">\n"
+            "  <ele>%.1f</ele>\n"
+            "  <time>%s</time>\n"
+            "  <name>WP%d</name>\n"
+            "  <desc>%s</desc>\n"
+            "</wpt>\n",
+            (double)current_gps.latitude,
+            (double)current_gps.longitude,
+            (double)current_gps.altitude,
+            ts,
+            wd_mark_count,
+            safe_note);
+        fflush(wd_marks_file);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    ESP_LOGI(TAG, "Mark WP%d saved: %.6f,%.6f  \"%s\"",
+             wd_mark_count, current_gps.latitude, current_gps.longitude,
+             safe_note[0] ? safe_note : "(quick)");
+}
+
+// Note dialog: Save button
+static void wd_mark_note_save_cb(lv_event_t *e)
+{
+    (void)e;
+    const char *note = "";
+    if (wd_mark_note_ta && lv_obj_is_valid(wd_mark_note_ta))
+        note = lv_textarea_get_text(wd_mark_note_ta);
+    if (wd_mark_note_overlay && lv_obj_is_valid(wd_mark_note_overlay)) {
+        lv_obj_del(wd_mark_note_overlay);
+    }
+    wd_mark_note_overlay = NULL;
+    wd_mark_note_ta = NULL;
+    wd_save_mark(note);
+}
+
+// Note dialog: Cancel button
+static void wd_mark_note_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    if (wd_mark_note_overlay && lv_obj_is_valid(wd_mark_note_overlay)) {
+        lv_obj_del(wd_mark_note_overlay);
+    }
+    wd_mark_note_overlay = NULL;
+    wd_mark_note_ta = NULL;
+}
+
+static void wd_mark_open_note_dialog(void)
+{
+    if (wd_mark_note_overlay) return;  // already open
+
+    wd_mark_note_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(wd_mark_note_overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(wd_mark_note_overlay, 0, 0);
+    lv_obj_set_style_bg_color(wd_mark_note_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(wd_mark_note_overlay, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(wd_mark_note_overlay, 0, 0);
+    lv_obj_set_style_pad_all(wd_mark_note_overlay, 0, 0);
+    lv_obj_clear_flag(wd_mark_note_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(wd_mark_note_overlay, 0, 0);
+
+    lv_obj_t *card = lv_obj_create(wd_mark_note_overlay);
+    lv_obj_set_size(card, LCD_H_RES - 16, LV_SIZE_CONTENT);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(card, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 8, 0);
+    lv_obj_set_style_pad_row(card, 6, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, LV_SYMBOL_GPS "  Mark Waypoint");
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+
+    // GPS coords preview
+    char coord_buf[48];
+    snprintf(coord_buf, sizeof(coord_buf), "%.5f, %.5f",
+             (double)current_gps.latitude, (double)current_gps.longitude);
+    lv_obj_t *coord_lbl = lv_label_create(card);
+    lv_label_set_text(coord_lbl, coord_buf);
+    lv_obj_set_style_text_color(coord_lbl, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_text_font(coord_lbl, &lv_font_montserrat_12, 0);
+
+    // Note text area
+    wd_mark_note_ta = lv_textarea_create(card);
+    lv_obj_set_width(wd_mark_note_ta, LCD_H_RES - 32);
+    lv_obj_set_height(wd_mark_note_ta, 36);
+    lv_textarea_set_max_length(wd_mark_note_ta, 60);
+    lv_textarea_set_one_line(wd_mark_note_ta, true);
+    lv_textarea_set_placeholder_text(wd_mark_note_ta, "Note (optional)...");
+    lv_obj_set_style_text_font(wd_mark_note_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(wd_mark_note_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(wd_mark_note_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(wd_mark_note_ta, COLOR_MATERIAL_AMBER, 0);
+
+    // Keyboard
+    lv_obj_t *kb = lv_keyboard_create(card);
+    lv_obj_set_width(kb, LCD_H_RES - 16);
+    lv_keyboard_set_textarea(kb, wd_mark_note_ta);
+    lv_obj_set_style_text_font(kb, &lv_font_montserrat_12, 0);
+
+    // Buttons row
+    lv_obj_t *btn_row = lv_obj_create(card);
+    lv_obj_set_size(btn_row, LCD_H_RES - 32, 30);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel_btn, 90, 26);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_make(70, 70, 70), 0);
+    lv_obj_set_style_radius(cancel_btn, 6, 0);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, LV_SYMBOL_CLOSE "  Cancel");
+    lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(cancel_lbl);
+    lv_obj_add_event_cb(cancel_btn, wd_mark_note_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *save_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(save_btn, 90, 26);
+    lv_obj_set_style_bg_color(save_btn, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_bg_color(save_btn, lv_color_make(200, 140, 0), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(save_btn, 6, 0);
+    lv_obj_t *save_lbl = lv_label_create(save_btn);
+    lv_label_set_text(save_lbl, LV_SYMBOL_OK "  Save");
+    lv_obj_set_style_text_font(save_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(save_lbl);
+    lv_obj_add_event_cb(save_btn, wd_mark_note_save_cb, LV_EVENT_CLICKED, NULL);
+}
+
+static void wd_mark_timer_cb(lv_timer_t *t)
+{
+    lv_timer_del(t);
+    wd_mark_timer = NULL;
+    int taps = wd_mark_tap_count;
+    wd_mark_tap_count = 0;
+    if (taps >= 2) {
+        // Double-tap: quick mark, no note
+        wd_save_mark("");
+    } else {
+        // Single tap: open note dialog
+        wd_mark_open_note_dialog();
+    }
+}
+
+static void wd_mark_tap_cb(lv_event_t *e)
+{
+    (void)e;
+    wd_mark_tap_count++;
+    if (wd_mark_timer) {
+        lv_timer_reset(wd_mark_timer);  // extend window on each tap
+    } else {
+        wd_mark_timer = lv_timer_create(wd_mark_timer_cb, 450, NULL);
+        lv_timer_set_repeat_count(wd_mark_timer, 1);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 // BLE GAP callback used during wardrive BLE time-slice passes
 static int wdp_ble_gap_cb(struct ble_gap_event *event, void *arg)
 {
@@ -9417,6 +9650,8 @@ static void wardrive_promisc_task(void *pvParameters) {
     ESP_LOGI(TAG, "Wardrive promisc task started");
 
     wardrive_file_counter = (int)(esp_timer_get_time() / 1000000);
+    snprintf(wd_marks_fname, sizeof(wd_marks_fname),
+             "/sdcard/lab/wardrives/wd%d_marks.gpx", wardrive_file_counter);
 
     wdp_seen_count = 0;
     wdp_dwell_new_networks = 0;
@@ -9856,10 +10091,14 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_set_scrollbar_mode(wd_ui_table, LV_SCROLLBAR_MODE_AUTO);
     lv_table_set_row_cnt(wd_ui_table, 1);
 
-    // ─── Stop button (bottom center) ─────────────────────────────
+    // ─── Bottom button row: [Stop] [Mark] ────────────────────────
+    wd_mark_count = 0;
+    wd_marks_file = NULL;
+    wd_marks_fname[0] = '\0';  // task will fill this in once counter is set
+
     wardrive_stop_btn = lv_btn_create(function_page);
-    lv_obj_set_size(wardrive_stop_btn, 110, 30);
-    lv_obj_align(wardrive_stop_btn, LV_ALIGN_BOTTOM_MID, 0, -5);
+    lv_obj_set_size(wardrive_stop_btn, 108, 30);
+    lv_obj_align(wardrive_stop_btn, LV_ALIGN_BOTTOM_MID, -60, -5);
     lv_obj_set_style_bg_color(wardrive_stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(wardrive_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(wardrive_stop_btn, 0, 0);
@@ -9878,6 +10117,29 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(stop_lbl, ui_text_color(), 0);
     lv_obj_add_event_cb(wardrive_stop_btn, wardrive_stop_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    // Mark button — double-tap for quick mark, single tap opens note dialog
+    lv_obj_t *mark_btn = lv_btn_create(function_page);
+    lv_obj_set_size(mark_btn, 108, 30);
+    lv_obj_align(mark_btn, LV_ALIGN_BOTTOM_MID, 60, -5);
+    lv_obj_set_style_bg_color(mark_btn, COLOR_MATERIAL_AMBER, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(mark_btn, lv_color_make(200, 140, 0), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(mark_btn, 0, 0);
+    lv_obj_set_style_radius(mark_btn, 8, 0);
+    lv_obj_set_style_shadow_width(mark_btn, 4, 0);
+    lv_obj_set_style_shadow_color(mark_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_flex_flow(mark_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(mark_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(mark_btn, 6, 0);
+    lv_obj_t *pin_icon = lv_label_create(mark_btn);
+    lv_label_set_text(pin_icon, LV_SYMBOL_GPS);
+    lv_obj_set_style_text_font(pin_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(pin_icon, lv_color_black(), 0);
+    lv_obj_t *mark_lbl = lv_label_create(mark_btn);
+    lv_label_set_text(mark_lbl, "Mark");
+    lv_obj_set_style_text_font(mark_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(mark_lbl, lv_color_black(), 0);
+    lv_obj_add_event_cb(mark_btn, wd_mark_tap_cb, LV_EVENT_CLICKED, NULL);
 
     // ─── Start timer for UI updates ──────────────────────────────
     wd_ui_timer = lv_timer_create(wd_ui_timer_cb, 1000, NULL);
@@ -9950,6 +10212,23 @@ static void wardrive_stop_btn_cb(lv_event_t *e)
     wd_ui_header = NULL;
     wd_ui_table = NULL;
     wdp_current_channel = 0;
+
+    // Close marks file (write GPX footer)
+    if (wd_mark_timer) { lv_timer_del(wd_mark_timer); wd_mark_timer = NULL; }
+    wd_mark_tap_count = 0;
+    if (wd_mark_note_overlay && lv_obj_is_valid(wd_mark_note_overlay)) {
+        lv_obj_del(wd_mark_note_overlay);
+    }
+    wd_mark_note_overlay = NULL;
+    wd_mark_note_ta = NULL;
+    if (wd_marks_file) {
+        if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+            fprintf(wd_marks_file, "</gpx>\n");
+            fclose(wd_marks_file);
+            xSemaphoreGive(sd_spi_mutex);
+        }
+        wd_marks_file = NULL;
+    }
 
     nav_to_menu_flag = true;
 }
