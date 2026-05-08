@@ -1,5 +1,97 @@
 # CYM-NM28C5 Pre-built Firmware Binaries
 
+**Firmware version: v1.2.14**
+
+---
+
+## Release Notes — v1.2.14
+
+### Wardrive Upload — Reliability & UX Overhaul
+
+HTTPS uploads to WiGLE and WDG Wars are now stable across all connection scenarios.
+
+- **TLS memory exhaustion fixed** — mbedTLS switched to system allocator (PSRAM-capable) with dynamic SSL buffers; the previous static 16 KB buffer allocation exhausted internal RAM before a handshake could begin, causing every upload attempt to fail with an allocation error.
+- **No WiFi? No problem** — tapping Upload when the device is not connected to a network now redirects to the WiFi Client screen to enter credentials. Once connected, the upload resumes automatically. Previously the screen showed a dead-end error with no path forward.
+- **Per-file progress strip** — a fixed indicator bar sits above the scrolling log showing: file count (`3/5`), a live WiGLE tally (`✓OK / !DUP / ✗FAIL`), and a separate WDG Wars tally updating independently. The scrolling log continues to show the full per-file history for review.
+- **SD card API keys** — keys placed in `/sdcard/lab/wigle.txt` and `/sdcard/lab/wdgwars.txt` now correctly override any key typed into the on-device form. Previously NVS always won, so SD-provisioned keys were silently ignored.
+- **DHCP race eliminated** — upload no longer attempts DNS/TLS before DHCP has assigned an IP, which previously caused immediate connection failures on fast-associating networks.
+
+### BLE During Wardrive — WDG Wars BLE Count
+
+The **Wardrive → Options → BLE** toggle is now uploaded to WDG Wars automatically via the standard CSV endpoint. BLE devices discovered during time-sliced BLE passes are written to the wardrive `.csv` with `Type=BLE` in the WigleWifi-1.6 format — the same file sent to WiGLE and WDG Wars. No separate upload step or API change required; WDG Wars credits BLE entries to your BLE counter on receipt.
+
+### GPS — Robustness Improvements
+
+- **Last-known position** — when GPS signal is lost mid-drive the device holds the last valid fix (stored in PSRAM) and continues logging rather than pausing. Position is saved to NVS every 5 minutes and restored at boot so cold-start wardrives begin with a reasonable fallback immediately.
+- **Go Dark now saves position** — activating Go Dark forces an immediate NVS GPS save, bypassing the 5-minute throttle, so the last fix survives an unexpected power cycle.
+- **System clock re-sync** — the device re-synchronises `settimeofday()` on every valid GPS sentence until the first confirmed fix, ensuring SD card timestamps are accurate even if the very first sentence arrives during boot noise.
+- **Manual fallback position editor** — GPS Info → Edit Position lets you type in a known lat/lon and save it as the NVS fallback. Useful for deploying to a fixed location or seeding position before driving into a GPS-dead zone.
+
+### CPU_LOCKUP Fix — NVS GPS Save
+
+`nvs_commit()` briefly disables the flash cache. Calling it from the GPS background task while the panic handler is also in flash caused a `CPU_LOCKUP` reboot every 5 minutes. GPS saves now happen exclusively from the main loop via a pending-flag handoff.
+
+### BLE Spam — Stability
+
+- Fixed a crash that occurred at approximately 1 400 packets into a BLE Spam session (buffer overrun in the advertising payload builder).
+- Advertising MAC address now rotates every 30 packets, reducing AP-side deduplication and improving effective range.
+- Samsung Fast Connect payload set expanded with additional registered model IDs.
+
+### Wardrive File Management
+
+**Wardrive → Manage Data** now supports multi-file selection: tap individual files to toggle selection, use Select All / Deselect All, then Delete Selected. File size and date shown per entry. Confirm-before-delete dialog prevents accidental data loss.
+
+### Crash Diagnostics (sdkconfig)
+
+- Panic handler pinned to IRAM (`CONFIG_ESP_PANIC_HANDLER_IRAM=y`) — prevents `CPU_LOCKUP` when a fault fires while the flash cache is dark.
+- Task WDT panic enabled (`CONFIG_ESP_TASK_WDT_PANIC=y`) — converts silent watchdog reboots into full panic dumps with register state and backtrace for easier diagnosis.
+
+### Release Workflow
+
+GitHub Actions CI workflow (`esp32c5-build-master.yml`) updated: version is now read from `CMakeLists.txt` `PROJECT_VER` (was `JANOS_VERSION` in `wifi_common.h`); binary name updated from the old project name to `CYM-NM28C5`; GitHub Pages web-flasher manifest regenerated correctly on every release.
+
+---
+
+## Release Notes — v1.0.4
+
+### Wardrive — Mark Button (GPS Waypoints / GPX Export)
+
+A **Mark** button on the wardrive live screen lets you drop a named GPS waypoint mid-drive. Tapping it opens a note dialog; confirming saves the waypoint (with current GPS coordinates, timestamp, and your note) to a `.gpx` file alongside the wardrive CSV. Compatible with GPX-aware mapping software.
+
+---
+
+## Release Notes — v1.0.3
+
+### BLE Wardrive (Time-Sliced)
+
+Enable **Wardrive → Options → BLE** to interleave BLE advertising scans with WiFi channel-hopping. Every 30 seconds the radio pauses WiFi promiscuous mode, runs an 8-second BLE active scan, then resumes. Up to 200 unique BLE devices are captured per session and written to the wardrive CSV with `Type=BLE`. The channel indicator on the live screen shows `BLE` during each pass.
+
+### BLE PCAP Capture
+
+BLE advertisement frames can now be captured in Kismet PCAPNG format. Enable via Wardrive options; PCAP files are written to `/sdcard/lab/pcaps/`.
+
+---
+
+## Release Notes — v1.0.2
+
+### Wardrive Submenu
+
+Wardrive has been promoted from a single tile to a submenu with three entries:
+
+- **Menu** — access to Start / Stop wardrive and the live dashboard
+- **Options** — band filter (2.4 GHz / 5 GHz / Both), BLE toggle, PCAP toggle
+- **Manage Data** — browse, inspect, and delete wardrive CSV files
+
+### Wardrive Upload — WiGLE & WDG Wars
+
+New **Settings → Data Transfer → Wardrive Upload** screen. Enter API keys on-device (saved to NVS) or provision them via SD card files (`/sdcard/lab/wigle.txt`, `/sdcard/lab/wdgwars.txt`). Uploads all wardrive CSV files in `/sdcard/lab/wardrives/` to WiGLE and/or WDG Wars over HTTPS. An upload log is appended to `/sdcard/lab/wardrives/upload_log.csv`.
+
+### Band Filter
+
+Wardrive → Options → Band: choose **2.4 GHz**, **5 GHz**, or **Both**. Setting is NVS-persisted.
+
+---
+
 **Firmware version: v1.0.1**
 
 This folder contains the latest compiled firmware for the **NM-CYD-C5 (ESP32-C5)** board.
