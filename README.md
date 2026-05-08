@@ -925,9 +925,15 @@ AA:BB:CC:DD:EE:FF,"MyNetwork",[WPA2_PSK],2026-05-08 12:34:56,6,2437,-65,37.12345
 
 **Upload after drive:**
 1. Wardrive → Manage Data → check row colors.
-2. Tap **Upload** → select WiGLE / WDG Wars / Both → enter API keys → Upload All.
+2. Tap **Upload** → select WiGLE / WDG Wars / Both → API keys are pre-filled if you set them by file (recommended — see below) or from a prior on-device entry → Upload All.
 3. Per-file status updates live. Green = accepted; amber = duplicate; red = failed.
 4. Return to Manage Data — uploaded rows turn green.
+
+> **Tip — avoid typing API keys on the device:** Put your keys in plain text files on the SD card before your first upload. The device loads them at boot and pre-fills the upload screen automatically — no on-screen keyboard needed.
+> - **WiGLE:** create `/sdcard/lab/wigle.txt` — paste your WiGLE *"Encoded for use"* token on line 1 (get it from wigle.net → Account → API Token).
+> - **WDG Wars:** create `/sdcard/lab/wdgwars.txt` — paste your WDG Wars API key on line 1 (from your wdgwars.pl profile page).
+>
+> Copy the files to the SD card from a PC, insert the card, and reboot. The upload screen will be pre-filled on every subsequent use.
 
 ### 4. Settings
 
@@ -1113,7 +1119,7 @@ Uploads all wardrive CSV files from `/sdcard/lab/wardrives/` to [WiGLE](https://
 
 **Upload flow:**
 1. Select service: **WiGLE**, **WDG Wars**, or **Both**
-2. Confirm/enter API keys in the text areas (pre-filled from NVS/SD if configured)
+2. API key text areas are automatically pre-filled if `/sdcard/lab/wigle.txt` or `/sdcard/lab/wdgwars.txt` exist, or from a key saved on a previous visit. If neither source is present, type the key directly into the text area — it will be saved to NVS for next time.
 3. Tap **Upload All** — the device connects to WiFi, walks every `.csv` file in `/sdcard/lab/wardrives/`, and uploads each one in sequence
 4. The progress list shows per-file status: **OK** (green), **dup** (amber — already submitted), **FAIL** (red)
 5. Each result is written to `/sdcard/lab/wardrives/upload_log.csv`; the **Manage Data** screen reads this file to color-code rows
