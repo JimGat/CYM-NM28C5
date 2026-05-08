@@ -25131,8 +25131,14 @@ static bool parse_gps_nmea(const char *nmea_sentence)
 		}
 
 		if (status == 'A' && yr > 0) {
-			static bool s_clock_synced = false;
-			if (!s_clock_synced) {
+			// Sync if clock looks wrong (year < 2024) or we haven't synced yet.
+			// Re-checked every RMC so late GPS fixes correct files written before first lock.
+			static bool s_gps_synced = false;
+			time_t now = time(NULL);
+			struct tm now_utc;
+			gmtime_r(&now, &now_utc);
+			bool clock_wrong = (now_utc.tm_year + 1900 < 2024);
+			if (clock_wrong || !s_gps_synced) {
 				struct tm t = {0};
 				t.tm_year  = 100 + yr; // 2000+yr, minus 1900
 				t.tm_mon   = mon - 1;
@@ -25147,9 +25153,11 @@ static bool parse_gps_nmea(const char *nmea_sentence)
 				if (epoch != (time_t)-1) {
 					struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
 					settimeofday(&tv, NULL);
-					s_clock_synced = true;
-					ESP_LOGI(TAG, "System clock synced from GPS: %04d-%02d-%02d %02d:%02d:%02d UTC",
-					         2000+yr, mon, day, hh, mm, ss);
+					if (!s_gps_synced) {
+						s_gps_synced = true;
+						ESP_LOGI(TAG, "System clock synced from GPS: %04d-%02d-%02d %02d:%02d:%02d UTC",
+						         2000+yr, mon, day, hh, mm, ss);
+					}
 				}
 			}
 			return true;
