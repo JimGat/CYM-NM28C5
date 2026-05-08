@@ -2546,11 +2546,11 @@ static void nvs_settings_save_gatt_timeout(uint32_t ms)
 
 // Persist last-known GPS to NVS. Throttled: max once per 5 minutes to protect flash.
 // Coordinates stored as integer μ-degrees (×1e6) to avoid float NVS blobs.
-static void nvs_save_last_gps(const gps_data_t *g)
+static void nvs_save_last_gps_force(const gps_data_t *g, bool force)
 {
     static int64_t s_last_gps_save_us = 0;
     int64_t now = esp_timer_get_time();
-    if (now - s_last_gps_save_us < (int64_t)5 * 60 * 1000000) return;  // 5-minute minimum interval
+    if (!force && now - s_last_gps_save_us < (int64_t)5 * 60 * 1000000) return;
     s_last_gps_save_us = now;
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
@@ -2563,6 +2563,7 @@ static void nvs_save_last_gps(const gps_data_t *g)
                  (double)g->latitude, (double)g->longitude);
     }
 }
+static void nvs_save_last_gps(const gps_data_t *g) { nvs_save_last_gps_force(g, false); }
 
 static void nvs_settings_save_wifi_creds(const char *ssid, const char *pass)
 {
@@ -2736,6 +2737,10 @@ void go_dark_enable(void)
     boot_btn_click_count   = 0;
     boot_btn_last_release_ms = 0;
     boot_btn_hold_start_ms = 0;
+    // Persist best-available GPS position before going dark — bypasses the
+    // 5-minute throttle so the last fix is never lost to a power cycle.
+    if (g_gps_last_known.valid)
+        nvs_save_last_gps_force(&g_gps_last_known, true);
     led_set(0, 0, 0);
     gpio_set_level(LCD_BL_IO, 0);
     if (panel_handle) esp_lcd_panel_disp_on_off(panel_handle, false);
