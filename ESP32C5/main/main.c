@@ -18776,11 +18776,16 @@ static void gps_info_refresh_cb(lv_timer_t *t)
     (void)t;
     if (!gps_info_fix_lbl || !lv_obj_is_valid(gps_info_fix_lbl)) return;
 
-    char buf[64];
+    char buf[80];
+    bool live = current_gps.valid;
+    bool stale = !live && g_gps_last_known.valid;
 
-    if (current_gps.valid) {
+    if (live) {
         lv_label_set_text(gps_info_fix_lbl, LV_SYMBOL_GPS " Fix: YES");
         lv_obj_set_style_text_color(gps_info_fix_lbl, COLOR_MATERIAL_GREEN, 0);
+    } else if (stale) {
+        lv_label_set_text(gps_info_fix_lbl, LV_SYMBOL_GPS " Fix: NO  (last known \xe2\x86\x93)");
+        lv_obj_set_style_text_color(gps_info_fix_lbl, COLOR_MATERIAL_AMBER, 0);
     } else {
         lv_label_set_text(gps_info_fix_lbl, LV_SYMBOL_GPS " Fix: NO");
         lv_obj_set_style_text_color(gps_info_fix_lbl, COLOR_MATERIAL_ORANGE, 0);
@@ -18795,29 +18800,43 @@ static void gps_info_refresh_cb(lv_timer_t *t)
     snprintf(buf, sizeof(buf), "Satellites: %d", current_gps.satellites);
     lv_label_set_text(gps_info_sat_lbl, buf);
 
-    if (current_gps.valid)
+    lv_color_t pos_color = live ? ui_text_color() : COLOR_MATERIAL_AMBER;
+
+    if (live)
         snprintf(buf, sizeof(buf), "Lat:  %.6f", (double)current_gps.latitude);
+    else if (stale)
+        snprintf(buf, sizeof(buf), "Lat:  %.6f *", (double)g_gps_last_known.latitude);
     else
         snprintf(buf, sizeof(buf), "Lat:  --");
     lv_label_set_text(gps_info_lat_lbl, buf);
+    lv_obj_set_style_text_color(gps_info_lat_lbl, pos_color, 0);
 
-    if (current_gps.valid)
+    if (live)
         snprintf(buf, sizeof(buf), "Lon:  %.6f", (double)current_gps.longitude);
+    else if (stale)
+        snprintf(buf, sizeof(buf), "Lon:  %.6f *", (double)g_gps_last_known.longitude);
     else
         snprintf(buf, sizeof(buf), "Lon:  --");
     lv_label_set_text(gps_info_lon_lbl, buf);
+    lv_obj_set_style_text_color(gps_info_lon_lbl, pos_color, 0);
 
-    if (current_gps.valid)
+    if (live)
         snprintf(buf, sizeof(buf), "Alt:  %.1f m", (double)current_gps.altitude);
+    else if (stale)
+        snprintf(buf, sizeof(buf), "Alt:  %.1f m *", (double)g_gps_last_known.altitude);
     else
         snprintf(buf, sizeof(buf), "Alt:  --");
     lv_label_set_text(gps_info_alt_lbl, buf);
+    lv_obj_set_style_text_color(gps_info_alt_lbl, pos_color, 0);
 
-    if (current_gps.valid)
+    if (live)
         snprintf(buf, sizeof(buf), "Accuracy: %.1f m", (double)current_gps.accuracy);
+    else if (stale)
+        snprintf(buf, sizeof(buf), "Accuracy: %.0f m (stale)", (double)GPS_STALE_ACCURACY_M);
     else
         snprintf(buf, sizeof(buf), "Accuracy: --");
     lv_label_set_text(gps_info_acc_lbl, buf);
+    lv_obj_set_style_text_color(gps_info_acc_lbl, pos_color, 0);
 }
 
 static void gps_back_to_settings_cb(lv_event_t *e)
@@ -18831,6 +18850,228 @@ static void gps_back_to_settings_cb(lv_event_t *e)
     gps_info_lat_lbl = gps_info_lon_lbl  = gps_info_alt_lbl = NULL;
     gps_info_acc_lbl = NULL;
     show_settings_screen();
+}
+
+// ── Manual GPS position edit overlay ─────────────────────────────────────────
+
+static lv_obj_t *gps_edit_overlay    = NULL;
+static lv_obj_t *gps_edit_lat_ta     = NULL;
+static lv_obj_t *gps_edit_lon_ta     = NULL;
+static lv_obj_t *gps_edit_alt_ta     = NULL;
+static lv_obj_t *gps_edit_save_btn   = NULL;
+static lv_obj_t *gps_edit_cancel_btn = NULL;
+
+static void gps_edit_kb_event_cb(lv_event_t *e)
+{
+    lv_obj_t *kb = lv_event_get_target(e);
+    if (lv_event_get_code(e) == LV_EVENT_READY || lv_event_get_code(e) == LV_EVENT_CANCEL) {
+        lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+        if (gps_edit_save_btn   && lv_obj_is_valid(gps_edit_save_btn))
+            lv_obj_clear_flag(gps_edit_save_btn,   LV_OBJ_FLAG_HIDDEN);
+        if (gps_edit_cancel_btn && lv_obj_is_valid(gps_edit_cancel_btn))
+            lv_obj_clear_flag(gps_edit_cancel_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void gps_edit_ta_focus_cb(lv_event_t *e)
+{
+    lv_obj_t *ta = lv_event_get_target(e);
+    lv_obj_t *kb = (lv_obj_t *)lv_event_get_user_data(e);
+    if (kb) {
+        lv_keyboard_set_textarea(kb, ta);
+        lv_obj_clear_flag(kb, LV_OBJ_FLAG_HIDDEN);
+        if (gps_edit_save_btn   && lv_obj_is_valid(gps_edit_save_btn))
+            lv_obj_add_flag(gps_edit_save_btn,   LV_OBJ_FLAG_HIDDEN);
+        if (gps_edit_cancel_btn && lv_obj_is_valid(gps_edit_cancel_btn))
+            lv_obj_add_flag(gps_edit_cancel_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void gps_edit_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    if (gps_edit_overlay && lv_obj_is_valid(gps_edit_overlay))
+        lv_obj_del(gps_edit_overlay);
+    gps_edit_overlay = gps_edit_lat_ta = gps_edit_lon_ta = NULL;
+    gps_edit_alt_ta  = gps_edit_save_btn = gps_edit_cancel_btn = NULL;
+}
+
+static void gps_edit_save_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!gps_edit_lat_ta || !gps_edit_lon_ta || !gps_edit_alt_ta) return;
+
+    const char *lat_s = lv_textarea_get_text(gps_edit_lat_ta);
+    const char *lon_s = lv_textarea_get_text(gps_edit_lon_ta);
+    const char *alt_s = lv_textarea_get_text(gps_edit_alt_ta);
+
+    double lat = atof(lat_s);
+    double lon = atof(lon_s);
+    double alt = atof(alt_s);
+
+    if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0 ||
+        (lat == 0.0 && lon == 0.0)) {
+        // Briefly flash the lat field red to signal invalid input
+        if (gps_edit_lat_ta && lv_obj_is_valid(gps_edit_lat_ta))
+            lv_obj_set_style_border_color(gps_edit_lat_ta, lv_color_make(255, 0, 0), 0);
+        return;
+    }
+
+    g_gps_last_known.latitude  = (float)lat;
+    g_gps_last_known.longitude = (float)lon;
+    g_gps_last_known.altitude  = (float)alt;
+    g_gps_last_known.accuracy  = GPS_STALE_ACCURACY_M;
+    g_gps_last_known.valid     = true;
+
+    // Write to NVS unconditionally — this is an explicit user action
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, NVS_KEY_GPS_LAT, (int32_t)(lat * 1e6));
+        nvs_set_i32(h, NVS_KEY_GPS_LON, (int32_t)(lon * 1e6));
+        nvs_set_i32(h, NVS_KEY_GPS_ALT, (int32_t)(alt * 10.0));
+        nvs_commit(h);
+        nvs_close(h);
+        ESP_LOGI(TAG, "Manual GPS position saved: %.6f, %.6f, alt %.1f", lat, lon, alt);
+    }
+
+    gps_edit_cancel_cb(NULL);  // close overlay
+}
+
+static void gps_show_edit_overlay(lv_event_t *e)
+{
+    (void)e;
+    if (gps_edit_overlay) return;  // already open
+
+    gps_edit_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(gps_edit_overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(gps_edit_overlay, 0, 0);
+    lv_obj_set_style_bg_color(gps_edit_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(gps_edit_overlay, LV_OPA_80, 0);
+    lv_obj_set_style_border_width(gps_edit_overlay, 0, 0);
+    lv_obj_set_style_pad_all(gps_edit_overlay, 0, 0);
+    lv_obj_clear_flag(gps_edit_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(gps_edit_overlay, 0, 0);
+
+    // ── Card (TOP_MID, above keyboard) ──────────────────────────────────────
+    lv_obj_t *card = lv_obj_create(gps_edit_overlay);
+    lv_obj_set_size(card, LCD_H_RES - 12, LV_SIZE_CONTENT);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 4);
+    lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+    lv_obj_set_style_border_color(card, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 8, 0);
+    lv_obj_set_style_pad_row(card, 4, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, LV_SYMBOL_GPS "  Set Fallback Position");
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+
+    lv_obj_t *sub = lv_label_create(card);
+    lv_label_set_text(sub, "Saved to NVS, used when GPS unavailable.");
+    lv_obj_set_style_text_font(sub, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sub, ui_muted_color(), 0);
+
+    // Pre-populate with best available position
+    char lat_buf[24] = "", lon_buf[24] = "", alt_buf[16] = "0.0";
+    const gps_data_t *pre = gps_best();
+    if (pre->valid) {
+        snprintf(lat_buf, sizeof(lat_buf), "%.6f", (double)pre->latitude);
+        snprintf(lon_buf, sizeof(lon_buf), "%.6f", (double)pre->longitude);
+        snprintf(alt_buf, sizeof(alt_buf), "%.1f",  (double)pre->altitude);
+    }
+
+    // Lat row
+    lv_obj_t *lat_lbl = lv_label_create(card);
+    lv_label_set_text(lat_lbl, "Latitude (-90 to 90):");
+    lv_obj_set_style_text_font(lat_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(lat_lbl, ui_text_color(), 0);
+
+    gps_edit_lat_ta = lv_textarea_create(card);
+    lv_obj_set_width(gps_edit_lat_ta, lv_pct(100));
+    lv_textarea_set_one_line(gps_edit_lat_ta, true);
+    lv_textarea_set_max_length(gps_edit_lat_ta, 16);
+    lv_textarea_set_accepted_chars(gps_edit_lat_ta, "-0123456789.");
+    lv_textarea_set_text(gps_edit_lat_ta, lat_buf);
+    lv_obj_set_style_text_font(gps_edit_lat_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(gps_edit_lat_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(gps_edit_lat_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(gps_edit_lat_ta, COLOR_MATERIAL_AMBER, 0);
+
+    // Lon row
+    lv_obj_t *lon_lbl = lv_label_create(card);
+    lv_label_set_text(lon_lbl, "Longitude (-180 to 180):");
+    lv_obj_set_style_text_font(lon_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(lon_lbl, ui_text_color(), 0);
+
+    gps_edit_lon_ta = lv_textarea_create(card);
+    lv_obj_set_width(gps_edit_lon_ta, lv_pct(100));
+    lv_textarea_set_one_line(gps_edit_lon_ta, true);
+    lv_textarea_set_max_length(gps_edit_lon_ta, 17);
+    lv_textarea_set_accepted_chars(gps_edit_lon_ta, "-0123456789.");
+    lv_textarea_set_text(gps_edit_lon_ta, lon_buf);
+    lv_obj_set_style_text_font(gps_edit_lon_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(gps_edit_lon_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(gps_edit_lon_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(gps_edit_lon_ta, COLOR_MATERIAL_AMBER, 0);
+
+    // Alt row
+    lv_obj_t *alt_lbl = lv_label_create(card);
+    lv_label_set_text(alt_lbl, "Altitude (m, optional):");
+    lv_obj_set_style_text_font(alt_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(alt_lbl, ui_text_color(), 0);
+
+    gps_edit_alt_ta = lv_textarea_create(card);
+    lv_obj_set_width(gps_edit_alt_ta, lv_pct(100));
+    lv_textarea_set_one_line(gps_edit_alt_ta, true);
+    lv_textarea_set_max_length(gps_edit_alt_ta, 10);
+    lv_textarea_set_accepted_chars(gps_edit_alt_ta, "-0123456789.");
+    lv_textarea_set_text(gps_edit_alt_ta, alt_buf);
+    lv_obj_set_style_text_font(gps_edit_alt_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(gps_edit_alt_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(gps_edit_alt_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(gps_edit_alt_ta, lv_color_make(80, 80, 80), 0);
+
+    // ── Buttons (created before keyboard so keyboard is on top in Z-order) ──
+    gps_edit_save_btn = lv_btn_create(gps_edit_overlay);
+    lv_obj_set_size(gps_edit_save_btn, 110, 30);
+    lv_obj_align(gps_edit_save_btn, LV_ALIGN_BOTTOM_MID, -62, -136);
+    lv_obj_set_style_bg_color(gps_edit_save_btn, COLOR_MATERIAL_AMBER, LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(gps_edit_save_btn, 8, 0);
+    lv_obj_set_style_border_width(gps_edit_save_btn, 0, 0);
+    lv_obj_add_event_cb(gps_edit_save_btn, gps_edit_save_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *save_lbl = lv_label_create(gps_edit_save_btn);
+    lv_label_set_text(save_lbl, LV_SYMBOL_OK "  Save to NVS");
+    lv_obj_set_style_text_font(save_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(save_lbl, lv_color_black(), 0);
+    lv_obj_center(save_lbl);
+
+    gps_edit_cancel_btn = lv_btn_create(gps_edit_overlay);
+    lv_obj_set_size(gps_edit_cancel_btn, 100, 30);
+    lv_obj_align(gps_edit_cancel_btn, LV_ALIGN_BOTTOM_MID, 60, -136);
+    lv_obj_set_style_bg_color(gps_edit_cancel_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(gps_edit_cancel_btn, 8, 0);
+    lv_obj_set_style_border_width(gps_edit_cancel_btn, 0, 0);
+    lv_obj_add_event_cb(gps_edit_cancel_btn, gps_edit_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *cancel_lbl = lv_label_create(gps_edit_cancel_btn);
+    lv_label_set_text(cancel_lbl, LV_SYMBOL_CLOSE "  Cancel");
+    lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(cancel_lbl);
+
+    // ── Keyboard (created last — highest Z-order, renders above buttons) ────
+    lv_obj_t *kb = lv_keyboard_create(gps_edit_overlay);
+    lv_obj_set_size(kb, LCD_H_RES, 130);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(kb, gps_edit_kb_event_cb, LV_EVENT_READY,  NULL);
+    lv_obj_add_event_cb(kb, gps_edit_kb_event_cb, LV_EVENT_CANCEL, NULL);
+    lv_obj_add_event_cb(gps_edit_lat_ta, gps_edit_ta_focus_cb, LV_EVENT_CLICKED, kb);
+    lv_obj_add_event_cb(gps_edit_lon_ta, gps_edit_ta_focus_cb, LV_EVENT_CLICKED, kb);
+    lv_obj_add_event_cb(gps_edit_alt_ta, gps_edit_ta_focus_cb, LV_EVENT_CLICKED, kb);
 }
 
 static void show_gps_info_screen(void)
@@ -18910,16 +19151,33 @@ static void show_gps_info_screen(void)
     gps_info_refresh_cb(NULL);
     gps_info_refresh_timer = lv_timer_create(gps_info_refresh_cb, 1000, NULL);
 
+    // Set Position button (amber)
+    lv_obj_t *setpos_btn = lv_btn_create(function_page);
+    lv_obj_set_size(setpos_btn, 120, 32);
+    lv_obj_align(setpos_btn, LV_ALIGN_BOTTOM_MID, -66, -10);
+    lv_obj_set_style_bg_color(setpos_btn, COLOR_MATERIAL_AMBER, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(setpos_btn, lv_color_lighten(COLOR_MATERIAL_AMBER, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(setpos_btn, 0, 0);
+    lv_obj_set_style_radius(setpos_btn, 8, 0);
+    lv_obj_add_event_cb(setpos_btn, gps_show_edit_overlay, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *setpos_lbl = lv_label_create(setpos_btn);
+    lv_label_set_text(setpos_lbl, LV_SYMBOL_EDIT "  Set Position");
+    lv_obj_set_style_text_font(setpos_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(setpos_lbl, lv_color_black(), 0);
+    lv_obj_center(setpos_lbl);
+
+    // Back button (teal)
     lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 90, 34);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_size(back_btn, 80, 32);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 54, -10);
     lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(back_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(back_btn, 0, 0);
     lv_obj_set_style_radius(back_btn, 8, 0);
     lv_obj_add_event_cb(back_btn, gps_back_to_settings_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *back_lbl2 = lv_label_create(back_btn);
-    lv_label_set_text(back_lbl2, "Back");
+    lv_label_set_text(back_lbl2, LV_SYMBOL_LEFT "  Back");
+    lv_obj_set_style_text_font(back_lbl2, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(back_lbl2, ui_text_color(), 0);
     lv_obj_center(back_lbl2);
 }
