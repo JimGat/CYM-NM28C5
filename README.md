@@ -130,7 +130,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **Display** | 2.8" ST7789 TFT (240×320 portrait, 16-bit RGB565) | SPI @ 40 MHz |
 | **Touch** | XPT2046 Resistive Touch (polling, T_IRQ not connected) | SPI @ 2 MHz |
 | **SD Card** | MicroSD **FAT32, max 32 GB** (shared SPI2 bus with display and touch) | SPI @ 20 MHz |
-| **GPS** | ATGM336H NMEA module (GGA, RMC sentences) | UART1 @ 9600 baud |
+| **GPS** | [ATGM336H GPS+BDS Dual-Mode Module](https://www.amazon.com/dp/B09LQDG1HY) (Teyleten Robot, ASIN B09LQDG1HY; search "ATGM336H UART" if unavailable) — outputs NMEA 0183 GGA + RMC at 9600 baud, 3.3 V, onboard ceramic patch antenna | UART1 @ 9600 baud |
 | **LED** | WS2812 NeoPixel (single, GPIO 27) | RMT / GPIO |
 
 Board reference: https://github.com/RockBase-iot/NM-CYD-C5
@@ -210,7 +210,13 @@ Mutual exclusion via sd_spi_mutex
 
 ### GPS Wiring — ATGM336H
 
-The ATGM336H is a compact GPS/GNSS module that outputs standard NMEA 0183 sentences (GGA, RMC) at 9600 baud. It is wired directly to the NM-CYD-C5 LP-UART pins — no level shifter required as the module operates at 3.3 V.
+**Recommended module:** [Teyleten Robot ATGM336H GPS+BDS Dual-Mode Module](https://www.amazon.com/dp/B09LQDG1HY) (Amazon ASIN B09LQDG1HY, typically sold as a 2-pack)
+
+> If the link above is unavailable, search Amazon or AliExpress for: **"ATGM336H GPS BDS module UART"** or **"Teyleten Robot ATGM336H"**. The module is also sold under other brand names (e.g. HiLetgo, KeeYees) — any ATGM336H-based board with a 4-pin header (VCC / GND / TX / RX) and a 3.3 V UART interface will work.
+
+The ATGM336H is a compact GPS/BeiDou dual-mode GNSS module that outputs standard NMEA 0183 sentences (GGA, RMC) at 9600 baud over a 3.3 V UART interface. It is manufactured by ZHONGKEWEI (ATGM) and is a cost-effective drop-in replacement for the popular u-blox NEO-6M and NEO-M8N modules. The Teyleten Robot variant ships with an onboard passive ceramic patch antenna and a 5-pin 2.54 mm header (VCC / GND / TX / RX / PPS). No level shifter is required — the module operates natively at 3.3 V and connects directly to the NM-CYD-C5 LP-UART pins with just 4 wires.
+
+**Wiring diagram — 4 wires only:**
 
 ```
 ATGM336H Module          NM-CYD-C5 (ESP32-C5)
@@ -221,6 +227,9 @@ ATGM336H Module          NM-CYD-C5 (ESP32-C5)
 │         RX ├───────────┤ IO5  (UART1 TX)  │
 │        PPS │  (unused) │                  │
 └────────────┘           └──────────────────┘
+
+  ⚠️  Power from 3.3 V only — do NOT use the 5 V pin
+  ⚠️  TX on the GPS module connects to RX on the ESP (and vice versa)
 ```
 
 | Signal | ATGM336H pin | ESP32-C5 pin | Notes |
