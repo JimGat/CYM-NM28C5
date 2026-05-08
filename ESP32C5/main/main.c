@@ -332,6 +332,16 @@ static inline lv_color_t ui_accent_color(void) {
 #define WPASEC_KEY_PATH      "/sdcard/lab/wpa-sec.txt"
 #define WPASEC_KEY_MAX_LEN   65
 
+// Wardrive upload constants
+#define WIGLE_HOST           "api.wigle.net"
+#define WIGLE_UPLOAD_PATH    "/api/v2/file/upload"
+#define WDGWARS_HOST         "wdgwars.pl"
+#define WDGWARS_UPLOAD_PATH  "/api/upload-csv"
+#define WIGLE_KEY_PATH       "/sdcard/lab/wigle.txt"
+#define WDGWARS_KEY_PATH     "/sdcard/lab/wdgwars.txt"
+#define WIGLE_KEY_MAX_LEN    128
+#define WDGWARS_KEY_MAX_LEN  128
+
 typedef int (*vprintf_like_t)(const char *, va_list);
 
 static lv_disp_draw_buf_t draw_buf;
@@ -377,6 +387,8 @@ static char     g_saved_wifi_pass[65] = ""; // Home network password
 #define NVS_KEY_GATT_TIMEOUT "gatt_tmo"
 #define NVS_KEY_WIFI_SSID    "wifi_ssid"
 #define NVS_KEY_WIFI_PASS    "wifi_pass"
+#define NVS_KEY_WIGLE_KEY    "wigle_key"
+#define NVS_KEY_WDGWARS_KEY  "wdg_key"
 
 // Touch calibration NVS
 #define TOUCH_CAL_NVS_NS      "touch_cal"
@@ -548,7 +560,11 @@ typedef struct {
     
     // WPA-SEC API key from wpa-sec.txt
     char wpasec_key[WPASEC_KEY_MAX_LEN];
-    
+
+    // Wardrive upload API keys
+    char wigle_key[WIGLE_KEY_MAX_LEN];       // base64(apiname:apitoken) from wigle.txt
+    char wdgwars_key[WDGWARS_KEY_MAX_LEN];   // plain API key from wdgwars.txt
+
     bool loaded;  // True when all data is loaded
 } sd_cache_t;
 
@@ -950,6 +966,21 @@ static lv_timer_t *wpasec_upload_timer = NULL;
 static volatile bool wpasec_upload_done = false;
 static volatile bool wpasec_upload_active = false;
 static TaskHandle_t wpasec_upload_task_handle = NULL;
+
+// Wardrive Upload state
+typedef enum { WDUP_WIGLE = 0, WDUP_WDG, WDUP_BOTH } wdup_target_t;
+static char              wigle_api_key[WIGLE_KEY_MAX_LEN]   = "";
+static char              wdgwars_api_key[WDGWARS_KEY_MAX_LEN] = "";
+static lv_obj_t         *wdup_status_list      = NULL;
+static lv_timer_t       *wdup_timer            = NULL;
+static volatile bool     wdup_active           = false;
+static volatile bool     wdup_done             = false;
+static TaskHandle_t      wdup_task_handle      = NULL;
+static QueueHandle_t     wdup_ui_queue         = NULL;
+static wdup_target_t     wdup_target           = WDUP_BOTH;
+static lv_obj_t         *wdup_wigle_key_ta     = NULL;
+static lv_obj_t         *wdup_wdg_key_ta       = NULL;
+typedef struct { char text[128]; lv_color_t color; } wdup_ui_msg_t;
 
 // SD Card settings screen state
 typedef struct { char line[96]; } sd_prov_update_t;
@@ -1442,6 +1473,15 @@ static void reset_function_page_children(void) {
         lv_timer_del(wpasec_upload_timer);
         wpasec_upload_timer = NULL;
     }
+    // Wardrive upload cleanup
+    wdup_status_list   = NULL;
+    wdup_wigle_key_ta  = NULL;
+    wdup_wdg_key_ta    = NULL;
+    wdup_active        = false;
+    if (wdup_timer) {
+        lv_timer_del(wdup_timer);
+        wdup_timer = NULL;
+    }
 }
 
 static void create_function_page_base(const char *name);
@@ -1544,6 +1584,11 @@ static int wpasec_tls_write_all(esp_tls_t *tls, const char *buf, int len);
 static int wpasec_upload_file(const char *filepath, const char *filename);
 static void wpasec_upload_task(void *pvParameters);
 static void wpasec_upload_timer_cb(lv_timer_t *timer);
+
+// Wardrive upload helpers
+static void show_wardrive_upload_screen(void);
+static void wdup_task(void *pvParameters);
+static void wdup_timer_cb(lv_timer_t *timer);
 
 // Radio mode switching (WiFi <-> BLE)
 static bool ensure_wifi_mode(void);
@@ -2289,6 +2334,10 @@ static void nvs_settings_load(void)
         nvs_get_str(h, NVS_KEY_WIFI_SSID, g_saved_wifi_ssid, &ssid_len);
         size_t pass_len = sizeof(g_saved_wifi_pass);
         nvs_get_str(h, NVS_KEY_WIFI_PASS, g_saved_wifi_pass, &pass_len);
+        size_t wk_len = sizeof(wigle_api_key);
+        nvs_get_str(h, NVS_KEY_WIGLE_KEY, wigle_api_key, &wk_len);
+        size_t wdg_len = sizeof(wdgwars_api_key);
+        nvs_get_str(h, NVS_KEY_WDGWARS_KEY, wdgwars_api_key, &wdg_len);
         nvs_close(h);
         ESP_LOGI(TAG, "NVS settings loaded: timeout=%ldms, brightness=%u%%, scan=%u-%ums, dark=%d, max_power=%d, gatt_tmo=%ums",
                  (long)screen_timeout_ms, screen_brightness_pct, scan_time_min_ms, scan_time_max_ms,
@@ -3837,6 +3886,50 @@ static esp_err_t sd_cache_load_all(void) {
         ESP_LOGI(TAG, "  WPA-SEC key: not found");
     }
     
+    // 7. Load WiGLE API key from wigle.txt
+    sd_cache->wigle_key[0] = '\0';
+    file = fopen(WIGLE_KEY_PATH, "r");
+    if (file != NULL) {
+        char buf[WIGLE_KEY_MAX_LEN + 8];
+        if (fgets(buf, sizeof(buf), file) != NULL) {
+            size_t len = strlen(buf);
+            while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r' ||
+                   buf[len-1] == ' '  || buf[len-1] == '\t')) buf[--len] = '\0';
+            char *start = buf;
+            while (*start == ' ' || *start == '\t') start++;
+            if (strlen(start) > 0 && strlen(start) < WIGLE_KEY_MAX_LEN) {
+                strncpy(sd_cache->wigle_key, start, WIGLE_KEY_MAX_LEN - 1);
+                sd_cache->wigle_key[WIGLE_KEY_MAX_LEN - 1] = '\0';
+            }
+        }
+        fclose(file);
+        ESP_LOGI(TAG, "  WiGLE key: %.8s****", sd_cache->wigle_key);
+    } else {
+        ESP_LOGI(TAG, "  WiGLE key: not found");
+    }
+
+    // 8. Load WDG Wars API key from wdgwars.txt
+    sd_cache->wdgwars_key[0] = '\0';
+    file = fopen(WDGWARS_KEY_PATH, "r");
+    if (file != NULL) {
+        char buf[WDGWARS_KEY_MAX_LEN + 8];
+        if (fgets(buf, sizeof(buf), file) != NULL) {
+            size_t len = strlen(buf);
+            while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r' ||
+                   buf[len-1] == ' '  || buf[len-1] == '\t')) buf[--len] = '\0';
+            char *start = buf;
+            while (*start == ' ' || *start == '\t') start++;
+            if (strlen(start) > 0 && strlen(start) < WDGWARS_KEY_MAX_LEN) {
+                strncpy(sd_cache->wdgwars_key, start, WDGWARS_KEY_MAX_LEN - 1);
+                sd_cache->wdgwars_key[WDGWARS_KEY_MAX_LEN - 1] = '\0';
+            }
+        }
+        fclose(file);
+        ESP_LOGI(TAG, "  WDG Wars key: %.8s****", sd_cache->wdgwars_key);
+    } else {
+        ESP_LOGI(TAG, "  WDG Wars key: not found");
+    }
+
     sd_cache->loaded = true;
     ESP_LOGI(TAG, "SD cache loading complete");
     return ESP_OK;
@@ -9255,7 +9348,7 @@ static void wardrive_promisc_task(void *pvParameters) {
     if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
 
     char filename[64];
-    snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/w%d.log", wardrive_file_counter);
+    snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/wd%d.csv", wardrive_file_counter);
 
     if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
     FILE *file = fopen(filename, "w");
@@ -9267,8 +9360,9 @@ static void wardrive_promisc_task(void *pvParameters) {
         vTaskDelete(NULL);
         return;
     }
-    fprintf(file, "WigleWifi-1.4,appRelease=v1.1,model=Gen4,release=v1.0,device=Gen4Board\n");
-    fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n");
+    fprintf(file, "WigleWifi-1.6,appRelease=%s,model=NM-CYD-C5,release=%s,device=CheapYellowMonster,display=240x320,board=ESP32C5,brand=JanOS\n",
+            FW_VERSION, FW_VERSION);
+    fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type\n");
     fflush(file);
     if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
 
@@ -9336,9 +9430,13 @@ static void wardrive_promisc_task(void *pvParameters) {
             char escaped_ssid[64];
             escape_csv_field(net->ssid, escaped_ssid, sizeof(escaped_ssid));
             const char *auth = get_auth_mode_wiggle(net->authmode);
-            fprintf(file, "%s,%s,[%s],%s,%d,%d,%.7f,%.7f,0.00,0.00,WIFI\n",
+            int freq = (net->channel >= 1 && net->channel <= 13) ?
+                       2412 + (net->channel - 1) * 5 :
+                       (net->channel == 14) ? 2484 :
+                       (net->channel >= 36)  ? 5000 + 5 * net->channel : 0;
+            fprintf(file, "%s,%s,[%s],%s,%d,%d,%d,%.7f,%.7f,0.00,0.00,,,WIFI\n",
                     mac_str, escaped_ssid, auth, timestamp,
-                    net->channel, net->rssi, net->latitude, net->longitude);
+                    net->channel, freq, net->rssi, net->latitude, net->longitude);
             net->written_to_file = true;
             networks_since_flush++;
         }
@@ -9365,7 +9463,7 @@ static void wardrive_promisc_task(void *pvParameters) {
 
     wardrive_active = false;
     wardrive_task_handle = NULL;
-    ESP_LOGI(TAG, "Wardrive promisc stopped. Total networks: %d. File: w%d.log",
+    ESP_LOGI(TAG, "Wardrive promisc stopped. Total networks: %d. File: wd%d.csv",
              wdp_seen_count, wardrive_file_counter);
     vTaskDelete(NULL);
 }
@@ -15001,6 +15099,540 @@ static void show_wifi_client_server_screen(void)
     s_wcs_active_ta = s_wcs_ssid_ta;
 }
 
+// ============================================================================
+// Wardrive Upload Implementation (WiGLE + WDG Wars)
+// ============================================================================
+
+static void wdup_push_msg(const char *text, lv_color_t color)
+{
+    if (!wdup_ui_queue) return;
+    wdup_ui_msg_t m;
+    strncpy(m.text, text, sizeof(m.text) - 1);
+    m.text[sizeof(m.text) - 1] = '\0';
+    m.color = color;
+    xQueueSend(wdup_ui_queue, &m, pdMS_TO_TICKS(200));
+}
+
+static int wdup_tls_write_all(esp_tls_t *tls, const char *buf, int len)
+{
+    int written = 0;
+    while (written < len) {
+        int ret = esp_tls_conn_write(tls, buf + written, len - written);
+        if (ret < 0) return ret;
+        written += ret;
+    }
+    return written;
+}
+
+// Returns 0=ok, 1=duplicate, -1=error
+static int wdup_upload_one(const char *filepath, const char *filename,
+                            bool use_wigle)
+{
+    // Read file into PSRAM buffer
+    uint8_t *fbuf = NULL;
+    long fsize = 0;
+
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        FILE *f = fopen(filepath, "rb");
+        if (!f) { xSemaphoreGive(sd_spi_mutex); return -1; }
+        fseek(f, 0, SEEK_END); fsize = ftell(f); fseek(f, 0, SEEK_SET);
+        if (fsize <= 0 || fsize > 8 * 1024 * 1024) {
+            fclose(f); xSemaphoreGive(sd_spi_mutex); return -1;
+        }
+        fbuf = (uint8_t *)heap_caps_malloc((size_t)fsize, MALLOC_CAP_SPIRAM);
+        if (!fbuf) fbuf = (uint8_t *)malloc((size_t)fsize);
+        if (!fbuf) { fclose(f); xSemaphoreGive(sd_spi_mutex); return -1; }
+        size_t nr = fread(fbuf, 1, (size_t)fsize, f);
+        fclose(f);
+        xSemaphoreGive(sd_spi_mutex);
+        if (nr != (size_t)fsize) { free(fbuf); return -1; }
+    } else {
+        return -1;
+    }
+
+    // Build multipart body
+    char boundary[32];
+    snprintf(boundary, sizeof(boundary), "----CYMNM%lu", (unsigned long)(esp_timer_get_time() / 1000));
+
+    char body_start[320];
+    int  bs_len = snprintf(body_start, sizeof(body_start),
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
+        "Content-Type: text/csv\r\n\r\n",
+        boundary, filename);
+
+    char body_end[64];
+    int  be_len = snprintf(body_end, sizeof(body_end), "\r\n--%s--\r\n", boundary);
+
+    int body_total = bs_len + (int)fsize + be_len;
+
+    // Build HTTP headers
+    const char *host = use_wigle ? WIGLE_HOST : WDGWARS_HOST;
+    const char *path = use_wigle ? WIGLE_UPLOAD_PATH : WDGWARS_UPLOAD_PATH;
+    const char *key  = use_wigle ? wigle_api_key : wdgwars_api_key;
+
+    char http_hdr[640];
+    int  hdr_len;
+    if (use_wigle) {
+        hdr_len = snprintf(http_hdr, sizeof(http_hdr),
+            "POST %s HTTP/1.1\r\n"
+            "Host: %s\r\n"
+            "Authorization: Basic %s\r\n"
+            "Content-Type: multipart/form-data; boundary=%s\r\n"
+            "Content-Length: %d\r\n"
+            "User-Agent: CheapYellowMonster/" FW_VERSION "\r\n"
+            "Connection: close\r\n\r\n",
+            path, host, key, boundary, body_total);
+    } else {
+        hdr_len = snprintf(http_hdr, sizeof(http_hdr),
+            "POST %s HTTP/1.1\r\n"
+            "Host: %s\r\n"
+            "X-API-Key: %s\r\n"
+            "Content-Type: multipart/form-data; boundary=%s\r\n"
+            "Content-Length: %d\r\n"
+            "User-Agent: CheapYellowMonster/" FW_VERSION "\r\n"
+            "Connection: close\r\n\r\n",
+            path, host, key, boundary, body_total);
+    }
+
+    // TLS connection (skip cert verification for speed on embedded target)
+    esp_tls_cfg_t cfg = { .crt_bundle_attach = NULL, .timeout_ms = 20000 };
+    esp_tls_t *tls = esp_tls_init();
+    if (!tls) { free(fbuf); return -1; }
+
+    char url[128];
+    snprintf(url, sizeof(url), "https://%s%s", host, path);
+    if (esp_tls_conn_http_new_sync(url, &cfg, tls) < 0) {
+        esp_tls_conn_destroy(tls); free(fbuf); return -1;
+    }
+
+    int ok = 1;
+    if (wdup_tls_write_all(tls, http_hdr, hdr_len) < 0) ok = 0;
+    if (ok && wdup_tls_write_all(tls, body_start, bs_len) < 0) ok = 0;
+    if (ok && wdup_tls_write_all(tls, (const char *)fbuf, (int)fsize) < 0) ok = 0;
+    if (ok && wdup_tls_write_all(tls, body_end, be_len) < 0) ok = 0;
+    free(fbuf);
+
+    if (!ok) { esp_tls_conn_destroy(tls); return -1; }
+
+    // Read response
+    char resp[768] = {0};
+    int  rlen = 0;
+    while (rlen < (int)sizeof(resp) - 1) {
+        int r = esp_tls_conn_read(tls, resp + rlen, sizeof(resp) - 1 - rlen);
+        if (r <= 0) break;
+        rlen += r;
+    }
+    resp[rlen] = '\0';
+    esp_tls_conn_destroy(tls);
+
+    // Parse HTTP status
+    int status = 0;
+    if (rlen > 12 && strncmp(resp, "HTTP/", 5) == 0) {
+        const char *sp = strchr(resp, ' ');
+        if (sp) status = atoi(sp + 1);
+    }
+    ESP_LOGI(TAG, "WDUP [%s] %s -> HTTP %d",
+             use_wigle ? "WiGLE" : "WDG", filename, status);
+
+    if (status == 200) {
+        // Check for already-submitted (WiGLE) or duplicate (WDG)
+        if (strstr(resp, "already") || strstr(resp, "duplicate") || strstr(resp, "DUPE"))
+            return 1;
+        return 0;
+    }
+    if (status == 409) return 1; // conflict = duplicate on WDG
+    return -1;
+}
+
+static bool wdup_ensure_wifi(void)
+{
+    // Already connected?
+    wifi_ap_record_t ap;
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) return true;
+
+    // Try with saved credentials
+    if (g_saved_wifi_ssid[0] == '\0') return false;
+
+    esp_wifi_start();
+    wifi_config_t cfg = {0};
+    strncpy((char *)cfg.sta.ssid,     g_saved_wifi_ssid, sizeof(cfg.sta.ssid) - 1);
+    strncpy((char *)cfg.sta.password, g_saved_wifi_pass,  sizeof(cfg.sta.password) - 1);
+    esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    esp_wifi_connect();
+
+    // Wait up to 12 s for IP
+    for (int i = 0; i < 60; i++) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) return true;
+    }
+    return false;
+}
+
+static void wdup_task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    lv_color_t cyan   = lv_color_make(0, 188, 212);
+    lv_color_t green  = lv_color_make(76, 175, 80);
+    lv_color_t amber  = lv_color_make(255, 193, 7);
+    lv_color_t red    = lv_color_make(244, 67, 54);
+
+    // Ensure WiFi STA connection
+    wdup_push_msg("Connecting to WiFi...", cyan);
+    if (!wdup_ensure_wifi()) {
+        wdup_push_msg("WiFi failed. Set SSID via WiFi Client.", red);
+        goto task_done;
+    }
+    wdup_push_msg("WiFi connected.", green);
+
+    // Check at least one key is configured
+    bool do_wigle = (wdup_target == WDUP_WIGLE || wdup_target == WDUP_BOTH) && wigle_api_key[0];
+    bool do_wdg   = (wdup_target == WDUP_WDG   || wdup_target == WDUP_BOTH) && wdgwars_api_key[0];
+
+    if (!do_wigle && !do_wdg) {
+        wdup_push_msg("No API keys configured.", red);
+        goto task_done;
+    }
+
+    // Open wardrives directory
+    DIR *dir = NULL;
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        dir = opendir("/sdcard/lab/wardrives");
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    if (!dir) {
+        wdup_push_msg("No wardrives directory found.", red);
+        goto task_done;
+    }
+
+    // Count .csv files
+    int total = 0;
+    struct dirent *ent;
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        while ((ent = readdir(dir)) != NULL) {
+            size_t nl = strlen(ent->d_name);
+            if (nl > 4 && strcasecmp(ent->d_name + nl - 4, ".csv") == 0) total++;
+        }
+        rewinddir(dir);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    if (total == 0) {
+        wdup_push_msg("No .csv wardrive files found.", amber);
+        if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+            closedir(dir); xSemaphoreGive(sd_spi_mutex);
+        }
+        goto task_done;
+    }
+
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Found %d file(s). Uploading...", total);
+    wdup_push_msg(msg, cyan);
+
+    int cur = 0, ok_count = 0, dup_count = 0, fail_count = 0;
+
+    while (wdup_active) {
+        char dname[256] = {0};
+        bool got = false;
+        if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+            ent = readdir(dir);
+            if (ent) { strncpy(dname, ent->d_name, 255); got = true; }
+            xSemaphoreGive(sd_spi_mutex);
+        }
+        if (!got) break;
+
+        size_t nl = strlen(dname);
+        if (nl <= 4 || strcasecmp(dname + nl - 4, ".csv") != 0) continue;
+        cur++;
+
+        char fpath[320];
+        snprintf(fpath, sizeof(fpath), "/sdcard/lab/wardrives/%s", dname);
+
+        // Upload to WiGLE
+        if (do_wigle) {
+            snprintf(msg, sizeof(msg), "[%d/%d] WiGLE: %.60s...", cur, total, dname);
+            wdup_push_msg(msg, cyan);
+            int r = wdup_upload_one(fpath, dname, true);
+            if (r == 0) {
+                snprintf(msg, sizeof(msg), "[%d/%d] WiGLE: %.60s -> OK", cur, total, dname);
+                wdup_push_msg(msg, green); ok_count++;
+            } else if (r == 1) {
+                snprintf(msg, sizeof(msg), "[%d/%d] WiGLE: %.60s -> dup", cur, total, dname);
+                wdup_push_msg(msg, amber); dup_count++;
+            } else {
+                snprintf(msg, sizeof(msg), "[%d/%d] WiGLE: %.60s -> FAIL", cur, total, dname);
+                wdup_push_msg(msg, red); fail_count++;
+            }
+            vTaskDelay(pdMS_TO_TICKS(800));
+        }
+
+        // Upload to WDG Wars
+        if (do_wdg) {
+            snprintf(msg, sizeof(msg), "[%d/%d] WDG: %.60s...", cur, total, dname);
+            wdup_push_msg(msg, cyan);
+            int r = wdup_upload_one(fpath, dname, false);
+            if (r == 0) {
+                snprintf(msg, sizeof(msg), "[%d/%d] WDG: %.60s -> OK", cur, total, dname);
+                wdup_push_msg(msg, green); ok_count++;
+            } else if (r == 1) {
+                snprintf(msg, sizeof(msg), "[%d/%d] WDG: %.60s -> dup", cur, total, dname);
+                wdup_push_msg(msg, amber); dup_count++;
+            } else {
+                snprintf(msg, sizeof(msg), "[%d/%d] WDG: %.60s -> FAIL", cur, total, dname);
+                wdup_push_msg(msg, red); fail_count++;
+            }
+            vTaskDelay(pdMS_TO_TICKS(800));
+        }
+    }
+
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        closedir(dir); xSemaphoreGive(sd_spi_mutex);
+    }
+
+    snprintf(msg, sizeof(msg), "Done: %d OK, %d dup, %d failed", ok_count, dup_count, fail_count);
+    wdup_push_msg(msg, (fail_count > 0) ? red : green);
+
+task_done:
+    wdup_done   = true;
+    wdup_active = false;
+    wdup_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void wdup_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    if (!wdup_ui_queue) return;
+
+    wdup_ui_msg_t m;
+    while (xQueueReceive(wdup_ui_queue, &m, 0) == pdTRUE) {
+        if (wdup_status_list && lv_obj_is_valid(wdup_status_list)) {
+            lv_obj_t *item = lv_list_add_text(wdup_status_list, m.text);
+            if (item) {
+                lv_obj_set_style_text_color(item, m.color, 0);
+                lv_obj_set_style_bg_color(item, ui_bg_color(), 0);
+                lv_obj_set_style_bg_opa(item, LV_OPA_COVER, 0);
+                lv_obj_set_style_text_font(item, &lv_font_montserrat_12, 0);
+                lv_obj_set_style_pad_ver(item, 2, 0);
+            }
+            lv_obj_scroll_to_y(wdup_status_list, LV_COORD_MAX, LV_ANIM_ON);
+        }
+    }
+    if (wdup_done) {
+        lv_timer_del(wdup_timer);
+        wdup_timer = NULL;
+    }
+}
+
+/* Save a key typed on-device to NVS */
+static void wdup_save_key_cb(lv_event_t *e)
+{
+    (void)e;
+    nvs_handle_t h;
+    if (nvs_open("settings", NVS_READWRITE, &h) == ESP_OK) {
+        if (wdup_wigle_key_ta && lv_obj_is_valid(wdup_wigle_key_ta)) {
+            const char *v = lv_textarea_get_text(wdup_wigle_key_ta);
+            strncpy(wigle_api_key, v, WIGLE_KEY_MAX_LEN - 1);
+            wigle_api_key[WIGLE_KEY_MAX_LEN - 1] = '\0';
+            nvs_set_str(h, NVS_KEY_WIGLE_KEY, wigle_api_key);
+        }
+        if (wdup_wdg_key_ta && lv_obj_is_valid(wdup_wdg_key_ta)) {
+            const char *v = lv_textarea_get_text(wdup_wdg_key_ta);
+            strncpy(wdgwars_api_key, v, WDGWARS_KEY_MAX_LEN - 1);
+            wdgwars_api_key[WDGWARS_KEY_MAX_LEN - 1] = '\0';
+            nvs_set_str(h, NVS_KEY_WDGWARS_KEY, wdgwars_api_key);
+        }
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static void wdup_start_cb(lv_event_t *e)
+{
+    (void)e;
+    if (wdup_active || wdup_task_handle) return;
+
+    // Save any keys typed on-screen before starting
+    wdup_save_key_cb(NULL);
+
+    if (!wdup_ui_queue)
+        wdup_ui_queue = xQueueCreate(32, sizeof(wdup_ui_msg_t));
+    else
+        xQueueReset(wdup_ui_queue);
+
+    wdup_done   = false;
+    wdup_active = true;
+
+    xTaskCreate(wdup_task, "wdup", 8192, NULL, 4, &wdup_task_handle);
+
+    if (wdup_timer) { lv_timer_del(wdup_timer); wdup_timer = NULL; }
+    wdup_timer = lv_timer_create(wdup_timer_cb, 200, NULL);
+}
+
+static void wdup_target_dd_cb(lv_event_t *e)
+{
+    lv_obj_t *dd = lv_event_get_target(e);
+    uint16_t sel = lv_dropdown_get_selected(dd);
+    if (sel == 0) wdup_target = WDUP_WIGLE;
+    else if (sel == 1) wdup_target = WDUP_WDG;
+    else wdup_target = WDUP_BOTH;
+}
+
+static void wdup_kb_event_cb(lv_event_t *e)
+{
+    lv_obj_t *kb = lv_event_get_target(e);
+    if (lv_event_get_code(e) == LV_EVENT_READY || lv_event_get_code(e) == LV_EVENT_CANCEL)
+        lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+    (void)kb;
+}
+
+static void wdup_ta_focus_cb(lv_event_t *e)
+{
+    lv_obj_t *ta = lv_event_get_target(e);
+    lv_obj_t *kb = (lv_obj_t *)lv_event_get_user_data(e);
+    if (kb) {
+        lv_keyboard_set_textarea(kb, ta);
+        lv_obj_clear_flag(kb, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void wdup_back_cb(lv_event_t *e)
+{
+    (void)e;
+    wdup_active       = false;
+    wdup_wigle_key_ta = NULL;
+    wdup_wdg_key_ta   = NULL;
+    wdup_status_list  = NULL;
+    if (wdup_timer) { lv_timer_del(wdup_timer); wdup_timer = NULL; }
+    show_data_transfer_screen();
+}
+
+static void show_wardrive_upload_screen(void)
+{
+    create_function_page_base("Wardrive Upload");
+
+    lv_obj_t *content = lv_obj_create(function_page);
+    lv_obj_set_size(content, LCD_H_RES, LCD_V_RES - 30 - 44);
+    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_pad_all(content, 6, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(content, 4, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+
+    // ── Service selector ──────────────────────────────────────────────────
+    lv_obj_t *svc_row = lv_obj_create(content);
+    lv_obj_set_size(svc_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(svc_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(svc_row, 0, 0);
+    lv_obj_set_style_pad_all(svc_row, 0, 0);
+    lv_obj_set_flex_flow(svc_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(svc_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(svc_row, 4, 0);
+
+    lv_obj_t *svc_lbl = lv_label_create(svc_row);
+    lv_label_set_text(svc_lbl, "Service:");
+    lv_obj_set_style_text_font(svc_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(svc_lbl, ui_text_color(), 0);
+
+    lv_obj_t *dd = lv_dropdown_create(svc_row);
+    lv_dropdown_set_options(dd, "WiGLE\nWDG Wars\nBoth");
+    lv_dropdown_set_selected(dd, (wdup_target == WDUP_WIGLE) ? 0 :
+                                  (wdup_target == WDUP_WDG)  ? 1 : 2);
+    lv_obj_set_width(dd, 120);
+    lv_obj_set_style_text_font(dd, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(dd, lv_color_make(40, 40, 40), 0);
+    lv_obj_set_style_text_color(dd, ui_text_color(), 0);
+    lv_obj_add_event_cb(dd, wdup_target_dd_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    // ── WiGLE key entry ───────────────────────────────────────────────────
+    lv_obj_t *wg_lbl = lv_label_create(content);
+    lv_label_set_text(wg_lbl, "WiGLE API token (base64):");
+    lv_obj_set_style_text_font(wg_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wg_lbl, lv_color_make(0, 188, 212), 0);
+
+    wdup_wigle_key_ta = lv_textarea_create(content);
+    lv_obj_set_width(wdup_wigle_key_ta, lv_pct(100));
+    lv_textarea_set_one_line(wdup_wigle_key_ta, true);
+    lv_textarea_set_max_length(wdup_wigle_key_ta, WIGLE_KEY_MAX_LEN - 1);
+    lv_textarea_set_text(wdup_wigle_key_ta, wigle_api_key[0] ? wigle_api_key : "");
+    lv_textarea_set_placeholder_text(wdup_wigle_key_ta, "Paste base64 token from wigle.net");
+    lv_obj_set_style_text_font(wdup_wigle_key_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(wdup_wigle_key_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(wdup_wigle_key_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(wdup_wigle_key_ta, lv_color_make(0, 188, 212), 0);
+
+    // ── WDG Wars key entry ────────────────────────────────────────────────
+    lv_obj_t *wdg_lbl = lv_label_create(content);
+    lv_label_set_text(wdg_lbl, "WDG Wars API key:");
+    lv_obj_set_style_text_font(wdg_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wdg_lbl, lv_color_make(255, 152, 0), 0);
+
+    wdup_wdg_key_ta = lv_textarea_create(content);
+    lv_obj_set_width(wdup_wdg_key_ta, lv_pct(100));
+    lv_textarea_set_one_line(wdup_wdg_key_ta, true);
+    lv_textarea_set_max_length(wdup_wdg_key_ta, WDGWARS_KEY_MAX_LEN - 1);
+    lv_textarea_set_text(wdup_wdg_key_ta, wdgwars_api_key[0] ? wdgwars_api_key : "");
+    lv_textarea_set_placeholder_text(wdup_wdg_key_ta, "Paste key from wdgwars.pl");
+    lv_obj_set_style_text_font(wdup_wdg_key_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(wdup_wdg_key_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(wdup_wdg_key_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(wdup_wdg_key_ta, lv_color_make(255, 152, 0), 0);
+
+    // ── Progress list ─────────────────────────────────────────────────────
+    wdup_status_list = lv_list_create(content);
+    lv_obj_set_size(wdup_status_list, lv_pct(100), 80);
+    lv_obj_set_style_bg_color(wdup_status_list, lv_color_make(20, 20, 20), 0);
+    lv_obj_set_style_border_width(wdup_status_list, 1, 0);
+    lv_obj_set_style_border_color(wdup_status_list, lv_color_make(60, 60, 60), 0);
+    lv_obj_set_style_pad_all(wdup_status_list, 2, 0);
+    if (wigle_api_key[0] || wdgwars_api_key[0]) {
+        lv_obj_t *hint = lv_list_add_text(wdup_status_list, "Ready. Tap Upload to start.");
+        if (hint) lv_obj_set_style_text_color(hint, lv_color_make(150, 150, 150), 0);
+    } else {
+        lv_obj_t *hint = lv_list_add_text(wdup_status_list, "Enter API key(s) above, then tap Upload.");
+        if (hint) lv_obj_set_style_text_color(hint, lv_color_make(255, 193, 7), 0);
+    }
+
+    // ── On-screen keyboard (hidden until a text area is tapped) ───────────
+    lv_obj_t *kb = lv_keyboard_create(function_page);
+    lv_obj_set_size(kb, LCD_H_RES, 130);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(kb, wdup_kb_event_cb, LV_EVENT_READY,  NULL);
+    lv_obj_add_event_cb(kb, wdup_kb_event_cb, LV_EVENT_CANCEL, NULL);
+    lv_obj_add_event_cb(wdup_wigle_key_ta, wdup_ta_focus_cb, LV_EVENT_CLICKED, kb);
+    lv_obj_add_event_cb(wdup_wdg_key_ta,   wdup_ta_focus_cb, LV_EVENT_CLICKED, kb);
+
+    // ── Bottom button bar: [Upload] [Back] ────────────────────────────────
+    lv_obj_t *upload_btn = lv_btn_create(function_page);
+    lv_obj_set_size(upload_btn, 110, 32);
+    lv_obj_align(upload_btn, LV_ALIGN_BOTTOM_MID, -62, -6);
+    lv_obj_set_style_bg_color(upload_btn, lv_color_make(233, 30, 99), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(upload_btn, 8, 0);
+    lv_obj_set_style_border_width(upload_btn, 0, 0);
+    lv_obj_t *upload_lbl = lv_label_create(upload_btn);
+    lv_label_set_text(upload_lbl, LV_SYMBOL_UPLOAD "  Upload All");
+    lv_obj_set_style_text_font(upload_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(upload_lbl);
+    lv_obj_add_event_cb(upload_btn, wdup_start_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 32);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 62, -6);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT "  Back");
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(back_lbl);
+    lv_obj_add_event_cb(back_btn, wdup_back_cb, LV_EVENT_CLICKED, NULL);
+}
+
 // ── Data Transfer sub-menu screen ────────────────────────────────────────────
 
 static void data_transfer_tile_cb(lv_event_t *e)
@@ -15010,11 +15642,7 @@ static void data_transfer_tile_cb(lv_event_t *e)
     if (strcmp(key, "AP File Server") == 0)      show_ap_file_server_screen();
     else if (strcmp(key, "WiFi Client") == 0)    show_wifi_client_server_screen();
     else if (strcmp(key, "Wardrive Upload") == 0) {
-        // Placeholder
-        if (s_fileserv_status_lbl) return;
-        lv_obj_t *msg = lv_msgbox_create(lv_scr_act(), "Coming Soon",
-            "Wardrive data upload to WiGLE\nand other services will be\nadded in a future update.", NULL, true);
-        lv_obj_center(msg);
+        show_wardrive_upload_screen();
     }
 }
 
