@@ -11,8 +11,11 @@
 extern "C" {
 #endif
 
-// Version
-#define FW_VERSION "v1.0.4"
+// Version — defined by CMakeLists.txt (PROJECT_VER) and injected as a compile
+// definition.  Edit the version in CMakeLists.txt only; do not hardcode here.
+#ifndef FW_VERSION
+#define FW_VERSION "unknown"
+#endif
 
 // Maximum limits
 #define MAX_AP_CNT 64
