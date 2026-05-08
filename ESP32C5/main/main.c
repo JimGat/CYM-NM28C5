@@ -1036,6 +1036,8 @@ static QueueHandle_t     wdup_ui_queue         = NULL;
 static wdup_target_t     wdup_target           = WDUP_BOTH;
 static lv_obj_t         *wdup_wigle_key_ta     = NULL;
 static lv_obj_t         *wdup_wdg_key_ta       = NULL;
+static lv_obj_t         *wdup_upload_btn       = NULL;
+static lv_obj_t         *wdup_back_btn_obj     = NULL;
 typedef struct { char text[128]; lv_color_t color; } wdup_ui_msg_t;
 static wd_band_t         g_wd_band         = WD_BAND_BOTH;
 static bool              g_wd_pcap         = false;
@@ -1043,6 +1045,7 @@ static void            (*wdup_back_fn)(void) = NULL;
 static bool              wdup_use_explicit  = false;
 static int               wdup_explicit_indices[64];
 static int               wdup_explicit_count  = 0;
+static void            (*wdm_back_fn)(void)   = NULL;
 // wd_manage_paths declared here so wdup_task (explicit mode) can reference it
 #define WD_MANAGE_MAX_FILES 64
 static char              wd_manage_paths[WD_MANAGE_MAX_FILES][320];
@@ -16030,7 +16033,7 @@ static void wd_menu_tile_cb(lv_event_t *e)
     if (!key) return;
     if (strcmp(key, "Start") == 0)        wardrive_start_btn_cb(NULL);
     else if (strcmp(key, "Options") == 0) show_wardrive_options_screen();
-    else if (strcmp(key, "Manage")  == 0) show_wardrive_manage_screen();
+    else if (strcmp(key, "Manage")  == 0) { wdm_back_fn = NULL; show_wardrive_manage_screen(); }
 }
 
 static void show_wardrive_menu_screen(void)
@@ -16434,7 +16437,10 @@ static void wdm_upload_selected_cb(lv_event_t *e)
 static void wdm_back_cb(lv_event_t *e)
 {
     (void)e;
-    show_wardrive_menu_screen();
+    void (*fn)(void) = wdm_back_fn;
+    wdm_back_fn = NULL;
+    if (fn) fn();
+    else show_wardrive_menu_screen();
 }
 
 static void show_wardrive_manage_screen(void)
@@ -16708,9 +16714,11 @@ static void wdup_target_dd_cb(lv_event_t *e)
 static void wdup_kb_event_cb(lv_event_t *e)
 {
     lv_obj_t *kb = lv_event_get_target(e);
-    if (lv_event_get_code(e) == LV_EVENT_READY || lv_event_get_code(e) == LV_EVENT_CANCEL)
+    if (lv_event_get_code(e) == LV_EVENT_READY || lv_event_get_code(e) == LV_EVENT_CANCEL) {
         lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
-    (void)kb;
+        if (wdup_upload_btn)   lv_obj_clear_flag(wdup_upload_btn,   LV_OBJ_FLAG_HIDDEN);
+        if (wdup_back_btn_obj) lv_obj_clear_flag(wdup_back_btn_obj, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 static void wdup_ta_focus_cb(lv_event_t *e)
@@ -16720,6 +16728,8 @@ static void wdup_ta_focus_cb(lv_event_t *e)
     if (kb) {
         lv_keyboard_set_textarea(kb, ta);
         lv_obj_clear_flag(kb, LV_OBJ_FLAG_HIDDEN);
+        if (wdup_upload_btn)   lv_obj_add_flag(wdup_upload_btn,   LV_OBJ_FLAG_HIDDEN);
+        if (wdup_back_btn_obj) lv_obj_add_flag(wdup_back_btn_obj, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -16730,6 +16740,8 @@ static void wdup_back_cb(lv_event_t *e)
     wdup_wigle_key_ta = NULL;
     wdup_wdg_key_ta   = NULL;
     wdup_status_list  = NULL;
+    wdup_upload_btn   = NULL;
+    wdup_back_btn_obj = NULL;
     if (wdup_timer) { lv_timer_del(wdup_timer); wdup_timer = NULL; }
     void (*back_fn)(void) = wdup_back_fn;
     wdup_back_fn = NULL;
@@ -16826,7 +16838,32 @@ static void show_wardrive_upload_screen(void)
         if (hint) lv_obj_set_style_text_color(hint, lv_color_make(255, 193, 7), 0);
     }
 
-    // ── On-screen keyboard (hidden until a text area is tapped) ───────────
+    // ── Bottom button bar: [Upload] [Back] — created before keyboard for Z-order ──
+    wdup_upload_btn = lv_btn_create(function_page);
+    lv_obj_set_size(wdup_upload_btn, 110, 32);
+    lv_obj_align(wdup_upload_btn, LV_ALIGN_BOTTOM_MID, -62, -6);
+    lv_obj_set_style_bg_color(wdup_upload_btn, lv_color_make(233, 30, 99), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(wdup_upload_btn, 8, 0);
+    lv_obj_set_style_border_width(wdup_upload_btn, 0, 0);
+    lv_obj_t *upload_lbl = lv_label_create(wdup_upload_btn);
+    lv_label_set_text(upload_lbl, LV_SYMBOL_UPLOAD "  Upload All");
+    lv_obj_set_style_text_font(upload_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(upload_lbl);
+    lv_obj_add_event_cb(wdup_upload_btn, wdup_start_cb, LV_EVENT_CLICKED, NULL);
+
+    wdup_back_btn_obj = lv_btn_create(function_page);
+    lv_obj_set_size(wdup_back_btn_obj, 110, 32);
+    lv_obj_align(wdup_back_btn_obj, LV_ALIGN_BOTTOM_MID, 62, -6);
+    lv_obj_set_style_bg_color(wdup_back_btn_obj, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(wdup_back_btn_obj, 8, 0);
+    lv_obj_set_style_border_width(wdup_back_btn_obj, 0, 0);
+    lv_obj_t *back_lbl = lv_label_create(wdup_back_btn_obj);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT "  Back");
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(back_lbl);
+    lv_obj_add_event_cb(wdup_back_btn_obj, wdup_back_cb, LV_EVENT_CLICKED, NULL);
+
+    // ── On-screen keyboard (hidden until a text area is tapped; above buttons in Z-order) ──
     lv_obj_t *kb = lv_keyboard_create(function_page);
     lv_obj_set_size(kb, LCD_H_RES, 130);
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
@@ -16835,31 +16872,6 @@ static void show_wardrive_upload_screen(void)
     lv_obj_add_event_cb(kb, wdup_kb_event_cb, LV_EVENT_CANCEL, NULL);
     lv_obj_add_event_cb(wdup_wigle_key_ta, wdup_ta_focus_cb, LV_EVENT_CLICKED, kb);
     lv_obj_add_event_cb(wdup_wdg_key_ta,   wdup_ta_focus_cb, LV_EVENT_CLICKED, kb);
-
-    // ── Bottom button bar: [Upload] [Back] ────────────────────────────────
-    lv_obj_t *upload_btn = lv_btn_create(function_page);
-    lv_obj_set_size(upload_btn, 110, 32);
-    lv_obj_align(upload_btn, LV_ALIGN_BOTTOM_MID, -62, -6);
-    lv_obj_set_style_bg_color(upload_btn, lv_color_make(233, 30, 99), LV_STATE_DEFAULT);
-    lv_obj_set_style_radius(upload_btn, 8, 0);
-    lv_obj_set_style_border_width(upload_btn, 0, 0);
-    lv_obj_t *upload_lbl = lv_label_create(upload_btn);
-    lv_label_set_text(upload_lbl, LV_SYMBOL_UPLOAD "  Upload All");
-    lv_obj_set_style_text_font(upload_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_center(upload_lbl);
-    lv_obj_add_event_cb(upload_btn, wdup_start_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 110, 32);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 62, -6);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
-    lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_t *back_lbl = lv_label_create(back_btn);
-    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT "  Back");
-    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_center(back_lbl);
-    lv_obj_add_event_cb(back_btn, wdup_back_cb, LV_EVENT_CLICKED, NULL);
 }
 
 // ── Data Transfer sub-menu screen ────────────────────────────────────────────
@@ -16871,7 +16883,8 @@ static void data_transfer_tile_cb(lv_event_t *e)
     if (strcmp(key, "AP File Server") == 0)      show_ap_file_server_screen();
     else if (strcmp(key, "WiFi Client") == 0)    show_wifi_client_server_screen();
     else if (strcmp(key, "Wardrive Upload") == 0) {
-        show_wardrive_upload_screen();
+        wdm_back_fn = show_data_transfer_screen;
+        show_wardrive_manage_screen();
     }
 }
 
