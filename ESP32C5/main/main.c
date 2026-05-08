@@ -19795,11 +19795,11 @@ static void show_bluetooth_screen(void)
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
-    lv_obj_set_style_pad_all(tiles, 10, 0);
-    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_style_pad_all(tiles, 6, 0);
+    lv_obj_set_style_pad_gap(tiles, 6, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    
+
     // BT Scan & Select - first tile, cyan
     lv_obj_t *btsas_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BT Scan\n& Select", UI_ACCENT_CYAN, NULL, NULL);
     lv_obj_add_event_cb(btsas_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Scan & Select");
