@@ -35,3 +35,17 @@ CONFIG_ESP_PANIC_HANDLER_IRAM=y
 # Task WDT panic — converts silent watchdog reboot into a full panic with register
 # dump and backtrace so we can see which task/line caused the hang.
 CONFIG_ESP_TASK_WDT_PANIC=y
+
+# mbedTLS memory — use system allocator so PSRAM (via SPIRAM_USE_MALLOC) is
+# available for TLS context structures instead of a fixed internal-RAM pool.
+# DYNAMIC_BUFFER defers the 16 KB SSL I/O buffer allocation until a connection
+# is actually in progress and frees it immediately after, preventing the internal
+# heap from being exhausted before the TLS handshake can start.
+CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC=y
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+
+# Smaller CA bundle — "common" set covers every major commercial CA
+# (Amazon, DigiCert, Let's Encrypt, Comodo, GeoTrust, etc.) used by
+# WiGLE and WDGWars, while consuming ~60 % less flash/parse overhead
+# than the full Mozilla bundle.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
