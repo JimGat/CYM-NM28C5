@@ -79,6 +79,7 @@ LV_IMG_DECLARE(deedee_img);
 
 // TLS (WPA-SEC upload)
 #include "esp_tls.h"
+#include "esp_crt_bundle.h"
 
 // NimBLE (BLE scanner)
 #include "nimble/nimble_port.h"
@@ -332,6 +333,16 @@ static inline lv_color_t ui_accent_color(void) {
 #define WPASEC_KEY_PATH      "/sdcard/lab/wpa-sec.txt"
 #define WPASEC_KEY_MAX_LEN   65
 
+// Wardrive upload constants
+#define WIGLE_HOST           "api.wigle.net"
+#define WIGLE_UPLOAD_PATH    "/api/v2/file/upload"
+#define WDGWARS_HOST         "wdgwars.pl"
+#define WDGWARS_UPLOAD_PATH  "/api/upload-csv"
+#define WIGLE_KEY_PATH       "/sdcard/lab/wigle.txt"
+#define WDGWARS_KEY_PATH     "/sdcard/lab/wdgwars.txt"
+#define WIGLE_KEY_MAX_LEN    128
+#define WDGWARS_KEY_MAX_LEN  128
+
 typedef int (*vprintf_like_t)(const char *, va_list);
 
 static lv_disp_draw_buf_t draw_buf;
@@ -377,6 +388,28 @@ static char     g_saved_wifi_pass[65] = ""; // Home network password
 #define NVS_KEY_GATT_TIMEOUT "gatt_tmo"
 #define NVS_KEY_WIFI_SSID    "wifi_ssid"
 #define NVS_KEY_WIFI_PASS    "wifi_pass"
+#define NVS_KEY_WIGLE_KEY    "wigle_key"
+#define NVS_KEY_WDGWARS_KEY  "wdg_key"
+#define NVS_KEY_WD_BAND      "wd_band"
+#define NVS_KEY_WD_PCAP      "wd_pcap"
+#define NVS_KEY_WD_BLE       "wd_ble"
+#define NVS_KEY_GPS_LAT      "gps_lat_i"
+#define NVS_KEY_GPS_LON      "gps_lon_i"
+#define NVS_KEY_GPS_ALT      "gps_alt_i"
+
+// Wardrive band selection
+typedef enum { WD_BAND_BOTH = 0, WD_BAND_24G, WD_BAND_5G } wd_band_t;
+
+// Wardrive upload log path
+#define WDUP_LOG_PATH "/sdcard/lab/wardrives/upload_log.csv"
+
+// Wardrive BLE time-slice parameters
+#define WDP_BLE_INTERVAL_S   30     // seconds of WiFi scanning between BLE passes
+#define WDP_BLE_DWELL_MS     8000   // ms to scan BLE each pass
+#define WDP_BLE_MAX_DEVICES  200
+
+// BLE PCAP capture
+#define BLE_PCAP_DIR         "/sdcard/lab/ble_captures"
 
 // Touch calibration NVS
 #define TOUCH_CAL_NVS_NS      "touch_cal"
@@ -426,18 +459,6 @@ static void style_modal_overlay(lv_obj_t *overlay, lv_opa_t opacity) {
     lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
 }
 
-static void style_neutral_button(lv_obj_t *btn) {
-    if (!btn) return;
-    lv_obj_set_style_bg_color(btn,
-        dark_mode_enabled ? lv_color_hex(0x13263C) : lv_color_hex(0xD4DFEA), 0);
-    lv_obj_set_style_bg_color(btn,
-        dark_mode_enabled ? lv_color_hex(0x1E3550) : lv_color_hex(0xC3D1E1),
-        LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(btn, 1, 0);
-    lv_obj_set_style_border_color(btn, ui_border_color(), 0);
-    lv_obj_set_style_border_opa(btn, dark_mode_enabled ? LV_OPA_70 : LV_OPA_100, 0);
-    lv_obj_set_style_radius(btn, 8, 0);
-}
 
 static esp_lcd_panel_handle_t panel_handle;
 static esp_lcd_panel_io_handle_t lcd_io_handle;
@@ -460,14 +481,25 @@ typedef struct {
 } screenshot_msg_t;
 
 // Use GPS definitions from wifi_common.h via wifi_cli.h
-static gps_data_t current_gps = {0};
+static gps_data_t current_gps      = {0};
+static gps_data_t g_gps_last_known = {0};  // persists across GPS dropouts; loaded from NVS at boot
+#define GPS_STALE_ACCURACY_M 150.0f         // ~city block; used when position is held from last fix
+// Set by GPS task when a new valid fix arrives; main loop calls nvs_save_last_gps() from
+// main-task context to avoid nvs_commit() disabling flash cache in a background task.
+static volatile bool g_gps_save_pending = false;
+
+// Returns the best available GPS reading: live if valid, last-known (stale) if not.
+// Callers that write location data should always use this instead of current_gps directly.
+static const gps_data_t *gps_best(void) {
+    return current_gps.valid ? &current_gps : &g_gps_last_known;
+}
+// Returns the accuracy to report: live accuracy or GPS_STALE_ACCURACY_M for held position.
+static float gps_best_accuracy(void) {
+    return current_gps.valid ? current_gps.accuracy : GPS_STALE_ACCURACY_M;
+}
 static char gps_rx_buffer[GPS_BUF_SIZE];
 static StaticTask_t gps_task_buffer;
 static StackType_t *gps_task_stack = NULL;
-
-// SD init task buffers
-static StaticTask_t sd_init_task_buffer;
-static StackType_t *sd_init_task_stack = NULL;
 
 static esp_err_t init_gps_uart(void);
 static bool parse_gps_nmea(const char *nmea_sentence);
@@ -548,7 +580,11 @@ typedef struct {
     
     // WPA-SEC API key from wpa-sec.txt
     char wpasec_key[WPASEC_KEY_MAX_LEN];
-    
+
+    // Wardrive upload API keys
+    char wigle_key[WIGLE_KEY_MAX_LEN];       // base64(apiname:apitoken) from wigle.txt
+    char wdgwars_key[WDGWARS_KEY_MAX_LEN];   // plain API key from wdgwars.txt
+
     bool loaded;  // True when all data is loaded
 } sd_cache_t;
 
@@ -847,6 +883,7 @@ typedef struct {
     bool     written_to_file;
     float    latitude;
     float    longitude;
+    float    accuracy;  // GPS accuracy at time of discovery (m); GPS_STALE_ACCURACY_M if held
 } wdp_network_t;
 
 static wdp_ducb_channel_t wdp_ducb_channels[WDP_TOTAL_CHANNELS];
@@ -875,6 +912,45 @@ static lv_timer_t *wd_ui_timer = NULL;
 static volatile bool wd_ui_update_flag = false;
 static volatile int wdp_current_channel = 0;
 
+// Wardrive GPS marks (waypoints)
+static FILE       *wd_marks_file      = NULL;
+static int         wd_mark_count      = 0;
+static char        wd_marks_fname[96] = "";
+static int         wd_mark_tap_count  = 0;
+static lv_timer_t *wd_mark_timer      = NULL;
+static lv_obj_t   *wd_mark_note_overlay = NULL;
+static lv_obj_t   *wd_mark_note_ta      = NULL;
+
+// Wardrive BLE time-slice
+typedef struct {
+    uint8_t mac[6];
+    char    name[32];
+    int8_t  rssi;
+    float   latitude;
+    float   longitude;
+    bool    written;
+} wdp_ble_device_t;
+static wdp_ble_device_t *wdp_ble_devices = NULL;
+static volatile int      wdp_ble_count   = 0;
+static bool              g_wd_ble        = false;
+
+// BLE PCAP capture state
+typedef struct {
+    uint8_t  addr[6];
+    uint8_t  addr_type;
+    uint8_t  event_type;
+    int8_t   rssi;
+    uint8_t  data_len;
+    uint8_t  data[31];
+    uint64_t timestamp_us;
+} ble_pcap_pkt_t;
+static FILE          *ble_pcap_file      = NULL;
+static QueueHandle_t  ble_pcap_queue     = NULL;
+static lv_timer_t    *ble_pcap_timer     = NULL;
+static volatile bool  ble_pcap_active    = false;
+static lv_obj_t      *ble_pcap_cnt_label = NULL;
+static uint32_t       ble_pcap_pkt_count = 0;
+
 // Wardrive attack state
 static TaskHandle_t wardrive_task_handle = NULL;
 static StaticTask_t wardrive_task_buffer;
@@ -884,7 +960,6 @@ static int wardrive_file_counter = 1;
 
 // Wardrive buffers (static to avoid stack overflow)
 static char wardrive_gps_buffer[GPS_BUF_SIZE];
-static wifi_ap_record_t wardrive_scan_results[MAX_AP_CNT];
 
 // Karma UI state
 static lv_obj_t *karma_log_ta = NULL;
@@ -950,6 +1025,48 @@ static lv_timer_t *wpasec_upload_timer = NULL;
 static volatile bool wpasec_upload_done = false;
 static volatile bool wpasec_upload_active = false;
 static TaskHandle_t wpasec_upload_task_handle = NULL;
+
+// Wardrive Upload state
+typedef enum { WDUP_WIGLE = 0, WDUP_WDG, WDUP_BOTH } wdup_target_t;
+static char              wigle_api_key[WIGLE_KEY_MAX_LEN]   = "";
+static char              wdgwars_api_key[WDGWARS_KEY_MAX_LEN] = "";
+static lv_obj_t         *wdup_status_list      = NULL;
+static lv_timer_t       *wdup_timer            = NULL;
+static volatile bool     wdup_active           = false;
+static volatile bool     wdup_done             = false;
+static TaskHandle_t      wdup_task_handle      = NULL;
+static QueueHandle_t     wdup_ui_queue         = NULL;
+static wdup_target_t     wdup_target           = WDUP_BOTH;
+static lv_obj_t         *wdup_wigle_key_ta     = NULL;
+static lv_obj_t         *wdup_wdg_key_ta       = NULL;
+static lv_obj_t         *wdup_upload_btn       = NULL;
+static lv_obj_t         *wdup_back_btn_obj     = NULL;
+typedef struct { char text[128]; lv_color_t color; } wdup_ui_msg_t;
+static wd_band_t         g_wd_band         = WD_BAND_BOTH;
+static bool              g_wd_pcap         = false;
+static void            (*wdup_back_fn)(void) = NULL;
+static bool              wdup_use_explicit  = false;
+static int               wdup_explicit_indices[64];
+static int               wdup_explicit_count  = 0;
+// Set when the upload screen redirects to WiFi Client to get credentials.
+// Cleared once WiFi connects and the upload screen is shown again.
+static bool              s_wdup_pending_after_wifi = false;
+static void            (*wdm_back_fn)(void)   = NULL;
+static lv_obj_t        *wdup_progress_bar    = NULL;
+static lv_obj_t        *wdup_progress_lbl    = NULL;
+static lv_obj_t        *wdup_wigle_stat_lbl  = NULL;
+static lv_obj_t        *wdup_wdg_stat_lbl    = NULL;
+static volatile int     wdup_prog_cur        = 0;
+static volatile int     wdup_prog_total      = 0;
+static volatile int     wdup_wigle_ok_cnt    = 0;
+static volatile int     wdup_wigle_dup_cnt   = 0;
+static volatile int     wdup_wigle_fail_cnt  = 0;
+static volatile int     wdup_wdg_ok_cnt      = 0;
+static volatile int     wdup_wdg_dup_cnt     = 0;
+static volatile int     wdup_wdg_fail_cnt    = 0;
+// wd_manage_paths declared here so wdup_task (explicit mode) can reference it
+#define WD_MANAGE_MAX_FILES 64
+static char              wd_manage_paths[WD_MANAGE_MAX_FILES][320];
 
 // SD Card settings screen state
 typedef struct { char line[96]; } sd_prov_update_t;
@@ -1442,6 +1559,19 @@ static void reset_function_page_children(void) {
         lv_timer_del(wpasec_upload_timer);
         wpasec_upload_timer = NULL;
     }
+    // Wardrive upload cleanup
+    wdup_status_list      = NULL;
+    wdup_wigle_key_ta     = NULL;
+    wdup_wdg_key_ta       = NULL;
+    wdup_progress_bar     = NULL;
+    wdup_progress_lbl     = NULL;
+    wdup_wigle_stat_lbl   = NULL;
+    wdup_wdg_stat_lbl     = NULL;
+    wdup_active           = false;
+    if (wdup_timer) {
+        lv_timer_del(wdup_timer);
+        wdup_timer = NULL;
+    }
 }
 
 static void create_function_page_base(const char *name);
@@ -1495,7 +1625,12 @@ static void ducb_update(int channel_idx, double reward);
 static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type);
 static void hs_send_targeted_deauth(const uint8_t *station_mac, const uint8_t *ap_bssid, uint8_t channel);
 static bool hs_save_handshake_to_sd(int ap_idx);
+// Wardrive GPS mark helpers
+static void wd_save_mark(const char *note);
+static void wd_mark_tap_cb(lv_event_t *e);
+
 // Wardrive promisc helpers
+static int  wdp_ble_gap_cb(struct ble_gap_event *event, void *arg);
 static void wdp_ducb_init(void);
 static int wdp_ducb_select_channel(void);
 static void wdp_ducb_update(int channel_idx, double reward);
@@ -1544,6 +1679,19 @@ static int wpasec_tls_write_all(esp_tls_t *tls, const char *buf, int len);
 static int wpasec_upload_file(const char *filepath, const char *filename);
 static void wpasec_upload_task(void *pvParameters);
 static void wpasec_upload_timer_cb(lv_timer_t *timer);
+
+// BLE PCAP capture
+static void show_ble_pcap_screen(void);
+static void ble_pcap_stop(void);
+
+// Wardrive submenu + upload helpers
+static void show_wardrive_menu_screen(void);
+static void show_wardrive_options_screen(void);
+static void show_wardrive_manage_screen(void);
+static void show_wardrive_upload_screen(void);
+static void wdup_start_cb(lv_event_t *e);
+static void wdup_task(void *pvParameters);
+static void wdup_timer_cb(lv_timer_t *timer);
 
 // Radio mode switching (WiFi <-> BLE)
 static bool ensure_wifi_mode(void);
@@ -2289,6 +2437,30 @@ static void nvs_settings_load(void)
         nvs_get_str(h, NVS_KEY_WIFI_SSID, g_saved_wifi_ssid, &ssid_len);
         size_t pass_len = sizeof(g_saved_wifi_pass);
         nvs_get_str(h, NVS_KEY_WIFI_PASS, g_saved_wifi_pass, &pass_len);
+        size_t wk_len = sizeof(wigle_api_key);
+        nvs_get_str(h, NVS_KEY_WIGLE_KEY, wigle_api_key, &wk_len);
+        size_t wdg_len = sizeof(wdgwars_api_key);
+        nvs_get_str(h, NVS_KEY_WDGWARS_KEY, wdgwars_api_key, &wdg_len);
+        uint8_t wb = 0;
+        if (nvs_get_u8(h, NVS_KEY_WD_BAND, &wb) == ESP_OK) g_wd_band = (wd_band_t)wb;
+        uint8_t wp = 0;
+        if (nvs_get_u8(h, NVS_KEY_WD_PCAP, &wp) == ESP_OK) g_wd_pcap = (wp != 0);
+        uint8_t wble = 0;
+        if (nvs_get_u8(h, NVS_KEY_WD_BLE, &wble) == ESP_OK) g_wd_ble = (wble != 0);
+        // Restore last-known GPS position so functions have a fallback before first fix
+        int32_t gps_lat_i = 0, gps_lon_i = 0, gps_alt_i = 0;
+        if (nvs_get_i32(h, NVS_KEY_GPS_LAT, &gps_lat_i) == ESP_OK &&
+            nvs_get_i32(h, NVS_KEY_GPS_LON, &gps_lon_i) == ESP_OK) {
+            g_gps_last_known.latitude  = (float)gps_lat_i / 1e6f;
+            g_gps_last_known.longitude = (float)gps_lon_i / 1e6f;
+            nvs_get_i32(h, NVS_KEY_GPS_ALT, &gps_alt_i);
+            g_gps_last_known.altitude  = (float)gps_alt_i / 10.0f;
+            g_gps_last_known.accuracy  = GPS_STALE_ACCURACY_M;
+            g_gps_last_known.valid     = true;
+            ESP_LOGI(TAG, "NVS: restored last GPS %.6f, %.6f (stale, %.0fm accuracy)",
+                     (double)g_gps_last_known.latitude, (double)g_gps_last_known.longitude,
+                     (double)GPS_STALE_ACCURACY_M);
+        }
         nvs_close(h);
         ESP_LOGI(TAG, "NVS settings loaded: timeout=%ldms, brightness=%u%%, scan=%u-%ums, dark=%d, max_power=%d, gatt_tmo=%ums",
                  (long)screen_timeout_ms, screen_brightness_pct, scan_time_min_ms, scan_time_max_ms,
@@ -2375,6 +2547,27 @@ static void nvs_settings_save_gatt_timeout(uint32_t ms)
         ESP_LOGI(TAG, "NVS: saved gatt_timeout = %ums", (unsigned)ms);
     }
 }
+
+// Persist last-known GPS to NVS. Throttled: max once per 5 minutes to protect flash.
+// Coordinates stored as integer μ-degrees (×1e6) to avoid float NVS blobs.
+static void nvs_save_last_gps_force(const gps_data_t *g, bool force)
+{
+    static int64_t s_last_gps_save_us = 0;
+    int64_t now = esp_timer_get_time();
+    if (!force && now - s_last_gps_save_us < (int64_t)5 * 60 * 1000000) return;
+    s_last_gps_save_us = now;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, NVS_KEY_GPS_LAT, (int32_t)(g->latitude  * 1e6f));
+        nvs_set_i32(h, NVS_KEY_GPS_LON, (int32_t)(g->longitude * 1e6f));
+        nvs_set_i32(h, NVS_KEY_GPS_ALT, (int32_t)(g->altitude  * 10.0f));
+        nvs_commit(h);
+        nvs_close(h);
+        ESP_LOGI(TAG, "NVS: GPS last-known saved %.6f, %.6f",
+                 (double)g->latitude, (double)g->longitude);
+    }
+}
+static void nvs_save_last_gps(const gps_data_t *g) { nvs_save_last_gps_force(g, false); }
 
 static void nvs_settings_save_wifi_creds(const char *ssid, const char *pass)
 {
@@ -2548,6 +2741,10 @@ void go_dark_enable(void)
     boot_btn_click_count   = 0;
     boot_btn_last_release_ms = 0;
     boot_btn_hold_start_ms = 0;
+    // Persist best-available GPS position before going dark — bypasses the
+    // 5-minute throttle so the last fix is never lost to a power cycle.
+    if (g_gps_last_known.valid)
+        nvs_save_last_gps_force(&g_gps_last_known, true);
     led_set(0, 0, 0);
     gpio_set_level(LCD_BL_IO, 0);
     if (panel_handle) esp_lcd_panel_disp_on_off(panel_handle, false);
@@ -3837,6 +4034,50 @@ static esp_err_t sd_cache_load_all(void) {
         ESP_LOGI(TAG, "  WPA-SEC key: not found");
     }
     
+    // 7. Load WiGLE API key from wigle.txt
+    sd_cache->wigle_key[0] = '\0';
+    file = fopen(WIGLE_KEY_PATH, "r");
+    if (file != NULL) {
+        char buf[WIGLE_KEY_MAX_LEN + 8];
+        if (fgets(buf, sizeof(buf), file) != NULL) {
+            size_t len = strlen(buf);
+            while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r' ||
+                   buf[len-1] == ' '  || buf[len-1] == '\t')) buf[--len] = '\0';
+            char *start = buf;
+            while (*start == ' ' || *start == '\t') start++;
+            if (strlen(start) > 0 && strlen(start) < WIGLE_KEY_MAX_LEN) {
+                strncpy(sd_cache->wigle_key, start, WIGLE_KEY_MAX_LEN - 1);
+                sd_cache->wigle_key[WIGLE_KEY_MAX_LEN - 1] = '\0';
+            }
+        }
+        fclose(file);
+        ESP_LOGI(TAG, "  WiGLE key: %.8s****", sd_cache->wigle_key);
+    } else {
+        ESP_LOGI(TAG, "  WiGLE key: not found");
+    }
+
+    // 8. Load WDG Wars API key from wdgwars.txt
+    sd_cache->wdgwars_key[0] = '\0';
+    file = fopen(WDGWARS_KEY_PATH, "r");
+    if (file != NULL) {
+        char buf[WDGWARS_KEY_MAX_LEN + 8];
+        if (fgets(buf, sizeof(buf), file) != NULL) {
+            size_t len = strlen(buf);
+            while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r' ||
+                   buf[len-1] == ' '  || buf[len-1] == '\t')) buf[--len] = '\0';
+            char *start = buf;
+            while (*start == ' ' || *start == '\t') start++;
+            if (strlen(start) > 0 && strlen(start) < WDGWARS_KEY_MAX_LEN) {
+                strncpy(sd_cache->wdgwars_key, start, WDGWARS_KEY_MAX_LEN - 1);
+                sd_cache->wdgwars_key[WDGWARS_KEY_MAX_LEN - 1] = '\0';
+            }
+        }
+        fclose(file);
+        ESP_LOGI(TAG, "  WDG Wars key: %.8s****", sd_cache->wdgwars_key);
+    } else {
+        ESP_LOGI(TAG, "  WDG Wars key: not found");
+    }
+
     sd_cache->loaded = true;
     ESP_LOGI(TAG, "SD cache loading complete");
     return ESP_OK;
@@ -4331,7 +4572,20 @@ void app_main(void)
         sd_cache_load_all();
         xSemaphoreGive(sd_spi_mutex);
     }
-    
+
+    // SD card files take priority over NVS — if wigle.txt / wdgwars.txt are present,
+    // overwrite whatever was loaded from NVS so the upload screen shows the file key.
+    if (sd_cache && sd_cache->wigle_key[0]) {
+        strncpy(wigle_api_key, sd_cache->wigle_key, WIGLE_KEY_MAX_LEN - 1);
+        wigle_api_key[WIGLE_KEY_MAX_LEN - 1] = '\0';
+        ESP_LOGI(TAG, "WiGLE key: SD file overrides NVS");
+    }
+    if (sd_cache && sd_cache->wdgwars_key[0]) {
+        strncpy(wdgwars_api_key, sd_cache->wdgwars_key, WDGWARS_KEY_MAX_LEN - 1);
+        wdgwars_api_key[WDGWARS_KEY_MAX_LEN - 1] = '\0';
+        ESP_LOGI(TAG, "WDG Wars key: SD file overrides NVS");
+    }
+
     // Hide popup
     hide_sd_loading_popup();
 
@@ -5645,7 +5899,10 @@ void app_main(void)
 
                 if (wd_ui_channel_label && lv_obj_is_valid(wd_ui_channel_label)) {
                     char wd_ch_buf[16];
-                    snprintf(wd_ch_buf, sizeof(wd_ch_buf), "CH %d", wdp_current_channel);
+                    if (wdp_current_channel < 0)
+                        snprintf(wd_ch_buf, sizeof(wd_ch_buf), "BLE");
+                    else
+                        snprintf(wd_ch_buf, sizeof(wd_ch_buf), "CH %d", wdp_current_channel);
                     lv_label_set_text(wd_ui_channel_label, wd_ch_buf);
                 }
 
@@ -5713,6 +5970,14 @@ void app_main(void)
         if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             wifi_attacks_process_pending_saves();
             xSemaphoreGive(sd_spi_mutex);
+        }
+
+        // Flush GPS position to NVS from main-task context (throttled inside the function).
+        // nvs_commit() briefly disables the flash cache; calling it from a background task
+        // (gps_task) while the panic handler is in flash causes CPU_LOCKUP — do it here instead.
+        if (g_gps_save_pending) {
+            g_gps_save_pending = false;
+            nvs_save_last_gps(&g_gps_last_known);
         }
         
         vTaskDelay(pdMS_TO_TICKS(sleep_ms > 10 ? 10 : sleep_ms));
@@ -7751,37 +8016,41 @@ static void ducb_update(int channel_idx, double reward) {
 static void wdp_ducb_init(void) {
     wdp_ducb_channel_count = 0;
     wdp_ducb_discounted_total = 0.0;
-    for (int i = 0; i < (int)WDP_CH_24_PRIMARY_COUNT; i++) {
-        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_24_primary[i];
-        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_24_PRIMARY;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.5;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
-        wdp_ducb_channel_count++;
+    if (g_wd_band != WD_BAND_5G) {
+        for (int i = 0; i < (int)WDP_CH_24_PRIMARY_COUNT; i++) {
+            wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_24_primary[i];
+            wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_24_PRIMARY;
+            wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.5;
+            wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
+            wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
+            wdp_ducb_channel_count++;
+        }
+        for (int i = 0; i < (int)WDP_CH_24_SECONDARY_COUNT; i++) {
+            wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_24_secondary[i];
+            wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_24_SECONDARY;
+            wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
+            wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
+            wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
+            wdp_ducb_channel_count++;
+        }
     }
-    for (int i = 0; i < (int)WDP_CH_24_SECONDARY_COUNT; i++) {
-        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_24_secondary[i];
-        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_24_SECONDARY;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
-        wdp_ducb_channel_count++;
-    }
-    for (int i = 0; i < (int)WDP_CH_5_NON_DFS_COUNT; i++) {
-        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_5_non_dfs[i];
-        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_5_NON_DFS;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
-        wdp_ducb_channel_count++;
-    }
-    for (int i = 0; i < (int)WDP_CH_5_DFS_COUNT; i++) {
-        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_5_dfs[i];
-        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_5_DFS;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
-        wdp_ducb_channel_count++;
+    if (g_wd_band != WD_BAND_24G) {
+        for (int i = 0; i < (int)WDP_CH_5_NON_DFS_COUNT; i++) {
+            wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_5_non_dfs[i];
+            wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_5_NON_DFS;
+            wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
+            wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
+            wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
+            wdp_ducb_channel_count++;
+        }
+        for (int i = 0; i < (int)WDP_CH_5_DFS_COUNT; i++) {
+            wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_5_dfs[i];
+            wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_5_DFS;
+            wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
+            wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
+            wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
+            wdp_ducb_channel_count++;
+        }
     }
 }
 
@@ -8212,6 +8481,275 @@ static int wdp_find_bssid(const uint8_t *bssid) {
     return -1;
 }
 
+// ─── Wardrive GPS mark (waypoint) functions ───────────────────────────────
+
+static void wd_save_mark(const char *note)
+{
+    const gps_data_t *g = gps_best();
+    if (!g->valid) {
+        ESP_LOGW(TAG, "Mark: no GPS fix and no last-known position, skipping");
+        return;
+    }
+
+    // Open file on first mark (GPX header)
+    if (!wd_marks_file) {
+        if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+            wd_marks_file = fopen(wd_marks_fname, "w");
+            if (wd_marks_file) {
+                fprintf(wd_marks_file,
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                    "<gpx version=\"1.1\" creator=\"JANOS NM-CYD-C5 %s\">\n",
+                    FW_VERSION);
+                fflush(wd_marks_file);
+            }
+            xSemaphoreGive(sd_spi_mutex);
+        }
+        if (!wd_marks_file) {
+            ESP_LOGE(TAG, "Mark: cannot open %s", wd_marks_fname);
+            return;
+        }
+    }
+
+    wd_mark_count++;
+
+    // Build timestamp string from GPS UTC if available, otherwise blank
+    char ts[32] = "1970-01-01T00:00:00Z";
+    if (current_gps.time_utc[0]) {
+        // GPS gives HH:MM:SS — use date 0000 placeholder (no date from NMEA here)
+        snprintf(ts, sizeof(ts), "0000-01-01T%sZ", current_gps.time_utc);
+    }
+
+    // Sanitize note for XML (replace < > & with entities)
+    char safe_note[128] = "";
+    if (note && note[0]) {
+        int j = 0;
+        for (int i = 0; note[i] && j < (int)sizeof(safe_note) - 7; i++) {
+            if (note[i] == '<')      { memcpy(safe_note+j, "&lt;",  4); j+=4; }
+            else if (note[i] == '>') { memcpy(safe_note+j, "&gt;",  4); j+=4; }
+            else if (note[i] == '&') { memcpy(safe_note+j, "&amp;", 5); j+=5; }
+            else                     { safe_note[j++] = note[i]; }
+        }
+        safe_note[j] = '\0';
+    }
+
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        fprintf(wd_marks_file,
+            "<wpt lat=\"%.7f\" lon=\"%.7f\">\n"
+            "  <ele>%.1f</ele>\n"
+            "  <time>%s</time>\n"
+            "  <name>WP%d</name>\n"
+            "  <desc>%s%s</desc>\n"
+            "</wpt>\n",
+            (double)g->latitude,
+            (double)g->longitude,
+            (double)g->altitude,
+            ts,
+            wd_mark_count,
+            safe_note,
+            current_gps.valid ? "" : " [stale pos]");
+        fflush(wd_marks_file);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    ESP_LOGI(TAG, "Mark WP%d saved: %.6f,%.6f  \"%s\"%s",
+             wd_mark_count, (double)g->latitude, (double)g->longitude,
+             safe_note[0] ? safe_note : "(quick)",
+             current_gps.valid ? "" : " [stale pos]");
+}
+
+// Note dialog: Save button
+static void wd_mark_note_save_cb(lv_event_t *e)
+{
+    (void)e;
+    const char *note = "";
+    if (wd_mark_note_ta && lv_obj_is_valid(wd_mark_note_ta))
+        note = lv_textarea_get_text(wd_mark_note_ta);
+    if (wd_mark_note_overlay && lv_obj_is_valid(wd_mark_note_overlay)) {
+        lv_obj_del(wd_mark_note_overlay);
+    }
+    wd_mark_note_overlay = NULL;
+    wd_mark_note_ta = NULL;
+    wd_save_mark(note);
+}
+
+// Note dialog: Cancel button
+static void wd_mark_note_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    if (wd_mark_note_overlay && lv_obj_is_valid(wd_mark_note_overlay)) {
+        lv_obj_del(wd_mark_note_overlay);
+    }
+    wd_mark_note_overlay = NULL;
+    wd_mark_note_ta = NULL;
+}
+
+static void wd_mark_open_note_dialog(void)
+{
+    if (wd_mark_note_overlay) return;  // already open
+
+    wd_mark_note_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(wd_mark_note_overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(wd_mark_note_overlay, 0, 0);
+    lv_obj_set_style_bg_color(wd_mark_note_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(wd_mark_note_overlay, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(wd_mark_note_overlay, 0, 0);
+    lv_obj_set_style_pad_all(wd_mark_note_overlay, 0, 0);
+    lv_obj_clear_flag(wd_mark_note_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(wd_mark_note_overlay, 0, 0);
+
+    // Keyboard at the bottom of the overlay (same pattern as every other keyboard screen)
+    lv_obj_t *kb = lv_keyboard_create(wd_mark_note_overlay);
+    lv_obj_set_width(kb, LCD_H_RES);
+    lv_obj_set_style_text_font(kb, &lv_font_montserrat_12, 0);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+
+    // Card sits above the keyboard
+    lv_obj_t *card = lv_obj_create(wd_mark_note_overlay);
+    lv_obj_set_size(card, LCD_H_RES - 16, LV_SIZE_CONTENT);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 4);
+    lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(card, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 8, 0);
+    lv_obj_set_style_pad_row(card, 6, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, LV_SYMBOL_GPS "  Mark Waypoint");
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+
+    char coord_buf[64];
+    {
+        const gps_data_t *cg = gps_best();
+        if (cg->valid)
+            snprintf(coord_buf, sizeof(coord_buf), "%.5f, %.5f%s",
+                     (double)cg->latitude, (double)cg->longitude,
+                     current_gps.valid ? "" : " [stale]");
+        else
+            snprintf(coord_buf, sizeof(coord_buf), "No GPS");
+    }
+    lv_obj_t *coord_lbl = lv_label_create(card);
+    lv_label_set_text(coord_lbl, coord_buf);
+    lv_obj_set_style_text_color(coord_lbl, current_gps.valid ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_text_font(coord_lbl, &lv_font_montserrat_12, 0);
+
+    // Note text area — linked to keyboard
+    wd_mark_note_ta = lv_textarea_create(card);
+    lv_obj_set_width(wd_mark_note_ta, LCD_H_RES - 32);
+    lv_obj_set_height(wd_mark_note_ta, 36);
+    lv_textarea_set_max_length(wd_mark_note_ta, 60);
+    lv_textarea_set_one_line(wd_mark_note_ta, true);
+    lv_textarea_set_placeholder_text(wd_mark_note_ta, "Note (optional)...");
+    lv_obj_set_style_text_font(wd_mark_note_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(wd_mark_note_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(wd_mark_note_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(wd_mark_note_ta, COLOR_MATERIAL_AMBER, 0);
+    lv_keyboard_set_textarea(kb, wd_mark_note_ta);
+
+    // Cancel / Save buttons
+    lv_obj_t *btn_row = lv_obj_create(card);
+    lv_obj_set_size(btn_row, LCD_H_RES - 32, 30);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel_btn, 90, 26);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_make(70, 70, 70), 0);
+    lv_obj_set_style_radius(cancel_btn, 6, 0);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, LV_SYMBOL_CLOSE "  Cancel");
+    lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(cancel_lbl);
+    lv_obj_add_event_cb(cancel_btn, wd_mark_note_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *save_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(save_btn, 90, 26);
+    lv_obj_set_style_bg_color(save_btn, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_bg_color(save_btn, lv_color_make(200, 140, 0), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(save_btn, 6, 0);
+    lv_obj_t *save_lbl = lv_label_create(save_btn);
+    lv_label_set_text(save_lbl, LV_SYMBOL_OK "  Save");
+    lv_obj_set_style_text_font(save_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(save_lbl);
+    lv_obj_add_event_cb(save_btn, wd_mark_note_save_cb, LV_EVENT_CLICKED, NULL);
+}
+
+static void wd_mark_timer_cb(lv_timer_t *t)
+{
+    lv_timer_del(t);
+    wd_mark_timer = NULL;
+    int taps = wd_mark_tap_count;
+    wd_mark_tap_count = 0;
+    if (taps >= 2) {
+        // Double-tap: quick mark, no note
+        wd_save_mark("");
+    } else {
+        // Single tap: open note dialog
+        wd_mark_open_note_dialog();
+    }
+}
+
+static void wd_mark_tap_cb(lv_event_t *e)
+{
+    (void)e;
+    wd_mark_tap_count++;
+    if (wd_mark_timer) {
+        lv_timer_reset(wd_mark_timer);  // extend window on each tap
+    } else {
+        wd_mark_timer = lv_timer_create(wd_mark_timer_cb, 450, NULL);
+        lv_timer_set_repeat_count(wd_mark_timer, 1);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+// BLE GAP callback used during wardrive BLE time-slice passes
+static int wdp_ble_gap_cb(struct ble_gap_event *event, void *arg)
+{
+    (void)arg;
+    if (event->type != BLE_GAP_EVENT_DISC) return 0;
+    struct ble_gap_disc_desc *desc = &event->disc;
+    if (!wdp_ble_devices) return 0;
+
+    // Dedup by MAC
+    int cnt = wdp_ble_count;
+    for (int i = 0; i < cnt; i++)
+        if (memcmp(wdp_ble_devices[i].mac, desc->addr.val, 6) == 0) return 0;
+
+    if (cnt >= WDP_BLE_MAX_DEVICES) return 0;
+
+    wdp_ble_device_t *dev = &wdp_ble_devices[cnt];
+    memcpy(dev->mac, desc->addr.val, 6);
+    dev->rssi      = desc->rssi;
+    {
+        const gps_data_t *g = gps_best();
+        dev->latitude  = g->latitude;
+        dev->longitude = g->longitude;
+    }
+    dev->name[0]   = '\0';
+    dev->written   = false;
+
+    struct ble_hs_adv_fields fields;
+    if (ble_hs_adv_parse_fields(&fields, desc->data, desc->length_data) == 0
+        && fields.name && fields.name_len > 0) {
+        int nl = fields.name_len < 31 ? fields.name_len : 31;
+        memcpy(dev->name, fields.name, nl);
+        dev->name[nl] = '\0';
+    }
+
+    wdp_ble_count = cnt + 1;
+    return 0;
+}
+
 static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     if (!wardrive_active) return;
     if (type != WIFI_PKT_MGMT) return;
@@ -8274,8 +8812,12 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     wdp_seen_networks[idx].rssi = (int8_t)pkt->rx_ctrl.rssi;
     wdp_seen_networks[idx].authmode = authmode;
     wdp_seen_networks[idx].written_to_file = false;
-    wdp_seen_networks[idx].latitude = current_gps.valid ? current_gps.latitude : 0.0f;
-    wdp_seen_networks[idx].longitude = current_gps.valid ? current_gps.longitude : 0.0f;
+    {
+        const gps_data_t *g = gps_best();
+        wdp_seen_networks[idx].latitude  = g->valid ? g->latitude  : 0.0f;
+        wdp_seen_networks[idx].longitude = g->valid ? g->longitude : 0.0f;
+        wdp_seen_networks[idx].accuracy  = g->valid ? gps_best_accuracy() : 0.0f;
+    }
     wdp_seen_count++;
     wdp_dwell_new_networks++;
 }
@@ -9218,33 +9760,44 @@ static void wardrive_promisc_task(void *pvParameters) {
     ESP_LOGI(TAG, "Wardrive promisc task started");
 
     wardrive_file_counter = (int)(esp_timer_get_time() / 1000000);
+    snprintf(wd_marks_fname, sizeof(wd_marks_fname),
+             "/sdcard/lab/wardrives/wd%d_marks.gpx", wardrive_file_counter);
 
     wdp_seen_count = 0;
     wdp_dwell_new_networks = 0;
     wdp_needs_grow = false;
     if (wdp_seen_networks) memset(wdp_seen_networks, 0, (size_t)wdp_seen_capacity * sizeof(wdp_network_t));
 
-    ESP_LOGI(TAG, "Waiting for GPS fix...");
-    while (wardrive_active && !current_gps.valid) {
-        int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(200));
-        if (len > 0) {
-            wardrive_gps_buffer[len] = '\0';
-            char *line = strtok(wardrive_gps_buffer, "\r\n");
-            while (line != NULL) {
-                parse_gps_nmea(line);
-                line = strtok(NULL, "\r\n");
+    if (!current_gps.valid) {
+        if (g_gps_last_known.valid) {
+            ESP_LOGI(TAG, "Wardrive: using last-known GPS (%.6f, %.6f, accuracy %.0fm) while awaiting fix",
+                     (double)g_gps_last_known.latitude, (double)g_gps_last_known.longitude,
+                     (double)GPS_STALE_ACCURACY_M);
+        } else {
+            ESP_LOGI(TAG, "Waiting for GPS fix...");
+            while (wardrive_active && !current_gps.valid) {
+                int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(200));
+                if (len > 0) {
+                    wardrive_gps_buffer[len] = '\0';
+                    char *line = strtok(wardrive_gps_buffer, "\r\n");
+                    while (line != NULL) { parse_gps_nmea(line); line = strtok(NULL, "\r\n"); }
+                }
+                wd_ui_update_flag = true;
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
+            if (!wardrive_active) {
+                wardrive_task_handle = NULL;
+                vTaskDelete(NULL);
+                return;
             }
         }
-        wd_ui_update_flag = true;
-        vTaskDelay(pdMS_TO_TICKS(500));
     }
-    if (!wardrive_active) {
-        wardrive_task_handle = NULL;
-        vTaskDelete(NULL);
-        return;
+    {
+        const gps_data_t *g = gps_best();
+        ESP_LOGI(TAG, "GPS ready: Lat:%.6f Lon:%.6f Sats:%d%s",
+                 (double)g->latitude, (double)g->longitude, current_gps.satellites,
+                 current_gps.valid ? "" : " [STALE]");
     }
-    ESP_LOGI(TAG, "GPS fix obtained! Lat:%.6f Lon:%.6f Sats:%d",
-             current_gps.latitude, current_gps.longitude, current_gps.satellites);
 
     if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
     struct stat st = {0};
@@ -9255,7 +9808,7 @@ static void wardrive_promisc_task(void *pvParameters) {
     if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
 
     char filename[64];
-    snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/w%d.log", wardrive_file_counter);
+    snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/wd%d.csv", wardrive_file_counter);
 
     if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
     FILE *file = fopen(filename, "w");
@@ -9267,12 +9820,20 @@ static void wardrive_promisc_task(void *pvParameters) {
         vTaskDelete(NULL);
         return;
     }
-    fprintf(file, "WigleWifi-1.4,appRelease=v1.1,model=Gen4,release=v1.0,device=Gen4Board\n");
-    fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n");
+    fprintf(file, "WigleWifi-1.6,appRelease=%s,model=NM-CYD-C5,release=%s,device=CheapYellowMonster,display=240x320,board=ESP32C5,brand=JanOS\n",
+            FW_VERSION, FW_VERSION);
+    fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type\n");
     fflush(file);
     if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
 
     wdp_ducb_init();
+
+    // Allocate BLE device table in PSRAM (used only if g_wd_ble enabled)
+    if (g_wd_ble && !wdp_ble_devices) {
+        wdp_ble_devices = heap_caps_calloc(WDP_BLE_MAX_DEVICES, sizeof(wdp_ble_device_t),
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    wdp_ble_count = 0;
 
     wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
     esp_wifi_set_promiscuous_filter(&filt);
@@ -9280,6 +9841,7 @@ static void wardrive_promisc_task(void *pvParameters) {
     esp_wifi_set_promiscuous(true);
 
     int64_t last_stats_us = esp_timer_get_time();
+    int64_t last_ble_us   = esp_timer_get_time();
     int networks_since_flush = 0;
 
     while (wardrive_active) {
@@ -9301,20 +9863,28 @@ static void wardrive_promisc_task(void *pvParameters) {
         }
 
         if (!current_gps.valid) {
-            ESP_LOGI(TAG, "[WDP] GPS fix lost, pausing promisc...");
-            esp_wifi_set_promiscuous(false);
-            while (wardrive_active && !current_gps.valid) {
-                len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(200));
-                if (len > 0) {
-                    wardrive_gps_buffer[len] = '\0';
-                    char *l = strtok(wardrive_gps_buffer, "\r\n");
-                    while (l) { parse_gps_nmea(l); l = strtok(NULL, "\r\n"); }
+            if (g_gps_last_known.valid) {
+                // Hold last-known position — continue scanning without pausing
+                ESP_LOGD(TAG, "[WDP] GPS fix lost; holding last-known (%.6f, %.6f, acc %.0fm)",
+                         (double)g_gps_last_known.latitude, (double)g_gps_last_known.longitude,
+                         (double)GPS_STALE_ACCURACY_M);
+            } else {
+                // No fallback at all — must pause until re-acquired
+                ESP_LOGI(TAG, "[WDP] GPS fix lost (no last-known), pausing promisc...");
+                esp_wifi_set_promiscuous(false);
+                while (wardrive_active && !current_gps.valid) {
+                    len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(200));
+                    if (len > 0) {
+                        wardrive_gps_buffer[len] = '\0';
+                        char *l = strtok(wardrive_gps_buffer, "\r\n");
+                        while (l) { parse_gps_nmea(l); l = strtok(NULL, "\r\n"); }
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(500));
                 }
-                vTaskDelay(pdMS_TO_TICKS(500));
+                if (!wardrive_active) break;
+                ESP_LOGI(TAG, "[WDP] GPS fix re-acquired, resuming promisc.");
+                esp_wifi_set_promiscuous(true);
             }
-            if (!wardrive_active) break;
-            ESP_LOGI(TAG, "[WDP] GPS fix re-acquired, resuming promisc.");
-            esp_wifi_set_promiscuous(true);
         }
 
         if (wdp_needs_grow) wdp_grow_network_buffer();
@@ -9322,6 +9892,49 @@ static void wardrive_promisc_task(void *pvParameters) {
         double reward = (double)wdp_dwell_new_networks;
         wdp_ducb_update(ch_idx, reward);
         wd_ui_update_flag = true;
+
+        // ── BLE time-slice pass ──────────────────────────────────
+        if (g_wd_ble && wdp_ble_devices &&
+            (esp_timer_get_time() - last_ble_us) >= (int64_t)WDP_BLE_INTERVAL_S * 1000000LL) {
+            last_ble_us = esp_timer_get_time();
+
+            // Pause WiFi promiscuous
+            esp_wifi_set_promiscuous(false);
+
+            // Switch to BLE
+            if (ensure_ble_mode()) {
+                wdp_current_channel = -1;  // signal UI: BLE pass in progress
+                wd_ui_update_flag = true;
+
+                struct ble_gap_disc_params bp = {
+                    .itvl = 0x60, .window = 0x60,
+                    .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
+                    .limited = 0, .passive = 0, .filter_duplicates = 0,
+                };
+                if (ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &bp,
+                                 wdp_ble_gap_cb, NULL) == 0) {
+                    vTaskDelay(pdMS_TO_TICKS(WDP_BLE_DWELL_MS));
+                    ble_gap_disc_cancel();
+                }
+            }
+
+            if (!wardrive_active) break;
+
+            // Switch back to WiFi
+            ensure_wifi_mode();
+            wifi_country_t wifi_country = {
+                .cc = "PH", .schan = 1, .nchan = 14,
+                .policy = WIFI_COUNTRY_POLICY_AUTO,
+            };
+            esp_wifi_set_country(&wifi_country);
+            apply_wifi_power_settings();
+            wdp_ducb_init();  // rebuild channel list after reinit
+
+            esp_wifi_set_promiscuous_filter(&filt);
+            esp_wifi_set_promiscuous_rx_cb(wdp_promiscuous_cb);
+            esp_wifi_set_promiscuous(true);
+        }
+        // ─────────────────────────────────────────────────────────
 
         if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
         char timestamp[32];
@@ -9336,12 +9949,37 @@ static void wardrive_promisc_task(void *pvParameters) {
             char escaped_ssid[64];
             escape_csv_field(net->ssid, escaped_ssid, sizeof(escaped_ssid));
             const char *auth = get_auth_mode_wiggle(net->authmode);
-            fprintf(file, "%s,%s,[%s],%s,%d,%d,%.7f,%.7f,0.00,0.00,WIFI\n",
+            int freq = (net->channel >= 1 && net->channel <= 13) ?
+                       2412 + (net->channel - 1) * 5 :
+                       (net->channel == 14) ? 2484 :
+                       (net->channel >= 36)  ? 5000 + 5 * net->channel : 0;
+            fprintf(file, "%s,%s,[%s],%s,%d,%d,%d,%.7f,%.7f,0.00,%.2f,,,WIFI\n",
                     mac_str, escaped_ssid, auth, timestamp,
-                    net->channel, net->rssi, net->latitude, net->longitude);
+                    net->channel, freq, net->rssi, net->latitude, net->longitude,
+                    (double)net->accuracy);
             net->written_to_file = true;
             networks_since_flush++;
         }
+        // Write any newly discovered BLE devices
+        if (g_wd_ble && wdp_ble_devices) {
+            int ble_cnt = wdp_ble_count;
+            for (int i = 0; i < ble_cnt; i++) {
+                if (wdp_ble_devices[i].written) continue;
+                wdp_ble_device_t *bd = &wdp_ble_devices[i];
+                char ble_mac[18];
+                snprintf(ble_mac, sizeof(ble_mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                         bd->mac[5], bd->mac[4], bd->mac[3],
+                         bd->mac[2], bd->mac[1], bd->mac[0]);
+                char ble_name[64];
+                escape_csv_field(bd->name[0] ? bd->name : "[BLE]", ble_name, sizeof(ble_name));
+                fprintf(file, "%s,%s,[BLE],%s,37,2402,%d,%.7f,%.7f,0.00,0.00,,,BLE\n",
+                        ble_mac, ble_name, timestamp,
+                        bd->rssi, bd->latitude, bd->longitude);
+                bd->written = true;
+                networks_since_flush++;
+            }
+        }
+
         if (networks_since_flush >= WDP_FILE_FLUSH_INTERVAL) {
             fflush(file);
             networks_since_flush = 0;
@@ -9363,9 +10001,15 @@ static void wardrive_promisc_task(void *pvParameters) {
     if (file) { fflush(file); fclose(file); }
     if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
 
+    if (wdp_ble_devices) {
+        heap_caps_free(wdp_ble_devices);
+        wdp_ble_devices = NULL;
+    }
+    wdp_ble_count = 0;
+
     wardrive_active = false;
     wardrive_task_handle = NULL;
-    ESP_LOGI(TAG, "Wardrive promisc stopped. Total networks: %d. File: w%d.log",
+    ESP_LOGI(TAG, "Wardrive promisc stopped. Total networks: %d. File: wd%d.csv",
              wdp_seen_count, wardrive_file_counter);
     vTaskDelete(NULL);
 }
@@ -9377,7 +10021,10 @@ static void wd_ui_timer_cb(lv_timer_t *timer) {
 
     if (wd_ui_channel_label) {
         char wd_ch_buf[16];
-        snprintf(wd_ch_buf, sizeof(wd_ch_buf), "CH %d", wdp_current_channel);
+        if (wdp_current_channel < 0)
+            snprintf(wd_ch_buf, sizeof(wd_ch_buf), "BLE");
+        else
+            snprintf(wd_ch_buf, sizeof(wd_ch_buf), "CH %d", wdp_current_channel);
         lv_label_set_text(wd_ui_channel_label, wd_ch_buf);
     }
 
@@ -9572,10 +10219,14 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_set_scrollbar_mode(wd_ui_table, LV_SCROLLBAR_MODE_AUTO);
     lv_table_set_row_cnt(wd_ui_table, 1);
 
-    // ─── Stop button (bottom center) ─────────────────────────────
+    // ─── Bottom button row: [Stop] [Mark] ────────────────────────
+    wd_mark_count = 0;
+    wd_marks_file = NULL;
+    wd_marks_fname[0] = '\0';  // task will fill this in once counter is set
+
     wardrive_stop_btn = lv_btn_create(function_page);
-    lv_obj_set_size(wardrive_stop_btn, 110, 30);
-    lv_obj_align(wardrive_stop_btn, LV_ALIGN_BOTTOM_MID, 0, -5);
+    lv_obj_set_size(wardrive_stop_btn, 108, 30);
+    lv_obj_align(wardrive_stop_btn, LV_ALIGN_BOTTOM_MID, -60, -5);
     lv_obj_set_style_bg_color(wardrive_stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(wardrive_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(wardrive_stop_btn, 0, 0);
@@ -9594,6 +10245,29 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(stop_lbl, ui_text_color(), 0);
     lv_obj_add_event_cb(wardrive_stop_btn, wardrive_stop_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    // Mark button — double-tap for quick mark, single tap opens note dialog
+    lv_obj_t *mark_btn = lv_btn_create(function_page);
+    lv_obj_set_size(mark_btn, 108, 30);
+    lv_obj_align(mark_btn, LV_ALIGN_BOTTOM_MID, 60, -5);
+    lv_obj_set_style_bg_color(mark_btn, COLOR_MATERIAL_AMBER, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(mark_btn, lv_color_make(200, 140, 0), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(mark_btn, 0, 0);
+    lv_obj_set_style_radius(mark_btn, 8, 0);
+    lv_obj_set_style_shadow_width(mark_btn, 4, 0);
+    lv_obj_set_style_shadow_color(mark_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_flex_flow(mark_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(mark_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(mark_btn, 6, 0);
+    lv_obj_t *pin_icon = lv_label_create(mark_btn);
+    lv_label_set_text(pin_icon, LV_SYMBOL_GPS);
+    lv_obj_set_style_text_font(pin_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(pin_icon, lv_color_black(), 0);
+    lv_obj_t *mark_lbl = lv_label_create(mark_btn);
+    lv_label_set_text(mark_lbl, "Mark");
+    lv_obj_set_style_text_font(mark_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(mark_lbl, lv_color_black(), 0);
+    lv_obj_add_event_cb(mark_btn, wd_mark_tap_cb, LV_EVENT_CLICKED, NULL);
 
     // ─── Start timer for UI updates ──────────────────────────────
     wd_ui_timer = lv_timer_create(wd_ui_timer_cb, 1000, NULL);
@@ -9666,6 +10340,23 @@ static void wardrive_stop_btn_cb(lv_event_t *e)
     wd_ui_header = NULL;
     wd_ui_table = NULL;
     wdp_current_channel = 0;
+
+    // Close marks file (write GPX footer)
+    if (wd_mark_timer) { lv_timer_del(wd_mark_timer); wd_mark_timer = NULL; }
+    wd_mark_tap_count = 0;
+    if (wd_mark_note_overlay && lv_obj_is_valid(wd_mark_note_overlay)) {
+        lv_obj_del(wd_mark_note_overlay);
+    }
+    wd_mark_note_overlay = NULL;
+    wd_mark_note_ta = NULL;
+    if (wd_marks_file) {
+        if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+            fprintf(wd_marks_file, "</gpx>\n");
+            fclose(wd_marks_file);
+            xSemaphoreGive(sd_spi_mutex);
+        }
+        wd_marks_file = NULL;
+    }
 
     nav_to_menu_flag = true;
 }
@@ -11240,7 +11931,7 @@ static void main_tile_event_cb(lv_event_t *e)
     } else if (strcmp(tile_name, "Bluetooth") == 0) {
         show_bluetooth_screen();
     } else if (strcmp(tile_name, "Wardrive") == 0) {
-        wardrive_start_btn_cb(NULL);
+        show_wardrive_menu_screen();
     } else if (strcmp(tile_name, "Go Dark") == 0) {
         show_go_dark_confirm();
     }
@@ -13577,9 +14268,8 @@ static int wpasec_upload_file(const char *filepath, const char *filename)
         "\r\n",
         wpasec_api_key, boundary, body_total_len);
 
-    // Open TLS connection - skip server cert verification
     esp_tls_cfg_t tls_cfg = {
-        .crt_bundle_attach = NULL,
+        .crt_bundle_attach = esp_crt_bundle_attach,
         .timeout_ms = 15000,
     };
 
@@ -14720,14 +15410,23 @@ static void s_fileserv_poll_ip_cb(lv_timer_t *t)
     if (!netif) return;
     esp_netif_ip_info_t ip;
     if (esp_netif_get_ip_info(netif, &ip) == ESP_OK && ip.ip.addr != 0) {
+        lv_timer_del(t);
+        s_fileserv_poll_timer = NULL;
+
+        if (s_wdup_pending_after_wifi) {
+            // Came from the upload screen — go back and auto-start the upload.
+            s_wdup_pending_after_wifi = false;
+            show_wardrive_upload_screen();
+            wdup_start_cb(NULL);
+            return;
+        }
+
         char ip_str[64];
         snprintf(ip_str, sizeof(ip_str), "IP: " IPSTR " => http://" IPSTR,
                  IP2STR(&ip.ip), IP2STR(&ip.ip));
         if (s_fileserv_ip_lbl)     lv_label_set_text(s_fileserv_ip_lbl, ip_str);
         if (s_fileserv_status_lbl) lv_label_set_text(s_fileserv_status_lbl, "Server active");
         s_fileserv_httpd_start();
-        lv_timer_del(t);
-        s_fileserv_poll_timer = NULL;
     }
 }
 
@@ -14737,6 +15436,11 @@ static void s_fileserv_stop_cb(lv_event_t *e)
     (void)e;
     if (s_fileserv_poll_timer) { lv_timer_del(s_fileserv_poll_timer); s_fileserv_poll_timer = NULL; }
     s_fileserv_httpd_stop();
+    if (s_wdup_pending_after_wifi) {
+        s_wdup_pending_after_wifi = false;
+        show_wardrive_upload_screen();
+        return;
+    }
     show_settings_screen();
 }
 
@@ -14887,7 +15591,7 @@ static void s_wcs_connect_cb(lv_event_t *e)
 
 static void show_wifi_client_server_screen(void)
 {
-    create_function_page_base("WiFi File Server");
+    create_function_page_base(s_wdup_pending_after_wifi ? "WiFi for Upload" : "WiFi File Server");
     apply_menu_bg();
 
     lv_obj_t *content = lv_obj_create(function_page);
@@ -15001,6 +15705,1427 @@ static void show_wifi_client_server_screen(void)
     s_wcs_active_ta = s_wcs_ssid_ta;
 }
 
+// ============================================================================
+// Wardrive Upload Implementation (WiGLE + WDG Wars)
+// ============================================================================
+
+static void wdup_push_msg(const char *text, lv_color_t color)
+{
+    if (!wdup_ui_queue) return;
+    wdup_ui_msg_t m;
+    strncpy(m.text, text, sizeof(m.text) - 1);
+    m.text[sizeof(m.text) - 1] = '\0';
+    m.color = color;
+    xQueueSend(wdup_ui_queue, &m, pdMS_TO_TICKS(200));
+}
+
+static int wdup_tls_write_all(esp_tls_t *tls, const char *buf, int len)
+{
+    int written = 0;
+    while (written < len) {
+        int ret = esp_tls_conn_write(tls, buf + written, len - written);
+        if (ret < 0) return ret;
+        written += ret;
+    }
+    return written;
+}
+
+// Returns 0=ok, 1=duplicate, -1=error
+static int wdup_upload_one(const char *filepath, const char *filename,
+                            bool use_wigle)
+{
+    // Read file into PSRAM buffer
+    uint8_t *fbuf = NULL;
+    long fsize = 0;
+
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        FILE *f = fopen(filepath, "rb");
+        if (!f) { xSemaphoreGive(sd_spi_mutex); return -1; }
+        fseek(f, 0, SEEK_END); fsize = ftell(f); fseek(f, 0, SEEK_SET);
+        if (fsize <= 0 || fsize > 8 * 1024 * 1024) {
+            fclose(f); xSemaphoreGive(sd_spi_mutex); return -1;
+        }
+        fbuf = (uint8_t *)heap_caps_malloc((size_t)fsize, MALLOC_CAP_SPIRAM);
+        if (!fbuf) fbuf = (uint8_t *)malloc((size_t)fsize);
+        if (!fbuf) { fclose(f); xSemaphoreGive(sd_spi_mutex); return -1; }
+        size_t nr = fread(fbuf, 1, (size_t)fsize, f);
+        fclose(f);
+        xSemaphoreGive(sd_spi_mutex);
+        if (nr != (size_t)fsize) { free(fbuf); return -1; }
+    } else {
+        return -1;
+    }
+
+    // Build multipart body
+    char boundary[32];
+    snprintf(boundary, sizeof(boundary), "----CYMNM%lu", (unsigned long)(esp_timer_get_time() / 1000));
+
+    char body_start[320];
+    int  bs_len = snprintf(body_start, sizeof(body_start),
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
+        "Content-Type: text/csv\r\n\r\n",
+        boundary, filename);
+
+    char body_end[64];
+    int  be_len = snprintf(body_end, sizeof(body_end), "\r\n--%s--\r\n", boundary);
+
+    int body_total = bs_len + (int)fsize + be_len;
+
+    // Build HTTP headers
+    const char *host = use_wigle ? WIGLE_HOST : WDGWARS_HOST;
+    const char *path = use_wigle ? WIGLE_UPLOAD_PATH : WDGWARS_UPLOAD_PATH;
+    const char *key  = use_wigle ? wigle_api_key : wdgwars_api_key;
+
+    char http_hdr[640];
+    int  hdr_len;
+    if (use_wigle) {
+        hdr_len = snprintf(http_hdr, sizeof(http_hdr),
+            "POST %s HTTP/1.1\r\n"
+            "Host: %s\r\n"
+            "Authorization: Basic %s\r\n"
+            "Content-Type: multipart/form-data; boundary=%s\r\n"
+            "Content-Length: %d\r\n"
+            "User-Agent: CheapYellowMonster/" FW_VERSION "\r\n"
+            "Connection: close\r\n\r\n",
+            path, host, key, boundary, body_total);
+    } else {
+        hdr_len = snprintf(http_hdr, sizeof(http_hdr),
+            "POST %s HTTP/1.1\r\n"
+            "Host: %s\r\n"
+            "X-API-Key: %s\r\n"
+            "Content-Type: multipart/form-data; boundary=%s\r\n"
+            "Content-Length: %d\r\n"
+            "User-Agent: CheapYellowMonster/" FW_VERSION "\r\n"
+            "Connection: close\r\n\r\n",
+            path, host, key, boundary, body_total);
+    }
+
+    esp_tls_cfg_t cfg = { .crt_bundle_attach = esp_crt_bundle_attach, .timeout_ms = 20000 };
+    esp_tls_t *tls = esp_tls_init();
+    if (!tls) { free(fbuf); return -1; }
+
+    char url[128];
+    snprintf(url, sizeof(url), "https://%s%s", host, path);
+    if (esp_tls_conn_http_new_sync(url, &cfg, tls) < 0) {
+        esp_tls_conn_destroy(tls); free(fbuf); return -1;
+    }
+
+    int ok = 1;
+    if (wdup_tls_write_all(tls, http_hdr, hdr_len) < 0) ok = 0;
+    if (ok && wdup_tls_write_all(tls, body_start, bs_len) < 0) ok = 0;
+    if (ok && wdup_tls_write_all(tls, (const char *)fbuf, (int)fsize) < 0) ok = 0;
+    if (ok && wdup_tls_write_all(tls, body_end, be_len) < 0) ok = 0;
+    free(fbuf);
+
+    if (!ok) { esp_tls_conn_destroy(tls); return -1; }
+
+    // Read response
+    char resp[768] = {0};
+    int  rlen = 0;
+    while (rlen < (int)sizeof(resp) - 1) {
+        int r = esp_tls_conn_read(tls, resp + rlen, sizeof(resp) - 1 - rlen);
+        if (r <= 0) break;
+        rlen += r;
+    }
+    resp[rlen] = '\0';
+    esp_tls_conn_destroy(tls);
+
+    // Parse HTTP status
+    int status = 0;
+    if (rlen > 12 && strncmp(resp, "HTTP/", 5) == 0) {
+        const char *sp = strchr(resp, ' ');
+        if (sp) status = atoi(sp + 1);
+    }
+    ESP_LOGI(TAG, "WDUP [%s] %s -> HTTP %d",
+             use_wigle ? "WiGLE" : "WDG", filename, status);
+
+    if (status == 200) {
+        // Check for already-submitted (WiGLE) or duplicate (WDG)
+        if (strstr(resp, "already") || strstr(resp, "duplicate") || strstr(resp, "DUPE"))
+            return 1;
+        return 0;
+    }
+    if (status == 409) return 1; // conflict = duplicate on WDG
+    return -1;
+}
+
+static bool wdup_ensure_wifi(void)
+{
+    wifi_ap_record_t ap;
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+
+    // Helper: poll until DHCP gives us a non-zero IP (up to wait_ms ms).
+    // L2 association alone is not enough — DNS fails until the IP lease is live.
+    #define WDUP_WAIT_IP_MS(ms) do { \
+        int _ticks = (ms) / 100; \
+        if (sta_netif) { \
+            for (int _i = 0; _i < _ticks; _i++) { \
+                esp_netif_ip_info_t _ip; \
+                if (esp_netif_get_ip_info(sta_netif, &_ip) == ESP_OK && _ip.ip.addr != 0) \
+                    return true; \
+                vTaskDelay(pdMS_TO_TICKS(100)); \
+            } \
+        } \
+    } while(0)
+
+    // Already associated — wait for DHCP before returning (guards the race where
+    // the caller gets back true but DNS still fails because no IP is assigned yet).
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        WDUP_WAIT_IP_MS(3000);
+        return true; // associated; proceed even if IP poll timed out
+    }
+
+    // No saved credentials — caller should direct user to WiFi Client screen.
+    if (g_saved_wifi_ssid[0] == '\0') return false;
+
+    esp_wifi_start();
+    wifi_config_t cfg = {0};
+    strncpy((char *)cfg.sta.ssid,     g_saved_wifi_ssid, sizeof(cfg.sta.ssid) - 1);
+    strncpy((char *)cfg.sta.password, g_saved_wifi_pass,  sizeof(cfg.sta.password) - 1);
+    esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    esp_wifi_connect();
+
+    // Wait up to 15 s for a routable IP (not just L2 association).
+    WDUP_WAIT_IP_MS(15000);
+    return false;
+    #undef WDUP_WAIT_IP_MS
+}
+
+static void wdup_task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    lv_color_t cyan   = lv_color_make(0, 188, 212);
+    lv_color_t green  = lv_color_make(76, 175, 80);
+    lv_color_t amber  = lv_color_make(255, 193, 7);
+    lv_color_t red    = lv_color_make(244, 67, 54);
+
+    wdup_prog_cur = wdup_prog_total = 0;
+    wdup_wigle_ok_cnt = wdup_wigle_dup_cnt = wdup_wigle_fail_cnt = 0;
+    wdup_wdg_ok_cnt   = wdup_wdg_dup_cnt   = wdup_wdg_fail_cnt   = 0;
+
+    // Ensure WiFi STA connection
+    wdup_push_msg("Connecting to WiFi...", cyan);
+    if (!wdup_ensure_wifi()) {
+        if (g_saved_wifi_ssid[0] == '\0')
+            wdup_push_msg("No WiFi saved. Go Back > Settings > Data Transfer > WiFi Client.", red);
+        else
+            wdup_push_msg("WiFi failed. Check SSID/password in Settings > Data Transfer > WiFi Client.", red);
+        goto task_done;
+    }
+    wdup_push_msg("WiFi connected.", green);
+
+    // Check at least one key is configured
+    bool do_wigle = (wdup_target == WDUP_WIGLE || wdup_target == WDUP_BOTH) && wigle_api_key[0];
+    bool do_wdg   = (wdup_target == WDUP_WDG   || wdup_target == WDUP_BOTH) && wdgwars_api_key[0];
+
+    if (!do_wigle && !do_wdg) {
+        wdup_push_msg("No API keys configured.", red);
+        goto task_done;
+    }
+
+    // Explicit selection mode: upload only user-selected files
+    if (wdup_use_explicit) {
+        int n = wdup_explicit_count;
+        int ok_count2 = 0, dup_count2 = 0, fail_count2 = 0;
+        wdup_prog_total = n;
+        char xmsg[128];
+        snprintf(xmsg, sizeof(xmsg), "Uploading %d selected file(s)...", n);
+        wdup_push_msg(xmsg, cyan);
+        for (int si = 0; si < n && wdup_active; si++) {
+            int idx = wdup_explicit_indices[si];
+            if (idx < 0 || idx >= 64 || wd_manage_paths[idx][0] == '\0') continue;
+            const char *xfpath = wd_manage_paths[idx];
+            const char *xname  = strrchr(xfpath, '/');
+            xname = xname ? xname + 1 : xfpath;
+            wdup_prog_cur = si + 1;
+            if (do_wigle) {
+                snprintf(xmsg, sizeof(xmsg), "[%d/%d] WiGLE: %.50s...", si+1, n, xname);
+                wdup_push_msg(xmsg, cyan);
+                int r = wdup_upload_one(xfpath, xname, true);
+                const char *ws = (r==0)?"OK":(r==1)?"DUP":"FAIL";
+                lv_color_t wc = (r==0)?green:(r==1)?amber:red;
+                if (r==0) { ok_count2++; wdup_wigle_ok_cnt++; }
+                else if (r==1) { dup_count2++; wdup_wigle_dup_cnt++; }
+                else { fail_count2++; wdup_wigle_fail_cnt++; }
+                snprintf(xmsg, sizeof(xmsg), "[%d/%d] WiGLE: %.50s -> %s", si+1, n, xname, ws);
+                wdup_push_msg(xmsg, wc);
+                if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+                    FILE *lf = fopen(WDUP_LOG_PATH, "a");
+                    if (lf) { fprintf(lf, "%s,WIGLE,%s\n", xname, ws); fclose(lf); }
+                    xSemaphoreGive(sd_spi_mutex);
+                }
+                vTaskDelay(pdMS_TO_TICKS(800));
+            }
+            if (do_wdg && wdup_active) {
+                snprintf(xmsg, sizeof(xmsg), "[%d/%d] WDG: %.50s...", si+1, n, xname);
+                wdup_push_msg(xmsg, cyan);
+                int r = wdup_upload_one(xfpath, xname, false);
+                const char *ws = (r==0)?"OK":(r==1)?"DUP":"FAIL";
+                lv_color_t wc = (r==0)?green:(r==1)?amber:red;
+                if (r==0) { ok_count2++; wdup_wdg_ok_cnt++; }
+                else if (r==1) { dup_count2++; wdup_wdg_dup_cnt++; }
+                else { fail_count2++; wdup_wdg_fail_cnt++; }
+                snprintf(xmsg, sizeof(xmsg), "[%d/%d] WDG: %.50s -> %s", si+1, n, xname, ws);
+                wdup_push_msg(xmsg, wc);
+                if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+                    FILE *lf = fopen(WDUP_LOG_PATH, "a");
+                    if (lf) { fprintf(lf, "%s,WDG,%s\n", xname, ws); fclose(lf); }
+                    xSemaphoreGive(sd_spi_mutex);
+                }
+                vTaskDelay(pdMS_TO_TICKS(800));
+            }
+        }
+        snprintf(xmsg, sizeof(xmsg), "Done: %d OK, %d dup, %d failed",
+                 ok_count2, dup_count2, fail_count2);
+        wdup_push_msg(xmsg, (fail_count2 > 0) ? red : green);
+        wdup_use_explicit = false;
+        wdup_explicit_count = 0;
+        goto task_done;
+    }
+
+    // Open wardrives directory
+    DIR *dir = NULL;
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        dir = opendir("/sdcard/lab/wardrives");
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    if (!dir) {
+        wdup_push_msg("No wardrives directory found.", red);
+        goto task_done;
+    }
+
+    // Count .csv files
+    int total = 0;
+    struct dirent *ent;
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        while ((ent = readdir(dir)) != NULL) {
+            size_t nl = strlen(ent->d_name);
+            if (nl > 4 && strcasecmp(ent->d_name + nl - 4, ".csv") == 0) total++;
+        }
+        rewinddir(dir);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    if (total == 0) {
+        wdup_push_msg("No .csv wardrive files found.", amber);
+        if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+            closedir(dir); xSemaphoreGive(sd_spi_mutex);
+        }
+        goto task_done;
+    }
+
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Found %d file(s). Uploading...", total);
+    wdup_push_msg(msg, cyan);
+    wdup_prog_total = total;
+
+    int cur = 0, ok_count = 0, dup_count = 0, fail_count = 0;
+
+    while (wdup_active) {
+        char dname[256] = {0};
+        bool got = false;
+        if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+            ent = readdir(dir);
+            if (ent) { strncpy(dname, ent->d_name, 255); got = true; }
+            xSemaphoreGive(sd_spi_mutex);
+        }
+        if (!got) break;
+
+        size_t nl = strlen(dname);
+        if (nl <= 4 || strcasecmp(dname + nl - 4, ".csv") != 0) continue;
+        cur++;
+        wdup_prog_cur = cur;
+
+        char fpath[320];
+        snprintf(fpath, sizeof(fpath), "/sdcard/lab/wardrives/%s", dname);
+
+        // Upload to WiGLE
+        if (do_wigle) {
+            snprintf(msg, sizeof(msg), "[%d/%d] WiGLE: %.60s...", cur, total, dname);
+            wdup_push_msg(msg, cyan);
+            int r = wdup_upload_one(fpath, dname, true);
+            const char *wigle_status;
+            if (r == 0) {
+                snprintf(msg, sizeof(msg), "[%d/%d] WiGLE: %.60s -> OK", cur, total, dname);
+                wdup_push_msg(msg, green); ok_count++; wdup_wigle_ok_cnt++;
+                wigle_status = "OK";
+            } else if (r == 1) {
+                snprintf(msg, sizeof(msg), "[%d/%d] WiGLE: %.60s -> dup", cur, total, dname);
+                wdup_push_msg(msg, amber); dup_count++; wdup_wigle_dup_cnt++;
+                wigle_status = "DUP";
+            } else {
+                snprintf(msg, sizeof(msg), "[%d/%d] WiGLE: %.60s -> FAIL", cur, total, dname);
+                wdup_push_msg(msg, red); fail_count++; wdup_wigle_fail_cnt++;
+                wigle_status = "FAIL";
+            }
+            if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+                FILE *lf = fopen(WDUP_LOG_PATH, "a");
+                if (lf) { fprintf(lf, "%s,WIGLE,%s\n", dname, wigle_status); fclose(lf); }
+                xSemaphoreGive(sd_spi_mutex);
+            }
+            vTaskDelay(pdMS_TO_TICKS(800));
+        }
+
+        // Upload to WDG Wars
+        if (do_wdg) {
+            snprintf(msg, sizeof(msg), "[%d/%d] WDG: %.60s...", cur, total, dname);
+            wdup_push_msg(msg, cyan);
+            int r = wdup_upload_one(fpath, dname, false);
+            const char *wdg_status;
+            if (r == 0) {
+                snprintf(msg, sizeof(msg), "[%d/%d] WDG: %.60s -> OK", cur, total, dname);
+                wdup_push_msg(msg, green); ok_count++; wdup_wdg_ok_cnt++;
+                wdg_status = "OK";
+            } else if (r == 1) {
+                snprintf(msg, sizeof(msg), "[%d/%d] WDG: %.60s -> dup", cur, total, dname);
+                wdup_push_msg(msg, amber); dup_count++; wdup_wdg_dup_cnt++;
+                wdg_status = "DUP";
+            } else {
+                snprintf(msg, sizeof(msg), "[%d/%d] WDG: %.60s -> FAIL", cur, total, dname);
+                wdup_push_msg(msg, red); fail_count++; wdup_wdg_fail_cnt++;
+                wdg_status = "FAIL";
+            }
+            if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+                FILE *lf = fopen(WDUP_LOG_PATH, "a");
+                if (lf) { fprintf(lf, "%s,WDG,%s\n", dname, wdg_status); fclose(lf); }
+                xSemaphoreGive(sd_spi_mutex);
+            }
+            vTaskDelay(pdMS_TO_TICKS(800));
+        }
+    }
+
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        closedir(dir); xSemaphoreGive(sd_spi_mutex);
+    }
+
+    snprintf(msg, sizeof(msg), "Done: %d OK, %d dup, %d failed", ok_count, dup_count, fail_count);
+    wdup_push_msg(msg, (fail_count > 0) ? red : green);
+
+task_done:
+    wdup_done   = true;
+    wdup_active = false;
+    wdup_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void wdup_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    if (!wdup_ui_queue) return;
+
+    wdup_ui_msg_t m;
+    while (xQueueReceive(wdup_ui_queue, &m, 0) == pdTRUE) {
+        if (wdup_status_list && lv_obj_is_valid(wdup_status_list)) {
+            lv_obj_t *item = lv_list_add_text(wdup_status_list, m.text);
+            if (item) {
+                lv_obj_set_style_text_color(item, m.color, 0);
+                lv_obj_set_style_bg_color(item, ui_bg_color(), 0);
+                lv_obj_set_style_bg_opa(item, LV_OPA_COVER, 0);
+                lv_obj_set_style_text_font(item, &lv_font_montserrat_12, 0);
+                lv_obj_set_style_pad_ver(item, 2, 0);
+            }
+            lv_obj_scroll_to_y(wdup_status_list, LV_COORD_MAX, LV_ANIM_ON);
+        }
+    }
+
+    // Update fixed progress widgets
+    if (wdup_progress_bar && lv_obj_is_valid(wdup_progress_bar) && wdup_prog_total > 0) {
+        lv_bar_set_range(wdup_progress_bar, 0, wdup_prog_total);
+        lv_bar_set_value(wdup_progress_bar, wdup_prog_cur, LV_ANIM_OFF);
+    }
+    if (wdup_progress_lbl && lv_obj_is_valid(wdup_progress_lbl)) {
+        char pbuf[20];
+        snprintf(pbuf, sizeof(pbuf), "%d/%d", wdup_prog_cur, wdup_prog_total);
+        lv_label_set_text(wdup_progress_lbl, pbuf);
+    }
+    if (wdup_wigle_stat_lbl && lv_obj_is_valid(wdup_wigle_stat_lbl)) {
+        char sbuf[48];
+        snprintf(sbuf, sizeof(sbuf), "WiGLE " LV_SYMBOL_OK "%d " LV_SYMBOL_WARNING "%d " LV_SYMBOL_CLOSE "%d",
+                 wdup_wigle_ok_cnt, wdup_wigle_dup_cnt, wdup_wigle_fail_cnt);
+        lv_label_set_text(wdup_wigle_stat_lbl, sbuf);
+        lv_color_t sc = (wdup_wigle_fail_cnt > 0) ? lv_color_make(244, 67,  54) :
+                        (wdup_wigle_dup_cnt  > 0) ? lv_color_make(255, 193,  7) :
+                        (wdup_wigle_ok_cnt   > 0) ? lv_color_make( 76, 175, 80) :
+                                                     lv_color_make(150, 150,150);
+        lv_obj_set_style_text_color(wdup_wigle_stat_lbl, sc, 0);
+    }
+    if (wdup_wdg_stat_lbl && lv_obj_is_valid(wdup_wdg_stat_lbl)) {
+        char sbuf[48];
+        snprintf(sbuf, sizeof(sbuf), "WDG " LV_SYMBOL_OK "%d " LV_SYMBOL_WARNING "%d " LV_SYMBOL_CLOSE "%d",
+                 wdup_wdg_ok_cnt, wdup_wdg_dup_cnt, wdup_wdg_fail_cnt);
+        lv_label_set_text(wdup_wdg_stat_lbl, sbuf);
+        lv_color_t sc = (wdup_wdg_fail_cnt > 0) ? lv_color_make(244, 67,  54) :
+                        (wdup_wdg_dup_cnt   > 0) ? lv_color_make(255, 193,  7) :
+                        (wdup_wdg_ok_cnt    > 0) ? lv_color_make( 76, 175, 80) :
+                                                    lv_color_make(150, 150,150);
+        lv_obj_set_style_text_color(wdup_wdg_stat_lbl, sc, 0);
+    }
+
+    if (wdup_done) {
+        lv_timer_del(wdup_timer);
+        wdup_timer = NULL;
+    }
+}
+
+/* Save a key typed on-device to NVS */
+static void wdup_save_key_cb(lv_event_t *e)
+{
+    (void)e;
+    nvs_handle_t h;
+    if (nvs_open("settings", NVS_READWRITE, &h) == ESP_OK) {
+        if (wdup_wigle_key_ta && lv_obj_is_valid(wdup_wigle_key_ta)) {
+            const char *v = lv_textarea_get_text(wdup_wigle_key_ta);
+            strncpy(wigle_api_key, v, WIGLE_KEY_MAX_LEN - 1);
+            wigle_api_key[WIGLE_KEY_MAX_LEN - 1] = '\0';
+            nvs_set_str(h, NVS_KEY_WIGLE_KEY, wigle_api_key);
+        }
+        if (wdup_wdg_key_ta && lv_obj_is_valid(wdup_wdg_key_ta)) {
+            const char *v = lv_textarea_get_text(wdup_wdg_key_ta);
+            strncpy(wdgwars_api_key, v, WDGWARS_KEY_MAX_LEN - 1);
+            wdgwars_api_key[WDGWARS_KEY_MAX_LEN - 1] = '\0';
+            nvs_set_str(h, NVS_KEY_WDGWARS_KEY, wdgwars_api_key);
+        }
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static void wdup_start_cb(lv_event_t *e)
+{
+    (void)e;
+    if (wdup_active || wdup_task_handle) return;
+
+    // If no routable IP, redirect to WiFi Client screen to get credentials first.
+    esp_netif_t *_sn = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    bool _has_ip = false;
+    if (_sn) {
+        esp_netif_ip_info_t _ip;
+        _has_ip = (esp_netif_get_ip_info(_sn, &_ip) == ESP_OK && _ip.ip.addr != 0);
+    }
+    if (!_has_ip) {
+        s_wdup_pending_after_wifi = true;
+        show_wifi_client_server_screen();
+        return;
+    }
+
+    // Save any keys typed on-screen before starting
+    wdup_save_key_cb(NULL);
+
+    if (!wdup_ui_queue)
+        wdup_ui_queue = xQueueCreate(32, sizeof(wdup_ui_msg_t));
+    else
+        xQueueReset(wdup_ui_queue);
+
+    wdup_done   = false;
+    wdup_active = true;
+
+    xTaskCreate(wdup_task, "wdup", 8192, NULL, 4, &wdup_task_handle);
+
+    if (wdup_timer) { lv_timer_del(wdup_timer); wdup_timer = NULL; }
+    wdup_timer = lv_timer_create(wdup_timer_cb, 200, NULL);
+}
+
+// ─── Wardrive submenu: Menu / Options / Manage ────────────────────────────
+
+// --- Wardrive Menu screen ---
+
+static void wd_menu_back_cb(lv_event_t *e)
+{
+    (void)e;
+    show_main_tiles();
+}
+
+static void wd_menu_tile_cb(lv_event_t *e)
+{
+    const char *key = (const char *)lv_event_get_user_data(e);
+    if (!key) return;
+    if (strcmp(key, "Start") == 0)        wardrive_start_btn_cb(NULL);
+    else if (strcmp(key, "Options") == 0) show_wardrive_options_screen();
+    else if (strcmp(key, "Manage")  == 0) { wdm_back_fn = NULL; show_wardrive_manage_screen(); }
+}
+
+static void show_wardrive_menu_screen(void)
+{
+    create_function_page_base("Wardrive");
+    apply_menu_bg();
+
+    lv_obj_t *tiles = lv_obj_create(function_page);
+    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30 - 44);
+    lv_obj_align(tiles, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(tiles, 0, 0);
+    lv_obj_set_style_pad_all(tiles, 8, 0);
+    lv_obj_set_style_pad_gap(tiles, 8, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    create_tile(tiles, MY_SYMBOL_CAR,      "Start\nWardrive", COLOR_MATERIAL_RED,    wd_menu_tile_cb, "Start");
+    create_tile(tiles, LV_SYMBOL_SETTINGS, "Options",         UI_ACCENT_GREEN,       wd_menu_tile_cb, "Options");
+    create_tile(tiles, LV_SYMBOL_LIST,     "Manage\nData",    UI_ACCENT_CYAN,        wd_menu_tile_cb, "Manage");
+
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 30);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), 0);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT "  Home");
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(back_lbl, ui_text_color(), 0);
+    lv_obj_center(back_lbl);
+    lv_obj_add_event_cb(back_btn, wd_menu_back_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// --- Wardrive Options screen ---
+
+static lv_obj_t *wd_opts_band_dd = NULL;
+static lv_obj_t *wd_opts_pcap_sw = NULL;
+static lv_obj_t *wd_opts_ble_sw  = NULL;
+
+static void wd_opts_save_cb(lv_event_t *e)
+{
+    (void)e;
+    if (wd_opts_band_dd) g_wd_band = (wd_band_t)lv_dropdown_get_selected(wd_opts_band_dd);
+    if (wd_opts_pcap_sw) g_wd_pcap = lv_obj_has_state(wd_opts_pcap_sw, LV_STATE_CHECKED);
+    if (wd_opts_ble_sw)  g_wd_ble  = lv_obj_has_state(wd_opts_ble_sw,  LV_STATE_CHECKED);
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, NVS_KEY_WD_BAND, (uint8_t)g_wd_band);
+        nvs_set_u8(h, NVS_KEY_WD_PCAP, g_wd_pcap ? 1 : 0);
+        nvs_set_u8(h, NVS_KEY_WD_BLE,  g_wd_ble  ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    wd_opts_band_dd = NULL;
+    wd_opts_pcap_sw = NULL;
+    wd_opts_ble_sw  = NULL;
+    show_wardrive_menu_screen();
+}
+
+static void wd_opts_back_cb(lv_event_t *e)
+{
+    (void)e;
+    wd_opts_band_dd = NULL;
+    wd_opts_pcap_sw = NULL;
+    wd_opts_ble_sw  = NULL;
+    show_wardrive_menu_screen();
+}
+
+static void show_wardrive_options_screen(void)
+{
+    create_function_page_base("WD Options");
+
+    lv_obj_t *content = lv_obj_create(function_page);
+    lv_obj_set_size(content, LCD_H_RES - 16, LCD_V_RES - 30 - 50);
+    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 34);
+    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_pad_all(content, 8, 0);
+    lv_obj_set_style_pad_row(content, 12, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Band label
+    lv_obj_t *band_lbl = lv_label_create(content);
+    lv_label_set_text(band_lbl, "Scan Band");
+    lv_obj_set_style_text_color(band_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(band_lbl, &lv_font_montserrat_14, 0);
+
+    // Band dropdown
+    wd_opts_band_dd = lv_dropdown_create(content);
+    lv_dropdown_set_options(wd_opts_band_dd, "Both (2.4G + 5G)\n2.4 GHz only\n5 GHz only");
+    lv_dropdown_set_selected(wd_opts_band_dd, (uint16_t)g_wd_band);
+    lv_obj_set_width(wd_opts_band_dd, LCD_H_RES - 32);
+    lv_obj_set_style_text_font(wd_opts_band_dd, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wd_opts_band_dd, ui_text_color(), 0);
+    lv_obj_set_style_bg_color(wd_opts_band_dd, ui_card_color(), 0);
+    lv_obj_set_style_border_color(wd_opts_band_dd, UI_ACCENT_GREEN, 0);
+    lv_obj_set_style_border_width(wd_opts_band_dd, 1, 0);
+
+    // PCAP toggle row
+    lv_obj_t *pcap_row = lv_obj_create(content);
+    lv_obj_set_size(pcap_row, LCD_H_RES - 32, 30);
+    lv_obj_set_style_bg_opa(pcap_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(pcap_row, 0, 0);
+    lv_obj_set_style_pad_all(pcap_row, 0, 0);
+    lv_obj_clear_flag(pcap_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *pcap_lbl = lv_label_create(pcap_row);
+    lv_label_set_text(pcap_lbl, "Raw PCAP capture");
+    lv_obj_set_style_text_font(pcap_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(pcap_lbl, ui_text_color(), 0);
+    lv_obj_align(pcap_lbl, LV_ALIGN_LEFT_MID, 0, 0);
+
+    wd_opts_pcap_sw = lv_switch_create(pcap_row);
+    lv_obj_align(wd_opts_pcap_sw, LV_ALIGN_RIGHT_MID, 0, 0);
+    if (g_wd_pcap) lv_obj_add_state(wd_opts_pcap_sw, LV_STATE_CHECKED);
+
+    // BLE toggle row
+    lv_obj_t *ble_row = lv_obj_create(content);
+    lv_obj_set_size(ble_row, LCD_H_RES - 32, 30);
+    lv_obj_set_style_bg_opa(ble_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ble_row, 0, 0);
+    lv_obj_set_style_pad_all(ble_row, 0, 0);
+    lv_obj_clear_flag(ble_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *ble_lbl = lv_label_create(ble_row);
+    lv_label_set_text(ble_lbl, "BLE scan (time-sliced)");
+    lv_obj_set_style_text_font(ble_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ble_lbl, ui_text_color(), 0);
+    lv_obj_align(ble_lbl, LV_ALIGN_LEFT_MID, 0, 0);
+
+    wd_opts_ble_sw = lv_switch_create(ble_row);
+    lv_obj_align(wd_opts_ble_sw, LV_ALIGN_RIGHT_MID, 0, 0);
+    if (g_wd_ble) lv_obj_add_state(wd_opts_ble_sw, LV_STATE_CHECKED);
+
+    lv_obj_t *ble_note = lv_label_create(content);
+    lv_label_set_text(ble_note, LV_SYMBOL_WARNING " BLE pauses WiFi every 30s");
+    lv_obj_set_style_text_color(ble_note, lv_color_make(140, 140, 140), 0);
+    lv_obj_set_style_text_font(ble_note, &lv_font_montserrat_12, 0);
+    lv_label_set_long_mode(ble_note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(ble_note, LCD_H_RES - 32);
+
+    // Save button
+    lv_obj_t *save_btn = lv_btn_create(function_page);
+    lv_obj_set_size(save_btn, 110, 30);
+    lv_obj_align(save_btn, LV_ALIGN_BOTTOM_MID, 62, -8);
+    lv_obj_set_style_bg_color(save_btn, UI_ACCENT_GREEN, 0);
+    lv_obj_set_style_bg_color(save_btn, lv_color_make(50, 140, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(save_btn, 8, 0);
+    lv_obj_t *save_lbl = lv_label_create(save_btn);
+    lv_label_set_text(save_lbl, LV_SYMBOL_OK "  Save");
+    lv_obj_set_style_text_font(save_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(save_lbl);
+    lv_obj_add_event_cb(save_btn, wd_opts_save_cb, LV_EVENT_CLICKED, NULL);
+
+    // Back button
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 30);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, -62, -8);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), 0);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT "  Back");
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(back_lbl, ui_text_color(), 0);
+    lv_obj_center(back_lbl);
+    lv_obj_add_event_cb(back_btn, wd_opts_back_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// --- Wardrive Manage Data screen ---
+
+static lv_obj_t *wd_manage_rows[WD_MANAGE_MAX_FILES];
+static int       wd_manage_count = 0;
+static bool      wd_manage_selected[WD_MANAGE_MAX_FILES];
+static lv_obj_t *wd_manage_chk[WD_MANAGE_MAX_FILES];   // per-row check indicator
+static long      wd_manage_sizes[WD_MANAGE_MAX_FILES];
+static time_t    wd_manage_times[WD_MANAGE_MAX_FILES];
+static lv_obj_t *wdm_sel_count_lbl  = NULL;
+static lv_obj_t *wdm_del_btn_bottom = NULL;
+static lv_obj_t *wdm_up_btn_bottom  = NULL;
+static lv_obj_t *wdm_confirm_overlay = NULL;
+
+// Returns true if 'filename' has an OK or DUP entry for 'service' in the log buffer
+static bool wdm_log_accepted(const char *log_buf, const char *filename, const char *service)
+{
+    if (!log_buf || !filename || !service) return false;
+    const char *p = log_buf;
+    char line[128];
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        if (len > 0 && len < sizeof(line)) {
+            memcpy(line, p, len);
+            line[len] = '\0';
+            char *c1 = strchr(line, ',');
+            if (c1) {
+                *c1 = '\0';
+                if (strcmp(line, filename) == 0) {
+                    char *c2 = strchr(c1 + 1, ',');
+                    if (c2) {
+                        *c2 = '\0';
+                        if (strcmp(c1 + 1, service) == 0) {
+                            const char *st = c2 + 1;
+                            if (strcmp(st, "OK") == 0 || strcmp(st, "DUP") == 0)
+                                return true;
+                        }
+                    }
+                }
+            }
+        }
+        p = nl ? nl + 1 : p + len;
+    }
+    return false;
+}
+
+// Update counter label and enable/disable action buttons based on selection
+static void wdm_update_actions(void)
+{
+    int n = 0;
+    for (int i = 0; i < wd_manage_count; i++)
+        if (wd_manage_selected[i]) n++;
+
+    if (wdm_sel_count_lbl && lv_obj_is_valid(wdm_sel_count_lbl)) {
+        char buf[40];
+        if (n == 0) snprintf(buf, sizeof(buf), "Tap rows to select");
+        else        snprintf(buf, sizeof(buf), "%d of %d selected", n, wd_manage_count);
+        lv_label_set_text(wdm_sel_count_lbl, buf);
+    }
+    if (wdm_del_btn_bottom && lv_obj_is_valid(wdm_del_btn_bottom)) {
+        lv_obj_set_style_opa(wdm_del_btn_bottom, n > 0 ? LV_OPA_COVER : LV_OPA_40, 0);
+        if (n > 0) lv_obj_clear_state(wdm_del_btn_bottom, LV_STATE_DISABLED);
+        else       lv_obj_add_state(wdm_del_btn_bottom,   LV_STATE_DISABLED);
+    }
+    if (wdm_up_btn_bottom && lv_obj_is_valid(wdm_up_btn_bottom)) {
+        lv_obj_set_style_opa(wdm_up_btn_bottom, n > 0 ? LV_OPA_COVER : LV_OPA_40, 0);
+        if (n > 0) lv_obj_clear_state(wdm_up_btn_bottom, LV_STATE_DISABLED);
+        else       lv_obj_add_state(wdm_up_btn_bottom,   LV_STATE_DISABLED);
+    }
+}
+
+// Toggle selection on a row tap
+static void wdm_row_tap_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= wd_manage_count) return;
+    wd_manage_selected[idx] = !wd_manage_selected[idx];
+    bool sel = wd_manage_selected[idx];
+    lv_color_t sel_bg = sel ? lv_color_make(25, 65, 130) : ui_card_color();
+    if (wd_manage_rows[idx] && lv_obj_is_valid(wd_manage_rows[idx]))
+        lv_obj_set_style_bg_color(wd_manage_rows[idx], sel_bg, 0);
+    if (wd_manage_chk[idx] && lv_obj_is_valid(wd_manage_chk[idx]))
+        lv_label_set_text(wd_manage_chk[idx], sel ? LV_SYMBOL_OK : " ");
+    wdm_update_actions();
+}
+
+static void wdm_sel_all_cb(lv_event_t *e)
+{
+    (void)e;
+    for (int i = 0; i < wd_manage_count; i++) {
+        if (wd_manage_paths[i][0] == '\0') continue;
+        wd_manage_selected[i] = true;
+        if (wd_manage_rows[i] && lv_obj_is_valid(wd_manage_rows[i]))
+            lv_obj_set_style_bg_color(wd_manage_rows[i], lv_color_make(25, 65, 130), 0);
+        if (wd_manage_chk[i] && lv_obj_is_valid(wd_manage_chk[i]))
+            lv_label_set_text(wd_manage_chk[i], LV_SYMBOL_OK);
+    }
+    wdm_update_actions();
+}
+
+static void wdm_sel_none_cb(lv_event_t *e)
+{
+    (void)e;
+    for (int i = 0; i < wd_manage_count; i++) {
+        wd_manage_selected[i] = false;
+        if (wd_manage_rows[i] && lv_obj_is_valid(wd_manage_rows[i]))
+            lv_obj_set_style_bg_color(wd_manage_rows[i], ui_card_color(), 0);
+        if (wd_manage_chk[i] && lv_obj_is_valid(wd_manage_chk[i]))
+            lv_label_set_text(wd_manage_chk[i], " ");
+    }
+    wdm_update_actions();
+}
+
+// Confirm-delete overlay callbacks
+static void wdm_confirm_ok_cb(lv_event_t *e)
+{
+    (void)e;
+    if (wdm_confirm_overlay && lv_obj_is_valid(wdm_confirm_overlay)) {
+        lv_obj_del(wdm_confirm_overlay);
+        wdm_confirm_overlay = NULL;
+    }
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        for (int i = 0; i < wd_manage_count; i++) {
+            if (!wd_manage_selected[i] || wd_manage_paths[i][0] == '\0') continue;
+            remove(wd_manage_paths[i]);
+            wd_manage_paths[i][0] = '\0';
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    for (int i = 0; i < wd_manage_count; i++) {
+        if (!wd_manage_selected[i]) continue;
+        if (wd_manage_rows[i] && lv_obj_is_valid(wd_manage_rows[i])) {
+            lv_obj_del(wd_manage_rows[i]);
+            wd_manage_rows[i] = NULL;
+        }
+        wd_manage_selected[i] = false;
+        wd_manage_chk[i]     = NULL;
+    }
+    wdm_update_actions();
+}
+
+static void wdm_confirm_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    if (wdm_confirm_overlay && lv_obj_is_valid(wdm_confirm_overlay)) {
+        lv_obj_del(wdm_confirm_overlay);
+        wdm_confirm_overlay = NULL;
+    }
+}
+
+static void wdm_delete_selected_cb(lv_event_t *e)
+{
+    (void)e;
+    int n = 0;
+    for (int i = 0; i < wd_manage_count; i++)
+        if (wd_manage_selected[i]) n++;
+    if (n == 0) return;
+
+    // Modal overlay on lv_layer_top()
+    wdm_confirm_overlay = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(wdm_confirm_overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(wdm_confirm_overlay, 0, 0);
+    lv_obj_set_style_bg_color(wdm_confirm_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(wdm_confirm_overlay, LV_OPA_60, 0);
+    lv_obj_set_style_border_width(wdm_confirm_overlay, 0, 0);
+    lv_obj_clear_flag(wdm_confirm_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *card = lv_obj_create(wdm_confirm_overlay);
+    lv_obj_set_size(card, 210, 116);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, lv_color_make(38, 38, 38), 0);
+    lv_obj_set_style_border_color(card, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 10, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    char buf[72];
+    snprintf(buf, sizeof(buf),
+             LV_SYMBOL_WARNING " Delete %d file(s)?\nThis cannot be undone.", n);
+    lv_obj_t *msg = lv_label_create(card);
+    lv_label_set_text(msg, buf);
+    lv_obj_set_style_text_font(msg, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(msg, lv_color_hex(0xFFCC44), 0);
+    lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(msg, 190);
+    lv_obj_align(msg, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *cancel_btn = lv_btn_create(card);
+    lv_obj_set_size(cancel_btn, 84, 30);
+    lv_obj_align(cancel_btn, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_make(70, 70, 70), 0);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_make(100, 100, 100), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(cancel_btn, 6, 0);
+    lv_obj_t *cl = lv_label_create(cancel_btn);
+    lv_label_set_text(cl, LV_SYMBOL_CLOSE "  Cancel");
+    lv_obj_set_style_text_font(cl, &lv_font_montserrat_12, 0);
+    lv_obj_center(cl);
+    lv_obj_add_event_cb(cancel_btn, wdm_confirm_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *del_btn = lv_btn_create(card);
+    lv_obj_set_size(del_btn, 84, 30);
+    lv_obj_align(del_btn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(del_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_bg_color(del_btn, lv_color_make(180, 30, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(del_btn, 6, 0);
+    lv_obj_t *dl = lv_label_create(del_btn);
+    lv_label_set_text(dl, LV_SYMBOL_TRASH "  Delete");
+    lv_obj_set_style_text_font(dl, &lv_font_montserrat_12, 0);
+    lv_obj_center(dl);
+    lv_obj_add_event_cb(del_btn, wdm_confirm_ok_cb, LV_EVENT_CLICKED, NULL);
+}
+
+static void wdm_upload_selected_cb(lv_event_t *e)
+{
+    (void)e;
+    wdup_explicit_count = 0;
+    for (int i = 0; i < wd_manage_count; i++) {
+        if (wd_manage_selected[i] && wd_manage_paths[i][0])
+            wdup_explicit_indices[wdup_explicit_count++] = i;
+    }
+    if (wdup_explicit_count == 0) return;
+    wdup_use_explicit = true;
+    wdup_back_fn = show_wardrive_manage_screen;
+    show_wardrive_upload_screen();
+}
+
+static void wdm_back_cb(lv_event_t *e)
+{
+    (void)e;
+    void (*fn)(void) = wdm_back_fn;
+    wdm_back_fn = NULL;
+    if (fn) fn();
+    else show_wardrive_menu_screen();
+}
+
+static void show_wardrive_manage_screen(void)
+{
+    create_function_page_base("Manage Data");
+
+    wd_manage_count = 0;
+    memset(wd_manage_rows,     0, sizeof(wd_manage_rows));
+    memset(wd_manage_selected, 0, sizeof(wd_manage_selected));
+    memset(wd_manage_chk,      0, sizeof(wd_manage_chk));
+    memset(wd_manage_sizes,    0, sizeof(wd_manage_sizes));
+    memset(wd_manage_times,    0, sizeof(wd_manage_times));
+    wdm_sel_count_lbl  = NULL;
+    wdm_del_btn_bottom = NULL;
+    wdm_up_btn_bottom  = NULL;
+    wdm_confirm_overlay = NULL;
+
+    // Load upload log into buffer
+    char *log_buf = NULL;
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        FILE *lf = fopen(WDUP_LOG_PATH, "r");
+        if (lf) {
+            fseek(lf, 0, SEEK_END);
+            long lsz = ftell(lf); rewind(lf);
+            if (lsz > 0 && lsz < 8192) {
+                log_buf = heap_caps_malloc(lsz + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                if (log_buf) { fread(log_buf, 1, lsz, lf); log_buf[lsz] = '\0'; }
+            }
+            fclose(lf);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    // Enumerate wardrive CSV files and stat each for size + mtime
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        DIR *dir = opendir("/sdcard/lab/wardrives");
+        if (dir) {
+            struct dirent *ent;
+            while ((ent = readdir(dir)) != NULL && wd_manage_count < WD_MANAGE_MAX_FILES) {
+                const char *nm = ent->d_name;
+                size_t nl = strlen(nm);
+                if (nl <= 4 || strcasecmp(nm + nl - 4, ".csv") != 0) continue;
+                if (strcmp(nm, "upload_log.csv") == 0) continue;
+                snprintf(wd_manage_paths[wd_manage_count], sizeof(wd_manage_paths[0]),
+                         "/sdcard/lab/wardrives/%s", nm);
+                struct stat st;
+                if (stat(wd_manage_paths[wd_manage_count], &st) == 0) {
+                    wd_manage_sizes[wd_manage_count] = (long)st.st_size;
+                    wd_manage_times[wd_manage_count] = st.st_mtime;
+                }
+                wd_manage_count++;
+            }
+            closedir(dir);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    // Scrollable file list — leaves 72px at bottom for action controls
+    lv_obj_t *list = lv_obj_create(function_page);
+    lv_obj_set_size(list, LCD_H_RES, LCD_V_RES - 30 - 72);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_color(list, ui_bg_color(), 0);
+    lv_obj_set_style_bg_opa(list, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    lv_obj_set_style_pad_all(list, 3, 0);
+    lv_obj_set_style_pad_row(list, 3, 0);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+    if (wd_manage_count == 0) {
+        lv_obj_t *empty = lv_label_create(list);
+        lv_label_set_text(empty, "No wardrive files found.\nStart a wardrive to create logs.");
+        lv_obj_set_style_text_color(empty, lv_color_make(140, 140, 140), 0);
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align(empty, LV_ALIGN_CENTER, 0, 0);
+    }
+
+    lv_color_t col_green = lv_color_make(76, 175, 80);
+    lv_color_t col_amber = lv_color_make(255, 193, 7);
+    lv_color_t col_gray  = lv_color_make(160, 160, 160);
+
+    for (int i = 0; i < wd_manage_count; i++) {
+        const char *fname = strrchr(wd_manage_paths[i], '/');
+        fname = fname ? fname + 1 : wd_manage_paths[i];
+
+        bool wigle_ok = wdm_log_accepted(log_buf, fname, "WIGLE");
+        bool wdg_ok   = wdm_log_accepted(log_buf, fname, "WDG");
+        lv_color_t acc_color;    // left-border accent
+        const char *status_txt;  // status badge text
+        lv_color_t status_color;
+        if (wigle_ok && wdg_ok) {
+            acc_color   = col_green;
+            status_txt  = LV_SYMBOL_OK " Both";
+            status_color = col_green;
+        } else if (wigle_ok || wdg_ok) {
+            acc_color   = col_amber;
+            status_txt  = LV_SYMBOL_WARNING " Part";
+            status_color = col_amber;
+        } else {
+            acc_color   = col_gray;
+            status_txt  = LV_SYMBOL_UPLOAD " New";
+            status_color = col_gray;
+        }
+
+        // Build size string
+        char size_buf[16];
+        long sz = wd_manage_sizes[i];
+        if (sz < 1024)            snprintf(size_buf, sizeof(size_buf), "%ld B", sz);
+        else if (sz < 1024*1024)  snprintf(size_buf, sizeof(size_buf), "%.1f KB", sz / 1024.0f);
+        else                      snprintf(size_buf, sizeof(size_buf), "%.1f MB", sz / (1024.0f*1024.0f));
+
+        // Build date string from mtime
+        char date_buf[20] = "--";
+        if (wd_manage_times[i] > 0) {
+            struct tm tm_info;
+            localtime_r(&wd_manage_times[i], &tm_info);
+            strftime(date_buf, sizeof(date_buf), "%Y-%m-%d %H:%M", &tm_info);
+        }
+
+        char meta_buf[48];
+        snprintf(meta_buf, sizeof(meta_buf), "%s  %s", size_buf, date_buf);
+
+        // Row container (44px tall, full-width minus margin)
+        lv_obj_t *row = lv_obj_create(list);
+        lv_obj_set_size(row, LCD_H_RES - 6, 44);
+        lv_obj_set_style_bg_color(row, ui_card_color(), 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_radius(row, 5, 0);
+        lv_obj_set_style_pad_all(row, 0, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        wd_manage_rows[i] = row;
+
+        // Left accent strip (upload status color)
+        lv_obj_t *accent = lv_obj_create(row);
+        lv_obj_set_size(accent, 4, 34);
+        lv_obj_align(accent, LV_ALIGN_LEFT_MID, 4, 0);
+        lv_obj_set_style_bg_color(accent, acc_color, 0);
+        lv_obj_set_style_bg_opa(accent, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(accent, 0, 0);
+        lv_obj_set_style_radius(accent, 2, 0);
+
+        // Filename label (top line)
+        lv_obj_t *name_lbl = lv_label_create(row);
+        lv_label_set_text(name_lbl, fname);
+        lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(name_lbl, ui_text_color(), 0);
+        lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(name_lbl, 148);
+        lv_obj_align(name_lbl, LV_ALIGN_TOP_LEFT, 14, 5);
+
+        // Meta label (bottom line): size + date
+        lv_obj_t *meta_lbl = lv_label_create(row);
+        lv_label_set_text(meta_lbl, meta_buf);
+        lv_obj_set_style_text_font(meta_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(meta_lbl, lv_color_make(120, 120, 120), 0);
+        lv_label_set_long_mode(meta_lbl, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(meta_lbl, 148);
+        lv_obj_align(meta_lbl, LV_ALIGN_BOTTOM_LEFT, 14, -5);
+
+        // Status badge (right side, upper)
+        lv_obj_t *status_lbl = lv_label_create(row);
+        lv_label_set_text(status_lbl, status_txt);
+        lv_obj_set_style_text_font(status_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(status_lbl, status_color, 0);
+        lv_obj_align(status_lbl, LV_ALIGN_RIGHT_MID, -22, -8);
+
+        // Selected check indicator (right side, lower — shows ✓ when selected)
+        lv_obj_t *chk = lv_label_create(row);
+        lv_label_set_text(chk, " ");
+        lv_obj_set_style_text_font(chk, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(chk, lv_color_make(100, 180, 255), 0);
+        lv_obj_align(chk, LV_ALIGN_RIGHT_MID, -4, 8);
+        wd_manage_chk[i] = chk;
+
+        // Tap the row to toggle selection
+        lv_obj_add_event_cb(row, wdm_row_tap_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+    }
+
+    if (log_buf) heap_caps_free(log_buf);
+
+    // ── Action area (bottom 72px) ─────────────────────────────────────
+
+    // Row 1: counter label + All / None buttons  (y from bottom = -10 - 30 - 4 - 22 = -66)
+    wdm_sel_count_lbl = lv_label_create(function_page);
+    lv_label_set_text(wdm_sel_count_lbl, "Tap rows to select");
+    lv_obj_set_style_text_font(wdm_sel_count_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wdm_sel_count_lbl, lv_color_make(160, 160, 160), 0);
+    lv_obj_align(wdm_sel_count_lbl, LV_ALIGN_BOTTOM_LEFT, 6, -48);
+
+    lv_obj_t *all_btn = lv_btn_create(function_page);
+    lv_obj_set_size(all_btn, 40, 22);
+    lv_obj_align(all_btn, LV_ALIGN_BOTTOM_RIGHT, -44, -48);
+    lv_obj_set_style_bg_color(all_btn, lv_color_make(50, 80, 50), 0);
+    lv_obj_set_style_bg_color(all_btn, lv_color_make(70, 110, 70), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(all_btn, 4, 0);
+    lv_obj_t *all_lbl = lv_label_create(all_btn);
+    lv_label_set_text(all_lbl, "All");
+    lv_obj_set_style_text_font(all_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(all_lbl);
+    lv_obj_add_event_cb(all_btn, wdm_sel_all_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *none_btn = lv_btn_create(function_page);
+    lv_obj_set_size(none_btn, 40, 22);
+    lv_obj_align(none_btn, LV_ALIGN_BOTTOM_RIGHT, -2, -48);
+    lv_obj_set_style_bg_color(none_btn, lv_color_make(60, 60, 60), 0);
+    lv_obj_set_style_bg_color(none_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(none_btn, 4, 0);
+    lv_obj_t *none_lbl = lv_label_create(none_btn);
+    lv_label_set_text(none_lbl, "None");
+    lv_obj_set_style_text_font(none_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(none_lbl);
+    lv_obj_add_event_cb(none_btn, wdm_sel_none_cb, LV_EVENT_CLICKED, NULL);
+
+    // Row 2: Back / Delete / Upload  (y from bottom = -10)
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 68, 30);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_LEFT, 4, -10);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), 0);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " Back");
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(back_lbl, ui_text_color(), 0);
+    lv_obj_center(back_lbl);
+    lv_obj_add_event_cb(back_btn, wdm_back_cb, LV_EVENT_CLICKED, NULL);
+
+    wdm_del_btn_bottom = lv_btn_create(function_page);
+    lv_obj_set_size(wdm_del_btn_bottom, 76, 30);
+    lv_obj_align(wdm_del_btn_bottom, LV_ALIGN_BOTTOM_LEFT, 78, -10);
+    lv_obj_set_style_bg_color(wdm_del_btn_bottom, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_bg_color(wdm_del_btn_bottom, lv_color_make(180, 30, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(wdm_del_btn_bottom, 8, 0);
+    lv_obj_add_state(wdm_del_btn_bottom, LV_STATE_DISABLED);
+    lv_obj_set_style_opa(wdm_del_btn_bottom, LV_OPA_40, 0);
+    lv_obj_t *del_lbl = lv_label_create(wdm_del_btn_bottom);
+    lv_label_set_text(del_lbl, LV_SYMBOL_TRASH " Delete");
+    lv_obj_set_style_text_font(del_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(del_lbl);
+    lv_obj_add_event_cb(wdm_del_btn_bottom, wdm_delete_selected_cb, LV_EVENT_CLICKED, NULL);
+
+    wdm_up_btn_bottom = lv_btn_create(function_page);
+    lv_obj_set_size(wdm_up_btn_bottom, 76, 30);
+    lv_obj_align(wdm_up_btn_bottom, LV_ALIGN_BOTTOM_RIGHT, -4, -10);
+    lv_obj_set_style_bg_color(wdm_up_btn_bottom, lv_color_hex(0xE91E63), 0);
+    lv_obj_set_style_bg_color(wdm_up_btn_bottom, lv_color_hex(0xAD1457), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(wdm_up_btn_bottom, 8, 0);
+    lv_obj_add_state(wdm_up_btn_bottom, LV_STATE_DISABLED);
+    lv_obj_set_style_opa(wdm_up_btn_bottom, LV_OPA_40, 0);
+    lv_obj_t *up_lbl = lv_label_create(wdm_up_btn_bottom);
+    lv_label_set_text(up_lbl, LV_SYMBOL_UPLOAD " Upload");
+    lv_obj_set_style_text_font(up_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(up_lbl);
+    lv_obj_add_event_cb(wdm_up_btn_bottom, wdm_upload_selected_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void wdup_target_dd_cb(lv_event_t *e)
+{
+    lv_obj_t *dd = lv_event_get_target(e);
+    uint16_t sel = lv_dropdown_get_selected(dd);
+    if (sel == 0) wdup_target = WDUP_WIGLE;
+    else if (sel == 1) wdup_target = WDUP_WDG;
+    else wdup_target = WDUP_BOTH;
+}
+
+static void wdup_kb_event_cb(lv_event_t *e)
+{
+    lv_obj_t *kb = lv_event_get_target(e);
+    if (lv_event_get_code(e) == LV_EVENT_READY || lv_event_get_code(e) == LV_EVENT_CANCEL) {
+        lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+        if (wdup_upload_btn)   lv_obj_clear_flag(wdup_upload_btn,   LV_OBJ_FLAG_HIDDEN);
+        if (wdup_back_btn_obj) lv_obj_clear_flag(wdup_back_btn_obj, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void wdup_ta_focus_cb(lv_event_t *e)
+{
+    lv_obj_t *ta = lv_event_get_target(e);
+    lv_obj_t *kb = (lv_obj_t *)lv_event_get_user_data(e);
+    if (kb) {
+        lv_keyboard_set_textarea(kb, ta);
+        lv_obj_clear_flag(kb, LV_OBJ_FLAG_HIDDEN);
+        if (wdup_upload_btn)   lv_obj_add_flag(wdup_upload_btn,   LV_OBJ_FLAG_HIDDEN);
+        if (wdup_back_btn_obj) lv_obj_add_flag(wdup_back_btn_obj, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void wdup_back_cb(lv_event_t *e)
+{
+    (void)e;
+    wdup_active       = false;
+    wdup_wigle_key_ta = NULL;
+    wdup_wdg_key_ta   = NULL;
+    wdup_status_list  = NULL;
+    wdup_upload_btn   = NULL;
+    wdup_back_btn_obj = NULL;
+    if (wdup_timer) { lv_timer_del(wdup_timer); wdup_timer = NULL; }
+    void (*back_fn)(void) = wdup_back_fn;
+    wdup_back_fn = NULL;
+    if (back_fn) back_fn();
+    else show_data_transfer_screen();
+}
+
+static void show_wardrive_upload_screen(void)
+{
+    create_function_page_base("Wardrive Upload");
+
+    lv_obj_t *content = lv_obj_create(function_page);
+    lv_obj_set_size(content, LCD_H_RES, LCD_V_RES - 30 - 44);
+    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_pad_all(content, 6, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(content, 4, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+
+    // ── Service selector ──────────────────────────────────────────────────
+    lv_obj_t *svc_row = lv_obj_create(content);
+    lv_obj_set_size(svc_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(svc_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(svc_row, 0, 0);
+    lv_obj_set_style_pad_all(svc_row, 0, 0);
+    lv_obj_set_flex_flow(svc_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(svc_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(svc_row, 4, 0);
+
+    lv_obj_t *svc_lbl = lv_label_create(svc_row);
+    lv_label_set_text(svc_lbl, "Service:");
+    lv_obj_set_style_text_font(svc_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(svc_lbl, ui_text_color(), 0);
+
+    lv_obj_t *dd = lv_dropdown_create(svc_row);
+    lv_dropdown_set_options(dd, "WiGLE\nWDG Wars\nBoth");
+    lv_dropdown_set_selected(dd, (wdup_target == WDUP_WIGLE) ? 0 :
+                                  (wdup_target == WDUP_WDG)  ? 1 : 2);
+    lv_obj_set_width(dd, 120);
+    lv_obj_set_style_text_font(dd, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(dd, lv_color_make(40, 40, 40), 0);
+    lv_obj_set_style_text_color(dd, ui_text_color(), 0);
+    lv_obj_add_event_cb(dd, wdup_target_dd_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    // ── WiGLE key entry ───────────────────────────────────────────────────
+    lv_obj_t *wg_lbl = lv_label_create(content);
+    lv_label_set_text(wg_lbl, "WiGLE API token (base64):");
+    lv_obj_set_style_text_font(wg_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wg_lbl, lv_color_make(0, 188, 212), 0);
+
+    wdup_wigle_key_ta = lv_textarea_create(content);
+    lv_obj_set_width(wdup_wigle_key_ta, lv_pct(100));
+    lv_textarea_set_one_line(wdup_wigle_key_ta, true);
+    lv_textarea_set_max_length(wdup_wigle_key_ta, WIGLE_KEY_MAX_LEN - 1);
+    lv_textarea_set_text(wdup_wigle_key_ta, wigle_api_key[0] ? wigle_api_key : "");
+    lv_textarea_set_placeholder_text(wdup_wigle_key_ta, "Paste base64 token from wigle.net");
+    lv_obj_set_style_text_font(wdup_wigle_key_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(wdup_wigle_key_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(wdup_wigle_key_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(wdup_wigle_key_ta, lv_color_make(0, 188, 212), 0);
+
+    // ── WDG Wars key entry ────────────────────────────────────────────────
+    lv_obj_t *wdg_lbl = lv_label_create(content);
+    lv_label_set_text(wdg_lbl, "WDG Wars API key:");
+    lv_obj_set_style_text_font(wdg_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wdg_lbl, lv_color_make(255, 152, 0), 0);
+
+    wdup_wdg_key_ta = lv_textarea_create(content);
+    lv_obj_set_width(wdup_wdg_key_ta, lv_pct(100));
+    lv_textarea_set_one_line(wdup_wdg_key_ta, true);
+    lv_textarea_set_max_length(wdup_wdg_key_ta, WDGWARS_KEY_MAX_LEN - 1);
+    lv_textarea_set_text(wdup_wdg_key_ta, wdgwars_api_key[0] ? wdgwars_api_key : "");
+    lv_textarea_set_placeholder_text(wdup_wdg_key_ta, "Paste key from wdgwars.pl");
+    lv_obj_set_style_text_font(wdup_wdg_key_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(wdup_wdg_key_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(wdup_wdg_key_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(wdup_wdg_key_ta, lv_color_make(255, 152, 0), 0);
+
+    // ── Per-file progress indicators ──────────────────────────────────────
+    lv_obj_t *prog_row = lv_obj_create(content);
+    lv_obj_set_size(prog_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(prog_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(prog_row, 0, 0);
+    lv_obj_set_style_pad_all(prog_row, 0, 0);
+    lv_obj_set_flex_flow(prog_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(prog_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(prog_row, 6, 0);
+
+    wdup_progress_bar = lv_bar_create(prog_row);
+    lv_obj_set_size(wdup_progress_bar, 160, 8);
+    lv_bar_set_range(wdup_progress_bar, 0, 1);
+    lv_bar_set_value(wdup_progress_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(wdup_progress_bar, lv_color_make(50, 50, 50), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(wdup_progress_bar, lv_color_make(76, 175, 80), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(wdup_progress_bar, 4, LV_PART_MAIN);
+    lv_obj_set_style_radius(wdup_progress_bar, 4, LV_PART_INDICATOR);
+
+    wdup_progress_lbl = lv_label_create(prog_row);
+    lv_label_set_text(wdup_progress_lbl, "0/0");
+    lv_obj_set_style_text_font(wdup_progress_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wdup_progress_lbl, lv_color_make(180, 180, 180), 0);
+
+    lv_obj_t *stat_row = lv_obj_create(content);
+    lv_obj_set_size(stat_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(stat_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(stat_row, 0, 0);
+    lv_obj_set_style_pad_all(stat_row, 0, 0);
+    lv_obj_set_flex_flow(stat_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(stat_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    wdup_wigle_stat_lbl = lv_label_create(stat_row);
+    lv_label_set_text(wdup_wigle_stat_lbl, "WiGLE --");
+    lv_obj_set_style_text_font(wdup_wigle_stat_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wdup_wigle_stat_lbl, lv_color_make(150, 150, 150), 0);
+
+    wdup_wdg_stat_lbl = lv_label_create(stat_row);
+    lv_label_set_text(wdup_wdg_stat_lbl, "WDG --");
+    lv_obj_set_style_text_font(wdup_wdg_stat_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wdup_wdg_stat_lbl, lv_color_make(150, 150, 150), 0);
+
+    // ── Progress list ─────────────────────────────────────────────────────
+    wdup_status_list = lv_list_create(content);
+    lv_obj_set_size(wdup_status_list, lv_pct(100), 60);
+    lv_obj_set_style_bg_color(wdup_status_list, lv_color_make(20, 20, 20), 0);
+    lv_obj_set_style_border_width(wdup_status_list, 1, 0);
+    lv_obj_set_style_border_color(wdup_status_list, lv_color_make(60, 60, 60), 0);
+    lv_obj_set_style_pad_all(wdup_status_list, 2, 0);
+    if (wigle_api_key[0] || wdgwars_api_key[0]) {
+        lv_obj_t *hint = lv_list_add_text(wdup_status_list, "Ready. Tap Upload to start.");
+        if (hint) lv_obj_set_style_text_color(hint, lv_color_make(150, 150, 150), 0);
+    } else {
+        lv_obj_t *hint = lv_list_add_text(wdup_status_list, "Enter API key(s) above, then tap Upload.");
+        if (hint) lv_obj_set_style_text_color(hint, lv_color_make(255, 193, 7), 0);
+    }
+
+    // ── Bottom button bar: [Upload] [Back] — created before keyboard for Z-order ──
+    wdup_upload_btn = lv_btn_create(function_page);
+    lv_obj_set_size(wdup_upload_btn, 110, 32);
+    lv_obj_align(wdup_upload_btn, LV_ALIGN_BOTTOM_MID, -62, -6);
+    lv_obj_set_style_bg_color(wdup_upload_btn, lv_color_make(233, 30, 99), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(wdup_upload_btn, 8, 0);
+    lv_obj_set_style_border_width(wdup_upload_btn, 0, 0);
+    lv_obj_t *upload_lbl = lv_label_create(wdup_upload_btn);
+    lv_label_set_text(upload_lbl, LV_SYMBOL_UPLOAD "  Upload All");
+    lv_obj_set_style_text_font(upload_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(upload_lbl);
+    lv_obj_add_event_cb(wdup_upload_btn, wdup_start_cb, LV_EVENT_CLICKED, NULL);
+
+    wdup_back_btn_obj = lv_btn_create(function_page);
+    lv_obj_set_size(wdup_back_btn_obj, 110, 32);
+    lv_obj_align(wdup_back_btn_obj, LV_ALIGN_BOTTOM_MID, 62, -6);
+    lv_obj_set_style_bg_color(wdup_back_btn_obj, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(wdup_back_btn_obj, 8, 0);
+    lv_obj_set_style_border_width(wdup_back_btn_obj, 0, 0);
+    lv_obj_t *back_lbl = lv_label_create(wdup_back_btn_obj);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT "  Back");
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(back_lbl);
+    lv_obj_add_event_cb(wdup_back_btn_obj, wdup_back_cb, LV_EVENT_CLICKED, NULL);
+
+    // ── On-screen keyboard (hidden until a text area is tapped; above buttons in Z-order) ──
+    lv_obj_t *kb = lv_keyboard_create(function_page);
+    lv_obj_set_size(kb, LCD_H_RES, 130);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(kb, wdup_kb_event_cb, LV_EVENT_READY,  NULL);
+    lv_obj_add_event_cb(kb, wdup_kb_event_cb, LV_EVENT_CANCEL, NULL);
+    lv_obj_add_event_cb(wdup_wigle_key_ta, wdup_ta_focus_cb, LV_EVENT_CLICKED, kb);
+    lv_obj_add_event_cb(wdup_wdg_key_ta,   wdup_ta_focus_cb, LV_EVENT_CLICKED, kb);
+}
+
 // ── Data Transfer sub-menu screen ────────────────────────────────────────────
 
 static void data_transfer_tile_cb(lv_event_t *e)
@@ -15010,11 +17135,8 @@ static void data_transfer_tile_cb(lv_event_t *e)
     if (strcmp(key, "AP File Server") == 0)      show_ap_file_server_screen();
     else if (strcmp(key, "WiFi Client") == 0)    show_wifi_client_server_screen();
     else if (strcmp(key, "Wardrive Upload") == 0) {
-        // Placeholder
-        if (s_fileserv_status_lbl) return;
-        lv_obj_t *msg = lv_msgbox_create(lv_scr_act(), "Coming Soon",
-            "Wardrive data upload to WiGLE\nand other services will be\nadded in a future update.", NULL, true);
-        lv_obj_center(msg);
+        wdm_back_fn = show_data_transfer_screen;
+        show_wardrive_manage_screen();
     }
 }
 
@@ -16821,11 +18943,16 @@ static void gps_info_refresh_cb(lv_timer_t *t)
     (void)t;
     if (!gps_info_fix_lbl || !lv_obj_is_valid(gps_info_fix_lbl)) return;
 
-    char buf[64];
+    char buf[80];
+    bool live = current_gps.valid;
+    bool stale = !live && g_gps_last_known.valid;
 
-    if (current_gps.valid) {
+    if (live) {
         lv_label_set_text(gps_info_fix_lbl, LV_SYMBOL_GPS " Fix: YES");
         lv_obj_set_style_text_color(gps_info_fix_lbl, COLOR_MATERIAL_GREEN, 0);
+    } else if (stale) {
+        lv_label_set_text(gps_info_fix_lbl, LV_SYMBOL_GPS " Fix: NO  (last known \xe2\x86\x93)");
+        lv_obj_set_style_text_color(gps_info_fix_lbl, COLOR_MATERIAL_AMBER, 0);
     } else {
         lv_label_set_text(gps_info_fix_lbl, LV_SYMBOL_GPS " Fix: NO");
         lv_obj_set_style_text_color(gps_info_fix_lbl, COLOR_MATERIAL_ORANGE, 0);
@@ -16840,29 +18967,43 @@ static void gps_info_refresh_cb(lv_timer_t *t)
     snprintf(buf, sizeof(buf), "Satellites: %d", current_gps.satellites);
     lv_label_set_text(gps_info_sat_lbl, buf);
 
-    if (current_gps.valid)
+    lv_color_t pos_color = live ? ui_text_color() : COLOR_MATERIAL_AMBER;
+
+    if (live)
         snprintf(buf, sizeof(buf), "Lat:  %.6f", (double)current_gps.latitude);
+    else if (stale)
+        snprintf(buf, sizeof(buf), "Lat:  %.6f *", (double)g_gps_last_known.latitude);
     else
         snprintf(buf, sizeof(buf), "Lat:  --");
     lv_label_set_text(gps_info_lat_lbl, buf);
+    lv_obj_set_style_text_color(gps_info_lat_lbl, pos_color, 0);
 
-    if (current_gps.valid)
+    if (live)
         snprintf(buf, sizeof(buf), "Lon:  %.6f", (double)current_gps.longitude);
+    else if (stale)
+        snprintf(buf, sizeof(buf), "Lon:  %.6f *", (double)g_gps_last_known.longitude);
     else
         snprintf(buf, sizeof(buf), "Lon:  --");
     lv_label_set_text(gps_info_lon_lbl, buf);
+    lv_obj_set_style_text_color(gps_info_lon_lbl, pos_color, 0);
 
-    if (current_gps.valid)
+    if (live)
         snprintf(buf, sizeof(buf), "Alt:  %.1f m", (double)current_gps.altitude);
+    else if (stale)
+        snprintf(buf, sizeof(buf), "Alt:  %.1f m *", (double)g_gps_last_known.altitude);
     else
         snprintf(buf, sizeof(buf), "Alt:  --");
     lv_label_set_text(gps_info_alt_lbl, buf);
+    lv_obj_set_style_text_color(gps_info_alt_lbl, pos_color, 0);
 
-    if (current_gps.valid)
+    if (live)
         snprintf(buf, sizeof(buf), "Accuracy: %.1f m", (double)current_gps.accuracy);
+    else if (stale)
+        snprintf(buf, sizeof(buf), "Accuracy: %.0f m (stale)", (double)GPS_STALE_ACCURACY_M);
     else
         snprintf(buf, sizeof(buf), "Accuracy: --");
     lv_label_set_text(gps_info_acc_lbl, buf);
+    lv_obj_set_style_text_color(gps_info_acc_lbl, pos_color, 0);
 }
 
 static void gps_back_to_settings_cb(lv_event_t *e)
@@ -16876,6 +19017,237 @@ static void gps_back_to_settings_cb(lv_event_t *e)
     gps_info_lat_lbl = gps_info_lon_lbl  = gps_info_alt_lbl = NULL;
     gps_info_acc_lbl = NULL;
     show_settings_screen();
+}
+
+// ── Manual GPS position edit overlay ─────────────────────────────────────────
+
+static lv_obj_t *gps_edit_overlay    = NULL;
+static lv_obj_t *gps_edit_lat_ta     = NULL;
+static lv_obj_t *gps_edit_lon_ta     = NULL;
+static lv_obj_t *gps_edit_alt_ta     = NULL;
+static lv_obj_t *gps_edit_save_btn   = NULL;
+static lv_obj_t *gps_edit_cancel_btn = NULL;
+
+static void gps_edit_kb_event_cb(lv_event_t *e)
+{
+    lv_obj_t *kb = lv_event_get_target(e);
+    if (lv_event_get_code(e) == LV_EVENT_READY || lv_event_get_code(e) == LV_EVENT_CANCEL) {
+        lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+        if (gps_edit_save_btn   && lv_obj_is_valid(gps_edit_save_btn))
+            lv_obj_clear_flag(gps_edit_save_btn,   LV_OBJ_FLAG_HIDDEN);
+        if (gps_edit_cancel_btn && lv_obj_is_valid(gps_edit_cancel_btn))
+            lv_obj_clear_flag(gps_edit_cancel_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void gps_edit_ta_focus_cb(lv_event_t *e)
+{
+    lv_obj_t *ta = lv_event_get_target(e);
+    lv_obj_t *kb = (lv_obj_t *)lv_event_get_user_data(e);
+    if (kb) {
+        lv_keyboard_set_textarea(kb, ta);
+        lv_obj_clear_flag(kb, LV_OBJ_FLAG_HIDDEN);
+        if (gps_edit_save_btn   && lv_obj_is_valid(gps_edit_save_btn))
+            lv_obj_add_flag(gps_edit_save_btn,   LV_OBJ_FLAG_HIDDEN);
+        if (gps_edit_cancel_btn && lv_obj_is_valid(gps_edit_cancel_btn))
+            lv_obj_add_flag(gps_edit_cancel_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void gps_edit_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    if (gps_edit_overlay && lv_obj_is_valid(gps_edit_overlay))
+        lv_obj_del(gps_edit_overlay);
+    gps_edit_overlay = gps_edit_lat_ta = gps_edit_lon_ta = NULL;
+    gps_edit_alt_ta  = gps_edit_save_btn = gps_edit_cancel_btn = NULL;
+}
+
+static void gps_edit_save_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!gps_edit_lat_ta || !gps_edit_lon_ta || !gps_edit_alt_ta) return;
+
+    const char *lat_s = lv_textarea_get_text(gps_edit_lat_ta);
+    const char *lon_s = lv_textarea_get_text(gps_edit_lon_ta);
+    const char *alt_s = lv_textarea_get_text(gps_edit_alt_ta);
+
+    double lat = atof(lat_s);
+    double lon = atof(lon_s);
+    double alt = atof(alt_s);
+
+    if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0 ||
+        (lat == 0.0 && lon == 0.0)) {
+        // Briefly flash the lat field red to signal invalid input
+        if (gps_edit_lat_ta && lv_obj_is_valid(gps_edit_lat_ta))
+            lv_obj_set_style_border_color(gps_edit_lat_ta, lv_color_make(255, 0, 0), 0);
+        return;
+    }
+
+    g_gps_last_known.latitude  = (float)lat;
+    g_gps_last_known.longitude = (float)lon;
+    g_gps_last_known.altitude  = (float)alt;
+    g_gps_last_known.accuracy  = GPS_STALE_ACCURACY_M;
+    g_gps_last_known.valid     = true;
+
+    // Write to NVS unconditionally — this is an explicit user action
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, NVS_KEY_GPS_LAT, (int32_t)(lat * 1e6));
+        nvs_set_i32(h, NVS_KEY_GPS_LON, (int32_t)(lon * 1e6));
+        nvs_set_i32(h, NVS_KEY_GPS_ALT, (int32_t)(alt * 10.0));
+        nvs_commit(h);
+        nvs_close(h);
+        ESP_LOGI(TAG, "Manual GPS position saved: %.6f, %.6f, alt %.1f", lat, lon, alt);
+    }
+
+    gps_edit_cancel_cb(NULL);  // close overlay
+}
+
+static void gps_show_edit_overlay(lv_event_t *e)
+{
+    (void)e;
+    if (gps_edit_overlay) return;  // already open
+
+    gps_edit_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(gps_edit_overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(gps_edit_overlay, 0, 0);
+    lv_obj_set_style_bg_color(gps_edit_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(gps_edit_overlay, LV_OPA_80, 0);
+    lv_obj_set_style_border_width(gps_edit_overlay, 0, 0);
+    lv_obj_set_style_pad_all(gps_edit_overlay, 0, 0);
+    lv_obj_clear_flag(gps_edit_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(gps_edit_overlay, 0, 0);
+
+    // ── Card (TOP_MID, above keyboard) ──────────────────────────────────────
+    lv_obj_t *card = lv_obj_create(gps_edit_overlay);
+    lv_obj_set_size(card, LCD_H_RES - 12, LV_SIZE_CONTENT);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 4);
+    lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+    lv_obj_set_style_border_color(card, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 8, 0);
+    lv_obj_set_style_pad_row(card, 4, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, LV_SYMBOL_GPS "  Set Fallback Position");
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+
+    lv_obj_t *sub = lv_label_create(card);
+    lv_label_set_text(sub, "Saved to NVS, used when GPS unavailable.");
+    lv_obj_set_style_text_font(sub, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sub, ui_muted_color(), 0);
+
+    // Pre-populate with best available position
+    char lat_buf[24] = "", lon_buf[24] = "", alt_buf[16] = "0.0";
+    const gps_data_t *pre = gps_best();
+    if (pre->valid) {
+        snprintf(lat_buf, sizeof(lat_buf), "%.6f", (double)pre->latitude);
+        snprintf(lon_buf, sizeof(lon_buf), "%.6f", (double)pre->longitude);
+        snprintf(alt_buf, sizeof(alt_buf), "%.1f",  (double)pre->altitude);
+    }
+
+    // Lat row
+    lv_obj_t *lat_lbl = lv_label_create(card);
+    lv_label_set_text(lat_lbl, "Latitude (-90 to 90):");
+    lv_obj_set_style_text_font(lat_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(lat_lbl, ui_text_color(), 0);
+
+    gps_edit_lat_ta = lv_textarea_create(card);
+    lv_obj_set_width(gps_edit_lat_ta, lv_pct(100));
+    lv_textarea_set_one_line(gps_edit_lat_ta, true);
+    lv_textarea_set_max_length(gps_edit_lat_ta, 16);
+    lv_textarea_set_accepted_chars(gps_edit_lat_ta, "-0123456789.");
+    lv_textarea_set_text(gps_edit_lat_ta, lat_buf);
+    lv_obj_set_style_text_font(gps_edit_lat_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(gps_edit_lat_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(gps_edit_lat_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(gps_edit_lat_ta, COLOR_MATERIAL_AMBER, 0);
+
+    // Lon row
+    lv_obj_t *lon_lbl = lv_label_create(card);
+    lv_label_set_text(lon_lbl, "Longitude (-180 to 180):");
+    lv_obj_set_style_text_font(lon_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(lon_lbl, ui_text_color(), 0);
+
+    gps_edit_lon_ta = lv_textarea_create(card);
+    lv_obj_set_width(gps_edit_lon_ta, lv_pct(100));
+    lv_textarea_set_one_line(gps_edit_lon_ta, true);
+    lv_textarea_set_max_length(gps_edit_lon_ta, 17);
+    lv_textarea_set_accepted_chars(gps_edit_lon_ta, "-0123456789.");
+    lv_textarea_set_text(gps_edit_lon_ta, lon_buf);
+    lv_obj_set_style_text_font(gps_edit_lon_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(gps_edit_lon_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(gps_edit_lon_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(gps_edit_lon_ta, COLOR_MATERIAL_AMBER, 0);
+
+    // Alt row
+    lv_obj_t *alt_lbl = lv_label_create(card);
+    lv_label_set_text(alt_lbl, "Altitude (m, optional):");
+    lv_obj_set_style_text_font(alt_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(alt_lbl, ui_text_color(), 0);
+
+    gps_edit_alt_ta = lv_textarea_create(card);
+    lv_obj_set_width(gps_edit_alt_ta, lv_pct(100));
+    lv_textarea_set_one_line(gps_edit_alt_ta, true);
+    lv_textarea_set_max_length(gps_edit_alt_ta, 10);
+    lv_textarea_set_accepted_chars(gps_edit_alt_ta, "-0123456789.");
+    lv_textarea_set_text(gps_edit_alt_ta, alt_buf);
+    lv_obj_set_style_text_font(gps_edit_alt_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(gps_edit_alt_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(gps_edit_alt_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(gps_edit_alt_ta, lv_color_make(80, 80, 80), 0);
+
+    // ── Button row inside card (keyboard is a sibling of card on overlay,
+    //    so it always renders on top regardless of button creation order) ──
+    lv_obj_t *btn_row = lv_obj_create(card);
+    lv_obj_set_width(btn_row, lv_pct(100));
+    lv_obj_set_height(btn_row, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    gps_edit_save_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(gps_edit_save_btn, 110, 30);
+    lv_obj_set_style_bg_color(gps_edit_save_btn, COLOR_MATERIAL_AMBER, LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(gps_edit_save_btn, 8, 0);
+    lv_obj_set_style_border_width(gps_edit_save_btn, 0, 0);
+    lv_obj_add_event_cb(gps_edit_save_btn, gps_edit_save_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *save_lbl = lv_label_create(gps_edit_save_btn);
+    lv_label_set_text(save_lbl, LV_SYMBOL_OK "  Save to NVS");
+    lv_obj_set_style_text_font(save_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(save_lbl, lv_color_black(), 0);
+    lv_obj_center(save_lbl);
+
+    gps_edit_cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(gps_edit_cancel_btn, 100, 30);
+    lv_obj_set_style_bg_color(gps_edit_cancel_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(gps_edit_cancel_btn, 8, 0);
+    lv_obj_set_style_border_width(gps_edit_cancel_btn, 0, 0);
+    lv_obj_add_event_cb(gps_edit_cancel_btn, gps_edit_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *cancel_lbl = lv_label_create(gps_edit_cancel_btn);
+    lv_label_set_text(cancel_lbl, LV_SYMBOL_CLOSE "  Cancel");
+    lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(cancel_lbl);
+
+    // ── Keyboard (child of overlay, always renders above card and its contents) ──
+    lv_obj_t *kb = lv_keyboard_create(gps_edit_overlay);
+    lv_obj_set_size(kb, LCD_H_RES, 130);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(kb, gps_edit_kb_event_cb, LV_EVENT_READY,  NULL);
+    lv_obj_add_event_cb(kb, gps_edit_kb_event_cb, LV_EVENT_CANCEL, NULL);
+    lv_obj_add_event_cb(gps_edit_lat_ta, gps_edit_ta_focus_cb, LV_EVENT_CLICKED, kb);
+    lv_obj_add_event_cb(gps_edit_lon_ta, gps_edit_ta_focus_cb, LV_EVENT_CLICKED, kb);
+    lv_obj_add_event_cb(gps_edit_alt_ta, gps_edit_ta_focus_cb, LV_EVENT_CLICKED, kb);
 }
 
 static void show_gps_info_screen(void)
@@ -16955,16 +19327,33 @@ static void show_gps_info_screen(void)
     gps_info_refresh_cb(NULL);
     gps_info_refresh_timer = lv_timer_create(gps_info_refresh_cb, 1000, NULL);
 
+    // Set Position button (amber)
+    lv_obj_t *setpos_btn = lv_btn_create(function_page);
+    lv_obj_set_size(setpos_btn, 120, 32);
+    lv_obj_align(setpos_btn, LV_ALIGN_BOTTOM_MID, -44, -10);
+    lv_obj_set_style_bg_color(setpos_btn, COLOR_MATERIAL_AMBER, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(setpos_btn, lv_color_lighten(COLOR_MATERIAL_AMBER, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(setpos_btn, 0, 0);
+    lv_obj_set_style_radius(setpos_btn, 8, 0);
+    lv_obj_add_event_cb(setpos_btn, gps_show_edit_overlay, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *setpos_lbl = lv_label_create(setpos_btn);
+    lv_label_set_text(setpos_lbl, LV_SYMBOL_EDIT "  Set Position");
+    lv_obj_set_style_text_font(setpos_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(setpos_lbl, lv_color_black(), 0);
+    lv_obj_center(setpos_lbl);
+
+    // Back button (teal)
     lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 90, 34);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_size(back_btn, 80, 32);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 64, -10);
     lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(back_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(back_btn, 0, 0);
     lv_obj_set_style_radius(back_btn, 8, 0);
     lv_obj_add_event_cb(back_btn, gps_back_to_settings_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *back_lbl2 = lv_label_create(back_btn);
-    lv_label_set_text(back_lbl2, "Back");
+    lv_label_set_text(back_lbl2, LV_SYMBOL_LEFT "  Back");
+    lv_obj_set_style_text_font(back_lbl2, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(back_lbl2, ui_text_color(), 0);
     lv_obj_center(back_lbl2);
 }
@@ -17967,6 +20356,288 @@ static void show_oui_groups_screen(void)
     lv_obj_add_event_cb(back_btn, oui_groups_back_cb, LV_EVENT_CLICKED, NULL);
 }
 
+// ─── BLE PCAP capture (Kismet/PCAPNG format) ─────────────────────────────
+
+// Write PCAPNG Section Header Block
+static void ble_pcap_write_shb(FILE *f)
+{
+    uint32_t block_type   = 0x0A0D0D0A;
+    uint32_t block_len    = 28;
+    uint32_t byte_order   = 0x1A2B3C4D;
+    uint16_t major        = 1, minor = 0;
+    int64_t  section_len  = -1;
+
+    fwrite(&block_type,  4, 1, f);
+    fwrite(&block_len,   4, 1, f);
+    fwrite(&byte_order,  4, 1, f);
+    fwrite(&major,       2, 1, f);
+    fwrite(&minor,       2, 1, f);
+    fwrite(&section_len, 8, 1, f);
+    fwrite(&block_len,   4, 1, f);
+}
+
+// Write PCAPNG Interface Description Block (LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR = 256)
+static void ble_pcap_write_idb(FILE *f)
+{
+    uint32_t block_type = 0x00000001;
+    uint32_t block_len  = 20;
+    uint16_t link_type  = 256;
+    uint16_t reserved   = 0;
+    uint32_t snap_len   = 65535;
+
+    fwrite(&block_type, 4, 1, f);
+    fwrite(&block_len,  4, 1, f);
+    fwrite(&link_type,  2, 1, f);
+    fwrite(&reserved,   2, 1, f);
+    fwrite(&snap_len,   4, 1, f);
+    fwrite(&block_len,  4, 1, f);
+}
+
+// Write one Enhanced Packet Block from a ble_pcap_pkt_t
+static void ble_pcap_write_epb(FILE *f, const ble_pcap_pkt_t *pkt)
+{
+    // Build LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR pseudo-header (10 bytes)
+    uint8_t phdr[10];
+    phdr[0] = 37;                       // rf_channel: advertising ch 37 (2402 MHz)
+    phdr[1] = (uint8_t)(int8_t)pkt->rssi;
+    phdr[2] = (uint8_t)(int8_t)(-128);  // noise: unavailable
+    phdr[3] = 0;                        // access address offenses
+    uint32_t ref_aa = 0x8E89BED6;       // BLE advertising access address (LE)
+    memcpy(phdr + 4, &ref_aa, 4);
+    uint16_t flags = 0x0002;            // signal power valid
+    memcpy(phdr + 8, &flags, 2);
+
+    // Build BLE LL ADV PDU
+    // PDU header: type | TxAdd | length
+    uint8_t pdu_type = 0; // ADV_IND default
+    switch (pkt->event_type) {
+        case 1: pdu_type = 1; break;  // ADV_DIRECT_IND
+        case 2: pdu_type = 2; break;  // ADV_NONCONN_IND
+        case 4: pdu_type = 4; break;  // SCAN_RSP
+        default: pdu_type = 0; break;
+    }
+    uint8_t payload_len = 6 + pkt->data_len;
+    uint8_t hdr0 = (uint8_t)(pdu_type | (pkt->addr_type ? 0x40 : 0x00));
+    uint8_t hdr1 = payload_len;
+
+    // Packet = phdr(10) + PDU_header(2) + AdvA(6) + AdvData(N)
+    int pkt_len = 10 + 2 + 6 + pkt->data_len;
+    int pad     = (4 - (pkt_len & 3)) & 3;
+    int padded  = pkt_len + pad;
+    uint32_t block_len = 32 + (uint32_t)padded;
+
+    uint32_t block_type    = 0x00000006;
+    uint32_t iface_id      = 0;
+    uint32_t ts_high       = (uint32_t)(pkt->timestamp_us >> 32);
+    uint32_t ts_low        = (uint32_t)(pkt->timestamp_us & 0xFFFFFFFF);
+    uint32_t captured_len  = (uint32_t)pkt_len;
+    uint32_t original_len  = (uint32_t)pkt_len;
+
+    fwrite(&block_type,   4, 1, f);
+    fwrite(&block_len,    4, 1, f);
+    fwrite(&iface_id,     4, 1, f);
+    fwrite(&ts_high,      4, 1, f);
+    fwrite(&ts_low,       4, 1, f);
+    fwrite(&captured_len, 4, 1, f);
+    fwrite(&original_len, 4, 1, f);
+    // Pseudo-header
+    fwrite(phdr, 10, 1, f);
+    // PDU header
+    fwrite(&hdr0, 1, 1, f);
+    fwrite(&hdr1, 1, 1, f);
+    // AdvA (NimBLE stores in LE byte order = correct for LL frame)
+    fwrite(pkt->addr, 6, 1, f);
+    // AdvData
+    fwrite(pkt->data, pkt->data_len, 1, f);
+    // Padding
+    if (pad) { uint8_t zeros[4] = {0}; fwrite(zeros, pad, 1, f); }
+    // Repeated block length
+    fwrite(&block_len, 4, 1, f);
+}
+
+// BLE GAP callback for PCAP capture
+static int ble_pcap_gap_cb(struct ble_gap_event *event, void *arg)
+{
+    (void)arg;
+    if (event->type != BLE_GAP_EVENT_DISC) return 0;
+    if (!ble_pcap_active || !ble_pcap_queue) return 0;
+
+    struct ble_gap_disc_desc *desc = &event->disc;
+    ble_pcap_pkt_t pkt;
+    memcpy(pkt.addr, desc->addr.val, 6);
+    pkt.addr_type    = desc->addr.type;
+    pkt.event_type   = (uint8_t)desc->event_type;
+    pkt.rssi         = desc->rssi;
+    pkt.data_len     = desc->length_data < 31 ? desc->length_data : 31;
+    memcpy(pkt.data, desc->data, pkt.data_len);
+    pkt.timestamp_us = (uint64_t)esp_timer_get_time();
+
+    xQueueSend(ble_pcap_queue, &pkt, 0);  // non-blocking; drop if full
+    return 0;
+}
+
+static void ble_pcap_stop(void)
+{
+    if (!ble_pcap_active) return;
+    ble_pcap_active = false;
+    ble_gap_disc_cancel();
+
+    if (ble_pcap_timer) { lv_timer_del(ble_pcap_timer); ble_pcap_timer = NULL; }
+
+    // Drain remaining queue to file
+    if (ble_pcap_file && ble_pcap_queue) {
+        ble_pcap_pkt_t pkt;
+        if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+            while (xQueueReceive(ble_pcap_queue, &pkt, 0) == pdTRUE)
+                ble_pcap_write_epb(ble_pcap_file, &pkt);
+            fflush(ble_pcap_file);
+            fclose(ble_pcap_file);
+            ble_pcap_file = NULL;
+            xSemaphoreGive(sd_spi_mutex);
+        }
+    }
+
+    if (ble_pcap_queue) { vQueueDelete(ble_pcap_queue); ble_pcap_queue = NULL; }
+    ble_pcap_cnt_label = NULL;
+}
+
+static void ble_pcap_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!ble_pcap_active || !ble_pcap_queue) return;
+
+    ble_pcap_pkt_t pkt;
+    int drained = 0;
+
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        while (xQueueReceive(ble_pcap_queue, &pkt, 0) == pdTRUE) {
+            if (ble_pcap_file) ble_pcap_write_epb(ble_pcap_file, &pkt);
+            ble_pcap_pkt_count++;
+            drained++;
+            if (drained >= 16) { fflush(ble_pcap_file); break; }
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    if (ble_pcap_cnt_label && lv_obj_is_valid(ble_pcap_cnt_label)) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "Packets: %lu", (unsigned long)ble_pcap_pkt_count);
+        lv_label_set_text(ble_pcap_cnt_label, buf);
+    }
+}
+
+static void ble_pcap_stop_cb(lv_event_t *e)
+{
+    (void)e;
+    ble_pcap_stop();
+    show_bluetooth_screen();
+}
+
+static void show_ble_pcap_screen(void)
+{
+    if (!ensure_ble_mode()) {
+        ESP_LOGE(TAG, "BLE PCAP: BLE init failed");
+        return;
+    }
+
+    // Open output file
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        struct stat st = {0};
+        if (stat(BLE_PCAP_DIR, &st) == -1) {
+            mkdir("/sdcard/lab", 0777);
+            mkdir(BLE_PCAP_DIR, 0777);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    uint32_t ts = (uint32_t)(esp_timer_get_time() / 1000000);
+    char fname[96];
+    snprintf(fname, sizeof(fname), BLE_PCAP_DIR "/ble_%lu.pcapng", (unsigned long)ts);
+
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        ble_pcap_file = fopen(fname, "wb");
+        if (ble_pcap_file) {
+            ble_pcap_write_shb(ble_pcap_file);
+            ble_pcap_write_idb(ble_pcap_file);
+            fflush(ble_pcap_file);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    if (!ble_pcap_file) {
+        ESP_LOGE(TAG, "BLE PCAP: cannot open %s", fname);
+        show_bluetooth_screen();
+        return;
+    }
+
+    ble_pcap_queue     = xQueueCreate(64, sizeof(ble_pcap_pkt_t));
+    ble_pcap_pkt_count = 0;
+    ble_pcap_active    = true;
+
+    create_function_page_base("BLE PCAP");
+
+    // Filename label
+    lv_obj_t *fn_lbl = lv_label_create(function_page);
+    const char *short_name = strrchr(fname, '/');
+    short_name = short_name ? short_name + 1 : fname;
+    lv_label_set_text(fn_lbl, short_name);
+    lv_obj_set_style_text_font(fn_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(fn_lbl, UI_ACCENT_CYAN, 0);
+    lv_obj_align(fn_lbl, LV_ALIGN_TOP_MID, 0, 36);
+    lv_label_set_long_mode(fn_lbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(fn_lbl, LCD_H_RES - 8);
+    lv_obj_set_style_text_align(fn_lbl, LV_TEXT_ALIGN_CENTER, 0);
+
+    // Packet counter
+    ble_pcap_cnt_label = lv_label_create(function_page);
+    lv_label_set_text(ble_pcap_cnt_label, "Packets: 0");
+    lv_obj_set_style_text_font(ble_pcap_cnt_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(ble_pcap_cnt_label, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_align(ble_pcap_cnt_label, LV_ALIGN_CENTER, 0, -20);
+
+    // Status
+    lv_obj_t *status_lbl = lv_label_create(function_page);
+    lv_label_set_text(status_lbl, LV_SYMBOL_BLUETOOTH " Capturing...");
+    lv_obj_set_style_text_font(status_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(status_lbl, UI_ACCENT_CYAN, 0);
+    lv_obj_align(status_lbl, LV_ALIGN_CENTER, 0, 20);
+
+    // Format note
+    lv_obj_t *fmt_lbl = lv_label_create(function_page);
+    lv_label_set_text(fmt_lbl, "Kismet/Wireshark PCAPNG\nDLT_BLUETOOTH_LE_LL_WITH_PHDR");
+    lv_obj_set_style_text_font(fmt_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(fmt_lbl, lv_color_make(120, 120, 120), 0);
+    lv_obj_set_style_text_align(fmt_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(fmt_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(fmt_lbl, LCD_H_RES - 16);
+    lv_obj_align(fmt_lbl, LV_ALIGN_CENTER, 0, 60);
+
+    // Stop button
+    lv_obj_t *stop_btn = lv_btn_create(function_page);
+    lv_obj_set_size(stop_btn, 110, 30);
+    lv_obj_align(stop_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_make(200, 50, 50), 0);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_make(160, 30, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(stop_btn, 8, 0);
+    lv_obj_t *stop_lbl = lv_label_create(stop_btn);
+    lv_label_set_text(stop_lbl, LV_SYMBOL_STOP "  Stop");
+    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(stop_lbl);
+    lv_obj_add_event_cb(stop_btn, ble_pcap_stop_cb, LV_EVENT_CLICKED, NULL);
+
+    // Start scanning
+    struct ble_gap_disc_params scan_params = {
+        .itvl = 0x60, .window = 0x60,
+        .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
+        .limited = 0, .passive = 0, .filter_duplicates = 0,
+    };
+    ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &scan_params, ble_pcap_gap_cb, NULL);
+
+    ble_pcap_timer = lv_timer_create(ble_pcap_timer_cb, 200, NULL);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 // Bluetooth screen
 static void show_bluetooth_screen(void)
 {
@@ -17978,11 +20649,11 @@ static void show_bluetooth_screen(void)
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
-    lv_obj_set_style_pad_all(tiles, 10, 0);
-    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_style_pad_all(tiles, 6, 0);
+    lv_obj_set_style_pad_gap(tiles, 6, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    
+
     // BT Scan & Select - first tile, cyan
     lv_obj_t *btsas_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BT Scan\n& Select", UI_ACCENT_CYAN, NULL, NULL);
     lv_obj_add_event_cb(btsas_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Scan & Select");
@@ -18003,9 +20674,13 @@ static void show_bluetooth_screen(void)
     lv_obj_t *lookout_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BT\nLookout", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(lookout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Dee Dee Detector");
 
-    // BT Attacks - Orange (bottom-right, 6th tile)
+    // BT Attacks - Orange
     lv_obj_t *btatk_tile = create_tile(tiles, LV_SYMBOL_WARNING, "BT\nAttacks", COLOR_MATERIAL_AMBER, NULL, NULL);
     lv_obj_add_event_cb(btatk_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Attacks");
+
+    // BLE PCAP - teal/purple
+    lv_obj_t *pcap_tile = create_tile(tiles, LV_SYMBOL_SAVE, "BLE\nPCAP", lv_color_hex(0x00897B), NULL, NULL);
+    lv_obj_add_event_cb(pcap_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE PCAP");
 }
 
 // BT Locator screen - scan BT devices, select one, then track RSSI every 10s
@@ -18474,10 +21149,11 @@ static void bto_probe_btn_cb(lv_event_t *e)
         /* Different device — re-walk to get fresh handles, then auto-probe */
         if (gw_probe_status_lbl && lv_obj_is_valid(gw_probe_status_lbl))
             lv_label_set_text(gw_probe_status_lbl, "Preparing...");
-        double lat = current_gps.valid ? (double)current_gps.latitude  : 0.0;
-        double lon = current_gps.valid ? (double)current_gps.longitude : 0.0;
+        const gps_data_t *gwg = gps_best();
+        double lat = gwg->valid ? (double)gwg->latitude  : 0.0;
+        double lon = gwg->valid ? (double)gwg->longitude : 0.0;
         if (!gw_walk(d->addr, d->addr_type, d->name[0] ? d->name : "Unknown",
-                     d->rssi, lat, lon, current_gps.valid)) {
+                     d->rssi, lat, lon, gwg->valid)) {
             gw_probe_result_back_cb(NULL);
             return;
         }
@@ -19999,18 +22675,36 @@ static const uint8_t s_apple_payloads[][10] = {
 };
 #define APPLE_PAYLOAD_COUNT (int)(sizeof(s_apple_payloads)/sizeof(s_apple_payloads[0]))
 
-// Samsung Galaxy Watch fast-connect (company ID 0x0075)
+// Samsung Galaxy Buds fast-connect (company ID 0x0075)
+// Last byte selects device model — triggers "Connect to <device>" popup on Samsung phones
 static const uint8_t s_samsung_payloads[][10] = {
-    {0x75,0x00,0x42,0x09,0x81,0x02,0x14,0x15,0x03,0x21},
-    {0x75,0x00,0x00,0x00,0x80,0x00,0x00,0x00,0x00,0x00},
+    {0x75,0x00,0x42,0x09,0x81,0x02,0x14,0x15,0x03,0x21}, // Galaxy Buds Pro  (SM-R190)
+    {0x75,0x00,0x42,0x09,0x81,0x02,0x14,0x15,0x03,0xA7}, // Galaxy Buds Live (SM-R180)
+    {0x75,0x00,0x42,0x09,0x81,0x02,0x14,0x15,0x03,0x33}, // Galaxy Buds2     (SM-R177)
+    {0x75,0x00,0x42,0x09,0x81,0x02,0x14,0x15,0x03,0x09}, // Galaxy Buds+     (SM-R175)
+    {0x75,0x00,0x42,0x09,0x81,0x02,0x14,0x15,0x03,0x46}, // Galaxy Buds2 Pro (SM-R510)
+    {0x75,0x00,0x42,0x09,0x81,0x02,0x14,0x15,0x03,0x63}, // Galaxy Buds FE   (SM-R400)
 };
 #define SAMSUNG_PAYLOAD_COUNT (int)(sizeof(s_samsung_payloads)/sizeof(s_samsung_payloads[0]))
 
 // Google Fast Pair — service data UUID 0xFE2C (little-endian) + 3-byte model ID
-// Format used in ble_hs_adv_fields.svc_data_uuid16: [UUID_LO UUID_HI data...]
-static const uint8_t s_google_fp_svc[] = {0x2C,0xFE,0x00,0x00,0x00};
-static const uint8_t s_google_fp_svc2[] = {0x2C,0xFE,0x00,0xC0,0x57};
-#define GOOGLE_PAYLOAD_COUNT 2
+// Format: [0x2C 0xFE model_byte0 model_byte1 model_byte2]
+// Model IDs are 3-byte big-endian values registered with Google's Fast Pair registry
+static const uint8_t s_google_fp_payloads[][5] = {
+    {0x2C,0xFE, 0x2D,0x7A,0x23}, // Pixel Buds A-Series
+    {0x2C,0xFE, 0x71,0x8F,0xA4}, // JBL Live 300TWS
+    {0x2C,0xFE, 0xCD,0x82,0x56}, // Bose NC 700
+    {0x2C,0xFE, 0xD4,0x46,0xA7}, // Sony WH-1000XM5
+    {0x2C,0xFE, 0x07,0xF4,0x26}, // Google Nest Hub Max
+    {0x2C,0xFE, 0xF5,0x24,0x94}, // JBL Buds Pro
+    {0x2C,0xFE, 0x82,0x1F,0x66}, // JBL Flip 6
+    {0x2C,0xFE, 0x02,0xDD,0x4F}, // JBL Tune 770NC
+    {0x2C,0xFE, 0x17,0x53,0x5E}, // Sony WH-1000XM5 (alt)
+    {0x2C,0xFE, 0xF0,0x00,0x00}, // Bose QuietComfort 35 II
+    {0x2C,0xFE, 0x06,0x00,0x00}, // Pixel Buds (1st gen)
+    {0x2C,0xFE, 0x92,0xBB,0xBD}, // Pixel Buds (variant)
+};
+#define GOOGLE_PAYLOAD_COUNT (int)(sizeof(s_google_fp_payloads)/sizeof(s_google_fp_payloads[0]))
 
 // Windows Swift Pair — service UUID 0xFE14 + payload
 static const uint8_t s_windows_sp_svc[] = {0x14,0xFE,0x80,0x00,0x00,0x00,0x00};
@@ -20048,7 +22742,19 @@ static void ble_spam_task(void *pvParameters)
     int mode_round = 0; // cycles through modes when ALL
 
     while (ble_spam_active) {
-        ble_gap_adv_stop(); // stop any previous advertising (ignore return)
+        // Rotate random address each cycle so scanners see a new device every packet.
+        // Without this every advertisement comes from the same MAC and nRF Connect
+        // updates the same row instead of showing a new device.
+        ble_addr_t rnd_addr;
+        if (ble_hs_id_gen_rnd(1, &rnd_addr) == 0)
+            ble_hs_id_set_rnd(rnd_addr.val);
+
+        ble_gap_adv_stop();
+        // Brief yield so NimBLE host task can process the stop event and free
+        // internal advertising resources before we set new fields. Without this
+        // the mbuf pool and event queue drain slowly until ~1400 cycles in the
+        // host asserts / watchdog fires.
+        vTaskDelay(pdMS_TO_TICKS(10));
 
         struct ble_hs_adv_fields fields;
         memset(&fields, 0, sizeof(fields));
@@ -20077,8 +22783,8 @@ static void ble_spam_task(void *pvParameters)
             break;
         case BLE_SPAM_MODE_GOOGLE:
             use_svc = true;
-            svc_data = (google_idx == 0) ? s_google_fp_svc : s_google_fp_svc2;
-            svc_data_len = sizeof(s_google_fp_svc);
+            svc_data = s_google_fp_payloads[google_idx];
+            svc_data_len = sizeof(s_google_fp_payloads[0]);
             google_idx = (google_idx + 1) % GOOGLE_PAYLOAD_COUNT;
             break;
         case BLE_SPAM_MODE_WINDOWS:
@@ -20107,7 +22813,7 @@ static void ble_spam_task(void *pvParameters)
                               &adv_params, NULL, NULL);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(180));
+        vTaskDelay(pdMS_TO_TICKS(170)); // 10 + 170 = 180 ms total per cycle
         ble_spam_count++;
         ble_spam_needs_ui_update = true;
     }
@@ -20137,7 +22843,7 @@ static void ble_spam_start_btn_cb(lv_event_t *e)
         ble_spam_active = true;
         lv_label_set_text(lv_obj_get_child(ble_spam_start_btn, 0), "STOP");
         lv_obj_set_style_bg_color(ble_spam_start_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-        xTaskCreate(ble_spam_task, "ble_spam", 4096, NULL, 5, &ble_spam_task_handle);
+        xTaskCreate(ble_spam_task, "ble_spam", 8192, NULL, 5, &ble_spam_task_handle);
     }
 }
 
@@ -22774,6 +25480,12 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
 
+    // BLE PCAP capture
+    if (strcmp(attack_name, "BLE PCAP") == 0) {
+        show_ble_pcap_screen();
+        return;
+    }
+
     // Directed BT Attacks menu — target-specific attacks from SAS actions screen
     if (strcmp(attack_name, "Directed BT Attacks") == 0) {
         show_directed_bt_attacks_screen();
@@ -22874,7 +25586,9 @@ static bool parse_gps_nmea(const char *nmea_sentence)
 		strncpy(sentence, nmea_sentence, sizeof(sentence) - 1);
 		sentence[sizeof(sentence) - 1] = '\0';
 
-		char *token = strtok(sentence, ",");
+		// Use strtok_r so the caller's strtok state (in gps_task) is not clobbered.
+		char *sp = NULL;
+		char *token = strtok_r(sentence, ",", &sp);
 		int field = 0;
 		float lat_deg = 0, lat_min = 0;
 		float lon_deg = 0, lon_min = 0;
@@ -22906,7 +25620,7 @@ static bool parse_gps_nmea(const char *nmea_sentence)
 				case 8: hdop = atof(token); break;
 				case 9: altitude = atof(token); break;
 			}
-			token = strtok(NULL, ",");
+			token = strtok_r(NULL, ",", &sp);
 			field++;
 		}
 
@@ -22918,6 +25632,8 @@ static bool parse_gps_nmea(const char *nmea_sentence)
 			current_gps.altitude = altitude;
 			current_gps.accuracy = hdop * 4.0f;
 			current_gps.valid = true;
+			g_gps_last_known = current_gps;  // always snapshot every valid fix
+			g_gps_save_pending = true;       // main loop will call nvs_save_last_gps()
 			return true;
 		}
 	}
@@ -22928,7 +25644,8 @@ static bool parse_gps_nmea(const char *nmea_sentence)
 		strncpy(sentence, nmea_sentence, sizeof(sentence) - 1);
 		sentence[sizeof(sentence) - 1] = '\0';
 
-		char *token = strtok(sentence, ",");
+		char *sp = NULL;
+		char *token = strtok_r(sentence, ",", &sp);
 		int field = 0;
 		char status = 'V';
 		int hh = 0, mm = 0, ss = 0, day = 0, mon = 0, yr = 0;
@@ -22951,13 +25668,19 @@ static bool parse_gps_nmea(const char *nmea_sentence)
 					}
 					break;
 			}
-			token = strtok(NULL, ",");
+			token = strtok_r(NULL, ",", &sp);
 			field++;
 		}
 
 		if (status == 'A' && yr > 0) {
-			static bool s_clock_synced = false;
-			if (!s_clock_synced) {
+			// Sync if clock looks wrong (year < 2024) or we haven't synced yet.
+			// Re-checked every RMC so late GPS fixes correct files written before first lock.
+			static bool s_gps_synced = false;
+			time_t now = time(NULL);
+			struct tm now_utc;
+			gmtime_r(&now, &now_utc);
+			bool clock_wrong = (now_utc.tm_year + 1900 < 2024);
+			if (clock_wrong || !s_gps_synced) {
 				struct tm t = {0};
 				t.tm_year  = 100 + yr; // 2000+yr, minus 1900
 				t.tm_mon   = mon - 1;
@@ -22972,9 +25695,11 @@ static bool parse_gps_nmea(const char *nmea_sentence)
 				if (epoch != (time_t)-1) {
 					struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
 					settimeofday(&tv, NULL);
-					s_clock_synced = true;
-					ESP_LOGI(TAG, "System clock synced from GPS: %04d-%02d-%02d %02d:%02d:%02d UTC",
-					         2000+yr, mon, day, hh, mm, ss);
+					if (!s_gps_synced) {
+						s_gps_synced = true;
+						ESP_LOGI(TAG, "System clock synced from GPS: %04d-%02d-%02d %02d:%02d:%02d UTC",
+						         2000+yr, mon, day, hh, mm, ss);
+					}
 				}
 			}
 			return true;
