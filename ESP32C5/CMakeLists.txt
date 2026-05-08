@@ -3,8 +3,10 @@ cmake_minimum_required(VERSION 3.16)
 # Add linker flag globally (needed for duplicate symbols in ROM)
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-zmuldefs")
 
-# Version shown in boot log (app_init: App version).
-# Keep in sync with FW_VERSION in wifi_common.h.
+# ── Single source of truth for firmware version ──────────────────────────────
+# Update ONLY this line when bumping the version. It is automatically propagated
+# to both the IDF boot log (app_init: App version) and to the FW_VERSION macro
+# used throughout the firmware — no need to edit wifi_common.h separately.
 set(PROJECT_VER "v1.0.4")
 
 # Bootstrap ESP-IDF build system
@@ -17,6 +19,10 @@ idf_build_set_property(LINK_OPTIONS "-Wl,-zmuldefs" APPEND)
 idf_build_set_property(COMPILE_OPTIONS "-I${CMAKE_SOURCE_DIR}/main" APPEND)
 
 project(CYM-NM28C5)
+
+# Expose PROJECT_VER as FW_VERSION compile definition so wifi_common.h picks it
+# up without a separate hardcoded string.  All translation units see this.
+idf_build_set_property(COMPILE_DEFINITIONS "FW_VERSION=\"${PROJECT_VER}\"" APPEND)
 
 # ===== MITM: allow lwIP to forward packets back out the same WiFi interface =====
 idf_component_get_property(lwip_lib lwip COMPONENT_LIB)
