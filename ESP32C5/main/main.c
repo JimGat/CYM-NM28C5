@@ -19163,7 +19163,7 @@ static void show_gps_info_screen(void)
     // Set Position button (amber)
     lv_obj_t *setpos_btn = lv_btn_create(function_page);
     lv_obj_set_size(setpos_btn, 120, 32);
-    lv_obj_align(setpos_btn, LV_ALIGN_BOTTOM_MID, -66, -10);
+    lv_obj_align(setpos_btn, LV_ALIGN_BOTTOM_MID, -44, -10);
     lv_obj_set_style_bg_color(setpos_btn, COLOR_MATERIAL_AMBER, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(setpos_btn, lv_color_lighten(COLOR_MATERIAL_AMBER, 30), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(setpos_btn, 0, 0);
@@ -19178,7 +19178,7 @@ static void show_gps_info_screen(void)
     // Back button (teal)
     lv_obj_t *back_btn = lv_btn_create(function_page);
     lv_obj_set_size(back_btn, 80, 32);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 54, -10);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 64, -10);
     lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(back_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(back_btn, 0, 0);
