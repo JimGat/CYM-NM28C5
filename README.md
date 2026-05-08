@@ -89,7 +89,8 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **WiFi Attacks** | Deauth, Evil Twin, Captive Portal, Blackout, Snifferdog, SAE Overflow |
 | **Handshake Capture** | WPA/WPA2 4-way handshake capture (PCAP & HCCAPX) |
 | **Karma AP** | Respond to probe requests, rogue access point |
-| **Wardriving** | GPS + WiFi logging, dual-band filter (2.4 GHz / 5 GHz / Both), optional BLE time-sliced scanning, WiGLE CSV 1.6, upload log tracking, raw PCAP toggle, GPS mark waypoints (GPX output), WiGLE and WDG Wars upload |
+| **Wardriving** | GPS + WiFi logging, dual-band filter (2.4 GHz / 5 GHz / Both), optional BLE time-sliced scanning, WiGLE CSV 1.6, upload log tracking, raw PCAP toggle, GPS mark waypoints (GPX output), WiGLE and WDG Wars upload; GPS last-known position hold with 150 m stale accuracy when signal is lost |
+| **GPS** | NMEA RMC auto-syncs system clock (FAT timestamps); last-known position persisted to NVS (5-minute throttle); manual fallback editor in Settings → GPS Info; all data-collection features (wardrive, GATT Walker, marks) use best available GPS transparently |
 | **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk, Bluetooth Lookout, BLE Spam, Device Spoof (general + directed), BLE Disconnect (directed), BLE PCAP (Kismet PCAPNG raw capture) |
 | **Deauth Monitor** | Passive detection of nearby deauth attacks |
 | **Credentials** | Captive portal credential capture, WPA-SEC upload |
@@ -232,7 +233,15 @@ ATGM336H Module          NM-CYD-C5 (ESP32-C5)
 
 **Settings:** UART1 · 9600 baud · 8N1 · no flow control
 
-The firmware parses GGA sentences for latitude, longitude, altitude, and satellite count, and RMC sentences for fix validity. Cold start to first fix typically takes 30–60 seconds with a clear sky view.
+The firmware parses **GGA** sentences for latitude, longitude, altitude, and satellite count, and **RMC** sentences for fix validity and date/time.
+
+**System clock sync:** The first valid RMC sentence with an active fix (`status = A`) sets `settimeofday()` with the GPS UTC date and time. This corrects the ESP32's clock — which boots at epoch (1970-01-01) — so that files written to the SD card carry accurate FAT timestamps. The sync logic re-applies the time on every incoming RMC sentence until the system year reaches 2024 or later, meaning a late GPS fix (e.g. acquired 60 s into a wardrive) will still correct the timestamps of all files written afterward.
+
+**Last-known position persistence:** Every valid GGA fix is snapshotted to a `g_gps_last_known` global. When GPS signal is lost (entering a building, underground parking, etc.) all data-collection features automatically fall back to the last-known coordinates and report an accuracy of **150 m** (approximately one city block) in the WiGLE CSV `AccuracyMeters` field and in GPX waypoints. This ensures wardrive sessions continue collecting data indoors rather than pausing or producing empty location entries.
+
+The last-known position is also written to **NVS** (keys `gps_lat_i`, `gps_lon_i`, `gps_alt_i`, stored as integer micro-degrees ×10⁶) and reloaded at boot — so even if the first session of the day starts with no GPS fix, the device uses the last outdoor position from a prior session. Writes are throttled to at most once every five minutes to protect NVS flash life (~5+ years at that rate). An explicit save via **Settings → GPS Info → Set Position** bypasses the throttle.
+
+Cold start to first fix typically takes 30–60 seconds with a clear sky view.
 
 ---
 
@@ -281,8 +290,9 @@ Main Menu
 │   │   ├── Timeout       (inactivity timer)
 │   │   └── Brightness    (10–100% overlay)
 │   ├── SD Card
-│   ├── GPS Info
-│   ├── Power Mode
+│   ├── GPS Info            ← live status; amber display when using last-known
+│   └── Set Position    ← manual lat/lon/alt editor, saves to NVS
+├── Power Mode
 │   └── Data Transfer
 │       ├── AP File Server
 │       ├── WiFi Client
@@ -544,7 +554,7 @@ Walk complete
 
 **Fingerprint:** An FNV-32 hash computed over all service UUIDs, characteristic UUIDs, and property flags in walk order. Identical device models typically produce the same fingerprint, making it useful for passive device-type identification across multiple captures.
 
-**GPS geotagging:** If a GPS fix is active when GATT Walker starts, the coordinates are embedded in the JSON. This enables later mapping of device sightings.
+**GPS geotagging:** GATT Walker uses the best available GPS position — live fix if locked, last-known fallback if not (see [GPS Info & Fallback Position](#gps-info--fallback-position)). The JSON `gps.valid` field is `true` whenever any position is available (live or stale). When the fallback position was used, the coordinates are still useful for approximate area-level mapping; the 150 m stale accuracy is reflected in the surrounding context even though the JSON does not currently include an accuracy field.
 
 **Characteristic Properties (`props` / `props_str`):** Each characteristic has a bitmask that declares what operations it supports. The JSON includes both the raw integer (`"properties"`) and the decoded string (`"props_str"`). The on-device result screen shows both the compact flag string and the full human-readable expansion, e.g. `Props: R N (Read, Notify)`.
 
@@ -746,7 +756,19 @@ Wardrive
 
 #### Starting a Wardrive
 
-Tap **Wardrive** from the main menu, then **Start Wardrive**. The firmware switches the radio to promiscuous mode, begins D-UCB channel hopping, and writes a new WiGLE CSV 1.6 file to `/sdcard/lab/wardrives/` on each fixed GPS position change. The live dashboard shows:
+Tap **Wardrive** from the main menu, then **Start Wardrive**. The firmware switches the radio to promiscuous mode, begins D-UCB channel hopping, and writes a new WiGLE CSV 1.6 file to `/sdcard/lab/wardrives/`.
+
+**GPS at start-up:**
+- If a live GPS fix is already active, wardrive starts immediately.
+- If no live fix but a **last-known position is available** (from a prior session saved in NVS, or set manually), wardrive starts immediately using that position with 150 m accuracy — no blocking wait.
+- If neither is available (first-ever boot, no GPS module), the firmware waits in a blocking loop until a fix is acquired. Set a manual position via **Settings → GPS Info → Set Position** to skip this wait.
+
+**GPS loss during a session:**
+- When signal is lost (entering a building, tunnel, underground garage), wardrive **continues scanning** using the last-known coordinates and reports `150 m` in the `AccuracyMeters` CSV field.
+- Scanning only pauses if there is truly no position at all (no live fix, no last-known).
+- When signal returns, live coordinates and accuracy resume automatically.
+
+The live dashboard shows:
 
 | Field | Description |
 |-------|-------------|
@@ -771,6 +793,8 @@ A **Mark** button sits in the lower-right of the wardrive dashboard (amber, GPS 
 | **Single tap** | Opens a note dialog — enter a description, then **Save** to record the point with text |
 
 Waypoints are saved in GPX format to `/sdcard/lab/wardrives/wdXXXXXX_marks.gpx` — one file per session, named to match the session's CSV file. The file is closed cleanly when you tap **Stop**.
+
+**Stale position behavior:** If the live GPS fix is lost at the time a mark is saved, the device falls back to the last-known position (same 150 m accuracy rule as wardrive logging). The note dialog coordinate display shows the coordinates in **amber** with a `[stale]` label so you know the position is approximate. The saved `<wpt>` entry includes `[stale pos]` appended to the `<desc>` field so it's visible in any GPX viewer.
 
 **GPX output:**
 
@@ -858,18 +882,27 @@ WiGLE CSV 1.6 — accepted directly by WiGLE and WDG Wars without conversion.
 ```
 WigleWifi-1.6,appRelease=v1.0.4,model=NM-CYD-C5,...
 MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type
-AA:BB:CC:DD:EE:FF,"MyNetwork",[WPA2_PSK],2026-05-08 12:34:56,6,2437,-65,37.123456,-122.456789,0.00,0.00,,,WIFI
-11:22:33:44:55:66,"BLE Device",[BLE],2026-05-08 12:35:02,37,2402,-72,37.123456,-122.456789,0.00,0.00,,,BLE
+AA:BB:CC:DD:EE:FF,"MyNetwork",[WPA2_PSK],2026-05-08 12:34:56,6,2437,-65,37.123456,-122.456789,0.00,8.40,,,WIFI
+11:22:33:44:55:66,"BLE Device",[BLE],2026-05-08 12:35:02,37,2402,-72,37.123456,-122.456789,0.00,150.00,,,BLE
 ```
+
+`AccuracyMeters` is populated per-network from the GPS reading at discovery time. A live fix with HDOP 2.1 produces accuracy = `2.1 × 4 = 8.4 m`. A network logged from last-known fallback coordinates produces `150.00 m`. WiGLE uses this field to place the network on its map with an appropriate uncertainty radius.
 
 #### Wardriving Workflow — Field Use
 
 **Quick drive:**
-1. Insert GPS module (ATGM336H) — wait for fix (30–60 s clear sky).
+1. Insert GPS module (ATGM336H) — fix typically arrives in 30–60 s with clear sky.
+   - If last-known position is stored (NVS), wardrive starts immediately without waiting.
 2. Wardrive → Start Wardrive. The NeoPixel turns cyan.
-3. Drive. The AP count increments as new networks are logged.
+3. Drive. The AP count increments as new networks are logged. If you enter a building and GPS signal is lost, scanning continues using the last-known position (150 m accuracy in the CSV).
 4. Tap **Stop** when done. Files are closed and ready to upload.
 5. Wardrive → Manage Data → Upload.
+
+**Indoor / no-GPS use:**
+1. Settings → GPS Info → **Set Position** — enter your approximate location (e.g. city centre coordinates).
+2. Tap **Save to NVS**. The position is stored immediately.
+3. Start Wardrive — the device uses the entered position for all log entries.
+4. Networks are logged with `AccuracyMeters = 150` indicating approximate coordinates.
 
 **With BLE:**
 1. Options → BLE Wardrive → On. Options → Band → Both.
@@ -915,9 +948,77 @@ All settings are persisted via **NVS** (Non-Volatile Storage) across reboots. Th
 | **Timing** | Combined timing popup — WiFi scan dwell time sliders and GATT connect timeout slider |
 | **Screen** | Combined screen popup — inactivity timeout dropdown and brightness overlay slider |
 | **SD Card** | Validate/provision (creates `/sdcard/lab/` structure, shows completion status); browse file tree; check free space |
-| **GPS Info** | Live GPS fix status — latitude, longitude, altitude, satellite count, UTC time (parsed from NMEA RMC), and UART config reference (IO4/IO5, 9600 baud, ATGM336H). Refreshes every second. First active fix syncs the system clock (used for FAT timestamps) |
+| **GPS Info** | Live GPS fix status — latitude, longitude, altitude, satellite count, UTC time, and UART reference. When no live fix, last-known coordinates are shown in amber with `*` suffix and `Accuracy: 150 m (stale)`. **Set Position** button opens manual coordinate editor (see below). Refreshes every second. |
 | **Power Mode** | TX Power Mode selector — Normal or Max Power (see below) |
 | **Data Transfer** | File server sub-menu — AP mode or WiFi client mode (see below) |
+
+#### GPS Info & Fallback Position
+
+Accessible via **Settings → GPS Info**. Refreshes every second.
+
+**Live fix (GPS module connected and locked):**
+
+| Field | Description |
+|-------|-------------|
+| Fix | `YES` in green — active GNSS lock |
+| UTC | Time string parsed from NMEA RMC sentence |
+| Satellites | Count of tracked SVs from GGA |
+| Lat / Lon / Alt | Live coordinates in white |
+| Accuracy | Live HDOP × 4 in metres |
+
+**No live fix (signal lost or module not connected):**
+
+| Field | Display |
+|-------|---------|
+| Fix | `NO  (last known ↓)` in amber (or `NO` in orange if no fallback at all) |
+| Lat / Lon / Alt | Last-known coordinates in amber followed by `*` |
+| Accuracy | `150 m (stale)` in amber |
+
+The `*`-suffix values are what the device is actually using as its GPS fallback for wardrive logging, GATT Walker geotags, and GPS waypoints.
+
+**Set Position button (amber):**
+
+Opens a modal overlay to manually enter fallback coordinates:
+
+```
+┌─ Set Fallback Position ──────────────────┐
+│  Stored in NVS, used when GPS unavailable │
+├───────────────────────────────────────────┤
+│  Latitude (-90 to 90):   [ 37.421900    ] │
+│  Longitude (-180 to 180):[-122.084058   ] │
+│  Altitude (m, optional): [ 30.0         ] │
+├───────────────────────────────────────────┤
+│       [ ✓ Save to NVS ]  [ ✕ Cancel ]    │
+└───────────────────────────────────────────┘
+        [ on-screen keyboard ]
+```
+
+- Text areas are **pre-populated** with the best available position: live GPS if locked, last-known from NVS if not
+- **Accepted characters:** `-0123456789.` only — the keyboard filters invalid input
+- **Validation:** latitude must be in `[-90, 90]`, longitude in `[-180, 180]`; the null island `(0, 0)` is rejected. The lat field border flashes red on invalid input.
+- **On Save:** `g_gps_last_known` is updated immediately in RAM **and** written to NVS unconditionally (bypasses the 5-minute auto-save throttle — this is a deliberate user action). All subsequent wardrive scans, GATT walks, and mark waypoints use the new position.
+- **On Cancel:** no changes are written
+
+**NVS keys written by GPS (namespace `settings`):**
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `gps_lat_i` | i32 | Latitude × 10⁶ (integer micro-degrees) |
+| `gps_lon_i` | i32 | Longitude × 10⁶ |
+| `gps_alt_i` | i32 | Altitude × 10 (integer deci-metres) |
+
+Integer storage avoids NVS blob overhead and gives ~0.1 m altitude resolution and ~0.11 m position resolution — well within the 150 m stale accuracy the system reports.
+
+**Write frequency and flash lifetime:**
+
+| Write path | Frequency | Estimated NVS life |
+|---|---|---|
+| Auto (from GPS fix) | ≤ once per 5 minutes | ~5.7 years continuous use |
+| Manual (Set Position) | On user tap only | Decades |
+
+The NVS partition is 24 KB (≈6 flash pages × 100 K P/E cycles each). At one auto-write per 5 minutes, the effective write budget of ~600 K commits lasts roughly 5–6 years of daily wardriving. SD card writes (if used for logging) are handled by the SD FTL across gigabytes of storage — the per-minute rate would be trivial.
+
+---
 
 #### TX Power Mode
 
