@@ -19036,10 +19036,20 @@ static void gps_show_edit_overlay(lv_event_t *e)
     lv_obj_set_style_text_color(gps_edit_alt_ta, ui_text_color(), 0);
     lv_obj_set_style_border_color(gps_edit_alt_ta, lv_color_make(80, 80, 80), 0);
 
-    // ── Buttons (created before keyboard so keyboard is on top in Z-order) ──
-    gps_edit_save_btn = lv_btn_create(gps_edit_overlay);
+    // ── Button row inside card (keyboard is a sibling of card on overlay,
+    //    so it always renders on top regardless of button creation order) ──
+    lv_obj_t *btn_row = lv_obj_create(card);
+    lv_obj_set_width(btn_row, lv_pct(100));
+    lv_obj_set_height(btn_row, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    gps_edit_save_btn = lv_btn_create(btn_row);
     lv_obj_set_size(gps_edit_save_btn, 110, 30);
-    lv_obj_align(gps_edit_save_btn, LV_ALIGN_BOTTOM_MID, -62, -136);
     lv_obj_set_style_bg_color(gps_edit_save_btn, COLOR_MATERIAL_AMBER, LV_STATE_DEFAULT);
     lv_obj_set_style_radius(gps_edit_save_btn, 8, 0);
     lv_obj_set_style_border_width(gps_edit_save_btn, 0, 0);
@@ -19050,9 +19060,8 @@ static void gps_show_edit_overlay(lv_event_t *e)
     lv_obj_set_style_text_color(save_lbl, lv_color_black(), 0);
     lv_obj_center(save_lbl);
 
-    gps_edit_cancel_btn = lv_btn_create(gps_edit_overlay);
+    gps_edit_cancel_btn = lv_btn_create(btn_row);
     lv_obj_set_size(gps_edit_cancel_btn, 100, 30);
-    lv_obj_align(gps_edit_cancel_btn, LV_ALIGN_BOTTOM_MID, 60, -136);
     lv_obj_set_style_bg_color(gps_edit_cancel_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
     lv_obj_set_style_radius(gps_edit_cancel_btn, 8, 0);
     lv_obj_set_style_border_width(gps_edit_cancel_btn, 0, 0);
@@ -19062,7 +19071,7 @@ static void gps_show_edit_overlay(lv_event_t *e)
     lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_12, 0);
     lv_obj_center(cancel_lbl);
 
-    // ── Keyboard (created last — highest Z-order, renders above buttons) ────
+    // ── Keyboard (child of overlay, always renders above card and its contents) ──
     lv_obj_t *kb = lv_keyboard_create(gps_edit_overlay);
     lv_obj_set_size(kb, LCD_H_RES, 130);
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
