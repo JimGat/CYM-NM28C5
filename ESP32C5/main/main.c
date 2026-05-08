@@ -79,6 +79,7 @@ LV_IMG_DECLARE(deedee_img);
 
 // TLS (WPA-SEC upload)
 #include "esp_tls.h"
+#include "esp_crt_bundle.h"
 
 // NimBLE (BLE scanner)
 #include "nimble/nimble_port.h"
@@ -14264,9 +14265,8 @@ static int wpasec_upload_file(const char *filepath, const char *filename)
         "\r\n",
         wpasec_api_key, boundary, body_total_len);
 
-    // Open TLS connection - skip server cert verification
     esp_tls_cfg_t tls_cfg = {
-        .crt_bundle_attach = NULL,
+        .crt_bundle_attach = esp_crt_bundle_attach,
         .timeout_ms = 15000,
     };
 
@@ -15784,8 +15784,7 @@ static int wdup_upload_one(const char *filepath, const char *filename,
             path, host, key, boundary, body_total);
     }
 
-    // TLS connection (skip cert verification for speed on embedded target)
-    esp_tls_cfg_t cfg = { .crt_bundle_attach = NULL, .timeout_ms = 20000 };
+    esp_tls_cfg_t cfg = { .crt_bundle_attach = esp_crt_bundle_attach, .timeout_ms = 20000 };
     esp_tls_t *tls = esp_tls_init();
     if (!tls) { free(fbuf); return -1; }
 
@@ -15836,12 +15835,32 @@ static int wdup_upload_one(const char *filepath, const char *filename,
 
 static bool wdup_ensure_wifi(void)
 {
-    // Already connected?
     wifi_ap_record_t ap;
     esp_wifi_set_mode(WIFI_MODE_STA);
-    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) return true;
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
 
-    // Try with saved credentials
+    // Helper: poll until DHCP gives us a non-zero IP (up to wait_ms ms).
+    // L2 association alone is not enough — DNS fails until the IP lease is live.
+    #define WDUP_WAIT_IP_MS(ms) do { \
+        int _ticks = (ms) / 100; \
+        if (sta_netif) { \
+            for (int _i = 0; _i < _ticks; _i++) { \
+                esp_netif_ip_info_t _ip; \
+                if (esp_netif_get_ip_info(sta_netif, &_ip) == ESP_OK && _ip.ip.addr != 0) \
+                    return true; \
+                vTaskDelay(pdMS_TO_TICKS(100)); \
+            } \
+        } \
+    } while(0)
+
+    // Already associated — wait for DHCP before returning (guards the race where
+    // the caller gets back true but DNS still fails because no IP is assigned yet).
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        WDUP_WAIT_IP_MS(3000);
+        return true; // associated; proceed even if IP poll timed out
+    }
+
+    // No saved credentials — caller should direct user to WiFi Client screen.
     if (g_saved_wifi_ssid[0] == '\0') return false;
 
     esp_wifi_start();
@@ -15851,12 +15870,10 @@ static bool wdup_ensure_wifi(void)
     esp_wifi_set_config(WIFI_IF_STA, &cfg);
     esp_wifi_connect();
 
-    // Wait up to 12 s for IP
-    for (int i = 0; i < 60; i++) {
-        vTaskDelay(pdMS_TO_TICKS(200));
-        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) return true;
-    }
+    // Wait up to 15 s for a routable IP (not just L2 association).
+    WDUP_WAIT_IP_MS(15000);
     return false;
+    #undef WDUP_WAIT_IP_MS
 }
 
 static void wdup_task(void *pvParameters)
@@ -15871,7 +15888,10 @@ static void wdup_task(void *pvParameters)
     // Ensure WiFi STA connection
     wdup_push_msg("Connecting to WiFi...", cyan);
     if (!wdup_ensure_wifi()) {
-        wdup_push_msg("WiFi failed. Set SSID via WiFi Client.", red);
+        if (g_saved_wifi_ssid[0] == '\0')
+            wdup_push_msg("No WiFi saved. Go Back → Settings → Data Transfer → WiFi Client to set SSID.", red);
+        else
+            wdup_push_msg("WiFi connection failed. Check SSID/password in Settings → Data Transfer → WiFi Client.", red);
         goto task_done;
     }
     wdup_push_msg("WiFi connected.", green);
