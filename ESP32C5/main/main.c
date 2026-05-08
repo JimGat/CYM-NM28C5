@@ -8508,9 +8508,16 @@ static void wd_mark_open_note_dialog(void)
     lv_obj_clear_flag(wd_mark_note_overlay, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_radius(wd_mark_note_overlay, 0, 0);
 
+    // Keyboard at the bottom of the overlay (same pattern as every other keyboard screen)
+    lv_obj_t *kb = lv_keyboard_create(wd_mark_note_overlay);
+    lv_obj_set_width(kb, LCD_H_RES);
+    lv_obj_set_style_text_font(kb, &lv_font_montserrat_12, 0);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+
+    // Card sits above the keyboard
     lv_obj_t *card = lv_obj_create(wd_mark_note_overlay);
     lv_obj_set_size(card, LCD_H_RES - 16, LV_SIZE_CONTENT);
-    lv_obj_center(card);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 4);
     lv_obj_set_style_bg_color(card, ui_card_color(), 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(card, COLOR_MATERIAL_AMBER, 0);
@@ -8527,7 +8534,6 @@ static void wd_mark_open_note_dialog(void)
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_AMBER, 0);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
 
-    // GPS coords preview
     char coord_buf[48];
     snprintf(coord_buf, sizeof(coord_buf), "%.5f, %.5f",
              (double)current_gps.latitude, (double)current_gps.longitude);
@@ -8536,7 +8542,7 @@ static void wd_mark_open_note_dialog(void)
     lv_obj_set_style_text_color(coord_lbl, COLOR_MATERIAL_GREEN, 0);
     lv_obj_set_style_text_font(coord_lbl, &lv_font_montserrat_12, 0);
 
-    // Note text area
+    // Note text area — linked to keyboard
     wd_mark_note_ta = lv_textarea_create(card);
     lv_obj_set_width(wd_mark_note_ta, LCD_H_RES - 32);
     lv_obj_set_height(wd_mark_note_ta, 36);
@@ -8547,14 +8553,9 @@ static void wd_mark_open_note_dialog(void)
     lv_obj_set_style_bg_color(wd_mark_note_ta, ui_bg_color(), 0);
     lv_obj_set_style_text_color(wd_mark_note_ta, ui_text_color(), 0);
     lv_obj_set_style_border_color(wd_mark_note_ta, COLOR_MATERIAL_AMBER, 0);
-
-    // Keyboard
-    lv_obj_t *kb = lv_keyboard_create(card);
-    lv_obj_set_width(kb, LCD_H_RES - 16);
     lv_keyboard_set_textarea(kb, wd_mark_note_ta);
-    lv_obj_set_style_text_font(kb, &lv_font_montserrat_12, 0);
 
-    // Buttons row
+    // Cancel / Save buttons
     lv_obj_t *btn_row = lv_obj_create(card);
     lv_obj_set_size(btn_row, LCD_H_RES - 32, 30);
     lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
