@@ -389,6 +389,14 @@ static char     g_saved_wifi_pass[65] = ""; // Home network password
 #define NVS_KEY_WIFI_PASS    "wifi_pass"
 #define NVS_KEY_WIGLE_KEY    "wigle_key"
 #define NVS_KEY_WDGWARS_KEY  "wdg_key"
+#define NVS_KEY_WD_BAND      "wd_band"
+#define NVS_KEY_WD_PCAP      "wd_pcap"
+
+// Wardrive band selection
+typedef enum { WD_BAND_BOTH = 0, WD_BAND_24G, WD_BAND_5G } wd_band_t;
+
+// Wardrive upload log path
+#define WDUP_LOG_PATH "/sdcard/lab/wardrives/upload_log.csv"
 
 // Touch calibration NVS
 #define TOUCH_CAL_NVS_NS      "touch_cal"
@@ -981,6 +989,9 @@ static wdup_target_t     wdup_target           = WDUP_BOTH;
 static lv_obj_t         *wdup_wigle_key_ta     = NULL;
 static lv_obj_t         *wdup_wdg_key_ta       = NULL;
 typedef struct { char text[128]; lv_color_t color; } wdup_ui_msg_t;
+static wd_band_t         g_wd_band         = WD_BAND_BOTH;
+static bool              g_wd_pcap         = false;
+static void            (*wdup_back_fn)(void) = NULL;
 
 // SD Card settings screen state
 typedef struct { char line[96]; } sd_prov_update_t;
@@ -1585,7 +1596,10 @@ static int wpasec_upload_file(const char *filepath, const char *filename);
 static void wpasec_upload_task(void *pvParameters);
 static void wpasec_upload_timer_cb(lv_timer_t *timer);
 
-// Wardrive upload helpers
+// Wardrive submenu + upload helpers
+static void show_wardrive_menu_screen(void);
+static void show_wardrive_options_screen(void);
+static void show_wardrive_manage_screen(void);
 static void show_wardrive_upload_screen(void);
 static void wdup_task(void *pvParameters);
 static void wdup_timer_cb(lv_timer_t *timer);
@@ -2338,6 +2352,10 @@ static void nvs_settings_load(void)
         nvs_get_str(h, NVS_KEY_WIGLE_KEY, wigle_api_key, &wk_len);
         size_t wdg_len = sizeof(wdgwars_api_key);
         nvs_get_str(h, NVS_KEY_WDGWARS_KEY, wdgwars_api_key, &wdg_len);
+        uint8_t wb = 0;
+        if (nvs_get_u8(h, NVS_KEY_WD_BAND, &wb) == ESP_OK) g_wd_band = (wd_band_t)wb;
+        uint8_t wp = 0;
+        if (nvs_get_u8(h, NVS_KEY_WD_PCAP, &wp) == ESP_OK) g_wd_pcap = (wp != 0);
         nvs_close(h);
         ESP_LOGI(TAG, "NVS settings loaded: timeout=%ldms, brightness=%u%%, scan=%u-%ums, dark=%d, max_power=%d, gatt_tmo=%ums",
                  (long)screen_timeout_ms, screen_brightness_pct, scan_time_min_ms, scan_time_max_ms,
@@ -7844,37 +7862,41 @@ static void ducb_update(int channel_idx, double reward) {
 static void wdp_ducb_init(void) {
     wdp_ducb_channel_count = 0;
     wdp_ducb_discounted_total = 0.0;
-    for (int i = 0; i < (int)WDP_CH_24_PRIMARY_COUNT; i++) {
-        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_24_primary[i];
-        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_24_PRIMARY;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.5;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
-        wdp_ducb_channel_count++;
+    if (g_wd_band != WD_BAND_5G) {
+        for (int i = 0; i < (int)WDP_CH_24_PRIMARY_COUNT; i++) {
+            wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_24_primary[i];
+            wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_24_PRIMARY;
+            wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.5;
+            wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
+            wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
+            wdp_ducb_channel_count++;
+        }
+        for (int i = 0; i < (int)WDP_CH_24_SECONDARY_COUNT; i++) {
+            wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_24_secondary[i];
+            wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_24_SECONDARY;
+            wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
+            wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
+            wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
+            wdp_ducb_channel_count++;
+        }
     }
-    for (int i = 0; i < (int)WDP_CH_24_SECONDARY_COUNT; i++) {
-        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_24_secondary[i];
-        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_24_SECONDARY;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
-        wdp_ducb_channel_count++;
-    }
-    for (int i = 0; i < (int)WDP_CH_5_NON_DFS_COUNT; i++) {
-        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_5_non_dfs[i];
-        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_5_NON_DFS;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
-        wdp_ducb_channel_count++;
-    }
-    for (int i = 0; i < (int)WDP_CH_5_DFS_COUNT; i++) {
-        wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_5_dfs[i];
-        wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_5_DFS;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
-        wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
-        wdp_ducb_channel_count++;
+    if (g_wd_band != WD_BAND_24G) {
+        for (int i = 0; i < (int)WDP_CH_5_NON_DFS_COUNT; i++) {
+            wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_5_non_dfs[i];
+            wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_5_NON_DFS;
+            wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
+            wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
+            wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
+            wdp_ducb_channel_count++;
+        }
+        for (int i = 0; i < (int)WDP_CH_5_DFS_COUNT; i++) {
+            wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_5_dfs[i];
+            wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_5_DFS;
+            wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
+            wdp_ducb_channels[wdp_ducb_channel_count].discounted_pulls = 0.0;
+            wdp_ducb_channels[wdp_ducb_channel_count].total_pulls = 0;
+            wdp_ducb_channel_count++;
+        }
     }
 }
 
@@ -11338,7 +11360,7 @@ static void main_tile_event_cb(lv_event_t *e)
     } else if (strcmp(tile_name, "Bluetooth") == 0) {
         show_bluetooth_screen();
     } else if (strcmp(tile_name, "Wardrive") == 0) {
-        wardrive_start_btn_cb(NULL);
+        show_wardrive_menu_screen();
     } else if (strcmp(tile_name, "Go Dark") == 0) {
         show_go_dark_confirm();
     }
@@ -15354,15 +15376,24 @@ static void wdup_task(void *pvParameters)
             snprintf(msg, sizeof(msg), "[%d/%d] WiGLE: %.60s...", cur, total, dname);
             wdup_push_msg(msg, cyan);
             int r = wdup_upload_one(fpath, dname, true);
+            const char *wigle_status;
             if (r == 0) {
                 snprintf(msg, sizeof(msg), "[%d/%d] WiGLE: %.60s -> OK", cur, total, dname);
                 wdup_push_msg(msg, green); ok_count++;
+                wigle_status = "OK";
             } else if (r == 1) {
                 snprintf(msg, sizeof(msg), "[%d/%d] WiGLE: %.60s -> dup", cur, total, dname);
                 wdup_push_msg(msg, amber); dup_count++;
+                wigle_status = "DUP";
             } else {
                 snprintf(msg, sizeof(msg), "[%d/%d] WiGLE: %.60s -> FAIL", cur, total, dname);
                 wdup_push_msg(msg, red); fail_count++;
+                wigle_status = "FAIL";
+            }
+            if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+                FILE *lf = fopen(WDUP_LOG_PATH, "a");
+                if (lf) { fprintf(lf, "%s,WIGLE,%s\n", dname, wigle_status); fclose(lf); }
+                xSemaphoreGive(sd_spi_mutex);
             }
             vTaskDelay(pdMS_TO_TICKS(800));
         }
@@ -15372,15 +15403,24 @@ static void wdup_task(void *pvParameters)
             snprintf(msg, sizeof(msg), "[%d/%d] WDG: %.60s...", cur, total, dname);
             wdup_push_msg(msg, cyan);
             int r = wdup_upload_one(fpath, dname, false);
+            const char *wdg_status;
             if (r == 0) {
                 snprintf(msg, sizeof(msg), "[%d/%d] WDG: %.60s -> OK", cur, total, dname);
                 wdup_push_msg(msg, green); ok_count++;
+                wdg_status = "OK";
             } else if (r == 1) {
                 snprintf(msg, sizeof(msg), "[%d/%d] WDG: %.60s -> dup", cur, total, dname);
                 wdup_push_msg(msg, amber); dup_count++;
+                wdg_status = "DUP";
             } else {
                 snprintf(msg, sizeof(msg), "[%d/%d] WDG: %.60s -> FAIL", cur, total, dname);
                 wdup_push_msg(msg, red); fail_count++;
+                wdg_status = "FAIL";
+            }
+            if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+                FILE *lf = fopen(WDUP_LOG_PATH, "a");
+                if (lf) { fprintf(lf, "%s,WDG,%s\n", dname, wdg_status); fclose(lf); }
+                xSemaphoreGive(sd_spi_mutex);
             }
             vTaskDelay(pdMS_TO_TICKS(800));
         }
@@ -15470,6 +15510,405 @@ static void wdup_start_cb(lv_event_t *e)
     wdup_timer = lv_timer_create(wdup_timer_cb, 200, NULL);
 }
 
+// ─── Wardrive submenu: Menu / Options / Manage ────────────────────────────
+
+// --- Wardrive Menu screen ---
+
+static void wd_menu_back_cb(lv_event_t *e)
+{
+    (void)e;
+    show_main_tiles();
+}
+
+static void wd_menu_tile_cb(lv_event_t *e)
+{
+    const char *key = (const char *)lv_event_get_user_data(e);
+    if (!key) return;
+    if (strcmp(key, "Start") == 0)        wardrive_start_btn_cb(NULL);
+    else if (strcmp(key, "Options") == 0) show_wardrive_options_screen();
+    else if (strcmp(key, "Manage")  == 0) show_wardrive_manage_screen();
+}
+
+static void show_wardrive_menu_screen(void)
+{
+    create_function_page_base("Wardrive");
+    apply_menu_bg();
+
+    lv_obj_t *tiles = lv_obj_create(function_page);
+    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30 - 44);
+    lv_obj_align(tiles, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(tiles, 0, 0);
+    lv_obj_set_style_pad_all(tiles, 8, 0);
+    lv_obj_set_style_pad_gap(tiles, 8, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    create_tile(tiles, MY_SYMBOL_CAR,      "Start\nWardrive", COLOR_MATERIAL_RED,    wd_menu_tile_cb, "Start");
+    create_tile(tiles, LV_SYMBOL_SETTINGS, "Options",         UI_ACCENT_GREEN,       wd_menu_tile_cb, "Options");
+    create_tile(tiles, LV_SYMBOL_LIST,     "Manage\nData",    UI_ACCENT_CYAN,        wd_menu_tile_cb, "Manage");
+
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 30);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), 0);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT "  Home");
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(back_lbl, ui_text_color(), 0);
+    lv_obj_center(back_lbl);
+    lv_obj_add_event_cb(back_btn, wd_menu_back_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// --- Wardrive Options screen ---
+
+static lv_obj_t *wd_opts_band_dd = NULL;
+static lv_obj_t *wd_opts_pcap_sw = NULL;
+
+static void wd_opts_save_cb(lv_event_t *e)
+{
+    (void)e;
+    if (wd_opts_band_dd) g_wd_band = (wd_band_t)lv_dropdown_get_selected(wd_opts_band_dd);
+    if (wd_opts_pcap_sw) g_wd_pcap = lv_obj_has_state(wd_opts_pcap_sw, LV_STATE_CHECKED);
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, NVS_KEY_WD_BAND, (uint8_t)g_wd_band);
+        nvs_set_u8(h, NVS_KEY_WD_PCAP, g_wd_pcap ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    wd_opts_band_dd = NULL;
+    wd_opts_pcap_sw = NULL;
+    show_wardrive_menu_screen();
+}
+
+static void wd_opts_back_cb(lv_event_t *e)
+{
+    (void)e;
+    wd_opts_band_dd = NULL;
+    wd_opts_pcap_sw = NULL;
+    show_wardrive_menu_screen();
+}
+
+static void show_wardrive_options_screen(void)
+{
+    create_function_page_base("WD Options");
+
+    lv_obj_t *content = lv_obj_create(function_page);
+    lv_obj_set_size(content, LCD_H_RES - 16, LCD_V_RES - 30 - 50);
+    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 34);
+    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_pad_all(content, 8, 0);
+    lv_obj_set_style_pad_row(content, 12, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Band label
+    lv_obj_t *band_lbl = lv_label_create(content);
+    lv_label_set_text(band_lbl, "Scan Band");
+    lv_obj_set_style_text_color(band_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(band_lbl, &lv_font_montserrat_14, 0);
+
+    // Band dropdown
+    wd_opts_band_dd = lv_dropdown_create(content);
+    lv_dropdown_set_options(wd_opts_band_dd, "Both (2.4G + 5G)\n2.4 GHz only\n5 GHz only");
+    lv_dropdown_set_selected(wd_opts_band_dd, (uint16_t)g_wd_band);
+    lv_obj_set_width(wd_opts_band_dd, LCD_H_RES - 32);
+    lv_obj_set_style_text_font(wd_opts_band_dd, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wd_opts_band_dd, ui_text_color(), 0);
+    lv_obj_set_style_bg_color(wd_opts_band_dd, ui_card_color(), 0);
+    lv_obj_set_style_border_color(wd_opts_band_dd, UI_ACCENT_GREEN, 0);
+    lv_obj_set_style_border_width(wd_opts_band_dd, 1, 0);
+
+    // PCAP toggle row
+    lv_obj_t *pcap_row = lv_obj_create(content);
+    lv_obj_set_size(pcap_row, LCD_H_RES - 32, 30);
+    lv_obj_set_style_bg_opa(pcap_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(pcap_row, 0, 0);
+    lv_obj_set_style_pad_all(pcap_row, 0, 0);
+    lv_obj_clear_flag(pcap_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *pcap_lbl = lv_label_create(pcap_row);
+    lv_label_set_text(pcap_lbl, "Raw PCAP capture");
+    lv_obj_set_style_text_font(pcap_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(pcap_lbl, ui_text_color(), 0);
+    lv_obj_align(pcap_lbl, LV_ALIGN_LEFT_MID, 0, 0);
+
+    wd_opts_pcap_sw = lv_switch_create(pcap_row);
+    lv_obj_align(wd_opts_pcap_sw, LV_ALIGN_RIGHT_MID, 0, 0);
+    if (g_wd_pcap) lv_obj_add_state(wd_opts_pcap_sw, LV_STATE_CHECKED);
+
+    // BLE note
+    lv_obj_t *ble_note = lv_label_create(content);
+    lv_label_set_text(ble_note, LV_SYMBOL_WARNING " BLE scan not available\n  (single shared radio)");
+    lv_obj_set_style_text_color(ble_note, lv_color_make(140, 140, 140), 0);
+    lv_obj_set_style_text_font(ble_note, &lv_font_montserrat_12, 0);
+    lv_label_set_long_mode(ble_note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(ble_note, LCD_H_RES - 32);
+
+    // Save button
+    lv_obj_t *save_btn = lv_btn_create(function_page);
+    lv_obj_set_size(save_btn, 110, 30);
+    lv_obj_align(save_btn, LV_ALIGN_BOTTOM_MID, 62, -8);
+    lv_obj_set_style_bg_color(save_btn, UI_ACCENT_GREEN, 0);
+    lv_obj_set_style_bg_color(save_btn, lv_color_make(50, 140, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(save_btn, 8, 0);
+    lv_obj_t *save_lbl = lv_label_create(save_btn);
+    lv_label_set_text(save_lbl, LV_SYMBOL_OK "  Save");
+    lv_obj_set_style_text_font(save_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(save_lbl);
+    lv_obj_add_event_cb(save_btn, wd_opts_save_cb, LV_EVENT_CLICKED, NULL);
+
+    // Back button
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 30);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, -62, -8);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), 0);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT "  Back");
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(back_lbl, ui_text_color(), 0);
+    lv_obj_center(back_lbl);
+    lv_obj_add_event_cb(back_btn, wd_opts_back_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// --- Wardrive Manage Data screen ---
+
+#define WD_MANAGE_MAX_FILES 64
+static char     wd_manage_paths[WD_MANAGE_MAX_FILES][320];
+static lv_obj_t *wd_manage_rows[WD_MANAGE_MAX_FILES];
+static int       wd_manage_count = 0;
+
+// Returns true if 'filename' has an OK or DUP entry for 'service' in the log buffer
+static bool wdm_log_accepted(const char *log_buf, const char *filename, const char *service)
+{
+    if (!log_buf || !filename || !service) return false;
+    const char *p = log_buf;
+    char line[128];
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        if (len > 0 && len < sizeof(line)) {
+            memcpy(line, p, len);
+            line[len] = '\0';
+            // format: filename,SERVICE,STATUS
+            char *c1 = strchr(line, ',');
+            if (c1) {
+                *c1 = '\0';
+                if (strcmp(line, filename) == 0) {
+                    char *c2 = strchr(c1 + 1, ',');
+                    if (c2) {
+                        *c2 = '\0';
+                        if (strcmp(c1 + 1, service) == 0) {
+                            const char *status = c2 + 1;
+                            if (strcmp(status, "OK") == 0 || strcmp(status, "DUP") == 0)
+                                return true;
+                        }
+                    }
+                }
+            }
+        }
+        p = nl ? nl + 1 : p + len;
+    }
+    return false;
+}
+
+static void wdm_delete_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= wd_manage_count) return;
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        remove(wd_manage_paths[idx]);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    if (wd_manage_rows[idx] && lv_obj_is_valid(wd_manage_rows[idx])) {
+        lv_obj_del(wd_manage_rows[idx]);
+        wd_manage_rows[idx] = NULL;
+    }
+    wd_manage_paths[idx][0] = '\0';
+}
+
+static void wdm_upload_cb(lv_event_t *e)
+{
+    (void)e;
+    wdup_back_fn = show_wardrive_manage_screen;
+    show_wardrive_upload_screen();
+}
+
+static void wdm_back_cb(lv_event_t *e)
+{
+    (void)e;
+    show_wardrive_menu_screen();
+}
+
+static void show_wardrive_manage_screen(void)
+{
+    create_function_page_base("Manage Data");
+
+    wd_manage_count = 0;
+    memset(wd_manage_rows, 0, sizeof(wd_manage_rows));
+
+    // Load upload log into buffer for status lookup
+    char *log_buf = NULL;
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        FILE *lf = fopen(WDUP_LOG_PATH, "r");
+        if (lf) {
+            fseek(lf, 0, SEEK_END);
+            long lsz = ftell(lf);
+            rewind(lf);
+            if (lsz > 0 && lsz < 8192) {
+                log_buf = heap_caps_malloc(lsz + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                if (log_buf) {
+                    fread(log_buf, 1, lsz, lf);
+                    log_buf[lsz] = '\0';
+                }
+            }
+            fclose(lf);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    // Enumerate wardrive CSV files
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        DIR *dir = opendir("/sdcard/lab/wardrives");
+        if (dir) {
+            struct dirent *ent;
+            while ((ent = readdir(dir)) != NULL && wd_manage_count < WD_MANAGE_MAX_FILES) {
+                const char *nm = ent->d_name;
+                size_t nl = strlen(nm);
+                if (nl <= 4 || strcasecmp(nm + nl - 4, ".csv") != 0) continue;
+                if (strcmp(nm, "upload_log.csv") == 0) continue;
+                snprintf(wd_manage_paths[wd_manage_count], sizeof(wd_manage_paths[0]),
+                         "/sdcard/lab/wardrives/%s", nm);
+                wd_manage_count++;
+            }
+            closedir(dir);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    // Scrollable file list area
+    lv_obj_t *list = lv_obj_create(function_page);
+    lv_obj_set_size(list, LCD_H_RES, LCD_V_RES - 30 - 46);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_color(list, ui_bg_color(), 0);
+    lv_obj_set_style_bg_opa(list, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    lv_obj_set_style_pad_all(list, 4, 0);
+    lv_obj_set_style_pad_row(list, 3, 0);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+    if (wd_manage_count == 0) {
+        lv_obj_t *empty = lv_label_create(list);
+        lv_label_set_text(empty, "No wardrive files found");
+        lv_obj_set_style_text_color(empty, lv_color_make(140, 140, 140), 0);
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_12, 0);
+        lv_obj_center(empty);
+    }
+
+    lv_color_t col_green = lv_color_make(76, 175, 80);
+    lv_color_t col_amber = lv_color_make(255, 193, 7);
+    lv_color_t col_white = ui_text_color();
+    lv_color_t col_red   = lv_color_make(244, 67, 54);
+
+    for (int i = 0; i < wd_manage_count; i++) {
+        const char *fname = strrchr(wd_manage_paths[i], '/');
+        fname = fname ? fname + 1 : wd_manage_paths[i];
+
+        // Determine status
+        bool wigle_ok = wdm_log_accepted(log_buf, fname, "WIGLE");
+        bool wdg_ok   = wdm_log_accepted(log_buf, fname, "WDG");
+        lv_color_t row_color;
+        const char *status_icon;
+        if (wigle_ok && wdg_ok) {
+            row_color = col_green; status_icon = LV_SYMBOL_OK;
+        } else if (wigle_ok || wdg_ok) {
+            row_color = col_amber; status_icon = LV_SYMBOL_WARNING;
+        } else {
+            row_color = col_white; status_icon = LV_SYMBOL_UPLOAD;
+        }
+
+        // Row container
+        lv_obj_t *row = lv_obj_create(list);
+        lv_obj_set_size(row, LCD_H_RES - 8, 28);
+        lv_obj_set_style_bg_color(row, ui_card_color(), 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_radius(row, 4, 0);
+        lv_obj_set_style_pad_all(row, 2, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        wd_manage_rows[i] = row;
+
+        // Status icon
+        lv_obj_t *icon = lv_label_create(row);
+        lv_label_set_text(icon, status_icon);
+        lv_obj_set_style_text_color(icon, row_color, 0);
+        lv_obj_set_style_text_font(icon, &lv_font_montserrat_12, 0);
+        lv_obj_align(icon, LV_ALIGN_LEFT_MID, 2, 0);
+
+        // Filename
+        lv_obj_t *name_lbl = lv_label_create(row);
+        lv_label_set_text(name_lbl, fname);
+        lv_obj_set_style_text_color(name_lbl, row_color, 0);
+        lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_12, 0);
+        lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(name_lbl, LCD_H_RES - 60);
+        lv_obj_align(name_lbl, LV_ALIGN_LEFT_MID, 18, 0);
+
+        // Delete (X) button
+        lv_obj_t *del_btn = lv_btn_create(row);
+        lv_obj_set_size(del_btn, 24, 22);
+        lv_obj_align(del_btn, LV_ALIGN_RIGHT_MID, -2, 0);
+        lv_obj_set_style_bg_color(del_btn, col_red, 0);
+        lv_obj_set_style_bg_color(del_btn, lv_color_make(180, 30, 30), LV_STATE_PRESSED);
+        lv_obj_set_style_radius(del_btn, 4, 0);
+        lv_obj_set_style_pad_all(del_btn, 2, 0);
+        lv_obj_t *del_lbl = lv_label_create(del_btn);
+        lv_label_set_text(del_lbl, LV_SYMBOL_CLOSE);
+        lv_obj_set_style_text_font(del_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_center(del_lbl);
+        lv_obj_add_event_cb(del_btn, wdm_delete_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+    }
+
+    if (log_buf) heap_caps_free(log_buf);
+
+    // Bottom button row
+    lv_obj_t *upload_btn = lv_btn_create(function_page);
+    lv_obj_set_size(upload_btn, 110, 30);
+    lv_obj_align(upload_btn, LV_ALIGN_BOTTOM_MID, 62, -8);
+    lv_obj_set_style_bg_color(upload_btn, lv_color_hex(0xE91E63), 0);
+    lv_obj_set_style_bg_color(upload_btn, lv_color_hex(0xAD1457), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(upload_btn, 8, 0);
+    lv_obj_t *up_lbl = lv_label_create(upload_btn);
+    lv_label_set_text(up_lbl, LV_SYMBOL_UPLOAD "  Upload");
+    lv_obj_set_style_text_font(up_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(up_lbl);
+    lv_obj_add_event_cb(upload_btn, wdm_upload_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 30);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, -62, -8);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), 0);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT "  Back");
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(back_lbl, ui_text_color(), 0);
+    lv_obj_center(back_lbl);
+    lv_obj_add_event_cb(back_btn, wdm_back_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 static void wdup_target_dd_cb(lv_event_t *e)
 {
     lv_obj_t *dd = lv_event_get_target(e);
@@ -15505,7 +15944,10 @@ static void wdup_back_cb(lv_event_t *e)
     wdup_wdg_key_ta   = NULL;
     wdup_status_list  = NULL;
     if (wdup_timer) { lv_timer_del(wdup_timer); wdup_timer = NULL; }
-    show_data_transfer_screen();
+    void (*back_fn)(void) = wdup_back_fn;
+    wdup_back_fn = NULL;
+    if (back_fn) back_fn();
+    else show_data_transfer_screen();
 }
 
 static void show_wardrive_upload_screen(void)
