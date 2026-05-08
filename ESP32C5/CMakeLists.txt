@@ -3,6 +3,10 @@ cmake_minimum_required(VERSION 3.16)
 # Add linker flag globally (needed for duplicate symbols in ROM)
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-zmuldefs")
 
+# Version shown in boot log (app_init: App version).
+# Keep in sync with FW_VERSION in wifi_common.h.
+set(PROJECT_VER "v1.0.4")
+
 # Bootstrap ESP-IDF build system
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
