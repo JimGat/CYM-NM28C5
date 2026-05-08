@@ -4563,7 +4563,20 @@ void app_main(void)
         sd_cache_load_all();
         xSemaphoreGive(sd_spi_mutex);
     }
-    
+
+    // SD card files take priority over NVS — if wigle.txt / wdgwars.txt are present,
+    // overwrite whatever was loaded from NVS so the upload screen shows the file key.
+    if (sd_cache && sd_cache->wigle_key[0]) {
+        strncpy(wigle_api_key, sd_cache->wigle_key, WIGLE_KEY_MAX_LEN - 1);
+        wigle_api_key[WIGLE_KEY_MAX_LEN - 1] = '\0';
+        ESP_LOGI(TAG, "WiGLE key: SD file overrides NVS");
+    }
+    if (sd_cache && sd_cache->wdgwars_key[0]) {
+        strncpy(wdgwars_api_key, sd_cache->wdgwars_key, WDGWARS_KEY_MAX_LEN - 1);
+        wdgwars_api_key[WDGWARS_KEY_MAX_LEN - 1] = '\0';
+        ESP_LOGI(TAG, "WDG Wars key: SD file overrides NVS");
+    }
+
     // Hide popup
     hide_sd_loading_popup();
 
