@@ -1052,6 +1052,18 @@ static int               wdup_explicit_count  = 0;
 // Cleared once WiFi connects and the upload screen is shown again.
 static bool              s_wdup_pending_after_wifi = false;
 static void            (*wdm_back_fn)(void)   = NULL;
+static lv_obj_t        *wdup_progress_bar    = NULL;
+static lv_obj_t        *wdup_progress_lbl    = NULL;
+static lv_obj_t        *wdup_wigle_stat_lbl  = NULL;
+static lv_obj_t        *wdup_wdg_stat_lbl    = NULL;
+static volatile int     wdup_prog_cur        = 0;
+static volatile int     wdup_prog_total      = 0;
+static volatile int     wdup_wigle_ok_cnt    = 0;
+static volatile int     wdup_wigle_dup_cnt   = 0;
+static volatile int     wdup_wigle_fail_cnt  = 0;
+static volatile int     wdup_wdg_ok_cnt      = 0;
+static volatile int     wdup_wdg_dup_cnt     = 0;
+static volatile int     wdup_wdg_fail_cnt    = 0;
 // wd_manage_paths declared here so wdup_task (explicit mode) can reference it
 #define WD_MANAGE_MAX_FILES 64
 static char              wd_manage_paths[WD_MANAGE_MAX_FILES][320];
@@ -1548,10 +1560,14 @@ static void reset_function_page_children(void) {
         wpasec_upload_timer = NULL;
     }
     // Wardrive upload cleanup
-    wdup_status_list   = NULL;
-    wdup_wigle_key_ta  = NULL;
-    wdup_wdg_key_ta    = NULL;
-    wdup_active        = false;
+    wdup_status_list      = NULL;
+    wdup_wigle_key_ta     = NULL;
+    wdup_wdg_key_ta       = NULL;
+    wdup_progress_bar     = NULL;
+    wdup_progress_lbl     = NULL;
+    wdup_wigle_stat_lbl   = NULL;
+    wdup_wdg_stat_lbl     = NULL;
+    wdup_active           = false;
     if (wdup_timer) {
         lv_timer_del(wdup_timer);
         wdup_timer = NULL;
@@ -15886,6 +15902,10 @@ static void wdup_task(void *pvParameters)
     lv_color_t amber  = lv_color_make(255, 193, 7);
     lv_color_t red    = lv_color_make(244, 67, 54);
 
+    wdup_prog_cur = wdup_prog_total = 0;
+    wdup_wigle_ok_cnt = wdup_wigle_dup_cnt = wdup_wigle_fail_cnt = 0;
+    wdup_wdg_ok_cnt   = wdup_wdg_dup_cnt   = wdup_wdg_fail_cnt   = 0;
+
     // Ensure WiFi STA connection
     wdup_push_msg("Connecting to WiFi...", cyan);
     if (!wdup_ensure_wifi()) {
@@ -15910,6 +15930,7 @@ static void wdup_task(void *pvParameters)
     if (wdup_use_explicit) {
         int n = wdup_explicit_count;
         int ok_count2 = 0, dup_count2 = 0, fail_count2 = 0;
+        wdup_prog_total = n;
         char xmsg[128];
         snprintf(xmsg, sizeof(xmsg), "Uploading %d selected file(s)...", n);
         wdup_push_msg(xmsg, cyan);
@@ -15919,13 +15940,16 @@ static void wdup_task(void *pvParameters)
             const char *xfpath = wd_manage_paths[idx];
             const char *xname  = strrchr(xfpath, '/');
             xname = xname ? xname + 1 : xfpath;
+            wdup_prog_cur = si + 1;
             if (do_wigle) {
                 snprintf(xmsg, sizeof(xmsg), "[%d/%d] WiGLE: %.50s...", si+1, n, xname);
                 wdup_push_msg(xmsg, cyan);
                 int r = wdup_upload_one(xfpath, xname, true);
                 const char *ws = (r==0)?"OK":(r==1)?"DUP":"FAIL";
                 lv_color_t wc = (r==0)?green:(r==1)?amber:red;
-                if (r==0) ok_count2++; else if (r==1) dup_count2++; else fail_count2++;
+                if (r==0) { ok_count2++; wdup_wigle_ok_cnt++; }
+                else if (r==1) { dup_count2++; wdup_wigle_dup_cnt++; }
+                else { fail_count2++; wdup_wigle_fail_cnt++; }
                 snprintf(xmsg, sizeof(xmsg), "[%d/%d] WiGLE: %.50s -> %s", si+1, n, xname, ws);
                 wdup_push_msg(xmsg, wc);
                 if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
@@ -15941,7 +15965,9 @@ static void wdup_task(void *pvParameters)
                 int r = wdup_upload_one(xfpath, xname, false);
                 const char *ws = (r==0)?"OK":(r==1)?"DUP":"FAIL";
                 lv_color_t wc = (r==0)?green:(r==1)?amber:red;
-                if (r==0) ok_count2++; else if (r==1) dup_count2++; else fail_count2++;
+                if (r==0) { ok_count2++; wdup_wdg_ok_cnt++; }
+                else if (r==1) { dup_count2++; wdup_wdg_dup_cnt++; }
+                else { fail_count2++; wdup_wdg_fail_cnt++; }
                 snprintf(xmsg, sizeof(xmsg), "[%d/%d] WDG: %.50s -> %s", si+1, n, xname, ws);
                 wdup_push_msg(xmsg, wc);
                 if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
@@ -15993,6 +16019,7 @@ static void wdup_task(void *pvParameters)
     char msg[128];
     snprintf(msg, sizeof(msg), "Found %d file(s). Uploading...", total);
     wdup_push_msg(msg, cyan);
+    wdup_prog_total = total;
 
     int cur = 0, ok_count = 0, dup_count = 0, fail_count = 0;
 
@@ -16009,6 +16036,7 @@ static void wdup_task(void *pvParameters)
         size_t nl = strlen(dname);
         if (nl <= 4 || strcasecmp(dname + nl - 4, ".csv") != 0) continue;
         cur++;
+        wdup_prog_cur = cur;
 
         char fpath[320];
         snprintf(fpath, sizeof(fpath), "/sdcard/lab/wardrives/%s", dname);
@@ -16021,15 +16049,15 @@ static void wdup_task(void *pvParameters)
             const char *wigle_status;
             if (r == 0) {
                 snprintf(msg, sizeof(msg), "[%d/%d] WiGLE: %.60s -> OK", cur, total, dname);
-                wdup_push_msg(msg, green); ok_count++;
+                wdup_push_msg(msg, green); ok_count++; wdup_wigle_ok_cnt++;
                 wigle_status = "OK";
             } else if (r == 1) {
                 snprintf(msg, sizeof(msg), "[%d/%d] WiGLE: %.60s -> dup", cur, total, dname);
-                wdup_push_msg(msg, amber); dup_count++;
+                wdup_push_msg(msg, amber); dup_count++; wdup_wigle_dup_cnt++;
                 wigle_status = "DUP";
             } else {
                 snprintf(msg, sizeof(msg), "[%d/%d] WiGLE: %.60s -> FAIL", cur, total, dname);
-                wdup_push_msg(msg, red); fail_count++;
+                wdup_push_msg(msg, red); fail_count++; wdup_wigle_fail_cnt++;
                 wigle_status = "FAIL";
             }
             if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
@@ -16048,15 +16076,15 @@ static void wdup_task(void *pvParameters)
             const char *wdg_status;
             if (r == 0) {
                 snprintf(msg, sizeof(msg), "[%d/%d] WDG: %.60s -> OK", cur, total, dname);
-                wdup_push_msg(msg, green); ok_count++;
+                wdup_push_msg(msg, green); ok_count++; wdup_wdg_ok_cnt++;
                 wdg_status = "OK";
             } else if (r == 1) {
                 snprintf(msg, sizeof(msg), "[%d/%d] WDG: %.60s -> dup", cur, total, dname);
-                wdup_push_msg(msg, amber); dup_count++;
+                wdup_push_msg(msg, amber); dup_count++; wdup_wdg_dup_cnt++;
                 wdg_status = "DUP";
             } else {
                 snprintf(msg, sizeof(msg), "[%d/%d] WDG: %.60s -> FAIL", cur, total, dname);
-                wdup_push_msg(msg, red); fail_count++;
+                wdup_push_msg(msg, red); fail_count++; wdup_wdg_fail_cnt++;
                 wdg_status = "FAIL";
             }
             if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
@@ -16101,6 +16129,40 @@ static void wdup_timer_cb(lv_timer_t *timer)
             lv_obj_scroll_to_y(wdup_status_list, LV_COORD_MAX, LV_ANIM_ON);
         }
     }
+
+    // Update fixed progress widgets
+    if (wdup_progress_bar && lv_obj_is_valid(wdup_progress_bar) && wdup_prog_total > 0) {
+        lv_bar_set_range(wdup_progress_bar, 0, wdup_prog_total);
+        lv_bar_set_value(wdup_progress_bar, wdup_prog_cur, LV_ANIM_OFF);
+    }
+    if (wdup_progress_lbl && lv_obj_is_valid(wdup_progress_lbl)) {
+        char pbuf[20];
+        snprintf(pbuf, sizeof(pbuf), "%d/%d", wdup_prog_cur, wdup_prog_total);
+        lv_label_set_text(wdup_progress_lbl, pbuf);
+    }
+    if (wdup_wigle_stat_lbl && lv_obj_is_valid(wdup_wigle_stat_lbl)) {
+        char sbuf[48];
+        snprintf(sbuf, sizeof(sbuf), "WiGLE " LV_SYMBOL_OK "%d " LV_SYMBOL_WARNING "%d " LV_SYMBOL_CLOSE "%d",
+                 wdup_wigle_ok_cnt, wdup_wigle_dup_cnt, wdup_wigle_fail_cnt);
+        lv_label_set_text(wdup_wigle_stat_lbl, sbuf);
+        lv_color_t sc = (wdup_wigle_fail_cnt > 0) ? lv_color_make(244, 67,  54) :
+                        (wdup_wigle_dup_cnt  > 0) ? lv_color_make(255, 193,  7) :
+                        (wdup_wigle_ok_cnt   > 0) ? lv_color_make( 76, 175, 80) :
+                                                     lv_color_make(150, 150,150);
+        lv_obj_set_style_text_color(wdup_wigle_stat_lbl, sc, 0);
+    }
+    if (wdup_wdg_stat_lbl && lv_obj_is_valid(wdup_wdg_stat_lbl)) {
+        char sbuf[48];
+        snprintf(sbuf, sizeof(sbuf), "WDG " LV_SYMBOL_OK "%d " LV_SYMBOL_WARNING "%d " LV_SYMBOL_CLOSE "%d",
+                 wdup_wdg_ok_cnt, wdup_wdg_dup_cnt, wdup_wdg_fail_cnt);
+        lv_label_set_text(wdup_wdg_stat_lbl, sbuf);
+        lv_color_t sc = (wdup_wdg_fail_cnt > 0) ? lv_color_make(244, 67,  54) :
+                        (wdup_wdg_dup_cnt   > 0) ? lv_color_make(255, 193,  7) :
+                        (wdup_wdg_ok_cnt    > 0) ? lv_color_make( 76, 175, 80) :
+                                                    lv_color_make(150, 150,150);
+        lv_obj_set_style_text_color(wdup_wdg_stat_lbl, sc, 0);
+    }
+
     if (wdup_done) {
         lv_timer_del(wdup_timer);
         wdup_timer = NULL;
@@ -16971,9 +17033,51 @@ static void show_wardrive_upload_screen(void)
     lv_obj_set_style_text_color(wdup_wdg_key_ta, ui_text_color(), 0);
     lv_obj_set_style_border_color(wdup_wdg_key_ta, lv_color_make(255, 152, 0), 0);
 
+    // ── Per-file progress indicators ──────────────────────────────────────
+    lv_obj_t *prog_row = lv_obj_create(content);
+    lv_obj_set_size(prog_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(prog_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(prog_row, 0, 0);
+    lv_obj_set_style_pad_all(prog_row, 0, 0);
+    lv_obj_set_flex_flow(prog_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(prog_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(prog_row, 6, 0);
+
+    wdup_progress_bar = lv_bar_create(prog_row);
+    lv_obj_set_size(wdup_progress_bar, 160, 8);
+    lv_bar_set_range(wdup_progress_bar, 0, 1);
+    lv_bar_set_value(wdup_progress_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(wdup_progress_bar, lv_color_make(50, 50, 50), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(wdup_progress_bar, lv_color_make(76, 175, 80), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(wdup_progress_bar, 4, LV_PART_MAIN);
+    lv_obj_set_style_radius(wdup_progress_bar, 4, LV_PART_INDICATOR);
+
+    wdup_progress_lbl = lv_label_create(prog_row);
+    lv_label_set_text(wdup_progress_lbl, "0/0");
+    lv_obj_set_style_text_font(wdup_progress_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wdup_progress_lbl, lv_color_make(180, 180, 180), 0);
+
+    lv_obj_t *stat_row = lv_obj_create(content);
+    lv_obj_set_size(stat_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(stat_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(stat_row, 0, 0);
+    lv_obj_set_style_pad_all(stat_row, 0, 0);
+    lv_obj_set_flex_flow(stat_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(stat_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    wdup_wigle_stat_lbl = lv_label_create(stat_row);
+    lv_label_set_text(wdup_wigle_stat_lbl, "WiGLE --");
+    lv_obj_set_style_text_font(wdup_wigle_stat_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wdup_wigle_stat_lbl, lv_color_make(150, 150, 150), 0);
+
+    wdup_wdg_stat_lbl = lv_label_create(stat_row);
+    lv_label_set_text(wdup_wdg_stat_lbl, "WDG --");
+    lv_obj_set_style_text_font(wdup_wdg_stat_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wdup_wdg_stat_lbl, lv_color_make(150, 150, 150), 0);
+
     // ── Progress list ─────────────────────────────────────────────────────
     wdup_status_list = lv_list_create(content);
-    lv_obj_set_size(wdup_status_list, lv_pct(100), 80);
+    lv_obj_set_size(wdup_status_list, lv_pct(100), 60);
     lv_obj_set_style_bg_color(wdup_status_list, lv_color_make(20, 20, 20), 0);
     lv_obj_set_style_border_width(wdup_status_list, 1, 0);
     lv_obj_set_style_border_color(wdup_status_list, lv_color_make(60, 60, 60), 0);
