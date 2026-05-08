@@ -25419,7 +25419,9 @@ static bool parse_gps_nmea(const char *nmea_sentence)
 		strncpy(sentence, nmea_sentence, sizeof(sentence) - 1);
 		sentence[sizeof(sentence) - 1] = '\0';
 
-		char *token = strtok(sentence, ",");
+		// Use strtok_r so the caller's strtok state (in gps_task) is not clobbered.
+		char *sp = NULL;
+		char *token = strtok_r(sentence, ",", &sp);
 		int field = 0;
 		float lat_deg = 0, lat_min = 0;
 		float lon_deg = 0, lon_min = 0;
@@ -25451,7 +25453,7 @@ static bool parse_gps_nmea(const char *nmea_sentence)
 				case 8: hdop = atof(token); break;
 				case 9: altitude = atof(token); break;
 			}
-			token = strtok(NULL, ",");
+			token = strtok_r(NULL, ",", &sp);
 			field++;
 		}
 
@@ -25475,7 +25477,8 @@ static bool parse_gps_nmea(const char *nmea_sentence)
 		strncpy(sentence, nmea_sentence, sizeof(sentence) - 1);
 		sentence[sizeof(sentence) - 1] = '\0';
 
-		char *token = strtok(sentence, ",");
+		char *sp = NULL;
+		char *token = strtok_r(sentence, ",", &sp);
 		int field = 0;
 		char status = 'V';
 		int hh = 0, mm = 0, ss = 0, day = 0, mon = 0, yr = 0;
@@ -25498,7 +25501,7 @@ static bool parse_gps_nmea(const char *nmea_sentence)
 					}
 					break;
 			}
-			token = strtok(NULL, ",");
+			token = strtok_r(NULL, ",", &sp);
 			field++;
 		}
 
