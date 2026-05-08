@@ -391,12 +391,21 @@ static char     g_saved_wifi_pass[65] = ""; // Home network password
 #define NVS_KEY_WDGWARS_KEY  "wdg_key"
 #define NVS_KEY_WD_BAND      "wd_band"
 #define NVS_KEY_WD_PCAP      "wd_pcap"
+#define NVS_KEY_WD_BLE       "wd_ble"
 
 // Wardrive band selection
 typedef enum { WD_BAND_BOTH = 0, WD_BAND_24G, WD_BAND_5G } wd_band_t;
 
 // Wardrive upload log path
 #define WDUP_LOG_PATH "/sdcard/lab/wardrives/upload_log.csv"
+
+// Wardrive BLE time-slice parameters
+#define WDP_BLE_INTERVAL_S   30     // seconds of WiFi scanning between BLE passes
+#define WDP_BLE_DWELL_MS     8000   // ms to scan BLE each pass
+#define WDP_BLE_MAX_DEVICES  200
+
+// BLE PCAP capture
+#define BLE_PCAP_DIR         "/sdcard/lab/ble_captures"
 
 // Touch calibration NVS
 #define TOUCH_CAL_NVS_NS      "touch_cal"
@@ -898,6 +907,36 @@ static lv_obj_t *wd_ui_channel_label = NULL;
 static lv_timer_t *wd_ui_timer = NULL;
 static volatile bool wd_ui_update_flag = false;
 static volatile int wdp_current_channel = 0;
+
+// Wardrive BLE time-slice
+typedef struct {
+    uint8_t mac[6];
+    char    name[32];
+    int8_t  rssi;
+    float   latitude;
+    float   longitude;
+    bool    written;
+} wdp_ble_device_t;
+static wdp_ble_device_t *wdp_ble_devices = NULL;
+static volatile int      wdp_ble_count   = 0;
+static bool              g_wd_ble        = false;
+
+// BLE PCAP capture state
+typedef struct {
+    uint8_t  addr[6];
+    uint8_t  addr_type;
+    uint8_t  event_type;
+    int8_t   rssi;
+    uint8_t  data_len;
+    uint8_t  data[31];
+    uint64_t timestamp_us;
+} ble_pcap_pkt_t;
+static FILE          *ble_pcap_file      = NULL;
+static QueueHandle_t  ble_pcap_queue     = NULL;
+static lv_timer_t    *ble_pcap_timer     = NULL;
+static volatile bool  ble_pcap_active    = false;
+static lv_obj_t      *ble_pcap_cnt_label = NULL;
+static uint32_t       ble_pcap_pkt_count = 0;
 
 // Wardrive attack state
 static TaskHandle_t wardrive_task_handle = NULL;
@@ -1547,6 +1586,7 @@ static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t typ
 static void hs_send_targeted_deauth(const uint8_t *station_mac, const uint8_t *ap_bssid, uint8_t channel);
 static bool hs_save_handshake_to_sd(int ap_idx);
 // Wardrive promisc helpers
+static int  wdp_ble_gap_cb(struct ble_gap_event *event, void *arg);
 static void wdp_ducb_init(void);
 static int wdp_ducb_select_channel(void);
 static void wdp_ducb_update(int channel_idx, double reward);
@@ -1595,6 +1635,10 @@ static int wpasec_tls_write_all(esp_tls_t *tls, const char *buf, int len);
 static int wpasec_upload_file(const char *filepath, const char *filename);
 static void wpasec_upload_task(void *pvParameters);
 static void wpasec_upload_timer_cb(lv_timer_t *timer);
+
+// BLE PCAP capture
+static void show_ble_pcap_screen(void);
+static void ble_pcap_stop(void);
 
 // Wardrive submenu + upload helpers
 static void show_wardrive_menu_screen(void);
@@ -2356,6 +2400,8 @@ static void nvs_settings_load(void)
         if (nvs_get_u8(h, NVS_KEY_WD_BAND, &wb) == ESP_OK) g_wd_band = (wd_band_t)wb;
         uint8_t wp = 0;
         if (nvs_get_u8(h, NVS_KEY_WD_PCAP, &wp) == ESP_OK) g_wd_pcap = (wp != 0);
+        uint8_t wble = 0;
+        if (nvs_get_u8(h, NVS_KEY_WD_BLE, &wble) == ESP_OK) g_wd_ble = (wble != 0);
         nvs_close(h);
         ESP_LOGI(TAG, "NVS settings loaded: timeout=%ldms, brightness=%u%%, scan=%u-%ums, dark=%d, max_power=%d, gatt_tmo=%ums",
                  (long)screen_timeout_ms, screen_brightness_pct, scan_time_min_ms, scan_time_max_ms,
@@ -5756,7 +5802,10 @@ void app_main(void)
 
                 if (wd_ui_channel_label && lv_obj_is_valid(wd_ui_channel_label)) {
                     char wd_ch_buf[16];
-                    snprintf(wd_ch_buf, sizeof(wd_ch_buf), "CH %d", wdp_current_channel);
+                    if (wdp_current_channel < 0)
+                        snprintf(wd_ch_buf, sizeof(wd_ch_buf), "BLE");
+                    else
+                        snprintf(wd_ch_buf, sizeof(wd_ch_buf), "CH %d", wdp_current_channel);
                     lv_label_set_text(wd_ui_channel_label, wd_ch_buf);
                 }
 
@@ -8327,6 +8376,41 @@ static int wdp_find_bssid(const uint8_t *bssid) {
     return -1;
 }
 
+// BLE GAP callback used during wardrive BLE time-slice passes
+static int wdp_ble_gap_cb(struct ble_gap_event *event, void *arg)
+{
+    (void)arg;
+    if (event->type != BLE_GAP_EVENT_DISC) return 0;
+    struct ble_gap_disc_desc *desc = &event->disc;
+    if (!wdp_ble_devices) return 0;
+
+    // Dedup by MAC
+    int cnt = wdp_ble_count;
+    for (int i = 0; i < cnt; i++)
+        if (memcmp(wdp_ble_devices[i].mac, desc->addr.val, 6) == 0) return 0;
+
+    if (cnt >= WDP_BLE_MAX_DEVICES) return 0;
+
+    wdp_ble_device_t *dev = &wdp_ble_devices[cnt];
+    memcpy(dev->mac, desc->addr.val, 6);
+    dev->rssi      = desc->rssi;
+    dev->latitude  = current_gps.latitude;
+    dev->longitude = current_gps.longitude;
+    dev->name[0]   = '\0';
+    dev->written   = false;
+
+    struct ble_hs_adv_fields fields;
+    if (ble_hs_adv_parse_fields(&fields, desc->data, desc->length_data) == 0
+        && fields.name && fields.name_len > 0) {
+        int nl = fields.name_len < 31 ? fields.name_len : 31;
+        memcpy(dev->name, fields.name, nl);
+        dev->name[nl] = '\0';
+    }
+
+    wdp_ble_count = cnt + 1;
+    return 0;
+}
+
 static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     if (!wardrive_active) return;
     if (type != WIFI_PKT_MGMT) return;
@@ -9390,12 +9474,20 @@ static void wardrive_promisc_task(void *pvParameters) {
 
     wdp_ducb_init();
 
+    // Allocate BLE device table in PSRAM (used only if g_wd_ble enabled)
+    if (g_wd_ble && !wdp_ble_devices) {
+        wdp_ble_devices = heap_caps_calloc(WDP_BLE_MAX_DEVICES, sizeof(wdp_ble_device_t),
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    wdp_ble_count = 0;
+
     wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
     esp_wifi_set_promiscuous_filter(&filt);
     esp_wifi_set_promiscuous_rx_cb(wdp_promiscuous_cb);
     esp_wifi_set_promiscuous(true);
 
     int64_t last_stats_us = esp_timer_get_time();
+    int64_t last_ble_us   = esp_timer_get_time();
     int networks_since_flush = 0;
 
     while (wardrive_active) {
@@ -9439,6 +9531,49 @@ static void wardrive_promisc_task(void *pvParameters) {
         wdp_ducb_update(ch_idx, reward);
         wd_ui_update_flag = true;
 
+        // ── BLE time-slice pass ──────────────────────────────────
+        if (g_wd_ble && wdp_ble_devices &&
+            (esp_timer_get_time() - last_ble_us) >= (int64_t)WDP_BLE_INTERVAL_S * 1000000LL) {
+            last_ble_us = esp_timer_get_time();
+
+            // Pause WiFi promiscuous
+            esp_wifi_set_promiscuous(false);
+
+            // Switch to BLE
+            if (ensure_ble_mode()) {
+                wdp_current_channel = -1;  // signal UI: BLE pass in progress
+                wd_ui_update_flag = true;
+
+                struct ble_gap_disc_params bp = {
+                    .itvl = 0x60, .window = 0x60,
+                    .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
+                    .limited = 0, .passive = 0, .filter_duplicates = 0,
+                };
+                if (ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &bp,
+                                 wdp_ble_gap_cb, NULL) == 0) {
+                    vTaskDelay(pdMS_TO_TICKS(WDP_BLE_DWELL_MS));
+                    ble_gap_disc_cancel();
+                }
+            }
+
+            if (!wardrive_active) break;
+
+            // Switch back to WiFi
+            ensure_wifi_mode();
+            wifi_country_t wifi_country = {
+                .cc = "PH", .schan = 1, .nchan = 14,
+                .policy = WIFI_COUNTRY_POLICY_AUTO,
+            };
+            esp_wifi_set_country(&wifi_country);
+            apply_wifi_power_settings();
+            wdp_ducb_init();  // rebuild channel list after reinit
+
+            esp_wifi_set_promiscuous_filter(&filt);
+            esp_wifi_set_promiscuous_rx_cb(wdp_promiscuous_cb);
+            esp_wifi_set_promiscuous(true);
+        }
+        // ─────────────────────────────────────────────────────────
+
         if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
         char timestamp[32];
         get_timestamp_string(timestamp, sizeof(timestamp));
@@ -9462,6 +9597,26 @@ static void wardrive_promisc_task(void *pvParameters) {
             net->written_to_file = true;
             networks_since_flush++;
         }
+        // Write any newly discovered BLE devices
+        if (g_wd_ble && wdp_ble_devices) {
+            int ble_cnt = wdp_ble_count;
+            for (int i = 0; i < ble_cnt; i++) {
+                if (wdp_ble_devices[i].written) continue;
+                wdp_ble_device_t *bd = &wdp_ble_devices[i];
+                char ble_mac[18];
+                snprintf(ble_mac, sizeof(ble_mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                         bd->mac[5], bd->mac[4], bd->mac[3],
+                         bd->mac[2], bd->mac[1], bd->mac[0]);
+                char ble_name[64];
+                escape_csv_field(bd->name[0] ? bd->name : "[BLE]", ble_name, sizeof(ble_name));
+                fprintf(file, "%s,%s,[BLE],%s,37,2402,%d,%.7f,%.7f,0.00,0.00,,,BLE\n",
+                        ble_mac, ble_name, timestamp,
+                        bd->rssi, bd->latitude, bd->longitude);
+                bd->written = true;
+                networks_since_flush++;
+            }
+        }
+
         if (networks_since_flush >= WDP_FILE_FLUSH_INTERVAL) {
             fflush(file);
             networks_since_flush = 0;
@@ -9483,6 +9638,12 @@ static void wardrive_promisc_task(void *pvParameters) {
     if (file) { fflush(file); fclose(file); }
     if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
 
+    if (wdp_ble_devices) {
+        heap_caps_free(wdp_ble_devices);
+        wdp_ble_devices = NULL;
+    }
+    wdp_ble_count = 0;
+
     wardrive_active = false;
     wardrive_task_handle = NULL;
     ESP_LOGI(TAG, "Wardrive promisc stopped. Total networks: %d. File: wd%d.csv",
@@ -9497,7 +9658,10 @@ static void wd_ui_timer_cb(lv_timer_t *timer) {
 
     if (wd_ui_channel_label) {
         char wd_ch_buf[16];
-        snprintf(wd_ch_buf, sizeof(wd_ch_buf), "CH %d", wdp_current_channel);
+        if (wdp_current_channel < 0)
+            snprintf(wd_ch_buf, sizeof(wd_ch_buf), "BLE");
+        else
+            snprintf(wd_ch_buf, sizeof(wd_ch_buf), "CH %d", wdp_current_channel);
         lv_label_set_text(wd_ui_channel_label, wd_ch_buf);
     }
 
@@ -15566,21 +15730,25 @@ static void show_wardrive_menu_screen(void)
 
 static lv_obj_t *wd_opts_band_dd = NULL;
 static lv_obj_t *wd_opts_pcap_sw = NULL;
+static lv_obj_t *wd_opts_ble_sw  = NULL;
 
 static void wd_opts_save_cb(lv_event_t *e)
 {
     (void)e;
     if (wd_opts_band_dd) g_wd_band = (wd_band_t)lv_dropdown_get_selected(wd_opts_band_dd);
     if (wd_opts_pcap_sw) g_wd_pcap = lv_obj_has_state(wd_opts_pcap_sw, LV_STATE_CHECKED);
+    if (wd_opts_ble_sw)  g_wd_ble  = lv_obj_has_state(wd_opts_ble_sw,  LV_STATE_CHECKED);
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_u8(h, NVS_KEY_WD_BAND, (uint8_t)g_wd_band);
         nvs_set_u8(h, NVS_KEY_WD_PCAP, g_wd_pcap ? 1 : 0);
+        nvs_set_u8(h, NVS_KEY_WD_BLE,  g_wd_ble  ? 1 : 0);
         nvs_commit(h);
         nvs_close(h);
     }
     wd_opts_band_dd = NULL;
     wd_opts_pcap_sw = NULL;
+    wd_opts_ble_sw  = NULL;
     show_wardrive_menu_screen();
 }
 
@@ -15589,6 +15757,7 @@ static void wd_opts_back_cb(lv_event_t *e)
     (void)e;
     wd_opts_band_dd = NULL;
     wd_opts_pcap_sw = NULL;
+    wd_opts_ble_sw  = NULL;
     show_wardrive_menu_screen();
 }
 
@@ -15642,9 +15811,26 @@ static void show_wardrive_options_screen(void)
     lv_obj_align(wd_opts_pcap_sw, LV_ALIGN_RIGHT_MID, 0, 0);
     if (g_wd_pcap) lv_obj_add_state(wd_opts_pcap_sw, LV_STATE_CHECKED);
 
-    // BLE note
+    // BLE toggle row
+    lv_obj_t *ble_row = lv_obj_create(content);
+    lv_obj_set_size(ble_row, LCD_H_RES - 32, 30);
+    lv_obj_set_style_bg_opa(ble_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ble_row, 0, 0);
+    lv_obj_set_style_pad_all(ble_row, 0, 0);
+    lv_obj_clear_flag(ble_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *ble_lbl = lv_label_create(ble_row);
+    lv_label_set_text(ble_lbl, "BLE scan (time-sliced)");
+    lv_obj_set_style_text_font(ble_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ble_lbl, ui_text_color(), 0);
+    lv_obj_align(ble_lbl, LV_ALIGN_LEFT_MID, 0, 0);
+
+    wd_opts_ble_sw = lv_switch_create(ble_row);
+    lv_obj_align(wd_opts_ble_sw, LV_ALIGN_RIGHT_MID, 0, 0);
+    if (g_wd_ble) lv_obj_add_state(wd_opts_ble_sw, LV_STATE_CHECKED);
+
     lv_obj_t *ble_note = lv_label_create(content);
-    lv_label_set_text(ble_note, LV_SYMBOL_WARNING " BLE scan not available\n  (single shared radio)");
+    lv_label_set_text(ble_note, LV_SYMBOL_WARNING " BLE pauses WiFi every 30s");
     lv_obj_set_style_text_color(ble_note, lv_color_make(140, 140, 140), 0);
     lv_obj_set_style_text_font(ble_note, &lv_font_montserrat_12, 0);
     lv_label_set_long_mode(ble_note, LV_LABEL_LONG_WRAP);
@@ -19037,6 +19223,288 @@ static void show_oui_groups_screen(void)
     lv_obj_add_event_cb(back_btn, oui_groups_back_cb, LV_EVENT_CLICKED, NULL);
 }
 
+// ─── BLE PCAP capture (Kismet/PCAPNG format) ─────────────────────────────
+
+// Write PCAPNG Section Header Block
+static void ble_pcap_write_shb(FILE *f)
+{
+    uint32_t block_type   = 0x0A0D0D0A;
+    uint32_t block_len    = 28;
+    uint32_t byte_order   = 0x1A2B3C4D;
+    uint16_t major        = 1, minor = 0;
+    int64_t  section_len  = -1;
+
+    fwrite(&block_type,  4, 1, f);
+    fwrite(&block_len,   4, 1, f);
+    fwrite(&byte_order,  4, 1, f);
+    fwrite(&major,       2, 1, f);
+    fwrite(&minor,       2, 1, f);
+    fwrite(&section_len, 8, 1, f);
+    fwrite(&block_len,   4, 1, f);
+}
+
+// Write PCAPNG Interface Description Block (LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR = 256)
+static void ble_pcap_write_idb(FILE *f)
+{
+    uint32_t block_type = 0x00000001;
+    uint32_t block_len  = 20;
+    uint16_t link_type  = 256;
+    uint16_t reserved   = 0;
+    uint32_t snap_len   = 65535;
+
+    fwrite(&block_type, 4, 1, f);
+    fwrite(&block_len,  4, 1, f);
+    fwrite(&link_type,  2, 1, f);
+    fwrite(&reserved,   2, 1, f);
+    fwrite(&snap_len,   4, 1, f);
+    fwrite(&block_len,  4, 1, f);
+}
+
+// Write one Enhanced Packet Block from a ble_pcap_pkt_t
+static void ble_pcap_write_epb(FILE *f, const ble_pcap_pkt_t *pkt)
+{
+    // Build LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR pseudo-header (10 bytes)
+    uint8_t phdr[10];
+    phdr[0] = 37;                       // rf_channel: advertising ch 37 (2402 MHz)
+    phdr[1] = (uint8_t)(int8_t)pkt->rssi;
+    phdr[2] = (uint8_t)(int8_t)(-128);  // noise: unavailable
+    phdr[3] = 0;                        // access address offenses
+    uint32_t ref_aa = 0x8E89BED6;       // BLE advertising access address (LE)
+    memcpy(phdr + 4, &ref_aa, 4);
+    uint16_t flags = 0x0002;            // signal power valid
+    memcpy(phdr + 8, &flags, 2);
+
+    // Build BLE LL ADV PDU
+    // PDU header: type | TxAdd | length
+    uint8_t pdu_type = 0; // ADV_IND default
+    switch (pkt->event_type) {
+        case 1: pdu_type = 1; break;  // ADV_DIRECT_IND
+        case 2: pdu_type = 2; break;  // ADV_NONCONN_IND
+        case 4: pdu_type = 4; break;  // SCAN_RSP
+        default: pdu_type = 0; break;
+    }
+    uint8_t payload_len = 6 + pkt->data_len;
+    uint8_t hdr0 = (uint8_t)(pdu_type | (pkt->addr_type ? 0x40 : 0x00));
+    uint8_t hdr1 = payload_len;
+
+    // Packet = phdr(10) + PDU_header(2) + AdvA(6) + AdvData(N)
+    int pkt_len = 10 + 2 + 6 + pkt->data_len;
+    int pad     = (4 - (pkt_len & 3)) & 3;
+    int padded  = pkt_len + pad;
+    uint32_t block_len = 32 + (uint32_t)padded;
+
+    uint32_t block_type    = 0x00000006;
+    uint32_t iface_id      = 0;
+    uint32_t ts_high       = (uint32_t)(pkt->timestamp_us >> 32);
+    uint32_t ts_low        = (uint32_t)(pkt->timestamp_us & 0xFFFFFFFF);
+    uint32_t captured_len  = (uint32_t)pkt_len;
+    uint32_t original_len  = (uint32_t)pkt_len;
+
+    fwrite(&block_type,   4, 1, f);
+    fwrite(&block_len,    4, 1, f);
+    fwrite(&iface_id,     4, 1, f);
+    fwrite(&ts_high,      4, 1, f);
+    fwrite(&ts_low,       4, 1, f);
+    fwrite(&captured_len, 4, 1, f);
+    fwrite(&original_len, 4, 1, f);
+    // Pseudo-header
+    fwrite(phdr, 10, 1, f);
+    // PDU header
+    fwrite(&hdr0, 1, 1, f);
+    fwrite(&hdr1, 1, 1, f);
+    // AdvA (NimBLE stores in LE byte order = correct for LL frame)
+    fwrite(pkt->addr, 6, 1, f);
+    // AdvData
+    fwrite(pkt->data, pkt->data_len, 1, f);
+    // Padding
+    if (pad) { uint8_t zeros[4] = {0}; fwrite(zeros, pad, 1, f); }
+    // Repeated block length
+    fwrite(&block_len, 4, 1, f);
+}
+
+// BLE GAP callback for PCAP capture
+static int ble_pcap_gap_cb(struct ble_gap_event *event, void *arg)
+{
+    (void)arg;
+    if (event->type != BLE_GAP_EVENT_DISC) return 0;
+    if (!ble_pcap_active || !ble_pcap_queue) return 0;
+
+    struct ble_gap_disc_desc *desc = &event->disc;
+    ble_pcap_pkt_t pkt;
+    memcpy(pkt.addr, desc->addr.val, 6);
+    pkt.addr_type    = desc->addr.type;
+    pkt.event_type   = (uint8_t)desc->event_type;
+    pkt.rssi         = desc->rssi;
+    pkt.data_len     = desc->length_data < 31 ? desc->length_data : 31;
+    memcpy(pkt.data, desc->data, pkt.data_len);
+    pkt.timestamp_us = (uint64_t)esp_timer_get_time();
+
+    xQueueSend(ble_pcap_queue, &pkt, 0);  // non-blocking; drop if full
+    return 0;
+}
+
+static void ble_pcap_stop(void)
+{
+    if (!ble_pcap_active) return;
+    ble_pcap_active = false;
+    ble_gap_disc_cancel();
+
+    if (ble_pcap_timer) { lv_timer_del(ble_pcap_timer); ble_pcap_timer = NULL; }
+
+    // Drain remaining queue to file
+    if (ble_pcap_file && ble_pcap_queue) {
+        ble_pcap_pkt_t pkt;
+        if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+            while (xQueueReceive(ble_pcap_queue, &pkt, 0) == pdTRUE)
+                ble_pcap_write_epb(ble_pcap_file, &pkt);
+            fflush(ble_pcap_file);
+            fclose(ble_pcap_file);
+            ble_pcap_file = NULL;
+            xSemaphoreGive(sd_spi_mutex);
+        }
+    }
+
+    if (ble_pcap_queue) { vQueueDelete(ble_pcap_queue); ble_pcap_queue = NULL; }
+    ble_pcap_cnt_label = NULL;
+}
+
+static void ble_pcap_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!ble_pcap_active || !ble_pcap_queue) return;
+
+    ble_pcap_pkt_t pkt;
+    int drained = 0;
+
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        while (xQueueReceive(ble_pcap_queue, &pkt, 0) == pdTRUE) {
+            if (ble_pcap_file) ble_pcap_write_epb(ble_pcap_file, &pkt);
+            ble_pcap_pkt_count++;
+            drained++;
+            if (drained >= 16) { fflush(ble_pcap_file); break; }
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    if (ble_pcap_cnt_label && lv_obj_is_valid(ble_pcap_cnt_label)) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "Packets: %lu", (unsigned long)ble_pcap_pkt_count);
+        lv_label_set_text(ble_pcap_cnt_label, buf);
+    }
+}
+
+static void ble_pcap_stop_cb(lv_event_t *e)
+{
+    (void)e;
+    ble_pcap_stop();
+    show_bluetooth_screen();
+}
+
+static void show_ble_pcap_screen(void)
+{
+    if (!ensure_ble_mode()) {
+        ESP_LOGE(TAG, "BLE PCAP: BLE init failed");
+        return;
+    }
+
+    // Open output file
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        struct stat st = {0};
+        if (stat(BLE_PCAP_DIR, &st) == -1) {
+            mkdir("/sdcard/lab", 0777);
+            mkdir(BLE_PCAP_DIR, 0777);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    uint32_t ts = (uint32_t)(esp_timer_get_time() / 1000000);
+    char fname[96];
+    snprintf(fname, sizeof(fname), BLE_PCAP_DIR "/ble_%lu.pcapng", (unsigned long)ts);
+
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        ble_pcap_file = fopen(fname, "wb");
+        if (ble_pcap_file) {
+            ble_pcap_write_shb(ble_pcap_file);
+            ble_pcap_write_idb(ble_pcap_file);
+            fflush(ble_pcap_file);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    if (!ble_pcap_file) {
+        ESP_LOGE(TAG, "BLE PCAP: cannot open %s", fname);
+        show_bluetooth_screen();
+        return;
+    }
+
+    ble_pcap_queue     = xQueueCreate(64, sizeof(ble_pcap_pkt_t));
+    ble_pcap_pkt_count = 0;
+    ble_pcap_active    = true;
+
+    create_function_page_base("BLE PCAP");
+
+    // Filename label
+    lv_obj_t *fn_lbl = lv_label_create(function_page);
+    const char *short_name = strrchr(fname, '/');
+    short_name = short_name ? short_name + 1 : fname;
+    lv_label_set_text(fn_lbl, short_name);
+    lv_obj_set_style_text_font(fn_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(fn_lbl, UI_ACCENT_CYAN, 0);
+    lv_obj_align(fn_lbl, LV_ALIGN_TOP_MID, 0, 36);
+    lv_label_set_long_mode(fn_lbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(fn_lbl, LCD_H_RES - 8);
+    lv_obj_set_style_text_align(fn_lbl, LV_TEXT_ALIGN_CENTER, 0);
+
+    // Packet counter
+    ble_pcap_cnt_label = lv_label_create(function_page);
+    lv_label_set_text(ble_pcap_cnt_label, "Packets: 0");
+    lv_obj_set_style_text_font(ble_pcap_cnt_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(ble_pcap_cnt_label, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_align(ble_pcap_cnt_label, LV_ALIGN_CENTER, 0, -20);
+
+    // Status
+    lv_obj_t *status_lbl = lv_label_create(function_page);
+    lv_label_set_text(status_lbl, LV_SYMBOL_BLUETOOTH " Capturing...");
+    lv_obj_set_style_text_font(status_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(status_lbl, UI_ACCENT_CYAN, 0);
+    lv_obj_align(status_lbl, LV_ALIGN_CENTER, 0, 20);
+
+    // Format note
+    lv_obj_t *fmt_lbl = lv_label_create(function_page);
+    lv_label_set_text(fmt_lbl, "Kismet/Wireshark PCAPNG\nDLT_BLUETOOTH_LE_LL_WITH_PHDR");
+    lv_obj_set_style_text_font(fmt_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(fmt_lbl, lv_color_make(120, 120, 120), 0);
+    lv_obj_set_style_text_align(fmt_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(fmt_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(fmt_lbl, LCD_H_RES - 16);
+    lv_obj_align(fmt_lbl, LV_ALIGN_CENTER, 0, 60);
+
+    // Stop button
+    lv_obj_t *stop_btn = lv_btn_create(function_page);
+    lv_obj_set_size(stop_btn, 110, 30);
+    lv_obj_align(stop_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_make(200, 50, 50), 0);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_make(160, 30, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(stop_btn, 8, 0);
+    lv_obj_t *stop_lbl = lv_label_create(stop_btn);
+    lv_label_set_text(stop_lbl, LV_SYMBOL_STOP "  Stop");
+    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(stop_lbl);
+    lv_obj_add_event_cb(stop_btn, ble_pcap_stop_cb, LV_EVENT_CLICKED, NULL);
+
+    // Start scanning
+    struct ble_gap_disc_params scan_params = {
+        .itvl = 0x60, .window = 0x60,
+        .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
+        .limited = 0, .passive = 0, .filter_duplicates = 0,
+    };
+    ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &scan_params, ble_pcap_gap_cb, NULL);
+
+    ble_pcap_timer = lv_timer_create(ble_pcap_timer_cb, 200, NULL);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 // Bluetooth screen
 static void show_bluetooth_screen(void)
 {
@@ -19073,9 +19541,13 @@ static void show_bluetooth_screen(void)
     lv_obj_t *lookout_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BT\nLookout", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(lookout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Dee Dee Detector");
 
-    // BT Attacks - Orange (bottom-right, 6th tile)
+    // BT Attacks - Orange
     lv_obj_t *btatk_tile = create_tile(tiles, LV_SYMBOL_WARNING, "BT\nAttacks", COLOR_MATERIAL_AMBER, NULL, NULL);
     lv_obj_add_event_cb(btatk_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Attacks");
+
+    // BLE PCAP - teal/purple
+    lv_obj_t *pcap_tile = create_tile(tiles, LV_SYMBOL_SAVE, "BLE\nPCAP", lv_color_hex(0x00897B), NULL, NULL);
+    lv_obj_add_event_cb(pcap_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE PCAP");
 }
 
 // BT Locator screen - scan BT devices, select one, then track RSSI every 10s
@@ -23854,6 +24326,12 @@ void attack_event_cb(lv_event_t *e)
     // BT Attacks menu
     if (strcmp(attack_name, "BT Attacks") == 0) {
         show_bt_attacks_screen();
+        return;
+    }
+
+    // BLE PCAP capture
+    if (strcmp(attack_name, "BLE PCAP") == 0) {
+        show_ble_pcap_screen();
         return;
     }
 
