@@ -54,7 +54,20 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
     - [WiFi Observer & Karma](#wifi-observer--karma)
     - [Deauth Monitor](#deauth-monitor)
   - [Bluetooth](#2-bluetooth)
+    - [BLE PCAP — How It Works](#ble-pcap--how-it-works)
+    - [BT Scan & Select — How It Works](#bt-scan--select--how-it-works)
+    - [AirTag / SmartTag Locator — How It Works](#airtag--smarttag-locator--how-it-works)
+    - [GATT Walker — How It Works](#gatt-walker--how-it-works)
+    - [BT Observer — How It Works](#bt-observer--how-it-works)
+    - [Bluetooth Lookout — How It Works](#bluetooth-lookout--how-it-works)
   - [Wardriving](#3-wardriving)
+    - [Starting a Wardrive](#starting-a-wardrive)
+    - [Mark Button — GPS Waypoints](#mark-button--gps-waypoints)
+    - [Options Screen](#options-screen)
+    - [BLE Time-Sliced Wardriving](#ble-time-sliced-wardriving)
+    - [Manage Data Screen](#manage-data-screen)
+    - [Wardrive File Format](#wardrive-file-format)
+    - [Wardriving Workflow — Field Use](#wardriving-workflow--field-use)
   - [Settings](#4-settings)
     - [TX Power Mode](#tx-power-mode)
     - [GATT Connect Timeout](#gatt-connect-timeout)
@@ -76,8 +89,8 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **WiFi Attacks** | Deauth, Evil Twin, Captive Portal, Blackout, Snifferdog, SAE Overflow |
 | **Handshake Capture** | WPA/WPA2 4-way handshake capture (PCAP & HCCAPX) |
 | **Karma AP** | Respond to probe requests, rogue access point |
-| **Wardriving** | GPS + WiFi logging to SD card (CSV) |
-| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk, Bluetooth Lookout, BLE Spam, Device Spoof (general + directed), BLE Disconnect (directed) |
+| **Wardriving** | GPS + WiFi logging, dual-band filter (2.4 GHz / 5 GHz / Both), optional BLE time-sliced scanning, WiGLE CSV 1.6, upload log tracking, raw PCAP toggle, GPS mark waypoints (GPX output), WiGLE and WDG Wars upload |
+| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk, Bluetooth Lookout, BLE Spam, Device Spoof (general + directed), BLE Disconnect (directed), BLE PCAP (Kismet PCAPNG raw capture) |
 | **Deauth Monitor** | Passive detection of nearby deauth attacks |
 | **Credentials** | Captive portal credential capture, WPA-SEC upload |
 | **TX Power Mode** | Selectable Normal / Max Power for WiFi and BLE — persisted across reboots |
@@ -255,6 +268,9 @@ Main Menu
 │       ├── Edit Watchlist
 │       └── OUI Groups
 ├── Wardrive
+│   ├── Start Wardrive
+│   ├── Options              ← band (2.4/5/Both), raw PCAP toggle, BLE wardrive toggle
+│   └── Manage Data         ← CSV file list, upload-log color coding, delete, upload
 ├── Settings
 │   ├── Compromised Data
 │   ├── Timing
@@ -348,6 +364,7 @@ Bluetooth
 │   ├── BLE Spam        (Apple / Samsung / Google / Windows / All broadcast spam)
 │   └── Device Spoof    (select from spooflist.csv or add new entry via keyboard)
 ├── BT Observer         ← 10 s scan then sequential GATT walk on all found devices
+├── BLE PCAP            ← raw Kismet PCAPNG capture; streams to SD card
 ├── AirTag Scan
 ├── BT Locator
 └── Bluetooth Lookout   ← continuous watchlist monitor
@@ -368,6 +385,7 @@ Bluetooth
 | **Device Spoof (directed)** | Clones the MAC address and name of a device pre-selected in BT Scan & Select — no additional selection step required |
 | **Device Spoof (general)** | Loads `/sdcard/lab/bluetooth/spooflist.csv`; select an entry or add new devices via on-screen keyboard, then START to begin spoofing |
 | **BLE Disconnect (directed)** | Floods a BT Scan & Select pre-selected target with BLE TERMINATE_IND frames to force disconnection |
+| **BLE PCAP** | Captures raw BLE advertising packets to SD card in Kismet PCAPNG format (link type 256 — `LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR`). Includes a 10-byte pseudo-header per packet: RF channel 37, RSSI, noise floor, and BLE access address. Queue-based write path keeps the SD bus free for the UI. Live packet count shown on screen. |
 
 > **Note:** WiFi and BLE share the same radio. The firmware automatically switches between `RADIO_MODE_WIFI` and `RADIO_MODE_BLE` as needed.
 
@@ -683,14 +701,191 @@ Pre-loaded groups:
 
 Tap **+ Add to Watchlist** on any group card. Each OUI is written to `lookout.csv` as an OUI-only entry (visible in the editor as `OUI: AA:BB:CC:*`). Entries added this way are preserved across reboots and editable via **Edit List**.
 
+#### BLE PCAP — How It Works
+
+**BLE PCAP** captures raw BLE advertising packets from the air and writes them to SD card in **Kismet PCAPNG format** — the same format used by Kismet Wireless, Wireshark, and other BLE analysis tools.
+
+**Workflow:**
+1. Open **BLE PCAP** from the Bluetooth tile.
+2. A new `.pcapng` file is created in `/sdcard/lab/ble_captures/` (e.g. `ble_YYYYMMDD_HHMMSS.pcapng`).
+3. The screen shows a live packet counter. All advertising packets detected by the radio are captured.
+4. Tap **Stop** to flush and close the file cleanly.
+
+**File format:** PCAPNG with:
+- **Section Header Block (SHB)** — hardware, OS, and application metadata
+- **Interface Description Block (IDB)** — link type 256 (`LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR`)
+- **Enhanced Packet Block (EPB)** — one per advertising packet
+
+Each EPB includes a **10-byte pseudo-header** preceding the reconstructed BLE LL PDU:
+
+| Byte(s) | Field | Value |
+|---------|-------|-------|
+| 0 | RF channel | 37 |
+| 1 | Signal power (dBm) | RSSI from radio |
+| 2 | Noise power (dBm) | −128 (unknown) |
+| 3–4 | Access address offenses | 0 |
+| 5–8 | Reference access address | `0x8E89BED6` (BLE advertising AA) |
+| 9 | Flags | `0x02` (dewhitened PDU) |
+
+The reconstructed PDU contains the advertising PDU header (event type + address type + length), the 6-byte AdvA, and the AdvData payload. This format is directly openable in **Wireshark** with the `BTBREDR` or `BTLE` dissector, and in **Kismet** with its standard BLE plugin.
+
+**Output path:** `/sdcard/lab/ble_captures/ble_YYYYMMDD_HHMMSS.pcapng`
+
+> **Note:** The ESP32-C5's BLE radio captures advertising packets on channels 37/38/39. The pseudo-header records channel 37 for all packets; the actual advertising channel is determined by the PDU type and timing.
+
 ### 3. Wardriving
 
-GPS-enabled WiFi logging for mapping wireless networks. Requires an **ATGM336H** (or compatible NMEA module) wired to IO4/IO5 — see [GPS Wiring](#gps-wiring--atgm336h).
+GPS-enabled WiFi (and optionally BLE) mapping. Requires an **ATGM336H** (or compatible NMEA module) wired to IO4/IO5 — see [GPS Wiring](#gps-wiring--atgm336h).
 
-- Combines GPS coordinates (NMEA GGA/RMC) with WiFi scan results
-- Uses D-UCB channel hopping for thorough band coverage
-- Logs SSID, BSSID, channel, RSSI, auth mode, and GPS coordinates to CSV on the SD card
-- Compatible with standard wardriving visualization tools (Wigle, etc.)
+```
+Wardrive
+├── Start Wardrive     ← launches the live dashboard
+├── Options            ← band, PCAP, and BLE settings
+└── Manage Data        ← file list with upload status, delete, and upload
+```
+
+#### Starting a Wardrive
+
+Tap **Wardrive** from the main menu, then **Start Wardrive**. The firmware switches the radio to promiscuous mode, begins D-UCB channel hopping, and writes a new WiGLE CSV 1.6 file to `/sdcard/lab/wardrives/` on each fixed GPS position change. The live dashboard shows:
+
+| Field | Description |
+|-------|-------------|
+| **Ch** | Current channel being scanned (shows **BLE** during a BLE time-slice pass) |
+| **APs** | Unique networks logged this session |
+| **Pts** | GPS points written to the CSV |
+| **Marks** | GPS waypoints saved this session |
+| **Lat / Lon** | Live GPS coordinates |
+| **Sats** | Satellite count |
+
+**Stop** — ends the session, closes all open files, and returns to the Wardrive menu.
+
+**Go Dark** — available from the title bar power icon on every screen. The display turns off while wardriving continues in the background. Double-press the **BOOT** button to wake the display. The NeoPixel stays cyan while active.
+
+#### Mark Button — GPS Waypoints
+
+A **Mark** button sits in the lower-right of the wardrive dashboard (amber, GPS icon). Use it to tag any point of interest during a drive:
+
+| Gesture | Result |
+|---------|--------|
+| **Double-tap** (within 450 ms) | Quick waypoint — saves current GPS coordinates immediately with no note |
+| **Single tap** | Opens a note dialog — enter a description, then **Save** to record the point with text |
+
+Waypoints are saved in GPX format to `/sdcard/lab/wardrives/wdXXXXXX_marks.gpx` — one file per session, named to match the session's CSV file. The file is closed cleanly when you tap **Stop**.
+
+**GPX output:**
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="JANOS-CYM">
+  <wpt lat="37.123456" lon="-122.456789">
+    <ele>42.0</ele>
+    <time>2026-05-08T12:34:56Z</time>
+    <name>Mark 1</name>
+  </wpt>
+  <wpt lat="37.123789" lon="-122.457012">
+    <ele>42.0</ele>
+    <time>2026-05-08T12:36:11Z</time>
+    <name>Coffee shop on corner</name>
+  </wpt>
+</gpx>
+```
+
+GPX files can be loaded directly into QGIS, Google Earth, or any mapping tool that accepts the standard GPX format.
+
+#### Options Screen
+
+Tap **Options** from the Wardrive menu to configure the current session parameters. All settings are NVS-persisted.
+
+| Option | Values | Default | Description |
+|--------|--------|---------|-------------|
+| **Band** | Both / 2.4 GHz / 5 GHz | Both | Restricts D-UCB channel hopping to the selected band |
+| **Raw PCAP** | On / Off | Off | When enabled, writes a `.pcap` file alongside the CSV for each session |
+| **BLE Wardrive** | On / Off | Off | Enables BLE time-sliced scanning (see below) |
+
+#### BLE Time-Sliced Wardriving
+
+When **BLE Wardrive** is enabled, the firmware periodically pauses WiFi scanning for a short BLE pass:
+
+1. Every **30 seconds** of WiFi scanning, the promiscuous sniffer is paused.
+2. The radio switches to BLE mode and runs an **8-second active BLE scan**.
+3. All discovered BLE devices (deduplicated by MAC) are recorded with the current GPS fix.
+4. The radio switches back to WiFi, D-UCB is rebuilt, and scanning resumes.
+
+During the BLE pass, the dashboard channel indicator shows **BLE** instead of a channel number.
+
+**BLE rows in the CSV** follow the same WiGLE 1.6 format as WiFi rows, with `Type=BLE`, `Channel=37`, `Frequency=2402`, and `[BLE]` as the auth mode:
+
+```
+AA:BB:CC:DD:EE:FF,"My Speaker",[BLE],2026-05-08 12:34:56,37,2402,-72,37.123456,-122.456789,42.0,0.00,,,BLE
+```
+
+This produces a single CSV file containing both WiFi and BLE sightings, uploadable directly to WiGLE which supports both types in the same file.
+
+#### D-UCB Band Filtering
+
+The D-UCB channel scheduler respects the **Band** option:
+
+| Band setting | Channels hopped |
+|---|---|
+| **Both** | All 2.4 GHz channels (1–14) + 5 GHz channels (36, 40, 44, 48, 52, 56, 60, 64, 100–165) |
+| **2.4 GHz only** | Channels 1–14 only |
+| **5 GHz only** | 5 GHz channels only |
+
+#### Manage Data Screen
+
+**Manage Data** lists all wardrive CSV files in `/sdcard/lab/wardrives/`. Each row shows the filename and upload status read from `upload_log.csv`:
+
+| Row color | Meaning |
+|-----------|---------|
+| **Green** | Uploaded successfully to all selected services |
+| **Amber** | Partially uploaded (e.g. WiGLE OK, WDG Wars failed) |
+| **White** | Not yet uploaded |
+
+Each row has an **X** button to delete that file from the SD card. Tap **Upload** to proceed to the upload screen (which returns to Manage Data when done, so you can check updated statuses).
+
+The upload log at `/sdcard/lab/wardrives/upload_log.csv` records one row per file per service:
+
+```
+wd000001.csv,WIGLE,OK
+wd000001.csv,WDGWARS,OK
+wd000002.csv,WIGLE,FAIL
+```
+
+#### Wardrive File Format
+
+WiGLE CSV 1.6 — accepted directly by WiGLE and WDG Wars without conversion.
+
+```
+WigleWifi-1.6,appRelease=v1.0.4,model=NM-CYD-C5,...
+MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type
+AA:BB:CC:DD:EE:FF,"MyNetwork",[WPA2_PSK],2026-05-08 12:34:56,6,2437,-65,37.123456,-122.456789,0.00,0.00,,,WIFI
+11:22:33:44:55:66,"BLE Device",[BLE],2026-05-08 12:35:02,37,2402,-72,37.123456,-122.456789,0.00,0.00,,,BLE
+```
+
+#### Wardriving Workflow — Field Use
+
+**Quick drive:**
+1. Insert GPS module (ATGM336H) — wait for fix (30–60 s clear sky).
+2. Wardrive → Start Wardrive. The NeoPixel turns cyan.
+3. Drive. The AP count increments as new networks are logged.
+4. Tap **Stop** when done. Files are closed and ready to upload.
+5. Wardrive → Manage Data → Upload.
+
+**With BLE:**
+1. Options → BLE Wardrive → On. Options → Band → Both.
+2. Start Wardrive. The channel indicator flashes **BLE** every 30 s for an 8-second scan.
+3. Both WiFi and BLE sightings appear in the same CSV.
+
+**Marking a point of interest:**
+- Double-tap **Mark** to silently drop a quick waypoint.
+- Single-tap **Mark**, type a note (e.g. "camera on pole"), tap **Save**.
+- GPX file is written alongside the CSV — load both into QGIS for a full picture.
+
+**Upload after drive:**
+1. Wardrive → Manage Data → check row colors.
+2. Tap **Upload** → select WiGLE / WDG Wars / Both → enter API keys → Upload All.
+3. Per-file status updates live. Green = accepted; amber = duplicate; red = failed.
+4. Return to Manage Data — uploaded rows turn green.
 
 ### 4. Settings
 
@@ -811,14 +1006,9 @@ Uploads all wardrive CSV files from `/sdcard/lab/wardrives/` to [WiGLE](https://
 2. Confirm/enter API keys in the text areas (pre-filled from NVS/SD if configured)
 3. Tap **Upload All** — the device connects to WiFi, walks every `.csv` file in `/sdcard/lab/wardrives/`, and uploads each one in sequence
 4. The progress list shows per-file status: **OK** (green), **dup** (amber — already submitted), **FAIL** (red)
+5. Each result is written to `/sdcard/lab/wardrives/upload_log.csv`; the **Manage Data** screen reads this file to color-code rows
 
-**Wardrive file format:** WiGLE CSV 1.6 — accepted by both WiGLE and WDG Wars without conversion.
-
-```
-WigleWifi-1.6,appRelease=v1.0.1,model=NM-CYD-C5,...
-MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type
-AA:BB:CC:DD:EE:FF,"MyNetwork",[WPA2_PSK],2026-05-08 12:34:56,6,2437,-65,37.123456,-122.456789,0.00,0.00,,,WIFI
-```
+> **Tip:** Use **Wardrive → Manage Data → Upload** instead of **Settings → Data Transfer → Wardrive Upload** when you want to see file status before and after uploading. Both paths use the same upload screen and log.
 
 ### UI & System Features
 
@@ -868,8 +1058,11 @@ All data is stored on the SD card:
 │   ├── htmls/            # ← Captive portal HTML pages
 │   │   └── *.html / *.htm   # Drop any portal page here — each file appears in the attack dropdown
 │   ├── pcaps/            # MITM/sniff PCAP captures
-│   ├── wardrives/        # GPS + WiFi wardrive logs (WiGLE CSV 1.6 format)
-│   │   └── wd*.csv       # One file per session — uploaded via Wardrive Upload
+│   ├── wardrives/        # GPS + WiFi/BLE wardrive logs (WiGLE CSV 1.6 format)
+│   │   ├── wd*.csv           # One file per session — uploaded via Wardrive Upload
+│   │   ├── wd*_marks.gpx     # GPS waypoints for that session (GPX 1.1)
+│   │   └── upload_log.csv    # Upload tracking: filename,SERVICE,STATUS per row
+│   ├── ble_captures/     # BLE PCAP files (Kismet PCAPNG, DLT 256)
 │   ├── deauths/          # Deauth monitor PCAP captures
 │   ├── bluetooth/
 │   │   ├── lookout.csv   # Bluetooth Lookout watchlist
