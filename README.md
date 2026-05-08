@@ -54,7 +54,20 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
     - [WiFi Observer & Karma](#wifi-observer--karma)
     - [Deauth Monitor](#deauth-monitor)
   - [Bluetooth](#2-bluetooth)
+    - [BLE PCAP — How It Works](#ble-pcap--how-it-works)
+    - [BT Scan & Select — How It Works](#bt-scan--select--how-it-works)
+    - [AirTag / SmartTag Locator — How It Works](#airtag--smarttag-locator--how-it-works)
+    - [GATT Walker — How It Works](#gatt-walker--how-it-works)
+    - [BT Observer — How It Works](#bt-observer--how-it-works)
+    - [Bluetooth Lookout — How It Works](#bluetooth-lookout--how-it-works)
   - [Wardriving](#3-wardriving)
+    - [Starting a Wardrive](#starting-a-wardrive)
+    - [Mark Button — GPS Waypoints](#mark-button--gps-waypoints)
+    - [Options Screen](#options-screen)
+    - [BLE Time-Sliced Wardriving](#ble-time-sliced-wardriving)
+    - [Manage Data Screen](#manage-data-screen)
+    - [Wardrive File Format](#wardrive-file-format)
+    - [Wardriving Workflow — Field Use](#wardriving-workflow--field-use)
   - [Settings](#4-settings)
     - [TX Power Mode](#tx-power-mode)
     - [GATT Connect Timeout](#gatt-connect-timeout)
@@ -63,6 +76,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 - [Touch Calibration](#touch-calibration)
 - [Building & Flashing](#building--flashing)
 - [Photos](#photos)
+- [On Signal Jamming](#on-signal-jamming)
 - [Disclaimer](#disclaimer)
 
 ---
@@ -75,8 +89,9 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **WiFi Attacks** | Deauth, Evil Twin, Captive Portal, Blackout, Snifferdog, SAE Overflow |
 | **Handshake Capture** | WPA/WPA2 4-way handshake capture (PCAP & HCCAPX) |
 | **Karma AP** | Respond to probe requests, rogue access point |
-| **Wardriving** | GPS + WiFi logging to SD card (CSV) |
-| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk, Bluetooth Lookout, BLE Spam, Device Spoof (general + directed), BLE Disconnect (directed) |
+| **Wardriving** | GPS + WiFi logging, dual-band filter (2.4 GHz / 5 GHz / Both), optional BLE time-sliced scanning, WiGLE CSV 1.6, upload log tracking, raw PCAP toggle, GPS mark waypoints (GPX output), WiGLE and WDG Wars upload; GPS last-known position hold with 150 m stale accuracy when signal is lost |
+| **GPS** | NMEA RMC auto-syncs system clock (FAT timestamps); last-known position persisted to NVS (5-minute throttle); manual fallback editor in Settings → GPS Info; all data-collection features (wardrive, GATT Walker, marks) use best available GPS transparently |
+| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk, Bluetooth Lookout, BLE Spam, Device Spoof (general + directed), BLE Disconnect (directed), BLE PCAP (Kismet PCAPNG raw capture) |
 | **Deauth Monitor** | Passive detection of nearby deauth attacks |
 | **Credentials** | Captive portal credential capture, WPA-SEC upload |
 | **TX Power Mode** | Selectable Normal / Max Power for WiFi and BLE — persisted across reboots |
@@ -115,7 +130,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **Display** | 2.8" ST7789 TFT (240×320 portrait, 16-bit RGB565) | SPI @ 40 MHz |
 | **Touch** | XPT2046 Resistive Touch (polling, T_IRQ not connected) | SPI @ 2 MHz |
 | **SD Card** | MicroSD **FAT32, max 32 GB** (shared SPI2 bus with display and touch) | SPI @ 20 MHz |
-| **GPS** | ATGM336H NMEA module (GGA, RMC sentences) | UART1 @ 9600 baud |
+| **GPS** | [ATGM336H GPS+BDS Dual-Mode Module](https://www.amazon.com/dp/B09LQDG1HY) (Teyleten Robot, ASIN B09LQDG1HY; search "ATGM336H UART" if unavailable) — outputs NMEA 0183 GGA + RMC at 9600 baud, 3.3 V, onboard ceramic patch antenna | UART1 @ 9600 baud |
 | **LED** | WS2812 NeoPixel (single, GPIO 27) | RMT / GPIO |
 
 Board reference: https://github.com/RockBase-iot/NM-CYD-C5
@@ -195,7 +210,13 @@ Mutual exclusion via sd_spi_mutex
 
 ### GPS Wiring — ATGM336H
 
-The ATGM336H is a compact GPS/GNSS module that outputs standard NMEA 0183 sentences (GGA, RMC) at 9600 baud. It is wired directly to the NM-CYD-C5 LP-UART pins — no level shifter required as the module operates at 3.3 V.
+**Recommended module:** [Teyleten Robot ATGM336H GPS+BDS Dual-Mode Module](https://www.amazon.com/dp/B09LQDG1HY) (Amazon ASIN B09LQDG1HY, typically sold as a 2-pack)
+
+> If the link above is unavailable, search Amazon or AliExpress for: **"ATGM336H GPS BDS module UART"** or **"Teyleten Robot ATGM336H"**. The module is also sold under other brand names (e.g. HiLetgo, KeeYees) — any ATGM336H-based board with a 4-pin header (VCC / GND / TX / RX) and a 3.3 V UART interface will work.
+
+The ATGM336H is a compact GPS/BeiDou dual-mode GNSS module that outputs standard NMEA 0183 sentences (GGA, RMC) at 9600 baud over a 3.3 V UART interface. It is manufactured by ZHONGKEWEI (ATGM) and is a cost-effective drop-in replacement for the popular u-blox NEO-6M and NEO-M8N modules. The Teyleten Robot variant ships with an onboard passive ceramic patch antenna and a 5-pin 2.54 mm header (VCC / GND / TX / RX / PPS). No level shifter is required — the module operates natively at 3.3 V and connects directly to the NM-CYD-C5 LP-UART pins with just 4 wires.
+
+**Wiring diagram — 4 wires only:**
 
 ```
 ATGM336H Module          NM-CYD-C5 (ESP32-C5)
@@ -206,6 +227,9 @@ ATGM336H Module          NM-CYD-C5 (ESP32-C5)
 │         RX ├───────────┤ IO5  (UART1 TX)  │
 │        PPS │  (unused) │                  │
 └────────────┘           └──────────────────┘
+
+  ⚠️  Power from 3.3 V only — do NOT use the 5 V pin
+  ⚠️  TX on the GPS module connects to RX on the ESP (and vice versa)
 ```
 
 | Signal | ATGM336H pin | ESP32-C5 pin | Notes |
@@ -218,7 +242,15 @@ ATGM336H Module          NM-CYD-C5 (ESP32-C5)
 
 **Settings:** UART1 · 9600 baud · 8N1 · no flow control
 
-The firmware parses GGA sentences for latitude, longitude, altitude, and satellite count, and RMC sentences for fix validity. Cold start to first fix typically takes 30–60 seconds with a clear sky view.
+The firmware parses **GGA** sentences for latitude, longitude, altitude, and satellite count, and **RMC** sentences for fix validity and date/time.
+
+**System clock sync:** The first valid RMC sentence with an active fix (`status = A`) sets `settimeofday()` with the GPS UTC date and time. This corrects the ESP32's clock — which boots at epoch (1970-01-01) — so that files written to the SD card carry accurate FAT timestamps. The sync logic re-applies the time on every incoming RMC sentence until the system year reaches 2024 or later, meaning a late GPS fix (e.g. acquired 60 s into a wardrive) will still correct the timestamps of all files written afterward.
+
+**Last-known position persistence:** Every valid GGA fix is snapshotted to a `g_gps_last_known` global. When GPS signal is lost (entering a building, underground parking, etc.) all data-collection features automatically fall back to the last-known coordinates and report an accuracy of **150 m** (approximately one city block) in the WiGLE CSV `AccuracyMeters` field and in GPX waypoints. This ensures wardrive sessions continue collecting data indoors rather than pausing or producing empty location entries.
+
+The last-known position is also written to **NVS** (keys `gps_lat_i`, `gps_lon_i`, `gps_alt_i`, stored as integer micro-degrees ×10⁶) and reloaded at boot — so even if the first session of the day starts with no GPS fix, the device uses the last outdoor position from a prior session. Writes are throttled to at most once every five minutes to protect NVS flash life (~5+ years at that rate). An explicit save via **Settings → GPS Info → Set Position** bypasses the throttle.
+
+Cold start to first fix typically takes 30–60 seconds with a clear sky view.
 
 ---
 
@@ -254,6 +286,9 @@ Main Menu
 │       ├── Edit Watchlist
 │       └── OUI Groups
 ├── Wardrive
+│   ├── Start Wardrive
+│   ├── Options              ← band (2.4/5/Both), raw PCAP toggle, BLE wardrive toggle
+│   └── Manage Data         ← CSV file list, upload-log color coding, delete, upload
 ├── Settings
 │   ├── Compromised Data
 │   ├── Timing
@@ -264,8 +299,9 @@ Main Menu
 │   │   ├── Timeout       (inactivity timer)
 │   │   └── Brightness    (10–100% overlay)
 │   ├── SD Card
-│   ├── GPS Info
-│   ├── Power Mode
+│   ├── GPS Info            ← live status; amber display when using last-known
+│   └── Set Position    ← manual lat/lon/alt editor, saves to NVS
+├── Power Mode
 │   └── Data Transfer
 │       ├── AP File Server
 │       ├── WiFi Client
@@ -347,6 +383,7 @@ Bluetooth
 │   ├── BLE Spam        (Apple / Samsung / Google / Windows / All broadcast spam)
 │   └── Device Spoof    (select from spooflist.csv or add new entry via keyboard)
 ├── BT Observer         ← 10 s scan then sequential GATT walk on all found devices
+├── BLE PCAP            ← raw Kismet PCAPNG capture; streams to SD card
 ├── AirTag Scan
 ├── BT Locator
 └── Bluetooth Lookout   ← continuous watchlist monitor
@@ -367,6 +404,7 @@ Bluetooth
 | **Device Spoof (directed)** | Clones the MAC address and name of a device pre-selected in BT Scan & Select — no additional selection step required |
 | **Device Spoof (general)** | Loads `/sdcard/lab/bluetooth/spooflist.csv`; select an entry or add new devices via on-screen keyboard, then START to begin spoofing |
 | **BLE Disconnect (directed)** | Floods a BT Scan & Select pre-selected target with BLE TERMINATE_IND frames to force disconnection |
+| **BLE PCAP** | Captures raw BLE advertising packets to SD card in Kismet PCAPNG format (link type 256 — `LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR`). Includes a 10-byte pseudo-header per packet: RF channel 37, RSSI, noise floor, and BLE access address. Queue-based write path keeps the SD bus free for the UI. Live packet count shown on screen. |
 
 > **Note:** WiFi and BLE share the same radio. The firmware automatically switches between `RADIO_MODE_WIFI` and `RADIO_MODE_BLE` as needed.
 
@@ -487,7 +525,7 @@ Walk complete
 
 5. When complete, the screen automatically transitions to a **full scrollable detail view** showing the entire GATT tree: MAC + OUI vendor, FP, GPS, per-service UUID + name, per-characteristic UUID + name, decoded property flags, hex data, and ASCII preview.
 
-**Output file:** `/sdcard/gattwalker/YYYYMMDD_HHMMSS_AABBCCDDEEFF_gattwalk.json`
+**Output file:** `/sdcard/lab/gattwalker/YYYYMMDD_HHMMSS_AABBCCDDEEFF_gattwalk.json`
 
 ```json
 {
@@ -515,8 +553,7 @@ Walk complete
           "properties": 2,
           "props_str": "R",
           "read_data": "4D7920446576696365",
-          "ascii": "My Device",
-          "descriptors": []
+          "ascii": "My Device"
         }
       ]
     }
@@ -526,7 +563,7 @@ Walk complete
 
 **Fingerprint:** An FNV-32 hash computed over all service UUIDs, characteristic UUIDs, and property flags in walk order. Identical device models typically produce the same fingerprint, making it useful for passive device-type identification across multiple captures.
 
-**GPS geotagging:** If a GPS fix is active when GATT Walker starts, the coordinates are embedded in the JSON. This enables later mapping of device sightings.
+**GPS geotagging:** GATT Walker uses the best available GPS position — live fix if locked, last-known fallback if not (see [GPS Info & Fallback Position](#gps-info--fallback-position)). The JSON `gps.valid` field is `true` whenever any position is available (live or stale). When the fallback position was used, the coordinates are still useful for approximate area-level mapping; the 150 m stale accuracy is reflected in the surrounding context even though the JSON does not currently include an accuracy field.
 
 **Characteristic Properties (`props` / `props_str`):** Each characteristic has a bitmask that declares what operations it supports. The JSON includes both the raw integer (`"properties"`) and the decoded string (`"props_str"`). The on-device result screen shows both the compact flag string and the full human-readable expansion, e.g. `Props: R N (Read, Notify)`.
 
@@ -578,7 +615,7 @@ Attributes longer than one MTU are read automatically in multiple chunks (`ATT_R
 
 #### BT Observer — How It Works
 
-**BT Observer** automates the scan-then-walk workflow: it runs a single 10-second active BLE scan, captures all discovered devices, then attempts a sequential GATT walk on each one (5 s connect timeout). Results are displayed in a live scrollable list and saved as JSON files to `/sdcard/gattwalker/` — identical format to manual GATT Walker.
+**BT Observer** automates the scan-then-walk workflow: it runs a single 10-second active BLE scan, captures all discovered devices, then attempts a sequential GATT walk on each one (5 s connect timeout). Results are displayed in a live scrollable list and saved as JSON files to `/sdcard/lab/gattwalker/` — identical format to manual GATT Walker.
 
 **Workflow:**
 
@@ -597,49 +634,45 @@ Attributes longer than one MTU are read automatically in multiple chunks (`ATT_R
 | Result screen | Auto-navigates to detail on complete | Tap-to-open per device |
 | Scan pass | Continuous (relies on existing scan) | Single 10 s burst, no re-scan |
 
-**Per-device JSON files** are saved using the same `/sdcard/gattwalker/` path and enriched format as single walks (manufacturer, service/chr names, props_str, ascii).
+**Per-device JSON files** are saved using the same `/sdcard/lab/gattwalker/` path and enriched format as single walks (manufacturer, service/chr names, props_str, ascii).
 
 ---
 
-#### GATT Walker — Next Step: CCCD Subscription Probe *(planned)*
+#### GATT Walker — Extended Probe (CCCD Subscription)
 
-The current GATT Walker captures the static snapshot — every readable attribute value at the moment of connection. The next layer is **subscription probing**: after the initial walk completes, identify every characteristic with **N (Notify)** or **I (Indicate)** in its property flags, write `0x0001` to its CCCD descriptor (`0x2902`), and collect whatever the device pushes back. This is the live telemetry layer that a read-only walk never touches.
+The static walk captures every readable attribute value at the moment of connection. **Extended Probe** goes one layer deeper: after the walk completes, it reconnects to the target and iterates every characteristic with **N (Notify)** or **I (Indicate)** in its property flags, writes `0x0001` (or `0x0002` for Indicate) to the associated CCCD descriptor (`0x2902`), and collects whatever the device pushes back during the listen window. This is the live telemetry layer — heart rate streams, sensor readings, status updates — that a read-only walk never sees.
 
-**Proposed UI behaviour:**
+**How to run it:**
 
-- In the GATT detail view, characteristics with a subscribable CCCD show a **bell icon** (🔔) next to their property flags row — tapping it launches the Extended Probe for that single characteristic
-- A **"Extended Probe"** button at the bottom of the result screen runs all subscribable characteristics in sequence automatically, with a configurable dwell time per characteristic (e.g. 3 s listen window)
-- Writable characteristics (`W` / `WNR` flags) show a **write indicator** — tapping opens a hex input and sends a single probed write, returning the characteristic value immediately after (for `W`, the acknowledged response; for `WNR`, a re-read)
+From the GATT result screen, tap the red **Ext. Probe** button at the bottom. The firmware reconnects to the same device, walks every N/I characteristic in sequence with an 8-second listen window each, then re-saves the JSON with the captured notification frames appended inline. A dedicated probe progress screen shows which characteristic is being subscribed in real time.
 
-**Safe probe rules (destructive-write avoidance):**
-
-The probe only writes to CCCD descriptors and reads back notify/indicate data — it never writes to value handles directly unless the user explicitly taps the write indicator. Before showing the write indicator, the firmware checks:
-1. Characteristic User Description (`0x2901`) — if present, the label is shown and any descriptor containing `reset`, `erase`, `factory`, `clear`, or `update` suppresses the write indicator entirely (shown greyed-out with a warning icon instead)
-2. CCCD enables only — `0x0001` (Notify) or `0x0002` (Indicate); never combined writes
+The probe only writes to CCCD descriptors — it never writes to value handles directly.
 
 **JSON enrichment:**
 
-The subscription data is written back into the existing JSON file for that device (matched by MAC + timestamp) as a new `"probe"` key on each characteristic that returned notification data:
+The subscription data is written back into the same JSON file as a `"probe"` key on each characteristic that was attempted. Characteristics with no N/I flag are unchanged:
 
 ```json
 {
   "uuid": "0x2A37",
   "name": "Heart Rate Measurement",
   "props_str": "N",
-  "read_data": "",
+  "read_data": null,
+  "ascii": null,
   "probe": {
     "cccd_written": true,
     "notify_count": 4,
     "notify_data": [
-      "0x004C",
-      "0x004F",
-      "0x0051",
-      "0x004E"
-    ],
-    "dwell_ms": 3000
+      "0048",
+      "0049",
+      "004B",
+      "004A"
+    ]
   }
 }
 ```
+
+Each string in `notify_data` is the raw bytes of one notification frame, concatenated as hex without separators (e.g. `"0048"` = flags byte `0x00` + heart rate `72 BPM`). `read_data` and `ascii` are `null` for notify/indicate-only characteristics that cannot be directly read.
 
 This keeps all data from a device in a single enriched file — the initial static snapshot plus the live subscription layer — indexed by the same FNV-32 fingerprint for cross-session correlation.
 
@@ -687,14 +720,220 @@ Pre-loaded groups:
 
 Tap **+ Add to Watchlist** on any group card. Each OUI is written to `lookout.csv` as an OUI-only entry (visible in the editor as `OUI: AA:BB:CC:*`). Entries added this way are preserved across reboots and editable via **Edit List**.
 
+#### BLE PCAP — How It Works
+
+**BLE PCAP** captures raw BLE advertising packets from the air and writes them to SD card in **Kismet PCAPNG format** — the same format used by Kismet Wireless, Wireshark, and other BLE analysis tools.
+
+**Workflow:**
+1. Open **BLE PCAP** from the Bluetooth tile.
+2. A new `.pcapng` file is created in `/sdcard/lab/ble_captures/` (e.g. `ble_YYYYMMDD_HHMMSS.pcapng`).
+3. The screen shows a live packet counter. All advertising packets detected by the radio are captured.
+4. Tap **Stop** to flush and close the file cleanly.
+
+**File format:** PCAPNG with:
+- **Section Header Block (SHB)** — hardware, OS, and application metadata
+- **Interface Description Block (IDB)** — link type 256 (`LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR`)
+- **Enhanced Packet Block (EPB)** — one per advertising packet
+
+Each EPB includes a **10-byte pseudo-header** preceding the reconstructed BLE LL PDU:
+
+| Byte(s) | Field | Value |
+|---------|-------|-------|
+| 0 | RF channel | 37 |
+| 1 | Signal power (dBm) | RSSI from radio |
+| 2 | Noise power (dBm) | −128 (unknown) |
+| 3–4 | Access address offenses | 0 |
+| 5–8 | Reference access address | `0x8E89BED6` (BLE advertising AA) |
+| 9 | Flags | `0x02` (dewhitened PDU) |
+
+The reconstructed PDU contains the advertising PDU header (event type + address type + length), the 6-byte AdvA, and the AdvData payload. This format is directly openable in **Wireshark** with the `BTBREDR` or `BTLE` dissector, and in **Kismet** with its standard BLE plugin.
+
+**Output path:** `/sdcard/lab/ble_captures/ble_YYYYMMDD_HHMMSS.pcapng`
+
+> **Note:** The ESP32-C5's BLE radio captures advertising packets on channels 37/38/39. The pseudo-header records channel 37 for all packets; the actual advertising channel is determined by the PDU type and timing.
+
 ### 3. Wardriving
 
-GPS-enabled WiFi logging for mapping wireless networks. Requires an **ATGM336H** (or compatible NMEA module) wired to IO4/IO5 — see [GPS Wiring](#gps-wiring--atgm336h).
+GPS-enabled WiFi (and optionally BLE) mapping. Requires an **ATGM336H** (or compatible NMEA module) wired to IO4/IO5 — see [GPS Wiring](#gps-wiring--atgm336h).
 
-- Combines GPS coordinates (NMEA GGA/RMC) with WiFi scan results
-- Uses D-UCB channel hopping for thorough band coverage
-- Logs SSID, BSSID, channel, RSSI, auth mode, and GPS coordinates to CSV on the SD card
-- Compatible with standard wardriving visualization tools (Wigle, etc.)
+```
+Wardrive
+├── Start Wardrive     ← launches the live dashboard
+├── Options            ← band, PCAP, and BLE settings
+└── Manage Data        ← file list with upload status, delete, and upload
+```
+
+#### Starting a Wardrive
+
+Tap **Wardrive** from the main menu, then **Start Wardrive**. The firmware switches the radio to promiscuous mode, begins D-UCB channel hopping, and writes a new WiGLE CSV 1.6 file to `/sdcard/lab/wardrives/`.
+
+**GPS at start-up:**
+- If a live GPS fix is already active, wardrive starts immediately.
+- If no live fix but a **last-known position is available** (from a prior session saved in NVS, or set manually), wardrive starts immediately using that position with 150 m accuracy — no blocking wait.
+- If neither is available (first-ever boot, no GPS module), the firmware waits in a blocking loop until a fix is acquired. Set a manual position via **Settings → GPS Info → Set Position** to skip this wait.
+
+**GPS loss during a session:**
+- When signal is lost (entering a building, tunnel, underground garage), wardrive **continues scanning** using the last-known coordinates and reports `150 m` in the `AccuracyMeters` CSV field.
+- Scanning only pauses if there is truly no position at all (no live fix, no last-known).
+- When signal returns, live coordinates and accuracy resume automatically.
+
+The live dashboard shows:
+
+| Field | Description |
+|-------|-------------|
+| **Ch** | Current channel being scanned (shows **BLE** during a BLE time-slice pass) |
+| **APs** | Unique networks logged this session |
+| **Pts** | GPS points written to the CSV |
+| **Marks** | GPS waypoints saved this session |
+| **Lat / Lon** | Live GPS coordinates |
+| **Sats** | Satellite count |
+
+**Stop** — ends the session, closes all open files, and returns to the Wardrive menu.
+
+**Go Dark** — available from the title bar power icon on every screen. The display turns off while wardriving continues in the background. Double-press the **BOOT** button to wake the display. The NeoPixel stays cyan while active.
+
+#### Mark Button — GPS Waypoints
+
+A **Mark** button sits in the lower-right of the wardrive dashboard (amber, GPS icon). Use it to tag any point of interest during a drive:
+
+| Gesture | Result |
+|---------|--------|
+| **Double-tap** (within 450 ms) | Quick waypoint — saves current GPS coordinates immediately with no note |
+| **Single tap** | Opens a note dialog — enter a description, then **Save** to record the point with text |
+
+Waypoints are saved in GPX format to `/sdcard/lab/wardrives/wdXXXXXX_marks.gpx` — one file per session, named to match the session's CSV file. The file is closed cleanly when you tap **Stop**.
+
+**Stale position behavior:** If the live GPS fix is lost at the time a mark is saved, the device falls back to the last-known position (same 150 m accuracy rule as wardrive logging). The note dialog coordinate display shows the coordinates in **amber** with a `[stale]` label so you know the position is approximate. The saved `<wpt>` entry includes `[stale pos]` appended to the `<desc>` field so it's visible in any GPX viewer.
+
+**GPX output:**
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="JANOS-CYM">
+  <wpt lat="37.123456" lon="-122.456789">
+    <ele>42.0</ele>
+    <time>2026-05-08T12:34:56Z</time>
+    <name>Mark 1</name>
+  </wpt>
+  <wpt lat="37.123789" lon="-122.457012">
+    <ele>42.0</ele>
+    <time>2026-05-08T12:36:11Z</time>
+    <name>Coffee shop on corner</name>
+  </wpt>
+</gpx>
+```
+
+GPX files can be loaded directly into QGIS, Google Earth, or any mapping tool that accepts the standard GPX format.
+
+#### Options Screen
+
+Tap **Options** from the Wardrive menu to configure the current session parameters. All settings are NVS-persisted.
+
+| Option | Values | Default | Description |
+|--------|--------|---------|-------------|
+| **Band** | Both / 2.4 GHz / 5 GHz | Both | Restricts D-UCB channel hopping to the selected band |
+| **Raw PCAP** | On / Off | Off | When enabled, writes a `.pcap` file alongside the CSV for each session |
+| **BLE Wardrive** | On / Off | Off | Enables BLE time-sliced scanning (see below) |
+
+#### BLE Time-Sliced Wardriving
+
+When **BLE Wardrive** is enabled, the firmware periodically pauses WiFi scanning for a short BLE pass:
+
+1. Every **30 seconds** of WiFi scanning, the promiscuous sniffer is paused.
+2. The radio switches to BLE mode and runs an **8-second active BLE scan**.
+3. All discovered BLE devices (deduplicated by MAC) are recorded with the current GPS fix.
+4. The radio switches back to WiFi, D-UCB is rebuilt, and scanning resumes.
+
+During the BLE pass, the dashboard channel indicator shows **BLE** instead of a channel number.
+
+**BLE rows in the CSV** follow the same WiGLE 1.6 format as WiFi rows, with `Type=BLE`, `Channel=37`, `Frequency=2402`, and `[BLE]` as the auth mode:
+
+```
+AA:BB:CC:DD:EE:FF,"My Speaker",[BLE],2026-05-08 12:34:56,37,2402,-72,37.123456,-122.456789,42.0,0.00,,,BLE
+```
+
+This produces a single CSV file containing both WiFi and BLE sightings, uploadable directly to WiGLE which supports both types in the same file.
+
+#### D-UCB Band Filtering
+
+The D-UCB channel scheduler respects the **Band** option:
+
+| Band setting | Channels hopped |
+|---|---|
+| **Both** | All 2.4 GHz channels (1–14) + 5 GHz channels (36, 40, 44, 48, 52, 56, 60, 64, 100–165) |
+| **2.4 GHz only** | Channels 1–14 only |
+| **5 GHz only** | 5 GHz channels only |
+
+#### Manage Data Screen
+
+**Manage Data** lists all wardrive CSV files in `/sdcard/lab/wardrives/`. Each row shows the filename and upload status read from `upload_log.csv`:
+
+| Row color | Meaning |
+|-----------|---------|
+| **Green** | Uploaded successfully to all selected services |
+| **Amber** | Partially uploaded (e.g. WiGLE OK, WDG Wars failed) |
+| **White** | Not yet uploaded |
+
+Each row has an **X** button to delete that file from the SD card. Tap **Upload** to proceed to the upload screen (which returns to Manage Data when done, so you can check updated statuses).
+
+The upload log at `/sdcard/lab/wardrives/upload_log.csv` records one row per file per service:
+
+```
+wd000001.csv,WIGLE,OK
+wd000001.csv,WDGWARS,OK
+wd000002.csv,WIGLE,FAIL
+```
+
+#### Wardrive File Format
+
+WiGLE CSV 1.6 — accepted directly by WiGLE and WDG Wars without conversion.
+
+```
+WigleWifi-1.6,appRelease=v1.0.4,model=NM-CYD-C5,...
+MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type
+AA:BB:CC:DD:EE:FF,"MyNetwork",[WPA2_PSK],2026-05-08 12:34:56,6,2437,-65,37.123456,-122.456789,0.00,8.40,,,WIFI
+11:22:33:44:55:66,"BLE Device",[BLE],2026-05-08 12:35:02,37,2402,-72,37.123456,-122.456789,0.00,150.00,,,BLE
+```
+
+`AccuracyMeters` is populated per-network from the GPS reading at discovery time. A live fix with HDOP 2.1 produces accuracy = `2.1 × 4 = 8.4 m`. A network logged from last-known fallback coordinates produces `150.00 m`. WiGLE uses this field to place the network on its map with an appropriate uncertainty radius.
+
+#### Wardriving Workflow — Field Use
+
+**Quick drive:**
+1. Insert GPS module (ATGM336H) — fix typically arrives in 30–60 s with clear sky.
+   - If last-known position is stored (NVS), wardrive starts immediately without waiting.
+2. Wardrive → Start Wardrive. The NeoPixel turns cyan.
+3. Drive. The AP count increments as new networks are logged. If you enter a building and GPS signal is lost, scanning continues using the last-known position (150 m accuracy in the CSV).
+4. Tap **Stop** when done. Files are closed and ready to upload.
+5. Wardrive → Manage Data → Upload.
+
+**Indoor / no-GPS use:**
+1. Settings → GPS Info → **Set Position** — enter your approximate location (e.g. city centre coordinates).
+2. Tap **Save to NVS**. The position is stored immediately.
+3. Start Wardrive — the device uses the entered position for all log entries.
+4. Networks are logged with `AccuracyMeters = 150` indicating approximate coordinates.
+
+**With BLE:**
+1. Options → BLE Wardrive → On. Options → Band → Both.
+2. Start Wardrive. The channel indicator flashes **BLE** every 30 s for an 8-second scan.
+3. Both WiFi and BLE sightings appear in the same CSV.
+
+**Marking a point of interest:**
+- Double-tap **Mark** to silently drop a quick waypoint.
+- Single-tap **Mark**, type a note (e.g. "camera on pole"), tap **Save**.
+- GPX file is written alongside the CSV — load both into QGIS for a full picture.
+
+**Upload after drive:**
+1. Wardrive → Manage Data → check row colors.
+2. Tap **Upload** → select WiGLE / WDG Wars / Both → API keys are pre-filled if you set them by file (recommended — see below) or from a prior on-device entry → Upload All.
+3. Per-file status updates live. Green = accepted; amber = duplicate; red = failed.
+4. Return to Manage Data — uploaded rows turn green.
+
+> **Tip — avoid typing API keys on the device:** Put your keys in plain text files on the SD card before your first upload. The device loads them at boot and pre-fills the upload screen automatically — no on-screen keyboard needed.
+> - **WiGLE:** create `/sdcard/lab/wigle.txt` — paste your WiGLE *"Encoded for use"* token on line 1 (get it from wigle.net → Account → API Token).
+> - **WDG Wars:** create `/sdcard/lab/wdgwars.txt` — paste your WDG Wars API key on line 1 (from your wdgwars.pl profile page).
+>
+> Copy the files to the SD card from a PC, insert the card, and reboot. The upload screen will be pre-filled on every subsequent use.
 
 ### 4. Settings
 
@@ -714,7 +953,7 @@ Settings
 └── Data Transfer       (file server sub-menu)
     ├── AP File Server  (start TheLab AP, serve /sdcard/ on 192.168.4.1)
     ├── WiFi Client     (join a saved network, serve /sdcard/ on DHCP IP)
-    └── Wardrive Upload (coming soon)
+    └── Wardrive Upload (WiGLE + WDG Wars HTTPS upload)
 ```
 
 All settings are persisted via **NVS** (Non-Volatile Storage) across reboots. The settings menu fits on a single screen (8 tiles, 3-column grid, no scrolling).
@@ -724,9 +963,77 @@ All settings are persisted via **NVS** (Non-Volatile Storage) across reboots. Th
 | **Timing** | Combined timing popup — WiFi scan dwell time sliders and GATT connect timeout slider |
 | **Screen** | Combined screen popup — inactivity timeout dropdown and brightness overlay slider |
 | **SD Card** | Validate/provision (creates `/sdcard/lab/` structure, shows completion status); browse file tree; check free space |
-| **GPS Info** | Live GPS fix status — latitude, longitude, altitude, satellite count, UTC time (parsed from NMEA RMC), and UART config reference (IO4/IO5, 9600 baud, ATGM336H). Refreshes every second. First active fix syncs the system clock (used for FAT timestamps) |
+| **GPS Info** | Live GPS fix status — latitude, longitude, altitude, satellite count, UTC time, and UART reference. When no live fix, last-known coordinates are shown in amber with `*` suffix and `Accuracy: 150 m (stale)`. **Set Position** button opens manual coordinate editor (see below). Refreshes every second. |
 | **Power Mode** | TX Power Mode selector — Normal or Max Power (see below) |
 | **Data Transfer** | File server sub-menu — AP mode or WiFi client mode (see below) |
+
+#### GPS Info & Fallback Position
+
+Accessible via **Settings → GPS Info**. Refreshes every second.
+
+**Live fix (GPS module connected and locked):**
+
+| Field | Description |
+|-------|-------------|
+| Fix | `YES` in green — active GNSS lock |
+| UTC | Time string parsed from NMEA RMC sentence |
+| Satellites | Count of tracked SVs from GGA |
+| Lat / Lon / Alt | Live coordinates in white |
+| Accuracy | Live HDOP × 4 in metres |
+
+**No live fix (signal lost or module not connected):**
+
+| Field | Display |
+|-------|---------|
+| Fix | `NO  (last known ↓)` in amber (or `NO` in orange if no fallback at all) |
+| Lat / Lon / Alt | Last-known coordinates in amber followed by `*` |
+| Accuracy | `150 m (stale)` in amber |
+
+The `*`-suffix values are what the device is actually using as its GPS fallback for wardrive logging, GATT Walker geotags, and GPS waypoints.
+
+**Set Position button (amber):**
+
+Opens a modal overlay to manually enter fallback coordinates:
+
+```
+┌─ Set Fallback Position ──────────────────┐
+│  Stored in NVS, used when GPS unavailable │
+├───────────────────────────────────────────┤
+│  Latitude (-90 to 90):   [ 37.421900    ] │
+│  Longitude (-180 to 180):[-122.084058   ] │
+│  Altitude (m, optional): [ 30.0         ] │
+├───────────────────────────────────────────┤
+│       [ ✓ Save to NVS ]  [ ✕ Cancel ]    │
+└───────────────────────────────────────────┘
+        [ on-screen keyboard ]
+```
+
+- Text areas are **pre-populated** with the best available position: live GPS if locked, last-known from NVS if not
+- **Accepted characters:** `-0123456789.` only — the keyboard filters invalid input
+- **Validation:** latitude must be in `[-90, 90]`, longitude in `[-180, 180]`; the null island `(0, 0)` is rejected. The lat field border flashes red on invalid input.
+- **On Save:** `g_gps_last_known` is updated immediately in RAM **and** written to NVS unconditionally (bypasses the 5-minute auto-save throttle — this is a deliberate user action). All subsequent wardrive scans, GATT walks, and mark waypoints use the new position.
+- **On Cancel:** no changes are written
+
+**NVS keys written by GPS (namespace `settings`):**
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `gps_lat_i` | i32 | Latitude × 10⁶ (integer micro-degrees) |
+| `gps_lon_i` | i32 | Longitude × 10⁶ |
+| `gps_alt_i` | i32 | Altitude × 10 (integer deci-metres) |
+
+Integer storage avoids NVS blob overhead and gives ~0.1 m altitude resolution and ~0.11 m position resolution — well within the 150 m stale accuracy the system reports.
+
+**Write frequency and flash lifetime:**
+
+| Write path | Frequency | Estimated NVS life |
+|---|---|---|
+| Auto (from GPS fix) | ≤ once per 5 minutes | ~5.7 years continuous use |
+| Manual (Set Position) | On user tap only | Decades |
+
+The NVS partition is 24 KB (≈6 flash pages × 100 K P/E cycles each). At one auto-write per 5 minutes, the effective write budget of ~600 K commits lasts roughly 5–6 years of daily wardriving. SD card writes (if used for logging) are handled by the SD FTL across gigabytes of storage — the per-minute rate would be trivial.
+
+---
 
 #### TX Power Mode
 
@@ -760,13 +1067,13 @@ The value is saved to NVS key `gatt_tmo` and applied on every subsequent GATT Wa
 
 #### Data Transfer
 
-Accessible via **Settings → Data Transfer**. Turns the device into an HTTP file server so you can browse and download anything on the SD card from a phone or laptop — no cables or card reader needed.
+Accessible via **Settings → Data Transfer**.
 
 ```
 Settings → Data Transfer
 ├── AP File Server      ← device creates its own WiFi network
 ├── WiFi Client         ← device joins your existing network
-└── Wardrive Upload     (placeholder — coming in a future update)
+└── Wardrive Upload     ← upload CSV logs to WiGLE and/or WDG Wars
 ```
 
 **AP File Server**
@@ -794,6 +1101,30 @@ The device joins an existing WiFi network as a station (STA) and serves files on
 6. Tap **Back** to disconnect and stop the server.
 
 > **Note:** The WiFi radio must be available (not in BLE mode) to use the file server. If BLE is active, the firmware switches radio modes automatically.
+
+**Wardrive Upload**
+
+Uploads all wardrive CSV files from `/sdcard/lab/wardrives/` to [WiGLE](https://wigle.net) and/or [WDG Wars](https://wdgwars.pl) over HTTPS. The device connects to WiFi automatically using your saved credentials (set via **WiFi Client**) before uploading.
+
+**API key setup — two options (use either or both):**
+
+| Option | How |
+|--------|-----|
+| **SD card file** | Create `/sdcard/lab/wigle.txt` and/or `/sdcard/lab/wdgwars.txt` — paste the key on the first line. Loaded at boot. |
+| **On-device entry** | Tap **Wardrive Upload**, type the key into the text area, tap **Upload All**. Key is saved to NVS and persists across reboots. |
+
+**WiGLE API token:** Go to [wigle.net](https://wigle.net) → Account → API Token → copy the **"Encoded for use"** value (already base64 encoded — looks like `dXNlcm5h...`).
+
+**WDG Wars API key:** Obtain from your [wdgwars.pl](https://wdgwars.pl) profile page.
+
+**Upload flow:**
+1. Select service: **WiGLE**, **WDG Wars**, or **Both**
+2. API key text areas are automatically pre-filled if `/sdcard/lab/wigle.txt` or `/sdcard/lab/wdgwars.txt` exist, or from a key saved on a previous visit. If neither source is present, type the key directly into the text area — it will be saved to NVS for next time.
+3. Tap **Upload All** — the device connects to WiFi, walks every `.csv` file in `/sdcard/lab/wardrives/`, and uploads each one in sequence
+4. The progress list shows per-file status: **OK** (green), **dup** (amber — already submitted), **FAIL** (red)
+5. Each result is written to `/sdcard/lab/wardrives/upload_log.csv`; the **Manage Data** screen reads this file to color-code rows
+
+> **Tip:** Use **Wardrive → Manage Data → Upload** instead of **Settings → Data Transfer → Wardrive Upload** when you want to see file status before and after uploading. Both paths use the same upload screen and log.
 
 ### UI & System Features
 
@@ -833,7 +1164,9 @@ All data is stored on the SD card:
 ├── lab/
 │   ├── white.txt         # MAC/SSID whitelist (one per line)
 │   ├── ouilist.bin       # OUI vendor table — adds manufacturer names to BLE scan results
-│   ├── wpa-sec.txt       # wpa-sec.org API key (paste key on line 2, used by WPA-SEC upload)
+│   ├── wpa-sec.txt       # wpa-sec.org API key (paste key on line 1)
+│   ├── wigle.txt         # WiGLE API token — base64(apiname:apitoken) from wigle.net Account page
+│   ├── wdgwars.txt       # WDG Wars API key from wdgwars.pl profile
 │   ├── eviltwin.txt      # Credentials captured by Evil Twin / Captive Portal (auto-appended)
 │   ├── handshakes/       # Captured WPA handshakes
 │   │   ├── *.pcap        # Wireshark-compatible captures
@@ -841,14 +1174,18 @@ All data is stored on the SD card:
 │   ├── htmls/            # ← Captive portal HTML pages
 │   │   └── *.html / *.htm   # Drop any portal page here — each file appears in the attack dropdown
 │   ├── pcaps/            # MITM/sniff PCAP captures
-│   ├── wardrives/        # GPS + WiFi wardrive logs
+│   ├── wardrives/        # GPS + WiFi/BLE wardrive logs (WiGLE CSV 1.6 format)
+│   │   ├── wd*.csv           # One file per session — uploaded via Wardrive Upload
+│   │   ├── wd*_marks.gpx     # GPS waypoints for that session (GPX 1.1)
+│   │   └── upload_log.csv    # Upload tracking: filename,SERVICE,STATUS per row
+│   ├── ble_captures/     # BLE PCAP files (Kismet PCAPNG, DLT 256)
 │   ├── deauths/          # Deauth monitor PCAP captures
 │   ├── bluetooth/
 │   │   ├── lookout.csv   # Bluetooth Lookout watchlist
 │   │   └── spooflist.csv # Device Spoof targets — CSV: MAC,Name (one per line)
+│   ├── gattwalker/       # GATT Walker + BT Observer JSON fingerprints
+│   │   └── YYYYMMDD_HHMMSS_AABBCCDDEEFF_gattwalk.json
 │   └── config/           # Optional config overrides (created by Provision)
-├── gattwalker/           # GATT Walker JSON fingerprints
-│   └── *_gattwalk.json
 ├── screenshots/          # UI screenshots (BMP)
 └── calibrate.txt         # ← Create this file to trigger touch re-calibration on next boot
 ```
@@ -1081,6 +1418,22 @@ You can also install directly through the Launcher OTA screen without copying th
 ```
 
 This entry will appear in the Launcher OTA favorites list and install the latest release directly to the device.
+
+---
+
+## On Signal Jamming
+
+> **This project does not and will never include signal jamming or any feature that deliberately denies or disrupts authorized radio communications. This is a firm, non-negotiable design boundary — not a liability footnote.**
+
+Signal jamming is categorically different from every other capability in this firmware. Attacks like deauth, evil twin, and BLE spam operate at the protocol layer and can be targeted, scoped, and stopped. Jamming operates at the physical RF layer — it is inherently indiscriminate, cannot be aimed, cannot be recalled, and cannot distinguish a test network from a hospital cardiac monitor or an emergency services radio.
+
+The [FCC is explicit](https://www.fcc.gov/enforcement/areas/jammers): *"The Communications Act of 1934, as amended, prohibits the operation, manufacture, importation, marketing, and sale of equipment designed to jam or otherwise interfere with authorized radio communications... These jamming devices pose significant risks to public safety and potentially compromise other radio communications services."*
+
+The consequences are equally clear. Per the [FCC Jammer Enforcement](https://www.fcc.gov/general/jammer-enforcement) page: *"Signal jamming devices can prevent you and others from making 9-1-1 and other emergency calls and pose serious risks to public safety communications... The use or marketing of a jammer in the United States may subject you to substantial monetary penalties, seizure of the unlawful equipment, and criminal sanctions including imprisonment."*
+
+This is not a uniquely American position. Every jurisdiction with a radio communications law — which is effectively every country on Earth — treats jamming as a serious criminal offense precisely because the harm is real and uncontrollable.
+
+The security research community does itself no favors when it conflates "security tool" with "RF jammer." If you are looking for jamming firmware, this is not it, and no future version of this project will be.
 
 ---
 

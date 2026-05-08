@@ -30,7 +30,7 @@ on:
     types: [published, edited]
 
 env:
-  FW_BASENAME: pancake-esp32c5
+  FW_BASENAME: CYM-NM28C5
 
 jobs:
   build:
@@ -94,10 +94,10 @@ jobs:
           version=$(python - <<'PY'
           from pathlib import Path
           import re
-          text = Path("ESP32C5/components/wifi_cli/include/wifi_common.h").read_text()
-          match = re.search(r'#define\s+JANOS_VERSION\s+"([^"]+)"', text)
+          text = Path("ESP32C5/CMakeLists.txt").read_text()
+          match = re.search(r'set\(PROJECT_VER\s+"([^"]+)"\)', text)
           if not match:
-              raise SystemExit("JANOS_VERSION not found")
+              raise SystemExit("PROJECT_VER not found in CMakeLists.txt")
           print(match.group(1))
           PY
           )
@@ -190,7 +190,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
-          name: ${{ format('v{0} - pancake ESP32-C5', needs.package.outputs.fw_version) }}
+          name: ${{ format('CYM-NM28C5 {0}', needs.package.outputs.fw_version) }}
           overwrite_files: true
           files: |
             release_artifacts/firmware/flash_board.py
@@ -278,41 +278,24 @@ jobs:
           import os
           from pathlib import Path
 
+          fw_basename = os.environ.get("FW_BASENAME", "CYM-NM28C5")
           manifest = {
-              "name": "pancake ESP32-C5",
+              "name": "CYM-NM28C5",
               "version": os.environ["FW_VERSION"],
               "build": os.environ["BUILD_TAG"],
               "chipFamily": "ESP32-C5",
               "parts": [
-                  {
-                      "path": "firmware/bootloader.bin",
-                      "offset": 0x2000,
-                  },
-                  {
-                      "path": "firmware/partition-table.bin",
-                      "offset": 0x8000,
-                  },
-                  {
-                      "path": "firmware/pancake-esp32c5.bin",
-                      "offset": 0x10000,
-                  },
+                  {"path": "firmware/bootloader.bin",      "offset": 0x2000},
+                  {"path": "firmware/partition-table.bin", "offset": 0x8000},
+                  {"path": f"firmware/{fw_basename}.bin",  "offset": 0x10000},
               ],
               "builds": [
                   {
                       "chipFamily": "ESP32-C5",
                       "parts": [
-                          {
-                              "path": "firmware/bootloader.bin",
-                              "offset": 0x2000,
-                          },
-                          {
-                              "path": "firmware/partition-table.bin",
-                              "offset": 0x8000,
-                          },
-                          {
-                              "path": "firmware/pancake-esp32c5.bin",
-                              "offset": 0x10000,
-                          }
+                          {"path": "firmware/bootloader.bin",      "offset": 0x2000},
+                          {"path": "firmware/partition-table.bin", "offset": 0x8000},
+                          {"path": f"firmware/{fw_basename}.bin",  "offset": 0x10000},
                       ],
                   }
               ],
