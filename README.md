@@ -710,7 +710,7 @@ Settings
 └── Data Transfer       (file server sub-menu)
     ├── AP File Server  (start TheLab AP, serve /sdcard/ on 192.168.4.1)
     ├── WiFi Client     (join a saved network, serve /sdcard/ on DHCP IP)
-    └── Wardrive Upload (coming soon)
+    └── Wardrive Upload (WiGLE + WDG Wars HTTPS upload)
 ```
 
 All settings are persisted via **NVS** (Non-Volatile Storage) across reboots. The settings menu fits on a single screen (8 tiles, 3-column grid, no scrolling).
@@ -756,13 +756,13 @@ The value is saved to NVS key `gatt_tmo` and applied on every subsequent GATT Wa
 
 #### Data Transfer
 
-Accessible via **Settings → Data Transfer**. Turns the device into an HTTP file server so you can browse and download anything on the SD card from a phone or laptop — no cables or card reader needed.
+Accessible via **Settings → Data Transfer**.
 
 ```
 Settings → Data Transfer
 ├── AP File Server      ← device creates its own WiFi network
 ├── WiFi Client         ← device joins your existing network
-└── Wardrive Upload     (placeholder — coming in a future update)
+└── Wardrive Upload     ← upload CSV logs to WiGLE and/or WDG Wars
 ```
 
 **AP File Server**
@@ -790,6 +790,35 @@ The device joins an existing WiFi network as a station (STA) and serves files on
 6. Tap **Back** to disconnect and stop the server.
 
 > **Note:** The WiFi radio must be available (not in BLE mode) to use the file server. If BLE is active, the firmware switches radio modes automatically.
+
+**Wardrive Upload**
+
+Uploads all wardrive CSV files from `/sdcard/lab/wardrives/` to [WiGLE](https://wigle.net) and/or [WDG Wars](https://wdgwars.pl) over HTTPS. The device connects to WiFi automatically using your saved credentials (set via **WiFi Client**) before uploading.
+
+**API key setup — two options (use either or both):**
+
+| Option | How |
+|--------|-----|
+| **SD card file** | Create `/sdcard/lab/wigle.txt` and/or `/sdcard/lab/wdgwars.txt` — paste the key on the first line. Loaded at boot. |
+| **On-device entry** | Tap **Wardrive Upload**, type the key into the text area, tap **Upload All**. Key is saved to NVS and persists across reboots. |
+
+**WiGLE API token:** Go to [wigle.net](https://wigle.net) → Account → API Token → copy the **"Encoded for use"** value (already base64 encoded — looks like `dXNlcm5h...`).
+
+**WDG Wars API key:** Obtain from your [wdgwars.pl](https://wdgwars.pl) profile page.
+
+**Upload flow:**
+1. Select service: **WiGLE**, **WDG Wars**, or **Both**
+2. Confirm/enter API keys in the text areas (pre-filled from NVS/SD if configured)
+3. Tap **Upload All** — the device connects to WiFi, walks every `.csv` file in `/sdcard/lab/wardrives/`, and uploads each one in sequence
+4. The progress list shows per-file status: **OK** (green), **dup** (amber — already submitted), **FAIL** (red)
+
+**Wardrive file format:** WiGLE CSV 1.6 — accepted by both WiGLE and WDG Wars without conversion.
+
+```
+WigleWifi-1.6,appRelease=v1.0.1,model=NM-CYD-C5,...
+MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type
+AA:BB:CC:DD:EE:FF,"MyNetwork",[WPA2_PSK],2026-05-08 12:34:56,6,2437,-65,37.123456,-122.456789,0.00,0.00,,,WIFI
+```
 
 ### UI & System Features
 
@@ -829,7 +858,9 @@ All data is stored on the SD card:
 ├── lab/
 │   ├── white.txt         # MAC/SSID whitelist (one per line)
 │   ├── ouilist.bin       # OUI vendor table — adds manufacturer names to BLE scan results
-│   ├── wpa-sec.txt       # wpa-sec.org API key (paste key on line 2, used by WPA-SEC upload)
+│   ├── wpa-sec.txt       # wpa-sec.org API key (paste key on line 1)
+│   ├── wigle.txt         # WiGLE API token — base64(apiname:apitoken) from wigle.net Account page
+│   ├── wdgwars.txt       # WDG Wars API key from wdgwars.pl profile
 │   ├── eviltwin.txt      # Credentials captured by Evil Twin / Captive Portal (auto-appended)
 │   ├── handshakes/       # Captured WPA handshakes
 │   │   ├── *.pcap        # Wireshark-compatible captures
@@ -837,7 +868,8 @@ All data is stored on the SD card:
 │   ├── htmls/            # ← Captive portal HTML pages
 │   │   └── *.html / *.htm   # Drop any portal page here — each file appears in the attack dropdown
 │   ├── pcaps/            # MITM/sniff PCAP captures
-│   ├── wardrives/        # GPS + WiFi wardrive logs
+│   ├── wardrives/        # GPS + WiFi wardrive logs (WiGLE CSV 1.6 format)
+│   │   └── wd*.csv       # One file per session — uploaded via Wardrive Upload
 │   ├── deauths/          # Deauth monitor PCAP captures
 │   ├── bluetooth/
 │   │   ├── lookout.csv   # Bluetooth Lookout watchlist
