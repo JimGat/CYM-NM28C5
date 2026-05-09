@@ -1283,9 +1283,15 @@ static char          drone_pcap_path[80];
 
 // ── WiFi Channel Analyzer (Chanalizer) state ─────────────────────────────────
 // Portrait layout: 240×320. Two-phase UI: SSID picker → bell-curve chart.
-#define WANA_W          240   // pixel buffer width
-#define WANA_2G_H       105   // 2.4 GHz chart height
-#define WANA_5G_H        80   // 5 GHz chart height
+// Landscape pixel buffer (device held 90° CW): width=panel_h, height=disp_w
+#define WANA_LAND_W     290   // landscape buffer width  = panel height (320-30)
+#define WANA_LAND_H     240   // landscape buffer height = display width
+// Band regions within the landscape buffer (x axis = frequency, y axis = strength)
+#define WANA_2G_LX        0   // 2.4 GHz band x-start
+#define WANA_2G_LW      138   // 2.4 GHz band width
+#define WANA_SEP_LX     138   // separator stripe x-start
+#define WANA_5G_LX      142   // 5 GHz band x-start
+#define WANA_5G_LW      148   // 5 GHz band width (142+148=290)
 #define WANA_MAX_APS     48
 #define WANA_MAX_LABELS  48
 #define WANA_MAX_SSIDS   20   // max unique SSID groups shown in picker
@@ -1668,7 +1674,7 @@ static void reset_function_page_children(void) {
     drone_ui_active   = false;
     // WiFi Analyzer cleanup
     wana_canvas_2g = NULL; wana_canvas_5g = NULL;
-    wana_status_lbl = NULL; wana_panel = NULL;
+    wana_status_lbl = NULL; wana_panel = NULL;  // canvas_5g aliased = canvas_2g
     wana_lbl_count = 0; wana_ssid_count = 0;
     wana_active = false; wana_scanning = false;
     if (wana_ui_timer) { lv_timer_del(wana_ui_timer); wana_ui_timer = NULL; }
@@ -28217,44 +28223,61 @@ static void wana_group_ssids(void) {
     }
 }
 
-// Fill one band's PSRAM pixel buffer. Only draws selected SSID groups.
-// canvas_y_off: y of this viz within wana_panel (for SSID label positioning).
-static void wana_draw_band(lv_color_t *buf, int w, int h,
-                           float disp_min, float disp_max, float sigma_mhz,
-                           bool is_5g_band, int canvas_y_off)
+// Render both bands into the landscape PSRAM buffer (WANA_LAND_W × WANA_LAND_H).
+// Landscape orientation: x = frequency (low→high), y = signal strength (0=strong, top).
+// After 90° CW software rotation in the draw callback:
+//   landscape top (ly=0, strong) → portrait right  (sx=239)
+//   landscape x   (lx)          → portrait y       (sy=lx+30)
+static void wana_draw_landscape(void)
 {
-    float span     = disp_max - disp_min;
-    float sigma_px = sigma_mhz / span * (float)w;
-    lv_color_t bg   = lv_color_make(8, 8, 22);
-    lv_color_t grid = lv_color_make(35, 35, 65);
+    lv_color_t *buf  = wana_buf;
+    lv_color_t  bg   = lv_color_make(8, 8, 22);
+    lv_color_t  grid = lv_color_make(35, 35, 65);
+    lv_color_t  sep  = lv_color_make(40, 40, 80);
 
-    for (int i = 0; i < w * h; i++) buf[i] = bg;
+    // Clear
+    for (int i = 0; i < WANA_LAND_W * WANA_LAND_H; i++) buf[i] = bg;
 
-    // Vertical grid lines
-    if (!is_5g_band) {
-        uint8_t gchs[] = {1,2,3,4,5,6,7,8,9,10,11,12,13};
-        for (int k = 0; k < 13; k++) {
-            int gx = (int)((wana_ch_to_mhz(gchs[k]) - disp_min) / span * w);
-            if (gx >= 0 && gx < w) for (int y = 0; y < h; y++) buf[y*w+gx] = grid;
-        }
-    } else {
-        float bounds[] = {5180,5200,5220,5240,5260,5280,5300,5320,
-                          5500,5520,5540,5560,5580,5600,5620,5640,
-                          5660,5680,5700,5720,5745,5765,5785,5805,5825};
-        for (int k = 0; k < 25; k++) {
-            int gx = (int)((bounds[k] - disp_min) / span * w);
-            if (gx >= 0 && gx < w) for (int y = 0; y < h; y++) buf[y*w+gx] = grid;
-        }
+    // Band-colour header strips at ly=0..1 (visible at portrait right edge)
+    for (int lx = WANA_2G_LX; lx < WANA_2G_LX + WANA_2G_LW; lx++) {
+        buf[0 * WANA_LAND_W + lx] = lv_color_hex(0x4FC3F7);
+        buf[1 * WANA_LAND_W + lx] = lv_color_hex(0x1A6080);
+    }
+    for (int lx = WANA_5G_LX; lx < WANA_5G_LX + WANA_5G_LW; lx++) {
+        buf[0 * WANA_LAND_W + lx] = lv_color_hex(0x81C784);
+        buf[1 * WANA_LAND_W + lx] = lv_color_hex(0x2E6030);
+    }
+    // Separator column
+    for (int ly = 0; ly < WANA_LAND_H; ly++)
+        for (int lx = WANA_SEP_LX; lx < WANA_5G_LX; lx++)
+            buf[ly * WANA_LAND_W + lx] = sep;
+
+    // 2G grid lines (vertical in landscape = horizontal bands in portrait)
+    static const uint8_t gchs2g[] = {1,2,3,4,5,6,7,8,9,10,11,12,13};
+    for (int k = 0; k < 13; k++) {
+        int gx = WANA_2G_LX + (int)((wana_ch_to_mhz(gchs2g[k]) - 2397.0f) / 90.0f * WANA_2G_LW);
+        if (gx >= WANA_2G_LX && gx < WANA_2G_LX + WANA_2G_LW)
+            for (int ly = 2; ly < WANA_LAND_H; ly++) buf[ly * WANA_LAND_W + gx] = grid;
+    }
+    // 5G grid lines
+    static const float b5g[] = {
+        5180,5200,5220,5240,5260,5280,5300,5320,
+        5500,5520,5540,5560,5580,5600,5620,5640,
+        5660,5680,5700,5720,5745,5765,5785,5805,5825
+    };
+    for (int k = 0; k < 25; k++) {
+        int gx = WANA_5G_LX + (int)((b5g[k] - 5150.0f) / 730.0f * WANA_5G_LW);
+        if (gx >= WANA_5G_LX && gx < WANA_5G_LX + WANA_5G_LW)
+            for (int ly = 2; ly < WANA_LAND_H; ly++) buf[ly * WANA_LAND_W + gx] = grid;
     }
 
-    // Build draw list: only APs whose SSID is in a selected group, sorted RSSI asc
+    // Build filtered+sorted AP list (RSSI ascending → strongest drawn last/on top)
     int si[WANA_MAX_APS], cnt = 0;
     for (int i = 0; i < wana_ap_count; i++) {
         const char *ssid = (char*)wana_aps[i].ssid;
         for (int g = 0; g < wana_ssid_count; g++) {
-            if (wana_ssids[g].selected && strncmp(wana_ssids[g].ssid, ssid, 32) == 0) {
-                si[cnt++] = i; break;
-            }
+            if (wana_ssids[g].selected && strncmp(wana_ssids[g].ssid, ssid, 32) == 0)
+                { si[cnt++] = i; break; }
         }
     }
     for (int i = 1; i < cnt; i++) {
@@ -28265,24 +28288,31 @@ static void wana_draw_band(lv_color_t *buf, int w, int h,
         si[j+1] = key;
     }
 
-    // Peak info for SSID labels (one label per unique peak x per group)
-    int      peak_x[WANA_MAX_APS], peak_ytop[WANA_MAX_APS], peak_ch_n[WANA_MAX_APS];
-    uint8_t  peak_cidx[WANA_MAX_APS];
-    char     peak_ssid[WANA_MAX_APS][14];
-    int      np = 0;
+    // Peak info for LVGL labels (placed at portrait screen coords)
+    int     peak_lx[WANA_MAX_APS];   // landscape x of peak centre
+    int     peak_bh[WANA_MAX_APS];   // bell height (determines portrait sx)
+    uint8_t peak_cidx[WANA_MAX_APS];
+    int     peak_ch[WANA_MAX_APS];
+    int     np = 0;
 
     for (int k = 0; k < cnt; k++) {
         wifi_ap_record_t *ap = &wana_aps[si[k]];
-        if ((ap->primary >= 36) != is_5g_band) continue;
+        bool is5g = (ap->primary >= 36);
+        float freq = wana_ch_to_mhz(ap->primary);
+        float disp_min  = is5g ? 5150.0f : 2397.0f;
+        float span      = is5g ? 730.0f  :   90.0f;
+        float sigma_mhz = is5g ? 38.0f   :   11.0f;
+        int   band_x    = is5g ? WANA_5G_LX : WANA_2G_LX;
+        int   band_w    = is5g ? WANA_5G_LW : WANA_2G_LW;
+        float sigma_px  = sigma_mhz / span * (float)band_w;
 
-        float cx    = (wana_ch_to_mhz(ap->primary) - disp_min) / span * (float)w;
-        float max_h = (float)(ap->rssi + 100) / 70.0f * (float)(h - 6);
-        if (max_h < 5.0f)  max_h = 5.0f;
-        if (max_h > h - 4) max_h = (float)(h - 4);
+        float cx_l  = band_x + (freq - disp_min) / span * (float)band_w;
+        float max_h = (float)(ap->rssi + 100) / 70.0f * (float)(WANA_LAND_H - 4);
+        if (max_h < 5.0f)             max_h = 5.0f;
+        if (max_h > WANA_LAND_H - 2)  max_h = (float)(WANA_LAND_H - 2);
 
-        // Resolve group color
-        lv_color_t col = lv_color_make(160, 160, 160);
         uint8_t cidx = 0;
+        lv_color_t col = lv_color_make(160, 160, 160);
         for (int g = 0; g < wana_ssid_count; g++) {
             if (strncmp(wana_ssids[g].ssid, (char*)ap->ssid, 32) == 0) {
                 cidx = wana_ssids[g].color_idx;
@@ -28290,67 +28320,78 @@ static void wana_draw_band(lv_color_t *buf, int w, int h,
                 break;
             }
         }
-        lv_color_t col_top = lv_color_mix(lv_color_white(), col, LV_OPA_60);
+        lv_color_t col_tip = lv_color_mix(lv_color_white(), col, LV_OPA_60);
 
-        int x0 = (int)(cx - sigma_px * 3.8f); if (x0 < 0) x0 = 0;
-        int x1 = (int)(cx + sigma_px * 3.8f); if (x1 >= w) x1 = w - 1;
+        int x0 = (int)(cx_l - sigma_px * 3.8f); if (x0 < band_x) x0 = band_x;
+        int x1 = (int)(cx_l + sigma_px * 3.8f); if (x1 >= band_x+band_w) x1 = band_x+band_w-1;
 
-        for (int x = x0; x <= x1; x++) {
-            float dx = (x - cx) / sigma_px;
-            int bh   = (int)(max_h * expf(-0.5f * dx * dx));
+        int bh_at_cx = 0;
+        for (int lx = x0; lx <= x1; lx++) {
+            float dx = (lx - cx_l) / sigma_px;
+            int   bh = (int)(max_h * expf(-0.5f * dx * dx));
             if (bh < 1) continue;
-            int ytop = h - bh;
-            if (ytop < 0) ytop = 0;
-            for (int y = ytop; y < h; y++) {
-                float frac  = 1.0f - (float)(y - ytop) / (float)bh;
+            // Fill from ly=0 (top=strong) down to ly=bh-1
+            for (int ly = 0; ly < bh && ly < WANA_LAND_H; ly++) {
+                float frac  = 1.0f - (float)ly / (float)bh;
                 uint8_t opa = (uint8_t)(50 + frac * 205.0f);
-                buf[y * w + x] = lv_color_mix(col, lv_color_black(), opa);
+                buf[ly * WANA_LAND_W + lx] = lv_color_mix(col, lv_color_black(), opa);
             }
-            if (ytop < h) buf[ytop * w + x] = col_top;
+            // Tip line at extent
+            int tip = bh - 1; if (tip < 0) tip = 0; if (tip >= WANA_LAND_H) tip = WANA_LAND_H-1;
+            buf[tip * WANA_LAND_W + lx] = col_tip;
+            if (lx == (int)cx_l) bh_at_cx = bh;
         }
-
         if (np < WANA_MAX_APS) {
-            peak_x[np]    = (int)cx;
-            peak_ytop[np] = h - (int)max_h - 18;
-            if (peak_ytop[np] < 0) peak_ytop[np] = 0;
-            peak_ch_n[np] = ap->primary;
+            peak_lx[np]   = (int)cx_l;
+            peak_bh[np]   = bh_at_cx;
             peak_cidx[np] = cidx;
-            snprintf(peak_ssid[np], sizeof(peak_ssid[np]), "%.13s",
-                     ap->ssid[0] ? (char*)ap->ssid : "?");
+            peak_ch[np]   = ap->primary;
             np++;
         }
     }
 
-    // SSID labels as LVGL objects inside wana_panel (panel-relative coords)
+    // Place LVGL labels at portrait screen coords corresponding to landscape peaks.
+    // After 90° CW rotation: portrait sx = LAND_H-1 - ly, portrait sy = lx + 30.
+    // Peak tip is at ly = bh_at_cx - 1, so portrait sx_tip = 239 - (bh-1).
+    // Label sits at sx_tip - 2 (just inside the tip line), sy = lx + 30 - 12.
     for (int i = 0; i < np && wana_lbl_count < WANA_MAX_LABELS; i++) {
         if (!wana_panel || !lv_obj_is_valid(wana_panel)) break;
-        char txt[20];
-        snprintf(txt, sizeof(txt), "%.13s\nch%d", peak_ssid[i], peak_ch_n[i]);
-        lv_obj_t *lbl = lv_label_create(wana_panel);
+        int bh   = peak_bh[i];
+        int lx   = peak_lx[i];
+        // portrait coordinates (absolute screen, clamp to visible area)
+        int sx_tip = WANA_LAND_H - 1 - (bh > 1 ? bh - 1 : 0); // portrait x of tip
+        int sy_ctr = lx + 30;  // portrait y of channel centre
+        // label above the tip: sx_tip + small margin, sy centred on channel
+        int lbl_sx = sx_tip - 1;  // label right edge near tip
+        int lbl_sy = sy_ctr - 10; // vertically centred
+        if (lbl_sx < 2)    lbl_sx = 2;
+        if (lbl_sx > 210)  lbl_sx = 210;
+        if (lbl_sy < 32)   lbl_sy = 32;
+        if (lbl_sy > 295)  lbl_sy = 295;
+        // position is absolute screen coords; lbl parent = function_page
+        char txt[8]; snprintf(txt, sizeof(txt), "ch%d", peak_ch[i]);
+        lv_obj_t *lbl = lv_label_create(function_page);
         lv_label_set_text(lbl, txt);
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(lbl, wana_grp_color(peak_cidx[i]), 0);
-        lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_bg_opa(lbl, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_bg_color(lbl, lv_color_make(8, 8, 22), 0);
+        lv_obj_set_style_bg_opa(lbl, LV_OPA_70, 0);
         lv_obj_set_style_border_width(lbl, 0, 0);
+        lv_obj_set_style_pad_all(lbl, 1, 0);
         lv_obj_clear_flag(lbl, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(lbl, LV_OBJ_FLAG_IGNORE_LAYOUT);
-        int lx = peak_x[i] - 22;
-        int ly = canvas_y_off + peak_ytop[i];
-        if (lx < 0)     lx = 0;
-        if (lx > w-44)  lx = w - 44;
-        lv_obj_set_pos(lbl, lx, ly);
-        lv_obj_set_size(lbl, 44, 24);
+        lv_obj_set_pos(lbl, lbl_sx, lbl_sy);
+        lv_obj_set_size(lbl, 34, 14);
         wana_ssid_lbls[wana_lbl_count++] = lbl;
     }
 }
 
-// LV_EVENT_DRAW_MAIN callback: memcpy PSRAM → LVGL DRAM draw buffer.
+// LV_EVENT_DRAW_MAIN callback: 90° CW software rotation, PSRAM → LVGL DRAM.
+// Landscape buffer (WANA_LAND_W × WANA_LAND_H) maps to portrait panel (240×290).
+// 90° CW: portrait (sx, sy) ← landscape (lx = sy - oa.y1,  ly = LAND_H-1 - sx)
 static void wana_viz_draw_cb(lv_event_t *e) {
     if (lv_event_get_code(e) != LV_EVENT_DRAW_MAIN) return;
     if (!wana_buf) return;
-    bool        is5g     = (lv_event_get_user_data(e) != NULL);
-    lv_color_t *src      = is5g ? (wana_buf + (size_t)WANA_W * WANA_2G_H) : wana_buf;
     lv_draw_ctx_t *draw_ctx = lv_event_get_draw_ctx(e);
     lv_obj_t      *obj      = lv_event_get_target(e);
     lv_area_t oa; lv_obj_get_coords(obj, &oa);
@@ -28363,27 +28404,23 @@ static void wana_viz_draw_cb(lv_event_t *e) {
     if (x1 > x2 || y1 > y2) return;
     lv_coord_t buf_w = ba->x2 - ba->x1 + 1;
     lv_color_t *dst  = (lv_color_t *)draw_ctx->buf;
-    lv_coord_t row_w = x2 - x1 + 1;
-    for (lv_coord_t y = y1; y <= y2; y++) {
-        memcpy(&dst[(y - ba->y1) * buf_w + (x1 - ba->x1)],
-               &src[(y - oa.y1) * WANA_W  + (x1 - oa.x1)],
-               (size_t)row_w * sizeof(lv_color_t));
+    lv_color_t  bg   = lv_color_make(8, 8, 22);
+    for (lv_coord_t sy = y1; sy <= y2; sy++) {
+        lv_coord_t lx = sy - oa.y1;              // panel-relative y → landscape x
+        for (lv_coord_t sx = x1; sx <= x2; sx++) {
+            lv_coord_t ly = WANA_LAND_H - 1 - sx; // portrait x → landscape y (CW)
+            lv_color_t px = (lx >= 0 && lx < WANA_LAND_W && ly >= 0 && ly < WANA_LAND_H)
+                             ? wana_buf[ly * WANA_LAND_W + lx] : bg;
+            dst[(sy - ba->y1) * buf_w + (sx - ba->x1)] = px;
+        }
     }
 }
 
-// chart panel layout constants (coords within wana_panel, which starts at y=30)
-#define WANA_P_2G_Y   12   // 2G viz top within panel
-#define WANA_P_5G_Y   129  // 5G viz top: 12+105+12
-
 static void wana_redraw(void) {
-    if (!wana_buf || !wana_canvas_2g || !wana_canvas_5g) return;
+    if (!wana_buf || !wana_canvas_2g) return;
     wana_clear_ssid_labels();
-    wana_draw_band(wana_buf,                             WANA_W, WANA_2G_H,
-                   2397.0f, 2487.0f, 11.0f, false, WANA_P_2G_Y);
-    wana_draw_band(wana_buf + (size_t)WANA_W * WANA_2G_H, WANA_W, WANA_5G_H,
-                   5150.0f, 5880.0f, 38.0f, true,  WANA_P_5G_Y);
+    wana_draw_landscape();
     lv_obj_invalidate(wana_canvas_2g);
-    lv_obj_invalidate(wana_canvas_5g);
 }
 
 // ── Common panel helpers ──────────────────────────────────────────────────────
@@ -28394,7 +28431,7 @@ static void wana_exit_cb(lv_event_t *e) {
     wana_scanning = false;
     if (wana_ui_timer) { lv_timer_del(wana_ui_timer); wana_ui_timer = NULL; }
     wana_canvas_2g = NULL; wana_canvas_5g = NULL;
-    wana_status_lbl = NULL; wana_panel = NULL;
+    wana_status_lbl = NULL; wana_panel = NULL;  // canvas_5g aliased = canvas_2g
     wana_clear_ssid_labels();
     if (wana_buf) { heap_caps_free(wana_buf); wana_buf = NULL; }
     show_wifi_menu_screen();
@@ -28630,7 +28667,7 @@ static lv_obj_t *wana_make_viz(lv_obj_t *parent, lv_coord_t y,
                                 lv_coord_t h, void *user_data_5g)
 {
     lv_obj_t *v = lv_obj_create(parent);
-    lv_obj_set_size(v, WANA_W, h);
+    lv_obj_set_size(v, WANA_LAND_H, h);  // portrait width = landscape height
     lv_obj_set_pos(v, 0, y);
     lv_obj_set_style_bg_color(v, lv_color_make(8, 8, 22), 0);
     lv_obj_set_style_bg_opa(v, LV_OPA_COVER, 0);
@@ -28646,72 +28683,24 @@ static void show_wana_chart_screen(void) {
     if (!function_page || !lv_obj_is_valid(function_page)) return;
     wana_swap_panel();
     wana_panel = wana_make_panel();
-    lv_color_t bg = lv_color_make(8, 8, 22);
 
-    // Count selected per band for header text
-    int n24 = 0, n5g = 0;
-    for (int i = 0; i < wana_ssid_count; i++) {
-        if (!wana_ssids[i].selected) continue;
-        for (int k = 0; k < wana_ssids[i].ap_count; k++) {
-            uint8_t pri = wana_aps[wana_ssids[i].ap_indices[k]].primary;
-            if (pri < 36) n24++; else n5g++;
-        }
-    }
+    // Single viz covering the full panel — landscape buffer rendered with 90° CW rotation
+    wana_canvas_2g = wana_make_viz(wana_panel, 0, 252, NULL);
+    wana_canvas_5g = wana_canvas_2g;  // single canvas, wana_redraw invalidates one
 
-    // 2.4 GHz header (y=0, h=12)
-    lv_obj_t *hdr2g = lv_obj_create(wana_panel);
-    lv_obj_set_size(hdr2g, WANA_W, 12); lv_obj_set_pos(hdr2g, 0, 0);
-    lv_obj_set_style_bg_color(hdr2g, lv_color_make(10,10,30), 0);
-    lv_obj_set_style_border_width(hdr2g, 0, 0);
-    lv_obj_set_style_radius(hdr2g, 0, 0);
-    lv_obj_set_style_pad_all(hdr2g, 0, 0);
-    lv_obj_clear_flag(hdr2g, LV_OBJ_FLAG_SCROLLABLE);
-    char h2g_txt[32]; snprintf(h2g_txt, sizeof(h2g_txt), "2.4 GHz — %d AP%s",
-                               n24, n24!=1?"s":"");
-    lv_obj_t *l2g = lv_label_create(hdr2g);
-    lv_label_set_text(l2g, h2g_txt);
-    lv_obj_set_style_text_font(l2g, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(l2g, lv_color_hex(0x4FC3F7), 0);
-    lv_obj_align(l2g, LV_ALIGN_CENTER, 0, 0);
-
-    // 2G viz (y=WANA_P_2G_Y=12, h=105)
-    wana_canvas_2g = wana_make_viz(wana_panel, WANA_P_2G_Y, WANA_2G_H, NULL);
-
-    // 5 GHz header (y=117, h=12)
-    lv_obj_t *hdr5g = lv_obj_create(wana_panel);
-    lv_obj_set_size(hdr5g, WANA_W, 12);
-    lv_obj_set_pos(hdr5g, 0, WANA_P_2G_Y + WANA_2G_H);
-    lv_obj_set_style_bg_color(hdr5g, lv_color_make(10,10,30), 0);
-    lv_obj_set_style_border_width(hdr5g, 1, 0);
-    lv_obj_set_style_border_color(hdr5g, lv_color_hex(0x333355), 0);
-    lv_obj_set_style_border_side(hdr5g, LV_BORDER_SIDE_TOP, 0);
-    lv_obj_set_style_radius(hdr5g, 0, 0);
-    lv_obj_set_style_pad_all(hdr5g, 0, 0);
-    lv_obj_clear_flag(hdr5g, LV_OBJ_FLAG_SCROLLABLE);
-    char h5g_txt[32]; snprintf(h5g_txt, sizeof(h5g_txt), "5 GHz — %d AP%s",
-                               n5g, n5g!=1?"s":"");
-    lv_obj_t *l5g = lv_label_create(hdr5g);
-    lv_label_set_text(l5g, h5g_txt);
-    lv_obj_set_style_text_font(l5g, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(l5g, lv_color_hex(0x81C784), 0);
-    lv_obj_align(l5g, LV_ALIGN_CENTER, 0, 0);
-
-    // 5G viz (y=WANA_P_5G_Y=129, h=80)
-    wana_canvas_5g = wana_make_viz(wana_panel, WANA_P_5G_Y, WANA_5G_H, (void*)1);
-
-    // Color legend: selected SSID names in their colors (y=211)
-    // Build a compact legend string using recolor markup
+    // Scrolling legend: SSID name + channel list, in group colors
     lv_obj_t *leg = lv_label_create(wana_panel);
-    lv_obj_set_pos(leg, 2, WANA_P_5G_Y + WANA_5G_H + 2);
-    lv_obj_set_size(leg, WANA_W - 4, 26);
+    lv_obj_set_pos(leg, 2, 254);
+    lv_obj_set_size(leg, 236, 14);
     lv_obj_set_style_text_font(leg, &lv_font_montserrat_12, 0);
     lv_obj_set_style_bg_opa(leg, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(leg, 0, 0);
     lv_obj_set_style_pad_all(leg, 0, 0);
     lv_label_set_recolor(leg, true);
-    char leg_txt[320] = "";
+
+    char leg_txt[480] = "";
     int lpos = 0;
-    for (int i = 0; i < wana_ssid_count && lpos < (int)sizeof(leg_txt)-40; i++) {
+    for (int i = 0; i < wana_ssid_count && lpos < (int)sizeof(leg_txt)-60; i++) {
         if (!wana_ssids[i].selected) continue;
         uint32_t c = 0;
         switch (wana_ssids[i].color_idx & 7) {
@@ -28722,17 +28711,24 @@ static void show_wana_chart_screen(void) {
         }
         char name[12];
         snprintf(name, sizeof(name), "%.11s", wana_ssids[i].ssid);
+        // Build channel list for this SSID group
+        char ch_str[32] = ""; int cp = 0;
+        for (int k = 0; k < wana_ssids[i].ap_count && cp < 28; k++) {
+            uint8_t ch = wana_aps[wana_ssids[i].ap_indices[k]].primary;
+            cp += snprintf(ch_str + cp, sizeof(ch_str) - cp, cp==0?"%d":",%d", ch);
+        }
         lpos += snprintf(leg_txt + lpos, sizeof(leg_txt) - lpos,
-                         "#%06X > %s#  ", (unsigned)c, name);
+                         "#%06X > %s [ch%s]#  ", (unsigned)c, name, ch_str);
     }
     lv_label_set_text(leg, leg_txt[0] ? leg_txt : "No SSIDs selected");
     lv_label_set_long_mode(leg, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_style_anim_speed(leg, 17, 0);  // 33% slower than default 25 px/s
     lv_obj_set_style_text_color(leg, lv_color_hex(0xAAAAAA), 0);
 
-    // Button row (y=239)
+    // Button row (y=270: below legend at 254+14+2=270)
     lv_obj_t *btns = lv_obj_create(wana_panel);
     lv_obj_set_size(btns, 240, 28);
-    lv_obj_set_pos(btns, 0, 239);
+    lv_obj_set_pos(btns, 0, 270);
     lv_obj_set_style_bg_opa(btns, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(btns, 0, 0);
     lv_obj_set_style_radius(btns, 0, 0);
@@ -28807,7 +28803,7 @@ static void show_wifi_analyzer_screen(void) {
     wana_lbl_count    = 0;
     wana_ssid_count   = 0;
 
-    size_t bufsz = (size_t)WANA_W * (WANA_2G_H + WANA_5G_H);
+    size_t bufsz = (size_t)WANA_LAND_W * WANA_LAND_H;  // 290×240 landscape buffer
     wana_buf = heap_caps_calloc(bufsz, sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
     if (!wana_buf) {
         ESP_LOGE(TAG, "wana: no PSRAM");
