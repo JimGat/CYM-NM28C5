@@ -21373,7 +21373,7 @@ static void bto_restore_screen(void)
     bto_status_lbl = lv_label_create(function_page);
     char sbuf[64];
     switch (bto_state) {
-        case BTO_STATE_DONE:    snprintf(sbuf, sizeof(sbuf), "Done — %d device(s) enumerated", bto_device_count); break;
+        case BTO_STATE_DONE:    snprintf(sbuf, sizeof(sbuf), "Done - %d device(s) enumerated", bto_device_count); break;
         case BTO_STATE_STOPPED: snprintf(sbuf, sizeof(sbuf), "Stopped"); break;
         default:                snprintf(sbuf, sizeof(sbuf), "%d device(s)", bto_device_count); break;
     }
@@ -23146,7 +23146,7 @@ static void show_ble_spoof_screen(void)
 
         if (bt_device_count == 0) {
             lv_obj_t *no_dev = lv_label_create(dev_list);
-            lv_label_set_text(no_dev, "No devices — run BLE Scan first");
+            lv_label_set_text(no_dev, "No devices - run BLE Scan first");
             lv_obj_set_style_text_font(no_dev, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(no_dev, ui_text_color(), 0);
         } else {
@@ -23435,7 +23435,7 @@ static void show_ble_disc_screen(void)
 
         if (bt_device_count == 0) {
             lv_obj_t *no_dev = lv_label_create(dev_list);
-            lv_label_set_text(no_dev, "No devices — run BLE Scan first");
+            lv_label_set_text(no_dev, "No devices - run BLE Scan first");
             lv_obj_set_style_text_font(no_dev, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(no_dev, ui_text_color(), 0);
         } else {
