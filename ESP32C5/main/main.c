@@ -1282,15 +1282,15 @@ static FILE         *drone_pcap_file      = NULL;
 static char          drone_pcap_path[80];
 
 // ── WiFi Channel Analyzer state ──────────────────────────────────────────────
-// Landscape mode (LV_DISP_ROT_90): logical screen = 320×240
-#define WANA_W          320   // landscape canvas width
-#define WANA_2G_H        88   // 2.4 GHz canvas height
-#define WANA_5G_H        56   // 5 GHz canvas height
-#define WANA_2G_Y        40   // y pos of 2G canvas on function_page
-#define WANA_5G_Y       140   // y pos of 5G canvas: 40+88+12=140
+// Portrait layout: 240×320, both bands stacked vertically
+#define WANA_W          240   // canvas width (full portrait width)
+#define WANA_2G_H       105   // 2.4 GHz canvas height
+#define WANA_5G_H        80   // 5 GHz canvas height
+#define WANA_2G_Y        42   // y pos of 2G canvas (below 30px title + 12px hdr)
+#define WANA_5G_Y       159   // y pos of 5G canvas: 42+105+12=159
 #define WANA_MAX_APS     48
 #define WANA_MAX_LABELS  48
-static lv_color_t      *wana_buf              = NULL;  // PSRAM: 320*(88+50)
+static lv_color_t      *wana_buf              = NULL;  // PSRAM: 240*(105+80)
 static lv_obj_t        *wana_canvas_2g        = NULL;
 static lv_obj_t        *wana_canvas_5g        = NULL;
 static lv_obj_t        *wana_status_lbl       = NULL;
@@ -1298,7 +1298,7 @@ static lv_timer_t      *wana_ui_timer         = NULL;
 static TaskHandle_t     wana_scan_task_handle = NULL;
 static bool             wana_active           = false;
 static bool             wana_landscape_active = false;
-static bool             wana_scan_done_flag   = false;
+static volatile bool    wana_scan_done_flag   = false;
 static wifi_ap_record_t wana_aps[WANA_MAX_APS];
 static int              wana_ap_count         = 0;
 static lv_obj_t        *wana_ssid_lbls[WANA_MAX_LABELS];
@@ -1659,12 +1659,9 @@ static void reset_function_page_children(void) {
     wana_canvas_2g = NULL; wana_canvas_5g = NULL;
     wana_status_lbl = NULL; wana_lbl_count = 0;
     wana_active = false;
+    wana_landscape_active = false;
     if (wana_ui_timer) { lv_timer_del(wana_ui_timer); wana_ui_timer = NULL; }
     if (wana_buf)      { heap_caps_free(wana_buf);     wana_buf = NULL; }
-    if (wana_landscape_active) {
-        lv_disp_set_rotation(lv_disp_get_default(), LV_DISP_ROT_NONE);
-        wana_landscape_active = false;
-    }
     // WiFi Band Scope cleanup
     wscope_canvas = NULL; wscope_status_lbl = NULL; wscope_active = false;
     if (wscope_ui_timer) { lv_timer_del(wscope_ui_timer); wscope_ui_timer = NULL; }
@@ -6312,18 +6309,8 @@ void lvgl_touch_read_cb(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
     }
 
     if (touched) {
-        int raw_x = point.x;
-        int raw_y = point.y;
-        if (wana_landscape_active) {
-            // LV_DISP_ROT_90: map portrait touch (0-239, 0-319) to
-            // landscape logical (0-319, 0-239)
-            // Rotation: CCW — portrait right becomes landscape top
-            data->point.x = LCD_V_RES - 1 - raw_y;
-            data->point.y = raw_x;
-        } else {
-            data->point.x = raw_x;
-            data->point.y = raw_y;
-        }
+        data->point.x = point.x;
+        data->point.y = point.y;
         data->state = LV_INDEV_STATE_PRESSED;
         touch_pressed_flag = true;
         touch_x_flag = data->point.x;
@@ -12151,7 +12138,7 @@ static void main_tile_event_cb(lv_event_t *e)
         show_deauth_monitor_screen();
     } else if (strcmp(tile_name, "Drone Detect") == 0) {
         show_drone_detector_screen();
-    } else if (strcmp(tile_name, "WiFi Analyzer") == 0) {
+    } else if (strcmp(tile_name, "Chanalizer") == 0) {
         show_wifi_analyzer_screen();
     } else if (strcmp(tile_name, "WiFi Scope") == 0) {
         show_wscope_screen();
@@ -15029,7 +15016,7 @@ static void show_wifi_menu_screen(void)
     (void)obs_tile;
     lv_obj_t *dd_tile   = create_tile(tiles, LV_SYMBOL_GPS,        "Drone\nDetect",    lv_color_hex(0x1B5E20), main_tile_event_cb, "Drone Detect");
     (void)dd_tile;
-    lv_obj_t *wana_tile = create_tile(tiles, LV_SYMBOL_WIFI,       "WiFi\nAnalyzer",   lv_color_hex(0x1A237E), main_tile_event_cb, "WiFi Analyzer");
+    lv_obj_t *wana_tile = create_tile(tiles, LV_SYMBOL_WIFI,       "Chan-\nalizer",    lv_color_hex(0x1A237E), main_tile_event_cb, "Chanalizer");
     (void)wana_tile;
     lv_obj_t *wscope_tile = create_tile(tiles, LV_SYMBOL_AUDIO,    "WiFi\nScope",      lv_color_hex(0x006064), main_tile_event_cb, "WiFi Scope");
     (void)wscope_tile;
@@ -28376,21 +28363,13 @@ static void wana_exit_cb(lv_event_t *e) {
     wana_canvas_2g = NULL; wana_canvas_5g = NULL; wana_status_lbl = NULL;
     wana_clear_ssid_labels();
     if (wana_buf) { heap_caps_free(wana_buf); wana_buf = NULL; }
-    if (wana_landscape_active) {
-        lv_disp_set_rotation(lv_disp_get_default(), LV_DISP_ROT_NONE);
-        wana_landscape_active = false;
-    }
     show_wifi_menu_screen();
 }
 
 static void show_wifi_analyzer_screen(void) {
     if (!ensure_wifi_mode()) return;
 
-    // Rotate to landscape BEFORE building the page (lv_pct() will use 320×240)
-    lv_disp_set_rotation(lv_disp_get_default(), LV_DISP_ROT_90);
-    wana_landscape_active = true;
-
-    create_function_page_base("WiFi Analyzer");
+    create_function_page_base("WiFi Chanalizer");
 
     wana_active         = true;
     wana_ap_count       = 0;
@@ -28402,8 +28381,6 @@ static void show_wifi_analyzer_screen(void) {
     if (!wana_buf) {
         ESP_LOGE(TAG, "wana: PSRAM alloc failed");
         wana_active = false;
-        lv_disp_set_rotation(lv_disp_get_default(), LV_DISP_ROT_NONE);
-        wana_landscape_active = false;
         show_wifi_menu_screen();
         return;
     }
@@ -28411,9 +28388,9 @@ static void show_wifi_analyzer_screen(void) {
     lv_color_t bg = lv_color_make(8, 8, 22);
     lv_obj_set_style_bg_color(function_page, bg, 0);
 
-    // ── 2.4 GHz section header bar (y=30) ───────────────────────────────────
+    // ── 2.4 GHz section header (y=30, h=12) ─────────────────────────────────
     lv_obj_t *hdr2g = lv_obj_create(function_page);
-    lv_obj_set_size(hdr2g, WANA_W, 10);
+    lv_obj_set_size(hdr2g, WANA_W, 12);
     lv_obj_set_pos(hdr2g, 0, 30);
     lv_obj_set_style_bg_color(hdr2g, lv_color_make(10, 10, 30), 0);
     lv_obj_set_style_border_width(hdr2g, 0, 0);
@@ -28426,22 +28403,20 @@ static void show_wifi_analyzer_screen(void) {
     lv_obj_set_style_text_color(lbl2g, lv_color_hex(0x4FC3F7), 0);
     lv_obj_align(lbl2g, LV_ALIGN_CENTER, 0, 0);
 
-    // ── 2.4 GHz canvas (y=40, h=88) ─────────────────────────────────────────
+    // ── 2.4 GHz canvas (y=42, h=105) ────────────────────────────────────────
     wana_canvas_2g = lv_canvas_create(function_page);
     lv_canvas_set_buffer(wana_canvas_2g, wana_buf, WANA_W, WANA_2G_H, LV_IMG_CF_TRUE_COLOR);
     lv_obj_set_pos(wana_canvas_2g, 0, WANA_2G_Y);
     lv_obj_set_size(wana_canvas_2g, WANA_W, WANA_2G_H);
-    lv_obj_add_event_cb(wana_canvas_2g, wana_exit_cb, LV_EVENT_CLICKED, NULL);
 
-    // ── 5 GHz section header bar (y=128) ─────────────────────────────────────
+    // ── 5 GHz section header (y=147, h=12) ──────────────────────────────────
     lv_obj_t *hdr5g = lv_obj_create(function_page);
     lv_obj_set_size(hdr5g, WANA_W, 12);
     lv_obj_set_pos(hdr5g, 0, WANA_2G_Y + WANA_2G_H);
     lv_obj_set_style_bg_color(hdr5g, lv_color_make(10, 10, 30), 0);
-    lv_obj_set_style_border_width(hdr5g, 0, 0);
+    lv_obj_set_style_border_width(hdr5g, 1, 0);
     lv_obj_set_style_border_color(hdr5g, lv_color_hex(0x333355), 0);
     lv_obj_set_style_border_side(hdr5g, LV_BORDER_SIDE_TOP, 0);
-    lv_obj_set_style_border_width(hdr5g, 1, 0);
     lv_obj_set_style_radius(hdr5g, 0, 0);
     lv_obj_set_style_pad_all(hdr5g, 0, 0);
     lv_obj_clear_flag(hdr5g, LV_OBJ_FLAG_SCROLLABLE);
@@ -28451,15 +28426,14 @@ static void show_wifi_analyzer_screen(void) {
     lv_obj_set_style_text_color(lbl5g, lv_color_hex(0x81C784), 0);
     lv_obj_align(lbl5g, LV_ALIGN_CENTER, 0, 0);
 
-    // ── 5 GHz canvas (y=140, h=56) ──────────────────────────────────────────
+    // ── 5 GHz canvas (y=159, h=80) ──────────────────────────────────────────
     wana_canvas_5g = lv_canvas_create(function_page);
     lv_canvas_set_buffer(wana_canvas_5g, wana_buf + WANA_W * WANA_2G_H,
                          WANA_W, WANA_5G_H, LV_IMG_CF_TRUE_COLOR);
     lv_obj_set_pos(wana_canvas_5g, 0, WANA_5G_Y);
     lv_obj_set_size(wana_canvas_5g, WANA_W, WANA_5G_H);
-    lv_obj_add_event_cb(wana_canvas_5g, wana_exit_cb, LV_EVENT_CLICKED, NULL);
 
-    // ── Legend (y=196) ───────────────────────────────────────────────────────
+    // ── Legend (y=241) ───────────────────────────────────────────────────────
     lv_obj_t *leg = lv_label_create(function_page);
     lv_obj_set_pos(leg, 0, WANA_5G_Y + WANA_5G_H + 2);
     lv_obj_set_size(leg, WANA_W, 14);
@@ -28472,10 +28446,10 @@ static void show_wifi_analyzer_screen(void) {
     lv_obj_set_style_border_width(leg, 0, 0);
     lv_obj_set_style_pad_all(leg, 0, 0);
 
-    // ── Status + buttons row (y=212) ─────────────────────────────────────────
+    // ── Status + Rescan + Exit row (y=257) ───────────────────────────────────
     lv_obj_t *btns = lv_obj_create(function_page);
     lv_obj_set_pos(btns, 0, WANA_5G_Y + WANA_5G_H + 18);
-    lv_obj_set_size(btns, WANA_W, 22);
+    lv_obj_set_size(btns, WANA_W, 26);
     lv_obj_set_style_bg_color(btns, bg, 0);
     lv_obj_set_style_border_width(btns, 0, 0);
     lv_obj_set_style_radius(btns, 0, 0);
@@ -28492,7 +28466,7 @@ static void show_wifi_analyzer_screen(void) {
     lv_obj_set_flex_grow(wana_status_lbl, 1);
 
     lv_obj_t *rescan_btn = lv_btn_create(btns);
-    lv_obj_set_size(rescan_btn, 84, 20);
+    lv_obj_set_size(rescan_btn, 84, 24);
     lv_obj_set_style_bg_color(rescan_btn, lv_color_hex(0x1565C0), 0);
     lv_obj_set_style_radius(rescan_btn, 4, 0);
     lv_obj_set_style_shadow_width(rescan_btn, 0, 0);
@@ -28503,7 +28477,7 @@ static void show_wifi_analyzer_screen(void) {
     lv_obj_set_style_text_font(rl, &lv_font_montserrat_12, 0);
 
     lv_obj_t *exit_btn = lv_btn_create(btns);
-    lv_obj_set_size(exit_btn, 64, 20);
+    lv_obj_set_size(exit_btn, 64, 24);
     lv_obj_set_style_bg_color(exit_btn, lv_color_hex(0x333333), 0);
     lv_obj_set_style_radius(exit_btn, 4, 0);
     lv_obj_set_style_shadow_width(exit_btn, 0, 0);
@@ -28513,7 +28487,10 @@ static void show_wifi_analyzer_screen(void) {
     lv_obj_center(el);
     lv_obj_set_style_text_font(el, &lv_font_montserrat_12, 0);
 
-    // Kick off initial scan and UI refresh timer
+    // Draw empty grid immediately so the screen isn't blank while scanning
+    wana_redraw();
+
+    // Start scan task and refresh timer
     xTaskCreate(wana_scan_task, "wana_scan", 4096, NULL, 5, &wana_scan_task_handle);
     wana_ui_timer = lv_timer_create(wana_ui_timer_cb, 300, NULL);
 }
