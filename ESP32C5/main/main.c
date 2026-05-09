@@ -413,6 +413,20 @@ typedef enum { WD_BAND_BOTH = 0, WD_BAND_24G, WD_BAND_5G } wd_band_t;
 // BLE PCAP capture
 #define BLE_PCAP_DIR         "/sdcard/lab/ble_captures"
 
+// Drone Detector — Remote ID (ASTM F3411-22a)
+#define DRONE_DETECT_DIR     "/sdcard/lab/dronedetect"
+#define DRONE_MAX            20
+#define DRONE_WIFI_PHASE_MS  10000   // ms per WiFi promiscuous pass
+#define DRONE_BLE_PHASE_MS    5000   // ms per BLE scan pass
+#define RID_SRC_BLE          0
+#define RID_SRC_WIFI         1
+#define RID_MSG_BASIC        0
+#define RID_MSG_LOC          1
+#define RID_MSG_SELFID       3
+#define RID_MSG_SYS          4
+#define RID_MSG_OPID         5
+#define RID_MSG_PACK         0xF
+
 // Touch calibration NVS
 #define TOUCH_CAL_NVS_NS      "touch_cal"
 #define TOUCH_CAL_MAGIC       ((uint16_t)0xCA11)
@@ -946,6 +960,31 @@ typedef struct {
     uint8_t  data[31];
     uint64_t timestamp_us;
 } ble_pcap_pkt_t;
+
+typedef struct {
+    char     uas_id[21];    // UAS serial / CAA / UTM ID (null-terminated)
+    uint8_t  id_type;       // 0=None 1=Serial 2=CAA 3=UTM 4=Session
+    uint8_t  ua_type;       // aircraft class (0=Undecl … 15=Other)
+    bool     has_loc;
+    double   lat, lon;      // drone GPS degrees
+    float    alt_geo;       // geodetic altitude m
+    float    alt_baro;      // barometric altitude m
+    float    speed;         // horizontal m/s
+    float    vert_speed;    // vertical m/s
+    uint16_t heading;       // 0-359 deg
+    bool     has_sys;
+    double   pilot_lat;     // operator lat
+    double   pilot_lon;     // operator lon
+    char     self_id[24];   // self-ID description text
+    char     op_id[21];     // operator ID
+    uint8_t  source;        // RID_SRC_BLE or RID_SRC_WIFI
+    int8_t   rssi;
+    uint8_t  mac[6];        // BLE addr or WiFi SA (NimBLE LE byte order)
+    uint32_t first_seen;    // seconds since boot
+    uint32_t last_seen;
+    uint32_t pkt_count;
+} drone_rec_t;
+
 static FILE          *ble_pcap_file      = NULL;
 static QueueHandle_t  ble_pcap_queue     = NULL;
 static lv_timer_t    *ble_pcap_timer     = NULL;
@@ -1219,6 +1258,28 @@ typedef struct {
 static QueueHandle_t deauth_pcap_queue = NULL;
 static FILE         *deauth_pcap_file  = NULL;
 static char          deauth_pcap_path[64] = "";
+
+// Drone Detector state
+static drone_rec_t   g_drones[DRONE_MAX];
+static int           g_drone_count        = 0;
+static portMUX_TYPE  g_drone_mux          = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool drone_scan_active    = false;
+static volatile bool drone_update_flag    = false;
+static volatile bool drone_phase_ble      = false;  // false=WiFi, true=BLE
+static volatile int  drone_pcap_pkt_count = 0;
+static TaskHandle_t  drone_task_handle    = NULL;
+static StaticTask_t  drone_task_buf;
+static StackType_t  *drone_task_stack     = NULL;
+static lv_obj_t     *drone_list           = NULL;
+static lv_obj_t     *drone_status_lbl     = NULL;
+static lv_obj_t     *drone_count_lbl      = NULL;
+static lv_obj_t     *drone_rec_lbl        = NULL;
+static volatile bool drone_ui_active      = false;
+static FILE         *drone_csv            = NULL;
+static char          drone_csv_path[80];
+static QueueHandle_t drone_pcap_queue     = NULL;
+static FILE         *drone_pcap_file      = NULL;
+static char          drone_pcap_path[80];
 
 // AirTag Scanner state
 static TaskHandle_t airtag_scan_task_handle = NULL;
@@ -1537,6 +1598,11 @@ static void reset_function_page_children(void) {
     airtag_scan_stats_label2 = NULL;
     airtag_scan_stats_label3 = NULL;
     airtag_view_tags_btn = NULL;
+    drone_list        = NULL;
+    drone_status_lbl  = NULL;
+    drone_count_lbl   = NULL;
+    drone_rec_lbl     = NULL;
+    drone_ui_active   = false;
     deauth_monitor_rec_label = NULL;
     bt_locator_content = NULL;
     bt_locator_list = NULL;
@@ -1809,6 +1875,11 @@ static const char* deauth_monitor_find_ssid_by_bssid(const uint8_t *bssid);
 static void show_airtag_scan_screen(void);
 static void airtag_scan_exit_cb(lv_event_t *e);
 static void airtag_scan_task(void *pvParameters);
+static void show_drone_detector_screen(void);
+static void drone_exit_cb(lv_event_t *e);
+static void drone_task(void *pvParameters);
+static void drone_show_detail(int idx);
+static void drone_row_tap_cb(lv_event_t *e);
 
 // BT Locator functions
 static void show_bt_locator_screen(void);
@@ -5758,6 +5829,67 @@ void app_main(void)
                         lv_obj_set_width(lbl, lv_pct(95));
                     }
                     portEXIT_CRITICAL(&deauth_monitor_spin);
+                }
+            }
+
+            // Drone Detector UI update
+            if (drone_update_flag && drone_ui_active) {
+                drone_update_flag = false;
+
+                // Snapshot display lines under spinlock, then build UI outside it
+                typedef struct { char line[72]; uint8_t src; } dd_snap_t;
+                static dd_snap_t dd_snap[DRONE_MAX];
+                int dcnt;
+                portENTER_CRITICAL(&g_drone_mux);
+                dcnt = g_drone_count;
+                for (int di = 0; di < dcnt; di++) {
+                    drone_rec_t *r = &g_drones[di];
+                    dd_snap[di].src = r->source;
+                    if (r->uas_id[0])
+                        snprintf(dd_snap[di].line, 72, "[%s] %s  %ddBm",
+                                 r->source == RID_SRC_BLE ? "BLE" : "WiFi",
+                                 r->uas_id, r->rssi);
+                    else
+                        snprintf(dd_snap[di].line, 72, "[%s] %02X:%02X:%02X:%02X  %ddBm",
+                                 r->source == RID_SRC_BLE ? "BLE" : "WiFi",
+                                 r->mac[5],r->mac[4],r->mac[3],r->mac[2], r->rssi);
+                }
+                portEXIT_CRITICAL(&g_drone_mux);
+
+                if (drone_count_lbl && lv_obj_is_valid(drone_count_lbl)) {
+                    char cb[32]; snprintf(cb, sizeof(cb), "Drones detected: %d", dcnt);
+                    lv_label_set_text(drone_count_lbl, cb);
+                }
+                if (drone_status_lbl && lv_obj_is_valid(drone_status_lbl)) {
+                    if (drone_phase_ble)
+                        lv_label_set_text(drone_status_lbl, MY_SYMBOL_BLUETOOTH_B "  BLE scanning...");
+                    else
+                        lv_label_set_text(drone_status_lbl, LV_SYMBOL_WIFI "  WiFi NAN (ch 1/6/11)...");
+                }
+                if (drone_list && lv_obj_is_valid(drone_list)) {
+                    lv_obj_clean(drone_list);
+                    if (dcnt == 0) {
+                        lv_obj_t *emp = lv_label_create(drone_list);
+                        lv_label_set_text(emp, "Scanning... no Remote ID detected yet");
+                        lv_obj_set_style_text_font(emp, &lv_font_montserrat_12, 0);
+                        lv_obj_set_style_text_color(emp, lv_color_make(120,120,120), 0);
+                    }
+                    for (int di = 0; di < dcnt; di++) {
+                        lv_obj_t *row = lv_list_add_btn(drone_list, NULL, "");
+                        lv_obj_set_width(row, lv_pct(100));
+                        lv_obj_set_style_pad_all(row, 6, 0);
+                        lv_obj_set_height(row, LV_SIZE_CONTENT);
+                        lv_obj_set_style_bg_color(row, ui_card_color(), LV_STATE_DEFAULT);
+                        lv_obj_set_style_radius(row, 8, 0);
+                        lv_obj_t *lbl = lv_label_create(row);
+                        lv_label_set_text(lbl, dd_snap[di].line);
+                        lv_label_set_long_mode(lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+                        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+                        lv_obj_set_style_text_color(lbl, lv_color_hex(0x66BB6A), 0);
+                        lv_obj_set_width(lbl, lv_pct(95));
+                        lv_obj_add_event_cb(row, (lv_event_cb_t)drone_row_tap_cb,
+                                            LV_EVENT_CLICKED, (void*)(intptr_t)di);
+                    }
                 }
             }
 
@@ -11931,6 +12063,8 @@ static void main_tile_event_cb(lv_event_t *e)
         settings_nav_timer = lv_timer_create(settings_nav_timer_cb, 800, NULL);
     } else if (strcmp(tile_name, "Deauth Monitor") == 0) {
         show_deauth_monitor_screen();
+    } else if (strcmp(tile_name, "Drone Detect") == 0) {
+        show_drone_detector_screen();
     } else if (strcmp(tile_name, "Bluetooth") == 0) {
         show_bluetooth_screen();
     } else if (strcmp(tile_name, "Wardrive") == 0) {
@@ -14803,6 +14937,8 @@ static void show_wifi_menu_screen(void)
     (void)dm_tile;
     lv_obj_t *obs_tile  = create_tile(tiles, LV_SYMBOL_EYE_OPEN,   "WiFi\nObserver",   UI_ACCENT_PURPLE, main_tile_event_cb, "WiFi Sniff&Karma");
     (void)obs_tile;
+    lv_obj_t *dd_tile   = create_tile(tiles, LV_SYMBOL_GPS,        "Drone\nDetect",    lv_color_hex(0x1B5E20), main_tile_event_cb, "Drone Detect");
+    (void)dd_tile;
 }
 
 // WiFi Sniff & Karma screen
@@ -27334,6 +27470,555 @@ static void show_deauth_monitor_screen(void)
     // Start WiFi scan to gather network SSIDs
     ESP_LOGI(TAG, "Starting WiFi scan for deauth monitor...");
     wifi_scanner_start_scan();
+}
+
+// ============================================================================
+// DRONE DETECTOR — Remote ID (ASTM F3411-22a) via BLE + WiFi NAN/Beacon
+// Alternates 10 s WiFi promiscuous (ch 1/6/11) → 5 s BLE scan → repeat.
+// BLE packets are captured to PCAPNG; all parsed data logged to CSV.
+// ============================================================================
+
+static const char *drone_ua_str(uint8_t t) {
+    switch (t) {
+        case 1: return "Aeroplane"; case 2: return "Rotorcraft"; case 3: return "Gyroplane";
+        case 4: return "VTOL";      case 5: return "Ornithopter";case 6: return "Glider";
+        case 7: return "Kite";      case 8: return "Free Balloon";case 9: return "Captive Balloon";
+        case 10:return "Airship";   case 11:return "Free Fall";   case 12:return "Rocket";
+        case 13:return "Tethered";  case 14:return "Obstacle";    case 15:return "Other";
+        default:return "Unknown";
+    }
+}
+
+// Find existing record by MAC or create a new one. Returns NULL if table full.
+static drone_rec_t *drone_find_or_create(const uint8_t *mac)
+{
+    portENTER_CRITICAL(&g_drone_mux);
+    for (int i = 0; i < g_drone_count; i++) {
+        if (memcmp(g_drones[i].mac, mac, 6) == 0) {
+            portEXIT_CRITICAL(&g_drone_mux);
+            return &g_drones[i];
+        }
+    }
+    if (g_drone_count >= DRONE_MAX) { portEXIT_CRITICAL(&g_drone_mux); return NULL; }
+    drone_rec_t *r = &g_drones[g_drone_count++];
+    memset(r, 0, sizeof(*r));
+    memcpy(r->mac, mac, 6);
+    r->first_seen = (uint32_t)(esp_timer_get_time() / 1000000);
+    portEXIT_CRITICAL(&g_drone_mux);
+    return r;
+}
+
+// Parse one 25-byte ASTM F3411-22a message into a drone_rec_t.
+static void drone_parse_rid(drone_rec_t *rec, const uint8_t *msg, int len)
+{
+    if (len < 1) return;
+    uint8_t mtype = (msg[0] >> 4) & 0x0F;
+
+    if (mtype == RID_MSG_BASIC && len >= 22) {
+        rec->id_type = (msg[1] >> 4) & 0x0F;
+        rec->ua_type = msg[1] & 0x0F;
+        memcpy(rec->uas_id, msg + 2, 20);
+        rec->uas_id[20] = '\0';
+        for (int i = 19; i >= 0 && (rec->uas_id[i] == '\0' || rec->uas_id[i] == ' '); i--)
+            rec->uas_id[i] = '\0';
+    }
+    else if (mtype == RID_MSG_LOC && len >= 25) {
+        uint8_t  status = msg[1];
+        uint8_t  dir    = msg[2];
+        uint8_t  smult  = msg[3] & 0x01;
+        uint8_t  spd    = msg[4];
+        int8_t   vspd   = (int8_t)msg[5];
+        int32_t  lat32  = (int32_t)((uint32_t)msg[6] |(uint32_t)msg[7]<<8 |(uint32_t)msg[8]<<16 |(uint32_t)msg[9]<<24);
+        int32_t  lon32  = (int32_t)((uint32_t)msg[10]|(uint32_t)msg[11]<<8|(uint32_t)msg[12]<<16|(uint32_t)msg[13]<<24);
+        uint16_t baroe  = (uint16_t)(msg[14] | (msg[15]<<8));
+        uint16_t geoe   = (uint16_t)(msg[16] | (msg[17]<<8));
+        uint16_t hdg    = dir; if (status & 0x10) hdg += 180; if (hdg > 359) hdg = 359;
+        rec->heading    = hdg;
+        rec->lat        = lat32 * 1e-7;
+        rec->lon        = lon32 * 1e-7;
+        rec->alt_baro   = (baroe != 0xFFFF) ? (baroe * 0.5f - 1000.0f) : -1000.0f;
+        rec->alt_geo    = (geoe  != 0xFFFF) ? (geoe  * 0.5f - 1000.0f) : -1000.0f;
+        rec->speed      = smult ? (spd * 0.75f) : (spd * 0.25f);
+        rec->vert_speed = vspd * 0.5f;
+        rec->has_loc    = (lat32 != 0 || lon32 != 0);
+    }
+    else if (mtype == RID_MSG_SYS && len >= 10) {
+        int32_t plat = (int32_t)((uint32_t)msg[2]|(uint32_t)msg[3]<<8|(uint32_t)msg[4]<<16|(uint32_t)msg[5]<<24);
+        int32_t plon = (int32_t)((uint32_t)msg[6]|(uint32_t)msg[7]<<8|(uint32_t)msg[8]<<16|(uint32_t)msg[9]<<24);
+        rec->pilot_lat = plat * 1e-7;
+        rec->pilot_lon = plon * 1e-7;
+        rec->has_sys   = (plat != 0 || plon != 0);
+    }
+    else if (mtype == RID_MSG_SELFID && len >= 24) {
+        memcpy(rec->self_id, msg + 2, 22); rec->self_id[22] = '\0';
+    }
+    else if (mtype == RID_MSG_OPID && len >= 22) {
+        memcpy(rec->op_id, msg + 2, 20); rec->op_id[20] = '\0';
+    }
+    else if (mtype == RID_MSG_PACK && len >= 3) {
+        uint8_t qty = msg[1];
+        for (int i = 0; i < qty && (3 + (i+1)*25) <= len; i++)
+            drone_parse_rid(rec, msg + 3 + i*25, 25);
+    }
+}
+
+// Append one CSV row to the open drone_csv file.
+static void drone_log_csv(drone_rec_t *rec)
+{
+    if (!drone_csv || !sd_spi_mutex) return;
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return;
+    char ms[18];
+    snprintf(ms, sizeof(ms), "%02X:%02X:%02X:%02X:%02X:%02X",
+             rec->mac[5],rec->mac[4],rec->mac[3],rec->mac[2],rec->mac[1],rec->mac[0]);
+    fprintf(drone_csv,
+        "%lu,%s,%d,%s,\"%s\",%d,%d,%.7f,%.7f,%.1f,%.1f,%.2f,%d,%.2f,%.7f,%.7f,\"%s\",\"%s\",%lu\n",
+        (unsigned long)rec->last_seen,
+        rec->source == RID_SRC_BLE ? "BLE" : "WiFi",
+        rec->rssi, ms,
+        rec->uas_id, rec->id_type, rec->ua_type,
+        rec->lat, rec->lon, rec->alt_geo, rec->alt_baro,
+        rec->speed, rec->heading, rec->vert_speed,
+        rec->pilot_lat, rec->pilot_lon,
+        rec->self_id, rec->op_id,
+        (unsigned long)rec->pkt_count);
+    fflush(drone_csv);
+    xSemaphoreGive(sd_spi_mutex);
+}
+
+// Flush all records to CSV.
+static void drone_flush_csv(void)
+{
+    portENTER_CRITICAL(&g_drone_mux);
+    int cnt = g_drone_count;
+    portEXIT_CRITICAL(&g_drone_mux);
+    for (int i = 0; i < cnt; i++)
+        if (g_drones[i].pkt_count > 0) drone_log_csv(&g_drones[i]);
+}
+
+// Drain BLE PCAP queue → drone_pcap_file.
+static void drone_drain_pcap(void)
+{
+    if (!drone_pcap_queue || !drone_pcap_file || !sd_spi_mutex) return;
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(300)) != pdTRUE) return;
+    ble_pcap_pkt_t pkt;
+    while (xQueueReceive(drone_pcap_queue, &pkt, 0) == pdTRUE) {
+        ble_pcap_write_epb(drone_pcap_file, &pkt);
+        drone_pcap_pkt_count++;
+    }
+    fflush(drone_pcap_file);
+    xSemaphoreGive(sd_spi_mutex);
+}
+
+// BLE GAP callback: filter company ID 0x0E00 (OpenDroneID) advertisements.
+static int drone_ble_gap_cb(struct ble_gap_event *event, void *arg)
+{
+    (void)arg;
+    if (!drone_scan_active) return 0;
+    if (event->type != BLE_GAP_EVENT_DISC) return 0;
+    struct ble_gap_disc_desc *desc = &event->disc;
+    struct ble_hs_adv_fields fields;
+    if (ble_hs_adv_parse_fields(&fields, desc->data, desc->length_data) != 0) return 0;
+    if (!fields.mfg_data || fields.mfg_data_len < 5) return 0;
+    // Company ID 0x0E00 (LE: 0x00 0x0E), AD application code 0x0D
+    if (fields.mfg_data[0] != 0x00 || fields.mfg_data[1] != 0x0E) return 0;
+    if (fields.mfg_data[2] != 0x0D) return 0;
+
+    drone_rec_t *rec = drone_find_or_create(desc->addr.val);
+    if (!rec) return 0;
+    rec->rssi      = desc->rssi;
+    rec->source    = RID_SRC_BLE;
+    rec->last_seen = (uint32_t)(esp_timer_get_time() / 1000000);
+    rec->pkt_count++;
+    // Byte 3 = counter, byte 4+ = 25-byte RID message
+    if (fields.mfg_data_len >= 5)
+        drone_parse_rid(rec, fields.mfg_data + 4, fields.mfg_data_len - 4);
+
+    // Queue raw advertisement for PCAP
+    if (drone_pcap_queue) {
+        ble_pcap_pkt_t pkt;
+        memcpy(pkt.addr, desc->addr.val, 6);
+        pkt.addr_type    = desc->addr.type;
+        pkt.event_type   = (uint8_t)desc->event_type;
+        pkt.rssi         = desc->rssi;
+        pkt.data_len     = desc->length_data < 31 ? desc->length_data : 31;
+        memcpy(pkt.data, desc->data, pkt.data_len);
+        pkt.timestamp_us = (uint64_t)esp_timer_get_time();
+        xQueueSend(drone_pcap_queue, &pkt, 0);
+    }
+    drone_update_flag = true;
+    return 0;
+}
+
+// WiFi promiscuous callback: parse Remote ID from NAN action frames and beacon vendor IEs.
+// NAN SDF: mgmt action, cat 0x04, OUI 50:6F:9A:13, then look for RID service hash.
+// Beacon/Probe: vendor IE tag 0xDD, OUI FA:0B:BC, type 0x0D.
+static void drone_wifi_cb(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    if (!drone_scan_active) return;
+    const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *frame = pkt->payload;
+    int len = (int)pkt->rx_ctrl.sig_len;
+    if (len < 24) return;
+
+    uint8_t ftype    = (frame[0] >> 2) & 0x03;
+    uint8_t fsubtype = (frame[0] >> 4) & 0x0F;
+    if (ftype != 0x00) return;  // management frames only
+
+    const uint8_t *src_mac = frame + 10;   // SA offset
+    const uint8_t *body    = frame + 24;
+    int            blen    = len - 24;
+
+    if (fsubtype == 0x0D && blen >= 5) {
+        // Action frame: NAN SDF signature — category 0x04, OUI 50:6F:9A, type 0x13
+        if (body[0] == 0x04 && body[1] == 0x50 && body[2] == 0x6F &&
+            body[3] == 0x9A && body[4] == 0x13) {
+            // Scan for Remote ID service name hash within the NAN body
+            static const uint8_t rid_svc_hash[6] = {0xD0, 0x4F, 0x22, 0xA4, 0xEC, 0xD1};
+            for (int i = 5; i <= blen - 31; i++) {
+                if (memcmp(body + i, rid_svc_hash, 6) == 0) {
+                    const uint8_t *rid = body + i + 6;
+                    int rlen = blen - (i + 6);
+                    drone_rec_t *rec = drone_find_or_create(src_mac);
+                    if (rec) {
+                        rec->rssi      = pkt->rx_ctrl.rssi;
+                        rec->source    = RID_SRC_WIFI;
+                        rec->last_seen = (uint32_t)(esp_timer_get_time() / 1000000);
+                        rec->pkt_count++;
+                        drone_parse_rid(rec, rid, rlen < 25 ? rlen : 25);
+                        drone_update_flag = true;
+                    }
+                    return;
+                }
+            }
+        }
+    }
+    else if ((fsubtype == 0x08 || fsubtype == 0x05) && blen >= 12) {
+        // Beacon (0x08) or Probe Response (0x05) — scan IEs after 12-byte fixed fields
+        const uint8_t *ie = body + 12;
+        int ie_rem = blen - 12;
+        while (ie_rem >= 2) {
+            uint8_t tag  = ie[0];
+            uint8_t tlen = ie[1];
+            if (2 + tlen > ie_rem) break;
+            // Vendor IE (0xDD) with OUI FA:0B:BC, type 0x0D = OpenDroneID
+            if (tag == 0xDD && tlen >= 29 &&
+                ie[2] == 0xFA && ie[3] == 0x0B && ie[4] == 0xBC && ie[5] == 0x0D) {
+                drone_rec_t *rec = drone_find_or_create(src_mac);
+                if (rec) {
+                    rec->rssi      = pkt->rx_ctrl.rssi;
+                    rec->source    = RID_SRC_WIFI;
+                    rec->last_seen = (uint32_t)(esp_timer_get_time() / 1000000);
+                    rec->pkt_count++;
+                    int rlen = tlen - 4;
+                    drone_parse_rid(rec, ie + 6, rlen < 25 ? rlen : 25);
+                    drone_update_flag = true;
+                }
+                return;
+            }
+            ie += 2 + tlen;
+            ie_rem -= 2 + tlen;
+        }
+    }
+}
+
+// Channel sequence for WiFi phase — extra weight on ch 6 (NAN)
+static const int s_drone_wifi_channels[] = {6, 6, 1, 6, 6, 11, 6, 6};
+#define DRONE_WIFI_CH_COUNT (int)(sizeof(s_drone_wifi_channels)/sizeof(s_drone_wifi_channels[0]))
+
+// Main drone detector task: alternates WiFi promiscuous and BLE scan phases.
+static void drone_task(void *pvParameters)
+{
+    (void)pvParameters;
+    ESP_LOGI(TAG, "Drone Detector task started");
+    int ch_idx = 0;
+
+    while (drone_scan_active) {
+        // ── WiFi phase ───────────────────────────────────────────────────
+        drone_phase_ble   = false;
+        drone_update_flag = true;   // refresh status label
+        if (!ensure_wifi_mode()) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+
+        wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
+        esp_wifi_set_promiscuous_filter(&filt);
+        esp_wifi_set_promiscuous_rx_cb(drone_wifi_cb);
+        esp_wifi_set_promiscuous(true);
+
+        int64_t wifi_end = esp_timer_get_time() / 1000 + DRONE_WIFI_PHASE_MS;
+        while (drone_scan_active && esp_timer_get_time() / 1000 < wifi_end) {
+            int ch = s_drone_wifi_channels[ch_idx % DRONE_WIFI_CH_COUNT];
+            ch_idx++;
+            esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+        esp_wifi_set_promiscuous(false);
+        esp_wifi_set_promiscuous_rx_cb(NULL);
+        if (!drone_scan_active) break;
+
+        drone_flush_csv();
+
+        // ── BLE phase ────────────────────────────────────────────────────
+        drone_phase_ble   = true;
+        drone_update_flag = true;
+        if (!ensure_ble_mode()) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+
+        struct ble_gap_disc_params bp = {
+            .itvl = 0x60, .window = 0x60,
+            .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
+            .limited = 0, .passive = 0, .filter_duplicates = 0
+        };
+        int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &bp, drone_ble_gap_cb, NULL);
+
+        int64_t ble_end = esp_timer_get_time() / 1000 + DRONE_BLE_PHASE_MS;
+        while (drone_scan_active && esp_timer_get_time() / 1000 < ble_end)
+            vTaskDelay(pdMS_TO_TICKS(100));
+
+        if (rc == 0) ble_gap_disc_cancel();
+        drone_drain_pcap();
+        drone_flush_csv();
+    }
+
+    // Shutdown
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(NULL);
+    if (current_radio_mode == RADIO_MODE_BLE) {
+        ble_gap_disc_cancel();
+        bt_nimble_deinit();
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+    drone_drain_pcap();
+    if (drone_pcap_queue) { vQueueDelete(drone_pcap_queue); drone_pcap_queue = NULL; }
+    if (drone_pcap_file && sd_spi_mutex &&
+        xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        fflush(drone_pcap_file); fclose(drone_pcap_file); drone_pcap_file = NULL;
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    drone_flush_csv();
+    if (drone_csv && sd_spi_mutex &&
+        xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        fflush(drone_csv); fclose(drone_csv); drone_csv = NULL;
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    ESP_LOGI(TAG, "Drone Detector ended — %d drone(s) logged", g_drone_count);
+    drone_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// Exit callback — stops task, closes files, returns to WiFi menu.
+static void drone_exit_cb(lv_event_t *e)
+{
+    (void)e;
+    drone_scan_active = false;
+    drone_ui_active   = false;
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(NULL);
+    if (current_radio_mode == RADIO_MODE_BLE) ble_gap_disc_cancel();
+    for (int i = 0; i < 35 && drone_task_handle != NULL; i++)
+        vTaskDelay(pdMS_TO_TICKS(100));
+    if (drone_task_stack) { heap_caps_free(drone_task_stack); drone_task_stack = NULL; }
+    if (drone_pcap_queue) { vQueueDelete(drone_pcap_queue); drone_pcap_queue = NULL; }
+    show_wifi_menu_screen();
+}
+
+// Detail view — scrollable parsed fields for one drone record.
+static void drone_detail_back_cb(lv_event_t *e) { (void)e; show_drone_detector_screen(); }
+
+static void drone_row_tap_cb(lv_event_t *e)
+{
+    drone_show_detail((int)(intptr_t)lv_event_get_user_data(e));
+}
+
+static void drone_show_detail(int idx)
+{
+    if (idx < 0 || idx >= g_drone_count) return;
+    drone_rec_t r;
+    portENTER_CRITICAL(&g_drone_mux);
+    r = g_drones[idx];
+    portEXIT_CRITICAL(&g_drone_mux);
+
+    create_function_page_base("Drone Detail");
+
+    lv_obj_t *cont = lv_obj_create(function_page);
+    lv_obj_set_size(cont, lv_pct(100), LCD_V_RES - 30 - 44);
+    lv_obj_align(cont, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(cont, 0, 0);
+    lv_obj_set_style_pad_all(cont, 6, 0);
+    lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(cont, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_gap(cont, 2, 0);
+    lv_obj_set_scrollbar_mode(cont, LV_SCROLLBAR_MODE_AUTO);
+
+    char ms[18], buf[120];
+    snprintf(ms, sizeof(ms), "%02X:%02X:%02X:%02X:%02X:%02X",
+             r.mac[5],r.mac[4],r.mac[3],r.mac[2],r.mac[1],r.mac[0]);
+
+    #define DR(fmt,...) do { \
+        snprintf(buf, sizeof(buf), fmt, ##__VA_ARGS__); \
+        lv_obj_t *_l = lv_label_create(cont); \
+        lv_label_set_text(_l, buf); \
+        lv_obj_set_style_text_font(_l, &lv_font_montserrat_12, 0); \
+        lv_obj_set_style_text_color(_l, ui_text_color(), 0); \
+        lv_obj_set_width(_l, lv_pct(100)); \
+        lv_label_set_long_mode(_l, LV_LABEL_LONG_WRAP); \
+    } while(0)
+
+    DR("MAC: %s", ms);
+    DR("Source: %s  RSSI: %d dBm  Pkts: %lu",
+       r.source == RID_SRC_BLE ? "BLE" : "WiFi", r.rssi, (unsigned long)r.pkt_count);
+    DR("UAS ID: %s", r.uas_id[0] ? r.uas_id : "(none)");
+    DR("ID Type: %d  Aircraft: %s", r.id_type, drone_ua_str(r.ua_type));
+    if (r.has_loc) {
+        DR("Lat: %.6f  Lon: %.6f", r.lat, r.lon);
+        DR("Alt Geo: %.1f m  Baro: %.1f m", r.alt_geo, r.alt_baro);
+        DR("Speed: %.1f m/s  Vert: %+.1f m/s", r.speed, r.vert_speed);
+        DR("Heading: %d deg", r.heading);
+    } else {
+        DR("Position: not reported");
+    }
+    if (r.has_sys)  DR("Pilot: %.6f, %.6f", r.pilot_lat, r.pilot_lon);
+    if (r.self_id[0]) DR("Desc: %s", r.self_id);
+    if (r.op_id[0])   DR("OpID: %s", r.op_id);
+    #undef DR
+
+    lv_obj_t *bb = lv_btn_create(function_page);
+    lv_obj_set_size(bb, 110, 28);
+    lv_obj_align(bb, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(bb, lv_color_make(60,60,60), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(bb, 0, 0);
+    lv_obj_set_style_radius(bb, 8, 0);
+    lv_obj_t *bbl = lv_label_create(bb);
+    lv_label_set_text(bbl, LV_SYMBOL_LEFT " Back");
+    lv_obj_set_style_text_font(bbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bbl, lv_color_white(), 0);
+    lv_obj_center(bbl);
+    lv_obj_add_event_cb(bb, drone_detail_back_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// Main screen builder. Safe to call both for fresh start and from detail-view back.
+static void show_drone_detector_screen(void)
+{
+    bool fresh = !drone_scan_active;
+    if (fresh) {
+        portENTER_CRITICAL(&g_drone_mux);
+        g_drone_count = 0;
+        memset(g_drones, 0, sizeof(g_drones));
+        portEXIT_CRITICAL(&g_drone_mux);
+        drone_pcap_pkt_count = 0;
+    }
+
+    create_function_page_base("Drone Detector");
+    drone_ui_active = true;
+
+    drone_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(drone_status_lbl, LV_SYMBOL_WIFI "  Initializing scan...");
+    lv_obj_set_style_text_font(drone_status_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(drone_status_lbl, lv_color_hex(0x66BB6A), 0);
+    lv_obj_align(drone_status_lbl, LV_ALIGN_TOP_MID, 0, 34);
+
+    drone_count_lbl = lv_label_create(function_page);
+    lv_label_set_text(drone_count_lbl, "Drones detected: 0");
+    lv_obj_set_style_text_font(drone_count_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(drone_count_lbl, ui_text_color(), 0);
+    lv_obj_align(drone_count_lbl, LV_ALIGN_TOP_MID, 0, 54);
+
+    drone_list = lv_list_create(function_page);
+    lv_obj_set_size(drone_list, lv_pct(100), LCD_V_RES - 30 - 100);
+    lv_obj_align(drone_list, LV_ALIGN_TOP_MID, 0, 72);
+    lv_obj_set_style_bg_color(drone_list, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(drone_list, 0, LV_PART_ITEMS);
+
+    lv_obj_t *emp = lv_label_create(drone_list);
+    lv_label_set_text(emp, "Scanning... no Remote ID detected yet");
+    lv_obj_set_style_text_font(emp, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(emp, lv_color_make(120,120,120), 0);
+
+    drone_rec_lbl = lv_label_create(function_page);
+    lv_label_set_text(drone_rec_lbl, LV_SYMBOL_SD_CARD " Opening SD...");
+    lv_obj_set_style_text_font(drone_rec_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(drone_rec_lbl, lv_color_make(150,150,150), 0);
+    lv_obj_set_style_text_align(drone_rec_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(drone_rec_lbl, lv_pct(100));
+    lv_obj_align(drone_rec_lbl, LV_ALIGN_BOTTOM_MID, 0, -42);
+
+    lv_obj_t *exit_btn = lv_btn_create(function_page);
+    lv_obj_set_size(exit_btn, 110, 28);
+    lv_obj_align(exit_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(exit_btn, lv_color_lighten(COLOR_MATERIAL_RED,50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(exit_btn, 0, 0);
+    lv_obj_set_style_radius(exit_btn, 8, 0);
+    lv_obj_set_flex_flow(exit_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(exit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(exit_btn, 4, 0);
+    lv_obj_t *eico = lv_label_create(exit_btn);
+    lv_label_set_text(eico, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_font(eico, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(eico, lv_color_white(), 0);
+    lv_obj_t *etxt = lv_label_create(exit_btn);
+    lv_label_set_text(etxt, "Exit");
+    lv_obj_set_style_text_font(etxt, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(etxt, lv_color_white(), 0);
+    lv_obj_add_event_cb(exit_btn, drone_exit_cb, LV_EVENT_CLICKED, NULL);
+
+    if (!fresh) {
+        // Returning from detail view — trigger UI refresh from existing data
+        drone_update_flag = true;
+        return;
+    }
+
+    // Fresh start: open SD logging files
+    drone_scan_active = true;
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        struct stat st = {0};
+        if (stat(DRONE_DETECT_DIR, &st) == -1) {
+            mkdir("/sdcard/lab", 0777);
+            mkdir(DRONE_DETECT_DIR, 0777);
+        }
+        uint64_t ts = esp_timer_get_time() / 1000;
+        snprintf(drone_csv_path,  sizeof(drone_csv_path),
+                 DRONE_DETECT_DIR "/drone_%llu.csv",    (unsigned long long)ts);
+        snprintf(drone_pcap_path, sizeof(drone_pcap_path),
+                 DRONE_DETECT_DIR "/drone_%llu.pcapng", (unsigned long long)ts);
+
+        drone_csv = fopen(drone_csv_path, "w");
+        if (drone_csv) {
+            fprintf(drone_csv,
+                "timestamp_s,source,rssi,mac,uas_id,id_type,ua_type,"
+                "lat,lon,alt_geo,alt_baro,speed,heading,vert_speed,"
+                "pilot_lat,pilot_lon,self_id,op_id,pkt_count\n");
+            fflush(drone_csv);
+        }
+        drone_pcap_file = fopen(drone_pcap_path, "wb");
+        if (drone_pcap_file) {
+            ble_pcap_write_shb(drone_pcap_file);
+            ble_pcap_write_idb(drone_pcap_file);
+            fflush(drone_pcap_file);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    if (drone_rec_lbl && lv_obj_is_valid(drone_rec_lbl)) {
+        if (drone_csv) {
+            const char *fn = strrchr(drone_csv_path, '/');
+            char rb[96];
+            snprintf(rb, sizeof(rb), LV_SYMBOL_SD_CARD " %s", fn ? fn+1 : drone_csv_path);
+            lv_label_set_text(drone_rec_lbl, rb);
+            lv_obj_set_style_text_color(drone_rec_lbl, COLOR_MATERIAL_RED, 0);
+        } else {
+            lv_label_set_text(drone_rec_lbl, LV_SYMBOL_SD_CARD " SD unavailable");
+        }
+    }
+
+    // Launch task with PSRAM stack
+    drone_pcap_queue = xQueueCreate(64, sizeof(ble_pcap_pkt_t));
+    drone_task_stack = (StackType_t *)heap_caps_malloc(6144 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    if (drone_task_stack) {
+        drone_task_handle = xTaskCreateStatic(
+            drone_task, "drone_det", 6144, NULL, 5,
+            drone_task_stack, &drone_task_buf);
+    } else {
+        ESP_LOGE(TAG, "Drone detector: failed to allocate task stack");
+        drone_scan_active = false;
+    }
 }
 
 // ============================================================================
