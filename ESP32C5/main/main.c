@@ -28723,7 +28723,7 @@ static void show_wana_chart_screen(void) {
         char name[12];
         snprintf(name, sizeof(name), "%.11s", wana_ssids[i].ssid);
         lpos += snprintf(leg_txt + lpos, sizeof(leg_txt) - lpos,
-                         "#%06X ■ %s#  ", (unsigned)c, name);
+                         "#%06X > %s#  ", (unsigned)c, name);
     }
     lv_label_set_text(leg, leg_txt[0] ? leg_txt : "No SSIDs selected");
     lv_label_set_long_mode(leg, LV_LABEL_LONG_SCROLL_CIRCULAR);
