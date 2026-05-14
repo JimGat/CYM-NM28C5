@@ -1283,9 +1283,10 @@ static char          drone_pcap_path[80];
 
 // ── WiFi Channel Analyzer (Chanalizer) state ─────────────────────────────────
 // Portrait layout: 240×320. Two-phase UI: SSID picker → bell-curve chart.
-// Chart is a wide (520px) PSRAM buffer shown through a 240px scrollable viewport.
-// x axis = frequency (left→right), y axis = signal strength (top=strong, bottom=weak).
-// Auto-scrolls left↔right; touch-drag pauses auto-scroll for manual panning.
+// Chart is a 520px-wide PSRAM buffer displayed through a 240px-wide fixed canvas.
+// Manual wana_scroll_x tracks which 240px slice of the buffer is visible.
+// Auto-scrolls left↔right via lv_obj_invalidate() — no LVGL scroll container,
+// avoiding the layout cascade + child re-render overhead that causes WDT starvation.
 #define WANA_WIDE_W    520   // total chart canvas width  (frequency axis, px)
 #define WANA_CHART_H   200   // chart canvas height       (signal axis, px; 0=top=strong)
 #define WANA_2G_X        0   // 2.4 GHz band x-start
@@ -1296,6 +1297,7 @@ static char          drone_pcap_path[80];
 #define WANA_MAX_APS     48
 #define WANA_MAX_LABELS  48
 #define WANA_MAX_SSIDS   20   // max unique SSID groups shown in picker
+#define WANA_MAX_SCROLL  (WANA_WIDE_W - 240)   // 280
 
 typedef struct {
     char    ssid[33];
@@ -1307,8 +1309,7 @@ typedef struct {
 } wana_ssid_group_t;
 
 static lv_color_t        *wana_buf           = NULL;   // PSRAM pixel buffer (520×200)
-static lv_obj_t          *wana_chart_obj     = NULL;   // 520-wide custom-draw object
-static lv_obj_t          *wana_scroll_cont   = NULL;   // 240-wide scrollable viewport
+static lv_obj_t          *wana_chart_obj     = NULL;   // 240-wide fixed-size draw object
 static lv_obj_t          *wana_status_lbl    = NULL;
 static lv_obj_t          *wana_panel         = NULL;   // swappable content panel
 static lv_timer_t        *wana_ui_timer      = NULL;
@@ -1318,9 +1319,13 @@ static bool               wana_scanning      = false;
 static bool               wana_needs_redraw  = false;
 static bool               wana_scroll_paused = false;  // true while user is dragging
 static int8_t             wana_scroll_dir    = 1;      // +1=right, -1=left (ping-pong)
+static int                wana_scroll_x      = 0;      // current viewport start in buf (0..280)
+static int                wana_drag_last_x   = 0;      // last touch x for delta calculation
 static wifi_ap_record_t   wana_aps[WANA_MAX_APS];
 static int                wana_ap_count      = 0;
 static lv_obj_t          *wana_ssid_lbls[WANA_MAX_LABELS];
+static int                wana_lbl_buf_x[WANA_MAX_LABELS];  // label x in buffer coords
+static int                wana_lbl_buf_y[WANA_MAX_LABELS];  // label y in buffer coords
 static int                wana_lbl_count     = 0;
 static wana_ssid_group_t  wana_ssids[WANA_MAX_SSIDS];
 static int                wana_ssid_count    = 0;
@@ -1677,9 +1682,9 @@ static void reset_function_page_children(void) {
     drone_rec_lbl     = NULL;
     drone_ui_active   = false;
     // WiFi Analyzer cleanup
-    wana_chart_obj = NULL; wana_scroll_cont = NULL;
+    wana_chart_obj = NULL;
     wana_status_lbl = NULL; wana_panel = NULL;
-    wana_lbl_count = 0; wana_ssid_count = 0;
+    wana_lbl_count = 0; wana_ssid_count = 0; wana_scroll_x = 0;
     wana_active = false; wana_scanning = false; wana_scroll_paused = false;
     if (wana_scroll_timer) { lv_timer_del(wana_scroll_timer); wana_scroll_timer = NULL; }
     if (wana_ui_timer)     { lv_timer_del(wana_ui_timer);     wana_ui_timer     = NULL; }
@@ -28349,17 +28354,20 @@ static void wana_draw_wide(void)
         }
     }
 
-    // Place channel labels on wana_chart_obj so they scroll with the chart
+    // Place channel labels on wana_panel in viewport coords.
+    // Buffer x/y stored in wana_lbl_buf_* so wana_update_label_positions() can
+    // recompute screen coords on each scroll step without recreating objects.
     for (int i = 0; i < np && wana_lbl_count < WANA_MAX_LABELS; i++) {
-        if (!wana_chart_obj || !lv_obj_is_valid(wana_chart_obj)) break;
-        int lbl_x = peak_cx[i] - 17;
-        int lbl_y = peak_ty[i] - 16;
-        if (lbl_x < 0)                lbl_x = 0;
-        if (lbl_x > WANA_WIDE_W - 34) lbl_x = WANA_WIDE_W - 34;
-        if (lbl_y < 2)                lbl_y = 2;
-        if (lbl_y > WANA_CHART_H - 16) lbl_y = WANA_CHART_H - 16;
+        if (!wana_panel || !lv_obj_is_valid(wana_panel)) break;
+        int buf_x = peak_cx[i] - 17;
+        int buf_y = peak_ty[i] - 16;
+        if (buf_x < 0)                buf_x = 0;
+        if (buf_x > WANA_WIDE_W - 34) buf_x = WANA_WIDE_W - 34;
+        if (buf_y < 2)                buf_y = 2;
+        if (buf_y > WANA_CHART_H - 16) buf_y = WANA_CHART_H - 16;
+        int screen_x = buf_x - wana_scroll_x;
         char txt[8]; snprintf(txt, sizeof(txt), "ch%d", peak_ch[i]);
-        lv_obj_t *lbl = lv_label_create(wana_chart_obj);
+        lv_obj_t *lbl = lv_label_create(wana_panel);
         lv_label_set_text(lbl, txt);
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(lbl, wana_grp_color(peak_cidx[i]), 0);
@@ -28369,15 +28377,19 @@ static void wana_draw_wide(void)
         lv_obj_set_style_pad_all(lbl, 1, 0);
         lv_obj_clear_flag(lbl, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(lbl, LV_OBJ_FLAG_IGNORE_LAYOUT);
-        lv_obj_set_pos(lbl, lbl_x, lbl_y);
+        lv_obj_set_pos(lbl, screen_x, buf_y);
         lv_obj_set_size(lbl, 34, 14);
+        if (screen_x < -34 || screen_x > 240)
+            lv_obj_add_flag(lbl, LV_OBJ_FLAG_HIDDEN);
+        wana_lbl_buf_x[wana_lbl_count] = buf_x;
+        wana_lbl_buf_y[wana_lbl_count] = buf_y;
         wana_ssid_lbls[wana_lbl_count++] = lbl;
     }
 }
 
-// LV_EVENT_DRAW_MAIN callback: direct copy PSRAM wide buffer → LVGL tile.
-// No rotation — buffer is already in portrait orientation.
-// sx - oa.x1 is correct even when scrolled (oa.x1 goes negative as container scrolls right).
+// LV_EVENT_DRAW_MAIN callback: copy the visible 240px slice of the wide buffer.
+// wana_scroll_x is added to the buffer x offset so the correct portion is shown.
+// Uses memcpy per row for fast PSRAM burst reads instead of per-pixel access.
 static void wana_chart_draw_cb(lv_event_t *e) {
     if (lv_event_get_code(e) != LV_EVENT_DRAW_MAIN) return;
     if (!wana_buf) return;
@@ -28395,13 +28407,26 @@ static void wana_chart_draw_cb(lv_event_t *e) {
     lv_color_t *dst  = (lv_color_t *)draw_ctx->buf;
     lv_color_t  bg   = lv_color_make(8, 8, 22);
     for (lv_coord_t sy = y1; sy <= y2; sy++) {
-        lv_coord_t py = sy - oa.y1;
-        for (lv_coord_t sx = x1; sx <= x2; sx++) {
-            lv_coord_t px = sx - oa.x1;
-            lv_color_t col = (px >= 0 && px < WANA_WIDE_W && py >= 0 && py < WANA_CHART_H)
-                              ? wana_buf[py * WANA_WIDE_W + px] : bg;
-            dst[(sy - ba->y1) * buf_w + (sx - ba->x1)] = col;
+        lv_coord_t py  = sy - oa.y1;
+        lv_color_t *row_dst = dst + (sy - ba->y1) * buf_w + (x1 - ba->x1);
+        if (py < 0 || py >= WANA_CHART_H) {
+            for (lv_coord_t n = 0; n <= x2 - x1; n++) row_dst[n] = bg;
+            continue;
         }
+        lv_coord_t px_start = (x1 - oa.x1) + wana_scroll_x;
+        lv_coord_t px_end   = (x2 - oa.x1) + wana_scroll_x;
+        lv_coord_t valid_s  = px_start < 0 ? 0 : px_start;
+        lv_coord_t valid_e  = px_end >= WANA_WIDE_W ? WANA_WIDE_W - 1 : px_end;
+        // pre-guard (buffer underflow region)
+        lv_coord_t pre = valid_s - px_start;
+        for (lv_coord_t n = 0; n < pre; n++) row_dst[n] = bg;
+        // valid region — single memcpy from PSRAM
+        if (valid_s <= valid_e)
+            memcpy(row_dst + pre, &wana_buf[py * WANA_WIDE_W + valid_s],
+                   (valid_e - valid_s + 1) * sizeof(lv_color_t));
+        // post-guard (buffer overflow region)
+        lv_coord_t post_start = pre + (valid_e - valid_s + 1);
+        for (lv_coord_t n = post_start; n <= x2 - x1; n++) row_dst[n] = bg;
     }
 }
 
@@ -28421,10 +28446,9 @@ static void wana_exit_cb(lv_event_t *e) {
     wana_scroll_paused = false;
     if (wana_scroll_timer) { lv_timer_del(wana_scroll_timer); wana_scroll_timer = NULL; }
     if (wana_ui_timer)     { lv_timer_del(wana_ui_timer);     wana_ui_timer     = NULL; }
-    wana_chart_obj   = NULL;
-    wana_scroll_cont = NULL;
-    wana_status_lbl  = NULL;
-    wana_panel       = NULL;
+    wana_chart_obj  = NULL;
+    wana_status_lbl = NULL;
+    wana_panel      = NULL;
     wana_clear_ssid_labels();
     if (wana_buf) { heap_caps_free(wana_buf); wana_buf = NULL; }
     show_wifi_menu_screen();
@@ -28446,7 +28470,7 @@ static lv_obj_t *wana_make_panel(void) {
 static void wana_swap_panel(void) {
     if (wana_scroll_timer) { lv_timer_del(wana_scroll_timer); wana_scroll_timer = NULL; }
     if (wana_panel && lv_obj_is_valid(wana_panel)) {
-        wana_chart_obj = NULL; wana_scroll_cont = NULL; wana_status_lbl = NULL;
+        wana_chart_obj = NULL; wana_status_lbl = NULL;
         wana_clear_ssid_labels();
         lv_obj_del(wana_panel);
     }
@@ -28657,44 +28681,64 @@ static void show_wana_select_screen(void) {
 
 // ── Chart view ────────────────────────────────────────────────────────────────
 
-// Pause auto-scroll while the user is manually dragging; resume on release.
-static void wana_scroll_event_cb(lv_event_t *e) {
-    lv_event_code_t code = lv_event_get_code(e);
-    if (code == LV_EVENT_SCROLL_BEGIN) wana_scroll_paused = true;
-    else if (code == LV_EVENT_SCROLL_END) wana_scroll_paused = false;
+// Reposition channel labels in viewport coords after wana_scroll_x changes.
+// Called by auto-scroll timer and touch drag handler — cheap (just set_pos + flag).
+static void wana_update_label_positions(void) {
+    for (int i = 0; i < wana_lbl_count; i++) {
+        if (!wana_ssid_lbls[i] || !lv_obj_is_valid(wana_ssid_lbls[i])) continue;
+        int sx = wana_lbl_buf_x[i] - wana_scroll_x;
+        lv_obj_set_pos(wana_ssid_lbls[i], sx, wana_lbl_buf_y[i]);
+        if (sx < -34 || sx > 240)
+            lv_obj_add_flag(wana_ssid_lbls[i], LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_clear_flag(wana_ssid_lbls[i], LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
-// Ping-pong auto-scroll: 2px every 50ms ≈ 40px/s.
+// Ping-pong auto-scroll: 2px every 100ms ≈ 20px/s.
+// Uses lv_obj_invalidate() — does NOT trigger LVGL layout refresh or scroll events,
+// so lv_timer_handler() returns quickly and IDLE gets its WDT reset time.
 static void wana_auto_scroll_timer_cb(lv_timer_t *t) {
     (void)t;
     if (!wana_active || wana_scroll_paused) return;
-    if (!wana_scroll_cont || !lv_obj_is_valid(wana_scroll_cont)) return;
-    lv_coord_t cur  = lv_obj_get_scroll_x(wana_scroll_cont);
-    lv_coord_t maxs = WANA_WIDE_W - 240;
-    lv_coord_t next = cur + wana_scroll_dir * 2;
-    if (next >= maxs) { next = maxs; wana_scroll_dir = -1; }
-    else if (next <= 0) { next = 0;  wana_scroll_dir =  1; }
-    lv_obj_scroll_to_x(wana_scroll_cont, next, LV_ANIM_OFF);
+    if (!wana_chart_obj || !lv_obj_is_valid(wana_chart_obj)) return;
+    wana_scroll_x += wana_scroll_dir * 2;
+    if (wana_scroll_x >= WANA_MAX_SCROLL) { wana_scroll_x = WANA_MAX_SCROLL; wana_scroll_dir = -1; }
+    else if (wana_scroll_x <= 0)          { wana_scroll_x = 0;               wana_scroll_dir =  1; }
+    wana_update_label_positions();
+    lv_obj_invalidate(wana_chart_obj);
 }
 
-// Creates a 240-wide scrollable viewport containing a WANA_WIDE_W-wide chart object.
-static void wana_make_scroll_chart(lv_obj_t *parent, lv_coord_t y_pos) {
-    wana_scroll_cont = lv_obj_create(parent);
-    lv_obj_set_size(wana_scroll_cont, 240, WANA_CHART_H);
-    lv_obj_set_pos(wana_scroll_cont, 0, y_pos);
-    lv_obj_set_style_bg_color(wana_scroll_cont, lv_color_make(8, 8, 22), 0);
-    lv_obj_set_style_bg_opa(wana_scroll_cont, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(wana_scroll_cont, 0, 0);
-    lv_obj_set_style_radius(wana_scroll_cont, 0, 0);
-    lv_obj_set_style_pad_all(wana_scroll_cont, 0, 0);
-    lv_obj_set_scroll_dir(wana_scroll_cont, LV_DIR_HOR);
-    lv_obj_set_scrollbar_mode(wana_scroll_cont, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_add_event_cb(wana_scroll_cont, wana_scroll_event_cb, LV_EVENT_SCROLL_BEGIN, NULL);
-    lv_obj_add_event_cb(wana_scroll_cont, wana_scroll_event_cb, LV_EVENT_SCROLL_END, NULL);
+// Touch drag on the chart object: pause auto-scroll and pan manually.
+static void wana_chart_touch_cb(lv_event_t *e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_PRESSED) {
+        lv_indev_t *indev = lv_indev_get_act();
+        if (!indev) return;
+        lv_point_t pt; lv_indev_get_point(indev, &pt);
+        wana_drag_last_x   = pt.x;
+        wana_scroll_paused = true;
+    } else if (code == LV_EVENT_PRESSING) {
+        lv_indev_t *indev = lv_indev_get_act();
+        if (!indev) return;
+        lv_point_t pt; lv_indev_get_point(indev, &pt);
+        int dx = wana_drag_last_x - pt.x;   // drag left = positive dx = scroll right
+        wana_drag_last_x = pt.x;
+        wana_scroll_x += dx;
+        if (wana_scroll_x < 0)                wana_scroll_x = 0;
+        if (wana_scroll_x > WANA_MAX_SCROLL)  wana_scroll_x = WANA_MAX_SCROLL;
+        wana_update_label_positions();
+        lv_obj_invalidate(wana_chart_obj);
+    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        wana_scroll_paused = false;
+    }
+}
 
-    wana_chart_obj = lv_obj_create(wana_scroll_cont);
-    lv_obj_set_size(wana_chart_obj, WANA_WIDE_W, WANA_CHART_H);
-    lv_obj_set_pos(wana_chart_obj, 0, 0);
+// Creates the 240×CHART_H chart object directly in the panel — no scroll container.
+static void wana_make_chart(lv_obj_t *parent, lv_coord_t y_pos) {
+    wana_chart_obj = lv_obj_create(parent);
+    lv_obj_set_size(wana_chart_obj, 240, WANA_CHART_H);
+    lv_obj_set_pos(wana_chart_obj, 0, y_pos);
     lv_obj_set_style_bg_color(wana_chart_obj, lv_color_make(8, 8, 22), 0);
     lv_obj_set_style_bg_opa(wana_chart_obj, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(wana_chart_obj, 0, 0);
@@ -28702,10 +28746,15 @@ static void wana_make_scroll_chart(lv_obj_t *parent, lv_coord_t y_pos) {
     lv_obj_set_style_pad_all(wana_chart_obj, 0, 0);
     lv_obj_clear_flag(wana_chart_obj, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(wana_chart_obj, wana_chart_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
+    lv_obj_add_event_cb(wana_chart_obj, wana_chart_touch_cb, LV_EVENT_PRESSED,    NULL);
+    lv_obj_add_event_cb(wana_chart_obj, wana_chart_touch_cb, LV_EVENT_PRESSING,   NULL);
+    lv_obj_add_event_cb(wana_chart_obj, wana_chart_touch_cb, LV_EVENT_RELEASED,   NULL);
+    lv_obj_add_event_cb(wana_chart_obj, wana_chart_touch_cb, LV_EVENT_PRESS_LOST, NULL);
 
+    wana_scroll_x      = 0;
     wana_scroll_dir    = 1;
     wana_scroll_paused = false;
-    wana_scroll_timer  = lv_timer_create(wana_auto_scroll_timer_cb, 50, NULL);
+    wana_scroll_timer  = lv_timer_create(wana_auto_scroll_timer_cb, 100, NULL);
 }
 
 static void show_wana_chart_screen(void) {
@@ -28713,8 +28762,8 @@ static void show_wana_chart_screen(void) {
     wana_swap_panel();
     wana_panel = wana_make_panel();
 
-    // Wide scrollable chart (200px tall, auto-scrolling left↔right, touch to pause)
-    wana_make_scroll_chart(wana_panel, 0);
+    // Chart viewport (200px tall, manual wana_scroll_x offset, touch to drag)
+    wana_make_chart(wana_panel, 0);
 
     // Scrolling legend: SSID name + channel list, in group colors (y=202)
     lv_obj_t *leg = lv_label_create(wana_panel);
