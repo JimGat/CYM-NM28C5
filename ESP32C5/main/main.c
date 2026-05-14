@@ -3351,14 +3351,14 @@ static void cal_wait_release(int nx, int ny)
 }
 
 // Calibration target points [screen_x, screen_y]: TL, TR, BL
-// 4 near-corner calibration points: TL, TR, BL, BR.
-// Placed 15 px from each edge — close enough to minimise extrapolation error
-// (~9–15 px to true edge) while still being reliably tappable.
+// 4 corner calibration points: TL, TR, BL, BR.
+// Placed 10 px from each edge — matches Launcher corner-tap approach.
+// Edge touches now register correctly (raw ADC range check removed from xpt2046.c).
 static const int16_t CAL_PTS[4][2] = {
-    { 15,  15},   // 0: Top-Left
-    {225,  15},   // 1: Top-Right
-    { 15, 305},   // 2: Bottom-Left
-    {225, 305},   // 3: Bottom-Right
+    { 10,  10},   // 0: Top-Left
+    {229,  10},   // 1: Top-Right
+    { 10, 309},   // 2: Bottom-Left
+    {229, 309},   // 3: Bottom-Right
 };
 
 static void run_touch_calibration(void)
