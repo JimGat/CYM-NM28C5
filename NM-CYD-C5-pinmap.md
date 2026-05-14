@@ -323,7 +323,9 @@ CS:        GPIO 1 (active LOW, manual or SPI device handle)
 Touch detection (no IRQ):
   1. Assert CS (LOW)
   2. Send 0xB0, read Z1 (16-bit)
-  3. If Z1 > ~400: touch is active
+  3. If Z1 > 200 (XPT2046_Z_THRESHOLD): touch is active
+     NOTE: Do NOT add raw X/Y range checks — edge touches legitimately
+     produce values outside 100–4000. Z1 is the only gate needed.
   4. Send 0xD0, read X (16-bit), extract bits [14:3]
   5. Send 0x90, read Y (16-bit), extract bits [14:3]
   6. Deassert CS (HIGH)
@@ -358,6 +360,9 @@ Touch detection (no IRQ):
 | 2026-05-14 | GPIO 26 (SPEAK_IN) documented: SC8002B class-D amp, BTL speaker header.   |
 |            | v1.3.1: vibrator motor support added via LEDC PWM + diode rectifier circuit|
 |            | (1N5819 series + 1N4148 flyback). See Speaker section for revert details. |
+| 2026-05-14 | v1.3.3: touch calibration upgraded to 4-point (TL/TR/BL/BR at 10 px from  |
+|            | edges). v1.3.4: removed raw ADC range check from xpt2046.c — physical edge |
+|            | reads legitimately exceed 4000; Z1 pressure is the sole touch gate.       |
 
 ---
 
