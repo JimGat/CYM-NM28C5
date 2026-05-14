@@ -1338,6 +1338,7 @@ static int                wana_ssid_count    = 0;
 static lv_color_t   *wscope_buf         = NULL;
 static lv_obj_t     *wscope_canvas      = NULL;
 static lv_obj_t     *wscope_status_lbl  = NULL;
+static lv_obj_t     *wscope_ax_lbl      = NULL;
 static lv_timer_t   *wscope_ui_timer    = NULL;
 static TaskHandle_t  wscope_task_handle = NULL;
 static volatile bool wscope_active      = false;
@@ -28944,7 +28945,7 @@ static void wscope_task(void *p) {
             wscope_ch_cnt[i]  = 0;
             portEXIT_CRITICAL(&wscope_mux);
             esp_wifi_set_channel(chl[i], WIFI_SECOND_CHAN_NONE);
-            vTaskDelay(pdMS_TO_TICKS(120));
+            vTaskDelay(pdMS_TO_TICKS(60));
         }
         wscope_sweep_done = true;
     }
@@ -29033,7 +29034,7 @@ static void wscope_ui_timer_cb(lv_timer_t *t) {
         snprintf(s, sizeof(s), "Ch%u | %s | sweep %.1fs",
                  (ci < nch) ? cl[ci] : 0,
                  wscope_5g_mode ? "5 GHz" : "2.4 GHz",
-                 nch * 0.12f);
+                 nch * 0.06f);
         lv_label_set_text(wscope_status_lbl, s);
     }
 }
@@ -29042,12 +29043,15 @@ static void wscope_band_toggle_cb(lv_event_t *e) {
     lv_obj_t *lbl = (lv_obj_t *)lv_event_get_user_data(e);
     wscope_5g_mode = !wscope_5g_mode;
     if (lbl) lv_label_set_text(lbl, wscope_5g_mode ? "Band: 5 GHz" : "Band: 2.4GHz");
-    // Clear waterfall on band switch
-    if (wscope_buf) {
-        int wf_start = WSCOPE_SPEC_H + 1;
-        memset(wscope_buf + WSCOPE_W * wf_start, 0,
-               WSCOPE_W * WSCOPE_WF_H * sizeof(lv_color_t));
-    }
+    portENTER_CRITICAL(&wscope_mux);
+    for (int i = 0; i < WSCOPE_CH_MAX; i++) { wscope_ch_peak[i] = -110; wscope_ch_cnt[i] = 0; }
+    portEXIT_CRITICAL(&wscope_mux);
+    if (wscope_ax_lbl)
+        lv_label_set_text(wscope_ax_lbl, wscope_5g_mode
+            ? "36-64 | 100-144 | 149-165"
+            : "1    2    3    4    5    6    7    8    9   10   11   12   13");
+    if (wscope_buf)
+        memset(wscope_buf, 0, WSCOPE_W * WSCOPE_CANVAS_H * sizeof(lv_color_t));
 }
 
 static void wscope_exit_cb(lv_event_t *e) {
@@ -29057,6 +29061,7 @@ static void wscope_exit_cb(lv_event_t *e) {
     if (wscope_buf)      { heap_caps_free(wscope_buf);     wscope_buf = NULL; }
     wscope_canvas = NULL;
     wscope_status_lbl = NULL;
+    wscope_ax_lbl = NULL;
     show_wifi_menu_screen();
 }
 
@@ -29094,12 +29099,12 @@ static void show_wscope_screen(void) {
     lv_obj_set_style_text_color(wscope_status_lbl, lv_color_hex(0xAAAAAA), 0);
 
     // Channel axis label (y=250)
-    lv_obj_t *ax = lv_label_create(function_page);
-    lv_obj_set_size(ax, 240, 14);
-    lv_obj_set_pos(ax, 0, cy + 17);
-    lv_label_set_text(ax, "1    2    3    4    5    6    7    8    9   10   11   12   13");
-    lv_obj_set_style_text_font(ax, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(ax, lv_color_hex(0x666666), 0);
+    wscope_ax_lbl = lv_label_create(function_page);
+    lv_obj_set_size(wscope_ax_lbl, 240, 14);
+    lv_obj_set_pos(wscope_ax_lbl, 0, cy + 17);
+    lv_label_set_text(wscope_ax_lbl, "1    2    3    4    5    6    7    8    9   10   11   12   13");
+    lv_obj_set_style_text_font(wscope_ax_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wscope_ax_lbl, lv_color_hex(0x666666), 0);
 
     // Band toggle + Exit (y=266)
     int brow_y = cy + 33;
@@ -29280,7 +29285,13 @@ static void show_blescope_screen(void) {
         .itvl = BLE_GAP_SCAN_ITVL_MS(100),
         .window = BLE_GAP_SCAN_WIN_MS(90),
     };
-    ble_gap_disc(BLE_OWN_ADDR_RANDOM, BLE_HS_FOREVER, &sp, blescope_gap_cb, NULL);
+    ble_gap_disc_cancel();
+    int blescope_rc = ble_gap_disc(BLE_OWN_ADDR_RANDOM, BLE_HS_FOREVER, &sp, blescope_gap_cb, NULL);
+    if (blescope_rc != 0 && blescope_status_lbl) {
+        char err[40];
+        snprintf(err, sizeof(err), "Scan start err %d - check BLE", blescope_rc);
+        lv_label_set_text(blescope_status_lbl, err);
+    }
 
     blescope_ui_timer = lv_timer_create(blescope_ui_timer_cb, 300, NULL);
 }
