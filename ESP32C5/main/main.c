@@ -443,7 +443,7 @@ typedef enum { WD_BAND_BOTH = 0, WD_BAND_24G, WD_BAND_5G } wd_band_t;
 
 // Touch calibration NVS
 #define TOUCH_CAL_NVS_NS      "touch_cal"
-#define TOUCH_CAL_MAGIC       ((uint16_t)0xCA11)
+#define TOUCH_CAL_MAGIC       ((uint16_t)0xCA12)  // bump invalidates old 3-point NVS data
 #define TOUCH_CAL_NULL_RADIUS 250   // raw ADC units — reject within this radius of null point
 
 typedef struct {
@@ -3351,7 +3351,15 @@ static void cal_wait_release(int nx, int ny)
 }
 
 // Calibration target points [screen_x, screen_y]: TL, TR, BL
-static const int16_t CAL_PTS[3][2] = { {20, 20}, {220, 20}, {20, 300} };
+// 4 near-corner calibration points: TL, TR, BL, BR.
+// Placed 15 px from each edge — close enough to minimise extrapolation error
+// (~9–15 px to true edge) while still being reliably tappable.
+static const int16_t CAL_PTS[4][2] = {
+    { 15,  15},   // 0: Top-Left
+    {225,  15},   // 1: Top-Right
+    { 15, 305},   // 2: Bottom-Left
+    {225, 305},   // 3: Bottom-Right
+};
 
 static void run_touch_calibration(void)
 {
@@ -3406,15 +3414,16 @@ static void run_touch_calibration(void)
     int null_y = (nn > 0) ? (int)(nys / nn) : 0;
     ESP_LOGI(TAG, "Null zone raw=(%d,%d) n=%d", null_x, null_y, nn);
 
-    // Steps 1–3: collect 3 calibration points
-    uint16_t raw_x[3], raw_y[3];
-    const char *pt_lbl[3] = {
-        "Touch the [+]\nTop-Left  (1/3)",
-        "Touch the [+]\nTop-Right (2/3)",
-        "Touch the [+]\nBottom-Left (3/3)"
+    // Steps 1–4: collect 4 near-corner calibration points (TL, TR, BL, BR)
+    uint16_t raw_x[4], raw_y[4];
+    const char *pt_lbl[4] = {
+        "Touch the [+]\nTop-Left     (1/4)",
+        "Touch the [+]\nTop-Right    (2/4)",
+        "Touch the [+]\nBottom-Left  (3/4)",
+        "Touch the [+]\nBottom-Right (4/4)",
     };
 
-    for (int pt = 0; pt < 3; pt++) {
+    for (int pt = 0; pt < 4; pt++) {
         int tx = CAL_PTS[pt][0], ty = CAL_PTS[pt][1];
         lv_obj_set_pos(hbar, tx - 16, ty - 1);
         lv_obj_set_pos(vbar, tx - 1,  ty - 16);
@@ -3427,20 +3436,33 @@ static void run_touch_calibration(void)
 
         if (!cal_wait_touch(null_x, null_y, &raw_x[pt], &raw_y[pt], 15000)) {
             ESP_LOGW(TAG, "Calibration timeout at point %d — aborting", pt + 1);
-            lv_obj_clean(scr);  // strip cal widgets; scr stays active for create_home_ui
+            lv_obj_clean(scr);
             return;
         }
-        ESP_LOGI(TAG, "Cal[%d] screen(%d,%d) → raw(%u,%u)", pt+1, tx, ty, raw_x[pt], raw_y[pt]);
+        ESP_LOGI(TAG, "Cal[%d] screen(%d,%d) -> raw(%u,%u)", pt+1, tx, ty, raw_x[pt], raw_y[pt]);
     }
 
-    // Derive calibration from two X points (TL,TR) and two Y points (TL,BL)
-    float xscale = (float)((int)raw_x[1] - (int)raw_x[0]) / (CAL_PTS[1][0] - CAL_PTS[0][0]);
-    int x_at_0   = (int)raw_x[0] - (int)(CAL_PTS[0][0] * xscale);
-    int x_at_239 = (int)raw_x[1] + (int)((LV_HOR_RES - 1 - CAL_PTS[1][0]) * xscale);
+    // 4-point calibration: average X scale from top pair (TL,TR) and bottom pair (BL,BR),
+    // average Y scale from left pair (TL,BL) and right pair (TR,BR).
+    // This halves the sensitivity to noise at any single point and gives independent
+    // verification of both axes — same principle as Launcher's calibration.
+    float xscale_top = (float)((int)raw_x[1] - (int)raw_x[0]) / (CAL_PTS[1][0] - CAL_PTS[0][0]);
+    float xscale_bot = (float)((int)raw_x[3] - (int)raw_x[2]) / (CAL_PTS[3][0] - CAL_PTS[2][0]);
+    float xscale     = (xscale_top + xscale_bot) / 2.0f;
 
-    float yscale = (float)((int)raw_y[2] - (int)raw_y[0]) / (CAL_PTS[2][1] - CAL_PTS[0][1]);
-    int y_at_0   = (int)raw_y[0] - (int)(CAL_PTS[0][1] * yscale);
-    int y_at_319 = (int)raw_y[2] + (int)((LV_VER_RES - 1 - CAL_PTS[2][1]) * yscale);
+    int x_at_0   = ((int)raw_x[0] - (int)(CAL_PTS[0][0] * xscale) +
+                    (int)raw_x[2] - (int)(CAL_PTS[2][0] * xscale)) / 2;
+    int x_at_239 = ((int)raw_x[1] + (int)((LV_HOR_RES - 1 - CAL_PTS[1][0]) * xscale) +
+                    (int)raw_x[3] + (int)((LV_HOR_RES - 1 - CAL_PTS[3][0]) * xscale)) / 2;
+
+    float yscale_left  = (float)((int)raw_y[2] - (int)raw_y[0]) / (CAL_PTS[2][1] - CAL_PTS[0][1]);
+    float yscale_right = (float)((int)raw_y[3] - (int)raw_y[1]) / (CAL_PTS[3][1] - CAL_PTS[1][1]);
+    float yscale       = (yscale_left + yscale_right) / 2.0f;
+
+    int y_at_0   = ((int)raw_y[0] - (int)(CAL_PTS[0][1] * yscale) +
+                    (int)raw_y[1] - (int)(CAL_PTS[1][1] * yscale)) / 2;
+    int y_at_319 = ((int)raw_y[2] + (int)((LV_VER_RES - 1 - CAL_PTS[2][1]) * yscale) +
+                    (int)raw_y[3] + (int)((LV_VER_RES - 1 - CAL_PTS[3][1]) * yscale)) / 2;
 
     touch_cal_t cal;
     cal.invert_x = (uint8_t)(x_at_0 > x_at_239);
