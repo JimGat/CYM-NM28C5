@@ -24,6 +24,8 @@
 | **SD Card**        | MicroSD slot                             | SPI (shared)   |
 | **USB**            | 2× USB-C (CH340 UART + Native USB 2.0)  | —              |
 | **RGB LED**        | Onboard WS2812 (IO27, module pin 18)     | GPIO / RMT     |
+| **Audio Amp**      | SC8002B class-D mono amp (U5)            | GPIO (SPEAK_IN)|
+| **Speaker Header** | 2-pin HCZZ0015-2 (VO1/VO2 BTL output)   | SC8002B output |
 | **Operating Temp** | −20°C to +70°C                          | —              |
 
 > The NM-CYD-C5 is **fully dimensionally and interface-compatible** with the ESP32-2432S028 (standard CYD), enabling drop-in replacement.
@@ -97,14 +99,45 @@ All pins confirmed from `User_Setup-NM-CYD-C5.h` and the official README pinout 
 | 3   | **8** | I2C SCL (IO8)      |
 | 4   | GND   | Ground             |
 
+### Speaker / Audio Amplifier (SC8002B — U5)
+
+The SC8002B is a class-D mono amplifier powered from 3.3 V. Its input (`SPEAK_IN`) is driven
+by **GPIO 26** via a 4.7 kΩ series resistor. The amplifier's differential BTL output (VO1/VO2)
+connects to the 2-pin `SPEAK` header (HCZZ0015-2). The SHUTDOWN pin is tied to 3.3 V — the amp
+is always powered; GPIO 26 LOW = silent.
+
+| Signal    | GPIO / Net | Notes                                              |
+|-----------|------------|----------------------------------------------------|
+| SPEAK_IN  | **26**     | Amp input — 4.7 kΩ series resistor to U5 pin 3    |
+| VO1       | SPEAK pin 1| BTL output + (not ground-referenced)               |
+| VO2       | SPEAK pin 2| BTL output − (not ground-referenced)               |
+| SHUTDOWN  | 3.3 V      | Always-on — no software shutdown                   |
+
+**Driving a vibrator motor from the SPEAK header (v1.3.1):**  
+A micro ERM vibrator motor can be connected to the SPEAK header with two diodes:
+- **D1** — 1N5819 Schottky in series (anode → VO1, cathode → Motor +): half-wave rectifies
+  the BTL output to give unidirectional current to the motor.
+- **D2** — 1N4148 flyback across the motor (cathode toward Motor +): suppresses back-EMF.
+
+GPIO 26 is driven by LEDC PWM at 150 Hz / 50% duty (`VIBRATOR_LEDC_CH = LEDC_CHANNEL_4`,
+`VIBRATOR_LEDC_TIMER = LEDC_TIMER_2`). Public API: `vibrator_on()`, `vibrator_off()`,
+`vibrator_pulse(ms)`. Test tile: Settings → Vibrator Test.
+
+> **Revert note (v1.3.1):** If the vibrator is removed, delete the diode circuit, remove
+> `#include "driver/ledc.h"`, the `VIBRATOR_*` defines, the vibrator driver block
+> (`vibrator_init/on/off/pulse`), the `show_vibrator_test_popup` block and its statics,
+> the "Vibrator Test" `create_tile` call in `show_settings_screen`, the matching
+> `settings_tile_event_cb` branch, the forward declarations, and remove `esp_driver_ledc`
+> from `main/CMakeLists.txt` PRIV_REQUIRES.
+
 ### Expansion Header — P1
 
-| Pin | GPIO   | Notes   |
-|-----|--------|---------|
-| 1   | **4**  | IO4     |
-| 2   | **8**  | IO8     |
-| 3   | **26** | IO26    |
-| 4   | GND    | Ground  |
+| Pin | GPIO   | Notes                             |
+|-----|--------|-----------------------------------|
+| 1   | **4**  | IO4 (also GPS RX)                 |
+| 2   | **8**  | IO8 (also I2C SCL)                |
+| 3   | **26** | IO26 — SPEAK_IN (SC8002B amp in)  |
+| 4   | GND    | Ground                            |
 
 ### FPC2 — 12-Pin FPC Interface
 
@@ -144,7 +177,7 @@ All pins confirmed from `User_Setup-NM-CYD-C5.h` and the official README pinout 
 | 23   | Display CS (ST7789)   | Output | SPI        | Active LOW                           |
 | 24   | Display DC (ST7789)   | Output | GPIO       | Data/Command select                  |
 | 25   | Display Backlight     | Output | GPIO/PWM   | HIGH = ON; ⚠️ strapping pin at boot  |
-| 26   | P1 Expansion pin 3    | I/O    | GPIO       | P1 header                            |
+| 26   | SPEAK_IN / P1 pin 3   | Output | LEDC PWM   | SC8002B amp input; vibrator motor (v1.3.1) |
 | 27   | RGB LED (WS2812)      | Output | RMT/GPIO   | Module pin 18 on ESP32-C5-WROOM-1    |
 | 28   | (strapping pin)       | —      | —          | ⚠️ Avoid using as output             |
 
@@ -322,6 +355,9 @@ Touch detection (no IRQ):
 |            | SD card, ST7789 display, XPT2046 touch (Z1 threshold 400 works), WS2812  |
 |            | LED via RMT driver (GPIO 27). Battery ADC permanently disabled (GPIO 6    |
 |            | conflict with SPI SCK). GPS UART wired (GPIO 4/5), no module attached yet.|
+| 2026-05-14 | GPIO 26 (SPEAK_IN) documented: SC8002B class-D amp, BTL speaker header.   |
+|            | v1.3.1: vibrator motor support added via LEDC PWM + diode rectifier circuit|
+|            | (1N5819 series + 1N4148 flyback). See Speaker section for revert details. |
 
 ---
 
