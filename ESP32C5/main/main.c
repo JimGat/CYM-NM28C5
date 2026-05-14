@@ -3370,6 +3370,7 @@ static void run_touch_calibration(void)
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(scr, 0, 0);
     lv_obj_set_style_pad_all(scr, 0, 0);
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *lbl = lv_label_create(scr);
     lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
@@ -11829,6 +11830,7 @@ static void create_function_page_base(const char *name)
     lv_obj_set_style_border_width(function_page, 0, 0);
     lv_obj_set_style_radius(function_page, 0, 0);
     lv_obj_set_style_pad_all(function_page, 0, 0);
+    lv_obj_clear_flag(function_page, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *page_title_bar = lv_obj_create(function_page);
     lv_obj_set_size(page_title_bar, lv_pct(100), 30);
@@ -18610,6 +18612,7 @@ static void show_settings_screen(void)
     lv_obj_set_style_pad_gap(tiles, 4, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
 
     create_tile(tiles, LV_SYMBOL_EYE_OPEN,       "Compromised\nData",  COLOR_TILE_BLUE,         settings_tile_event_cb, "Compromised Data");
     create_tile(tiles, LV_SYMBOL_LOOP,           "Timing",             COLOR_MATERIAL_PURPLE,   settings_tile_event_cb, "Timing");
