@@ -64,6 +64,9 @@ LV_IMG_DECLARE(deedee_img);
 // GPS
 #include "driver/uart.h"
 
+// Vibrator motor (LEDC PWM on GPIO26 → SC8002B amp)
+#include "driver/ledc.h"
+
 // ADC for battery voltage monitoring
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
@@ -240,6 +243,16 @@ static void (*s_ble_disc_return_fn)(void) = NULL;
 #define LCD_H_RES 240
 #define LCD_V_RES 320
 #define LCD_HOST SPI2_HOST
+
+// Vibrator motor — GPIO26 → SC8002B amp (SPEAK_IN). LEDC PWM drives the amp
+// input; a Schottky diode + flyback diode on the speaker header rectify the BTL
+// output to give pulsed DC to the motor.
+#define VIBRATOR_GPIO        26
+#define VIBRATOR_LEDC_TIMER  LEDC_TIMER_2
+#define VIBRATOR_LEDC_CH     LEDC_CHANNEL_4
+#define VIBRATOR_FREQ_HZ     150              // 150 Hz — clear haptic buzz
+#define VIBRATOR_RESOLUTION  LEDC_TIMER_8_BIT // 0–255 duty range
+#define VIBRATOR_DUTY_ON     128              // 50 % duty = full drive through diode
 
 // Battery ADC configuration - Waveshare ESP32-C5-WIFI6-KIT (DISABLED - using regular C5 chip)
 // Schematic: R10=200k, R16=100k voltage divider on BAT_ADC line
@@ -1584,6 +1597,11 @@ static void attack_tile_event_cb(lv_event_t *e);
 static void update_sniffer_button_ui(void);
 static void show_settings_screen(void);
 static void settings_tile_event_cb(lv_event_t *e);
+static void show_vibrator_test_popup(void);
+void vibrator_on(void);
+void vibrator_off(void);
+void vibrator_pulse(uint32_t duration_ms);
+bool vibrator_is_active(void);
 static void show_sd_card_screen(void);
 static void show_gps_info_screen(void);
 static void show_found_tags_screen(void);
@@ -18258,6 +18276,137 @@ static void show_screen_popup(void)
 }
 
 // ============================================================================
+// Vibrator Test Popup
+// ============================================================================
+
+static lv_obj_t *vibtest_popup  = NULL;
+static lv_obj_t *vibtest_on_btn = NULL;
+static lv_obj_t *vibtest_off_btn = NULL;
+static lv_obj_t *vibtest_status_lbl = NULL;
+
+static void vibtest_refresh(void)
+{
+    if (!vibtest_on_btn || !vibtest_off_btn || !vibtest_status_lbl) return;
+    bool active = vibrator_is_active();
+    lv_obj_set_style_bg_color(vibtest_on_btn,  active ? lv_color_hex(0x2E7D32)    : lv_color_make(80, 80, 80), 0);
+    lv_obj_set_style_bg_color(vibtest_off_btn, active ? lv_color_make(80, 80, 80) : COLOR_MATERIAL_RED, 0);
+    lv_label_set_text(vibtest_status_lbl, active ? LV_SYMBOL_AUDIO " Vibrating" : LV_SYMBOL_STOP " Stopped");
+    lv_obj_set_style_text_color(vibtest_status_lbl,
+        active ? lv_color_hex(0x4CAF50) : ui_muted_color(), 0);
+}
+
+static void vibtest_on_cb(lv_event_t *e)
+{
+    (void)e;
+    vibrator_on();
+    vibtest_refresh();
+}
+
+static void vibtest_off_cb(lv_event_t *e)
+{
+    (void)e;
+    vibrator_off();
+    vibtest_refresh();
+}
+
+static void vibtest_close_cb(lv_event_t *e)
+{
+    (void)e;
+    vibrator_off();
+    if (vibtest_popup) {
+        lv_obj_del(vibtest_popup);
+        vibtest_popup      = NULL;
+        vibtest_on_btn     = NULL;
+        vibtest_off_btn    = NULL;
+        vibtest_status_lbl = NULL;
+    }
+}
+
+static void show_vibrator_test_popup(void)
+{
+    if (vibtest_popup) return;
+
+    vibtest_popup = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(vibtest_popup, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(vibtest_popup, 0, 0);
+    lv_obj_set_style_bg_color(vibtest_popup, ui_bg_color(), 0);
+    lv_obj_set_style_bg_opa(vibtest_popup, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(vibtest_popup, 0, 0);
+    lv_obj_set_style_radius(vibtest_popup, 0, 0);
+    lv_obj_clear_flag(vibtest_popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *dialog = lv_obj_create(vibtest_popup);
+    lv_obj_set_size(dialog, 210, 205);
+    lv_obj_center(dialog);
+    lv_obj_set_style_bg_color(dialog, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(dialog, lv_color_hex(0x9C27B0), 0);
+    lv_obj_set_style_border_width(dialog, 2, 0);
+    lv_obj_set_style_radius(dialog, 12, 0);
+    lv_obj_clear_flag(dialog, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(dialog, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(dialog, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(dialog, 14, 0);
+    lv_obj_set_style_pad_gap(dialog, 10, 0);
+
+    lv_obj_t *title = lv_label_create(dialog);
+    lv_label_set_text(title, LV_SYMBOL_AUDIO " Vibrator Test");
+    lv_obj_set_style_text_color(title, ui_text_color(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+
+    lv_obj_t *sub = lv_label_create(dialog);
+    lv_label_set_text(sub, "GPIO26 \xe2\x86\x92 SC8002B amp");
+    lv_obj_set_style_text_color(sub, ui_muted_color(), 0);
+    lv_obj_set_style_text_font(sub, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_align(sub, LV_TEXT_ALIGN_CENTER, 0);
+
+    vibtest_status_lbl = lv_label_create(dialog);
+    lv_obj_set_style_text_font(vibtest_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_align(vibtest_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *btn_row = lv_obj_create(dialog);
+    lv_obj_set_size(btn_row, 175, 44);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    vibtest_on_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(vibtest_on_btn, 82, 38);
+    lv_obj_set_style_radius(vibtest_on_btn, 8, 0);
+    lv_obj_t *onl = lv_label_create(vibtest_on_btn);
+    lv_label_set_text(onl, "ON");
+    lv_obj_set_style_text_font(onl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(onl, ui_text_color(), 0);
+    lv_obj_center(onl);
+    lv_obj_add_event_cb(vibtest_on_btn, vibtest_on_cb, LV_EVENT_CLICKED, NULL);
+
+    vibtest_off_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(vibtest_off_btn, 82, 38);
+    lv_obj_set_style_radius(vibtest_off_btn, 8, 0);
+    lv_obj_t *offl = lv_label_create(vibtest_off_btn);
+    lv_label_set_text(offl, "OFF");
+    lv_obj_set_style_text_font(offl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(offl, ui_text_color(), 0);
+    lv_obj_center(offl);
+    lv_obj_add_event_cb(vibtest_off_btn, vibtest_off_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *close_btn = lv_btn_create(dialog);
+    lv_obj_set_size(close_btn, 80, 30);
+    lv_obj_set_style_bg_color(close_btn, lv_color_make(80, 80, 80), 0);
+    lv_obj_set_style_radius(close_btn, 8, 0);
+    lv_obj_t *cl = lv_label_create(close_btn);
+    lv_label_set_text(cl, "Close");
+    lv_obj_set_style_text_font(cl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(cl, ui_text_color(), 0);
+    lv_obj_center(cl);
+    lv_obj_add_event_cb(close_btn, vibtest_close_cb, LV_EVENT_CLICKED, NULL);
+
+    vibtest_refresh();
+}
+
+// ============================================================================
 // Power Mode Popup
 // ============================================================================
 
@@ -18418,6 +18567,8 @@ static void settings_tile_event_cb(lv_event_t *e)
         show_gps_info_screen();
     } else if (strcmp(tile_name, "Power Mode") == 0) {
         show_power_mode_popup();
+    } else if (strcmp(tile_name, "Vibrator Test") == 0) {
+        show_vibrator_test_popup();
     }
 }
 
@@ -18446,6 +18597,7 @@ static void show_settings_screen(void)
     create_tile(tiles, MY_SYMBOL_SATELLITE_DISH, "GPS\nInfo",          lv_color_hex(0x00BCD4),  settings_tile_event_cb, "GPS Info");
     create_tile(tiles, LV_SYMBOL_CHARGE,         "Power\nMode",        COLOR_MATERIAL_RED,      settings_tile_event_cb, "Power Mode");
     create_tile(tiles, LV_SYMBOL_UPLOAD,         "Data\nTransfer",     lv_color_hex(0xE91E63),  settings_tile_event_cb, "Data Transfer");
+    create_tile(tiles, LV_SYMBOL_AUDIO,          "Vibrator\nTest",     lv_color_hex(0x9C27B0),  settings_tile_event_cb, "Vibrator Test");
 
     lv_obj_t *ver = lv_label_create(function_page);
     lv_label_set_text(ver, "LAB5 " FW_VERSION);
@@ -26075,6 +26227,95 @@ static void gps_task(void *arg)
 		}
 		vTaskDelay(pdMS_TO_TICKS(100));
 	}
+}
+
+// ============================================================================
+// Vibrator Motor Driver
+// ============================================================================
+
+static bool g_vibrator_initialized  = false;
+static bool g_vibrator_active       = false;
+static esp_timer_handle_t g_vibrator_pulse_timer = NULL;
+
+static esp_err_t vibrator_init(void)
+{
+    if (g_vibrator_initialized) return ESP_OK;
+
+    ledc_timer_config_t timer = {
+        .speed_mode      = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = VIBRATOR_RESOLUTION,
+        .timer_num       = VIBRATOR_LEDC_TIMER,
+        .freq_hz         = VIBRATOR_FREQ_HZ,
+        .clk_cfg         = LEDC_AUTO_CLK,
+    };
+    esp_err_t ret = ledc_timer_config(&timer);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Vibrator: ledc_timer_config failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ledc_channel_config_t ch = {
+        .gpio_num   = VIBRATOR_GPIO,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel    = VIBRATOR_LEDC_CH,
+        .timer_sel  = VIBRATOR_LEDC_TIMER,
+        .duty       = 0,
+        .hpoint     = 0,
+    };
+    ret = ledc_channel_config(&ch);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Vibrator: ledc_channel_config failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    g_vibrator_initialized = true;
+    ESP_LOGI(TAG, "Vibrator: initialized on GPIO%d at %d Hz", VIBRATOR_GPIO, VIBRATOR_FREQ_HZ);
+    return ESP_OK;
+}
+
+// Start the vibrator. Safe to call repeatedly.
+void vibrator_on(void)
+{
+    if (vibrator_init() != ESP_OK) return;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, VIBRATOR_LEDC_CH, VIBRATOR_DUTY_ON);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, VIBRATOR_LEDC_CH);
+    g_vibrator_active = true;
+}
+
+// Stop the vibrator. Safe to call when already off.
+void vibrator_off(void)
+{
+    if (!g_vibrator_initialized) return;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, VIBRATOR_LEDC_CH, 0);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, VIBRATOR_LEDC_CH);
+    g_vibrator_active = false;
+}
+
+bool vibrator_is_active(void)
+{
+    return g_vibrator_active;
+}
+
+static void vibrator_pulse_timer_cb(void *arg)
+{
+    (void)arg;
+    vibrator_off();
+}
+
+// Vibrate for duration_ms milliseconds then stop automatically. Non-blocking.
+void vibrator_pulse(uint32_t duration_ms)
+{
+    if (vibrator_init() != ESP_OK) return;
+    if (!g_vibrator_pulse_timer) {
+        const esp_timer_create_args_t args = {
+            .callback = vibrator_pulse_timer_cb,
+            .name     = "vib_pulse",
+        };
+        esp_timer_create(&args, &g_vibrator_pulse_timer);
+    }
+    esp_timer_stop(g_vibrator_pulse_timer);   // cancel any pending pulse
+    vibrator_on();
+    esp_timer_start_once(g_vibrator_pulse_timer, (uint64_t)duration_ms * 1000ULL);
 }
 
 // === BATTERY VOLTAGE MONITOR IMPLEMENTATION ===
