@@ -504,6 +504,7 @@ static gps_data_t g_gps_last_known = {0};  // persists across GPS dropouts; load
 // Set by GPS task when a new valid fix arrives; main loop calls nvs_save_last_gps() from
 // main-task context to avoid nvs_commit() disabling flash cache in a background task.
 static volatile bool g_gps_save_pending = false;
+static volatile bool g_gps_force_save_pending = false; // set on lock loss; bypasses 5-min throttle
 
 // Returns the best available GPS reading: live if valid, last-known (stale) if not.
 // Callers that write location data should always use this instead of current_gps directly.
@@ -6211,7 +6212,11 @@ void app_main(void)
         // Flush GPS position to NVS from main-task context (throttled inside the function).
         // nvs_commit() briefly disables the flash cache; calling it from a background task
         // (gps_task) while the panic handler is in flash causes CPU_LOCKUP — do it here instead.
-        if (g_gps_save_pending) {
+        if (g_gps_force_save_pending) {
+            g_gps_force_save_pending = false;
+            g_gps_save_pending = false;
+            nvs_save_last_gps_force(&g_gps_last_known, true);
+        } else if (g_gps_save_pending) {
             g_gps_save_pending = false;
             nvs_save_last_gps(&g_gps_last_known);
         }
@@ -26012,6 +26017,11 @@ static bool parse_gps_nmea(const char *nmea_sentence)
 			}
 			token = strtok_r(NULL, ",", &sp);
 			field++;
+		}
+
+		if (status == 'V' && current_gps.valid) {
+			current_gps.valid = false;
+			g_gps_force_save_pending = true; // force NVS save of last-known on lock loss
 		}
 
 		if (status == 'A' && yr > 0) {
