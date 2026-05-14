@@ -443,7 +443,7 @@ typedef enum { WD_BAND_BOTH = 0, WD_BAND_24G, WD_BAND_5G } wd_band_t;
 
 // Touch calibration NVS
 #define TOUCH_CAL_NVS_NS      "touch_cal"
-#define TOUCH_CAL_MAGIC       ((uint16_t)0xCA12)  // bump invalidates old 3-point NVS data
+#define TOUCH_CAL_MAGIC       ((uint16_t)0xCA13)  // bump: corner-avg approach replaces extrapolation
 #define TOUCH_CAL_NULL_RADIUS 250   // raw ADC units — reject within this radius of null point
 
 typedef struct {
@@ -3317,24 +3317,31 @@ static bool cal_in_null(int x, int y, int nx, int ny)
     return (dx * dx + dy * dy) < (TOUCH_CAL_NULL_RADIUS * TOUCH_CAL_NULL_RADIUS);
 }
 
-// Wait for 8 consecutive stable reads not in the null zone; timeout_ms = 0 → wait forever
+// Wait for first valid touch not in the null zone, then average 8 samples (~160 ms).
+// No stability window: resistive panels produce noisier readings near the physical edge;
+// a tight consecutive-stable check causes the user to drift inward to find a quieter spot,
+// recording the wrong raw value. Simple averaging matches the Launcher approach.
 static bool cal_wait_touch(int nx, int ny, uint16_t *rx, uint16_t *ry, int timeout_ms)
 {
     int64_t t0 = esp_timer_get_time() / 1000;
-    uint16_t lx = 0, ly = 0;
-    int stable = 0;
     for (;;) {
         cal_tick();
         if (timeout_ms > 0 && (esp_timer_get_time() / 1000 - t0) > timeout_ms) return false;
         uint16_t x, y;
-        if (!xpt2046_read_raw_point(&touch_handle, &x, &y) || cal_in_null(x, y, nx, ny)) {
-            stable = 0; lx = ly = 0;
-            continue;
+        if (!xpt2046_read_raw_point(&touch_handle, &x, &y) || cal_in_null(x, y, nx, ny)) continue;
+        // First valid touch — collect 7 more samples at 20 ms intervals and average all 8
+        uint32_t sx = x, sy = y;
+        int n = 1;
+        for (int i = 0; i < 7; i++) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            uint16_t ax, ay;
+            if (xpt2046_read_raw_point(&touch_handle, &ax, &ay) && !cal_in_null(ax, ay, nx, ny)) {
+                sx += ax; sy += ay; n++;
+            }
         }
-        if (lx > 0 && abs((int)x - (int)lx) < 80 && abs((int)y - (int)ly) < 80) {
-            if (++stable >= 8) { *rx = x; *ry = y; return true; }
-        } else { stable = 1; }
-        lx = x; ly = y;
+        *rx = (uint16_t)(sx / n);
+        *ry = (uint16_t)(sy / n);
+        return true;
     }
 }
 
@@ -3350,15 +3357,14 @@ static void cal_wait_release(int nx, int ny)
     }
 }
 
-// Calibration target points [screen_x, screen_y]: TL, TR, BL
-// 4 corner calibration points: TL, TR, BL, BR.
-// Placed 10 px from each edge — matches Launcher corner-tap approach.
-// Edge touches now register correctly (raw ADC range check removed from xpt2046.c).
+// Calibration target points [screen_x, screen_y]: TL, TR, BL, BR.
+// 16 px from each edge keeps the 32px crosshair fully on-screen.
+// Raw values recorded here are used directly as min/max — no extrapolation.
 static const int16_t CAL_PTS[4][2] = {
-    { 10,  10},   // 0: Top-Left
-    {229,  10},   // 1: Top-Right
-    { 10, 309},   // 2: Bottom-Left
-    {229, 309},   // 3: Bottom-Right
+    { 16,  16},   // 0: Top-Left
+    {223,  16},   // 1: Top-Right
+    { 16, 303},   // 2: Bottom-Left
+    {223, 303},   // 3: Bottom-Right
 };
 
 static void run_touch_calibration(void)
@@ -3443,35 +3449,23 @@ static void run_touch_calibration(void)
         ESP_LOGI(TAG, "Cal[%d] screen(%d,%d) -> raw(%u,%u)", pt+1, tx, ty, raw_x[pt], raw_y[pt]);
     }
 
-    // 4-point calibration: average X scale from top pair (TL,TR) and bottom pair (BL,BR),
-    // average Y scale from left pair (TL,BL) and right pair (TR,BR).
-    // This halves the sensitivity to noise at any single point and gives independent
-    // verification of both axes — same principle as Launcher's calibration.
-    float xscale_top = (float)((int)raw_x[1] - (int)raw_x[0]) / (CAL_PTS[1][0] - CAL_PTS[0][0]);
-    float xscale_bot = (float)((int)raw_x[3] - (int)raw_x[2]) / (CAL_PTS[3][0] - CAL_PTS[2][0]);
-    float xscale     = (xscale_top + xscale_bot) / 2.0f;
-
-    int x_at_0   = ((int)raw_x[0] - (int)(CAL_PTS[0][0] * xscale) +
-                    (int)raw_x[2] - (int)(CAL_PTS[2][0] * xscale)) / 2;
-    int x_at_239 = ((int)raw_x[1] + (int)((LV_HOR_RES - 1 - CAL_PTS[1][0]) * xscale) +
-                    (int)raw_x[3] + (int)((LV_HOR_RES - 1 - CAL_PTS[3][0]) * xscale)) / 2;
-
-    float yscale_left  = (float)((int)raw_y[2] - (int)raw_y[0]) / (CAL_PTS[2][1] - CAL_PTS[0][1]);
-    float yscale_right = (float)((int)raw_y[3] - (int)raw_y[1]) / (CAL_PTS[3][1] - CAL_PTS[1][1]);
-    float yscale       = (yscale_left + yscale_right) / 2.0f;
-
-    int y_at_0   = ((int)raw_y[0] - (int)(CAL_PTS[0][1] * yscale) +
-                    (int)raw_y[1] - (int)(CAL_PTS[1][1] * yscale)) / 2;
-    int y_at_319 = ((int)raw_y[2] + (int)((LV_VER_RES - 1 - CAL_PTS[2][1]) * yscale) +
-                    (int)raw_y[3] + (int)((LV_VER_RES - 1 - CAL_PTS[3][1]) * yscale)) / 2;
+    // Use column/row averages directly as the calibration range — no extrapolation.
+    // Extrapolation amplifies noise from edge-of-panel ADC instability; the Launcher
+    // uses this same min/max-of-corners approach and calibrates the full screen reliably.
+    // xpt2046_map clamps raw values outside [x_min, x_max] to the screen edge, so the
+    // 16px margin between the crosshair and the physical edge maps cleanly to screen 0/239.
+    int x_left  = ((int)raw_x[0] + (int)raw_x[2]) / 2;  // TL+BL column average
+    int x_right = ((int)raw_x[1] + (int)raw_x[3]) / 2;  // TR+BR column average
+    int y_top   = ((int)raw_y[0] + (int)raw_y[1]) / 2;  // TL+TR row average
+    int y_bot   = ((int)raw_y[2] + (int)raw_y[3]) / 2;  // BL+BR row average
 
     touch_cal_t cal;
-    cal.invert_x = (uint8_t)(x_at_0 > x_at_239);
-    cal.x_min    = (int32_t)(cal.invert_x ? x_at_239 : x_at_0);
-    cal.x_max    = (int32_t)(cal.invert_x ? x_at_0   : x_at_239);
-    cal.invert_y = (uint8_t)(y_at_0 > y_at_319);
-    cal.y_min    = (int32_t)(cal.invert_y ? y_at_319 : y_at_0);
-    cal.y_max    = (int32_t)(cal.invert_y ? y_at_0   : y_at_319);
+    cal.invert_x = (uint8_t)(x_left > x_right);
+    cal.x_min    = (int32_t)(cal.invert_x ? x_right : x_left);
+    cal.x_max    = (int32_t)(cal.invert_x ? x_left  : x_right);
+    cal.invert_y = (uint8_t)(y_top > y_bot);
+    cal.y_min    = (int32_t)(cal.invert_y ? y_bot : y_top);
+    cal.y_max    = (int32_t)(cal.invert_y ? y_top : y_bot);
     cal.swap_xy  = 0;
     cal.null_x   = (int32_t)null_x;
     cal.null_y   = (int32_t)null_y;
