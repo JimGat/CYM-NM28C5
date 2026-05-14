@@ -1,6 +1,42 @@
 # CYM-NM28C5 Pre-built Firmware Binaries
 
-**Firmware version: v1.2.14**
+**Firmware version: v1.3.0**
+
+---
+
+## Release Notes — v1.3.0
+
+### Chanalizer — Wide Auto-Scrolling WiFi Channel Map
+
+The WiFi Analyzer has been renamed **Chanalizer** and completely rewritten as a wide portrait-mode channel visualization tool.
+
+- **520 px wide canvas** displays 2.4 GHz (ch 1–13) and 5 GHz (ch 36–165) side-by-side in a single portrait view — no device rotation required.
+- **Auto-scroll:** The 240 px viewport pans left/right automatically, bouncing at each end so the full band is always visible.
+- **Touch drag:** Tap and hold to pause auto-scroll; drag to scrub to any position; release to resume. No task watchdog issues — scroll is implemented via a manual pixel offset in the draw callback (`lv_obj_invalidate`) rather than LVGL's scroll container, which was causing WDT crashes at ~172 s.
+- **SSID group color coding:** Up to 8 color-coded SSID groups with a legend panel below the chart.
+- **Channel annotations:** Channel numbers drawn at correct pixel positions on the x-axis.
+
+### WiFi Band Scope — Band Switch Fix + 2× Faster Sweep
+
+- **Band toggle now works:** Switching 2.4 ↔ 5 GHz resets peak arrays under critical section, clears the full canvas, and updates the channel axis label. Previously stale 2.4 GHz bars persisted into 5 GHz view.
+- **Axis label updates on toggle:** 2.4 GHz shows `1 2 3...13`; 5 GHz shows `36-64 | 100-144 | 149-165` band groups.
+- **Dwell reduced 120 ms → 60 ms:** Full 2.4 GHz sweep now takes ~0.8 s (was 1.6 s); 5 GHz ~1.5 s (was 3.0 s). No loss of measurement quality.
+
+### BLE Band Scope — Scan Start Fix
+
+- `ble_gap_disc_cancel()` now called before `ble_gap_disc()` on entry, preventing a silent `EALREADY` failure if a prior BLE scan (BT Lookout, BT Observer) was still active. Scan start errors are surfaced in the status label.
+
+### BLE Spam — Sour Apple Mode
+
+New **Sour Apple (iOS Popups)** mode (mode 7) added to BLE Spam. Sends Apple **Nearby Action** (`0x0F`) advertisements — distinct from the existing Apple Proximity Pairing (`0x10`) mode. Cycles through 11 action types with a randomized 3-byte auth tag each packet, triggering iOS system popups (AirDrop, HomePod setup, Apple Watch pairing, Handoff, AirPlay, device setup flows). Included in the All Platforms rotation.
+
+### Drone Detector
+
+New **Drone Detector** screen under the Bluetooth menu. Passive BLE scan for DJI/Remote ID drone advertisement packets — detects drones broadcasting operator ID and location data without active probing.
+
+### BLE Scope — Crash Fix on Entry
+
+Fixed a crash and false-positive warning that fired when entering BLE Band Scope while no BLE scan was actually active. The check was incorrectly using `current_radio_mode == RADIO_MODE_WIFI` (always true at boot); corrected to `bt_lookout_is_active()` — matching the pattern used by all other BT features.
 
 ---
 

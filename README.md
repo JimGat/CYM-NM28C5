@@ -5,7 +5,7 @@
 <h1 align="center">Cheap Yellow Monster</h1>
 
 <p align="center">
-  <b>JanOS on NM-CYD-C5</b>
+  <b>v1.3.0</b>
 </p>
 
 <p align="center">
@@ -89,9 +89,13 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **WiFi Attacks** | Deauth, Evil Twin, Captive Portal, Blackout, Snifferdog, SAE Overflow |
 | **Handshake Capture** | WPA/WPA2 4-way handshake capture (PCAP & HCCAPX) |
 | **Karma AP** | Respond to probe requests, rogue access point |
+| **Chanalizer** | Wide 520 px WiFi channel map — auto-scrolling left/right with touch-drag pause; SSID color grouping, group legend, channel annotations; portrait 240 px viewport over 2.4 GHz + 5 GHz |
+| **WiFi Band Scope** | Promiscuous RSSI per-channel waterfall (2.4 GHz 13-ch or 5 GHz 25-ch); band toggle updates axis label and resets peaks; 60 ms dwell / 0.8 s full 2.4 sweep |
+| **BLE Band Scope** | Passive BLE scan RSSI histogram + waterfall — packet RSSI distribution across −100 to −30 dBm |
+| **Drone Detector** | Passive BLE scan for DJI/Remote ID drone advertisements |
 | **Wardriving** | GPS + WiFi logging, dual-band filter (2.4 GHz / 5 GHz / Both), optional BLE time-sliced scanning, WiGLE CSV 1.6, upload log tracking, raw PCAP toggle, GPS mark waypoints (GPX output), WiGLE and WDG Wars upload; GPS last-known position hold with 150 m stale accuracy when signal is lost |
 | **GPS** | NMEA RMC auto-syncs system clock (FAT timestamps); last-known position persisted to NVS (5-minute throttle); manual fallback editor in Settings → GPS Info; all data-collection features (wardrive, GATT Walker, marks) use best available GPS transparently |
-| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk, Bluetooth Lookout, BLE Spam, Device Spoof (general + directed), BLE Disconnect (directed), BLE PCAP (Kismet PCAPNG raw capture) |
+| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk, Bluetooth Lookout, BLE Spam (8 modes incl. Sour Apple), Device Spoof (general + directed), BLE Disconnect (directed), BLE PCAP (Kismet PCAPNG raw capture) |
 | **Deauth Monitor** | Passive detection of nearby deauth attacks |
 | **Credentials** | Captive portal credential capture, WPA-SEC upload |
 | **TX Power Mode** | Selectable Normal / Max Power for WiFi and BLE — persisted across reboots |
@@ -265,6 +269,9 @@ Main Menu
 ├── WiFi
 │   ├── Scan & Attack
 │   ├── WiFi Attacks
+│   ├── Chanalizer
+│   ├── WiFi Band Scope
+│   ├── BLE Band Scope
 │   ├── Deauth Mon.
 │   └── WiFi Observer
 ├── Bluetooth
@@ -365,6 +372,31 @@ Passive network intelligence and rogue AP capabilities.
 
 **Passive detection** of deauthentication attacks happening in the area. Alerts when deauth frames are detected on nearby channels — useful for detecting hostile activity.
 
+#### Chanalizer
+
+**WiFi channel visualization** — a 520 px wide portrait-mode channel map showing both 2.4 GHz (ch 1–13) and 5 GHz (ch 36–165) in a single scrollable view. All visible SSIDs are plotted as color-coded bar groups positioned at their operating channel, with a legend showing the group color → SSID mapping.
+
+- **Auto-scroll:** The chart pans left/right automatically (2 px per tick, bouncing at each end) so the full band is always visible without interaction.
+- **Touch drag:** Tap and drag to pause auto-scroll and manually scrub to any position. Releasing resumes auto-scroll.
+- **SSID picker:** Tap any SSID in the legend to highlight that network's bar across all its channels.
+- **Group color coding:** Up to 8 SSID groups are color-coded; legend shows group → SSID mapping.
+- **Channel annotations:** Channel numbers annotate the x-axis at correct pixel positions.
+
+#### WiFi Band Scope
+
+**Per-channel RSSI spectrum and waterfall** using the WiFi promiscuous radio. Measures peak RSSI of received 802.11 frames per channel — reflects band activity and congestion, not raw RF noise floor.
+
+| Band | Channels | Sweep time |
+|------|----------|------------|
+| 2.4 GHz | 13 channels (1–13) | ~0.8 s |
+| 5 GHz | 25 channels (36–165) | ~1.5 s |
+
+The spectrum bar chart (top) shows current peak RSSI per channel as a heat-color bar. The waterfall (bottom) scrolls down one row per completed sweep, building a time history of band activity. Tap **Band: 2.4GHz / Band: 5 GHz** to toggle — the axis label, peak arrays, and waterfall all reset cleanly on each switch.
+
+#### BLE Band Scope
+
+**BLE RSSI histogram and waterfall** — shows the distribution of received BLE advertising packet RSSI values across −100 to −30 dBm using a log-scale bar chart and a scrolling waterfall. Useful for visualizing BLE traffic density and signal levels in a given area. Packet count is shown in the status bar.
+
 ### 2. Bluetooth
 
 BLE scanning and fingerprinting features leveraging the ESP32-C5's BLE 5.0 radio.
@@ -380,11 +412,12 @@ Bluetooth
 │           ├── Device Spoof    (clones target MAC + name, no selection needed)
 │           └── BLE Disconnect  (flood target with TERMINATE_IND)
 ├── BT Attacks          ← general attacks (no target needed)
-│   ├── BLE Spam        (Apple / Samsung / Google / Windows / All broadcast spam)
+│   ├── BLE Spam        (Apple Prox. Pair / Samsung / Google / Windows / All / AirTag / SmartTag / Sour Apple)
 │   └── Device Spoof    (select from spooflist.csv or add new entry via keyboard)
 ├── BT Observer         ← 10 s scan then sequential GATT walk on all found devices
 ├── BLE PCAP            ← raw Kismet PCAPNG capture; streams to SD card
 ├── AirTag Scan
+├── Drone Detector
 ├── BT Locator
 └── Bluetooth Lookout   ← continuous watchlist monitor
     ├── Edit Watchlist
@@ -400,7 +433,8 @@ Bluetooth
 | **AirTag Scanner** | Passive BLE scan — detects Apple AirTags and Samsung SmartTags by manufacturer ID |
 | **Tag Locator** | Per-tag RSSI tracking launched from the AirTag Scan found-tags list |
 | **Bluetooth Lookout** | Continuous BLE monitor that alerts when a watchlisted device (by full MAC or OUI prefix) is detected nearby |
-| **BLE Spam** | Broadcasts fake BLE advertisements — Apple (all subtypes), Samsung, Google, Windows Swift Pair, or all simultaneously |
+| **BLE Spam** | Broadcasts fake BLE advertisements — Apple Prox. Pair (13 device types), Samsung Fast Connect (6 models), Google Fast Pair (12 model IDs), Windows Swift Pair, Apple Find My (AirTag), Samsung SmartTag, **Sour Apple** (Apple Nearby Action 0x0F — cycles 11 action types to flood iOS with system popups), or All simultaneously |
+| **Drone Detector** | Passive BLE scan for DJI/Remote ID drone advertisements — detects drones broadcasting operator ID and location data |
 | **Device Spoof (directed)** | Clones the MAC address and name of a device pre-selected in BT Scan & Select — no additional selection step required |
 | **Device Spoof (general)** | Loads `/sdcard/lab/bluetooth/spooflist.csv`; select an entry or add new devices via on-screen keyboard, then START to begin spoofing |
 | **BLE Disconnect (directed)** | Floods a BT Scan & Select pre-selected target with BLE TERMINATE_IND frames to force disconnection |
@@ -809,7 +843,7 @@ Waypoints are saved in GPX format to `/sdcard/lab/wardrives/wdXXXXXX_marks.gpx` 
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
-<gpx version="1.1" creator="JANOS-CYM">
+<gpx version="1.1" creator="CYM-NM28C5">
   <wpt lat="37.123456" lon="-122.456789">
     <ele>42.0</ele>
     <time>2026-05-08T12:34:56Z</time>
