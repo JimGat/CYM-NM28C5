@@ -1283,15 +1283,16 @@ static char          drone_pcap_path[80];
 
 // ── WiFi Channel Analyzer (Chanalizer) state ─────────────────────────────────
 // Portrait layout: 240×320. Two-phase UI: SSID picker → bell-curve chart.
-// Landscape pixel buffer (device held 90° CW): width=panel_h, height=disp_w
-#define WANA_LAND_W     290   // landscape buffer width  = panel height (320-30)
-#define WANA_LAND_H     240   // landscape buffer height = display width
-// Band regions within the landscape buffer (x axis = frequency, y axis = strength)
-#define WANA_2G_LX        0   // 2.4 GHz band x-start
-#define WANA_2G_LW      138   // 2.4 GHz band width
-#define WANA_SEP_LX     138   // separator stripe x-start
-#define WANA_5G_LX      142   // 5 GHz band x-start
-#define WANA_5G_LW      148   // 5 GHz band width (142+148=290)
+// Chart is a wide (520px) PSRAM buffer shown through a 240px scrollable viewport.
+// x axis = frequency (left→right), y axis = signal strength (top=strong, bottom=weak).
+// Auto-scrolls left↔right; touch-drag pauses auto-scroll for manual panning.
+#define WANA_WIDE_W    520   // total chart canvas width  (frequency axis, px)
+#define WANA_CHART_H   200   // chart canvas height       (signal axis, px; 0=top=strong)
+#define WANA_2G_X        0   // 2.4 GHz band x-start
+#define WANA_2G_W      200   // 2.4 GHz band width
+#define WANA_SEP_X     200   // separator stripe x-start
+#define WANA_5G_X      208   // 5 GHz band x-start
+#define WANA_5G_W      312   // 5 GHz band width  (208+312=520)
 #define WANA_MAX_APS     48
 #define WANA_MAX_LABELS  48
 #define WANA_MAX_SSIDS   20   // max unique SSID groups shown in picker
@@ -1305,21 +1306,24 @@ typedef struct {
     uint8_t color_idx;
 } wana_ssid_group_t;
 
-static lv_color_t        *wana_buf          = NULL;   // PSRAM pixel buffer
-static lv_obj_t          *wana_canvas_2g    = NULL;
-static lv_obj_t          *wana_canvas_5g    = NULL;
-static lv_obj_t          *wana_status_lbl   = NULL;
-static lv_obj_t          *wana_panel        = NULL;   // swappable content panel
-static lv_timer_t        *wana_ui_timer     = NULL;
-static bool               wana_active       = false;
-static bool               wana_scanning     = false;
-static bool               wana_needs_redraw = false;
+static lv_color_t        *wana_buf           = NULL;   // PSRAM pixel buffer (520×200)
+static lv_obj_t          *wana_chart_obj     = NULL;   // 520-wide custom-draw object
+static lv_obj_t          *wana_scroll_cont   = NULL;   // 240-wide scrollable viewport
+static lv_obj_t          *wana_status_lbl    = NULL;
+static lv_obj_t          *wana_panel         = NULL;   // swappable content panel
+static lv_timer_t        *wana_ui_timer      = NULL;
+static lv_timer_t        *wana_scroll_timer  = NULL;   // auto-scroll driver
+static bool               wana_active        = false;
+static bool               wana_scanning      = false;
+static bool               wana_needs_redraw  = false;
+static bool               wana_scroll_paused = false;  // true while user is dragging
+static int8_t             wana_scroll_dir    = 1;      // +1=right, -1=left (ping-pong)
 static wifi_ap_record_t   wana_aps[WANA_MAX_APS];
-static int                wana_ap_count     = 0;
+static int                wana_ap_count      = 0;
 static lv_obj_t          *wana_ssid_lbls[WANA_MAX_LABELS];
-static int                wana_lbl_count    = 0;
+static int                wana_lbl_count     = 0;
 static wana_ssid_group_t  wana_ssids[WANA_MAX_SSIDS];
-static int                wana_ssid_count   = 0;
+static int                wana_ssid_count    = 0;
 
 // ── WiFi Band Scope state ────────────────────────────────────────────────────
 #define WSCOPE_W       240
@@ -1673,12 +1677,13 @@ static void reset_function_page_children(void) {
     drone_rec_lbl     = NULL;
     drone_ui_active   = false;
     // WiFi Analyzer cleanup
-    wana_canvas_2g = NULL; wana_canvas_5g = NULL;
-    wana_status_lbl = NULL; wana_panel = NULL;  // canvas_5g aliased = canvas_2g
+    wana_chart_obj = NULL; wana_scroll_cont = NULL;
+    wana_status_lbl = NULL; wana_panel = NULL;
     wana_lbl_count = 0; wana_ssid_count = 0;
-    wana_active = false; wana_scanning = false;
-    if (wana_ui_timer) { lv_timer_del(wana_ui_timer); wana_ui_timer = NULL; }
-    if (wana_buf)      { heap_caps_free(wana_buf);     wana_buf = NULL; }
+    wana_active = false; wana_scanning = false; wana_scroll_paused = false;
+    if (wana_scroll_timer) { lv_timer_del(wana_scroll_timer); wana_scroll_timer = NULL; }
+    if (wana_ui_timer)     { lv_timer_del(wana_ui_timer);     wana_ui_timer     = NULL; }
+    if (wana_buf)          { heap_caps_free(wana_buf);         wana_buf          = NULL; }
     // WiFi Band Scope cleanup
     wscope_canvas = NULL; wscope_status_lbl = NULL; wscope_active = false;
     if (wscope_ui_timer) { lv_timer_del(wscope_ui_timer); wscope_ui_timer = NULL; }
@@ -25805,13 +25810,12 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
 
-    // BLE Band Scope (passive — no conflict check needed)
+    // BLE Band Scope
     if (strcmp(attack_name, "BLE Scope") == 0) {
-        if (current_radio_mode == RADIO_MODE_WIFI) {
+        if (bt_lookout_is_active())
             show_bt_conflict_warning("BLE Band Scope", show_blescope_screen);
-        } else {
+        else
             show_blescope_screen();
-        }
         return;
     }
 
@@ -28223,52 +28227,47 @@ static void wana_group_ssids(void) {
     }
 }
 
-// Render both bands into the landscape PSRAM buffer (WANA_LAND_W × WANA_LAND_H).
-// Landscape orientation: x = frequency (low→high), y = signal strength (0=strong, top).
-// After 90° CW software rotation in the draw callback:
-//   landscape top (ly=0, strong) → portrait right  (sx=239)
-//   landscape x   (lx)          → portrait y       (sy=lx+30)
-static void wana_draw_landscape(void)
+// Render both bands into the wide PSRAM buffer (WANA_WIDE_W × WANA_CHART_H).
+// Portrait orientation: x = frequency (left=low, right=high), y = signal (0=top=strong).
+// Bell curves are bottom-anchored: strong signals reach up toward y=0.
+static void wana_draw_wide(void)
 {
     lv_color_t *buf  = wana_buf;
     lv_color_t  bg   = lv_color_make(8, 8, 22);
     lv_color_t  grid = lv_color_make(35, 35, 65);
     lv_color_t  sep  = lv_color_make(40, 40, 80);
 
-    // Clear
-    for (int i = 0; i < WANA_LAND_W * WANA_LAND_H; i++) buf[i] = bg;
+    for (int i = 0; i < WANA_WIDE_W * WANA_CHART_H; i++) buf[i] = bg;
 
-    // Band-colour header strips at ly=0..1 (visible at portrait right edge)
-    for (int lx = WANA_2G_LX; lx < WANA_2G_LX + WANA_2G_LW; lx++) {
-        buf[0 * WANA_LAND_W + lx] = lv_color_hex(0x4FC3F7);
-        buf[1 * WANA_LAND_W + lx] = lv_color_hex(0x1A6080);
+    // Band header strips at y=0..1 (top edge)
+    for (int x = WANA_2G_X; x < WANA_2G_X + WANA_2G_W; x++) {
+        buf[0 * WANA_WIDE_W + x] = lv_color_hex(0x4FC3F7);
+        buf[1 * WANA_WIDE_W + x] = lv_color_hex(0x1A6080);
     }
-    for (int lx = WANA_5G_LX; lx < WANA_5G_LX + WANA_5G_LW; lx++) {
-        buf[0 * WANA_LAND_W + lx] = lv_color_hex(0x81C784);
-        buf[1 * WANA_LAND_W + lx] = lv_color_hex(0x2E6030);
+    for (int x = WANA_5G_X; x < WANA_5G_X + WANA_5G_W; x++) {
+        buf[0 * WANA_WIDE_W + x] = lv_color_hex(0x81C784);
+        buf[1 * WANA_WIDE_W + x] = lv_color_hex(0x2E6030);
     }
-    // Separator column
-    for (int ly = 0; ly < WANA_LAND_H; ly++)
-        for (int lx = WANA_SEP_LX; lx < WANA_5G_LX; lx++)
-            buf[ly * WANA_LAND_W + lx] = sep;
+    for (int y = 0; y < WANA_CHART_H; y++)
+        for (int x = WANA_SEP_X; x < WANA_5G_X; x++)
+            buf[y * WANA_WIDE_W + x] = sep;
 
-    // 2G grid lines (vertical in landscape = horizontal bands in portrait)
+    // Vertical grid lines per channel
     static const uint8_t gchs2g[] = {1,2,3,4,5,6,7,8,9,10,11,12,13};
     for (int k = 0; k < 13; k++) {
-        int gx = WANA_2G_LX + (int)((wana_ch_to_mhz(gchs2g[k]) - 2397.0f) / 90.0f * WANA_2G_LW);
-        if (gx >= WANA_2G_LX && gx < WANA_2G_LX + WANA_2G_LW)
-            for (int ly = 2; ly < WANA_LAND_H; ly++) buf[ly * WANA_LAND_W + gx] = grid;
+        int gx = WANA_2G_X + (int)((wana_ch_to_mhz(gchs2g[k]) - 2397.0f) / 90.0f * WANA_2G_W);
+        if (gx >= WANA_2G_X && gx < WANA_2G_X + WANA_2G_W)
+            for (int y = 2; y < WANA_CHART_H; y++) buf[y * WANA_WIDE_W + gx] = grid;
     }
-    // 5G grid lines
     static const float b5g[] = {
         5180,5200,5220,5240,5260,5280,5300,5320,
         5500,5520,5540,5560,5580,5600,5620,5640,
         5660,5680,5700,5720,5745,5765,5785,5805,5825
     };
     for (int k = 0; k < 25; k++) {
-        int gx = WANA_5G_LX + (int)((b5g[k] - 5150.0f) / 730.0f * WANA_5G_LW);
-        if (gx >= WANA_5G_LX && gx < WANA_5G_LX + WANA_5G_LW)
-            for (int ly = 2; ly < WANA_LAND_H; ly++) buf[ly * WANA_LAND_W + gx] = grid;
+        int gx = WANA_5G_X + (int)((b5g[k] - 5150.0f) / 730.0f * WANA_5G_W);
+        if (gx >= WANA_5G_X && gx < WANA_5G_X + WANA_5G_W)
+            for (int y = 2; y < WANA_CHART_H; y++) buf[y * WANA_WIDE_W + gx] = grid;
     }
 
     // Build filtered+sorted AP list (RSSI ascending → strongest drawn last/on top)
@@ -28288,9 +28287,9 @@ static void wana_draw_landscape(void)
         si[j+1] = key;
     }
 
-    // Peak info for LVGL labels (placed at portrait screen coords)
-    int     peak_lx[WANA_MAX_APS];   // landscape x of peak centre
-    int     peak_bh[WANA_MAX_APS];   // bell height (determines portrait sx)
+    // Peak coords for channel labels (chart-local, scroll with content)
+    int     peak_cx[WANA_MAX_APS];
+    int     peak_ty[WANA_MAX_APS];   // chart y of peak tip
     uint8_t peak_cidx[WANA_MAX_APS];
     int     peak_ch[WANA_MAX_APS];
     int     np = 0;
@@ -28302,14 +28301,14 @@ static void wana_draw_landscape(void)
         float disp_min  = is5g ? 5150.0f : 2397.0f;
         float span      = is5g ? 730.0f  :   90.0f;
         float sigma_mhz = is5g ? 38.0f   :   11.0f;
-        int   band_x    = is5g ? WANA_5G_LX : WANA_2G_LX;
-        int   band_w    = is5g ? WANA_5G_LW : WANA_2G_LW;
+        int   band_x    = is5g ? WANA_5G_X : WANA_2G_X;
+        int   band_w    = is5g ? WANA_5G_W : WANA_2G_W;
         float sigma_px  = sigma_mhz / span * (float)band_w;
 
-        float cx_l  = band_x + (freq - disp_min) / span * (float)band_w;
-        float max_h = (float)(ap->rssi + 100) / 70.0f * (float)(WANA_LAND_H - 4);
-        if (max_h < 5.0f)             max_h = 5.0f;
-        if (max_h > WANA_LAND_H - 2)  max_h = (float)(WANA_LAND_H - 2);
+        float cx      = band_x + (freq - disp_min) / span * (float)band_w;
+        float max_h   = (float)(ap->rssi + 100) / 70.0f * (float)(WANA_CHART_H - 4);
+        if (max_h < 5.0f)               max_h = 5.0f;
+        if (max_h > WANA_CHART_H - 2)   max_h = (float)(WANA_CHART_H - 2);
 
         uint8_t cidx = 0;
         lv_color_t col = lv_color_make(160, 160, 160);
@@ -28322,55 +28321,45 @@ static void wana_draw_landscape(void)
         }
         lv_color_t col_tip = lv_color_mix(lv_color_white(), col, LV_OPA_60);
 
-        int x0 = (int)(cx_l - sigma_px * 3.8f); if (x0 < band_x) x0 = band_x;
-        int x1 = (int)(cx_l + sigma_px * 3.8f); if (x1 >= band_x+band_w) x1 = band_x+band_w-1;
+        int x0 = (int)(cx - sigma_px * 3.8f); if (x0 < band_x) x0 = band_x;
+        int x1 = (int)(cx + sigma_px * 3.8f); if (x1 >= band_x+band_w) x1 = band_x+band_w-1;
 
         int bh_at_cx = 0;
-        for (int lx = x0; lx <= x1; lx++) {
-            float dx = (lx - cx_l) / sigma_px;
-            int   bh = (int)(max_h * expf(-0.5f * dx * dx));
+        for (int bx = x0; bx <= x1; bx++) {
+            float dx  = (bx - cx) / sigma_px;
+            int   bh  = (int)(max_h * expf(-0.5f * dx * dx));
             if (bh < 1) continue;
-            // Fill from ly=0 (top=strong) down to ly=bh-1
-            for (int ly = 0; ly < bh && ly < WANA_LAND_H; ly++) {
-                float frac  = 1.0f - (float)ly / (float)bh;
+            // Bottom-anchored bell: rows [CHART_H-bh .. CHART_H-1]
+            int y_top = WANA_CHART_H - bh;
+            for (int by = y_top; by < WANA_CHART_H; by++) {
+                float frac  = 1.0f - (float)(by - y_top) / (float)bh;
                 uint8_t opa = (uint8_t)(50 + frac * 205.0f);
-                buf[ly * WANA_LAND_W + lx] = lv_color_mix(col, lv_color_black(), opa);
+                buf[by * WANA_WIDE_W + bx] = lv_color_mix(col, lv_color_black(), opa);
             }
-            // Tip line at extent
-            int tip = bh - 1; if (tip < 0) tip = 0; if (tip >= WANA_LAND_H) tip = WANA_LAND_H-1;
-            buf[tip * WANA_LAND_W + lx] = col_tip;
-            if (lx == (int)cx_l) bh_at_cx = bh;
+            if (y_top >= 0 && y_top < WANA_CHART_H)
+                buf[y_top * WANA_WIDE_W + bx] = col_tip;
+            if (bx == (int)cx) bh_at_cx = bh;
         }
         if (np < WANA_MAX_APS) {
-            peak_lx[np]   = (int)cx_l;
-            peak_bh[np]   = bh_at_cx;
+            peak_cx[np]   = (int)cx;
+            peak_ty[np]   = WANA_CHART_H - bh_at_cx;   // chart y of peak tip
             peak_cidx[np] = cidx;
             peak_ch[np]   = ap->primary;
             np++;
         }
     }
 
-    // Place LVGL labels at portrait screen coords corresponding to landscape peaks.
-    // After 90° CW rotation: portrait sx = LAND_H-1 - ly, portrait sy = lx + 30.
-    // Peak tip is at ly = bh_at_cx - 1, so portrait sx_tip = 239 - (bh-1).
-    // Label sits at sx_tip - 2 (just inside the tip line), sy = lx + 30 - 12.
+    // Place channel labels on wana_chart_obj so they scroll with the chart
     for (int i = 0; i < np && wana_lbl_count < WANA_MAX_LABELS; i++) {
-        if (!wana_panel || !lv_obj_is_valid(wana_panel)) break;
-        int bh   = peak_bh[i];
-        int lx   = peak_lx[i];
-        // portrait coordinates (absolute screen, clamp to visible area)
-        int sx_tip = WANA_LAND_H - 1 - (bh > 1 ? bh - 1 : 0); // portrait x of tip
-        int sy_ctr = lx + 30;  // portrait y of channel centre
-        // label above the tip: sx_tip + small margin, sy centred on channel
-        int lbl_sx = sx_tip - 1;  // label right edge near tip
-        int lbl_sy = sy_ctr - 10; // vertically centred
-        if (lbl_sx < 2)    lbl_sx = 2;
-        if (lbl_sx > 210)  lbl_sx = 210;
-        if (lbl_sy < 32)   lbl_sy = 32;
-        if (lbl_sy > 295)  lbl_sy = 295;
-        // position is absolute screen coords; lbl parent = function_page
+        if (!wana_chart_obj || !lv_obj_is_valid(wana_chart_obj)) break;
+        int lbl_x = peak_cx[i] - 17;
+        int lbl_y = peak_ty[i] - 16;
+        if (lbl_x < 0)                lbl_x = 0;
+        if (lbl_x > WANA_WIDE_W - 34) lbl_x = WANA_WIDE_W - 34;
+        if (lbl_y < 2)                lbl_y = 2;
+        if (lbl_y > WANA_CHART_H - 16) lbl_y = WANA_CHART_H - 16;
         char txt[8]; snprintf(txt, sizeof(txt), "ch%d", peak_ch[i]);
-        lv_obj_t *lbl = lv_label_create(function_page);
+        lv_obj_t *lbl = lv_label_create(wana_chart_obj);
         lv_label_set_text(lbl, txt);
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(lbl, wana_grp_color(peak_cidx[i]), 0);
@@ -28380,16 +28369,16 @@ static void wana_draw_landscape(void)
         lv_obj_set_style_pad_all(lbl, 1, 0);
         lv_obj_clear_flag(lbl, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(lbl, LV_OBJ_FLAG_IGNORE_LAYOUT);
-        lv_obj_set_pos(lbl, lbl_sx, lbl_sy);
+        lv_obj_set_pos(lbl, lbl_x, lbl_y);
         lv_obj_set_size(lbl, 34, 14);
         wana_ssid_lbls[wana_lbl_count++] = lbl;
     }
 }
 
-// LV_EVENT_DRAW_MAIN callback: 90° CW software rotation, PSRAM → LVGL DRAM.
-// Landscape buffer (WANA_LAND_W × WANA_LAND_H) maps to portrait panel (240×290).
-// 90° CW: portrait (sx, sy) ← landscape (lx = sy - oa.y1,  ly = LAND_H-1 - sx)
-static void wana_viz_draw_cb(lv_event_t *e) {
+// LV_EVENT_DRAW_MAIN callback: direct copy PSRAM wide buffer → LVGL tile.
+// No rotation — buffer is already in portrait orientation.
+// sx - oa.x1 is correct even when scrolled (oa.x1 goes negative as container scrolls right).
+static void wana_chart_draw_cb(lv_event_t *e) {
     if (lv_event_get_code(e) != LV_EVENT_DRAW_MAIN) return;
     if (!wana_buf) return;
     lv_draw_ctx_t *draw_ctx = lv_event_get_draw_ctx(e);
@@ -28406,32 +28395,36 @@ static void wana_viz_draw_cb(lv_event_t *e) {
     lv_color_t *dst  = (lv_color_t *)draw_ctx->buf;
     lv_color_t  bg   = lv_color_make(8, 8, 22);
     for (lv_coord_t sy = y1; sy <= y2; sy++) {
-        lv_coord_t lx = sy - oa.y1;              // panel-relative y → landscape x
+        lv_coord_t py = sy - oa.y1;
         for (lv_coord_t sx = x1; sx <= x2; sx++) {
-            lv_coord_t ly = WANA_LAND_H - 1 - sx; // portrait x → landscape y (CW)
-            lv_color_t px = (lx >= 0 && lx < WANA_LAND_W && ly >= 0 && ly < WANA_LAND_H)
-                             ? wana_buf[ly * WANA_LAND_W + lx] : bg;
-            dst[(sy - ba->y1) * buf_w + (sx - ba->x1)] = px;
+            lv_coord_t px = sx - oa.x1;
+            lv_color_t col = (px >= 0 && px < WANA_WIDE_W && py >= 0 && py < WANA_CHART_H)
+                              ? wana_buf[py * WANA_WIDE_W + px] : bg;
+            dst[(sy - ba->y1) * buf_w + (sx - ba->x1)] = col;
         }
     }
 }
 
 static void wana_redraw(void) {
-    if (!wana_buf || !wana_canvas_2g) return;
+    if (!wana_buf || !wana_chart_obj) return;
     wana_clear_ssid_labels();
-    wana_draw_landscape();
-    lv_obj_invalidate(wana_canvas_2g);
+    wana_draw_wide();
+    lv_obj_invalidate(wana_chart_obj);
 }
 
 // ── Common panel helpers ──────────────────────────────────────────────────────
 
 static void wana_exit_cb(lv_event_t *e) {
     (void)e;
-    wana_active   = false;
-    wana_scanning = false;
-    if (wana_ui_timer) { lv_timer_del(wana_ui_timer); wana_ui_timer = NULL; }
-    wana_canvas_2g = NULL; wana_canvas_5g = NULL;
-    wana_status_lbl = NULL; wana_panel = NULL;  // canvas_5g aliased = canvas_2g
+    wana_active        = false;
+    wana_scanning      = false;
+    wana_scroll_paused = false;
+    if (wana_scroll_timer) { lv_timer_del(wana_scroll_timer); wana_scroll_timer = NULL; }
+    if (wana_ui_timer)     { lv_timer_del(wana_ui_timer);     wana_ui_timer     = NULL; }
+    wana_chart_obj   = NULL;
+    wana_scroll_cont = NULL;
+    wana_status_lbl  = NULL;
+    wana_panel       = NULL;
     wana_clear_ssid_labels();
     if (wana_buf) { heap_caps_free(wana_buf); wana_buf = NULL; }
     show_wifi_menu_screen();
@@ -28451,8 +28444,9 @@ static lv_obj_t *wana_make_panel(void) {
 }
 
 static void wana_swap_panel(void) {
+    if (wana_scroll_timer) { lv_timer_del(wana_scroll_timer); wana_scroll_timer = NULL; }
     if (wana_panel && lv_obj_is_valid(wana_panel)) {
-        wana_canvas_2g = NULL; wana_canvas_5g = NULL; wana_status_lbl = NULL;
+        wana_chart_obj = NULL; wana_scroll_cont = NULL; wana_status_lbl = NULL;
         wana_clear_ssid_labels();
         lv_obj_del(wana_panel);
     }
@@ -28663,20 +28657,55 @@ static void show_wana_select_screen(void) {
 
 // ── Chart view ────────────────────────────────────────────────────────────────
 
-static lv_obj_t *wana_make_viz(lv_obj_t *parent, lv_coord_t y,
-                                lv_coord_t h, void *user_data_5g)
-{
-    lv_obj_t *v = lv_obj_create(parent);
-    lv_obj_set_size(v, WANA_LAND_H, h);  // portrait width = landscape height
-    lv_obj_set_pos(v, 0, y);
-    lv_obj_set_style_bg_color(v, lv_color_make(8, 8, 22), 0);
-    lv_obj_set_style_bg_opa(v, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(v, 0, 0);
-    lv_obj_set_style_radius(v, 0, 0);
-    lv_obj_set_style_pad_all(v, 0, 0);
-    lv_obj_clear_flag(v, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(v, wana_viz_draw_cb, LV_EVENT_DRAW_MAIN, user_data_5g);
-    return v;
+// Pause auto-scroll while the user is manually dragging; resume on release.
+static void wana_scroll_event_cb(lv_event_t *e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_SCROLL_BEGIN) wana_scroll_paused = true;
+    else if (code == LV_EVENT_SCROLL_END) wana_scroll_paused = false;
+}
+
+// Ping-pong auto-scroll: 2px every 50ms ≈ 40px/s.
+static void wana_auto_scroll_timer_cb(lv_timer_t *t) {
+    (void)t;
+    if (!wana_active || wana_scroll_paused) return;
+    if (!wana_scroll_cont || !lv_obj_is_valid(wana_scroll_cont)) return;
+    lv_coord_t cur  = lv_obj_get_scroll_x(wana_scroll_cont);
+    lv_coord_t maxs = WANA_WIDE_W - 240;
+    lv_coord_t next = cur + wana_scroll_dir * 2;
+    if (next >= maxs) { next = maxs; wana_scroll_dir = -1; }
+    else if (next <= 0) { next = 0;  wana_scroll_dir =  1; }
+    lv_obj_scroll_to_x(wana_scroll_cont, next, LV_ANIM_OFF);
+}
+
+// Creates a 240-wide scrollable viewport containing a WANA_WIDE_W-wide chart object.
+static void wana_make_scroll_chart(lv_obj_t *parent, lv_coord_t y_pos) {
+    wana_scroll_cont = lv_obj_create(parent);
+    lv_obj_set_size(wana_scroll_cont, 240, WANA_CHART_H);
+    lv_obj_set_pos(wana_scroll_cont, 0, y_pos);
+    lv_obj_set_style_bg_color(wana_scroll_cont, lv_color_make(8, 8, 22), 0);
+    lv_obj_set_style_bg_opa(wana_scroll_cont, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(wana_scroll_cont, 0, 0);
+    lv_obj_set_style_radius(wana_scroll_cont, 0, 0);
+    lv_obj_set_style_pad_all(wana_scroll_cont, 0, 0);
+    lv_obj_set_scroll_dir(wana_scroll_cont, LV_DIR_HOR);
+    lv_obj_set_scrollbar_mode(wana_scroll_cont, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_add_event_cb(wana_scroll_cont, wana_scroll_event_cb, LV_EVENT_SCROLL_BEGIN, NULL);
+    lv_obj_add_event_cb(wana_scroll_cont, wana_scroll_event_cb, LV_EVENT_SCROLL_END, NULL);
+
+    wana_chart_obj = lv_obj_create(wana_scroll_cont);
+    lv_obj_set_size(wana_chart_obj, WANA_WIDE_W, WANA_CHART_H);
+    lv_obj_set_pos(wana_chart_obj, 0, 0);
+    lv_obj_set_style_bg_color(wana_chart_obj, lv_color_make(8, 8, 22), 0);
+    lv_obj_set_style_bg_opa(wana_chart_obj, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(wana_chart_obj, 0, 0);
+    lv_obj_set_style_radius(wana_chart_obj, 0, 0);
+    lv_obj_set_style_pad_all(wana_chart_obj, 0, 0);
+    lv_obj_clear_flag(wana_chart_obj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(wana_chart_obj, wana_chart_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
+
+    wana_scroll_dir    = 1;
+    wana_scroll_paused = false;
+    wana_scroll_timer  = lv_timer_create(wana_auto_scroll_timer_cb, 50, NULL);
 }
 
 static void show_wana_chart_screen(void) {
@@ -28684,13 +28713,12 @@ static void show_wana_chart_screen(void) {
     wana_swap_panel();
     wana_panel = wana_make_panel();
 
-    // Single viz covering the full panel — landscape buffer rendered with 90° CW rotation
-    wana_canvas_2g = wana_make_viz(wana_panel, 0, 252, NULL);
-    wana_canvas_5g = wana_canvas_2g;  // single canvas, wana_redraw invalidates one
+    // Wide scrollable chart (200px tall, auto-scrolling left↔right, touch to pause)
+    wana_make_scroll_chart(wana_panel, 0);
 
-    // Scrolling legend: SSID name + channel list, in group colors
+    // Scrolling legend: SSID name + channel list, in group colors (y=202)
     lv_obj_t *leg = lv_label_create(wana_panel);
-    lv_obj_set_pos(leg, 2, 254);
+    lv_obj_set_pos(leg, 2, WANA_CHART_H + 2);
     lv_obj_set_size(leg, 236, 14);
     lv_obj_set_style_text_font(leg, &lv_font_montserrat_12, 0);
     lv_obj_set_style_bg_opa(leg, LV_OPA_TRANSP, 0);
@@ -28711,7 +28739,6 @@ static void show_wana_chart_screen(void) {
         }
         char name[12];
         snprintf(name, sizeof(name), "%.11s", wana_ssids[i].ssid);
-        // Build channel list for this SSID group
         char ch_str[32] = ""; int cp = 0;
         for (int k = 0; k < wana_ssids[i].ap_count && cp < 28; k++) {
             uint8_t ch = wana_aps[wana_ssids[i].ap_indices[k]].primary;
@@ -28722,13 +28749,13 @@ static void show_wana_chart_screen(void) {
     }
     lv_label_set_text(leg, leg_txt[0] ? leg_txt : "No SSIDs selected");
     lv_label_set_long_mode(leg, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_set_style_anim_speed(leg, 17, 0);  // 33% slower than default 25 px/s
+    lv_obj_set_style_anim_speed(leg, 17, 0);
     lv_obj_set_style_text_color(leg, lv_color_hex(0xAAAAAA), 0);
 
-    // Button row (y=270: below legend at 254+14+2=270)
+    // Button row (y=218)
     lv_obj_t *btns = lv_obj_create(wana_panel);
     lv_obj_set_size(btns, 240, 28);
-    lv_obj_set_pos(btns, 0, 270);
+    lv_obj_set_pos(btns, 0, WANA_CHART_H + 18);
     lv_obj_set_style_bg_opa(btns, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(btns, 0, 0);
     lv_obj_set_style_radius(btns, 0, 0);
@@ -28803,7 +28830,7 @@ static void show_wifi_analyzer_screen(void) {
     wana_lbl_count    = 0;
     wana_ssid_count   = 0;
 
-    size_t bufsz = (size_t)WANA_LAND_W * WANA_LAND_H;  // 290×240 landscape buffer
+    size_t bufsz = (size_t)WANA_WIDE_W * WANA_CHART_H;  // 520×200 wide portrait buffer
     wana_buf = heap_caps_calloc(bufsz, sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
     if (!wana_buf) {
         ESP_LOGE(TAG, "wana: no PSRAM");
