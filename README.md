@@ -5,7 +5,7 @@
 <h1 align="center">Cheap Yellow Monster</h1>
 
 <p align="center">
-  <b>v1.3.0</b>
+  <b>v1.3.4</b>
 </p>
 
 <p align="center">
@@ -253,6 +253,8 @@ The firmware parses **GGA** sentences for latitude, longitude, altitude, and sat
 **Last-known position persistence:** Every valid GGA fix is snapshotted to a `g_gps_last_known` global. When GPS signal is lost (entering a building, underground parking, etc.) all data-collection features automatically fall back to the last-known coordinates and report an accuracy of **150 m** (approximately one city block) in the WiGLE CSV `AccuracyMeters` field and in GPX waypoints. This ensures wardrive sessions continue collecting data indoors rather than pausing or producing empty location entries.
 
 The last-known position is also written to **NVS** (keys `gps_lat_i`, `gps_lon_i`, `gps_alt_i`, stored as integer micro-degrees ×10⁶) and reloaded at boot — so even if the first session of the day starts with no GPS fix, the device uses the last outdoor position from a prior session. Writes are throttled to at most once every five minutes to protect NVS flash life (~5+ years at that rate). An explicit save via **Settings → GPS Info → Set Position** bypasses the throttle.
+
+In addition to the periodic throttled save, the firmware **force-saves immediately when GPS lock is lost** — detected by an RMC sentence with `status = V` (void) while `current_gps.valid` is `true`. This ensures the most recent fix survives a power cycle even if lock was lost before the next scheduled five-minute write.
 
 Cold start to first fix typically takes 30–60 seconds with a clear sky view.
 
@@ -1000,6 +1002,7 @@ All settings are persisted via **NVS** (Non-Volatile Storage) across reboots. Th
 | **GPS Info** | Live GPS fix status — latitude, longitude, altitude, satellite count, UTC time, and UART reference. When no live fix, last-known coordinates are shown in amber with `*` suffix and `Accuracy: 150 m (stale)`. **Set Position** button opens manual coordinate editor (see below). Refreshes every second. |
 | **Power Mode** | TX Power Mode selector — Normal or Max Power (see below) |
 | **Data Transfer** | File server sub-menu — AP mode or WiFi client mode (see below) |
+| **Vibrator Test** | Test tile for the experimental vibrator motor output — drives GPIO 26 (SPEAK_IN → SC8002B amp) with 150 Hz LEDC PWM. ON/OFF popup. Requires external 1N5819 + 1N4148 diode circuit on the SPEAK header. |
 
 #### GPS Info & Fallback Position
 
@@ -1271,10 +1274,13 @@ The XPT2046 resistive touch panel requires one-time calibration to map raw ADC v
 Calibration runs automatically the first time the firmware boots (when no NVS calibration is found). The sequence appears after the splash screen:
 
 1. **"Do NOT touch screen"** — holds for 2 seconds while measuring the panel's resting (null) position.
-2. **"Touch the [+] Top-Left (1/3)"** — a white crosshair appears at the top-left corner. Press it firmly and hold until the screen advances.
-3. **"Touch the [+] Top-Right (2/3)"** — press the top-right crosshair.
-4. **"Touch the [+] Bottom-Left (3/3)"** — press the bottom-left crosshair.
-5. **"Calibration done!"** — calculated values are saved to NVS namespace `touch_cal` and applied immediately.
+2. **"Touch the [+] Top-Left (1/4)"** — a white crosshair appears 10 px from the top-left corner. Press it firmly and hold until the screen advances.
+3. **"Touch the [+] Top-Right (2/4)"** — press the top-right crosshair.
+4. **"Touch the [+] Bottom-Left (3/4)"** — press the bottom-left crosshair.
+5. **"Touch the [+] Bottom-Right (4/4)"** — press the bottom-right crosshair.
+6. **"Calibration done!"** — calculated values are saved to NVS namespace `touch_cal` and applied immediately.
+
+The 4-point method measures X scale independently from the top and bottom crosshair pairs, and Y scale from the left and right pairs, then averages both. This halves measurement noise and eliminates the edge dead zones that the old 3-point extrapolation produced.
 
 ### Re-Calibrating
 
@@ -1295,11 +1301,13 @@ The file content does not matter. On the next boot, the firmware detects it, del
 | `null_x` / `null_y` | i32 | Resting panel position (false-touch dead zone center) |
 | `invert_x` / `invert_y` | u8 | Axis inversion flags (NM-CYD-C5: both typically `1`) |
 | `swap_xy` | u8 | Axis swap (typically `0` for portrait) |
-| `magic` | u16 | `0xCA11` — marks calibration as valid |
+| `magic` | u16 | `0xCA12` — marks calibration as valid |
 
 ### Default Fallback
 
-If NVS has no calibration (i.e., `magic` ≠ `0xCA11`), the firmware applies hardware-observed defaults for the NM-CYD-C5: **both axes inverted** (`invert_x = true`, `invert_y = true`). These are good enough for initial boot but may be off by ~20 pixels. Run calibration for accurate touch.
+If NVS has no calibration (i.e., `magic` ≠ `0xCA12`), the firmware applies hardware-observed defaults for the NM-CYD-C5: **both axes inverted** (`invert_x = true`, `invert_y = true`). These are good enough for initial boot but will be inaccurate near the edges. Run calibration for accurate full-screen touch.
+
+> **Note:** The magic value was bumped from `0xCA11` to `0xCA12` in v1.3.3 when the 4-point calibration was introduced. Any device previously calibrated with the 3-point sequence will automatically re-calibrate on next boot.
 
 ---
 
