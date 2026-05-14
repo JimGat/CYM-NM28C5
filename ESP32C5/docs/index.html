@@ -3,8 +3,8 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>JANOS Web Flasher</title>
-    <meta name="description" content="Browser flasher and serial monitor for JANOS firmware on the NM-CYD-C5 (ESP32-C5).">
+    <title>Cheap Yellow Monster Web Flasher</title>
+    <meta name="description" content="Browser flasher and serial monitor for Cheap Yellow Monster firmware on the NM-CYD-C5 (ESP32-C5).">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -64,9 +64,9 @@
   <body>
     <div class="container">
       <header>
-        <div class="eyebrow">JANOS &nbsp; NM-CYD-C5 &nbsp; ESP32-C5</div>
-        <h1>Flash JANOS straight from your browser</h1>
-        <p>Web Serial flasher powered by esptool-js. Flash the current release firmware for the NM-CYD-C5 (ESP32-C5) WiFi 6 security toolkit directly from your browser — no software install required.</p>
+        <div class="eyebrow">Cheap Yellow Monster &nbsp; NM-CYD-C5 &nbsp; ESP32-C5</div>
+        <h1>Flash Cheap Yellow Monster straight from your browser</h1>
+        <p>Web Serial flasher powered by esptool-js. Flash the current release firmware for the NM-CYD-C5 (ESP32-C5) WiFi 6 &amp; BLE security toolkit directly from your browser — no software install required.</p>
         <div class="hero-meta">
           <span class="pill"><strong>Chip</strong> ESP32-C5</span>
           <span class="pill"><strong>Board</strong> NM-CYD-C5</span>
@@ -238,7 +238,7 @@
 
       const normalizeManifest = (raw) => {
         const parts = Array.isArray(raw?.parts) && raw.parts.length ? raw.parts : (raw?.builds?.[0]?.parts || []);
-        return { name: raw?.name || "JANOS CYM-NM28C5", version: raw?.version || "n/a", build: raw?.build || raw?.version || "n/a", chipFamily: raw?.chipFamily || raw?.builds?.[0]?.chipFamily || "ESP32-C5", parts };
+        return { name: raw?.name || "Cheap Yellow Monster", version: raw?.version || "n/a", build: raw?.build || raw?.version || "n/a", chipFamily: raw?.chipFamily || raw?.builds?.[0]?.chipFamily || "ESP32-C5", parts };
       };
 
       const loadManifest = async () => {
