@@ -18354,7 +18354,7 @@ static void show_vibrator_test_popup(void)
     lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
 
     lv_obj_t *sub = lv_label_create(dialog);
-    lv_label_set_text(sub, "GPIO26 \xe2\x86\x92 SC8002B amp");
+    lv_label_set_text(sub, "GPIO26 -> SC8002B amp");
     lv_obj_set_style_text_color(sub, ui_muted_color(), 0);
     lv_obj_set_style_text_font(sub, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_align(sub, LV_TEXT_ALIGN_CENTER, 0);
