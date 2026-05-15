@@ -91,7 +91,6 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **Karma AP** | Respond to probe requests, rogue access point |
 | **Chanalizer** | Wide 520 px WiFi channel map — auto-scrolling left/right with touch-drag pause; SSID color grouping, group legend, channel annotations; portrait 240 px viewport over 2.4 GHz + 5 GHz |
 | **WiFi Band Scope** | Promiscuous RSSI per-channel waterfall (2.4 GHz 13-ch or 5 GHz 25-ch); band toggle updates axis label and resets peaks; 60 ms dwell / 0.8 s full 2.4 sweep |
-| **BLE Band Scope** | Passive BLE scan RSSI histogram + waterfall — packet RSSI distribution across −100 to −30 dBm |
 | **Drone Detector** | Passive BLE scan for DJI/Remote ID drone advertisements |
 | **Wardriving** | GPS + WiFi logging, dual-band filter (2.4 GHz / 5 GHz / Both), optional BLE time-sliced scanning, WiGLE CSV 1.6, upload log tracking, raw PCAP toggle, GPS mark waypoints (GPX output), WiGLE and WDG Wars upload; GPS last-known position hold with 150 m stale accuracy when signal is lost |
 | **GPS** | NMEA RMC auto-syncs system clock (FAT timestamps); last-known position persisted to NVS (5-minute throttle); manual fallback editor in Settings → GPS Info; all data-collection features (wardrive, GATT Walker, marks) use best available GPS transparently |
@@ -310,7 +309,6 @@ Main Menu
 │   ├── WiFi Attacks
 │   ├── Chanalizer
 │   ├── WiFi Band Scope
-│   ├── BLE Band Scope
 │   ├── Deauth Mon.
 │   └── WiFi Observer
 ├── Bluetooth
@@ -431,10 +429,6 @@ Passive network intelligence and rogue AP capabilities.
 | 5 GHz | 25 channels (36–165) | ~1.5 s |
 
 The spectrum bar chart (top) shows current peak RSSI per channel as a heat-color bar. The waterfall (bottom) scrolls down one row per completed sweep, building a time history of band activity. Tap **Band: 2.4GHz / Band: 5 GHz** to toggle — the axis label, peak arrays, and waterfall all reset cleanly on each switch.
-
-#### BLE Band Scope
-
-**BLE RSSI histogram and waterfall** — shows the distribution of received BLE advertising packet RSSI values across −100 to −30 dBm using a log-scale bar chart and a scrolling waterfall. Useful for visualizing BLE traffic density and signal levels in a given area. Packet count is shown in the status bar.
 
 ### 2. Bluetooth
 

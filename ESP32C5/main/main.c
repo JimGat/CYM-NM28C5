@@ -1369,17 +1369,6 @@ static portMUX_TYPE  wscope_mux         = portMUX_INITIALIZER_UNLOCKED;
 static int8_t        wscope_ch_peak[WSCOPE_CH_MAX];
 static uint16_t      wscope_ch_cnt[WSCOPE_CH_MAX];
 
-// ── BLE Band Scope state ─────────────────────────────────────────────────────
-static lv_color_t   *blescope_buf        = NULL;
-static lv_obj_t     *blescope_canvas     = NULL;
-static lv_obj_t     *blescope_status_lbl = NULL;
-static lv_timer_t   *blescope_ui_timer   = NULL;
-static volatile bool blescope_active     = false;
-static portMUX_TYPE  blescope_mux        = portMUX_INITIALIZER_UNLOCKED;
-static uint16_t      blescope_hist[WSCOPE_W];
-static volatile uint32_t blescope_pkt_total = 0;
-static volatile uint32_t blescope_win_pkts  = 0;
-
 // AirTag Scanner state
 static TaskHandle_t airtag_scan_task_handle = NULL;
 static StaticTask_t airtag_scan_task_buffer;
@@ -1722,11 +1711,6 @@ static void reset_function_page_children(void) {
     wscope_canvas = NULL; wscope_status_lbl = NULL; wscope_active = false;
     if (wscope_ui_timer) { lv_timer_del(wscope_ui_timer); wscope_ui_timer = NULL; }
     if (wscope_buf)      { heap_caps_free(wscope_buf);     wscope_buf = NULL; }
-    // BLE Band Scope cleanup
-    blescope_canvas = NULL; blescope_status_lbl = NULL;
-    if (blescope_ui_timer) { lv_timer_del(blescope_ui_timer); blescope_ui_timer = NULL; }
-    if (blescope_buf)      { heap_caps_free(blescope_buf);     blescope_buf = NULL; }
-    if (blescope_active)   { blescope_active = false; ble_gap_disc_cancel(); }
     deauth_monitor_rec_label = NULL;
     bt_locator_content = NULL;
     bt_locator_list = NULL;
@@ -2006,7 +1990,6 @@ static void drone_show_detail(int idx);
 static void drone_row_tap_cb(lv_event_t *e);
 static void show_wifi_analyzer_screen(void);
 static void show_wscope_screen(void);
-static void show_blescope_screen(void);
 static void wscope_task(void *p);
 
 // BT Locator functions
@@ -21276,9 +21259,6 @@ static void show_bluetooth_screen(void)
     lv_obj_t *pcap_tile = create_tile(tiles, LV_SYMBOL_SAVE, "BLE\nPCAP", lv_color_hex(0x00897B), NULL, NULL);
     lv_obj_add_event_cb(pcap_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE PCAP");
 
-    // BLE Band Scope - deep purple
-    lv_obj_t *blescope_tile = create_tile(tiles, LV_SYMBOL_AUDIO, "BLE\nScope", lv_color_hex(0x4A148C), NULL, NULL);
-    lv_obj_add_event_cb(blescope_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Scope");
 }
 
 // BT Locator screen - scan BT devices, select one, then track RSSI every 10s
@@ -26185,15 +26165,6 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
 
-    // BLE Band Scope
-    if (strcmp(attack_name, "BLE Scope") == 0) {
-        if (bt_lookout_is_active())
-            show_bt_conflict_warning("BLE Band Scope", show_blescope_screen);
-        else
-            show_blescope_screen();
-        return;
-    }
-
     // BT Attacks — active attacks guarded by authorization warning
     if (strcmp(attack_name, "BLE Spam") == 0) {
         show_attack_warning(show_ble_spam_screen);
@@ -28667,7 +28638,7 @@ static void show_drone_detector_screen(void)
 }
 
 // ============================================================================
-// SCOPE VISUALIZERS — WiFi Channel Analyzer · WiFi Band Scope · BLE Band Scope
+// SCOPE VISUALIZERS — WiFi Channel Analyzer · WiFi Band Scope
 // ============================================================================
 
 // ── Shared: SDR rainbow heat-map (0=black, 64=blue, 128=cyan, 192=yellow, 255=red)
@@ -29659,166 +29630,6 @@ static void show_wscope_screen(void) {
 // ────────────────────────────────────────────────────────────────────────────
 // BLE BAND SCOPE — real-time NimBLE passive scan · RSSI distribution waterfall
 // ────────────────────────────────────────────────────────────────────────────
-
-static int blescope_gap_cb(struct ble_gap_event *event, void *arg) {
-    (void)arg;
-    if (!blescope_active) return 0;
-    if (event->type != BLE_GAP_EVENT_DISC) return 0;
-    int rssi = event->disc.rssi;          // typically -100..-20 dBm
-    // Map rssi to pixel column: -100 dBm = x=0, -30 dBm = x=239
-    int x = (rssi + 100) * WSCOPE_W / 70;
-    if (x < 0)          x = 0;
-    if (x >= WSCOPE_W)  x = WSCOPE_W - 1;
-    portENTER_CRITICAL(&blescope_mux);
-    if (blescope_hist[x] < 0xFFFF) blescope_hist[x]++;
-    blescope_win_pkts++;
-    blescope_pkt_total++;
-    portEXIT_CRITICAL(&blescope_mux);
-    return 0;
-}
-
-static void blescope_ui_timer_cb(lv_timer_t *t) {
-    (void)t;
-    if (!blescope_active || !blescope_canvas || !blescope_buf) return;
-
-    // Snapshot + clear histogram
-    uint16_t hist[WSCOPE_W];
-    uint32_t win_pkts;
-    portENTER_CRITICAL(&blescope_mux);
-    memcpy(hist, blescope_hist, sizeof(hist));
-    memset(blescope_hist, 0, sizeof(blescope_hist));
-    win_pkts = blescope_win_pkts;
-    blescope_win_pkts = 0;
-    portEXIT_CRITICAL(&blescope_mux);
-
-    // Find max for log-scale normalization
-    uint16_t mx = 1;
-    for (int x = 0; x < WSCOPE_W; x++) if (hist[x] > mx) mx = hist[x];
-
-    // ── Spectrum section ─────────────────────────────────────────────────
-    lv_color_t bg = lv_color_make(4, 4, 12);
-    for (int y = 0; y < WSCOPE_SPEC_H; y++)
-        for (int x = 0; x < WSCOPE_W; x++)
-            blescope_buf[y * WSCOPE_W + x] = bg;
-
-    for (int x = 0; x < WSCOPE_W; x++) {
-        if (!hist[x]) continue;
-        // Log scale: v = log2(1+count) / log2(1+max) * 255
-        float v = log2f(1.0f + hist[x]) / log2f(1.0f + mx) * 255.0f;
-        if (v > 255.0f) v = 255.0f;
-        int bar_h = (int)(v * (WSCOPE_SPEC_H - 2) / 255.0f);
-        if (bar_h < 1) bar_h = 1;
-        lv_color_t col = scope_heat_color((uint8_t)v);
-        for (int y = WSCOPE_SPEC_H - bar_h; y < WSCOPE_SPEC_H; y++)
-            blescope_buf[y * WSCOPE_W + x] = col;
-        // Peak pixel
-        blescope_buf[(WSCOPE_SPEC_H - bar_h) * WSCOPE_W + x] = lv_color_make(220,220,220);
-    }
-
-    // Separator
-    lv_color_t sep = lv_color_make(50, 50, 70);
-    for (int x = 0; x < WSCOPE_W; x++)
-        blescope_buf[WSCOPE_SPEC_H * WSCOPE_W + x] = sep;
-
-    // ── Waterfall row ────────────────────────────────────────────────────
-    int wf_start = WSCOPE_SPEC_H + 1;
-    memmove(blescope_buf + WSCOPE_W * (wf_start + 1),
-            blescope_buf + WSCOPE_W * wf_start,
-            WSCOPE_W * (WSCOPE_WF_H - 1) * sizeof(lv_color_t));
-    for (int x = 0; x < WSCOPE_W; x++) {
-        float v = hist[x] ? log2f(1.0f + hist[x]) / log2f(1.0f + mx) * 255.0f : 0.0f;
-        if (v > 255.0f) v = 255.0f;
-        blescope_buf[wf_start * WSCOPE_W + x] = scope_heat_color((uint8_t)v);
-    }
-
-    lv_obj_invalidate(blescope_canvas);
-
-    if (blescope_status_lbl) {
-        char s[48];
-        snprintf(s, sizeof(s), "Total: %lu pkts | Window: %lu pkts",
-                 (unsigned long)blescope_pkt_total, (unsigned long)win_pkts);
-        lv_label_set_text(blescope_status_lbl, s);
-    }
-}
-
-static void blescope_exit_cb(lv_event_t *e) {
-    (void)e;
-    blescope_active = false;
-    ble_gap_disc_cancel();
-    if (blescope_ui_timer) { lv_timer_del(blescope_ui_timer); blescope_ui_timer = NULL; }
-    if (blescope_buf)      { heap_caps_free(blescope_buf);     blescope_buf = NULL; }
-    blescope_canvas = NULL;
-    blescope_status_lbl = NULL;
-    show_bluetooth_screen();
-}
-
-static void show_blescope_screen(void) {
-    if (!ensure_ble_mode()) {
-        ESP_LOGE(TAG, "BLE Scope: cannot init BLE"); return;
-    }
-
-    create_function_page_base("BLE Band Scope");
-    blescope_active    = true;
-    blescope_pkt_total = 0;
-    blescope_win_pkts  = 0;
-    memset(blescope_hist, 0, sizeof(blescope_hist));
-
-    int buf_px = WSCOPE_W * WSCOPE_CANVAS_H;
-    blescope_buf = heap_caps_calloc(buf_px, sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
-    if (!blescope_buf) { ESP_LOGE(TAG, "BLEScope: PSRAM fail"); return; }
-
-    // Canvas (y=30)
-    blescope_canvas = lv_canvas_create(function_page);
-    lv_canvas_set_buffer(blescope_canvas, blescope_buf, WSCOPE_W, WSCOPE_CANVAS_H, LV_IMG_CF_TRUE_COLOR);
-    lv_obj_set_pos(blescope_canvas, 0, 30);
-    lv_obj_set_size(blescope_canvas, WSCOPE_W, WSCOPE_CANVAS_H);
-
-    int cy = 30 + WSCOPE_CANVAS_H;   // y below canvas = 233
-
-    // Status label
-    blescope_status_lbl = lv_label_create(function_page);
-    lv_obj_set_size(blescope_status_lbl, 236, 14);
-    lv_obj_set_pos(blescope_status_lbl, 2, cy + 1);
-    lv_label_set_text(blescope_status_lbl, "Scanning BLE...");
-    lv_obj_set_style_text_font(blescope_status_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(blescope_status_lbl, lv_color_hex(0xAAAAAA), 0);
-
-    // RSSI axis labels
-    lv_obj_t *ax = lv_label_create(function_page);
-    lv_obj_set_size(ax, 240, 14);
-    lv_obj_set_pos(ax, 0, cy + 17);
-    lv_label_set_text(ax, "-100       -80        -60        -40    dBm");
-    lv_obj_set_style_text_font(ax, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(ax, lv_color_hex(0x666666), 0);
-
-    // Exit button
-    lv_obj_t *exit_btn = lv_btn_create(function_page);
-    lv_obj_set_size(exit_btn, 110, 26);
-    lv_obj_set_pos(exit_btn, 65, cy + 33);
-    lv_obj_set_style_bg_color(exit_btn, lv_color_hex(0x333333), 0);
-    lv_obj_add_event_cb(exit_btn, blescope_exit_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *el = lv_label_create(exit_btn);
-    lv_label_set_text(el, LV_SYMBOL_LEFT " Exit");
-    lv_obj_center(el);
-    lv_obj_set_style_text_font(el, &lv_font_montserrat_12, 0);
-
-    // Start passive BLE scan
-    struct ble_gap_disc_params sp = {
-        .passive = 1,
-        .filter_duplicates = 0,
-        .itvl = BLE_GAP_SCAN_ITVL_MS(100),
-        .window = BLE_GAP_SCAN_WIN_MS(90),
-    };
-    ble_gap_disc_cancel();
-    int blescope_rc = ble_gap_disc(BLE_OWN_ADDR_RANDOM, BLE_HS_FOREVER, &sp, blescope_gap_cb, NULL);
-    if (blescope_rc != 0 && blescope_status_lbl) {
-        char err[40];
-        snprintf(err, sizeof(err), "Scan start err %d - check BLE", blescope_rc);
-        lv_label_set_text(blescope_status_lbl, err);
-    }
-
-    blescope_ui_timer = lv_timer_create(blescope_ui_timer_cb, 300, NULL);
-}
 
 // ============================================================================
 // AIRTAG SCANNER IMPLEMENTATION
