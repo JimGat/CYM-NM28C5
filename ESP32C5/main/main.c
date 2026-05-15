@@ -3489,15 +3489,16 @@ static void run_touch_calibration(void)
         lv_label_set_text(lbl, "Tap OK to confirm.\nMust hit the button.");
         lv_obj_align(lbl, LV_ALIGN_CENTER, 0, -70);
 
-        // OK button at screen center — 140×60
+        // OK button at screen center — 47×20 (1/3 of original 140×60)
         lv_obj_t *ok_btn = lv_btn_create(scr);
-        lv_obj_set_size(ok_btn, 140, 60);
+        lv_obj_set_size(ok_btn, 47, 20);
         lv_obj_align(ok_btn, LV_ALIGN_CENTER, 0, 0);
         lv_obj_set_style_bg_color(ok_btn, lv_color_hex(0x2E7D32), 0);
-        lv_obj_set_style_radius(ok_btn, 12, 0);
+        lv_obj_set_style_radius(ok_btn, 4, 0);
+        lv_obj_set_style_pad_all(ok_btn, 2, 0);
         lv_obj_t *ok_lbl_w = lv_label_create(ok_btn);
-        lv_label_set_text(ok_lbl_w, LV_SYMBOL_OK "  OK");
-        lv_obj_set_style_text_font(ok_lbl_w, &lv_font_montserrat_16, 0);
+        lv_label_set_text(ok_lbl_w, "OK");
+        lv_obj_set_style_text_font(ok_lbl_w, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(ok_lbl_w, lv_color_white(), 0);
         lv_obj_center(ok_lbl_w);
 
@@ -3531,9 +3532,9 @@ static void run_touch_calibration(void)
         cal_wait_release(null_x, null_y);
         for (int i = 0; i < 5; i++) cal_tick();
 
-        // OK button screen bounds (center ± half-size, with 10 px margin)
-        const int ok_x0 = LCD_H_RES / 2 - 80,  ok_x1 = LCD_H_RES / 2 + 80;
-        const int ok_y0 = LCD_V_RES / 2 - 40,  ok_y1 = LCD_V_RES / 2 + 40;
+        // OK button screen bounds (half-button + 5 px margin each side)
+        const int ok_x0 = LCD_H_RES / 2 - 28,  ok_x1 = LCD_H_RES / 2 + 28;
+        const int ok_y0 = LCD_V_RES / 2 - 15,  ok_y1 = LCD_V_RES / 2 + 15;
 
         int64_t deadline = esp_timer_get_time() / 1000 + 5000;
         bool ok_tapped   = false;
