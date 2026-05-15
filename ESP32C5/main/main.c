@@ -676,9 +676,9 @@ static lv_obj_t *evil_twin_start_btn = NULL;
 static lv_obj_t *evil_twin_status_label = NULL;
 static lv_obj_t *evil_twin_log_ta = NULL;
 static lv_obj_t *evil_twin_content = NULL;
-static int evil_twin_network_map[SCAN_RESULTS_MAX_DISPLAY];
+static int evil_twin_network_map[MAX_SCAN_RESULTS];
 static int evil_twin_network_count = 0;
-static int evil_twin_html_map[SCAN_RESULTS_MAX_DISPLAY];
+static int evil_twin_html_map[MAX_SCAN_RESULTS];
 static int evil_twin_html_count = 0;
 
 // Evil Twin new UI elements
@@ -2023,6 +2023,10 @@ static void scan_checkbox_event_cb(lv_event_t *e)
     lv_obj_t *cb = lv_event_get_target(e);
     int index = (int)(intptr_t)lv_event_get_user_data(e);
     bool checked = lv_obj_has_state(cb, LV_STATE_CHECKED);
+    if (checked && wifi_scanner_get_selected_count() >= 20) {
+        lv_obj_clear_state(cb, LV_STATE_CHECKED);
+        return;
+    }
     wifi_scanner_select_network(index, checked);
 }
 
@@ -5575,17 +5579,15 @@ void app_main(void)
                 if (count == 0U) {
                     lv_list_add_text(scan_list, "No networks found");
                 } else {
-                    uint16_t display_count = (count > SCAN_RESULTS_MAX_DISPLAY) ? SCAN_RESULTS_MAX_DISPLAY : count;
-
-                    wifi_ap_record_t *records = (wifi_ap_record_t *)lv_mem_alloc(sizeof(wifi_ap_record_t) * display_count);
+                    wifi_ap_record_t *records = (wifi_ap_record_t *)lv_mem_alloc(sizeof(wifi_ap_record_t) * count);
                     if (!records) {
                         lv_list_add_text(scan_list, "Out of memory");
                     } else {
-                        int got = wifi_scanner_get_results(records, display_count);
+                        int got = wifi_scanner_get_results(records, count);
                         if (got < 0) {
                             lv_list_add_text(scan_list, "Failed to fetch results");
                         } else {
-                            if (got > display_count) got = display_count;
+                            if (got > count) got = count;
                             for (int i = 0; i < got; i++) {
                                 lv_obj_t *row = lv_list_add_btn(scan_list, NULL, "");
                                 if (!row) break;
@@ -5639,12 +5641,6 @@ void app_main(void)
                         }
 
                         lv_mem_free(records);
-
-                        if (count > SCAN_RESULTS_MAX_DISPLAY) {
-                            char msg[48];
-                            snprintf(msg, sizeof(msg), "... and %u more", count - SCAN_RESULTS_MAX_DISPLAY);
-                            lv_list_add_text(scan_list, msg);
-                        }
                     }
                 }
                 
