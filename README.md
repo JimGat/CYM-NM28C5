@@ -260,6 +260,43 @@ Cold start to first fix typically takes 30–60 seconds with a clear sky view.
 
 ---
 
+### Vibrator Motor Circuit
+
+An ERM (eccentric rotating mass) vibrator motor can be added to the NM-CYD-C5 via the onboard **SC8002B class-D amp** on the SPEAK header (GPIO 26). Two diodes convert the BTL differential output into safe unidirectional motor drive:
+
+| Role | Part | Notes |
+|------|------|-------|
+| Series rectifier | [1N5819 Schottky diode](https://a.co/d/0bnr0eiq) | Anode → VO1 (SPEAK pin 1), cathode → motor +. Half-wave rectifies the BTL output so current flows only in one direction. |
+| Flyback / protection | [1N4148 signal diode](https://a.co/d/01jTSulE) | Cathode → motor +, anode → motor −. Suppresses back-EMF inductive spikes when the motor stops. |
+| Motor | [Mini ERM Vibration Motor](https://a.co/d/00013Sqj) | Micro coin or cylindrical ERM, 3 V nominal. |
+| SPEAK header connector | 1.25 mm JST 2-pin (HCZZ0015-2) — [example](https://a.co/d/0cOYm9sE) | ⚠️ The official NM-CYD-C5 docs list part "HCZZ0015-2" but do not publish the pitch. 1.25 mm JST fits physically — test-fit before soldering. |
+
+**How it works:** GPIO 26 drives the SC8002B input with LEDC PWM at **333 Hz / 50% duty** (half-wave max = 50% duty). The 1N5819 rectifies the BTL output to give the motor a clean DC-biased drive. The 1N4148 across the motor clamps the inductive kick on every PWM off-cycle. Strength is adjustable 10–100% via **Settings → Vibrator Test** without reflashing.
+
+**Circuit photos:**
+
+<p align="center">
+  <img src="docs/screenshots/Vibrator Rectifier Circuit Closeup.jpg" width="480" alt="Vibrator rectifier circuit — diode detail"/>
+  <br/><em>Rectifier circuit closeup — 1N5819 series + 1N4148 flyback</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/Vibrator Wireup.jpg" width="480" alt="Vibrator motor wired to SPEAK header"/>
+  <br/><em>Motor wired to SPEAK header with diode circuit</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/Vibrator Wraped.jpg" width="480" alt="Vibrator assembly wrapped for installation"/>
+  <br/><em>Assembly wrapped and ready to install</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/Vibrator Installed.jpg" width="480" alt="Vibrator motor installed in device"/>
+  <br/><em>Motor installed in device</em>
+</p>
+
+---
+
 ## Software Features — Detailed
 
 ### 1. WiFi
