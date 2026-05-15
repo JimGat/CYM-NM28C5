@@ -3384,23 +3384,32 @@ static void run_touch_calibration(void)
     lv_obj_set_style_pad_all(scr, 0, 0);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
+    // Lab background image with dark overlay so white UI elements stay visible
+    lv_obj_t *bg_img = lv_img_create(scr);
+    lv_img_set_src(bg_img, &lab_bg);
+    lv_obj_align(bg_img, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_img_recolor(bg_img, lv_color_black(), 0);
+    lv_obj_set_style_img_recolor_opa(bg_img, LV_OPA_60, 0);
+    lv_obj_move_to_index(bg_img, 0);
+
     lv_obj_t *lbl = lv_label_create(scr);
     lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
     lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
     lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(lbl, 200);
     lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 50);
 
     lv_obj_t *hbar = lv_obj_create(scr);
     lv_obj_set_size(hbar, 32, 2);
-    lv_obj_set_style_bg_color(hbar, lv_color_white(), 0);
+    lv_obj_set_style_bg_color(hbar, lv_color_hex(0xFFD600), 0);
     lv_obj_set_style_bg_opa(hbar, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(hbar, 0, 0);
     lv_obj_set_style_radius(hbar, 0, 0);
 
     lv_obj_t *vbar = lv_obj_create(scr);
     lv_obj_set_size(vbar, 2, 32);
-    lv_obj_set_style_bg_color(vbar, lv_color_white(), 0);
+    lv_obj_set_style_bg_color(vbar, lv_color_hex(0xFFD600), 0);
     lv_obj_set_style_bg_opa(vbar, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(vbar, 0, 0);
     lv_obj_set_style_radius(vbar, 0, 0);
@@ -3410,79 +3419,140 @@ static void run_touch_calibration(void)
     lv_scr_load(scr);
     for (int i = 0; i < 5; i++) cal_tick();
 
-    // No null-zone measurement: XPT2046 panels can report ghost reads near the
-    // top of the panel during the "don't touch" window; if those raw coords
-    // coincide with the top-right calibration corner they would reject valid taps.
-    // Z1 threshold (200) is the sole ghost-touch gate, matching the Launcher.
+    // No null-zone measurement: XPT2046 ghost reads near the top during the
+    // "don't touch" window would reject valid top-right taps if they matched
+    // the null zone coords. Z threshold is the sole ghost-touch gate.
     const int null_x = 0, null_y = 0;
 
-    // Collect 4 corner calibration points (TL, TR, BL, BR)
-    uint16_t raw_x[4], raw_y[4];
-    const char *pt_lbl[4] = {
+    const char *pt_names[4] = {
         "Tap corner crosshair\nTop-Left     (1/4)",
         "Tap corner crosshair\nTop-Right    (2/4)",
         "Tap corner crosshair\nBottom-Left  (3/4)",
         "Tap corner crosshair\nBottom-Right (4/4)",
     };
 
-    for (int pt = 0; pt < 4; pt++) {
-        int tx = CAL_PTS[pt][0], ty = CAL_PTS[pt][1];
-        lv_obj_set_pos(hbar, tx - 16, ty - 1);
-        lv_obj_set_pos(vbar, tx - 1,  ty - 16);
-        lv_obj_clear_flag(hbar, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(vbar, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(lbl, pt_lbl[pt]);
-        for (int i = 0; i < 3; i++) cal_tick();
+    // Outer loop: redo calibration if user does not confirm within 5 s
+    while (true) {
+        uint16_t raw_x[4], raw_y[4];
+        bool aborted = false;
 
-        cal_wait_release(null_x, null_y);
+        for (int pt = 0; pt < 4; pt++) {
+            int tx = CAL_PTS[pt][0], ty = CAL_PTS[pt][1];
+            lv_obj_set_pos(hbar, tx - 16, ty - 1);
+            lv_obj_set_pos(vbar, tx - 1,  ty - 16);
+            lv_obj_clear_flag(hbar, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(vbar, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(lbl, pt_names[pt]);
+            lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 50);
+            for (int i = 0; i < 3; i++) cal_tick();
 
-        if (!cal_wait_touch(null_x, null_y, &raw_x[pt], &raw_y[pt], 15000)) {
-            ESP_LOGW(TAG, "Calibration timeout at point %d — aborting", pt + 1);
+            cal_wait_release(null_x, null_y);
+
+            if (!cal_wait_touch(null_x, null_y, &raw_x[pt], &raw_y[pt], 15000)) {
+                ESP_LOGW(TAG, "Calibration timeout at point %d — aborting", pt + 1);
+                aborted = true;
+                break;
+            }
+            ESP_LOGI(TAG, "Cal[%d] screen(%d,%d) -> raw(%u,%u)", pt+1, tx, ty, raw_x[pt], raw_y[pt]);
+        }
+
+        if (aborted) {
             lv_obj_clean(scr);
             return;
         }
-        ESP_LOGI(TAG, "Cal[%d] screen(%d,%d) -> raw(%u,%u)", pt+1, tx, ty, raw_x[pt], raw_y[pt]);
+
+        // Compute calibration using column/row averages — no extrapolation.
+        int x_left  = ((int)raw_x[0] + (int)raw_x[2]) / 2;
+        int x_right = ((int)raw_x[1] + (int)raw_x[3]) / 2;
+        int y_top   = ((int)raw_y[0] + (int)raw_y[1]) / 2;
+        int y_bot   = ((int)raw_y[2] + (int)raw_y[3]) / 2;
+
+        touch_cal_t cal;
+        cal.invert_x = (uint8_t)(x_left > x_right);
+        cal.x_min    = (int32_t)(cal.invert_x ? x_right : x_left);
+        cal.x_max    = (int32_t)(cal.invert_x ? x_left  : x_right);
+        cal.invert_y = (uint8_t)(y_top > y_bot);
+        cal.y_min    = (int32_t)(cal.invert_y ? y_bot : y_top);
+        cal.y_max    = (int32_t)(cal.invert_y ? y_top : y_bot);
+        cal.swap_xy  = 0;
+        cal.null_x   = (int32_t)null_x;
+        cal.null_y   = (int32_t)null_y;
+
+        ESP_LOGI(TAG, "Cal: X%ld-%ld(inv=%d) Y%ld-%ld(inv=%d)",
+                 cal.x_min, cal.x_max, cal.invert_x,
+                 cal.y_min, cal.y_max, cal.invert_y);
+
+        // ── Confirmation UI ──────────────────────────────────────────────────
+        lv_obj_add_flag(hbar, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(vbar, LV_OBJ_FLAG_HIDDEN);
+
+        lv_label_set_text(lbl, "Calibration ready.\nTap OK to save.");
+        lv_obj_align(lbl, LV_ALIGN_CENTER, 0, -70);
+
+        lv_obj_t *ok_btn = lv_btn_create(scr);
+        lv_obj_set_size(ok_btn, 140, 60);
+        lv_obj_align(ok_btn, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_bg_color(ok_btn, lv_color_hex(0x2E7D32), 0);
+        lv_obj_set_style_radius(ok_btn, 12, 0);
+        lv_obj_t *ok_lbl_w = lv_label_create(ok_btn);
+        lv_label_set_text(ok_lbl_w, LV_SYMBOL_OK "  OK");
+        lv_obj_set_style_text_font(ok_lbl_w, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(ok_lbl_w, lv_color_white(), 0);
+        lv_obj_center(ok_lbl_w);
+
+        lv_obj_t *cd_lbl = lv_label_create(scr);
+        lv_obj_set_style_text_color(cd_lbl, lv_color_make(160, 160, 160), 0);
+        lv_obj_set_style_text_font(cd_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_align(cd_lbl, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(cd_lbl, 200);
+        lv_obj_align(cd_lbl, LV_ALIGN_CENTER, 0, 65);
+        lv_label_set_text(cd_lbl, "Retry in 5 s...");
+
+        // Wait for finger to lift from last cal point before polling for OK
+        cal_wait_release(null_x, null_y);
+        for (int i = 0; i < 5; i++) cal_tick();
+
+        int64_t deadline = esp_timer_get_time() / 1000 + 5000;
+        bool ok_tapped   = false;
+        int  last_shown  = -1;
+
+        while (esp_timer_get_time() / 1000 < deadline) {
+            cal_tick();
+            int remaining_ms = (int)(deadline - esp_timer_get_time() / 1000);
+            int remaining_s  = (remaining_ms + 999) / 1000;
+            if (remaining_s != last_shown) {
+                char cd_buf[28];
+                snprintf(cd_buf, sizeof(cd_buf), "Retry in %d s...", remaining_s);
+                lv_label_set_text(cd_lbl, cd_buf);
+                last_shown = remaining_s;
+            }
+            xpt2046_touch_point_t tp;
+            if (xpt2046_read_touch(&touch_handle, &tp) && tp.touched) {
+                ok_tapped = true;
+                break;
+            }
+        }
+
+        lv_obj_del(ok_btn);   // also deletes ok_lbl_w (child)
+        lv_obj_del(cd_lbl);
+
+        if (ok_tapped) {
+            touch_cal_nvs_save(&cal);
+            touch_cal_apply(&cal);
+            lv_label_set_text(lbl, "Calibration saved!");
+            lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 0);
+            int64_t t_done = esp_timer_get_time() / 1000 + 1500;
+            while (esp_timer_get_time() / 1000 < t_done) cal_tick();
+            break;
+        }
+
+        // Not confirmed — show brief retry notice then loop
+        lv_label_set_text(lbl, "Retrying...");
+        lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 50);
+        for (int i = 0; i < 20; i++) cal_tick();  // ~200 ms pause
     }
 
-    // Use column/row averages directly as the calibration range — no extrapolation.
-    // Extrapolation amplifies noise from edge-of-panel ADC instability; the Launcher
-    // uses this same min/max-of-corners approach and calibrates the full screen reliably.
-    // xpt2046_map clamps raw values outside [x_min, x_max] to the screen edge, so the
-    // 16px margin between the crosshair and the physical edge maps cleanly to screen 0/239.
-    int x_left  = ((int)raw_x[0] + (int)raw_x[2]) / 2;  // TL+BL column average
-    int x_right = ((int)raw_x[1] + (int)raw_x[3]) / 2;  // TR+BR column average
-    int y_top   = ((int)raw_y[0] + (int)raw_y[1]) / 2;  // TL+TR row average
-    int y_bot   = ((int)raw_y[2] + (int)raw_y[3]) / 2;  // BL+BR row average
-
-    touch_cal_t cal;
-    cal.invert_x = (uint8_t)(x_left > x_right);
-    cal.x_min    = (int32_t)(cal.invert_x ? x_right : x_left);
-    cal.x_max    = (int32_t)(cal.invert_x ? x_left  : x_right);
-    cal.invert_y = (uint8_t)(y_top > y_bot);
-    cal.y_min    = (int32_t)(cal.invert_y ? y_bot : y_top);
-    cal.y_max    = (int32_t)(cal.invert_y ? y_top : y_bot);
-    cal.swap_xy  = 0;
-    cal.null_x   = (int32_t)null_x;
-    cal.null_y   = (int32_t)null_y;
-
-    ESP_LOGI(TAG, "Cal: X%ld-%ld(inv=%d) Y%ld-%ld(inv=%d) null(%ld,%ld)",
-             cal.x_min, cal.x_max, cal.invert_x,
-             cal.y_min, cal.y_max, cal.invert_y,
-             cal.null_x, cal.null_y);
-
-    touch_cal_nvs_save(&cal);
-    touch_cal_apply(&cal);
-
-    lv_label_set_text(lbl, "Calibration done!");
-    lv_obj_add_flag(hbar, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(vbar, LV_OBJ_FLAG_HIDDEN);
-    int64_t t_done = esp_timer_get_time() / 1000 + 1500;
-    while (esp_timer_get_time() / 1000 < t_done) cal_tick();
-
-    // Strip cal widgets off the screen without deleting it — lv_scr_load sets
-    // disp->prev_scr which remains a dangling pointer after lv_obj_del(scr),
-    // causing a load-access fault in the next lv_timer_handler call.
-    // lv_obj_clean leaves scr as the active screen; create_home_ui() populates it.
+    // Strip cal widgets without deleting scr (avoids dangling prev_scr pointer).
     lv_obj_clean(scr);
     ESP_LOGI(TAG, "Touch calibration complete");
 }
