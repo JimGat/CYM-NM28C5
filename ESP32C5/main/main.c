@@ -1607,6 +1607,7 @@ static void run_touch_calibration(void);
 void vibrator_on(void);
 void vibrator_off(void);
 void vibrator_pulse(uint32_t duration_ms);
+void vibrator_burst(int count, uint32_t on_ms, uint32_t gap_ms);
 bool vibrator_is_active(void);
 static void show_sd_card_screen(void);
 static void show_gps_info_screen(void);
@@ -3364,13 +3365,13 @@ static void cal_wait_release(int nx, int ny)
 }
 
 // Calibration target points [screen_x, screen_y]: TL, TR, BL, BR.
-// 16 px from each edge keeps the 32px crosshair fully on-screen.
-// Raw values recorded here are used directly as min/max — no extrapolation.
+// Corners give raw ADC values that span the full screen range — no extrapolation error.
+// L-shaped bracket indicators are drawn at each corner so the target is unambiguous.
 static const int16_t CAL_PTS[4][2] = {
-    { 16,  16},   // 0: Top-Left
-    {223,  16},   // 1: Top-Right
-    { 16, 303},   // 2: Bottom-Left
-    {223, 303},   // 3: Bottom-Right
+    {  0,   0},   // 0: Top-Left
+    {239,   0},   // 1: Top-Right
+    {  0, 319},   // 2: Bottom-Left
+    {239, 319},   // 3: Bottom-Right
 };
 
 static void run_touch_calibration(void)
@@ -3400,15 +3401,16 @@ static void run_touch_calibration(void)
     lv_obj_set_width(lbl, 200);
     lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 50);
 
+    // L-shaped corner bracket: two bars, 40×4 and 4×40, positioned at each corner.
     lv_obj_t *hbar = lv_obj_create(scr);
-    lv_obj_set_size(hbar, 32, 2);
+    lv_obj_set_size(hbar, 40, 4);
     lv_obj_set_style_bg_color(hbar, lv_color_hex(0xFFD600), 0);
     lv_obj_set_style_bg_opa(hbar, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(hbar, 0, 0);
     lv_obj_set_style_radius(hbar, 0, 0);
 
     lv_obj_t *vbar = lv_obj_create(scr);
-    lv_obj_set_size(vbar, 2, 32);
+    lv_obj_set_size(vbar, 4, 40);
     lv_obj_set_style_bg_color(vbar, lv_color_hex(0xFFD600), 0);
     lv_obj_set_style_bg_opa(vbar, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(vbar, 0, 0);
@@ -3425,10 +3427,10 @@ static void run_touch_calibration(void)
     const int null_x = 0, null_y = 0;
 
     const char *pt_names[4] = {
-        "Tap corner crosshair\nTop-Left     (1/4)",
-        "Tap corner crosshair\nTop-Right    (2/4)",
-        "Tap corner crosshair\nBottom-Left  (3/4)",
-        "Tap corner crosshair\nBottom-Right (4/4)",
+        "Tap the corner:\nTop-Left     (1/4)",
+        "Tap the corner:\nTop-Right    (2/4)",
+        "Tap the corner:\nBottom-Left  (3/4)",
+        "Tap the corner:\nBottom-Right (4/4)",
     };
 
     // Outer loop: redo calibration if user does not confirm within 5 s
@@ -3438,8 +3440,9 @@ static void run_touch_calibration(void)
 
         for (int pt = 0; pt < 4; pt++) {
             int tx = CAL_PTS[pt][0], ty = CAL_PTS[pt][1];
-            lv_obj_set_pos(hbar, tx - 16, ty - 1);
-            lv_obj_set_pos(vbar, tx - 1,  ty - 16);
+            // L-bracket anchored to corner: horizontal bar along edge, vertical bar along side
+            lv_obj_set_pos(hbar, (tx == 0) ? 0 : tx - 39, (ty == 0) ? 0 : ty - 3);
+            lv_obj_set_pos(vbar, (tx == 0) ? 0 : tx - 3,  (ty == 0) ? 0 : ty - 39);
             lv_obj_clear_flag(hbar, LV_OBJ_FLAG_HIDDEN);
             lv_obj_clear_flag(vbar, LV_OBJ_FLAG_HIDDEN);
             lv_label_set_text(lbl, pt_names[pt]);
@@ -5959,6 +5962,7 @@ void app_main(void)
                              det.mac[0], det.mac[1], det.mac[2],
                              det.mac[3], det.mac[4], det.mac[5]);
                     show_lookout_alert_popup(det.name, mac_str, det.rssi);
+                    vibrator_burst(3, 1000, 500);   // 3 × 1-second blasts on watchlist hit
                     if (bt_lookout_last_lbl && lv_obj_is_valid(bt_lookout_last_lbl)) {
                         char last_buf[64];
                         snprintf(last_buf, sizeof(last_buf), "%s  %s", det.name, mac_str);
@@ -25361,6 +25365,7 @@ static void deauther_proceed(void)
     show_function_page("Deauther");
     wifi_scanner_save_target_bssids();
     wifi_attacks_start_deauth();
+    vibrator_pulse(3000);   // 3-second blast to signal deauth launched
     {
         int sel_indices[MAX_SCAN_RESULTS];
         int sel_count = wifi_scanner_get_selected(sel_indices, MAX_SCAN_RESULTS);
@@ -26502,6 +26507,45 @@ void vibrator_pulse(uint32_t duration_ms)
     esp_timer_stop(g_vibrator_pulse_timer);   // cancel any pending pulse
     vibrator_on();
     esp_timer_start_once(g_vibrator_pulse_timer, (uint64_t)duration_ms * 1000ULL);
+}
+
+// ── burst support ─────────────────────────────────────────────────────────────
+static int               g_vib_burst_remain  = 0;
+static uint32_t          g_vib_burst_on_ms   = 0;
+static uint32_t          g_vib_burst_gap_ms  = 0;
+static esp_timer_handle_t g_vib_burst_timer  = NULL;
+
+static void vib_burst_next_cb(void *arg)
+{
+    if (g_vib_burst_remain <= 0) return;
+    g_vib_burst_remain--;
+    vibrator_pulse(g_vib_burst_on_ms);
+    if (g_vib_burst_remain > 0) {
+        esp_timer_start_once(g_vib_burst_timer,
+            (uint64_t)(g_vib_burst_on_ms + g_vib_burst_gap_ms) * 1000ULL);
+    }
+}
+
+// Fire count vibrator pulses, each on_ms long, gap_ms between them. Non-blocking.
+void vibrator_burst(int count, uint32_t on_ms, uint32_t gap_ms)
+{
+    if (count <= 0 || vibrator_init() != ESP_OK) return;
+    if (!g_vib_burst_timer) {
+        const esp_timer_create_args_t args = {
+            .callback = vib_burst_next_cb,
+            .name     = "vib_burst",
+        };
+        esp_timer_create(&args, &g_vib_burst_timer);
+    }
+    esp_timer_stop(g_vib_burst_timer);
+    g_vib_burst_remain = count - 1;
+    g_vib_burst_on_ms  = on_ms;
+    g_vib_burst_gap_ms = gap_ms;
+    vibrator_pulse(on_ms);
+    if (g_vib_burst_remain > 0) {
+        esp_timer_start_once(g_vib_burst_timer,
+            (uint64_t)(on_ms + gap_ms) * 1000ULL);
+    }
 }
 
 // === BATTERY VOLTAGE MONITOR IMPLEMENTATION ===
