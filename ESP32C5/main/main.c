@@ -64,6 +64,9 @@ LV_IMG_DECLARE(deedee_img);
 // GPS
 #include "driver/uart.h"
 
+// Vibrator motor (LEDC PWM on GPIO26 → SC8002B amp)
+#include "driver/ledc.h"
+
 // ADC for battery voltage monitoring
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
@@ -240,6 +243,21 @@ static void (*s_ble_disc_return_fn)(void) = NULL;
 #define LCD_H_RES 240
 #define LCD_V_RES 320
 #define LCD_HOST SPI2_HOST
+
+// Vibrator motor — GPIO26 → SC8002B amp (SPEAK_IN). LEDC PWM drives the amp
+// input; a Schottky diode + flyback diode on the speaker header rectify the BTL
+// output to give pulsed DC to the motor.
+#define VIBRATOR_GPIO        26
+#define VIBRATOR_LEDC_TIMER  LEDC_TIMER_2
+#define VIBRATOR_LEDC_CH     LEDC_CHANNEL_4
+#define VIBRATOR_FREQ_HZ     333              // 333 Hz — confirmed best haptic feel
+#define VIBRATOR_RESOLUTION  LEDC_TIMER_8_BIT // 0–255 duty range
+#define VIBRATOR_DUTY_ON     128              // 50 % duty = full drive through diode
+
+// Strength 10–100% where 100% → 50% duty (128/255). Motor is half-wave rectified
+// so 50% duty is the practical maximum; higher duty gives no extra drive.
+static int g_vibtest_strength_pct = 100;
+
 
 // Battery ADC configuration - Waveshare ESP32-C5-WIFI6-KIT (DISABLED - using regular C5 chip)
 // Schematic: R10=200k, R16=100k voltage divider on BAT_ADC line
@@ -430,7 +448,7 @@ typedef enum { WD_BAND_BOTH = 0, WD_BAND_24G, WD_BAND_5G } wd_band_t;
 
 // Touch calibration NVS
 #define TOUCH_CAL_NVS_NS      "touch_cal"
-#define TOUCH_CAL_MAGIC       ((uint16_t)0xCA11)
+#define TOUCH_CAL_MAGIC       ((uint16_t)0xCA15)  // bump: Z1+4095-Z2 compensated pressure replaces Z1-only
 #define TOUCH_CAL_NULL_RADIUS 250   // raw ADC units — reject within this radius of null point
 
 typedef struct {
@@ -504,6 +522,7 @@ static gps_data_t g_gps_last_known = {0};  // persists across GPS dropouts; load
 // Set by GPS task when a new valid fix arrives; main loop calls nvs_save_last_gps() from
 // main-task context to avoid nvs_commit() disabling flash cache in a background task.
 static volatile bool g_gps_save_pending = false;
+static volatile bool g_gps_force_save_pending = false; // set on lock loss; bypasses 5-min throttle
 
 // Returns the best available GPS reading: live if valid, last-known (stale) if not.
 // Callers that write location data should always use this instead of current_gps directly.
@@ -1350,17 +1369,6 @@ static portMUX_TYPE  wscope_mux         = portMUX_INITIALIZER_UNLOCKED;
 static int8_t        wscope_ch_peak[WSCOPE_CH_MAX];
 static uint16_t      wscope_ch_cnt[WSCOPE_CH_MAX];
 
-// ── BLE Band Scope state ─────────────────────────────────────────────────────
-static lv_color_t   *blescope_buf        = NULL;
-static lv_obj_t     *blescope_canvas     = NULL;
-static lv_obj_t     *blescope_status_lbl = NULL;
-static lv_timer_t   *blescope_ui_timer   = NULL;
-static volatile bool blescope_active     = false;
-static portMUX_TYPE  blescope_mux        = portMUX_INITIALIZER_UNLOCKED;
-static uint16_t      blescope_hist[WSCOPE_W];
-static volatile uint32_t blescope_pkt_total = 0;
-static volatile uint32_t blescope_win_pkts  = 0;
-
 // AirTag Scanner state
 static TaskHandle_t airtag_scan_task_handle = NULL;
 static StaticTask_t airtag_scan_task_buffer;
@@ -1386,6 +1394,7 @@ static volatile bool bt_locator_ui_active = false;
 static volatile bool bt_locator_tracking_active = false;
 static volatile bool bt_locator_needs_ui_update = false;
 static char bt_locator_status_text[48] = "";
+static int bt_locator_saved_strength_pct = 100; // g_vibtest_strength_pct saved on entry, restored on exit
 
 // BT tracking mode support (for BT Locator)
 static bool bt_tracking_mode = false;
@@ -1583,6 +1592,13 @@ static void attack_tile_event_cb(lv_event_t *e);
 static void update_sniffer_button_ui(void);
 static void show_settings_screen(void);
 static void settings_tile_event_cb(lv_event_t *e);
+static void show_vibrator_test_popup(void);
+static void run_touch_calibration(void);
+void vibrator_on(void);
+void vibrator_off(void);
+void vibrator_pulse(uint32_t duration_ms);
+void vibrator_burst(int count, uint32_t on_ms, uint32_t gap_ms);
+bool vibrator_is_active(void);
 static void show_sd_card_screen(void);
 static void show_gps_info_screen(void);
 static void show_found_tags_screen(void);
@@ -1695,11 +1711,6 @@ static void reset_function_page_children(void) {
     wscope_canvas = NULL; wscope_status_lbl = NULL; wscope_active = false;
     if (wscope_ui_timer) { lv_timer_del(wscope_ui_timer); wscope_ui_timer = NULL; }
     if (wscope_buf)      { heap_caps_free(wscope_buf);     wscope_buf = NULL; }
-    // BLE Band Scope cleanup
-    blescope_canvas = NULL; blescope_status_lbl = NULL;
-    if (blescope_ui_timer) { lv_timer_del(blescope_ui_timer); blescope_ui_timer = NULL; }
-    if (blescope_buf)      { heap_caps_free(blescope_buf);     blescope_buf = NULL; }
-    if (blescope_active)   { blescope_active = false; ble_gap_disc_cancel(); }
     deauth_monitor_rec_label = NULL;
     bt_locator_content = NULL;
     bt_locator_list = NULL;
@@ -1979,7 +1990,6 @@ static void drone_show_detail(int idx);
 static void drone_row_tap_cb(lv_event_t *e);
 static void show_wifi_analyzer_screen(void);
 static void show_wscope_screen(void);
-static void show_blescope_screen(void);
 static void wscope_task(void *p);
 
 // BT Locator functions
@@ -3298,24 +3308,31 @@ static bool cal_in_null(int x, int y, int nx, int ny)
     return (dx * dx + dy * dy) < (TOUCH_CAL_NULL_RADIUS * TOUCH_CAL_NULL_RADIUS);
 }
 
-// Wait for 8 consecutive stable reads not in the null zone; timeout_ms = 0 → wait forever
+// Wait for first valid touch not in the null zone, then average 8 samples (~160 ms).
+// No stability window: resistive panels produce noisier readings near the physical edge;
+// a tight consecutive-stable check causes the user to drift inward to find a quieter spot,
+// recording the wrong raw value. Simple averaging matches the Launcher approach.
 static bool cal_wait_touch(int nx, int ny, uint16_t *rx, uint16_t *ry, int timeout_ms)
 {
     int64_t t0 = esp_timer_get_time() / 1000;
-    uint16_t lx = 0, ly = 0;
-    int stable = 0;
     for (;;) {
         cal_tick();
         if (timeout_ms > 0 && (esp_timer_get_time() / 1000 - t0) > timeout_ms) return false;
         uint16_t x, y;
-        if (!xpt2046_read_raw_point(&touch_handle, &x, &y) || cal_in_null(x, y, nx, ny)) {
-            stable = 0; lx = ly = 0;
-            continue;
+        if (!xpt2046_read_raw_point(&touch_handle, &x, &y) || cal_in_null(x, y, nx, ny)) continue;
+        // First valid touch — collect 7 more samples at 20 ms intervals and average all 8
+        uint32_t sx = x, sy = y;
+        int n = 1;
+        for (int i = 0; i < 7; i++) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            uint16_t ax, ay;
+            if (xpt2046_read_raw_point(&touch_handle, &ax, &ay) && !cal_in_null(ax, ay, nx, ny)) {
+                sx += ax; sy += ay; n++;
+            }
         }
-        if (lx > 0 && abs((int)x - (int)lx) < 80 && abs((int)y - (int)ly) < 80) {
-            if (++stable >= 8) { *rx = x; *ry = y; return true; }
-        } else { stable = 1; }
-        lx = x; ly = y;
+        *rx = (uint16_t)(sx / n);
+        *ry = (uint16_t)(sy / n);
+        return true;
     }
 }
 
@@ -3331,8 +3348,15 @@ static void cal_wait_release(int nx, int ny)
     }
 }
 
-// Calibration target points [screen_x, screen_y]: TL, TR, BL
-static const int16_t CAL_PTS[3][2] = { {20, 20}, {220, 20}, {20, 300} };
+// Calibration target points [screen_x, screen_y]: TL, TR, BL, BR.
+// Corners give raw ADC values that span the full screen range — no extrapolation error.
+// L-shaped bracket indicators are drawn at each corner so the target is unambiguous.
+static const int16_t CAL_PTS[4][2] = {
+    {  0,   0},   // 0: Top-Left
+    {239,   0},   // 1: Top-Right
+    {  0, 319},   // 2: Bottom-Left
+    {239, 319},   // 3: Bottom-Right
+};
 
 static void run_touch_calibration(void)
 {
@@ -3343,24 +3367,35 @@ static void run_touch_calibration(void)
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(scr, 0, 0);
     lv_obj_set_style_pad_all(scr, 0, 0);
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Lab background image with dark overlay so white UI elements stay visible
+    lv_obj_t *bg_img = lv_img_create(scr);
+    lv_img_set_src(bg_img, &lab_bg);
+    lv_obj_align(bg_img, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_img_recolor(bg_img, lv_color_black(), 0);
+    lv_obj_set_style_img_recolor_opa(bg_img, LV_OPA_10, 0);
+    lv_obj_move_to_index(bg_img, 0);
 
     lv_obj_t *lbl = lv_label_create(scr);
     lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
     lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
     lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(lbl, 200);
     lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 50);
 
+    // L-shaped corner bracket: two bars, 40×4 and 4×40, positioned at each corner.
     lv_obj_t *hbar = lv_obj_create(scr);
-    lv_obj_set_size(hbar, 32, 2);
-    lv_obj_set_style_bg_color(hbar, lv_color_white(), 0);
+    lv_obj_set_size(hbar, 40, 4);
+    lv_obj_set_style_bg_color(hbar, lv_color_hex(0xFFD600), 0);
     lv_obj_set_style_bg_opa(hbar, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(hbar, 0, 0);
     lv_obj_set_style_radius(hbar, 0, 0);
 
     lv_obj_t *vbar = lv_obj_create(scr);
-    lv_obj_set_size(vbar, 2, 32);
-    lv_obj_set_style_bg_color(vbar, lv_color_white(), 0);
+    lv_obj_set_size(vbar, 4, 40);
+    lv_obj_set_style_bg_color(vbar, lv_color_hex(0xFFD600), 0);
     lv_obj_set_style_bg_opa(vbar, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(vbar, 0, 0);
     lv_obj_set_style_radius(vbar, 0, 0);
@@ -3370,88 +3405,168 @@ static void run_touch_calibration(void)
     lv_scr_load(scr);
     for (int i = 0; i < 5; i++) cal_tick();
 
-    // Step 0: measure resting null zone (2 s, do not touch)
-    lv_label_set_text(lbl, "Calibrating...\nDo NOT touch screen.");
-    for (int i = 0; i < 3; i++) cal_tick();
+    // No null-zone measurement: XPT2046 ghost reads near the top during the
+    // "don't touch" window would reject valid top-right taps if they matched
+    // the null zone coords. Z threshold is the sole ghost-touch gate.
+    const int null_x = 0, null_y = 0;
 
-    int64_t t_end = esp_timer_get_time() / 1000 + 2000;
-    int32_t nxs = 0, nys = 0; int nn = 0;
-    while (esp_timer_get_time() / 1000 < t_end) {
-        cal_tick();
-        uint16_t x, y;
-        if (xpt2046_read_raw_point(&touch_handle, &x, &y)) {
-            nxs += x; nys += y; nn++;
-        }
-    }
-    int null_x = (nn > 0) ? (int)(nxs / nn) : 0;
-    int null_y = (nn > 0) ? (int)(nys / nn) : 0;
-    ESP_LOGI(TAG, "Null zone raw=(%d,%d) n=%d", null_x, null_y, nn);
-
-    // Steps 1–3: collect 3 calibration points
-    uint16_t raw_x[3], raw_y[3];
-    const char *pt_lbl[3] = {
-        "Touch the [+]\nTop-Left  (1/3)",
-        "Touch the [+]\nTop-Right (2/3)",
-        "Touch the [+]\nBottom-Left (3/3)"
+    const char *pt_names[4] = {
+        "Tap the corner:\nTop-Left     (1/4)",
+        "Tap the corner:\nTop-Right    (2/4)",
+        "Tap the corner:\nBottom-Left  (3/4)",
+        "Tap the corner:\nBottom-Right (4/4)",
     };
 
-    for (int pt = 0; pt < 3; pt++) {
-        int tx = CAL_PTS[pt][0], ty = CAL_PTS[pt][1];
-        lv_obj_set_pos(hbar, tx - 16, ty - 1);
-        lv_obj_set_pos(vbar, tx - 1,  ty - 16);
-        lv_obj_clear_flag(hbar, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(vbar, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(lbl, pt_lbl[pt]);
-        for (int i = 0; i < 3; i++) cal_tick();
+    // Outer loop: redo calibration if user does not confirm within 5 s
+    while (true) {
+        uint16_t raw_x[4], raw_y[4];
+        bool aborted = false;
 
-        cal_wait_release(null_x, null_y);
+        for (int pt = 0; pt < 4; pt++) {
+            int tx = CAL_PTS[pt][0], ty = CAL_PTS[pt][1];
+            // L-bracket anchored to corner: horizontal bar along edge, vertical bar along side
+            lv_obj_set_pos(hbar, (tx == 0) ? 0 : tx - 39, (ty == 0) ? 0 : ty - 3);
+            lv_obj_set_pos(vbar, (tx == 0) ? 0 : tx - 3,  (ty == 0) ? 0 : ty - 39);
+            lv_obj_clear_flag(hbar, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(vbar, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(lbl, pt_names[pt]);
+            lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 50);
+            for (int i = 0; i < 3; i++) cal_tick();
 
-        if (!cal_wait_touch(null_x, null_y, &raw_x[pt], &raw_y[pt], 15000)) {
-            ESP_LOGW(TAG, "Calibration timeout at point %d — aborting", pt + 1);
-            lv_obj_clean(scr);  // strip cal widgets; scr stays active for create_home_ui
+            cal_wait_release(null_x, null_y);
+
+            if (!cal_wait_touch(null_x, null_y, &raw_x[pt], &raw_y[pt], 15000)) {
+                ESP_LOGW(TAG, "Calibration timeout at point %d — aborting", pt + 1);
+                aborted = true;
+                break;
+            }
+            ESP_LOGI(TAG, "Cal[%d] screen(%d,%d) -> raw(%u,%u)", pt+1, tx, ty, raw_x[pt], raw_y[pt]);
+        }
+
+        if (aborted) {
+            lv_obj_clean(scr);
             return;
         }
-        ESP_LOGI(TAG, "Cal[%d] screen(%d,%d) → raw(%u,%u)", pt+1, tx, ty, raw_x[pt], raw_y[pt]);
+
+        // Compute calibration using column/row averages — no extrapolation.
+        int x_left  = ((int)raw_x[0] + (int)raw_x[2]) / 2;
+        int x_right = ((int)raw_x[1] + (int)raw_x[3]) / 2;
+        int y_top   = ((int)raw_y[0] + (int)raw_y[1]) / 2;
+        int y_bot   = ((int)raw_y[2] + (int)raw_y[3]) / 2;
+
+        touch_cal_t cal;
+        cal.invert_x = (uint8_t)(x_left > x_right);
+        cal.x_min    = (int32_t)(cal.invert_x ? x_right : x_left);
+        cal.x_max    = (int32_t)(cal.invert_x ? x_left  : x_right);
+        cal.invert_y = (uint8_t)(y_top > y_bot);
+        cal.y_min    = (int32_t)(cal.invert_y ? y_bot : y_top);
+        cal.y_max    = (int32_t)(cal.invert_y ? y_top : y_bot);
+        cal.swap_xy  = 0;
+        cal.null_x   = (int32_t)null_x;
+        cal.null_y   = (int32_t)null_y;
+
+        ESP_LOGI(TAG, "Cal: X%ld-%ld(inv=%d) Y%ld-%ld(inv=%d)",
+                 cal.x_min, cal.x_max, cal.invert_x,
+                 cal.y_min, cal.y_max, cal.invert_y);
+
+        // ── Confirmation UI ──────────────────────────────────────────────────
+        lv_obj_add_flag(hbar, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(vbar, LV_OBJ_FLAG_HIDDEN);
+
+        lv_label_set_text(lbl, "Tap OK to confirm.\nMust hit the button.");
+        lv_obj_align(lbl, LV_ALIGN_CENTER, 0, -70);
+
+        // OK button at screen center — 47×20 (1/3 of original 140×60)
+        lv_obj_t *ok_btn = lv_btn_create(scr);
+        lv_obj_set_size(ok_btn, 47, 20);
+        lv_obj_align(ok_btn, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_bg_color(ok_btn, lv_color_hex(0x2E7D32), 0);
+        lv_obj_set_style_radius(ok_btn, 4, 0);
+        lv_obj_set_style_pad_all(ok_btn, 2, 0);
+        lv_obj_t *ok_lbl_w = lv_label_create(ok_btn);
+        lv_label_set_text(ok_lbl_w, "OK");
+        lv_obj_set_style_text_font(ok_lbl_w, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(ok_lbl_w, lv_color_white(), 0);
+        lv_obj_center(ok_lbl_w);
+
+        lv_obj_t *cd_lbl = lv_label_create(scr);
+        lv_obj_set_style_text_color(cd_lbl, lv_color_make(160, 160, 160), 0);
+        lv_obj_set_style_text_font(cd_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_align(cd_lbl, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(cd_lbl, 200);
+        lv_obj_align(cd_lbl, LV_ALIGN_CENTER, 0, 65);
+        lv_label_set_text(cd_lbl, "Retry in 5 s...");
+
+        // Snapshot old cal so we can restore it if the user doesn't confirm
+        touch_cal_t old_cal = {
+            .x_min    = (int32_t)touch_handle.x_min,
+            .x_max    = (int32_t)touch_handle.x_max,
+            .y_min    = (int32_t)touch_handle.y_min,
+            .y_max    = (int32_t)touch_handle.y_max,
+            .invert_x = (uint8_t)touch_handle.invert_x,
+            .invert_y = (uint8_t)touch_handle.invert_y,
+            .swap_xy  = (uint8_t)touch_handle.swap_xy,
+            .null_x   = (int32_t)touch_handle.null_x,
+            .null_y   = (int32_t)touch_handle.null_y,
+        };
+
+        // Apply new cal now so xpt2046_read_touch maps to new coordinates.
+        // The OK button hit-check uses these new coordinates — if the cal is
+        // good, the button registers; if it's bad, touches miss and it retries.
+        touch_cal_apply(&cal);
+
+        // Wait for finger to lift from last cal point before polling for OK
+        cal_wait_release(null_x, null_y);
+        for (int i = 0; i < 5; i++) cal_tick();
+
+        // OK button screen bounds (half-button + 5 px margin each side)
+        const int ok_x0 = LCD_H_RES / 2 - 28,  ok_x1 = LCD_H_RES / 2 + 28;
+        const int ok_y0 = LCD_V_RES / 2 - 15,  ok_y1 = LCD_V_RES / 2 + 15;
+
+        int64_t deadline = esp_timer_get_time() / 1000 + 5000;
+        bool ok_tapped   = false;
+        int  last_shown  = -1;
+
+        while (esp_timer_get_time() / 1000 < deadline) {
+            cal_tick();
+            int remaining_ms = (int)(deadline - esp_timer_get_time() / 1000);
+            int remaining_s  = (remaining_ms + 999) / 1000;
+            if (remaining_s != last_shown) {
+                char cd_buf[28];
+                snprintf(cd_buf, sizeof(cd_buf), "Retry in %d s...", remaining_s);
+                lv_label_set_text(cd_lbl, cd_buf);
+                last_shown = remaining_s;
+            }
+            xpt2046_touch_point_t tp;
+            if (xpt2046_read_touch(&touch_handle, &tp) && tp.touched) {
+                if ((int)tp.x >= ok_x0 && (int)tp.x <= ok_x1 &&
+                    (int)tp.y >= ok_y0 && (int)tp.y <= ok_y1) {
+                    ok_tapped = true;
+                    break;
+                }
+            }
+        }
+
+        lv_obj_del(ok_btn);   // also deletes ok_lbl_w (child)
+        lv_obj_del(cd_lbl);
+
+        if (ok_tapped) {
+            touch_cal_nvs_save(&cal);   // cal already applied above
+            lv_label_set_text(lbl, "Calibration saved!");
+            lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 0);
+            int64_t t_done = esp_timer_get_time() / 1000 + 1500;
+            while (esp_timer_get_time() / 1000 < t_done) cal_tick();
+            break;
+        }
+
+        // Not confirmed — restore old cal and retry
+        touch_cal_apply(&old_cal);
+        lv_label_set_text(lbl, "Missed — retrying...");
+        lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 50);
+        for (int i = 0; i < 20; i++) cal_tick();  // ~200 ms pause
     }
 
-    // Derive calibration from two X points (TL,TR) and two Y points (TL,BL)
-    float xscale = (float)((int)raw_x[1] - (int)raw_x[0]) / (CAL_PTS[1][0] - CAL_PTS[0][0]);
-    int x_at_0   = (int)raw_x[0] - (int)(CAL_PTS[0][0] * xscale);
-    int x_at_239 = (int)raw_x[1] + (int)((LV_HOR_RES - 1 - CAL_PTS[1][0]) * xscale);
-
-    float yscale = (float)((int)raw_y[2] - (int)raw_y[0]) / (CAL_PTS[2][1] - CAL_PTS[0][1]);
-    int y_at_0   = (int)raw_y[0] - (int)(CAL_PTS[0][1] * yscale);
-    int y_at_319 = (int)raw_y[2] + (int)((LV_VER_RES - 1 - CAL_PTS[2][1]) * yscale);
-
-    touch_cal_t cal;
-    cal.invert_x = (uint8_t)(x_at_0 > x_at_239);
-    cal.x_min    = (int32_t)(cal.invert_x ? x_at_239 : x_at_0);
-    cal.x_max    = (int32_t)(cal.invert_x ? x_at_0   : x_at_239);
-    cal.invert_y = (uint8_t)(y_at_0 > y_at_319);
-    cal.y_min    = (int32_t)(cal.invert_y ? y_at_319 : y_at_0);
-    cal.y_max    = (int32_t)(cal.invert_y ? y_at_0   : y_at_319);
-    cal.swap_xy  = 0;
-    cal.null_x   = (int32_t)null_x;
-    cal.null_y   = (int32_t)null_y;
-
-    ESP_LOGI(TAG, "Cal: X%ld-%ld(inv=%d) Y%ld-%ld(inv=%d) null(%ld,%ld)",
-             cal.x_min, cal.x_max, cal.invert_x,
-             cal.y_min, cal.y_max, cal.invert_y,
-             cal.null_x, cal.null_y);
-
-    touch_cal_nvs_save(&cal);
-    touch_cal_apply(&cal);
-
-    lv_label_set_text(lbl, "Calibration done!");
-    lv_obj_add_flag(hbar, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(vbar, LV_OBJ_FLAG_HIDDEN);
-    int64_t t_done = esp_timer_get_time() / 1000 + 1500;
-    while (esp_timer_get_time() / 1000 < t_done) cal_tick();
-
-    // Strip cal widgets off the screen without deleting it — lv_scr_load sets
-    // disp->prev_scr which remains a dangling pointer after lv_obj_del(scr),
-    // causing a load-access fault in the next lv_timer_handler call.
-    // lv_obj_clean leaves scr as the active screen; create_home_ui() populates it.
+    // Strip cal widgets without deleting scr (avoids dangling prev_scr pointer).
     lv_obj_clean(scr);
     ESP_LOGI(TAG, "Touch calibration complete");
 }
@@ -5831,6 +5946,7 @@ void app_main(void)
                              det.mac[0], det.mac[1], det.mac[2],
                              det.mac[3], det.mac[4], det.mac[5]);
                     show_lookout_alert_popup(det.name, mac_str, det.rssi);
+                    vibrator_burst(3, 1000, 500);   // 3 × 1-second blasts on watchlist hit
                     if (bt_lookout_last_lbl && lv_obj_is_valid(bt_lookout_last_lbl)) {
                         char last_buf[64];
                         snprintf(last_buf, sizeof(last_buf), "%s  %s", det.name, mac_str);
@@ -6211,7 +6327,11 @@ void app_main(void)
         // Flush GPS position to NVS from main-task context (throttled inside the function).
         // nvs_commit() briefly disables the flash cache; calling it from a background task
         // (gps_task) while the panic handler is in flash causes CPU_LOCKUP — do it here instead.
-        if (g_gps_save_pending) {
+        if (g_gps_force_save_pending) {
+            g_gps_force_save_pending = false;
+            g_gps_save_pending = false;
+            nvs_save_last_gps_force(&g_gps_last_known, true);
+        } else if (g_gps_save_pending) {
             g_gps_save_pending = false;
             nvs_save_last_gps(&g_gps_last_known);
         }
@@ -10802,12 +10922,12 @@ static void show_karma_page(void)
     lv_obj_set_style_pad_all(karma_btn_row, 0, 0);
     lv_obj_set_style_pad_gap(karma_btn_row, 10, 0);
     lv_obj_set_flex_flow(karma_btn_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(karma_btn_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_align(karma_btn_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(karma_btn_row, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Start Karma button
+    // Start Karma button — 105 px so both buttons fit in 220 px row
     karma_start_btn = lv_btn_create(karma_btn_row);
-    lv_obj_set_size(karma_start_btn, 140, 35);
+    lv_obj_set_size(karma_start_btn, 105, 35);
     lv_obj_set_style_bg_color(karma_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(karma_start_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(karma_start_btn, 0, 0);
@@ -10816,6 +10936,7 @@ static void show_karma_page(void)
 
     lv_obj_t *start_label = lv_label_create(karma_start_btn);
     lv_label_set_text(start_label, "Start Karma");
+    lv_obj_set_style_text_font(start_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(start_label, ui_text_color(), 0);
     lv_obj_center(start_label);
 
@@ -10824,9 +10945,9 @@ static void show_karma_page(void)
         lv_obj_add_state(karma_start_btn, LV_STATE_DISABLED);
     }
 
-    // Back To Observer button
+    // Back To Observer button — 105 px
     lv_obj_t *back_obs_btn = lv_btn_create(karma_btn_row);
-    lv_obj_set_size(back_obs_btn, 160, 35);
+    lv_obj_set_size(back_obs_btn, 105, 35);
     lv_obj_set_style_bg_color(back_obs_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(back_obs_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(back_obs_btn, 0, 0);
@@ -10835,7 +10956,10 @@ static void show_karma_page(void)
 
     lv_obj_t *back_obs_label = lv_label_create(back_obs_btn);
     lv_label_set_text(back_obs_label, "Back To Observer");
+    lv_obj_set_style_text_font(back_obs_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(back_obs_label, ui_text_color(), 0);
+    lv_label_set_long_mode(back_obs_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(back_obs_label, 100);
     lv_obj_center(back_obs_label);
 }
 
@@ -11784,6 +11908,7 @@ static void create_function_page_base(const char *name)
     lv_obj_set_style_border_width(function_page, 0, 0);
     lv_obj_set_style_radius(function_page, 0, 0);
     lv_obj_set_style_pad_all(function_page, 0, 0);
+    lv_obj_clear_flag(function_page, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *page_title_bar = lv_obj_create(function_page);
     lv_obj_set_size(page_title_bar, lv_pct(100), 30);
@@ -18129,6 +18254,19 @@ static void screen_popup_save_cb(lv_event_t *e)
     brightness_value_label = NULL;
 }
 
+static void screen_popup_recal_cb(lv_event_t *e)
+{
+    (void)e;
+    // Invalidate NVS touch cal magic so boot detects no valid cal and runs calibration.
+    nvs_handle_t h;
+    if (nvs_open(TOUCH_CAL_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u16(h, "magic", 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    esp_restart();
+}
+
 static void show_screen_popup(void)
 {
     if (screen_popup) return;
@@ -18218,6 +18356,31 @@ static void show_screen_popup(void)
     lv_obj_set_style_pad_all(brightness_slider, 4, LV_PART_KNOB);
     lv_obj_add_event_cb(brightness_slider, brightness_slider_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
+    /* ── Divider ──────────────────────────────────── */
+    lv_obj_t *div2 = lv_obj_create(dialog);
+    lv_obj_set_size(div2, 196, 1);
+    lv_obj_set_style_bg_color(div2, lv_color_make(70,70,70), 0);
+    lv_obj_set_style_border_width(div2, 0, 0);
+    lv_obj_set_style_pad_all(div2, 0, 0);
+
+    /* ── Recalibrate Touch section ────────────────── */
+    lv_obj_t *recal_hdr = lv_label_create(dialog);
+    lv_label_set_text(recal_hdr, "Touch Calibration");
+    lv_obj_set_style_text_color(recal_hdr, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_text_font(recal_hdr, &lv_font_montserrat_12, 0);
+
+    lv_obj_t *recal_btn = lv_btn_create(dialog);
+    lv_obj_set_size(recal_btn, 196, 30);
+    lv_obj_set_style_bg_color(recal_btn, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_bg_color(recal_btn, lv_color_lighten(COLOR_MATERIAL_AMBER, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(recal_btn, 8, 0);
+    lv_obj_t *recal_lbl = lv_label_create(recal_btn);
+    lv_label_set_text(recal_lbl, LV_SYMBOL_REFRESH " Recalibrate Touch");
+    lv_obj_set_style_text_color(recal_lbl, lv_color_black(), 0);
+    lv_obj_set_style_text_font(recal_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(recal_lbl);
+    lv_obj_add_event_cb(recal_btn, screen_popup_recal_cb, LV_EVENT_CLICKED, NULL);
+
     /* ── Buttons ──────────────────────────────────── */
     lv_obj_t *btn_row = lv_obj_create(dialog);
     lv_obj_set_size(btn_row, 196, 36);
@@ -18250,6 +18413,168 @@ static void show_screen_popup(void)
     lv_obj_set_style_text_font(save_lbl, &lv_font_montserrat_12, 0);
     lv_obj_center(save_lbl);
     lv_obj_add_event_cb(save_btn, screen_popup_save_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// ============================================================================
+// Vibrator Test Popup
+// ============================================================================
+
+static lv_obj_t *vibtest_popup      = NULL;
+static lv_obj_t *vibtest_on_btn     = NULL;
+static lv_obj_t *vibtest_off_btn    = NULL;
+static lv_obj_t *vibtest_status_lbl = NULL;
+static lv_obj_t *vibtest_strength_lbl = NULL;
+
+static void vibtest_strength_cb(lv_event_t *e)
+{
+    lv_obj_t *slider = lv_event_get_target(e);
+    int val = lv_slider_get_value(slider);
+    g_vibtest_strength_pct = val;
+    char buf[28];
+    snprintf(buf, sizeof(buf), "Strength: %d%%", val);
+    if (vibtest_strength_lbl) lv_label_set_text(vibtest_strength_lbl, buf);
+    if (vibrator_is_active()) {
+        uint32_t duty = (uint32_t)val * 128 / 100;
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, VIBRATOR_LEDC_CH, duty);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, VIBRATOR_LEDC_CH);
+    }
+}
+
+static void vibtest_refresh(void)
+{
+    if (!vibtest_on_btn || !vibtest_off_btn || !vibtest_status_lbl) return;
+    bool active = vibrator_is_active();
+    lv_obj_set_style_bg_color(vibtest_on_btn,  active ? lv_color_hex(0x2E7D32)    : lv_color_make(80, 80, 80), 0);
+    lv_obj_set_style_bg_color(vibtest_off_btn, active ? lv_color_make(80, 80, 80) : COLOR_MATERIAL_RED, 0);
+    lv_label_set_text(vibtest_status_lbl, active ? LV_SYMBOL_AUDIO " Vibrating" : LV_SYMBOL_STOP " Stopped");
+    lv_obj_set_style_text_color(vibtest_status_lbl,
+        active ? lv_color_hex(0x4CAF50) : ui_muted_color(), 0);
+}
+
+static void vibtest_on_cb(lv_event_t *e)
+{
+    (void)e;
+    vibrator_on();
+    vibtest_refresh();
+}
+
+static void vibtest_off_cb(lv_event_t *e)
+{
+    (void)e;
+    vibrator_off();
+    vibtest_refresh();
+}
+
+static void vibtest_close_cb(lv_event_t *e)
+{
+    (void)e;
+    vibrator_off();
+    if (vibtest_popup) {
+        lv_obj_del(vibtest_popup);
+        vibtest_popup         = NULL;
+        vibtest_on_btn        = NULL;
+        vibtest_off_btn       = NULL;
+        vibtest_status_lbl    = NULL;
+        vibtest_strength_lbl  = NULL;
+    }
+}
+
+static void show_vibrator_test_popup(void)
+{
+    if (vibtest_popup) return;
+
+    vibtest_popup = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(vibtest_popup, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(vibtest_popup, 0, 0);
+    lv_obj_set_style_bg_color(vibtest_popup, ui_bg_color(), 0);
+    lv_obj_set_style_bg_opa(vibtest_popup, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(vibtest_popup, 0, 0);
+    lv_obj_set_style_radius(vibtest_popup, 0, 0);
+    lv_obj_clear_flag(vibtest_popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *dialog = lv_obj_create(vibtest_popup);
+    lv_obj_set_size(dialog, 210, 235);
+    lv_obj_center(dialog);
+    lv_obj_set_style_bg_color(dialog, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(dialog, lv_color_hex(0x9C27B0), 0);
+    lv_obj_set_style_border_width(dialog, 2, 0);
+    lv_obj_set_style_radius(dialog, 12, 0);
+    lv_obj_clear_flag(dialog, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(dialog, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(dialog, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(dialog, 10, 0);
+    lv_obj_set_style_pad_gap(dialog, 8, 0);
+
+    lv_obj_t *title = lv_label_create(dialog);
+    lv_label_set_text(title, LV_SYMBOL_AUDIO " Vibrator Test");
+    lv_obj_set_style_text_color(title, ui_text_color(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+
+    lv_obj_t *sub = lv_label_create(dialog);
+    lv_label_set_text(sub, "GPIO26 -> SC8002B amp");
+    lv_obj_set_style_text_color(sub, ui_muted_color(), 0);
+    lv_obj_set_style_text_font(sub, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_align(sub, LV_TEXT_ALIGN_CENTER, 0);
+
+    vibtest_status_lbl = lv_label_create(dialog);
+    lv_obj_set_style_text_font(vibtest_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_align(vibtest_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+
+    // Strength slider (10–100%; 100% = 50% duty through half-wave rectifier)
+    vibtest_strength_lbl = lv_label_create(dialog);
+    char strength_buf[28];
+    snprintf(strength_buf, sizeof(strength_buf), "Strength: %d%%", g_vibtest_strength_pct);
+    lv_label_set_text(vibtest_strength_lbl, strength_buf);
+    lv_obj_set_style_text_font(vibtest_strength_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(vibtest_strength_lbl, ui_text_color(), 0);
+
+    lv_obj_t *strength_slider = lv_slider_create(dialog);
+    lv_obj_set_size(strength_slider, 185, 18);
+    lv_slider_set_range(strength_slider, 10, 100);
+    lv_slider_set_value(strength_slider, g_vibtest_strength_pct, LV_ANIM_OFF);
+    lv_obj_add_event_cb(strength_slider, vibtest_strength_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *btn_row = lv_obj_create(dialog);
+    lv_obj_set_size(btn_row, 175, 40);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    vibtest_on_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(vibtest_on_btn, 82, 38);
+    lv_obj_set_style_radius(vibtest_on_btn, 8, 0);
+    lv_obj_t *onl = lv_label_create(vibtest_on_btn);
+    lv_label_set_text(onl, "ON");
+    lv_obj_set_style_text_font(onl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(onl, ui_text_color(), 0);
+    lv_obj_center(onl);
+    lv_obj_add_event_cb(vibtest_on_btn, vibtest_on_cb, LV_EVENT_CLICKED, NULL);
+
+    vibtest_off_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(vibtest_off_btn, 82, 38);
+    lv_obj_set_style_radius(vibtest_off_btn, 8, 0);
+    lv_obj_t *offl = lv_label_create(vibtest_off_btn);
+    lv_label_set_text(offl, "OFF");
+    lv_obj_set_style_text_font(offl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(offl, ui_text_color(), 0);
+    lv_obj_center(offl);
+    lv_obj_add_event_cb(vibtest_off_btn, vibtest_off_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *close_btn = lv_btn_create(dialog);
+    lv_obj_set_size(close_btn, 80, 30);
+    lv_obj_set_style_bg_color(close_btn, lv_color_make(80, 80, 80), 0);
+    lv_obj_set_style_radius(close_btn, 8, 0);
+    lv_obj_t *cl = lv_label_create(close_btn);
+    lv_label_set_text(cl, "Close");
+    lv_obj_set_style_text_font(cl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(cl, ui_text_color(), 0);
+    lv_obj_center(cl);
+    lv_obj_add_event_cb(close_btn, vibtest_close_cb, LV_EVENT_CLICKED, NULL);
+
+    vibtest_refresh();
 }
 
 // ============================================================================
@@ -18413,6 +18738,8 @@ static void settings_tile_event_cb(lv_event_t *e)
         show_gps_info_screen();
     } else if (strcmp(tile_name, "Power Mode") == 0) {
         show_power_mode_popup();
+    } else if (strcmp(tile_name, "Vibrator Test") == 0) {
+        show_vibrator_test_popup();
     }
 }
 
@@ -18432,6 +18759,7 @@ static void show_settings_screen(void)
     lv_obj_set_style_pad_gap(tiles, 4, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
 
     create_tile(tiles, LV_SYMBOL_EYE_OPEN,       "Compromised\nData",  COLOR_TILE_BLUE,         settings_tile_event_cb, "Compromised Data");
     create_tile(tiles, LV_SYMBOL_LOOP,           "Timing",             COLOR_MATERIAL_PURPLE,   settings_tile_event_cb, "Timing");
@@ -18441,6 +18769,7 @@ static void show_settings_screen(void)
     create_tile(tiles, MY_SYMBOL_SATELLITE_DISH, "GPS\nInfo",          lv_color_hex(0x00BCD4),  settings_tile_event_cb, "GPS Info");
     create_tile(tiles, LV_SYMBOL_CHARGE,         "Power\nMode",        COLOR_MATERIAL_RED,      settings_tile_event_cb, "Power Mode");
     create_tile(tiles, LV_SYMBOL_UPLOAD,         "Data\nTransfer",     lv_color_hex(0xE91E63),  settings_tile_event_cb, "Data Transfer");
+    create_tile(tiles, LV_SYMBOL_AUDIO,          "Vibrator\nTest",     lv_color_hex(0x9C27B0),  settings_tile_event_cb, "Vibrator Test");
 
     lv_obj_t *ver = lv_label_create(function_page);
     lv_label_set_text(ver, "LAB5 " FW_VERSION);
@@ -20930,9 +21259,6 @@ static void show_bluetooth_screen(void)
     lv_obj_t *pcap_tile = create_tile(tiles, LV_SYMBOL_SAVE, "BLE\nPCAP", lv_color_hex(0x00897B), NULL, NULL);
     lv_obj_add_event_cb(pcap_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE PCAP");
 
-    // BLE Band Scope - deep purple
-    lv_obj_t *blescope_tile = create_tile(tiles, LV_SYMBOL_AUDIO, "BLE\nScope", lv_color_hex(0x4A148C), NULL, NULL);
-    lv_obj_add_event_cb(blescope_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Scope");
 }
 
 // BT Locator screen - scan BT devices, select one, then track RSSI every 10s
@@ -22132,6 +22458,7 @@ static void show_bt_locator_direct_track(void)
     }
 
     // Start tracking directly — no scan-and-select step
+    bt_locator_saved_strength_pct = g_vibtest_strength_pct;
     bt_locator_tracking_active = true;
     bt_tracking_mode = true;
     BaseType_t task_ret = xTaskCreate(
@@ -25020,6 +25347,7 @@ static void deauther_proceed(void)
     show_function_page("Deauther");
     wifi_scanner_save_target_bssids();
     wifi_attacks_start_deauth();
+    vibrator_pulse(3000);   // 3-second blast to signal deauth launched
     {
         int sel_indices[MAX_SCAN_RESULTS];
         int sel_count = wifi_scanner_get_selected(sel_indices, MAX_SCAN_RESULTS);
@@ -25837,15 +26165,6 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
 
-    // BLE Band Scope
-    if (strcmp(attack_name, "BLE Scope") == 0) {
-        if (bt_lookout_is_active())
-            show_bt_conflict_warning("BLE Band Scope", show_blescope_screen);
-        else
-            show_blescope_screen();
-        return;
-    }
-
     // BT Attacks — active attacks guarded by authorization warning
     if (strcmp(attack_name, "BLE Spam") == 0) {
         show_attack_warning(show_ble_spam_screen);
@@ -26014,6 +26333,11 @@ static bool parse_gps_nmea(const char *nmea_sentence)
 			field++;
 		}
 
+		if (status == 'V' && current_gps.valid) {
+			current_gps.valid = false;
+			g_gps_force_save_pending = true; // force NVS save of last-known on lock loss
+		}
+
 		if (status == 'A' && yr > 0) {
 			// Sync if clock looks wrong (year < 2024) or we haven't synced yet.
 			// Re-checked every RMC so late GPS fixes correct files written before first lock.
@@ -26065,6 +26389,136 @@ static void gps_task(void *arg)
 		}
 		vTaskDelay(pdMS_TO_TICKS(100));
 	}
+}
+
+// ============================================================================
+// Vibrator Motor Driver
+// ============================================================================
+
+static bool g_vibrator_initialized  = false;
+static bool g_vibrator_active       = false;
+static esp_timer_handle_t g_vibrator_pulse_timer = NULL;
+
+static esp_err_t vibrator_init(void)
+{
+    if (g_vibrator_initialized) return ESP_OK;
+
+    ledc_timer_config_t timer = {
+        .speed_mode      = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = VIBRATOR_RESOLUTION,
+        .timer_num       = VIBRATOR_LEDC_TIMER,
+        .freq_hz         = VIBRATOR_FREQ_HZ,
+        .clk_cfg         = LEDC_AUTO_CLK,
+    };
+    esp_err_t ret = ledc_timer_config(&timer);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Vibrator: ledc_timer_config failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ledc_channel_config_t ch = {
+        .gpio_num   = VIBRATOR_GPIO,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel    = VIBRATOR_LEDC_CH,
+        .timer_sel  = VIBRATOR_LEDC_TIMER,
+        .duty       = 0,
+        .hpoint     = 0,
+    };
+    ret = ledc_channel_config(&ch);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Vibrator: ledc_channel_config failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    g_vibrator_initialized = true;
+    ESP_LOGI(TAG, "Vibrator: initialized on GPIO%d at %d Hz", VIBRATOR_GPIO, VIBRATOR_FREQ_HZ);
+    return ESP_OK;
+}
+
+// Start the vibrator. Safe to call repeatedly.
+void vibrator_on(void)
+{
+    if (vibrator_init() != ESP_OK) return;
+    // strength 10–100% maps to duty 0–128 (50% of 8-bit range = half-wave max drive)
+    uint32_t duty = (uint32_t)g_vibtest_strength_pct * 128 / 100;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, VIBRATOR_LEDC_CH, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, VIBRATOR_LEDC_CH);
+    g_vibrator_active = true;
+}
+
+// Stop the vibrator. Safe to call when already off.
+void vibrator_off(void)
+{
+    if (!g_vibrator_initialized) return;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, VIBRATOR_LEDC_CH, 0);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, VIBRATOR_LEDC_CH);
+    g_vibrator_active = false;
+}
+
+bool vibrator_is_active(void)
+{
+    return g_vibrator_active;
+}
+
+static void vibrator_pulse_timer_cb(void *arg)
+{
+    (void)arg;
+    vibrator_off();
+}
+
+// Vibrate for duration_ms milliseconds then stop automatically. Non-blocking.
+void vibrator_pulse(uint32_t duration_ms)
+{
+    if (vibrator_init() != ESP_OK) return;
+    if (!g_vibrator_pulse_timer) {
+        const esp_timer_create_args_t args = {
+            .callback = vibrator_pulse_timer_cb,
+            .name     = "vib_pulse",
+        };
+        esp_timer_create(&args, &g_vibrator_pulse_timer);
+    }
+    esp_timer_stop(g_vibrator_pulse_timer);   // cancel any pending pulse
+    vibrator_on();
+    esp_timer_start_once(g_vibrator_pulse_timer, (uint64_t)duration_ms * 1000ULL);
+}
+
+// ── burst support ─────────────────────────────────────────────────────────────
+static int               g_vib_burst_remain  = 0;
+static uint32_t          g_vib_burst_on_ms   = 0;
+static uint32_t          g_vib_burst_gap_ms  = 0;
+static esp_timer_handle_t g_vib_burst_timer  = NULL;
+
+static void vib_burst_next_cb(void *arg)
+{
+    if (g_vib_burst_remain <= 0) return;
+    g_vib_burst_remain--;
+    vibrator_pulse(g_vib_burst_on_ms);
+    if (g_vib_burst_remain > 0) {
+        esp_timer_start_once(g_vib_burst_timer,
+            (uint64_t)(g_vib_burst_on_ms + g_vib_burst_gap_ms) * 1000ULL);
+    }
+}
+
+// Fire count vibrator pulses, each on_ms long, gap_ms between them. Non-blocking.
+void vibrator_burst(int count, uint32_t on_ms, uint32_t gap_ms)
+{
+    if (count <= 0 || vibrator_init() != ESP_OK) return;
+    if (!g_vib_burst_timer) {
+        const esp_timer_create_args_t args = {
+            .callback = vib_burst_next_cb,
+            .name     = "vib_burst",
+        };
+        esp_timer_create(&args, &g_vib_burst_timer);
+    }
+    esp_timer_stop(g_vib_burst_timer);
+    g_vib_burst_remain = count - 1;
+    g_vib_burst_on_ms  = on_ms;
+    g_vib_burst_gap_ms = gap_ms;
+    vibrator_pulse(on_ms);
+    if (g_vib_burst_remain > 0) {
+        esp_timer_start_once(g_vib_burst_timer,
+            (uint64_t)(on_ms + gap_ms) * 1000ULL);
+    }
 }
 
 // === BATTERY VOLTAGE MONITOR IMPLEMENTATION ===
@@ -26919,13 +27373,26 @@ static void bt_locator_tracking_task(void *pvParameters)
             break;
         }
         
-        // Scan for 10 seconds, updating RSSI display periodically
+        // Scan for 10 seconds, updating RSSI display and vibrator every 500ms
         for (int i = 0; i < 100 && bt_locator_tracking_active && bt_locator_ui_active; i++) {
             vTaskDelay(pdMS_TO_TICKS(100));
-            
-            // Update UI every 500ms if device found
-            if (i % 5 == 0 && bt_tracking_found) {
-                bt_locator_needs_ui_update = true;
+
+            if (i % 5 == 0) {
+                if (bt_tracking_found) {
+                    bt_locator_needs_ui_update = true;
+                    // Map RSSI (dBm, already log-scale) linearly to strength.
+                    // -69 dBm → 10% (starts), -40 dBm → 100%. Below -69 = silent.
+                    int rssi = bt_tracking_rssi;
+                    if (rssi >= -69) {
+                        int pct = 10 + (rssi + 69) * 90 / 29;
+                        g_vibtest_strength_pct = (pct > 100) ? 100 : pct;
+                        vibrator_on();
+                    } else {
+                        vibrator_off();
+                    }
+                } else {
+                    vibrator_off();
+                }
             }
         }
         
@@ -26946,6 +27413,8 @@ static void bt_locator_tracking_task(void *pvParameters)
         bt_locator_needs_ui_update = true;
     }
     
+    vibrator_off();
+    g_vibtest_strength_pct = bt_locator_saved_strength_pct;
     bt_tracking_mode = false;
     bt_locator_tracking_active = false;
     bt_locator_task_handle = NULL;
@@ -26963,12 +27432,16 @@ static void bt_locator_exit_cb(lv_event_t *e)
     // Stop tracking if running
     bt_locator_tracking_active = false;
     bt_tracking_mode = false;
-    
+
+    // Stop vibrator and restore strength that was active before locator
+    vibrator_off();
+    g_vibtest_strength_pct = bt_locator_saved_strength_pct;
+
     // Stop scan if running
     if (bt_scan_active && bt_scan_task_handle != NULL) {
         bt_scan_active = false;
     }
-    
+
     // Wait for tasks to stop
     vTaskDelay(pdMS_TO_TICKS(300));
     
@@ -27054,9 +27527,10 @@ static void bt_locator_device_selected_cb(lv_event_t *e)
     }
     
     // Start tracking task
+    bt_locator_saved_strength_pct = g_vibtest_strength_pct;
     bt_locator_tracking_active = true;
     bt_tracking_mode = true;
-    
+
     BaseType_t task_ret = xTaskCreate(
         bt_locator_tracking_task,
         "bt_locator_task",
@@ -27065,7 +27539,7 @@ static void bt_locator_device_selected_cb(lv_event_t *e)
         5,
         &bt_locator_task_handle
     );
-    
+
     if (task_ret != pdPASS) {
         bt_locator_tracking_active = false;
         bt_tracking_mode = false;
@@ -28164,7 +28638,7 @@ static void show_drone_detector_screen(void)
 }
 
 // ============================================================================
-// SCOPE VISUALIZERS — WiFi Channel Analyzer · WiFi Band Scope · BLE Band Scope
+// SCOPE VISUALIZERS — WiFi Channel Analyzer · WiFi Band Scope
 // ============================================================================
 
 // ── Shared: SDR rainbow heat-map (0=black, 64=blue, 128=cyan, 192=yellow, 255=red)
@@ -29157,166 +29631,6 @@ static void show_wscope_screen(void) {
 // BLE BAND SCOPE — real-time NimBLE passive scan · RSSI distribution waterfall
 // ────────────────────────────────────────────────────────────────────────────
 
-static int blescope_gap_cb(struct ble_gap_event *event, void *arg) {
-    (void)arg;
-    if (!blescope_active) return 0;
-    if (event->type != BLE_GAP_EVENT_DISC) return 0;
-    int rssi = event->disc.rssi;          // typically -100..-20 dBm
-    // Map rssi to pixel column: -100 dBm = x=0, -30 dBm = x=239
-    int x = (rssi + 100) * WSCOPE_W / 70;
-    if (x < 0)          x = 0;
-    if (x >= WSCOPE_W)  x = WSCOPE_W - 1;
-    portENTER_CRITICAL(&blescope_mux);
-    if (blescope_hist[x] < 0xFFFF) blescope_hist[x]++;
-    blescope_win_pkts++;
-    blescope_pkt_total++;
-    portEXIT_CRITICAL(&blescope_mux);
-    return 0;
-}
-
-static void blescope_ui_timer_cb(lv_timer_t *t) {
-    (void)t;
-    if (!blescope_active || !blescope_canvas || !blescope_buf) return;
-
-    // Snapshot + clear histogram
-    uint16_t hist[WSCOPE_W];
-    uint32_t win_pkts;
-    portENTER_CRITICAL(&blescope_mux);
-    memcpy(hist, blescope_hist, sizeof(hist));
-    memset(blescope_hist, 0, sizeof(blescope_hist));
-    win_pkts = blescope_win_pkts;
-    blescope_win_pkts = 0;
-    portEXIT_CRITICAL(&blescope_mux);
-
-    // Find max for log-scale normalization
-    uint16_t mx = 1;
-    for (int x = 0; x < WSCOPE_W; x++) if (hist[x] > mx) mx = hist[x];
-
-    // ── Spectrum section ─────────────────────────────────────────────────
-    lv_color_t bg = lv_color_make(4, 4, 12);
-    for (int y = 0; y < WSCOPE_SPEC_H; y++)
-        for (int x = 0; x < WSCOPE_W; x++)
-            blescope_buf[y * WSCOPE_W + x] = bg;
-
-    for (int x = 0; x < WSCOPE_W; x++) {
-        if (!hist[x]) continue;
-        // Log scale: v = log2(1+count) / log2(1+max) * 255
-        float v = log2f(1.0f + hist[x]) / log2f(1.0f + mx) * 255.0f;
-        if (v > 255.0f) v = 255.0f;
-        int bar_h = (int)(v * (WSCOPE_SPEC_H - 2) / 255.0f);
-        if (bar_h < 1) bar_h = 1;
-        lv_color_t col = scope_heat_color((uint8_t)v);
-        for (int y = WSCOPE_SPEC_H - bar_h; y < WSCOPE_SPEC_H; y++)
-            blescope_buf[y * WSCOPE_W + x] = col;
-        // Peak pixel
-        blescope_buf[(WSCOPE_SPEC_H - bar_h) * WSCOPE_W + x] = lv_color_make(220,220,220);
-    }
-
-    // Separator
-    lv_color_t sep = lv_color_make(50, 50, 70);
-    for (int x = 0; x < WSCOPE_W; x++)
-        blescope_buf[WSCOPE_SPEC_H * WSCOPE_W + x] = sep;
-
-    // ── Waterfall row ────────────────────────────────────────────────────
-    int wf_start = WSCOPE_SPEC_H + 1;
-    memmove(blescope_buf + WSCOPE_W * (wf_start + 1),
-            blescope_buf + WSCOPE_W * wf_start,
-            WSCOPE_W * (WSCOPE_WF_H - 1) * sizeof(lv_color_t));
-    for (int x = 0; x < WSCOPE_W; x++) {
-        float v = hist[x] ? log2f(1.0f + hist[x]) / log2f(1.0f + mx) * 255.0f : 0.0f;
-        if (v > 255.0f) v = 255.0f;
-        blescope_buf[wf_start * WSCOPE_W + x] = scope_heat_color((uint8_t)v);
-    }
-
-    lv_obj_invalidate(blescope_canvas);
-
-    if (blescope_status_lbl) {
-        char s[48];
-        snprintf(s, sizeof(s), "Total: %lu pkts | Window: %lu pkts",
-                 (unsigned long)blescope_pkt_total, (unsigned long)win_pkts);
-        lv_label_set_text(blescope_status_lbl, s);
-    }
-}
-
-static void blescope_exit_cb(lv_event_t *e) {
-    (void)e;
-    blescope_active = false;
-    ble_gap_disc_cancel();
-    if (blescope_ui_timer) { lv_timer_del(blescope_ui_timer); blescope_ui_timer = NULL; }
-    if (blescope_buf)      { heap_caps_free(blescope_buf);     blescope_buf = NULL; }
-    blescope_canvas = NULL;
-    blescope_status_lbl = NULL;
-    show_bluetooth_screen();
-}
-
-static void show_blescope_screen(void) {
-    if (!ensure_ble_mode()) {
-        ESP_LOGE(TAG, "BLE Scope: cannot init BLE"); return;
-    }
-
-    create_function_page_base("BLE Band Scope");
-    blescope_active    = true;
-    blescope_pkt_total = 0;
-    blescope_win_pkts  = 0;
-    memset(blescope_hist, 0, sizeof(blescope_hist));
-
-    int buf_px = WSCOPE_W * WSCOPE_CANVAS_H;
-    blescope_buf = heap_caps_calloc(buf_px, sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
-    if (!blescope_buf) { ESP_LOGE(TAG, "BLEScope: PSRAM fail"); return; }
-
-    // Canvas (y=30)
-    blescope_canvas = lv_canvas_create(function_page);
-    lv_canvas_set_buffer(blescope_canvas, blescope_buf, WSCOPE_W, WSCOPE_CANVAS_H, LV_IMG_CF_TRUE_COLOR);
-    lv_obj_set_pos(blescope_canvas, 0, 30);
-    lv_obj_set_size(blescope_canvas, WSCOPE_W, WSCOPE_CANVAS_H);
-
-    int cy = 30 + WSCOPE_CANVAS_H;   // y below canvas = 233
-
-    // Status label
-    blescope_status_lbl = lv_label_create(function_page);
-    lv_obj_set_size(blescope_status_lbl, 236, 14);
-    lv_obj_set_pos(blescope_status_lbl, 2, cy + 1);
-    lv_label_set_text(blescope_status_lbl, "Scanning BLE...");
-    lv_obj_set_style_text_font(blescope_status_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(blescope_status_lbl, lv_color_hex(0xAAAAAA), 0);
-
-    // RSSI axis labels
-    lv_obj_t *ax = lv_label_create(function_page);
-    lv_obj_set_size(ax, 240, 14);
-    lv_obj_set_pos(ax, 0, cy + 17);
-    lv_label_set_text(ax, "-100       -80        -60        -40    dBm");
-    lv_obj_set_style_text_font(ax, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(ax, lv_color_hex(0x666666), 0);
-
-    // Exit button
-    lv_obj_t *exit_btn = lv_btn_create(function_page);
-    lv_obj_set_size(exit_btn, 110, 26);
-    lv_obj_set_pos(exit_btn, 65, cy + 33);
-    lv_obj_set_style_bg_color(exit_btn, lv_color_hex(0x333333), 0);
-    lv_obj_add_event_cb(exit_btn, blescope_exit_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *el = lv_label_create(exit_btn);
-    lv_label_set_text(el, LV_SYMBOL_LEFT " Exit");
-    lv_obj_center(el);
-    lv_obj_set_style_text_font(el, &lv_font_montserrat_12, 0);
-
-    // Start passive BLE scan
-    struct ble_gap_disc_params sp = {
-        .passive = 1,
-        .filter_duplicates = 0,
-        .itvl = BLE_GAP_SCAN_ITVL_MS(100),
-        .window = BLE_GAP_SCAN_WIN_MS(90),
-    };
-    ble_gap_disc_cancel();
-    int blescope_rc = ble_gap_disc(BLE_OWN_ADDR_RANDOM, BLE_HS_FOREVER, &sp, blescope_gap_cb, NULL);
-    if (blescope_rc != 0 && blescope_status_lbl) {
-        char err[40];
-        snprintf(err, sizeof(err), "Scan start err %d - check BLE", blescope_rc);
-        lv_label_set_text(blescope_status_lbl, err);
-    }
-
-    blescope_ui_timer = lv_timer_create(blescope_ui_timer_cb, 300, NULL);
-}
-
 // ============================================================================
 // AIRTAG SCANNER IMPLEMENTATION
 // ============================================================================
@@ -29665,6 +29979,7 @@ static void show_tag_tracker_screen(int dev_idx)
     lv_obj_add_event_cb(bt_locator_exit_btn, bt_locator_exit_cb, LV_EVENT_CLICKED, NULL);
 
     // Start tracking task
+    bt_locator_saved_strength_pct = g_vibtest_strength_pct;
     bt_locator_tracking_active = true;
     bt_tracking_mode = true;
 

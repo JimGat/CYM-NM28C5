@@ -17,10 +17,11 @@ extern "C" {
 #define XPT2046_CMD_Z1   0xB3   // Read Z1 pressure
 #define XPT2046_CMD_Z2   0xC3   // Read Z2 pressure
 
-// Touch is considered active when Z1 raw ADC > this threshold.
-// Resting panel contact reads ~0–80; a real touch reads 200–2000+.
-// Raise if ghost touches persist; lower if light touches are missed.
-#define XPT2046_Z_THRESHOLD  200
+// Threshold for the position-compensated pressure formula: Z1_adc + 4095 - Z2_adc.
+// Untouched panel reads ~0 (Z1≈0, Z2≈4095). Any real touch anywhere on the panel
+// gives 200+, even at the right/top edges where Z1 alone falls below 200.
+// Raise if ghost touches appear; lower if very light corner touches are missed.
+#define XPT2046_Z_THRESHOLD  100
 
 // ─── Calibration defaults for NM-CYD-C5 2.8" 240×320 (portrait) ─────────────
 // Adjust these via xpt2046_set_calibration() after running a calibration sketch.
