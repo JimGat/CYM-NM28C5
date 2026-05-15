@@ -443,7 +443,7 @@ typedef enum { WD_BAND_BOTH = 0, WD_BAND_24G, WD_BAND_5G } wd_band_t;
 
 // Touch calibration NVS
 #define TOUCH_CAL_NVS_NS      "touch_cal"
-#define TOUCH_CAL_MAGIC       ((uint16_t)0xCA14)  // bump: null-zone removed (was masking top-right taps)
+#define TOUCH_CAL_MAGIC       ((uint16_t)0xCA15)  // bump: Z1+4095-Z2 compensated pressure replaces Z1-only
 #define TOUCH_CAL_NULL_RADIUS 250   // raw ADC units — reject within this radius of null point
 
 typedef struct {
