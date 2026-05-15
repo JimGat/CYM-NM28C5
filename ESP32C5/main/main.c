@@ -443,7 +443,7 @@ typedef enum { WD_BAND_BOTH = 0, WD_BAND_24G, WD_BAND_5G } wd_band_t;
 
 // Touch calibration NVS
 #define TOUCH_CAL_NVS_NS      "touch_cal"
-#define TOUCH_CAL_MAGIC       ((uint16_t)0xCA13)  // bump: corner-avg approach replaces extrapolation
+#define TOUCH_CAL_MAGIC       ((uint16_t)0xCA14)  // bump: null-zone removed (was masking top-right taps)
 #define TOUCH_CAL_NULL_RADIUS 250   // raw ADC units — reject within this radius of null point
 
 typedef struct {
@@ -3404,30 +3404,19 @@ static void run_touch_calibration(void)
     lv_scr_load(scr);
     for (int i = 0; i < 5; i++) cal_tick();
 
-    // Step 0: measure resting null zone (2 s, do not touch)
-    lv_label_set_text(lbl, "Calibrating...\nDo NOT touch screen.");
-    for (int i = 0; i < 3; i++) cal_tick();
+    // No null-zone measurement: XPT2046 panels can report ghost reads near the
+    // top of the panel during the "don't touch" window; if those raw coords
+    // coincide with the top-right calibration corner they would reject valid taps.
+    // Z1 threshold (200) is the sole ghost-touch gate, matching the Launcher.
+    const int null_x = 0, null_y = 0;
 
-    int64_t t_end = esp_timer_get_time() / 1000 + 2000;
-    int32_t nxs = 0, nys = 0; int nn = 0;
-    while (esp_timer_get_time() / 1000 < t_end) {
-        cal_tick();
-        uint16_t x, y;
-        if (xpt2046_read_raw_point(&touch_handle, &x, &y)) {
-            nxs += x; nys += y; nn++;
-        }
-    }
-    int null_x = (nn > 0) ? (int)(nxs / nn) : 0;
-    int null_y = (nn > 0) ? (int)(nys / nn) : 0;
-    ESP_LOGI(TAG, "Null zone raw=(%d,%d) n=%d", null_x, null_y, nn);
-
-    // Steps 1–4: collect 4 near-corner calibration points (TL, TR, BL, BR)
+    // Collect 4 corner calibration points (TL, TR, BL, BR)
     uint16_t raw_x[4], raw_y[4];
     const char *pt_lbl[4] = {
-        "Touch the [+]\nTop-Left     (1/4)",
-        "Touch the [+]\nTop-Right    (2/4)",
-        "Touch the [+]\nBottom-Left  (3/4)",
-        "Touch the [+]\nBottom-Right (4/4)",
+        "Tap corner crosshair\nTop-Left     (1/4)",
+        "Tap corner crosshair\nTop-Right    (2/4)",
+        "Tap corner crosshair\nBottom-Left  (3/4)",
+        "Tap corner crosshair\nBottom-Right (4/4)",
     };
 
     for (int pt = 0; pt < 4; pt++) {
