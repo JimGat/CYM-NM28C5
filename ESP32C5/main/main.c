@@ -676,9 +676,9 @@ static lv_obj_t *evil_twin_start_btn = NULL;
 static lv_obj_t *evil_twin_status_label = NULL;
 static lv_obj_t *evil_twin_log_ta = NULL;
 static lv_obj_t *evil_twin_content = NULL;
-static int evil_twin_network_map[MAX_SCAN_RESULTS];
+static int evil_twin_network_map[SCAN_RESULTS_MAX_DISPLAY];
 static int evil_twin_network_count = 0;
-static int evil_twin_html_map[MAX_SCAN_RESULTS];
+static int evil_twin_html_map[SCAN_RESULTS_MAX_DISPLAY];
 static int evil_twin_html_count = 0;
 
 // Evil Twin new UI elements
@@ -5635,6 +5635,7 @@ void app_main(void)
                                 lv_obj_set_width(ssid_lbl, lv_pct(85));
 
                                 if ((i & 7) == 7) {
+                                    esp_task_wdt_reset();
                                     vTaskDelay(pdMS_TO_TICKS(1));
                                 }
                             }
