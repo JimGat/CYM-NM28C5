@@ -250,13 +250,14 @@ static void (*s_ble_disc_return_fn)(void) = NULL;
 #define VIBRATOR_GPIO        26
 #define VIBRATOR_LEDC_TIMER  LEDC_TIMER_2
 #define VIBRATOR_LEDC_CH     LEDC_CHANNEL_4
-#define VIBRATOR_FREQ_HZ     150              // 150 Hz — clear haptic buzz
+#define VIBRATOR_FREQ_HZ     333              // 333 Hz — confirmed best haptic feel
 #define VIBRATOR_RESOLUTION  LEDC_TIMER_8_BIT // 0–255 duty range
 #define VIBRATOR_DUTY_ON     128              // 50 % duty = full drive through diode
 
-// Runtime-adjustable vibrator parameters (set via vibrator test popup sliders)
-static int g_vibtest_freq_hz  = VIBRATOR_FREQ_HZ;
-static int g_vibtest_duty_pct = 50;
+// Strength 10–100% where 100% → 50% duty (128/255). Motor is half-wave rectified
+// so 50% duty is the practical maximum; higher duty gives no extra drive.
+static int g_vibtest_strength_pct = 100;
+
 
 // Battery ADC configuration - Waveshare ESP32-C5-WIFI6-KIT (DISABLED - using regular C5 chip)
 // Schematic: R10=200k, R16=100k voltage divider on BAT_ADC line
@@ -18167,12 +18168,14 @@ static void screen_popup_save_cb(lv_event_t *e)
 static void screen_popup_recal_cb(lv_event_t *e)
 {
     (void)e;
-    set_backlight_percent(brightness_before_popup);
-    if (screen_popup) { lv_obj_del(screen_popup); screen_popup = NULL; }
-    timeout_dropdown      = NULL;
-    brightness_slider     = NULL;
-    brightness_value_label = NULL;
-    run_touch_calibration();
+    // Invalidate NVS touch cal magic so boot detects no valid cal and runs calibration.
+    nvs_handle_t h;
+    if (nvs_open(TOUCH_CAL_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u16(h, "magic", 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    esp_restart();
 }
 
 static void show_screen_popup(void)
@@ -18327,38 +18330,24 @@ static void show_screen_popup(void)
 // Vibrator Test Popup
 // ============================================================================
 
-static lv_obj_t *vibtest_popup     = NULL;
-static lv_obj_t *vibtest_on_btn    = NULL;
-static lv_obj_t *vibtest_off_btn   = NULL;
+static lv_obj_t *vibtest_popup      = NULL;
+static lv_obj_t *vibtest_on_btn     = NULL;
+static lv_obj_t *vibtest_off_btn    = NULL;
 static lv_obj_t *vibtest_status_lbl = NULL;
-static lv_obj_t *vibtest_duty_lbl  = NULL;
-static lv_obj_t *vibtest_freq_lbl  = NULL;
+static lv_obj_t *vibtest_strength_lbl = NULL;
 
-static void vibtest_duty_cb(lv_event_t *e)
+static void vibtest_strength_cb(lv_event_t *e)
 {
     lv_obj_t *slider = lv_event_get_target(e);
     int val = lv_slider_get_value(slider);
-    g_vibtest_duty_pct = val;
-    char buf[24];
-    snprintf(buf, sizeof(buf), "Duty: %d%%", val);
-    if (vibtest_duty_lbl) lv_label_set_text(vibtest_duty_lbl, buf);
+    g_vibtest_strength_pct = val;
+    char buf[28];
+    snprintf(buf, sizeof(buf), "Strength: %d%%", val);
+    if (vibtest_strength_lbl) lv_label_set_text(vibtest_strength_lbl, buf);
     if (vibrator_is_active()) {
-        uint32_t duty = (uint32_t)val * 255 / 100;
+        uint32_t duty = (uint32_t)val * 128 / 100;
         ledc_set_duty(LEDC_LOW_SPEED_MODE, VIBRATOR_LEDC_CH, duty);
         ledc_update_duty(LEDC_LOW_SPEED_MODE, VIBRATOR_LEDC_CH);
-    }
-}
-
-static void vibtest_freq_cb(lv_event_t *e)
-{
-    lv_obj_t *slider = lv_event_get_target(e);
-    int val = lv_slider_get_value(slider);
-    g_vibtest_freq_hz = val;
-    char buf[28];
-    snprintf(buf, sizeof(buf), "Freq: %d Hz", val);
-    if (vibtest_freq_lbl) lv_label_set_text(vibtest_freq_lbl, buf);
-    if (vibrator_is_active()) {
-        ledc_set_freq(LEDC_LOW_SPEED_MODE, VIBRATOR_LEDC_TIMER, (uint32_t)val);
     }
 }
 
@@ -18393,12 +18382,11 @@ static void vibtest_close_cb(lv_event_t *e)
     vibrator_off();
     if (vibtest_popup) {
         lv_obj_del(vibtest_popup);
-        vibtest_popup      = NULL;
-        vibtest_on_btn     = NULL;
-        vibtest_off_btn    = NULL;
-        vibtest_status_lbl = NULL;
-        vibtest_duty_lbl   = NULL;
-        vibtest_freq_lbl   = NULL;
+        vibtest_popup         = NULL;
+        vibtest_on_btn        = NULL;
+        vibtest_off_btn       = NULL;
+        vibtest_status_lbl    = NULL;
+        vibtest_strength_lbl  = NULL;
     }
 }
 
@@ -18416,7 +18404,7 @@ static void show_vibrator_test_popup(void)
     lv_obj_clear_flag(vibtest_popup, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *dialog = lv_obj_create(vibtest_popup);
-    lv_obj_set_size(dialog, 210, 295);
+    lv_obj_set_size(dialog, 210, 235);
     lv_obj_center(dialog);
     lv_obj_set_style_bg_color(dialog, ui_panel_color(), 0);
     lv_obj_set_style_border_color(dialog, lv_color_hex(0x9C27B0), 0);
@@ -18443,33 +18431,19 @@ static void show_vibrator_test_popup(void)
     lv_obj_set_style_text_font(vibtest_status_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_align(vibtest_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
 
-    // Duty cycle slider
-    vibtest_duty_lbl = lv_label_create(dialog);
-    char duty_buf[24];
-    snprintf(duty_buf, sizeof(duty_buf), "Duty: %d%%", g_vibtest_duty_pct);
-    lv_label_set_text(vibtest_duty_lbl, duty_buf);
-    lv_obj_set_style_text_font(vibtest_duty_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(vibtest_duty_lbl, ui_text_color(), 0);
+    // Strength slider (10–100%; 100% = 50% duty through half-wave rectifier)
+    vibtest_strength_lbl = lv_label_create(dialog);
+    char strength_buf[28];
+    snprintf(strength_buf, sizeof(strength_buf), "Strength: %d%%", g_vibtest_strength_pct);
+    lv_label_set_text(vibtest_strength_lbl, strength_buf);
+    lv_obj_set_style_text_font(vibtest_strength_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(vibtest_strength_lbl, ui_text_color(), 0);
 
-    lv_obj_t *duty_slider = lv_slider_create(dialog);
-    lv_obj_set_size(duty_slider, 185, 18);
-    lv_slider_set_range(duty_slider, 0, 100);
-    lv_slider_set_value(duty_slider, g_vibtest_duty_pct, LV_ANIM_OFF);
-    lv_obj_add_event_cb(duty_slider, vibtest_duty_cb, LV_EVENT_VALUE_CHANGED, NULL);
-
-    // Frequency slider
-    vibtest_freq_lbl = lv_label_create(dialog);
-    char freq_buf[28];
-    snprintf(freq_buf, sizeof(freq_buf), "Freq: %d Hz", g_vibtest_freq_hz);
-    lv_label_set_text(vibtest_freq_lbl, freq_buf);
-    lv_obj_set_style_text_font(vibtest_freq_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(vibtest_freq_lbl, ui_text_color(), 0);
-
-    lv_obj_t *freq_slider = lv_slider_create(dialog);
-    lv_obj_set_size(freq_slider, 185, 18);
-    lv_slider_set_range(freq_slider, 20, 500);
-    lv_slider_set_value(freq_slider, g_vibtest_freq_hz, LV_ANIM_OFF);
-    lv_obj_add_event_cb(freq_slider, vibtest_freq_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_t *strength_slider = lv_slider_create(dialog);
+    lv_obj_set_size(strength_slider, 185, 18);
+    lv_slider_set_range(strength_slider, 10, 100);
+    lv_slider_set_value(strength_slider, g_vibtest_strength_pct, LV_ANIM_OFF);
+    lv_obj_add_event_cb(strength_slider, vibtest_strength_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     lv_obj_t *btn_row = lv_obj_create(dialog);
     lv_obj_set_size(btn_row, 175, 40);
@@ -26354,7 +26328,7 @@ static esp_err_t vibrator_init(void)
         .speed_mode      = LEDC_LOW_SPEED_MODE,
         .duty_resolution = VIBRATOR_RESOLUTION,
         .timer_num       = VIBRATOR_LEDC_TIMER,
-        .freq_hz         = (uint32_t)g_vibtest_freq_hz,
+        .freq_hz         = VIBRATOR_FREQ_HZ,
         .clk_cfg         = LEDC_AUTO_CLK,
     };
     esp_err_t ret = ledc_timer_config(&timer);
@@ -26386,7 +26360,8 @@ static esp_err_t vibrator_init(void)
 void vibrator_on(void)
 {
     if (vibrator_init() != ESP_OK) return;
-    uint32_t duty = (uint32_t)g_vibtest_duty_pct * 255 / 100;
+    // strength 10–100% maps to duty 0–128 (50% of 8-bit range = half-wave max drive)
+    uint32_t duty = (uint32_t)g_vibtest_strength_pct * 128 / 100;
     ledc_set_duty(LEDC_LOW_SPEED_MODE, VIBRATOR_LEDC_CH, duty);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, VIBRATOR_LEDC_CH);
     g_vibrator_active = true;
