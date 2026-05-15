@@ -1405,6 +1405,7 @@ static volatile bool bt_locator_ui_active = false;
 static volatile bool bt_locator_tracking_active = false;
 static volatile bool bt_locator_needs_ui_update = false;
 static char bt_locator_status_text[48] = "";
+static int bt_locator_saved_strength_pct = 100; // g_vibtest_strength_pct saved on entry, restored on exit
 
 // BT tracking mode support (for BT Locator)
 static bool bt_tracking_mode = false;
@@ -22477,6 +22478,7 @@ static void show_bt_locator_direct_track(void)
     }
 
     // Start tracking directly — no scan-and-select step
+    bt_locator_saved_strength_pct = g_vibtest_strength_pct;
     bt_locator_tracking_active = true;
     bt_tracking_mode = true;
     BaseType_t task_ret = xTaskCreate(
@@ -27400,13 +27402,26 @@ static void bt_locator_tracking_task(void *pvParameters)
             break;
         }
         
-        // Scan for 10 seconds, updating RSSI display periodically
+        // Scan for 10 seconds, updating RSSI display and vibrator every 500ms
         for (int i = 0; i < 100 && bt_locator_tracking_active && bt_locator_ui_active; i++) {
             vTaskDelay(pdMS_TO_TICKS(100));
-            
-            // Update UI every 500ms if device found
-            if (i % 5 == 0 && bt_tracking_found) {
-                bt_locator_needs_ui_update = true;
+
+            if (i % 5 == 0) {
+                if (bt_tracking_found) {
+                    bt_locator_needs_ui_update = true;
+                    // Map RSSI (dBm, already log-scale) linearly to strength.
+                    // -69 dBm → 10% (starts), -40 dBm → 100%. Below -69 = silent.
+                    int rssi = bt_tracking_rssi;
+                    if (rssi >= -69) {
+                        int pct = 10 + (rssi + 69) * 90 / 29;
+                        g_vibtest_strength_pct = (pct > 100) ? 100 : pct;
+                        vibrator_on();
+                    } else {
+                        vibrator_off();
+                    }
+                } else {
+                    vibrator_off();
+                }
             }
         }
         
@@ -27427,6 +27442,8 @@ static void bt_locator_tracking_task(void *pvParameters)
         bt_locator_needs_ui_update = true;
     }
     
+    vibrator_off();
+    g_vibtest_strength_pct = bt_locator_saved_strength_pct;
     bt_tracking_mode = false;
     bt_locator_tracking_active = false;
     bt_locator_task_handle = NULL;
@@ -27444,12 +27461,16 @@ static void bt_locator_exit_cb(lv_event_t *e)
     // Stop tracking if running
     bt_locator_tracking_active = false;
     bt_tracking_mode = false;
-    
+
+    // Stop vibrator and restore strength that was active before locator
+    vibrator_off();
+    g_vibtest_strength_pct = bt_locator_saved_strength_pct;
+
     // Stop scan if running
     if (bt_scan_active && bt_scan_task_handle != NULL) {
         bt_scan_active = false;
     }
-    
+
     // Wait for tasks to stop
     vTaskDelay(pdMS_TO_TICKS(300));
     
@@ -27535,9 +27556,10 @@ static void bt_locator_device_selected_cb(lv_event_t *e)
     }
     
     // Start tracking task
+    bt_locator_saved_strength_pct = g_vibtest_strength_pct;
     bt_locator_tracking_active = true;
     bt_tracking_mode = true;
-    
+
     BaseType_t task_ret = xTaskCreate(
         bt_locator_tracking_task,
         "bt_locator_task",
@@ -27546,7 +27568,7 @@ static void bt_locator_device_selected_cb(lv_event_t *e)
         5,
         &bt_locator_task_handle
     );
-    
+
     if (task_ret != pdPASS) {
         bt_locator_tracking_active = false;
         bt_tracking_mode = false;
@@ -30146,6 +30168,7 @@ static void show_tag_tracker_screen(int dev_idx)
     lv_obj_add_event_cb(bt_locator_exit_btn, bt_locator_exit_cb, LV_EVENT_CLICKED, NULL);
 
     // Start tracking task
+    bt_locator_saved_strength_pct = g_vibtest_strength_pct;
     bt_locator_tracking_active = true;
     bt_tracking_mode = true;
 
