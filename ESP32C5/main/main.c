@@ -10934,12 +10934,12 @@ static void show_karma_page(void)
     lv_obj_set_style_pad_all(karma_btn_row, 0, 0);
     lv_obj_set_style_pad_gap(karma_btn_row, 10, 0);
     lv_obj_set_flex_flow(karma_btn_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(karma_btn_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_align(karma_btn_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(karma_btn_row, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Start Karma button
+    // Start Karma button — 105 px so both buttons fit in 220 px row
     karma_start_btn = lv_btn_create(karma_btn_row);
-    lv_obj_set_size(karma_start_btn, 140, 35);
+    lv_obj_set_size(karma_start_btn, 105, 35);
     lv_obj_set_style_bg_color(karma_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(karma_start_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(karma_start_btn, 0, 0);
@@ -10948,6 +10948,7 @@ static void show_karma_page(void)
 
     lv_obj_t *start_label = lv_label_create(karma_start_btn);
     lv_label_set_text(start_label, "Start Karma");
+    lv_obj_set_style_text_font(start_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(start_label, ui_text_color(), 0);
     lv_obj_center(start_label);
 
@@ -10956,9 +10957,9 @@ static void show_karma_page(void)
         lv_obj_add_state(karma_start_btn, LV_STATE_DISABLED);
     }
 
-    // Back To Observer button
+    // Back To Observer button — 105 px
     lv_obj_t *back_obs_btn = lv_btn_create(karma_btn_row);
-    lv_obj_set_size(back_obs_btn, 160, 35);
+    lv_obj_set_size(back_obs_btn, 105, 35);
     lv_obj_set_style_bg_color(back_obs_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(back_obs_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(back_obs_btn, 0, 0);
@@ -10967,7 +10968,10 @@ static void show_karma_page(void)
 
     lv_obj_t *back_obs_label = lv_label_create(back_obs_btn);
     lv_label_set_text(back_obs_label, "Back To Observer");
+    lv_obj_set_style_text_font(back_obs_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(back_obs_label, ui_text_color(), 0);
+    lv_label_set_long_mode(back_obs_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(back_obs_label, 100);
     lv_obj_center(back_obs_label);
 }
 
