@@ -3486,9 +3486,10 @@ static void run_touch_calibration(void)
         lv_obj_add_flag(hbar, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(vbar, LV_OBJ_FLAG_HIDDEN);
 
-        lv_label_set_text(lbl, "Calibration ready.\nTap OK to save.");
+        lv_label_set_text(lbl, "Tap OK to confirm.\nMust hit the button.");
         lv_obj_align(lbl, LV_ALIGN_CENTER, 0, -70);
 
+        // OK button at screen center — 140×60
         lv_obj_t *ok_btn = lv_btn_create(scr);
         lv_obj_set_size(ok_btn, 140, 60);
         lv_obj_align(ok_btn, LV_ALIGN_CENTER, 0, 0);
@@ -3508,9 +3509,31 @@ static void run_touch_calibration(void)
         lv_obj_align(cd_lbl, LV_ALIGN_CENTER, 0, 65);
         lv_label_set_text(cd_lbl, "Retry in 5 s...");
 
+        // Snapshot old cal so we can restore it if the user doesn't confirm
+        touch_cal_t old_cal = {
+            .x_min    = (int32_t)touch_handle.x_min,
+            .x_max    = (int32_t)touch_handle.x_max,
+            .y_min    = (int32_t)touch_handle.y_min,
+            .y_max    = (int32_t)touch_handle.y_max,
+            .invert_x = (uint8_t)touch_handle.invert_x,
+            .invert_y = (uint8_t)touch_handle.invert_y,
+            .swap_xy  = (uint8_t)touch_handle.swap_xy,
+            .null_x   = (int32_t)touch_handle.null_x,
+            .null_y   = (int32_t)touch_handle.null_y,
+        };
+
+        // Apply new cal now so xpt2046_read_touch maps to new coordinates.
+        // The OK button hit-check uses these new coordinates — if the cal is
+        // good, the button registers; if it's bad, touches miss and it retries.
+        touch_cal_apply(&cal);
+
         // Wait for finger to lift from last cal point before polling for OK
         cal_wait_release(null_x, null_y);
         for (int i = 0; i < 5; i++) cal_tick();
+
+        // OK button screen bounds (center ± half-size, with 10 px margin)
+        const int ok_x0 = LCD_H_RES / 2 - 80,  ok_x1 = LCD_H_RES / 2 + 80;
+        const int ok_y0 = LCD_V_RES / 2 - 40,  ok_y1 = LCD_V_RES / 2 + 40;
 
         int64_t deadline = esp_timer_get_time() / 1000 + 5000;
         bool ok_tapped   = false;
@@ -3528,8 +3551,11 @@ static void run_touch_calibration(void)
             }
             xpt2046_touch_point_t tp;
             if (xpt2046_read_touch(&touch_handle, &tp) && tp.touched) {
-                ok_tapped = true;
-                break;
+                if ((int)tp.x >= ok_x0 && (int)tp.x <= ok_x1 &&
+                    (int)tp.y >= ok_y0 && (int)tp.y <= ok_y1) {
+                    ok_tapped = true;
+                    break;
+                }
             }
         }
 
@@ -3537,8 +3563,7 @@ static void run_touch_calibration(void)
         lv_obj_del(cd_lbl);
 
         if (ok_tapped) {
-            touch_cal_nvs_save(&cal);
-            touch_cal_apply(&cal);
+            touch_cal_nvs_save(&cal);   // cal already applied above
             lv_label_set_text(lbl, "Calibration saved!");
             lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 0);
             int64_t t_done = esp_timer_get_time() / 1000 + 1500;
@@ -3546,8 +3571,9 @@ static void run_touch_calibration(void)
             break;
         }
 
-        // Not confirmed — show brief retry notice then loop
-        lv_label_set_text(lbl, "Retrying...");
+        // Not confirmed — restore old cal and retry
+        touch_cal_apply(&old_cal);
+        lv_label_set_text(lbl, "Missed — retrying...");
         lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 50);
         for (int i = 0; i < 20; i++) cal_tick();  // ~200 ms pause
     }
