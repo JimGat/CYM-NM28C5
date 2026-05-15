@@ -5,7 +5,7 @@
 <h1 align="center">Cheap Yellow Monster</h1>
 
 <p align="center">
-  <b>v1.3.0</b>
+  <b>v1.3.4</b>
 </p>
 
 <p align="center">
@@ -91,7 +91,6 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **Karma AP** | Respond to probe requests, rogue access point |
 | **Chanalizer** | Wide 520 px WiFi channel map — auto-scrolling left/right with touch-drag pause; SSID color grouping, group legend, channel annotations; portrait 240 px viewport over 2.4 GHz + 5 GHz |
 | **WiFi Band Scope** | Promiscuous RSSI per-channel waterfall (2.4 GHz 13-ch or 5 GHz 25-ch); band toggle updates axis label and resets peaks; 60 ms dwell / 0.8 s full 2.4 sweep |
-| **BLE Band Scope** | Passive BLE scan RSSI histogram + waterfall — packet RSSI distribution across −100 to −30 dBm |
 | **Drone Detector** | Passive BLE scan for DJI/Remote ID drone advertisements |
 | **Wardriving** | GPS + WiFi logging, dual-band filter (2.4 GHz / 5 GHz / Both), optional BLE time-sliced scanning, WiGLE CSV 1.6, upload log tracking, raw PCAP toggle, GPS mark waypoints (GPX output), WiGLE and WDG Wars upload; GPS last-known position hold with 150 m stale accuracy when signal is lost |
 | **GPS** | NMEA RMC auto-syncs system clock (FAT timestamps); last-known position persisted to NVS (5-minute throttle); manual fallback editor in Settings → GPS Info; all data-collection features (wardrive, GATT Walker, marks) use best available GPS transparently |
@@ -254,7 +253,46 @@ The firmware parses **GGA** sentences for latitude, longitude, altitude, and sat
 
 The last-known position is also written to **NVS** (keys `gps_lat_i`, `gps_lon_i`, `gps_alt_i`, stored as integer micro-degrees ×10⁶) and reloaded at boot — so even if the first session of the day starts with no GPS fix, the device uses the last outdoor position from a prior session. Writes are throttled to at most once every five minutes to protect NVS flash life (~5+ years at that rate). An explicit save via **Settings → GPS Info → Set Position** bypasses the throttle.
 
+In addition to the periodic throttled save, the firmware **force-saves immediately when GPS lock is lost** — detected by an RMC sentence with `status = V` (void) while `current_gps.valid` is `true`. This ensures the most recent fix survives a power cycle even if lock was lost before the next scheduled five-minute write.
+
 Cold start to first fix typically takes 30–60 seconds with a clear sky view.
+
+---
+
+### Vibrator Motor Circuit
+
+An ERM (eccentric rotating mass) vibrator motor can be added to the NM-CYD-C5 via the onboard **SC8002B class-D amp** on the SPEAK header (GPIO 26). Two diodes convert the BTL differential output into safe unidirectional motor drive:
+
+| Role | Part | Notes |
+|------|------|-------|
+| Series rectifier | [1N5819 Schottky diode](https://a.co/d/0bnr0eiq) | Anode → VO1 (SPEAK pin 1), cathode → motor +. Half-wave rectifies the BTL output so current flows only in one direction. |
+| Flyback / protection | [1N4148 signal diode](https://a.co/d/01jTSulE) | Cathode → motor +, anode → motor −. Suppresses back-EMF inductive spikes when the motor stops. |
+| Motor | [Mini ERM Vibration Motor](https://a.co/d/00013Sqj) | Micro coin or cylindrical ERM, 3 V nominal. |
+| SPEAK header connector | [JST SH 1.0 mm 2-pin](https://a.co/d/017FKez2) (HCZZ0015-2) | Measured housing width = 3.35 mm, confirming 1.0 mm SH pitch. The 1.25 mm GH connector (~5 mm housing) will **not** fit. |
+
+**How it works:** GPIO 26 drives the SC8002B input with LEDC PWM at **333 Hz / 50% duty** (half-wave max = 50% duty). The 1N5819 rectifies the BTL output to give the motor a clean DC-biased drive. The 1N4148 across the motor clamps the inductive kick on every PWM off-cycle. Strength is adjustable 10–100% via **Settings → Vibrator Test** without reflashing.
+
+**Circuit photos:**
+
+<p align="center">
+  <img src="docs/screenshots/Vibrator Rectifier Circuit Closeup.jpg" width="480" alt="Vibrator rectifier circuit — diode detail"/>
+  <br/><em>Rectifier circuit closeup — 1N5819 series + 1N4148 flyback</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/Vibrator Wireup.jpg" width="480" alt="Vibrator motor wired to SPEAK header"/>
+  <br/><em>Motor wired to SPEAK header with diode circuit</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/Vibrator Wraped.jpg" width="480" alt="Vibrator assembly wrapped for installation"/>
+  <br/><em>Assembly wrapped and ready to install</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/Vibrator Installed.jpg" width="480" alt="Vibrator motor installed in device"/>
+  <br/><em>Motor installed in device</em>
+</p>
 
 ---
 
@@ -271,7 +309,6 @@ Main Menu
 │   ├── WiFi Attacks
 │   ├── Chanalizer
 │   ├── WiFi Band Scope
-│   ├── BLE Band Scope
 │   ├── Deauth Mon.
 │   └── WiFi Observer
 ├── Bluetooth
@@ -323,7 +360,7 @@ Main Menu
 | Feature | Description |
 |---------|-------------|
 | **WiFi Scan** | Scans all channels, shows SSID, BSSID, RSSI, channel, encryption |
-| **Deauth Attack** | Sends deauthentication frames to disconnect clients from selected AP |
+| **Deauth Attack** | Sends deauthentication frames to disconnect clients from selected AP. Triggers a 3-second vibrator pulse on launch (requires vibrator hardware). |
 | **Evil Twin** | Creates a rogue AP cloning the target SSID to lure clients |
 | **Captive Portal** | HTTP server presenting a custom HTML login page to capture credentials |
 | **Handshake Capture** | Captures WPA/WPA2 4-way handshakes and saves as PCAP/HCCAPX |
@@ -393,10 +430,6 @@ Passive network intelligence and rogue AP capabilities.
 
 The spectrum bar chart (top) shows current peak RSSI per channel as a heat-color bar. The waterfall (bottom) scrolls down one row per completed sweep, building a time history of band activity. Tap **Band: 2.4GHz / Band: 5 GHz** to toggle — the axis label, peak arrays, and waterfall all reset cleanly on each switch.
 
-#### BLE Band Scope
-
-**BLE RSSI histogram and waterfall** — shows the distribution of received BLE advertising packet RSSI values across −100 to −30 dBm using a log-scale bar chart and a scrolling waterfall. Useful for visualizing BLE traffic density and signal levels in a given area. Packet count is shown in the status bar.
-
 ### 2. Bluetooth
 
 BLE scanning and fingerprinting features leveraging the ESP32-C5's BLE 5.0 radio.
@@ -428,11 +461,11 @@ Bluetooth
 |---------|-------------|
 | **BT Scan & Select** | Active BLE scan — discovers all nearby devices; shows name or vendor (from OUI lookup), RSSI, partial MAC; tap to select a target |
 | **BT Observer** | 10-second active BLE scan followed by sequential GATT walks on every discovered device (5 s timeout per device). Results shown in a scrollable live list; tap any row to open the full GATT detail view |
-| **BT Locator** | RSSI-based proximity tracking of a selected BLE device; updates every 10 s |
+| **BT Locator** | RSSI-based proximity tracking of a selected BLE device; updates every 10 s. Vibrator strength scales logarithmically with signal strength — silent below −69 dBm, 10% at −69 dBm, 100% at −40 dBm (requires vibrator hardware). |
 | **GATT Walker** | Full BLE GATT inspection — walks all services, characteristics, and descriptors; reads attribute values; computes FNV-32 device fingerprint; saves enriched JSON to SD card with service/characteristic names, decoded properties, ASCII data preview, OUI manufacturer, and optional GPS geotag |
 | **AirTag Scanner** | Passive BLE scan — detects Apple AirTags and Samsung SmartTags by manufacturer ID |
 | **Tag Locator** | Per-tag RSSI tracking launched from the AirTag Scan found-tags list |
-| **Bluetooth Lookout** | Continuous BLE monitor that alerts when a watchlisted device (by full MAC or OUI prefix) is detected nearby |
+| **Bluetooth Lookout** | Continuous BLE monitor that alerts when a watchlisted device (by full MAC or OUI prefix) is detected nearby. Triggers 3 × 1-second vibrator pulses on each detection (requires vibrator hardware). |
 | **BLE Spam** | Broadcasts fake BLE advertisements — Apple Prox. Pair (13 device types), Samsung Fast Connect (6 models), Google Fast Pair (12 model IDs), Windows Swift Pair, Apple Find My (AirTag), Samsung SmartTag, **Sour Apple** (Apple Nearby Action 0x0F — cycles 11 action types to flood iOS with system popups), or All simultaneously |
 | **Drone Detector** | Passive BLE scan for DJI/Remote ID drone advertisements — detects drones broadcasting operator ID and location data |
 | **Device Spoof (directed)** | Clones the MAC address and name of a device pre-selected in BT Scan & Select — no additional selection step required |
@@ -484,12 +517,14 @@ Tap **Track** on any device. The firmware locks onto that device's MAC address a
 
 Use the RSSI value to home in on the tag — a higher (less negative) number means you are closer:
 
-| RSSI | Approximate distance |
-|------|----------------------|
-| −40 to −55 dBm | Very close (within ~1 m) |
-| −55 to −70 dBm | Nearby (~1–5 m) |
-| −70 to −85 dBm | In the same room (~5–15 m) |
-| Below −85 dBm | Far away or obstructed |
+| RSSI | Approximate distance | Vibrator strength |
+|------|----------------------|-------------------|
+| −40 dBm or stronger | Very close (within ~1 m) | 100% |
+| −55 dBm | Nearby (~1–3 m) | ~58% |
+| −69 dBm | ~5 m range edge | 10% (threshold) |
+| Below −69 dBm | Far away or obstructed | Silent |
+
+Vibrator strength updates every 500 ms and scales linearly with dBm (which is already a log-scale of power), giving a natural haptic proximity feel. The strength used by **Settings → Vibrator Test** is saved on entry and fully restored when you exit the locator.
 
 <p align="center">
   <img width="340" alt="AirTag Far Away" src="docs/screenshots/airtag_detection_far.jpg" />
@@ -728,7 +763,7 @@ This keeps all data from a device in a single enriched file — the initial stat
 - **Full MAC** — triggers only when that exact 6-byte address is seen. Best for tracking a specific known device.
 - **OUI prefix** — triggers when *any* device from that manufacturer's OUI block (`AA:BB:CC:*:*:*`) is seen. Best for detecting a category of hardware (e.g., any Axon body camera in range).
 
-**Alert:** When a match is found the NeoPixel flashes red (3 × 250 ms on/off) and a popup appears on screen showing the device name, MAC address, vendor (if OUI database is loaded), and RSSI. A 30-second per-device cooldown prevents repeated alerts for the same device.
+**Alert:** When a match is found the NeoPixel flashes red (3 × 250 ms on/off), the vibrator fires 3 × 1-second pulses (requires vibrator hardware), and a popup appears on screen showing the device name, MAC address, vendor (if OUI database is loaded), and RSSI. A 30-second per-device cooldown prevents repeated alerts for the same device.
 
 **Controls on the Lookout screen:**
 
@@ -1000,6 +1035,7 @@ All settings are persisted via **NVS** (Non-Volatile Storage) across reboots. Th
 | **GPS Info** | Live GPS fix status — latitude, longitude, altitude, satellite count, UTC time, and UART reference. When no live fix, last-known coordinates are shown in amber with `*` suffix and `Accuracy: 150 m (stale)`. **Set Position** button opens manual coordinate editor (see below). Refreshes every second. |
 | **Power Mode** | TX Power Mode selector — Normal or Max Power (see below) |
 | **Data Transfer** | File server sub-menu — AP mode or WiFi client mode (see below) |
+| **Vibrator Test** | Test tile for the vibrator motor — drives GPIO 26 (SPEAK_IN → SC8002B amp) at 333 Hz via LEDC PWM. Popup exposes ON / OFF buttons and a **Strength slider** (10–100%, where 100% = 50% duty cycle, the half-wave rectified maximum). Strength persists within the session. API: `vibrator_on()`, `vibrator_off()`, `vibrator_pulse(ms)`, `vibrator_burst(count, on_ms, gap_ms)`. Requires the 1N5819 + 1N4148 diode circuit on the SPEAK header — see Vibrator Motor Circuit section. |
 
 #### GPS Info & Fallback Position
 
@@ -1268,38 +1304,40 @@ The XPT2046 resistive touch panel requires one-time calibration to map raw ADC v
 
 ### First Boot
 
-Calibration runs automatically the first time the firmware boots (when no NVS calibration is found). The sequence appears after the splash screen:
+Calibration runs automatically the first time the firmware boots (when no NVS calibration is found). The sequence appears after the splash screen, with the lab background image displayed at high brightness and **yellow L-shaped corner brackets** marking each tap target:
 
-1. **"Do NOT touch screen"** — holds for 2 seconds while measuring the panel's resting (null) position.
-2. **"Touch the [+] Top-Left (1/3)"** — a white crosshair appears at the top-left corner. Press it firmly and hold until the screen advances.
-3. **"Touch the [+] Top-Right (2/3)"** — press the top-right crosshair.
-4. **"Touch the [+] Bottom-Left (3/3)"** — press the bottom-left crosshair.
-5. **"Calibration done!"** — calculated values are saved to NVS namespace `touch_cal` and applied immediately.
+1. **"Tap the corner: Top-Left (1/4)"** — tap firmly in the top-left corner of the screen where the yellow L-bracket is shown.
+2. **"Tap the corner: Top-Right (2/4)"** — tap the top-right corner.
+3. **"Tap the corner: Bottom-Left (3/4)"** — tap the bottom-left corner.
+4. **"Tap the corner: Bottom-Right (4/4)"** — tap the bottom-right corner.
+5. **Confirm step** — a small green **OK** button appears at screen center with a 5-second countdown. The new calibration is applied immediately. Tap the OK button using the new calibration:
+   - **Tap lands on OK** → calibration is saved to NVS.
+   - **Countdown expires or tap misses** → old calibration is restored and the 4-point sequence restarts from the beginning. NVS is never written until OK is successfully hit.
+
+The 4-point corner method records raw ADC values at the actual screen edges (not inset positions), so the full pixel range maps accurately with no extrapolation error. Column and row averages are used directly as `x_min`/`x_max`/`y_min`/`y_max`.
 
 ### Re-Calibrating
 
-To re-run calibration after first boot, create a **trigger file** on the SD card:
+Three ways to trigger re-calibration after first boot:
 
-```
-/sdcard/calibrate.txt
-```
-
-The file content does not matter. On the next boot, the firmware detects it, deletes it, and runs the calibration UI before showing the home screen.
+1. **Settings → Screen → Recalibrate Touch** — invalidates the NVS magic value and restarts the device; calibration runs on the next boot.
+2. **SD card trigger file** — create `/sdcard/calibrate.txt` (content does not matter). On the next boot the firmware detects it, deletes it, and runs calibration before showing the home screen.
+3. **NVS magic reset** — setting the `magic` key in namespace `touch_cal` to any value other than `0xCA15` will trigger recalibration on next boot.
 
 ### What Is Stored (NVS namespace `touch_cal`)
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `x_min` / `x_max` | i32 | Raw ADC X range mapped to screen edges |
-| `y_min` / `y_max` | i32 | Raw ADC Y range mapped to screen edges |
-| `null_x` / `null_y` | i32 | Resting panel position (false-touch dead zone center) |
+| `x_min` / `x_max` | i32 | Raw ADC X range — values at actual screen corners |
+| `y_min` / `y_max` | i32 | Raw ADC Y range — values at actual screen corners |
+| `null_x` / `null_y` | i32 | Reserved (set to 0; null-zone filtering disabled) |
 | `invert_x` / `invert_y` | u8 | Axis inversion flags (NM-CYD-C5: both typically `1`) |
 | `swap_xy` | u8 | Axis swap (typically `0` for portrait) |
-| `magic` | u16 | `0xCA11` — marks calibration as valid |
+| `magic` | u16 | `0xCA15` — marks calibration as valid |
 
 ### Default Fallback
 
-If NVS has no calibration (i.e., `magic` ≠ `0xCA11`), the firmware applies hardware-observed defaults for the NM-CYD-C5: **both axes inverted** (`invert_x = true`, `invert_y = true`). These are good enough for initial boot but may be off by ~20 pixels. Run calibration for accurate touch.
+If NVS has no valid calibration (i.e., `magic` ≠ `0xCA15`), the firmware applies hardware-observed defaults for the NM-CYD-C5: **both axes inverted** (`invert_x = true`, `invert_y = true`). These defaults allow basic interaction but will be inaccurate near the screen edges. Run calibration for accurate full-screen touch.
 
 ---
 

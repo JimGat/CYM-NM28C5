@@ -134,32 +134,31 @@ bool xpt2046_read_touch(xpt2046_handle_t *handle, xpt2046_touch_point_t *point)
 
     point->touched = false;
 
-    // Z1 pressure gate — primary touch/no-touch discriminator.
-    // T_IRQ is NC on NM-CYD-C5 so we poll. XPT2046 Z1 reads near 0 when the
-    // panel is floating and climbs to hundreds/thousands under real finger pressure.
+    // Position-compensated pressure gate: Z1 + 4095 - Z2.
+    // Z1 alone is X-position-dependent — at the right/top edges it reads low even
+    // under real pressure, creating false dead zones. The datasheet-recommended
+    // formula Z1+4095-Z2 cancels the position bias: untouched ≈ 0, any real touch
+    // anywhere on the panel gives a consistent value well above XPT2046_Z_THRESHOLD.
     uint16_t z1 = xpt2046_read_raw(handle, XPT2046_CMD_Z1);
-    if (z1 < XPT2046_Z_THRESHOLD) {
+    uint16_t z2 = xpt2046_read_raw(handle, XPT2046_CMD_Z2);
+    if ((int)z1 + 4095 - (int)z2 < XPT2046_Z_THRESHOLD) {
         return false;
     }
 
     uint16_t raw_x = xpt2046_read_averaged(handle, XPT2046_CMD_X);
     uint16_t raw_y = xpt2046_read_averaged(handle, XPT2046_CMD_Y);
 
-    // Values at or near 0 or 4095 mean the panel is floating (not touched).
-    bool valid_x = (raw_x > 100 && raw_x < 4000);
-    bool valid_y = (raw_y > 100 && raw_y < 4000);
+    // Z1 is the sole touched/not-touched gate — do not range-check raw_x/raw_y here.
+    // Near the physical screen edges the ADC legitimately reads above 4000 or below 100;
+    // a range check silently drops those touches and creates dead zones at the edges.
 
-    // Reject readings within the null zone (resting-state ghost touch at rest position).
-    if (valid_x && valid_y && handle->null_radius > 0) {
+    // Reject readings within the null zone (ghost touches at the panel resting position).
+    if (handle->null_radius > 0) {
         int dx = (int)raw_x - handle->null_x;
         int dy = (int)raw_y - handle->null_y;
         if ((dx * dx + dy * dy) < (handle->null_radius * handle->null_radius)) {
-            valid_x = false;
+            return false;
         }
-    }
-
-    if (!valid_x || !valid_y) {
-        return false;
     }
 
     // Apply axis swap / invert before mapping
@@ -189,9 +188,10 @@ bool xpt2046_read_raw_point(xpt2046_handle_t *handle, uint16_t *out_x, uint16_t 
 {
     if (!handle || !out_x || !out_y) return false;
 
-    // Z1 pressure gate — same as xpt2046_read_touch; prevents floating-panel
-    // noise from looking like a valid touch during calibration.
-    if (xpt2046_read_raw(handle, XPT2046_CMD_Z1) < XPT2046_Z_THRESHOLD) return false;
+    // Same position-compensated pressure gate as xpt2046_read_touch.
+    uint16_t rz1 = xpt2046_read_raw(handle, XPT2046_CMD_Z1);
+    uint16_t rz2 = xpt2046_read_raw(handle, XPT2046_CMD_Z2);
+    if ((int)rz1 + 4095 - (int)rz2 < XPT2046_Z_THRESHOLD) return false;
 
     // Discard first sample per axis (ADC settling), then average 4 samples
     xpt2046_read_raw(handle, XPT2046_CMD_X);
@@ -202,9 +202,7 @@ bool xpt2046_read_raw_point(xpt2046_handle_t *handle, uint16_t *out_x, uint16_t 
     uint32_t sy = 0;
     for (int i = 0; i < 4; i++) sy += xpt2046_read_raw(handle, XPT2046_CMD_Y);
 
-    uint16_t x = (uint16_t)(sx / 4);
-    uint16_t y = (uint16_t)(sy / 4);
-    *out_x = x;
-    *out_y = y;
-    return (x > 100 && x < 4000 && y > 100 && y < 4000);
+    *out_x = (uint16_t)(sx / 4);
+    *out_y = (uint16_t)(sy / 4);
+    return true;  // Z1 already confirmed touch; don't range-filter raw values
 }
