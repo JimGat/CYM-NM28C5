@@ -134,11 +134,14 @@ bool xpt2046_read_touch(xpt2046_handle_t *handle, xpt2046_touch_point_t *point)
 
     point->touched = false;
 
-    // Z1 pressure gate — primary touch/no-touch discriminator.
-    // T_IRQ is NC on NM-CYD-C5 so we poll. XPT2046 Z1 reads near 0 when the
-    // panel is floating and climbs to hundreds/thousands under real finger pressure.
+    // Position-compensated pressure gate: Z1 + 4095 - Z2.
+    // Z1 alone is X-position-dependent — at the right/top edges it reads low even
+    // under real pressure, creating false dead zones. The datasheet-recommended
+    // formula Z1+4095-Z2 cancels the position bias: untouched ≈ 0, any real touch
+    // anywhere on the panel gives a consistent value well above XPT2046_Z_THRESHOLD.
     uint16_t z1 = xpt2046_read_raw(handle, XPT2046_CMD_Z1);
-    if (z1 < XPT2046_Z_THRESHOLD) {
+    uint16_t z2 = xpt2046_read_raw(handle, XPT2046_CMD_Z2);
+    if ((int)z1 + 4095 - (int)z2 < XPT2046_Z_THRESHOLD) {
         return false;
     }
 
@@ -185,9 +188,10 @@ bool xpt2046_read_raw_point(xpt2046_handle_t *handle, uint16_t *out_x, uint16_t 
 {
     if (!handle || !out_x || !out_y) return false;
 
-    // Z1 pressure gate — same as xpt2046_read_touch; prevents floating-panel
-    // noise from looking like a valid touch during calibration.
-    if (xpt2046_read_raw(handle, XPT2046_CMD_Z1) < XPT2046_Z_THRESHOLD) return false;
+    // Same position-compensated pressure gate as xpt2046_read_touch.
+    uint16_t rz1 = xpt2046_read_raw(handle, XPT2046_CMD_Z1);
+    uint16_t rz2 = xpt2046_read_raw(handle, XPT2046_CMD_Z2);
+    if ((int)rz1 + 4095 - (int)rz2 < XPT2046_Z_THRESHOLD) return false;
 
     // Discard first sample per axis (ADC settling), then average 4 samples
     xpt2046_read_raw(handle, XPT2046_CMD_X);
