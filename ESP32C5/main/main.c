@@ -3389,7 +3389,7 @@ static void run_touch_calibration(void)
     lv_img_set_src(bg_img, &lab_bg);
     lv_obj_align(bg_img, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_img_recolor(bg_img, lv_color_black(), 0);
-    lv_obj_set_style_img_recolor_opa(bg_img, LV_OPA_60, 0);
+    lv_obj_set_style_img_recolor_opa(bg_img, LV_OPA_20, 0);
     lv_obj_move_to_index(bg_img, 0);
 
     lv_obj_t *lbl = lv_label_create(scr);
