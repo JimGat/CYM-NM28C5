@@ -133,6 +133,7 @@ static int bt_found_device_count = 0;
 // AirTag/SmartTag counters
 static int bt_airtag_count = 0;
 static int bt_smarttag_count = 0;
+static int bt_possible_airtag_count = 0;  // Apple 0x05 Nearby Action (owner-nearby/paused mode)
 
 // Generic BT device storage for scan_bt command
 typedef struct {
@@ -144,6 +145,7 @@ typedef struct {
     uint16_t company_id;
     bool is_airtag;
     bool is_smarttag;
+    bool is_possible_airtag;  /* Apple 0x05 Nearby Action — AirTag in owner-proximity/paused mode */
 } bt_device_info_t;
 
 static bt_device_info_t bt_devices[BT_MAX_DEVICES];
@@ -1503,6 +1505,7 @@ static lv_obj_t  *gw_back_btn        = NULL;
 // Snapshot values for UI (copied before reset)
 static volatile int airtag_scan_snapshot_airtag = 0;
 static volatile int airtag_scan_snapshot_smarttag = 0;
+static volatile int airtag_scan_snapshot_possible_airtag = 0;
 static volatile int airtag_scan_snapshot_total = 0;
 
 // Promiscuous filter
@@ -6113,42 +6116,44 @@ void app_main(void)
                 airtag_scan_update_flag = false;
                 
                 // Read snapshot values (thread-safe copy)
-                int snap_airtag = airtag_scan_snapshot_airtag;
-                int snap_smarttag = airtag_scan_snapshot_smarttag;
-                int snap_total = airtag_scan_snapshot_total;
-                
+                int snap_airtag          = airtag_scan_snapshot_airtag;
+                int snap_smarttag        = airtag_scan_snapshot_smarttag;
+                int snap_possible_airtag = airtag_scan_snapshot_possible_airtag;
+                int snap_total           = airtag_scan_snapshot_total;
+
                 // Hide "Scan in progress", show stats
                 if (airtag_scan_status_label && lv_obj_is_valid(airtag_scan_status_label)) {
                     lv_obj_add_flag(airtag_scan_status_label, LV_OBJ_FLAG_HIDDEN);
                 }
-                
+
                 // Update and show stats labels
                 if (airtag_scan_stats_label1 && lv_obj_is_valid(airtag_scan_stats_label1)) {
-                    char stats1[64];
-                    snprintf(stats1, sizeof(stats1), "Air Tags: %d\nSmart Tags: %d",
-                             snap_airtag, snap_smarttag);
+                    char stats1[96];
+                    snprintf(stats1, sizeof(stats1),
+                             "Air Tags: %d\nAirTag? (Prox): %d\nSmart Tags: %d",
+                             snap_airtag, snap_possible_airtag, snap_smarttag);
                     lv_label_set_text(airtag_scan_stats_label1, stats1);
                     lv_obj_clear_flag(airtag_scan_stats_label1, LV_OBJ_FLAG_HIDDEN);
                 }
 
-                // Show "View Found Tags" button when at least one tag is detected
+                // Show "View Found Tags" button when at least one tag-type device is detected
                 if (airtag_view_tags_btn && lv_obj_is_valid(airtag_view_tags_btn)) {
-                    if (snap_airtag + snap_smarttag > 0) {
+                    if (snap_airtag + snap_smarttag + snap_possible_airtag > 0) {
                         lv_obj_clear_flag(airtag_view_tags_btn, LV_OBJ_FLAG_HIDDEN);
                     } else {
                         lv_obj_add_flag(airtag_view_tags_btn, LV_OBJ_FLAG_HIDDEN);
                     }
                 }
-                
+
                 if (airtag_scan_stats_label2 && lv_obj_is_valid(airtag_scan_stats_label2)) {
-                    int other_devices = snap_total - snap_airtag - snap_smarttag;
+                    int other_devices = snap_total - snap_airtag - snap_smarttag - snap_possible_airtag;
                     if (other_devices < 0) other_devices = 0;
                     char stats2[48];
                     snprintf(stats2, sizeof(stats2), "Other BT Devices: %d", other_devices);
                     lv_label_set_text(airtag_scan_stats_label2, stats2);
                     lv_obj_clear_flag(airtag_scan_stats_label2, LV_OBJ_FLAG_HIDDEN);
                 }
-                
+
                 if (airtag_scan_stats_label3 && lv_obj_is_valid(airtag_scan_stats_label3)) {
                     char stats3[48];
                     snprintf(stats3, sizeof(stats3), "Total BT devices: %d", snap_total);
@@ -27013,6 +27018,7 @@ static void bt_reset_counters(void)
 {
     bt_airtag_count = 0;
     bt_smarttag_count = 0;
+    bt_possible_airtag_count = 0;
     bt_found_device_count = 0;
     bt_device_count = 0;
     memset(bt_found_devices, 0, sizeof(bt_found_devices));
@@ -27071,6 +27077,30 @@ static bool bt_is_samsung_smarttag(const uint8_t *data, uint8_t len)
     }
     
     return false;
+}
+
+/**
+ * Detect an Apple device likely in AirTag owner-proximity (paused) mode.
+ *
+ * When an AirTag detects its owner's iPhone nearby it stops broadcasting the
+ * standard Find My advertisement (type 0x12) and switches to Apple's Nearby
+ * Action protocol (type 0x05).  Short payload (≤12 B) with no device name
+ * distinguishes this from AirDrop, which also uses 0x05 but with an 18+ B
+ * payload and often accompanies a visible device name.
+ */
+static bool bt_is_possible_airtag(const uint8_t *data, uint8_t len, bool has_name)
+{
+    if (has_name) return false;         // AirTags never advertise a name
+    if (len < 3) return false;
+
+    uint16_t company_id = data[0] | (data[1] << 8);
+    if (company_id != APPLE_COMPANY_ID) return false;
+
+    uint8_t subtype = data[2];
+    if (subtype == APPLE_FIND_MY_TYPE) return false;  // Already classified as AirTag
+
+    // Nearby Action (0x05), short payload — hallmark of AirTag in paused/proximity mode
+    return (subtype == 0x05 && len <= 12);
 }
 
 /**
@@ -27170,8 +27200,9 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
         dev->phy       = phy;
         dev->name[0]   = '\0';
         dev->company_id = 0;
-        dev->is_airtag  = false;
-        dev->is_smarttag = false;
+        dev->is_airtag          = false;
+        dev->is_smarttag        = false;
+        dev->is_possible_airtag = false;
 
         bool has_name = (fields.name != NULL && fields.name_len > 0);
         if (has_name) {
@@ -27189,6 +27220,9 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
             } else if (bt_is_samsung_smarttag(fields.mfg_data, fields.mfg_data_len)) {
                 dev->is_smarttag = true;
                 bt_smarttag_count++;
+            } else if (bt_is_possible_airtag(fields.mfg_data, fields.mfg_data_len, has_name)) {
+                dev->is_possible_airtag = true;
+                bt_possible_airtag_count++;
             }
         }
 
@@ -27399,7 +27433,10 @@ static void ble_scan_update_list(void)
 
         bool coded = (dev->phy == BLE_HCI_LE_PHY_CODED);
         const char *phy_tag  = coded ? "[LR] " : "";
-        const char *type_str = dev->is_airtag ? " AT" : dev->is_smarttag ? " ST" : "";
+        const char *type_str = dev->is_airtag          ? " AT"
+                             : dev->is_smarttag         ? " ST"
+                             : dev->is_possible_airtag  ? " ?AT"
+                             : "";
 
         char item_text[88];
         if (dev->name[0] != '\0') {
@@ -29739,13 +29776,15 @@ static void airtag_scan_task(void *pvParameters)
         if (!airtag_scan_active)
             break;
 
-        airtag_scan_snapshot_airtag  = bt_airtag_count;
-        airtag_scan_snapshot_smarttag = bt_smarttag_count;
-        airtag_scan_snapshot_total   = bt_device_count;
+        airtag_scan_snapshot_airtag          = bt_airtag_count;
+        airtag_scan_snapshot_smarttag        = bt_smarttag_count;
+        airtag_scan_snapshot_possible_airtag = bt_possible_airtag_count;
+        airtag_scan_snapshot_total           = bt_device_count;
         airtag_scan_update_flag = true;
 
-        ESP_LOGI(TAG, "AirTag scan cycle: %d AT, %d ST, %d total",
-                 airtag_scan_snapshot_airtag, airtag_scan_snapshot_smarttag, airtag_scan_snapshot_total);
+        ESP_LOGI(TAG, "AirTag scan cycle: %d AT, %d AT-Prox?, %d ST, %d total",
+                 airtag_scan_snapshot_airtag, airtag_scan_snapshot_possible_airtag,
+                 airtag_scan_snapshot_smarttag, airtag_scan_snapshot_total);
     }
 
     ESP_LOGI(TAG, "AirTag scanner task ending");
@@ -29848,7 +29887,7 @@ static void show_found_tags_screen(void)
     int found = 0;
     for (int i = 0; i < bt_device_count; i++) {
         bt_device_info_t *dev = &bt_devices[i];
-        if (!dev->is_airtag && !dev->is_smarttag) continue;
+        if (!dev->is_airtag && !dev->is_smarttag && !dev->is_possible_airtag) continue;
         found++;
 
         // Row container
@@ -29860,12 +29899,23 @@ static void show_found_tags_screen(void)
         lv_obj_set_style_pad_all(row, 6, 0);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
-        // Type badge: "AirTag" or "SmartTag"
+        // Type badge
         lv_obj_t *type_label = lv_label_create(row);
-        lv_label_set_text(type_label, dev->is_airtag ? "AirTag" : "SmartTag");
+        const char *badge_text;
+        lv_color_t badge_color;
+        if (dev->is_airtag) {
+            badge_text  = "AirTag";
+            badge_color = lv_color_make(255, 149, 0);   // Apple orange
+        } else if (dev->is_smarttag) {
+            badge_text  = "SmartTag";
+            badge_color = lv_color_make(90, 200, 250);  // Samsung blue
+        } else {
+            badge_text  = "AirTag? (Proximity)";
+            badge_color = lv_color_make(255, 214, 10);  // Yellow — owner-nearby mode
+        }
+        lv_label_set_text(type_label, badge_text);
         lv_obj_set_style_text_font(type_label, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(type_label,
-            dev->is_airtag ? lv_color_make(255, 149, 0) : lv_color_make(90, 200, 250), 0);
+        lv_obj_set_style_text_color(type_label, badge_color, 0);
         lv_obj_align(type_label, LV_ALIGN_TOP_LEFT, 0, 0);
 
         // MAC address
@@ -30095,13 +30145,13 @@ static void show_airtag_scan_screen(void)
     lv_obj_set_style_text_color(airtag_scan_status_label, ui_text_color(), 0);
     lv_obj_align(airtag_scan_status_label, LV_ALIGN_CENTER, 0, -105);
 
-    // Stats label 1: "Air Tags: X\nSmart Tags: X" (two lines, large font)
+    // Stats label 1: "Air Tags: X\nAirTag? (Prox): X\nSmart Tags: X" (three lines, large font)
     airtag_scan_stats_label1 = lv_label_create(function_page);
-    lv_label_set_text(airtag_scan_stats_label1, "Air Tags: 0\nSmart Tags: 0");
+    lv_label_set_text(airtag_scan_stats_label1, "Air Tags: 0\nAirTag? (Prox): 0\nSmart Tags: 0");
     lv_obj_set_style_text_align(airtag_scan_stats_label1, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(airtag_scan_stats_label1, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(airtag_scan_stats_label1, ui_text_color(), 0);
-    lv_obj_align(airtag_scan_stats_label1, LV_ALIGN_CENTER, 0, -85);
+    lv_obj_align(airtag_scan_stats_label1, LV_ALIGN_CENTER, 0, -95);
     lv_obj_add_flag(airtag_scan_stats_label1, LV_OBJ_FLAG_HIDDEN);
 
     // Stats label 2: "Other BT Devices: X"
@@ -30110,7 +30160,7 @@ static void show_airtag_scan_screen(void)
     lv_obj_set_style_text_align(airtag_scan_stats_label2, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(airtag_scan_stats_label2, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(airtag_scan_stats_label2, lv_color_make(176, 176, 176), 0);
-    lv_obj_align(airtag_scan_stats_label2, LV_ALIGN_CENTER, 0, -20);
+    lv_obj_align(airtag_scan_stats_label2, LV_ALIGN_CENTER, 0, 10);
     lv_obj_add_flag(airtag_scan_stats_label2, LV_OBJ_FLAG_HIDDEN);
 
     // Stats label 3: "Total BT devices: X"
@@ -30119,13 +30169,13 @@ static void show_airtag_scan_screen(void)
     lv_obj_set_style_text_align(airtag_scan_stats_label3, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(airtag_scan_stats_label3, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(airtag_scan_stats_label3, lv_color_make(176, 176, 176), 0);
-    lv_obj_align(airtag_scan_stats_label3, LV_ALIGN_CENTER, 0, 5);
+    lv_obj_align(airtag_scan_stats_label3, LV_ALIGN_CENTER, 0, 35);
     lv_obj_add_flag(airtag_scan_stats_label3, LV_OBJ_FLAG_HIDDEN);
 
-    // "View Found Tags" button — shown when at least one AirTag or SmartTag detected
+    // "View Found Tags" button — shown when at least one tag-type device detected
     airtag_view_tags_btn = lv_btn_create(function_page);
     lv_obj_set_size(airtag_view_tags_btn, 160, 44);
-    lv_obj_align(airtag_view_tags_btn, LV_ALIGN_CENTER, 0, 55);
+    lv_obj_align(airtag_view_tags_btn, LV_ALIGN_CENTER, 0, 78);
     lv_obj_set_style_bg_color(airtag_view_tags_btn, COLOR_MATERIAL_BLUE, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(airtag_view_tags_btn, lv_color_lighten(COLOR_MATERIAL_BLUE, 50), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(airtag_view_tags_btn, 0, 0);
