@@ -138,6 +138,7 @@ static int bt_smarttag_count = 0;
 typedef struct {
     uint8_t addr[6];
     uint8_t addr_type;   /* BLE_ADDR_PUBLIC=0 or BLE_ADDR_RANDOM=1 */
+    uint8_t phy;         /* BLE_HCI_LE_PHY_1M=1 or BLE_HCI_LE_PHY_CODED=3 */
     int8_t rssi;
     char name[32];
     uint16_t company_id;
@@ -9069,20 +9070,42 @@ static void wd_mark_tap_cb(lv_event_t *e)
 static int wdp_ble_gap_cb(struct ble_gap_event *event, void *arg)
 {
     (void)arg;
-    if (event->type != BLE_GAP_EVENT_DISC) return 0;
-    struct ble_gap_disc_desc *desc = &event->disc;
     if (!wdp_ble_devices) return 0;
+
+    const uint8_t *addr_val;
+    int8_t rssi;
+    const uint8_t *adv_data;
+    uint8_t adv_data_len;
+
+#if MYNEWT_VAL(BLE_EXT_ADV)
+    if (event->type == BLE_GAP_EVENT_EXT_DISC) {
+        struct ble_gap_ext_disc_desc *d = &event->ext_disc;
+        addr_val     = d->addr.val;
+        rssi         = d->rssi;
+        adv_data     = d->data;
+        adv_data_len = d->length_data;
+    } else
+#endif
+    if (event->type == BLE_GAP_EVENT_DISC) {
+        struct ble_gap_disc_desc *d = &event->disc;
+        addr_val     = d->addr.val;
+        rssi         = d->rssi;
+        adv_data     = d->data;
+        adv_data_len = d->length_data;
+    } else {
+        return 0;
+    }
 
     // Dedup by MAC
     int cnt = wdp_ble_count;
     for (int i = 0; i < cnt; i++)
-        if (memcmp(wdp_ble_devices[i].mac, desc->addr.val, 6) == 0) return 0;
+        if (memcmp(wdp_ble_devices[i].mac, addr_val, 6) == 0) return 0;
 
     if (cnt >= WDP_BLE_MAX_DEVICES) return 0;
 
     wdp_ble_device_t *dev = &wdp_ble_devices[cnt];
-    memcpy(dev->mac, desc->addr.val, 6);
-    dev->rssi      = desc->rssi;
+    memcpy(dev->mac, addr_val, 6);
+    dev->rssi      = rssi;
     {
         const gps_data_t *g = gps_best();
         dev->latitude  = g->latitude;
@@ -9092,7 +9115,7 @@ static int wdp_ble_gap_cb(struct ble_gap_event *event, void *arg)
     dev->written   = false;
 
     struct ble_hs_adv_fields fields;
-    if (ble_hs_adv_parse_fields(&fields, desc->data, desc->length_data) == 0
+    if (ble_hs_adv_parse_fields(&fields, adv_data, adv_data_len) == 0
         && fields.name && fields.name_len > 0) {
         int nl = fields.name_len < 31 ? fields.name_len : 31;
         memcpy(dev->name, fields.name, nl);
@@ -10259,6 +10282,18 @@ static void wardrive_promisc_task(void *pvParameters) {
                 wdp_current_channel = -1;  // signal UI: BLE pass in progress
                 wd_ui_update_flag = true;
 
+#if MYNEWT_VAL(BLE_EXT_ADV)
+                struct ble_gap_ext_disc_params bpe = {
+                    .itvl = 0x60, .window = 0x60, .passive = 0,
+                };
+                if (ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 0, 0, 0,
+                                     BLE_HCI_SCAN_FILT_NO_WL, 0,
+                                     &bpe, &bpe,
+                                     wdp_ble_gap_cb, NULL) == 0) {
+                    vTaskDelay(pdMS_TO_TICKS(WDP_BLE_DWELL_MS));
+                    ble_gap_disc_cancel();
+                }
+#else
                 struct ble_gap_disc_params bp = {
                     .itvl = 0x60, .window = 0x60,
                     .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
@@ -10269,6 +10304,7 @@ static void wardrive_promisc_task(void *pvParameters) {
                     vTaskDelay(pdMS_TO_TICKS(WDP_BLE_DWELL_MS));
                     ble_gap_disc_cancel();
                 }
+#endif
             }
 
             if (!wardrive_active) break;
@@ -27038,57 +27074,81 @@ static bool bt_is_samsung_smarttag(const uint8_t *data, uint8_t len)
 }
 
 /**
- * BLE GAP event callback for scanning
+ * BLE GAP event callback for scanning — handles both legacy and BLE 5 Coded PHY
  */
 static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
 {
-    if (event->type != BLE_GAP_EVENT_DISC) {
+    // Extract common fields from either legacy or extended disc event
+    const uint8_t *adv_data;
+    uint8_t adv_data_len;
+    const uint8_t *addr_val;
+    uint8_t addr_type;
+    int8_t rssi;
+    uint8_t phy;
+    bool is_scan_response;
+
+#if MYNEWT_VAL(BLE_EXT_ADV)
+    if (event->type == BLE_GAP_EVENT_EXT_DISC) {
+        struct ble_gap_ext_disc_desc *d = &event->ext_disc;
+        adv_data        = d->data;
+        adv_data_len    = d->length_data;
+        addr_val        = d->addr.val;
+        addr_type       = d->addr.type;
+        rssi            = d->rssi;
+        phy             = d->prim_phy;
+        is_scan_response = (d->props & BLE_HCI_ADV_SCAN_RSP_MASK) != 0;
+    } else
+#endif
+    if (event->type == BLE_GAP_EVENT_DISC) {
+        struct ble_gap_disc_desc *d = &event->disc;
+        adv_data        = d->data;
+        adv_data_len    = d->length_data;
+        addr_val        = d->addr.val;
+        addr_type       = d->addr.type;
+        rssi            = d->rssi;
+        phy             = BLE_HCI_LE_PHY_1M;
+        is_scan_response = (d->event_type == BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP);
+    } else {
         return 0;
     }
-    
-    struct ble_gap_disc_desc *desc = &event->disc;
 
     // Dee Dee Detector — check every advertisement against watchlist,
     // regardless of whether BT Locator is also running.
     if (bt_lookout_is_active()) {
         char adv_name_buf[32] = "";
         struct ble_hs_adv_fields lk_fields;
-        if (ble_hs_adv_parse_fields(&lk_fields, desc->data, desc->length_data) == 0
+        if (ble_hs_adv_parse_fields(&lk_fields, adv_data, adv_data_len) == 0
             && lk_fields.name && lk_fields.name_len > 0) {
             int nl = lk_fields.name_len < 31 ? lk_fields.name_len : 31;
             memcpy(adv_name_buf, lk_fields.name, nl);
         }
-        bt_lookout_on_adv(desc->addr.val, desc->rssi,
+        bt_lookout_on_adv(addr_val, rssi,
                           adv_name_buf[0] ? adv_name_buf : NULL);
     }
 
     // MAC tracking mode - update RSSI for tracked device (BT Locator)
     if (bt_tracking_mode) {
-        if (memcmp(desc->addr.val, bt_tracking_mac, 6) == 0) {
-            bt_tracking_rssi = desc->rssi;
+        if (memcmp(addr_val, bt_tracking_mac, 6) == 0) {
+            bt_tracking_rssi = rssi;
             bt_tracking_found = true;
         }
         return 0;
     }
-    
+
     // Parse advertising data
     struct ble_hs_adv_fields fields;
-    int rc = ble_hs_adv_parse_fields(&fields, desc->data, desc->length_data);
+    int rc = ble_hs_adv_parse_fields(&fields, adv_data, adv_data_len);
     if (rc != 0) {
         return 0;
     }
-    
-    // Check if this is a Scan Response packet (contains names more often)
-    bool is_scan_response = (desc->event_type == BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP);
-    
+
     // Check if device already seen
-    bool already_seen = bt_is_device_found(desc->addr.val);
-    
+    bool already_seen = bt_is_device_found(addr_val);
+
     // If already seen, only process scan responses to update names
     if (already_seen) {
-        // Try to update name from scan response if we don't have one
         if (is_scan_response && fields.name != NULL && fields.name_len > 0) {
-            int dev_idx = bt_find_device_index(desc->addr.val);
+            int dev_idx = bt_find_device_index(addr_val);
             if (dev_idx >= 0 && bt_devices[dev_idx].name[0] == '\0') {
                 int name_len = fields.name_len < 31 ? fields.name_len : 31;
                 memcpy(bt_devices[dev_idx].name, fields.name, name_len);
@@ -27097,66 +27157,86 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
         }
         return 0;
     }
-    
+
     // Add to found devices list
-    bt_add_found_device(desc->addr.val);
-    
+    bt_add_found_device(addr_val);
+
     // Store device info
     if (bt_device_count < BT_MAX_DEVICES) {
         bt_device_info_t *dev = &bt_devices[bt_device_count];
-        memcpy(dev->addr, desc->addr.val, 6);
-        dev->addr_type = desc->addr.type;
-        dev->rssi = desc->rssi;
-        dev->name[0] = '\0';
+        memcpy(dev->addr, addr_val, 6);
+        dev->addr_type = addr_type;
+        dev->rssi      = rssi;
+        dev->phy       = phy;
+        dev->name[0]   = '\0';
         dev->company_id = 0;
-        dev->is_airtag = false;
+        dev->is_airtag  = false;
         dev->is_smarttag = false;
-        
-        // Extract device name if available
+
         bool has_name = (fields.name != NULL && fields.name_len > 0);
         if (has_name) {
             int name_len = fields.name_len < 31 ? fields.name_len : 31;
             memcpy(dev->name, fields.name, name_len);
             dev->name[name_len] = '\0';
         }
-        
-        // Check manufacturer data
+
         if (fields.mfg_data != NULL && fields.mfg_data_len >= 2) {
             dev->company_id = fields.mfg_data[0] | (fields.mfg_data[1] << 8);
-            
+
             if (bt_is_apple_airtag(fields.mfg_data, fields.mfg_data_len, has_name)) {
                 dev->is_airtag = true;
                 bt_airtag_count++;
-            }
-            else if (bt_is_samsung_smarttag(fields.mfg_data, fields.mfg_data_len)) {
+            } else if (bt_is_samsung_smarttag(fields.mfg_data, fields.mfg_data_len)) {
                 dev->is_smarttag = true;
                 bt_smarttag_count++;
             }
         }
-        
+
         bt_device_count++;
     }
-    
+
     return 0;
 }
 
 /**
- * Start BLE scanning
+ * Start BLE scanning — enables both 1M PHY and Coded PHY (BLE 5 Long Range)
  */
 static int bt_start_scan(void)
 {
+#if MYNEWT_VAL(BLE_EXT_ADV)
+    // Active scan on both 1M and Coded PHY simultaneously
+    struct ble_gap_ext_disc_params p1m = {
+        .itvl    = 0x60,   // 60 ms interval (0.625 ms units)
+        .window  = 0x60,   // 60 ms window — continuous
+        .passive = 0,      // active: send scan requests to get Scan Responses
+    };
+    struct ble_gap_ext_disc_params pcoded = {
+        .itvl    = 0x60,
+        .window  = 0x60,
+        .passive = 0,
+    };
+    int rc = ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC,
+                              0,    // duration: 0 = scan until cancelled
+                              0,    // period: 0 = no periodic scheduling
+                              0,    // filter_duplicates: we dedup ourselves
+                              BLE_HCI_SCAN_FILT_NO_WL,
+                              0,    // limited
+                              &p1m,
+                              &pcoded,
+                              bt_gap_event_callback, NULL);
+    return rc;
+#else
     struct ble_gap_disc_params scan_params = {
-        .itvl = 0x60,             // 60ms interval
-        .window = 0x60,           // 60ms window = continuous listening
+        .itvl = 0x60,
+        .window = 0x60,
         .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
         .limited = 0,
-        .passive = 0,             // ACTIVE scan - critical for Scan Response names
-        .filter_duplicates = 0,   // We handle duplicates ourselves
+        .passive = 0,
+        .filter_duplicates = 0,
     };
-    
-    int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &scan_params,
-                          bt_gap_event_callback, NULL);
-    return rc;
+    return ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &scan_params,
+                        bt_gap_event_callback, NULL);
+#endif
 }
 
 /**
@@ -27309,42 +27389,39 @@ static void bt_scan_stop(void)
 static void ble_scan_update_list(void)
 {
     if (!ble_scan_list) return;
-    
-    // Clear existing items
+
     lv_obj_clean(ble_scan_list);
-    
+
     for (int i = 0; i < bt_device_count; i++) {
         bt_device_info_t *dev = &bt_devices[i];
         char addr_str[18];
         bt_format_addr(dev->addr, addr_str);
-        
-        char item_text[80];
-        const char *type_str = "";
-        if (dev->is_airtag) {
-            type_str = " AirTag";
-        } else if (dev->is_smarttag) {
-            type_str = " SmartTag";
-        }
-        
+
+        bool coded = (dev->phy == BLE_HCI_LE_PHY_CODED);
+        const char *phy_tag  = coded ? "[LR] " : "";
+        const char *type_str = dev->is_airtag ? " AT" : dev->is_smarttag ? " ST" : "";
+
+        char item_text[88];
         if (dev->name[0] != '\0') {
-            // Truncate name if too long
             char short_name[13];
             strncpy(short_name, dev->name, 12);
             short_name[12] = '\0';
-            snprintf(item_text, sizeof(item_text), "%d %s%s %s", 
-                     dev->rssi, short_name, type_str, addr_str);
+            snprintf(item_text, sizeof(item_text), "%s%d %s%s %s",
+                     phy_tag, dev->rssi, short_name, type_str, addr_str);
         } else {
-            snprintf(item_text, sizeof(item_text), "%d%s %s", 
-                     dev->rssi, type_str, addr_str);
+            snprintf(item_text, sizeof(item_text), "%s%d%s %s",
+                     phy_tag, dev->rssi, type_str, addr_str);
         }
-        
+
         lv_obj_t *item = lv_label_create(ble_scan_list);
         lv_label_set_text(item, item_text);
         lv_obj_set_width(item, lv_pct(100));
-        lv_obj_set_style_text_color(item, ui_text_color(), 0);
-        lv_obj_set_style_text_font(item, &lv_font_montserrat_12, 0);  // Smaller font to fit more
+        // Coded PHY devices shown in green to distinguish long-range finds
+        lv_color_t row_color = coded ? lv_color_make(80, 220, 80) : ui_text_color();
+        lv_obj_set_style_text_color(item, row_color, 0);
+        lv_obj_set_style_text_font(item, &lv_font_montserrat_12, 0);
         lv_obj_set_style_pad_ver(item, 1, 0);
-        lv_label_set_long_mode(item, LV_LABEL_LONG_SCROLL_CIRCULAR);  // Scroll if too long
+        lv_label_set_long_mode(item, LV_LABEL_LONG_SCROLL_CIRCULAR);
     }
 }
 
@@ -27552,43 +27629,44 @@ static void bt_locator_device_selected_cb(lv_event_t *e)
 static void bt_locator_update_list(void)
 {
     if (!bt_locator_list) return;
-    
-    // Clear existing items
+
     lv_obj_clean(bt_locator_list);
-    
+
     for (int i = 0; i < bt_device_count; i++) {
         bt_device_info_t *dev = &bt_devices[i];
         char addr_str[18];
         bt_format_addr(dev->addr, addr_str);
-        
-        char item_text[80];
+
+        bool coded = (dev->phy == BLE_HCI_LE_PHY_CODED);
+
+        char item_text[88];
         if (dev->name[0] != '\0') {
             char short_name[16];
             strncpy(short_name, dev->name, 15);
             short_name[15] = '\0';
-            snprintf(item_text, sizeof(item_text), "%d dBm  %s  %s", 
-                     dev->rssi, short_name, addr_str);
+            snprintf(item_text, sizeof(item_text), "%s%d dBm  %s  %s",
+                     coded ? "[LR] " : "", dev->rssi, short_name, addr_str);
         } else {
-            snprintf(item_text, sizeof(item_text), "%d dBm  %s", 
-                     dev->rssi, addr_str);
+            snprintf(item_text, sizeof(item_text), "%s%d dBm  %s",
+                     coded ? "[LR] " : "", dev->rssi, addr_str);
         }
-        
-        // Create a clickable button for each device (no border, subtle pressed color)
+
         lv_obj_t *btn = lv_btn_create(bt_locator_list);
         lv_obj_set_size(btn, lv_pct(100), 32);
         lv_obj_set_style_bg_color(btn, ui_card_color(), LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_color(btn, lv_color_make(50, 50, 50), LV_STATE_PRESSED);  // Subtle gray on press
+        lv_obj_set_style_bg_color(btn, lv_color_make(50, 50, 50), LV_STATE_PRESSED);
         lv_obj_set_style_border_width(btn, 0, 0);
         lv_obj_set_style_radius(btn, 4, 0);
-        
+
         lv_obj_t *lbl = lv_label_create(btn);
         lv_label_set_text(lbl, item_text);
-        lv_obj_set_style_text_color(lbl, ui_text_color(), 0);
+        // Coded PHY devices in green
+        lv_color_t row_color = coded ? lv_color_make(80, 220, 80) : ui_text_color();
+        lv_obj_set_style_text_color(lbl, row_color, 0);
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
         lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 5, 0);
         lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
-        
-        // Store device index as user data
+
         lv_obj_add_event_cb(btn, bt_locator_device_selected_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
     }
 }
