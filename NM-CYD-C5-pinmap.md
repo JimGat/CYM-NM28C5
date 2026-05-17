@@ -25,7 +25,7 @@
 | **USB**            | 2× USB-C (CH340 UART + Native USB 2.0)  | —              |
 | **RGB LED**        | Onboard WS2812 (IO27, module pin 18)     | GPIO / RMT     |
 | **Audio Amp**      | SC8002B class-D mono amp (U5)            | GPIO (SPEAK_IN)|
-| **Speaker Header** | 2-pin HCZZ0015-2 — **JST SH 1.0 mm** (measured: 3.35 mm housing) | SC8002B output |
+| **Speaker Header** | 2-pin HCZZ0015-2 — **JST GH 1.25 mm** | SC8002B output |
 | **Operating Temp** | −20°C to +70°C                          | —              |
 
 > The NM-CYD-C5 is **fully dimensionally and interface-compatible** with the ESP32-2432S028 (standard CYD), enabling drop-in replacement.
