@@ -15745,7 +15745,8 @@ static const char *s_human_size(long bytes, char *buf, size_t bufsz)
     return buf;
 }
 
-/* Send an HTML directory listing for sd_path, with URL base url_path. */
+/* Send an HTML directory listing for sd_path, with URL base url_path.
+ * Includes upload bar, new-folder form, and per-file delete buttons. */
 static void s_fileserv_send_dir(httpd_req_t *req, const char *sd_path, const char *url_path)
 {
     DIR *d = opendir(sd_path);
@@ -15753,28 +15754,85 @@ static void s_fileserv_send_dir(httpd_req_t *req, const char *sd_path, const cha
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
 
-    char chunk[640];
-    snprintf(chunk, sizeof(chunk),
+    /* Head + inline JS for upload and delete */
+    static const char s_head[] =
         "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-        "<meta name='viewport' content='width=device-width'>"
-        "<title>Cheap Yellow Monster</title></head>"
-        "<body style='font-family:monospace;background:#111;color:#0f0;padding:8px'>"
-        "<h2 style='color:#0ff'>%s</h2><hr>", url_path);
-    httpd_resp_send_chunk(req, chunk, strlen(chunk));
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>Cheap Yellow Monster</title>"
+        "<script>"
+        "function upload(dir){"
+          "var f=document.getElementById('uf').files[0];"
+          "if(!f){alert('Select a file first.');return;}"
+          "var sep=dir[dir.length-1]==='/'?'':'/';"
+          "fetch('/upload?path='+encodeURIComponent(dir+sep+f.name),"
+                "{method:'PUT',body:f})"
+          ".then(function(r){"
+            "if(r.ok)location.reload();"
+            "else r.text().then(function(t){alert('Upload failed: '+t);});"
+          "});"
+        "}"
+        "function del(p){"
+          "if(!confirm('Delete '+p+'?'))return;"
+          "fetch('/delete?path='+encodeURIComponent(p),{method:'POST'})"
+          ".then(function(r){"
+            "if(r.ok)location.reload();"
+            "else r.text().then(function(t){alert('Delete failed: '+t);});"
+          "});"
+        "}"
+        "</script></head>"
+        "<body style='font-family:monospace;background:#111;color:#0f0;padding:8px'>";
+    httpd_resp_send_chunk(req, s_head, strlen(s_head));
 
+    char chunk[1024];
+    int n;
+
+    /* Title */
+    n = snprintf(chunk, sizeof(chunk),
+        "<h2 style='color:#0ff'>%s</h2><hr>", url_path);
+    if (n > 0 && n < (int)sizeof(chunk)) httpd_resp_send_chunk(req, chunk, n);
+
+    /* Parent link */
     if (strlen(url_path) > 1) {
         char parent[128];
         strncpy(parent, url_path, sizeof(parent) - 1);
         parent[sizeof(parent)-1] = '\0';
         char *sl = strrchr(parent, '/');
         if (sl && sl != parent) *sl = '\0'; else strcpy(parent, "/");
-        int n = snprintf(chunk, sizeof(chunk),
+        n = snprintf(chunk, sizeof(chunk),
             "<p><a href='/files%s' style='color:#0ff'>[..] Parent</a></p>", parent);
         if (n > 0 && n < (int)sizeof(chunk)) httpd_resp_send_chunk(req, chunk, n);
     }
 
+    /* Upload action bar */
+    n = snprintf(chunk, sizeof(chunk),
+        "<div style='margin:8px 0;padding:6px 8px;border:1px solid #333;border-radius:4px'>"
+        "<span style='color:#888;font-size:12px'>Upload: </span>"
+        "<input type='file' id='uf' style='color:#aaa;font-size:12px'>"
+        "<button onclick='upload(\"%s\")' style='background:#155;color:#0ff;"
+        "border:1px solid #0ff;padding:2px 8px;cursor:pointer;margin-left:4px;"
+        "font-size:12px'>&#8679; Send</button></div>",
+        url_path);
+    if (n > 0 && n < (int)sizeof(chunk)) httpd_resp_send_chunk(req, chunk, n);
+
+    /* New folder form */
+    n = snprintf(chunk, sizeof(chunk),
+        "<form action='/mkdir' method='post' "
+        "style='margin-bottom:10px;display:flex;align-items:center;gap:6px'>"
+        "<input type='hidden' name='dir' value='%s'>"
+        "<input type='text' name='name' placeholder='New folder name' "
+        "style='background:#222;color:#0f0;border:1px solid #444;padding:3px 6px;"
+        "font-family:monospace;font-size:12px;width:150px'>"
+        "<button type='submit' style='background:#1a5;color:#fff;border:none;"
+        "padding:3px 10px;cursor:pointer;font-size:12px'>+ Folder</button>"
+        "</form>",
+        url_path);
+    if (n > 0 && n < (int)sizeof(chunk)) httpd_resp_send_chunk(req, chunk, n);
+
+    /* Directory entries */
     struct dirent *e;
     while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+
         char entry_sd[260];
         snprintf(entry_sd, sizeof(entry_sd), "%s/%.200s", sd_path, e->d_name);
         const char *sep = (url_path[strlen(url_path)-1] == '/') ? "" : "/";
@@ -15782,18 +15840,16 @@ static void s_fileserv_send_dir(httpd_req_t *req, const char *sd_path, const cha
         memset(&st, 0, sizeof(st));
         stat(entry_sd, &st);
 
-        /* Format modification time */
         char tmbuf[20] = "";
         if (st.st_mtime) {
             struct tm *tm_info = localtime(&st.st_mtime);
             if (tm_info) strftime(tmbuf, sizeof(tmbuf), "%Y-%m-%d %H:%M", tm_info);
         }
 
-        int n;
         if (S_ISDIR(st.st_mode)) {
             n = snprintf(chunk, sizeof(chunk),
-                "<p><a href='/files%s%s%.100s' style='color:#ff0'>[DIR] %.100s</a>"
-                " <span style='color:#555'>%s</span></p>",
+                "<p><a href='/files%s%s%.100s' style='color:#ff0'>"
+                "[DIR] %.100s</a> <span style='color:#555'>%s</span></p>",
                 url_path, sep, e->d_name, e->d_name, tmbuf);
         } else {
             char szbuf[16];
@@ -15801,15 +15857,152 @@ static void s_fileserv_send_dir(httpd_req_t *req, const char *sd_path, const cha
             n = snprintf(chunk, sizeof(chunk),
                 "<p><a href='/files%s%s%.100s' style='color:#0f0'>%.100s</a>"
                 " <span style='color:#888'>%s</span>"
-                " <span style='color:#555'>%s</span></p>",
-                url_path, sep, e->d_name, e->d_name, szbuf, tmbuf);
+                " <span style='color:#555'>%s</span>"
+                " <button onclick='del(this.dataset.p)' data-p='%s%s%.200s'"
+                " title='Delete' style='background:#500;color:#f66;"
+                "border:1px solid #700;padding:1px 5px;cursor:pointer;"
+                "margin-left:6px;font-size:11px'>&#x2715;</button></p>",
+                url_path, sep, e->d_name, e->d_name, szbuf, tmbuf,
+                url_path, sep, e->d_name);
         }
         if (n > 0 && n < (int)sizeof(chunk)) httpd_resp_send_chunk(req, chunk, n);
     }
     closedir(d);
-    const char *foot = "<hr><small style='color:#555'>Cheap Yellow Monster</small></body></html>";
-    httpd_resp_send_chunk(req, foot, strlen(foot));
+
+    static const char s_foot[] =
+        "<hr><small style='color:#555'>Cheap Yellow Monster</small></body></html>";
+    httpd_resp_send_chunk(req, s_foot, strlen(s_foot));
     httpd_resp_send_chunk(req, NULL, 0);
+}
+
+/* PUT /upload?path=/url/path/to/filename  — raw body is file content */
+static esp_err_t fileserv_upload_handler(httpd_req_t *req)
+{
+    char query[512] = "";
+    httpd_req_get_url_query_str(req, query, sizeof(query));
+    char path_param[256] = "";
+    if (httpd_query_key_value(query, "path", path_param, sizeof(path_param)) != ESP_OK
+        || path_param[0] != '/' || strstr(path_param, "..")) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path"); return ESP_OK;
+    }
+    if (req->content_len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No content"); return ESP_OK;
+    }
+
+    char sd_path[280];
+    snprintf(sd_path, sizeof(sd_path), "/sdcard%.240s", path_param);
+
+    char *buf = malloc(4096);
+    if (!buf) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_OK; }
+
+    if (!sd_spi_mutex || xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        free(buf);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD busy"); return ESP_OK;
+    }
+    FILE *f = fopen(sd_path, "wb");
+    xSemaphoreGive(sd_spi_mutex);
+
+    if (!f) {
+        free(buf);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Cannot create file");
+        return ESP_OK;
+    }
+
+    int remaining = req->content_len;
+    bool ok = true;
+    while (remaining > 0) {
+        int to_recv = remaining > 4096 ? 4096 : remaining;
+        int got = httpd_req_recv(req, buf, to_recv);
+        if (got <= 0) { ok = false; break; }
+        if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) { ok = false; break; }
+        size_t written = fwrite(buf, 1, (size_t)got, f);
+        xSemaphoreGive(sd_spi_mutex);
+        if ((int)written != got) { ok = false; break; }
+        remaining -= got;
+    }
+    free(buf);
+
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        fclose(f); xSemaphoreGive(sd_spi_mutex);
+    } else {
+        fclose(f);
+    }
+    if (!ok) {
+        remove(sd_path);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Write error");
+        return ESP_OK;
+    }
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+/* POST /mkdir  body (form-encoded): dir=/url/path&name=dirname */
+static esp_err_t fileserv_mkdir_handler(httpd_req_t *req)
+{
+    char body[400] = "";
+    int blen = req->content_len;
+    if (blen > 0 && blen < (int)sizeof(body) - 1) {
+        int got = httpd_req_recv(req, body, blen);
+        if (got > 0) body[got] = '\0';
+    }
+
+    char dir_param[256] = "";
+    char name_param[64]  = "";
+    httpd_query_key_value(body, "dir",  dir_param,  sizeof(dir_param));
+    httpd_query_key_value(body, "name", name_param, sizeof(name_param));
+
+    if (!dir_param[0] || !name_param[0] || dir_param[0] != '/'
+        || strstr(dir_param, "..") || strstr(name_param, "..") || strchr(name_param, '/')) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid params"); return ESP_OK;
+    }
+
+    /* Strip trailing slash from dir */
+    int dlen = (int)strlen(dir_param);
+    while (dlen > 1 && dir_param[dlen - 1] == '/') dir_param[--dlen] = '\0';
+
+    char sd_path[320];
+    snprintf(sd_path, sizeof(sd_path), "/sdcard%.200s/%.60s", dir_param, name_param);
+
+    int ret = -1;
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        ret = mkdir(sd_path, 0755);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    char location[300];
+    snprintf(location, sizeof(location), "/files%.200s", dir_param);
+    (void)ret; /* redirect regardless — browser shows new dir if success */
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", location);
+    httpd_resp_sendstr(req, "");
+    return ESP_OK;
+}
+
+/* POST /delete?path=/url/path/to/file */
+static esp_err_t fileserv_delete_handler(httpd_req_t *req)
+{
+    char query[512] = "";
+    httpd_req_get_url_query_str(req, query, sizeof(query));
+    char path_param[256] = "";
+    if (httpd_query_key_value(query, "path", path_param, sizeof(path_param)) != ESP_OK
+        || path_param[0] != '/' || strstr(path_param, "..")) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path"); return ESP_OK;
+    }
+
+    char sd_path[280];
+    snprintf(sd_path, sizeof(sd_path), "/sdcard%.240s", path_param);
+
+    int ret = -1;
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        ret = remove(sd_path);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    if (ret != 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Delete failed");
+        return ESP_OK;
+    }
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
 }
 
 static esp_err_t fileserv_root_handler(httpd_req_t *req)
@@ -15847,13 +16040,23 @@ static bool s_fileserv_httpd_start(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = 80;
     cfg.max_open_sockets = 5;
-    cfg.max_uri_handlers = 4;
+    cfg.max_uri_handlers = 6;
     cfg.uri_match_fn     = httpd_uri_match_wildcard;
     cfg.lru_purge_enable = true;
     if (httpd_start(&s_fileserv_httpd, &cfg) != ESP_OK) return false;
-    httpd_uri_t handler = { .uri="/*", .method=HTTP_GET,
-                            .handler=fileserv_root_handler, .user_ctx=NULL };
-    httpd_register_uri_handler(s_fileserv_httpd, &handler);
+
+    httpd_uri_t h_upload = { .uri="/upload", .method=HTTP_PUT,
+                             .handler=fileserv_upload_handler, .user_ctx=NULL };
+    httpd_uri_t h_mkdir  = { .uri="/mkdir",  .method=HTTP_POST,
+                             .handler=fileserv_mkdir_handler,  .user_ctx=NULL };
+    httpd_uri_t h_delete = { .uri="/delete", .method=HTTP_POST,
+                             .handler=fileserv_delete_handler, .user_ctx=NULL };
+    httpd_uri_t h_files  = { .uri="/*",      .method=HTTP_GET,
+                             .handler=fileserv_root_handler,   .user_ctx=NULL };
+    httpd_register_uri_handler(s_fileserv_httpd, &h_upload);
+    httpd_register_uri_handler(s_fileserv_httpd, &h_mkdir);
+    httpd_register_uri_handler(s_fileserv_httpd, &h_delete);
+    httpd_register_uri_handler(s_fileserv_httpd, &h_files);
     s_fileserv_active = true;
     return true;
 }
