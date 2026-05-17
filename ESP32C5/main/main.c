@@ -3582,7 +3582,7 @@ static void run_touch_calibration(void)
 
         // Not confirmed — restore old cal and retry
         touch_cal_apply(&old_cal);
-        lv_label_set_text(lbl, "Missed — retrying...");
+        lv_label_set_text(lbl, "Missed - retrying...");
         lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 50);
         for (int i = 0; i < 20; i++) cal_tick();  // ~200 ms pause
     }
@@ -26247,7 +26247,7 @@ void attack_event_cb(lv_event_t *e)
     }
 
     if (strcmp(attack_name, "HoneyPair") == 0) {
-        if (current_radio_mode == RADIO_MODE_WIFI || bt_lookout_is_active()) {
+        if (bt_lookout_is_active()) {
             show_bt_conflict_warning("HoneyPair", show_honeypair_screen);
         } else {
             show_honeypair_screen();
@@ -29187,7 +29187,7 @@ static void show_wana_select_screen(void) {
 
     // Status line
     char s[56];
-    snprintf(s, sizeof(s), "%d SSIDs — %d selected — tap to toggle",
+    snprintf(s, sizeof(s), "%d SSIDs - %d selected - tap to toggle",
              wana_ssid_count, sel_count);
     lv_obj_t *status = lv_label_create(wana_panel);
     lv_obj_set_size(status, 238, 18);
@@ -30312,7 +30312,7 @@ static void hp_ui_refresh(lv_timer_t *t)
             lv_label_set_text(hp_status_lbl, buf);
             lv_obj_set_style_text_color(hp_status_lbl, lv_color_make(80, 220, 80), 0);
         } else {
-            lv_label_set_text(hp_status_lbl, "Idle — not advertising");
+            lv_label_set_text(hp_status_lbl, "Idle - not advertising");
             lv_obj_set_style_text_color(hp_status_lbl, lv_color_make(176, 176, 176), 0);
         }
     }
@@ -30410,7 +30410,7 @@ static void show_honeypair_screen(void)
 
     /* Status label ──────────────────────────────────────────────────────── */
     hp_status_lbl = lv_label_create(function_page);
-    lv_label_set_text(hp_status_lbl, "Idle — not advertising");
+    lv_label_set_text(hp_status_lbl, "Idle - not advertising");
     lv_obj_set_style_text_font(hp_status_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(hp_status_lbl, lv_color_make(176, 176, 176), 0);
     lv_obj_set_style_text_align(hp_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
