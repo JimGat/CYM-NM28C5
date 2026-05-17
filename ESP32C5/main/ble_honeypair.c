@@ -9,6 +9,7 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_timer.h"
 
 #include "nimble/nimble_port.h"
 #include "host/ble_hs.h"
@@ -55,6 +56,12 @@ static volatile int      s_persona    = 0;
  * Each persona gets a unique address so phones treat them as separate devices. */
 static uint8_t           s_persona_addr[HP_PERSONA_COUNT][6];
 static bool              s_addrs_generated = false;
+
+/* Auto-rotate: cycles through all real personas every 5 minutes */
+#define HP_AUTO_ROTATE_IDX  HP_PERSONA_COUNT   /* sentinel index, not in s_personas[] */
+#define HP_ROTATE_PERIOD_US (5ULL * 60 * 1000000)
+static esp_timer_handle_t s_rot_timer   = NULL;
+static bool               s_auto_rotate = false;
 static volatile int      s_connects   = 0;
 static volatile int      s_pairs      = 0;
 static volatile int      s_reads      = 0;
@@ -264,7 +271,24 @@ static void hp_addr_str(const uint8_t *val, char *out18)
              val[5], val[4], val[3], val[2], val[1], val[0]);
 }
 
-static int hp_gap_cb(struct ble_gap_event *event, void *arg);
+static int  hp_gap_cb(struct ble_gap_event *event, void *arg);
+static void hp_ext_adv_start(int persona_idx);
+
+static void hp_rot_timer_cb(void *arg)
+{
+    (void)arg;
+    if (!s_active || !s_auto_rotate) return;
+    int next = (s_persona + 1) % HP_PERSONA_COUNT;
+    s_persona = next;
+    hp_log("auto_rotate", NULL, NULL);
+    ESP_LOGI(TAG, "Auto-rotate -> persona %d ('%s')", next, s_personas[next].name);
+    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        /* Disconnect; hp_gap_cb will restart advertising with updated s_persona */
+        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    } else {
+        hp_ext_adv_start(next);
+    }
+}
 
 static void hp_gen_persona_addrs(void)
 {
@@ -441,13 +465,28 @@ void honeypair_init(SemaphoreHandle_t sd_mutex, hp_gps_fn_t gps_fn)
     s_sd_mutex = sd_mutex;
     s_gps_fn   = gps_fn;
     hp_gen_persona_addrs();
+    if (!s_rot_timer) {
+        esp_timer_create_args_t args = {
+            .callback = hp_rot_timer_cb,
+            .name     = "hp_rot",
+        };
+        esp_timer_create(&args, &s_rot_timer);
+    }
 }
 
 void honeypair_start(int persona_idx)
 {
-    if (persona_idx < 0 || persona_idx >= HP_PERSONA_COUNT) persona_idx = 0;
-    s_persona = persona_idx;
-    s_active  = true;
+    bool do_rotate = (persona_idx == HP_AUTO_ROTATE_IDX);
+    esp_timer_stop(s_rot_timer);  /* always stop first; restarts below if needed */
+    if (do_rotate) {
+        /* Resume rotation position or start from persona 0 */
+        persona_idx = (s_auto_rotate && s_persona < HP_PERSONA_COUNT) ? s_persona : 0;
+    } else {
+        if (persona_idx < 0 || persona_idx >= HP_PERSONA_COUNT) persona_idx = 0;
+    }
+    s_auto_rotate = do_rotate;
+    s_persona     = persona_idx;
+    s_active      = true;
 
     /* Create log file on first start this session */
     if (!s_log_path[0]) {
@@ -475,11 +514,16 @@ void honeypair_start(int persona_idx)
     }
 
     hp_ext_adv_start(persona_idx);
+
+    if (s_auto_rotate)
+        esp_timer_start_periodic(s_rot_timer, HP_ROTATE_PERIOD_US);
 }
 
 void honeypair_stop(void)
 {
-    s_active = false;
+    s_active      = false;
+    s_auto_rotate = false;
+    esp_timer_stop(s_rot_timer);
     ble_gap_ext_adv_stop(HP_ADV_INSTANCE);
     if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
@@ -497,7 +541,7 @@ void honeypair_get_stats(honeypair_stats_t *out)
     out->pairs           = s_pairs;
     out->gatt_reads      = s_reads;
     out->disconnects     = s_disconnects;
-    out->current_persona = s_persona;
+    out->current_persona = s_auto_rotate ? HP_AUTO_ROTATE_IDX : s_persona;
     out->active          = s_active;
     strlcpy(out->persona_name, s_personas[s_persona].name, sizeof(out->persona_name));
     strlcpy(out->log_path, s_log_path, sizeof(out->log_path));
@@ -505,16 +549,19 @@ void honeypair_get_stats(honeypair_stats_t *out)
 
 void honeypair_set_persona(int idx)
 {
-    if (idx < 0 || idx >= HP_PERSONA_COUNT) return;
+    if (idx < 0 || idx > HP_AUTO_ROTATE_IDX) return;
     if (s_active)
         honeypair_start(idx);
-    else
-        s_persona = idx;
+    else {
+        s_auto_rotate = (idx == HP_AUTO_ROTATE_IDX);
+        s_persona = s_auto_rotate ? 0 : idx;
+    }
 }
 
-int         honeypair_persona_count(void) { return HP_PERSONA_COUNT; }
+int         honeypair_persona_count(void) { return HP_PERSONA_COUNT + 1; }  /* +1 for Auto Rotate */
 const char *honeypair_persona_name(int idx)
 {
+    if (idx == HP_AUTO_ROTATE_IDX) return "Auto Rotate (5 min)";
     if (idx < 0 || idx >= HP_PERSONA_COUNT) return "";
     return s_personas[idx].name;
 }
