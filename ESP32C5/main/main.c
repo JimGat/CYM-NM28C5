@@ -25217,8 +25217,11 @@ static void bt_conflict_proceed_cb(lv_event_t *ev)
         lv_obj_del(s_bt_conflict_popup);
         s_bt_conflict_popup = NULL;
     }
-    bt_lookout_stop();
-    ble_gap_disc_cancel();   /* stop active scan now; lookout task's later bt_stop_scan() becomes a no-op */
+    if (bt_lookout_is_active()) {
+        bt_lookout_stop();
+        /* scan loop task calls ble_gap_disc_cancel() via bt_stop_scan() within ~100 ms;
+           calling it here from a different task races NimBLE internals and crashes */
+    }
     bt_lookout_ui_active  = false;
     bt_lookout_status_lbl = NULL;
     bt_lookout_count_lbl  = NULL;
@@ -26244,7 +26247,7 @@ void attack_event_cb(lv_event_t *e)
     }
 
     if (strcmp(attack_name, "HoneyPair") == 0) {
-        if (current_radio_mode == RADIO_MODE_WIFI) {
+        if (current_radio_mode == RADIO_MODE_WIFI || bt_lookout_is_active()) {
             show_bt_conflict_warning("HoneyPair", show_honeypair_screen);
         } else {
             show_honeypair_screen();
