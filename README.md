@@ -268,7 +268,7 @@ An ERM (eccentric rotating mass) vibrator motor can be added to the NM-CYD-C5 vi
 | Series rectifier | [1N5819 Schottky diode](https://a.co/d/0bnr0eiq) | Anode → VO1 (SPEAK pin 1), cathode → motor +. Half-wave rectifies the BTL output so current flows only in one direction. |
 | Flyback / protection | [1N4148 signal diode](https://a.co/d/01jTSulE) | Cathode → motor +, anode → motor −. Suppresses back-EMF inductive spikes when the motor stops. |
 | Motor | [Mini ERM Vibration Motor](https://a.co/d/00013Sqj) | Micro coin or cylindrical ERM, 3 V nominal. |
-| SPEAK header connector | [JST SH 1.0 mm 2-pin](https://a.co/d/017FKez2) (HCZZ0015-2) | Measured housing width = 3.35 mm, confirming 1.0 mm SH pitch. The 1.25 mm GH connector (~5 mm housing) will **not** fit. |
+| SPEAK header connector | JST GH 1.25 mm 2-pin (HCZZ0015-2) | **1.25 mm pitch** — the 1.0 mm SH connector is too small and will not fit. |
 
 **How it works:** GPIO 26 drives the SC8002B input with LEDC PWM at **333 Hz / 50% duty** (half-wave max = 50% duty). The 1N5819 rectifies the BTL output to give the motor a clean DC-biased drive. The 1N4148 across the motor clamps the inductive kick on every PWM off-cycle. Strength is adjustable 10–100% via **Settings → Vibrator Test** without reflashing.
 
