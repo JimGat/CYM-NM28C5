@@ -10,6 +10,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -85,6 +86,12 @@ static bool               s_addrs_generated = false;
 static bool               s_auto_rotate     = false;
 static esp_timer_handle_t s_rot_timer       = NULL;
 #define BD_ROTATE_PERIOD_US (5ULL * 60 * 1000000)
+
+/* PSRAM-backed task stack (allocated once in blueduck_init); avoids OOM when
+ * internal heap is depleted after a BLE advertising session. */
+static StaticTask_t  s_payload_tcb;
+static StackType_t  *s_payload_stack = NULL;
+#define BD_PAYLOAD_STACK_WORDS 4096
 
 // ── GATT definitions (HID keyboard + Battery + DIS) ──────────────────────────
 
@@ -758,7 +765,12 @@ static int bd_gap_cb(struct ble_gap_event *event, void *arg)
                 bd_addr_str(desc.peer_ota_addr.val, addr);
             bd_log("connect", addr, NULL);
             ESP_LOGI(TAG, "Connected: %s", addr);
-            xTaskCreate(bd_payload_task, "bd_payload", 4096, NULL, 5, NULL);
+            if (s_payload_stack) {
+                xTaskCreateStatic(bd_payload_task, "bd_payload", BD_PAYLOAD_STACK_WORDS,
+                                  NULL, 5, s_payload_stack, &s_payload_tcb);
+            } else {
+                ESP_LOGE(TAG, "bd_payload_task skipped — no PSRAM stack");
+            }
         }
         break;
 
@@ -812,6 +824,12 @@ void blueduck_init(SemaphoreHandle_t sd_mutex, bd_gps_fn_t gps_fn)
     s_sd_mutex = sd_mutex;
     s_gps_fn   = gps_fn;
     bd_gen_persona_addrs();
+    if (!s_payload_stack) {
+        s_payload_stack = heap_caps_malloc(BD_PAYLOAD_STACK_WORDS * sizeof(StackType_t),
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_payload_stack)
+            ESP_LOGW(TAG, "PSRAM stack alloc failed — payload task may not run after BLE");
+    }
     if (!s_rot_timer) {
         esp_timer_create_args_t args = { .callback = bd_rot_timer_cb, .name = "bd_rot" };
         esp_timer_create(&args, &s_rot_timer);
