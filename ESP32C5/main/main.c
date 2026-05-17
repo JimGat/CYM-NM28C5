@@ -19311,121 +19311,208 @@ static void show_sd_free_space_screen(void)
 
 // ─── File Tree screen ────────────────────────────────────────────────────────
 
-static void sd_tree_walk(char *buf, size_t bufsz, const char *path, int depth, size_t *pos)
+// ─── Interactive SD file browser ─────────────────────────────────────────────
+
+#define SD_TREE_ROOT     "/sdcard"
+#define SD_TREE_MAX_DIRS 64
+
+static char      s_sd_tree_cwd[300];
+static lv_obj_t *s_sd_tree_list  = NULL;
+static lv_obj_t *s_sd_path_lbl   = NULL;
+static char      s_sd_dir_paths[SD_TREE_MAX_DIRS][256];
+static int       s_sd_dir_count  = 0;
+
+static void sd_tree_populate(const char *path);
+
+static void sd_dir_btn_cb(lv_event_t *e)
 {
-    if (depth > 8) return;
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx >= 0 && idx < s_sd_dir_count)
+        sd_tree_populate(s_sd_dir_paths[idx]);
+}
+
+static void sd_tree_up_cb(lv_event_t *e)
+{
+    char parent[300];
+    strncpy(parent, s_sd_tree_cwd, sizeof(parent) - 1);
+    parent[sizeof(parent) - 1] = '\0';
+    char *slash = strrchr(parent, '/');
+    if (!slash || slash == parent) {
+        sd_back_to_menu_cb(e);
+        return;
+    }
+    *slash = '\0';
+    if (strlen(parent) < strlen(SD_TREE_ROOT)) {
+        sd_back_to_menu_cb(e);
+        return;
+    }
+    sd_tree_populate(parent);
+}
+
+static void sd_tree_populate(const char *path)
+{
+    strncpy(s_sd_tree_cwd, path, sizeof(s_sd_tree_cwd) - 1);
+    s_sd_tree_cwd[sizeof(s_sd_tree_cwd) - 1] = '\0';
+    s_sd_dir_count = 0;
+
+    /* Update path label — strip /sdcard prefix for display */
+    if (s_sd_path_lbl) {
+        const char *disp = s_sd_tree_cwd;
+        if (strncmp(disp, SD_TREE_ROOT, strlen(SD_TREE_ROOT)) == 0)
+            disp += strlen(SD_TREE_ROOT);
+        lv_label_set_text(s_sd_path_lbl, disp[0] ? disp : "/");
+    }
+
+    if (!s_sd_tree_list) return;
+    lv_obj_clean(s_sd_tree_list);
+
+    bool have_mutex = sd_spi_mutex &&
+                      xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE;
+    if (!have_mutex) {
+        lv_obj_t *e = lv_label_create(s_sd_tree_list);
+        lv_label_set_text(e, "SD not available");
+        lv_obj_set_style_text_color(e, COLOR_MATERIAL_RED, 0);
+        return;
+    }
+
     DIR *dir = opendir(path);
-    if (!dir) return;
-    struct dirent *entry;
-    char child[300];
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_name[0] == '.') continue;
-        if (*pos + 128 >= bufsz) {
-            if (bufsz - *pos > 20)
-                *pos += snprintf(buf + *pos, bufsz - *pos, "...(truncated)\n");
-            break;
-        }
-        snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
-        struct stat st;
-        bool have_stat = (stat(child, &st) == 0);
-        bool is_dir    = have_stat && S_ISDIR(st.st_mode);
+    if (!dir) {
+        xSemaphoreGive(sd_spi_mutex);
+        lv_obj_t *e = lv_label_create(s_sd_tree_list);
+        lv_label_set_text(e, "Cannot open directory");
+        lv_obj_set_style_text_color(e, COLOR_MATERIAL_RED, 0);
+        return;
+    }
 
-        for (int i = 0; i < depth * 2 && *pos + 1 < bufsz; i++)
-            buf[(*pos)++] = ' ';
+    /* Two passes: directories first, then files */
+    for (int pass = 0; pass < 2; pass++) {
+        rewinddir(dir);
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (entry->d_name[0] == '.') continue;
 
-        if (is_dir) {
-            *pos += snprintf(buf + *pos, bufsz - *pos, "%s/\n", entry->d_name);
-            sd_tree_walk(buf, bufsz, child, depth + 1, pos);
-        } else {
-            if (have_stat) {
-                uint32_t sz = (uint32_t)st.st_size;
-                char sz_str[12];
-                if (sz >= 1024 * 1024)
-                    snprintf(sz_str, sizeof(sz_str), "%luM", (unsigned long)(sz / (1024 * 1024)));
-                else if (sz >= 1024)
-                    snprintf(sz_str, sizeof(sz_str), "%luK", (unsigned long)(sz / 1024));
-                else
-                    snprintf(sz_str, sizeof(sz_str), "%luB", (unsigned long)sz);
-                *pos += snprintf(buf + *pos, bufsz - *pos, "%s [%s]\n", entry->d_name, sz_str);
+            char child[300];
+            snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+            struct stat st;
+            bool have_stat = (stat(child, &st) == 0);
+            bool is_dir    = have_stat && S_ISDIR(st.st_mode);
+
+            if (pass == 0 && !is_dir) continue;
+            if (pass == 1 &&  is_dir) continue;
+
+            lv_obj_t *row = lv_btn_create(s_sd_tree_list);
+            lv_obj_set_size(row, lv_pct(100), 26);
+            lv_obj_set_style_bg_color(row, lv_color_make(28, 32, 42), 0);
+            lv_obj_set_style_bg_color(row, lv_color_make(50, 60, 80), LV_STATE_PRESSED);
+            lv_obj_set_style_border_width(row, 0, 0);
+            lv_obj_set_style_radius(row, 4, 0);
+            lv_obj_set_style_pad_ver(row, 3, 0);
+            lv_obj_set_style_pad_hor(row, 6, 0);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_column(row, 4, 0);
+
+            lv_obj_t *lbl = lv_label_create(row);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+
+            if (is_dir) {
+                char text[280];
+                snprintf(text, sizeof(text), "%s  " LV_SYMBOL_RIGHT, entry->d_name);
+                lv_label_set_text(lbl, text);
+                lv_obj_set_style_text_color(lbl, lv_color_make(255, 210, 0), 0);
+                if (s_sd_dir_count < SD_TREE_MAX_DIRS) {
+                    strncpy(s_sd_dir_paths[s_sd_dir_count], child,
+                            sizeof(s_sd_dir_paths[0]) - 1);
+                    s_sd_dir_paths[s_sd_dir_count][sizeof(s_sd_dir_paths[0]) - 1] = '\0';
+                    lv_obj_add_event_cb(row, sd_dir_btn_cb, LV_EVENT_CLICKED,
+                                        (void *)(intptr_t)s_sd_dir_count);
+                    s_sd_dir_count++;
+                }
             } else {
-                *pos += snprintf(buf + *pos, bufsz - *pos, "%s\n", entry->d_name);
+                char sz_str[12] = "";
+                if (have_stat) {
+                    uint32_t sz = (uint32_t)st.st_size;
+                    if (sz >= 1024 * 1024)
+                        snprintf(sz_str, sizeof(sz_str), " [%luM]",
+                                 (unsigned long)(sz / (1024 * 1024)));
+                    else if (sz >= 1024)
+                        snprintf(sz_str, sizeof(sz_str), " [%luK]",
+                                 (unsigned long)(sz / 1024));
+                    else
+                        snprintf(sz_str, sizeof(sz_str), " [%luB]", (unsigned long)sz);
+                }
+                char text[280];
+                snprintf(text, sizeof(text), "%s%s", entry->d_name, sz_str);
+                lv_label_set_text(lbl, text);
+                lv_obj_set_style_text_color(lbl, ui_text_color(), 0);
+                lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICKABLE);
             }
         }
     }
     closedir(dir);
+    xSemaphoreGive(sd_spi_mutex);
 }
 
 static void show_sd_tree_screen(void)
 {
     create_function_page_base("SD File Tree");
 
-    const size_t bufsz = 16 * 1024;
-    char *tree_buf = heap_caps_malloc(bufsz, MALLOC_CAP_SPIRAM);
-    if (!tree_buf) tree_buf = malloc(4096);
+    /* ── Path bar ─────────────────────────────────────────────── */
+    lv_obj_t *path_bar = lv_obj_create(function_page);
+    lv_obj_set_size(path_bar, lv_pct(100), 22);
+    lv_obj_align(path_bar, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_set_style_bg_color(path_bar, lv_color_make(20, 35, 20), 0);
+    lv_obj_set_style_border_width(path_bar, 0, 0);
+    lv_obj_set_style_radius(path_bar, 0, 0);
+    lv_obj_set_style_pad_all(path_bar, 3, 0);
+    lv_obj_clear_flag(path_bar, LV_OBJ_FLAG_SCROLLABLE);
 
-    if (!tree_buf) {
-        lv_obj_t *err = lv_label_create(function_page);
-        lv_label_set_text(err, "Out of memory");
-        lv_obj_set_style_text_color(err, COLOR_MATERIAL_RED, 0);
-        lv_obj_align(err, LV_ALIGN_CENTER, 0, 0);
-    } else {
-        size_t pos = 0;
-        tree_buf[0] = '\0';
+    s_sd_path_lbl = lv_label_create(path_bar);
+    lv_obj_set_style_text_font(s_sd_path_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_sd_path_lbl, lv_color_make(100, 220, 100), 0);
+    lv_label_set_long_mode(s_sd_path_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(s_sd_path_lbl, lv_pct(100));
+    lv_obj_align(s_sd_path_lbl, LV_ALIGN_LEFT_MID, 0, 0);
 
-        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
-            sd_tree_walk(tree_buf, bufsz, "/sdcard", 0, &pos);
-            xSemaphoreGive(sd_spi_mutex);
-        } else {
-            pos += snprintf(tree_buf, bufsz, "SD not available");
-        }
-        if (pos == 0) pos += snprintf(tree_buf, bufsz, "(empty)");
-        tree_buf[pos < bufsz ? pos : bufsz - 1] = '\0';
+    /* ── Scrollable entry list ────────────────────────────────── */
+    /* height = screen - title(30) - path_bar(22) - nav_btn(28+8) */
+    s_sd_tree_list = lv_obj_create(function_page);
+    lv_obj_set_size(s_sd_tree_list, lv_pct(100), LCD_V_RES - 30 - 22 - 38);
+    lv_obj_align(s_sd_tree_list, LV_ALIGN_TOP_MID, 0, 54);
+    lv_obj_set_style_bg_color(s_sd_tree_list, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(s_sd_tree_list, 0, 0);
+    lv_obj_set_style_radius(s_sd_tree_list, 0, 0);
+    lv_obj_set_style_pad_all(s_sd_tree_list, 4, 0);
+    lv_obj_set_style_pad_row(s_sd_tree_list, 3, 0);
+    lv_obj_set_flex_flow(s_sd_tree_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_sd_tree_list, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 
-        lv_obj_t *scroll_cont = lv_obj_create(function_page);
-        lv_obj_set_size(scroll_cont, lv_pct(100), LCD_V_RES - 35 - 43);
-        lv_obj_align(scroll_cont, LV_ALIGN_TOP_MID, 0, 35);
-        lv_obj_set_style_bg_color(scroll_cont, ui_bg_color(), 0);
-        lv_obj_set_style_border_color(scroll_cont, ui_border_color(), 0);
-        lv_obj_set_style_border_width(scroll_cont, 1, 0);
-        lv_obj_set_style_radius(scroll_cont, 6, 0);
-        lv_obj_set_style_pad_all(scroll_cont, 6, 0);
+    /* ── Up / Back button ────────────────────────────────────── */
+    lv_obj_t *nav_btn = lv_btn_create(function_page);
+    lv_obj_set_size(nav_btn, 120, 28);
+    lv_obj_align(nav_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_bg_color(nav_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(nav_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(nav_btn, 0, 0);
+    lv_obj_set_style_radius(nav_btn, 8, 0);
+    lv_obj_set_flex_flow(nav_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(nav_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(nav_btn, 4, 0);
 
-        lv_obj_t *tree_label = lv_label_create(scroll_cont);
-        lv_label_set_long_mode(tree_label, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(tree_label, lv_pct(100));
-        lv_obj_set_style_text_font(tree_label, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(tree_label, ui_text_color(), 0);
-        lv_label_set_text(tree_label, tree_buf);
-        free(tree_buf);
-    }
+    lv_obj_t *nav_icon = lv_label_create(nav_btn);
+    lv_label_set_text(nav_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(nav_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(nav_icon, lv_color_white(), 0);
+    lv_obj_t *nav_text = lv_label_create(nav_btn);
+    lv_label_set_text(nav_text, "Up / Back");
+    lv_obj_set_style_text_font(nav_text, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(nav_text, lv_color_white(), 0);
+    lv_obj_add_event_cb(nav_btn, sd_tree_up_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 110, 28);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(back_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_set_style_shadow_width(back_btn, 4, 0);
-    lv_obj_set_style_shadow_color(back_btn, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_shadow_opa(back_btn, LV_OPA_40, 0);
-    lv_obj_set_style_pad_ver(back_btn, 4, 0);
-    lv_obj_set_style_pad_hor(back_btn, 8, 0);
-    lv_obj_set_style_pad_column(back_btn, 4, 0);
-    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-    lv_obj_t *back_icon = lv_label_create(back_btn);
-    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
-    lv_obj_set_style_text_font(back_icon, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(back_icon, ui_text_color(), 0);
-
-    lv_obj_t *back_text = lv_label_create(back_btn);
-    lv_label_set_text(back_text, "Back");
-    lv_obj_set_style_text_font(back_text, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(back_text, ui_text_color(), 0);
-
-    lv_obj_add_event_cb(back_btn, sd_back_to_menu_cb, LV_EVENT_CLICKED, NULL);
+    /* Start at SD root */
+    sd_tree_populate(SD_TREE_ROOT);
 }
 
 // ─── Format — two-stage confirmation ─────────────────────────────────────────
@@ -30625,7 +30712,7 @@ static void show_blueduck_screen(void)
 
     create_function_page_base("BlueDuck");
 
-    /* ── Consent banner ─────────────────────────────────────────── */
+    /* ── Consent banner (below 30px title bar) ──────────────────── */
     lv_obj_t *warn_lbl = lv_label_create(function_page);
     lv_label_set_text(warn_lbl,
         LV_SYMBOL_WARNING " Any willing pair receives the payload");
@@ -30633,14 +30720,14 @@ static void show_blueduck_screen(void)
     lv_obj_set_width(warn_lbl, lv_pct(96));
     lv_obj_set_style_text_font(warn_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(warn_lbl, lv_color_make(255, 160, 0), 0);
-    lv_obj_align(warn_lbl, LV_ALIGN_TOP_MID, 0, 2);
+    lv_obj_align(warn_lbl, LV_ALIGN_TOP_MID, 0, 34);
 
     /* ── Persona dropdown ───────────────────────────────────────── */
     lv_obj_t *pl = lv_label_create(function_page);
     lv_label_set_text(pl, "Persona:");
     lv_obj_set_style_text_font(pl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(pl, ui_text_color(), 0);
-    lv_obj_align(pl, LV_ALIGN_TOP_LEFT, 8, 26);
+    lv_obj_align(pl, LV_ALIGN_TOP_LEFT, 8, 56);
 
     char persona_opts[320] = "";
     for (int i = 0; i < blueduck_persona_count(); i++) {
@@ -30653,8 +30740,8 @@ static void show_blueduck_screen(void)
         blueduck_stats_t st; blueduck_get_stats(&st);
         lv_dropdown_set_selected(bd_persona_dd, (uint16_t)st.current_persona);
     }
-    lv_obj_set_size(bd_persona_dd, lv_pct(96), 32);
-    lv_obj_align(bd_persona_dd, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_set_size(bd_persona_dd, lv_pct(96), 30);
+    lv_obj_align(bd_persona_dd, LV_ALIGN_TOP_MID, 0, 70);
     lv_obj_set_style_bg_color(bd_persona_dd, ui_card_color(), LV_PART_MAIN);
     lv_obj_set_style_text_color(bd_persona_dd, ui_text_color(), LV_PART_MAIN);
     lv_obj_set_style_border_color(bd_persona_dd, ui_border_color(), LV_PART_MAIN);
@@ -30666,7 +30753,7 @@ static void show_blueduck_screen(void)
     lv_label_set_text(sl, "Script:");
     lv_obj_set_style_text_font(sl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(sl, ui_text_color(), 0);
-    lv_obj_align(sl, LV_ALIGN_TOP_LEFT, 8, 78);
+    lv_obj_align(sl, LV_ALIGN_TOP_LEFT, 8, 106);
 
     bd_script_dd = lv_dropdown_create(function_page);
     if (nscripts == 0) {
@@ -30680,8 +30767,8 @@ static void show_blueduck_screen(void)
         }
         lv_dropdown_set_options(bd_script_dd, script_opts);
     }
-    lv_obj_set_size(bd_script_dd, lv_pct(96), 32);
-    lv_obj_align(bd_script_dd, LV_ALIGN_TOP_MID, 0, 92);
+    lv_obj_set_size(bd_script_dd, lv_pct(96), 30);
+    lv_obj_align(bd_script_dd, LV_ALIGN_TOP_MID, 0, 120);
     lv_obj_set_style_bg_color(bd_script_dd, ui_card_color(), LV_PART_MAIN);
     lv_obj_set_style_text_color(bd_script_dd, ui_text_color(), LV_PART_MAIN);
     lv_obj_set_style_border_color(bd_script_dd, ui_border_color(), LV_PART_MAIN);
@@ -30694,19 +30781,19 @@ static void show_blueduck_screen(void)
     lv_obj_set_style_text_color(bd_status_lbl, lv_color_make(176, 176, 176), 0);
     lv_label_set_long_mode(bd_status_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_obj_set_width(bd_status_lbl, lv_pct(96));
-    lv_obj_align(bd_status_lbl, LV_ALIGN_TOP_MID, 0, 132);
+    lv_obj_align(bd_status_lbl, LV_ALIGN_TOP_MID, 0, 158);
 
     /* ── Stats label ────────────────────────────────────────────── */
     bd_stats_lbl = lv_label_create(function_page);
     lv_label_set_text(bd_stats_lbl, "Connects: 0   Payloads: 0");
     lv_obj_set_style_text_font(bd_stats_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(bd_stats_lbl, ui_text_color(), 0);
-    lv_obj_align(bd_stats_lbl, LV_ALIGN_TOP_MID, 0, 150);
+    lv_obj_align(bd_stats_lbl, LV_ALIGN_TOP_MID, 0, 175);
 
     /* ── LAUNCH / STOP button ───────────────────────────────────── */
     bd_start_btn = lv_btn_create(function_page);
-    lv_obj_set_size(bd_start_btn, lv_pct(90), 38);
-    lv_obj_align(bd_start_btn, LV_ALIGN_TOP_MID, 0, 170);
+    lv_obj_set_size(bd_start_btn, lv_pct(90), 36);
+    lv_obj_align(bd_start_btn, LV_ALIGN_TOP_MID, 0, 194);
     lv_obj_set_style_bg_color(bd_start_btn, lv_color_make(0, 100, 200), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(bd_start_btn, lv_color_make(0, 140, 255), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(bd_start_btn, 0, 0);
@@ -30723,7 +30810,7 @@ static void show_blueduck_screen(void)
     lv_label_set_text(log_lbl, "Logs: /sdcard/lab/ble/blueduck/");
     lv_obj_set_style_text_font(log_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(log_lbl, lv_color_make(120, 120, 120), 0);
-    lv_obj_align(log_lbl, LV_ALIGN_TOP_MID, 0, 214);
+    lv_obj_align(log_lbl, LV_ALIGN_TOP_MID, 0, 235);
 
     /* ── Back button ────────────────────────────────────────────── */
     lv_obj_t *back_btn = lv_btn_create(function_page);
