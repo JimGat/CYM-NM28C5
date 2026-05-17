@@ -577,8 +577,9 @@ static void bd_payload_task(void *arg)
 
     /* Log LED state before script — captures current CapsLock/NumLock state */
     {
-        char kv[160];
-        snprintf(kv, sizeof(kv), "\"script\":\"%s\",\"leds\":%d", s_script_path, s_led_state);
+        char kv[192];
+        snprintf(kv, sizeof(kv), "\"script\":\"%s\",\"leds\":%d,\"paired\":%s",
+                 s_script_path, s_led_state, s_paired ? "true" : "false");
         /* inline log since we're in a task context */
         const gps_data_t *gps = s_gps_fn ? s_gps_fn() : NULL;
         char ts[12] = "";
