@@ -94,6 +94,9 @@ LV_IMG_DECLARE(deedee_img);
 #include "bt_lookout.h"
 #include "oui_lookup.h"
 #include "gatt_walker.h"
+#include "ble_honeypair.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
 
 #define TAG "WiFi_Hacker"
 
@@ -169,6 +172,13 @@ static volatile int ble_spam_count = 0;
 static bool ble_spam_ui_active = false;
 static volatile bool ble_spam_needs_ui_update = false;
 static int ble_spam_mode = BLE_SPAM_MODE_ALL;
+
+// HoneyPair UI state
+static lv_obj_t   *hp_status_lbl = NULL;
+static lv_obj_t   *hp_stats_lbl  = NULL;
+static lv_obj_t   *hp_start_btn  = NULL;
+static lv_obj_t   *hp_dd         = NULL;
+static lv_timer_t *hp_ui_timer   = NULL;
 
 // BLE Device Spoof state
 static volatile bool ble_spoof_active = false;
@@ -1995,6 +2005,9 @@ static void drone_row_tap_cb(lv_event_t *e);
 static void show_wifi_analyzer_screen(void);
 static void show_wscope_screen(void);
 static void wscope_task(void *p);
+
+// HoneyPair
+static void show_honeypair_screen(void);
 
 // BT Locator functions
 static void show_bt_locator_screen(void);
@@ -4585,6 +4598,7 @@ void app_main(void)
     }
 
     gw_init(sd_spi_mutex);
+    honeypair_init(sd_spi_mutex, gps_best);
 
     // Screenshot worker (queue + background saver task)
     screenshot_queue = xQueueCreate(1, sizeof(screenshot_msg_t));
@@ -21297,6 +21311,11 @@ static void show_bluetooth_screen(void)
     lv_obj_t *pcap_tile = create_tile(tiles, LV_SYMBOL_SAVE, "BLE\nPCAP", lv_color_hex(0x00897B), NULL, NULL);
     lv_obj_add_event_cb(pcap_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE PCAP");
 
+    // HoneyPair - BLE honeypot / pairing telemetry logger
+    lv_obj_t *hp_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Honey\nPair",
+                                    lv_color_make(212, 175, 55), NULL, NULL);
+    lv_obj_add_event_cb(hp_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"HoneyPair");
+
 }
 
 // BT Locator screen - scan BT devices, select one, then track RSSI every 10s
@@ -26221,6 +26240,15 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
 
+    if (strcmp(attack_name, "HoneyPair") == 0) {
+        if (current_radio_mode == RADIO_MODE_WIFI) {
+            show_bt_conflict_warning("HoneyPair", show_honeypair_screen);
+        } else {
+            show_honeypair_screen();
+        }
+        return;
+    }
+
     // Add BT Scan & Select target to BT Lookout watchlist
     if (strcmp(attack_name, "Add to Lookout") == 0) {
         char mac_str[18];
@@ -27343,7 +27371,20 @@ static esp_err_t bt_nimble_init(void)
     // Configure BLE host callbacks
     ble_hs_cfg.sync_cb = bt_on_sync;
     ble_hs_cfg.reset_cb = bt_on_reset;
-    
+
+    // Security manager: Just Works pairing (needed for HoneyPair)
+    ble_hs_cfg.sm_io_cap       = BLE_SM_IO_CAP_NO_IO;
+    ble_hs_cfg.sm_bonding      = 1;
+    ble_hs_cfg.sm_mitm         = 0;
+    ble_hs_cfg.sm_sc           = 1;
+    ble_hs_cfg.sm_our_key_dist  = BLE_SM_PAIR_KEY_DIST_ENC;
+    ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC;
+
+    // GAP/GATT base services + HoneyPair service table (must precede host start)
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    honeypair_register_services();
+
     // Start NimBLE host task
     nimble_port_freertos_init(nimble_host_task);
     
@@ -30246,4 +30287,195 @@ static void show_airtag_scan_screen(void)
         /* Returning from Found Tags — task already running, UI rebuilt only */
         ESP_LOGI(TAG, "AirTag scanner UI restored (task already running)");
     }
+}
+
+// ── HoneyPair screen ──────────────────────────────────────────────────────────
+
+static void hp_ui_refresh(lv_timer_t *t)
+{
+    (void)t;
+    if (!function_page) return;
+
+    honeypair_stats_t st;
+    honeypair_get_stats(&st);
+
+    if (hp_status_lbl) {
+        if (st.active) {
+            char buf[56];
+            snprintf(buf, sizeof(buf), LV_SYMBOL_BLUETOOTH "  Advertising as: %s", st.persona_name);
+            lv_label_set_text(hp_status_lbl, buf);
+            lv_obj_set_style_text_color(hp_status_lbl, lv_color_make(80, 220, 80), 0);
+        } else {
+            lv_label_set_text(hp_status_lbl, "Idle — not advertising");
+            lv_obj_set_style_text_color(hp_status_lbl, lv_color_make(176, 176, 176), 0);
+        }
+    }
+
+    if (hp_stats_lbl) {
+        char buf[72];
+        snprintf(buf, sizeof(buf), "Connects: %d   Pairs: %d   GATT Reads: %d",
+                 st.connects, st.pairs, st.gatt_reads);
+        lv_label_set_text(hp_stats_lbl, buf);
+    }
+
+    if (hp_start_btn) {
+        lv_obj_t *lbl = lv_obj_get_child(hp_start_btn, 0);
+        if (st.active) {
+            if (lbl) lv_label_set_text(lbl, "STOP");
+            lv_obj_set_style_bg_color(hp_start_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+        } else {
+            if (lbl) lv_label_set_text(lbl, "START BAIT");
+            lv_obj_set_style_bg_color(hp_start_btn, lv_color_make(40, 160, 40), LV_STATE_DEFAULT);
+        }
+    }
+}
+
+static void hp_start_cb(lv_event_t *e)
+{
+    (void)e;
+    if (honeypair_is_active()) {
+        honeypair_stop();
+        bt_nimble_deinit();
+        current_radio_mode = RADIO_MODE_NONE;
+    } else {
+        if (!ensure_ble_mode()) {
+            if (hp_status_lbl)
+                lv_label_set_text(hp_status_lbl, "BLE init failed!");
+            return;
+        }
+        int pidx = hp_dd ? (int)lv_dropdown_get_selected(hp_dd) : 0;
+        honeypair_start(pidx);
+    }
+    hp_ui_refresh(NULL);
+}
+
+static void hp_dd_cb(lv_event_t *e)
+{
+    lv_obj_t *dd = lv_event_get_target(e);
+    int idx = (int)lv_dropdown_get_selected(dd);
+    if (honeypair_is_active())
+        honeypair_set_persona(idx);
+}
+
+static void hp_back_cb(lv_event_t *e)
+{
+    (void)e;
+    if (hp_ui_timer) { lv_timer_del(hp_ui_timer); hp_ui_timer = NULL; }
+    hp_status_lbl = NULL; hp_stats_lbl = NULL; hp_start_btn = NULL; hp_dd = NULL;
+    if (honeypair_is_active()) {
+        honeypair_stop();
+        bt_nimble_deinit();
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+    show_bluetooth_screen();
+}
+
+static void show_honeypair_screen(void)
+{
+    create_function_page_base("HoneyPair");
+
+    /* Persona dropdown ──────────────────────────────────────────────────── */
+    lv_obj_t *dd_lbl = lv_label_create(function_page);
+    lv_label_set_text(dd_lbl, "Persona:");
+    lv_obj_set_style_text_font(dd_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(dd_lbl, ui_text_color(), 0);
+    lv_obj_align(dd_lbl, LV_ALIGN_TOP_LEFT, 8, 38);
+
+    /* Build dropdown option string from persona table */
+    char opts[256] = "";
+    for (int i = 0; i < honeypair_persona_count(); i++) {
+        if (i) strncat(opts, "\n", sizeof(opts) - strlen(opts) - 1);
+        strncat(opts, honeypair_persona_name(i), sizeof(opts) - strlen(opts) - 1);
+    }
+
+    hp_dd = lv_dropdown_create(function_page);
+    lv_dropdown_set_options(hp_dd, opts);
+    {
+        honeypair_stats_t st; honeypair_get_stats(&st);
+        lv_dropdown_set_selected(hp_dd, (uint16_t)st.current_persona);
+    }
+    lv_obj_set_size(hp_dd, lv_pct(96), 36);
+    lv_obj_align(hp_dd, LV_ALIGN_TOP_MID, 0, 58);
+    lv_obj_set_style_bg_color(hp_dd, ui_card_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(hp_dd, ui_text_color(), LV_PART_MAIN);
+    lv_obj_set_style_border_color(hp_dd, ui_border_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(hp_dd, &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_add_event_cb(hp_dd, hp_dd_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    /* Status label ──────────────────────────────────────────────────────── */
+    hp_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(hp_status_lbl, "Idle — not advertising");
+    lv_obj_set_style_text_font(hp_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hp_status_lbl, lv_color_make(176, 176, 176), 0);
+    lv_obj_set_style_text_align(hp_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(hp_status_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(hp_status_lbl, lv_pct(96));
+    lv_obj_align(hp_status_lbl, LV_ALIGN_TOP_MID, 0, 104);
+
+    /* Stats label ───────────────────────────────────────────────────────── */
+    hp_stats_lbl = lv_label_create(function_page);
+    lv_label_set_text(hp_stats_lbl, "Connects: 0   Pairs: 0   GATT Reads: 0");
+    lv_obj_set_style_text_font(hp_stats_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hp_stats_lbl, lv_color_make(176, 176, 176), 0);
+    lv_obj_set_style_text_align(hp_stats_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(hp_stats_lbl, lv_pct(96));
+    lv_obj_align(hp_stats_lbl, LV_ALIGN_TOP_MID, 0, 124);
+
+    /* Rotation note ─────────────────────────────────────────────────────── */
+    lv_obj_t *rot_lbl = lv_label_create(function_page);
+    lv_label_set_text(rot_lbl, "Auto-rotates persona every 5 min (when idle)");
+    lv_obj_set_style_text_font(rot_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(rot_lbl, lv_color_make(120, 120, 120), 0);
+    lv_obj_set_style_text_align(rot_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(rot_lbl, lv_pct(96));
+    lv_obj_align(rot_lbl, LV_ALIGN_TOP_MID, 0, 143);
+
+    /* START BAIT button ─────────────────────────────────────────────────── */
+    hp_start_btn = lv_btn_create(function_page);
+    lv_obj_set_size(hp_start_btn, 150, 44);
+    lv_obj_align(hp_start_btn, LV_ALIGN_TOP_MID, 0, 170);
+    lv_obj_set_style_bg_color(hp_start_btn, lv_color_make(40, 160, 40), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(hp_start_btn, lv_color_lighten(lv_color_make(40, 160, 40), 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(hp_start_btn, 0, 0);
+    lv_obj_set_style_radius(hp_start_btn, 10, 0);
+    lv_obj_t *hp_btn_lbl = lv_label_create(hp_start_btn);
+    lv_label_set_text(hp_btn_lbl, "START BAIT");
+    lv_obj_set_style_text_font(hp_btn_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(hp_btn_lbl, lv_color_white(), 0);
+    lv_obj_center(hp_btn_lbl);
+    lv_obj_add_event_cb(hp_start_btn, hp_start_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Log path note (only shown when active) ────────────────────────────── */
+    lv_obj_t *log_lbl = lv_label_create(function_page);
+    lv_label_set_text(log_lbl, "Logs: /sdcard/lab/ble/honeypair/");
+    lv_obj_set_style_text_font(log_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(log_lbl, lv_color_make(100, 100, 100), 0);
+    lv_obj_set_style_text_align(log_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(log_lbl, lv_pct(96));
+    lv_obj_align(log_lbl, LV_ALIGN_TOP_MID, 0, 228);
+
+    /* Back button ───────────────────────────────────────────────────────── */
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 120, 30);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_t *bi = lv_label_create(back_btn);
+    lv_label_set_text(bi, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(bi, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bi, lv_color_white(), 0);
+    lv_obj_t *bl = lv_label_create(back_btn);
+    lv_label_set_text(bl, "Bluetooth");
+    lv_obj_set_style_text_font(bl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bl, lv_color_white(), 0);
+    lv_obj_add_event_cb(back_btn, hp_back_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Refresh UI state immediately, then every 1s */
+    hp_ui_refresh(NULL);
+    hp_ui_timer = lv_timer_create(hp_ui_refresh, 1000, NULL);
 }
