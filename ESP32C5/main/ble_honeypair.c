@@ -309,8 +309,6 @@ static void hp_gen_persona_addrs(void)
 
 static void hp_ext_adv_start(int persona_idx)
 {
-    static ble_uuid16_t s_hid_uuid = BLE_UUID16_INIT(0x1812);
-
     ESP_LOGI(TAG, "hp_ext_adv_start: persona=%d ('%s') synced=%d",
              persona_idx, s_personas[persona_idx].name, ble_hs_synced());
 
@@ -353,9 +351,9 @@ static void hp_ext_adv_start(int persona_idx)
     struct ble_hs_adv_fields f;
     memset(&f, 0, sizeof(f));
     f.flags                 = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    f.uuids16               = &s_hid_uuid;
-    f.num_uuids16           = 1;
-    f.uuids16_is_complete   = 1;
+    /* Do NOT include UUID 0x1812 in adv payload — passive scanners (nRF Connect)
+     * override the appearance icon with a generic HID mouse when they see it.
+     * The HID service is still fully discoverable in GATT after connection. */
     f.name                  = (const uint8_t *)s_personas[persona_idx].name;
     f.name_len              = (uint8_t)strlen(s_personas[persona_idx].name);
     f.name_is_complete      = 1;

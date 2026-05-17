@@ -95,6 +95,7 @@ LV_IMG_DECLARE(deedee_img);
 #include "oui_lookup.h"
 #include "gatt_walker.h"
 #include "ble_honeypair.h"
+#include "ble_blueduck.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
@@ -126,7 +127,8 @@ static bool wifi_initialized = false;
 // BLE scan state
 static volatile bool bt_scan_active = false;
 static TaskHandle_t bt_scan_task_handle = NULL;
-static volatile bool nimble_initialized = false;
+static volatile bool nimble_initialized  = false;
+static bool          s_ble_for_blueduck  = false; /* selects GATT table at bt_nimble_init time */
 
 // BLE device tracking for deduplication
 #define BT_MAX_DEVICES 128
@@ -179,6 +181,16 @@ static lv_obj_t   *hp_stats_lbl  = NULL;
 static lv_obj_t   *hp_start_btn  = NULL;
 static lv_obj_t   *hp_dd         = NULL;
 static lv_timer_t *hp_ui_timer   = NULL;
+
+// BlueDuck UI state
+static lv_obj_t   *bd_status_lbl  = NULL;
+static lv_obj_t   *bd_stats_lbl   = NULL;
+static lv_obj_t   *bd_start_btn   = NULL;
+static lv_obj_t   *bd_persona_dd  = NULL;
+static lv_obj_t   *bd_script_dd   = NULL;
+static lv_obj_t   *bd_human_sw    = NULL;
+static lv_obj_t   *bd_speed_dd    = NULL;
+static lv_timer_t *bd_ui_timer    = NULL;
 
 // BLE Device Spoof state
 static volatile bool ble_spoof_active = false;
@@ -2008,6 +2020,8 @@ static void wscope_task(void *p);
 
 // HoneyPair
 static void show_honeypair_screen(void);
+// BlueDuck
+static void show_blueduck_screen(void);
 
 // BT Locator functions
 static void show_bt_locator_screen(void);
@@ -4648,6 +4662,7 @@ void app_main(void)
     lv_disp_drv_register(&disp_drv);
 
     honeypair_init(sd_spi_mutex, gps_best);
+    blueduck_init(sd_spi_mutex, gps_best);
 
     flush_done_sem = xSemaphoreCreateBinary();
     if (flush_done_sem == NULL) {
@@ -24944,6 +24959,9 @@ static void show_bt_attacks_screen(void)
     lv_obj_t *spoof_gen_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Device\nSpoof", COLOR_MATERIAL_ORANGE, NULL, NULL);
     lv_obj_add_event_cb(spoof_gen_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spoof General");
 
+    lv_obj_t *bd_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Blue\nDuck", lv_color_make(0, 120, 200), NULL, NULL);
+    lv_obj_add_event_cb(bd_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BlueDuck");
+
     /* Back button */
     lv_obj_t *back_btn = lv_btn_create(function_page);
     lv_obj_set_size(back_btn, 110, 28);
@@ -26256,6 +26274,15 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
 
+    if (strcmp(attack_name, "BlueDuck") == 0) {
+        if (bt_lookout_is_active()) {
+            show_bt_conflict_warning("BlueDuck", show_blueduck_screen);
+        } else {
+            show_attack_warning(show_blueduck_screen);
+        }
+        return;
+    }
+
     // Add BT Scan & Select target to BT Lookout watchlist
     if (strcmp(attack_name, "Add to Lookout") == 0) {
         char mac_str[18];
@@ -27387,10 +27414,13 @@ static esp_err_t bt_nimble_init(void)
     ble_hs_cfg.sm_our_key_dist  = BLE_SM_PAIR_KEY_DIST_ENC;
     ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC;
 
-    // GAP/GATT base services + HoneyPair service table (must precede host start)
+    // GAP/GATT base services + feature service table (must precede host start)
     ble_svc_gap_init();
     ble_svc_gatt_init();
-    honeypair_register_services();
+    if (s_ble_for_blueduck)
+        blueduck_register_services();
+    else
+        honeypair_register_services();
 
     // Start NimBLE host task
     nimble_port_freertos_init(nimble_host_task);
@@ -30476,4 +30506,246 @@ static void show_honeypair_screen(void)
     /* Refresh UI state immediately, then every 1s */
     hp_ui_refresh(NULL);
     hp_ui_timer = lv_timer_create(hp_ui_refresh, 1000, NULL);
+}
+
+// ── BlueDuck screen ───────────────────────────────────────────────────────────
+
+static void bd_ui_refresh(lv_timer_t *t)
+{
+    (void)t;
+    if (!function_page) return;
+    blueduck_stats_t st;
+    blueduck_get_stats(&st);
+
+    if (bd_status_lbl) {
+        if (st.executing) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), LV_SYMBOL_BLUETOOTH "  Injecting: %s", st.persona_name);
+            lv_label_set_text(bd_status_lbl, buf);
+            lv_obj_set_style_text_color(bd_status_lbl, lv_color_make(255, 160, 0), 0);
+        } else if (st.active) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), LV_SYMBOL_BLUETOOTH "  Waiting: %s", st.persona_name);
+            lv_label_set_text(bd_status_lbl, buf);
+            lv_obj_set_style_text_color(bd_status_lbl, lv_color_make(80, 220, 80), 0);
+        } else {
+            lv_label_set_text(bd_status_lbl, "Idle - not advertising");
+            lv_obj_set_style_text_color(bd_status_lbl, lv_color_make(176, 176, 176), 0);
+        }
+    }
+
+    if (bd_stats_lbl) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Connects: %d   Payloads: %d", st.connects, st.payloads_sent);
+        lv_label_set_text(bd_stats_lbl, buf);
+    }
+
+    if (bd_start_btn) {
+        lv_obj_t *lbl = lv_obj_get_child(bd_start_btn, 0);
+        if (st.active) {
+            if (lbl) lv_label_set_text(lbl, "STOP");
+            lv_obj_set_style_bg_color(bd_start_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+        } else {
+            if (lbl) lv_label_set_text(lbl, "LAUNCH");
+            lv_obj_set_style_bg_color(bd_start_btn, lv_color_make(0, 100, 200), LV_STATE_DEFAULT);
+        }
+    }
+}
+
+static void bd_start_cb(lv_event_t *e)
+{
+    (void)e;
+    if (blueduck_is_active()) {
+        blueduck_stop();
+        bt_nimble_deinit();
+        s_ble_for_blueduck  = false;
+        current_radio_mode  = RADIO_MODE_NONE;
+    } else {
+        int pidx  = bd_persona_dd  ? (int)lv_dropdown_get_selected(bd_persona_dd) : 0;
+        int sidx  = bd_script_dd   ? (int)lv_dropdown_get_selected(bd_script_dd)  : 0;
+        const char *spath = blueduck_script_path(sidx);
+        if (!spath || !spath[0]) {
+            if (bd_status_lbl)
+                lv_label_set_text(bd_status_lbl, "No script selected!");
+            return;
+        }
+        s_ble_for_blueduck = true;
+        if (!ensure_ble_mode()) {
+            s_ble_for_blueduck = false;
+            if (bd_status_lbl) lv_label_set_text(bd_status_lbl, "BLE init failed!");
+            return;
+        }
+        blueduck_start(pidx, spath);
+    }
+    bd_ui_refresh(NULL);
+}
+
+static void bd_persona_dd_cb(lv_event_t *e)
+{
+    (void)e;
+    if (blueduck_is_active()) {
+        int idx = bd_persona_dd ? (int)lv_dropdown_get_selected(bd_persona_dd) : 0;
+        /* persona changes take effect on next connection; re-advertise immediately */
+        blueduck_stop();
+        bt_nimble_deinit();
+        s_ble_for_blueduck = true;
+        if (ensure_ble_mode()) {
+            int sidx = bd_script_dd ? (int)lv_dropdown_get_selected(bd_script_dd) : 0;
+            blueduck_start(idx, blueduck_script_path(sidx));
+        }
+    }
+}
+
+static void bd_human_sw_cb(lv_event_t *e)
+{
+    (void)e;
+    /* Human mode toggle handled via HUMAN_MODE command in scripts.
+     * This switch sets a session default communicated via a synthetic command. */
+}
+
+static void bd_back_cb(lv_event_t *e)
+{
+    (void)e;
+    if (bd_ui_timer) { lv_timer_del(bd_ui_timer); bd_ui_timer = NULL; }
+    bd_status_lbl = NULL; bd_stats_lbl = NULL; bd_start_btn = NULL;
+    bd_persona_dd = NULL; bd_script_dd = NULL; bd_human_sw = NULL; bd_speed_dd = NULL;
+    if (blueduck_is_active()) {
+        blueduck_stop();
+        bt_nimble_deinit();
+        s_ble_for_blueduck = false;
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+    show_bt_attacks_screen();
+}
+
+static void show_blueduck_screen(void)
+{
+    /* Scan for scripts before building UI */
+    int nscripts = blueduck_scan_scripts();
+
+    create_function_page_base("BlueDuck");
+
+    /* ── Consent banner ─────────────────────────────────────────── */
+    lv_obj_t *warn_lbl = lv_label_create(function_page);
+    lv_label_set_text(warn_lbl,
+        LV_SYMBOL_WARNING " Any willing pair receives the payload");
+    lv_label_set_long_mode(warn_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(warn_lbl, lv_pct(96));
+    lv_obj_set_style_text_font(warn_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(warn_lbl, lv_color_make(255, 160, 0), 0);
+    lv_obj_align(warn_lbl, LV_ALIGN_TOP_MID, 0, 2);
+
+    /* ── Persona dropdown ───────────────────────────────────────── */
+    lv_obj_t *pl = lv_label_create(function_page);
+    lv_label_set_text(pl, "Persona:");
+    lv_obj_set_style_text_font(pl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(pl, ui_text_color(), 0);
+    lv_obj_align(pl, LV_ALIGN_TOP_LEFT, 8, 26);
+
+    char persona_opts[320] = "";
+    for (int i = 0; i < blueduck_persona_count(); i++) {
+        if (i) strncat(persona_opts, "\n", sizeof(persona_opts) - strlen(persona_opts) - 1);
+        strncat(persona_opts, blueduck_persona_name(i), sizeof(persona_opts) - strlen(persona_opts) - 1);
+    }
+    bd_persona_dd = lv_dropdown_create(function_page);
+    lv_dropdown_set_options(bd_persona_dd, persona_opts);
+    {
+        blueduck_stats_t st; blueduck_get_stats(&st);
+        lv_dropdown_set_selected(bd_persona_dd, (uint16_t)st.current_persona);
+    }
+    lv_obj_set_size(bd_persona_dd, lv_pct(96), 32);
+    lv_obj_align(bd_persona_dd, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_set_style_bg_color(bd_persona_dd, ui_card_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(bd_persona_dd, ui_text_color(), LV_PART_MAIN);
+    lv_obj_set_style_border_color(bd_persona_dd, ui_border_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(bd_persona_dd, &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_add_event_cb(bd_persona_dd, bd_persona_dd_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    /* ── Script dropdown ────────────────────────────────────────── */
+    lv_obj_t *sl = lv_label_create(function_page);
+    lv_label_set_text(sl, "Script:");
+    lv_obj_set_style_text_font(sl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sl, ui_text_color(), 0);
+    lv_obj_align(sl, LV_ALIGN_TOP_LEFT, 8, 78);
+
+    bd_script_dd = lv_dropdown_create(function_page);
+    if (nscripts == 0) {
+        lv_dropdown_set_options(bd_script_dd, "(no scripts on SD)");
+    } else {
+        char script_opts[BD_MAX_SCRIPTS * 68];
+        script_opts[0] = '\0';
+        for (int i = 0; i < nscripts; i++) {
+            if (i) strncat(script_opts, "\n", sizeof(script_opts) - strlen(script_opts) - 1);
+            strncat(script_opts, blueduck_script_name(i), sizeof(script_opts) - strlen(script_opts) - 1);
+        }
+        lv_dropdown_set_options(bd_script_dd, script_opts);
+    }
+    lv_obj_set_size(bd_script_dd, lv_pct(96), 32);
+    lv_obj_align(bd_script_dd, LV_ALIGN_TOP_MID, 0, 92);
+    lv_obj_set_style_bg_color(bd_script_dd, ui_card_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(bd_script_dd, ui_text_color(), LV_PART_MAIN);
+    lv_obj_set_style_border_color(bd_script_dd, ui_border_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(bd_script_dd, &lv_font_montserrat_12, LV_PART_MAIN);
+
+    /* ── Status label ───────────────────────────────────────────── */
+    bd_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(bd_status_lbl, "Idle - not advertising");
+    lv_obj_set_style_text_font(bd_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(bd_status_lbl, lv_color_make(176, 176, 176), 0);
+    lv_label_set_long_mode(bd_status_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(bd_status_lbl, lv_pct(96));
+    lv_obj_align(bd_status_lbl, LV_ALIGN_TOP_MID, 0, 132);
+
+    /* ── Stats label ────────────────────────────────────────────── */
+    bd_stats_lbl = lv_label_create(function_page);
+    lv_label_set_text(bd_stats_lbl, "Connects: 0   Payloads: 0");
+    lv_obj_set_style_text_font(bd_stats_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(bd_stats_lbl, ui_text_color(), 0);
+    lv_obj_align(bd_stats_lbl, LV_ALIGN_TOP_MID, 0, 150);
+
+    /* ── LAUNCH / STOP button ───────────────────────────────────── */
+    bd_start_btn = lv_btn_create(function_page);
+    lv_obj_set_size(bd_start_btn, lv_pct(90), 38);
+    lv_obj_align(bd_start_btn, LV_ALIGN_TOP_MID, 0, 170);
+    lv_obj_set_style_bg_color(bd_start_btn, lv_color_make(0, 100, 200), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(bd_start_btn, lv_color_make(0, 140, 255), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(bd_start_btn, 0, 0);
+    lv_obj_set_style_radius(bd_start_btn, 8, 0);
+    lv_obj_t *start_lbl = lv_label_create(bd_start_btn);
+    lv_label_set_text(start_lbl, "LAUNCH");
+    lv_obj_set_style_text_font(start_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(start_lbl, lv_color_white(), 0);
+    lv_obj_center(start_lbl);
+    lv_obj_add_event_cb(bd_start_btn, bd_start_cb, LV_EVENT_CLICKED, NULL);
+
+    /* ── Log path label ─────────────────────────────────────────── */
+    lv_obj_t *log_lbl = lv_label_create(function_page);
+    lv_label_set_text(log_lbl, "Logs: /sdcard/lab/ble/blueduck/");
+    lv_obj_set_style_text_font(log_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(log_lbl, lv_color_make(120, 120, 120), 0);
+    lv_obj_align(log_lbl, LV_ALIGN_TOP_MID, 0, 214);
+
+    /* ── Back button ────────────────────────────────────────────── */
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 28);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_t *bi = lv_label_create(back_btn);
+    lv_label_set_text(bi, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(bi, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bi, lv_color_white(), 0);
+    lv_obj_t *bl2 = lv_label_create(back_btn);
+    lv_label_set_text(bl2, "BT Attacks");
+    lv_obj_set_style_text_font(bl2, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bl2, lv_color_white(), 0);
+    lv_obj_add_event_cb(back_btn, bd_back_cb, LV_EVENT_CLICKED, NULL);
+
+    bd_ui_refresh(NULL);
+    bd_ui_timer = lv_timer_create(bd_ui_refresh, 1000, NULL);
 }
