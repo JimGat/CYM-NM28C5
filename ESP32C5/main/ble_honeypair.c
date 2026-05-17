@@ -7,8 +7,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
-#include "freertos/timers.h"
-
 #include "esp_log.h"
 
 #include "nimble/nimble_port.h"
@@ -58,11 +56,46 @@ static volatile int      s_reads      = 0;
 static volatile int      s_disconnects = 0;
 static uint16_t          s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static char              s_log_path[72];
-static TimerHandle_t     s_rot_timer  = NULL;
 
 // ── GATT definitions ──────────────────────────────────────────────────────────
 
 static uint16_t s_batt_lvl_handle;
+static uint16_t s_hid_report_handle;
+
+/* Standard keyboard HID report descriptor */
+static const uint8_t s_hid_report_map[] = {
+    0x05, 0x01,  /* Usage Page (Generic Desktop) */
+    0x09, 0x06,  /* Usage (Keyboard) */
+    0xA1, 0x01,  /* Collection (Application) */
+    0x05, 0x07,  /*   Usage Page (Key Codes) */
+    0x19, 0xE0,  /*   Usage Minimum (224) */
+    0x29, 0xE7,  /*   Usage Maximum (231) */
+    0x15, 0x00,  /*   Logical Minimum (0) */
+    0x25, 0x01,  /*   Logical Maximum (1) */
+    0x75, 0x01,  /*   Report Size (1) */
+    0x95, 0x08,  /*   Report Count (8) */
+    0x81, 0x02,  /*   Input (Data, Var, Abs) -- modifier keys */
+    0x95, 0x01,  /*   Report Count (1) */
+    0x75, 0x08,  /*   Report Size (8) */
+    0x81, 0x01,  /*   Input (Const) -- reserved byte */
+    0x95, 0x06,  /*   Report Count (6) */
+    0x75, 0x08,  /*   Report Size (8) */
+    0x15, 0x00,  /*   Logical Minimum (0) */
+    0x25, 0x65,  /*   Logical Maximum (101) */
+    0x05, 0x07,  /*   Usage Page (Key Codes) */
+    0x19, 0x00,  /*   Usage Minimum (0) */
+    0x29, 0x65,  /*   Usage Maximum (101) */
+    0x81, 0x00,  /*   Input (Data, Array) -- key array */
+    0xC0,        /* End Collection */
+};
+
+/* HID Information: bcdHID=1.11, country=0, flags=0x02 (normally connectable) */
+static const uint8_t s_hid_info[]       = { 0x11, 0x01, 0x00, 0x02 };
+/* Empty keyboard input report: modifier + reserved + 6 keycodes */
+static const uint8_t s_hid_report[]     = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+/* Report Reference descriptor: report ID=0, type=Input(1) */
+static const uint8_t s_report_ref[]     = { 0x00, 0x01 };
+static       uint8_t s_protocol_mode    = 0x01; /* Report Protocol */
 
 static int hp_chr_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                              struct ble_gatt_access_ctxt *ctxt, void *arg)
@@ -74,15 +107,46 @@ static int hp_chr_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     const hp_persona_t *p = &s_personas[s_persona];
     uint16_t uuid16 = ble_uuid_u16(ctxt->chr->uuid);
 
-    if (uuid16 == 0x2A19) {                         /* Battery Level */
-        os_mbuf_append(ctxt->om, &p->battery_level, sizeof(p->battery_level));
-    } else if (uuid16 == 0x2A29) {                  /* Manufacturer Name */
-        os_mbuf_append(ctxt->om, p->manufacturer, strlen(p->manufacturer));
-    } else if (uuid16 == 0x2A24) {                  /* Model Number */
-        os_mbuf_append(ctxt->om, p->model, strlen(p->model));
+    if      (uuid16 == 0x2A19) os_mbuf_append(ctxt->om, &p->battery_level, 1);
+    else if (uuid16 == 0x2A29) os_mbuf_append(ctxt->om, p->manufacturer, strlen(p->manufacturer));
+    else if (uuid16 == 0x2A24) os_mbuf_append(ctxt->om, p->model, strlen(p->model));
+    return 0;
+}
+
+static int hp_hid_access_cb(uint16_t conn_handle, uint16_t attr_handle,
+                             struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void)conn_handle; (void)attr_handle; (void)arg;
+    uint16_t uuid16 = ble_uuid_u16(ctxt->chr->uuid);
+
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+        if      (uuid16 == 0x2A4A) os_mbuf_append(ctxt->om, s_hid_info, sizeof(s_hid_info));
+        else if (uuid16 == 0x2A4B) os_mbuf_append(ctxt->om, s_hid_report_map, sizeof(s_hid_report_map));
+        else if (uuid16 == 0x2A4D) os_mbuf_append(ctxt->om, s_hid_report, sizeof(s_hid_report));
+        else if (uuid16 == 0x2A4E) os_mbuf_append(ctxt->om, &s_protocol_mode, 1);
+    } else if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        if (uuid16 == 0x2A4E && OS_MBUF_PKTLEN(ctxt->om) == 1)
+            os_mbuf_copydata(ctxt->om, 0, 1, &s_protocol_mode);
     }
     return 0;
 }
+
+static int hp_hid_dsc_access_cb(uint16_t conn_handle, uint16_t attr_handle,
+                                 struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void)conn_handle; (void)attr_handle; (void)arg;
+    os_mbuf_append(ctxt->om, s_report_ref, sizeof(s_report_ref));
+    return 0;
+}
+
+static struct ble_gatt_dsc_def s_report_dscs[] = {
+    {
+        .uuid      = BLE_UUID16_DECLARE(0x2908), /* Report Reference */
+        .att_flags = BLE_ATT_F_READ,
+        .access_cb = hp_hid_dsc_access_cb,
+    },
+    { 0 }
+};
 
 static const struct ble_gatt_chr_def s_batt_chrs[] = {
     {
@@ -108,7 +172,43 @@ static const struct ble_gatt_chr_def s_dis_chrs[] = {
     { 0 }
 };
 
+static const struct ble_gatt_chr_def s_hid_chrs[] = {
+    {   /* Protocol Mode */
+        .uuid      = BLE_UUID16_DECLARE(0x2A4E),
+        .access_cb = hp_hid_access_cb,
+        .flags     = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE_NO_RSP,
+    },
+    {   /* Report Map */
+        .uuid      = BLE_UUID16_DECLARE(0x2A4B),
+        .access_cb = hp_hid_access_cb,
+        .flags     = BLE_GATT_CHR_F_READ,
+    },
+    {   /* HID Information */
+        .uuid      = BLE_UUID16_DECLARE(0x2A4A),
+        .access_cb = hp_hid_access_cb,
+        .flags     = BLE_GATT_CHR_F_READ,
+    },
+    {   /* HID Control Point */
+        .uuid      = BLE_UUID16_DECLARE(0x2A4C),
+        .access_cb = hp_hid_access_cb,
+        .flags     = BLE_GATT_CHR_F_WRITE_NO_RSP,
+    },
+    {   /* Input Report */
+        .uuid        = BLE_UUID16_DECLARE(0x2A4D),
+        .access_cb   = hp_hid_access_cb,
+        .val_handle  = &s_hid_report_handle,
+        .flags       = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+        .descriptors = s_report_dscs,
+    },
+    { 0 }
+};
+
 static const struct ble_gatt_svc_def s_hp_svcs[] = {
+    {
+        .type            = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid            = BLE_UUID16_DECLARE(0x1812), /* HID Service */
+        .characteristics = s_hid_chrs,
+    },
     {
         .type            = BLE_GATT_SVC_TYPE_PRIMARY,
         .uuid            = BLE_UUID16_DECLARE(0x180F), /* Battery Service */
@@ -231,17 +331,6 @@ static int hp_gap_cb(struct ble_gap_event *event, void *arg)
     return 0;
 }
 
-// ── Rotation timer ────────────────────────────────────────────────────────────
-
-#define HP_ROTATE_MS (5 * 60 * 1000)
-
-static void hp_rotate_cb(TimerHandle_t tmr)
-{
-    (void)tmr;
-    if (!s_active || s_conn_handle != BLE_HS_CONN_HANDLE_NONE) return;
-    honeypair_start((s_persona + 1) % HP_PERSONA_COUNT);
-}
-
 // ── Public API ────────────────────────────────────────────────────────────────
 
 void honeypair_register_services(void)
@@ -254,9 +343,6 @@ void honeypair_init(SemaphoreHandle_t sd_mutex, hp_gps_fn_t gps_fn)
 {
     s_sd_mutex = sd_mutex;
     s_gps_fn   = gps_fn;
-    if (!s_rot_timer)
-        s_rot_timer = xTimerCreate("hp_rot", pdMS_TO_TICKS(HP_ROTATE_MS),
-                                   pdTRUE, NULL, hp_rotate_cb);
 }
 
 void honeypair_start(int persona_idx)
@@ -296,13 +382,20 @@ void honeypair_start(int persona_idx)
         hp_log("persona_change", NULL, NULL);
     }
 
+    /* HID service UUID — all personas advertise it so they appear as
+       bondable HID devices in the host OS pairing list */
+    static ble_uuid16_t s_hid_uuid = BLE_UUID16_INIT(0x1812);
+
     struct ble_hs_adv_fields f;
     memset(&f, 0, sizeof(f));
-    f.flags              = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    f.name               = (const uint8_t *)s_personas[persona_idx].name;
-    f.name_len           = (uint8_t)strlen(s_personas[persona_idx].name);
-    f.name_is_complete   = 1;
-    f.appearance         = s_personas[persona_idx].appearance;
+    f.flags                 = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    f.uuids16               = &s_hid_uuid;
+    f.num_uuids16           = 1;
+    f.uuids16_is_complete   = 1;
+    f.name                  = (const uint8_t *)s_personas[persona_idx].name;
+    f.name_len              = (uint8_t)strlen(s_personas[persona_idx].name);
+    f.name_is_complete      = 1;
+    f.appearance            = s_personas[persona_idx].appearance;
     f.appearance_is_present = 1;
 
     int rc = ble_gap_adv_set_fields(&f);
@@ -319,7 +412,6 @@ void honeypair_start(int persona_idx)
                            &ap, hp_gap_cb, NULL);
     if (rc == 0 || rc == BLE_HS_EALREADY) {
         ESP_LOGI(TAG, "Advertising as '%s'", s_personas[persona_idx].name);
-        if (s_rot_timer) xTimerReset(s_rot_timer, 0);
     } else {
         ESP_LOGE(TAG, "adv_start: %d", rc);
     }
@@ -328,7 +420,6 @@ void honeypair_start(int persona_idx)
 void honeypair_stop(void)
 {
     s_active = false;
-    if (s_rot_timer) xTimerStop(s_rot_timer, 0);
     ble_gap_adv_stop();
     if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);

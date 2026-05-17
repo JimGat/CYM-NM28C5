@@ -443,7 +443,7 @@ typedef enum { WD_BAND_BOTH = 0, WD_BAND_24G, WD_BAND_5G } wd_band_t;
 #define WDP_BLE_MAX_DEVICES  200
 
 // BLE PCAP capture
-#define BLE_PCAP_DIR         "/sdcard/lab/ble_captures"
+#define BLE_PCAP_DIR         "/sdcard/lab/ble/captures"
 
 // Drone Detector — Remote ID (ASTM F3411-22a)
 #define DRONE_DETECT_DIR     "/sdcard/lab/dronedetect"
@@ -21177,6 +21177,7 @@ static void show_ble_pcap_screen(void)
         struct stat st = {0};
         if (stat(BLE_PCAP_DIR, &st) == -1) {
             mkdir("/sdcard/lab", 0777);
+            mkdir("/sdcard/lab/ble", 0777);
             mkdir(BLE_PCAP_DIR, 0777);
         }
         xSemaphoreGive(sd_spi_mutex);
@@ -30427,19 +30428,10 @@ static void show_honeypair_screen(void)
     lv_obj_set_width(hp_stats_lbl, lv_pct(96));
     lv_obj_align(hp_stats_lbl, LV_ALIGN_TOP_MID, 0, 124);
 
-    /* Rotation note ─────────────────────────────────────────────────────── */
-    lv_obj_t *rot_lbl = lv_label_create(function_page);
-    lv_label_set_text(rot_lbl, "Auto-rotates persona every 5 min (when idle)");
-    lv_obj_set_style_text_font(rot_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(rot_lbl, lv_color_make(120, 120, 120), 0);
-    lv_obj_set_style_text_align(rot_lbl, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(rot_lbl, lv_pct(96));
-    lv_obj_align(rot_lbl, LV_ALIGN_TOP_MID, 0, 143);
-
     /* START BAIT button ─────────────────────────────────────────────────── */
     hp_start_btn = lv_btn_create(function_page);
     lv_obj_set_size(hp_start_btn, 150, 44);
-    lv_obj_align(hp_start_btn, LV_ALIGN_TOP_MID, 0, 170);
+    lv_obj_align(hp_start_btn, LV_ALIGN_TOP_MID, 0, 143);
     lv_obj_set_style_bg_color(hp_start_btn, lv_color_make(40, 160, 40), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(hp_start_btn, lv_color_lighten(lv_color_make(40, 160, 40), 30), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(hp_start_btn, 0, 0);
