@@ -795,7 +795,7 @@ Tap **+ Add to Watchlist** on any group card. Each OUI is written to `lookout.cs
 
 **Workflow:**
 1. Open **BLE PCAP** from the Bluetooth tile.
-2. A new `.pcapng` file is created in `/sdcard/lab/ble_captures/` (e.g. `ble_YYYYMMDD_HHMMSS.pcapng`).
+2. A new `.pcapng` file is created in `/sdcard/lab/ble/captures/` (e.g. `ble_YYYYMMDD_HHMMSS.pcapng`).
 3. The screen shows a live packet counter. All advertising packets detected by the radio are captured.
 4. Tap **Stop** to flush and close the file cleanly.
 
@@ -817,7 +817,7 @@ Each EPB includes a **10-byte pseudo-header** preceding the reconstructed BLE LL
 
 The reconstructed PDU contains the advertising PDU header (event type + address type + length), the 6-byte AdvA, and the AdvData payload. This format is directly openable in **Wireshark** with the `BTBREDR` or `BTLE` dissector, and in **Kismet** with its standard BLE plugin.
 
-**Output path:** `/sdcard/lab/ble_captures/ble_YYYYMMDD_HHMMSS.pcapng`
+**Output path:** `/sdcard/lab/ble/captures/ble_YYYYMMDD_HHMMSS.pcapng`
 
 > **Note:** The ESP32-C5's BLE radio captures advertising packets on channels 37/38/39. The pseudo-header records channel 37 for all packets; the actual advertising channel is determined by the PDU type and timing.
 
@@ -1227,42 +1227,63 @@ Uploads all wardrive CSV files from `/sdcard/lab/wardrives/` to [WiGLE](https://
 
 > **SD card requirement:** MicroSD formatted as **FAT32, 32 GB or smaller**. exFAT and NTFS are not supported. SDXC cards (>32 GB) require manual FAT32 formatting before use.
 
-All data is stored on the SD card:
+All data is stored on the SD card. `/sdcard/lab/` is the root for all project data:
 
 ```
 /sdcard/
-├── lab/
-│   ├── white.txt         # MAC/SSID whitelist (one per line)
-│   ├── ouilist.bin       # OUI vendor table — adds manufacturer names to BLE scan results
-│   ├── wpa-sec.txt       # wpa-sec.org API key (paste key on line 1)
-│   ├── wigle.txt         # WiGLE API token — base64(apiname:apitoken) from wigle.net Account page
-│   ├── wdgwars.txt       # WDG Wars API key from wdgwars.pl profile
-│   ├── eviltwin.txt      # Credentials captured by Evil Twin / Captive Portal (auto-appended)
-│   ├── handshakes/       # Captured WPA handshakes
-│   │   ├── *.pcap        # Wireshark-compatible captures
-│   │   └── *.hccapx      # Hashcat-compatible format
-│   ├── htmls/            # ← Captive portal HTML pages
-│   │   └── *.html / *.htm   # Drop any portal page here — each file appears in the attack dropdown
-│   ├── pcaps/            # MITM/sniff PCAP captures
-│   ├── wardrives/        # GPS + WiFi/BLE wardrive logs (WiGLE CSV 1.6 format)
-│   │   ├── wd*.csv           # One file per session — uploaded via Wardrive Upload
-│   │   ├── wd*_marks.gpx     # GPS waypoints for that session (GPX 1.1)
-│   │   └── upload_log.csv    # Upload tracking: filename,SERVICE,STATUS per row
-│   ├── ble_captures/     # BLE PCAP files (Kismet PCAPNG, DLT 256)
-│   ├── deauths/          # Deauth monitor PCAP captures
-│   ├── bluetooth/
-│   │   ├── lookout.csv   # Bluetooth Lookout watchlist
-│   │   └── spooflist.csv # Device Spoof targets — CSV: MAC,Name (one per line)
-│   ├── gattwalker/       # GATT Walker + BT Observer JSON fingerprints
-│   │   └── YYYYMMDD_HHMMSS_AABBCCDDEEFF_gattwalk.json
-│   └── config/           # Optional config overrides (created by Provision)
-├── screenshots/          # UI screenshots (BMP)
-└── calibrate.txt         # ← Create this file to trigger touch re-calibration on next boot
+├── calibrate.txt             # Create this file to trigger touch re-calibration on next boot
+└── lab/                      # Root for all project data
+    ├── ouilist.bin           # OUI vendor table -- adds manufacturer names to BLE scan results
+    ├── white.txt             # MAC/SSID whitelist (one per line)
+    ├── eviltwin.txt          # Credentials captured by Evil Twin / Captive Portal (auto-appended)
+    ├── portals.txt           # Captive portal config
+    ├── wpa-sec.txt           # wpa-sec.org API key (paste key on line 1)
+    ├── wigle.txt             # WiGLE API token -- base64(apiname:apitoken) from wigle.net Account page
+    ├── wdgwars.txt           # WDG Wars API key from wdgwars.pl profile
+    ├── alerts/
+    │   ├── proximity.csv     # BLE proximity alert rules
+    │   └── css_alerts.csv    # CSS alert definitions
+    ├── ble/
+    │   ├── captures/         # BLE PCAP files (Kismet PCAPNG, DLT 256)
+    │   │   └── ble_<timestamp>.pcapng
+    │   ├── honeypair/        # HoneyPair session logs
+    │   │   └── honeypair_<timestamp>.jsonl
+    │   └── blueduck/         # BlueDuck DuckyScript payloads (upcoming)
+    │       └── scripts/
+    │           └── *.duck
+    ├── bluetooth/
+    │   ├── lookout.csv       # Bluetooth Lookout watchlist
+    │   └── spooflist.csv     # Device Spoof targets -- CSV: MAC,Name (one per line)
+    ├── cellular/
+    │   ├── tower_baseline.csv
+    │   ├── tower_anomalies.csv
+    │   └── raw_at.log
+    ├── config/               # Optional config overrides (created by Provision)
+    │   ├── detection.cfg
+    │   └── provision.log
+    ├── deauths/              # Deauth monitor PCAP captures
+    │   └── deauth_<ts>.pcap
+    ├── dronedetect/          # Drone / Remote ID detection logs
+    ├── gattwalker/           # GATT Walker + BT Observer JSON fingerprints
+    │   └── <name>_<MAC>_gattwalk.json
+    ├── handshakes/           # Captured WPA handshakes
+    │   ├── *.pcap            # Wireshark-compatible captures
+    │   └── *.hccapx          # Hashcat-compatible format
+    ├── htmls/                # Captive portal HTML pages
+    │   └── *.html / *.htm    # Drop any portal page here -- each file appears in the attack dropdown
+    ├── pcaps/                # MITM/sniff PCAP captures
+    │   └── mitm_<n>.pcap
+    ├── screenshots/          # UI screenshots (BMP)
+    │   └── screen_<n>.bmp
+    └── wardrives/            # GPS + WiFi wardrive logs (WiGLE CSV 1.6 format)
+        ├── wd<n>.csv         # One file per session -- uploaded via Wardrive Upload
+        ├── wd<n>_marks.gpx   # GPS waypoints for that session (GPX 1.1)
+        └── upload_log.csv    # Upload tracking: filename,SERVICE,STATUS per row
 ```
 
 ### Screenshot Capture
 
-Tap the **title bar on any screen** to capture a screenshot. The image is saved as an uncompressed 24-bit BMP to `/sdcard/screenshots/screen_N.bmp` with an auto-incrementing index. The write runs in a background task so the UI stays responsive, and the title bar is briefly disabled while the save is in progress to prevent double-captures. Requires a mounted SD card — a warning is logged if the card is unavailable.
+Tap the **title bar on any screen** to capture a screenshot. The image is saved as an uncompressed 24-bit BMP to `/sdcard/lab/screenshots/screen_N.bmp` with an auto-incrementing index. The write runs in a background task so the UI stays responsive, and the title bar is briefly disabled while the save is in progress to prevent double-captures. Requires a mounted SD card — a warning is logged if the card is unavailable.
 
 Screenshots are captured at full 240×320 resolution and can be opened directly in any image viewer or graphics application.
 
