@@ -1,0 +1,18 @@
+REM android_settings_search.duck
+REM Opens the Android Settings search — useful for demonstrating
+REM that the paired "keyboard" has system-level access.
+REM Copy to: /sdcard/lab/ble/blueduck/scripts/
+
+HUMAN_MODE ON
+HUMAN_SPEED SLOW
+
+HOME
+DELAY 1200
+
+STRING settings
+DELAY 800
+ENTER
+DELAY 1800
+
+REM Settings search bar - type to filter
+STRING bluetooth

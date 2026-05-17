@@ -1,0 +1,14 @@
+REM android_search.duck
+REM Works on most Android launchers: HOME triggers home screen,
+REM typing immediately opens the global search overlay.
+REM Copy to: /sdcard/lab/ble/blueduck/scripts/
+
+HUMAN_MODE ON
+HUMAN_SPEED NORMAL
+
+HOME
+DELAY 1200
+
+STRING who is watching you
+DELAY 400
+ENTER
