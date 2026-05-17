@@ -11953,6 +11953,13 @@ static void create_function_page_base(const char *name)
         arp_scan_check_timer = NULL;
     }
 
+    /* Stop BlueDuck refresh timer before deleting function_page to prevent
+     * bd_ui_refresh from running against the next screen's function_page
+     * with dangling label pointers. */
+    if (bd_ui_timer) { lv_timer_del(bd_ui_timer); bd_ui_timer = NULL; }
+    bd_status_lbl = NULL; bd_stats_lbl = NULL; bd_start_btn = NULL;
+    bd_persona_dd = NULL; bd_script_dd = NULL; bd_human_sw = NULL; bd_speed_dd = NULL;
+
     if (function_page) {
         lv_obj_del(function_page);
         function_page = NULL;
@@ -12196,13 +12203,20 @@ void show_menu(void)
         arp_scan_check_timer = NULL;
     }
     
+    /* BlueDuck timer must be stopped before function_page is deleted;
+     * otherwise bd_ui_refresh fires against the next screen's function_page
+     * with stale (dangling) label pointers → crash. */
+    if (bd_ui_timer) { lv_timer_del(bd_ui_timer); bd_ui_timer = NULL; }
+    bd_status_lbl = NULL; bd_stats_lbl = NULL; bd_start_btn = NULL;
+    bd_persona_dd = NULL; bd_script_dd = NULL; bd_human_sw = NULL; bd_speed_dd = NULL;
+
     // Delete function page if it exists
     if (function_page) {
         lv_obj_del(function_page);
         function_page = NULL;
     }
     reset_function_page_children();
-    
+
     // Show main tiles and title bar
     show_main_tiles();
     lv_obj_clear_flag(title_bar, LV_OBJ_FLAG_HIDDEN);
@@ -30712,22 +30726,22 @@ static void show_blueduck_screen(void)
 
     create_function_page_base("BlueDuck");
 
-    /* ── Consent banner (below 30px title bar) ──────────────────── */
+    /* ── Consent banner — fixed 34px height so wrap never bleeds down ── */
     lv_obj_t *warn_lbl = lv_label_create(function_page);
     lv_label_set_text(warn_lbl,
         LV_SYMBOL_WARNING " Any willing pair receives the payload");
     lv_label_set_long_mode(warn_lbl, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(warn_lbl, lv_pct(96));
+    lv_obj_set_size(warn_lbl, lv_pct(96), 34);
     lv_obj_set_style_text_font(warn_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(warn_lbl, lv_color_make(255, 160, 0), 0);
     lv_obj_align(warn_lbl, LV_ALIGN_TOP_MID, 0, 34);
 
-    /* ── Persona dropdown ───────────────────────────────────────── */
+    /* ── Persona dropdown  (y=72: below banner bottom 68 + 4 gap) ── */
     lv_obj_t *pl = lv_label_create(function_page);
     lv_label_set_text(pl, "Persona:");
     lv_obj_set_style_text_font(pl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(pl, ui_text_color(), 0);
-    lv_obj_align(pl, LV_ALIGN_TOP_LEFT, 8, 56);
+    lv_obj_align(pl, LV_ALIGN_TOP_LEFT, 8, 72);
 
     char persona_opts[320] = "";
     for (int i = 0; i < blueduck_persona_count(); i++) {
@@ -30741,7 +30755,7 @@ static void show_blueduck_screen(void)
         lv_dropdown_set_selected(bd_persona_dd, (uint16_t)st.current_persona);
     }
     lv_obj_set_size(bd_persona_dd, lv_pct(96), 30);
-    lv_obj_align(bd_persona_dd, LV_ALIGN_TOP_MID, 0, 70);
+    lv_obj_align(bd_persona_dd, LV_ALIGN_TOP_MID, 0, 88);
     lv_obj_set_style_bg_color(bd_persona_dd, ui_card_color(), LV_PART_MAIN);
     lv_obj_set_style_text_color(bd_persona_dd, ui_text_color(), LV_PART_MAIN);
     lv_obj_set_style_border_color(bd_persona_dd, ui_border_color(), LV_PART_MAIN);
@@ -30753,7 +30767,7 @@ static void show_blueduck_screen(void)
     lv_label_set_text(sl, "Script:");
     lv_obj_set_style_text_font(sl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(sl, ui_text_color(), 0);
-    lv_obj_align(sl, LV_ALIGN_TOP_LEFT, 8, 106);
+    lv_obj_align(sl, LV_ALIGN_TOP_LEFT, 8, 124);
 
     bd_script_dd = lv_dropdown_create(function_page);
     if (nscripts == 0) {
@@ -30768,7 +30782,7 @@ static void show_blueduck_screen(void)
         lv_dropdown_set_options(bd_script_dd, script_opts);
     }
     lv_obj_set_size(bd_script_dd, lv_pct(96), 30);
-    lv_obj_align(bd_script_dd, LV_ALIGN_TOP_MID, 0, 120);
+    lv_obj_align(bd_script_dd, LV_ALIGN_TOP_MID, 0, 140);
     lv_obj_set_style_bg_color(bd_script_dd, ui_card_color(), LV_PART_MAIN);
     lv_obj_set_style_text_color(bd_script_dd, ui_text_color(), LV_PART_MAIN);
     lv_obj_set_style_border_color(bd_script_dd, ui_border_color(), LV_PART_MAIN);
@@ -30781,19 +30795,19 @@ static void show_blueduck_screen(void)
     lv_obj_set_style_text_color(bd_status_lbl, lv_color_make(176, 176, 176), 0);
     lv_label_set_long_mode(bd_status_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_obj_set_width(bd_status_lbl, lv_pct(96));
-    lv_obj_align(bd_status_lbl, LV_ALIGN_TOP_MID, 0, 158);
+    lv_obj_align(bd_status_lbl, LV_ALIGN_TOP_MID, 0, 176);
 
     /* ── Stats label ────────────────────────────────────────────── */
     bd_stats_lbl = lv_label_create(function_page);
     lv_label_set_text(bd_stats_lbl, "Connects: 0   Payloads: 0");
     lv_obj_set_style_text_font(bd_stats_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(bd_stats_lbl, ui_text_color(), 0);
-    lv_obj_align(bd_stats_lbl, LV_ALIGN_TOP_MID, 0, 175);
+    lv_obj_align(bd_stats_lbl, LV_ALIGN_TOP_MID, 0, 193);
 
     /* ── LAUNCH / STOP button ───────────────────────────────────── */
     bd_start_btn = lv_btn_create(function_page);
     lv_obj_set_size(bd_start_btn, lv_pct(90), 36);
-    lv_obj_align(bd_start_btn, LV_ALIGN_TOP_MID, 0, 194);
+    lv_obj_align(bd_start_btn, LV_ALIGN_TOP_MID, 0, 212);
     lv_obj_set_style_bg_color(bd_start_btn, lv_color_make(0, 100, 200), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(bd_start_btn, lv_color_make(0, 140, 255), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(bd_start_btn, 0, 0);
@@ -30810,7 +30824,7 @@ static void show_blueduck_screen(void)
     lv_label_set_text(log_lbl, "Logs: /sdcard/lab/ble/blueduck/");
     lv_obj_set_style_text_font(log_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(log_lbl, lv_color_make(120, 120, 120), 0);
-    lv_obj_align(log_lbl, LV_ALIGN_TOP_MID, 0, 235);
+    lv_obj_align(log_lbl, LV_ALIGN_TOP_MID, 0, 252);
 
     /* ── Back button ────────────────────────────────────────────── */
     lv_obj_t *back_btn = lv_btn_create(function_page);
