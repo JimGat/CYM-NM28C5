@@ -16067,13 +16067,25 @@ static bool s_fileserv_httpd_start(void)
 {
     if (s_fileserv_httpd) return true;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.server_port      = 80;
-    cfg.max_open_sockets = 5;
-    cfg.max_uri_handlers = 6;
-    cfg.uri_match_fn     = httpd_uri_match_wildcard;
-    cfg.lru_purge_enable = true;
-    if (httpd_start(&s_fileserv_httpd, &cfg) != ESP_OK) return false;
+    cfg.server_port        = 80;
+    cfg.max_open_sockets   = 4;
+    cfg.max_uri_handlers   = 8;
+    cfg.stack_size         = 8192;   /* default 4096 is too tight for dir-listing stack frames */
+    cfg.uri_match_fn       = httpd_uri_match_wildcard;
+    cfg.lru_purge_enable   = true;
+    cfg.recv_wait_timeout  = 10;     /* seconds; allow slow SD reads */
+    cfg.send_wait_timeout  = 10;
+    esp_err_t err = httpd_start(&s_fileserv_httpd, &cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE("fileserv", "httpd_start failed: 0x%x (free heap: %lu)", err,
+                 (unsigned long)esp_get_free_heap_size());
+        return false;
+    }
+    ESP_LOGI("fileserv", "HTTP server started on port 80 (free heap: %lu)",
+             (unsigned long)esp_get_free_heap_size());
 
+    httpd_uri_t h_root   = { .uri="/",       .method=HTTP_GET,
+                             .handler=fileserv_root_handler,   .user_ctx=NULL };
     httpd_uri_t h_upload = { .uri="/upload", .method=HTTP_PUT,
                              .handler=fileserv_upload_handler, .user_ctx=NULL };
     httpd_uri_t h_mkdir  = { .uri="/mkdir",  .method=HTTP_POST,
@@ -16082,6 +16094,7 @@ static bool s_fileserv_httpd_start(void)
                              .handler=fileserv_delete_handler, .user_ctx=NULL };
     httpd_uri_t h_files  = { .uri="/*",      .method=HTTP_GET,
                              .handler=fileserv_root_handler,   .user_ctx=NULL };
+    httpd_register_uri_handler(s_fileserv_httpd, &h_root);
     httpd_register_uri_handler(s_fileserv_httpd, &h_upload);
     httpd_register_uri_handler(s_fileserv_httpd, &h_mkdir);
     httpd_register_uri_handler(s_fileserv_httpd, &h_delete);
