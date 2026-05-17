@@ -16,6 +16,7 @@ LV_IMG_DECLARE(deedee_img);
 #define MY_SYMBOL_XRAY            "\xEF\x92\x97"   /* fa-x-ray          U+F497 */
 #define MY_SYMBOL_JET_FIGHTER     "\xEE\x94\x98"   /* jet-fighter       U+E518 */
 #define MY_SYMBOL_PERSON_WALKING  "\xEE\x95\x93"   /* person-walking    U+E553 */
+#define MY_SYMBOL_MICROCHIP       "\xEF\x87\x9B"   /* fa-microchip      U+F2DB */
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
@@ -1617,6 +1618,7 @@ static void main_tile_event_cb(lv_event_t *e);
 static void attack_tile_event_cb(lv_event_t *e);
 static void update_sniffer_button_ui(void);
 static void show_settings_screen(void);
+static void show_hardware_options_screen(void);
 static void settings_tile_event_cb(lv_event_t *e);
 static void show_vibrator_test_popup(void);
 static void run_touch_calibration(void);
@@ -1949,6 +1951,8 @@ static void bto_rebuild_list(void);
 
 // Data Transfer screens
 static void show_data_transfer_screen(void);
+static void show_new_folder_screen(void);
+static void show_delete_file_screen(void);
 static void show_ap_file_server_screen(void);
 static void show_wifi_client_server_screen(void);
 static void show_bt_locator_direct_track(void);
@@ -17585,16 +17589,465 @@ static void show_wardrive_upload_screen(void)
 
 // ── Data Transfer sub-menu screen ────────────────────────────────────────────
 
+// ─── New Folder screen ────────────────────────────────────────────────────────
+
+static lv_obj_t *nf_ta         = NULL;
+static lv_obj_t *nf_result_lbl = NULL;
+
+static void nf_back_cb(lv_event_t *e)
+{
+    (void)e;
+    nf_ta = NULL; nf_result_lbl = NULL;
+    show_data_transfer_screen();
+}
+
+static void nf_create_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!nf_ta || !nf_result_lbl) return;
+    const char *name = lv_textarea_get_text(nf_ta);
+    if (!name || !name[0]) {
+        lv_label_set_text(nf_result_lbl, LV_SYMBOL_WARNING " Enter a folder name");
+        lv_obj_set_style_text_color(nf_result_lbl, COLOR_MATERIAL_AMBER, 0);
+        return;
+    }
+    /* Reject names containing path separators */
+    if (strchr(name, '/')) {
+        lv_label_set_text(nf_result_lbl, LV_SYMBOL_WARNING " Name cannot contain '/'");
+        lv_obj_set_style_text_color(nf_result_lbl, COLOR_MATERIAL_AMBER, 0);
+        return;
+    }
+    char path[160];
+    snprintf(path, sizeof(path), "/sdcard/lab/%s", name);
+    int ok = 0;
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        ok = (mkdir(path, 0755) == 0);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    if (ok) {
+        lv_label_set_text(nf_result_lbl, LV_SYMBOL_OK "  Created!");
+        lv_obj_set_style_text_color(nf_result_lbl, COLOR_MATERIAL_GREEN, 0);
+        lv_textarea_set_text(nf_ta, "");
+    } else if (errno == EEXIST) {
+        lv_label_set_text(nf_result_lbl, "Already exists");
+        lv_obj_set_style_text_color(nf_result_lbl, COLOR_MATERIAL_AMBER, 0);
+    } else {
+        lv_label_set_text(nf_result_lbl, LV_SYMBOL_CLOSE "  Error creating folder");
+        lv_obj_set_style_text_color(nf_result_lbl, COLOR_MATERIAL_RED, 0);
+    }
+}
+
+static void show_new_folder_screen(void)
+{
+    create_function_page_base("New Folder");
+    nf_ta = NULL; nf_result_lbl = NULL;
+
+    /* Keyboard at bottom (130px), card above it */
+    lv_obj_t *kb = lv_keyboard_create(function_page);
+    lv_obj_set_size(kb, lv_pct(100), 130);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(kb, ui_bg_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(kb, ui_text_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(kb, &lv_font_montserrat_12, 0);
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
+
+    lv_obj_t *card = lv_obj_create(function_page);
+    /* height = screen - title(30) - keyboard(130) - gaps */
+    lv_obj_set_size(card, lv_pct(96), LCD_V_RES - 30 - 130 - 6);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(card, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 8, 0);
+    lv_obj_set_style_pad_all(card, 8, 0);
+    lv_obj_set_style_pad_row(card, 6, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *path_lbl = lv_label_create(card);
+    lv_label_set_text(path_lbl, LV_SYMBOL_DIRECTORY "  /sdcard/lab/");
+    lv_obj_set_style_text_font(path_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(path_lbl, COLOR_MATERIAL_GREEN, 0);
+
+    nf_ta = lv_textarea_create(card);
+    lv_obj_set_size(nf_ta, lv_pct(100), 36);
+    lv_textarea_set_max_length(nf_ta, 60);
+    lv_textarea_set_one_line(nf_ta, true);
+    lv_textarea_set_placeholder_text(nf_ta, "folder name...");
+    lv_obj_set_style_text_font(nf_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(nf_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(nf_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(nf_ta, COLOR_MATERIAL_GREEN, 0);
+    lv_keyboard_set_textarea(kb, nf_ta);
+
+    nf_result_lbl = lv_label_create(card);
+    lv_label_set_text(nf_result_lbl, "");
+    lv_obj_set_style_text_font(nf_result_lbl, &lv_font_montserrat_12, 0);
+
+    lv_obj_t *btn_row = lv_obj_create(card);
+    lv_obj_set_size(btn_row, lv_pct(100), 32);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *cancel = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel, 90, 28);
+    lv_obj_set_style_bg_color(cancel, lv_color_make(70, 70, 70), 0);
+    lv_obj_set_style_border_width(cancel, 0, 0);
+    lv_obj_set_style_radius(cancel, 6, 0);
+    lv_obj_t *cl = lv_label_create(cancel);
+    lv_label_set_text(cl, LV_SYMBOL_LEFT "  Back");
+    lv_obj_set_style_text_font(cl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(cl, lv_color_white(), 0);
+    lv_obj_center(cl);
+    lv_obj_add_event_cb(cancel, nf_back_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *create_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(create_btn, 100, 28);
+    lv_obj_set_style_bg_color(create_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_border_width(create_btn, 0, 0);
+    lv_obj_set_style_radius(create_btn, 6, 0);
+    lv_obj_t *crl = lv_label_create(create_btn);
+    lv_label_set_text(crl, LV_SYMBOL_PLUS "  Create");
+    lv_obj_set_style_text_font(crl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(crl, lv_color_white(), 0);
+    lv_obj_center(crl);
+    lv_obj_add_event_cb(create_btn, nf_create_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// ─── Delete File browser ──────────────────────────────────────────────────────
+
+#define DELBR_MAX_DIRS 32
+
+static char      s_delbr_cwd[300];
+static lv_obj_t *s_delbr_list     = NULL;
+static lv_obj_t *s_delbr_path_lbl = NULL;
+static char      s_delbr_dirs[DELBR_MAX_DIRS][256];
+static int       s_delbr_dir_count = 0;
+static char      s_delbr_del_target[300];
+
+static void delbr_populate(const char *path);
+
+static void delbr_dir_btn_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx >= 0 && idx < s_delbr_dir_count)
+        delbr_populate(s_delbr_dirs[idx]);
+}
+
+static void delbr_up_cb(lv_event_t *e)
+{
+    char parent[300];
+    strncpy(parent, s_delbr_cwd, sizeof(parent) - 1);
+    parent[sizeof(parent) - 1] = '\0';
+    char *slash = strrchr(parent, '/');
+    if (!slash || slash == parent || strlen(parent) <= strlen("/sdcard")) {
+        show_data_transfer_screen();
+        return;
+    }
+    *slash = '\0';
+    if (strlen(parent) < strlen("/sdcard/lab"))
+        show_data_transfer_screen();
+    else
+        delbr_populate(parent);
+}
+
+static void delbr_cancel_del_cb(lv_event_t *e)
+{
+    lv_obj_t *overlay = (lv_obj_t *)lv_event_get_user_data(e);
+    if (overlay) lv_obj_del(overlay);
+}
+
+static void delbr_confirm_del_cb(lv_event_t *e)
+{
+    lv_obj_t *overlay = (lv_obj_t *)lv_event_get_user_data(e);
+    bool confirmed = (lv_event_get_code(e) == LV_EVENT_CLICKED);
+    if (overlay) lv_obj_del(overlay);
+    if (!confirmed || !s_delbr_del_target[0]) return;
+
+    int ok = 0;
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        ok = (remove(s_delbr_del_target) == 0);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    s_delbr_del_target[0] = '\0';
+    if (ok) delbr_populate(s_delbr_cwd);  /* refresh on success */
+}
+
+static void delbr_trash_btn_cb(lv_event_t *e)
+{
+    const char *fullpath = (const char *)lv_event_get_user_data(e);
+    if (!fullpath || !fullpath[0]) return;
+    strncpy(s_delbr_del_target, fullpath, sizeof(s_delbr_del_target) - 1);
+    s_delbr_del_target[sizeof(s_delbr_del_target) - 1] = '\0';
+
+    /* Extract filename for display */
+    const char *fname = strrchr(fullpath, '/');
+    fname = fname ? fname + 1 : fullpath;
+
+    /* Confirmation overlay */
+    lv_obj_t *overlay = lv_obj_create(function_page);
+    lv_obj_set_size(overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(overlay, 0, 0);
+    lv_obj_set_style_bg_color(overlay, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(overlay, 0, 0);
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *card = lv_obj_create(overlay);
+    lv_obj_set_size(card, 210, 150);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(card, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, LV_SYMBOL_TRASH "  Delete File?");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_RED, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    /* Filename (truncated if long) */
+    char disp[48];
+    snprintf(disp, sizeof(disp), "%.45s", fname);
+    lv_obj_t *fn_lbl = lv_label_create(card);
+    lv_label_set_text(fn_lbl, disp);
+    lv_obj_set_style_text_font(fn_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(fn_lbl, ui_text_color(), 0);
+    lv_label_set_long_mode(fn_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(fn_lbl, 185);
+    lv_obj_align(fn_lbl, LV_ALIGN_TOP_MID, 0, 26);
+
+    lv_obj_t *warn = lv_label_create(card);
+    lv_label_set_text(warn, "Cannot be undone.");
+    lv_obj_set_style_text_font(warn, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(warn, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_align(warn, LV_ALIGN_TOP_MID, 0, 68);
+
+    lv_obj_t *no_btn = lv_btn_create(card);
+    lv_obj_set_size(no_btn, 80, 28);
+    lv_obj_align(no_btn, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_set_style_bg_color(no_btn, lv_color_make(70, 70, 70), 0);
+    lv_obj_set_style_border_width(no_btn, 0, 0);
+    lv_obj_set_style_radius(no_btn, 6, 0);
+    lv_obj_t *nl = lv_label_create(no_btn);
+    lv_label_set_text(nl, "Cancel");
+    lv_obj_set_style_text_font(nl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(nl, lv_color_white(), 0);
+    lv_obj_center(nl);
+    lv_obj_add_event_cb(no_btn, delbr_cancel_del_cb, LV_EVENT_CLICKED, overlay);
+
+    lv_obj_t *yes_btn = lv_btn_create(card);
+    lv_obj_set_size(yes_btn, 80, 28);
+    lv_obj_align(yes_btn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(yes_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_border_width(yes_btn, 0, 0);
+    lv_obj_set_style_radius(yes_btn, 6, 0);
+    lv_obj_t *yl = lv_label_create(yes_btn);
+    lv_label_set_text(yl, LV_SYMBOL_TRASH "  Delete");
+    lv_obj_set_style_text_font(yl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(yl, lv_color_white(), 0);
+    lv_obj_center(yl);
+    lv_obj_add_event_cb(yes_btn, delbr_confirm_del_cb, LV_EVENT_CLICKED, overlay);
+}
+
+static void delbr_populate(const char *path)
+{
+    strncpy(s_delbr_cwd, path, sizeof(s_delbr_cwd) - 1);
+    s_delbr_cwd[sizeof(s_delbr_cwd) - 1] = '\0';
+    s_delbr_dir_count = 0;
+
+    if (s_delbr_path_lbl) {
+        const char *disp = s_delbr_cwd;
+        if (strncmp(disp, "/sdcard", 7) == 0) disp += 7;
+        lv_label_set_text(s_delbr_path_lbl, disp[0] ? disp : "/");
+    }
+    if (!s_delbr_list) return;
+    lv_obj_clean(s_delbr_list);
+
+    bool hm = sd_spi_mutex &&
+              xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE;
+    if (!hm) {
+        lv_obj_t *err = lv_label_create(s_delbr_list);
+        lv_label_set_text(err, "SD not available");
+        lv_obj_set_style_text_color(err, COLOR_MATERIAL_RED, 0);
+        return;
+    }
+    DIR *dir = opendir(path);
+    if (!dir) {
+        xSemaphoreGive(sd_spi_mutex);
+        lv_obj_t *err = lv_label_create(s_delbr_list);
+        lv_label_set_text(err, "Cannot open dir");
+        lv_obj_set_style_text_color(err, COLOR_MATERIAL_RED, 0);
+        return;
+    }
+
+    for (int pass = 0; pass < 2; pass++) {
+        rewinddir(dir);
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (entry->d_name[0] == '.') continue;
+            char child[300];
+            snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+            struct stat st;
+            bool have_stat = (stat(child, &st) == 0);
+            bool is_dir    = have_stat && S_ISDIR(st.st_mode);
+            if (pass == 0 && !is_dir) continue;
+            if (pass == 1 &&  is_dir) continue;
+
+            lv_obj_t *row = lv_obj_create(s_delbr_list);
+            lv_obj_set_size(row, lv_pct(100), 26);
+            lv_obj_set_style_bg_color(row, lv_color_make(28, 32, 42), 0);
+            lv_obj_set_style_border_width(row, 0, 0);
+            lv_obj_set_style_radius(row, 4, 0);
+            lv_obj_set_style_pad_ver(row, 3, 0);
+            lv_obj_set_style_pad_hor(row, 4, 0);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+            lv_obj_t *lbl = lv_label_create(row);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+            lv_obj_set_flex_grow(lbl, 1);
+
+            if (is_dir) {
+                char text[280];
+                snprintf(text, sizeof(text), "%s  " LV_SYMBOL_RIGHT, entry->d_name);
+                lv_label_set_text(lbl, text);
+                lv_obj_set_style_text_color(lbl, lv_color_make(255, 210, 0), 0);
+                if (s_delbr_dir_count < DELBR_MAX_DIRS) {
+                    strncpy(s_delbr_dirs[s_delbr_dir_count], child,
+                            sizeof(s_delbr_dirs[0]) - 1);
+                    s_delbr_dirs[s_delbr_dir_count][sizeof(s_delbr_dirs[0])-1] = '\0';
+                    lv_obj_add_event_cb(row, delbr_dir_btn_cb, LV_EVENT_CLICKED,
+                                        (void*)(intptr_t)s_delbr_dir_count);
+                    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+                    s_delbr_dir_count++;
+                }
+            } else {
+                char sz_str[12] = "";
+                if (have_stat) {
+                    uint32_t sz = (uint32_t)st.st_size;
+                    if      (sz >= 1024*1024) snprintf(sz_str,sizeof(sz_str)," [%luM]",(unsigned long)(sz/(1024*1024)));
+                    else if (sz >= 1024)      snprintf(sz_str,sizeof(sz_str)," [%luK]",(unsigned long)(sz/1024));
+                    else                      snprintf(sz_str,sizeof(sz_str)," [%luB]",(unsigned long)sz);
+                }
+                char text[280];
+                snprintf(text, sizeof(text), "%s%s", entry->d_name, sz_str);
+                lv_label_set_text(lbl, text);
+                lv_obj_set_style_text_color(lbl, ui_text_color(), 0);
+
+                /* Trash button on the right — stores full path via static pool */
+                /* We allocate a copy in the static target buffer only on click,
+                 * so pass the child path as user_data via a per-row static.
+                 * Since rows are rebuilt on each delbr_populate(), we can use
+                 * the dir pool for files too (re-use s_delbr_dirs entries). */
+                lv_obj_t *trash = lv_btn_create(row);
+                lv_obj_set_size(trash, 28, 22);
+                lv_obj_set_style_bg_color(trash, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+                lv_obj_set_style_bg_color(trash, lv_color_make(200, 0, 0), LV_STATE_PRESSED);
+                lv_obj_set_style_border_width(trash, 0, 0);
+                lv_obj_set_style_radius(trash, 4, 0);
+                lv_obj_set_style_pad_all(trash, 2, 0);
+                lv_obj_t *ti = lv_label_create(trash);
+                lv_label_set_text(ti, LV_SYMBOL_TRASH);
+                lv_obj_set_style_text_font(ti, &lv_font_montserrat_12, 0);
+                lv_obj_set_style_text_color(ti, lv_color_white(), 0);
+                lv_obj_center(ti);
+                /* Store file path via the dir pool (mixed use is safe since
+                 * dirs are navigable and files are deleteable, never both) */
+                if (s_delbr_dir_count < DELBR_MAX_DIRS) {
+                    strncpy(s_delbr_dirs[s_delbr_dir_count], child,
+                            sizeof(s_delbr_dirs[0]) - 1);
+                    s_delbr_dirs[s_delbr_dir_count][sizeof(s_delbr_dirs[0])-1] = '\0';
+                    lv_obj_add_event_cb(trash, delbr_trash_btn_cb, LV_EVENT_CLICKED,
+                                        s_delbr_dirs[s_delbr_dir_count]);
+                    s_delbr_dir_count++;
+                }
+            }
+        }
+    }
+    closedir(dir);
+    xSemaphoreGive(sd_spi_mutex);
+}
+
+static void show_delete_file_screen(void)
+{
+    create_function_page_base("Delete File");
+    s_delbr_list = NULL; s_delbr_path_lbl = NULL;
+
+    lv_obj_t *path_bar = lv_obj_create(function_page);
+    lv_obj_set_size(path_bar, lv_pct(100), 22);
+    lv_obj_align(path_bar, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_set_style_bg_color(path_bar, lv_color_make(50, 20, 20), 0);
+    lv_obj_set_style_border_width(path_bar, 0, 0);
+    lv_obj_set_style_radius(path_bar, 0, 0);
+    lv_obj_set_style_pad_all(path_bar, 3, 0);
+    lv_obj_clear_flag(path_bar, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_delbr_path_lbl = lv_label_create(path_bar);
+    lv_obj_set_style_text_font(s_delbr_path_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_delbr_path_lbl, COLOR_MATERIAL_RED, 0);
+    lv_label_set_long_mode(s_delbr_path_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(s_delbr_path_lbl, lv_pct(100));
+    lv_obj_align(s_delbr_path_lbl, LV_ALIGN_LEFT_MID, 0, 0);
+
+    s_delbr_list = lv_obj_create(function_page);
+    lv_obj_set_size(s_delbr_list, lv_pct(100), LCD_V_RES - 30 - 22 - 38);
+    lv_obj_align(s_delbr_list, LV_ALIGN_TOP_MID, 0, 54);
+    lv_obj_set_style_bg_color(s_delbr_list, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(s_delbr_list, 0, 0);
+    lv_obj_set_style_radius(s_delbr_list, 0, 0);
+    lv_obj_set_style_pad_all(s_delbr_list, 4, 0);
+    lv_obj_set_style_pad_row(s_delbr_list, 3, 0);
+    lv_obj_set_flex_flow(s_delbr_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_delbr_list, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+    lv_obj_t *nav_btn = lv_btn_create(function_page);
+    lv_obj_set_size(nav_btn, 120, 28);
+    lv_obj_align(nav_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_bg_color(nav_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(nav_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(nav_btn, 0, 0);
+    lv_obj_set_style_radius(nav_btn, 8, 0);
+    lv_obj_set_flex_flow(nav_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(nav_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(nav_btn, 4, 0);
+    lv_obj_t *ni = lv_label_create(nav_btn);
+    lv_label_set_text(ni, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(ni, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ni, lv_color_white(), 0);
+    lv_obj_t *nt = lv_label_create(nav_btn);
+    lv_label_set_text(nt, "Up / Back");
+    lv_obj_set_style_text_font(nt, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(nt, lv_color_white(), 0);
+    lv_obj_add_event_cb(nav_btn, delbr_up_cb, LV_EVENT_CLICKED, NULL);
+
+    delbr_populate("/sdcard/lab");
+}
+
 static void data_transfer_tile_cb(lv_event_t *e)
 {
     const char *key = (const char *)lv_event_get_user_data(e);
     if (!key) return;
-    if (strcmp(key, "AP File Server") == 0)      show_ap_file_server_screen();
-    else if (strcmp(key, "WiFi Client") == 0)    show_wifi_client_server_screen();
+    if (strcmp(key, "AP File Server") == 0)        show_ap_file_server_screen();
+    else if (strcmp(key, "WiFi Client") == 0)      show_wifi_client_server_screen();
     else if (strcmp(key, "Wardrive Upload") == 0) {
         wdm_back_fn = show_data_transfer_screen;
         show_wardrive_manage_screen();
     }
+    else if (strcmp(key, "New Folder") == 0)       show_new_folder_screen();
+    else if (strcmp(key, "Delete File") == 0)      show_delete_file_screen();
 }
 
 static void data_transfer_back_cb(lv_event_t *e)
@@ -17618,9 +18071,11 @@ static void show_data_transfer_screen(void)
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    create_tile(tiles, LV_SYMBOL_UPLOAD,  "AP File\nServer",   UI_ACCENT_CYAN,          data_transfer_tile_cb, "AP File Server");
+    create_tile(tiles, LV_SYMBOL_UPLOAD,   "AP File\nServer",   UI_ACCENT_CYAN,          data_transfer_tile_cb, "AP File Server");
     create_tile(tiles, LV_SYMBOL_WIFI,    "WiFi\nClient",      COLOR_MATERIAL_GREEN,     data_transfer_tile_cb, "WiFi Client");
     create_tile(tiles, LV_SYMBOL_UPLOAD,  "Wardrive\nUpload",  lv_color_hex(0xE91E63),  data_transfer_tile_cb, "Wardrive Upload");
+    create_tile(tiles, LV_SYMBOL_PLUS,    "New\nFolder",       COLOR_MATERIAL_GREEN,     data_transfer_tile_cb, "New Folder");
+    create_tile(tiles, LV_SYMBOL_TRASH,   "Delete\nFile",      COLOR_MATERIAL_RED,       data_transfer_tile_cb, "Delete File");
 
     lv_obj_t *back_btn = lv_btn_create(function_page);
     lv_obj_set_size(back_btn, 110, 30);
@@ -18798,6 +19253,122 @@ static void show_power_mode_popup(void)
     lv_obj_add_event_cb(close_btn, powermode_close_cb, LV_EVENT_CLICKED, NULL);
 }
 
+// ─── Hardware Options sub-screen ─────────────────────────────────────────────
+
+static void hw_opts_back_cb(lv_event_t *e)
+{
+    (void)e;
+    show_settings_screen();
+}
+
+static void hw_nmrfhat_ok_cb(lv_event_t *e)
+{
+    lv_obj_t *overlay = (lv_obj_t *)lv_event_get_user_data(e);
+    if (overlay) lv_obj_del(overlay);
+}
+
+static void show_nmrfhat_info_popup(void)
+{
+    lv_obj_t *overlay = lv_obj_create(function_page);
+    lv_obj_set_size(overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(overlay, 0, 0);
+    lv_obj_set_style_bg_color(overlay, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(overlay, 0, 0);
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *card = lv_obj_create(overlay);
+    lv_obj_set_size(card, 210, 178);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x607D8B), 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, MY_SYMBOL_MICROCHIP "  NM-RF-HAT");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0x90A4AE), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *msg = lv_label_create(card);
+    lv_label_set_text(msg,
+        "RF hardware addon board\nsupport in development.\n\n"
+        "Addon boards will enable\nsoftware-configurable RF\n"
+        "module options (NM-RF-HAT).");
+    lv_obj_set_style_text_font(msg, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(msg, ui_text_color(), 0);
+    lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(msg, 185);
+    lv_obj_align(msg, LV_ALIGN_TOP_MID, 0, 26);
+
+    lv_obj_t *ok_btn = lv_btn_create(card);
+    lv_obj_set_size(ok_btn, 90, 28);
+    lv_obj_align(ok_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(ok_btn, lv_color_hex(0x607D8B), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(ok_btn, lv_color_hex(0x78909C), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(ok_btn, 0, 0);
+    lv_obj_set_style_radius(ok_btn, 6, 0);
+    lv_obj_t *ok_lbl = lv_label_create(ok_btn);
+    lv_label_set_text(ok_lbl, "OK");
+    lv_obj_set_style_text_font(ok_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ok_lbl, lv_color_white(), 0);
+    lv_obj_center(ok_lbl);
+    lv_obj_add_event_cb(ok_btn, hw_nmrfhat_ok_cb, LV_EVENT_CLICKED, overlay);
+}
+
+static void hw_options_tile_event_cb(lv_event_t *e)
+{
+    const char *name = (const char *)lv_event_get_user_data(e);
+    if (!name) return;
+    if (strcmp(name, "Power Mode") == 0)
+        show_power_mode_popup();
+    else if (strcmp(name, "NM-RF-HAT") == 0)
+        show_nmrfhat_info_popup();
+}
+
+static void show_hardware_options_screen(void)
+{
+    create_function_page_base("Hardware Options");
+    apply_menu_bg();
+
+    lv_obj_t *tiles = lv_obj_create(function_page);
+    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30 - 40);
+    lv_obj_align(tiles, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(tiles, 0, 0);
+    lv_obj_set_style_pad_all(tiles, 4, 0);
+    lv_obj_set_style_pad_gap(tiles, 4, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
+
+    create_tile(tiles, LV_SYMBOL_CHARGE,    "Power\nMode",  COLOR_MATERIAL_RED,     hw_options_tile_event_cb, "Power Mode");
+    create_tile(tiles, MY_SYMBOL_MICROCHIP, "NM-RF-HAT",   lv_color_hex(0x607D8B), hw_options_tile_event_cb, "NM-RF-HAT");
+
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 120, 30);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_t *bi = lv_label_create(back_btn);
+    lv_label_set_text(bi, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(bi, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bi, lv_color_white(), 0);
+    lv_obj_t *bl = lv_label_create(back_btn);
+    lv_label_set_text(bl, "Settings");
+    lv_obj_set_style_text_font(bl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bl, lv_color_white(), 0);
+    lv_obj_add_event_cb(back_btn, hw_opts_back_cb, LV_EVENT_CLICKED, NULL);
+}
+
 // Settings sub-menu tile event callback
 static void settings_tile_event_cb(lv_event_t *e)
 {
@@ -18820,8 +19391,8 @@ static void settings_tile_event_cb(lv_event_t *e)
         show_sd_card_screen();
     } else if (strcmp(tile_name, "GPS Info") == 0) {
         show_gps_info_screen();
-    } else if (strcmp(tile_name, "Power Mode") == 0) {
-        show_power_mode_popup();
+    } else if (strcmp(tile_name, "Hardware Options") == 0) {
+        show_hardware_options_screen();
     } else if (strcmp(tile_name, "Vibrator Test") == 0) {
         show_vibrator_test_popup();
     }
@@ -18851,7 +19422,7 @@ static void show_settings_screen(void)
     create_tile(tiles, LV_SYMBOL_IMAGE,          "Screen",             COLOR_MATERIAL_TEAL,     settings_tile_event_cb, "Screen");
     create_tile(tiles, LV_SYMBOL_SD_CARD,        "SD\nCard",           COLOR_MATERIAL_GREEN,    settings_tile_event_cb, "SD Card");
     create_tile(tiles, MY_SYMBOL_SATELLITE_DISH, "GPS\nInfo",          lv_color_hex(0x00BCD4),  settings_tile_event_cb, "GPS Info");
-    create_tile(tiles, LV_SYMBOL_CHARGE,         "Power\nMode",        COLOR_MATERIAL_RED,      settings_tile_event_cb, "Power Mode");
+    create_tile(tiles, MY_SYMBOL_MICROCHIP,      "Hardware\nOptions",  lv_color_hex(0x607D8B),  settings_tile_event_cb, "Hardware Options");
     create_tile(tiles, LV_SYMBOL_UPLOAD,         "Data\nTransfer",     lv_color_hex(0xE91E63),  settings_tile_event_cb, "Data Transfer");
     create_tile(tiles, LV_SYMBOL_AUDIO,          "Vibrator\nTest",     lv_color_hex(0x9C27B0),  settings_tile_event_cb, "Vibrator Test");
 
