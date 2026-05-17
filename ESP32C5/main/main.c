@@ -7,16 +7,45 @@
 LV_FONT_DECLARE(lv_extra_symbols);
 LV_IMG_DECLARE(lab_bg);
 LV_IMG_DECLARE(deedee_img);
-#define MY_SYMBOL_BLUETOOTH_B     "\xEF\x8A\x94"   /* fa-bluetooth-b    U+F294 */
-#define MY_SYMBOL_SEARCH          "\xEF\x8F\xAE"   /* fa-search         U+F3EE */
-#define MY_SYMBOL_USB             "\xEF\x8A\x87"   /* fa-usb            U+F287 */
-#define MY_SYMBOL_SATELLITE       "\xEF\x9E\xBF"   /* fa-satellite      U+F7BF */
-#define MY_SYMBOL_SATELLITE_DISH  "\xEF\x9F\x80"   /* fa-satellite-dish U+F7C0 */
-#define MY_SYMBOL_CAR             "\xEF\x86\xB9"   /* fa-car            U+F1B9 */
-#define MY_SYMBOL_XRAY            "\xEF\x92\x97"   /* fa-x-ray          U+F497 */
-#define MY_SYMBOL_JET_FIGHTER     "\xEE\x94\x98"   /* jet-fighter       U+E518 */
-#define MY_SYMBOL_PERSON_WALKING  "\xEE\x95\x93"   /* person-walking    U+E553 */
-#define MY_SYMBOL_MICROCHIP       "\xEF\x87\x9B"   /* fa-microchip      U+F2DB */
+/* ── FontAwesome custom glyph set (lv_extra_symbols font) ───────────────── */
+/* brands */
+#define MY_SYMBOL_BLUETOOTH_B     "\xEF\x8A\x94"   /* fa-bluetooth-b      U+F294 */
+#define MY_SYMBOL_USB             "\xEF\x8A\x87"   /* fa-usb              U+F287 */
+#define MY_SYMBOL_APPLE           "\xEF\x8F\xAE"   /* fa-apple            U+F3EE */
+/* solid — navigation / hardware */
+#define MY_SYMBOL_CAR             "\xEF\x86\xB9"   /* fa-car              U+F1B9 */
+#define MY_SYMBOL_JET_FIGHTER     "\xEE\x94\x98"   /* fa-drone            U+E518 */
+#define MY_SYMBOL_PERSON_WALKING  "\xEE\x95\x93"   /* fa-person-walking   U+E553 */
+#define MY_SYMBOL_SATELLITE       "\xEF\x9E\xBF"   /* fa-satellite        U+F7BF */
+#define MY_SYMBOL_SATELLITE_DISH  "\xEF\x9F\x80"   /* fa-satellite-dish   U+F7C0 */
+#define MY_SYMBOL_MICROCHIP       "\xEF\x8B\x9B"   /* fa-microchip        U+F2DB */
+#define MY_SYMBOL_TOWER           "\xEF\x94\x99"   /* fa-broadcast-tower  U+F519 */
+#define MY_SYMBOL_LAPTOP          "\xEF\x84\x89"   /* fa-laptop           U+F109 */
+#define MY_SYMBOL_DESKTOP         "\xEF\x84\x88"   /* fa-desktop          U+F108 */
+#define MY_SYMBOL_SERVER          "\xEF\x88\xB3"   /* fa-server           U+F233 */
+/* solid — data / files */
+#define MY_SYMBOL_DATABASE        "\xEF\x87\x80"   /* fa-database         U+F1C0 */
+#define MY_SYMBOL_NET_WIRED       "\xEF\x9B\xBF"   /* fa-network-wired    U+F6FF */
+#define MY_SYMBOL_CLOUD_UP        "\xEF\x8E\x82"   /* fa-cloud-upload-alt U+F382 */
+#define MY_SYMBOL_FOLDER_PLUS     "\xEF\x99\x9E"   /* fa-folder-plus      U+F65E */
+#define MY_SYMBOL_HANDSHAKE       "\xEF\x8A\xB5"   /* fa-handshake        U+F2B5 */
+#define MY_SYMBOL_KEY             "\xEF\x82\x84"   /* fa-key              U+F084 */
+#define MY_SYMBOL_XRAY            "\xEF\x92\x97"   /* fa-x-ray            U+F497 */
+/* solid — security / attack */
+#define MY_SYMBOL_SKULL_CROSS     "\xEF\x9C\x94"   /* fa-skull-crossbones U+F714 */
+#define MY_SYMBOL_USER_SECRET     "\xEF\x88\x9B"   /* fa-user-secret      U+F21B */
+#define MY_SYMBOL_MASK            "\xEF\x9B\xBA"   /* fa-mask             U+F6FA */
+#define MY_SYMBOL_UNLINK          "\xEF\x84\xA7"   /* fa-unlink           U+F127 */
+#define MY_SYMBOL_PAPER_PLANE     "\xEF\x87\x98"   /* fa-paper-plane      U+F1D8 */
+/* solid — monitoring / analysis */
+#define MY_SYMBOL_CROSSHAIRS      "\xEF\x81\x9B"   /* fa-crosshairs       U+F05B */
+#define MY_SYMBOL_SHIELD          "\xEF\x8F\xAD"   /* fa-shield-alt       U+F3ED */
+#define MY_SYMBOL_BINOCULARS      "\xEF\x87\xA5"   /* fa-binoculars       U+F1E5 */
+#define MY_SYMBOL_TAG             "\xEF\x80\xAB"   /* fa-tag              U+F02B */
+#define MY_SYMBOL_SITEMAP         "\xEF\x83\xA8"   /* fa-sitemap          U+F0E8 */
+#define MY_SYMBOL_CHART_BAR       "\xEF\x82\x80"   /* fa-chart-bar        U+F080 */
+#define MY_SYMBOL_WAVE            "\xEF\xA0\xBE"   /* fa-wave-square      U+F83E */
+#define MY_SYMBOL_CLOCK           "\xEF\x80\x97"   /* fa-clock            U+F017 */
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
@@ -15249,17 +15278,17 @@ static void show_wifi_menu_screen(void)
 
     lv_obj_t *scan_tile = create_tile(tiles, LV_SYMBOL_WIFI,       "Scan &\nAttack",   UI_ACCENT_BLUE,   main_tile_event_cb, "WiFi Scan & Attack");
     (void)scan_tile;
-    lv_obj_t *atk_tile  = create_tile(tiles, LV_SYMBOL_WARNING,    "WiFi\nAttacks",    UI_ACCENT_RED,    main_tile_event_cb, "Global WiFi Attacks");
+    lv_obj_t *atk_tile  = create_tile(tiles, MY_SYMBOL_SKULL_CROSS, "WiFi\nAttacks",    UI_ACCENT_RED,    main_tile_event_cb, "Global WiFi Attacks");
     (void)atk_tile;
     lv_obj_t *dm_tile   = create_tile(tiles, MY_SYMBOL_SATELLITE,  "Deauth\nMon.",     UI_ACCENT_AMBER,  main_tile_event_cb, "Deauth Monitor");
     (void)dm_tile;
-    lv_obj_t *obs_tile  = create_tile(tiles, LV_SYMBOL_EYE_OPEN,   "WiFi\nObserver",   UI_ACCENT_PURPLE, main_tile_event_cb, "WiFi Sniff&Karma");
+    lv_obj_t *obs_tile  = create_tile(tiles, MY_SYMBOL_BINOCULARS, "WiFi\nObserver",   UI_ACCENT_PURPLE, main_tile_event_cb, "WiFi Sniff&Karma");
     (void)obs_tile;
-    lv_obj_t *dd_tile   = create_tile(tiles, LV_SYMBOL_GPS,        "Drone\nDetect",    lv_color_hex(0x1B5E20), main_tile_event_cb, "Drone Detect");
+    lv_obj_t *dd_tile   = create_tile(tiles, MY_SYMBOL_JET_FIGHTER,"Drone\nDetect",    lv_color_hex(0x1B5E20), main_tile_event_cb, "Drone Detect");
     (void)dd_tile;
-    lv_obj_t *wana_tile = create_tile(tiles, LV_SYMBOL_WIFI,       "Chan-\nalizer",    lv_color_hex(0x1A237E), main_tile_event_cb, "Chanalizer");
+    lv_obj_t *wana_tile = create_tile(tiles, MY_SYMBOL_CHART_BAR,  "Chan-\nalizer",    lv_color_hex(0x1A237E), main_tile_event_cb, "Chanalizer");
     (void)wana_tile;
-    lv_obj_t *wscope_tile = create_tile(tiles, LV_SYMBOL_AUDIO,    "WiFi\nScope",      lv_color_hex(0x006064), main_tile_event_cb, "WiFi Scope");
+    lv_obj_t *wscope_tile = create_tile(tiles, MY_SYMBOL_WAVE,     "WiFi\nScope",      lv_color_hex(0x006064), main_tile_event_cb, "WiFi Scope");
     (void)wscope_tile;
 }
 
@@ -15280,7 +15309,7 @@ static void show_sniff_karma_screen(void)
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
     
     // Network Observer tile - Purple
-    lv_obj_t *sniffer_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "WiFi\nObserver", COLOR_MATERIAL_PURPLE, NULL, NULL);
+    lv_obj_t *sniffer_tile = create_tile(tiles, MY_SYMBOL_BINOCULARS, "WiFi\nObserver", COLOR_MATERIAL_PURPLE, NULL, NULL);
     lv_obj_add_event_cb(sniffer_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Sniffer");
     
     // Browse Clients tile - Indigo (REMOVED - integrated into Sniffer)
@@ -15292,7 +15321,7 @@ static void show_sniff_karma_screen(void)
     // lv_obj_add_event_cb(probes_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Show Probes");
     
     // Karma tile - Pink
-    lv_obj_t *karma_tile = create_tile(tiles, LV_SYMBOL_SHUFFLE, "Karma", COLOR_MATERIAL_PINK, NULL, NULL);
+    lv_obj_t *karma_tile = create_tile(tiles, MY_SYMBOL_USER_SECRET, "Karma", COLOR_MATERIAL_PINK, NULL, NULL);
     lv_obj_add_event_cb(karma_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Karma");
 }
 
@@ -18249,8 +18278,6 @@ static void data_transfer_tile_cb(lv_event_t *e)
         wdm_back_fn = show_data_transfer_screen;
         show_wardrive_manage_screen();
     }
-    else if (strcmp(key, "New Folder") == 0)       show_new_folder_screen();
-    else if (strcmp(key, "Delete File") == 0)      show_delete_file_screen();
 }
 
 static void data_transfer_back_cb(lv_event_t *e)
@@ -18274,11 +18301,9 @@ static void show_data_transfer_screen(void)
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    create_tile(tiles, LV_SYMBOL_UPLOAD,   "AP File\nServer",   UI_ACCENT_CYAN,          data_transfer_tile_cb, "AP File Server");
-    create_tile(tiles, LV_SYMBOL_WIFI,    "WiFi\nClient",      COLOR_MATERIAL_GREEN,     data_transfer_tile_cb, "WiFi Client");
-    create_tile(tiles, LV_SYMBOL_UPLOAD,  "Wardrive\nUpload",  lv_color_hex(0xE91E63),  data_transfer_tile_cb, "Wardrive Upload");
-    create_tile(tiles, LV_SYMBOL_PLUS,    "New\nFolder",       COLOR_MATERIAL_GREEN,     data_transfer_tile_cb, "New Folder");
-    create_tile(tiles, LV_SYMBOL_TRASH,   "Delete\nFile",      COLOR_MATERIAL_RED,       data_transfer_tile_cb, "Delete File");
+    create_tile(tiles, MY_SYMBOL_SERVER,  "AP File\nServer",   UI_ACCENT_CYAN,          data_transfer_tile_cb, "AP File Server");
+    create_tile(tiles, MY_SYMBOL_LAPTOP, "WiFi\nClient",      COLOR_MATERIAL_GREEN,     data_transfer_tile_cb, "WiFi Client");
+    create_tile(tiles, MY_SYMBOL_CLOUD_UP,"Wardrive\nUpload",  lv_color_hex(0xE91E63),  data_transfer_tile_cb, "Wardrive Upload");
 
     lv_obj_t *back_btn = lv_btn_create(function_page);
     lv_obj_set_size(back_btn, 110, 30);
@@ -19549,7 +19574,7 @@ static void show_hardware_options_screen(void)
     lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
 
     create_tile(tiles, LV_SYMBOL_CHARGE,    "Power\nMode",  COLOR_MATERIAL_RED,     hw_options_tile_event_cb, "Power Mode");
-    create_tile(tiles, MY_SYMBOL_MICROCHIP, "NM-RF-HAT",   lv_color_hex(0x607D8B), hw_options_tile_event_cb, "NM-RF-HAT");
+    create_tile(tiles, MY_SYMBOL_TOWER,     "NM-RF-HAT",   lv_color_hex(0x607D8B), hw_options_tile_event_cb, "NM-RF-HAT");
 
     lv_obj_t *back_btn = lv_btn_create(function_page);
     lv_obj_set_size(back_btn, 120, 30);
@@ -19619,14 +19644,14 @@ static void show_settings_screen(void)
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
 
-    create_tile(tiles, LV_SYMBOL_EYE_OPEN,       "Compromised\nData",  COLOR_TILE_BLUE,         settings_tile_event_cb, "Compromised Data");
-    create_tile(tiles, LV_SYMBOL_LOOP,           "Timing",             COLOR_MATERIAL_PURPLE,   settings_tile_event_cb, "Timing");
+    create_tile(tiles, MY_SYMBOL_KEY,            "Compromised\nData",  COLOR_TILE_BLUE,         settings_tile_event_cb, "Compromised Data");
+    create_tile(tiles, MY_SYMBOL_CLOCK,          "Timing",             COLOR_MATERIAL_PURPLE,   settings_tile_event_cb, "Timing");
     create_tile(tiles, LV_SYMBOL_DOWNLOAD,       "Download\nMode",     COLOR_MATERIAL_RED,      settings_tile_event_cb, "Download Mode");
-    create_tile(tiles, LV_SYMBOL_IMAGE,          "Screen",             COLOR_MATERIAL_TEAL,     settings_tile_event_cb, "Screen");
+    create_tile(tiles, MY_SYMBOL_DESKTOP,        "Screen",             COLOR_MATERIAL_TEAL,     settings_tile_event_cb, "Screen");
     create_tile(tiles, LV_SYMBOL_SD_CARD,        "SD\nCard",           COLOR_MATERIAL_GREEN,    settings_tile_event_cb, "SD Card");
     create_tile(tiles, MY_SYMBOL_SATELLITE_DISH, "GPS\nInfo",          lv_color_hex(0x00BCD4),  settings_tile_event_cb, "GPS Info");
     create_tile(tiles, MY_SYMBOL_MICROCHIP,      "Hardware\nOptions",  lv_color_hex(0x607D8B),  settings_tile_event_cb, "Hardware Options");
-    create_tile(tiles, LV_SYMBOL_UPLOAD,         "Data\nTransfer",     lv_color_hex(0xE91E63),  settings_tile_event_cb, "Data Transfer");
+    create_tile(tiles, MY_SYMBOL_SERVER,         "Data\nTransfer",     lv_color_hex(0xE91E63),  settings_tile_event_cb, "Data Transfer");
     create_tile(tiles, LV_SYMBOL_AUDIO,          "Vibrator\nTest",     lv_color_hex(0x9C27B0),  settings_tile_event_cb, "Vibrator Test");
 
     lv_obj_t *ver = lv_label_create(function_page);
@@ -20417,10 +20442,12 @@ static void sd_card_tile_event_cb(lv_event_t *e)
 {
     const char *name = (const char *)lv_event_get_user_data(e);
     if (!name) return;
-    if      (strcmp(name, "Validate") == 0)   show_sd_provision_confirm(false);
-    else if (strcmp(name, "Free Space") == 0) show_sd_free_space_screen();
-    else if (strcmp(name, "Tree") == 0)       show_sd_tree_screen();
-    else if (strcmp(name, "Format") == 0)     show_sd_format_confirm1();
+    if      (strcmp(name, "Validate") == 0)    show_sd_provision_confirm(false);
+    else if (strcmp(name, "Free Space") == 0)  show_sd_free_space_screen();
+    else if (strcmp(name, "Tree") == 0)        show_sd_tree_screen();
+    else if (strcmp(name, "New Folder") == 0)  show_new_folder_screen();
+    else if (strcmp(name, "Delete File") == 0) show_delete_file_screen();
+    else if (strcmp(name, "Format") == 0)      show_sd_format_confirm1();
 }
 
 static void show_sd_card_screen(void)
@@ -20437,13 +20464,17 @@ static void show_sd_card_screen(void)
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    create_tile(tiles, LV_SYMBOL_OK,      "Validate &\nProvision", COLOR_MATERIAL_TEAL,
+    create_tile(tiles, LV_SYMBOL_OK,          "Validate &\nProvision", COLOR_MATERIAL_TEAL,
                 sd_card_tile_event_cb, "Validate");
-    create_tile(tiles, LV_SYMBOL_DRIVE,   "Free\nSpace",            COLOR_TILE_BLUE,
+    create_tile(tiles, LV_SYMBOL_DRIVE,       "Free\nSpace",           COLOR_TILE_BLUE,
                 sd_card_tile_event_cb, "Free Space");
-    create_tile(tiles, LV_SYMBOL_LIST,    "File\nTree",             COLOR_MATERIAL_ORANGE,
+    create_tile(tiles, LV_SYMBOL_LIST,        "File\nTree",            COLOR_MATERIAL_ORANGE,
                 sd_card_tile_event_cb, "Tree");
-    create_tile(tiles, LV_SYMBOL_WARNING, "Format\nSD Card",        COLOR_MATERIAL_RED,
+    create_tile(tiles, MY_SYMBOL_FOLDER_PLUS, "New\nFolder",           COLOR_MATERIAL_GREEN,
+                sd_card_tile_event_cb, "New Folder");
+    create_tile(tiles, LV_SYMBOL_TRASH,       "Delete\nFile",          COLOR_MATERIAL_RED,
+                sd_card_tile_event_cb, "Delete File");
+    create_tile(tiles, LV_SYMBOL_WARNING,     "Format\nSD Card",       lv_color_hex(0xB71C1C),
                 sd_card_tile_event_cb, "Format");
 }
 
@@ -20899,13 +20930,13 @@ static void show_wifi_monitor_screen(void)
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     
     // Evil Twin Passwords - Blue
-    create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Evil Twin\nPasswords", COLOR_TILE_BLUE, wifi_monitor_tile_event_cb, "Evil Twin Passwords");
+    create_tile(tiles, MY_SYMBOL_KEY,      "Evil Twin\nPasswords", COLOR_TILE_BLUE, wifi_monitor_tile_event_cb, "Evil Twin Passwords");
     
     // Portal Data - Purple
-    create_tile(tiles, LV_SYMBOL_LIST, "Portal\nData", COLOR_MATERIAL_PURPLE, wifi_monitor_tile_event_cb, "Portal Data");
+    create_tile(tiles, MY_SYMBOL_DATABASE, "Portal\nData", COLOR_MATERIAL_PURPLE, wifi_monitor_tile_event_cb, "Portal Data");
     
     // Handshakes - Amber/Orange
-    create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Handshakes", COLOR_MATERIAL_AMBER, wifi_monitor_tile_event_cb, "Handshakes");
+    create_tile(tiles, MY_SYMBOL_HANDSHAKE, "Handshakes", COLOR_MATERIAL_AMBER, wifi_monitor_tile_event_cb, "Handshakes");
 }
 
 // ── BT Lookout ────────────────────────────────────────────────────────────────
@@ -22178,35 +22209,35 @@ static void show_bluetooth_screen(void)
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
     // BT Scan & Select - first tile, cyan
-    lv_obj_t *btsas_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BT Scan\n& Select", UI_ACCENT_CYAN, NULL, NULL);
+    lv_obj_t *btsas_tile = create_tile(tiles, MY_SYMBOL_CROSSHAIRS,   "BT Scan\n& Select", UI_ACCENT_CYAN, NULL, NULL);
     lv_obj_add_event_cb(btsas_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Scan & Select");
 
     // BT Observer - auto-enumerate all nearby devices
-    lv_obj_t *btobs_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "BT\nObserver", lv_color_hex(0x7B1FA2), NULL, NULL);
+    lv_obj_t *btobs_tile = create_tile(tiles, MY_SYMBOL_BINOCULARS, "BT\nObserver", lv_color_hex(0x7B1FA2), NULL, NULL);
     lv_obj_add_event_cb(btobs_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Observer");
 
     // AirTag scan - Apple-like gray
-    lv_obj_t *airtag_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "AirTag\nScan", lv_color_make(142, 142, 147), NULL, NULL);
+    lv_obj_t *airtag_tile = create_tile(tiles, MY_SYMBOL_TAG,          "AirTag\nScan", lv_color_make(142, 142, 147), NULL, NULL);
     lv_obj_add_event_cb(airtag_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"AirTag scan");
 
     // BT Locator - Blue
-    lv_obj_t *locator_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BT Locator", COLOR_TILE_BLUE, NULL, NULL);
+    lv_obj_t *locator_tile = create_tile(tiles, MY_SYMBOL_CROSSHAIRS,   "BT Locator", COLOR_TILE_BLUE, NULL, NULL);
     lv_obj_add_event_cb(locator_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Locator");
 
     // BT Lookout - Red
-    lv_obj_t *lookout_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BT\nLookout", COLOR_MATERIAL_RED, NULL, NULL);
+    lv_obj_t *lookout_tile = create_tile(tiles, MY_SYMBOL_SHIELD,       "BT\nLookout", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(lookout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Dee Dee Detector");
 
     // BT Attacks - Orange
-    lv_obj_t *btatk_tile = create_tile(tiles, LV_SYMBOL_WARNING, "BT\nAttacks", COLOR_MATERIAL_AMBER, NULL, NULL);
+    lv_obj_t *btatk_tile = create_tile(tiles, MY_SYMBOL_SKULL_CROSS, "BT\nAttacks", COLOR_MATERIAL_AMBER, NULL, NULL);
     lv_obj_add_event_cb(btatk_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Attacks");
 
     // BLE PCAP - teal/purple
-    lv_obj_t *pcap_tile = create_tile(tiles, LV_SYMBOL_SAVE, "BLE\nPCAP", lv_color_hex(0x00897B), NULL, NULL);
+    lv_obj_t *pcap_tile = create_tile(tiles, MY_SYMBOL_NET_WIRED, "BLE\nPCAP", lv_color_hex(0x00897B), NULL, NULL);
     lv_obj_add_event_cb(pcap_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE PCAP");
 
     // HoneyPair - BLE honeypot / pairing telemetry logger
-    lv_obj_t *hp_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Honey\nPair",
+    lv_obj_t *hp_tile = create_tile(tiles, MY_SYMBOL_USER_SECRET, "Honey\nPair",
                                     lv_color_make(212, 175, 55), NULL, NULL);
     lv_obj_add_event_cb(hp_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"HoneyPair");
 
@@ -24100,15 +24131,15 @@ static void show_bt_attack_tiles_screen(void)
     lv_obj_add_event_cb(loc_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Locator Direct");
 
     // GATT Walker tile
-    lv_obj_t *gatt_tile = create_tile(tiles, MY_SYMBOL_PERSON_WALKING, "GATT\nWalker", COLOR_MATERIAL_PURPLE, NULL, NULL);
+    lv_obj_t *gatt_tile = create_tile(tiles, MY_SYMBOL_SITEMAP,      "GATT\nWalker", COLOR_MATERIAL_PURPLE, NULL, NULL);
     lv_obj_add_event_cb(gatt_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"GATT Walker");
 
     // Add to BT Lookout watchlist
-    lv_obj_t *add_lookout_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Add to\nBT Lookout", COLOR_MATERIAL_RED, NULL, NULL);
+    lv_obj_t *add_lookout_tile = create_tile(tiles, MY_SYMBOL_SHIELD,       "Add to\nBT Lookout", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(add_lookout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Add to Lookout");
 
     // BT Attacks — opens directed attack menu (Spoof, Disconnect) targeting selected device
-    lv_obj_t *attacks_tile = create_tile(tiles, LV_SYMBOL_WARNING, "BT\nAttacks", COLOR_MATERIAL_AMBER, NULL, NULL);
+    lv_obj_t *attacks_tile = create_tile(tiles, MY_SYMBOL_SKULL_CROSS, "BT\nAttacks", COLOR_MATERIAL_AMBER, NULL, NULL);
     lv_obj_add_event_cb(attacks_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Directed BT Attacks");
 
     /* Back button — return to BT Scan & Select */
@@ -25312,10 +25343,10 @@ static void show_directed_bt_attacks_screen(void)
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
 
-    lv_obj_t *spoof_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Device\nSpoof", COLOR_MATERIAL_ORANGE, NULL, NULL);
+    lv_obj_t *spoof_tile = create_tile(tiles, MY_SYMBOL_MASK,        "Device\nSpoof", COLOR_MATERIAL_ORANGE, NULL, NULL);
     lv_obj_add_event_cb(spoof_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spoof SAS");
 
-    lv_obj_t *disc_tile = create_tile(tiles, LV_SYMBOL_CLOSE, "BLE\nDisconnect", COLOR_MATERIAL_PINK, NULL, NULL);
+    lv_obj_t *disc_tile = create_tile(tiles, MY_SYMBOL_UNLINK,    "BLE\nDisconnect", COLOR_MATERIAL_PINK, NULL, NULL);
     lv_obj_add_event_cb(disc_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Disc SAS");
 
     /* Back button — return to SAS actions */
@@ -25828,13 +25859,13 @@ static void show_bt_attacks_screen(void)
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
 
-    lv_obj_t *spam_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BLE\nSpam", COLOR_MATERIAL_RED, NULL, NULL);
+    lv_obj_t *spam_tile = create_tile(tiles, MY_SYMBOL_PAPER_PLANE, "BLE\nSpam", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(spam_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spam");
 
-    lv_obj_t *spoof_gen_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Device\nSpoof", COLOR_MATERIAL_ORANGE, NULL, NULL);
+    lv_obj_t *spoof_gen_tile = create_tile(tiles, MY_SYMBOL_MASK,        "Device\nSpoof", COLOR_MATERIAL_ORANGE, NULL, NULL);
     lv_obj_add_event_cb(spoof_gen_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spoof General");
 
-    lv_obj_t *bd_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Blue\nDuck", lv_color_make(0, 120, 200), NULL, NULL);
+    lv_obj_t *bd_tile = create_tile(tiles, LV_SYMBOL_KEYBOARD,    "Blue\nDuck", lv_color_make(0, 120, 200), NULL, NULL);
     lv_obj_add_event_cb(bd_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BlueDuck");
 
     /* Back button */
