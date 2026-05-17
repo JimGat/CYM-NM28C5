@@ -42,6 +42,7 @@ static const hp_persona_t s_personas[] = {
     { "Apple Watch",        "Apple",     "A2976",             41, 0x00C0 },
     { "JBL Clip 4",         "JBL",       "JBLCLIP4",          88, 0x0940 },
     { "Logitech MX Keys",   "Logitech",  "920-009294",        73, 0x03C1 },
+    { "Samsung 40\" TV",   "Samsung Electronics", "UN40T5300",  0, 0x0180 },
 };
 #define HP_PERSONA_COUNT ((int)(sizeof(s_personas)/sizeof(s_personas[0])))
 
