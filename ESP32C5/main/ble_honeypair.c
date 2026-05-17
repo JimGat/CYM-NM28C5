@@ -259,6 +259,75 @@ static void hp_addr_str(const uint8_t *val, char *out18)
              val[5], val[4], val[3], val[2], val[1], val[0]);
 }
 
+static int hp_gap_cb(struct ble_gap_event *event, void *arg);
+
+// ── Extended advertising helper ───────────────────────────────────────────────
+// ble_gap_adv_start / ble_gap_adv_set_fields are compiled out when
+// CONFIG_BT_NIMBLE_EXT_ADV=y.  Use the extended API with legacy_pdu=1
+// so every phone (BT 4.0+) can see the advertisement.
+
+#define HP_ADV_INSTANCE 1   /* instance 0 reserved for BT scanner; use 1 */
+
+static void hp_ext_adv_start(int persona_idx)
+{
+    static ble_uuid16_t s_hid_uuid = BLE_UUID16_INIT(0x1812);
+
+    /* Stop any running advertisement on our instance first */
+    ble_gap_ext_adv_stop(HP_ADV_INSTANCE);
+
+    ble_svc_gap_device_name_set(s_personas[persona_idx].name);
+    ble_svc_gap_device_appearance_set(s_personas[persona_idx].appearance);
+
+    /* Configure: connectable legacy PDU — visible to all BT 4.0+ hosts */
+    struct ble_gap_ext_adv_params p;
+    memset(&p, 0, sizeof(p));
+    p.connectable   = 1;
+    p.scannable     = 0;
+    p.legacy_pdu    = 1;
+    p.own_addr_type = BLE_OWN_ADDR_PUBLIC;
+    p.primary_phy   = BLE_HCI_LE_PHY_1M;
+    p.secondary_phy = BLE_HCI_LE_PHY_1M;
+    p.itvl_min      = BLE_GAP_ADV_ITVL_MS(200);
+    p.itvl_max      = BLE_GAP_ADV_ITVL_MS(350);
+    p.sid           = HP_ADV_INSTANCE;
+
+    int rc = ble_gap_ext_adv_configure(HP_ADV_INSTANCE, &p, NULL, hp_gap_cb, NULL);
+    if (rc != 0) { ESP_LOGE(TAG, "ext_adv_configure: %d", rc); return; }
+
+    /* Build advertisement payload */
+    struct ble_hs_adv_fields f;
+    memset(&f, 0, sizeof(f));
+    f.flags                 = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    f.uuids16               = &s_hid_uuid;
+    f.num_uuids16           = 1;
+    f.uuids16_is_complete   = 1;
+    f.name                  = (const uint8_t *)s_personas[persona_idx].name;
+    f.name_len              = (uint8_t)strlen(s_personas[persona_idx].name);
+    f.name_is_complete      = 1;
+    f.appearance            = s_personas[persona_idx].appearance;
+    f.appearance_is_present = 1;
+
+    struct os_mbuf *om = os_msys_get_pkthdr(BLE_HS_ADV_MAX_SZ, 0);
+    if (!om) { ESP_LOGE(TAG, "ext_adv: no mbuf"); return; }
+
+    rc = ble_hs_adv_set_fields_mbuf(&f, om);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "adv_set_fields_mbuf: %d", rc);
+        os_mbuf_free_chain(om);
+        return;
+    }
+
+    rc = ble_gap_ext_adv_set_data(HP_ADV_INSTANCE, om);
+    if (rc != 0) { ESP_LOGE(TAG, "ext_adv_set_data: %d", rc); return; }
+
+    rc = ble_gap_ext_adv_start(HP_ADV_INSTANCE, 0, 0);
+    if (rc == 0 || rc == BLE_HS_EALREADY) {
+        ESP_LOGI(TAG, "Advertising as '%s'", s_personas[persona_idx].name);
+    } else {
+        ESP_LOGE(TAG, "ext_adv_start: %d", rc);
+    }
+}
+
 // ── GAP event callback ────────────────────────────────────────────────────────
 
 static int hp_gap_cb(struct ble_gap_event *event, void *arg)
@@ -292,16 +361,7 @@ static int hp_gap_cb(struct ble_gap_event *event, void *arg)
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 
         /* Re-advertise as same persona */
-        if (s_active) {
-            struct ble_gap_adv_params ap;
-            memset(&ap, 0, sizeof(ap));
-            ap.conn_mode = BLE_GAP_CONN_MODE_UND;
-            ap.disc_mode = BLE_GAP_DISC_MODE_GEN;
-            ap.itvl_min  = BLE_GAP_ADV_ITVL_MS(200);
-            ap.itvl_max  = BLE_GAP_ADV_ITVL_MS(350);
-            ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER,
-                              &ap, hp_gap_cb, NULL);
-        }
+        if (s_active) hp_ext_adv_start(s_persona);
         break;
 
     case BLE_GAP_EVENT_ENC_CHANGE:
@@ -351,11 +411,6 @@ void honeypair_start(int persona_idx)
     s_persona = persona_idx;
     s_active  = true;
 
-    ble_gap_adv_stop();
-
-    ble_svc_gap_device_name_set(s_personas[persona_idx].name);
-    ble_svc_gap_device_appearance_set(s_personas[persona_idx].appearance);
-
     /* Create log file on first start this session */
     if (!s_log_path[0]) {
         const char *dir = "/sdcard/lab/ble/honeypair";
@@ -365,7 +420,6 @@ void honeypair_start(int persona_idx)
             mkdir(dir, 0755);
             xSemaphoreGive(s_sd_mutex);
         }
-        /* Use GPS time or tick-count for unique filename */
         const gps_data_t *gps = s_gps_fn ? s_gps_fn() : NULL;
         char suffix[24];
         if (gps && gps->time_utc[0]) {
@@ -382,45 +436,13 @@ void honeypair_start(int persona_idx)
         hp_log("persona_change", NULL, NULL);
     }
 
-    /* HID service UUID — all personas advertise it so they appear as
-       bondable HID devices in the host OS pairing list */
-    static ble_uuid16_t s_hid_uuid = BLE_UUID16_INIT(0x1812);
-
-    struct ble_hs_adv_fields f;
-    memset(&f, 0, sizeof(f));
-    f.flags                 = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    f.uuids16               = &s_hid_uuid;
-    f.num_uuids16           = 1;
-    f.uuids16_is_complete   = 1;
-    f.name                  = (const uint8_t *)s_personas[persona_idx].name;
-    f.name_len              = (uint8_t)strlen(s_personas[persona_idx].name);
-    f.name_is_complete      = 1;
-    f.appearance            = s_personas[persona_idx].appearance;
-    f.appearance_is_present = 1;
-
-    int rc = ble_gap_adv_set_fields(&f);
-    if (rc != 0) { ESP_LOGE(TAG, "adv_set_fields: %d", rc); return; }
-
-    struct ble_gap_adv_params ap;
-    memset(&ap, 0, sizeof(ap));
-    ap.conn_mode = BLE_GAP_CONN_MODE_UND;
-    ap.disc_mode = BLE_GAP_DISC_MODE_GEN;
-    ap.itvl_min  = BLE_GAP_ADV_ITVL_MS(200);
-    ap.itvl_max  = BLE_GAP_ADV_ITVL_MS(350);
-
-    rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER,
-                           &ap, hp_gap_cb, NULL);
-    if (rc == 0 || rc == BLE_HS_EALREADY) {
-        ESP_LOGI(TAG, "Advertising as '%s'", s_personas[persona_idx].name);
-    } else {
-        ESP_LOGE(TAG, "adv_start: %d", rc);
-    }
+    hp_ext_adv_start(persona_idx);
 }
 
 void honeypair_stop(void)
 {
     s_active = false;
-    ble_gap_adv_stop();
+    ble_gap_ext_adv_stop(HP_ADV_INSTANCE);
     if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
