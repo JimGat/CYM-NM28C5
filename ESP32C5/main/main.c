@@ -4598,7 +4598,6 @@ void app_main(void)
     }
 
     gw_init(sd_spi_mutex);
-    honeypair_init(sd_spi_mutex, gps_best);
 
     // Screenshot worker (queue + background saver task)
     screenshot_queue = xQueueCreate(1, sizeof(screenshot_msg_t));
@@ -4628,8 +4627,7 @@ void app_main(void)
         return;
     }
 
-    // For 32-bit color depth, we need to reduce buffer size due to memory constraints
-    // 15 lines * 480 pixels * 4 bytes = 28.8 KB per buffer (vs 28.8 KB for 30 lines @ 16-bit)
+    // 15 lines per buffer — works for both 16-bit (7200 B) and 32-bit (14400 B) color depth
     const size_t buf_size = LCD_H_RES * 15 * sizeof(lv_color_t);
     buf1 = spi_bus_dma_memory_alloc(LCD_HOST, buf_size, 0);
     buf2 = spi_bus_dma_memory_alloc(LCD_HOST, buf_size, 0);
@@ -4649,6 +4647,8 @@ void app_main(void)
     disp_drv.user_data = panel_handle;
     lv_disp_drv_register(&disp_drv);
 
+    honeypair_init(sd_spi_mutex, gps_best);
+
     flush_done_sem = xSemaphoreCreateBinary();
     if (flush_done_sem == NULL) {
         ESP_LOGE(TAG, "Failed to create flush_done_sem!");
@@ -4660,20 +4660,23 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(esp_lcd_panel_io_register_event_callbacks(lcd_io_handle, &cbs, &disp_drv));
 
-    uint16_t black = 0x0000;
-    for (int i = 0; i < LCD_H_RES * 30; i++) {
-        ((uint16_t*)buf1)[i] = black;
-    }
-    for (int y = 0; y < LCD_V_RES; y += 30) {
-        int lines = (y + 30 <= LCD_V_RES) ? 30 : (LCD_V_RES - y);
+    // Clear screen: memset writes exactly buf_size bytes (no overflow regardless of color depth)
+    memset(buf1, 0, buf_size);
+    for (int y = 0; y < LCD_V_RES; y += 15) {
+        int lines = (y + 15 <= LCD_V_RES) ? 15 : (LCD_V_RES - y);
         esp_lcd_panel_draw_bitmap(panel_handle, 0, y, LCD_H_RES, y + lines, buf1);
     }
-    
-    lv_obj_set_style_bg_color(lv_scr_act(), lv_color_black(), 0);
+
+    lv_obj_t *scr = lv_scr_act();
+    if (!scr) {
+        ESP_LOGE(TAG, "FATAL: LVGL default screen is NULL after display init");
+        return;
+    }
+    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
 
     ESP_LOGI(TAG, "LVGL OBJECTS:");
 
-    lv_obj_set_style_bg_color(lv_scr_act(), ui_bg_color(), 0);
+    lv_obj_set_style_bg_color(scr, ui_bg_color(), 0);
 
     show_splash_screen();
     
