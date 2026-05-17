@@ -16070,10 +16070,11 @@ static bool s_fileserv_httpd_start(void)
     cfg.server_port        = 80;
     cfg.max_open_sockets   = 4;
     cfg.max_uri_handlers   = 8;
-    cfg.stack_size         = 8192;   /* default 4096 is too tight for dir-listing stack frames */
+    cfg.stack_size         = 8192;
+    cfg.task_caps          = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;  /* internal RAM ~2-3KB after WiFi init — not enough */
     cfg.uri_match_fn       = httpd_uri_match_wildcard;
     cfg.lru_purge_enable   = true;
-    cfg.recv_wait_timeout  = 10;     /* seconds; allow slow SD reads */
+    cfg.recv_wait_timeout  = 10;
     cfg.send_wait_timeout  = 10;
     esp_err_t err = httpd_start(&s_fileserv_httpd, &cfg);
     if (err != ESP_OK) {
