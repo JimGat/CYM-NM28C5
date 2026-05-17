@@ -281,11 +281,13 @@ static void hp_ext_adv_start(int persona_idx)
     ble_svc_gap_device_name_set(s_personas[persona_idx].name);
     ble_svc_gap_device_appearance_set(s_personas[persona_idx].appearance);
 
-    /* Configure: connectable legacy PDU — visible to all BT 4.0+ hosts */
+    /* Configure: legacy ADV_IND PDU (connectable+scannable) — BLE_HCI_LE_SET_EXT_ADV_PROP_LEGACY_IND=0x13.
+     * Legacy PDUs require scannable=1 when connectable=1; omitting it yields props=0x11 which
+     * is not a valid legacy PDU type and ble_gap_set_ext_adv_params() returns BLE_HS_EINVAL. */
     struct ble_gap_ext_adv_params p;
     memset(&p, 0, sizeof(p));
     p.connectable   = 1;
-    p.scannable     = 0;
+    p.scannable     = 1;
     p.legacy_pdu    = 1;
     p.own_addr_type = BLE_OWN_ADDR_PUBLIC;
     p.primary_phy   = BLE_HCI_LE_PHY_1M;
