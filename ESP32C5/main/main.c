@@ -16117,9 +16117,13 @@ static void s_fileserv_poll_ip_cb(lv_timer_t *t)
         char ip_str[64];
         snprintf(ip_str, sizeof(ip_str), "IP: " IPSTR " => http://" IPSTR,
                  IP2STR(&ip.ip), IP2STR(&ip.ip));
-        if (s_fileserv_ip_lbl)     lv_label_set_text(s_fileserv_ip_lbl, ip_str);
-        if (s_fileserv_status_lbl) lv_label_set_text(s_fileserv_status_lbl, "Server active");
-        s_fileserv_httpd_start();
+        if (s_fileserv_ip_lbl) lv_label_set_text(s_fileserv_ip_lbl, ip_str);
+        if (s_fileserv_status_lbl) {
+            if (s_fileserv_httpd_start())
+                lv_label_set_text(s_fileserv_status_lbl, "Active  use http://");
+            else
+                lv_label_set_text(s_fileserv_status_lbl, "HTTP start failed");
+        }
     }
 }
 
@@ -16204,6 +16208,12 @@ static void show_ap_file_server_screen(void)
 
     /* Start the AP and HTTP server */
     ensure_wifi_mode();
+
+    /* Ensure AP netif exists — required for DHCP server and 192.168.4.1 IP assignment */
+    if (!esp_netif_get_handle_from_ifkey("WIFI_AP_DEF")) {
+        esp_netif_create_default_wifi_ap();
+    }
+
     wifi_mode_t wmode;
     esp_wifi_get_mode(&wmode);
     if (wmode != WIFI_MODE_APSTA && wmode != WIFI_MODE_AP) {
