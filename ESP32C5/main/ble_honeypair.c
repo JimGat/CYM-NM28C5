@@ -266,11 +266,14 @@ static int hp_gap_cb(struct ble_gap_event *event, void *arg);
 // CONFIG_BT_NIMBLE_EXT_ADV=y.  Use the extended API with legacy_pdu=1
 // so every phone (BT 4.0+) can see the advertisement.
 
-#define HP_ADV_INSTANCE 1   /* instance 0 reserved for BT scanner; use 1 */
+#define HP_ADV_INSTANCE 0   /* only one ext-adv instance configured (MAX=1) */
 
 static void hp_ext_adv_start(int persona_idx)
 {
     static ble_uuid16_t s_hid_uuid = BLE_UUID16_INIT(0x1812);
+
+    ESP_LOGI(TAG, "hp_ext_adv_start: persona=%d ('%s') synced=%d",
+             persona_idx, s_personas[persona_idx].name, ble_hs_synced());
 
     /* Stop any running advertisement on our instance first */
     ble_gap_ext_adv_stop(HP_ADV_INSTANCE);
@@ -292,7 +295,8 @@ static void hp_ext_adv_start(int persona_idx)
     p.sid           = HP_ADV_INSTANCE;
 
     int rc = ble_gap_ext_adv_configure(HP_ADV_INSTANCE, &p, NULL, hp_gap_cb, NULL);
-    if (rc != 0) { ESP_LOGE(TAG, "ext_adv_configure: %d", rc); return; }
+    ESP_LOGI(TAG, "ext_adv_configure: rc=%d", rc);
+    if (rc != 0) { ESP_LOGE(TAG, "ext_adv_configure FAILED: %d", rc); return; }
 
     /* Build advertisement payload */
     struct ble_hs_adv_fields f;
@@ -311,18 +315,31 @@ static void hp_ext_adv_start(int persona_idx)
     if (!om) { ESP_LOGE(TAG, "ext_adv: no mbuf"); return; }
 
     rc = ble_hs_adv_set_fields_mbuf(&f, om);
+    ESP_LOGI(TAG, "adv_set_fields_mbuf: rc=%d mbuf_len=%d", rc, OS_MBUF_PKTLEN(om));
     if (rc != 0) {
-        ESP_LOGE(TAG, "adv_set_fields_mbuf: %d", rc);
+        ESP_LOGE(TAG, "adv_set_fields_mbuf FAILED: %d", rc);
         os_mbuf_free_chain(om);
         return;
     }
 
     rc = ble_gap_ext_adv_set_data(HP_ADV_INSTANCE, om);
-    if (rc != 0) { ESP_LOGE(TAG, "ext_adv_set_data: %d", rc); return; }
+    ESP_LOGI(TAG, "ext_adv_set_data: rc=%d", rc);
+    if (rc != 0) { ESP_LOGE(TAG, "ext_adv_set_data FAILED: %d", rc); return; }
 
     rc = ble_gap_ext_adv_start(HP_ADV_INSTANCE, 0, 0);
+    ESP_LOGI(TAG, "ext_adv_start: rc=%d", rc);
     if (rc == 0 || rc == BLE_HS_EALREADY) {
-        ESP_LOGI(TAG, "Advertising as '%s'", s_personas[persona_idx].name);
+        uint8_t own_mac[6];
+        uint8_t addr_type;
+        if (ble_hs_id_infer_auto(0, &addr_type) == 0 &&
+            ble_hs_id_copy_addr(addr_type, own_mac, NULL) == 0) {
+            ESP_LOGI(TAG, "Advertising as '%s'  MAC %02X:%02X:%02X:%02X:%02X:%02X",
+                     s_personas[persona_idx].name,
+                     own_mac[5], own_mac[4], own_mac[3],
+                     own_mac[2], own_mac[1], own_mac[0]);
+        } else {
+            ESP_LOGI(TAG, "Advertising as '%s'", s_personas[persona_idx].name);
+        }
     } else {
         ESP_LOGE(TAG, "ext_adv_start: %d", rc);
     }
