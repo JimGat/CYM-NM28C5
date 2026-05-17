@@ -270,28 +270,14 @@ void honeypair_start(int persona_idx)
     ble_svc_gap_device_name_set(s_personas[persona_idx].name);
     ble_svc_gap_device_appearance_set(s_personas[persona_idx].appearance);
 
-    /* Create log file on first start this session */
+    /* Fixed log path — all sessions append to the same file */
     if (!s_log_path[0]) {
-        const char *dir = "/sdcard/lab/ble/honeypair";
         if (s_sd_mutex && xSemaphoreTake(s_sd_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
             mkdir("/sdcard/lab", 0755);
             mkdir("/sdcard/lab/ble", 0755);
-            mkdir(dir, 0755);
             xSemaphoreGive(s_sd_mutex);
         }
-        /* Use GPS time or tick-count for unique filename */
-        const gps_data_t *gps = s_gps_fn ? s_gps_fn() : NULL;
-        char suffix[24];
-        if (gps && gps->time_utc[0]) {
-            /* "HH:MM:SS" → "HH-MM-SS" (colons invalid on FAT) */
-            snprintf(suffix, sizeof(suffix), "%s", gps->time_utc);
-            for (int i = 0; suffix[i]; i++)
-                if (suffix[i] == ':') suffix[i] = '-';
-        } else {
-            snprintf(suffix, sizeof(suffix), "%lu",
-                     (unsigned long)(xTaskGetTickCount() / configTICK_RATE_HZ));
-        }
-        snprintf(s_log_path, sizeof(s_log_path), "%s/honeypair_%s.jsonl", dir, suffix);
+        snprintf(s_log_path, sizeof(s_log_path), "/sdcard/lab/ble/honeypair.jsonl");
         hp_log("start", NULL, NULL);
     } else {
         hp_log("persona_change", NULL, NULL);
@@ -336,7 +322,6 @@ void honeypair_stop(void)
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
     }
     hp_log("stop", NULL, NULL);
-    s_log_path[0] = '\0'; /* New log file on next session */
 }
 
 bool honeypair_is_active(void) { return s_active; }
