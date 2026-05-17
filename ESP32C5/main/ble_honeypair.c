@@ -8,6 +8,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
+#include "esp_random.h"
 
 #include "nimble/nimble_port.h"
 #include "host/ble_hs.h"
@@ -50,6 +51,10 @@ static SemaphoreHandle_t s_sd_mutex   = NULL;
 static hp_gps_fn_t       s_gps_fn     = NULL;
 static volatile bool     s_active     = false;
 static volatile int      s_persona    = 0;
+/* Per-persona static random BLE addresses (generated once at init).
+ * Each persona gets a unique address so phones treat them as separate devices. */
+static uint8_t           s_persona_addr[HP_PERSONA_COUNT][6];
+static bool              s_addrs_generated = false;
 static volatile int      s_connects   = 0;
 static volatile int      s_pairs      = 0;
 static volatile int      s_reads      = 0;
@@ -261,6 +266,16 @@ static void hp_addr_str(const uint8_t *val, char *out18)
 
 static int hp_gap_cb(struct ble_gap_event *event, void *arg);
 
+static void hp_gen_persona_addrs(void)
+{
+    if (s_addrs_generated) return;
+    for (int i = 0; i < HP_PERSONA_COUNT; i++) {
+        esp_fill_random(s_persona_addr[i], 6);
+        s_persona_addr[i][5] |= 0xC0;  /* BLE static random: top 2 bits must be 1 */
+    }
+    s_addrs_generated = true;
+}
+
 // ── Extended advertising helper ───────────────────────────────────────────────
 // ble_gap_adv_start / ble_gap_adv_set_fields are compiled out when
 // CONFIG_BT_NIMBLE_EXT_ADV=y.  Use the extended API with legacy_pdu=1
@@ -289,7 +304,7 @@ static void hp_ext_adv_start(int persona_idx)
     p.connectable   = 1;
     p.scannable     = 1;
     p.legacy_pdu    = 1;
-    p.own_addr_type = BLE_OWN_ADDR_PUBLIC;
+    p.own_addr_type = BLE_OWN_ADDR_RANDOM;  /* use persona-specific random address */
     p.primary_phy   = BLE_HCI_LE_PHY_1M;
     p.secondary_phy = BLE_HCI_LE_PHY_1M;
     p.itvl_min      = BLE_GAP_ADV_ITVL_MS(200);
@@ -299,6 +314,16 @@ static void hp_ext_adv_start(int persona_idx)
     int rc = ble_gap_ext_adv_configure(HP_ADV_INSTANCE, &p, NULL, hp_gap_cb, NULL);
     ESP_LOGI(TAG, "ext_adv_configure: rc=%d", rc);
     if (rc != 0) { ESP_LOGE(TAG, "ext_adv_configure FAILED: %d", rc); return; }
+
+    /* Assign persona-specific static random address — each persona appears as a
+     * distinct Bluetooth device so phones won't auto-connect or show stale icons. */
+    ble_addr_t persona_rnd = { .type = BLE_ADDR_RANDOM };
+    memcpy(persona_rnd.val, s_persona_addr[persona_idx], 6);
+    rc = ble_gap_ext_adv_set_addr(HP_ADV_INSTANCE, &persona_rnd);
+    ESP_LOGI(TAG, "ext_adv_set_addr: rc=%d  %02X:%02X:%02X:%02X:%02X:%02X",
+             rc, persona_rnd.val[5], persona_rnd.val[4], persona_rnd.val[3],
+             persona_rnd.val[2], persona_rnd.val[1], persona_rnd.val[0]);
+    if (rc != 0) { ESP_LOGE(TAG, "ext_adv_set_addr FAILED: %d", rc); return; }
 
     /* Build advertisement payload */
     struct ble_hs_adv_fields f;
@@ -331,17 +356,10 @@ static void hp_ext_adv_start(int persona_idx)
     rc = ble_gap_ext_adv_start(HP_ADV_INSTANCE, 0, 0);
     ESP_LOGI(TAG, "ext_adv_start: rc=%d", rc);
     if (rc == 0 || rc == BLE_HS_EALREADY) {
-        uint8_t own_mac[6];
-        uint8_t addr_type;
-        if (ble_hs_id_infer_auto(0, &addr_type) == 0 &&
-            ble_hs_id_copy_addr(addr_type, own_mac, NULL) == 0) {
-            ESP_LOGI(TAG, "Advertising as '%s'  MAC %02X:%02X:%02X:%02X:%02X:%02X",
-                     s_personas[persona_idx].name,
-                     own_mac[5], own_mac[4], own_mac[3],
-                     own_mac[2], own_mac[1], own_mac[0]);
-        } else {
-            ESP_LOGI(TAG, "Advertising as '%s'", s_personas[persona_idx].name);
-        }
+        const uint8_t *a = s_persona_addr[persona_idx];
+        ESP_LOGI(TAG, "Advertising as '%s'  addr %02X:%02X:%02X:%02X:%02X:%02X (random)",
+                 s_personas[persona_idx].name,
+                 a[5], a[4], a[3], a[2], a[1], a[0]);
     } else {
         ESP_LOGE(TAG, "ext_adv_start: %d", rc);
     }
@@ -422,6 +440,7 @@ void honeypair_init(SemaphoreHandle_t sd_mutex, hp_gps_fn_t gps_fn)
 {
     s_sd_mutex = sd_mutex;
     s_gps_fn   = gps_fn;
+    hp_gen_persona_addrs();
 }
 
 void honeypair_start(int persona_idx)
