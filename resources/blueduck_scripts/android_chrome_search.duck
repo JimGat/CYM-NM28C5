@@ -1,0 +1,20 @@
+REM android_chrome_search.duck
+REM Opens Chrome via Android home search, then navigates to a Google search.
+REM Reliable on stock Android and Samsung One UI.
+REM Copy to: /sdcard/lab/ble/blueduck/scripts/
+
+HUMAN_MODE ON
+HUMAN_SPEED NORMAL
+
+HOME
+DELAY 1200
+
+REM Type app name to search launcher - most launchers open Chrome first result
+STRING chrome
+DELAY 800
+ENTER
+DELAY 2000
+
+REM Chrome address bar is focused on open - type search URL directly
+STRING google.com/search?q=am+i+being+hacked
+ENTER
