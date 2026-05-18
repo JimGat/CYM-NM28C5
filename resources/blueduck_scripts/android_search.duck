@@ -1,14 +1,18 @@
 REM android_search.duck
-REM Works on most Android launchers: HOME triggers home screen,
+REM Triggers Android home-screen search and types a query.
+REM Works on most Android launchers: GUI triggers home screen,
 REM typing immediately opens the global search overlay.
 REM Copy to: /sdcard/lab/ble/blueduck/scripts/
+REM
+REM NOTE: GUI (Meta/Windows key) = Android home on most devices.
+REM HOME (0x4A) is cursor-home — do NOT use it here.
 
 HUMAN_MODE ON
 HUMAN_SPEED NORMAL
 
-HOME
-DELAY 1200
+GUI
+DELAY 1500
 
 STRING who is watching you
-DELAY 400
+DELAY 500
 ENTER
