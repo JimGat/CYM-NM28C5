@@ -77,3 +77,13 @@ int          ir_hat_list_saved(char names[][IR_HAT_NAME_LEN], int max_count);
 // Calls progress_cb(index, total, ctx) after each code is sent (may be NULL).
 typedef void (*ir_hat_progress_cb_t)(int index, int total, void *ctx);
 void ir_hat_tvbgone(ir_hat_progress_cb_t progress_cb, void *ctx);
+
+// ── Jammer ───────────────────────────────────────────────────────────────────
+// Outputs continuous IR carrier via LEDC (hardware PWM — zero CPU overhead).
+// Blinds all IR receivers in range for the duration.
+// freq_hz: carrier frequency (0 = default 38000 Hz).
+// jam_start releases the RMT TX channel and takes the GPIO via LEDC.
+// jam_stop restores RMT TX by re-running ir_hat_init().
+ir_hat_err_t ir_hat_jam_start(uint32_t freq_hz);
+void         ir_hat_jam_stop(void);
+bool         ir_hat_is_jamming(void);

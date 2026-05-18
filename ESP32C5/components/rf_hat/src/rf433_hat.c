@@ -23,6 +23,7 @@ static const char *TAG = "rf433_hat";
 static volatile bool     s_capturing    = false;
 static volatile uint32_t s_pulse_count  = 0;
 static volatile int64_t  s_last_edge_us = 0;
+static bool              s_jamming      = false;
 
 // Double-buffer: ISR fills s_isr_buf; task copies to s_cap_signal when frame ends
 static uint32_t s_isr_buf[RF433_HAT_MAX_PULSES];
@@ -250,6 +251,27 @@ rf433_hat_err_t rf433_hat_load(rf433_signal_t *sig_out, const char *filename)
     fclose(f);
     return (sig_out->count > 0) ? RF433_HAT_OK : RF433_HAT_ERR_IO;
 }
+
+// ── Jammer ───────────────────────────────────────────────────────────────────
+
+void rf433_hat_jam_start(void)
+{
+    if (s_jamming) return;
+    rf433_hat_capture_cancel();
+    gpio_set_level(RF_HAT_RF433_TX_GPIO, 1);  // continuous carrier
+    s_jamming = true;
+    ESP_LOGI(TAG, "RF433 jam start");
+}
+
+void rf433_hat_jam_stop(void)
+{
+    if (!s_jamming) return;
+    gpio_set_level(RF_HAT_RF433_TX_GPIO, 0);
+    s_jamming = false;
+    ESP_LOGI(TAG, "RF433 jam stop");
+}
+
+bool rf433_hat_is_jamming(void) { return s_jamming; }
 
 int rf433_hat_list_saved(char names[][RF433_HAT_NAME_LEN], int max_count)
 {
