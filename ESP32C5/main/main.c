@@ -1703,8 +1703,11 @@ static void show_rfid_menu_screen(void);
 static void show_ir_capture_screen(void);
 static void show_ir_replay_screen(void);
 static void show_ir_tvbgone_screen(void);
+static void show_ir_jammer_screen(void);
+static void show_rf433_menu_screen(void);
 static void show_rf433_capture_screen(void);
 static void show_rf433_replay_screen(void);
+static void show_rf433_jammer_screen(void);
 static void show_vibrator_test_popup(void);
 static void run_touch_calibration(void);
 void vibrator_on(void);
@@ -32454,6 +32457,8 @@ static void ir_menu_tile_cb(lv_event_t *e)
         show_dip_switch_popup(4, "Infrared", show_ir_replay_screen);
     else if (strcmp(name, "TV-B-Gone") == 0)
         show_dip_switch_popup(4, "Infrared", show_ir_tvbgone_screen);
+    else if (strcmp(name, "Jammer") == 0)
+        show_dip_switch_popup(4, "Infrared", show_ir_jammer_screen);
 }
 
 static void show_ir_menu_screen(void)
@@ -32475,6 +32480,7 @@ static void show_ir_menu_screen(void)
     create_tile(tiles, LV_SYMBOL_AUDIO,        "Capture",   lv_color_hex(0xE65100), ir_menu_tile_cb, "Capture");
     create_tile(tiles, LV_SYMBOL_PLAY,         "Replay",    lv_color_hex(0xBF360C), ir_menu_tile_cb, "Replay");
     create_tile(tiles, LV_SYMBOL_POWER,        "TV-B-Gone", lv_color_hex(0x4A148C), ir_menu_tile_cb, "TV-B-Gone");
+    create_tile(tiles, LV_SYMBOL_WARNING,      "Jammer",    lv_color_hex(0xB71C1C), ir_menu_tile_cb, "Jammer");
 
     rfhat_add_back_btn("Home", show_main_tiles);
 }
@@ -32761,6 +32767,86 @@ static void show_ir_tvbgone_screen(void)
     rfhat_add_back_btn("Infrared", show_ir_menu_screen);
 }
 
+// ── IR Jammer ─────────────────────────────────────────────────────────────────
+// FOR AUTHORIZED SECURITY RESEARCH AND EDUCATION ONLY.
+
+static lv_obj_t *s_ir_jam_status = NULL;
+static lv_obj_t *s_ir_jam_btn    = NULL;
+
+static void ir_jam_toggle_cb(lv_event_t *e)
+{
+    (void)e;
+    if (ir_hat_is_jamming()) {
+        ir_hat_jam_stop();
+        if (s_ir_jam_status) lv_label_set_text(s_ir_jam_status, "Jammer OFF");
+        if (s_ir_jam_status) lv_obj_set_style_text_color(s_ir_jam_status, ui_text_color(), 0);
+        if (s_ir_jam_btn) {
+            lv_obj_set_style_bg_color(s_ir_jam_btn, lv_color_hex(0xB71C1C), LV_STATE_DEFAULT);
+            lv_obj_t *lbl = lv_obj_get_child(s_ir_jam_btn, 0);
+            if (lbl) lv_label_set_text(lbl, LV_SYMBOL_WARNING "  START JAM");
+        }
+    } else {
+        if (!ir_hat_is_init()) ir_hat_init();
+        ir_hat_jam_start(0);
+        if (s_ir_jam_status) lv_label_set_text(s_ir_jam_status, "JAMMING — 38kHz active");
+        if (s_ir_jam_status) lv_obj_set_style_text_color(s_ir_jam_status, lv_color_hex(0xFF5722), 0);
+        if (s_ir_jam_btn) {
+            lv_obj_set_style_bg_color(s_ir_jam_btn, lv_color_hex(0x388E3C), LV_STATE_DEFAULT);
+            lv_obj_t *lbl = lv_obj_get_child(s_ir_jam_btn, 0);
+            if (lbl) lv_label_set_text(lbl, LV_SYMBOL_STOP "  STOP JAM");
+        }
+    }
+}
+
+static void show_ir_jammer_screen(void)
+{
+    // Stop jammer if navigating away mid-jam
+    if (ir_hat_is_jamming()) ir_hat_jam_stop();
+
+    create_function_page_base("IR Jammer");
+    apply_menu_bg();
+    s_ir_jam_status = NULL;
+    s_ir_jam_btn    = NULL;
+
+    lv_obj_t *warn = lv_label_create(function_page);
+    lv_label_set_text(warn, LV_SYMBOL_WARNING " FOR AUTHORIZED USE ONLY");
+    lv_obj_set_style_text_font(warn, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(warn, lv_color_hex(0xFF5722), 0);
+    lv_obj_set_style_text_align(warn, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(warn, LV_ALIGN_TOP_MID, 0, 40);
+
+    lv_obj_t *desc = lv_label_create(function_page);
+    lv_label_set_text(desc, "Outputs continuous 38kHz IR carrier.\nBlinds all IR receivers in range.");
+    lv_obj_set_style_text_font(desc, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(desc, ui_text_color(), 0);
+    lv_obj_set_style_text_align(desc, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(desc, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(desc, LCD_H_RES - 20);
+    lv_obj_align(desc, LV_ALIGN_TOP_MID, 0, 72);
+
+    s_ir_jam_status = lv_label_create(function_page);
+    lv_label_set_text(s_ir_jam_status, "Jammer OFF");
+    lv_obj_set_style_text_font(s_ir_jam_status, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_ir_jam_status, ui_text_color(), 0);
+    lv_obj_set_style_text_align(s_ir_jam_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_ir_jam_status, LV_ALIGN_CENTER, 0, -20);
+
+    s_ir_jam_btn = lv_btn_create(function_page);
+    lv_obj_set_size(s_ir_jam_btn, 180, 46);
+    lv_obj_align(s_ir_jam_btn, LV_ALIGN_CENTER, 0, 28);
+    lv_obj_set_style_bg_color(s_ir_jam_btn, lv_color_hex(0xB71C1C), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(s_ir_jam_btn, 0, 0);
+    lv_obj_set_style_radius(s_ir_jam_btn, 8, 0);
+    lv_obj_t *jlbl = lv_label_create(s_ir_jam_btn);
+    lv_label_set_text(jlbl, LV_SYMBOL_WARNING "  START JAM");
+    lv_obj_set_style_text_font(jlbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(jlbl, lv_color_white(), 0);
+    lv_obj_center(jlbl);
+    lv_obj_add_event_cb(s_ir_jam_btn, ir_jam_toggle_cb, LV_EVENT_CLICKED, NULL);
+
+    rfhat_add_back_btn("Infrared", show_ir_menu_screen);
+}
+
 // ── RF433 Menu ────────────────────────────────────────────────────────────────
 
 static void rf433_menu_tile_cb(lv_event_t *e)
@@ -32771,6 +32857,31 @@ static void rf433_menu_tile_cb(lv_event_t *e)
         show_dip_switch_popup(5, "RF433 OOK", show_rf433_capture_screen);
     else if (strcmp(name, "Replay") == 0)
         show_dip_switch_popup(5, "RF433 OOK", show_rf433_replay_screen);
+    else if (strcmp(name, "Jammer") == 0)
+        show_dip_switch_popup(5, "RF433 OOK", show_rf433_jammer_screen);
+}
+
+static void show_rf433_menu_screen(void)
+{
+    create_function_page_base("RF433 OOK");
+    apply_menu_bg();
+
+    lv_obj_t *tiles = lv_obj_create(function_page);
+    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30 - 48);
+    lv_obj_align(tiles, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(tiles, 0, 0);
+    lv_obj_set_style_pad_all(tiles, 4, 0);
+    lv_obj_set_style_pad_gap(tiles, 4, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
+
+    create_tile(tiles, LV_SYMBOL_AUDIO,   "Capture", lv_color_hex(0x827717), rf433_menu_tile_cb, "Capture");
+    create_tile(tiles, LV_SYMBOL_PLAY,    "Replay",  lv_color_hex(0x5D4037), rf433_menu_tile_cb, "Replay");
+    create_tile(tiles, LV_SYMBOL_WARNING, "Jammer",  lv_color_hex(0xB71C1C), rf433_menu_tile_cb, "Jammer");
+
+    rfhat_add_back_btn("Radio", show_radio_menu_screen);
 }
 
 // ── Radio Menu ────────────────────────────────────────────────────────────────
@@ -32785,7 +32896,7 @@ static void radio_menu_tile_cb(lv_event_t *e)
     else if (strcmp(name, "nRF24") == 0)
         show_dip_switch_popup(2, "nRF24L01 2.4GHz", NULL);
     else if (strcmp(name, "RF433") == 0)
-        show_dip_switch_popup(5, "RF433 OOK", show_rf433_capture_screen);
+        show_rf433_menu_screen();
 }
 
 static void show_radio_menu_screen(void)
@@ -32871,6 +32982,85 @@ static void show_rfid_menu_screen(void)
     lv_obj_set_width(coming, LCD_H_RES - 44);
 
     rfhat_add_back_btn("Home", show_main_tiles);
+}
+
+// ── RF433 Jammer ──────────────────────────────────────────────────────────────
+// FOR AUTHORIZED SECURITY RESEARCH AND EDUCATION ONLY.
+
+static lv_obj_t *s_rf433_jam_status = NULL;
+static lv_obj_t *s_rf433_jam_btn    = NULL;
+
+static void rf433_jam_toggle_cb(lv_event_t *e)
+{
+    (void)e;
+    if (rf433_hat_is_jamming()) {
+        rf433_hat_jam_stop();
+        if (s_rf433_jam_status) lv_label_set_text(s_rf433_jam_status, "Jammer OFF");
+        if (s_rf433_jam_status) lv_obj_set_style_text_color(s_rf433_jam_status, ui_text_color(), 0);
+        if (s_rf433_jam_btn) {
+            lv_obj_set_style_bg_color(s_rf433_jam_btn, lv_color_hex(0xB71C1C), LV_STATE_DEFAULT);
+            lv_obj_t *lbl = lv_obj_get_child(s_rf433_jam_btn, 0);
+            if (lbl) lv_label_set_text(lbl, LV_SYMBOL_WARNING "  START JAM");
+        }
+    } else {
+        if (!rf433_hat_is_init()) rf433_hat_init();
+        rf433_hat_jam_start();
+        if (s_rf433_jam_status) lv_label_set_text(s_rf433_jam_status, "JAMMING — 433MHz active");
+        if (s_rf433_jam_status) lv_obj_set_style_text_color(s_rf433_jam_status, lv_color_hex(0xFF5722), 0);
+        if (s_rf433_jam_btn) {
+            lv_obj_set_style_bg_color(s_rf433_jam_btn, lv_color_hex(0x388E3C), LV_STATE_DEFAULT);
+            lv_obj_t *lbl = lv_obj_get_child(s_rf433_jam_btn, 0);
+            if (lbl) lv_label_set_text(lbl, LV_SYMBOL_STOP "  STOP JAM");
+        }
+    }
+}
+
+static void show_rf433_jammer_screen(void)
+{
+    if (rf433_hat_is_jamming()) rf433_hat_jam_stop();
+
+    create_function_page_base("RF433 Jammer");
+    apply_menu_bg();
+    s_rf433_jam_status = NULL;
+    s_rf433_jam_btn    = NULL;
+
+    lv_obj_t *warn = lv_label_create(function_page);
+    lv_label_set_text(warn, LV_SYMBOL_WARNING " FOR AUTHORIZED USE ONLY");
+    lv_obj_set_style_text_font(warn, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(warn, lv_color_hex(0xFF5722), 0);
+    lv_obj_set_style_text_align(warn, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(warn, LV_ALIGN_TOP_MID, 0, 40);
+
+    lv_obj_t *desc = lv_label_create(function_page);
+    lv_label_set_text(desc, "Holds 433MHz TX line HIGH.\nSaturates the 433MHz band in range.");
+    lv_obj_set_style_text_font(desc, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(desc, ui_text_color(), 0);
+    lv_obj_set_style_text_align(desc, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(desc, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(desc, LCD_H_RES - 20);
+    lv_obj_align(desc, LV_ALIGN_TOP_MID, 0, 72);
+
+    s_rf433_jam_status = lv_label_create(function_page);
+    lv_label_set_text(s_rf433_jam_status, "Jammer OFF");
+    lv_obj_set_style_text_font(s_rf433_jam_status, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_rf433_jam_status, ui_text_color(), 0);
+    lv_obj_set_style_text_align(s_rf433_jam_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_rf433_jam_status, LV_ALIGN_CENTER, 0, -20);
+
+    s_rf433_jam_btn = lv_btn_create(function_page);
+    lv_obj_set_size(s_rf433_jam_btn, 180, 46);
+    lv_obj_align(s_rf433_jam_btn, LV_ALIGN_CENTER, 0, 28);
+    lv_obj_set_style_bg_color(s_rf433_jam_btn, lv_color_hex(0xB71C1C), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(s_rf433_jam_btn, 0, 0);
+    lv_obj_set_style_radius(s_rf433_jam_btn, 8, 0);
+    lv_obj_t *jlbl = lv_label_create(s_rf433_jam_btn);
+    lv_label_set_text(jlbl, LV_SYMBOL_WARNING "  START JAM");
+    lv_obj_set_style_text_font(jlbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(jlbl, lv_color_white(), 0);
+    lv_obj_center(jlbl);
+    lv_obj_add_event_cb(s_rf433_jam_btn, rf433_jam_toggle_cb, LV_EVENT_CLICKED, NULL);
+
+    rfhat_add_back_btn("RF433", show_rf433_menu_screen);
 }
 
 // ── RF433 Capture ─────────────────────────────────────────────────────────────
@@ -32969,7 +33159,7 @@ static void show_rf433_capture_screen(void)
     lv_obj_center(save_lbl);
     lv_obj_add_event_cb(s_rf433_cap_save, rf433_cap_save_cb, LV_EVENT_CLICKED, NULL);
 
-    rfhat_add_back_btn("Radio", show_radio_menu_screen);
+    rfhat_add_back_btn("RF433", show_rf433_menu_screen);
 }
 
 // ── RF433 Replay ──────────────────────────────────────────────────────────────
@@ -33046,5 +33236,5 @@ static void show_rf433_replay_screen(void)
     lv_obj_center(tx_lbl);
     lv_obj_add_event_cb(tx_btn, rf433_do_replay_cb, LV_EVENT_CLICKED, NULL);
 
-    rfhat_add_back_btn("Radio", show_radio_menu_screen);
+    rfhat_add_back_btn("RF433", show_rf433_menu_screen);
 }

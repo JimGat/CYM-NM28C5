@@ -3,6 +3,7 @@
 #include "driver/rmt_tx.h"
 #include "driver/rmt_rx.h"
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -12,6 +13,9 @@
 #include <stdio.h>
 #include <dirent.h>
 #include <sys/stat.h>
+
+#define IR_JAM_LEDC_TIMER   LEDC_TIMER_3
+#define IR_JAM_LEDC_CHANNEL LEDC_CHANNEL_5
 
 static const char *TAG = "ir_hat";
 
@@ -33,6 +37,7 @@ static rmt_channel_handle_t s_rx_chan  = NULL;
 static rmt_encoder_handle_t s_tx_enc  = NULL;
 static QueueHandle_t        s_rx_queue = NULL;
 static bool                 s_init     = false;
+static bool                 s_jamming  = false;
 
 // Capture task state
 static TaskHandle_t   s_cap_task   = NULL;
@@ -337,3 +342,53 @@ void ir_hat_tvbgone(ir_hat_progress_cb_t progress_cb, void *ctx)
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
+
+// ── Jammer ───────────────────────────────────────────────────────────────────
+
+ir_hat_err_t ir_hat_jam_start(uint32_t freq_hz)
+{
+    if (s_jamming) return IR_HAT_OK;
+    if (!freq_hz) freq_hz = 38000;
+
+    // Release RMT TX so LEDC can drive the same GPIO
+    ir_hat_capture_cancel();
+    if (s_tx_chan) { rmt_disable(s_tx_chan); rmt_del_channel(s_tx_chan); s_tx_chan = NULL; }
+    if (s_tx_enc)  { rmt_del_encoder(s_tx_enc); s_tx_enc = NULL; }
+    s_init = false;  // force full re-init on jam_stop
+
+    ledc_timer_config_t t = {
+        .speed_mode      = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_8_BIT,
+        .timer_num       = IR_JAM_LEDC_TIMER,
+        .freq_hz         = freq_hz,
+        .clk_cfg         = LEDC_AUTO_CLK,
+    };
+    if (ledc_timer_config(&t) != ESP_OK) return IR_HAT_ERR_HW;
+
+    ledc_channel_config_t ch = {
+        .gpio_num   = RF_HAT_IR_TX_GPIO,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel    = IR_JAM_LEDC_CHANNEL,
+        .timer_sel  = IR_JAM_LEDC_TIMER,
+        .duty       = 85,   // ~33% of 255
+        .hpoint     = 0,
+        .intr_type  = LEDC_INTR_DISABLE,
+    };
+    if (ledc_channel_config(&ch) != ESP_OK) return IR_HAT_ERR_HW;
+
+    s_jamming = true;
+    ESP_LOGI(TAG, "IR jam start @ %lu Hz", (unsigned long)freq_hz);
+    return IR_HAT_OK;
+}
+
+void ir_hat_jam_stop(void)
+{
+    if (!s_jamming) return;
+    ledc_stop(LEDC_LOW_SPEED_MODE, IR_JAM_LEDC_CHANNEL, 0);
+    gpio_set_level(RF_HAT_IR_TX_GPIO, 0);
+    s_jamming = false;
+    ir_hat_init();  // restore RMT TX + RX
+    ESP_LOGI(TAG, "IR jam stop");
+}
+
+bool ir_hat_is_jamming(void) { return s_jamming; }

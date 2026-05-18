@@ -17,8 +17,9 @@
 #include <stdbool.h>
 
 // Maximum number of pulse timing entries per capture.
-// Flipper .sub lines hold up to 512 values; we store up to 1024.
-#define RF433_HAT_MAX_PULSES  1024
+// 512 covers all standard OOK signals (garage, car keys, weather stations, etc.)
+// and matches Flipper Zero's default .sub line limit.
+#define RF433_HAT_MAX_PULSES  512
 #define RF433_HAT_NAME_LEN    32
 #define RF433_HAT_SAVE_EXT    ".sub"
 
@@ -70,3 +71,10 @@ rf433_hat_err_t rf433_hat_replay(const rf433_signal_t *sig, uint8_t repeat);
 rf433_hat_err_t rf433_hat_save(const rf433_signal_t *sig, const char *filename);
 rf433_hat_err_t rf433_hat_load(rf433_signal_t *sig_out, const char *filename);
 int             rf433_hat_list_saved(char names[][RF433_HAT_NAME_LEN], int max_count);
+
+// ── Jammer ───────────────────────────────────────────────────────────────────
+// Holds RF_HAT_RF433_TX_GPIO HIGH — the OOK transmitter outputs a continuous
+// 433 MHz carrier that saturates the band in range.
+void rf433_hat_jam_start(void);
+void rf433_hat_jam_stop(void);
+bool rf433_hat_is_jamming(void);
