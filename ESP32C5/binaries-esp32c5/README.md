@@ -1,6 +1,27 @@
 # CYM-NM28C5 Pre-built Firmware Binaries
 
-**Firmware version: v1.6.15**
+**Firmware version: v1.6.16**
+
+---
+
+## Release Notes — v1.6.16
+
+### WhisperPair Scanner (CVE-2025-36911)
+
+**FOR AUTHORIZED SECURITY RESEARCH ONLY.** Adds detection and exploitation of the WhisperPair vulnerability in Google's Fast Pair protocol, disclosed January 2026 by COSIC/KU Leuven. Affected devices (Sony, JBL, Jabra, Bose, Marshall, Xiaomi, Nothing, OnePlus, Soundcore, Logitech, Google) accept Key-Based Pairing requests without verifying pairing mode, allowing unauthorized pairing within ~14m.
+
+**Detection (passive):** BLE scanner now flags devices advertising Fast Pair service UUID `0xFE2C` with a `[FP]` tag in the scan list. No connection required.
+
+**WhisperPair screen** (`BT Attacks → WhisperPair`, behind authorization disclaimer):
+- Shows all `[FP]` devices found in the most recent BLE scan
+- **Probe (safe):** Connects via GATT, writes a plaintext KBP block to characteristic `fe2c1234-8366-4814-8eb0-01de32100bea`. If the device sends a notification response → **VULNERABLE**; no response within 5 s → patched. No pairing is established.
+- **Exploit (AES):** Full CVE-2025-36911 attack — AES-128-ECB encrypted KBP packet (using ESP32-C5 ROM hardware AES, key = random Salt zero-padded to 128 bits) triggers unauthorized pairing bypass on vulnerable devices.
+
+**GATT Walker integration:** If a GATT walk discovers the `0xFE2C` service, the result screen flags it with `⚠ Fast Pair (CVE-2025-36911)`.
+
+**Janos portability:** `ble_whisperpair.c/h` is self-contained — no LVGL dependency. Swap `ets_aes_*` for `mbedtls_aes_crypt_ecb` and replace `heap_caps_malloc` with `malloc` for other platforms.
+
+Results logged to `/sdcard/lab/ble/whisperpair/` as JSON with MAC, mode, result, KBP packet hex, and notification response hex.
 
 ---
 

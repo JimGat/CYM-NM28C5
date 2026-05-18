@@ -157,6 +157,7 @@ LV_IMG_DECLARE(deedee_img);
 #include "gatt_walker.h"
 #include "ble_honeypair.h"
 #include "ble_blueduck.h"
+#include "ble_whisperpair.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
@@ -212,6 +213,7 @@ typedef struct {
     bool is_airtag;
     bool is_smarttag;
     bool is_possible_airtag;  /* Apple 0x05 Nearby Action — AirTag in owner-proximity/paused mode */
+    bool is_fast_pair;         /* Google Fast Pair — service UUID 0xFE2C; potentially CVE-2025-36911 vulnerable */
 } bt_device_info_t;
 
 static bt_device_info_t bt_devices[BT_MAX_DEVICES];
@@ -242,6 +244,12 @@ static lv_obj_t   *hp_stats_lbl  = NULL;
 static lv_obj_t   *hp_start_btn  = NULL;
 static lv_obj_t   *hp_dd         = NULL;
 static lv_timer_t *hp_ui_timer   = NULL;
+
+// WhisperPair UI state
+static lv_obj_t   *wp_status_lbl  = NULL;
+static lv_obj_t   *wp_result_lbl  = NULL;
+static lv_timer_t *wp_ui_timer    = NULL;
+static int         wp_selected_idx = -1;   /* bt_devices[] index of target */
 
 // BlueDuck UI state
 static lv_obj_t   *bd_status_lbl  = NULL;
@@ -2084,6 +2092,9 @@ static void wscope_task(void *p);
 
 // HoneyPair
 static void show_honeypair_screen(void);
+
+// WhisperPair
+static void show_whisperpair_screen(void);
 // BlueDuck
 static void show_blueduck_screen(void);
 
@@ -4735,6 +4746,7 @@ void app_main(void)
 
     honeypair_init(sd_spi_mutex, gps_best);
     blueduck_init(sd_spi_mutex, gps_best);
+    wp_init(sd_spi_mutex);
 
     flush_done_sem = xSemaphoreCreateBinary();
     if (flush_done_sem == NULL) {
@@ -24208,9 +24220,19 @@ static void gw_update_screen_ui(void)
             const gw_result_t *r = gw_get_result();
             char t[80];
             if (r) {
-                snprintf(t, sizeof(t), "%d svcs  %d chrs\nFP: 0x%08lX\n%s",
+                /* Check if Fast Pair service (0xFE2C) was discovered — flag CVE-2025-36911 */
+                bool has_fast_pair = false;
+                for (int si = 0; si < r->svc_count && !has_fast_pair; si++) {
+                    unsigned uuid_val = 0;
+                    if (strncmp(r->svcs[si].uuid_str, "0x", 2) == 0)
+                        sscanf(r->svcs[si].uuid_str + 2, "%x", &uuid_val);
+                    if (uuid_val == 0xFE2C) has_fast_pair = true;
+                }
+                snprintf(t, sizeof(t), "%d svcs  %d chrs\nFP: 0x%08lX%s\n%s",
                          r->svc_count, (int)gw_ui_chr_count,
-                         r->fingerprint, r->filepath + 8 /* skip /sdcard/ */);
+                         r->fingerprint,
+                         has_fast_pair ? "\n" LV_SYMBOL_WARNING " Fast Pair (CVE-2025-36911)" : "",
+                         r->filepath + 8 /* skip /sdcard/ */);
             } else {
                 snprintf(t, sizeof(t), "Done");
             }
@@ -26081,6 +26103,9 @@ static void show_bt_attacks_screen(void)
     lv_obj_t *bd_tile = create_tile(tiles, LV_SYMBOL_KEYBOARD,    "Blue\nDuck", lv_color_make(0, 120, 200), NULL, NULL);
     lv_obj_add_event_cb(bd_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BlueDuck");
 
+    lv_obj_t *wp_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Whisper\nPair", lv_color_make(140, 0, 180), NULL, NULL);
+    lv_obj_add_event_cb(wp_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"WhisperPair");
+
     /* Back button */
     lv_obj_t *back_btn = lv_btn_create(function_page);
     lv_obj_set_size(back_btn, 110, 28);
@@ -27330,6 +27355,15 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
 
+    // WhisperPair — CVE-2025-36911 Fast Pair KBP bypass (attack, requires authorization)
+    if (strcmp(attack_name, "WhisperPair") == 0) {
+        if (bt_lookout_is_active())
+            show_bt_conflict_warning("WhisperPair", show_whisperpair_screen);
+        else
+            show_attack_warning(show_whisperpair_screen);
+        return;
+    }
+
     // BT Lookout screen
     if (strcmp(attack_name, "Dee Dee Detector") == 0) {
         show_bt_lookout_screen();
@@ -28405,6 +28439,7 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
         dev->is_airtag          = false;
         dev->is_smarttag        = false;
         dev->is_possible_airtag = false;
+        dev->is_fast_pair       = false;
 
         bool has_name = (fields.name != NULL && fields.name_len > 0);
         if (has_name) {
@@ -28426,6 +28461,11 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
                 dev->is_possible_airtag = true;
                 bt_possible_airtag_count++;
             }
+        }
+
+        /* Fast Pair detection: service data UUID 0xFE2C in advertisement */
+        if (wp_is_fast_pair_adv(&fields)) {
+            dev->is_fast_pair = true;
         }
 
         bt_device_count++;
@@ -28659,6 +28699,7 @@ static void ble_scan_update_list(void)
         const char *type_str = dev->is_airtag          ? " AT"
                              : dev->is_smarttag         ? " ST"
                              : dev->is_possible_airtag  ? " ?AT"
+                             : dev->is_fast_pair        ? " FP"
                              : "";
 
         char item_text[88];
@@ -31893,4 +31934,219 @@ static void show_blueduck_screen(void)
 
     bd_ui_refresh(NULL);
     bd_ui_timer = lv_timer_create(bd_ui_refresh, 1000, NULL);
+}
+
+// ── WhisperPair screen ────────────────────────────────────────────────────────
+// CVE-2025-36911 — Google Fast Pair key-based pairing bypass scanner/exploit.
+// FOR AUTHORIZED SECURITY RESEARCH ONLY.
+
+static void wp_back_cb(lv_event_t *e)
+{
+    (void)e;
+    if (wp_ui_timer) { lv_timer_del(wp_ui_timer); wp_ui_timer = NULL; }
+    if (wp_is_active()) wp_cancel();
+    show_bt_attacks_screen();
+}
+
+static void wp_result_cb(wp_result_t result, const char *detail,
+                          const uint8_t mac[6], wp_mode_t mode)
+{
+    (void)mac; (void)mode;
+    /* Called from wp task — update volatile status label on next UI tick */
+    /* wp_ui_refresh polls wp_status() and wp_is_active(), so no direct LVGL here */
+    (void)result; (void)detail;
+}
+
+static void wp_ui_refresh(lv_timer_t *t)
+{
+    (void)t;
+    if (wp_status_lbl && lv_obj_is_valid(wp_status_lbl))
+        lv_label_set_text(wp_status_lbl, wp_status());
+
+    if (!wp_is_active() && wp_result_lbl && lv_obj_is_valid(wp_result_lbl)) {
+        /* Status string already contains the result phrase from wp module */
+        const char *s = wp_status();
+        lv_color_t col = lv_color_make(160, 160, 160);
+        if (strstr(s, "VULNERABLE"))
+            col = lv_color_make(255, 80, 80);
+        else if (strstr(s, "PATCHED") || strstr(s, "patched"))
+            col = lv_color_make(80, 200, 80);
+        lv_obj_set_style_text_color(wp_result_lbl, col, 0);
+        lv_label_set_text(wp_result_lbl, s);
+    }
+}
+
+static void wp_probe_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    if (wp_selected_idx < 0 || wp_selected_idx >= bt_device_count) return;
+    if (wp_is_active()) return;
+    bt_device_info_t *d = &bt_devices[wp_selected_idx];
+    if (!ensure_ble_mode()) return;
+    if (wp_result_lbl && lv_obj_is_valid(wp_result_lbl))
+        lv_label_set_text(wp_result_lbl, "Running...");
+    wp_start(d->addr, d->addr_type, d->name, d->rssi,
+              WP_MODE_PROBE, wp_result_cb);
+}
+
+static void wp_exploit_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    if (wp_selected_idx < 0 || wp_selected_idx >= bt_device_count) return;
+    if (wp_is_active()) return;
+    bt_device_info_t *d = &bt_devices[wp_selected_idx];
+    if (!ensure_ble_mode()) return;
+    if (wp_result_lbl && lv_obj_is_valid(wp_result_lbl))
+        lv_label_set_text(wp_result_lbl, "Running...");
+    wp_start(d->addr, d->addr_type, d->name, d->rssi,
+              WP_MODE_EXPLOIT, wp_result_cb);
+}
+
+/* Device list row tap — select target */
+static void wp_row_tap_cb(lv_event_t *e)
+{
+    lv_obj_t *row = lv_event_get_target(e);
+    wp_selected_idx = (int)(uintptr_t)lv_obj_get_user_data(row);
+}
+
+static void show_whisperpair_screen(void)
+{
+    create_function_page_base("WhisperPair");
+    wp_selected_idx = -1;
+
+    /* ── Disclaimer banner ─────────────────────────────────────────── */
+    lv_obj_t *disc = lv_label_create(function_page);
+    lv_label_set_text(disc,
+        LV_SYMBOL_WARNING " CVE-2025-36911 | Authorized research only");
+    lv_obj_set_style_text_font(disc, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(disc, lv_color_make(255, 120, 30), 0);
+    lv_obj_set_style_text_align(disc, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(disc, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(disc, lv_pct(96));
+    lv_obj_align(disc, LV_ALIGN_TOP_MID, 0, 32);
+
+    /* ── Fast Pair device list (pre-populated from BLE scan) ────────── */
+    lv_obj_t *list_lbl = lv_label_create(function_page);
+    lv_label_set_text(list_lbl, "Fast Pair targets (from scan):");
+    lv_obj_set_style_text_font(list_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(list_lbl, ui_text_color(), 0);
+    lv_obj_align(list_lbl, LV_ALIGN_TOP_LEFT, 8, 52);
+
+    lv_obj_t *fp_list = lv_obj_create(function_page);
+    lv_obj_set_size(fp_list, lv_pct(98), 90);
+    lv_obj_align(fp_list, LV_ALIGN_TOP_MID, 0, 68);
+    lv_obj_set_style_bg_color(fp_list, ui_card_color(), 0);
+    lv_obj_set_style_border_color(fp_list, ui_border_color(), 0);
+    lv_obj_set_style_border_width(fp_list, 1, 0);
+    lv_obj_set_style_radius(fp_list, 6, 0);
+    lv_obj_set_style_pad_all(fp_list, 4, 0);
+    lv_obj_set_flex_flow(fp_list, LV_FLEX_FLOW_COLUMN);
+
+    int fp_count = 0;
+    for (int i = 0; i < bt_device_count; i++) {
+        bt_device_info_t *dev = &bt_devices[i];
+        if (!dev->is_fast_pair) continue;
+        fp_count++;
+        char row_buf[72];
+        char addr[18]; bt_format_addr(dev->addr, addr);
+        snprintf(row_buf, sizeof(row_buf), "%d %.12s %s [FP]",
+                 dev->rssi,
+                 dev->name[0] ? dev->name : "?",
+                 addr);
+        lv_obj_t *row = lv_label_create(fp_list);
+        lv_label_set_text(row, row_buf);
+        lv_obj_set_style_text_font(row, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(row, lv_color_make(200, 180, 255), 0);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_label_set_long_mode(row, LV_LABEL_LONG_SCROLL_CIRCULAR);
+        lv_obj_set_user_data(row, (void *)(uintptr_t)i);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, wp_row_tap_cb, LV_EVENT_CLICKED, NULL);
+        if (wp_selected_idx < 0) wp_selected_idx = i; /* auto-select first */
+    }
+    if (fp_count == 0) {
+        lv_obj_t *none = lv_label_create(fp_list);
+        lv_label_set_text(none, "No Fast Pair devices in scan. Run BLE scan first.");
+        lv_obj_set_style_text_font(none, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(none, lv_color_make(160, 160, 160), 0);
+    }
+
+    /* ── Status / result label ──────────────────────────────────────── */
+    wp_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(wp_status_lbl, wp_status());
+    lv_obj_set_style_text_font(wp_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wp_status_lbl, lv_color_make(176, 176, 176), 0);
+    lv_obj_set_style_text_align(wp_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(wp_status_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(wp_status_lbl, lv_pct(96));
+    lv_obj_align(wp_status_lbl, LV_ALIGN_TOP_MID, 0, 164);
+
+    wp_result_lbl = lv_label_create(function_page);
+    lv_label_set_text(wp_result_lbl, "");
+    lv_obj_set_style_text_font(wp_result_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(wp_result_lbl, lv_color_make(160, 160, 160), 0);
+    lv_obj_set_style_text_align(wp_result_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(wp_result_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(wp_result_lbl, lv_pct(96));
+    lv_obj_align(wp_result_lbl, LV_ALIGN_TOP_MID, 0, 182);
+
+    /* ── Action buttons ─────────────────────────────────────────────── */
+    lv_obj_t *probe_btn = lv_btn_create(function_page);
+    lv_obj_set_size(probe_btn, 110, 32);
+    lv_obj_align(probe_btn, LV_ALIGN_TOP_LEFT, 6, 204);
+    lv_obj_set_style_bg_color(probe_btn, lv_color_make(0, 100, 180), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(probe_btn, lv_color_make(0, 130, 220), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(probe_btn, 0, 0);
+    lv_obj_set_style_radius(probe_btn, 8, 0);
+    lv_obj_t *probe_lbl = lv_label_create(probe_btn);
+    lv_label_set_text(probe_lbl, "Probe (safe)");
+    lv_obj_set_style_text_font(probe_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(probe_lbl, lv_color_white(), 0);
+    lv_obj_center(probe_lbl);
+    lv_obj_add_event_cb(probe_btn, wp_probe_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *exploit_btn = lv_btn_create(function_page);
+    lv_obj_set_size(exploit_btn, 110, 32);
+    lv_obj_align(exploit_btn, LV_ALIGN_TOP_RIGHT, -6, 204);
+    lv_obj_set_style_bg_color(exploit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(exploit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(exploit_btn, 0, 0);
+    lv_obj_set_style_radius(exploit_btn, 8, 0);
+    lv_obj_t *exploit_lbl = lv_label_create(exploit_btn);
+    lv_label_set_text(exploit_lbl, "Exploit (AES)");
+    lv_obj_set_style_text_font(exploit_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(exploit_lbl, lv_color_white(), 0);
+    lv_obj_center(exploit_lbl);
+    lv_obj_add_event_cb(exploit_btn, wp_exploit_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *log_note = lv_label_create(function_page);
+    lv_label_set_text(log_note, "Logs: /sdcard/lab/ble/whisperpair/");
+    lv_obj_set_style_text_font(log_note, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(log_note, lv_color_make(100, 100, 100), 0);
+    lv_obj_set_style_text_align(log_note, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(log_note, lv_pct(96));
+    lv_obj_align(log_note, LV_ALIGN_TOP_MID, 0, 244);
+
+    /* ── Back button ─────────────────────────────────────────────────── */
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 28);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_t *bi = lv_label_create(back_btn);
+    lv_label_set_text(bi, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(bi, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bi, lv_color_white(), 0);
+    lv_obj_t *bl = lv_label_create(back_btn);
+    lv_label_set_text(bl, "BT Attacks");
+    lv_obj_set_style_text_font(bl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bl, lv_color_white(), 0);
+    lv_obj_add_event_cb(back_btn, wp_back_cb, LV_EVENT_CLICKED, NULL);
+
+    wp_ui_timer = lv_timer_create(wp_ui_refresh, 500, NULL);
 }
