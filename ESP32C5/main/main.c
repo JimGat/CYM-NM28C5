@@ -12681,9 +12681,16 @@ static void sta_connect_event_handler(void *arg, esp_event_base_t event_base,
         sta_connect_success = true;
     } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
         sta_connect_attempt_count++;
-        if (sta_connect_attempt_count >= 3) {
+        if (sta_connect_attempt_count >= 8) {
             sta_connect_failed = true;
         } else {
+            /* Re-apply the STA config before retrying — this clears the
+               driver's internal failed-AP blacklist that gets set after an
+               assoc comeback (0x2c0) rejection, allowing the next probe to
+               find the AP again without waiting for the blacklist to expire. */
+            wifi_config_t retry_cfg = {0};
+            if (esp_wifi_get_config(WIFI_IF_STA, &retry_cfg) == ESP_OK)
+                esp_wifi_set_config(WIFI_IF_STA, &retry_cfg);
             esp_wifi_connect();
         }
     }
