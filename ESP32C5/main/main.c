@@ -15814,6 +15814,15 @@ static void s_fileserv_send_dir(httpd_req_t *req, const char *sd_path, const cha
             "else r.text().then(function(t){alert('Delete failed: '+t);});"
           "});"
         "}"
+        "function deldir(p){"
+          "if(!confirm('Delete directory \"'+p+'\" and ALL its contents?'))return;"
+          "if(!confirm('CONFIRM AGAIN: permanently erase \"'+p+'\"?\\nThis cannot be undone.'))return;"
+          "fetch('/delete?path='+encodeURIComponent(p),{method:'POST'})"
+          ".then(function(r){"
+            "if(r.ok)location.reload();"
+            "else r.text().then(function(t){alert('Delete failed: '+t);});"
+          "});"
+        "}"
         "</script></head>"
         "<body style='font-family:monospace;background:#111;color:#0f0;padding:8px'>";
     httpd_resp_send_chunk(req, s_head, strlen(s_head));
@@ -15884,8 +15893,13 @@ static void s_fileserv_send_dir(httpd_req_t *req, const char *sd_path, const cha
         if (S_ISDIR(st.st_mode)) {
             n = snprintf(chunk, sizeof(chunk),
                 "<p><a href='/files%s%s%.100s' style='color:#ff0'>"
-                "[DIR] %.100s</a> <span style='color:#555'>%s</span></p>",
-                url_path, sep, e->d_name, e->d_name, tmbuf);
+                "[DIR] %.100s</a> <span style='color:#555'>%s</span>"
+                " <button onclick='deldir(this.dataset.p)' data-p='%s%s%.100s'"
+                " title='Delete directory' style='background:#530;color:#fa4;"
+                "border:1px solid #750;padding:1px 5px;cursor:pointer;"
+                "margin-left:6px;font-size:11px'>&#x2715;</button></p>",
+                url_path, sep, e->d_name, e->d_name, tmbuf,
+                url_path, sep, e->d_name);
         } else {
             char szbuf[16];
             s_human_size((long)st.st_size, szbuf, sizeof(szbuf));
@@ -16057,24 +16071,55 @@ static esp_err_t fileserv_mkdir_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* POST /delete?path=/url/path/to/file */
+static int fileserv_rmdir_recursive(const char *path)
+{
+    DIR *d = opendir(path);
+    if (!d) return -1;
+    struct dirent *e;
+    char child[300];
+    int ret = 0;
+    while (ret == 0 && (e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        snprintf(child, sizeof(child), "%s/%.196s", path, e->d_name);
+        struct stat st;
+        memset(&st, 0, sizeof(st));
+        if (stat(child, &st) != 0) { ret = -1; break; }
+        if (S_ISDIR(st.st_mode))
+            ret = fileserv_rmdir_recursive(child);
+        else
+            ret = remove(child);
+    }
+    closedir(d);
+    if (ret == 0) ret = rmdir(path);
+    return ret;
+}
+
+/* POST /delete?path=/url/path  — works for both files and directories */
 static esp_err_t fileserv_delete_handler(httpd_req_t *req)
 {
     fileserv_log_client(req, "POST(delete)");
     char query[512] = "";
     httpd_req_get_url_query_str(req, query, sizeof(query));
+    char path_enc[256] = "";
+    if (httpd_query_key_value(query, "path", path_enc, sizeof(path_enc)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path"); return ESP_OK;
+    }
     char path_param[256] = "";
-    if (httpd_query_key_value(query, "path", path_param, sizeof(path_param)) != ESP_OK
-        || path_param[0] != '/' || strstr(path_param, "..")) {
+    fileserv_url_decode(path_param, sizeof(path_param), path_enc);
+    if (path_param[0] != '/' || strstr(path_param, "..")) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path"); return ESP_OK;
     }
 
     char sd_path[280];
     snprintf(sd_path, sizeof(sd_path), "/sdcard%.240s", path_param);
 
+    struct stat st;
+    memset(&st, 0, sizeof(st));
+    int is_dir = (stat(sd_path, &st) == 0 && S_ISDIR(st.st_mode));
+
     int ret = -1;
     if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
-        ret = remove(sd_path);
+        ret = is_dir ? fileserv_rmdir_recursive(sd_path) : remove(sd_path);
         xSemaphoreGive(sd_spi_mutex);
     }
     if (ret != 0) {
