@@ -12214,8 +12214,8 @@ static void radio_reset_to_idle(void)
 
     // ---- 4. WiFi reset ----
     if (!wifi_initialized || current_radio_mode == RADIO_MODE_NONE) {
-        // WiFi driver was fully deinited (BLE switch or exit callback already ran);
-        // reinitialize from scratch.
+        // Radio is idle — either never started or BLE was active.
+        // ensure_wifi_mode() will restart (not reinit) if driver was retained.
         ensure_wifi_mode();
     } else {
         // WiFi driver is alive — just cycle stop/start to clear AP, promisc, etc.
@@ -28077,14 +28077,35 @@ static bool ensure_wifi_mode(void)
             return true;
             
         case RADIO_MODE_NONE:
-            // Initialize WiFi
+            if (wifi_initialized) {
+                // WiFi driver is still initialized (BLE switch only stopped it).
+                // Restart without reallocating DMA buffers to avoid heap fragmentation crash.
+                ESP_LOGI(TAG, "Restarting WiFi (driver retained across BLE switch)...");
+                esp_wifi_set_mode(WIFI_MODE_STA);
+                wifi_config_t restart_cfg = {0};
+                esp_wifi_set_config(WIFI_IF_STA, &restart_cfg);
+                esp_err_t start_err = esp_wifi_start();
+                if (start_err != ESP_OK) {
+                    ESP_LOGE(TAG, "esp_wifi_start failed: 0x%x — restarting", start_err);
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    esp_restart();
+                    return false;
+                }
+                esp_wifi_set_country_code("01", false);
+                vTaskDelay(pdMS_TO_TICKS(400));
+                apply_wifi_power_settings();
+                current_radio_mode = RADIO_MODE_WIFI;
+                ESP_LOGI(TAG, "WiFi restarted OK");
+                return true;
+            }
+            // First boot: full initialization including esp_wifi_init().
             ESP_LOGI(TAG, "Initializing WiFi...");
             esp_err_t ret = wifi_cli_init();
             if (ret != ESP_OK) {
                 ESP_LOGE(TAG, "WiFi init failed: %d", ret);
                 return false;
             }
-            
+
             // Set WiFi country for extended channels
             wifi_country_t wifi_country = {
                 .cc = "PH",
@@ -28135,13 +28156,13 @@ static bool ensure_ble_mode(void)
             return true;
             
         case RADIO_MODE_WIFI: {
-            // Deinitialize WiFi and switch to BLE
-            ESP_LOGI(TAG, "Switching from WiFi to BLE mode...");
+            // Stop WiFi but keep driver initialized to avoid DMA reallocation on return.
+            // esp_wifi_deinit() is intentionally NOT called: freeing then reallocating
+            // the 10×1700B DMA buffers after BLE teardown fails on a fragmented heap.
+            // esp_wifi_start() can restart a stopped-but-initialized driver without
+            // touching DMA allocations.
+            ESP_LOGI(TAG, "Switching from WiFi to BLE mode (WiFi driver retained)...");
             esp_wifi_stop();
-            esp_wifi_deinit();
-            // STA netif is kept for reuse on WiFi re-init
-            // AP netif is created/destroyed dynamically when needed
-            wifi_initialized = false;
             current_radio_mode = RADIO_MODE_NONE;
             // Now initialize BLE (recursive call with RADIO_MODE_NONE)
             return ensure_ble_mode();
@@ -28585,10 +28606,10 @@ static void bt_nimble_deinit(void)
     // Deinitialize NimBLE port (also deinits BLE controller)
     nimble_port_deinit();
 
-    /* BLE controller releases DMA-capable memory asynchronously after deinit.
-     * Without this delay esp_wifi_init() fails with 0x101 (no mem) because the
-     * controller hasn't returned its ~30 KB of DMA buffers yet. */
-    vTaskDelay(pdMS_TO_TICKS(600));
+    /* Let the BLE controller finish radio handover before WiFi restarts.
+     * 200 ms is enough for PHY cleanup; memory fragmentation is no longer
+     * an issue because WiFi DMA buffers are never freed on the BLE switch. */
+    vTaskDelay(pdMS_TO_TICKS(200));
 
     nimble_initialized = false;
     ESP_LOGI(TAG, "NimBLE stopped");

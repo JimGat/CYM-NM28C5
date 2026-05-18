@@ -1,6 +1,20 @@
 # CYM-NM28C5 Pre-built Firmware Binaries
 
-**Firmware version: v1.6.14**
+**Firmware version: v1.6.15**
+
+---
+
+## Release Notes — v1.6.15
+
+### BlueDuck — Home Button Crash Fix (Heap Fragmentation)
+
+**Root cause:** Pressing Home from the BlueDuck screen crashed with `esp_wifi_init failed (0x101)` and forced a device restart. The 600 ms BLE settle delay introduced in v1.6.12 was insufficient — the crash was still occurring 1.8 seconds after NimBLE stopped. The problem was heap fragmentation, not timing.
+
+After BLE teardown, the internal SRAM heap is fragmented: total free bytes may be adequate but the WiFi driver needs 10 × 1700-byte contiguous DMA-capable blocks from internal SRAM, and fragmentation prevents those allocations from succeeding (only 7 of 10 rx buffers could be allocated).
+
+**Fix:** When switching WiFi → BLE, `esp_wifi_deinit()` is no longer called. Only `esp_wifi_stop()` runs, leaving the WiFi driver initialized (with DMA buffers still allocated) but stopped. When returning from BLE, `esp_wifi_start()` restarts the already-initialized driver without any DMA reallocation. Heap fragmentation becomes irrelevant to the WiFi restart path.
+
+The BLE settle delay is reduced from 600 ms → 200 ms (radio handover only; memory is no longer the constraint).
 
 ---
 
