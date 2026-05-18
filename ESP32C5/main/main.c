@@ -15778,7 +15778,11 @@ static const char *s_human_size(long bytes, char *buf, size_t bufsz)
  * Includes upload bar, new-folder form, and per-file delete buttons. */
 static void s_fileserv_send_dir(httpd_req_t *req, const char *sd_path, const char *url_path)
 {
+    ESP_LOGI("fileserv", "opendir '%s'", sd_path);
+    if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000));
     DIR *d = opendir(sd_path);
+    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+    ESP_LOGI("fileserv", "opendir '%s' -> %s", sd_path, d ? "OK" : "FAIL");
     if (!d) { httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Directory not found"); return; }
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
@@ -16047,12 +16051,22 @@ static esp_err_t fileserv_root_handler(httpd_req_t *req)
     size_t pl = strlen(sd_path);
     if (pl > 1 && sd_path[pl-1] == '/') sd_path[pl-1] = '\0';
 
+    ESP_LOGI("fileserv", "req: %s -> sd:%s", uri, sd_path);
+
     struct stat st;
     memset(&st, 0, sizeof(st));
-    if (stat(sd_path, &st) != 0) {
+    if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000));
+    int stat_rc = stat(sd_path, &st);
+    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+
+    ESP_LOGI("fileserv", "stat('%s') = %d mode=0%o", sd_path, stat_rc, (unsigned)st.st_mode);
+
+    if (stat_rc != 0) {
         if (strcmp(url_path, "/") == 0) {
             strcpy(sd_path, "/sdcard");
+            if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000));
             stat(sd_path, &st);
+            if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
         } else {
             httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Not found");
             return ESP_OK;
