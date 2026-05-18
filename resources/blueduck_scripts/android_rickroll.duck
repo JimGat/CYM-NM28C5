@@ -1,0 +1,19 @@
+REM android_rickroll.duck
+REM Opens the browser and navigates to Rick Astley - Never Gonna Give You Up.
+REM Uses Win+B to open the default browser, Ctrl+L to focus the address bar.
+REM Copy to: /sdcard/lab/ble/blueduck/scripts/
+
+HUMAN_MODE ON
+HUMAN_SPEED NORMAL
+
+REM Open default browser (Win+B)
+GUI b
+DELAY 2500
+
+REM Focus address bar
+CTRL l
+DELAY 500
+
+REM Never gonna give you up
+STRING youtube.com/watch?v=dQw4w9WgXcQ
+ENTER
