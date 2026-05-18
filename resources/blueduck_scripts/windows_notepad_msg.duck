@@ -1,0 +1,25 @@
+REM windows_notepad_msg.duck
+REM Opens Notepad via the Run dialog and types an awareness message.
+REM Classic HID demonstration — shows a keyboard can open apps and type without being seen.
+REM Works on Windows 10 and 11.
+REM Copy to: /sdcard/lab/ble/blueduck/scripts/
+
+HUMAN_MODE ON
+HUMAN_SPEED NORMAL
+
+REM Open Run dialog and launch Notepad
+GUI r
+DELAY 600
+STRING notepad
+ENTER
+DELAY 1200
+
+REM Type the message — Notepad is ready immediately after opening
+STRING This keyboard is not what it seems.
+ENTER
+STRING It connected to your device over Bluetooth without your knowledge.
+ENTER
+STRING A real attacker could have installed malware, stolen credentials, or locked you out.
+ENTER
+ENTER
+STRING Stay aware. Lock your screen when you step away.

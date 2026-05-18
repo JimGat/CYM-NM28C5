@@ -2,16 +2,32 @@
 
 Copy `.duck` files to `/sdcard/lab/ble/blueduck/scripts/` on the device SD card.
 
+---
+
 ## Scripts
 
-| File | Target | What it does |
-|------|--------|--------------|
-| `android_search.duck` | Android | Win+H → home, ENTER on Google search widget |
-| `android_chrome_search.duck` | Android | Win+B → browser, Ctrl+L → address bar, Google search |
-| `android_settings_search.duck` | Android | Win+H → home, type "settings" to open, search bluetooth |
-| `android_browser_url.duck` | Android | Win+B → browser, Ctrl+L → address bar, navigate URL |
-| `android_notifications.duck` | Android | Win+N → open notification shade |
-| `android_rickroll.duck` | Android | Win+B → browser → Rick Astley — Never Gonna Give You Up |
+### Android
+
+| File | What it does |
+|------|--------------|
+| `android_search.duck` | Win+H → home, ENTER on Google search widget |
+| `android_chrome_search.duck` | Win+B → browser, Ctrl+L → address bar, Google search |
+| `android_settings_search.duck` | Win+H → home, type "settings" → search bluetooth |
+| `android_browser_url.duck` | Win+B → browser, Ctrl+L → navigate URL |
+| `android_notifications.duck` | Win+N → open notification shade |
+| `android_rickroll.duck` | Win+B → browser → Rick Astley |
+
+### Windows
+
+| File | What it does |
+|------|--------------|
+| `windows_rickroll.duck` | Win+R → Run dialog → browser → Rick Astley |
+| `windows_lock.duck` | Win+L → lock workstation immediately |
+| `windows_notepad_msg.duck` | Win+R → Notepad → type awareness message |
+| `windows_screenshot.duck` | Win+Shift+S → Snip & Sketch screen capture overlay |
+| `windows_sysinfo.duck` | Win+Pause → System Information panel |
+| `windows_task_manager.duck` | Ctrl+Shift+Esc → Task Manager (no UAC screen) |
+| `windows_open_browser.duck` | Win+R → Run dialog → default browser at target URL |
 
 ---
 
@@ -19,76 +35,72 @@ Copy `.duck` files to `/sdcard/lab/ble/blueduck/scripts/` on the device SD card.
 
 ### Meta / Win / Search Key (⊞)
 
-Modifier key is called **Search** on ChromeOS keyboards, **Windows/Win** on PC keyboards,
+The modifier key is called **Search** on ChromeOS, **Windows/Win** on PC keyboards,
 **Command** on Mac keyboards. All map to the same HID modifier bit (Left GUI, 0x08).
 
 #### System Navigation
 
-| Shortcut | Action | Notes |
-|----------|--------|-------|
-| Win+H | Home screen | Confirmed Samsung One UI |
-| Win+Return | Home screen | Alternate |
+| Shortcut | Action | Confirmed |
+|----------|--------|-----------|
+| Win+H | Home screen | Samsung One UI ✓ |
+| Win+Return | Home screen (alternate) | |
 | Win+Tab | Recent apps / App switcher | |
 | Win+~ | Back button | |
-| Win+N | Notification shade | Confirmed Samsung One UI |
+| Win+N | Notification shade | Samsung One UI ✓ |
 | Win+I | System Settings | |
 | Win+L | Lock screen | |
-| Win+T | Toggle taskbar | Tablets / DeX |
-| Win+/ | Show keyboard shortcut menu | Android 14+ |
+| Win+T | Toggle taskbar (tablets) | |
+| Win+/ | Show keyboard shortcut menu (Android 14+) | |
 | Win+A | Google Assistant | |
 | Win+Space | Switch input method | |
-| Win+Ctrl+← | Split screen left | Tablets |
-| Win+Ctrl+→ | Split screen right | Tablets |
+| Win+Ctrl+← | Split screen left (tablets) | |
+| Win+Ctrl+→ | Split screen right (tablets) | |
 | Win+Ctrl+S | Screenshot | |
 | Win+Ctrl+N | Quick memo | |
 
 #### App Launchers (Win + letter)
 
-These launch or switch to specific apps. Behavior is manufacturer- and version-dependent —
-Samsung One UI results confirmed below; other launchers may differ.
+Behavior is manufacturer- and version-dependent. Samsung One UI results confirmed below.
 
-| Shortcut | Generic Android | Samsung One UI (confirmed) |
-|----------|----------------|---------------------------|
-| Win+B | Default browser | Default browser |
-| Win+C | Contacts | Contacts |
+| Shortcut | Generic Android | Samsung One UI |
+|----------|----------------|----------------|
+| Win+B | Default browser | Default browser ✓ |
+| Win+C | Contacts | Contacts ✓ |
 | Win+E | Email | Email |
 | Win+G | Gmail | Gmail |
-| Win+H | Home screen | Home screen |
+| Win+H | Home screen | Home screen ✓ |
 | Win+K | Calendar | Calendar |
 | Win+M | Maps | Maps |
+| Win+N | Notifications | Notifications ✓ |
 | Win+P | Music player | Music player |
-| Win+S | Messages | Messages |
+| Win+S | Messages | Messages ✓ |
 | Win+U | Calculator | Calculator |
-| Win+Y | YouTube | **Smart View** (screen mirroring) |
+| Win+Y | YouTube | **Smart View** (screen mirroring) ✓ |
 
 > **Samsung note:** Win+Y opens Smart View on Samsung One UI, not YouTube.
 > Use `GUI b` + `CTRL l` + `youtube.com` to reach YouTube reliably.
 
----
+### Android — Ctrl Key
 
-### Ctrl Key
+| Shortcut | Action |
+|----------|--------|
+| Ctrl+A | Select all |
+| Ctrl+C | Copy |
+| Ctrl+V | Paste |
+| Ctrl+X | Cut |
+| Ctrl+Z | Undo |
+| Ctrl+Y | Redo |
+| Ctrl+L | Focus browser address bar (Chrome, Firefox, Brave) |
+| Ctrl+K | Focus global search bar |
+| Ctrl+T | New browser tab |
+| Ctrl+W | Close current tab |
+| Ctrl+Shift+T | Reopen last closed tab |
+| Ctrl+R | Refresh page |
+| Ctrl+Space | Switch input language |
+| Ctrl+Shift+Space | Previous input language |
+| Ctrl+Alt+Del | Reboot device |
 
-| Shortcut | Action | Notes |
-|----------|--------|-------|
-| Ctrl+A | Select all | |
-| Ctrl+C | Copy | |
-| Ctrl+V | Paste | |
-| Ctrl+X | Cut | |
-| Ctrl+Z | Undo | |
-| Ctrl+Y | Redo | |
-| Ctrl+L | Focus browser address bar | Chrome, Firefox, Brave, Kiwi |
-| Ctrl+K | Focus global search bar | Google Discover, Samsung Notes |
-| Ctrl+T | New browser tab | |
-| Ctrl+W | Close current tab | |
-| Ctrl+Shift+T | Reopen last closed tab | |
-| Ctrl+R | Refresh page | |
-| Ctrl+Space | Switch input language | |
-| Ctrl+Shift+Space | Previous input language | |
-| Ctrl+Alt+Del | Reboot device | |
-
----
-
-### Alt Key
+### Android — Alt Key
 
 | Shortcut | Action |
 |----------|--------|
@@ -100,15 +112,203 @@ Samsung One UI results confirmed below; other launchers may differ.
 
 ---
 
-### Navigation / Other
+## Windows 10 / 11 Keyboard Shortcuts
+
+### Windows Key (Win / GUI)
+
+#### System & Navigation
+
+| Shortcut | Action |
+|----------|--------|
+| Win+D | Show / hide desktop |
+| Win+L | **Lock workstation** |
+| Win+E | File Explorer |
+| Win+I | Settings |
+| Win+R | **Run dialog** |
+| Win+S | Windows Search |
+| Win+X | Power User menu (Quick Link) |
+| Win+A | Quick Settings panel |
+| Win+Tab | Task View |
+| Win+V | Clipboard History |
+| Win+Pause | System Information / About |
+| Win+. or Win+; | Emoji & Symbols panel |
+| Win+Space | Switch input language |
+| Win+T | Cycle taskbar apps |
+| Win+1–9 | Open/launch pinned taskbar app by position |
+| Win+Shift+S | **Snip & Sketch screenshot overlay** |
+| Win+Shift+Arrow | Move window between displays |
+| Win+Up | Maximize active window |
+| Win+Down | Minimize / restore window |
+| Win+Left | Snap window left |
+| Win+Right | Snap window right |
+| Win+Ctrl+D | Create new virtual desktop |
+| Win+Ctrl+←/→ | Switch virtual desktops |
+
+#### Windows 11 Only
+
+| Shortcut | Action |
+|----------|--------|
+| Win+W | Widgets pane |
+| Win+Z | Snap Layouts |
+| Win+C | Microsoft Copilot |
+| Win+N | Notification Center |
+| Win+H | Voice Typing |
+| Win+K | Cast / Connect panel |
+| Win+G | Xbox Game Bar |
+| Win+P | Display projection settings |
+| Win+Alt+R | Start / stop game recording |
+
+#### Accessibility
+
+| Shortcut | Action |
+|----------|--------|
+| Win+U | Accessibility Settings |
+| Win++ | Activate Magnifier / zoom in |
+| Win+- | Zoom out (Magnifier) |
+| Win+Esc | Deactivate Magnifier |
+| Win+Ctrl+N | Narrator (screen reader) |
+| Win+Ctrl+S | Speech Recognition |
+| Win+Ctrl+O | On-Screen Keyboard |
+| Win+Ctrl+C | Toggle Color Filters |
+
+### Windows — Ctrl Key
+
+| Shortcut | Action |
+|----------|--------|
+| Ctrl+A | Select all |
+| Ctrl+C | Copy |
+| Ctrl+V | Paste |
+| Ctrl+X | Cut |
+| Ctrl+Z | Undo |
+| Ctrl+Y | Redo |
+| Ctrl+S | Save |
+| Ctrl+P | Print |
+| Ctrl+F | Find |
+| Ctrl+L | Jump to address bar (browser / Explorer) |
+| Ctrl+N | New window |
+| Ctrl+W | Close window / tab |
+| Ctrl+T | New browser tab |
+| Ctrl+Shift+T | Reopen last closed tab |
+| Ctrl+R | Refresh |
+| Ctrl+Shift+Esc | **Task Manager (direct, no UAC screen)** |
+| Ctrl+Esc | Open Start menu |
+| Ctrl+Shift+N | New folder (File Explorer) |
+| Ctrl+D | Delete selected (File Explorer) |
+| Ctrl+Alt+Del | Security screen (cannot be intercepted by HID) |
+
+### Windows — Alt Key
+
+| Shortcut | Action |
+|----------|--------|
+| Alt+Tab | Switch between open applications |
+| Alt+Esc | Cycle windows in taskbar order |
+| Alt+F4 | Close active window / shutdown dialog on desktop |
+| Alt+Spacebar | Active window shortcut menu |
+| Alt+F8 | Show password on sign-in screen |
+| Alt+Enter | File properties (Explorer) |
+| Alt+← / → | Back / Forward (Explorer, browser) |
+| Alt+Up | Go to parent folder (Explorer) |
+| Alt+D | Select address bar (Explorer) |
+| Alt+P | Toggle preview pane (Explorer) |
+
+### Windows — Function Keys
 
 | Key | Action |
 |-----|--------|
-| Esc | Back / dismiss dialog |
-| Tab | Move focus forward through UI elements |
-| Shift+Tab | Move focus backward |
+| F2 | Rename selected item |
+| F3 / Ctrl+F | Find / search |
+| F4 | Select address bar (Explorer) |
+| F5 | Refresh |
+| F11 | Toggle fullscreen |
+| Shift+F10 | Open context menu (right-click) |
+
+### Windows Run Dialog — Useful Commands
+
+Open with `GUI r`, type command, press ENTER.
+
+| Command | Opens |
+|---------|-------|
+| `notepad` | Notepad |
+| `calc` | Calculator |
+| `explorer` | File Explorer |
+| `cmd` | Command Prompt |
+| `powershell` | PowerShell |
+| `taskmgr` | Task Manager |
+| `msinfo32` | System Information |
+| `devmgmt.msc` | Device Manager |
+| `eventvwr` | Event Viewer |
+| `services.msc` | Services |
+| `regedit` | Registry Editor |
+| `control` | Control Panel |
+| `mstsc` | Remote Desktop |
+| `msconfig` | System Configuration |
+| `diskmgmt.msc` | Disk Management |
+| `compmgmt.msc` | Computer Management |
+| `https://...` | Opens URL in default browser |
+| `msedge https://...` | Opens URL in Edge |
+| `chrome https://...` | Opens URL in Chrome (if installed) |
+
+> **HID note:** `Ctrl+Alt+Del` cannot be sent by a HID keyboard device on Windows —
+> it is intercepted at the firmware/OS level. Use `Ctrl+Shift+Esc` to open Task Manager
+> directly without going through the security screen.
+
+---
+
+## iOS / iPhone Keyboard Shortcuts (External Keyboard)
+
+*For testing — behavior confirmed on iOS 16+.*
+
+### System Navigation
+
+| Shortcut | Action |
+|----------|--------|
+| Cmd+H | Home screen |
+| Cmd+Spacebar | Spotlight search |
+| Fn+H | Home screen (alternate) |
+| Fn+Up | App Switcher |
+| Fn+N | Notification Center |
+| Fn+C | Control Center |
+| Fn+S | Activate Siri |
+| Tab+L | Lock screen |
+| Globe+N | Notifications |
+| Globe+C | Control Center |
+
+### Text Editing
+
+| Shortcut | Action |
+|----------|--------|
+| Cmd+C | Copy |
+| Cmd+X | Cut |
+| Cmd+V | Paste |
+| Cmd+Z | Undo |
+| Cmd+Shift+Z | Redo |
+| Cmd+A | Select all |
+| Cmd+↑/↓ | Jump to document start / end |
+| Cmd+←/→ | Jump to line start / end |
+| Alt+←/→ | Move by word |
 | Shift+Arrow | Select text |
-| Shift+Space | Switch input language |
+
+### Safari
+
+| Shortcut | Action |
+|----------|--------|
+| Cmd+L | Focus address bar |
+| Cmd+T | New tab |
+| Cmd+W | Close tab |
+| Cmd+R | Refresh |
+| Cmd+F | Find on page |
+| Cmd+D | Add bookmark |
+| Spacebar | Scroll down |
+| Shift+Space | Scroll up |
+
+### Navigation (Full Keyboard Access)
+
+| Key | Action |
+|-----|--------|
+| Tab | Move forward through items |
+| Shift+Tab | Move backward |
+| Spacebar | Activate focused item |
+| Escape | Back / dismiss |
 
 ---
 
@@ -128,7 +328,7 @@ Samsung One UI results confirmed below; other launchers may differ.
 | Command | Example | Notes |
 |---------|---------|-------|
 | `STRING` | `STRING hello world` | Type text character by character |
-| `STRINGLN` | `STRINGLN hello` | Type text then press ENTER |
+| `STRINGLN` | `STRINGLN hello` | Type text then ENTER |
 | `HUMAN_MODE` | `HUMAN_MODE ON` | Enable variable-speed typing |
 | `HUMAN_SPEED` | `HUMAN_SPEED NORMAL` | `SLOW` / `NORMAL` / `FAST` |
 
@@ -141,22 +341,25 @@ CAPS_LOCK  NUM_LOCK  F1–F12
 ```
 
 > **Android note:** `HOME` (HID 0x4A) is **cursor home** (beginning of line), NOT the
-> Android home button. Use `GUI h` (Win+H) to go to the Android home screen.
+> Android home button. Use `GUI h` (Win+H) for the Android home screen.
 
 ### Modifier Combos
 
-Syntax: `MODIFIER key` (space-separated). Multiple modifiers chain with dashes before the key.
+Syntax: `MODIFIER key` (space-separated). Chain multiple modifiers with dashes before the final key.
 
 ```
-GUI h              → Win+H (Android home screen)
-GUI b              → Win+B (open default browser)
-GUI n              → Win+N (open notifications)
+GUI r              → Win+R (Windows Run dialog)
+GUI l              → Win+L (lock screen — Windows or Android)
+GUI h              → Win+H (Android home / Windows Voice Typing on Win11)
+GUI b              → Win+B (Android default browser)
+GUI n              → Win+N (Android/Windows notifications)
 CTRL l             → Ctrl+L (focus browser address bar)
+CTRL-SHIFT ESC     → Ctrl+Shift+Esc (Windows Task Manager)
+GUI-SHIFT s        → Win+Shift+S (Windows screenshot)
 CTRL c             → Copy
 CTRL v             → Paste
-CTRL-ALT DELETE    → Reboot
-ALT TAB            → App switcher
-GUI-SHIFT s        → Windows screenshot (Windows target)
+ALT TAB            → App switcher (Windows or Android)
+ALT F4             → Close window (Windows)
 ```
 
 **Supported modifiers:** `GUI` / `WINDOWS` / `COMMAND`, `CTRL` / `CONTROL`,
@@ -164,12 +367,20 @@ GUI-SHIFT s        → Windows screenshot (Windows target)
 
 ---
 
-## Tips for Android Targets
+## Tips
 
-- Use `GUI h` (Win+H) to go to the home screen — bare `GUI` alone is not a valid command
-- Use `GUI b` + `CTRL l` for reliable browser navigation on any launcher (no launcher search dependency)
-- Samsung One UI in keyboard-nav mode **does not** open a search overlay when typing from home — use the browser approach instead
-- Add `DELAY 1500`+ after `GUI b` — wait for the browser to fully load before `CTRL l`
-- Add `DELAY 500`+ after `CTRL l` — address bar focus animation needs to complete
-- Use `HUMAN_MODE ON` + `HUMAN_SPEED SLOW` for maximum authenticity
-- Test with the **Wireless Keyboard** persona first (phones expect a keyboard to type, not a mouse)
+### Android
+- Use `GUI h` to go home — bare `GUI` alone is unrecognised
+- Use `GUI b` + `CTRL l` for browser navigation — more reliable than launcher search on Samsung One UI
+- Samsung One UI in keyboard-nav mode **does not** open a search overlay when typing from home
+- Wait `DELAY 1500`+ after `GUI b` for the browser to load before sending `CTRL l`
+- Use **Wireless Keyboard** persona — phones expect a keyboard, not a mouse
+
+### Windows
+- `Win+R` → URL is the most reliable cross-browser approach (no need to know which browser is installed)
+- `Ctrl+Alt+Del` **cannot** be sent via HID on Windows — use `Ctrl+Shift+Esc` for Task Manager
+- `HUMAN_MODE OFF` is fine for Windows — most Windows machines don't rate-limit HID input
+
+### iOS
+- `Cmd+H` goes home; `Cmd+Space` opens Spotlight
+- Test with **Wireless Keyboard** persona; iOS may prompt to trust an unrecognised input device
