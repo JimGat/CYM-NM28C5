@@ -32481,18 +32481,18 @@ static void show_ir_menu_screen(void)
 
 // ── IR Capture ────────────────────────────────────────────────────────────────
 
-static ir_signal_t s_last_ir_signal;
-static lv_obj_t   *s_ir_cap_status_lbl = NULL;
-static lv_obj_t   *s_ir_cap_save_btn   = NULL;
+static ir_signal_t           s_last_ir_signal;
+static lv_obj_t             *s_ir_cap_status_lbl = NULL;
+static lv_obj_t             *s_ir_cap_save_btn   = NULL;
+static volatile ir_hat_err_t s_ir_cap_result      = IR_HAT_ERR_TIMEOUT;
 
-static void s_ir_capture_done(ir_hat_err_t result, const ir_signal_t *sig, void *ctx)
+static void s_ir_cap_ui_update(void *arg)
 {
+    (void)arg;
     if (!s_ir_cap_status_lbl) return;
-    (void)ctx;
-    if (result == IR_HAT_OK && sig) {
-        memcpy(&s_last_ir_signal, sig, sizeof(s_last_ir_signal));
+    if (s_ir_cap_result == IR_HAT_OK) {
         char buf[64];
-        snprintf(buf, sizeof(buf), "Captured! %lu pulses", (unsigned long)sig->count);
+        snprintf(buf, sizeof(buf), "Captured! %lu pulses", (unsigned long)s_last_ir_signal.count);
         lv_label_set_text(s_ir_cap_status_lbl, buf);
         lv_obj_set_style_text_color(s_ir_cap_status_lbl, COLOR_MATERIAL_GREEN, 0);
         if (s_ir_cap_save_btn) lv_obj_clear_state(s_ir_cap_save_btn, LV_STATE_DISABLED);
@@ -32500,6 +32500,15 @@ static void s_ir_capture_done(ir_hat_err_t result, const ir_signal_t *sig, void 
         lv_label_set_text(s_ir_cap_status_lbl, "No signal — try again");
         lv_obj_set_style_text_color(s_ir_cap_status_lbl, lv_color_hex(0xFF5722), 0);
     }
+}
+
+static void s_ir_capture_done(ir_hat_err_t result, const ir_signal_t *sig, void *ctx)
+{
+    (void)ctx;
+    s_ir_cap_result = result;
+    if (result == IR_HAT_OK && sig)
+        memcpy(&s_last_ir_signal, sig, sizeof(s_last_ir_signal));
+    lv_async_call(s_ir_cap_ui_update, NULL);
 }
 
 static void ir_cap_start_cb(lv_event_t *e) {
@@ -32866,18 +32875,18 @@ static void show_rfid_menu_screen(void)
 
 // ── RF433 Capture ─────────────────────────────────────────────────────────────
 
-static rf433_signal_t s_last_rf433_signal;
-static lv_obj_t *s_rf433_cap_status = NULL;
-static lv_obj_t *s_rf433_cap_save   = NULL;
+static rf433_signal_t               s_last_rf433_signal;
+static lv_obj_t                    *s_rf433_cap_status = NULL;
+static lv_obj_t                    *s_rf433_cap_save   = NULL;
+static volatile rf433_hat_err_t     s_rf433_cap_result = RF433_HAT_ERR_TIMEOUT;
 
-static void s_rf433_done(rf433_hat_err_t result, const rf433_signal_t *sig, void *ctx)
+static void s_rf433_ui_update(void *arg)
 {
-    (void)ctx;
+    (void)arg;
     if (!s_rf433_cap_status) return;
-    if (result == RF433_HAT_OK && sig) {
-        memcpy(&s_last_rf433_signal, sig, sizeof(s_last_rf433_signal));
+    if (s_rf433_cap_result == RF433_HAT_OK) {
         char buf[64];
-        snprintf(buf, sizeof(buf), "Captured! %lu pulses", (unsigned long)sig->count);
+        snprintf(buf, sizeof(buf), "Captured! %lu pulses", (unsigned long)s_last_rf433_signal.count);
         lv_label_set_text(s_rf433_cap_status, buf);
         lv_obj_set_style_text_color(s_rf433_cap_status, COLOR_MATERIAL_GREEN, 0);
         if (s_rf433_cap_save) lv_obj_clear_state(s_rf433_cap_save, LV_STATE_DISABLED);
@@ -32885,6 +32894,15 @@ static void s_rf433_done(rf433_hat_err_t result, const rf433_signal_t *sig, void
         lv_label_set_text(s_rf433_cap_status, "No signal — try again");
         lv_obj_set_style_text_color(s_rf433_cap_status, lv_color_hex(0xFF5722), 0);
     }
+}
+
+static void s_rf433_done(rf433_hat_err_t result, const rf433_signal_t *sig, void *ctx)
+{
+    (void)ctx;
+    s_rf433_cap_result = result;
+    if (result == RF433_HAT_OK && sig)
+        memcpy(&s_last_rf433_signal, sig, sizeof(s_last_rf433_signal));
+    lv_async_call(s_rf433_ui_update, NULL);
 }
 
 static void rf433_cap_start_cb(lv_event_t *e) {
