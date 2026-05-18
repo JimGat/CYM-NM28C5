@@ -5,7 +5,7 @@
 <h1 align="center">Cheap Yellow Monster</h1>
 
 <p align="center">
-  <b>v1.6.14</b>
+  <b>v1.6.16</b>
 </p>
 
 <p align="center">
@@ -60,6 +60,8 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
     - [GATT Walker — How It Works](#gatt-walker--how-it-works)
     - [BT Observer — How It Works](#bt-observer--how-it-works)
     - [Bluetooth Lookout — How It Works](#bluetooth-lookout--how-it-works)
+    - [BlueDuck — BLE HID Keyboard Injector](#blueduck--ble-hid-keyboard-injector)
+    - [WhisperPair — CVE-2025-36911 Fast Pair Bypass](#whisperpair--cve-2025-36911-fast-pair-bypass)
   - [Wardriving](#3-wardriving)
     - [Starting a Wardrive](#starting-a-wardrive)
     - [Mark Button — GPS Waypoints](#mark-button--gps-waypoints)
@@ -94,7 +96,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **Drone Detector** | Passive BLE scan for DJI/Remote ID drone advertisements |
 | **Wardriving** | GPS + WiFi logging, dual-band filter (2.4 GHz / 5 GHz / Both), optional BLE time-sliced scanning, WiGLE CSV 1.6, upload log tracking, raw PCAP toggle, GPS mark waypoints (GPX output), WiGLE and WDG Wars upload; GPS last-known position hold with 150 m stale accuracy when signal is lost |
 | **GPS** | NMEA RMC auto-syncs system clock (FAT timestamps); last-known position persisted to NVS (5-minute throttle); manual fallback editor in Settings → GPS Info; all data-collection features (wardrive, GATT Walker, marks) use best available GPS transparently |
-| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk, Bluetooth Lookout, BLE Spam (8 modes incl. Sour Apple), Device Spoof (general + directed), BLE Disconnect (directed), BLE PCAP (Kismet PCAPNG raw capture), **BlueDuck** (BLE HID DuckyScript keyboard injector), **HoneyPair** (BLE persona honeypot) |
+| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk, Bluetooth Lookout, BLE Spam (8 modes incl. Sour Apple), Device Spoof (general + directed), BLE Disconnect (directed), BLE PCAP (Kismet PCAPNG raw capture), **BlueDuck** (BLE HID DuckyScript keyboard injector), **HoneyPair** (BLE persona honeypot), **WhisperPair** (CVE-2025-36911 Google Fast Pair KBP bypass — passive detection, GATT probe, AES-128-ECB exploit) |
 | **BlueDuck** | BLE HID keyboard injector — pairs as any of 9 device personas; executes DuckyScript payloads from SD card (preloaded into PSRAM at boot, immune to SD DMA OOM during BLE); HUMAN_MODE variable-speed typing; Android (Win+H/B/N), Windows (Win+R/L, Ctrl+Shift+Esc), and iOS (Cmd+H/Space) keyboard shortcut support; session JSONL log to SD card; 13-script library included |
 | **HoneyPair** | Continuous BLE persona honeypot — cycles 9 consumer device personas every 5 min, logs all pairing attempts to JSONL; GATT/HID enumeration on any pairing device; persona MACs randomised and deduplicated |
 | **Deauth Monitor** | Passive detection of nearby deauth attacks |
@@ -455,7 +457,8 @@ Bluetooth
 │           └── BLE Disconnect  (flood target with TERMINATE_IND)
 ├── BT Attacks          ← general attacks (no target needed)
 │   ├── BLE Spam        (Apple Prox. Pair / Samsung / Google / Windows / All / AirTag / SmartTag / Sour Apple)
-│   └── Device Spoof    (select from spooflist.csv or add new entry via keyboard)
+│   ├── Device Spoof    (select from spooflist.csv or add new entry via keyboard)
+│   └── WhisperPair     ← CVE-2025-36911 Fast Pair KBP pairing bypass (detect / probe / exploit)
 ├── BlueDuck            ← BLE HID keyboard injector + DuckyScript engine
 │   ├── Script selector (scans /sdcard/lab/ble/blueduck/scripts/)
 │   ├── Persona picker  (9 device identities + auto-rotate)
@@ -487,6 +490,7 @@ Bluetooth
 | **BLE PCAP** | Captures raw BLE advertising packets to SD card in Kismet PCAPNG format (link type 256 — `LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR`). Includes a 10-byte pseudo-header per packet: RF channel 37, RSSI, noise floor, and BLE access address. Queue-based write path keeps the SD bus free for the UI. Live packet count shown on screen. |
 | **BlueDuck** | BLE HID keyboard injector. Pairs with any nearby BLE-capable device, then executes DuckyScript payloads — sending keystrokes as if from a Bluetooth keyboard. Nine built-in device personas (Wireless Keyboard, AirPods Pro, Fitbit, Galaxy Buds, Garmin Fenix, Apple Watch, JBL speaker, Logitech MX Keys, Samsung TV). Auto-rotate mode cycles personas every 5 minutes. Scripts are preloaded into PSRAM at scan time (immune to SD DMA OOM during BLE). HUMAN_MODE with SLOW/NORMAL/FAST variable-speed typing. Full Android (Win+H/B/N), Windows (Win+R/L, Ctrl+Shift+Esc, Win+Shift+S), and iOS (Cmd+H/Space) keyboard shortcut support — 13-script library in `resources/blueduck_scripts/`. Session stats shown live; all events logged to `/sdcard/lab/ble/blueduck/`. |
 | **HoneyPair** | BLE persona honeypot. Continuously cycles through 9 consumer device personas (AirPods, Galaxy Buds, Garmin watch, etc.), logging every device that initiates a pairing request. Persona MACs are randomised and deduplicated across sessions; auto-rotate every 5 minutes prevents stale scan-response caching. GATT/HID enumeration runs on any device that completes pairing. All events logged to `/sdcard/lab/ble/honeypair/`. |
+| **WhisperPair** | CVE-2025-36911 Google Fast Pair Key-Based Pairing (KBP) bypass scanner. Passively detects Fast Pair–capable devices during BLE scan (tagged `[FP]` in scan list). Three attack modes: **Detect** (passive advertisement fingerprinting), **Probe** (GATT connect + service enumeration, confirms 0xFE2C service presence), and **Exploit** (writes a crafted AES-128-ECB encrypted KBP packet to trigger unsolicited pairing on vulnerable devices). All results logged to `/sdcard/lab/ble/whisperpair/`. *For authorized security research only.* |
 
 > **Note:** WiFi and BLE share the same radio. The firmware automatically switches between `RADIO_MODE_WIFI` and `RADIO_MODE_BLE` as needed.
 
@@ -894,6 +898,108 @@ The reconstructed PDU contains the advertising PDU header (event type + address 
 | Persona | Current active persona name |
 
 **Script library:** See [`resources/blueduck_scripts/`](resources/blueduck_scripts/README.md) for the included script collection and full DuckyScript reference.
+
+---
+
+#### WhisperPair — CVE-2025-36911 Fast Pair Bypass
+
+> **Legal notice — authorized use only.** WhisperPair is a security research tool. Only run it against devices you own or have explicit written authorization to test. Unauthorized use may violate the Computer Fraud and Abuse Act (CFAA), the UK Computer Misuse Act, or equivalent legislation in your jurisdiction. The authors provide this tool for authorized penetration testing, academic research, and defensive security education only.
+
+**WhisperPair** implements detection and exploitation of **CVE-2025-36911**, a vulnerability in the Google Fast Pair Key-Based Pairing (KBP) protocol disclosed in January 2026 by COSIC/KU Leuven. The flaw allows any BLE device to trigger unsolicited pairing popups on Android phones and other Fast Pair–enabled devices without any user interaction on the target.
+
+##### Background — CVE-2025-36911
+
+Google Fast Pair uses a Key-Based Pairing (KBP) handshake to accelerate the Bluetooth pairing UX. The protocol is advertised via the `0xFE2C` BLE service UUID. The vulnerability: **Fast Pair providers (earbuds, speakers, accessories) accept KBP packets without verifying that the device is in explicit pairing mode.** An attacker can construct a valid-looking KBP packet encrypted with AES-128-ECB using the salt as the key and deliver it over BLE to any nearby Fast Pair device, triggering an Android pairing prompt on the victim's phone.
+
+**Affected devices:** Any Google Fast Pair–enabled accessory (Google Pixel Buds, Samsung Galaxy Buds, Sony WF/WH series, Bose, JBL, and thousands of other accessories using the GFP SDK) running unpatched firmware.
+
+**CVSS:** 6.5 Medium — does not require authentication, exploitable at BLE range (~10 m), results in unsolicited UI interaction on victim devices.
+
+##### How It Works
+
+Fast Pair providers broadcast a `0xFE2C` service UUID in their BLE advertisements. A KBP packet is 16 bytes:
+
+```
+Byte 0:   Type = 0x00 (Key-Based Pairing Request)
+Byte 1:   Flags = 0x00
+Bytes 2–7: Provider MAC address (target device address, big-endian)
+Bytes 8–15: Salt (8 random bytes, attacker-chosen)
+```
+
+The packet is encrypted with AES-128-ECB where the key is `Salt || 0x00 × 8` (salt padded to 16 bytes). The provider decrypts and processes this packet — triggering the pairing flow — without checking whether it is in discoverable/pairing mode.
+
+##### Access in CYM
+
+WhisperPair is found under **Bluetooth → BT Attacks → WhisperPair**. The authorization disclaimer must be acknowledged before the screen opens.
+
+**Passive detection** is automatic during any BLE scan. Devices advertising the `0xFE2C` Fast Pair service are tagged with `[FP]` in the BT Scan & Select list. GATT Walker also flags these devices with a `⚠ Fast Pair (CVE-2025-36911)` warning when the 0xFE2C service is discovered during a walk.
+
+##### WhisperPair Screen
+
+The WhisperPair screen shows all Fast Pair–tagged devices detected during the most recent BLE scan. Each row shows:
+
+- Device index
+- Device name (truncated to 12 chars)
+- RSSI
+- Partial MAC (last 3 octets)
+- `[FP]` badge
+
+**Two action buttons:**
+
+| Button | Mode | Description |
+|--------|------|-------------|
+| **Probe** | GATT connect | Connects to the selected device, discovers the `0xFE2C` service and the KBP characteristic (`fe2c1234-...`), confirms exploitability, disconnects cleanly |
+| **Exploit** | KBP write | Connects, enables CCCD notifications, constructs and writes the crafted AES-128-ECB KBP packet, waits up to 5 s for a response notification |
+
+**Status and result display** update in real time below the device list. Results are also logged to SD.
+
+##### Usage
+
+1. Open **Bluetooth → BT Attacks → WhisperPair**. Acknowledge the authorization disclaimer.
+2. If no Fast Pair devices are listed, return to **BT Scan & Select** and run a scan — `[FP]` devices will appear in the WhisperPair screen on return.
+3. Tap a row to select a target.
+4. Tap **Probe** to confirm the device has the KBP GATT characteristic (non-intrusive, read-only enumeration).
+5. Tap **Exploit** to deliver the KBP packet. Observe the target phone for a Fast Pair pairing popup.
+6. Results are logged to `/sdcard/lab/ble/whisperpair/`.
+
+##### Output Log
+
+Each probe or exploit attempt produces a JSON entry in `/sdcard/lab/ble/whisperpair/`:
+
+```json
+{
+  "timestamp": "20260518_193200",
+  "mac": "AA:BB:CC:DD:EE:FF",
+  "name": "Galaxy Buds2 Pro",
+  "rssi": -54,
+  "mode": "exploit",
+  "kbp_chr_found": true,
+  "result": "notify_received",
+  "notify_hex": "1A2B3C4D5E6F7A8B9C0D1E2F3A4B5C6D",
+  "gps": { "valid": true, "lat": 37.1234567, "lon": -122.4567890 }
+}
+```
+
+`result` values:
+
+| Value | Meaning |
+|-------|---------|
+| `notify_received` | Provider responded with a KBP notification — device is vulnerable |
+| `no_notify` | KBP packet written but no notification received within 5 s — may be patched |
+| `chr_not_found` | 0xFE2C service present but KBP characteristic not found |
+| `connect_failed` | BLE connection could not be established |
+| `probe_ok` | Probe mode: KBP characteristic confirmed present |
+
+##### Porting to Janos
+
+The `ble_whisperpair.c/h` module is self-contained and portable. Dependencies:
+
+- **NimBLE** — `ble_gap_connect`, `ble_gattc_disc_svc_by_uuid`, `ble_gattc_disc_chrs_by_uuid`, `ble_gattc_write_flat` (standard NimBLE API, available in ESP-IDF and Zephyr)
+- **ROM AES** — `ets_aes_enable/setkey_enc/block/disable` from `esp32c5/rom/aes.h` — on other targets, substitute any AES-128-ECB implementation (mbedTLS `mbedtls_aes_crypt_ecb` or a bare-metal block cipher)
+- **FreeRTOS** — task + semaphore for async BLE serialization (replaceable with any RTOS primitives or a state machine)
+- **SD logging** — optional; the core exploit logic has no SD dependency
+
+To port: copy `ble_whisperpair.c/h`, replace the AES calls with your platform's AES-128-ECB, replace the FreeRTOS semaphores with your RTOS equivalents, and wire `wp_init(mutex)` + `wp_start(target, mode, cb)` into your UI. The GATT client pattern is identical to `gatt_walker.c` and can share the same connection infrastructure.
 
 ---
 
