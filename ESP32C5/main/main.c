@@ -5,6 +5,10 @@
 #include "lvgl.h"
 
 LV_FONT_DECLARE(lv_extra_symbols);
+/* Mutable Montserrat copies with lv_extra_symbols chained as .fallback.
+   Used for labels that mix ASCII text with FA icon / arrow glyphs. */
+static lv_font_t g_font_icon14;
+static lv_font_t g_font_icon16;
 LV_IMG_DECLARE(lab_bg);
 LV_IMG_DECLARE(deedee_img);
 /* ── FontAwesome custom glyph set (lv_extra_symbols font) ───────────────── */
@@ -46,6 +50,32 @@ LV_IMG_DECLARE(deedee_img);
 #define MY_SYMBOL_CHART_BAR       "\xEF\x82\x80"   /* fa-chart-bar        U+F080 */
 #define MY_SYMBOL_WAVE            "\xEF\xA0\xBE"   /* fa-wave-square      U+F83E */
 #define MY_SYMBOL_CLOCK           "\xEF\x80\x97"   /* fa-clock            U+F017 */
+/* solid — arrows (also present in FA Solid, needed for GPS display) */
+#define MY_SYMBOL_ARROW_DOWN     "\xE2\x86\x93"   /* fa-arrow-down       U+2193 */
+#define MY_SYMBOL_ARROW_UP       "\xE2\x86\x91"   /* fa-arrow-up         U+2191 */
+/* solid — RF / NRF / IR / RFID / hacker toolkit */
+#define MY_SYMBOL_LOCK           "\xEF\x80\xA3"   /* fa-lock             U+F023 */
+#define MY_SYMBOL_LOCK_OPEN      "\xEF\x8F\x81"   /* fa-lock-open        U+F3C1 */
+#define MY_SYMBOL_TERMINAL       "\xEF\x84\xA0"   /* fa-terminal         U+F120 */
+#define MY_SYMBOL_CODE           "\xEF\x84\xA1"   /* fa-code             U+F121 */
+#define MY_SYMBOL_BUG            "\xEF\x86\x88"   /* fa-bug              U+F188 */
+#define MY_SYMBOL_SKULL          "\xEF\x95\x8C"   /* fa-skull            U+F54C */
+#define MY_SYMBOL_GHOST          "\xEF\x9B\xA2"   /* fa-ghost            U+F6E2 */
+#define MY_SYMBOL_FINGERPRINT    "\xEF\x95\xB7"   /* fa-fingerprint      U+F577 */
+#define MY_SYMBOL_ID_BADGE       "\xEF\x8B\x81"   /* fa-id-badge         U+F2C1 */
+#define MY_SYMBOL_ID_CARD        "\xEF\x8B\x82"   /* fa-id-card          U+F2C2 */
+#define MY_SYMBOL_SIM_CARD       "\xEF\x9F\x84"   /* fa-sim-card         U+F7C4 */
+#define MY_SYMBOL_BIOHAZARD      "\xEF\x9E\x80"   /* fa-biohazard        U+F780 */
+#define MY_SYMBOL_RADIATION      "\xEF\x9E\xB9"   /* fa-radiation        U+F7B9 */
+#define MY_SYMBOL_ETHERNET       "\xEF\x9E\x96"   /* fa-ethernet         U+F796 */
+#define MY_SYMBOL_RSS            "\xEF\x82\x9E"   /* fa-rss (signal)     U+F09E */
+#define MY_SYMBOL_FILTER         "\xEF\x82\xB0"   /* fa-filter           U+F0B0 */
+#define MY_SYMBOL_CIRCLE_INFO    "\xEF\x81\x9A"   /* fa-circle-info      U+F05A */
+#define MY_SYMBOL_FLAG           "\xEF\x80\xA4"   /* fa-flag             U+F024 */
+#define MY_SYMBOL_PLUG           "\xEF\x87\xA6"   /* fa-plug             U+F1E6 */
+#define MY_SYMBOL_TRASH          "\xEF\x87\xB8"   /* fa-trash            U+F1F8 */
+#define MY_SYMBOL_ROTATE         "\xEF\x8B\xB1"   /* fa-rotate           U+F2F1 */
+#define MY_SYMBOL_CIRCLE_NODES   "\xEE\x93\xA2"   /* fa-circle-nodes     U+E4E2 */
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
@@ -4622,6 +4652,14 @@ void app_main(void)
 
     lvgl_memory_init();
     lv_init();
+    /* Mutable RAM copies of the two Montserrat sizes that need to render FA
+       icons (lv_extra_symbols).  The originals are const in flash so we copy
+       them to RAM and set .fallback there, then use these pointers for the
+       specific labels that mix ASCII text with FA/arrow glyphs. */
+    memcpy(&g_font_icon14, &lv_font_montserrat_14, sizeof(lv_font_t));
+    g_font_icon14.fallback = &lv_extra_symbols;
+    memcpy(&g_font_icon16, &lv_font_montserrat_16, sizeof(lv_font_t));
+    g_font_icon16.fallback = &lv_extra_symbols;
     init_display();
     init_touch();
     init_backlight();
@@ -19683,7 +19721,7 @@ static void show_nmrfhat_info_popup(void)
 
     lv_obj_t *title = lv_label_create(card);
     lv_label_set_text(title, MY_SYMBOL_MICROCHIP "  NM-RF-HAT");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(title, &g_font_icon14, 0);
     lv_obj_set_style_text_color(title, lv_color_hex(0x90A4AE), 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
 
@@ -20670,7 +20708,7 @@ static void gps_info_refresh_cb(lv_timer_t *t)
         lv_label_set_text(gps_info_fix_lbl, LV_SYMBOL_GPS " Fix: YES");
         lv_obj_set_style_text_color(gps_info_fix_lbl, COLOR_MATERIAL_GREEN, 0);
     } else if (stale) {
-        lv_label_set_text(gps_info_fix_lbl, LV_SYMBOL_GPS " Fix: NO  (last known \xe2\x86\x93)");
+        lv_label_set_text(gps_info_fix_lbl, LV_SYMBOL_GPS " Fix: NO  (last known " MY_SYMBOL_ARROW_DOWN ")");
         lv_obj_set_style_text_color(gps_info_fix_lbl, COLOR_MATERIAL_AMBER, 0);
     } else {
         lv_label_set_text(gps_info_fix_lbl, LV_SYMBOL_GPS " Fix: NO");
@@ -20986,7 +21024,7 @@ static void show_gps_info_screen(void)
     int y = 0;
 
     gps_info_fix_lbl = lv_label_create(card);
-    lv_obj_set_style_text_font(gps_info_fix_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(gps_info_fix_lbl, &g_font_icon16, 0);
     lv_obj_align(gps_info_fix_lbl, LV_ALIGN_TOP_LEFT, 0, y);
     y += 26;
 
