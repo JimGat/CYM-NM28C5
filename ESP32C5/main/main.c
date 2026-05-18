@@ -28581,10 +28581,15 @@ static void bt_nimble_deinit(void)
     // Stop NimBLE host task
     nimble_port_stop();
     vTaskDelay(pdMS_TO_TICKS(100));
-    
-    // Deinitialize NimBLE port
+
+    // Deinitialize NimBLE port (also deinits BLE controller)
     nimble_port_deinit();
-    
+
+    /* BLE controller releases DMA-capable memory asynchronously after deinit.
+     * Without this delay esp_wifi_init() fails with 0x101 (no mem) because the
+     * controller hasn't returned its ~30 KB of DMA buffers yet. */
+    vTaskDelay(pdMS_TO_TICKS(600));
+
     nimble_initialized = false;
     ESP_LOGI(TAG, "NimBLE stopped");
 }
