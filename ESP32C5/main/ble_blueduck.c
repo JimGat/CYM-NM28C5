@@ -326,7 +326,7 @@ static void bd_key_tap(uint8_t modifier, uint8_t keycode)
     bd_send_report(modifier, kc);
     vTaskDelay(pdMS_TO_TICKS(BD_KEY_HOLD_MS));
     bd_send_report(0, 0);  /* key up */
-    vTaskDelay(pdMS_TO_TICKS(5));
+    vTaskDelay(pdMS_TO_TICKS(BD_KEY_HOLD_MS));  /* full interval — BLE min CI is 7.5 ms */
 }
 
 /* Human typing delay for one character. Space gets extra inter-word pause. */
@@ -377,6 +377,9 @@ static uint16_t bd_named_key(const char *name)
         {"UP",        0x0052}, {"DOWN",      0x0051},
         {"LEFT",      0x0050}, {"RIGHT",     0x004F},
         {"CAPS_LOCK", 0x0039}, {"NUM_LOCK",  0x0053},
+        {"PRINT_SCREEN", 0x0046}, {"PRTSC",  0x0046},
+        {"SCROLL_LOCK",  0x0047},
+        {"PAUSE",        0x0048}, {"BREAK",  0x0048},
         {"F1",        0x003A}, {"F2",        0x003B},
         {"F3",        0x003C}, {"F4",        0x003D},
         {"F5",        0x003E}, {"F6",        0x003F},
