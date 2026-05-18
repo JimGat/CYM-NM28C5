@@ -1741,4 +1741,4 @@ This project is intended for **educational and authorized security research purp
   <b>Made with ☕ and ESP-IDF</b>
 </p>
 
-I love your Face!
+<p align="center">KAL, I love your face!</p>
