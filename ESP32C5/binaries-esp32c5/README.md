@@ -1,6 +1,121 @@
 # CYM-NM28C5 Pre-built Firmware Binaries
 
-**Firmware version: v1.3.0**
+**Firmware version: v1.6.10**
+
+---
+
+## Release Notes — v1.6.10
+
+### BlueDuck — PSRAM Script Cache (SD DMA OOM Fix)
+
+BlueDuck now preloads all `.duck` scripts into PSRAM during the script-scan phase (while WiFi is still active and DMA RAM is available). Previously, scripts were read via `fopen()` at execution time — but after NimBLE initialises, internal DMA-capable RAM drops below 1 KB, causing `sdmmc_read_blocks` to fail with `allocate_dma_buf 0x101` on every attempt. Scripts are now served from PSRAM on every pair event, making payload delivery reliable regardless of BLE/SD memory pressure.
+
+- Startup log confirms: `Cached 'script_name' (NNN B) in PSRAM` for each discovered script
+- Execution log: `Executing script from PSRAM cache: ...` instead of SD read errors
+- Cache is freed and rebuilt whenever the script directory is re-scanned
+- `fopen()` fallback retained for pre-BLE use cases (should never be reached in practice)
+
+### LVGL Icon Library — Hacker / RF / RFID Toolkit
+
+25 new FontAwesome icons added to the `lv_extra_symbols` custom font, all available as `MY_SYMBOL_*` macros in `main.c`:
+
+| Category | Symbols added |
+|----------|---------------|
+| Arrows | `ARROW_DOWN` (↓), `ARROW_UP` (↑) |
+| Access / Auth | `LOCK`, `LOCK_OPEN`, `FINGERPRINT`, `ID_BADGE`, `ID_CARD`, `SIM_CARD` |
+| Hacking | `TERMINAL`, `CODE`, `BUG`, `SKULL`, `GHOST` |
+| RF / RFID | `BIOHAZARD`, `RADIATION`, `ETHERNET`, `RSS`, `CIRCLE_NODES` |
+| Interface | `FILTER`, `CIRCLE_INFO`, `FLAG`, `PLUG`, `TRASH`, `ROTATE` |
+
+GPS "last known fix" indicator now renders the ↓ arrow correctly. NM-RF-HAT popup title now renders the microchip icon (U+F2DB) correctly. Both use mutable `lv_font_t` wrappers (`g_font_icon14`, `g_font_icon16`) that chain `lv_extra_symbols` as a fallback — required because Montserrat fonts live in const flash.
+
+---
+
+## Release Notes — v1.6.8
+
+### WiFi First-Connect Dropout Fix
+
+ESP32-C5 devices were disconnecting with error `0x2c0` (or `ASSOC_EXPIRE`) on the first association attempt after boot or mode switch. Root cause: `esp_wifi_set_country()` triggered an IEEE 802.11d regulatory domain update mid-association, causing the AP to deauthenticate the client.
+
+Fix: `esp_wifi_set_country_code("01", false)` called after `esp_wifi_start()` (not before), combined with `ieee80211d_enabled: false` in the WiFi config. Region `"01"` is the international fallback that all APs accept without a country-specific domain update.
+
+- Eliminates the first-connection dropout seen on all networks since v1.5.x
+- WiFi reconnects reliably without requiring a second tap or a device reset
+
+---
+
+## Release Notes — v1.6.4
+
+### AP File Server — Full File Manager
+
+The AP file server (`TheLab` network, `http://192.168.4.1`) now supports a complete SD card file management workflow from the browser:
+
+| Operation | How |
+|-----------|-----|
+| Browse | Click directories to navigate; path shown in header |
+| Download | Click any file |
+| Upload | Drag-and-drop or file picker on any directory page |
+| Create folder | `[+ New Folder]` button on any directory page |
+| Delete file | `[✕]` button per file with single confirm |
+| Delete directory | `[✕]` on a directory — double confirm, recursive |
+
+URL-encoded paths (spaces, special characters) are now decoded correctly throughout. Client IP address logged to serial on every HTTP request. All paths handle trailing slashes consistently.
+
+---
+
+## Release Notes — v1.5.52
+
+### AP File Server — Working (DRAM / PSRAM Tuning)
+
+The AP file server (`Settings → Data Transfer → AP File Server`) is now fully functional. Previous versions failed at `httpd_start()` with error `0xb008` due to DRAM exhaustion from WiFi static TX buffers.
+
+Fix: `CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM` reduced from 16 → 4, recovering ~19 KB of DRAM for LVGL draw buffers and the HTTP server. `SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y` retained so lwIP pbufs continue to use PSRAM. HTTP GET handler stack raised from 4096 → 8192 bytes.
+
+---
+
+## Release Notes — v1.5.43
+
+### BlueDuck — BLE HID Keyboard Injector
+
+BlueDuck is a BLE HID keyboard device that pairs with nearby phones and tablets and automatically executes a DuckyScript payload on connection. Designed for authorized security testing and device compliance verification.
+
+**Workflow:**
+1. Place `.duck` script files in `/sdcard/lab/ble/blueduck/scripts/`
+2. Open **Bluetooth → BlueDuck**, select a script, select a persona, and press **Start**
+3. The device advertises as the chosen persona and waits for a target to pair
+4. On successful pairing (3 s gate), the selected DuckyScript executes as keystrokes
+5. Session events are logged to `/sdcard/lab/ble/blueduck/sessions/YYYYMMDD_HHMMSS.jsonl`
+
+**9 device personas with MAC randomization:**
+
+| Persona | Advertises as |
+|---------|--------------|
+| Wireless Keyboard | Generic HID keyboard |
+| AirPods Pro | Apple audio accessory |
+| Fitbit Sense | Fitbit wearable |
+| Galaxy Buds Pro | Samsung audio |
+| Garmin Fenix 7 | Garmin GPS watch |
+| Apple Watch Series 8 | Apple wearable |
+| JBL Flip 6 | JBL speaker |
+| Logitech MX Keys | Logitech keyboard |
+| Samsung Smart TV | Samsung display |
+
+**DuckyScript commands supported:** `REM`, `DELAY`, `DEFAULT_DELAY`, `STRING`, `STRINGLN`, `ENTER`, `TAB`, `SPACE`, `BACKSPACE`, `DELETE`, `ESCAPE`, `HOME`, `END`, `INSERT`, `PAGEUP`, `PAGEDOWN`, `UP`, `DOWN`, `LEFT`, `RIGHT`, `F1`–`F12`, `GUI`, `CTRL`, `ALT`, `SHIFT`, `CTRL-ALT-DEL`, `GUI-L`, `GUI-R`, `CTRL-C`, `CTRL-V`, `CTRL-Z`, `ALT-F4`, `CTRL-ALT-T`
+
+Scripts placed in the scripts directory are automatically discovered and listed on the script selector screen.
+
+### HoneyPair — BLE Persona Honeypot
+
+HoneyPair runs a continuous BLE persona cycle, advertising as popular consumer devices (AirPods, Galaxy Buds, etc.) to detect and log devices that initiate pairing requests. Useful for mapping Bluetooth activity and identifying devices that auto-connect to known peripherals.
+
+- Up to 9 personas cycle automatically every 5 minutes
+- Per-session JSONL logs saved to `/sdcard/lab/ble/honeypair/`
+- Persona MACs are randomised and deduplicated across sessions
+- GATT / HID service enumeration on any device that completes pairing
+- Auto-rotate prevents stale scan-response caching on nearby phones
+- Pair-gate timing tuned to avoid iOS popup dismissal race
+
+**Navigation:** Bluetooth → HoneyPair
 
 ---
 
