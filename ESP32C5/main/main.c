@@ -158,6 +158,11 @@ LV_IMG_DECLARE(deedee_img);
 #include "ble_honeypair.h"
 #include "ble_blueduck.h"
 #include "ble_whisperpair.h"
+#include "rf_hat_config.h"
+#include "ir_hat.h"
+#include "rf433_hat.h"
+#include "radio_hat.h"
+#include "rfid_hat.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
@@ -489,6 +494,7 @@ static lv_obj_t *brightness_overlay = NULL; // Software brightness overlay on lv
 static uint16_t scan_time_min_ms = 100;     // Active scan min time per channel (default 100)
 static uint16_t scan_time_max_ms = 300;     // Active scan max time per channel (default 300)
 static uint32_t g_gatt_timeout_ms = 30000; // GATT connect timeout (NVS-persisted)
+static bool     g_rf_hat_enabled   = false; // NM-RF-HAT addon board present (NVS-persisted)
 static char     g_saved_wifi_ssid[33] = ""; // Home network SSID for file server STA mode
 static char     g_saved_wifi_pass[65] = ""; // Home network password
 
@@ -511,6 +517,7 @@ static char     g_saved_wifi_pass[65] = ""; // Home network password
 #define NVS_KEY_GPS_LAT      "gps_lat_i"
 #define NVS_KEY_GPS_LON      "gps_lon_i"
 #define NVS_KEY_GPS_ALT      "gps_alt_i"
+#define NVS_KEY_RF_HAT       "rf_hat"
 
 // Wardrive band selection
 typedef enum { WD_BAND_BOTH = 0, WD_BAND_24G, WD_BAND_5G } wd_band_t;
@@ -1688,6 +1695,16 @@ static void update_sniffer_button_ui(void);
 static void show_settings_screen(void);
 static void show_hardware_options_screen(void);
 static void settings_tile_event_cb(lv_event_t *e);
+static void show_nmrfhat_settings_screen(void);
+static void show_dip_switch_popup(uint8_t dip_pos, const char *module_name, void (*proceed_fn)(void));
+static void show_ir_menu_screen(void);
+static void show_radio_menu_screen(void);
+static void show_rfid_menu_screen(void);
+static void show_ir_capture_screen(void);
+static void show_ir_replay_screen(void);
+static void show_ir_tvbgone_screen(void);
+static void show_rf433_capture_screen(void);
+static void show_rf433_replay_screen(void);
 static void show_vibrator_test_popup(void);
 static void run_touch_calibration(void);
 void vibrator_on(void);
@@ -2741,6 +2758,8 @@ static void nvs_settings_load(void)
         if (nvs_get_u8(h, NVS_KEY_WD_PCAP, &wp) == ESP_OK) g_wd_pcap = (wp != 0);
         uint8_t wble = 0;
         if (nvs_get_u8(h, NVS_KEY_WD_BLE, &wble) == ESP_OK) g_wd_ble = (wble != 0);
+        uint8_t rfhat = 0;
+        if (nvs_get_u8(h, NVS_KEY_RF_HAT, &rfhat) == ESP_OK) g_rf_hat_enabled = (rfhat != 0);
         // Restore last-known GPS position so functions have a fallback before first fix
         int32_t gps_lat_i = 0, gps_lon_i = 0, gps_alt_i = 0;
         if (nvs_get_i32(h, NVS_KEY_GPS_LAT, &gps_lat_i) == ESP_OK &&
@@ -2839,6 +2858,17 @@ static void nvs_settings_save_gatt_timeout(uint32_t ms)
         nvs_commit(h);
         nvs_close(h);
         ESP_LOGI(TAG, "NVS: saved gatt_timeout = %ums", (unsigned)ms);
+    }
+}
+
+static void nvs_settings_save_rf_hat(bool enabled)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, NVS_KEY_RF_HAT, enabled ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+        ESP_LOGI(TAG, "NVS: rf_hat = %s", enabled ? "enabled" : "disabled");
     }
 }
 
@@ -12478,6 +12508,13 @@ static void main_tile_event_cb(lv_event_t *e)
         show_wardrive_menu_screen();
     } else if (strcmp(tile_name, "Go Dark") == 0) {
         show_go_dark_confirm();
+    // NM-RF-HAT tiles
+    } else if (strcmp(tile_name, "IR Menu") == 0) {
+        show_ir_menu_screen();
+    } else if (strcmp(tile_name, "Radio Menu") == 0) {
+        show_radio_menu_screen();
+    } else if (strcmp(tile_name, "RFID Menu") == 0) {
+        show_rfid_menu_screen();
     }
 }
 
@@ -12671,6 +12708,12 @@ static void show_main_tiles(void)
     create_tile(tiles_container, MY_SYMBOL_CAR,         "Wardrive",     COLOR_MATERIAL_RED,     main_tile_event_cb, "Wardrive");
     create_tile(tiles_container, LV_SYMBOL_SETTINGS,    "Settings",     UI_ACCENT_GREEN,        main_tile_event_cb, "Settings");
     create_tile(tiles_container, LV_SYMBOL_POWER,       "Go Dark",      lv_color_hex(0x8A8FA8), main_tile_event_cb, "Go Dark");
+    // NM-RF-HAT tiles — shown only when the addon board is enabled in Hardware Options
+    if (g_rf_hat_enabled) {
+        create_tile(tiles_container, MY_SYMBOL_WAVE,      "Infrared",   lv_color_hex(0xE65100), main_tile_event_cb, "IR Menu");
+        create_tile(tiles_container, MY_SYMBOL_TOWER,     "Radio",      lv_color_hex(0x6A1B9A), main_tile_event_cb, "Radio Menu");
+        create_tile(tiles_container, MY_SYMBOL_MICROCHIP, "RFID/NFC",  lv_color_hex(0x00695C), main_tile_event_cb, "RFID Menu");
+    }
 
     apply_menu_bg();
 
@@ -19714,62 +19757,216 @@ static void hw_opts_back_cb(lv_event_t *e)
     show_settings_screen();
 }
 
-static void hw_nmrfhat_ok_cb(lv_event_t *e)
+// ── NM-RF-HAT settings screen ─────────────────────────────────────────────────
+
+static lv_obj_t *s_rfhat_status_lbl = NULL;
+static lv_obj_t *s_rfhat_en_btn     = NULL;
+static lv_obj_t *s_rfhat_dis_btn    = NULL;
+
+static void rfhat_toggle_cb(lv_event_t *e)
 {
-    lv_obj_t *overlay = (lv_obj_t *)lv_event_get_user_data(e);
-    if (overlay) lv_obj_del(overlay);
+    bool enable = (bool)(uintptr_t)lv_event_get_user_data(e);
+    g_rf_hat_enabled = enable;
+    nvs_settings_save_rf_hat(enable);
+    if (s_rfhat_status_lbl) {
+        lv_label_set_text(s_rfhat_status_lbl, enable ? "Status: ENABLED" : "Status: DISABLED");
+        lv_obj_set_style_text_color(s_rfhat_status_lbl,
+            enable ? COLOR_MATERIAL_GREEN : lv_color_hex(0x9E9E9E), 0);
+    }
+    // Re-draw home tiles so IR/Radio/RFID tiles appear or disappear
+    show_main_tiles();
 }
 
-static void show_nmrfhat_info_popup(void)
+static void rfhat_back_cb(lv_event_t *e) { (void)e; show_hardware_options_screen(); }
+
+static void show_nmrfhat_settings_screen(void)
 {
-    lv_obj_t *overlay = lv_obj_create(function_page);
+    create_function_page_base("NM-RF-HAT");
+    apply_menu_bg();
+
+    lv_obj_t *card = lv_obj_create(function_page);
+    lv_obj_set_size(card, LCD_H_RES - 12, LCD_V_RES - 60);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 34);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x607D8B), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 10, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(card, 6, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Title icon + name
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, MY_SYMBOL_MICROCHIP "  NM-RF-HAT");
+    lv_obj_set_style_text_font(title, &g_font_icon14, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0x90A4AE), 0);
+
+    // Current status
+    s_rfhat_status_lbl = lv_label_create(card);
+    lv_label_set_text(s_rfhat_status_lbl, g_rf_hat_enabled ? "Status: ENABLED" : "Status: DISABLED");
+    lv_obj_set_style_text_font(s_rfhat_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_rfhat_status_lbl,
+        g_rf_hat_enabled ? COLOR_MATERIAL_GREEN : lv_color_hex(0x9E9E9E), 0);
+
+    // Info text
+    lv_obj_t *info = lv_label_create(card);
+    lv_label_set_text(info,
+        "Enables IR, Radio, and RFID\n"
+        "tiles on the main screen.\n"
+        "Requires NM-RF-HAT addon board\n"
+        "connected to the NM-CYD-C5.");
+    lv_obj_set_style_text_font(info, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(info, ui_text_color(), 0);
+    lv_label_set_long_mode(info, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(info, LCD_H_RES - 36);
+
+    // DIP switch reminder
+    lv_obj_t *dip = lv_label_create(card);
+    lv_label_set_text(dip,
+        "DIP 1=CC1101  2=nRF24\n"
+        "DIP 3=PN532   4=IR   5=RF433\n"
+        "DIP 6=Battery switch");
+    lv_obj_set_style_text_font(dip, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(dip, lv_color_hex(0xFFB300), 0);
+    lv_label_set_long_mode(dip, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(dip, LCD_H_RES - 36);
+
+    // Enable / Disable buttons
+    lv_obj_t *btn_row = lv_obj_create(card);
+    lv_obj_set_size(btn_row, LCD_H_RES - 32, 36);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_rfhat_en_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(s_rfhat_en_btn, 85, 32);
+    lv_obj_set_style_bg_color(s_rfhat_en_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(s_rfhat_en_btn, 0, 0);
+    lv_obj_set_style_radius(s_rfhat_en_btn, 6, 0);
+    lv_obj_t *en_lbl = lv_label_create(s_rfhat_en_btn);
+    lv_label_set_text(en_lbl, "Enable");
+    lv_obj_set_style_text_font(en_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(en_lbl, lv_color_white(), 0);
+    lv_obj_center(en_lbl);
+    lv_obj_add_event_cb(s_rfhat_en_btn, rfhat_toggle_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)true);
+
+    s_rfhat_dis_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(s_rfhat_dis_btn, 85, 32);
+    lv_obj_set_style_bg_color(s_rfhat_dis_btn, lv_color_hex(0x9E9E9E), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(s_rfhat_dis_btn, 0, 0);
+    lv_obj_set_style_radius(s_rfhat_dis_btn, 6, 0);
+    lv_obj_t *dis_lbl = lv_label_create(s_rfhat_dis_btn);
+    lv_label_set_text(dis_lbl, "Disable");
+    lv_obj_set_style_text_font(dis_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(dis_lbl, lv_color_white(), 0);
+    lv_obj_center(dis_lbl);
+    lv_obj_add_event_cb(s_rfhat_dis_btn, rfhat_toggle_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)false);
+
+    // Back button
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 120, 30);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60,60,60), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_t *bi = lv_label_create(back_btn); lv_label_set_text(bi, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(bi, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bi, lv_color_white(), 0);
+    lv_obj_t *bl = lv_label_create(back_btn); lv_label_set_text(bl, "Hw Options");
+    lv_obj_set_style_text_font(bl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bl, lv_color_white(), 0);
+    lv_obj_add_event_cb(back_btn, rfhat_back_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// ── DIP switch reminder popup ─────────────────────────────────────────────────
+// Shown when entering any RF HAT module function so the user knows which DIP to set.
+
+typedef struct { void (*proceed_fn)(void); lv_obj_t *overlay; } dip_popup_ctx_t;
+
+static void dip_popup_ok_cb(lv_event_t *e)
+{
+    dip_popup_ctx_t *ctx = (dip_popup_ctx_t *)lv_event_get_user_data(e);
+    if (!ctx) return;
+    void (*fn)(void) = ctx->proceed_fn;
+    lv_obj_t *ov = ctx->overlay;
+    free(ctx);
+    if (ov) lv_obj_del(ov);
+    if (fn) fn();
+}
+
+static void show_dip_switch_popup(uint8_t dip_pos, const char *module_name, void (*proceed_fn)(void))
+{
+    lv_obj_t *overlay = lv_obj_create(lv_scr_act());
     lv_obj_set_size(overlay, LCD_H_RES, LCD_V_RES);
     lv_obj_set_pos(overlay, 0, 0);
-    lv_obj_set_style_bg_color(overlay, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_bg_color(overlay, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(overlay, LV_OPA_70, 0);
     lv_obj_set_style_border_width(overlay, 0, 0);
     lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *card = lv_obj_create(overlay);
-    lv_obj_set_size(card, 210, 178);
+    lv_obj_set_size(card, 210, 200);
     lv_obj_center(card);
-    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
-    lv_obj_set_style_border_color(card, lv_color_hex(0x607D8B), 0);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x1A237E), 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0xFFB300), 0);
     lv_obj_set_style_border_width(card, 2, 0);
     lv_obj_set_style_radius(card, 10, 0);
     lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(card, 8, 0);
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *title = lv_label_create(card);
-    lv_label_set_text(title, MY_SYMBOL_MICROCHIP "  NM-RF-HAT");
+    lv_label_set_text(title, MY_SYMBOL_MICROCHIP "  Set DIP Switch");
     lv_obj_set_style_text_font(title, &g_font_icon14, 0);
-    lv_obj_set_style_text_color(title, lv_color_hex(0x90A4AE), 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0xFFB300), 0);
 
+    char dip_buf[80];
+    snprintf(dip_buf, sizeof(dip_buf),
+        "For %s:\n"
+        "Set DIP switch to\n"
+        "position %d ON\n"
+        "(all others OFF)",
+        module_name, (int)dip_pos);
     lv_obj_t *msg = lv_label_create(card);
-    lv_label_set_text(msg,
-        "RF hardware addon board\nsupport in development.\n\n"
-        "Addon boards will enable\nsoftware-configurable RF\n"
-        "module options (NM-RF-HAT).");
+    lv_label_set_text(msg, dip_buf);
     lv_obj_set_style_text_font(msg, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(msg, ui_text_color(), 0);
+    lv_obj_set_style_text_color(msg, lv_color_white(), 0);
     lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(msg, 185);
-    lv_obj_align(msg, LV_ALIGN_TOP_MID, 0, 26);
+    lv_obj_set_width(msg, 186);
+
+    // DIP map reminder
+    lv_obj_t *dmap = lv_label_create(card);
+    lv_label_set_text(dmap, "1=CC1101 2=nRF24 3=PN532\n4=IR      5=RF433 6=Batt");
+    lv_obj_set_style_text_font(dmap, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(dmap, lv_color_hex(0xB0BEC5), 0);
+    lv_label_set_long_mode(dmap, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(dmap, 186);
+
+    dip_popup_ctx_t *ctx = malloc(sizeof(dip_popup_ctx_t));
+    if (ctx) { ctx->proceed_fn = proceed_fn; ctx->overlay = overlay; }
 
     lv_obj_t *ok_btn = lv_btn_create(card);
-    lv_obj_set_size(ok_btn, 90, 28);
-    lv_obj_align(ok_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(ok_btn, lv_color_hex(0x607D8B), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(ok_btn, lv_color_hex(0x78909C), LV_STATE_PRESSED);
+    lv_obj_set_size(ok_btn, 150, 32);
+    lv_obj_set_style_bg_color(ok_btn, lv_color_hex(0xFFB300), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(ok_btn, lv_color_hex(0xFFCA28), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(ok_btn, 0, 0);
     lv_obj_set_style_radius(ok_btn, 6, 0);
     lv_obj_t *ok_lbl = lv_label_create(ok_btn);
-    lv_label_set_text(ok_lbl, "OK");
+    lv_label_set_text(ok_lbl, "DIP Set — Continue");
     lv_obj_set_style_text_font(ok_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(ok_lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_color(ok_lbl, lv_color_black(), 0);
     lv_obj_center(ok_lbl);
-    lv_obj_add_event_cb(ok_btn, hw_nmrfhat_ok_cb, LV_EVENT_CLICKED, overlay);
+    lv_obj_add_event_cb(ok_btn, dip_popup_ok_cb, LV_EVENT_CLICKED, ctx);
 }
 
 static void hw_options_tile_event_cb(lv_event_t *e)
@@ -19779,7 +19976,7 @@ static void hw_options_tile_event_cb(lv_event_t *e)
     if (strcmp(name, "Power Mode") == 0)
         show_power_mode_popup();
     else if (strcmp(name, "NM-RF-HAT") == 0)
-        show_nmrfhat_info_popup();
+        show_nmrfhat_settings_screen();
 }
 
 static void show_hardware_options_screen(void)
@@ -19969,6 +20166,10 @@ static const sd_provision_item_t SD_ITEMS[] = {
     { SD_ITEM_DIR,  "/sdcard/lab/ble/blueduck",              NULL },  /* BlueDuck session logs */
     { SD_ITEM_DIR,  "/sdcard/lab/ble/blueduck/scripts",      NULL },  /* DuckyScript payloads */
     { SD_ITEM_DIR,  "/sdcard/lab/ble/whisperpair",           NULL },  /* WhisperPair logs */
+    { SD_ITEM_DIR,  "/sdcard/lab/ir",                        NULL },  /* IR HAT captures */
+    { SD_ITEM_DIR,  "/sdcard/lab/rf433",                     NULL },  /* RF433 HAT captures (.sub) */
+    { SD_ITEM_DIR,  "/sdcard/lab/radio",                     NULL },  /* CC1101 / nRF24 captures */
+    { SD_ITEM_DIR,  "/sdcard/lab/rfid",                      NULL },  /* RFID/NFC card dumps */
     /* ── Seed files (written only on creation; never overwrite existing) ── */
     { SD_ITEM_FILE, "/sdcard/lab/white.txt",                 "" },
     { SD_ITEM_FILE, "/sdcard/lab/eviltwin.txt",              "" },
@@ -32205,4 +32406,627 @@ static void show_whisperpair_screen(void)
     lv_obj_add_event_cb(back_btn, wp_back_cb, LV_EVENT_CLICKED, NULL);
 
     wp_ui_timer = lv_timer_create(wp_ui_refresh, 500, NULL);
+}
+
+// ============================================================================
+// NM-RF-HAT — UI screens
+// FOR AUTHORIZED SECURITY RESEARCH AND EDUCATION ONLY.
+// ============================================================================
+
+// ── Shared back-button helper ─────────────────────────────────────────────────
+
+static void rfhat_menu_back_cb(lv_event_t *e)
+{
+    void (*parent_fn)(void) = (void(*)(void))lv_event_get_user_data(e);
+    if (parent_fn) parent_fn();
+}
+
+static lv_obj_t *rfhat_add_back_btn(const char *label, void (*parent_fn)(void))
+{
+    lv_obj_t *btn = lv_btn_create(function_page);
+    lv_obj_set_size(btn, 120, 30);
+    lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_bg_color(btn, lv_color_make(60,60,60), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(btn, 0, 0);
+    lv_obj_set_style_radius(btn, 8, 0);
+    lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(btn, 4, 0);
+    lv_obj_t *icon = lv_label_create(btn); lv_label_set_text(icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(icon, lv_color_white(), 0);
+    lv_obj_t *lbl = lv_label_create(btn); lv_label_set_text(lbl, label);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+    lv_obj_add_event_cb(btn, rfhat_menu_back_cb, LV_EVENT_CLICKED, (void*)parent_fn);
+    return btn;
+}
+
+// ── IR Menu ───────────────────────────────────────────────────────────────────
+
+static void ir_menu_tile_cb(lv_event_t *e)
+{
+    const char *name = (const char *)lv_event_get_user_data(e);
+    if (!name) return;
+    if (strcmp(name, "Capture") == 0)
+        show_dip_switch_popup(4, "Infrared", show_ir_capture_screen);
+    else if (strcmp(name, "Replay") == 0)
+        show_dip_switch_popup(4, "Infrared", show_ir_replay_screen);
+    else if (strcmp(name, "TV-B-Gone") == 0)
+        show_dip_switch_popup(4, "Infrared", show_ir_tvbgone_screen);
+}
+
+static void show_ir_menu_screen(void)
+{
+    create_function_page_base("Infrared");
+    apply_menu_bg();
+
+    lv_obj_t *tiles = lv_obj_create(function_page);
+    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30 - 48);
+    lv_obj_align(tiles, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(tiles, 0, 0);
+    lv_obj_set_style_pad_all(tiles, 4, 0);
+    lv_obj_set_style_pad_gap(tiles, 4, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
+
+    create_tile(tiles, LV_SYMBOL_AUDIO,        "Capture",   lv_color_hex(0xE65100), ir_menu_tile_cb, "Capture");
+    create_tile(tiles, LV_SYMBOL_PLAY,         "Replay",    lv_color_hex(0xBF360C), ir_menu_tile_cb, "Replay");
+    create_tile(tiles, LV_SYMBOL_POWER,        "TV-B-Gone", lv_color_hex(0x4A148C), ir_menu_tile_cb, "TV-B-Gone");
+
+    rfhat_add_back_btn("Home", show_main_tiles);
+}
+
+// ── IR Capture ────────────────────────────────────────────────────────────────
+
+static ir_signal_t s_last_ir_signal;
+static lv_obj_t   *s_ir_cap_status_lbl = NULL;
+static lv_obj_t   *s_ir_cap_save_btn   = NULL;
+
+static void s_ir_capture_done(ir_hat_err_t result, const ir_signal_t *sig, void *ctx)
+{
+    if (!s_ir_cap_status_lbl) return;
+    (void)ctx;
+    if (result == IR_HAT_OK && sig) {
+        memcpy(&s_last_ir_signal, sig, sizeof(s_last_ir_signal));
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Captured! %lu pulses", (unsigned long)sig->count);
+        lv_label_set_text(s_ir_cap_status_lbl, buf);
+        lv_obj_set_style_text_color(s_ir_cap_status_lbl, COLOR_MATERIAL_GREEN, 0);
+        if (s_ir_cap_save_btn) lv_obj_clear_state(s_ir_cap_save_btn, LV_STATE_DISABLED);
+    } else {
+        lv_label_set_text(s_ir_cap_status_lbl, "No signal — try again");
+        lv_obj_set_style_text_color(s_ir_cap_status_lbl, lv_color_hex(0xFF5722), 0);
+    }
+}
+
+static void ir_cap_start_cb(lv_event_t *e) {
+    (void)e;
+    if (!ir_hat_is_init()) ir_hat_init();
+    if (s_ir_cap_status_lbl) {
+        lv_label_set_text(s_ir_cap_status_lbl, "Listening... (5s)");
+        lv_obj_set_style_text_color(s_ir_cap_status_lbl, lv_color_hex(0xFFB300), 0);
+    }
+    if (s_ir_cap_save_btn) lv_obj_add_state(s_ir_cap_save_btn, LV_STATE_DISABLED);
+    ir_hat_capture_start(s_ir_capture_done, NULL, 5000);
+}
+
+static void ir_cap_save_cb(lv_event_t *e) {
+    (void)e;
+    static uint32_t idx = 0;
+    char name[IR_HAT_NAME_LEN];
+    snprintf(name, sizeof(name), "ir_%04lu", (unsigned long)idx++);
+    snprintf(s_last_ir_signal.name, IR_HAT_NAME_LEN, "%s", name);
+    ir_hat_err_t r = ir_hat_save(&s_last_ir_signal, name);
+    if (s_ir_cap_status_lbl)
+        lv_label_set_text(s_ir_cap_status_lbl, r == IR_HAT_OK ? "Saved to SD!" : "Save failed");
+}
+
+static void show_ir_capture_screen(void)
+{
+    create_function_page_base("IR Capture");
+    apply_menu_bg();
+
+    s_ir_cap_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_ir_cap_status_lbl, "Point remote at sensor\nthen press Capture.");
+    lv_obj_set_style_text_font(s_ir_cap_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_ir_cap_status_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_align(s_ir_cap_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_ir_cap_status_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_ir_cap_status_lbl, LCD_H_RES - 16);
+    lv_obj_align(s_ir_cap_status_lbl, LV_ALIGN_TOP_MID, 0, 50);
+
+    lv_obj_t *cap_btn = lv_btn_create(function_page);
+    lv_obj_set_size(cap_btn, 160, 42);
+    lv_obj_align(cap_btn, LV_ALIGN_CENTER, 0, 10);
+    lv_obj_set_style_bg_color(cap_btn, lv_color_hex(0xE65100), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(cap_btn, 0, 0);
+    lv_obj_set_style_radius(cap_btn, 8, 0);
+    lv_obj_t *cap_lbl = lv_label_create(cap_btn);
+    lv_label_set_text(cap_lbl, LV_SYMBOL_AUDIO "  Capture (5s)");
+    lv_obj_set_style_text_font(cap_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(cap_lbl, lv_color_white(), 0);
+    lv_obj_center(cap_lbl);
+    lv_obj_add_event_cb(cap_btn, ir_cap_start_cb, LV_EVENT_CLICKED, NULL);
+
+    s_ir_cap_save_btn = lv_btn_create(function_page);
+    lv_obj_set_size(s_ir_cap_save_btn, 160, 38);
+    lv_obj_align(s_ir_cap_save_btn, LV_ALIGN_CENTER, 0, 62);
+    lv_obj_set_style_bg_color(s_ir_cap_save_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(s_ir_cap_save_btn, 0, 0);
+    lv_obj_set_style_radius(s_ir_cap_save_btn, 8, 0);
+    lv_obj_add_state(s_ir_cap_save_btn, LV_STATE_DISABLED);
+    lv_obj_t *save_lbl = lv_label_create(s_ir_cap_save_btn);
+    lv_label_set_text(save_lbl, LV_SYMBOL_SAVE "  Save to SD");
+    lv_obj_set_style_text_font(save_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(save_lbl, lv_color_white(), 0);
+    lv_obj_center(save_lbl);
+    lv_obj_add_event_cb(s_ir_cap_save_btn, ir_cap_save_cb, LV_EVENT_CLICKED, NULL);
+
+    rfhat_add_back_btn("Infrared", show_ir_menu_screen);
+}
+
+// ── IR Replay ─────────────────────────────────────────────────────────────────
+
+static char s_ir_names[32][IR_HAT_NAME_LEN];
+static int  s_ir_name_count  = 0;
+static int  s_ir_sel_idx     = -1;
+static lv_obj_t *s_ir_replay_status = NULL;
+
+static void ir_replay_row_cb(lv_event_t *e)
+{
+    s_ir_sel_idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (s_ir_replay_status) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "Selected: %s", s_ir_names[s_ir_sel_idx]);
+        lv_label_set_text(s_ir_replay_status, buf);
+    }
+}
+
+static void ir_do_replay_cb(lv_event_t *e) {
+    (void)e;
+    if (s_ir_sel_idx < 0 || s_ir_sel_idx >= s_ir_name_count) return;
+    if (!ir_hat_is_init()) ir_hat_init();
+    ir_signal_t sig;
+    if (s_ir_replay_status) lv_label_set_text(s_ir_replay_status, "Transmitting...");
+    ir_hat_err_t r = ir_hat_load(&sig, s_ir_names[s_ir_sel_idx]);
+    if (r == IR_HAT_OK) {
+        ir_hat_replay(&sig);
+        if (s_ir_replay_status) lv_label_set_text(s_ir_replay_status, "Sent!");
+    } else {
+        if (s_ir_replay_status) lv_label_set_text(s_ir_replay_status, "Load error");
+    }
+}
+
+static void show_ir_replay_screen(void)
+{
+    create_function_page_base("IR Replay");
+    apply_menu_bg();
+
+    s_ir_name_count = ir_hat_list_saved(s_ir_names, 32);
+    s_ir_sel_idx = -1;
+
+    s_ir_replay_status = lv_label_create(function_page);
+    lv_label_set_text(s_ir_replay_status,
+        s_ir_name_count ? "Tap signal, then Transmit." : "No saved signals.\nCapture one first.");
+    lv_obj_set_style_text_font(s_ir_replay_status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_ir_replay_status, ui_text_color(), 0);
+    lv_obj_set_style_text_align(s_ir_replay_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_ir_replay_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_ir_replay_status, LCD_H_RES - 16);
+    lv_obj_align(s_ir_replay_status, LV_ALIGN_TOP_MID, 0, 38);
+
+    // Scrollable list of saved files
+    lv_obj_t *list = lv_list_create(function_page);
+    lv_obj_set_size(list, LCD_H_RES - 12, 140);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 78);
+    lv_obj_set_style_bg_color(list, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(list, lv_color_hex(0x444), 0);
+    lv_obj_set_style_border_width(list, 1, 0);
+    for (int i = 0; i < s_ir_name_count; i++) {
+        lv_obj_t *row = lv_list_add_btn(list, LV_SYMBOL_AUDIO, s_ir_names[i]);
+        lv_obj_set_style_text_font(row, &lv_font_montserrat_12, 0);
+        lv_obj_add_event_cb(row, ir_replay_row_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+    }
+
+    lv_obj_t *tx_btn = lv_btn_create(function_page);
+    lv_obj_set_size(tx_btn, 150, 36);
+    lv_obj_align(tx_btn, LV_ALIGN_BOTTOM_MID, 0, -46);
+    lv_obj_set_style_bg_color(tx_btn, lv_color_hex(0xBF360C), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(tx_btn, 0, 0);
+    lv_obj_set_style_radius(tx_btn, 8, 0);
+    lv_obj_t *tx_lbl = lv_label_create(tx_btn);
+    lv_label_set_text(tx_lbl, LV_SYMBOL_PLAY "  Transmit");
+    lv_obj_set_style_text_font(tx_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(tx_lbl, lv_color_white(), 0);
+    lv_obj_center(tx_lbl);
+    lv_obj_add_event_cb(tx_btn, ir_do_replay_cb, LV_EVENT_CLICKED, NULL);
+
+    rfhat_add_back_btn("Infrared", show_ir_menu_screen);
+}
+
+// ── TV-B-Gone ─────────────────────────────────────────────────────────────────
+
+static lv_obj_t *s_tvbg_status  = NULL;
+static lv_obj_t *s_tvbg_bar     = NULL;
+static lv_obj_t *s_tvbg_start_btn = NULL;
+static bool      s_tvbg_running = false;
+
+typedef struct { int idx; int total; } tvbg_prog_t;
+
+static void s_tvbg_prog_lvgl_cb(void *arg)
+{
+    tvbg_prog_t *p = (tvbg_prog_t *)arg;
+    if (s_tvbg_bar)    lv_bar_set_value(s_tvbg_bar, p->idx * 100 / p->total, LV_ANIM_ON);
+    if (s_tvbg_status) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "Code %d / %d", p->idx + 1, p->total);
+        lv_label_set_text(s_tvbg_status, buf);
+    }
+    free(p);
+}
+
+static void s_tvbg_done_lvgl_cb(void *arg)
+{
+    (void)arg;
+    s_tvbg_running = false;
+    if (s_tvbg_status)    lv_label_set_text(s_tvbg_status, "Done — all codes sent");
+    if (s_tvbg_start_btn) lv_obj_clear_state(s_tvbg_start_btn, LV_STATE_DISABLED);
+    if (s_tvbg_bar)       lv_bar_set_value(s_tvbg_bar, 100, LV_ANIM_ON);
+}
+
+static void s_tvbg_progress(int idx, int total, void *ctx)
+{
+    (void)ctx;
+    tvbg_prog_t *p = malloc(sizeof(tvbg_prog_t));
+    if (p) { p->idx = idx; p->total = total; lv_async_call(s_tvbg_prog_lvgl_cb, p); }
+}
+
+static void s_tvbg_task(void *arg)
+{
+    (void)arg;
+    ir_hat_tvbgone(s_tvbg_progress, NULL);
+    lv_async_call(s_tvbg_done_lvgl_cb, NULL);
+    vTaskDelete(NULL);
+}
+
+static void tvbg_start_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_tvbg_running) return;
+    if (!ir_hat_is_init()) ir_hat_init();
+    s_tvbg_running = true;
+    if (s_tvbg_status)    lv_label_set_text(s_tvbg_status, "Transmitting...");
+    if (s_tvbg_start_btn) lv_obj_add_state(s_tvbg_start_btn, LV_STATE_DISABLED);
+    if (s_tvbg_bar)       lv_bar_set_value(s_tvbg_bar, 0, LV_ANIM_OFF);
+    xTaskCreate(s_tvbg_task, "tvbgone", 4096, NULL, tskIDLE_PRIORITY + 2, NULL);
+}
+
+static void show_ir_tvbgone_screen(void)
+{
+    create_function_page_base("TV-B-Gone");
+    apply_menu_bg();
+
+    lv_obj_t *desc = lv_label_create(function_page);
+    lv_label_set_text(desc,
+        "Blasts common TV power-off\n"
+        "IR codes. Point sensor toward\n"
+        "target and press Start.");
+    lv_obj_set_style_text_font(desc, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(desc, ui_text_color(), 0);
+    lv_obj_set_style_text_align(desc, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(desc, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(desc, LCD_H_RES - 20);
+    lv_obj_align(desc, LV_ALIGN_TOP_MID, 0, 42);
+
+    s_tvbg_bar = lv_bar_create(function_page);
+    lv_obj_set_size(s_tvbg_bar, LCD_H_RES - 32, 14);
+    lv_obj_align(s_tvbg_bar, LV_ALIGN_TOP_MID, 0, 130);
+    lv_obj_set_style_bg_color(s_tvbg_bar, lv_color_hex(0x333), 0);
+    lv_obj_set_style_bg_color(s_tvbg_bar, lv_color_hex(0xE65100), LV_PART_INDICATOR);
+    lv_bar_set_value(s_tvbg_bar, 0, LV_ANIM_OFF);
+
+    s_tvbg_status = lv_label_create(function_page);
+    lv_label_set_text(s_tvbg_status, "Ready");
+    lv_obj_set_style_text_font(s_tvbg_status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_tvbg_status, ui_text_color(), 0);
+    lv_obj_set_style_text_align(s_tvbg_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_tvbg_status, LV_ALIGN_TOP_MID, 0, 152);
+
+    s_tvbg_running = false;
+    s_tvbg_start_btn = lv_btn_create(function_page);
+    lv_obj_set_size(s_tvbg_start_btn, 160, 42);
+    lv_obj_align(s_tvbg_start_btn, LV_ALIGN_TOP_MID, 0, 178);
+    lv_obj_set_style_bg_color(s_tvbg_start_btn, lv_color_hex(0x4A148C), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(s_tvbg_start_btn, 0, 0);
+    lv_obj_set_style_radius(s_tvbg_start_btn, 8, 0);
+    lv_obj_t *st_lbl = lv_label_create(s_tvbg_start_btn);
+    lv_label_set_text(st_lbl, LV_SYMBOL_POWER "  Start");
+    lv_obj_set_style_text_font(st_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(st_lbl, lv_color_white(), 0);
+    lv_obj_center(st_lbl);
+    lv_obj_add_event_cb(s_tvbg_start_btn, tvbg_start_cb, LV_EVENT_CLICKED, NULL);
+
+    rfhat_add_back_btn("Infrared", show_ir_menu_screen);
+}
+
+// ── RF433 Menu ────────────────────────────────────────────────────────────────
+
+static void rf433_menu_tile_cb(lv_event_t *e)
+{
+    const char *name = (const char *)lv_event_get_user_data(e);
+    if (!name) return;
+    if (strcmp(name, "Capture") == 0)
+        show_dip_switch_popup(5, "RF433 OOK", show_rf433_capture_screen);
+    else if (strcmp(name, "Replay") == 0)
+        show_dip_switch_popup(5, "RF433 OOK", show_rf433_replay_screen);
+}
+
+// ── Radio Menu ────────────────────────────────────────────────────────────────
+
+static void radio_menu_tile_cb(lv_event_t *e)
+{
+    const char *name = (const char *)lv_event_get_user_data(e);
+    if (!name) return;
+    // Show DIP reminder then a "coming soon" stub for each module
+    if (strcmp(name, "CC1101") == 0)
+        show_dip_switch_popup(1, "CC1101 Sub-GHz", NULL); // NULL = no proceed (not yet impl)
+    else if (strcmp(name, "nRF24") == 0)
+        show_dip_switch_popup(2, "nRF24L01 2.4GHz", NULL);
+    else if (strcmp(name, "RF433") == 0)
+        show_dip_switch_popup(5, "RF433 OOK", show_rf433_capture_screen);
+}
+
+static void show_radio_menu_screen(void)
+{
+    create_function_page_base("Radio");
+    apply_menu_bg();
+
+    lv_obj_t *tiles = lv_obj_create(function_page);
+    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30 - 48);
+    lv_obj_align(tiles, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(tiles, 0, 0);
+    lv_obj_set_style_pad_all(tiles, 4, 0);
+    lv_obj_set_style_pad_gap(tiles, 4, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
+
+    // CC1101 (DIP 1) — Sub-GHz
+    create_tile(tiles, MY_SYMBOL_TOWER,    "CC1101\nSub-GHz", lv_color_hex(0x1B5E20), radio_menu_tile_cb, "CC1101");
+    // nRF24L01 (DIP 2) — 2.4 GHz
+    create_tile(tiles, MY_SYMBOL_WAVE,     "nRF24\n2.4GHz",   lv_color_hex(0x0D47A1), radio_menu_tile_cb, "nRF24");
+    // RF433 OOK (DIP 5) — simple OOK
+    create_tile(tiles, MY_SYMBOL_SATELLITE,"RF433\nOOK/ASK",  lv_color_hex(0x827717), radio_menu_tile_cb, "RF433");
+
+    // Coming soon label
+    lv_obj_t *note = lv_label_create(function_page);
+    lv_label_set_text(note, "CC1101 & nRF24: coming soon\nRF433: capture/replay available");
+    lv_obj_set_style_text_font(note, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(note, lv_color_hex(0x9E9E9E), 0);
+    lv_obj_set_style_text_align(note, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(note, LCD_H_RES - 20);
+    lv_obj_align(note, LV_ALIGN_BOTTOM_MID, 0, -42);
+
+    rfhat_add_back_btn("Home", show_main_tiles);
+}
+
+// ── RFID Menu ─────────────────────────────────────────────────────────────────
+
+static void show_rfid_menu_screen(void)
+{
+    create_function_page_base("RFID / NFC");
+    apply_menu_bg();
+
+    lv_obj_t *card = lv_obj_create(function_page);
+    lv_obj_set_size(card, LCD_H_RES - 20, LCD_V_RES - 80);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 38);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x00695C), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(card, 10, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, MY_SYMBOL_MICROCHIP "  PN532 NFC/RFID");
+    lv_obj_set_style_text_font(title, &g_font_icon14, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0x4DB6AC), 0);
+
+    lv_obj_t *dip_note = lv_label_create(card);
+    lv_label_set_text(dip_note, "Set DIP switch position 3\nbefore using RFID features.");
+    lv_obj_set_style_text_font(dip_note, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(dip_note, lv_color_hex(0xFFB300), 0);
+    lv_obj_set_style_text_align(dip_note, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(dip_note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(dip_note, LCD_H_RES - 44);
+
+    lv_obj_t *coming = lv_label_create(card);
+    lv_label_set_text(coming,
+        "Planned features:\n"
+        "  Scan & Read Card\n"
+        "  Clone / Write Card\n"
+        "  Card Emulation\n"
+        "  Mifare Key Brute-force\n\n"
+        "PN532 driver in development.");
+    lv_obj_set_style_text_font(coming, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(coming, ui_text_color(), 0);
+    lv_label_set_long_mode(coming, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(coming, LCD_H_RES - 44);
+
+    rfhat_add_back_btn("Home", show_main_tiles);
+}
+
+// ── RF433 Capture ─────────────────────────────────────────────────────────────
+
+static rf433_signal_t s_last_rf433_signal;
+static lv_obj_t *s_rf433_cap_status = NULL;
+static lv_obj_t *s_rf433_cap_save   = NULL;
+
+static void s_rf433_done(rf433_hat_err_t result, const rf433_signal_t *sig, void *ctx)
+{
+    (void)ctx;
+    if (!s_rf433_cap_status) return;
+    if (result == RF433_HAT_OK && sig) {
+        memcpy(&s_last_rf433_signal, sig, sizeof(s_last_rf433_signal));
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Captured! %lu pulses", (unsigned long)sig->count);
+        lv_label_set_text(s_rf433_cap_status, buf);
+        lv_obj_set_style_text_color(s_rf433_cap_status, COLOR_MATERIAL_GREEN, 0);
+        if (s_rf433_cap_save) lv_obj_clear_state(s_rf433_cap_save, LV_STATE_DISABLED);
+    } else {
+        lv_label_set_text(s_rf433_cap_status, "No signal — try again");
+        lv_obj_set_style_text_color(s_rf433_cap_status, lv_color_hex(0xFF5722), 0);
+    }
+}
+
+static void rf433_cap_start_cb(lv_event_t *e) {
+    (void)e;
+    if (!rf433_hat_is_init()) rf433_hat_init();
+    if (s_rf433_cap_status) {
+        lv_label_set_text(s_rf433_cap_status, "Listening... (10s)");
+        lv_obj_set_style_text_color(s_rf433_cap_status, lv_color_hex(0xFFB300), 0);
+    }
+    if (s_rf433_cap_save) lv_obj_add_state(s_rf433_cap_save, LV_STATE_DISABLED);
+    rf433_hat_capture_start(s_rf433_done, NULL, 10000);
+}
+
+static void rf433_cap_save_cb(lv_event_t *e) {
+    (void)e;
+    static uint32_t idx = 0;
+    char name[RF433_HAT_NAME_LEN];
+    snprintf(name, sizeof(name), "rf_%04lu", (unsigned long)idx++);
+    snprintf(s_last_rf433_signal.name, RF433_HAT_NAME_LEN, "%s", name);
+    rf433_hat_err_t r = rf433_hat_save(&s_last_rf433_signal, name);
+    if (s_rf433_cap_status)
+        lv_label_set_text(s_rf433_cap_status, r == RF433_HAT_OK ? "Saved (.sub)!" : "Save failed");
+}
+
+static void show_rf433_capture_screen(void)
+{
+    create_function_page_base("RF433 Capture");
+    apply_menu_bg();
+
+    s_rf433_cap_status = lv_label_create(function_page);
+    lv_label_set_text(s_rf433_cap_status,
+        "Press your remote/button\nthen press Capture.\nSaves Flipper-compatible .sub");
+    lv_obj_set_style_text_font(s_rf433_cap_status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_rf433_cap_status, ui_text_color(), 0);
+    lv_obj_set_style_text_align(s_rf433_cap_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_rf433_cap_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_rf433_cap_status, LCD_H_RES - 16);
+    lv_obj_align(s_rf433_cap_status, LV_ALIGN_TOP_MID, 0, 44);
+
+    lv_obj_t *cap_btn = lv_btn_create(function_page);
+    lv_obj_set_size(cap_btn, 160, 42);
+    lv_obj_align(cap_btn, LV_ALIGN_CENTER, 0, 10);
+    lv_obj_set_style_bg_color(cap_btn, lv_color_hex(0x827717), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(cap_btn, 0, 0);
+    lv_obj_set_style_radius(cap_btn, 8, 0);
+    lv_obj_t *cap_lbl = lv_label_create(cap_btn);
+    lv_label_set_text(cap_lbl, LV_SYMBOL_AUDIO "  Capture (10s)");
+    lv_obj_set_style_text_font(cap_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(cap_lbl, lv_color_white(), 0);
+    lv_obj_center(cap_lbl);
+    lv_obj_add_event_cb(cap_btn, rf433_cap_start_cb, LV_EVENT_CLICKED, NULL);
+
+    s_rf433_cap_save = lv_btn_create(function_page);
+    lv_obj_set_size(s_rf433_cap_save, 160, 38);
+    lv_obj_align(s_rf433_cap_save, LV_ALIGN_CENTER, 0, 62);
+    lv_obj_set_style_bg_color(s_rf433_cap_save, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(s_rf433_cap_save, 0, 0);
+    lv_obj_set_style_radius(s_rf433_cap_save, 8, 0);
+    lv_obj_add_state(s_rf433_cap_save, LV_STATE_DISABLED);
+    lv_obj_t *save_lbl = lv_label_create(s_rf433_cap_save);
+    lv_label_set_text(save_lbl, LV_SYMBOL_SAVE "  Save (.sub)");
+    lv_obj_set_style_text_font(save_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(save_lbl, lv_color_white(), 0);
+    lv_obj_center(save_lbl);
+    lv_obj_add_event_cb(s_rf433_cap_save, rf433_cap_save_cb, LV_EVENT_CLICKED, NULL);
+
+    rfhat_add_back_btn("Radio", show_radio_menu_screen);
+}
+
+// ── RF433 Replay ──────────────────────────────────────────────────────────────
+
+static char s_rf433_names[32][RF433_HAT_NAME_LEN];
+static int  s_rf433_name_count = 0;
+static int  s_rf433_sel_idx    = -1;
+static lv_obj_t *s_rf433_replay_status = NULL;
+
+static void rf433_replay_row_cb(lv_event_t *e) {
+    s_rf433_sel_idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (s_rf433_replay_status) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "Selected: %s", s_rf433_names[s_rf433_sel_idx]);
+        lv_label_set_text(s_rf433_replay_status, buf);
+    }
+}
+
+static void rf433_do_replay_cb(lv_event_t *e) {
+    (void)e;
+    if (s_rf433_sel_idx < 0 || s_rf433_sel_idx >= s_rf433_name_count) return;
+    if (!rf433_hat_is_init()) rf433_hat_init();
+    rf433_signal_t sig;
+    if (s_rf433_replay_status) lv_label_set_text(s_rf433_replay_status, "Transmitting x3...");
+    rf433_hat_err_t r = rf433_hat_load(&sig, s_rf433_names[s_rf433_sel_idx]);
+    if (r == RF433_HAT_OK) {
+        rf433_hat_replay(&sig, 3);
+        if (s_rf433_replay_status) lv_label_set_text(s_rf433_replay_status, "Sent x3!");
+    } else {
+        if (s_rf433_replay_status) lv_label_set_text(s_rf433_replay_status, "Load error");
+    }
+}
+
+static void show_rf433_replay_screen(void)
+{
+    create_function_page_base("RF433 Replay");
+    apply_menu_bg();
+
+    s_rf433_name_count = rf433_hat_list_saved(s_rf433_names, 32);
+    s_rf433_sel_idx = -1;
+
+    s_rf433_replay_status = lv_label_create(function_page);
+    lv_label_set_text(s_rf433_replay_status,
+        s_rf433_name_count ? "Tap signal, then Transmit." : "No saved signals.\nCapture one first.");
+    lv_obj_set_style_text_font(s_rf433_replay_status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_rf433_replay_status, ui_text_color(), 0);
+    lv_obj_set_style_text_align(s_rf433_replay_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_rf433_replay_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_rf433_replay_status, LCD_H_RES - 16);
+    lv_obj_align(s_rf433_replay_status, LV_ALIGN_TOP_MID, 0, 38);
+
+    lv_obj_t *list = lv_list_create(function_page);
+    lv_obj_set_size(list, LCD_H_RES - 12, 140);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 78);
+    lv_obj_set_style_bg_color(list, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(list, lv_color_hex(0x444), 0);
+    lv_obj_set_style_border_width(list, 1, 0);
+    for (int i = 0; i < s_rf433_name_count; i++) {
+        lv_obj_t *row = lv_list_add_btn(list, LV_SYMBOL_AUDIO, s_rf433_names[i]);
+        lv_obj_set_style_text_font(row, &lv_font_montserrat_12, 0);
+        lv_obj_add_event_cb(row, rf433_replay_row_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+    }
+
+    lv_obj_t *tx_btn = lv_btn_create(function_page);
+    lv_obj_set_size(tx_btn, 150, 36);
+    lv_obj_align(tx_btn, LV_ALIGN_BOTTOM_MID, 0, -46);
+    lv_obj_set_style_bg_color(tx_btn, lv_color_hex(0x827717), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(tx_btn, 0, 0);
+    lv_obj_set_style_radius(tx_btn, 8, 0);
+    lv_obj_t *tx_lbl = lv_label_create(tx_btn);
+    lv_label_set_text(tx_lbl, LV_SYMBOL_PLAY "  Transmit x3");
+    lv_obj_set_style_text_font(tx_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(tx_lbl, lv_color_white(), 0);
+    lv_obj_center(tx_lbl);
+    lv_obj_add_event_cb(tx_btn, rf433_do_replay_cb, LV_EVENT_CLICKED, NULL);
+
+    rfhat_add_back_btn("Radio", show_radio_menu_screen);
 }
