@@ -1443,9 +1443,12 @@ All data is stored on the SD card. `/sdcard/lab/` is the root for all project da
     │   │   └── ble_<timestamp>.pcapng
     │   ├── honeypair/        # HoneyPair session logs
     │   │   └── honeypair_<timestamp>.jsonl
-    │   └── blueduck/         # BlueDuck DuckyScript payloads (upcoming)
-    │       └── scripts/
-    │           └── *.duck
+    │   ├── blueduck/         # BlueDuck session logs + DuckyScript payloads
+    │   │   ├── scripts/      # Drop .duck scripts here (seeded: android_rickroll.duck)
+    │   │   │   └── *.duck
+    │   │   └── blueduck_<timestamp>.jsonl
+    │   └── whisperpair/      # WhisperPair (CVE-2025-36911) probe/exploit logs
+    │       └── wp_<timestamp>.json
     ├── bluetooth/
     │   ├── lookout.csv       # Bluetooth Lookout watchlist
     │   └── spooflist.csv     # Device Spoof targets -- CSV: MAC,Name (one per line)
@@ -1465,7 +1468,8 @@ All data is stored on the SD card. `/sdcard/lab/` is the root for all project da
     │   ├── *.pcap            # Wireshark-compatible captures
     │   └── *.hccapx          # Hashcat-compatible format
     ├── htmls/                # Captive portal HTML pages
-    │   └── *.html / *.htm    # Drop any portal page here -- each file appears in the attack dropdown
+    │   ├── basic_portal.html # Seeded: dark-themed WiFi login page (posts to /login)
+    │   └── *.html / *.htm    # Drop additional portal pages here -- each appears in the attack dropdown
     ├── pcaps/                # MITM/sniff PCAP captures
     │   └── mitm_<n>.pcap
     ├── screenshots/          # UI screenshots (BMP)
