@@ -1,0 +1,9 @@
+REM windows_lock.duck
+REM Locks the Windows workstation immediately.
+REM Win+L is the native lock shortcut — works on all Windows versions.
+REM No unlock bypass — just a demonstration of physical access via HID.
+REM Copy to: /sdcard/lab/ble/blueduck/scripts/
+
+HUMAN_MODE OFF
+
+GUI l

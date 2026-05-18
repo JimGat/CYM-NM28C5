@@ -1,0 +1,16 @@
+REM windows_rickroll.duck
+REM Opens the default browser via the Run dialog and navigates to Never Gonna Give You Up.
+REM Win+R accepts URLs directly — no need to open a browser first.
+REM Works on Windows 10 and 11.
+REM Copy to: /sdcard/lab/ble/blueduck/scripts/
+
+HUMAN_MODE ON
+HUMAN_SPEED NORMAL
+
+REM Open Run dialog
+GUI r
+DELAY 600
+
+REM Type URL — Run dialog passes it to the default browser
+STRING https://youtube.com/watch?v=dQw4w9WgXcQ
+ENTER
