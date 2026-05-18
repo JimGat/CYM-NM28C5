@@ -12905,6 +12905,7 @@ static void wifi_connect_btn_cb(lv_event_t *e)
     
     // Start connection
     ESP_LOGI(TAG, "Connecting to '%s'...", wifi_connect_ssid);
+    esp_wifi_clear_fast_connect();
     esp_wifi_connect();
 }
 
@@ -16431,6 +16432,7 @@ static void s_wcs_connect_cb(lv_event_t *e)
     strncpy((char *)sta_cfg.sta.password, pass, sizeof(sta_cfg.sta.password) - 1);
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
+    esp_wifi_clear_fast_connect();
     esp_wifi_connect();
 
     /* Poll every 1s for IP or failure */
@@ -16734,6 +16736,7 @@ static bool wdup_ensure_wifi(void)
     strncpy((char *)cfg.sta.ssid,     g_saved_wifi_ssid, sizeof(cfg.sta.ssid) - 1);
     strncpy((char *)cfg.sta.password, g_saved_wifi_pass,  sizeof(cfg.sta.password) - 1);
     esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    esp_wifi_clear_fast_connect();
     esp_wifi_connect();
 
     // Wait up to 15 s for a routable IP (not just L2 association).
