@@ -107,6 +107,7 @@ LV_IMG_DECLARE(deedee_img);
 #include "lwip/netif.h"
 #include "lwip/pbuf.h"
 #include "lwip/prot/ethernet.h"
+#include "lwip/sockets.h"
 #include "esp_netif.h"
 #include "esp_netif_net_stack.h"
 
@@ -15909,9 +15910,42 @@ static void s_fileserv_send_dir(httpd_req_t *req, const char *sd_path, const cha
     httpd_resp_send_chunk(req, NULL, 0);
 }
 
+static void fileserv_url_decode(char *dst, size_t dsz, const char *src)
+{
+    size_t n = 0;
+    for (; *src && n + 1 < dsz; src++) {
+        if (*src == '%' && isxdigit((unsigned char)src[1]) && isxdigit((unsigned char)src[2])) {
+            char h[3] = { src[1], src[2], '\0' };
+            dst[n++] = (char)strtol(h, NULL, 16);
+            src += 2;
+        } else if (*src == '+') {
+            dst[n++] = ' ';
+        } else {
+            dst[n++] = *src;
+        }
+    }
+    dst[n] = '\0';
+}
+
+static void fileserv_log_client(httpd_req_t *req, const char *method)
+{
+    int fd = httpd_req_to_sockfd(req);
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof(ss);
+    char ipstr[INET6_ADDRSTRLEN] = "?";
+    if (getpeername(fd, (struct sockaddr *)&ss, &sl) == 0) {
+        if (ss.ss_family == AF_INET)
+            inet_ntop(AF_INET,  &((struct sockaddr_in  *)&ss)->sin_addr, ipstr, sizeof(ipstr));
+        else
+            inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&ss)->sin6_addr, ipstr, sizeof(ipstr));
+    }
+    ESP_LOGI("fileserv", "%s %s from %s", method, req->uri, ipstr);
+}
+
 /* PUT /upload?path=/url/path/to/filename  — raw body is file content */
 static esp_err_t fileserv_upload_handler(httpd_req_t *req)
 {
+    fileserv_log_client(req, "PUT");
     char query[512] = "";
     httpd_req_get_url_query_str(req, query, sizeof(query));
     char path_param[256] = "";
@@ -15973,17 +16007,28 @@ static esp_err_t fileserv_upload_handler(httpd_req_t *req)
 /* POST /mkdir  body (form-encoded): dir=/url/path&name=dirname */
 static esp_err_t fileserv_mkdir_handler(httpd_req_t *req)
 {
+    fileserv_log_client(req, "POST(mkdir)");
     char body[400] = "";
     int blen = req->content_len;
     if (blen > 0 && blen < (int)sizeof(body) - 1) {
         int got = httpd_req_recv(req, body, blen);
         if (got > 0) body[got] = '\0';
+    } else if (blen <= 0) {
+        /* content_len unknown — read what we can */
+        int got = httpd_req_recv(req, body, sizeof(body) - 1);
+        if (got > 0) body[got] = '\0';
     }
+    ESP_LOGI("fileserv", "mkdir body: '%s'", body);
 
-    char dir_param[256] = "";
-    char name_param[64]  = "";
-    httpd_query_key_value(body, "dir",  dir_param,  sizeof(dir_param));
-    httpd_query_key_value(body, "name", name_param, sizeof(name_param));
+    char dir_enc[256] = "", name_enc[64] = "";
+    httpd_query_key_value(body, "dir",  dir_enc,  sizeof(dir_enc));
+    httpd_query_key_value(body, "name", name_enc, sizeof(name_enc));
+
+    /* Browser URL-encodes '/' as '%2F' in form body — decode both params */
+    char dir_param[256] = "", name_param[64] = "";
+    fileserv_url_decode(dir_param,  sizeof(dir_param),  dir_enc);
+    fileserv_url_decode(name_param, sizeof(name_param), name_enc);
+    ESP_LOGI("fileserv", "mkdir dir='%s' name='%s'", dir_param, name_param);
 
     if (!dir_param[0] || !name_param[0] || dir_param[0] != '/'
         || strstr(dir_param, "..") || strstr(name_param, "..") || strchr(name_param, '/')) {
@@ -16015,6 +16060,7 @@ static esp_err_t fileserv_mkdir_handler(httpd_req_t *req)
 /* POST /delete?path=/url/path/to/file */
 static esp_err_t fileserv_delete_handler(httpd_req_t *req)
 {
+    fileserv_log_client(req, "POST(delete)");
     char query[512] = "";
     httpd_req_get_url_query_str(req, query, sizeof(query));
     char path_param[256] = "";
@@ -16052,7 +16098,7 @@ static esp_err_t fileserv_root_handler(httpd_req_t *req)
     size_t pl = strlen(sd_path);
     if (pl > 1 && sd_path[pl-1] == '/') sd_path[pl-1] = '\0';
 
-    ESP_LOGI("fileserv", "req: %s -> sd:%s", uri, sd_path);
+    fileserv_log_client(req, "GET");
 
     struct stat st;
     memset(&st, 0, sizeof(st));
