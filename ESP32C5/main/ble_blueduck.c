@@ -55,9 +55,14 @@ static const bd_persona_t s_personas[] = {
 
 #define BD_SCRIPT_DIR   "/sdcard/lab/ble/blueduck/scripts"
 
-static char s_script_names[BD_MAX_SCRIPTS][64];
-static char s_script_paths[BD_MAX_SCRIPTS][128];
-static int  s_script_count = 0;
+static char   s_script_names[BD_MAX_SCRIPTS][64];
+static char   s_script_paths[BD_MAX_SCRIPTS][128];
+static int    s_script_count = 0;
+/* PSRAM-backed script content cache — loaded during blueduck_scan_scripts()
+   while WiFi DMA RAM is still available; BLE leaves < 1 KB DMA-capable free
+   making fopen/fread fail with allocate_dma_buf 0x101 at execution time. */
+static char  *s_script_cache[BD_MAX_SCRIPTS];
+static size_t s_script_cache_len[BD_MAX_SCRIPTS];
 
 // ── Human typing config ───────────────────────────────────────────────────────
 
@@ -533,13 +538,40 @@ static void bd_exec_line(const char *line, bd_exec_ctx_t *ctx)
 
 static void bd_exec_script(const char *path)
 {
+    /* Prefer PSRAM cache — SD DMA alloc fails when BLE is active (< 1 KB free) */
+    for (int i = 0; i < s_script_count; i++) {
+        if (strcmp(s_script_paths[i], path) == 0 && s_script_cache[i]) {
+            ESP_LOGI(TAG, "Executing script from PSRAM cache: %s (%u bytes)",
+                     path, (unsigned)s_script_cache_len[i]);
+            s_executing = true;
+            bd_exec_ctx_t ctx = { .default_delay_ms = 0 };
+            char line[BD_MAX_LINE];
+            const char *p   = s_script_cache[i];
+            const char *end = p + s_script_cache_len[i];
+            while (p < end && s_active &&
+                   s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+                const char *nl = memchr(p, '\n', (size_t)(end - p));
+                size_t ll = nl ? (size_t)(nl - p) : (size_t)(end - p);
+                if (ll >= sizeof(line)) ll = sizeof(line) - 1;
+                memcpy(line, p, ll);
+                line[ll] = '\0';
+                bd_exec_line(line, &ctx);
+                p = nl ? nl + 1 : end;
+            }
+            s_executing = false;
+            ESP_LOGI(TAG, "Script complete");
+            return;
+        }
+    }
+
+    /* Fallback: direct file I/O (only works before BLE init) */
     FILE *f = fopen(path, "r");
     if (!f) {
-        ESP_LOGE(TAG, "Cannot open script: %s", path);
+        ESP_LOGE(TAG, "Cannot open script: %s (not cached, SD DMA likely OOM)", path);
         return;
     }
 
-    ESP_LOGI(TAG, "Executing script: %s", path);
+    ESP_LOGI(TAG, "Executing script from SD: %s", path);
     s_executing = true;
 
     bd_exec_ctx_t ctx = { .default_delay_ms = 0 };
@@ -920,6 +952,14 @@ const char *blueduck_persona_name(int idx)
 
 int blueduck_scan_scripts(void)
 {
+    /* Free any previously cached script content */
+    for (int i = 0; i < BD_MAX_SCRIPTS; i++) {
+        if (s_script_cache[i]) {
+            heap_caps_free(s_script_cache[i]);
+            s_script_cache[i]   = NULL;
+            s_script_cache_len[i] = 0;
+        }
+    }
     s_script_count = 0;
     if (!s_sd_mutex) return 0;
 
@@ -937,11 +977,38 @@ int blueduck_scan_scripts(void)
             const char *name = ent->d_name;
             size_t len = strlen(name);
             if (len > 5 && strcasecmp(name + len - 5, ".duck") == 0) {
-                /* Name without extension */
                 snprintf(s_script_names[s_script_count], sizeof(s_script_names[0]),
                          "%.*s", (int)(len - 5), name);
                 snprintf(s_script_paths[s_script_count], sizeof(s_script_paths[0]),
                          "%.50s/%.60s", BD_SCRIPT_DIR, name);
+
+                /* Read script content into PSRAM now, while WiFi DMA RAM is
+                   still available.  BLE leaves < 1 KB DMA-capable free, which
+                   causes sdmmc_read_blocks to fail with allocate_dma_buf 0x101
+                   at execution time. */
+                struct stat st;
+                if (stat(s_script_paths[s_script_count], &st) == 0 && st.st_size > 0) {
+                    char *buf = heap_caps_malloc((size_t)st.st_size + 1,
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                    if (buf) {
+                        FILE *sf = fopen(s_script_paths[s_script_count], "r");
+                        if (sf) {
+                            size_t n = fread(buf, 1, (size_t)st.st_size, sf);
+                            fclose(sf);
+                            buf[n] = '\0';
+                            s_script_cache[s_script_count]   = buf;
+                            s_script_cache_len[s_script_count] = n;
+                            ESP_LOGI(TAG, "Cached '%s' (%u B) in PSRAM",
+                                     s_script_names[s_script_count], (unsigned)n);
+                        } else {
+                            heap_caps_free(buf);
+                        }
+                    } else {
+                        ESP_LOGW(TAG, "PSRAM alloc failed for script cache '%s'",
+                                 s_script_names[s_script_count]);
+                    }
+                }
+
                 s_script_count++;
             }
         }
