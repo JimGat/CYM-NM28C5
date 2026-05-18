@@ -19893,6 +19893,53 @@ static void show_settings_screen(void)
 
 // ─── Provision directory/file table ──────────────────────────────────────────
 
+// Seed content for files written only on first provision (never overwrite)
+static const char SEED_PORTAL_HTML[] =
+    "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    "<title>WiFi Login</title>"
+    "<style>"
+    "body{font-family:sans-serif;background:#1a1a2e;color:#eee;display:flex;"
+    "align-items:center;justify-content:center;min-height:100vh;margin:0}"
+    ".box{background:#16213e;padding:2rem;border-radius:12px;width:320px;"
+    "box-shadow:0 4px 24px #0008}"
+    "h2{margin:0 0 1.5rem;text-align:center;color:#00b4d8}"
+    "input{width:100%;padding:.75rem;margin:.5rem 0 1rem;border:1px solid #444;"
+    "border-radius:6px;background:#0f3460;color:#eee;box-sizing:border-box}"
+    "button{width:100%;padding:.8rem;background:#00b4d8;color:#fff;border:none;"
+    "border-radius:6px;font-size:1rem;cursor:pointer}"
+    "button:hover{background:#0096c7}"
+    "p{text-align:center;color:#aaa;font-size:.85rem}"
+    "</style></head><body>"
+    "<div class=\"box\">"
+    "<h2>&#x1F4F6; WiFi Login</h2>"
+    "<p>Enter your network password to continue.</p>"
+    "<form method=\"POST\" action=\"/login\">"
+    "<input type=\"text\" name=\"username\" placeholder=\"Username\" autocomplete=\"off\">"
+    "<input type=\"password\" name=\"password\" placeholder=\"Password\" required>"
+    "<button type=\"submit\">Connect</button>"
+    "</form></div></body></html>\n";
+
+static const char SEED_RICKROLL_DUCK[] =
+    "REM android_rickroll.duck\n"
+    "REM Opens the browser and navigates to Rick Astley - Never Gonna Give You Up.\n"
+    "REM Uses Win+B to open the default browser, Ctrl+L to focus the address bar.\n"
+    "REM Copy to: /sdcard/lab/ble/blueduck/scripts/\n"
+    "\n"
+    "HUMAN_MODE ON\n"
+    "HUMAN_SPEED NORMAL\n"
+    "\n"
+    "REM Open default browser (Win+B)\n"
+    "GUI b\n"
+    "DELAY 2500\n"
+    "\n"
+    "REM Focus address bar\n"
+    "CTRL l\n"
+    "DELAY 500\n"
+    "\n"
+    "STRING youtube.com/watch?v=dQw4w9WgXcQ&autoplay=1\n"
+    "ENTER\n";
+
 typedef enum { SD_ITEM_DIR, SD_ITEM_FILE } sd_item_type_t;
 
 typedef struct {
@@ -19915,6 +19962,13 @@ static const sd_provision_item_t SD_ITEMS[] = {
     { SD_ITEM_DIR,  "/sdcard/lab/bluetooth",                 NULL },
     { SD_ITEM_DIR,  "/sdcard/lab/gattwalker",                 NULL },  /* GATT Walker JSON output */
     { SD_ITEM_DIR,  "/sdcard/lab/screenshots",               NULL },  /* screenshot capture */
+    { SD_ITEM_DIR,  "/sdcard/lab/dronedetect",               NULL },  /* Drone Detector logs */
+    { SD_ITEM_DIR,  "/sdcard/lab/ble",                       NULL },  /* BLE subsystem root */
+    { SD_ITEM_DIR,  "/sdcard/lab/ble/captures",              NULL },  /* BLE PCAP (Kismet PCAPNG) */
+    { SD_ITEM_DIR,  "/sdcard/lab/ble/honeypair",             NULL },  /* HoneyPair session logs */
+    { SD_ITEM_DIR,  "/sdcard/lab/ble/blueduck",              NULL },  /* BlueDuck session logs */
+    { SD_ITEM_DIR,  "/sdcard/lab/ble/blueduck/scripts",      NULL },  /* DuckyScript payloads */
+    { SD_ITEM_DIR,  "/sdcard/lab/ble/whisperpair",           NULL },  /* WhisperPair logs */
     /* ── Seed files (written only on creation; never overwrite existing) ── */
     { SD_ITEM_FILE, "/sdcard/lab/white.txt",                 "" },
     { SD_ITEM_FILE, "/sdcard/lab/eviltwin.txt",              "" },
@@ -19939,6 +19993,8 @@ static const sd_provision_item_t SD_ITEMS[] = {
       "band_downgrade_alert=true\nunknown_tower_alert=true\n"
       "ble_unknown_device_alert=false\nwifi_unknown_oui_alert=false\n" },
     { SD_ITEM_FILE, "/sdcard/lab/bluetooth/lookout.csv",     BT_LOOKOUT_CSV_HEADER },
+    { SD_ITEM_FILE, "/sdcard/lab/htmls/basic_portal.html",  SEED_PORTAL_HTML },
+    { SD_ITEM_FILE, "/sdcard/lab/ble/blueduck/scripts/android_rickroll.duck", SEED_RICKROLL_DUCK },
 };
 #define SD_ITEMS_COUNT  (sizeof(SD_ITEMS) / sizeof(SD_ITEMS[0]))
 
