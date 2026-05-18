@@ -138,6 +138,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **SD Card** | MicroSD **FAT32, max 32 GB** (shared SPI2 bus with display and touch) | SPI @ 20 MHz |
 | **GPS** | [ATGM336H GPS+BDS Dual-Mode Module](https://www.amazon.com/dp/B09LQDG1HY) (Teyleten Robot, ASIN B09LQDG1HY; search "ATGM336H UART" if unavailable) — outputs NMEA 0183 GGA + RMC at 9600 baud, 3.3 V, onboard ceramic patch antenna | UART1 @ 9600 baud |
 | **LED** | WS2812 NeoPixel (single, GPIO 27) | RMT / GPIO |
+| **Vibrator** | ERM vibrator motor via SC8002B class-D amp (SPEAK header, GPIO 26) — optional add-on; requires 1N5819 + 1N4148 diode circuit; see Vibrator Motor Circuit section | LEDC PWM |
 
 Board reference: https://github.com/RockBase-iot/NM-CYD-C5
 
@@ -169,6 +170,8 @@ Board reference: https://github.com/RockBase-iot/NM-CYD-C5
                       │                  │
     NeoPixel ─────────┤ GPIO 27          │
                       │                  │
+    SPEAK_IN (SC8002B)┤ GPIO 26          │ (vibrator motor driver)
+                      │                  │
     Console ──────────┤ USB (JTAG/CDC)   │
                       └──────────────────┘
 
@@ -191,6 +194,7 @@ Board reference: https://github.com/RockBase-iot/NM-CYD-C5
 | 23 | ST7789 Display CS | SPI | Active LOW |
 | 24 | ST7789 DC (Data/Cmd) | Output | |
 | 25 | Backlight | Output | ⚠️ Strapping, HIGH=on |
+| 26 | SPEAK_IN → SC8002B amp | LEDC PWM | Vibrator motor driver; 333 Hz / 50% duty max; see Vibrator Motor Circuit |
 | 27 | NeoPixel Data | RMT/GPIO | WS2812 LED |
 
 > **GPIO 6 / ADC1_CH5 conflict:** The battery voltage ADC (`BATTERY_ADC_CHANNEL ADC_CHANNEL_5`) maps to GPIO 6, which is also SPI SCK. Calling `adc_oneshot_config_channel` on this pin silently reconfigures it away from SPI, killing SPI clock for display and touch. The battery ADC is **permanently disabled** in firmware for this board revision (`if (false && init_battery_adc()...)`).
@@ -274,6 +278,8 @@ An ERM (eccentric rotating mass) vibrator motor can be added to the NM-CYD-C5 vi
 | SPEAK header connector | JST GH 1.25 mm 2-pin (HCZZ0015-2) | **1.25 mm pitch** — the 1.0 mm SH connector is too small and will not fit. |
 
 **How it works:** GPIO 26 drives the SC8002B input with LEDC PWM at **333 Hz / 50% duty** (half-wave max = 50% duty). The 1N5819 rectifies the BTL output to give the motor a clean DC-biased drive. The 1N4148 across the motor clamps the inductive kick on every PWM off-cycle. Strength is adjustable 10–100% via **Settings → Vibrator Test** without reflashing.
+
+**Why not drive the motor directly from GPIO:** ERM vibrator motors draw 100–200 mA at startup and 50–150 mA running — well beyond the ESP32-C5's safe GPIO limit of ~20 mA continuous (40 mA absolute maximum per pin, ~40 mA total chip budget across all outputs). Connecting a motor directly to a GPIO risks brownout or pin damage. The SC8002B acts as a current-buffered power stage: the GPIO sources only ~1 mA into the amplifier input, while the amp's BTL outputs can deliver up to ~1.5 A peak from the board's power rail. After half-wave rectification at 3.3 V supply (minus ~0.3 V Schottky drop = ~3.0 V motor drive), into a typical small ERM motor (~8–16 Ω), peak pulse current is **200–375 mA** and average current at 50% PWM duty is **100–180 mA** — roughly 10–15× what a GPIO could safely supply. The 1N4148 flyback diode is essential for the same reason: when the PWM pulse ends the motor's inductance produces a reverse voltage spike that would otherwise be absorbed by (and damage) the SC8002B output.
 
 **Circuit photos:**
 
