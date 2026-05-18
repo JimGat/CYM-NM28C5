@@ -15736,6 +15736,7 @@ static bool           s_fileserv_active = false;
 static lv_obj_t      *s_fileserv_ip_lbl = NULL;
 static lv_obj_t      *s_fileserv_status_lbl = NULL;
 static lv_timer_t    *s_fileserv_poll_timer = NULL;
+static uint32_t       s_fileserv_connect_ms = 0;
 
 /* Stream a file from SD to HTTP response in 4 KB chunks. */
 static void s_fileserv_send_file(httpd_req_t *req, const char *path)
@@ -16124,7 +16125,7 @@ static void s_fileserv_httpd_stop(void)
     s_fileserv_active = false;
 }
 
-/* Poll timer: update IP label once STA gets an address. */
+/* Poll timer: update IP label once STA gets an address, or show failure. */
 static void s_fileserv_poll_ip_cb(lv_timer_t *t)
 {
     esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
@@ -16135,23 +16136,44 @@ static void s_fileserv_poll_ip_cb(lv_timer_t *t)
         s_fileserv_poll_timer = NULL;
 
         if (s_wdup_pending_after_wifi) {
-            // Came from the upload screen — go back and auto-start the upload.
             s_wdup_pending_after_wifi = false;
             show_wardrive_upload_screen();
             wdup_start_cb(NULL);
             return;
         }
 
-        char ip_str[64];
-        snprintf(ip_str, sizeof(ip_str), "IP: " IPSTR " => http://" IPSTR,
-                 IP2STR(&ip.ip), IP2STR(&ip.ip));
-        if (s_fileserv_ip_lbl) lv_label_set_text(s_fileserv_ip_lbl, ip_str);
-        if (s_fileserv_status_lbl) {
-            if (s_fileserv_httpd_start())
-                lv_label_set_text(s_fileserv_status_lbl, "Active  use http://");
-            else
-                lv_label_set_text(s_fileserv_status_lbl, "HTTP start failed");
+        /* Show the URL to open prominently */
+        if (s_fileserv_httpd_start()) {
+            char url_str[64];
+            snprintf(url_str, sizeof(url_str), "http://" IPSTR "/", IP2STR(&ip.ip));
+            if (s_fileserv_ip_lbl)     lv_label_set_text(s_fileserv_ip_lbl, url_str);
+            if (s_fileserv_status_lbl) {
+                lv_label_set_text(s_fileserv_status_lbl, LV_SYMBOL_OK " Server active - open URL above");
+                lv_obj_set_style_text_color(s_fileserv_status_lbl, lv_color_make(0, 220, 80), 0);
+            }
+        } else {
+            if (s_fileserv_status_lbl)
+                lv_label_set_text(s_fileserv_status_lbl, LV_SYMBOL_CLOSE " HTTP start failed");
         }
+        return;
+    }
+
+    /* Not got IP yet — check if WiFi association dropped (connect failed) */
+    wifi_ap_record_t ap_info;
+    bool associated = (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK);
+    uint32_t elapsed = (xTaskGetTickCount() * portTICK_PERIOD_MS) - s_fileserv_connect_ms;
+
+    if (!associated && elapsed > 12000) {
+        /* 12 s with no association — give up and tell user */
+        lv_timer_del(t);
+        s_fileserv_poll_timer = NULL;
+        if (s_fileserv_status_lbl) {
+            lv_label_set_text(s_fileserv_status_lbl, LV_SYMBOL_CLOSE " Connect failed - tap Connect to retry");
+            lv_obj_set_style_text_color(s_fileserv_status_lbl, lv_color_make(220, 60, 60), 0);
+        }
+        if (s_fileserv_ip_lbl) lv_label_set_text(s_fileserv_ip_lbl, "");
+    } else if (associated && s_fileserv_status_lbl) {
+        lv_label_set_text(s_fileserv_status_lbl, "Associated, waiting for IP...");
     }
 }
 
@@ -16304,8 +16326,13 @@ static void s_wcs_connect_cb(lv_event_t *e)
     strncpy(g_saved_wifi_pass, pass, sizeof(g_saved_wifi_pass) - 1);
     nvs_settings_save_wifi_creds(ssid, pass);
 
-    if (s_fileserv_status_lbl) lv_label_set_text(s_fileserv_status_lbl, "Connecting...");
-    if (s_fileserv_ip_lbl)     lv_label_set_text(s_fileserv_ip_lbl, "Waiting for IP...");
+    if (s_fileserv_status_lbl) {
+        lv_label_set_text(s_fileserv_status_lbl, "Connecting...");
+        lv_obj_set_style_text_color(s_fileserv_status_lbl, ui_muted_color(), 0);
+    }
+    if (s_fileserv_ip_lbl) lv_label_set_text(s_fileserv_ip_lbl, "");
+
+    s_fileserv_connect_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
     ensure_wifi_mode();
     wifi_config_t sta_cfg = {};
@@ -16315,7 +16342,7 @@ static void s_wcs_connect_cb(lv_event_t *e)
     esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
     esp_wifi_connect();
 
-    /* Poll every 1s for IP */
+    /* Poll every 1s for IP or failure */
     if (s_fileserv_poll_timer) lv_timer_del(s_fileserv_poll_timer);
     s_fileserv_poll_timer = lv_timer_create(s_fileserv_poll_ip_cb, 1000, NULL);
 }
