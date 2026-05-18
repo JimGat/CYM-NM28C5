@@ -1,0 +1,16 @@
+REM windows_open_browser.duck
+REM Opens the default browser to a target URL via the Run dialog.
+REM Edit the STRING line to change the destination URL.
+REM Works on Windows 10 and 11 with any default browser.
+REM Copy to: /sdcard/lab/ble/blueduck/scripts/
+
+HUMAN_MODE ON
+HUMAN_SPEED NORMAL
+
+REM Open Run dialog
+GUI r
+DELAY 600
+
+REM Paste URL — Run dialog forwards it to the default browser
+STRING https://example.com
+ENTER

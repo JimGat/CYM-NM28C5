@@ -1,0 +1,10 @@
+REM windows_sysinfo.duck
+REM Opens the Windows System Information panel via Win+Pause/Break.
+REM Quick way to display device name, OS version, RAM, and processor.
+REM Works on Windows 10 and 11. No Run dialog needed.
+REM Copy to: /sdcard/lab/ble/blueduck/scripts/
+
+HUMAN_MODE OFF
+
+REM Win+Pause opens About / System Information directly
+GUI PAUSE

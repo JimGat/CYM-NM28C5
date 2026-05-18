@@ -5,17 +5,77 @@
 #include "lvgl.h"
 
 LV_FONT_DECLARE(lv_extra_symbols);
+/* Mutable Montserrat copies with lv_extra_symbols chained as .fallback.
+   Used for labels that mix ASCII text with FA icon / arrow glyphs. */
+static lv_font_t g_font_icon14;
+static lv_font_t g_font_icon16;
 LV_IMG_DECLARE(lab_bg);
 LV_IMG_DECLARE(deedee_img);
-#define MY_SYMBOL_BLUETOOTH_B     "\xEF\x8A\x94"   /* fa-bluetooth-b    U+F294 */
-#define MY_SYMBOL_SEARCH          "\xEF\x8F\xAE"   /* fa-search         U+F3EE */
-#define MY_SYMBOL_USB             "\xEF\x8A\x87"   /* fa-usb            U+F287 */
-#define MY_SYMBOL_SATELLITE       "\xEF\x9E\xBF"   /* fa-satellite      U+F7BF */
-#define MY_SYMBOL_SATELLITE_DISH  "\xEF\x9F\x80"   /* fa-satellite-dish U+F7C0 */
-#define MY_SYMBOL_CAR             "\xEF\x86\xB9"   /* fa-car            U+F1B9 */
-#define MY_SYMBOL_XRAY            "\xEF\x92\x97"   /* fa-x-ray          U+F497 */
-#define MY_SYMBOL_JET_FIGHTER     "\xEE\x94\x98"   /* jet-fighter       U+E518 */
-#define MY_SYMBOL_PERSON_WALKING  "\xEE\x95\x93"   /* person-walking    U+E553 */
+/* ── FontAwesome custom glyph set (lv_extra_symbols font) ───────────────── */
+/* brands */
+#define MY_SYMBOL_BLUETOOTH_B     "\xEF\x8A\x94"   /* fa-bluetooth-b      U+F294 */
+#define MY_SYMBOL_USB             "\xEF\x8A\x87"   /* fa-usb              U+F287 */
+#define MY_SYMBOL_APPLE           "\xEF\x8F\xAE"   /* fa-apple            U+F3EE */
+/* solid — navigation / hardware */
+#define MY_SYMBOL_CAR             "\xEF\x86\xB9"   /* fa-car              U+F1B9 */
+#define MY_SYMBOL_JET_FIGHTER     "\xEE\x94\x98"   /* fa-drone            U+E518 */
+#define MY_SYMBOL_PERSON_WALKING  "\xEE\x95\x93"   /* fa-person-walking   U+E553 */
+#define MY_SYMBOL_SATELLITE       "\xEF\x9E\xBF"   /* fa-satellite        U+F7BF */
+#define MY_SYMBOL_SATELLITE_DISH  "\xEF\x9F\x80"   /* fa-satellite-dish   U+F7C0 */
+#define MY_SYMBOL_MICROCHIP       "\xEF\x8B\x9B"   /* fa-microchip        U+F2DB */
+#define MY_SYMBOL_TOWER           "\xEF\x94\x99"   /* fa-broadcast-tower  U+F519 */
+#define MY_SYMBOL_LAPTOP          "\xEF\x84\x89"   /* fa-laptop           U+F109 */
+#define MY_SYMBOL_DESKTOP         "\xEF\x84\x88"   /* fa-desktop          U+F108 */
+#define MY_SYMBOL_SERVER          "\xEF\x88\xB3"   /* fa-server           U+F233 */
+/* solid — data / files */
+#define MY_SYMBOL_DATABASE        "\xEF\x87\x80"   /* fa-database         U+F1C0 */
+#define MY_SYMBOL_NET_WIRED       "\xEF\x9B\xBF"   /* fa-network-wired    U+F6FF */
+#define MY_SYMBOL_CLOUD_UP        "\xEF\x8E\x82"   /* fa-cloud-upload-alt U+F382 */
+#define MY_SYMBOL_FOLDER_PLUS     "\xEF\x99\x9E"   /* fa-folder-plus      U+F65E */
+#define MY_SYMBOL_HANDSHAKE       "\xEF\x8A\xB5"   /* fa-handshake        U+F2B5 */
+#define MY_SYMBOL_KEY             "\xEF\x82\x84"   /* fa-key              U+F084 */
+#define MY_SYMBOL_XRAY            "\xEF\x92\x97"   /* fa-x-ray            U+F497 */
+/* solid — security / attack */
+#define MY_SYMBOL_SKULL_CROSS     "\xEF\x9C\x94"   /* fa-skull-crossbones U+F714 */
+#define MY_SYMBOL_USER_SECRET     "\xEF\x88\x9B"   /* fa-user-secret      U+F21B */
+#define MY_SYMBOL_MASK            "\xEF\x9B\xBA"   /* fa-mask             U+F6FA */
+#define MY_SYMBOL_UNLINK          "\xEF\x84\xA7"   /* fa-unlink           U+F127 */
+#define MY_SYMBOL_PAPER_PLANE     "\xEF\x87\x98"   /* fa-paper-plane      U+F1D8 */
+/* solid — monitoring / analysis */
+#define MY_SYMBOL_CROSSHAIRS      "\xEF\x81\x9B"   /* fa-crosshairs       U+F05B */
+#define MY_SYMBOL_SHIELD          "\xEF\x8F\xAD"   /* fa-shield-alt       U+F3ED */
+#define MY_SYMBOL_BINOCULARS      "\xEF\x87\xA5"   /* fa-binoculars       U+F1E5 */
+#define MY_SYMBOL_TAG             "\xEF\x80\xAB"   /* fa-tag              U+F02B */
+#define MY_SYMBOL_SITEMAP         "\xEF\x83\xA8"   /* fa-sitemap          U+F0E8 */
+#define MY_SYMBOL_CHART_BAR       "\xEF\x82\x80"   /* fa-chart-bar        U+F080 */
+#define MY_SYMBOL_WAVE            "\xEF\xA0\xBE"   /* fa-wave-square      U+F83E */
+#define MY_SYMBOL_CLOCK           "\xEF\x80\x97"   /* fa-clock            U+F017 */
+/* solid — arrows (also present in FA Solid, needed for GPS display) */
+#define MY_SYMBOL_ARROW_DOWN     "\xE2\x86\x93"   /* fa-arrow-down       U+2193 */
+#define MY_SYMBOL_ARROW_UP       "\xE2\x86\x91"   /* fa-arrow-up         U+2191 */
+/* solid — RF / NRF / IR / RFID / hacker toolkit */
+#define MY_SYMBOL_LOCK           "\xEF\x80\xA3"   /* fa-lock             U+F023 */
+#define MY_SYMBOL_LOCK_OPEN      "\xEF\x8F\x81"   /* fa-lock-open        U+F3C1 */
+#define MY_SYMBOL_TERMINAL       "\xEF\x84\xA0"   /* fa-terminal         U+F120 */
+#define MY_SYMBOL_CODE           "\xEF\x84\xA1"   /* fa-code             U+F121 */
+#define MY_SYMBOL_BUG            "\xEF\x86\x88"   /* fa-bug              U+F188 */
+#define MY_SYMBOL_SKULL          "\xEF\x95\x8C"   /* fa-skull            U+F54C */
+#define MY_SYMBOL_GHOST          "\xEF\x9B\xA2"   /* fa-ghost            U+F6E2 */
+#define MY_SYMBOL_FINGERPRINT    "\xEF\x95\xB7"   /* fa-fingerprint      U+F577 */
+#define MY_SYMBOL_ID_BADGE       "\xEF\x8B\x81"   /* fa-id-badge         U+F2C1 */
+#define MY_SYMBOL_ID_CARD        "\xEF\x8B\x82"   /* fa-id-card          U+F2C2 */
+#define MY_SYMBOL_SIM_CARD       "\xEF\x9F\x84"   /* fa-sim-card         U+F7C4 */
+#define MY_SYMBOL_BIOHAZARD      "\xEF\x9E\x80"   /* fa-biohazard        U+F780 */
+#define MY_SYMBOL_RADIATION      "\xEF\x9E\xB9"   /* fa-radiation        U+F7B9 */
+#define MY_SYMBOL_ETHERNET       "\xEF\x9E\x96"   /* fa-ethernet         U+F796 */
+#define MY_SYMBOL_RSS            "\xEF\x82\x9E"   /* fa-rss (signal)     U+F09E */
+#define MY_SYMBOL_FILTER         "\xEF\x82\xB0"   /* fa-filter           U+F0B0 */
+#define MY_SYMBOL_CIRCLE_INFO    "\xEF\x81\x9A"   /* fa-circle-info      U+F05A */
+#define MY_SYMBOL_FLAG           "\xEF\x80\xA4"   /* fa-flag             U+F024 */
+#define MY_SYMBOL_PLUG           "\xEF\x87\xA6"   /* fa-plug             U+F1E6 */
+#define MY_SYMBOL_TRASH          "\xEF\x87\xB8"   /* fa-trash            U+F1F8 */
+#define MY_SYMBOL_ROTATE         "\xEF\x8B\xB1"   /* fa-rotate           U+F2F1 */
+#define MY_SYMBOL_CIRCLE_NODES   "\xEE\x93\xA2"   /* fa-circle-nodes     U+E4E2 */
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
@@ -77,6 +137,7 @@ LV_IMG_DECLARE(deedee_img);
 #include "lwip/netif.h"
 #include "lwip/pbuf.h"
 #include "lwip/prot/ethernet.h"
+#include "lwip/sockets.h"
 #include "esp_netif.h"
 #include "esp_netif_net_stack.h"
 
@@ -94,6 +155,10 @@ LV_IMG_DECLARE(deedee_img);
 #include "bt_lookout.h"
 #include "oui_lookup.h"
 #include "gatt_walker.h"
+#include "ble_honeypair.h"
+#include "ble_blueduck.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
 
 #define TAG "WiFi_Hacker"
 
@@ -123,7 +188,8 @@ static bool wifi_initialized = false;
 // BLE scan state
 static volatile bool bt_scan_active = false;
 static TaskHandle_t bt_scan_task_handle = NULL;
-static volatile bool nimble_initialized = false;
+static volatile bool nimble_initialized  = false;
+static bool          s_ble_for_blueduck  = false; /* selects GATT table at bt_nimble_init time */
 
 // BLE device tracking for deduplication
 #define BT_MAX_DEVICES 128
@@ -133,16 +199,19 @@ static int bt_found_device_count = 0;
 // AirTag/SmartTag counters
 static int bt_airtag_count = 0;
 static int bt_smarttag_count = 0;
+static int bt_possible_airtag_count = 0;  // Apple 0x05 Nearby Action (owner-nearby/paused mode)
 
 // Generic BT device storage for scan_bt command
 typedef struct {
     uint8_t addr[6];
     uint8_t addr_type;   /* BLE_ADDR_PUBLIC=0 or BLE_ADDR_RANDOM=1 */
+    uint8_t phy;         /* BLE_HCI_LE_PHY_1M=1 or BLE_HCI_LE_PHY_CODED=3 */
     int8_t rssi;
     char name[32];
     uint16_t company_id;
     bool is_airtag;
     bool is_smarttag;
+    bool is_possible_airtag;  /* Apple 0x05 Nearby Action — AirTag in owner-proximity/paused mode */
 } bt_device_info_t;
 
 static bt_device_info_t bt_devices[BT_MAX_DEVICES];
@@ -166,6 +235,23 @@ static volatile int ble_spam_count = 0;
 static bool ble_spam_ui_active = false;
 static volatile bool ble_spam_needs_ui_update = false;
 static int ble_spam_mode = BLE_SPAM_MODE_ALL;
+
+// HoneyPair UI state
+static lv_obj_t   *hp_status_lbl = NULL;
+static lv_obj_t   *hp_stats_lbl  = NULL;
+static lv_obj_t   *hp_start_btn  = NULL;
+static lv_obj_t   *hp_dd         = NULL;
+static lv_timer_t *hp_ui_timer   = NULL;
+
+// BlueDuck UI state
+static lv_obj_t   *bd_status_lbl  = NULL;
+static lv_obj_t   *bd_stats_lbl   = NULL;
+static lv_obj_t   *bd_start_btn   = NULL;
+static lv_obj_t   *bd_persona_dd  = NULL;
+static lv_obj_t   *bd_script_dd   = NULL;
+static lv_obj_t   *bd_human_sw    = NULL;
+static lv_obj_t   *bd_speed_dd    = NULL;
+static lv_timer_t *bd_ui_timer    = NULL;
 
 // BLE Device Spoof state
 static volatile bool ble_spoof_active = false;
@@ -430,7 +516,7 @@ typedef enum { WD_BAND_BOTH = 0, WD_BAND_24G, WD_BAND_5G } wd_band_t;
 #define WDP_BLE_MAX_DEVICES  200
 
 // BLE PCAP capture
-#define BLE_PCAP_DIR         "/sdcard/lab/ble_captures"
+#define BLE_PCAP_DIR         "/sdcard/lab/ble/captures"
 
 // Drone Detector — Remote ID (ASTM F3411-22a)
 #define DRONE_DETECT_DIR     "/sdcard/lab/dronedetect"
@@ -1502,6 +1588,7 @@ static lv_obj_t  *gw_back_btn        = NULL;
 // Snapshot values for UI (copied before reset)
 static volatile int airtag_scan_snapshot_airtag = 0;
 static volatile int airtag_scan_snapshot_smarttag = 0;
+static volatile int airtag_scan_snapshot_possible_airtag = 0;
 static volatile int airtag_scan_snapshot_total = 0;
 
 // Promiscuous filter
@@ -1591,6 +1678,7 @@ static void main_tile_event_cb(lv_event_t *e);
 static void attack_tile_event_cb(lv_event_t *e);
 static void update_sniffer_button_ui(void);
 static void show_settings_screen(void);
+static void show_hardware_options_screen(void);
 static void settings_tile_event_cb(lv_event_t *e);
 static void show_vibrator_test_popup(void);
 static void run_touch_calibration(void);
@@ -1923,6 +2011,8 @@ static void bto_rebuild_list(void);
 
 // Data Transfer screens
 static void show_data_transfer_screen(void);
+static void show_new_folder_screen(void);
+static void show_delete_file_screen(void);
 static void show_ap_file_server_screen(void);
 static void show_wifi_client_server_screen(void);
 static void show_bt_locator_direct_track(void);
@@ -1992,6 +2082,11 @@ static void show_wifi_analyzer_screen(void);
 static void show_wscope_screen(void);
 static void wscope_task(void *p);
 
+// HoneyPair
+static void show_honeypair_screen(void);
+// BlueDuck
+static void show_blueduck_screen(void);
+
 // BT Locator functions
 static void show_bt_locator_screen(void);
 static void bt_locator_device_selected_cb(lv_event_t *e);
@@ -2023,6 +2118,10 @@ static void scan_checkbox_event_cb(lv_event_t *e)
     lv_obj_t *cb = lv_event_get_target(e);
     int index = (int)(intptr_t)lv_event_get_user_data(e);
     bool checked = lv_obj_has_state(cb, LV_STATE_CHECKED);
+    if (checked && wifi_scanner_get_selected_count() >= 20) {
+        lv_obj_clear_state(cb, LV_STATE_CHECKED);
+        return;
+    }
     wifi_scanner_select_network(index, checked);
 }
 
@@ -3378,7 +3477,7 @@ static void run_touch_calibration(void)
     lv_obj_move_to_index(bg_img, 0);
 
     lv_obj_t *lbl = lv_label_create(scr);
-    lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_color(lbl, lv_color_black(), 0);
     lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
     lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
@@ -3473,7 +3572,7 @@ static void run_touch_calibration(void)
         lv_obj_add_flag(hbar, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(vbar, LV_OBJ_FLAG_HIDDEN);
 
-        lv_label_set_text(lbl, "Tap OK to confirm.\nMust hit the button.");
+        lv_label_set_text(lbl, "Tap OK to confirm.\nMust hit the button.\n(5 s to retry)");
         lv_obj_align(lbl, LV_ALIGN_CENTER, 0, -70);
 
         // OK button at screen center — 47×20 (1/3 of original 140×60)
@@ -3490,7 +3589,7 @@ static void run_touch_calibration(void)
         lv_obj_center(ok_lbl_w);
 
         lv_obj_t *cd_lbl = lv_label_create(scr);
-        lv_obj_set_style_text_color(cd_lbl, lv_color_make(160, 160, 160), 0);
+        lv_obj_set_style_text_color(cd_lbl, lv_color_make(40, 40, 40), 0);
         lv_obj_set_style_text_font(cd_lbl, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_align(cd_lbl, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_width(cd_lbl, 200);
@@ -3561,7 +3660,7 @@ static void run_touch_calibration(void)
 
         // Not confirmed — restore old cal and retry
         touch_cal_apply(&old_cal);
-        lv_label_set_text(lbl, "Missed — retrying...");
+        lv_label_set_text(lbl, "Missed - retrying...");
         lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 50);
         for (int i = 0; i < 20; i++) cal_tick();  // ~200 ms pause
     }
@@ -4553,6 +4652,14 @@ void app_main(void)
 
     lvgl_memory_init();
     lv_init();
+    /* Mutable RAM copies of the two Montserrat sizes that need to render FA
+       icons (lv_extra_symbols).  The originals are const in flash so we copy
+       them to RAM and set .fallback there, then use these pointers for the
+       specific labels that mix ASCII text with FA/arrow glyphs. */
+    memcpy(&g_font_icon14, &lv_font_montserrat_14, sizeof(lv_font_t));
+    g_font_icon14.fallback = &lv_extra_symbols;
+    memcpy(&g_font_icon16, &lv_font_montserrat_16, sizeof(lv_font_t));
+    g_font_icon16.fallback = &lv_extra_symbols;
     init_display();
     init_touch();
     init_backlight();
@@ -4606,8 +4713,7 @@ void app_main(void)
         return;
     }
 
-    // For 32-bit color depth, we need to reduce buffer size due to memory constraints
-    // 15 lines * 480 pixels * 4 bytes = 28.8 KB per buffer (vs 28.8 KB for 30 lines @ 16-bit)
+    // 15 lines per buffer — works for both 16-bit (7200 B) and 32-bit (14400 B) color depth
     const size_t buf_size = LCD_H_RES * 15 * sizeof(lv_color_t);
     buf1 = spi_bus_dma_memory_alloc(LCD_HOST, buf_size, 0);
     buf2 = spi_bus_dma_memory_alloc(LCD_HOST, buf_size, 0);
@@ -4627,6 +4733,9 @@ void app_main(void)
     disp_drv.user_data = panel_handle;
     lv_disp_drv_register(&disp_drv);
 
+    honeypair_init(sd_spi_mutex, gps_best);
+    blueduck_init(sd_spi_mutex, gps_best);
+
     flush_done_sem = xSemaphoreCreateBinary();
     if (flush_done_sem == NULL) {
         ESP_LOGE(TAG, "Failed to create flush_done_sem!");
@@ -4638,20 +4747,23 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(esp_lcd_panel_io_register_event_callbacks(lcd_io_handle, &cbs, &disp_drv));
 
-    uint16_t black = 0x0000;
-    for (int i = 0; i < LCD_H_RES * 30; i++) {
-        ((uint16_t*)buf1)[i] = black;
-    }
-    for (int y = 0; y < LCD_V_RES; y += 30) {
-        int lines = (y + 30 <= LCD_V_RES) ? 30 : (LCD_V_RES - y);
+    // Clear screen: memset writes exactly buf_size bytes (no overflow regardless of color depth)
+    memset(buf1, 0, buf_size);
+    for (int y = 0; y < LCD_V_RES; y += 15) {
+        int lines = (y + 15 <= LCD_V_RES) ? 15 : (LCD_V_RES - y);
         esp_lcd_panel_draw_bitmap(panel_handle, 0, y, LCD_H_RES, y + lines, buf1);
     }
-    
-    lv_obj_set_style_bg_color(lv_scr_act(), lv_color_black(), 0);
+
+    lv_obj_t *scr = lv_scr_act();
+    if (!scr) {
+        ESP_LOGE(TAG, "FATAL: LVGL default screen is NULL after display init");
+        return;
+    }
+    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
 
     ESP_LOGI(TAG, "LVGL OBJECTS:");
 
-    lv_obj_set_style_bg_color(lv_scr_act(), ui_bg_color(), 0);
+    lv_obj_set_style_bg_color(scr, ui_bg_color(), 0);
 
     show_splash_screen();
     
@@ -5575,17 +5687,15 @@ void app_main(void)
                 if (count == 0U) {
                     lv_list_add_text(scan_list, "No networks found");
                 } else {
-                    uint16_t display_count = (count > SCAN_RESULTS_MAX_DISPLAY) ? SCAN_RESULTS_MAX_DISPLAY : count;
-
-                    wifi_ap_record_t *records = (wifi_ap_record_t *)lv_mem_alloc(sizeof(wifi_ap_record_t) * display_count);
+                    wifi_ap_record_t *records = (wifi_ap_record_t *)lv_mem_alloc(sizeof(wifi_ap_record_t) * count);
                     if (!records) {
                         lv_list_add_text(scan_list, "Out of memory");
                     } else {
-                        int got = wifi_scanner_get_results(records, display_count);
+                        int got = wifi_scanner_get_results(records, count);
                         if (got < 0) {
                             lv_list_add_text(scan_list, "Failed to fetch results");
                         } else {
-                            if (got > display_count) got = display_count;
+                            if (got > count) got = count;
                             for (int i = 0; i < got; i++) {
                                 lv_obj_t *row = lv_list_add_btn(scan_list, NULL, "");
                                 if (!row) break;
@@ -5633,18 +5743,13 @@ void app_main(void)
                                 lv_obj_set_width(ssid_lbl, lv_pct(85));
 
                                 if ((i & 7) == 7) {
+                                    esp_task_wdt_reset();
                                     vTaskDelay(pdMS_TO_TICKS(1));
                                 }
                             }
                         }
 
                         lv_mem_free(records);
-
-                        if (count > SCAN_RESULTS_MAX_DISPLAY) {
-                            char msg[48];
-                            snprintf(msg, sizeof(msg), "... and %u more", count - SCAN_RESULTS_MAX_DISPLAY);
-                            lv_list_add_text(scan_list, msg);
-                        }
                     }
                 }
                 
@@ -6115,42 +6220,44 @@ void app_main(void)
                 airtag_scan_update_flag = false;
                 
                 // Read snapshot values (thread-safe copy)
-                int snap_airtag = airtag_scan_snapshot_airtag;
-                int snap_smarttag = airtag_scan_snapshot_smarttag;
-                int snap_total = airtag_scan_snapshot_total;
-                
+                int snap_airtag          = airtag_scan_snapshot_airtag;
+                int snap_smarttag        = airtag_scan_snapshot_smarttag;
+                int snap_possible_airtag = airtag_scan_snapshot_possible_airtag;
+                int snap_total           = airtag_scan_snapshot_total;
+
                 // Hide "Scan in progress", show stats
                 if (airtag_scan_status_label && lv_obj_is_valid(airtag_scan_status_label)) {
                     lv_obj_add_flag(airtag_scan_status_label, LV_OBJ_FLAG_HIDDEN);
                 }
-                
+
                 // Update and show stats labels
                 if (airtag_scan_stats_label1 && lv_obj_is_valid(airtag_scan_stats_label1)) {
-                    char stats1[64];
-                    snprintf(stats1, sizeof(stats1), "Air Tags: %d\nSmart Tags: %d",
-                             snap_airtag, snap_smarttag);
+                    char stats1[96];
+                    snprintf(stats1, sizeof(stats1),
+                             "Air Tags: %d\nAirTag? (Prox): %d\nSmart Tags: %d",
+                             snap_airtag, snap_possible_airtag, snap_smarttag);
                     lv_label_set_text(airtag_scan_stats_label1, stats1);
                     lv_obj_clear_flag(airtag_scan_stats_label1, LV_OBJ_FLAG_HIDDEN);
                 }
 
-                // Show "View Found Tags" button when at least one tag is detected
+                // Show "View Found Tags" button when at least one tag-type device is detected
                 if (airtag_view_tags_btn && lv_obj_is_valid(airtag_view_tags_btn)) {
-                    if (snap_airtag + snap_smarttag > 0) {
+                    if (snap_airtag + snap_smarttag + snap_possible_airtag > 0) {
                         lv_obj_clear_flag(airtag_view_tags_btn, LV_OBJ_FLAG_HIDDEN);
                     } else {
                         lv_obj_add_flag(airtag_view_tags_btn, LV_OBJ_FLAG_HIDDEN);
                     }
                 }
-                
+
                 if (airtag_scan_stats_label2 && lv_obj_is_valid(airtag_scan_stats_label2)) {
-                    int other_devices = snap_total - snap_airtag - snap_smarttag;
+                    int other_devices = snap_total - snap_airtag - snap_smarttag - snap_possible_airtag;
                     if (other_devices < 0) other_devices = 0;
                     char stats2[48];
                     snprintf(stats2, sizeof(stats2), "Other BT Devices: %d", other_devices);
                     lv_label_set_text(airtag_scan_stats_label2, stats2);
                     lv_obj_clear_flag(airtag_scan_stats_label2, LV_OBJ_FLAG_HIDDEN);
                 }
-                
+
                 if (airtag_scan_stats_label3 && lv_obj_is_valid(airtag_scan_stats_label3)) {
                     char stats3[48];
                     snprintf(stats3, sizeof(stats3), "Total BT devices: %d", snap_total);
@@ -9072,20 +9179,42 @@ static void wd_mark_tap_cb(lv_event_t *e)
 static int wdp_ble_gap_cb(struct ble_gap_event *event, void *arg)
 {
     (void)arg;
-    if (event->type != BLE_GAP_EVENT_DISC) return 0;
-    struct ble_gap_disc_desc *desc = &event->disc;
     if (!wdp_ble_devices) return 0;
+
+    const uint8_t *addr_val;
+    int8_t rssi;
+    const uint8_t *adv_data;
+    uint8_t adv_data_len;
+
+#if MYNEWT_VAL(BLE_EXT_ADV)
+    if (event->type == BLE_GAP_EVENT_EXT_DISC) {
+        struct ble_gap_ext_disc_desc *d = &event->ext_disc;
+        addr_val     = d->addr.val;
+        rssi         = d->rssi;
+        adv_data     = d->data;
+        adv_data_len = d->length_data;
+    } else
+#endif
+    if (event->type == BLE_GAP_EVENT_DISC) {
+        struct ble_gap_disc_desc *d = &event->disc;
+        addr_val     = d->addr.val;
+        rssi         = d->rssi;
+        adv_data     = d->data;
+        adv_data_len = d->length_data;
+    } else {
+        return 0;
+    }
 
     // Dedup by MAC
     int cnt = wdp_ble_count;
     for (int i = 0; i < cnt; i++)
-        if (memcmp(wdp_ble_devices[i].mac, desc->addr.val, 6) == 0) return 0;
+        if (memcmp(wdp_ble_devices[i].mac, addr_val, 6) == 0) return 0;
 
     if (cnt >= WDP_BLE_MAX_DEVICES) return 0;
 
     wdp_ble_device_t *dev = &wdp_ble_devices[cnt];
-    memcpy(dev->mac, desc->addr.val, 6);
-    dev->rssi      = desc->rssi;
+    memcpy(dev->mac, addr_val, 6);
+    dev->rssi      = rssi;
     {
         const gps_data_t *g = gps_best();
         dev->latitude  = g->latitude;
@@ -9095,7 +9224,7 @@ static int wdp_ble_gap_cb(struct ble_gap_event *event, void *arg)
     dev->written   = false;
 
     struct ble_hs_adv_fields fields;
-    if (ble_hs_adv_parse_fields(&fields, desc->data, desc->length_data) == 0
+    if (ble_hs_adv_parse_fields(&fields, adv_data, adv_data_len) == 0
         && fields.name && fields.name_len > 0) {
         int nl = fields.name_len < 31 ? fields.name_len : 31;
         memcpy(dev->name, fields.name, nl);
@@ -10262,6 +10391,18 @@ static void wardrive_promisc_task(void *pvParameters) {
                 wdp_current_channel = -1;  // signal UI: BLE pass in progress
                 wd_ui_update_flag = true;
 
+#if MYNEWT_VAL(BLE_EXT_ADV)
+                struct ble_gap_ext_disc_params bpe = {
+                    .itvl = 0x60, .window = 0x60, .passive = 0,
+                };
+                if (ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 0, 0, 0,
+                                     BLE_HCI_SCAN_FILT_NO_WL, 0,
+                                     &bpe, &bpe,
+                                     wdp_ble_gap_cb, NULL) == 0) {
+                    vTaskDelay(pdMS_TO_TICKS(WDP_BLE_DWELL_MS));
+                    ble_gap_disc_cancel();
+                }
+#else
                 struct ble_gap_disc_params bp = {
                     .itvl = 0x60, .window = 0x60,
                     .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
@@ -10272,6 +10413,7 @@ static void wardrive_promisc_task(void *pvParameters) {
                     vTaskDelay(pdMS_TO_TICKS(WDP_BLE_DWELL_MS));
                     ble_gap_disc_cancel();
                 }
+#endif
             }
 
             if (!wardrive_active) break;
@@ -11883,6 +12025,13 @@ static void create_function_page_base(const char *name)
         arp_scan_check_timer = NULL;
     }
 
+    /* Stop BlueDuck refresh timer before deleting function_page to prevent
+     * bd_ui_refresh from running against the next screen's function_page
+     * with dangling label pointers. */
+    if (bd_ui_timer) { lv_timer_del(bd_ui_timer); bd_ui_timer = NULL; }
+    bd_status_lbl = NULL; bd_stats_lbl = NULL; bd_start_btn = NULL;
+    bd_persona_dd = NULL; bd_script_dd = NULL; bd_human_sw = NULL; bd_speed_dd = NULL;
+
     if (function_page) {
         lv_obj_del(function_page);
         function_page = NULL;
@@ -12050,6 +12199,15 @@ static void radio_reset_to_idle(void)
 
     // ---- 3. BLE cleanup ----
     if (current_radio_mode == RADIO_MODE_BLE) {
+        /* Stop any BLE feature before tearing down NimBLE — calling bt_nimble_deinit()
+         * while GAP callbacks are still registered crashes the stack. */
+        if (blueduck_is_active()) {
+            blueduck_stop();
+            s_ble_for_blueduck = false;
+        }
+        if (honeypair_is_active()) {
+            honeypair_stop();
+        }
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
     }
@@ -12126,13 +12284,20 @@ void show_menu(void)
         arp_scan_check_timer = NULL;
     }
     
+    /* BlueDuck timer must be stopped before function_page is deleted;
+     * otherwise bd_ui_refresh fires against the next screen's function_page
+     * with stale (dangling) label pointers → crash. */
+    if (bd_ui_timer) { lv_timer_del(bd_ui_timer); bd_ui_timer = NULL; }
+    bd_status_lbl = NULL; bd_stats_lbl = NULL; bd_start_btn = NULL;
+    bd_persona_dd = NULL; bd_script_dd = NULL; bd_human_sw = NULL; bd_speed_dd = NULL;
+
     // Delete function page if it exists
     if (function_page) {
         lv_obj_del(function_page);
         function_page = NULL;
     }
     reset_function_page_children();
-    
+
     // Show main tiles and title bar
     show_main_tiles();
     lv_obj_clear_flag(title_bar, LV_OBJ_FLAG_HIDDEN);
@@ -12563,9 +12728,16 @@ static void sta_connect_event_handler(void *arg, esp_event_base_t event_base,
         sta_connect_success = true;
     } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
         sta_connect_attempt_count++;
-        if (sta_connect_attempt_count >= 3) {
+        if (sta_connect_attempt_count >= 8) {
             sta_connect_failed = true;
         } else {
+            /* Re-apply the STA config before retrying — this clears the
+               driver's internal failed-AP blacklist that gets set after an
+               assoc comeback (0x2c0) rejection, allowing the next probe to
+               find the AP again without waiting for the blacklist to expire. */
+            wifi_config_t retry_cfg = {0};
+            if (esp_wifi_get_config(WIFI_IF_STA, &retry_cfg) == ESP_OK)
+                esp_wifi_set_config(WIFI_IF_STA, &retry_cfg);
             esp_wifi_connect();
         }
     }
@@ -12787,6 +12959,7 @@ static void wifi_connect_btn_cb(lv_event_t *e)
     
     // Start connection
     ESP_LOGI(TAG, "Connecting to '%s'...", wifi_connect_ssid);
+    esp_wifi_clear_fast_connect();
     esp_wifi_connect();
 }
 
@@ -15161,17 +15334,17 @@ static void show_wifi_menu_screen(void)
 
     lv_obj_t *scan_tile = create_tile(tiles, LV_SYMBOL_WIFI,       "Scan &\nAttack",   UI_ACCENT_BLUE,   main_tile_event_cb, "WiFi Scan & Attack");
     (void)scan_tile;
-    lv_obj_t *atk_tile  = create_tile(tiles, LV_SYMBOL_WARNING,    "WiFi\nAttacks",    UI_ACCENT_RED,    main_tile_event_cb, "Global WiFi Attacks");
+    lv_obj_t *atk_tile  = create_tile(tiles, MY_SYMBOL_SKULL_CROSS, "WiFi\nAttacks",    UI_ACCENT_RED,    main_tile_event_cb, "Global WiFi Attacks");
     (void)atk_tile;
     lv_obj_t *dm_tile   = create_tile(tiles, MY_SYMBOL_SATELLITE,  "Deauth\nMon.",     UI_ACCENT_AMBER,  main_tile_event_cb, "Deauth Monitor");
     (void)dm_tile;
-    lv_obj_t *obs_tile  = create_tile(tiles, LV_SYMBOL_EYE_OPEN,   "WiFi\nObserver",   UI_ACCENT_PURPLE, main_tile_event_cb, "WiFi Sniff&Karma");
+    lv_obj_t *obs_tile  = create_tile(tiles, MY_SYMBOL_BINOCULARS, "WiFi\nObserver",   UI_ACCENT_PURPLE, main_tile_event_cb, "WiFi Sniff&Karma");
     (void)obs_tile;
-    lv_obj_t *dd_tile   = create_tile(tiles, LV_SYMBOL_GPS,        "Drone\nDetect",    lv_color_hex(0x1B5E20), main_tile_event_cb, "Drone Detect");
+    lv_obj_t *dd_tile   = create_tile(tiles, MY_SYMBOL_JET_FIGHTER,"Drone\nDetect",    lv_color_hex(0x1B5E20), main_tile_event_cb, "Drone Detect");
     (void)dd_tile;
-    lv_obj_t *wana_tile = create_tile(tiles, LV_SYMBOL_WIFI,       "Chan-\nalizer",    lv_color_hex(0x1A237E), main_tile_event_cb, "Chanalizer");
+    lv_obj_t *wana_tile = create_tile(tiles, MY_SYMBOL_CHART_BAR,  "Chan-\nalizer",    lv_color_hex(0x1A237E), main_tile_event_cb, "Chanalizer");
     (void)wana_tile;
-    lv_obj_t *wscope_tile = create_tile(tiles, LV_SYMBOL_AUDIO,    "WiFi\nScope",      lv_color_hex(0x006064), main_tile_event_cb, "WiFi Scope");
+    lv_obj_t *wscope_tile = create_tile(tiles, MY_SYMBOL_WAVE,     "WiFi\nScope",      lv_color_hex(0x006064), main_tile_event_cb, "WiFi Scope");
     (void)wscope_tile;
 }
 
@@ -15192,7 +15365,7 @@ static void show_sniff_karma_screen(void)
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
     
     // Network Observer tile - Purple
-    lv_obj_t *sniffer_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "WiFi\nObserver", COLOR_MATERIAL_PURPLE, NULL, NULL);
+    lv_obj_t *sniffer_tile = create_tile(tiles, MY_SYMBOL_BINOCULARS, "WiFi\nObserver", COLOR_MATERIAL_PURPLE, NULL, NULL);
     lv_obj_add_event_cb(sniffer_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Sniffer");
     
     // Browse Clients tile - Indigo (REMOVED - integrated into Sniffer)
@@ -15204,7 +15377,7 @@ static void show_sniff_karma_screen(void)
     // lv_obj_add_event_cb(probes_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Show Probes");
     
     // Karma tile - Pink
-    lv_obj_t *karma_tile = create_tile(tiles, LV_SYMBOL_SHUFFLE, "Karma", COLOR_MATERIAL_PINK, NULL, NULL);
+    lv_obj_t *karma_tile = create_tile(tiles, MY_SYMBOL_USER_SECRET, "Karma", COLOR_MATERIAL_PINK, NULL, NULL);
     lv_obj_add_event_cb(karma_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Karma");
 }
 
@@ -15619,6 +15792,7 @@ static bool           s_fileserv_active = false;
 static lv_obj_t      *s_fileserv_ip_lbl = NULL;
 static lv_obj_t      *s_fileserv_status_lbl = NULL;
 static lv_timer_t    *s_fileserv_poll_timer = NULL;
+static uint32_t       s_fileserv_connect_ms = 0;
 
 /* Stream a file from SD to HTTP response in 4 KB chunks. */
 static void s_fileserv_send_file(httpd_req_t *req, const char *path)
@@ -15657,36 +15831,107 @@ static const char *s_human_size(long bytes, char *buf, size_t bufsz)
     return buf;
 }
 
-/* Send an HTML directory listing for sd_path, with URL base url_path. */
+/* Send an HTML directory listing for sd_path, with URL base url_path.
+ * Includes upload bar, new-folder form, and per-file delete buttons. */
 static void s_fileserv_send_dir(httpd_req_t *req, const char *sd_path, const char *url_path)
 {
+    ESP_LOGI("fileserv", "opendir '%s'", sd_path);
+    if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000));
     DIR *d = opendir(sd_path);
+    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+    ESP_LOGI("fileserv", "opendir '%s' -> %s", sd_path, d ? "OK" : "FAIL");
     if (!d) { httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Directory not found"); return; }
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
 
-    char chunk[640];
-    snprintf(chunk, sizeof(chunk),
+    /* Head + inline JS for upload and delete */
+    static const char s_head[] =
         "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-        "<meta name='viewport' content='width=device-width'>"
-        "<title>Cheap Yellow Monster</title></head>"
-        "<body style='font-family:monospace;background:#111;color:#0f0;padding:8px'>"
-        "<h2 style='color:#0ff'>%s</h2><hr>", url_path);
-    httpd_resp_send_chunk(req, chunk, strlen(chunk));
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>Cheap Yellow Monster</title>"
+        "<script>"
+        "function upload(dir){"
+          "var f=document.getElementById('uf').files[0];"
+          "if(!f){alert('Select a file first.');return;}"
+          "var sep=dir[dir.length-1]==='/'?'':'/';"
+          "fetch('/upload?path='+encodeURIComponent(dir+sep+f.name),"
+                "{method:'PUT',body:f})"
+          ".then(function(r){"
+            "if(r.ok)location.reload();"
+            "else r.text().then(function(t){alert('Upload failed: '+t);});"
+          "});"
+        "}"
+        "function del(p){"
+          "if(!confirm('Delete '+p+'?'))return;"
+          "fetch('/delete?path='+encodeURIComponent(p),{method:'POST'})"
+          ".then(function(r){"
+            "if(r.ok)location.reload();"
+            "else r.text().then(function(t){alert('Delete failed: '+t);});"
+          "});"
+        "}"
+        "function deldir(p){"
+          "if(!confirm('Delete directory \"'+p+'\" and ALL its contents?'))return;"
+          "if(!confirm('CONFIRM AGAIN: permanently erase \"'+p+'\"?\\nThis cannot be undone.'))return;"
+          "fetch('/delete?path='+encodeURIComponent(p),{method:'POST'})"
+          ".then(function(r){"
+            "if(r.ok)location.reload();"
+            "else r.text().then(function(t){alert('Delete failed: '+t);});"
+          "});"
+        "}"
+        "</script></head>"
+        "<body style='font-family:monospace;background:#111;color:#0f0;padding:8px'>";
+    httpd_resp_send_chunk(req, s_head, strlen(s_head));
 
+    char chunk[1024];
+    int n;
+
+    /* Title */
+    n = snprintf(chunk, sizeof(chunk),
+        "<h2 style='color:#0ff'>%s</h2><hr>", url_path);
+    if (n > 0 && n < (int)sizeof(chunk)) httpd_resp_send_chunk(req, chunk, n);
+
+    /* Parent link */
     if (strlen(url_path) > 1) {
         char parent[128];
         strncpy(parent, url_path, sizeof(parent) - 1);
         parent[sizeof(parent)-1] = '\0';
         char *sl = strrchr(parent, '/');
         if (sl && sl != parent) *sl = '\0'; else strcpy(parent, "/");
-        int n = snprintf(chunk, sizeof(chunk),
+        n = snprintf(chunk, sizeof(chunk),
             "<p><a href='/files%s' style='color:#0ff'>[..] Parent</a></p>", parent);
         if (n > 0 && n < (int)sizeof(chunk)) httpd_resp_send_chunk(req, chunk, n);
     }
 
+    /* Upload action bar */
+    n = snprintf(chunk, sizeof(chunk),
+        "<div style='margin:8px 0;padding:6px 8px;border:1px solid #333;border-radius:4px'>"
+        "<span style='color:#888;font-size:12px'>Upload: </span>"
+        "<input type='file' id='uf' style='color:#aaa;font-size:12px'>"
+        "<button onclick='upload(\"%s\")' style='background:#155;color:#0ff;"
+        "border:1px solid #0ff;padding:2px 8px;cursor:pointer;margin-left:4px;"
+        "font-size:12px'>&#8679; Send</button></div>",
+        url_path);
+    if (n > 0 && n < (int)sizeof(chunk)) httpd_resp_send_chunk(req, chunk, n);
+
+    /* New folder form */
+    n = snprintf(chunk, sizeof(chunk),
+        "<form action='/mkdir' method='post' "
+        "style='margin-bottom:10px;display:flex;align-items:center;gap:6px'>"
+        "<input type='hidden' name='dir' value='%s'>"
+        "<input type='text' name='name' placeholder='New folder name' "
+        "style='background:#222;color:#0f0;border:1px solid #444;padding:3px 6px;"
+        "font-family:monospace;font-size:12px;width:150px'>"
+        "<button type='submit' style='background:#1a5;color:#fff;border:none;"
+        "padding:3px 10px;cursor:pointer;font-size:12px'>+ Folder</button>"
+        "</form>",
+        url_path);
+    if (n > 0 && n < (int)sizeof(chunk)) httpd_resp_send_chunk(req, chunk, n);
+
+    /* Directory entries */
     struct dirent *e;
     while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+
         char entry_sd[260];
         snprintf(entry_sd, sizeof(entry_sd), "%s/%.200s", sd_path, e->d_name);
         const char *sep = (url_path[strlen(url_path)-1] == '/') ? "" : "/";
@@ -15694,34 +15939,250 @@ static void s_fileserv_send_dir(httpd_req_t *req, const char *sd_path, const cha
         memset(&st, 0, sizeof(st));
         stat(entry_sd, &st);
 
-        /* Format modification time */
         char tmbuf[20] = "";
         if (st.st_mtime) {
             struct tm *tm_info = localtime(&st.st_mtime);
             if (tm_info) strftime(tmbuf, sizeof(tmbuf), "%Y-%m-%d %H:%M", tm_info);
         }
 
-        int n;
         if (S_ISDIR(st.st_mode)) {
             n = snprintf(chunk, sizeof(chunk),
-                "<p><a href='/files%s%s%.100s' style='color:#ff0'>[DIR] %.100s</a>"
-                " <span style='color:#555'>%s</span></p>",
-                url_path, sep, e->d_name, e->d_name, tmbuf);
+                "<p><a href='/files%s%s%.100s' style='color:#ff0'>"
+                "[DIR] %.100s</a> <span style='color:#555'>%s</span>"
+                " <button onclick='deldir(this.dataset.p)' data-p='%s%s%.100s'"
+                " title='Delete directory' style='background:#530;color:#fa4;"
+                "border:1px solid #750;padding:1px 5px;cursor:pointer;"
+                "margin-left:6px;font-size:11px'>&#x2715;</button></p>",
+                url_path, sep, e->d_name, e->d_name, tmbuf,
+                url_path, sep, e->d_name);
         } else {
             char szbuf[16];
             s_human_size((long)st.st_size, szbuf, sizeof(szbuf));
             n = snprintf(chunk, sizeof(chunk),
                 "<p><a href='/files%s%s%.100s' style='color:#0f0'>%.100s</a>"
                 " <span style='color:#888'>%s</span>"
-                " <span style='color:#555'>%s</span></p>",
-                url_path, sep, e->d_name, e->d_name, szbuf, tmbuf);
+                " <span style='color:#555'>%s</span>"
+                " <button onclick='del(this.dataset.p)' data-p='%s%s%.200s'"
+                " title='Delete' style='background:#500;color:#f66;"
+                "border:1px solid #700;padding:1px 5px;cursor:pointer;"
+                "margin-left:6px;font-size:11px'>&#x2715;</button></p>",
+                url_path, sep, e->d_name, e->d_name, szbuf, tmbuf,
+                url_path, sep, e->d_name);
         }
         if (n > 0 && n < (int)sizeof(chunk)) httpd_resp_send_chunk(req, chunk, n);
     }
     closedir(d);
-    const char *foot = "<hr><small style='color:#555'>Cheap Yellow Monster</small></body></html>";
-    httpd_resp_send_chunk(req, foot, strlen(foot));
+
+    static const char s_foot[] =
+        "<hr><small style='color:#555'>Cheap Yellow Monster</small></body></html>";
+    httpd_resp_send_chunk(req, s_foot, strlen(s_foot));
     httpd_resp_send_chunk(req, NULL, 0);
+}
+
+static void fileserv_url_decode(char *dst, size_t dsz, const char *src)
+{
+    size_t n = 0;
+    for (; *src && n + 1 < dsz; src++) {
+        if (*src == '%' && isxdigit((unsigned char)src[1]) && isxdigit((unsigned char)src[2])) {
+            char h[3] = { src[1], src[2], '\0' };
+            dst[n++] = (char)strtol(h, NULL, 16);
+            src += 2;
+        } else if (*src == '+') {
+            dst[n++] = ' ';
+        } else {
+            dst[n++] = *src;
+        }
+    }
+    dst[n] = '\0';
+}
+
+static void fileserv_log_client(httpd_req_t *req, const char *method)
+{
+    int fd = httpd_req_to_sockfd(req);
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof(ss);
+    char ipstr[INET6_ADDRSTRLEN] = "?";
+    if (getpeername(fd, (struct sockaddr *)&ss, &sl) == 0) {
+        if (ss.ss_family == AF_INET)
+            inet_ntop(AF_INET,  &((struct sockaddr_in  *)&ss)->sin_addr, ipstr, sizeof(ipstr));
+        else
+            inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&ss)->sin6_addr, ipstr, sizeof(ipstr));
+    }
+    ESP_LOGI("fileserv", "%s %s from %s", method, req->uri, ipstr);
+}
+
+/* PUT /upload?path=/url/path/to/filename  — raw body is file content */
+static esp_err_t fileserv_upload_handler(httpd_req_t *req)
+{
+    fileserv_log_client(req, "PUT");
+    char query[512] = "";
+    httpd_req_get_url_query_str(req, query, sizeof(query));
+    char path_param[256] = "";
+    if (httpd_query_key_value(query, "path", path_param, sizeof(path_param)) != ESP_OK
+        || path_param[0] != '/' || strstr(path_param, "..")) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path"); return ESP_OK;
+    }
+    if (req->content_len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No content"); return ESP_OK;
+    }
+
+    char sd_path[280];
+    snprintf(sd_path, sizeof(sd_path), "/sdcard%.240s", path_param);
+
+    char *buf = malloc(4096);
+    if (!buf) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_OK; }
+
+    if (!sd_spi_mutex || xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        free(buf);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD busy"); return ESP_OK;
+    }
+    FILE *f = fopen(sd_path, "wb");
+    xSemaphoreGive(sd_spi_mutex);
+
+    if (!f) {
+        free(buf);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Cannot create file");
+        return ESP_OK;
+    }
+
+    int remaining = req->content_len;
+    bool ok = true;
+    while (remaining > 0) {
+        int to_recv = remaining > 4096 ? 4096 : remaining;
+        int got = httpd_req_recv(req, buf, to_recv);
+        if (got <= 0) { ok = false; break; }
+        if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) { ok = false; break; }
+        size_t written = fwrite(buf, 1, (size_t)got, f);
+        xSemaphoreGive(sd_spi_mutex);
+        if ((int)written != got) { ok = false; break; }
+        remaining -= got;
+    }
+    free(buf);
+
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        fclose(f); xSemaphoreGive(sd_spi_mutex);
+    } else {
+        fclose(f);
+    }
+    if (!ok) {
+        remove(sd_path);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Write error");
+        return ESP_OK;
+    }
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
+}
+
+/* POST /mkdir  body (form-encoded): dir=/url/path&name=dirname */
+static esp_err_t fileserv_mkdir_handler(httpd_req_t *req)
+{
+    fileserv_log_client(req, "POST(mkdir)");
+    char body[400] = "";
+    int blen = req->content_len;
+    if (blen > 0 && blen < (int)sizeof(body) - 1) {
+        int got = httpd_req_recv(req, body, blen);
+        if (got > 0) body[got] = '\0';
+    } else if (blen <= 0) {
+        /* content_len unknown — read what we can */
+        int got = httpd_req_recv(req, body, sizeof(body) - 1);
+        if (got > 0) body[got] = '\0';
+    }
+    ESP_LOGI("fileserv", "mkdir body: '%s'", body);
+
+    char dir_enc[256] = "", name_enc[64] = "";
+    httpd_query_key_value(body, "dir",  dir_enc,  sizeof(dir_enc));
+    httpd_query_key_value(body, "name", name_enc, sizeof(name_enc));
+
+    /* Browser URL-encodes '/' as '%2F' in form body — decode both params */
+    char dir_param[256] = "", name_param[64] = "";
+    fileserv_url_decode(dir_param,  sizeof(dir_param),  dir_enc);
+    fileserv_url_decode(name_param, sizeof(name_param), name_enc);
+    ESP_LOGI("fileserv", "mkdir dir='%s' name='%s'", dir_param, name_param);
+
+    if (!dir_param[0] || !name_param[0] || dir_param[0] != '/'
+        || strstr(dir_param, "..") || strstr(name_param, "..") || strchr(name_param, '/')) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid params"); return ESP_OK;
+    }
+
+    /* Strip trailing slash from dir */
+    int dlen = (int)strlen(dir_param);
+    while (dlen > 1 && dir_param[dlen - 1] == '/') dir_param[--dlen] = '\0';
+
+    char sd_path[320];
+    snprintf(sd_path, sizeof(sd_path), "/sdcard%.200s/%.60s", dir_param, name_param);
+
+    int ret = -1;
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        ret = mkdir(sd_path, 0755);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    char location[300];
+    snprintf(location, sizeof(location), "/files%.200s", dir_param);
+    (void)ret; /* redirect regardless — browser shows new dir if success */
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", location);
+    httpd_resp_sendstr(req, "");
+    return ESP_OK;
+}
+
+static int fileserv_rmdir_recursive(const char *path)
+{
+    DIR *d = opendir(path);
+    if (!d) return -1;
+    struct dirent *e;
+    char child[300];
+    int ret = 0;
+    while (ret == 0 && (e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        snprintf(child, sizeof(child), "%s/%.196s", path, e->d_name);
+        struct stat st;
+        memset(&st, 0, sizeof(st));
+        if (stat(child, &st) != 0) { ret = -1; break; }
+        if (S_ISDIR(st.st_mode))
+            ret = fileserv_rmdir_recursive(child);
+        else
+            ret = remove(child);
+    }
+    closedir(d);
+    if (ret == 0) ret = rmdir(path);
+    return ret;
+}
+
+/* POST /delete?path=/url/path  — works for both files and directories */
+static esp_err_t fileserv_delete_handler(httpd_req_t *req)
+{
+    fileserv_log_client(req, "POST(delete)");
+    char query[512] = "";
+    httpd_req_get_url_query_str(req, query, sizeof(query));
+    char path_enc[256] = "";
+    if (httpd_query_key_value(query, "path", path_enc, sizeof(path_enc)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path"); return ESP_OK;
+    }
+    char path_param[256] = "";
+    fileserv_url_decode(path_param, sizeof(path_param), path_enc);
+    if (path_param[0] != '/' || strstr(path_param, "..")) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid path"); return ESP_OK;
+    }
+
+    char sd_path[280];
+    snprintf(sd_path, sizeof(sd_path), "/sdcard%.240s", path_param);
+
+    struct stat st;
+    memset(&st, 0, sizeof(st));
+    int is_dir = (stat(sd_path, &st) == 0 && S_ISDIR(st.st_mode));
+
+    int ret = -1;
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        ret = is_dir ? fileserv_rmdir_recursive(sd_path) : remove(sd_path);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    if (ret != 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Delete failed");
+        return ESP_OK;
+    }
+    httpd_resp_sendstr(req, "OK");
+    return ESP_OK;
 }
 
 static esp_err_t fileserv_root_handler(httpd_req_t *req)
@@ -15737,12 +16198,22 @@ static esp_err_t fileserv_root_handler(httpd_req_t *req)
     size_t pl = strlen(sd_path);
     if (pl > 1 && sd_path[pl-1] == '/') sd_path[pl-1] = '\0';
 
+    fileserv_log_client(req, "GET");
+
     struct stat st;
     memset(&st, 0, sizeof(st));
-    if (stat(sd_path, &st) != 0) {
+    if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000));
+    int stat_rc = stat(sd_path, &st);
+    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+
+    ESP_LOGI("fileserv", "stat('%s') = %d mode=0%o", sd_path, stat_rc, (unsigned)st.st_mode);
+
+    if (stat_rc != 0) {
         if (strcmp(url_path, "/") == 0) {
             strcpy(sd_path, "/sdcard");
+            if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000));
             stat(sd_path, &st);
+            if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
         } else {
             httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Not found");
             return ESP_OK;
@@ -15757,15 +16228,39 @@ static bool s_fileserv_httpd_start(void)
 {
     if (s_fileserv_httpd) return true;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.server_port      = 80;
-    cfg.max_open_sockets = 5;
-    cfg.max_uri_handlers = 4;
-    cfg.uri_match_fn     = httpd_uri_match_wildcard;
-    cfg.lru_purge_enable = true;
-    if (httpd_start(&s_fileserv_httpd, &cfg) != ESP_OK) return false;
-    httpd_uri_t handler = { .uri="/*", .method=HTTP_GET,
-                            .handler=fileserv_root_handler, .user_ctx=NULL };
-    httpd_register_uri_handler(s_fileserv_httpd, &handler);
+    cfg.server_port        = 80;
+    cfg.max_open_sockets   = 4;
+    cfg.max_uri_handlers   = 8;
+    cfg.stack_size         = 8192;
+    cfg.task_caps          = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;  /* internal RAM ~2-3KB after WiFi init — not enough */
+    cfg.uri_match_fn       = httpd_uri_match_wildcard;
+    cfg.lru_purge_enable   = true;
+    cfg.recv_wait_timeout  = 10;
+    cfg.send_wait_timeout  = 10;
+    esp_err_t err = httpd_start(&s_fileserv_httpd, &cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE("fileserv", "httpd_start failed: 0x%x (free heap: %lu)", err,
+                 (unsigned long)esp_get_free_heap_size());
+        return false;
+    }
+    ESP_LOGI("fileserv", "HTTP server started on port 80 (free heap: %lu)",
+             (unsigned long)esp_get_free_heap_size());
+
+    httpd_uri_t h_root   = { .uri="/",       .method=HTTP_GET,
+                             .handler=fileserv_root_handler,   .user_ctx=NULL };
+    httpd_uri_t h_upload = { .uri="/upload", .method=HTTP_PUT,
+                             .handler=fileserv_upload_handler, .user_ctx=NULL };
+    httpd_uri_t h_mkdir  = { .uri="/mkdir",  .method=HTTP_POST,
+                             .handler=fileserv_mkdir_handler,  .user_ctx=NULL };
+    httpd_uri_t h_delete = { .uri="/delete", .method=HTTP_POST,
+                             .handler=fileserv_delete_handler, .user_ctx=NULL };
+    httpd_uri_t h_files  = { .uri="/*",      .method=HTTP_GET,
+                             .handler=fileserv_root_handler,   .user_ctx=NULL };
+    httpd_register_uri_handler(s_fileserv_httpd, &h_root);
+    httpd_register_uri_handler(s_fileserv_httpd, &h_upload);
+    httpd_register_uri_handler(s_fileserv_httpd, &h_mkdir);
+    httpd_register_uri_handler(s_fileserv_httpd, &h_delete);
+    httpd_register_uri_handler(s_fileserv_httpd, &h_files);
     s_fileserv_active = true;
     return true;
 }
@@ -15776,7 +16271,7 @@ static void s_fileserv_httpd_stop(void)
     s_fileserv_active = false;
 }
 
-/* Poll timer: update IP label once STA gets an address. */
+/* Poll timer: update IP label once STA gets an address, or show failure. */
 static void s_fileserv_poll_ip_cb(lv_timer_t *t)
 {
     esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
@@ -15787,19 +16282,44 @@ static void s_fileserv_poll_ip_cb(lv_timer_t *t)
         s_fileserv_poll_timer = NULL;
 
         if (s_wdup_pending_after_wifi) {
-            // Came from the upload screen — go back and auto-start the upload.
             s_wdup_pending_after_wifi = false;
             show_wardrive_upload_screen();
             wdup_start_cb(NULL);
             return;
         }
 
-        char ip_str[64];
-        snprintf(ip_str, sizeof(ip_str), "IP: " IPSTR " => http://" IPSTR,
-                 IP2STR(&ip.ip), IP2STR(&ip.ip));
-        if (s_fileserv_ip_lbl)     lv_label_set_text(s_fileserv_ip_lbl, ip_str);
-        if (s_fileserv_status_lbl) lv_label_set_text(s_fileserv_status_lbl, "Server active");
-        s_fileserv_httpd_start();
+        /* Show the URL to open prominently */
+        if (s_fileserv_httpd_start()) {
+            char url_str[64];
+            snprintf(url_str, sizeof(url_str), "http://" IPSTR "/", IP2STR(&ip.ip));
+            if (s_fileserv_ip_lbl)     lv_label_set_text(s_fileserv_ip_lbl, url_str);
+            if (s_fileserv_status_lbl) {
+                lv_label_set_text(s_fileserv_status_lbl, LV_SYMBOL_OK " Server active - open URL above");
+                lv_obj_set_style_text_color(s_fileserv_status_lbl, lv_color_make(0, 220, 80), 0);
+            }
+        } else {
+            if (s_fileserv_status_lbl)
+                lv_label_set_text(s_fileserv_status_lbl, LV_SYMBOL_CLOSE " HTTP start failed");
+        }
+        return;
+    }
+
+    /* Not got IP yet — check if WiFi association dropped (connect failed) */
+    wifi_ap_record_t ap_info;
+    bool associated = (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK);
+    uint32_t elapsed = (xTaskGetTickCount() * portTICK_PERIOD_MS) - s_fileserv_connect_ms;
+
+    if (!associated && elapsed > 12000) {
+        /* 12 s with no association — give up and tell user */
+        lv_timer_del(t);
+        s_fileserv_poll_timer = NULL;
+        if (s_fileserv_status_lbl) {
+            lv_label_set_text(s_fileserv_status_lbl, LV_SYMBOL_CLOSE " Connect failed - tap Connect to retry");
+            lv_obj_set_style_text_color(s_fileserv_status_lbl, lv_color_make(220, 60, 60), 0);
+        }
+        if (s_fileserv_ip_lbl) lv_label_set_text(s_fileserv_ip_lbl, "");
+    } else if (associated && s_fileserv_status_lbl) {
+        lv_label_set_text(s_fileserv_status_lbl, "Associated, waiting for IP...");
     }
 }
 
@@ -15884,6 +16404,12 @@ static void show_ap_file_server_screen(void)
 
     /* Start the AP and HTTP server */
     ensure_wifi_mode();
+
+    /* Ensure AP netif exists — required for DHCP server and 192.168.4.1 IP assignment */
+    if (!esp_netif_get_handle_from_ifkey("WIFI_AP_DEF")) {
+        esp_netif_create_default_wifi_ap();
+    }
+
     wifi_mode_t wmode;
     esp_wifi_get_mode(&wmode);
     if (wmode != WIFI_MODE_APSTA && wmode != WIFI_MODE_AP) {
@@ -15946,8 +16472,13 @@ static void s_wcs_connect_cb(lv_event_t *e)
     strncpy(g_saved_wifi_pass, pass, sizeof(g_saved_wifi_pass) - 1);
     nvs_settings_save_wifi_creds(ssid, pass);
 
-    if (s_fileserv_status_lbl) lv_label_set_text(s_fileserv_status_lbl, "Connecting...");
-    if (s_fileserv_ip_lbl)     lv_label_set_text(s_fileserv_ip_lbl, "Waiting for IP...");
+    if (s_fileserv_status_lbl) {
+        lv_label_set_text(s_fileserv_status_lbl, "Connecting...");
+        lv_obj_set_style_text_color(s_fileserv_status_lbl, ui_muted_color(), 0);
+    }
+    if (s_fileserv_ip_lbl) lv_label_set_text(s_fileserv_ip_lbl, "");
+
+    s_fileserv_connect_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
     ensure_wifi_mode();
     wifi_config_t sta_cfg = {};
@@ -15955,9 +16486,10 @@ static void s_wcs_connect_cb(lv_event_t *e)
     strncpy((char *)sta_cfg.sta.password, pass, sizeof(sta_cfg.sta.password) - 1);
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
+    esp_wifi_clear_fast_connect();
     esp_wifi_connect();
 
-    /* Poll every 1s for IP */
+    /* Poll every 1s for IP or failure */
     if (s_fileserv_poll_timer) lv_timer_del(s_fileserv_poll_timer);
     s_fileserv_poll_timer = lv_timer_create(s_fileserv_poll_ip_cb, 1000, NULL);
 }
@@ -16258,6 +16790,7 @@ static bool wdup_ensure_wifi(void)
     strncpy((char *)cfg.sta.ssid,     g_saved_wifi_ssid, sizeof(cfg.sta.ssid) - 1);
     strncpy((char *)cfg.sta.password, g_saved_wifi_pass,  sizeof(cfg.sta.password) - 1);
     esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    esp_wifi_clear_fast_connect();
     esp_wifi_connect();
 
     // Wait up to 15 s for a routable IP (not just L2 association).
@@ -17501,12 +18034,459 @@ static void show_wardrive_upload_screen(void)
 
 // ── Data Transfer sub-menu screen ────────────────────────────────────────────
 
+// ─── New Folder screen ────────────────────────────────────────────────────────
+
+static lv_obj_t *nf_ta         = NULL;
+static lv_obj_t *nf_result_lbl = NULL;
+
+static void nf_back_cb(lv_event_t *e)
+{
+    (void)e;
+    nf_ta = NULL; nf_result_lbl = NULL;
+    show_data_transfer_screen();
+}
+
+static void nf_create_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!nf_ta || !nf_result_lbl) return;
+    const char *name = lv_textarea_get_text(nf_ta);
+    if (!name || !name[0]) {
+        lv_label_set_text(nf_result_lbl, LV_SYMBOL_WARNING " Enter a folder name");
+        lv_obj_set_style_text_color(nf_result_lbl, COLOR_MATERIAL_AMBER, 0);
+        return;
+    }
+    /* Reject names containing path separators */
+    if (strchr(name, '/')) {
+        lv_label_set_text(nf_result_lbl, LV_SYMBOL_WARNING " Name cannot contain '/'");
+        lv_obj_set_style_text_color(nf_result_lbl, COLOR_MATERIAL_AMBER, 0);
+        return;
+    }
+    char path[160];
+    snprintf(path, sizeof(path), "/sdcard/lab/%s", name);
+    int ok = 0;
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        ok = (mkdir(path, 0755) == 0);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    if (ok) {
+        lv_label_set_text(nf_result_lbl, LV_SYMBOL_OK "  Created!");
+        lv_obj_set_style_text_color(nf_result_lbl, COLOR_MATERIAL_GREEN, 0);
+        lv_textarea_set_text(nf_ta, "");
+    } else if (errno == EEXIST) {
+        lv_label_set_text(nf_result_lbl, "Already exists");
+        lv_obj_set_style_text_color(nf_result_lbl, COLOR_MATERIAL_AMBER, 0);
+    } else {
+        lv_label_set_text(nf_result_lbl, LV_SYMBOL_CLOSE "  Error creating folder");
+        lv_obj_set_style_text_color(nf_result_lbl, COLOR_MATERIAL_RED, 0);
+    }
+}
+
+static void show_new_folder_screen(void)
+{
+    create_function_page_base("New Folder");
+    nf_ta = NULL; nf_result_lbl = NULL;
+
+    /* Keyboard at bottom (130px), card above it */
+    lv_obj_t *kb = lv_keyboard_create(function_page);
+    lv_obj_set_size(kb, lv_pct(100), 130);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(kb, ui_bg_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(kb, ui_text_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(kb, &lv_font_montserrat_12, 0);
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
+
+    lv_obj_t *card = lv_obj_create(function_page);
+    /* height = screen - title(30) - keyboard(130) - gaps */
+    lv_obj_set_size(card, lv_pct(96), LCD_V_RES - 30 - 130 - 6);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(card, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 8, 0);
+    lv_obj_set_style_pad_all(card, 8, 0);
+    lv_obj_set_style_pad_row(card, 6, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *path_lbl = lv_label_create(card);
+    lv_label_set_text(path_lbl, LV_SYMBOL_DIRECTORY "  /sdcard/lab/");
+    lv_obj_set_style_text_font(path_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(path_lbl, COLOR_MATERIAL_GREEN, 0);
+
+    nf_ta = lv_textarea_create(card);
+    lv_obj_set_size(nf_ta, lv_pct(100), 36);
+    lv_textarea_set_max_length(nf_ta, 60);
+    lv_textarea_set_one_line(nf_ta, true);
+    lv_textarea_set_placeholder_text(nf_ta, "folder name...");
+    lv_obj_set_style_text_font(nf_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(nf_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(nf_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(nf_ta, COLOR_MATERIAL_GREEN, 0);
+    lv_keyboard_set_textarea(kb, nf_ta);
+
+    nf_result_lbl = lv_label_create(card);
+    lv_label_set_text(nf_result_lbl, "");
+    lv_obj_set_style_text_font(nf_result_lbl, &lv_font_montserrat_12, 0);
+
+    lv_obj_t *btn_row = lv_obj_create(card);
+    lv_obj_set_size(btn_row, lv_pct(100), 32);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *cancel = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel, 90, 28);
+    lv_obj_set_style_bg_color(cancel, lv_color_make(70, 70, 70), 0);
+    lv_obj_set_style_border_width(cancel, 0, 0);
+    lv_obj_set_style_radius(cancel, 6, 0);
+    lv_obj_t *cl = lv_label_create(cancel);
+    lv_label_set_text(cl, LV_SYMBOL_LEFT "  Back");
+    lv_obj_set_style_text_font(cl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(cl, lv_color_white(), 0);
+    lv_obj_center(cl);
+    lv_obj_add_event_cb(cancel, nf_back_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *create_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(create_btn, 100, 28);
+    lv_obj_set_style_bg_color(create_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_border_width(create_btn, 0, 0);
+    lv_obj_set_style_radius(create_btn, 6, 0);
+    lv_obj_t *crl = lv_label_create(create_btn);
+    lv_label_set_text(crl, LV_SYMBOL_PLUS "  Create");
+    lv_obj_set_style_text_font(crl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(crl, lv_color_white(), 0);
+    lv_obj_center(crl);
+    lv_obj_add_event_cb(create_btn, nf_create_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// ─── Delete File browser ──────────────────────────────────────────────────────
+
+#define DELBR_MAX_DIRS 32
+
+static char      s_delbr_cwd[300];
+static lv_obj_t *s_delbr_list     = NULL;
+static lv_obj_t *s_delbr_path_lbl = NULL;
+static char      s_delbr_dirs[DELBR_MAX_DIRS][256];
+static int       s_delbr_dir_count = 0;
+static char      s_delbr_del_target[300];
+
+static void delbr_populate(const char *path);
+
+static void delbr_dir_btn_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx >= 0 && idx < s_delbr_dir_count)
+        delbr_populate(s_delbr_dirs[idx]);
+}
+
+static void delbr_up_cb(lv_event_t *e)
+{
+    char parent[300];
+    strncpy(parent, s_delbr_cwd, sizeof(parent) - 1);
+    parent[sizeof(parent) - 1] = '\0';
+    char *slash = strrchr(parent, '/');
+    if (!slash || slash == parent || strlen(parent) <= strlen("/sdcard")) {
+        show_data_transfer_screen();
+        return;
+    }
+    *slash = '\0';
+    if (strlen(parent) < strlen("/sdcard/lab"))
+        show_data_transfer_screen();
+    else
+        delbr_populate(parent);
+}
+
+static void delbr_cancel_del_cb(lv_event_t *e)
+{
+    lv_obj_t *overlay = (lv_obj_t *)lv_event_get_user_data(e);
+    if (overlay) lv_obj_del(overlay);
+}
+
+static void delbr_confirm_del_cb(lv_event_t *e)
+{
+    lv_obj_t *overlay = (lv_obj_t *)lv_event_get_user_data(e);
+    bool confirmed = (lv_event_get_code(e) == LV_EVENT_CLICKED);
+    if (overlay) lv_obj_del(overlay);
+    if (!confirmed || !s_delbr_del_target[0]) return;
+
+    int ok = 0;
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        ok = (remove(s_delbr_del_target) == 0);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    s_delbr_del_target[0] = '\0';
+    if (ok) delbr_populate(s_delbr_cwd);  /* refresh on success */
+}
+
+static void delbr_trash_btn_cb(lv_event_t *e)
+{
+    const char *fullpath = (const char *)lv_event_get_user_data(e);
+    if (!fullpath || !fullpath[0]) return;
+    strncpy(s_delbr_del_target, fullpath, sizeof(s_delbr_del_target) - 1);
+    s_delbr_del_target[sizeof(s_delbr_del_target) - 1] = '\0';
+
+    /* Extract filename for display */
+    const char *fname = strrchr(fullpath, '/');
+    fname = fname ? fname + 1 : fullpath;
+
+    /* Confirmation overlay */
+    lv_obj_t *overlay = lv_obj_create(function_page);
+    lv_obj_set_size(overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(overlay, 0, 0);
+    lv_obj_set_style_bg_color(overlay, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(overlay, 0, 0);
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *card = lv_obj_create(overlay);
+    lv_obj_set_size(card, 210, 150);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(card, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, LV_SYMBOL_TRASH "  Delete File?");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_RED, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    /* Filename (truncated if long) */
+    char disp[48];
+    snprintf(disp, sizeof(disp), "%.45s", fname);
+    lv_obj_t *fn_lbl = lv_label_create(card);
+    lv_label_set_text(fn_lbl, disp);
+    lv_obj_set_style_text_font(fn_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(fn_lbl, ui_text_color(), 0);
+    lv_label_set_long_mode(fn_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(fn_lbl, 185);
+    lv_obj_align(fn_lbl, LV_ALIGN_TOP_MID, 0, 26);
+
+    lv_obj_t *warn = lv_label_create(card);
+    lv_label_set_text(warn, "Cannot be undone.");
+    lv_obj_set_style_text_font(warn, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(warn, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_align(warn, LV_ALIGN_TOP_MID, 0, 68);
+
+    lv_obj_t *no_btn = lv_btn_create(card);
+    lv_obj_set_size(no_btn, 80, 28);
+    lv_obj_align(no_btn, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_set_style_bg_color(no_btn, lv_color_make(70, 70, 70), 0);
+    lv_obj_set_style_border_width(no_btn, 0, 0);
+    lv_obj_set_style_radius(no_btn, 6, 0);
+    lv_obj_t *nl = lv_label_create(no_btn);
+    lv_label_set_text(nl, "Cancel");
+    lv_obj_set_style_text_font(nl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(nl, lv_color_white(), 0);
+    lv_obj_center(nl);
+    lv_obj_add_event_cb(no_btn, delbr_cancel_del_cb, LV_EVENT_CLICKED, overlay);
+
+    lv_obj_t *yes_btn = lv_btn_create(card);
+    lv_obj_set_size(yes_btn, 80, 28);
+    lv_obj_align(yes_btn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(yes_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_border_width(yes_btn, 0, 0);
+    lv_obj_set_style_radius(yes_btn, 6, 0);
+    lv_obj_t *yl = lv_label_create(yes_btn);
+    lv_label_set_text(yl, LV_SYMBOL_TRASH "  Delete");
+    lv_obj_set_style_text_font(yl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(yl, lv_color_white(), 0);
+    lv_obj_center(yl);
+    lv_obj_add_event_cb(yes_btn, delbr_confirm_del_cb, LV_EVENT_CLICKED, overlay);
+}
+
+static void delbr_populate(const char *path)
+{
+    strncpy(s_delbr_cwd, path, sizeof(s_delbr_cwd) - 1);
+    s_delbr_cwd[sizeof(s_delbr_cwd) - 1] = '\0';
+    s_delbr_dir_count = 0;
+
+    if (s_delbr_path_lbl) {
+        const char *disp = s_delbr_cwd;
+        if (strncmp(disp, "/sdcard", 7) == 0) disp += 7;
+        lv_label_set_text(s_delbr_path_lbl, disp[0] ? disp : "/");
+    }
+    if (!s_delbr_list) return;
+    lv_obj_clean(s_delbr_list);
+
+    bool hm = sd_spi_mutex &&
+              xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE;
+    if (!hm) {
+        lv_obj_t *err = lv_label_create(s_delbr_list);
+        lv_label_set_text(err, "SD not available");
+        lv_obj_set_style_text_color(err, COLOR_MATERIAL_RED, 0);
+        return;
+    }
+    DIR *dir = opendir(path);
+    if (!dir) {
+        xSemaphoreGive(sd_spi_mutex);
+        lv_obj_t *err = lv_label_create(s_delbr_list);
+        lv_label_set_text(err, "Cannot open dir");
+        lv_obj_set_style_text_color(err, COLOR_MATERIAL_RED, 0);
+        return;
+    }
+
+    for (int pass = 0; pass < 2; pass++) {
+        rewinddir(dir);
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (entry->d_name[0] == '.') continue;
+            char child[300];
+            snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+            struct stat st;
+            bool have_stat = (stat(child, &st) == 0);
+            bool is_dir    = have_stat && S_ISDIR(st.st_mode);
+            if (pass == 0 && !is_dir) continue;
+            if (pass == 1 &&  is_dir) continue;
+
+            lv_obj_t *row = lv_obj_create(s_delbr_list);
+            lv_obj_set_size(row, lv_pct(100), 26);
+            lv_obj_set_style_bg_color(row, lv_color_make(28, 32, 42), 0);
+            lv_obj_set_style_border_width(row, 0, 0);
+            lv_obj_set_style_radius(row, 4, 0);
+            lv_obj_set_style_pad_ver(row, 3, 0);
+            lv_obj_set_style_pad_hor(row, 4, 0);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+            lv_obj_t *lbl = lv_label_create(row);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+            lv_obj_set_flex_grow(lbl, 1);
+
+            if (is_dir) {
+                char text[280];
+                snprintf(text, sizeof(text), "%s  " LV_SYMBOL_RIGHT, entry->d_name);
+                lv_label_set_text(lbl, text);
+                lv_obj_set_style_text_color(lbl, lv_color_make(255, 210, 0), 0);
+                if (s_delbr_dir_count < DELBR_MAX_DIRS) {
+                    strncpy(s_delbr_dirs[s_delbr_dir_count], child,
+                            sizeof(s_delbr_dirs[0]) - 1);
+                    s_delbr_dirs[s_delbr_dir_count][sizeof(s_delbr_dirs[0])-1] = '\0';
+                    lv_obj_add_event_cb(row, delbr_dir_btn_cb, LV_EVENT_CLICKED,
+                                        (void*)(intptr_t)s_delbr_dir_count);
+                    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+                    s_delbr_dir_count++;
+                }
+            } else {
+                char sz_str[12] = "";
+                if (have_stat) {
+                    uint32_t sz = (uint32_t)st.st_size;
+                    if      (sz >= 1024*1024) snprintf(sz_str,sizeof(sz_str)," [%luM]",(unsigned long)(sz/(1024*1024)));
+                    else if (sz >= 1024)      snprintf(sz_str,sizeof(sz_str)," [%luK]",(unsigned long)(sz/1024));
+                    else                      snprintf(sz_str,sizeof(sz_str)," [%luB]",(unsigned long)sz);
+                }
+                char text[280];
+                snprintf(text, sizeof(text), "%s%s", entry->d_name, sz_str);
+                lv_label_set_text(lbl, text);
+                lv_obj_set_style_text_color(lbl, ui_text_color(), 0);
+
+                /* Trash button on the right — stores full path via static pool */
+                /* We allocate a copy in the static target buffer only on click,
+                 * so pass the child path as user_data via a per-row static.
+                 * Since rows are rebuilt on each delbr_populate(), we can use
+                 * the dir pool for files too (re-use s_delbr_dirs entries). */
+                lv_obj_t *trash = lv_btn_create(row);
+                lv_obj_set_size(trash, 28, 22);
+                lv_obj_set_style_bg_color(trash, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+                lv_obj_set_style_bg_color(trash, lv_color_make(200, 0, 0), LV_STATE_PRESSED);
+                lv_obj_set_style_border_width(trash, 0, 0);
+                lv_obj_set_style_radius(trash, 4, 0);
+                lv_obj_set_style_pad_all(trash, 2, 0);
+                lv_obj_t *ti = lv_label_create(trash);
+                lv_label_set_text(ti, LV_SYMBOL_TRASH);
+                lv_obj_set_style_text_font(ti, &lv_font_montserrat_12, 0);
+                lv_obj_set_style_text_color(ti, lv_color_white(), 0);
+                lv_obj_center(ti);
+                /* Store file path via the dir pool (mixed use is safe since
+                 * dirs are navigable and files are deleteable, never both) */
+                if (s_delbr_dir_count < DELBR_MAX_DIRS) {
+                    strncpy(s_delbr_dirs[s_delbr_dir_count], child,
+                            sizeof(s_delbr_dirs[0]) - 1);
+                    s_delbr_dirs[s_delbr_dir_count][sizeof(s_delbr_dirs[0])-1] = '\0';
+                    lv_obj_add_event_cb(trash, delbr_trash_btn_cb, LV_EVENT_CLICKED,
+                                        s_delbr_dirs[s_delbr_dir_count]);
+                    s_delbr_dir_count++;
+                }
+            }
+        }
+    }
+    closedir(dir);
+    xSemaphoreGive(sd_spi_mutex);
+}
+
+static void show_delete_file_screen(void)
+{
+    create_function_page_base("Delete File");
+    s_delbr_list = NULL; s_delbr_path_lbl = NULL;
+
+    lv_obj_t *path_bar = lv_obj_create(function_page);
+    lv_obj_set_size(path_bar, lv_pct(100), 22);
+    lv_obj_align(path_bar, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_set_style_bg_color(path_bar, lv_color_make(50, 20, 20), 0);
+    lv_obj_set_style_border_width(path_bar, 0, 0);
+    lv_obj_set_style_radius(path_bar, 0, 0);
+    lv_obj_set_style_pad_all(path_bar, 3, 0);
+    lv_obj_clear_flag(path_bar, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_delbr_path_lbl = lv_label_create(path_bar);
+    lv_obj_set_style_text_font(s_delbr_path_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_delbr_path_lbl, COLOR_MATERIAL_RED, 0);
+    lv_label_set_long_mode(s_delbr_path_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(s_delbr_path_lbl, lv_pct(100));
+    lv_obj_align(s_delbr_path_lbl, LV_ALIGN_LEFT_MID, 0, 0);
+
+    s_delbr_list = lv_obj_create(function_page);
+    lv_obj_set_size(s_delbr_list, lv_pct(100), LCD_V_RES - 30 - 22 - 38);
+    lv_obj_align(s_delbr_list, LV_ALIGN_TOP_MID, 0, 54);
+    lv_obj_set_style_bg_color(s_delbr_list, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(s_delbr_list, 0, 0);
+    lv_obj_set_style_radius(s_delbr_list, 0, 0);
+    lv_obj_set_style_pad_all(s_delbr_list, 4, 0);
+    lv_obj_set_style_pad_row(s_delbr_list, 3, 0);
+    lv_obj_set_flex_flow(s_delbr_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_delbr_list, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+    lv_obj_t *nav_btn = lv_btn_create(function_page);
+    lv_obj_set_size(nav_btn, 120, 28);
+    lv_obj_align(nav_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_bg_color(nav_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(nav_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(nav_btn, 0, 0);
+    lv_obj_set_style_radius(nav_btn, 8, 0);
+    lv_obj_set_flex_flow(nav_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(nav_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(nav_btn, 4, 0);
+    lv_obj_t *ni = lv_label_create(nav_btn);
+    lv_label_set_text(ni, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(ni, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ni, lv_color_white(), 0);
+    lv_obj_t *nt = lv_label_create(nav_btn);
+    lv_label_set_text(nt, "Up / Back");
+    lv_obj_set_style_text_font(nt, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(nt, lv_color_white(), 0);
+    lv_obj_add_event_cb(nav_btn, delbr_up_cb, LV_EVENT_CLICKED, NULL);
+
+    delbr_populate("/sdcard/lab");
+}
+
 static void data_transfer_tile_cb(lv_event_t *e)
 {
     const char *key = (const char *)lv_event_get_user_data(e);
     if (!key) return;
-    if (strcmp(key, "AP File Server") == 0)      show_ap_file_server_screen();
-    else if (strcmp(key, "WiFi Client") == 0)    show_wifi_client_server_screen();
+    if (strcmp(key, "AP File Server") == 0)        show_ap_file_server_screen();
+    else if (strcmp(key, "WiFi Client") == 0)      show_wifi_client_server_screen();
     else if (strcmp(key, "Wardrive Upload") == 0) {
         wdm_back_fn = show_data_transfer_screen;
         show_wardrive_manage_screen();
@@ -17534,9 +18514,9 @@ static void show_data_transfer_screen(void)
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    create_tile(tiles, LV_SYMBOL_UPLOAD,  "AP File\nServer",   UI_ACCENT_CYAN,          data_transfer_tile_cb, "AP File Server");
-    create_tile(tiles, LV_SYMBOL_WIFI,    "WiFi\nClient",      COLOR_MATERIAL_GREEN,     data_transfer_tile_cb, "WiFi Client");
-    create_tile(tiles, LV_SYMBOL_UPLOAD,  "Wardrive\nUpload",  lv_color_hex(0xE91E63),  data_transfer_tile_cb, "Wardrive Upload");
+    create_tile(tiles, MY_SYMBOL_SERVER,  "AP File\nServer",   UI_ACCENT_CYAN,          data_transfer_tile_cb, "AP File Server");
+    create_tile(tiles, MY_SYMBOL_LAPTOP, "WiFi\nClient",      COLOR_MATERIAL_GREEN,     data_transfer_tile_cb, "WiFi Client");
+    create_tile(tiles, MY_SYMBOL_CLOUD_UP,"Wardrive\nUpload",  lv_color_hex(0xE91E63),  data_transfer_tile_cb, "Wardrive Upload");
 
     lv_obj_t *back_btn = lv_btn_create(function_page);
     lv_obj_set_size(back_btn, 110, 30);
@@ -18714,6 +19694,122 @@ static void show_power_mode_popup(void)
     lv_obj_add_event_cb(close_btn, powermode_close_cb, LV_EVENT_CLICKED, NULL);
 }
 
+// ─── Hardware Options sub-screen ─────────────────────────────────────────────
+
+static void hw_opts_back_cb(lv_event_t *e)
+{
+    (void)e;
+    show_settings_screen();
+}
+
+static void hw_nmrfhat_ok_cb(lv_event_t *e)
+{
+    lv_obj_t *overlay = (lv_obj_t *)lv_event_get_user_data(e);
+    if (overlay) lv_obj_del(overlay);
+}
+
+static void show_nmrfhat_info_popup(void)
+{
+    lv_obj_t *overlay = lv_obj_create(function_page);
+    lv_obj_set_size(overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(overlay, 0, 0);
+    lv_obj_set_style_bg_color(overlay, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(overlay, 0, 0);
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *card = lv_obj_create(overlay);
+    lv_obj_set_size(card, 210, 178);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x607D8B), 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, MY_SYMBOL_MICROCHIP "  NM-RF-HAT");
+    lv_obj_set_style_text_font(title, &g_font_icon14, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0x90A4AE), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *msg = lv_label_create(card);
+    lv_label_set_text(msg,
+        "RF hardware addon board\nsupport in development.\n\n"
+        "Addon boards will enable\nsoftware-configurable RF\n"
+        "module options (NM-RF-HAT).");
+    lv_obj_set_style_text_font(msg, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(msg, ui_text_color(), 0);
+    lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(msg, 185);
+    lv_obj_align(msg, LV_ALIGN_TOP_MID, 0, 26);
+
+    lv_obj_t *ok_btn = lv_btn_create(card);
+    lv_obj_set_size(ok_btn, 90, 28);
+    lv_obj_align(ok_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(ok_btn, lv_color_hex(0x607D8B), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(ok_btn, lv_color_hex(0x78909C), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(ok_btn, 0, 0);
+    lv_obj_set_style_radius(ok_btn, 6, 0);
+    lv_obj_t *ok_lbl = lv_label_create(ok_btn);
+    lv_label_set_text(ok_lbl, "OK");
+    lv_obj_set_style_text_font(ok_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ok_lbl, lv_color_white(), 0);
+    lv_obj_center(ok_lbl);
+    lv_obj_add_event_cb(ok_btn, hw_nmrfhat_ok_cb, LV_EVENT_CLICKED, overlay);
+}
+
+static void hw_options_tile_event_cb(lv_event_t *e)
+{
+    const char *name = (const char *)lv_event_get_user_data(e);
+    if (!name) return;
+    if (strcmp(name, "Power Mode") == 0)
+        show_power_mode_popup();
+    else if (strcmp(name, "NM-RF-HAT") == 0)
+        show_nmrfhat_info_popup();
+}
+
+static void show_hardware_options_screen(void)
+{
+    create_function_page_base("Hardware Options");
+    apply_menu_bg();
+
+    lv_obj_t *tiles = lv_obj_create(function_page);
+    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30 - 40);
+    lv_obj_align(tiles, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(tiles, 0, 0);
+    lv_obj_set_style_pad_all(tiles, 4, 0);
+    lv_obj_set_style_pad_gap(tiles, 4, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
+
+    create_tile(tiles, LV_SYMBOL_CHARGE,    "Power\nMode",  COLOR_MATERIAL_RED,     hw_options_tile_event_cb, "Power Mode");
+    create_tile(tiles, MY_SYMBOL_TOWER,     "NM-RF-HAT",   lv_color_hex(0x607D8B), hw_options_tile_event_cb, "NM-RF-HAT");
+
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 120, 30);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_t *bi = lv_label_create(back_btn);
+    lv_label_set_text(bi, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(bi, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bi, lv_color_white(), 0);
+    lv_obj_t *bl = lv_label_create(back_btn);
+    lv_label_set_text(bl, "Settings");
+    lv_obj_set_style_text_font(bl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bl, lv_color_white(), 0);
+    lv_obj_add_event_cb(back_btn, hw_opts_back_cb, LV_EVENT_CLICKED, NULL);
+}
+
 // Settings sub-menu tile event callback
 static void settings_tile_event_cb(lv_event_t *e)
 {
@@ -18736,8 +19832,8 @@ static void settings_tile_event_cb(lv_event_t *e)
         show_sd_card_screen();
     } else if (strcmp(tile_name, "GPS Info") == 0) {
         show_gps_info_screen();
-    } else if (strcmp(tile_name, "Power Mode") == 0) {
-        show_power_mode_popup();
+    } else if (strcmp(tile_name, "Hardware Options") == 0) {
+        show_hardware_options_screen();
     } else if (strcmp(tile_name, "Vibrator Test") == 0) {
         show_vibrator_test_popup();
     }
@@ -18761,14 +19857,14 @@ static void show_settings_screen(void)
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
 
-    create_tile(tiles, LV_SYMBOL_EYE_OPEN,       "Compromised\nData",  COLOR_TILE_BLUE,         settings_tile_event_cb, "Compromised Data");
-    create_tile(tiles, LV_SYMBOL_LOOP,           "Timing",             COLOR_MATERIAL_PURPLE,   settings_tile_event_cb, "Timing");
+    create_tile(tiles, MY_SYMBOL_KEY,            "Compromised\nData",  COLOR_TILE_BLUE,         settings_tile_event_cb, "Compromised Data");
+    create_tile(tiles, MY_SYMBOL_CLOCK,          "Timing",             COLOR_MATERIAL_PURPLE,   settings_tile_event_cb, "Timing");
     create_tile(tiles, LV_SYMBOL_DOWNLOAD,       "Download\nMode",     COLOR_MATERIAL_RED,      settings_tile_event_cb, "Download Mode");
-    create_tile(tiles, LV_SYMBOL_IMAGE,          "Screen",             COLOR_MATERIAL_TEAL,     settings_tile_event_cb, "Screen");
+    create_tile(tiles, MY_SYMBOL_DESKTOP,        "Screen",             COLOR_MATERIAL_TEAL,     settings_tile_event_cb, "Screen");
     create_tile(tiles, LV_SYMBOL_SD_CARD,        "SD\nCard",           COLOR_MATERIAL_GREEN,    settings_tile_event_cb, "SD Card");
     create_tile(tiles, MY_SYMBOL_SATELLITE_DISH, "GPS\nInfo",          lv_color_hex(0x00BCD4),  settings_tile_event_cb, "GPS Info");
-    create_tile(tiles, LV_SYMBOL_CHARGE,         "Power\nMode",        COLOR_MATERIAL_RED,      settings_tile_event_cb, "Power Mode");
-    create_tile(tiles, LV_SYMBOL_UPLOAD,         "Data\nTransfer",     lv_color_hex(0xE91E63),  settings_tile_event_cb, "Data Transfer");
+    create_tile(tiles, MY_SYMBOL_MICROCHIP,      "Hardware\nOptions",  lv_color_hex(0x607D8B),  settings_tile_event_cb, "Hardware Options");
+    create_tile(tiles, MY_SYMBOL_SERVER,         "Data\nTransfer",     lv_color_hex(0xE91E63),  settings_tile_event_cb, "Data Transfer");
     create_tile(tiles, LV_SYMBOL_AUDIO,          "Vibrator\nTest",     lv_color_hex(0x9C27B0),  settings_tile_event_cb, "Vibrator Test");
 
     lv_obj_t *ver = lv_label_create(function_page);
@@ -19241,121 +20337,208 @@ static void show_sd_free_space_screen(void)
 
 // ─── File Tree screen ────────────────────────────────────────────────────────
 
-static void sd_tree_walk(char *buf, size_t bufsz, const char *path, int depth, size_t *pos)
+// ─── Interactive SD file browser ─────────────────────────────────────────────
+
+#define SD_TREE_ROOT     "/sdcard"
+#define SD_TREE_MAX_DIRS 64
+
+static char      s_sd_tree_cwd[300];
+static lv_obj_t *s_sd_tree_list  = NULL;
+static lv_obj_t *s_sd_path_lbl   = NULL;
+static char      s_sd_dir_paths[SD_TREE_MAX_DIRS][256];
+static int       s_sd_dir_count  = 0;
+
+static void sd_tree_populate(const char *path);
+
+static void sd_dir_btn_cb(lv_event_t *e)
 {
-    if (depth > 8) return;
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx >= 0 && idx < s_sd_dir_count)
+        sd_tree_populate(s_sd_dir_paths[idx]);
+}
+
+static void sd_tree_up_cb(lv_event_t *e)
+{
+    char parent[300];
+    strncpy(parent, s_sd_tree_cwd, sizeof(parent) - 1);
+    parent[sizeof(parent) - 1] = '\0';
+    char *slash = strrchr(parent, '/');
+    if (!slash || slash == parent) {
+        sd_back_to_menu_cb(e);
+        return;
+    }
+    *slash = '\0';
+    if (strlen(parent) < strlen(SD_TREE_ROOT)) {
+        sd_back_to_menu_cb(e);
+        return;
+    }
+    sd_tree_populate(parent);
+}
+
+static void sd_tree_populate(const char *path)
+{
+    strncpy(s_sd_tree_cwd, path, sizeof(s_sd_tree_cwd) - 1);
+    s_sd_tree_cwd[sizeof(s_sd_tree_cwd) - 1] = '\0';
+    s_sd_dir_count = 0;
+
+    /* Update path label — strip /sdcard prefix for display */
+    if (s_sd_path_lbl) {
+        const char *disp = s_sd_tree_cwd;
+        if (strncmp(disp, SD_TREE_ROOT, strlen(SD_TREE_ROOT)) == 0)
+            disp += strlen(SD_TREE_ROOT);
+        lv_label_set_text(s_sd_path_lbl, disp[0] ? disp : "/");
+    }
+
+    if (!s_sd_tree_list) return;
+    lv_obj_clean(s_sd_tree_list);
+
+    bool have_mutex = sd_spi_mutex &&
+                      xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE;
+    if (!have_mutex) {
+        lv_obj_t *e = lv_label_create(s_sd_tree_list);
+        lv_label_set_text(e, "SD not available");
+        lv_obj_set_style_text_color(e, COLOR_MATERIAL_RED, 0);
+        return;
+    }
+
     DIR *dir = opendir(path);
-    if (!dir) return;
-    struct dirent *entry;
-    char child[300];
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_name[0] == '.') continue;
-        if (*pos + 128 >= bufsz) {
-            if (bufsz - *pos > 20)
-                *pos += snprintf(buf + *pos, bufsz - *pos, "...(truncated)\n");
-            break;
-        }
-        snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
-        struct stat st;
-        bool have_stat = (stat(child, &st) == 0);
-        bool is_dir    = have_stat && S_ISDIR(st.st_mode);
+    if (!dir) {
+        xSemaphoreGive(sd_spi_mutex);
+        lv_obj_t *e = lv_label_create(s_sd_tree_list);
+        lv_label_set_text(e, "Cannot open directory");
+        lv_obj_set_style_text_color(e, COLOR_MATERIAL_RED, 0);
+        return;
+    }
 
-        for (int i = 0; i < depth * 2 && *pos + 1 < bufsz; i++)
-            buf[(*pos)++] = ' ';
+    /* Two passes: directories first, then files */
+    for (int pass = 0; pass < 2; pass++) {
+        rewinddir(dir);
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (entry->d_name[0] == '.') continue;
 
-        if (is_dir) {
-            *pos += snprintf(buf + *pos, bufsz - *pos, "%s/\n", entry->d_name);
-            sd_tree_walk(buf, bufsz, child, depth + 1, pos);
-        } else {
-            if (have_stat) {
-                uint32_t sz = (uint32_t)st.st_size;
-                char sz_str[12];
-                if (sz >= 1024 * 1024)
-                    snprintf(sz_str, sizeof(sz_str), "%luM", (unsigned long)(sz / (1024 * 1024)));
-                else if (sz >= 1024)
-                    snprintf(sz_str, sizeof(sz_str), "%luK", (unsigned long)(sz / 1024));
-                else
-                    snprintf(sz_str, sizeof(sz_str), "%luB", (unsigned long)sz);
-                *pos += snprintf(buf + *pos, bufsz - *pos, "%s [%s]\n", entry->d_name, sz_str);
+            char child[300];
+            snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+            struct stat st;
+            bool have_stat = (stat(child, &st) == 0);
+            bool is_dir    = have_stat && S_ISDIR(st.st_mode);
+
+            if (pass == 0 && !is_dir) continue;
+            if (pass == 1 &&  is_dir) continue;
+
+            lv_obj_t *row = lv_btn_create(s_sd_tree_list);
+            lv_obj_set_size(row, lv_pct(100), 26);
+            lv_obj_set_style_bg_color(row, lv_color_make(28, 32, 42), 0);
+            lv_obj_set_style_bg_color(row, lv_color_make(50, 60, 80), LV_STATE_PRESSED);
+            lv_obj_set_style_border_width(row, 0, 0);
+            lv_obj_set_style_radius(row, 4, 0);
+            lv_obj_set_style_pad_ver(row, 3, 0);
+            lv_obj_set_style_pad_hor(row, 6, 0);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_column(row, 4, 0);
+
+            lv_obj_t *lbl = lv_label_create(row);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+
+            if (is_dir) {
+                char text[280];
+                snprintf(text, sizeof(text), "%s  " LV_SYMBOL_RIGHT, entry->d_name);
+                lv_label_set_text(lbl, text);
+                lv_obj_set_style_text_color(lbl, lv_color_make(255, 210, 0), 0);
+                if (s_sd_dir_count < SD_TREE_MAX_DIRS) {
+                    strncpy(s_sd_dir_paths[s_sd_dir_count], child,
+                            sizeof(s_sd_dir_paths[0]) - 1);
+                    s_sd_dir_paths[s_sd_dir_count][sizeof(s_sd_dir_paths[0]) - 1] = '\0';
+                    lv_obj_add_event_cb(row, sd_dir_btn_cb, LV_EVENT_CLICKED,
+                                        (void *)(intptr_t)s_sd_dir_count);
+                    s_sd_dir_count++;
+                }
             } else {
-                *pos += snprintf(buf + *pos, bufsz - *pos, "%s\n", entry->d_name);
+                char sz_str[12] = "";
+                if (have_stat) {
+                    uint32_t sz = (uint32_t)st.st_size;
+                    if (sz >= 1024 * 1024)
+                        snprintf(sz_str, sizeof(sz_str), " [%luM]",
+                                 (unsigned long)(sz / (1024 * 1024)));
+                    else if (sz >= 1024)
+                        snprintf(sz_str, sizeof(sz_str), " [%luK]",
+                                 (unsigned long)(sz / 1024));
+                    else
+                        snprintf(sz_str, sizeof(sz_str), " [%luB]", (unsigned long)sz);
+                }
+                char text[280];
+                snprintf(text, sizeof(text), "%s%s", entry->d_name, sz_str);
+                lv_label_set_text(lbl, text);
+                lv_obj_set_style_text_color(lbl, ui_text_color(), 0);
+                lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICKABLE);
             }
         }
     }
     closedir(dir);
+    xSemaphoreGive(sd_spi_mutex);
 }
 
 static void show_sd_tree_screen(void)
 {
     create_function_page_base("SD File Tree");
 
-    const size_t bufsz = 16 * 1024;
-    char *tree_buf = heap_caps_malloc(bufsz, MALLOC_CAP_SPIRAM);
-    if (!tree_buf) tree_buf = malloc(4096);
+    /* ── Path bar ─────────────────────────────────────────────── */
+    lv_obj_t *path_bar = lv_obj_create(function_page);
+    lv_obj_set_size(path_bar, lv_pct(100), 22);
+    lv_obj_align(path_bar, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_set_style_bg_color(path_bar, lv_color_make(20, 35, 20), 0);
+    lv_obj_set_style_border_width(path_bar, 0, 0);
+    lv_obj_set_style_radius(path_bar, 0, 0);
+    lv_obj_set_style_pad_all(path_bar, 3, 0);
+    lv_obj_clear_flag(path_bar, LV_OBJ_FLAG_SCROLLABLE);
 
-    if (!tree_buf) {
-        lv_obj_t *err = lv_label_create(function_page);
-        lv_label_set_text(err, "Out of memory");
-        lv_obj_set_style_text_color(err, COLOR_MATERIAL_RED, 0);
-        lv_obj_align(err, LV_ALIGN_CENTER, 0, 0);
-    } else {
-        size_t pos = 0;
-        tree_buf[0] = '\0';
+    s_sd_path_lbl = lv_label_create(path_bar);
+    lv_obj_set_style_text_font(s_sd_path_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_sd_path_lbl, lv_color_make(100, 220, 100), 0);
+    lv_label_set_long_mode(s_sd_path_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(s_sd_path_lbl, lv_pct(100));
+    lv_obj_align(s_sd_path_lbl, LV_ALIGN_LEFT_MID, 0, 0);
 
-        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
-            sd_tree_walk(tree_buf, bufsz, "/sdcard", 0, &pos);
-            xSemaphoreGive(sd_spi_mutex);
-        } else {
-            pos += snprintf(tree_buf, bufsz, "SD not available");
-        }
-        if (pos == 0) pos += snprintf(tree_buf, bufsz, "(empty)");
-        tree_buf[pos < bufsz ? pos : bufsz - 1] = '\0';
+    /* ── Scrollable entry list ────────────────────────────────── */
+    /* height = screen - title(30) - path_bar(22) - nav_btn(28+8) */
+    s_sd_tree_list = lv_obj_create(function_page);
+    lv_obj_set_size(s_sd_tree_list, lv_pct(100), LCD_V_RES - 30 - 22 - 38);
+    lv_obj_align(s_sd_tree_list, LV_ALIGN_TOP_MID, 0, 54);
+    lv_obj_set_style_bg_color(s_sd_tree_list, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(s_sd_tree_list, 0, 0);
+    lv_obj_set_style_radius(s_sd_tree_list, 0, 0);
+    lv_obj_set_style_pad_all(s_sd_tree_list, 4, 0);
+    lv_obj_set_style_pad_row(s_sd_tree_list, 3, 0);
+    lv_obj_set_flex_flow(s_sd_tree_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_sd_tree_list, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 
-        lv_obj_t *scroll_cont = lv_obj_create(function_page);
-        lv_obj_set_size(scroll_cont, lv_pct(100), LCD_V_RES - 35 - 43);
-        lv_obj_align(scroll_cont, LV_ALIGN_TOP_MID, 0, 35);
-        lv_obj_set_style_bg_color(scroll_cont, ui_bg_color(), 0);
-        lv_obj_set_style_border_color(scroll_cont, ui_border_color(), 0);
-        lv_obj_set_style_border_width(scroll_cont, 1, 0);
-        lv_obj_set_style_radius(scroll_cont, 6, 0);
-        lv_obj_set_style_pad_all(scroll_cont, 6, 0);
+    /* ── Up / Back button ────────────────────────────────────── */
+    lv_obj_t *nav_btn = lv_btn_create(function_page);
+    lv_obj_set_size(nav_btn, 120, 28);
+    lv_obj_align(nav_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_bg_color(nav_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(nav_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(nav_btn, 0, 0);
+    lv_obj_set_style_radius(nav_btn, 8, 0);
+    lv_obj_set_flex_flow(nav_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(nav_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(nav_btn, 4, 0);
 
-        lv_obj_t *tree_label = lv_label_create(scroll_cont);
-        lv_label_set_long_mode(tree_label, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(tree_label, lv_pct(100));
-        lv_obj_set_style_text_font(tree_label, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(tree_label, ui_text_color(), 0);
-        lv_label_set_text(tree_label, tree_buf);
-        free(tree_buf);
-    }
+    lv_obj_t *nav_icon = lv_label_create(nav_btn);
+    lv_label_set_text(nav_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(nav_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(nav_icon, lv_color_white(), 0);
+    lv_obj_t *nav_text = lv_label_create(nav_btn);
+    lv_label_set_text(nav_text, "Up / Back");
+    lv_obj_set_style_text_font(nav_text, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(nav_text, lv_color_white(), 0);
+    lv_obj_add_event_cb(nav_btn, sd_tree_up_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 110, 28);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(back_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_set_style_shadow_width(back_btn, 4, 0);
-    lv_obj_set_style_shadow_color(back_btn, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_shadow_opa(back_btn, LV_OPA_40, 0);
-    lv_obj_set_style_pad_ver(back_btn, 4, 0);
-    lv_obj_set_style_pad_hor(back_btn, 8, 0);
-    lv_obj_set_style_pad_column(back_btn, 4, 0);
-    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-    lv_obj_t *back_icon = lv_label_create(back_btn);
-    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
-    lv_obj_set_style_text_font(back_icon, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(back_icon, ui_text_color(), 0);
-
-    lv_obj_t *back_text = lv_label_create(back_btn);
-    lv_label_set_text(back_text, "Back");
-    lv_obj_set_style_text_font(back_text, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(back_text, ui_text_color(), 0);
-
-    lv_obj_add_event_cb(back_btn, sd_back_to_menu_cb, LV_EVENT_CLICKED, NULL);
+    /* Start at SD root */
+    sd_tree_populate(SD_TREE_ROOT);
 }
 
 // ─── Format — two-stage confirmation ─────────────────────────────────────────
@@ -19472,10 +20655,12 @@ static void sd_card_tile_event_cb(lv_event_t *e)
 {
     const char *name = (const char *)lv_event_get_user_data(e);
     if (!name) return;
-    if      (strcmp(name, "Validate") == 0)   show_sd_provision_confirm(false);
-    else if (strcmp(name, "Free Space") == 0) show_sd_free_space_screen();
-    else if (strcmp(name, "Tree") == 0)       show_sd_tree_screen();
-    else if (strcmp(name, "Format") == 0)     show_sd_format_confirm1();
+    if      (strcmp(name, "Validate") == 0)    show_sd_provision_confirm(false);
+    else if (strcmp(name, "Free Space") == 0)  show_sd_free_space_screen();
+    else if (strcmp(name, "Tree") == 0)        show_sd_tree_screen();
+    else if (strcmp(name, "New Folder") == 0)  show_new_folder_screen();
+    else if (strcmp(name, "Delete File") == 0) show_delete_file_screen();
+    else if (strcmp(name, "Format") == 0)      show_sd_format_confirm1();
 }
 
 static void show_sd_card_screen(void)
@@ -19492,13 +20677,17 @@ static void show_sd_card_screen(void)
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    create_tile(tiles, LV_SYMBOL_OK,      "Validate &\nProvision", COLOR_MATERIAL_TEAL,
+    create_tile(tiles, LV_SYMBOL_OK,          "Validate &\nProvision", COLOR_MATERIAL_TEAL,
                 sd_card_tile_event_cb, "Validate");
-    create_tile(tiles, LV_SYMBOL_DRIVE,   "Free\nSpace",            COLOR_TILE_BLUE,
+    create_tile(tiles, LV_SYMBOL_DRIVE,       "Free\nSpace",           COLOR_TILE_BLUE,
                 sd_card_tile_event_cb, "Free Space");
-    create_tile(tiles, LV_SYMBOL_LIST,    "File\nTree",             COLOR_MATERIAL_ORANGE,
+    create_tile(tiles, LV_SYMBOL_LIST,        "File\nTree",            COLOR_MATERIAL_ORANGE,
                 sd_card_tile_event_cb, "Tree");
-    create_tile(tiles, LV_SYMBOL_WARNING, "Format\nSD Card",        COLOR_MATERIAL_RED,
+    create_tile(tiles, MY_SYMBOL_FOLDER_PLUS, "New\nFolder",           COLOR_MATERIAL_GREEN,
+                sd_card_tile_event_cb, "New Folder");
+    create_tile(tiles, LV_SYMBOL_TRASH,       "Delete\nFile",          COLOR_MATERIAL_RED,
+                sd_card_tile_event_cb, "Delete File");
+    create_tile(tiles, LV_SYMBOL_WARNING,     "Format\nSD Card",       lv_color_hex(0xB71C1C),
                 sd_card_tile_event_cb, "Format");
 }
 
@@ -19528,7 +20717,7 @@ static void gps_info_refresh_cb(lv_timer_t *t)
         lv_label_set_text(gps_info_fix_lbl, LV_SYMBOL_GPS " Fix: YES");
         lv_obj_set_style_text_color(gps_info_fix_lbl, COLOR_MATERIAL_GREEN, 0);
     } else if (stale) {
-        lv_label_set_text(gps_info_fix_lbl, LV_SYMBOL_GPS " Fix: NO  (last known \xe2\x86\x93)");
+        lv_label_set_text(gps_info_fix_lbl, LV_SYMBOL_GPS " Fix: NO  (last known " MY_SYMBOL_ARROW_DOWN ")");
         lv_obj_set_style_text_color(gps_info_fix_lbl, COLOR_MATERIAL_AMBER, 0);
     } else {
         lv_label_set_text(gps_info_fix_lbl, LV_SYMBOL_GPS " Fix: NO");
@@ -19844,7 +21033,7 @@ static void show_gps_info_screen(void)
     int y = 0;
 
     gps_info_fix_lbl = lv_label_create(card);
-    lv_obj_set_style_text_font(gps_info_fix_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(gps_info_fix_lbl, &g_font_icon16, 0);
     lv_obj_align(gps_info_fix_lbl, LV_ALIGN_TOP_LEFT, 0, y);
     y += 26;
 
@@ -19954,13 +21143,13 @@ static void show_wifi_monitor_screen(void)
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     
     // Evil Twin Passwords - Blue
-    create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Evil Twin\nPasswords", COLOR_TILE_BLUE, wifi_monitor_tile_event_cb, "Evil Twin Passwords");
+    create_tile(tiles, MY_SYMBOL_KEY,      "Evil Twin\nPasswords", COLOR_TILE_BLUE, wifi_monitor_tile_event_cb, "Evil Twin Passwords");
     
     // Portal Data - Purple
-    create_tile(tiles, LV_SYMBOL_LIST, "Portal\nData", COLOR_MATERIAL_PURPLE, wifi_monitor_tile_event_cb, "Portal Data");
+    create_tile(tiles, MY_SYMBOL_DATABASE, "Portal\nData", COLOR_MATERIAL_PURPLE, wifi_monitor_tile_event_cb, "Portal Data");
     
     // Handshakes - Amber/Orange
-    create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Handshakes", COLOR_MATERIAL_AMBER, wifi_monitor_tile_event_cb, "Handshakes");
+    create_tile(tiles, MY_SYMBOL_HANDSHAKE, "Handshakes", COLOR_MATERIAL_AMBER, wifi_monitor_tile_event_cb, "Handshakes");
 }
 
 // ── BT Lookout ────────────────────────────────────────────────────────────────
@@ -21122,6 +22311,7 @@ static void show_ble_pcap_screen(void)
         struct stat st = {0};
         if (stat(BLE_PCAP_DIR, &st) == -1) {
             mkdir("/sdcard/lab", 0777);
+            mkdir("/sdcard/lab/ble", 0777);
             mkdir(BLE_PCAP_DIR, 0777);
         }
         xSemaphoreGive(sd_spi_mutex);
@@ -21232,32 +22422,37 @@ static void show_bluetooth_screen(void)
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
     // BT Scan & Select - first tile, cyan
-    lv_obj_t *btsas_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BT Scan\n& Select", UI_ACCENT_CYAN, NULL, NULL);
+    lv_obj_t *btsas_tile = create_tile(tiles, MY_SYMBOL_CROSSHAIRS,   "BT Scan\n& Select", UI_ACCENT_CYAN, NULL, NULL);
     lv_obj_add_event_cb(btsas_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Scan & Select");
 
     // BT Observer - auto-enumerate all nearby devices
-    lv_obj_t *btobs_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "BT\nObserver", lv_color_hex(0x7B1FA2), NULL, NULL);
+    lv_obj_t *btobs_tile = create_tile(tiles, MY_SYMBOL_BINOCULARS, "BT\nObserver", lv_color_hex(0x7B1FA2), NULL, NULL);
     lv_obj_add_event_cb(btobs_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Observer");
 
     // AirTag scan - Apple-like gray
-    lv_obj_t *airtag_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "AirTag\nScan", lv_color_make(142, 142, 147), NULL, NULL);
+    lv_obj_t *airtag_tile = create_tile(tiles, MY_SYMBOL_TAG,          "AirTag\nScan", lv_color_make(142, 142, 147), NULL, NULL);
     lv_obj_add_event_cb(airtag_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"AirTag scan");
 
     // BT Locator - Blue
-    lv_obj_t *locator_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BT Locator", COLOR_TILE_BLUE, NULL, NULL);
+    lv_obj_t *locator_tile = create_tile(tiles, MY_SYMBOL_CROSSHAIRS,   "BT Locator", COLOR_TILE_BLUE, NULL, NULL);
     lv_obj_add_event_cb(locator_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Locator");
 
     // BT Lookout - Red
-    lv_obj_t *lookout_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BT\nLookout", COLOR_MATERIAL_RED, NULL, NULL);
+    lv_obj_t *lookout_tile = create_tile(tiles, MY_SYMBOL_SHIELD,       "BT\nLookout", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(lookout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Dee Dee Detector");
 
     // BT Attacks - Orange
-    lv_obj_t *btatk_tile = create_tile(tiles, LV_SYMBOL_WARNING, "BT\nAttacks", COLOR_MATERIAL_AMBER, NULL, NULL);
+    lv_obj_t *btatk_tile = create_tile(tiles, MY_SYMBOL_SKULL_CROSS, "BT\nAttacks", COLOR_MATERIAL_AMBER, NULL, NULL);
     lv_obj_add_event_cb(btatk_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Attacks");
 
     // BLE PCAP - teal/purple
-    lv_obj_t *pcap_tile = create_tile(tiles, LV_SYMBOL_SAVE, "BLE\nPCAP", lv_color_hex(0x00897B), NULL, NULL);
+    lv_obj_t *pcap_tile = create_tile(tiles, MY_SYMBOL_NET_WIRED, "BLE\nPCAP", lv_color_hex(0x00897B), NULL, NULL);
     lv_obj_add_event_cb(pcap_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE PCAP");
+
+    // HoneyPair - BLE honeypot / pairing telemetry logger
+    lv_obj_t *hp_tile = create_tile(tiles, MY_SYMBOL_USER_SECRET, "Honey\nPair",
+                                    lv_color_make(212, 175, 55), NULL, NULL);
+    lv_obj_add_event_cb(hp_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"HoneyPair");
 
 }
 
@@ -23149,15 +24344,15 @@ static void show_bt_attack_tiles_screen(void)
     lv_obj_add_event_cb(loc_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Locator Direct");
 
     // GATT Walker tile
-    lv_obj_t *gatt_tile = create_tile(tiles, MY_SYMBOL_PERSON_WALKING, "GATT\nWalker", COLOR_MATERIAL_PURPLE, NULL, NULL);
+    lv_obj_t *gatt_tile = create_tile(tiles, MY_SYMBOL_SITEMAP,      "GATT\nWalker", COLOR_MATERIAL_PURPLE, NULL, NULL);
     lv_obj_add_event_cb(gatt_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"GATT Walker");
 
     // Add to BT Lookout watchlist
-    lv_obj_t *add_lookout_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Add to\nBT Lookout", COLOR_MATERIAL_RED, NULL, NULL);
+    lv_obj_t *add_lookout_tile = create_tile(tiles, MY_SYMBOL_SHIELD,       "Add to\nBT Lookout", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(add_lookout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Add to Lookout");
 
     // BT Attacks — opens directed attack menu (Spoof, Disconnect) targeting selected device
-    lv_obj_t *attacks_tile = create_tile(tiles, LV_SYMBOL_WARNING, "BT\nAttacks", COLOR_MATERIAL_AMBER, NULL, NULL);
+    lv_obj_t *attacks_tile = create_tile(tiles, MY_SYMBOL_SKULL_CROSS, "BT\nAttacks", COLOR_MATERIAL_AMBER, NULL, NULL);
     lv_obj_add_event_cb(attacks_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Directed BT Attacks");
 
     /* Back button — return to BT Scan & Select */
@@ -24361,10 +25556,10 @@ static void show_directed_bt_attacks_screen(void)
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
 
-    lv_obj_t *spoof_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Device\nSpoof", COLOR_MATERIAL_ORANGE, NULL, NULL);
+    lv_obj_t *spoof_tile = create_tile(tiles, MY_SYMBOL_MASK,        "Device\nSpoof", COLOR_MATERIAL_ORANGE, NULL, NULL);
     lv_obj_add_event_cb(spoof_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spoof SAS");
 
-    lv_obj_t *disc_tile = create_tile(tiles, LV_SYMBOL_CLOSE, "BLE\nDisconnect", COLOR_MATERIAL_PINK, NULL, NULL);
+    lv_obj_t *disc_tile = create_tile(tiles, MY_SYMBOL_UNLINK,    "BLE\nDisconnect", COLOR_MATERIAL_PINK, NULL, NULL);
     lv_obj_add_event_cb(disc_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Disc SAS");
 
     /* Back button — return to SAS actions */
@@ -24877,11 +26072,14 @@ static void show_bt_attacks_screen(void)
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
 
-    lv_obj_t *spam_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "BLE\nSpam", COLOR_MATERIAL_RED, NULL, NULL);
+    lv_obj_t *spam_tile = create_tile(tiles, MY_SYMBOL_PAPER_PLANE, "BLE\nSpam", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(spam_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spam");
 
-    lv_obj_t *spoof_gen_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Device\nSpoof", COLOR_MATERIAL_ORANGE, NULL, NULL);
+    lv_obj_t *spoof_gen_tile = create_tile(tiles, MY_SYMBOL_MASK,        "Device\nSpoof", COLOR_MATERIAL_ORANGE, NULL, NULL);
     lv_obj_add_event_cb(spoof_gen_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spoof General");
+
+    lv_obj_t *bd_tile = create_tile(tiles, LV_SYMBOL_KEYBOARD,    "Blue\nDuck", lv_color_make(0, 120, 200), NULL, NULL);
+    lv_obj_add_event_cb(bd_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BlueDuck");
 
     /* Back button */
     lv_obj_t *back_btn = lv_btn_create(function_page);
@@ -25157,8 +26355,11 @@ static void bt_conflict_proceed_cb(lv_event_t *ev)
         lv_obj_del(s_bt_conflict_popup);
         s_bt_conflict_popup = NULL;
     }
-    bt_lookout_stop();
-    ble_gap_disc_cancel();   /* stop active scan now; lookout task's later bt_stop_scan() becomes a no-op */
+    if (bt_lookout_is_active()) {
+        bt_lookout_stop();
+        /* scan loop task calls ble_gap_disc_cancel() via bt_stop_scan() within ~100 ms;
+           calling it here from a different task races NimBLE internals and crashes */
+    }
     bt_lookout_ui_active  = false;
     bt_lookout_status_lbl = NULL;
     bt_lookout_count_lbl  = NULL;
@@ -26183,6 +27384,24 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
 
+    if (strcmp(attack_name, "HoneyPair") == 0) {
+        if (bt_lookout_is_active()) {
+            show_bt_conflict_warning("HoneyPair", show_honeypair_screen);
+        } else {
+            show_honeypair_screen();
+        }
+        return;
+    }
+
+    if (strcmp(attack_name, "BlueDuck") == 0) {
+        if (bt_lookout_is_active()) {
+            show_bt_conflict_warning("BlueDuck", show_blueduck_screen);
+        } else {
+            show_attack_warning(show_blueduck_screen);
+        }
+        return;
+    }
+
     // Add BT Scan & Select target to BT Lookout watchlist
     if (strcmp(attack_name, "Add to Lookout") == 0) {
         char mac_str[18];
@@ -26980,6 +28199,7 @@ static void bt_reset_counters(void)
 {
     bt_airtag_count = 0;
     bt_smarttag_count = 0;
+    bt_possible_airtag_count = 0;
     bt_found_device_count = 0;
     bt_device_count = 0;
     memset(bt_found_devices, 0, sizeof(bt_found_devices));
@@ -27041,57 +28261,105 @@ static bool bt_is_samsung_smarttag(const uint8_t *data, uint8_t len)
 }
 
 /**
- * BLE GAP event callback for scanning
+ * Detect an Apple device likely in AirTag owner-proximity (paused) mode.
+ *
+ * When an AirTag detects its owner's iPhone nearby it stops broadcasting the
+ * standard Find My advertisement (type 0x12) and switches to Apple's Nearby
+ * Action protocol (type 0x05).  Short payload (≤12 B) with no device name
+ * distinguishes this from AirDrop, which also uses 0x05 but with an 18+ B
+ * payload and often accompanies a visible device name.
+ */
+static bool bt_is_possible_airtag(const uint8_t *data, uint8_t len, bool has_name)
+{
+    if (has_name) return false;         // AirTags never advertise a name
+    if (len < 3) return false;
+
+    uint16_t company_id = data[0] | (data[1] << 8);
+    if (company_id != APPLE_COMPANY_ID) return false;
+
+    uint8_t subtype = data[2];
+    if (subtype == APPLE_FIND_MY_TYPE) return false;  // Already classified as AirTag
+
+    // Nearby Action (0x05), short payload — hallmark of AirTag in paused/proximity mode
+    return (subtype == 0x05 && len <= 12);
+}
+
+/**
+ * BLE GAP event callback for scanning — handles both legacy and BLE 5 Coded PHY
  */
 static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
 {
-    if (event->type != BLE_GAP_EVENT_DISC) {
+    // Extract common fields from either legacy or extended disc event
+    const uint8_t *adv_data;
+    uint8_t adv_data_len;
+    const uint8_t *addr_val;
+    uint8_t addr_type;
+    int8_t rssi;
+    uint8_t phy;
+    bool is_scan_response;
+
+#if MYNEWT_VAL(BLE_EXT_ADV)
+    if (event->type == BLE_GAP_EVENT_EXT_DISC) {
+        struct ble_gap_ext_disc_desc *d = &event->ext_disc;
+        adv_data        = d->data;
+        adv_data_len    = d->length_data;
+        addr_val        = d->addr.val;
+        addr_type       = d->addr.type;
+        rssi            = d->rssi;
+        phy             = d->prim_phy;
+        is_scan_response = (d->props & BLE_HCI_ADV_SCAN_RSP_MASK) != 0;
+    } else
+#endif
+    if (event->type == BLE_GAP_EVENT_DISC) {
+        struct ble_gap_disc_desc *d = &event->disc;
+        adv_data        = d->data;
+        adv_data_len    = d->length_data;
+        addr_val        = d->addr.val;
+        addr_type       = d->addr.type;
+        rssi            = d->rssi;
+        phy             = BLE_HCI_LE_PHY_1M;
+        is_scan_response = (d->event_type == BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP);
+    } else {
         return 0;
     }
-    
-    struct ble_gap_disc_desc *desc = &event->disc;
 
     // Dee Dee Detector — check every advertisement against watchlist,
     // regardless of whether BT Locator is also running.
     if (bt_lookout_is_active()) {
         char adv_name_buf[32] = "";
         struct ble_hs_adv_fields lk_fields;
-        if (ble_hs_adv_parse_fields(&lk_fields, desc->data, desc->length_data) == 0
+        if (ble_hs_adv_parse_fields(&lk_fields, adv_data, adv_data_len) == 0
             && lk_fields.name && lk_fields.name_len > 0) {
             int nl = lk_fields.name_len < 31 ? lk_fields.name_len : 31;
             memcpy(adv_name_buf, lk_fields.name, nl);
         }
-        bt_lookout_on_adv(desc->addr.val, desc->rssi,
+        bt_lookout_on_adv(addr_val, rssi,
                           adv_name_buf[0] ? adv_name_buf : NULL);
     }
 
     // MAC tracking mode - update RSSI for tracked device (BT Locator)
     if (bt_tracking_mode) {
-        if (memcmp(desc->addr.val, bt_tracking_mac, 6) == 0) {
-            bt_tracking_rssi = desc->rssi;
+        if (memcmp(addr_val, bt_tracking_mac, 6) == 0) {
+            bt_tracking_rssi = rssi;
             bt_tracking_found = true;
         }
         return 0;
     }
-    
+
     // Parse advertising data
     struct ble_hs_adv_fields fields;
-    int rc = ble_hs_adv_parse_fields(&fields, desc->data, desc->length_data);
+    int rc = ble_hs_adv_parse_fields(&fields, adv_data, adv_data_len);
     if (rc != 0) {
         return 0;
     }
-    
-    // Check if this is a Scan Response packet (contains names more often)
-    bool is_scan_response = (desc->event_type == BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP);
-    
+
     // Check if device already seen
-    bool already_seen = bt_is_device_found(desc->addr.val);
-    
+    bool already_seen = bt_is_device_found(addr_val);
+
     // If already seen, only process scan responses to update names
     if (already_seen) {
-        // Try to update name from scan response if we don't have one
         if (is_scan_response && fields.name != NULL && fields.name_len > 0) {
-            int dev_idx = bt_find_device_index(desc->addr.val);
+            int dev_idx = bt_find_device_index(addr_val);
             if (dev_idx >= 0 && bt_devices[dev_idx].name[0] == '\0') {
                 int name_len = fields.name_len < 31 ? fields.name_len : 31;
                 memcpy(bt_devices[dev_idx].name, fields.name, name_len);
@@ -27100,66 +28368,90 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
         }
         return 0;
     }
-    
+
     // Add to found devices list
-    bt_add_found_device(desc->addr.val);
-    
+    bt_add_found_device(addr_val);
+
     // Store device info
     if (bt_device_count < BT_MAX_DEVICES) {
         bt_device_info_t *dev = &bt_devices[bt_device_count];
-        memcpy(dev->addr, desc->addr.val, 6);
-        dev->addr_type = desc->addr.type;
-        dev->rssi = desc->rssi;
-        dev->name[0] = '\0';
+        memcpy(dev->addr, addr_val, 6);
+        dev->addr_type = addr_type;
+        dev->rssi      = rssi;
+        dev->phy       = phy;
+        dev->name[0]   = '\0';
         dev->company_id = 0;
-        dev->is_airtag = false;
-        dev->is_smarttag = false;
-        
-        // Extract device name if available
+        dev->is_airtag          = false;
+        dev->is_smarttag        = false;
+        dev->is_possible_airtag = false;
+
         bool has_name = (fields.name != NULL && fields.name_len > 0);
         if (has_name) {
             int name_len = fields.name_len < 31 ? fields.name_len : 31;
             memcpy(dev->name, fields.name, name_len);
             dev->name[name_len] = '\0';
         }
-        
-        // Check manufacturer data
+
         if (fields.mfg_data != NULL && fields.mfg_data_len >= 2) {
             dev->company_id = fields.mfg_data[0] | (fields.mfg_data[1] << 8);
-            
+
             if (bt_is_apple_airtag(fields.mfg_data, fields.mfg_data_len, has_name)) {
                 dev->is_airtag = true;
                 bt_airtag_count++;
-            }
-            else if (bt_is_samsung_smarttag(fields.mfg_data, fields.mfg_data_len)) {
+            } else if (bt_is_samsung_smarttag(fields.mfg_data, fields.mfg_data_len)) {
                 dev->is_smarttag = true;
                 bt_smarttag_count++;
+            } else if (bt_is_possible_airtag(fields.mfg_data, fields.mfg_data_len, has_name)) {
+                dev->is_possible_airtag = true;
+                bt_possible_airtag_count++;
             }
         }
-        
+
         bt_device_count++;
     }
-    
+
     return 0;
 }
 
 /**
- * Start BLE scanning
+ * Start BLE scanning — enables both 1M PHY and Coded PHY (BLE 5 Long Range)
  */
 static int bt_start_scan(void)
 {
+#if MYNEWT_VAL(BLE_EXT_ADV)
+    // Active scan on both 1M and Coded PHY simultaneously
+    struct ble_gap_ext_disc_params p1m = {
+        .itvl    = 0x60,   // 60 ms interval (0.625 ms units)
+        .window  = 0x60,   // 60 ms window — continuous
+        .passive = 0,      // active: send scan requests to get Scan Responses
+    };
+    struct ble_gap_ext_disc_params pcoded = {
+        .itvl    = 0x60,
+        .window  = 0x60,
+        .passive = 0,
+    };
+    int rc = ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC,
+                              0,    // duration: 0 = scan until cancelled
+                              0,    // period: 0 = no periodic scheduling
+                              0,    // filter_duplicates: we dedup ourselves
+                              BLE_HCI_SCAN_FILT_NO_WL,
+                              0,    // limited
+                              &p1m,
+                              &pcoded,
+                              bt_gap_event_callback, NULL);
+    return rc;
+#else
     struct ble_gap_disc_params scan_params = {
-        .itvl = 0x60,             // 60ms interval
-        .window = 0x60,           // 60ms window = continuous listening
+        .itvl = 0x60,
+        .window = 0x60,
         .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
         .limited = 0,
-        .passive = 0,             // ACTIVE scan - critical for Scan Response names
-        .filter_duplicates = 0,   // We handle duplicates ourselves
+        .passive = 0,
+        .filter_duplicates = 0,
     };
-    
-    int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &scan_params,
-                          bt_gap_event_callback, NULL);
-    return rc;
+    return ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &scan_params,
+                        bt_gap_event_callback, NULL);
+#endif
 }
 
 /**
@@ -27232,7 +28524,23 @@ static esp_err_t bt_nimble_init(void)
     // Configure BLE host callbacks
     ble_hs_cfg.sync_cb = bt_on_sync;
     ble_hs_cfg.reset_cb = bt_on_reset;
-    
+
+    // Security manager: Just Works pairing (needed for HoneyPair)
+    ble_hs_cfg.sm_io_cap       = BLE_SM_IO_CAP_NO_IO;
+    ble_hs_cfg.sm_bonding      = 1;
+    ble_hs_cfg.sm_mitm         = 0;
+    ble_hs_cfg.sm_sc           = 1;
+    ble_hs_cfg.sm_our_key_dist  = BLE_SM_PAIR_KEY_DIST_ENC;
+    ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC;
+
+    // GAP/GATT base services + feature service table (must precede host start)
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    if (s_ble_for_blueduck)
+        blueduck_register_services();
+    else
+        honeypair_register_services();
+
     // Start NimBLE host task
     nimble_port_freertos_init(nimble_host_task);
     
@@ -27273,10 +28581,15 @@ static void bt_nimble_deinit(void)
     // Stop NimBLE host task
     nimble_port_stop();
     vTaskDelay(pdMS_TO_TICKS(100));
-    
-    // Deinitialize NimBLE port
+
+    // Deinitialize NimBLE port (also deinits BLE controller)
     nimble_port_deinit();
-    
+
+    /* BLE controller releases DMA-capable memory asynchronously after deinit.
+     * Without this delay esp_wifi_init() fails with 0x101 (no mem) because the
+     * controller hasn't returned its ~30 KB of DMA buffers yet. */
+    vTaskDelay(pdMS_TO_TICKS(600));
+
     nimble_initialized = false;
     ESP_LOGI(TAG, "NimBLE stopped");
 }
@@ -27312,42 +28625,42 @@ static void bt_scan_stop(void)
 static void ble_scan_update_list(void)
 {
     if (!ble_scan_list) return;
-    
-    // Clear existing items
+
     lv_obj_clean(ble_scan_list);
-    
+
     for (int i = 0; i < bt_device_count; i++) {
         bt_device_info_t *dev = &bt_devices[i];
         char addr_str[18];
         bt_format_addr(dev->addr, addr_str);
-        
-        char item_text[80];
-        const char *type_str = "";
-        if (dev->is_airtag) {
-            type_str = " AirTag";
-        } else if (dev->is_smarttag) {
-            type_str = " SmartTag";
-        }
-        
+
+        bool coded = (dev->phy == BLE_HCI_LE_PHY_CODED);
+        const char *phy_tag  = coded ? "[LR] " : "";
+        const char *type_str = dev->is_airtag          ? " AT"
+                             : dev->is_smarttag         ? " ST"
+                             : dev->is_possible_airtag  ? " ?AT"
+                             : "";
+
+        char item_text[88];
         if (dev->name[0] != '\0') {
-            // Truncate name if too long
             char short_name[13];
             strncpy(short_name, dev->name, 12);
             short_name[12] = '\0';
-            snprintf(item_text, sizeof(item_text), "%d %s%s %s", 
-                     dev->rssi, short_name, type_str, addr_str);
+            snprintf(item_text, sizeof(item_text), "%s%d %s%s %s",
+                     phy_tag, dev->rssi, short_name, type_str, addr_str);
         } else {
-            snprintf(item_text, sizeof(item_text), "%d%s %s", 
-                     dev->rssi, type_str, addr_str);
+            snprintf(item_text, sizeof(item_text), "%s%d%s %s",
+                     phy_tag, dev->rssi, type_str, addr_str);
         }
-        
+
         lv_obj_t *item = lv_label_create(ble_scan_list);
         lv_label_set_text(item, item_text);
         lv_obj_set_width(item, lv_pct(100));
-        lv_obj_set_style_text_color(item, ui_text_color(), 0);
-        lv_obj_set_style_text_font(item, &lv_font_montserrat_12, 0);  // Smaller font to fit more
+        // Coded PHY devices shown in green to distinguish long-range finds
+        lv_color_t row_color = coded ? lv_color_make(80, 220, 80) : ui_text_color();
+        lv_obj_set_style_text_color(item, row_color, 0);
+        lv_obj_set_style_text_font(item, &lv_font_montserrat_12, 0);
         lv_obj_set_style_pad_ver(item, 1, 0);
-        lv_label_set_long_mode(item, LV_LABEL_LONG_SCROLL_CIRCULAR);  // Scroll if too long
+        lv_label_set_long_mode(item, LV_LABEL_LONG_SCROLL_CIRCULAR);
     }
 }
 
@@ -27555,43 +28868,44 @@ static void bt_locator_device_selected_cb(lv_event_t *e)
 static void bt_locator_update_list(void)
 {
     if (!bt_locator_list) return;
-    
-    // Clear existing items
+
     lv_obj_clean(bt_locator_list);
-    
+
     for (int i = 0; i < bt_device_count; i++) {
         bt_device_info_t *dev = &bt_devices[i];
         char addr_str[18];
         bt_format_addr(dev->addr, addr_str);
-        
-        char item_text[80];
+
+        bool coded = (dev->phy == BLE_HCI_LE_PHY_CODED);
+
+        char item_text[88];
         if (dev->name[0] != '\0') {
             char short_name[16];
             strncpy(short_name, dev->name, 15);
             short_name[15] = '\0';
-            snprintf(item_text, sizeof(item_text), "%d dBm  %s  %s", 
-                     dev->rssi, short_name, addr_str);
+            snprintf(item_text, sizeof(item_text), "%s%d dBm  %s  %s",
+                     coded ? "[LR] " : "", dev->rssi, short_name, addr_str);
         } else {
-            snprintf(item_text, sizeof(item_text), "%d dBm  %s", 
-                     dev->rssi, addr_str);
+            snprintf(item_text, sizeof(item_text), "%s%d dBm  %s",
+                     coded ? "[LR] " : "", dev->rssi, addr_str);
         }
-        
-        // Create a clickable button for each device (no border, subtle pressed color)
+
         lv_obj_t *btn = lv_btn_create(bt_locator_list);
         lv_obj_set_size(btn, lv_pct(100), 32);
         lv_obj_set_style_bg_color(btn, ui_card_color(), LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_color(btn, lv_color_make(50, 50, 50), LV_STATE_PRESSED);  // Subtle gray on press
+        lv_obj_set_style_bg_color(btn, lv_color_make(50, 50, 50), LV_STATE_PRESSED);
         lv_obj_set_style_border_width(btn, 0, 0);
         lv_obj_set_style_radius(btn, 4, 0);
-        
+
         lv_obj_t *lbl = lv_label_create(btn);
         lv_label_set_text(lbl, item_text);
-        lv_obj_set_style_text_color(lbl, ui_text_color(), 0);
+        // Coded PHY devices in green
+        lv_color_t row_color = coded ? lv_color_make(80, 220, 80) : ui_text_color();
+        lv_obj_set_style_text_color(lbl, row_color, 0);
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
         lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 5, 0);
         lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
-        
-        // Store device index as user data
+
         lv_obj_add_event_cb(btn, bt_locator_device_selected_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
     }
 }
@@ -29028,7 +30342,7 @@ static void show_wana_select_screen(void) {
 
     // Status line
     char s[56];
-    snprintf(s, sizeof(s), "%d SSIDs — %d selected — tap to toggle",
+    snprintf(s, sizeof(s), "%d SSIDs - %d selected - tap to toggle",
              wana_ssid_count, sel_count);
     lv_obj_t *status = lv_label_create(wana_panel);
     lv_obj_set_size(status, 238, 18);
@@ -29664,13 +30978,15 @@ static void airtag_scan_task(void *pvParameters)
         if (!airtag_scan_active)
             break;
 
-        airtag_scan_snapshot_airtag  = bt_airtag_count;
-        airtag_scan_snapshot_smarttag = bt_smarttag_count;
-        airtag_scan_snapshot_total   = bt_device_count;
+        airtag_scan_snapshot_airtag          = bt_airtag_count;
+        airtag_scan_snapshot_smarttag        = bt_smarttag_count;
+        airtag_scan_snapshot_possible_airtag = bt_possible_airtag_count;
+        airtag_scan_snapshot_total           = bt_device_count;
         airtag_scan_update_flag = true;
 
-        ESP_LOGI(TAG, "AirTag scan cycle: %d AT, %d ST, %d total",
-                 airtag_scan_snapshot_airtag, airtag_scan_snapshot_smarttag, airtag_scan_snapshot_total);
+        ESP_LOGI(TAG, "AirTag scan cycle: %d AT, %d AT-Prox?, %d ST, %d total",
+                 airtag_scan_snapshot_airtag, airtag_scan_snapshot_possible_airtag,
+                 airtag_scan_snapshot_smarttag, airtag_scan_snapshot_total);
     }
 
     ESP_LOGI(TAG, "AirTag scanner task ending");
@@ -29773,7 +31089,7 @@ static void show_found_tags_screen(void)
     int found = 0;
     for (int i = 0; i < bt_device_count; i++) {
         bt_device_info_t *dev = &bt_devices[i];
-        if (!dev->is_airtag && !dev->is_smarttag) continue;
+        if (!dev->is_airtag && !dev->is_smarttag && !dev->is_possible_airtag) continue;
         found++;
 
         // Row container
@@ -29785,12 +31101,23 @@ static void show_found_tags_screen(void)
         lv_obj_set_style_pad_all(row, 6, 0);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
-        // Type badge: "AirTag" or "SmartTag"
+        // Type badge
         lv_obj_t *type_label = lv_label_create(row);
-        lv_label_set_text(type_label, dev->is_airtag ? "AirTag" : "SmartTag");
+        const char *badge_text;
+        lv_color_t badge_color;
+        if (dev->is_airtag) {
+            badge_text  = "AirTag";
+            badge_color = lv_color_make(255, 149, 0);   // Apple orange
+        } else if (dev->is_smarttag) {
+            badge_text  = "SmartTag";
+            badge_color = lv_color_make(90, 200, 250);  // Samsung blue
+        } else {
+            badge_text  = "AirTag? (Proximity)";
+            badge_color = lv_color_make(255, 214, 10);  // Yellow — owner-nearby mode
+        }
+        lv_label_set_text(type_label, badge_text);
         lv_obj_set_style_text_font(type_label, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(type_label,
-            dev->is_airtag ? lv_color_make(255, 149, 0) : lv_color_make(90, 200, 250), 0);
+        lv_obj_set_style_text_color(type_label, badge_color, 0);
         lv_obj_align(type_label, LV_ALIGN_TOP_LEFT, 0, 0);
 
         // MAC address
@@ -30020,13 +31347,13 @@ static void show_airtag_scan_screen(void)
     lv_obj_set_style_text_color(airtag_scan_status_label, ui_text_color(), 0);
     lv_obj_align(airtag_scan_status_label, LV_ALIGN_CENTER, 0, -105);
 
-    // Stats label 1: "Air Tags: X\nSmart Tags: X" (two lines, large font)
+    // Stats label 1: "Air Tags: X\nAirTag? (Prox): X\nSmart Tags: X" (three lines, large font)
     airtag_scan_stats_label1 = lv_label_create(function_page);
-    lv_label_set_text(airtag_scan_stats_label1, "Air Tags: 0\nSmart Tags: 0");
+    lv_label_set_text(airtag_scan_stats_label1, "Air Tags: 0\nAirTag? (Prox): 0\nSmart Tags: 0");
     lv_obj_set_style_text_align(airtag_scan_stats_label1, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(airtag_scan_stats_label1, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(airtag_scan_stats_label1, ui_text_color(), 0);
-    lv_obj_align(airtag_scan_stats_label1, LV_ALIGN_CENTER, 0, -85);
+    lv_obj_align(airtag_scan_stats_label1, LV_ALIGN_CENTER, 0, -95);
     lv_obj_add_flag(airtag_scan_stats_label1, LV_OBJ_FLAG_HIDDEN);
 
     // Stats label 2: "Other BT Devices: X"
@@ -30035,7 +31362,7 @@ static void show_airtag_scan_screen(void)
     lv_obj_set_style_text_align(airtag_scan_stats_label2, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(airtag_scan_stats_label2, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(airtag_scan_stats_label2, lv_color_make(176, 176, 176), 0);
-    lv_obj_align(airtag_scan_stats_label2, LV_ALIGN_CENTER, 0, -20);
+    lv_obj_align(airtag_scan_stats_label2, LV_ALIGN_CENTER, 0, 10);
     lv_obj_add_flag(airtag_scan_stats_label2, LV_OBJ_FLAG_HIDDEN);
 
     // Stats label 3: "Total BT devices: X"
@@ -30044,13 +31371,13 @@ static void show_airtag_scan_screen(void)
     lv_obj_set_style_text_align(airtag_scan_stats_label3, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(airtag_scan_stats_label3, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(airtag_scan_stats_label3, lv_color_make(176, 176, 176), 0);
-    lv_obj_align(airtag_scan_stats_label3, LV_ALIGN_CENTER, 0, 5);
+    lv_obj_align(airtag_scan_stats_label3, LV_ALIGN_CENTER, 0, 35);
     lv_obj_add_flag(airtag_scan_stats_label3, LV_OBJ_FLAG_HIDDEN);
 
-    // "View Found Tags" button — shown when at least one AirTag or SmartTag detected
+    // "View Found Tags" button — shown when at least one tag-type device detected
     airtag_view_tags_btn = lv_btn_create(function_page);
     lv_obj_set_size(airtag_view_tags_btn, 160, 44);
-    lv_obj_align(airtag_view_tags_btn, LV_ALIGN_CENTER, 0, 55);
+    lv_obj_align(airtag_view_tags_btn, LV_ALIGN_CENTER, 0, 78);
     lv_obj_set_style_bg_color(airtag_view_tags_btn, COLOR_MATERIAL_BLUE, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(airtag_view_tags_btn, lv_color_lighten(COLOR_MATERIAL_BLUE, 50), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(airtag_view_tags_btn, 0, 0);
@@ -30121,4 +31448,428 @@ static void show_airtag_scan_screen(void)
         /* Returning from Found Tags — task already running, UI rebuilt only */
         ESP_LOGI(TAG, "AirTag scanner UI restored (task already running)");
     }
+}
+
+// ── HoneyPair screen ──────────────────────────────────────────────────────────
+
+static void hp_ui_refresh(lv_timer_t *t)
+{
+    (void)t;
+    if (!function_page) return;
+
+    honeypair_stats_t st;
+    honeypair_get_stats(&st);
+
+    if (hp_status_lbl) {
+        if (st.active) {
+            char buf[56];
+            snprintf(buf, sizeof(buf), LV_SYMBOL_BLUETOOTH "  Advertising as: %s", st.persona_name);
+            lv_label_set_text(hp_status_lbl, buf);
+            lv_obj_set_style_text_color(hp_status_lbl, lv_color_make(80, 220, 80), 0);
+        } else {
+            lv_label_set_text(hp_status_lbl, "Idle - not advertising");
+            lv_obj_set_style_text_color(hp_status_lbl, lv_color_make(176, 176, 176), 0);
+        }
+    }
+
+    if (hp_stats_lbl) {
+        char buf[72];
+        snprintf(buf, sizeof(buf), "Connects: %d   Pairs: %d   GATT Reads: %d",
+                 st.connects, st.pairs, st.gatt_reads);
+        lv_label_set_text(hp_stats_lbl, buf);
+    }
+
+    if (hp_start_btn) {
+        lv_obj_t *lbl = lv_obj_get_child(hp_start_btn, 0);
+        if (st.active) {
+            if (lbl) lv_label_set_text(lbl, "STOP");
+            lv_obj_set_style_bg_color(hp_start_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+        } else {
+            if (lbl) lv_label_set_text(lbl, "START BAIT");
+            lv_obj_set_style_bg_color(hp_start_btn, lv_color_make(40, 160, 40), LV_STATE_DEFAULT);
+        }
+    }
+}
+
+static void hp_start_cb(lv_event_t *e)
+{
+    (void)e;
+    if (honeypair_is_active()) {
+        honeypair_stop();
+        bt_nimble_deinit();
+        current_radio_mode = RADIO_MODE_NONE;
+    } else {
+        if (!ensure_ble_mode()) {
+            if (hp_status_lbl)
+                lv_label_set_text(hp_status_lbl, "BLE init failed!");
+            return;
+        }
+        int pidx = hp_dd ? (int)lv_dropdown_get_selected(hp_dd) : 0;
+        honeypair_start(pidx);
+    }
+    hp_ui_refresh(NULL);
+}
+
+static void hp_dd_cb(lv_event_t *e)
+{
+    lv_obj_t *dd = lv_event_get_target(e);
+    int idx = (int)lv_dropdown_get_selected(dd);
+    if (honeypair_is_active())
+        honeypair_set_persona(idx);
+}
+
+static void hp_back_cb(lv_event_t *e)
+{
+    (void)e;
+    if (hp_ui_timer) { lv_timer_del(hp_ui_timer); hp_ui_timer = NULL; }
+    hp_status_lbl = NULL; hp_stats_lbl = NULL; hp_start_btn = NULL; hp_dd = NULL;
+    if (honeypair_is_active()) {
+        honeypair_stop();
+        bt_nimble_deinit();
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+    show_bluetooth_screen();
+}
+
+static void show_honeypair_screen(void)
+{
+    create_function_page_base("HoneyPair");
+
+    /* Persona dropdown ──────────────────────────────────────────────────── */
+    lv_obj_t *dd_lbl = lv_label_create(function_page);
+    lv_label_set_text(dd_lbl, "Persona:");
+    lv_obj_set_style_text_font(dd_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(dd_lbl, ui_text_color(), 0);
+    lv_obj_align(dd_lbl, LV_ALIGN_TOP_LEFT, 8, 38);
+
+    /* Build dropdown option string from persona table */
+    char opts[256] = "";
+    for (int i = 0; i < honeypair_persona_count(); i++) {
+        if (i) strncat(opts, "\n", sizeof(opts) - strlen(opts) - 1);
+        strncat(opts, honeypair_persona_name(i), sizeof(opts) - strlen(opts) - 1);
+    }
+
+    hp_dd = lv_dropdown_create(function_page);
+    lv_dropdown_set_options(hp_dd, opts);
+    {
+        honeypair_stats_t st; honeypair_get_stats(&st);
+        lv_dropdown_set_selected(hp_dd, (uint16_t)st.current_persona);
+    }
+    lv_obj_set_size(hp_dd, lv_pct(96), 36);
+    lv_obj_align(hp_dd, LV_ALIGN_TOP_MID, 0, 58);
+    lv_obj_set_style_bg_color(hp_dd, ui_card_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(hp_dd, ui_text_color(), LV_PART_MAIN);
+    lv_obj_set_style_border_color(hp_dd, ui_border_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(hp_dd, &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_add_event_cb(hp_dd, hp_dd_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    /* Status label ──────────────────────────────────────────────────────── */
+    hp_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(hp_status_lbl, "Idle - not advertising");
+    lv_obj_set_style_text_font(hp_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hp_status_lbl, lv_color_make(176, 176, 176), 0);
+    lv_obj_set_style_text_align(hp_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(hp_status_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(hp_status_lbl, lv_pct(96));
+    lv_obj_align(hp_status_lbl, LV_ALIGN_TOP_MID, 0, 104);
+
+    /* Stats label ───────────────────────────────────────────────────────── */
+    hp_stats_lbl = lv_label_create(function_page);
+    lv_label_set_text(hp_stats_lbl, "Connects: 0   Pairs: 0   GATT Reads: 0");
+    lv_obj_set_style_text_font(hp_stats_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hp_stats_lbl, lv_color_make(176, 176, 176), 0);
+    lv_obj_set_style_text_align(hp_stats_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(hp_stats_lbl, lv_pct(96));
+    lv_obj_align(hp_stats_lbl, LV_ALIGN_TOP_MID, 0, 124);
+
+    /* START BAIT button ─────────────────────────────────────────────────── */
+    hp_start_btn = lv_btn_create(function_page);
+    lv_obj_set_size(hp_start_btn, 150, 44);
+    lv_obj_align(hp_start_btn, LV_ALIGN_TOP_MID, 0, 143);
+    lv_obj_set_style_bg_color(hp_start_btn, lv_color_make(40, 160, 40), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(hp_start_btn, lv_color_lighten(lv_color_make(40, 160, 40), 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(hp_start_btn, 0, 0);
+    lv_obj_set_style_radius(hp_start_btn, 10, 0);
+    lv_obj_t *hp_btn_lbl = lv_label_create(hp_start_btn);
+    lv_label_set_text(hp_btn_lbl, "START BAIT");
+    lv_obj_set_style_text_font(hp_btn_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(hp_btn_lbl, lv_color_white(), 0);
+    lv_obj_center(hp_btn_lbl);
+    lv_obj_add_event_cb(hp_start_btn, hp_start_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Log path note (only shown when active) ────────────────────────────── */
+    lv_obj_t *log_lbl = lv_label_create(function_page);
+    lv_label_set_text(log_lbl, "Logs: /sdcard/lab/ble/honeypair/");
+    lv_obj_set_style_text_font(log_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(log_lbl, lv_color_make(100, 100, 100), 0);
+    lv_obj_set_style_text_align(log_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(log_lbl, lv_pct(96));
+    lv_obj_align(log_lbl, LV_ALIGN_TOP_MID, 0, 228);
+
+    /* Back button ───────────────────────────────────────────────────────── */
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 120, 30);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_t *bi = lv_label_create(back_btn);
+    lv_label_set_text(bi, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(bi, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bi, lv_color_white(), 0);
+    lv_obj_t *bl = lv_label_create(back_btn);
+    lv_label_set_text(bl, "Bluetooth");
+    lv_obj_set_style_text_font(bl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bl, lv_color_white(), 0);
+    lv_obj_add_event_cb(back_btn, hp_back_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Refresh UI state immediately, then every 1s */
+    hp_ui_refresh(NULL);
+    hp_ui_timer = lv_timer_create(hp_ui_refresh, 1000, NULL);
+}
+
+// ── BlueDuck screen ───────────────────────────────────────────────────────────
+
+static void bd_ui_refresh(lv_timer_t *t)
+{
+    (void)t;
+    if (!function_page) return;
+    blueduck_stats_t st;
+    blueduck_get_stats(&st);
+
+    if (bd_status_lbl) {
+        if (st.executing) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), LV_SYMBOL_BLUETOOTH "  Injecting: %s", st.persona_name);
+            lv_label_set_text(bd_status_lbl, buf);
+            lv_obj_set_style_text_color(bd_status_lbl, lv_color_make(255, 160, 0), 0);
+        } else if (st.active) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), LV_SYMBOL_BLUETOOTH "  Waiting: %s", st.persona_name);
+            lv_label_set_text(bd_status_lbl, buf);
+            lv_obj_set_style_text_color(bd_status_lbl, lv_color_make(80, 220, 80), 0);
+        } else {
+            lv_label_set_text(bd_status_lbl, "Idle - not advertising");
+            lv_obj_set_style_text_color(bd_status_lbl, lv_color_make(176, 176, 176), 0);
+        }
+    }
+
+    if (bd_stats_lbl) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Connects: %d   Payloads: %d", st.connects, st.payloads_sent);
+        lv_label_set_text(bd_stats_lbl, buf);
+    }
+
+    if (bd_start_btn) {
+        lv_obj_t *lbl = lv_obj_get_child(bd_start_btn, 0);
+        if (st.active) {
+            if (lbl) lv_label_set_text(lbl, "STOP");
+            lv_obj_set_style_bg_color(bd_start_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+        } else {
+            if (lbl) lv_label_set_text(lbl, "LAUNCH");
+            lv_obj_set_style_bg_color(bd_start_btn, lv_color_make(0, 100, 200), LV_STATE_DEFAULT);
+        }
+    }
+}
+
+static void bd_start_cb(lv_event_t *e)
+{
+    (void)e;
+    if (blueduck_is_active()) {
+        blueduck_stop();
+        bt_nimble_deinit();
+        s_ble_for_blueduck  = false;
+        current_radio_mode  = RADIO_MODE_NONE;
+    } else {
+        int pidx  = bd_persona_dd  ? (int)lv_dropdown_get_selected(bd_persona_dd) : 0;
+        int sidx  = bd_script_dd   ? (int)lv_dropdown_get_selected(bd_script_dd)  : 0;
+        const char *spath = blueduck_script_path(sidx);
+        if (!spath || !spath[0]) {
+            if (bd_status_lbl)
+                lv_label_set_text(bd_status_lbl, "No script selected!");
+            return;
+        }
+        s_ble_for_blueduck = true;
+        if (!ensure_ble_mode()) {
+            s_ble_for_blueduck = false;
+            if (bd_status_lbl) lv_label_set_text(bd_status_lbl, "BLE init failed!");
+            return;
+        }
+        blueduck_start(pidx, spath);
+    }
+    bd_ui_refresh(NULL);
+}
+
+static void bd_persona_dd_cb(lv_event_t *e)
+{
+    (void)e;
+    if (blueduck_is_active()) {
+        int idx = bd_persona_dd ? (int)lv_dropdown_get_selected(bd_persona_dd) : 0;
+        /* persona changes take effect on next connection; re-advertise immediately */
+        blueduck_stop();
+        bt_nimble_deinit();
+        s_ble_for_blueduck = true;
+        if (ensure_ble_mode()) {
+            int sidx = bd_script_dd ? (int)lv_dropdown_get_selected(bd_script_dd) : 0;
+            blueduck_start(idx, blueduck_script_path(sidx));
+        }
+    }
+}
+
+static void bd_human_sw_cb(lv_event_t *e)
+{
+    (void)e;
+    /* Human mode toggle handled via HUMAN_MODE command in scripts.
+     * This switch sets a session default communicated via a synthetic command. */
+}
+
+static void bd_back_cb(lv_event_t *e)
+{
+    (void)e;
+    if (bd_ui_timer) { lv_timer_del(bd_ui_timer); bd_ui_timer = NULL; }
+    bd_status_lbl = NULL; bd_stats_lbl = NULL; bd_start_btn = NULL;
+    bd_persona_dd = NULL; bd_script_dd = NULL; bd_human_sw = NULL; bd_speed_dd = NULL;
+    if (blueduck_is_active()) {
+        blueduck_stop();
+        bt_nimble_deinit();
+        s_ble_for_blueduck = false;
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+    show_bt_attacks_screen();
+}
+
+static void show_blueduck_screen(void)
+{
+    /* Scan for scripts before building UI */
+    int nscripts = blueduck_scan_scripts();
+
+    create_function_page_base("BlueDuck");
+
+    /* ── Consent banner — fixed 34px height so wrap never bleeds down ── */
+    lv_obj_t *warn_lbl = lv_label_create(function_page);
+    lv_label_set_text(warn_lbl,
+        LV_SYMBOL_WARNING " Any willing pair receives the payload");
+    lv_label_set_long_mode(warn_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_size(warn_lbl, lv_pct(96), 34);
+    lv_obj_set_style_text_font(warn_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(warn_lbl, lv_color_make(255, 160, 0), 0);
+    lv_obj_align(warn_lbl, LV_ALIGN_TOP_MID, 0, 34);
+
+    /* ── Persona dropdown  (y=72: below banner bottom 68 + 4 gap) ── */
+    lv_obj_t *pl = lv_label_create(function_page);
+    lv_label_set_text(pl, "Persona:");
+    lv_obj_set_style_text_font(pl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(pl, ui_text_color(), 0);
+    lv_obj_align(pl, LV_ALIGN_TOP_LEFT, 8, 72);
+
+    char persona_opts[320] = "";
+    for (int i = 0; i < blueduck_persona_count(); i++) {
+        if (i) strncat(persona_opts, "\n", sizeof(persona_opts) - strlen(persona_opts) - 1);
+        strncat(persona_opts, blueduck_persona_name(i), sizeof(persona_opts) - strlen(persona_opts) - 1);
+    }
+    bd_persona_dd = lv_dropdown_create(function_page);
+    lv_dropdown_set_options(bd_persona_dd, persona_opts);
+    {
+        blueduck_stats_t st; blueduck_get_stats(&st);
+        lv_dropdown_set_selected(bd_persona_dd, (uint16_t)st.current_persona);
+    }
+    lv_obj_set_size(bd_persona_dd, lv_pct(96), 30);
+    lv_obj_align(bd_persona_dd, LV_ALIGN_TOP_MID, 0, 88);
+    lv_obj_set_style_bg_color(bd_persona_dd, ui_card_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(bd_persona_dd, ui_text_color(), LV_PART_MAIN);
+    lv_obj_set_style_border_color(bd_persona_dd, ui_border_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(bd_persona_dd, &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_add_event_cb(bd_persona_dd, bd_persona_dd_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    /* ── Script dropdown ────────────────────────────────────────── */
+    lv_obj_t *sl = lv_label_create(function_page);
+    lv_label_set_text(sl, "Script:");
+    lv_obj_set_style_text_font(sl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sl, ui_text_color(), 0);
+    lv_obj_align(sl, LV_ALIGN_TOP_LEFT, 8, 124);
+
+    bd_script_dd = lv_dropdown_create(function_page);
+    if (nscripts == 0) {
+        lv_dropdown_set_options(bd_script_dd, "(no scripts on SD)");
+    } else {
+        char script_opts[BD_MAX_SCRIPTS * 68];
+        script_opts[0] = '\0';
+        for (int i = 0; i < nscripts; i++) {
+            if (i) strncat(script_opts, "\n", sizeof(script_opts) - strlen(script_opts) - 1);
+            strncat(script_opts, blueduck_script_name(i), sizeof(script_opts) - strlen(script_opts) - 1);
+        }
+        lv_dropdown_set_options(bd_script_dd, script_opts);
+    }
+    lv_obj_set_size(bd_script_dd, lv_pct(96), 30);
+    lv_obj_align(bd_script_dd, LV_ALIGN_TOP_MID, 0, 140);
+    lv_obj_set_style_bg_color(bd_script_dd, ui_card_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(bd_script_dd, ui_text_color(), LV_PART_MAIN);
+    lv_obj_set_style_border_color(bd_script_dd, ui_border_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(bd_script_dd, &lv_font_montserrat_12, LV_PART_MAIN);
+
+    /* ── Status label ───────────────────────────────────────────── */
+    bd_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(bd_status_lbl, "Idle - not advertising");
+    lv_obj_set_style_text_font(bd_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(bd_status_lbl, lv_color_make(176, 176, 176), 0);
+    lv_label_set_long_mode(bd_status_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(bd_status_lbl, lv_pct(96));
+    lv_obj_align(bd_status_lbl, LV_ALIGN_TOP_MID, 0, 176);
+
+    /* ── Stats label ────────────────────────────────────────────── */
+    bd_stats_lbl = lv_label_create(function_page);
+    lv_label_set_text(bd_stats_lbl, "Connects: 0   Payloads: 0");
+    lv_obj_set_style_text_font(bd_stats_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(bd_stats_lbl, ui_text_color(), 0);
+    lv_obj_align(bd_stats_lbl, LV_ALIGN_TOP_MID, 0, 193);
+
+    /* ── LAUNCH / STOP button ───────────────────────────────────── */
+    bd_start_btn = lv_btn_create(function_page);
+    lv_obj_set_size(bd_start_btn, lv_pct(90), 36);
+    lv_obj_align(bd_start_btn, LV_ALIGN_TOP_MID, 0, 212);
+    lv_obj_set_style_bg_color(bd_start_btn, lv_color_make(0, 100, 200), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(bd_start_btn, lv_color_make(0, 140, 255), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(bd_start_btn, 0, 0);
+    lv_obj_set_style_radius(bd_start_btn, 8, 0);
+    lv_obj_t *start_lbl = lv_label_create(bd_start_btn);
+    lv_label_set_text(start_lbl, "LAUNCH");
+    lv_obj_set_style_text_font(start_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(start_lbl, lv_color_white(), 0);
+    lv_obj_center(start_lbl);
+    lv_obj_add_event_cb(bd_start_btn, bd_start_cb, LV_EVENT_CLICKED, NULL);
+
+    /* ── Log path label ─────────────────────────────────────────── */
+    lv_obj_t *log_lbl = lv_label_create(function_page);
+    lv_label_set_text(log_lbl, "Logs: /sdcard/lab/ble/blueduck/");
+    lv_obj_set_style_text_font(log_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(log_lbl, lv_color_make(120, 120, 120), 0);
+    lv_obj_align(log_lbl, LV_ALIGN_TOP_MID, 0, 252);
+
+    /* ── Back button ────────────────────────────────────────────── */
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 110, 28);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(back_btn, 4, 0);
+    lv_obj_t *bi = lv_label_create(back_btn);
+    lv_label_set_text(bi, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(bi, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bi, lv_color_white(), 0);
+    lv_obj_t *bl2 = lv_label_create(back_btn);
+    lv_label_set_text(bl2, "BT Attacks");
+    lv_obj_set_style_text_font(bl2, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bl2, lv_color_white(), 0);
+    lv_obj_add_event_cb(back_btn, bd_back_cb, LV_EVENT_CLICKED, NULL);
+
+    bd_ui_refresh(NULL);
+    bd_ui_timer = lv_timer_create(bd_ui_refresh, 1000, NULL);
 }

@@ -126,7 +126,7 @@ esp_err_t wifi_scanner_select_network(int index, bool selected) {
             }
         }
         
-        if (!already_selected && g_shared_selected_count < MAX_SCAN_RESULTS) {
+        if (!already_selected && g_shared_selected_count < 20) {
             g_shared_selected_indices[g_shared_selected_count++] = index;
         }
     } else {

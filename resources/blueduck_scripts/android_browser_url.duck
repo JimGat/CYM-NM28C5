@@ -1,0 +1,20 @@
+REM android_browser_url.duck
+REM Opens the default browser via Win+B, focuses the address bar with Ctrl+L,
+REM and navigates to a URL. Most reliable cross-launcher browser injection method.
+REM Tested on Samsung One UI with physical keyboard.
+REM Copy to: /sdcard/lab/ble/blueduck/scripts/
+
+HUMAN_MODE ON
+HUMAN_SPEED NORMAL
+
+REM Open default browser (Win+B — Samsung One UI / Android keyboard shortcut)
+GUI b
+DELAY 2500
+
+REM Focus address bar
+CTRL l
+DELAY 500
+
+REM Navigate to target URL
+STRING example.com
+ENTER

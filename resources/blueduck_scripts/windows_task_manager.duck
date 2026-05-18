@@ -1,0 +1,9 @@
+REM windows_task_manager.duck
+REM Opens Task Manager directly via Ctrl+Shift+Esc (bypasses the Ctrl+Alt+Del screen).
+REM Ctrl+Alt+Del cannot be intercepted by HID devices — this is the correct approach.
+REM Works on Windows 10 and 11.
+REM Copy to: /sdcard/lab/ble/blueduck/scripts/
+
+HUMAN_MODE OFF
+
+CTRL-SHIFT ESC
