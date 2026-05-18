@@ -319,7 +319,11 @@ static void bd_send_report(uint8_t modifier, uint8_t keycode)
 
 static void bd_key_tap(uint8_t modifier, uint8_t keycode)
 {
-    bd_send_report(modifier, keycode);
+    /* Modifier keycodes (0xE0-0xE7) belong in the modifier byte only.
+     * The HID descriptor Usage Maximum for the key array is 0x65; sending a
+     * code >= 0xE0 there is out-of-range and silently dropped by Android. */
+    uint8_t kc = (keycode >= 0xE0) ? 0x00 : keycode;
+    bd_send_report(modifier, kc);
     vTaskDelay(pdMS_TO_TICKS(BD_KEY_HOLD_MS));
     bd_send_report(0, 0);  /* key up */
     vTaskDelay(pdMS_TO_TICKS(5));
