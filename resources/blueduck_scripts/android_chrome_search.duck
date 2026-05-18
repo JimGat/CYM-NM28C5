@@ -1,0 +1,20 @@
+REM android_chrome_search.duck
+REM Opens the browser via Win+B, then navigates to a Google search.
+REM Win+B is the Samsung One UI / Android keyboard shortcut to open the default browser.
+REM Ctrl+L focuses the Chrome address bar with a physical keyboard connected.
+REM Copy to: /sdcard/lab/ble/blueduck/scripts/
+
+HUMAN_MODE ON
+HUMAN_SPEED NORMAL
+
+REM Open default browser (Win+B)
+GUI b
+DELAY 2500
+
+REM Focus address bar — Ctrl+L works in Chrome when a physical keyboard is connected
+CTRL l
+DELAY 500
+
+REM Type search URL directly into the address bar
+STRING google.com/search?q=am+i+being+hacked
+ENTER

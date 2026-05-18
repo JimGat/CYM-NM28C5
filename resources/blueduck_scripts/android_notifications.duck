@@ -1,0 +1,12 @@
+REM android_notifications.duck
+REM Opens the Android notification shade via Win+N.
+REM Demonstrates system-level HID keyboard access.
+REM Tested on Samsung One UI with physical keyboard.
+REM Copy to: /sdcard/lab/ble/blueduck/scripts/
+
+HUMAN_MODE ON
+HUMAN_SPEED NORMAL
+
+REM Open notification shade (Win+N)
+GUI n
+DELAY 1500

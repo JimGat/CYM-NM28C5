@@ -1,0 +1,20 @@
+REM android_search.duck
+REM Goes to the Android home screen (Win+H), then opens the Google app search bar.
+REM Win+H = Home on Samsung One UI and most Android launchers.
+REM After landing on home, press ENTER to activate the Google search widget (if present),
+REM then type the query. Adjust DELAY if the widget takes longer to focus.
+REM Copy to: /sdcard/lab/ble/blueduck/scripts/
+
+HUMAN_MODE ON
+HUMAN_SPEED NORMAL
+
+REM Go to home screen (Win+H)
+GUI h
+DELAY 1500
+
+REM Activate the Google search widget and type query
+ENTER
+DELAY 500
+STRING who is watching you
+DELAY 500
+ENTER

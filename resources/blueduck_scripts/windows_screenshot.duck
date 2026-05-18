@@ -1,0 +1,10 @@
+REM windows_screenshot.duck
+REM Opens the Snip & Sketch / Snipping Tool overlay via Win+Shift+S.
+REM Demonstrates that a paired "keyboard" can silently capture the screen.
+REM Windows 10 (1809+) and Windows 11.
+REM Copy to: /sdcard/lab/ble/blueduck/scripts/
+
+HUMAN_MODE OFF
+
+REM Win+Shift+S — open snipping tool overlay (region select mode)
+GUI-SHIFT s

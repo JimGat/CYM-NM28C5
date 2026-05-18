@@ -5,7 +5,7 @@
 <h1 align="center">Cheap Yellow Monster</h1>
 
 <p align="center">
-  <b>v1.3.4</b>
+  <b>v1.6.14</b>
 </p>
 
 <p align="center">
@@ -94,11 +94,14 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **Drone Detector** | Passive BLE scan for DJI/Remote ID drone advertisements |
 | **Wardriving** | GPS + WiFi logging, dual-band filter (2.4 GHz / 5 GHz / Both), optional BLE time-sliced scanning, WiGLE CSV 1.6, upload log tracking, raw PCAP toggle, GPS mark waypoints (GPX output), WiGLE and WDG Wars upload; GPS last-known position hold with 150 m stale accuracy when signal is lost |
 | **GPS** | NMEA RMC auto-syncs system clock (FAT timestamps); last-known position persisted to NVS (5-minute throttle); manual fallback editor in Settings → GPS Info; all data-collection features (wardrive, GATT Walker, marks) use best available GPS transparently |
-| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk, Bluetooth Lookout, BLE Spam (8 modes incl. Sour Apple), Device Spoof (general + directed), BLE Disconnect (directed), BLE PCAP (Kismet PCAPNG raw capture) |
+| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk, Bluetooth Lookout, BLE Spam (8 modes incl. Sour Apple), Device Spoof (general + directed), BLE Disconnect (directed), BLE PCAP (Kismet PCAPNG raw capture), **BlueDuck** (BLE HID DuckyScript keyboard injector), **HoneyPair** (BLE persona honeypot) |
+| **BlueDuck** | BLE HID keyboard injector — pairs as any of 9 device personas; executes DuckyScript payloads from SD card (preloaded into PSRAM at boot, immune to SD DMA OOM during BLE); HUMAN_MODE variable-speed typing; Android (Win+H/B/N), Windows (Win+R/L, Ctrl+Shift+Esc), and iOS (Cmd+H/Space) keyboard shortcut support; session JSONL log to SD card; 13-script library included |
+| **HoneyPair** | Continuous BLE persona honeypot — cycles 9 consumer device personas every 5 min, logs all pairing attempts to JSONL; GATT/HID enumeration on any pairing device; persona MACs randomised and deduplicated |
 | **Deauth Monitor** | Passive detection of nearby deauth attacks |
 | **Credentials** | Captive portal credential capture, WPA-SEC upload |
 | **TX Power Mode** | Selectable Normal / Max Power for WiFi and BLE — persisted across reboots |
-| **Data Transfer** | Self-hosted AP file server (TheLab) and WiFi client file server — browse & download SD card contents from any browser; IP shown on screen |
+| **Data Transfer** | Self-hosted AP file server (TheLab) and WiFi client file server — browse, upload, create directories, and recursively delete folders from any browser; client IP logged to serial; IP shown on screen |
+| **NM-RF-HAT** | Hardware addon board support *(coming soon)* — software-configurable RF module options for NRF, IR, and RFID expansion |
 | **UI** | Material dark theme, touch gestures, screen dimming, screenshots — all screens portrait 240×320 |
 | **Storage** | SD card for handshakes, wardrive logs, GATT Walker JSON, screenshots, file tree browser |
 
@@ -268,7 +271,7 @@ An ERM (eccentric rotating mass) vibrator motor can be added to the NM-CYD-C5 vi
 | Series rectifier | [1N5819 Schottky diode](https://a.co/d/0bnr0eiq) | Anode → VO1 (SPEAK pin 1), cathode → motor +. Half-wave rectifies the BTL output so current flows only in one direction. |
 | Flyback / protection | [1N4148 signal diode](https://a.co/d/01jTSulE) | Cathode → motor +, anode → motor −. Suppresses back-EMF inductive spikes when the motor stops. |
 | Motor | [Mini ERM Vibration Motor](https://a.co/d/00013Sqj) | Micro coin or cylindrical ERM, 3 V nominal. |
-| SPEAK header connector | [JST SH 1.0 mm 2-pin](https://a.co/d/017FKez2) (HCZZ0015-2) | Measured housing width = 3.35 mm, confirming 1.0 mm SH pitch. The 1.25 mm GH connector (~5 mm housing) will **not** fit. |
+| SPEAK header connector | JST GH 1.25 mm 2-pin (HCZZ0015-2) | **1.25 mm pitch** — the 1.0 mm SH connector is too small and will not fit. |
 
 **How it works:** GPIO 26 drives the SC8002B input with LEDC PWM at **333 Hz / 50% duty** (half-wave max = 50% duty). The 1N5819 rectifies the BTL output to give the motor a clean DC-biased drive. The 1N4148 across the motor clamps the inductive kick on every PWM off-cycle. Strength is adjustable 10–100% via **Settings → Vibrator Test** without reflashing.
 
@@ -447,6 +450,10 @@ Bluetooth
 ├── BT Attacks          ← general attacks (no target needed)
 │   ├── BLE Spam        (Apple Prox. Pair / Samsung / Google / Windows / All / AirTag / SmartTag / Sour Apple)
 │   └── Device Spoof    (select from spooflist.csv or add new entry via keyboard)
+├── BlueDuck            ← BLE HID keyboard injector + DuckyScript engine
+│   ├── Script selector (scans /sdcard/lab/ble/blueduck/scripts/)
+│   ├── Persona picker  (9 device identities + auto-rotate)
+│   └── Live stats      (connects / payloads / disconnects)
 ├── BT Observer         ← 10 s scan then sequential GATT walk on all found devices
 ├── BLE PCAP            ← raw Kismet PCAPNG capture; streams to SD card
 ├── AirTag Scan
@@ -472,6 +479,8 @@ Bluetooth
 | **Device Spoof (general)** | Loads `/sdcard/lab/bluetooth/spooflist.csv`; select an entry or add new devices via on-screen keyboard, then START to begin spoofing |
 | **BLE Disconnect (directed)** | Floods a BT Scan & Select pre-selected target with BLE TERMINATE_IND frames to force disconnection |
 | **BLE PCAP** | Captures raw BLE advertising packets to SD card in Kismet PCAPNG format (link type 256 — `LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR`). Includes a 10-byte pseudo-header per packet: RF channel 37, RSSI, noise floor, and BLE access address. Queue-based write path keeps the SD bus free for the UI. Live packet count shown on screen. |
+| **BlueDuck** | BLE HID keyboard injector. Pairs with any nearby BLE-capable device, then executes DuckyScript payloads — sending keystrokes as if from a Bluetooth keyboard. Nine built-in device personas (Wireless Keyboard, AirPods Pro, Fitbit, Galaxy Buds, Garmin Fenix, Apple Watch, JBL speaker, Logitech MX Keys, Samsung TV). Auto-rotate mode cycles personas every 5 minutes. Scripts are preloaded into PSRAM at scan time (immune to SD DMA OOM during BLE). HUMAN_MODE with SLOW/NORMAL/FAST variable-speed typing. Full Android (Win+H/B/N), Windows (Win+R/L, Ctrl+Shift+Esc, Win+Shift+S), and iOS (Cmd+H/Space) keyboard shortcut support — 13-script library in `resources/blueduck_scripts/`. Session stats shown live; all events logged to `/sdcard/lab/ble/blueduck/`. |
+| **HoneyPair** | BLE persona honeypot. Continuously cycles through 9 consumer device personas (AirPods, Galaxy Buds, Garmin watch, etc.), logging every device that initiates a pairing request. Persona MACs are randomised and deduplicated across sessions; auto-rotate every 5 minutes prevents stale scan-response caching. GATT/HID enumeration runs on any device that completes pairing. All events logged to `/sdcard/lab/ble/honeypair/`. |
 
 > **Note:** WiFi and BLE share the same radio. The firmware automatically switches between `RADIO_MODE_WIFI` and `RADIO_MODE_BLE` as needed.
 
@@ -795,7 +804,7 @@ Tap **+ Add to Watchlist** on any group card. Each OUI is written to `lookout.cs
 
 **Workflow:**
 1. Open **BLE PCAP** from the Bluetooth tile.
-2. A new `.pcapng` file is created in `/sdcard/lab/ble_captures/` (e.g. `ble_YYYYMMDD_HHMMSS.pcapng`).
+2. A new `.pcapng` file is created in `/sdcard/lab/ble/captures/` (e.g. `ble_YYYYMMDD_HHMMSS.pcapng`).
 3. The screen shows a live packet counter. All advertising packets detected by the radio are captured.
 4. Tap **Stop** to flush and close the file cleanly.
 
@@ -817,9 +826,70 @@ Each EPB includes a **10-byte pseudo-header** preceding the reconstructed BLE LL
 
 The reconstructed PDU contains the advertising PDU header (event type + address type + length), the 6-byte AdvA, and the AdvData payload. This format is directly openable in **Wireshark** with the `BTBREDR` or `BTLE` dissector, and in **Kismet** with its standard BLE plugin.
 
-**Output path:** `/sdcard/lab/ble_captures/ble_YYYYMMDD_HHMMSS.pcapng`
+**Output path:** `/sdcard/lab/ble/captures/ble_YYYYMMDD_HHMMSS.pcapng`
 
 > **Note:** The ESP32-C5's BLE radio captures advertising packets on channels 37/38/39. The pseudo-header records channel 37 for all packets; the actual advertising channel is determined by the PDU type and timing.
+
+#### BlueDuck — BLE HID Keyboard Injector
+
+**BlueDuck** pairs with nearby Bluetooth-capable devices as a BLE HID keyboard and executes DuckyScript payloads — sending keystrokes exactly as a real Bluetooth keyboard would. It is the wireless BLE equivalent of a USB Rubber Ducky.
+
+**How it works:**
+
+1. Open **Bluetooth → BlueDuck**. Select a DuckyScript file from the list (`.duck` files from `/sdcard/lab/ble/blueduck/scripts/`) and a device persona.
+2. BlueDuck begins advertising as the chosen persona (e.g. "Wireless Keyboard — Microsoft"). Any nearby device with Bluetooth enabled that is looking for an input device will see it.
+3. When a target connects and completes BLE pairing, BlueDuck waits 3 seconds for the OS to complete setup, then executes the script — typing keystrokes, pressing hotkeys, and adding delays as defined.
+4. After the script completes, BlueDuck disconnects and immediately re-advertises for the next target.
+
+**Device Personas** — 9 built-in identities:
+
+| Persona | Spoofed as | BLE Appearance |
+|---------|------------|----------------|
+| Wireless Keyboard | Microsoft Surface Keyboard | HID Keyboard |
+| AirPods Pro | Apple A2698 | Headset |
+| Fitbit Inspire 3 | Fitbit FB422 | Fitness Tracker |
+| Galaxy Buds2 Pro | Samsung SM-R510 | Headset |
+| Garmin Fenix 7 | Garmin 010-02540-01 | Watch |
+| Apple Watch | Apple A2976 | Watch |
+| JBL Clip 4 | JBL JBLCLIP4 | Speaker |
+| Logitech MX Keys | Logitech 920-009294 | HID Keyboard |
+| Samsung 40" TV | Samsung UN40T5300 | Display |
+
+**Auto-rotate** — cycles through all personas automatically every 5 minutes, randomizing the MAC address per persona to prevent denylisting.
+
+**DuckyScript command support:**
+
+| Command | Description |
+|---------|-------------|
+| `STRING` | Type literal text |
+| `STRINGLN` | Type text + ENTER |
+| `DELAY` | Wait N milliseconds |
+| `DEFAULT_DELAY` | Insert delay after every subsequent command |
+| `REPEAT` | Repeat the previous command N times |
+| `GUI` / `CTRL` / `ALT` / `SHIFT` | Modifier keys |
+| `ENTER`, `BACKSPACE`, `TAB`, `SPACE`, `ESCAPE`, `DELETE` | Special keys |
+| `UP`, `DOWN`, `LEFT`, `RIGHT`, `HOME`, `END`, `PAGEUP`, `PAGEDOWN` | Navigation keys |
+| `CAPS_LOCK`, `F1`–`F12` | Function and lock keys |
+| `HUMAN_MODE ON/OFF` | Enable variable-speed typing for authenticity |
+| `HUMAN_SPEED SLOW/NORMAL/FAST` | Set typing speed when human mode is active |
+| `REM` | Comment — ignored |
+
+**Script placement:** Copy `.duck` files to `/sdcard/lab/ble/blueduck/scripts/`. BlueDuck scans this directory on entry and loads all scripts into PSRAM at startup — scripts are cached before BLE is initialized to avoid SD card DMA exhaustion when the BLE stack is running.
+
+**Session logging:** Every connect, payload, and disconnect is appended to a JSONL session file at `/sdcard/lab/ble/blueduck/blueduck_<timestamp>.jsonl` — including script name, LED state (CapsLock/NumLock), GPS coordinates, pairing status, and event type.
+
+**Live stats panel** on the BlueDuck screen:
+
+| Field | Description |
+|-------|-------------|
+| Connects | Number of devices that have connected |
+| Payloads | Scripts successfully executed |
+| Disconnects | Connection terminations |
+| Persona | Current active persona name |
+
+**Script library:** See [`resources/blueduck_scripts/`](resources/blueduck_scripts/README.md) for the included script collection and full DuckyScript reference.
+
+---
 
 ### 3. Wardriving
 
@@ -1157,7 +1227,20 @@ The device starts a WPA2-secured access point and immediately serves `/sdcard/` 
 | **Server URL** | `http://192.168.4.1` |
 | **Channel** | 6 |
 
-Connect your phone or laptop to the `TheLab` network, then open `http://192.168.4.1` in a browser. You get a directory listing of the SD card. Click any folder to navigate, click any file to download it. Tap **Stop** on the device to shut the server down and restore normal operation.
+Connect your phone or laptop to the `TheLab` network, then open `http://192.168.4.1` in a browser. You get a directory listing of the SD card with full file management capability. Tap **Stop** on the device to shut the server down and restore normal operation.
+
+**File server capabilities:**
+
+| Action | How |
+|--------|-----|
+| Browse | Click any folder to navigate in |
+| Download | Click any file to download it |
+| Upload | Use the upload form at the bottom of each directory listing |
+| Create directory | Enter a name in the **New folder** field and click Create |
+| Delete file | Click the **✕** button next to any file |
+| Delete directory | Click the amber **✕** button next to any folder — requires double confirmation (recursive delete, irreversible) |
+
+All client IP addresses are logged to serial output so you can see which device is browsing or uploading.
 
 **WiFi Client Server**
 
@@ -1167,7 +1250,7 @@ The device joins an existing WiFi network as a station (STA) and serves files on
 2. Edit SSID / password if needed — tap either field to bring up the on-screen keyboard.
 3. Tap **Connect** — the device connects to your network. Credentials are saved to NVS so next time the fields are pre-filled.
 4. Once connected the screen shows the assigned IP: `IP: 192.168.x.x => http://192.168.x.x`
-5. Open that URL on any device on the same network to browse and download SD card files.
+5. Open that URL on any device on the same network to browse, upload, create folders, or delete files.
 6. Tap **Back** to disconnect and stop the server.
 
 > **Note:** The WiFi radio must be available (not in BLE mode) to use the file server. If BLE is active, the firmware switches radio modes automatically.
@@ -1227,42 +1310,63 @@ Uploads all wardrive CSV files from `/sdcard/lab/wardrives/` to [WiGLE](https://
 
 > **SD card requirement:** MicroSD formatted as **FAT32, 32 GB or smaller**. exFAT and NTFS are not supported. SDXC cards (>32 GB) require manual FAT32 formatting before use.
 
-All data is stored on the SD card:
+All data is stored on the SD card. `/sdcard/lab/` is the root for all project data:
 
 ```
 /sdcard/
-├── lab/
-│   ├── white.txt         # MAC/SSID whitelist (one per line)
-│   ├── ouilist.bin       # OUI vendor table — adds manufacturer names to BLE scan results
-│   ├── wpa-sec.txt       # wpa-sec.org API key (paste key on line 1)
-│   ├── wigle.txt         # WiGLE API token — base64(apiname:apitoken) from wigle.net Account page
-│   ├── wdgwars.txt       # WDG Wars API key from wdgwars.pl profile
-│   ├── eviltwin.txt      # Credentials captured by Evil Twin / Captive Portal (auto-appended)
-│   ├── handshakes/       # Captured WPA handshakes
-│   │   ├── *.pcap        # Wireshark-compatible captures
-│   │   └── *.hccapx      # Hashcat-compatible format
-│   ├── htmls/            # ← Captive portal HTML pages
-│   │   └── *.html / *.htm   # Drop any portal page here — each file appears in the attack dropdown
-│   ├── pcaps/            # MITM/sniff PCAP captures
-│   ├── wardrives/        # GPS + WiFi/BLE wardrive logs (WiGLE CSV 1.6 format)
-│   │   ├── wd*.csv           # One file per session — uploaded via Wardrive Upload
-│   │   ├── wd*_marks.gpx     # GPS waypoints for that session (GPX 1.1)
-│   │   └── upload_log.csv    # Upload tracking: filename,SERVICE,STATUS per row
-│   ├── ble_captures/     # BLE PCAP files (Kismet PCAPNG, DLT 256)
-│   ├── deauths/          # Deauth monitor PCAP captures
-│   ├── bluetooth/
-│   │   ├── lookout.csv   # Bluetooth Lookout watchlist
-│   │   └── spooflist.csv # Device Spoof targets — CSV: MAC,Name (one per line)
-│   ├── gattwalker/       # GATT Walker + BT Observer JSON fingerprints
-│   │   └── YYYYMMDD_HHMMSS_AABBCCDDEEFF_gattwalk.json
-│   └── config/           # Optional config overrides (created by Provision)
-├── screenshots/          # UI screenshots (BMP)
-└── calibrate.txt         # ← Create this file to trigger touch re-calibration on next boot
+├── calibrate.txt             # Create this file to trigger touch re-calibration on next boot
+└── lab/                      # Root for all project data
+    ├── ouilist.bin           # OUI vendor table -- adds manufacturer names to BLE scan results
+    ├── white.txt             # MAC/SSID whitelist (one per line)
+    ├── eviltwin.txt          # Credentials captured by Evil Twin / Captive Portal (auto-appended)
+    ├── portals.txt           # Captive portal config
+    ├── wpa-sec.txt           # wpa-sec.org API key (paste key on line 1)
+    ├── wigle.txt             # WiGLE API token -- base64(apiname:apitoken) from wigle.net Account page
+    ├── wdgwars.txt           # WDG Wars API key from wdgwars.pl profile
+    ├── alerts/
+    │   ├── proximity.csv     # BLE proximity alert rules
+    │   └── css_alerts.csv    # CSS alert definitions
+    ├── ble/
+    │   ├── captures/         # BLE PCAP files (Kismet PCAPNG, DLT 256)
+    │   │   └── ble_<timestamp>.pcapng
+    │   ├── honeypair/        # HoneyPair session logs
+    │   │   └── honeypair_<timestamp>.jsonl
+    │   └── blueduck/         # BlueDuck DuckyScript payloads (upcoming)
+    │       └── scripts/
+    │           └── *.duck
+    ├── bluetooth/
+    │   ├── lookout.csv       # Bluetooth Lookout watchlist
+    │   └── spooflist.csv     # Device Spoof targets -- CSV: MAC,Name (one per line)
+    ├── cellular/
+    │   ├── tower_baseline.csv
+    │   ├── tower_anomalies.csv
+    │   └── raw_at.log
+    ├── config/               # Optional config overrides (created by Provision)
+    │   ├── detection.cfg
+    │   └── provision.log
+    ├── deauths/              # Deauth monitor PCAP captures
+    │   └── deauth_<ts>.pcap
+    ├── dronedetect/          # Drone / Remote ID detection logs
+    ├── gattwalker/           # GATT Walker + BT Observer JSON fingerprints
+    │   └── <name>_<MAC>_gattwalk.json
+    ├── handshakes/           # Captured WPA handshakes
+    │   ├── *.pcap            # Wireshark-compatible captures
+    │   └── *.hccapx          # Hashcat-compatible format
+    ├── htmls/                # Captive portal HTML pages
+    │   └── *.html / *.htm    # Drop any portal page here -- each file appears in the attack dropdown
+    ├── pcaps/                # MITM/sniff PCAP captures
+    │   └── mitm_<n>.pcap
+    ├── screenshots/          # UI screenshots (BMP)
+    │   └── screen_<n>.bmp
+    └── wardrives/            # GPS + WiFi wardrive logs (WiGLE CSV 1.6 format)
+        ├── wd<n>.csv         # One file per session -- uploaded via Wardrive Upload
+        ├── wd<n>_marks.gpx   # GPS waypoints for that session (GPX 1.1)
+        └── upload_log.csv    # Upload tracking: filename,SERVICE,STATUS per row
 ```
 
 ### Screenshot Capture
 
-Tap the **title bar on any screen** to capture a screenshot. The image is saved as an uncompressed 24-bit BMP to `/sdcard/screenshots/screen_N.bmp` with an auto-incrementing index. The write runs in a background task so the UI stays responsive, and the title bar is briefly disabled while the save is in progress to prevent double-captures. Requires a mounted SD card — a warning is logged if the card is unavailable.
+Tap the **title bar on any screen** to capture a screenshot. The image is saved as an uncompressed 24-bit BMP to `/sdcard/lab/screenshots/screen_N.bmp` with an auto-incrementing index. The write runs in a background task so the UI stays responsive, and the title bar is briefly disabled while the save is in progress to prevent double-captures. Requires a mounted SD card — a warning is logged if the card is unavailable.
 
 Screenshots are captured at full 240×320 resolution and can be opened directly in any image viewer or graphics application.
 

@@ -61,7 +61,12 @@ static esp_err_t init_wifi(void) {
     }
     
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    esp_err_t wifi_init_err = esp_wifi_init(&cfg);
+    if (wifi_init_err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_init failed (0x%x) — restarting to recover RAM", wifi_init_err);
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_restart();
+    }
     
     // Register event handler only once
     if (!wifi_event_handler_registered) {
@@ -84,6 +89,10 @@ static esp_err_t init_wifi(void) {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    /* Pin regulatory domain so the driver never updates it mid-association from
+       a Country IE in a probe response — that update was causing the first
+       connect to drop at assoc->init (0x2c0 comeback) every boot. */
+    esp_wifi_set_country_code("01", false);
     vTaskDelay(pdMS_TO_TICKS(400));   // let background tasks run after start
     apply_wifi_power_settings();
 

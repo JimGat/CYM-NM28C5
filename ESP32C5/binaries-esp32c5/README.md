@@ -1,6 +1,194 @@
 # CYM-NM28C5 Pre-built Firmware Binaries
 
-**Firmware version: v1.3.0**
+**Firmware version: v1.6.14**
+
+---
+
+## Release Notes — v1.6.14
+
+### BlueDuck — HID Key Timing & New Keys
+
+`bd_key_tap()` post-keyup settle raised from 5 ms → 20 ms (matching the key-hold interval). The previous 5 ms was shorter than the BLE minimum connection interval of 7.5 ms, meaning the key-up HID report could be queued before the key-down had finished transmitting to the host. The longer settle gives the host a full connection interval to process each report before the next one is queued.
+
+New named keys added to the DuckyScript parser: `PAUSE` / `BREAK` (HID 0x48), `PRINT_SCREEN` / `PRTSC` (HID 0x46), `SCROLL_LOCK` (HID 0x47). These enable `windows_sysinfo.duck` (`GUI PAUSE` → System Information) and snipping tool scripts.
+
+Rick roll scripts updated with `&autoplay=1`. On Android, Chrome hands the URL directly to the YouTube app which autoplays fullscreen. On Windows the video autoplays in the default browser.
+
+---
+
+## Release Notes — v1.6.13
+
+### BlueDuck — HID Modifier Key Fix + Working Android Shortcuts
+
+**Root cause fixed:** Modifier keycodes (GUI, CTRL, ALT, SHIFT) in the range HID 0xE0–0xE7 were being placed in the key-array field of the HID report. The descriptor declares a Usage Maximum of 0x65 (101) for the key array — keycodes above this are silently dropped by Android. Only the modifier byte was going through, which alone has no effect. This is why `GUI` (alone) appeared to do nothing.
+
+**Fix:** `bd_key_tap()` now zeroes the keycode when it is ≥ 0xE0, so modifier bits go only in the modifier byte. Combo keys such as `GUI h` (modifier=0x08, keycode=0x0B) are unaffected — their keycodes are well within range.
+
+**Parser fix:** Bare `GUI` with no argument was unrecognised by the DuckyScript parser (falls through to "Unrecognised line"). Correct syntax is `GUI h`, `GUI b`, etc. — the modifier is always followed by a key.
+
+**Confirmed Android keyboard shortcuts (Samsung One UI):**
+
+| Script command | Shortcut | Effect |
+|---------------|----------|--------|
+| `GUI h` | Win+H | Home screen |
+| `GUI b` | Win+B | Default browser |
+| `GUI n` | Win+N | Notification shade |
+| `GUI s` | Win+S | Messages |
+| `GUI c` | Win+C | Contacts |
+
+### BlueDuck — Android, Windows & iOS Script Library
+
+Script library expanded with platform-specific payloads and a comprehensive keyboard shortcut reference:
+
+**Android scripts:** `android_search`, `android_chrome_search`, `android_settings_search`, `android_browser_url`, `android_notifications`, `android_rickroll`
+
+**Windows scripts:** `windows_rickroll` (Win+R→URL), `windows_lock` (Win+L), `windows_notepad_msg`, `windows_screenshot` (Win+Shift+S), `windows_sysinfo` (Win+Pause), `windows_task_manager` (Ctrl+Shift+Esc), `windows_open_browser`
+
+Full shortcut reference for Android (Win/Ctrl/Alt keys, Samsung One UI confirmed), Windows 10/11 (Win/Ctrl/Alt/Fn keys, Run dialog command list), and iOS external keyboard in `resources/blueduck_scripts/README.md`.
+
+> **Samsung note:** Win+Y opens Smart View (screen mirroring) on Samsung One UI — not YouTube. Use `GUI b` + `CTRL l` + `youtube.com` for YouTube.
+
+---
+
+## Release Notes — v1.6.12
+
+### BlueDuck — BLE→WiFi Radio Switch Crash Fix
+
+After a BlueDuck session ends (user presses Home or the connection drops and BLE is stopped), returning to WiFi mode was failing with `esp_wifi_init failed (0x101)` — no memory. Root cause: `nimble_port_deinit()` releases ~30 KB of DMA-capable internal RAM but does so asynchronously. Without a settle delay, `esp_wifi_init()` would race to claim DMA buffers before the BLE controller had returned them.
+
+Fix: `vTaskDelay(600 ms)` added after `nimble_port_deinit()` in `bt_nimble_deinit()`. Internal DMA free rises from ~3 KB during BLE → ~39 KB after settle — well above the ~17 KB WiFi requires for its RX buffer pool.
+
+### DuckyScript — HOME vs GUI h Correction
+
+`HOME` (HID keycode 0x4A) is the cursor-home key (jump to beginning of line) — not the Android home button. All Android demo scripts updated from `HOME` to `GUI h` (Win+H). Bare `GUI` with no argument is unrecognised by the parser; combo syntax (`GUI h`, `GUI b`, etc.) is required.
+
+---
+
+## Release Notes — v1.6.11
+
+### BlueDuck — Home Button Crash Fix (GAP Callbacks During NimBLE Deinit)
+
+Pressing the device Home button while BlueDuck (or HoneyPair) was advertising caused an immediate crash. Root cause: `radio_reset_to_idle()` called `bt_nimble_deinit()` while BlueDuck's GAP event callbacks were still registered against the NimBLE stack. Tearing down the stack with active callbacks produces a fault.
+
+Fix: `blueduck_stop()` and `honeypair_stop()` are now called before `bt_nimble_deinit()` in `radio_reset_to_idle()`, cleanly deregistering all GAP callbacks before the stack is torn down.
+
+---
+
+## Release Notes — v1.6.10
+
+### BlueDuck — PSRAM Script Cache (SD DMA OOM Fix)
+
+BlueDuck now preloads all `.duck` scripts into PSRAM during the script-scan phase (while WiFi is still active and DMA RAM is available). Previously, scripts were read via `fopen()` at execution time — but after NimBLE initialises, internal DMA-capable RAM drops below 1 KB, causing `sdmmc_read_blocks` to fail with `allocate_dma_buf 0x101` on every attempt. Scripts are now served from PSRAM on every pair event, making payload delivery reliable regardless of BLE/SD memory pressure.
+
+- Startup log confirms: `Cached 'script_name' (NNN B) in PSRAM` for each discovered script
+- Execution log: `Executing script from PSRAM cache: ...` instead of SD read errors
+- Cache is freed and rebuilt whenever the script directory is re-scanned
+- `fopen()` fallback retained for pre-BLE use cases (should never be reached in practice)
+
+### LVGL Icon Library — Hacker / RF / RFID Toolkit
+
+25 new FontAwesome icons added to the `lv_extra_symbols` custom font, all available as `MY_SYMBOL_*` macros in `main.c`:
+
+| Category | Symbols added |
+|----------|---------------|
+| Arrows | `ARROW_DOWN` (↓), `ARROW_UP` (↑) |
+| Access / Auth | `LOCK`, `LOCK_OPEN`, `FINGERPRINT`, `ID_BADGE`, `ID_CARD`, `SIM_CARD` |
+| Hacking | `TERMINAL`, `CODE`, `BUG`, `SKULL`, `GHOST` |
+| RF / RFID | `BIOHAZARD`, `RADIATION`, `ETHERNET`, `RSS`, `CIRCLE_NODES` |
+| Interface | `FILTER`, `CIRCLE_INFO`, `FLAG`, `PLUG`, `TRASH`, `ROTATE` |
+
+GPS "last known fix" indicator now renders the ↓ arrow correctly. NM-RF-HAT popup title now renders the microchip icon (U+F2DB) correctly. Both use mutable `lv_font_t` wrappers (`g_font_icon14`, `g_font_icon16`) that chain `lv_extra_symbols` as a fallback — required because Montserrat fonts live in const flash.
+
+---
+
+## Release Notes — v1.6.8
+
+### WiFi First-Connect Dropout Fix
+
+ESP32-C5 devices were disconnecting with error `0x2c0` (or `ASSOC_EXPIRE`) on the first association attempt after boot or mode switch. Root cause: `esp_wifi_set_country()` triggered an IEEE 802.11d regulatory domain update mid-association, causing the AP to deauthenticate the client.
+
+Fix: `esp_wifi_set_country_code("01", false)` called after `esp_wifi_start()` (not before), combined with `ieee80211d_enabled: false` in the WiFi config. Region `"01"` is the international fallback that all APs accept without a country-specific domain update.
+
+- Eliminates the first-connection dropout seen on all networks since v1.5.x
+- WiFi reconnects reliably without requiring a second tap or a device reset
+
+---
+
+## Release Notes — v1.6.4
+
+### AP File Server — Full File Manager
+
+The AP file server (`TheLab` network, `http://192.168.4.1`) now supports a complete SD card file management workflow from the browser:
+
+| Operation | How |
+|-----------|-----|
+| Browse | Click directories to navigate; path shown in header |
+| Download | Click any file |
+| Upload | Drag-and-drop or file picker on any directory page |
+| Create folder | `[+ New Folder]` button on any directory page |
+| Delete file | `[✕]` button per file with single confirm |
+| Delete directory | `[✕]` on a directory — double confirm, recursive |
+
+URL-encoded paths (spaces, special characters) are now decoded correctly throughout. Client IP address logged to serial on every HTTP request. All paths handle trailing slashes consistently.
+
+---
+
+## Release Notes — v1.5.52
+
+### AP File Server — Working (DRAM / PSRAM Tuning)
+
+The AP file server (`Settings → Data Transfer → AP File Server`) is now fully functional. Previous versions failed at `httpd_start()` with error `0xb008` due to DRAM exhaustion from WiFi static TX buffers.
+
+Fix: `CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM` reduced from 16 → 4, recovering ~19 KB of DRAM for LVGL draw buffers and the HTTP server. `SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y` retained so lwIP pbufs continue to use PSRAM. HTTP GET handler stack raised from 4096 → 8192 bytes.
+
+---
+
+## Release Notes — v1.5.43
+
+### BlueDuck — BLE HID Keyboard Injector
+
+BlueDuck is a BLE HID keyboard device that pairs with nearby phones and tablets and automatically executes a DuckyScript payload on connection. Designed for authorized security testing and device compliance verification.
+
+**Workflow:**
+1. Place `.duck` script files in `/sdcard/lab/ble/blueduck/scripts/`
+2. Open **Bluetooth → BlueDuck**, select a script, select a persona, and press **Start**
+3. The device advertises as the chosen persona and waits for a target to pair
+4. On successful pairing (3 s gate), the selected DuckyScript executes as keystrokes
+5. Session events are logged to `/sdcard/lab/ble/blueduck/sessions/YYYYMMDD_HHMMSS.jsonl`
+
+**9 device personas with MAC randomization:**
+
+| Persona | Advertises as |
+|---------|--------------|
+| Wireless Keyboard | Generic HID keyboard |
+| AirPods Pro | Apple audio accessory |
+| Fitbit Sense | Fitbit wearable |
+| Galaxy Buds Pro | Samsung audio |
+| Garmin Fenix 7 | Garmin GPS watch |
+| Apple Watch Series 8 | Apple wearable |
+| JBL Flip 6 | JBL speaker |
+| Logitech MX Keys | Logitech keyboard |
+| Samsung Smart TV | Samsung display |
+
+**DuckyScript commands supported:** `REM`, `DELAY`, `DEFAULT_DELAY`, `REPEAT`, `STRING`, `STRINGLN`, `HUMAN_MODE`, `HUMAN_SPEED`, `ENTER`, `TAB`, `SPACE`, `BACKSPACE`, `DELETE`, `ESCAPE`, `HOME`, `END`, `INSERT`, `PAGEUP`, `PAGEDOWN`, `UP`, `DOWN`, `LEFT`, `RIGHT`, `CAPS_LOCK`, `NUM_LOCK`, `PRINT_SCREEN`, `SCROLL_LOCK`, `PAUSE`, `F1`–`F12`
+
+**Modifier combos** (syntax: `MODIFIER key` space-separated, chain multiple modifiers with dashes):
+`GUI h` (Android home / Win voice typing), `GUI b` (browser), `GUI n` (notifications), `GUI r` (Windows Run), `GUI l` (lock), `GUI-SHIFT s` (Windows screenshot), `CTRL l` (address bar), `CTRL-SHIFT ESC` (Task Manager), `ALT TAB` (app switch), `ALT F4` (close), and all other modifier+key combinations
+
+Scripts placed in the scripts directory are automatically discovered and listed on the script selector screen.
+
+### HoneyPair — BLE Persona Honeypot
+
+HoneyPair runs a continuous BLE persona cycle, advertising as popular consumer devices (AirPods, Galaxy Buds, etc.) to detect and log devices that initiate pairing requests. Useful for mapping Bluetooth activity and identifying devices that auto-connect to known peripherals.
+
+- Up to 9 personas cycle automatically every 5 minutes
+- Per-session JSONL logs saved to `/sdcard/lab/ble/honeypair/`
+- Persona MACs are randomised and deduplicated across sessions
+- GATT / HID service enumeration on any device that completes pairing
+- Auto-rotate prevents stale scan-response caching on nearby phones
+- Pair-gate timing tuned to avoid iOS popup dismissal race
+
+**Navigation:** Bluetooth → HoneyPair
 
 ---
 
