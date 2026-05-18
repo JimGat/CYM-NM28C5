@@ -12199,6 +12199,15 @@ static void radio_reset_to_idle(void)
 
     // ---- 3. BLE cleanup ----
     if (current_radio_mode == RADIO_MODE_BLE) {
+        /* Stop any BLE feature before tearing down NimBLE — calling bt_nimble_deinit()
+         * while GAP callbacks are still registered crashes the stack. */
+        if (blueduck_is_active()) {
+            blueduck_stop();
+            s_ble_for_blueduck = false;
+        }
+        if (honeypair_is_active()) {
+            honeypair_stop();
+        }
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
     }
