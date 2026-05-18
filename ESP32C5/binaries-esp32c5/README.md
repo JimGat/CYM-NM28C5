@@ -1,6 +1,76 @@
 # CYM-NM28C5 Pre-built Firmware Binaries
 
-**Firmware version: v1.6.10**
+**Firmware version: v1.6.14**
+
+---
+
+## Release Notes — v1.6.14
+
+### BlueDuck — HID Key Timing & New Keys
+
+`bd_key_tap()` post-keyup settle raised from 5 ms → 20 ms (matching the key-hold interval). The previous 5 ms was shorter than the BLE minimum connection interval of 7.5 ms, meaning the key-up HID report could be queued before the key-down had finished transmitting to the host. The longer settle gives the host a full connection interval to process each report before the next one is queued.
+
+New named keys added to the DuckyScript parser: `PAUSE` / `BREAK` (HID 0x48), `PRINT_SCREEN` / `PRTSC` (HID 0x46), `SCROLL_LOCK` (HID 0x47). These enable `windows_sysinfo.duck` (`GUI PAUSE` → System Information) and snipping tool scripts.
+
+Rick roll scripts updated with `&autoplay=1`. On Android, Chrome hands the URL directly to the YouTube app which autoplays fullscreen. On Windows the video autoplays in the default browser.
+
+---
+
+## Release Notes — v1.6.13
+
+### BlueDuck — HID Modifier Key Fix + Working Android Shortcuts
+
+**Root cause fixed:** Modifier keycodes (GUI, CTRL, ALT, SHIFT) in the range HID 0xE0–0xE7 were being placed in the key-array field of the HID report. The descriptor declares a Usage Maximum of 0x65 (101) for the key array — keycodes above this are silently dropped by Android. Only the modifier byte was going through, which alone has no effect. This is why `GUI` (alone) appeared to do nothing.
+
+**Fix:** `bd_key_tap()` now zeroes the keycode when it is ≥ 0xE0, so modifier bits go only in the modifier byte. Combo keys such as `GUI h` (modifier=0x08, keycode=0x0B) are unaffected — their keycodes are well within range.
+
+**Parser fix:** Bare `GUI` with no argument was unrecognised by the DuckyScript parser (falls through to "Unrecognised line"). Correct syntax is `GUI h`, `GUI b`, etc. — the modifier is always followed by a key.
+
+**Confirmed Android keyboard shortcuts (Samsung One UI):**
+
+| Script command | Shortcut | Effect |
+|---------------|----------|--------|
+| `GUI h` | Win+H | Home screen |
+| `GUI b` | Win+B | Default browser |
+| `GUI n` | Win+N | Notification shade |
+| `GUI s` | Win+S | Messages |
+| `GUI c` | Win+C | Contacts |
+
+### BlueDuck — Android, Windows & iOS Script Library
+
+Script library expanded with platform-specific payloads and a comprehensive keyboard shortcut reference:
+
+**Android scripts:** `android_search`, `android_chrome_search`, `android_settings_search`, `android_browser_url`, `android_notifications`, `android_rickroll`
+
+**Windows scripts:** `windows_rickroll` (Win+R→URL), `windows_lock` (Win+L), `windows_notepad_msg`, `windows_screenshot` (Win+Shift+S), `windows_sysinfo` (Win+Pause), `windows_task_manager` (Ctrl+Shift+Esc), `windows_open_browser`
+
+Full shortcut reference for Android (Win/Ctrl/Alt keys, Samsung One UI confirmed), Windows 10/11 (Win/Ctrl/Alt/Fn keys, Run dialog command list), and iOS external keyboard in `resources/blueduck_scripts/README.md`.
+
+> **Samsung note:** Win+Y opens Smart View (screen mirroring) on Samsung One UI — not YouTube. Use `GUI b` + `CTRL l` + `youtube.com` for YouTube.
+
+---
+
+## Release Notes — v1.6.12
+
+### BlueDuck — BLE→WiFi Radio Switch Crash Fix
+
+After a BlueDuck session ends (user presses Home or the connection drops and BLE is stopped), returning to WiFi mode was failing with `esp_wifi_init failed (0x101)` — no memory. Root cause: `nimble_port_deinit()` releases ~30 KB of DMA-capable internal RAM but does so asynchronously. Without a settle delay, `esp_wifi_init()` would race to claim DMA buffers before the BLE controller had returned them.
+
+Fix: `vTaskDelay(600 ms)` added after `nimble_port_deinit()` in `bt_nimble_deinit()`. Internal DMA free rises from ~3 KB during BLE → ~39 KB after settle — well above the ~17 KB WiFi requires for its RX buffer pool.
+
+### DuckyScript — HOME vs GUI h Correction
+
+`HOME` (HID keycode 0x4A) is the cursor-home key (jump to beginning of line) — not the Android home button. All Android demo scripts updated from `HOME` to `GUI h` (Win+H). Bare `GUI` with no argument is unrecognised by the parser; combo syntax (`GUI h`, `GUI b`, etc.) is required.
+
+---
+
+## Release Notes — v1.6.11
+
+### BlueDuck — Home Button Crash Fix (GAP Callbacks During NimBLE Deinit)
+
+Pressing the device Home button while BlueDuck (or HoneyPair) was advertising caused an immediate crash. Root cause: `radio_reset_to_idle()` called `bt_nimble_deinit()` while BlueDuck's GAP event callbacks were still registered against the NimBLE stack. Tearing down the stack with active callbacks produces a fault.
+
+Fix: `blueduck_stop()` and `honeypair_stop()` are now called before `bt_nimble_deinit()` in `radio_reset_to_idle()`, cleanly deregistering all GAP callbacks before the stack is torn down.
 
 ---
 
@@ -100,7 +170,10 @@ BlueDuck is a BLE HID keyboard device that pairs with nearby phones and tablets 
 | Logitech MX Keys | Logitech keyboard |
 | Samsung Smart TV | Samsung display |
 
-**DuckyScript commands supported:** `REM`, `DELAY`, `DEFAULT_DELAY`, `STRING`, `STRINGLN`, `ENTER`, `TAB`, `SPACE`, `BACKSPACE`, `DELETE`, `ESCAPE`, `HOME`, `END`, `INSERT`, `PAGEUP`, `PAGEDOWN`, `UP`, `DOWN`, `LEFT`, `RIGHT`, `F1`–`F12`, `GUI`, `CTRL`, `ALT`, `SHIFT`, `CTRL-ALT-DEL`, `GUI-L`, `GUI-R`, `CTRL-C`, `CTRL-V`, `CTRL-Z`, `ALT-F4`, `CTRL-ALT-T`
+**DuckyScript commands supported:** `REM`, `DELAY`, `DEFAULT_DELAY`, `REPEAT`, `STRING`, `STRINGLN`, `HUMAN_MODE`, `HUMAN_SPEED`, `ENTER`, `TAB`, `SPACE`, `BACKSPACE`, `DELETE`, `ESCAPE`, `HOME`, `END`, `INSERT`, `PAGEUP`, `PAGEDOWN`, `UP`, `DOWN`, `LEFT`, `RIGHT`, `CAPS_LOCK`, `NUM_LOCK`, `PRINT_SCREEN`, `SCROLL_LOCK`, `PAUSE`, `F1`–`F12`
+
+**Modifier combos** (syntax: `MODIFIER key` space-separated, chain multiple modifiers with dashes):
+`GUI h` (Android home / Win voice typing), `GUI b` (browser), `GUI n` (notifications), `GUI r` (Windows Run), `GUI l` (lock), `GUI-SHIFT s` (Windows screenshot), `CTRL l` (address bar), `CTRL-SHIFT ESC` (Task Manager), `ALT TAB` (app switch), `ALT F4` (close), and all other modifier+key combinations
 
 Scripts placed in the scripts directory are automatically discovered and listed on the script selector screen.
 

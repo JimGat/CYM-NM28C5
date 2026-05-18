@@ -5,7 +5,7 @@
 <h1 align="center">Cheap Yellow Monster</h1>
 
 <p align="center">
-  <b>v1.6.10</b>
+  <b>v1.6.14</b>
 </p>
 
 <p align="center">
@@ -94,8 +94,9 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **Drone Detector** | Passive BLE scan for DJI/Remote ID drone advertisements |
 | **Wardriving** | GPS + WiFi logging, dual-band filter (2.4 GHz / 5 GHz / Both), optional BLE time-sliced scanning, WiGLE CSV 1.6, upload log tracking, raw PCAP toggle, GPS mark waypoints (GPX output), WiGLE and WDG Wars upload; GPS last-known position hold with 150 m stale accuracy when signal is lost |
 | **GPS** | NMEA RMC auto-syncs system clock (FAT timestamps); last-known position persisted to NVS (5-minute throttle); manual fallback editor in Settings → GPS Info; all data-collection features (wardrive, GATT Walker, marks) use best available GPS transparently |
-| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk, Bluetooth Lookout, BLE Spam (8 modes incl. Sour Apple), Device Spoof (general + directed), BLE Disconnect (directed), BLE PCAP (Kismet PCAPNG raw capture), **BlueDuck** (BLE HID DuckyScript keyboard injector) |
-| **BlueDuck** | Pairs as a Bluetooth HID keyboard to any target; executes DuckyScript payloads from SD card; 9 device personas (keyboard, earbuds, watch, TV, fitness tracker); auto-rotates persona every 5 min; session JSONL log to SD card |
+| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk, Bluetooth Lookout, BLE Spam (8 modes incl. Sour Apple), Device Spoof (general + directed), BLE Disconnect (directed), BLE PCAP (Kismet PCAPNG raw capture), **BlueDuck** (BLE HID DuckyScript keyboard injector), **HoneyPair** (BLE persona honeypot) |
+| **BlueDuck** | BLE HID keyboard injector — pairs as any of 9 device personas; executes DuckyScript payloads from SD card (preloaded into PSRAM at boot, immune to SD DMA OOM during BLE); HUMAN_MODE variable-speed typing; Android (Win+H/B/N), Windows (Win+R/L, Ctrl+Shift+Esc), and iOS (Cmd+H/Space) keyboard shortcut support; session JSONL log to SD card; 13-script library included |
+| **HoneyPair** | Continuous BLE persona honeypot — cycles 9 consumer device personas every 5 min, logs all pairing attempts to JSONL; GATT/HID enumeration on any pairing device; persona MACs randomised and deduplicated |
 | **Deauth Monitor** | Passive detection of nearby deauth attacks |
 | **Credentials** | Captive portal credential capture, WPA-SEC upload |
 | **TX Power Mode** | Selectable Normal / Max Power for WiFi and BLE — persisted across reboots |
@@ -478,7 +479,8 @@ Bluetooth
 | **Device Spoof (general)** | Loads `/sdcard/lab/bluetooth/spooflist.csv`; select an entry or add new devices via on-screen keyboard, then START to begin spoofing |
 | **BLE Disconnect (directed)** | Floods a BT Scan & Select pre-selected target with BLE TERMINATE_IND frames to force disconnection |
 | **BLE PCAP** | Captures raw BLE advertising packets to SD card in Kismet PCAPNG format (link type 256 — `LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR`). Includes a 10-byte pseudo-header per packet: RF channel 37, RSSI, noise floor, and BLE access address. Queue-based write path keeps the SD bus free for the UI. Live packet count shown on screen. |
-| **BlueDuck** | BLE HID keyboard injector. Pairs with any nearby BLE-capable device, then executes DuckyScript payloads — sending keystrokes as if from a Bluetooth keyboard. Nine built-in device personas (Wireless Keyboard, AirPods Pro, Fitbit, Galaxy Buds, Garmin Fenix, Apple Watch, JBL speaker, Logitech MX Keys, Samsung TV). Auto-rotate mode cycles personas every 5 minutes. Session stats (connects / payloads / disconnects) shown live. All events logged to `/sdcard/lab/ble/blueduck/blueduck_<timestamp>.jsonl`. |
+| **BlueDuck** | BLE HID keyboard injector. Pairs with any nearby BLE-capable device, then executes DuckyScript payloads — sending keystrokes as if from a Bluetooth keyboard. Nine built-in device personas (Wireless Keyboard, AirPods Pro, Fitbit, Galaxy Buds, Garmin Fenix, Apple Watch, JBL speaker, Logitech MX Keys, Samsung TV). Auto-rotate mode cycles personas every 5 minutes. Scripts are preloaded into PSRAM at scan time (immune to SD DMA OOM during BLE). HUMAN_MODE with SLOW/NORMAL/FAST variable-speed typing. Full Android (Win+H/B/N), Windows (Win+R/L, Ctrl+Shift+Esc, Win+Shift+S), and iOS (Cmd+H/Space) keyboard shortcut support — 13-script library in `resources/blueduck_scripts/`. Session stats shown live; all events logged to `/sdcard/lab/ble/blueduck/`. |
+| **HoneyPair** | BLE persona honeypot. Continuously cycles through 9 consumer device personas (AirPods, Galaxy Buds, Garmin watch, etc.), logging every device that initiates a pairing request. Persona MACs are randomised and deduplicated across sessions; auto-rotate every 5 minutes prevents stale scan-response caching. GATT/HID enumeration runs on any device that completes pairing. All events logged to `/sdcard/lab/ble/honeypair/`. |
 
 > **Note:** WiFi and BLE share the same radio. The firmware automatically switches between `RADIO_MODE_WIFI` and `RADIO_MODE_BLE` as needed.
 
