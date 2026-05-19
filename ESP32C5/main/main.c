@@ -33084,7 +33084,6 @@ static void rf433_jam_toggle_cb(lv_event_t *e)
             if (lbl) lv_label_set_text(lbl, LV_SYMBOL_WARNING "  START JAM");
         }
     } else {
-        if (!rf433_hat_is_init()) rf433_hat_init();
         rf433_hat_jam_start();
         if (s_rf433_jam_status) lv_label_set_text(s_rf433_jam_status, "JAMMING — 433MHz active");
         if (s_rf433_jam_status) lv_obj_set_style_text_color(s_rf433_jam_status, lv_color_hex(0xFF5722), 0);
@@ -33146,7 +33145,7 @@ static void show_rf433_jammer_screen(void)
 
 // ── RF433 Capture ─────────────────────────────────────────────────────────────
 
-static rf433_signal_t               s_last_rf433_signal;
+static rf433_signal_t              *s_last_rf433_signal = NULL;
 static lv_obj_t                    *s_rf433_cap_status = NULL;
 static lv_obj_t                    *s_rf433_cap_save   = NULL;
 static volatile rf433_hat_err_t     s_rf433_cap_result = RF433_HAT_ERR_TIMEOUT;
@@ -33157,7 +33156,8 @@ static void s_rf433_ui_update(void *arg)
     if (!s_rf433_cap_status) return;
     if (s_rf433_cap_result == RF433_HAT_OK) {
         char buf[64];
-        snprintf(buf, sizeof(buf), "Captured! %lu pulses", (unsigned long)s_last_rf433_signal.count);
+        snprintf(buf, sizeof(buf), "Captured! %lu pulses",
+                 (unsigned long)(s_last_rf433_signal ? s_last_rf433_signal->count : 0));
         lv_label_set_text(s_rf433_cap_status, buf);
         lv_obj_set_style_text_color(s_rf433_cap_status, COLOR_MATERIAL_GREEN, 0);
         if (s_rf433_cap_save) lv_obj_clear_state(s_rf433_cap_save, LV_STATE_DISABLED);
@@ -33171,8 +33171,13 @@ static void s_rf433_done(rf433_hat_err_t result, const rf433_signal_t *sig, void
 {
     (void)ctx;
     s_rf433_cap_result = result;
-    if (result == RF433_HAT_OK && sig)
-        memcpy(&s_last_rf433_signal, sig, sizeof(s_last_rf433_signal));
+    if (result == RF433_HAT_OK && sig) {
+        if (!s_last_rf433_signal)
+            s_last_rf433_signal = heap_caps_malloc(sizeof(rf433_signal_t),
+                                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_last_rf433_signal)
+            memcpy(s_last_rf433_signal, sig, sizeof(*s_last_rf433_signal));
+    }
     lv_async_call(s_rf433_ui_update, NULL);
 }
 
@@ -33192,8 +33197,9 @@ static void rf433_cap_save_cb(lv_event_t *e) {
     static uint32_t idx = 0;
     char name[RF433_HAT_NAME_LEN];
     snprintf(name, sizeof(name), "rf_%04lu", (unsigned long)idx++);
-    snprintf(s_last_rf433_signal.name, RF433_HAT_NAME_LEN, "%s", name);
-    rf433_hat_err_t r = rf433_hat_save(&s_last_rf433_signal, name);
+    if (!s_last_rf433_signal) return;
+    snprintf(s_last_rf433_signal->name, RF433_HAT_NAME_LEN, "%s", name);
+    rf433_hat_err_t r = rf433_hat_save(s_last_rf433_signal, name);
     if (s_rf433_cap_status)
         lv_label_set_text(s_rf433_cap_status, r == RF433_HAT_OK ? "Saved (.sub)!" : "Save failed");
 }
