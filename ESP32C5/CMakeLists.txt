@@ -7,7 +7,7 @@ set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-zmuldefs")
 # Update ONLY this line when bumping the version. It is automatically propagated
 # to both the IDF boot log (app_init: App version) and to the FW_VERSION macro
 # used throughout the firmware — no need to edit wifi_common.h separately.
-set(PROJECT_VER "v1.6.26")
+set(PROJECT_VER "v1.6.27")
 
 # Bootstrap ESP-IDF build system
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
