@@ -16540,9 +16540,6 @@ static lv_obj_t        *s_wcs_pass_ta    = NULL;
 static lv_obj_t        *s_wcs_keyboard   = NULL;
 static lv_obj_t        *s_wcs_active_ta  = NULL;
 /* s_wcs_scan_popup and s_wcs_scan_timer declared earlier (before stop callback) */
-static wifi_ap_record_t *s_wcs_ap_buf   = NULL;
-static uint16_t         s_wcs_ap_count  = 0;
-static volatile bool    s_wcs_scan_done = false;
 
 static void s_wcs_scan_close_cb(lv_event_t *e)
 {
@@ -16561,23 +16558,22 @@ static void s_wcs_ap_select_cb(lv_event_t *e)
 
 static void s_wcs_scan_poll_cb(lv_timer_t *t)
 {
-    if (!s_wcs_scan_done) return;
-    s_wcs_scan_done = false;
+    if (wifi_scanner_is_scanning()) return;  // still in progress
     lv_timer_del(t);
     s_wcs_scan_timer = NULL;
 
     log_heap_stats("wcs-scan-poll");
     size_t int_free  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     size_t int_block = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-    if (int_free < 16384 || int_block < 4096) {
-        ESP_LOGW(TAG, "Scan popup skipped: int free=%u block=%u — restart device",
+    if (int_free < 12288 || int_block < 4096) {
+        ESP_LOGW(TAG, "Scan popup skipped: int free=%u block=%u",
                  (unsigned)int_free, (unsigned)int_block);
-        if (s_fileserv_status_lbl)
-            lv_label_set_text(s_fileserv_status_lbl, "Low memory — restart device");
-        return;
+        return;  // heap too fragmented — do NOT call any LVGL functions
     }
-
     if (s_fileserv_status_lbl) lv_label_set_text(s_fileserv_status_lbl, "Not connected");
+
+    uint16_t ap_count = wifi_scanner_get_count();
+    const wifi_ap_record_t *ap_buf = wifi_scanner_get_results_ptr();
 
     if (s_wcs_scan_popup) { lv_obj_del(s_wcs_scan_popup); s_wcs_scan_popup = NULL; }
     s_wcs_scan_popup = lv_obj_create(lv_layer_top());
@@ -16619,56 +16615,41 @@ static void s_wcs_scan_poll_cb(lv_timer_t *t)
     lv_obj_set_style_pad_all(lst, 2, 0);
     lv_obj_set_style_pad_gap(lst, 2, 0);
 
-    if (s_wcs_ap_count == 0) {
+    if (ap_count == 0) {
         lv_obj_t *no = lv_label_create(lst);
         lv_label_set_text(no, "No networks found");
         lv_obj_set_style_text_font(no, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(no, ui_muted_color(), 0);
     } else {
-        for (uint16_t i = 0; i < s_wcs_ap_count; i++) {
+        for (uint16_t i = 0; i < ap_count; i++) {
             char entry[56];
             snprintf(entry, sizeof(entry), LV_SYMBOL_WIFI " %s  %d dBm",
-                     (char *)s_wcs_ap_buf[i].ssid, s_wcs_ap_buf[i].rssi);
+                     (char *)ap_buf[i].ssid, ap_buf[i].rssi);
             lv_obj_t *btn = lv_list_add_btn(lst, NULL, entry);
             lv_obj_set_style_text_font(btn, &lv_font_montserrat_12, 0);
             lv_obj_set_style_bg_color(btn, ui_bg_color(), 0);
             lv_obj_set_style_bg_color(btn, ui_accent_color(), LV_STATE_PRESSED);
             lv_obj_set_style_text_color(btn, ui_text_color(), 0);
-            lv_obj_set_user_data(btn, (void *)&s_wcs_ap_buf[i]);
+            lv_obj_set_user_data(btn, (void *)&ap_buf[i]);
             lv_obj_add_event_cb(btn, s_wcs_ap_select_cb, LV_EVENT_CLICKED, NULL);
         }
     }
-}
-
-static void s_wcs_do_scan_task(void *arg)
-{
-    (void)arg;
-    wifi_scan_config_t cfg = { .show_hidden = false };
-    esp_wifi_scan_start(&cfg, true);
-    uint16_t n = 20;
-    if (!s_wcs_ap_buf)
-        s_wcs_ap_buf = (wifi_ap_record_t *)heap_caps_malloc(
-                            n * sizeof(wifi_ap_record_t), MALLOC_CAP_SPIRAM);
-    if (s_wcs_ap_buf) {
-        esp_wifi_scan_get_ap_records(&n, s_wcs_ap_buf);
-        s_wcs_ap_count = n;
-    } else {
-        s_wcs_ap_count = 0;
-    }
-    s_wcs_scan_done = true;
-    vTaskDelete(NULL);
 }
 
 static void s_wcs_scan_btn_cb(lv_event_t *e)
 {
     (void)e;
     if (s_wcs_scan_timer) return;  // scan already running
+    if (wifi_scanner_is_scanning()) return;
     log_heap_stats("wcs-scan-btn");
     if (s_wcs_scan_popup) { lv_obj_del(s_wcs_scan_popup); s_wcs_scan_popup = NULL; }
+    esp_err_t err = wifi_scanner_start_scan();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "wcs scan start: %s", esp_err_to_name(err));
+        return;
+    }
     if (s_fileserv_status_lbl)
         lv_label_set_text(s_fileserv_status_lbl, LV_SYMBOL_REFRESH " Scanning networks...");
-    s_wcs_scan_done = false;
-    xTaskCreate(s_wcs_do_scan_task, "wcs_scan", 3072, NULL, 5, NULL);
     s_wcs_scan_timer = lv_timer_create(s_wcs_scan_poll_cb, 250, NULL);
 }
 
