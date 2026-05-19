@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "esp_heap_caps.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,9 +15,7 @@
 
 static const char *TAG = "rf433_hat";
 
-// Gap longer than this ends the frame (30 ms)
 #define RF433_FRAME_GAP_US   30000
-// Minimum pulse width to record (filter noise < 100 µs)
 #define RF433_MIN_PULSE_US   100
 
 // ── ISR state (IRAM) ─────────────────────────────────────────────────────────
@@ -25,17 +24,40 @@ static volatile uint32_t s_pulse_count  = 0;
 static volatile int64_t  s_last_edge_us = 0;
 static bool              s_jamming      = false;
 
-// Double-buffer: ISR fills s_isr_buf; task copies to s_cap_signal when frame ends
-static uint32_t s_isr_buf[RF433_HAT_MAX_PULSES];
+// ISR double-buffer in DRAM (ISR writes here; capped at 256 — enough for all
+// standard OOK frames like garage/car-key/weather-station codes).
+#define RF433_ISR_BUF_MAX 256
+static uint32_t s_isr_buf[RF433_ISR_BUF_MAX];
 static volatile bool s_frame_ready = false;
 
-static TaskHandle_t      s_cap_task    = NULL;
-static rf433_hat_cb_t    s_cap_cb      = NULL;
-static void             *s_cap_ctx     = NULL;
-static uint32_t          s_cap_tmo_ms  = 5000;
-static SemaphoreHandle_t s_frame_sem   = NULL;
-static rf433_signal_t    s_cap_signal;
-static bool              s_init        = false;
+static TaskHandle_t      s_cap_task   = NULL;
+static rf433_hat_cb_t    s_cap_cb     = NULL;
+static void             *s_cap_ctx    = NULL;
+static uint32_t          s_cap_tmo_ms = 5000;
+static SemaphoreHandle_t s_frame_sem  = NULL;
+
+// Signal buffer allocated from PSRAM at full init time (not DRAM static).
+static rf433_signal_t   *s_cap_buf   = NULL;
+
+static bool s_init    = false;  // full init (RX ISR + TX)
+static bool s_tx_init = false;  // TX-only init (for jammer without full init)
+
+// ── TX-only GPIO setup (called by both full init and jammer) ─────────────────
+
+static void s_setup_tx(void)
+{
+    if (s_tx_init) return;
+    gpio_config_t tx_cfg = {
+        .pin_bit_mask = (1ULL << RF_HAT_RF433_TX_GPIO),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&tx_cfg);
+    gpio_set_level(RF_HAT_RF433_TX_GPIO, 0);
+    s_tx_init = true;
+}
 
 // ── GPIO ISR handler (IRAM) ───────────────────────────────────────────────────
 
@@ -47,10 +69,9 @@ static void IRAM_ATTR s_gpio_isr(void *arg)
     int64_t gap_us = now - s_last_edge_us;
     s_last_edge_us = now;
 
-    if (gap_us < RF433_MIN_PULSE_US) return;  // too short — noise
+    if (gap_us < RF433_MIN_PULSE_US) return;
 
     if (gap_us > RF433_FRAME_GAP_US) {
-        // Long gap = end of frame; signal the capture task
         if (s_pulse_count > 4 && !s_frame_ready) {
             s_frame_ready = true;
             BaseType_t woken = pdFALSE;
@@ -61,7 +82,7 @@ static void IRAM_ATTR s_gpio_isr(void *arg)
         return;
     }
 
-    if (s_pulse_count < RF433_HAT_MAX_PULSES) {
+    if (s_pulse_count < RF433_ISR_BUF_MAX) {
         s_isr_buf[s_pulse_count++] = (uint32_t)gap_us;
     }
 }
@@ -78,18 +99,19 @@ static void s_capture_task(void *arg)
     rf433_hat_err_t result = RF433_HAT_ERR_TIMEOUT;
 
     if (xSemaphoreTake(s_frame_sem, pdMS_TO_TICKS(s_cap_tmo_ms)) == pdTRUE && s_frame_ready) {
-        // Copy ISR buffer to signal struct
         uint32_t n = s_pulse_count;
         if (n > RF433_HAT_MAX_PULSES) n = RF433_HAT_MAX_PULSES;
-        memcpy(s_cap_signal.pulses_us, s_isr_buf, n * sizeof(uint32_t));
-        s_cap_signal.count   = n;
-        s_cap_signal.freq_hz = RF433_HAT_DEFAULT_FREQ_HZ;
-        snprintf(s_cap_signal.name, RF433_HAT_NAME_LEN, "signal");
-        result = (n > 4) ? RF433_HAT_OK : RF433_HAT_ERR_TIMEOUT;
+        if (s_cap_buf) {
+            memcpy(s_cap_buf->pulses_us, s_isr_buf, n * sizeof(uint32_t));
+            s_cap_buf->count   = n;
+            s_cap_buf->freq_hz = RF433_HAT_DEFAULT_FREQ_HZ;
+            snprintf(s_cap_buf->name, RF433_HAT_NAME_LEN, "signal");
+        }
+        result = (n > 4 && s_cap_buf) ? RF433_HAT_OK : RF433_HAT_ERR_TIMEOUT;
     }
 
     s_capturing = false;
-    if (s_cap_cb) s_cap_cb(result, result == RF433_HAT_OK ? &s_cap_signal : NULL, s_cap_ctx);
+    if (s_cap_cb) s_cap_cb(result, result == RF433_HAT_OK ? s_cap_buf : NULL, s_cap_ctx);
     s_cap_task = NULL;
     vTaskDelete(NULL);
 }
@@ -100,10 +122,16 @@ rf433_hat_err_t rf433_hat_init(void)
 {
     if (s_init) return RF433_HAT_OK;
 
-    s_frame_sem = xSemaphoreCreateBinary();
-    if (!s_frame_sem) return RF433_HAT_ERR_HW;
+    // Signal buffer from PSRAM — keeps ~2 KB out of internal DRAM.
+    if (!s_cap_buf) {
+        s_cap_buf = heap_caps_malloc(sizeof(rf433_signal_t),
+                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_cap_buf) return RF433_HAT_ERR_HW;
+    }
 
-    // Configure RX GPIO as input with interrupt on both edges
+    s_frame_sem = xSemaphoreCreateBinary();
+    if (!s_frame_sem) goto fail;
+
     gpio_config_t rx_cfg = {
         .pin_bit_mask = (1ULL << RF_HAT_RF433_RX_GPIO),
         .mode         = GPIO_MODE_INPUT,
@@ -115,16 +143,7 @@ rf433_hat_err_t rf433_hat_init(void)
     gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
     gpio_isr_handler_add(RF_HAT_RF433_RX_GPIO, s_gpio_isr, NULL);
 
-    // Configure TX GPIO as output, idle LOW
-    gpio_config_t tx_cfg = {
-        .pin_bit_mask = (1ULL << RF_HAT_RF433_TX_GPIO),
-        .mode         = GPIO_MODE_OUTPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    if (gpio_config(&tx_cfg) != ESP_OK) goto fail;
-    gpio_set_level(RF_HAT_RF433_TX_GPIO, 0);
+    s_setup_tx();
 
     s_init = true;
     ESP_LOGI(TAG, "RF433 init OK (TX=GPIO%d, RX=GPIO%d)",
@@ -143,7 +162,9 @@ void rf433_hat_deinit(void)
     s_capturing = false;
     if (RF_HAT_RF433_RX_GPIO >= 0) gpio_isr_handler_remove(RF_HAT_RF433_RX_GPIO);
     if (s_frame_sem) { vSemaphoreDelete(s_frame_sem); s_frame_sem = NULL; }
-    s_init = false;
+    if (s_cap_buf)   { free(s_cap_buf); s_cap_buf = NULL; }
+    s_init    = false;
+    s_tx_init = false;
 }
 
 bool rf433_hat_is_init(void) { return s_init; }
@@ -156,7 +177,7 @@ rf433_hat_err_t rf433_hat_capture_start(rf433_hat_cb_t cb, void *ctx, uint32_t t
     s_cap_cb     = cb;
     s_cap_ctx    = ctx;
     s_cap_tmo_ms = timeout_ms ? timeout_ms : 5000;
-    xSemaphoreTake(s_frame_sem, 0);  // drain any stale signal
+    xSemaphoreTake(s_frame_sem, 0);
 
     BaseType_t ok = xTaskCreate(s_capture_task, "rf433_cap", 4096, NULL,
                                  tskIDLE_PRIORITY + 2, &s_cap_task);
@@ -177,10 +198,8 @@ rf433_hat_err_t rf433_hat_replay(const rf433_signal_t *sig, uint8_t repeat)
 
     for (uint8_t r = 0; r < repeat; r++) {
         for (uint32_t i = 0; i < sig->count; i++) {
-            // Even index = HIGH, odd index = LOW
             int level = (i % 2 == 0) ? 1 : 0;
             gpio_set_level(RF_HAT_RF433_TX_GPIO, level);
-            // Busy-wait for precise timing
             int64_t end = esp_timer_get_time() + sig->pulses_us[i];
             while (esp_timer_get_time() < end) {}
         }
@@ -209,7 +228,6 @@ rf433_hat_err_t rf433_hat_save(const rf433_signal_t *sig, const char *filename)
     fprintf(f, "Preset: FuriHalSubGhzPresetOokAsync\n");
     fprintf(f, "Protocol: RAW\nRAW_Data:");
 
-    // Flipper format: positive = HIGH, negative = LOW
     for (uint32_t i = 0; i < sig->count; i++) {
         int sign = (i % 2 == 0) ? 1 : -1;
         fprintf(f, " %d", sign * (int)sig->pulses_us[i]);
@@ -253,11 +271,14 @@ rf433_hat_err_t rf433_hat_load(rf433_signal_t *sig_out, const char *filename)
 }
 
 // ── Jammer ───────────────────────────────────────────────────────────────────
+// Jammer only needs TX GPIO HIGH — no RX ISR, no semaphore, no DRAM pressure.
+// Safe to call without rf433_hat_init() (works without HAT hardware too).
 
 void rf433_hat_jam_start(void)
 {
     if (s_jamming) return;
-    rf433_hat_capture_cancel();
+    s_setup_tx();                              // TX-only GPIO init, no RX ISR
+    rf433_hat_capture_cancel();               // stop any in-progress capture
     gpio_set_level(RF_HAT_RF433_TX_GPIO, 1);  // continuous carrier
     s_jamming = true;
     ESP_LOGI(TAG, "RF433 jam start");
