@@ -12520,7 +12520,7 @@ static void main_tile_event_cb(lv_event_t *e)
         show_go_dark_confirm();
     // NM-RF-HAT tiles
     } else if (strcmp(tile_name, "IR Menu") == 0) {
-        show_ir_menu_screen();
+        show_dip_switch_popup(4, "Infrared (IR)", show_ir_menu_screen);
     } else if (strcmp(tile_name, "Radio Menu") == 0) {
         show_radio_menu_screen();
     } else if (strcmp(tile_name, "RFID Menu") == 0) {
@@ -19972,7 +19972,7 @@ static void show_dip_switch_popup(uint8_t dip_pos, const char *module_name, void
     lv_obj_set_style_border_width(ok_btn, 0, 0);
     lv_obj_set_style_radius(ok_btn, 6, 0);
     lv_obj_t *ok_lbl = lv_label_create(ok_btn);
-    lv_label_set_text(ok_lbl, "DIP Set — Continue");
+    lv_label_set_text(ok_lbl, "DIP Set - Continue");
     lv_obj_set_style_text_font(ok_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(ok_lbl, lv_color_black(), 0);
     lv_obj_center(ok_lbl);
@@ -32459,13 +32459,13 @@ static void ir_menu_tile_cb(lv_event_t *e)
     const char *name = (const char *)lv_event_get_user_data(e);
     if (!name) return;
     if (strcmp(name, "Capture") == 0)
-        show_dip_switch_popup(4, "Infrared", show_ir_capture_screen);
+        show_ir_capture_screen();
     else if (strcmp(name, "Replay") == 0)
-        show_dip_switch_popup(4, "Infrared", show_ir_replay_screen);
+        show_ir_replay_screen();
     else if (strcmp(name, "TV-B-Gone") == 0)
-        show_dip_switch_popup(4, "Infrared", show_ir_tvbgone_screen);
+        show_ir_tvbgone_screen();
     else if (strcmp(name, "Jammer") == 0)
-        show_dip_switch_popup(4, "Infrared", show_ir_jammer_screen);
+        show_ir_jammer_screen();
 }
 
 static void show_ir_menu_screen(void)
@@ -32861,11 +32861,11 @@ static void rf433_menu_tile_cb(lv_event_t *e)
     const char *name = (const char *)lv_event_get_user_data(e);
     if (!name) return;
     if (strcmp(name, "Capture") == 0)
-        show_dip_switch_popup(5, "RF433 OOK", show_rf433_capture_screen);
+        show_rf433_capture_screen();
     else if (strcmp(name, "Replay") == 0)
-        show_dip_switch_popup(5, "RF433 OOK", show_rf433_replay_screen);
+        show_rf433_replay_screen();
     else if (strcmp(name, "Jammer") == 0)
-        show_dip_switch_popup(5, "RF433 OOK", show_rf433_jammer_screen);
+        show_rf433_jammer_screen();
 }
 
 static void show_rf433_menu_screen(void)
@@ -32903,7 +32903,7 @@ static void radio_menu_tile_cb(lv_event_t *e)
     else if (strcmp(name, "nRF24") == 0)
         show_dip_switch_popup(2, "nRF24L01 2.4GHz", show_nrf24_screen);
     else if (strcmp(name, "RF433") == 0)
-        show_rf433_menu_screen();
+        show_dip_switch_popup(5, "RF433 OOK", show_rf433_menu_screen);
 }
 
 static void show_radio_menu_screen(void)
