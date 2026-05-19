@@ -26,17 +26,15 @@ CONFIG_BT_NIMBLE_HCI_EVT_LO_BUF_COUNT=4
 # PSRAM (8 MB SPIRAM on NM-CYD-C5)
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_USE_MALLOC=y
-# DMA reserve pool: 45 KB. WiFi static RX (4×1700=6.8KB) + dynamic TX (per-packet,
-# not DMA pool) + BLE LL controller (~18KB) + SD (~1.3KB) ≈ 26KB used; 45KB gives
-# ~19KB margin. Reducing from 48KB to 45KB frees 3KB more general internal heap
-# for NimBLE host task stack and MSYS/ACL buffers (INTERNAL mode).
-CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=46080
-# WiFi RX: 4 static buffers (minimum for stable operation).
-# WiFi TX: dynamic (per-packet from regular heap, NOT DMA pool) — saves 5.1KB DMA.
+# DMA reserve pool: 48 KB. WiFi static RX (4×1700=6.8KB) + TX (3×~1700=5.1KB)
+# + BLE LL controller (~18KB) + SD (~1.3KB) ≈ 31KB used; 48KB gives ~17KB margin.
+# BLE controller init was confirmed successful with this pool size in v1.6.27.
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=49152
+# WiFi RX: 4 static buffers. TX: 3 static buffers (minimum tested to work).
+# Both BLE LL env and HCI UART transport allocate from the DMA pool regardless
+# of NIMBLE_MEM_ALLOC_MODE. WiFi + BLE together need ~31KB; 48KB pool gives ~17KB margin.
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
-CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER=y
-CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=8
-CONFIG_ESP_WIFI_TX_BUFFER_TYPE=1
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=3
 
 # LVGL fonts used by the UI
 CONFIG_LV_FONT_MONTSERRAT_12=y
