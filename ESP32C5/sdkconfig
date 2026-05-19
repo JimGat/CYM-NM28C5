@@ -4525,10 +4525,8 @@ CONFIG_LV_COLOR_CHROMA_KEY_HEX=0x00FF00
 #
 # Memory settings
 #
-# default:
 CONFIG_LV_MEM_CUSTOM=y
-# default:
-CONFIG_LV_MEM_CUSTOM_INCLUDE="stdlib.h"
+CONFIG_LV_MEM_CUSTOM_INCLUDE="lvgl_memory.h"
 # default:
 CONFIG_LV_MEM_BUF_MAX_NUM=16
 # default:

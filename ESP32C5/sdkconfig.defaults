@@ -73,3 +73,9 @@ CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 # WiGLE and WDGWars, while consuming ~60 % less flash/parse overhead
 # than the full Mozilla bundle.
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
+
+# LVGL custom memory allocator — route all LVGL heap through our PSRAM-preferring
+# wrapper (lvgl_malloc/free/realloc) so LVGL objects land in PSRAM instead of the
+# scarce internal DRAM/RTCRAM, preventing heap corruption under WiFi/BLE pressure.
+CONFIG_LV_MEM_CUSTOM=y
+CONFIG_LV_MEM_CUSTOM_INCLUDE="lvgl_memory.h"

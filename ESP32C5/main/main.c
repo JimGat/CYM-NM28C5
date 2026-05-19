@@ -9164,10 +9164,10 @@ static void wd_mark_open_note_dialog(void)
     lv_obj_set_style_bg_color(wd_mark_note_ta, ui_bg_color(), 0);
     lv_obj_set_style_text_color(wd_mark_note_ta, ui_text_color(), 0);
     lv_obj_set_style_border_color(wd_mark_note_ta, COLOR_MATERIAL_AMBER, 0);
-    lv_obj_set_style_bg_opa(wd_mark_note_ta, LV_OPA_TRANSP, LV_PART_CURSOR);
-    lv_obj_set_style_border_color(wd_mark_note_ta, UI_ACCENT_CYAN, LV_PART_CURSOR);
-    lv_obj_set_style_border_width(wd_mark_note_ta, 2, LV_PART_CURSOR);
-    lv_obj_set_style_border_side(wd_mark_note_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(wd_mark_note_ta, LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(wd_mark_note_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(wd_mark_note_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(wd_mark_note_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_keyboard_set_textarea(kb, wd_mark_note_ta);
 
     // Cancel / Save buttons
@@ -11436,10 +11436,10 @@ static void show_portal_page(void)
     lv_obj_set_style_bg_color(portal_ssid_ta, ui_bg_color(), 0);
     lv_obj_set_style_text_color(portal_ssid_ta, ui_text_color(), 0);
     lv_obj_set_style_border_color(portal_ssid_ta, ui_accent_color(), 0);
-    lv_obj_set_style_bg_opa(portal_ssid_ta, LV_OPA_TRANSP, LV_PART_CURSOR);
-    lv_obj_set_style_border_color(portal_ssid_ta, UI_ACCENT_CYAN, LV_PART_CURSOR);
-    lv_obj_set_style_border_width(portal_ssid_ta, 2, LV_PART_CURSOR);
-    lv_obj_set_style_border_side(portal_ssid_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(portal_ssid_ta, LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(portal_ssid_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(portal_ssid_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(portal_ssid_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR | LV_STATE_FOCUSED);
 
     // Add event to show keyboard when text area is clicked
     lv_obj_add_event_cb(portal_ssid_ta, portal_ssid_ta_event_cb, LV_EVENT_CLICKED, NULL);
@@ -13224,10 +13224,10 @@ static void show_wifi_connect_screen(void)
         lv_obj_set_style_bg_color(wifi_connect_ta, ui_bg_color(), 0);
         lv_obj_set_style_text_color(wifi_connect_ta, ui_text_color(), 0);
         lv_obj_set_style_border_color(wifi_connect_ta, ui_accent_color(), 0);
-        lv_obj_set_style_bg_opa(wifi_connect_ta, LV_OPA_TRANSP, LV_PART_CURSOR);
-        lv_obj_set_style_border_color(wifi_connect_ta, UI_ACCENT_CYAN, LV_PART_CURSOR);
-        lv_obj_set_style_border_width(wifi_connect_ta, 2, LV_PART_CURSOR);
-        lv_obj_set_style_border_side(wifi_connect_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR);
+        lv_obj_set_style_bg_opa(wifi_connect_ta, LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
+        lv_obj_set_style_border_color(wifi_connect_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
+        lv_obj_set_style_border_width(wifi_connect_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
+        lv_obj_set_style_border_side(wifi_connect_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR | LV_STATE_FOCUSED);
         lv_obj_add_event_cb(wifi_connect_ta, wifi_connect_ta_event_cb, LV_EVENT_CLICKED, NULL);
         
         wifi_connect_keyboard = lv_keyboard_create(function_page);
@@ -16570,12 +16570,17 @@ static void s_wcs_scan_poll_cb(lv_timer_t *t)
                  (unsigned)int_free, (unsigned)int_block);
         return;  // heap too fragmented — do NOT call any LVGL functions
     }
+    ESP_LOGI(TAG, "[WCS] A: status_lbl=%p", s_fileserv_status_lbl);
     if (s_fileserv_status_lbl) lv_label_set_text(s_fileserv_status_lbl, "Not connected");
 
+    ESP_LOGI(TAG, "[WCS] B: get_count");
     uint16_t ap_count = wifi_scanner_get_count();
+    ESP_LOGI(TAG, "[WCS] C: get_ptr count=%u", ap_count);
     const wifi_ap_record_t *ap_buf = wifi_scanner_get_results_ptr();
 
+    ESP_LOGI(TAG, "[WCS] D: del old popup");
     if (s_wcs_scan_popup) { lv_obj_del(s_wcs_scan_popup); s_wcs_scan_popup = NULL; }
+    ESP_LOGI(TAG, "[WCS] E: create popup");
     s_wcs_scan_popup = lv_obj_create(lv_layer_top());
     lv_obj_set_size(s_wcs_scan_popup, 222, 268);
     lv_obj_center(s_wcs_scan_popup);
@@ -16746,10 +16751,10 @@ static void show_wifi_client_server_screen(void)
     lv_obj_set_style_text_color(s_wcs_ssid_ta, ui_text_color(), 0);
     lv_obj_set_style_border_color(s_wcs_ssid_ta, UI_ACCENT_CYAN, 0);
     lv_obj_set_style_text_font(s_wcs_ssid_ta, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_bg_opa(s_wcs_ssid_ta, LV_OPA_TRANSP, LV_PART_CURSOR);
-    lv_obj_set_style_border_color(s_wcs_ssid_ta, UI_ACCENT_CYAN, LV_PART_CURSOR);
-    lv_obj_set_style_border_width(s_wcs_ssid_ta, 2, LV_PART_CURSOR);
-    lv_obj_set_style_border_side(s_wcs_ssid_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(s_wcs_ssid_ta, LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(s_wcs_ssid_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(s_wcs_ssid_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(s_wcs_ssid_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_obj_add_event_cb(s_wcs_ssid_ta, s_wcs_ta_focus_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *scan_btn = lv_btn_create(ssid_row);
@@ -16781,10 +16786,10 @@ static void show_wifi_client_server_screen(void)
     lv_obj_set_style_text_color(s_wcs_pass_ta, ui_text_color(), 0);
     lv_obj_set_style_border_color(s_wcs_pass_ta, UI_ACCENT_CYAN, 0);
     lv_obj_set_style_text_font(s_wcs_pass_ta, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_bg_opa(s_wcs_pass_ta, LV_OPA_TRANSP, LV_PART_CURSOR);
-    lv_obj_set_style_border_color(s_wcs_pass_ta, UI_ACCENT_CYAN, LV_PART_CURSOR);
-    lv_obj_set_style_border_width(s_wcs_pass_ta, 2, LV_PART_CURSOR);
-    lv_obj_set_style_border_side(s_wcs_pass_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(s_wcs_pass_ta, LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(s_wcs_pass_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(s_wcs_pass_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(s_wcs_pass_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_textarea_set_password_mode(s_wcs_pass_ta, true);
     lv_obj_add_event_cb(s_wcs_pass_ta, s_wcs_ta_focus_cb, LV_EVENT_CLICKED, NULL);
 
@@ -18165,10 +18170,10 @@ static void show_wardrive_upload_screen(void)
     lv_obj_set_style_bg_color(wdup_wigle_key_ta, ui_bg_color(), 0);
     lv_obj_set_style_text_color(wdup_wigle_key_ta, ui_text_color(), 0);
     lv_obj_set_style_border_color(wdup_wigle_key_ta, lv_color_make(0, 188, 212), 0);
-    lv_obj_set_style_bg_opa(wdup_wigle_key_ta, LV_OPA_TRANSP, LV_PART_CURSOR);
-    lv_obj_set_style_border_color(wdup_wigle_key_ta, UI_ACCENT_CYAN, LV_PART_CURSOR);
-    lv_obj_set_style_border_width(wdup_wigle_key_ta, 2, LV_PART_CURSOR);
-    lv_obj_set_style_border_side(wdup_wigle_key_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(wdup_wigle_key_ta, LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(wdup_wigle_key_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(wdup_wigle_key_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(wdup_wigle_key_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR | LV_STATE_FOCUSED);
 
     // ── WDG Wars key entry ────────────────────────────────────────────────
     lv_obj_t *wdg_lbl = lv_label_create(content);
@@ -18186,10 +18191,10 @@ static void show_wardrive_upload_screen(void)
     lv_obj_set_style_bg_color(wdup_wdg_key_ta, ui_bg_color(), 0);
     lv_obj_set_style_text_color(wdup_wdg_key_ta, ui_text_color(), 0);
     lv_obj_set_style_border_color(wdup_wdg_key_ta, lv_color_make(255, 152, 0), 0);
-    lv_obj_set_style_bg_opa(wdup_wdg_key_ta, LV_OPA_TRANSP, LV_PART_CURSOR);
-    lv_obj_set_style_border_color(wdup_wdg_key_ta, UI_ACCENT_CYAN, LV_PART_CURSOR);
-    lv_obj_set_style_border_width(wdup_wdg_key_ta, 2, LV_PART_CURSOR);
-    lv_obj_set_style_border_side(wdup_wdg_key_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(wdup_wdg_key_ta, LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(wdup_wdg_key_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(wdup_wdg_key_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(wdup_wdg_key_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR | LV_STATE_FOCUSED);
 
     // ── Per-file progress indicators ──────────────────────────────────────
     lv_obj_t *prog_row = lv_obj_create(content);
@@ -18376,10 +18381,10 @@ static void show_new_folder_screen(void)
     lv_obj_set_style_bg_color(nf_ta, ui_bg_color(), 0);
     lv_obj_set_style_text_color(nf_ta, ui_text_color(), 0);
     lv_obj_set_style_border_color(nf_ta, COLOR_MATERIAL_GREEN, 0);
-    lv_obj_set_style_bg_opa(nf_ta, LV_OPA_TRANSP, LV_PART_CURSOR);
-    lv_obj_set_style_border_color(nf_ta, UI_ACCENT_CYAN, LV_PART_CURSOR);
-    lv_obj_set_style_border_width(nf_ta, 2, LV_PART_CURSOR);
-    lv_obj_set_style_border_side(nf_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(nf_ta, LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(nf_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(nf_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(nf_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_keyboard_set_textarea(kb, nf_ta);
 
     nf_result_lbl = lv_label_create(card);
@@ -21404,10 +21409,10 @@ static void gps_show_edit_overlay(lv_event_t *e)
     lv_obj_set_style_bg_color(gps_edit_lat_ta, ui_bg_color(), 0);
     lv_obj_set_style_text_color(gps_edit_lat_ta, ui_text_color(), 0);
     lv_obj_set_style_border_color(gps_edit_lat_ta, COLOR_MATERIAL_AMBER, 0);
-    lv_obj_set_style_bg_opa(gps_edit_lat_ta, LV_OPA_TRANSP, LV_PART_CURSOR);
-    lv_obj_set_style_border_color(gps_edit_lat_ta, UI_ACCENT_CYAN, LV_PART_CURSOR);
-    lv_obj_set_style_border_width(gps_edit_lat_ta, 2, LV_PART_CURSOR);
-    lv_obj_set_style_border_side(gps_edit_lat_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(gps_edit_lat_ta, LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(gps_edit_lat_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(gps_edit_lat_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(gps_edit_lat_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR | LV_STATE_FOCUSED);
 
     // Lon row
     lv_obj_t *lon_lbl = lv_label_create(card);
@@ -21425,10 +21430,10 @@ static void gps_show_edit_overlay(lv_event_t *e)
     lv_obj_set_style_bg_color(gps_edit_lon_ta, ui_bg_color(), 0);
     lv_obj_set_style_text_color(gps_edit_lon_ta, ui_text_color(), 0);
     lv_obj_set_style_border_color(gps_edit_lon_ta, COLOR_MATERIAL_AMBER, 0);
-    lv_obj_set_style_bg_opa(gps_edit_lon_ta, LV_OPA_TRANSP, LV_PART_CURSOR);
-    lv_obj_set_style_border_color(gps_edit_lon_ta, UI_ACCENT_CYAN, LV_PART_CURSOR);
-    lv_obj_set_style_border_width(gps_edit_lon_ta, 2, LV_PART_CURSOR);
-    lv_obj_set_style_border_side(gps_edit_lon_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(gps_edit_lon_ta, LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(gps_edit_lon_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(gps_edit_lon_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(gps_edit_lon_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR | LV_STATE_FOCUSED);
 
     // Alt row
     lv_obj_t *alt_lbl = lv_label_create(card);
@@ -21446,10 +21451,10 @@ static void gps_show_edit_overlay(lv_event_t *e)
     lv_obj_set_style_bg_color(gps_edit_alt_ta, ui_bg_color(), 0);
     lv_obj_set_style_text_color(gps_edit_alt_ta, ui_text_color(), 0);
     lv_obj_set_style_border_color(gps_edit_alt_ta, lv_color_make(80, 80, 80), 0);
-    lv_obj_set_style_bg_opa(gps_edit_alt_ta, LV_OPA_TRANSP, LV_PART_CURSOR);
-    lv_obj_set_style_border_color(gps_edit_alt_ta, UI_ACCENT_CYAN, LV_PART_CURSOR);
-    lv_obj_set_style_border_width(gps_edit_alt_ta, 2, LV_PART_CURSOR);
-    lv_obj_set_style_border_side(gps_edit_alt_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(gps_edit_alt_ta, LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(gps_edit_alt_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(gps_edit_alt_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(gps_edit_alt_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR | LV_STATE_FOCUSED);
 
     // ── Button row inside card (keyboard is a sibling of card on overlay,
     //    so it always renders on top regardless of button creation order) ──
@@ -22378,10 +22383,10 @@ static void show_add_oui_entry_screen(void)
     lv_textarea_set_max_length(add_oui_ta, 8);   /* "AA:BB:CC" */
     lv_textarea_set_placeholder_text(add_oui_ta, "AA:BB:CC");
     lv_obj_set_style_text_font(add_oui_ta, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_bg_opa(add_oui_ta, LV_OPA_TRANSP, LV_PART_CURSOR);
-    lv_obj_set_style_border_color(add_oui_ta, UI_ACCENT_CYAN, LV_PART_CURSOR);
-    lv_obj_set_style_border_width(add_oui_ta, 2, LV_PART_CURSOR);
-    lv_obj_set_style_border_side(add_oui_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(add_oui_ta, LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(add_oui_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(add_oui_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(add_oui_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_obj_add_event_cb(add_oui_ta, add_oui_ta_focus_cb, LV_EVENT_CLICKED, NULL);
 
     /* Label / name text area */
@@ -22392,10 +22397,10 @@ static void show_add_oui_entry_screen(void)
     lv_textarea_set_max_length(add_oui_name_ta, 31);
     lv_textarea_set_placeholder_text(add_oui_name_ta, "Label (optional)");
     lv_obj_set_style_text_font(add_oui_name_ta, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_bg_opa(add_oui_name_ta, LV_OPA_TRANSP, LV_PART_CURSOR);
-    lv_obj_set_style_border_color(add_oui_name_ta, UI_ACCENT_CYAN, LV_PART_CURSOR);
-    lv_obj_set_style_border_width(add_oui_name_ta, 2, LV_PART_CURSOR);
-    lv_obj_set_style_border_side(add_oui_name_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(add_oui_name_ta, LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(add_oui_name_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(add_oui_name_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(add_oui_name_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_obj_add_event_cb(add_oui_name_ta, add_oui_ta_focus_cb, LV_EVENT_CLICKED, NULL);
 
     /* Button row */
@@ -26309,10 +26314,10 @@ static void show_spoof_add_entry_screen(void) {
     lv_textarea_set_max_length(s_spoof_mac_ta, 17);
     lv_textarea_set_placeholder_text(s_spoof_mac_ta, "AA:BB:CC:DD:EE:FF");
     lv_obj_set_style_text_font(s_spoof_mac_ta, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_bg_opa(s_spoof_mac_ta, LV_OPA_TRANSP, LV_PART_CURSOR);
-    lv_obj_set_style_border_color(s_spoof_mac_ta, UI_ACCENT_CYAN, LV_PART_CURSOR);
-    lv_obj_set_style_border_width(s_spoof_mac_ta, 2, LV_PART_CURSOR);
-    lv_obj_set_style_border_side(s_spoof_mac_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(s_spoof_mac_ta, LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(s_spoof_mac_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(s_spoof_mac_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(s_spoof_mac_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR | LV_STATE_FOCUSED);
 
     s_spoof_name_ta = lv_textarea_create(function_page);
     lv_obj_set_size(s_spoof_name_ta, 210, 36);
@@ -26321,10 +26326,10 @@ static void show_spoof_add_entry_screen(void) {
     lv_textarea_set_max_length(s_spoof_name_ta, 32);
     lv_textarea_set_placeholder_text(s_spoof_name_ta, "Device name (optional)");
     lv_obj_set_style_text_font(s_spoof_name_ta, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_bg_opa(s_spoof_name_ta, LV_OPA_TRANSP, LV_PART_CURSOR);
-    lv_obj_set_style_border_color(s_spoof_name_ta, UI_ACCENT_CYAN, LV_PART_CURSOR);
-    lv_obj_set_style_border_width(s_spoof_name_ta, 2, LV_PART_CURSOR);
-    lv_obj_set_style_border_side(s_spoof_name_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR);
+    lv_obj_set_style_bg_opa(s_spoof_name_ta, LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(s_spoof_name_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(s_spoof_name_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(s_spoof_name_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR | LV_STATE_FOCUSED);
 
     lv_obj_t *btn_row = lv_obj_create(function_page);
     lv_obj_set_size(btn_row, 228, 36);
