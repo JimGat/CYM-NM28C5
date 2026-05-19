@@ -4757,12 +4757,16 @@ void app_main(void)
         return;
     }
 
-    // 15 lines per buffer — works for both 16-bit (7200 B) and 32-bit (14400 B) color depth
+    // 15 lines per buffer — works for both 16-bit (7200 B) and 32-bit (14400 B) color depth.
+    // MALLOC_CAP_SPIRAM: ESP32-C5 GDMA is cache-transparent so PSRAM buffers work for SPI DMA,
+    // and the 32KB internal DMA pool is exhausted by WiFi static RX/TX buffers before we get here.
     const size_t buf_size = LCD_H_RES * 15 * sizeof(lv_color_t);
-    buf1 = spi_bus_dma_memory_alloc(LCD_HOST, buf_size, 0);
-    buf2 = spi_bus_dma_memory_alloc(LCD_HOST, buf_size, 0);
+    buf1 = spi_bus_dma_memory_alloc(LCD_HOST, buf_size, MALLOC_CAP_SPIRAM);
+    buf2 = spi_bus_dma_memory_alloc(LCD_HOST, buf_size, MALLOC_CAP_SPIRAM);
     if (buf1 == NULL || buf2 == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate draw buffers!");
+        ESP_LOGE(TAG, "Failed to allocate draw buffers! free SPIRAM=%zu internal=%zu",
+                 heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                 heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
         return;
     }
     ESP_LOGI(TAG, "Display buffers allocated: buf1=%p, buf2=%p (size: %zu bytes each)", buf1, buf2, buf_size);
