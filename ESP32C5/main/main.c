@@ -32357,6 +32357,14 @@ static void bd_start_cb(lv_event_t *e)
             return;
         }
         s_ble_for_blueduck = true;
+        /* If BLE is already running for another purpose (e.g. WhisperPair scan),
+         * the BlueDuck HID GATT table was never registered in that NimBLE session,
+         * so s_hid_report_handle is 0 or stale. Force a full deinit so the next
+         * bt_nimble_init() call registers BlueDuck's services correctly. */
+        if (current_radio_mode == RADIO_MODE_BLE) {
+            bt_nimble_deinit();
+            current_radio_mode = RADIO_MODE_NONE;
+        }
         if (!ensure_ble_mode()) {
             s_ble_for_blueduck = false;
             if (bd_status_lbl) lv_label_set_text(bd_status_lbl, "BLE init failed!");

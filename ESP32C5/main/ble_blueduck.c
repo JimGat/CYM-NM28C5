@@ -854,6 +854,7 @@ static int bd_gap_cb(struct ble_gap_event *event, void *arg)
 
 void blueduck_register_services(void)
 {
+    s_hid_report_handle = 0;   /* clear before NimBLE writes the assigned handle */
     ble_gatts_count_cfg(s_bd_svcs);
     ble_gatts_add_svcs(s_bd_svcs);
 }
