@@ -32566,7 +32566,7 @@ static void wp_rebuild_fp_list(void)
     }
     if (wp_fp_queue_count == 0) {
         lv_obj_t *none = lv_label_create(wp_fp_list);
-        lv_label_set_text(none, bt_scan_active ? "Scanning…" : "No Fast Pair devices found.");
+        lv_label_set_text(none, bt_scan_active ? "Scanning..." : "No Fast Pair devices found.");
         lv_obj_set_style_text_font(none, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(none, lv_color_make(160, 160, 160), 0);
     }
@@ -32623,7 +32623,7 @@ static void wp_ui_refresh(lv_timer_t *t)
         if (wp_scan_lbl && lv_obj_is_valid(wp_scan_lbl)) {
             char buf[64];
             snprintf(buf, sizeof(buf),
-                     LV_SYMBOL_REFRESH " Scanning BLE…  %ds  |  %d FP found", secs, fp);
+                     LV_SYMBOL_REFRESH " Scanning BLE...  %ds  |  %d FP found", secs, fp);
             lv_label_set_text(wp_scan_lbl, buf);
         }
         wp_rebuild_fp_list();
@@ -32633,7 +32633,7 @@ static void wp_ui_refresh(lv_timer_t *t)
     /* ── Scan done: final count banner ── */
     if (wp_scan_lbl && lv_obj_is_valid(wp_scan_lbl)) {
         char buf[52];
-        snprintf(buf, sizeof(buf), LV_SYMBOL_OK " Scan done — %d FP target(s)", wp_fp_queue_count);
+        snprintf(buf, sizeof(buf), LV_SYMBOL_OK " Scan done - %d FP target(s)", wp_fp_queue_count);
         lv_label_set_text(wp_scan_lbl, buf);
         lv_obj_set_style_text_color(wp_scan_lbl,
             wp_fp_queue_count ? lv_color_make(60, 220, 60) : lv_color_make(200, 80, 80), 0);
@@ -32645,7 +32645,7 @@ static void wp_ui_refresh(lv_timer_t *t)
     if (wp_status_lbl && lv_obj_is_valid(wp_status_lbl)) {
         if (running) {
             char buf[48];
-            snprintf(buf, sizeof(buf), "Running %d / %d…", wp_fp_queue_idx + 1, wp_fp_queue_count);
+            snprintf(buf, sizeof(buf), "Running %d / %d...", wp_fp_queue_idx + 1, wp_fp_queue_count);
             lv_label_set_text(wp_status_lbl, buf);
         } else if (wp_fp_queue_count) {
             lv_label_set_text_static(wp_status_lbl, "Tap Probe All or Exploit All to begin");
@@ -32680,12 +32680,12 @@ static void wp_run_all(wp_mode_t mode)
     wp_queue_mode   = mode;
     wp_fp_queue_idx = 0;
     if (wp_result_lbl && lv_obj_is_valid(wp_result_lbl))
-        lv_label_set_text(wp_result_lbl, "Running…");
+        lv_label_set_text(wp_result_lbl, "Running...");
     bt_device_info_t *d = &bt_devices[wp_fp_queue[0]];
     if (!wp_start(d->addr, d->addr_type, d->name, d->rssi, mode, wp_result_cb)) {
         wp_fp_queue_idx = -1;
         if (wp_result_lbl && lv_obj_is_valid(wp_result_lbl))
-            lv_label_set_text(wp_result_lbl, "Start failed — BLE busy?");
+            lv_label_set_text(wp_result_lbl, "Start failed - BLE busy?");
     }
 }
 
@@ -32712,7 +32712,7 @@ static void show_whisperpair_screen(void)
 
     /* ── Scan status spinner ────────────────────────────────── y=50 ── */
     wp_scan_lbl = lv_label_create(function_page);
-    lv_label_set_text_static(wp_scan_lbl, LV_SYMBOL_REFRESH " Starting BLE scan…");
+    lv_label_set_text_static(wp_scan_lbl, LV_SYMBOL_REFRESH " Starting BLE scan...");
     lv_obj_set_style_text_font(wp_scan_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(wp_scan_lbl, UI_ACCENT_CYAN, 0);
     lv_obj_set_style_text_align(wp_scan_lbl, LV_TEXT_ALIGN_CENTER, 0);
@@ -32927,7 +32927,7 @@ static void s_ir_cap_ui_update(void *arg)
         lv_obj_set_style_text_color(s_ir_cap_status_lbl, COLOR_MATERIAL_GREEN, 0);
         if (s_ir_cap_save_btn) lv_obj_clear_state(s_ir_cap_save_btn, LV_STATE_DISABLED);
     } else {
-        lv_label_set_text(s_ir_cap_status_lbl, "No signal — try again");
+        lv_label_set_text(s_ir_cap_status_lbl, "No signal - try again");
         lv_obj_set_style_text_color(s_ir_cap_status_lbl, lv_color_hex(0xFF5722), 0);
     }
 }
@@ -33111,7 +33111,7 @@ static void s_tvbg_done_lvgl_cb(void *arg)
 {
     (void)arg;
     s_tvbg_running = false;
-    if (s_tvbg_status)    lv_label_set_text(s_tvbg_status, "Done — all codes sent");
+    if (s_tvbg_status)    lv_label_set_text(s_tvbg_status, "Done - all codes sent");
     if (s_tvbg_start_btn) lv_obj_clear_state(s_tvbg_start_btn, LV_STATE_DISABLED);
     if (s_tvbg_bar)       lv_bar_set_value(s_tvbg_bar, 100, LV_ANIM_ON);
 }
@@ -33212,7 +33212,7 @@ static void ir_jam_toggle_cb(lv_event_t *e)
     } else {
         if (!ir_hat_is_init()) ir_hat_init();
         ir_hat_jam_start(0);
-        if (s_ir_jam_status) lv_label_set_text(s_ir_jam_status, "JAMMING — 38kHz active");
+        if (s_ir_jam_status) lv_label_set_text(s_ir_jam_status, "JAMMING - 38kHz active");
         if (s_ir_jam_status) lv_obj_set_style_text_color(s_ir_jam_status, lv_color_hex(0xFF5722), 0);
         if (s_ir_jam_btn) {
             lv_obj_set_style_bg_color(s_ir_jam_btn, lv_color_hex(0x388E3C), LV_STATE_DEFAULT);
@@ -33502,7 +33502,7 @@ static void rf433_jam_toggle_cb(lv_event_t *e)
         }
     } else {
         rf433_hat_jam_start();
-        if (s_rf433_jam_status) lv_label_set_text(s_rf433_jam_status, "JAMMING — 433MHz active");
+        if (s_rf433_jam_status) lv_label_set_text(s_rf433_jam_status, "JAMMING - 433MHz active");
         if (s_rf433_jam_status) lv_obj_set_style_text_color(s_rf433_jam_status, lv_color_hex(0xFF5722), 0);
         if (s_rf433_jam_btn) {
             lv_obj_set_style_bg_color(s_rf433_jam_btn, lv_color_hex(0x388E3C), LV_STATE_DEFAULT);
@@ -33579,7 +33579,7 @@ static void s_rf433_ui_update(void *arg)
         lv_obj_set_style_text_color(s_rf433_cap_status, COLOR_MATERIAL_GREEN, 0);
         if (s_rf433_cap_save) lv_obj_clear_state(s_rf433_cap_save, LV_STATE_DISABLED);
     } else {
-        lv_label_set_text(s_rf433_cap_status, "No signal — try again");
+        lv_label_set_text(s_rf433_cap_status, "No signal - try again");
         lv_obj_set_style_text_color(s_rf433_cap_status, lv_color_hex(0xFF5722), 0);
     }
 }
