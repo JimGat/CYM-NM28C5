@@ -3,65 +3,86 @@
 // =============================================================================
 // NM-RF-HAT — hardware pin configuration for NM-CYD-C5
 // =============================================================================
-// The NM-RF-HAT connects to the NM-CYD-C5 via its expansion connector.
-// TODO: Confirm GPIO assignments from NM-RF-HAT v1.0 schematic (SCH_NM-RF-HAT_v1.0.pdf).
-//       These are placeholder assignments using free GPIOs on the NM-CYD-C5.
-//       Free GPIOs: 3, 15, 21 (all others are occupied by SPI/display/LED/amp/GPS).
+// GPIO assignments verified against SCH_NM-RF-HAT_v1.0.pdf and
+// SCH_NM-CYD-C5-v1.0.pdf (RockBase-iot GitHub).
 //
-// Janos portability: override these defines in your board header before including
-// this file, or edit here for your target platform.
+// FPC2 connector (RF-HAT) → NM-CYD-C5 GPIO translation:
+//
+//  FPC2 Pin | RF-HAT label | NM-CYD-C5 GPIO | Role on RF-HAT
+//  ---------+--------------+----------------+----------------------------
+//      1    | IO19         | GPIO2          | SPI MISO (shared bus)
+//      2    | IO18         | GPIO6          | SPI CLK  (shared bus)
+//      3    | IO23         | GPIO7          | SPI MOSI (shared bus)
+//      4    | IO5          | GPIO10         | SPI CS — SD card (always SD)
+//      5    | GND          | GND            |
+//      6    | IO21         | GPIO4          | not used by any HAT module
+//      7    | IO22         | GPIO8          | multi-role (see DIP table)
+//      8    | IO35         | GPIO5          | not used by any HAT module
+//      9    | IO27         | GPIO9          | multi-role (see DIP table)
+//     10    | USB D-       | USB D-         |
+//     11    | USB D+       | USB D+         |
+//    12-14  | GND          | GND            |
+//
+// GPIO8 (IO22) and GPIO9 (IO27) are the only data GPIOs for all 5 modules.
+// DIP switches cut module power — mutual exclusion is enforced in hardware.
+// The SPI shared bus (GPIO2/6/7) is also used by the on-board display and SD.
+//
+//  DIP | Module          | GPIO9 (IO27)       | GPIO8 (IO22)
+//  ----+-----------------+--------------------+-------------------
+//   1  | CC1101 Sub-GHz  | CSN (SPI CS)       | GDO0 (interrupt)
+//   2  | nRF24L01 2.4GHz | CSN (SPI CS)       | CE (chip enable)
+//   3  | PN532 NFC/RFID  | SDA (I2C)          | SCL (I2C)
+//   4  | IR Infrared     | IR_DT (TX to air)  | IR_DR (RX from air)
+//   5  | RF433 OOK/ASK   | 433_DT (TX to air) | 433_DR (RX from air)
+//   6  | Battery switch  | (not a module)     |
 // =============================================================================
 
-// ── DIP switch mapping (informational — no GPIO read; user sets manually) ────
-//   DIP 1 ON → CC1101 Sub-GHz
-//   DIP 2 ON → nRF24L01 2.4 GHz
-//   DIP 3 ON → PN532 NFC/RFID
-//   DIP 4 ON → IR Infrared TX/RX
-//   DIP 5 ON → RF433 OOK/ASK
-//   DIP 6 ON → Battery power switch (not a module)
-
 // ── IR (DIP 4) ───────────────────────────────────────────────────────────────
+// IR_DT = IR transmit drive (ESP32→IR LED transistor), IR_DR = demodulated RX
 #ifndef RF_HAT_IR_TX_GPIO
-#define RF_HAT_IR_TX_GPIO    3   // TODO: verify from schematic
+#define RF_HAT_IR_TX_GPIO    9   // IO27, FPC2 Pin 9
 #endif
 #ifndef RF_HAT_IR_RX_GPIO
-#define RF_HAT_IR_RX_GPIO    15  // TODO: verify from schematic
+#define RF_HAT_IR_RX_GPIO    8   // IO22, FPC2 Pin 7
 #endif
 
 // ── RF433 OOK/ASK (DIP 5) ────────────────────────────────────────────────────
-// IR and RF433 are mutually exclusive via DIP switch, so TX pins can be shared.
+// 433_DT = OOK TX drive (ESP32→module), 433_DR = OOK RX output (module→ESP32)
+// Shares GPIO8/9 with IR via DIP-enforced power exclusion.
 #ifndef RF_HAT_RF433_TX_GPIO
-#define RF_HAT_RF433_TX_GPIO 3   // TODO: verify from schematic (may share with IR TX)
+#define RF_HAT_RF433_TX_GPIO 9   // IO27, FPC2 Pin 9 — same net as IR_DT
 #endif
 #ifndef RF_HAT_RF433_RX_GPIO
-#define RF_HAT_RF433_RX_GPIO 15  // TODO: verify from schematic (may share with IR RX)
+#define RF_HAT_RF433_RX_GPIO 8   // IO22, FPC2 Pin 7 — same net as IR_DR
 #endif
 
 // ── CC1101 Sub-GHz SPI (DIP 1) ───────────────────────────────────────────────
-// CC1101 uses SPI. On NM-CYD-C5 the SPI bus (GPIO 2/6/7) is shared with display/SD.
-// CC1101 can share the bus with a dedicated CS pin.
+// Shares SPI bus (GPIO2/6/7) with display and SD. CS and GDO0 on GPIO9/8.
 #ifndef RF_HAT_CC1101_CS_GPIO
-#define RF_HAT_CC1101_CS_GPIO 21  // TODO: verify from schematic
+#define RF_HAT_CC1101_CS_GPIO    9   // IO27, FPC2 Pin 9 (CSN_CC1101)
 #endif
 #ifndef RF_HAT_CC1101_GDO0_GPIO
-#define RF_HAT_CC1101_GDO0_GPIO -1 // TODO: verify or leave unconnected
+#define RF_HAT_CC1101_GDO0_GPIO  8   // IO22, FPC2 Pin 7 (GDO0_CC1101)
 #endif
 
 // ── nRF24L01 SPI (DIP 2) ─────────────────────────────────────────────────────
+// CSN shares GPIO9 with CC1101 — DIP-exclusive so no bus conflict.
+// CE is GPIO8 (IO22 → NRF24_CE per schematic).
 #ifndef RF_HAT_NRF24_CS_GPIO
-#define RF_HAT_NRF24_CS_GPIO  21  // TODO: verify (distinct CS from CC1101)
+#define RF_HAT_NRF24_CS_GPIO  9   // IO27, FPC2 Pin 9 (NRF24_CSN)
 #endif
 #ifndef RF_HAT_NRF24_CE_GPIO
-#define RF_HAT_NRF24_CE_GPIO  -1  // TODO: verify
+#define RF_HAT_NRF24_CE_GPIO  8   // IO22, FPC2 Pin 7 (NRF24_CE)
 #endif
 
-// ── PN532 I2C (DIP 3) ────────────────────────────────────────────────────────
-// PN532 uses I2C on the CN1 connector (GPIO 8/9 on NM-CYD-C5)
+// ── PN532 NFC/RFID I2C (DIP 3) ───────────────────────────────────────────────
+// I2C mode: SCL=GPIO8 (NSS/SCL_PN532 net), SDA=GPIO9.
+// Same GPIO8/9 nets serve all other modules when DIP 3 is off.
 #ifndef RF_HAT_PN532_SDA_GPIO
-#define RF_HAT_PN532_SDA_GPIO 9   // CN1 pin 2 — confirmed available
+#define RF_HAT_PN532_SDA_GPIO 9   // IO27, FPC2 Pin 9
 #endif
 #ifndef RF_HAT_PN532_SCL_GPIO
-#define RF_HAT_PN532_SCL_GPIO 8   // CN1 pin 3 — confirmed available
+#define RF_HAT_PN532_SCL_GPIO 8   // IO22, FPC2 Pin 7
 #endif
 
 // ── SD card directories created by rf_hat modules ────────────────────────────
