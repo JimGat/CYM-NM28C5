@@ -59,8 +59,6 @@ static volatile uint8_t   s_notify_len   = 0;
 
 static char               s_status[96]   = "Idle";
 
-static StackType_t       *s_task_stack   = NULL;
-static StaticTask_t       s_task_tcb;
 static TaskHandle_t       s_task_handle  = NULL;
 
 /* Saved parameters for task */
@@ -486,15 +484,22 @@ done:
                  s_notify_got ? (const uint8_t *)s_notify_data : NULL,
                  s_notify_got ? s_notify_len : 0);
 
-    /* Fire callback before marking inactive so caller can read state */
-    if (s_cb) s_cb(result, detail, s_target_mac, s_mode);
+    /* Save callback params, then clear state BEFORE firing callback.
+     * The callback (wp_result_cb) may call wp_start() for the next device;
+     * wp_start() checks s_active, so it must be false before we call out. */
+    wp_cb_t     cb    = s_cb;
+    wp_result_t res   = result;
+    const char *det   = detail;
+    uint8_t     cmac[6];
+    wp_mode_t   cmode = s_mode;
+    memcpy(cmac, s_target_mac, 6);
 
     s_active      = false;
     s_cancel_req  = false;
     s_task_handle = NULL;
 
-    heap_caps_free(s_task_stack);
-    s_task_stack = NULL;
+    if (cb) cb(res, det, cmac, cmode);
+
     vTaskDelete(NULL);
 }
 
@@ -552,21 +557,15 @@ bool wp_start(const uint8_t mac[6], uint8_t addr_type, const char *name,
     s_kbp_handle  = 0;
     s_notify_got  = false;
 
-    /* Allocate task stack from PSRAM to save internal SRAM */
-    s_task_stack = heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
-    if (!s_task_stack) {
-        ESP_LOGE(TAG, "Stack alloc failed");
-        s_active = false;
-        return false;
-    }
-
-    s_task_handle = xTaskCreateStatic(s_wp_task, "wp_task", 4096, NULL,
-                                       tskIDLE_PRIORITY + 2,
-                                       s_task_stack, &s_task_tcb);
-    if (!s_task_handle) {
+    /* xTaskCreate: each invocation gets its own TCB + stack from the PSRAM
+     * malloc pool (SPIRAM_USE_MALLOC routes large allocs to PSRAM).
+     * Must NOT use xTaskCreateStatic with a shared static TCB — if the old
+     * task's teardown races with a new wp_start() call from the result
+     * callback, the aliased TCB causes scheduler corruption and the freed
+     * stack causes an immediate overflow in the new task. */
+    if (xTaskCreate(s_wp_task, "wp_task", 4096, NULL,
+                    tskIDLE_PRIORITY + 2, &s_task_handle) != pdPASS) {
         ESP_LOGE(TAG, "Task create failed");
-        heap_caps_free(s_task_stack);
-        s_task_stack = NULL;
         s_active = false;
         return false;
     }
