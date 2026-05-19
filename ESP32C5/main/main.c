@@ -16559,52 +16559,25 @@ static void s_wcs_ap_select_cb(lv_event_t *e)
 
 static void s_wcs_scan_poll_cb(lv_timer_t *t)
 {
-    if (wifi_scanner_is_scanning()) {
-        // Periodic PSRAM heap check every ~1 s while scan runs
-        static uint8_t s_chk_ctr = 0;
-        if (++s_chk_ctr >= 4) {
-            s_chk_ctr = 0;
-            if (!heap_caps_check_integrity(MALLOC_CAP_SPIRAM, false))
-                ESP_LOGE(TAG, "[WCS-CHK] PSRAM HEAP CORRUPTED mid-scan!");
-            else
-                ESP_LOGI(TAG, "[WCS-CHK] PSRAM heap OK mid-scan");
-        }
-        return;
-    }
+    if (wifi_scanner_is_scanning()) return;
 
     lv_timer_del(t);
     s_wcs_scan_timer = NULL;
 
-    // Immediate post-scan heap check — if corrupted, bail before touching LVGL
-    bool spiram_ok = heap_caps_check_integrity(MALLOC_CAP_SPIRAM, false);
-    ESP_LOGI(TAG, "[WCS] scan done — PSRAM heap %s", spiram_ok ? "OK" : "CORRUPTED!");
-    if (!spiram_ok) {
-        ESP_LOGE(TAG, "[WCS] Aborting popup — PSRAM heap corrupt after scan");
-        if (s_fileserv_status_lbl)
-            lv_label_set_text_static(s_fileserv_status_lbl, "Scan failed (heap err)");
-        return;
-    }
-
     log_heap_stats("wcs-scan-poll");
-    size_t int_free  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    size_t int_block = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-    if (int_free < 12288 || int_block < 4096) {
-        ESP_LOGW(TAG, "Scan popup skipped: int free=%u block=%u",
-                 (unsigned)int_free, (unsigned)int_block);
-        return;
-    }
 
     uint16_t ap_count = wifi_scanner_get_count();
     const wifi_ap_record_t *ap_buf = wifi_scanner_get_results_ptr();
-    uint16_t show_count = (ap_count > 20) ? 20 : ap_count;  // cap popup at 20
-    ESP_LOGI(TAG, "[WCS] count=%u show=%u ap_buf=%p", ap_count, show_count, ap_buf);
+    /* Cap at 12 entries — each entry is a plain btn+label (no scroll animation). */
+    uint16_t show_count = (ap_count > 12) ? 12 : ap_count;
 
-    ESP_LOGI(TAG, "[WCS] del old popup (popup=%p)", s_wcs_scan_popup);
     if (s_wcs_scan_popup) { lv_obj_del(s_wcs_scan_popup); s_wcs_scan_popup = NULL; }
 
-    ESP_LOGI(TAG, "[WCS] lv_obj_create");
     s_wcs_scan_popup = lv_obj_create(lv_layer_top());
-    ESP_LOGI(TAG, "[WCS] popup=%p", s_wcs_scan_popup);
+    if (!s_wcs_scan_popup) {
+        ESP_LOGE(TAG, "[WCS] popup alloc failed");
+        return;
+    }
     lv_obj_set_size(s_wcs_scan_popup, 222, 268);
     lv_obj_center(s_wcs_scan_popup);
     lv_obj_set_style_bg_color(s_wcs_scan_popup, ui_bg_color(), 0);
@@ -16615,27 +16588,36 @@ static void s_wcs_scan_poll_cb(lv_timer_t *t)
     lv_obj_set_style_pad_ver(s_wcs_scan_popup, 6, 0);
     lv_obj_clear_flag(s_wcs_scan_popup, LV_OBJ_FLAG_SCROLLABLE);
 
-    ESP_LOGI(TAG, "[WCS] title label");
     lv_obj_t *title = lv_label_create(s_wcs_scan_popup);
-    lv_label_set_text(title, "Select Network");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(title, UI_ACCENT_CYAN, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 2);
+    if (title) {
+        lv_label_set_text(title, "Select Network");
+        lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(title, UI_ACCENT_CYAN, 0);
+        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 2);
+    }
 
     lv_obj_t *xbtn = lv_btn_create(s_wcs_scan_popup);
-    lv_obj_set_size(xbtn, 26, 20);
-    lv_obj_align(xbtn, LV_ALIGN_TOP_RIGHT, 0, 0);
-    lv_obj_set_style_bg_color(xbtn, COLOR_MATERIAL_RED, 0);
-    lv_obj_set_style_radius(xbtn, 4, 0);
-    lv_obj_set_style_pad_all(xbtn, 0, 0);
-    lv_obj_t *xlbl = lv_label_create(xbtn);
-    lv_label_set_text(xlbl, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_font(xlbl, &lv_font_montserrat_12, 0);
-    lv_obj_center(xlbl);
-    lv_obj_add_event_cb(xbtn, s_wcs_scan_close_cb, LV_EVENT_CLICKED, NULL);
+    if (xbtn) {
+        lv_obj_set_size(xbtn, 26, 20);
+        lv_obj_align(xbtn, LV_ALIGN_TOP_RIGHT, 0, 0);
+        lv_obj_set_style_bg_color(xbtn, COLOR_MATERIAL_RED, 0);
+        lv_obj_set_style_radius(xbtn, 4, 0);
+        lv_obj_set_style_pad_all(xbtn, 0, 0);
+        lv_obj_t *xlbl = lv_label_create(xbtn);
+        if (xlbl) {
+            lv_label_set_text_static(xlbl, LV_SYMBOL_CLOSE);
+            lv_obj_set_style_text_font(xlbl, &lv_font_montserrat_12, 0);
+            lv_obj_center(xlbl);
+        }
+        lv_obj_add_event_cb(xbtn, s_wcs_scan_close_cb, LV_EVENT_CLICKED, NULL);
+    }
 
-    ESP_LOGI(TAG, "[WCS] list create");
-    lv_obj_t *lst = lv_list_create(s_wcs_scan_popup);
+    /* Scrollable container — plain lv_obj so we control exactly what goes in. */
+    lv_obj_t *lst = lv_obj_create(s_wcs_scan_popup);
+    if (!lst) {
+        ESP_LOGE(TAG, "[WCS] list alloc failed");
+        return;
+    }
     lv_obj_set_size(lst, lv_pct(100), 232);
     lv_obj_align(lst, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(lst, ui_bg_color(), 0);
@@ -16643,31 +16625,46 @@ static void s_wcs_scan_poll_cb(lv_timer_t *t)
     lv_obj_set_style_border_color(lst, ui_muted_color(), 0);
     lv_obj_set_style_radius(lst, 4, 0);
     lv_obj_set_style_pad_all(lst, 2, 0);
-    lv_obj_set_style_pad_gap(lst, 2, 0);
+    lv_obj_set_style_pad_row(lst, 2, 0);
+    lv_obj_set_flex_flow(lst, LV_FLEX_FLOW_COLUMN);
 
     if (show_count == 0) {
         lv_obj_t *no = lv_label_create(lst);
-        lv_label_set_text(no, "No networks found");
-        lv_obj_set_style_text_font(no, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(no, ui_muted_color(), 0);
+        if (no) {
+            lv_label_set_text_static(no, "No networks found");
+            lv_obj_set_style_text_font(no, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(no, ui_muted_color(), 0);
+        }
     } else {
-        ESP_LOGI(TAG, "[WCS] adding %u AP buttons", show_count);
         for (uint16_t i = 0; i < show_count; i++) {
-            char entry[56];
-            snprintf(entry, sizeof(entry), LV_SYMBOL_WIFI " %s  %d dBm",
-                     (char *)ap_buf[i].ssid, ap_buf[i].rssi);
-            lv_obj_t *btn = lv_list_add_btn(lst, NULL, entry);
-            lv_obj_set_style_text_font(btn, &lv_font_montserrat_12, 0);
+            /* Plain button — no lv_list_add_btn so we control long_mode. */
+            lv_obj_t *btn = lv_btn_create(lst);
+            if (!btn) { ESP_LOGE(TAG, "[WCS] btn[%u] alloc failed", i); break; }
+            lv_obj_set_size(btn, lv_pct(100), LV_SIZE_CONTENT);
             lv_obj_set_style_bg_color(btn, ui_bg_color(), 0);
             lv_obj_set_style_bg_color(btn, ui_accent_color(), LV_STATE_PRESSED);
-            lv_obj_set_style_text_color(btn, ui_text_color(), 0);
+            lv_obj_set_style_radius(btn, 4, 0);
+            lv_obj_set_style_pad_all(btn, 4, 0);
             lv_obj_set_user_data(btn, (void *)&ap_buf[i]);
             lv_obj_add_event_cb(btn, s_wcs_ap_select_cb, LV_EVENT_CLICKED, NULL);
+
+            lv_obj_t *lbl = lv_label_create(btn);
+            if (!lbl) { ESP_LOGE(TAG, "[WCS] lbl[%u] alloc failed", i); continue; }
+            /* LV_LABEL_LONG_DOT: truncate with "..." — no scroll animation. */
+            lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
+            lv_obj_set_width(lbl, lv_pct(100));
+
+            char entry[52];
+            snprintf(entry, sizeof(entry), LV_SYMBOL_WIFI " %.28s  %d",
+                     (char *)ap_buf[i].ssid, ap_buf[i].rssi);
+            lv_label_set_text(lbl, entry);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(lbl, ui_text_color(), 0);
         }
-        if (ap_count > 20)
-            ESP_LOGI(TAG, "[WCS] %u more APs not shown", ap_count - 20);
+        if (ap_count > 12)
+            ESP_LOGI(TAG, "[WCS] %u more APs not shown", ap_count - 12);
     }
-    ESP_LOGI(TAG, "[WCS] popup done");
+    ESP_LOGI(TAG, "[WCS] popup done — %u entries", show_count);
 }
 
 static void s_wcs_scan_btn_cb(lv_event_t *e)
@@ -16675,10 +16672,6 @@ static void s_wcs_scan_btn_cb(lv_event_t *e)
     (void)e;
     if (s_wcs_scan_timer) return;  // scan already running
     if (wifi_scanner_is_scanning()) return;
-    log_heap_stats("wcs-scan-btn");
-    // Pre-scan baseline: confirm PSRAM heap is clean before we start
-    bool pre_ok = heap_caps_check_integrity(MALLOC_CAP_SPIRAM, false);
-    ESP_LOGI(TAG, "[WCS-BTN] pre-scan PSRAM heap: %s", pre_ok ? "OK" : "CORRUPTED");
     if (s_wcs_scan_popup) { lv_obj_del(s_wcs_scan_popup); s_wcs_scan_popup = NULL; }
     esp_err_t err = wifi_scanner_start_scan();
     if (err != ESP_OK) {
