@@ -28379,9 +28379,11 @@ static bool ensure_wifi_mode(void)
             
         case RADIO_MODE_NONE:
             if (wifi_initialized) {
-                // WiFi driver is still initialized (BLE switch only stopped it).
-                // Restart without reallocating DMA buffers to avoid heap fragmentation crash.
-                ESP_LOGI(TAG, "Restarting WiFi (driver retained across BLE switch)...");
+                // WiFi was previously initialized and is stopped but NOT deinitialized.
+                // This path is no longer reached in normal operation: ensure_ble_mode()
+                // now calls esp_wifi_deinit() and sets wifi_initialized=false.
+                // Kept as a fallback for any legacy code path that only calls esp_wifi_stop().
+                ESP_LOGI(TAG, "Restarting WiFi (driver retained)...");
                 esp_wifi_set_mode(WIFI_MODE_STA);
                 wifi_config_t restart_cfg = {0};
                 esp_wifi_set_config(WIFI_IF_STA, &restart_cfg);
@@ -28399,7 +28401,7 @@ static bool ensure_wifi_mode(void)
                 ESP_LOGI(TAG, "WiFi restarted OK");
                 return true;
             }
-            // First boot: full initialization including esp_wifi_init().
+            // Full init — either first boot or after esp_wifi_deinit() on BLE switch.
             ESP_LOGI(TAG, "Initializing WiFi...");
             esp_err_t ret = wifi_cli_init();
             if (ret != ESP_OK) {
@@ -28447,23 +28449,35 @@ static bool ensure_ble_mode(void)
         case RADIO_MODE_NONE:
             // Initialize BLE
             ESP_LOGI(TAG, "Initializing BLE (NimBLE)...");
+            ESP_LOGI(TAG, "DMA free before BLE init: %lu bytes (need ~18KB for BLE ctrl)",
+                     heap_caps_get_free_size(MALLOC_CAP_DMA));
+            heap_caps_print_heap_info(MALLOC_CAP_DMA);
+            {
             esp_err_t ret = bt_nimble_init();
             if (ret != ESP_OK) {
                 ESP_LOGE(TAG, "BLE init failed: %d", ret);
                 return false;
             }
             current_radio_mode = RADIO_MODE_BLE;
-            ESP_LOGI(TAG, "BLE initialized OK");
+            ESP_LOGI(TAG, "BLE initialized OK — DMA free now: %lu bytes",
+                     heap_caps_get_free_size(MALLOC_CAP_DMA));
             return true;
-            
+            }
+
         case RADIO_MODE_WIFI: {
-            // Stop WiFi but keep driver initialized to avoid DMA reallocation on return.
-            // esp_wifi_deinit() is intentionally NOT called: freeing then reallocating
-            // the 10×1700B DMA buffers after BLE teardown fails on a fragmented heap.
-            // esp_wifi_start() can restart a stopped-but-initialized driver without
-            // touching DMA allocations.
-            ESP_LOGI(TAG, "Switching from WiFi to BLE mode (WiFi driver retained)...");
+            // Full WiFi deinit (not just stop) to free the ~42KB DMA footprint.
+            // WiFi static RX/TX + management/control buffers consume nearly the entire
+            // 48KB DMA pool, leaving only ~6.9KB — far short of the ~18KB the BLE LL
+            // controller requires. esp_wifi_deinit() returns all of that to the pool.
+            // On BLE→WiFi switch, wifi_cli_init() does the full reinit (~700ms).
+            ESP_LOGI(TAG, "Switching from WiFi to BLE mode (full WiFi deinit)...");
+            ESP_LOGI(TAG, "DMA free before WiFi deinit: %lu bytes",
+                     heap_caps_get_free_size(MALLOC_CAP_DMA));
             esp_wifi_stop();
+            esp_wifi_deinit();
+            wifi_initialized = false;
+            ESP_LOGI(TAG, "DMA free after WiFi deinit: %lu bytes (freed WiFi DMA pool)",
+                     heap_caps_get_free_size(MALLOC_CAP_DMA));
             current_radio_mode = RADIO_MODE_NONE;
             // Now initialize BLE (recursive call with RADIO_MODE_NONE)
             return ensure_ble_mode();
