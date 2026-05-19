@@ -15888,6 +15888,10 @@ static uint32_t       s_fileserv_connect_ms = 0;
 /* Declared here so s_fileserv_stop_cb (below) can reference them. */
 static lv_obj_t      *s_wcs_scan_popup = NULL;
 static lv_timer_t    *s_wcs_scan_timer = NULL;
+static lv_obj_t      *s_wcs_ssid_ta    = NULL;
+static lv_obj_t      *s_wcs_pass_ta    = NULL;
+static lv_obj_t      *s_wcs_keyboard   = NULL;
+static lv_obj_t      *s_wcs_active_ta  = NULL;
 
 /* Stream a file from SD to HTTP response in 4 KB chunks. */
 static void s_fileserv_send_file(httpd_req_t *req, const char *path)
@@ -16425,6 +16429,11 @@ static void s_fileserv_stop_cb(lv_event_t *e)
     if (s_fileserv_poll_timer) { lv_timer_del(s_fileserv_poll_timer); s_fileserv_poll_timer = NULL; }
     if (s_wcs_scan_timer)     { lv_timer_del(s_wcs_scan_timer);     s_wcs_scan_timer = NULL; }
     if (s_wcs_scan_popup)     { lv_obj_del(s_wcs_scan_popup);       s_wcs_scan_popup = NULL; }
+    /* Null out all WCS widget pointers before function_page is deleted by the next screen. */
+    s_wcs_ssid_ta   = NULL;
+    s_wcs_pass_ta   = NULL;
+    s_wcs_keyboard  = NULL;
+    s_wcs_active_ta = NULL;
     s_fileserv_httpd_stop();
     if (s_wdup_pending_after_wifi) {
         s_wdup_pending_after_wifi = false;
@@ -16535,11 +16544,8 @@ static void show_ap_file_server_screen(void)
 
 // ── WiFi Client File Server screen ───────────────────────────────────────────
 
-static lv_obj_t        *s_wcs_ssid_ta    = NULL;
-static lv_obj_t        *s_wcs_pass_ta    = NULL;
-static lv_obj_t        *s_wcs_keyboard   = NULL;
-static lv_obj_t        *s_wcs_active_ta  = NULL;
-/* s_wcs_scan_popup and s_wcs_scan_timer declared earlier (before stop callback) */
+/* s_wcs_ssid_ta, s_wcs_pass_ta, s_wcs_keyboard, s_wcs_active_ta, s_wcs_scan_popup,
+   s_wcs_scan_timer all declared earlier (before s_fileserv_stop_cb). */
 
 static void s_wcs_scan_close_cb(lv_event_t *e)
 {
@@ -16552,8 +16558,25 @@ static void s_wcs_ap_select_cb(lv_event_t *e)
 {
     lv_obj_t *btn = lv_event_get_target(e);
     wifi_ap_record_t *rec = (wifi_ap_record_t *)lv_obj_get_user_data(btn);
-    if (rec && s_wcs_ssid_ta)
-        lv_textarea_set_text(s_wcs_ssid_ta, (const char *)rec->ssid);
+
+    /* ── Instrumentation: dump state before any LVGL write ── */
+    bool ta_valid = s_wcs_ssid_ta && lv_obj_is_valid(s_wcs_ssid_ta);
+    lv_obj_t *ta_label = s_wcs_ssid_ta ? ((lv_textarea_t *)s_wcs_ssid_ta)->label : NULL;
+    ESP_LOGI(TAG, "[WCSDBG] ap_select: btn=%p rec=%p ta=%p valid=%d label=%p",
+             btn, rec, s_wcs_ssid_ta, (int)ta_valid, ta_label);
+    if (rec)
+        ESP_LOGI(TAG, "[WCSDBG] ap ssid='%.32s'", (char *)rec->ssid);
+
+    if (rec && ta_valid) {
+        /* Safety: confirm label pointer looks like a heap address before dereferencing */
+        if ((uintptr_t)ta_label > 0x40000000u)
+            lv_textarea_set_text(s_wcs_ssid_ta, (const char *)rec->ssid);
+        else
+            ESP_LOGE(TAG, "[WCSDBG] label ptr %p invalid — skipping set_text", ta_label);
+    } else if (!ta_valid) {
+        ESP_LOGE(TAG, "[WCSDBG] ssid_ta invalid — cannot set text");
+    }
+
     if (s_wcs_scan_popup) { lv_obj_del(s_wcs_scan_popup); s_wcs_scan_popup = NULL; }
 }
 
@@ -16565,6 +16588,12 @@ static void s_wcs_scan_poll_cb(lv_timer_t *t)
     s_wcs_scan_timer = NULL;
 
     log_heap_stats("wcs-scan-poll");
+
+    /* ── Instrumentation: verify textarea state BEFORE building popup ── */
+    ESP_LOGI(TAG, "[WCSDBG] pre-popup: ta=%p label=%p valid=%d",
+             s_wcs_ssid_ta,
+             s_wcs_ssid_ta ? ((lv_textarea_t *)s_wcs_ssid_ta)->label : NULL,
+             s_wcs_ssid_ta ? (int)lv_obj_is_valid(s_wcs_ssid_ta) : -1);
 
     uint16_t ap_count = wifi_scanner_get_count();
     const wifi_ap_record_t *ap_buf = wifi_scanner_get_results_ptr();
@@ -16665,6 +16694,12 @@ static void s_wcs_scan_poll_cb(lv_timer_t *t)
             ESP_LOGI(TAG, "[WCS] %u more APs not shown", ap_count - 12);
     }
     ESP_LOGI(TAG, "[WCS] popup done — %u entries", show_count);
+
+    /* ── Instrumentation: verify textarea state AFTER building popup ── */
+    ESP_LOGI(TAG, "[WCSDBG] post-popup: ta=%p label=%p valid=%d",
+             s_wcs_ssid_ta,
+             s_wcs_ssid_ta ? ((lv_textarea_t *)s_wcs_ssid_ta)->label : NULL,
+             s_wcs_ssid_ta ? (int)lv_obj_is_valid(s_wcs_ssid_ta) : -1);
 }
 
 static void s_wcs_scan_btn_cb(lv_event_t *e)
@@ -16768,6 +16803,9 @@ static void show_wifi_client_server_screen(void)
     lv_obj_set_flex_align(ssid_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
     s_wcs_ssid_ta = lv_textarea_create(ssid_row);
+    ESP_LOGI(TAG, "[WCSDBG] ssid_ta created: ta=%p label=%p",
+             s_wcs_ssid_ta,
+             s_wcs_ssid_ta ? ((lv_textarea_t *)s_wcs_ssid_ta)->label : NULL);
     lv_obj_set_flex_grow(s_wcs_ssid_ta, 1);
     lv_textarea_set_one_line(s_wcs_ssid_ta, true);
     lv_textarea_set_placeholder_text(s_wcs_ssid_ta, "Enter SSID or Scan");
