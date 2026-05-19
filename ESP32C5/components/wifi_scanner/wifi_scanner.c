@@ -44,9 +44,15 @@ static void wifi_scanner_event_handler(void *arg, esp_event_base_t event_base,
 }
 
 esp_err_t wifi_scanner_init(void) {
-    // Register event handler for scan completion
-    esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE,
-                               &wifi_scanner_event_handler, NULL);
+    // Guard: only register once regardless of how many times this is called.
+    // wifi_cli_init() and main.c both call this; duplicate registrations each
+    // consume ~60 B of internal heap permanently and cause double result reads.
+    static bool s_handler_registered = false;
+    if (!s_handler_registered) {
+        esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE,
+                                   &wifi_scanner_event_handler, NULL);
+        s_handler_registered = true;
+    }
     return ESP_OK;
 }
 

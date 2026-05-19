@@ -10289,6 +10289,19 @@ static void handshake_stop_btn_cb(lv_event_t *e)
     nav_to_menu_flag = true;
 }
 
+// Heap diagnostic — logs internal free/min/largest-block and DMA free.
+// Call at any key transition to track what is consuming internal SRAM.
+static void log_heap_stats(const char *where)
+{
+    size_t int_free  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    size_t int_min   = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+    size_t int_block = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    size_t dma_free  = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    ESP_LOGI(TAG, "[HEAP] %s — int free=%u min=%u block=%u  DMA=%u",
+             where, (unsigned)int_free, (unsigned)int_min,
+             (unsigned)int_block, (unsigned)dma_free);
+}
+
 // Wardrive task kept as wrapper
 static void wardrive_task(void *pvParameters) {
     (void)pvParameters;
@@ -10299,6 +10312,7 @@ static void wardrive_task(void *pvParameters) {
 static void wardrive_promisc_task(void *pvParameters) {
     (void)pvParameters;
     ESP_LOGI(TAG, "Wardrive promisc task started");
+    log_heap_stats("wardrive-start");
 
     wardrive_file_counter = (int)(esp_timer_get_time() / 1000000);
     snprintf(wd_marks_fname, sizeof(wd_marks_fname),
@@ -10565,6 +10579,7 @@ static void wardrive_promisc_task(void *pvParameters) {
     wardrive_task_handle = NULL;
     ESP_LOGI(TAG, "Wardrive promisc stopped. Total networks: %d. File: wd%d.csv",
              wdp_seen_count, wardrive_file_counter);
+    log_heap_stats("wardrive-stop");
     vTaskDelete(NULL);
 }
 
@@ -16551,9 +16566,12 @@ static void s_wcs_scan_poll_cb(lv_timer_t *t)
     lv_timer_del(t);
     s_wcs_scan_timer = NULL;
 
-    size_t int_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    if (int_free < 16384) {
-        ESP_LOGW(TAG, "Scan popup skipped: internal heap only %u bytes — restart device", (unsigned)int_free);
+    log_heap_stats("wcs-scan-poll");
+    size_t int_free  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    size_t int_block = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    if (int_free < 16384 || int_block < 4096) {
+        ESP_LOGW(TAG, "Scan popup skipped: int free=%u block=%u — restart device",
+                 (unsigned)int_free, (unsigned)int_block);
         if (s_fileserv_status_lbl)
             lv_label_set_text(s_fileserv_status_lbl, "Low memory — restart device");
         return;
@@ -16645,6 +16663,7 @@ static void s_wcs_scan_btn_cb(lv_event_t *e)
 {
     (void)e;
     if (s_wcs_scan_timer) return;  // scan already running
+    log_heap_stats("wcs-scan-btn");
     if (s_wcs_scan_popup) { lv_obj_del(s_wcs_scan_popup); s_wcs_scan_popup = NULL; }
     if (s_fileserv_status_lbl)
         lv_label_set_text(s_fileserv_status_lbl, LV_SYMBOL_REFRESH " Scanning networks...");
@@ -16706,6 +16725,7 @@ static void s_wcs_connect_cb(lv_event_t *e)
 
 static void show_wifi_client_server_screen(void)
 {
+    log_heap_stats("fileserv-screen-open");
     create_function_page_base(s_wdup_pending_after_wifi ? "WiFi for Upload" : "WiFi File Server");
     apply_menu_bg();
 
