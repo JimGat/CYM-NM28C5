@@ -15891,6 +15891,10 @@ static lv_obj_t      *s_wcs_scan_popup = NULL;
 static lv_timer_t    *s_wcs_scan_timer = NULL;
 static lv_obj_t      *s_wcs_ssid_ta    = NULL;
 static lv_obj_t      *s_wcs_pass_ta    = NULL;
+static lv_obj_t      *s_wcs_conn_btn   = NULL;  /* connect/disconnect toggle button */
+static lv_obj_t      *s_wcs_conn_lbl   = NULL;  /* label inside that button */
+static bool           s_wcs_connected  = false; /* true once STA has an IP */
+static void s_wcs_set_btn_state(bool connected);  /* forward decl — defined below connect_cb */
 static lv_obj_t      *s_wcs_keyboard   = NULL;
 static lv_obj_t      *s_wcs_active_ta  = NULL;
 
@@ -16397,9 +16401,12 @@ static void s_fileserv_poll_ip_cb(lv_timer_t *t)
                 lv_label_set_text_static(s_fileserv_status_lbl, LV_SYMBOL_OK " Server active - open URL above");
                 lv_obj_set_style_text_color(s_fileserv_status_lbl, lv_color_make(0, 220, 80), 0);
             }
+            s_wcs_connected = true;
+            s_wcs_set_btn_state(true);
         } else {
             if (s_fileserv_status_lbl)
                 lv_label_set_text_static(s_fileserv_status_lbl, LV_SYMBOL_CLOSE " HTTP start failed");
+            s_wcs_set_btn_state(false);
         }
         return;
     }
@@ -16418,6 +16425,8 @@ static void s_fileserv_poll_ip_cb(lv_timer_t *t)
             lv_obj_set_style_text_color(s_fileserv_status_lbl, lv_color_make(220, 60, 60), 0);
         }
         if (s_fileserv_ip_lbl) lv_label_set_text(s_fileserv_ip_lbl, "");
+        s_wcs_connected = false;
+        s_wcs_set_btn_state(false);
     } else if (associated && s_fileserv_status_lbl) {
         lv_label_set_text_static(s_fileserv_status_lbl, "Associated, waiting for IP...");
     }
@@ -16437,6 +16446,10 @@ static void s_fileserv_stop_cb(lv_event_t *e)
     s_wcs_pass_ta   = NULL;
     s_wcs_keyboard  = NULL;
     s_wcs_active_ta = NULL;
+    s_wcs_conn_btn  = NULL;
+    s_wcs_conn_lbl  = NULL;
+    if (s_wcs_connected) esp_wifi_disconnect();  /* ensure clean disconnect on Back */
+    s_wcs_connected = false;
     s_fileserv_httpd_stop();
     if (s_wdup_pending_after_wifi) {
         s_wdup_pending_after_wifi = false;
@@ -16718,9 +16731,42 @@ static void s_wcs_kb_event_cb(lv_event_t *e)
     }
 }
 
+/* Update connect/disconnect button appearance. Connected=true → red Disconnect button. */
+static void s_wcs_set_btn_state(bool connected)
+{
+    if (!s_wcs_conn_btn || !lv_obj_is_valid(s_wcs_conn_btn)) return;
+    if (connected) {
+        lv_obj_set_style_bg_color(s_wcs_conn_btn, COLOR_MATERIAL_RED, 0);
+        lv_obj_set_style_bg_color(s_wcs_conn_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
+        if (s_wcs_conn_lbl && lv_obj_is_valid(s_wcs_conn_lbl))
+            lv_label_set_text(s_wcs_conn_lbl, LV_SYMBOL_CLOSE " Disconnect");
+    } else {
+        lv_obj_set_style_bg_color(s_wcs_conn_btn, UI_ACCENT_CYAN, 0);
+        lv_obj_set_style_bg_color(s_wcs_conn_btn, lv_color_lighten(UI_ACCENT_CYAN, 30), LV_STATE_PRESSED);
+        if (s_wcs_conn_lbl && lv_obj_is_valid(s_wcs_conn_lbl))
+            lv_label_set_text(s_wcs_conn_lbl, LV_SYMBOL_WIFI " Connect");
+    }
+}
+
 static void s_wcs_connect_cb(lv_event_t *e)
 {
     (void)e;
+
+    /* ── Disconnect path ── */
+    if (s_wcs_connected) {
+        s_wcs_connected = false;
+        esp_wifi_disconnect();
+        s_fileserv_httpd_stop();
+        if (s_fileserv_ip_lbl)     lv_label_set_text(s_fileserv_ip_lbl, "");
+        if (s_fileserv_status_lbl) {
+            lv_label_set_text_static(s_fileserv_status_lbl, "Disconnected");
+            lv_obj_set_style_text_color(s_fileserv_status_lbl, ui_muted_color(), 0);
+        }
+        s_wcs_set_btn_state(false);
+        return;
+    }
+
+    /* ── Connect path ── */
     if (!s_wcs_ssid_ta || !s_wcs_pass_ta) return;
     const char *ssid = lv_textarea_get_text(s_wcs_ssid_ta);
     const char *pass = lv_textarea_get_text(s_wcs_pass_ta);
@@ -16871,17 +16917,17 @@ static void show_wifi_client_server_screen(void)
     lv_obj_center(stop_lbl);
     lv_obj_add_event_cb(stop_btn, s_fileserv_stop_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *conn_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(conn_btn, 110, 32);
-    lv_obj_set_style_bg_color(conn_btn, UI_ACCENT_CYAN, 0);
-    lv_obj_set_style_bg_color(conn_btn, lv_color_lighten(UI_ACCENT_CYAN, 30), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(conn_btn, 8, 0);
-    lv_obj_t *conn_lbl = lv_label_create(conn_btn);
-    lv_label_set_text(conn_lbl, LV_SYMBOL_WIFI " Connect");
-    lv_obj_set_style_text_font(conn_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(conn_lbl, lv_color_black(), 0);
-    lv_obj_center(conn_lbl);
-    lv_obj_add_event_cb(conn_btn, s_wcs_connect_cb, LV_EVENT_CLICKED, NULL);
+    s_wcs_conn_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(s_wcs_conn_btn, 110, 32);
+    lv_obj_set_style_bg_color(s_wcs_conn_btn, UI_ACCENT_CYAN, 0);
+    lv_obj_set_style_bg_color(s_wcs_conn_btn, lv_color_lighten(UI_ACCENT_CYAN, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(s_wcs_conn_btn, 8, 0);
+    s_wcs_conn_lbl = lv_label_create(s_wcs_conn_btn);
+    lv_label_set_text(s_wcs_conn_lbl, LV_SYMBOL_WIFI " Connect");
+    lv_obj_set_style_text_font(s_wcs_conn_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_wcs_conn_lbl, lv_color_black(), 0);
+    lv_obj_center(s_wcs_conn_lbl);
+    lv_obj_add_event_cb(s_wcs_conn_btn, s_wcs_connect_cb, LV_EVENT_CLICKED, NULL);
 
     /* Keyboard — hidden until a text area is tapped */
     s_wcs_keyboard = lv_keyboard_create(function_page);
