@@ -22816,20 +22816,57 @@ static void ble_pcap_write_epb(FILE *f, const ble_pcap_pkt_t *pkt)
 static int ble_pcap_gap_cb(struct ble_gap_event *event, void *arg)
 {
     (void)arg;
-    if (event->type != BLE_GAP_EVENT_DISC) return 0;
+
+    /* [PCAPDBG] Count all event types to diagnose zero-packet issue.
+     * Remove these three statics and the ESP_LOGI below once capture
+     * is confirmed working (search: PCAPDBG). ── */
+    static uint32_t pcapdbg_total   = 0;
+    static uint32_t pcapdbg_disc    = 0;
+    static uint32_t pcapdbg_extdisc = 0;
+    pcapdbg_total++;
+    if (event->type == BLE_GAP_EVENT_DISC)     pcapdbg_disc++;
+    if (event->type == BLE_GAP_EVENT_EXT_DISC) pcapdbg_extdisc++;
+    if (pcapdbg_total <= 5 || (pcapdbg_total % 50 == 0))
+        ESP_LOGI(TAG, "[PCAPDBG] gap_cb: total=%lu disc=%lu ext=%lu active=%d",
+                 (unsigned long)pcapdbg_total, (unsigned long)pcapdbg_disc,
+                 (unsigned long)pcapdbg_extdisc, (int)ble_pcap_active);
+    /* ── [PCAPDBG] end ── */
+
     if (!ble_pcap_active || !ble_pcap_queue) return 0;
 
-    struct ble_gap_disc_desc *desc = &event->disc;
     ble_pcap_pkt_t pkt;
-    memcpy(pkt.addr, desc->addr.val, 6);
-    pkt.addr_type    = desc->addr.type;
-    pkt.event_type   = (uint8_t)desc->event_type;
-    pkt.rssi         = desc->rssi;
-    pkt.data_len     = desc->length_data < 31 ? desc->length_data : 31;
-    memcpy(pkt.data, desc->data, pkt.data_len);
-    pkt.timestamp_us = (uint64_t)esp_timer_get_time();
+    memset(&pkt, 0, sizeof(pkt));
 
-    xQueueSend(ble_pcap_queue, &pkt, 0);  // non-blocking; drop if full
+#if MYNEWT_VAL(BLE_EXT_ADV)
+    if (event->type == BLE_GAP_EVENT_EXT_DISC) {
+        struct ble_gap_ext_disc_desc *d = &event->ext_disc;
+        memcpy(pkt.addr, d->addr.val, 6);
+        pkt.addr_type    = d->addr.type;
+        pkt.rssi         = d->rssi;
+        pkt.data_len     = d->length_data < 31 ? d->length_data : 31;
+        if (d->data) memcpy(pkt.data, d->data, pkt.data_len);
+        pkt.timestamp_us = (uint64_t)esp_timer_get_time();
+        /* Map extended props bits to legacy event_type for the pcap writer */
+        if      (d->props & 0x0008) pkt.event_type = 4; /* SCAN_RSP       */
+        else if (d->props & 0x0004) pkt.event_type = 1; /* ADV_DIRECT_IND */
+        else if (!(d->props & 0x0001)) pkt.event_type = 2; /* ADV_NONCONN  */
+        else                        pkt.event_type = 0; /* ADV_IND        */
+        xQueueSend(ble_pcap_queue, &pkt, 0);
+        return 0;
+    }
+#endif
+
+    if (event->type == BLE_GAP_EVENT_DISC) {
+        struct ble_gap_disc_desc *d = &event->disc;
+        memcpy(pkt.addr, d->addr.val, 6);
+        pkt.addr_type    = d->addr.type;
+        pkt.event_type   = (uint8_t)d->event_type;
+        pkt.rssi         = d->rssi;
+        pkt.data_len     = d->length_data < 31 ? d->length_data : 31;
+        memcpy(pkt.data, d->data, pkt.data_len);
+        pkt.timestamp_us = (uint64_t)esp_timer_get_time();
+        xQueueSend(ble_pcap_queue, &pkt, 0);
+    }
     return 0;
 }
 
@@ -22862,6 +22899,17 @@ static void ble_pcap_timer_cb(lv_timer_t *t)
 {
     (void)t;
     if (!ble_pcap_active || !ble_pcap_queue) return;
+
+    /* [PCAPDBG] Log queue depth every ~2 s (10 ticks × 200 ms) to verify
+     * packets are accumulating. Remove the static + ESP_LOGI once confirmed.
+     * Search: PCAPDBG ── */
+    static int pcapdbg_ticks = 0;
+    if (++pcapdbg_ticks % 10 == 0)
+        ESP_LOGI(TAG, "[PCAPDBG] timer: q_waiting=%lu total_written=%lu mutex_ok=%d",
+                 (unsigned long)uxQueueMessagesWaiting(ble_pcap_queue),
+                 (unsigned long)ble_pcap_pkt_count,
+                 (ble_pcap_file != NULL));
+    /* ── [PCAPDBG] end ── */
 
     ble_pcap_pkt_t pkt;
     int drained = 0;
@@ -22983,13 +23031,38 @@ static void show_ble_pcap_screen(void)
     lv_obj_center(stop_lbl);
     lv_obj_add_event_cb(stop_btn, ble_pcap_stop_cb, LV_EVENT_CLICKED, NULL);
 
-    // Start scanning
+    /* [PCAPDBG] Log scan start result so we know if scanning actually begins.
+     * Remove the rc variable, ESP_LOGI, and ESP_LOGE below once capture
+     * is confirmed working (search: PCAPDBG). ── */
+    int pcap_scan_rc;
+#if MYNEWT_VAL(BLE_EXT_ADV)
+    /* Use extended discovery (same path as bt_scan_task) so events arrive as
+     * BLE_GAP_EVENT_EXT_DISC which ble_pcap_gap_cb now handles. With legacy
+     * ble_gap_disc() on an EXT_ADV-enabled build the stack still routes events
+     * as EXT_DISC, but they were silently dropped by the old DISC-only check. */
+    struct ble_gap_ext_disc_params ep = {
+        .itvl = 0x60, .window = 0x60, .passive = 0,
+    };
+    pcap_scan_rc = ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 0, 0,
+                                     0 /* filter_duplicates */,
+                                     BLE_HCI_SCAN_FILT_NO_WL,
+                                     0 /* limited */,
+                                     &ep, &ep,
+                                     ble_pcap_gap_cb, NULL);
+#else
     struct ble_gap_disc_params scan_params = {
         .itvl = 0x60, .window = 0x60,
         .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
         .limited = 0, .passive = 0, .filter_duplicates = 0,
     };
-    ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &scan_params, ble_pcap_gap_cb, NULL);
+    pcap_scan_rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER,
+                                  &scan_params, ble_pcap_gap_cb, NULL);
+#endif
+    if (pcap_scan_rc == 0)
+        ESP_LOGI(TAG, "[PCAPDBG] BLE PCAP scan started OK (ext=%d)", MYNEWT_VAL(BLE_EXT_ADV));
+    else
+        ESP_LOGE(TAG, "[PCAPDBG] BLE PCAP scan start FAILED rc=%d", pcap_scan_rc);
+    /* ── [PCAPDBG] end ── */
 
     ble_pcap_timer = lv_timer_create(ble_pcap_timer_cb, 200, NULL);
 }
