@@ -677,6 +677,7 @@ static int rom_vprintf(const char *fmt, va_list ap)
 
 // Scanner UI state
 static volatile bool scan_done_ui_flag = false;
+static volatile bool g_wcs_scan_active  = false;  /* WCS client scan owns SCAN_DONE — suppress attack flow */
 #define SCAN_RESULTS_MAX_DISPLAY 32
 
 // Whitelist for BSSID protection
@@ -5707,10 +5708,10 @@ void app_main(void)
                 // Start the actual monitoring
                 deauth_monitor_start_monitoring();
             }
-            // If scan finished, build results UI (but not during blackout/snifferdog/sae_overflow/handshake/wardrive/karma attack/deauth_monitor/portal or when handshaker is waiting for scan)
+            // If scan finished, build results UI (but not during blackout/snifferdog/sae_overflow/handshake/wardrive/karma attack/deauth_monitor/portal or when handshaker is waiting for scan, or when the WCS client scan owns it)
             else if (scan_done_ui_flag) {
-                if (blackout_ui_active || snifferdog_ui_active || sae_overflow_ui_active || handshake_ui_active || wardrive_ui_active || karma_ui_active || deauth_monitor_ui_active || portal_ui_active || handshake_waiting_for_scan || g_handshaker_global_mode || wana_active) {
-                    // During attacks/visualizers or while waiting for scan, just clear the flag without showing results
+                if (g_wcs_scan_active || blackout_ui_active || snifferdog_ui_active || sae_overflow_ui_active || handshake_ui_active || wardrive_ui_active || karma_ui_active || deauth_monitor_ui_active || portal_ui_active || handshake_waiting_for_scan || g_handshaker_global_mode || wana_active) {
+                    // WCS client scan or an active attack/visualizer owns this — clear flag, leave screen alone
                     scan_done_ui_flag = false;
                 } else {
                 scan_done_ui_flag = false;
@@ -16429,7 +16430,9 @@ static void s_fileserv_stop_cb(lv_event_t *e)
     if (s_fileserv_poll_timer) { lv_timer_del(s_fileserv_poll_timer); s_fileserv_poll_timer = NULL; }
     if (s_wcs_scan_timer)     { lv_timer_del(s_wcs_scan_timer);     s_wcs_scan_timer = NULL; }
     if (s_wcs_scan_popup)     { lv_obj_del(s_wcs_scan_popup);       s_wcs_scan_popup = NULL; }
-    /* Null out all WCS widget pointers before function_page is deleted by the next screen. */
+    /* Null out all WCS state before function_page is deleted by the next screen. */
+    g_wcs_scan_active = false;
+    scan_done_ui_flag = false;
     s_wcs_ssid_ta   = NULL;
     s_wcs_pass_ta   = NULL;
     s_wcs_keyboard  = NULL;
@@ -16550,6 +16553,9 @@ static void show_ap_file_server_screen(void)
 static void s_wcs_scan_close_cb(lv_event_t *e)
 {
     (void)e;
+    if (s_wcs_scan_timer) { lv_timer_del(s_wcs_scan_timer); s_wcs_scan_timer = NULL; }
+    g_wcs_scan_active = false;
+    scan_done_ui_flag = false;
     if (s_wcs_scan_popup) { lv_obj_del(s_wcs_scan_popup); s_wcs_scan_popup = NULL; }
     if (s_fileserv_status_lbl) lv_label_set_text_static(s_fileserv_status_lbl, "Not connected");
 }
@@ -16559,23 +16565,8 @@ static void s_wcs_ap_select_cb(lv_event_t *e)
     lv_obj_t *btn = lv_event_get_target(e);
     wifi_ap_record_t *rec = (wifi_ap_record_t *)lv_obj_get_user_data(btn);
 
-    /* ── Instrumentation: dump state before any LVGL write ── */
-    bool ta_valid = s_wcs_ssid_ta && lv_obj_is_valid(s_wcs_ssid_ta);
-    lv_obj_t *ta_label = s_wcs_ssid_ta ? ((lv_textarea_t *)s_wcs_ssid_ta)->label : NULL;
-    ESP_LOGI(TAG, "[WCSDBG] ap_select: btn=%p rec=%p ta=%p valid=%d label=%p",
-             btn, rec, s_wcs_ssid_ta, (int)ta_valid, ta_label);
-    if (rec)
-        ESP_LOGI(TAG, "[WCSDBG] ap ssid='%.32s'", (char *)rec->ssid);
-
-    if (rec && ta_valid) {
-        /* Safety: confirm label pointer looks like a heap address before dereferencing */
-        if ((uintptr_t)ta_label > 0x40000000u)
-            lv_textarea_set_text(s_wcs_ssid_ta, (const char *)rec->ssid);
-        else
-            ESP_LOGE(TAG, "[WCSDBG] label ptr %p invalid — skipping set_text", ta_label);
-    } else if (!ta_valid) {
-        ESP_LOGE(TAG, "[WCSDBG] ssid_ta invalid — cannot set text");
-    }
+    if (rec && s_wcs_ssid_ta && lv_obj_is_valid(s_wcs_ssid_ta))
+        lv_textarea_set_text(s_wcs_ssid_ta, (const char *)rec->ssid);
 
     if (s_wcs_scan_popup) { lv_obj_del(s_wcs_scan_popup); s_wcs_scan_popup = NULL; }
 }
@@ -16586,14 +16577,9 @@ static void s_wcs_scan_poll_cb(lv_timer_t *t)
 
     lv_timer_del(t);
     s_wcs_scan_timer = NULL;
+    g_wcs_scan_active = false;  // release claim; scan_done_ui_flag already cleared below
 
     log_heap_stats("wcs-scan-poll");
-
-    /* ── Instrumentation: verify textarea state BEFORE building popup ── */
-    ESP_LOGI(TAG, "[WCSDBG] pre-popup: ta=%p label=%p valid=%d",
-             s_wcs_ssid_ta,
-             s_wcs_ssid_ta ? ((lv_textarea_t *)s_wcs_ssid_ta)->label : NULL,
-             s_wcs_ssid_ta ? (int)lv_obj_is_valid(s_wcs_ssid_ta) : -1);
 
     uint16_t ap_count = wifi_scanner_get_count();
     const wifi_ap_record_t *ap_buf = wifi_scanner_get_results_ptr();
@@ -16694,12 +16680,6 @@ static void s_wcs_scan_poll_cb(lv_timer_t *t)
             ESP_LOGI(TAG, "[WCS] %u more APs not shown", ap_count - 12);
     }
     ESP_LOGI(TAG, "[WCS] popup done — %u entries", show_count);
-
-    /* ── Instrumentation: verify textarea state AFTER building popup ── */
-    ESP_LOGI(TAG, "[WCSDBG] post-popup: ta=%p label=%p valid=%d",
-             s_wcs_ssid_ta,
-             s_wcs_ssid_ta ? ((lv_textarea_t *)s_wcs_ssid_ta)->label : NULL,
-             s_wcs_ssid_ta ? (int)lv_obj_is_valid(s_wcs_ssid_ta) : -1);
 }
 
 static void s_wcs_scan_btn_cb(lv_event_t *e)
@@ -16708,8 +16688,10 @@ static void s_wcs_scan_btn_cb(lv_event_t *e)
     if (s_wcs_scan_timer) return;  // scan already running
     if (wifi_scanner_is_scanning()) return;
     if (s_wcs_scan_popup) { lv_obj_del(s_wcs_scan_popup); s_wcs_scan_popup = NULL; }
+    g_wcs_scan_active = true;  // claim SCAN_DONE before scan starts
     esp_err_t err = wifi_scanner_start_scan();
     if (err != ESP_OK) {
+        g_wcs_scan_active = false;
         ESP_LOGW(TAG, "wcs scan start: %s", esp_err_to_name(err));
         return;
     }
@@ -16803,9 +16785,6 @@ static void show_wifi_client_server_screen(void)
     lv_obj_set_flex_align(ssid_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
     s_wcs_ssid_ta = lv_textarea_create(ssid_row);
-    ESP_LOGI(TAG, "[WCSDBG] ssid_ta created: ta=%p label=%p",
-             s_wcs_ssid_ta,
-             s_wcs_ssid_ta ? ((lv_textarea_t *)s_wcs_ssid_ta)->label : NULL);
     lv_obj_set_flex_grow(s_wcs_ssid_ta, 1);
     lv_textarea_set_one_line(s_wcs_ssid_ta, true);
     lv_textarea_set_placeholder_text(s_wcs_ssid_ta, "Enter SSID or Scan");
