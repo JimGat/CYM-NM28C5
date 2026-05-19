@@ -16389,12 +16389,12 @@ static void s_fileserv_poll_ip_cb(lv_timer_t *t)
             snprintf(url_str, sizeof(url_str), "http://" IPSTR "/", IP2STR(&ip.ip));
             if (s_fileserv_ip_lbl)     lv_label_set_text(s_fileserv_ip_lbl, url_str);
             if (s_fileserv_status_lbl) {
-                lv_label_set_text(s_fileserv_status_lbl, LV_SYMBOL_OK " Server active - open URL above");
+                lv_label_set_text_static(s_fileserv_status_lbl, LV_SYMBOL_OK " Server active - open URL above");
                 lv_obj_set_style_text_color(s_fileserv_status_lbl, lv_color_make(0, 220, 80), 0);
             }
         } else {
             if (s_fileserv_status_lbl)
-                lv_label_set_text(s_fileserv_status_lbl, LV_SYMBOL_CLOSE " HTTP start failed");
+                lv_label_set_text_static(s_fileserv_status_lbl, LV_SYMBOL_CLOSE " HTTP start failed");
         }
         return;
     }
@@ -16409,12 +16409,12 @@ static void s_fileserv_poll_ip_cb(lv_timer_t *t)
         lv_timer_del(t);
         s_fileserv_poll_timer = NULL;
         if (s_fileserv_status_lbl) {
-            lv_label_set_text(s_fileserv_status_lbl, LV_SYMBOL_CLOSE " Connect failed - tap Connect to retry");
+            lv_label_set_text_static(s_fileserv_status_lbl, LV_SYMBOL_CLOSE " Connect failed - tap Connect to retry");
             lv_obj_set_style_text_color(s_fileserv_status_lbl, lv_color_make(220, 60, 60), 0);
         }
         if (s_fileserv_ip_lbl) lv_label_set_text(s_fileserv_ip_lbl, "");
     } else if (associated && s_fileserv_status_lbl) {
-        lv_label_set_text(s_fileserv_status_lbl, "Associated, waiting for IP...");
+        lv_label_set_text_static(s_fileserv_status_lbl, "Associated, waiting for IP...");
     }
 }
 
@@ -16481,7 +16481,7 @@ static void show_ap_file_server_screen(void)
     #undef AP_INFO_ROW
 
     s_fileserv_status_lbl = lv_label_create(function_page);
-    lv_label_set_text(s_fileserv_status_lbl, "Starting AP...");
+    lv_label_set_text_static(s_fileserv_status_lbl, "Starting AP...");
     lv_obj_set_style_text_color(s_fileserv_status_lbl, UI_ACCENT_CYAN, 0);
     lv_obj_set_style_text_font(s_fileserv_status_lbl, &lv_font_montserrat_12, 0);
     lv_obj_align(s_fileserv_status_lbl, LV_ALIGN_TOP_MID, 0, 175);
@@ -16527,9 +16527,9 @@ static void show_ap_file_server_screen(void)
     vTaskDelay(pdMS_TO_TICKS(200));
 
     if (s_fileserv_httpd_start()) {
-        lv_label_set_text(s_fileserv_status_lbl, "Active - connect to TheLab");
+        lv_label_set_text_static(s_fileserv_status_lbl, "Active - connect to TheLab");
     } else {
-        lv_label_set_text(s_fileserv_status_lbl, "HTTP start failed");
+        lv_label_set_text_static(s_fileserv_status_lbl, "HTTP start failed");
     }
 }
 
@@ -16545,6 +16545,7 @@ static void s_wcs_scan_close_cb(lv_event_t *e)
 {
     (void)e;
     if (s_wcs_scan_popup) { lv_obj_del(s_wcs_scan_popup); s_wcs_scan_popup = NULL; }
+    if (s_fileserv_status_lbl) lv_label_set_text_static(s_fileserv_status_lbl, "Not connected");
 }
 
 static void s_wcs_ap_select_cb(lv_event_t *e)
@@ -16570,17 +16571,12 @@ static void s_wcs_scan_poll_cb(lv_timer_t *t)
                  (unsigned)int_free, (unsigned)int_block);
         return;  // heap too fragmented — do NOT call any LVGL functions
     }
-    ESP_LOGI(TAG, "[WCS] A: status_lbl=%p", s_fileserv_status_lbl);
-    if (s_fileserv_status_lbl) lv_label_set_text(s_fileserv_status_lbl, "Not connected");
-
-    ESP_LOGI(TAG, "[WCS] B: get_count");
+    ESP_LOGI(TAG, "[WCS] get results");
     uint16_t ap_count = wifi_scanner_get_count();
-    ESP_LOGI(TAG, "[WCS] C: get_ptr count=%u", ap_count);
+    ESP_LOGI(TAG, "[WCS] count=%u", ap_count);
     const wifi_ap_record_t *ap_buf = wifi_scanner_get_results_ptr();
 
-    ESP_LOGI(TAG, "[WCS] D: del old popup");
     if (s_wcs_scan_popup) { lv_obj_del(s_wcs_scan_popup); s_wcs_scan_popup = NULL; }
-    ESP_LOGI(TAG, "[WCS] E: create popup");
     s_wcs_scan_popup = lv_obj_create(lv_layer_top());
     lv_obj_set_size(s_wcs_scan_popup, 222, 268);
     lv_obj_center(s_wcs_scan_popup);
@@ -16654,7 +16650,7 @@ static void s_wcs_scan_btn_cb(lv_event_t *e)
         return;
     }
     if (s_fileserv_status_lbl)
-        lv_label_set_text(s_fileserv_status_lbl, LV_SYMBOL_REFRESH " Scanning networks...");
+        lv_label_set_text_static(s_fileserv_status_lbl, LV_SYMBOL_REFRESH " Scanning networks...");
     s_wcs_scan_timer = lv_timer_create(s_wcs_scan_poll_cb, 250, NULL);
 }
 
@@ -16688,7 +16684,7 @@ static void s_wcs_connect_cb(lv_event_t *e)
     nvs_settings_save_wifi_creds(ssid, pass);
 
     if (s_fileserv_status_lbl) {
-        lv_label_set_text(s_fileserv_status_lbl, "Connecting...");
+        lv_label_set_text_static(s_fileserv_status_lbl, "Connecting...");
         lv_obj_set_style_text_color(s_fileserv_status_lbl, ui_muted_color(), 0);
     }
     if (s_fileserv_ip_lbl) lv_label_set_text(s_fileserv_ip_lbl, "");
@@ -16794,7 +16790,7 @@ static void show_wifi_client_server_screen(void)
     lv_obj_add_event_cb(s_wcs_pass_ta, s_wcs_ta_focus_cb, LV_EVENT_CLICKED, NULL);
 
     s_fileserv_status_lbl = lv_label_create(content);
-    lv_label_set_text(s_fileserv_status_lbl, "Not connected");
+    lv_label_set_text_static(s_fileserv_status_lbl, "Not connected");
     lv_obj_set_style_text_font(s_fileserv_status_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_fileserv_status_lbl, ui_muted_color(), 0);
 
