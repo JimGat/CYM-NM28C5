@@ -8,25 +8,35 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_NIMBLE_EXT_ADV=y
-# Allow NimBLE host buffers (MSYS/ACL/HCI) to use PSRAM via default allocator
-# instead of forcing all NimBLE allocations into internal DRAM. The BLE radio
-# controller's DMA buffers are allocated with MALLOC_CAP_DMA regardless of this
-# setting and always land in internal SRAM.
-CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+# NimBLE host buffers (MSYS/ACL/HCI) MUST be in internal DRAM — not PSRAM.
+# The BLE LL ISR (ROM code) accesses MSYS pool at interrupt level; PSRAM addresses
+# get corrupted by ROM pointer tagging → Load access fault. EXTERNAL mode is
+# incompatible with ESP32-C5 BLE ROM. Use INTERNAL to force DRAM allocation.
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_INTERNAL=y
+# Reduce NimBLE host buffer counts to fit in ~5 KB of general internal heap.
+# MSYS1(6×128=768) + MSYS2(5×320=1600) + ACL(5×255=1275) + HCI_HI(8×70=560) +
+# HCI_LO(4×70=280) = 4483 bytes — fits with ~700 B margin.
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=6
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=5
+CONFIG_BT_NIMBLE_MSYS1_BLOCK_COUNT=6
+CONFIG_BT_NIMBLE_ACL_BUF_COUNT=5
+CONFIG_BT_NIMBLE_HCI_EVT_HI_BUF_COUNT=8
+CONFIG_BT_NIMBLE_HCI_EVT_LO_BUF_COUNT=4
 
 # PSRAM (8 MB SPIRAM on NM-CYD-C5)
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_USE_MALLOC=y
-# Increase internal DMA reserve pool from 32 KB → 40 KB. WiFi static RX (6×1700)
-# + TX (4×~1700) + BLE LL controller all share this pool. Extra 8 KB gives BLE
-# enough headroom to initialize alongside a retained (not deinit'd) WiFi driver.
-CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=49152
-# Reduce WiFi static RX 10→4 and TX 4→3 to free DMA pool for BLE controller.
-# Both BLE LL env and HCI UART transport allocate from the DMA pool regardless
-# of NIMBLE_MEM_ALLOC_MODE. WiFi + BLE together need ~42 KB of DMA-capable
-# SRAM; 48 KB pool gives ~6 KB margin. RX≥3 and TX≥2 are ESP-IDF minimums.
+# DMA reserve pool: 45 KB. WiFi static RX (4×1700=6.8KB) + dynamic TX (per-packet,
+# not DMA pool) + BLE LL controller (~18KB) + SD (~1.3KB) ≈ 26KB used; 45KB gives
+# ~19KB margin. Reducing from 48KB to 45KB frees 3KB more general internal heap
+# for NimBLE host task stack and MSYS/ACL buffers (INTERNAL mode).
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=46080
+# WiFi RX: 4 static buffers (minimum for stable operation).
+# WiFi TX: dynamic (per-packet from regular heap, NOT DMA pool) — saves 5.1KB DMA.
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
-CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=3
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER=y
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_TX_BUFFER_TYPE=1
 
 # LVGL fonts used by the UI
 CONFIG_LV_FONT_MONTSERRAT_12=y
