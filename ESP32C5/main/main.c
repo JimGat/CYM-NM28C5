@@ -3521,7 +3521,7 @@ static void run_touch_calibration(void)
     lv_obj_move_to_index(bg_img, 0);
 
     lv_obj_t *lbl = lv_label_create(scr);
-    lv_obj_set_style_text_color(lbl, lv_color_black(), 0);
+    lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
     lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
     lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
@@ -3616,6 +3616,7 @@ static void run_touch_calibration(void)
         lv_obj_add_flag(hbar, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(vbar, LV_OBJ_FLAG_HIDDEN);
 
+        lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
         lv_label_set_text(lbl, "Tap OK to confirm.\nMust hit the button.\n(5 s to retry)");
         lv_obj_align(lbl, LV_ALIGN_CENTER, 0, -70);
 
@@ -3633,7 +3634,7 @@ static void run_touch_calibration(void)
         lv_obj_center(ok_lbl_w);
 
         lv_obj_t *cd_lbl = lv_label_create(scr);
-        lv_obj_set_style_text_color(cd_lbl, lv_color_make(40, 40, 40), 0);
+        lv_obj_set_style_text_color(cd_lbl, lv_color_white(), 0);
         lv_obj_set_style_text_font(cd_lbl, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_align(cd_lbl, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_width(cd_lbl, 200);
