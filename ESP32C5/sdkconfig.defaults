@@ -12,7 +12,7 @@ CONFIG_BT_NIMBLE_EXT_ADV=y
 # instead of forcing all NimBLE allocations into internal DRAM. The BLE radio
 # controller's DMA buffers are allocated with MALLOC_CAP_DMA regardless of this
 # setting and always land in internal SRAM.
-CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_DEFAULT=y
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
 
 # PSRAM (8 MB SPIRAM on NM-CYD-C5)
 CONFIG_SPIRAM=y
@@ -20,10 +20,13 @@ CONFIG_SPIRAM_USE_MALLOC=y
 # Increase internal DMA reserve pool from 32 KB → 40 KB. WiFi static RX (6×1700)
 # + TX (4×~1700) + BLE LL controller all share this pool. Extra 8 KB gives BLE
 # enough headroom to initialize alongside a retained (not deinit'd) WiFi driver.
-CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=40960
-# Reduce WiFi static RX buffer count from 10 → 6, freeing 4×1700=6800 bytes of
-# DMA memory. Minimum recommended is 3; 6 is safe for scanning workloads.
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=49152
+# Reduce WiFi static RX 10→4 and TX 4→3 to free DMA pool for BLE controller.
+# Both BLE LL env and HCI UART transport allocate from the DMA pool regardless
+# of NIMBLE_MEM_ALLOC_MODE. WiFi + BLE together need ~42 KB of DMA-capable
+# SRAM; 48 KB pool gives ~6 KB margin. RX≥3 and TX≥2 are ESP-IDF minimums.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=3
 
 # LVGL fonts used by the UI
 CONFIG_LV_FONT_MONTSERRAT_12=y
