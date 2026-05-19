@@ -15858,6 +15858,9 @@ static lv_obj_t      *s_fileserv_ip_lbl = NULL;
 static lv_obj_t      *s_fileserv_status_lbl = NULL;
 static lv_timer_t    *s_fileserv_poll_timer = NULL;
 static uint32_t       s_fileserv_connect_ms = 0;
+/* Declared here so s_fileserv_stop_cb (below) can reference them. */
+static lv_obj_t      *s_wcs_scan_popup = NULL;
+static lv_timer_t    *s_wcs_scan_timer = NULL;
 
 /* Stream a file from SD to HTTP response in 4 KB chunks. */
 static void s_fileserv_send_file(httpd_req_t *req, const char *path)
@@ -16393,6 +16396,8 @@ static void s_fileserv_stop_cb(lv_event_t *e)
 {
     (void)e;
     if (s_fileserv_poll_timer) { lv_timer_del(s_fileserv_poll_timer); s_fileserv_poll_timer = NULL; }
+    if (s_wcs_scan_timer)     { lv_timer_del(s_wcs_scan_timer);     s_wcs_scan_timer = NULL; }
+    if (s_wcs_scan_popup)     { lv_obj_del(s_wcs_scan_popup);       s_wcs_scan_popup = NULL; }
     s_fileserv_httpd_stop();
     if (s_wdup_pending_after_wifi) {
         s_wdup_pending_after_wifi = false;
@@ -16503,10 +16508,129 @@ static void show_ap_file_server_screen(void)
 
 // ── WiFi Client File Server screen ───────────────────────────────────────────
 
-static lv_obj_t *s_wcs_ssid_ta   = NULL;
-static lv_obj_t *s_wcs_pass_ta   = NULL;
-static lv_obj_t *s_wcs_keyboard  = NULL;
-static lv_obj_t *s_wcs_active_ta = NULL;
+static lv_obj_t        *s_wcs_ssid_ta    = NULL;
+static lv_obj_t        *s_wcs_pass_ta    = NULL;
+static lv_obj_t        *s_wcs_keyboard   = NULL;
+static lv_obj_t        *s_wcs_active_ta  = NULL;
+/* s_wcs_scan_popup and s_wcs_scan_timer declared earlier (before stop callback) */
+static wifi_ap_record_t *s_wcs_ap_buf   = NULL;
+static uint16_t         s_wcs_ap_count  = 0;
+static volatile bool    s_wcs_scan_done = false;
+
+static void s_wcs_scan_close_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_wcs_scan_popup) { lv_obj_del(s_wcs_scan_popup); s_wcs_scan_popup = NULL; }
+}
+
+static void s_wcs_ap_select_cb(lv_event_t *e)
+{
+    lv_obj_t *btn = lv_event_get_target(e);
+    wifi_ap_record_t *rec = (wifi_ap_record_t *)lv_obj_get_user_data(btn);
+    if (rec && s_wcs_ssid_ta)
+        lv_textarea_set_text(s_wcs_ssid_ta, (const char *)rec->ssid);
+    if (s_wcs_scan_popup) { lv_obj_del(s_wcs_scan_popup); s_wcs_scan_popup = NULL; }
+}
+
+static void s_wcs_scan_poll_cb(lv_timer_t *t)
+{
+    if (!s_wcs_scan_done) return;
+    s_wcs_scan_done = false;
+    lv_timer_del(t);
+    s_wcs_scan_timer = NULL;
+    if (s_fileserv_status_lbl) lv_label_set_text(s_fileserv_status_lbl, "Not connected");
+
+    if (s_wcs_scan_popup) { lv_obj_del(s_wcs_scan_popup); s_wcs_scan_popup = NULL; }
+    s_wcs_scan_popup = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_wcs_scan_popup, 222, 268);
+    lv_obj_center(s_wcs_scan_popup);
+    lv_obj_set_style_bg_color(s_wcs_scan_popup, ui_bg_color(), 0);
+    lv_obj_set_style_border_color(s_wcs_scan_popup, UI_ACCENT_CYAN, 0);
+    lv_obj_set_style_border_width(s_wcs_scan_popup, 2, 0);
+    lv_obj_set_style_radius(s_wcs_scan_popup, 8, 0);
+    lv_obj_set_style_pad_hor(s_wcs_scan_popup, 6, 0);
+    lv_obj_set_style_pad_ver(s_wcs_scan_popup, 6, 0);
+    lv_obj_clear_flag(s_wcs_scan_popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(s_wcs_scan_popup);
+    lv_label_set_text(title, "Select Network");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(title, UI_ACCENT_CYAN, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 2);
+
+    lv_obj_t *xbtn = lv_btn_create(s_wcs_scan_popup);
+    lv_obj_set_size(xbtn, 26, 20);
+    lv_obj_align(xbtn, LV_ALIGN_TOP_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(xbtn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_radius(xbtn, 4, 0);
+    lv_obj_set_style_pad_all(xbtn, 0, 0);
+    lv_obj_t *xlbl = lv_label_create(xbtn);
+    lv_label_set_text(xlbl, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_font(xlbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(xlbl);
+    lv_obj_add_event_cb(xbtn, s_wcs_scan_close_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *lst = lv_list_create(s_wcs_scan_popup);
+    lv_obj_set_size(lst, lv_pct(100), 232);
+    lv_obj_align(lst, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(lst, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(lst, 1, 0);
+    lv_obj_set_style_border_color(lst, ui_muted_color(), 0);
+    lv_obj_set_style_radius(lst, 4, 0);
+    lv_obj_set_style_pad_all(lst, 2, 0);
+    lv_obj_set_style_pad_gap(lst, 2, 0);
+
+    if (s_wcs_ap_count == 0) {
+        lv_obj_t *no = lv_label_create(lst);
+        lv_label_set_text(no, "No networks found");
+        lv_obj_set_style_text_font(no, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(no, ui_muted_color(), 0);
+    } else {
+        for (uint16_t i = 0; i < s_wcs_ap_count; i++) {
+            char entry[56];
+            snprintf(entry, sizeof(entry), LV_SYMBOL_WIFI " %s  %d dBm",
+                     (char *)s_wcs_ap_buf[i].ssid, s_wcs_ap_buf[i].rssi);
+            lv_obj_t *btn = lv_list_add_btn(lst, NULL, entry);
+            lv_obj_set_style_text_font(btn, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_bg_color(btn, ui_bg_color(), 0);
+            lv_obj_set_style_bg_color(btn, ui_accent_color(), LV_STATE_PRESSED);
+            lv_obj_set_style_text_color(btn, ui_text_color(), 0);
+            lv_obj_set_user_data(btn, (void *)&s_wcs_ap_buf[i]);
+            lv_obj_add_event_cb(btn, s_wcs_ap_select_cb, LV_EVENT_CLICKED, NULL);
+        }
+    }
+}
+
+static void s_wcs_do_scan_task(void *arg)
+{
+    (void)arg;
+    wifi_scan_config_t cfg = { .show_hidden = false };
+    esp_wifi_scan_start(&cfg, true);
+    uint16_t n = 20;
+    if (!s_wcs_ap_buf)
+        s_wcs_ap_buf = (wifi_ap_record_t *)heap_caps_malloc(
+                            n * sizeof(wifi_ap_record_t), MALLOC_CAP_SPIRAM);
+    if (s_wcs_ap_buf) {
+        esp_wifi_scan_get_ap_records(&n, s_wcs_ap_buf);
+        s_wcs_ap_count = n;
+    } else {
+        s_wcs_ap_count = 0;
+    }
+    s_wcs_scan_done = true;
+    vTaskDelete(NULL);
+}
+
+static void s_wcs_scan_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_wcs_scan_timer) return;  // scan already running
+    if (s_wcs_scan_popup) { lv_obj_del(s_wcs_scan_popup); s_wcs_scan_popup = NULL; }
+    if (s_fileserv_status_lbl)
+        lv_label_set_text(s_fileserv_status_lbl, LV_SYMBOL_REFRESH " Scanning networks...");
+    s_wcs_scan_done = false;
+    xTaskCreate(s_wcs_do_scan_task, "wcs_scan", 3072, NULL, 5, NULL);
+    s_wcs_scan_timer = lv_timer_create(s_wcs_scan_poll_cb, 250, NULL);
+}
 
 static void s_wcs_ta_focus_cb(lv_event_t *e)
 {
@@ -16574,22 +16698,51 @@ static void show_wifi_client_server_screen(void)
     lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
     lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* SSID label + textarea */
+    /* SSID label */
     lv_obj_t *ssid_lbl = lv_label_create(content);
     lv_label_set_text(ssid_lbl, "Network SSID:");
     lv_obj_set_style_text_font(ssid_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(ssid_lbl, ui_text_color(), 0);
 
-    s_wcs_ssid_ta = lv_textarea_create(content);
-    lv_obj_set_width(s_wcs_ssid_ta, lv_pct(100));
+    /* SSID row: [textarea | Scan button] */
+    lv_obj_t *ssid_row = lv_obj_create(content);
+    lv_obj_set_size(ssid_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(ssid_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ssid_row, 0, 0);
+    lv_obj_set_style_pad_all(ssid_row, 0, 0);
+    lv_obj_set_style_pad_gap(ssid_row, 4, 0);
+    lv_obj_clear_flag(ssid_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(ssid_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(ssid_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    s_wcs_ssid_ta = lv_textarea_create(ssid_row);
+    lv_obj_set_flex_grow(s_wcs_ssid_ta, 1);
     lv_textarea_set_one_line(s_wcs_ssid_ta, true);
-    lv_textarea_set_placeholder_text(s_wcs_ssid_ta, "Enter SSID");
+    lv_textarea_set_placeholder_text(s_wcs_ssid_ta, "Enter SSID or Scan");
     if (g_saved_wifi_ssid[0]) lv_textarea_set_text(s_wcs_ssid_ta, g_saved_wifi_ssid);
     lv_obj_set_style_bg_color(s_wcs_ssid_ta, ui_bg_color(), 0);
     lv_obj_set_style_text_color(s_wcs_ssid_ta, ui_text_color(), 0);
     lv_obj_set_style_border_color(s_wcs_ssid_ta, UI_ACCENT_CYAN, 0);
     lv_obj_set_style_text_font(s_wcs_ssid_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_opa(s_wcs_ssid_ta, LV_OPA_TRANSP, LV_PART_CURSOR);
+    lv_obj_set_style_border_color(s_wcs_ssid_ta, UI_ACCENT_CYAN, LV_PART_CURSOR);
+    lv_obj_set_style_border_width(s_wcs_ssid_ta, 2, LV_PART_CURSOR);
+    lv_obj_set_style_border_side(s_wcs_ssid_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR);
     lv_obj_add_event_cb(s_wcs_ssid_ta, s_wcs_ta_focus_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *scan_btn = lv_btn_create(ssid_row);
+    lv_obj_set_size(scan_btn, 52, 32);
+    lv_obj_set_style_bg_color(scan_btn, UI_ACCENT_CYAN, 0);
+    lv_obj_set_style_bg_color(scan_btn, lv_color_lighten(UI_ACCENT_CYAN, 40), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(scan_btn, 6, 0);
+    lv_obj_set_style_pad_all(scan_btn, 2, 0);
+    lv_obj_t *scan_lbl = lv_label_create(scan_btn);
+    lv_label_set_text(scan_lbl, LV_SYMBOL_WIFI "\nScan");
+    lv_obj_set_style_text_font(scan_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(scan_lbl, lv_color_black(), 0);
+    lv_obj_set_style_text_align(scan_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_center(scan_lbl);
+    lv_obj_add_event_cb(scan_btn, s_wcs_scan_btn_cb, LV_EVENT_CLICKED, NULL);
 
     /* Password label + textarea */
     lv_obj_t *pass_lbl = lv_label_create(content);
@@ -16606,6 +16759,10 @@ static void show_wifi_client_server_screen(void)
     lv_obj_set_style_text_color(s_wcs_pass_ta, ui_text_color(), 0);
     lv_obj_set_style_border_color(s_wcs_pass_ta, UI_ACCENT_CYAN, 0);
     lv_obj_set_style_text_font(s_wcs_pass_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_opa(s_wcs_pass_ta, LV_OPA_TRANSP, LV_PART_CURSOR);
+    lv_obj_set_style_border_color(s_wcs_pass_ta, UI_ACCENT_CYAN, LV_PART_CURSOR);
+    lv_obj_set_style_border_width(s_wcs_pass_ta, 2, LV_PART_CURSOR);
+    lv_obj_set_style_border_side(s_wcs_pass_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR);
     lv_textarea_set_password_mode(s_wcs_pass_ta, true);
     lv_obj_add_event_cb(s_wcs_pass_ta, s_wcs_ta_focus_cb, LV_EVENT_CLICKED, NULL);
 
