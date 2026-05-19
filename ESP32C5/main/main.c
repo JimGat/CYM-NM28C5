@@ -1700,6 +1700,8 @@ static void show_dip_switch_popup(uint8_t dip_pos, const char *module_name, void
 static void show_ir_menu_screen(void);
 static void show_radio_menu_screen(void);
 static void show_rfid_menu_screen(void);
+static void show_cc1101_screen(void);
+static void show_nrf24_screen(void);
 static void show_ir_capture_screen(void);
 static void show_ir_replay_screen(void);
 static void show_ir_tvbgone_screen(void);
@@ -12522,7 +12524,7 @@ static void main_tile_event_cb(lv_event_t *e)
     } else if (strcmp(tile_name, "Radio Menu") == 0) {
         show_radio_menu_screen();
     } else if (strcmp(tile_name, "RFID Menu") == 0) {
-        show_rfid_menu_screen();
+        show_dip_switch_popup(3, "PN532 RFID/NFC", show_rfid_menu_screen);
     }
 }
 
@@ -32897,9 +32899,9 @@ static void radio_menu_tile_cb(lv_event_t *e)
     if (!name) return;
     // Show DIP reminder then a "coming soon" stub for each module
     if (strcmp(name, "CC1101") == 0)
-        show_dip_switch_popup(1, "CC1101 Sub-GHz", NULL); // NULL = no proceed (not yet impl)
+        show_dip_switch_popup(1, "CC1101 Sub-GHz", show_cc1101_screen);
     else if (strcmp(name, "nRF24") == 0)
-        show_dip_switch_popup(2, "nRF24L01 2.4GHz", NULL);
+        show_dip_switch_popup(2, "nRF24L01 2.4GHz", show_nrf24_screen);
     else if (strcmp(name, "RF433") == 0)
         show_rf433_menu_screen();
 }
@@ -32927,17 +32929,91 @@ static void show_radio_menu_screen(void)
     // RF433 OOK (DIP 5) — simple OOK
     create_tile(tiles, MY_SYMBOL_SATELLITE,"RF433\nOOK/ASK",  lv_color_hex(0x827717), radio_menu_tile_cb, "RF433");
 
-    // Coming soon label
-    lv_obj_t *note = lv_label_create(function_page);
-    lv_label_set_text(note, "CC1101 & nRF24: coming soon\nRF433: capture/replay available");
-    lv_obj_set_style_text_font(note, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(note, lv_color_hex(0x9E9E9E), 0);
-    lv_obj_set_style_text_align(note, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(note, LCD_H_RES - 20);
-    lv_obj_align(note, LV_ALIGN_BOTTOM_MID, 0, -42);
-
     rfhat_add_back_btn("Home", show_main_tiles);
+}
+
+// ── CC1101 Stub ───────────────────────────────────────────────────────────────
+
+static void show_cc1101_screen(void)
+{
+    create_function_page_base("CC1101 Sub-GHz");
+    apply_menu_bg();
+
+    lv_obj_t *card = lv_obj_create(function_page);
+    lv_obj_set_size(card, LCD_H_RES - 20, LCD_V_RES - 80);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 38);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x1B5E20), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(card, 10, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, MY_SYMBOL_TOWER "  CC1101 Sub-GHz");
+    lv_obj_set_style_text_font(title, &g_font_icon14, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0x66BB6A), 0);
+
+    lv_obj_t *coming = lv_label_create(card);
+    lv_label_set_text(coming,
+        "Planned features:\n"
+        "  Spectrum Analyzer\n"
+        "  Signal Capture & Replay\n"
+        "  Rolling-code Analysis\n"
+        "  Packet Sniffer\n"
+        "  Custom Modulation\n\n"
+        "CC1101 driver in development.");
+    lv_obj_set_style_text_font(coming, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(coming, ui_text_color(), 0);
+    lv_label_set_long_mode(coming, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(coming, LCD_H_RES - 44);
+
+    rfhat_add_back_btn("Radio", show_radio_menu_screen);
+}
+
+// ── nRF24 Stub ────────────────────────────────────────────────────────────────
+
+static void show_nrf24_screen(void)
+{
+    create_function_page_base("nRF24L01 2.4GHz");
+    apply_menu_bg();
+
+    lv_obj_t *card = lv_obj_create(function_page);
+    lv_obj_set_size(card, LCD_H_RES - 20, LCD_V_RES - 80);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 38);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x0D47A1), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(card, 10, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, MY_SYMBOL_WAVE "  nRF24L01+ 2.4GHz");
+    lv_obj_set_style_text_font(title, &g_font_icon14, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0x42A5F5), 0);
+
+    lv_obj_t *coming = lv_label_create(card);
+    lv_label_set_text(coming,
+        "Planned features:\n"
+        "  Channel Scanner\n"
+        "  MouseJack Attack\n"
+        "  Packet Sniffing\n"
+        "  Replay Attack\n"
+        "  Keyboard Injection\n\n"
+        "nRF24 driver in development.");
+    lv_obj_set_style_text_font(coming, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(coming, ui_text_color(), 0);
+    lv_label_set_long_mode(coming, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(coming, LCD_H_RES - 44);
+
+    rfhat_add_back_btn("Radio", show_radio_menu_screen);
 }
 
 // ── RFID Menu ─────────────────────────────────────────────────────────────────
