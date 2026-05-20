@@ -74,6 +74,11 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
     - [TX Power Mode](#tx-power-mode)
     - [GATT Connect Timeout](#gatt-connect-timeout)
     - [Data Transfer](#data-transfer)
+  - [NM-RF-HAT](#5-nm-rf-hat)
+    - [Infrared (DIP 4)](#infrared-dip-4)
+    - [RF433 OOK/ASK (DIP 5)](#rf433-ookask-dip-5)
+    - [PN532 NFC/RFID (DIP 3)](#pn532-nfcrfid-dip-3)
+    - [CC1101 / nRF24L01 (DIP 1 / DIP 2)](#cc1101-sub-ghz-dip-1--nrf24l01-24-ghz-dip-2)
 - [Data & Storage](#data--storage)
 - [Touch Calibration](#touch-calibration)
 - [Building & Flashing](#building--flashing)
@@ -103,7 +108,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **Credentials** | Captive portal credential capture, WPA-SEC upload |
 | **TX Power Mode** | Selectable Normal / Max Power for WiFi and BLE — persisted across reboots |
 | **Data Transfer** | Self-hosted AP file server (TheLab) and WiFi client file server — browse, upload, create directories, and recursively delete folders from any browser; client IP logged to serial; IP shown on screen |
-| **NM-RF-HAT** | Hardware addon board support *(coming soon)* — software-configurable RF module options for NRF, IR, and RFID expansion |
+| **NM-RF-HAT** | Hardware addon board for RF expansion — IR capture/replay/TV-B-Gone (Flipper-compatible .ir format), RF433 OOK (Flipper-compatible .sub format), Sub-GHz CC1101, 2.4 GHz nRF24L01, NFC/RFID PN532; DIP switch per module |
 | **UI** | Material dark theme, touch gestures, screen dimming, screenshots — all screens portrait 240×320 |
 | **Storage** | SD card for handshakes, wardrive logs, GATT Walker JSON, screenshots, file tree browser |
 
@@ -1495,6 +1500,92 @@ Uploads all wardrive CSV files from `/sdcard/lab/wardrives/` to [WiGLE](https://
 
 > **Tip:** Use **Wardrive → Manage Data → Upload** instead of **Settings → Data Transfer → Wardrive Upload** when you want to see file status before and after uploading. Both paths use the same upload screen and log.
 
+### 5. NM-RF-HAT
+
+The **NM-RF-HAT** is an optional RF expansion board that connects to the NM-CYD-C5 via its FPC2 header. It provides five RF modules gated by a 6-position DIP switch — only one module is powered at a time (hardware exclusion). Enable support via **Settings → NM-RF-HAT**.
+
+> **Status:** Active development — IR is functional; RF433, CC1101, nRF24, and PN532 modules are in progress.
+
+#### Modules
+
+| DIP | Module | Frequency | GPIO9 (IO27) | GPIO8 (IO22) |
+|-----|--------|-----------|-------------|-------------|
+| 1 | CC1101 | Sub-1 GHz (300–928 MHz) | SPI CSN | GDO0 |
+| 2 | nRF24L01 | 2.4 GHz | SPI CSN | CE |
+| 3 | PN532 | 13.56 MHz NFC/RFID | I2C SDA | I2C SCL |
+| 4 | IR Infrared | 36–40 kHz carrier | TX (IR LED) | RX (demod) |
+| 5 | RF433 OOK/ASK | 433.92 MHz | TX | RX |
+| 6 | Battery switch | — | — | — |
+
+#### Infrared (DIP 4)
+
+IR capture and replay using the ESP32-C5's RMT peripheral. Files use the **Flipper Zero `.ir` format** — directly portable between this device and a Flipper Zero (mount point differs; content is identical).
+
+```
+NM-RF-HAT IR
+├── Capture       -- listen for any IR signal (5 s timeout), then save to a remote
+├── Replay        -- browse remotes -> signals -> transmit
+│   ├── <Remote>.ir
+│   │   ├── Signal 1
+│   │   ├── Signal 2
+│   │   └── ...
+│   └── ...
+├── TV-B-Gone     -- transmit built-in power-off sequence for common TV brands
+└── IR Jammer     -- continuous 38 kHz carrier via LEDC hardware PWM
+```
+
+**File format:** Each `.ir` file is a "remote" (e.g. `Samsung_TV.ir`) containing one or more named signals:
+
+```
+Filetype: IR signals file
+Version: 1
+#
+name: Power
+type: raw
+frequency: 38000
+duty_cycle: 0.33
+data: 4500 4500 560 1680 560 560 ...
+```
+
+**SD card path:** `/sdcard/lab/infrared/`
+
+**Compatible IR file sources:**
+- Flipper Zero IR library: https://github.com/flipperdevices/flipperzero-firmware/tree/dev/assets/infrared/assets
+- IRDB community database: https://github.com/probonopd/irdb
+- Flipper-irdb (comprehensive): https://github.com/logickworkshop/Flipper-IRDB
+
+Copy any `.ir` file from these repositories directly into `/sdcard/lab/infrared/` — no conversion needed. The signal will appear in the Replay remote list immediately.
+
+#### RF433 OOK/ASK (DIP 5)
+
+433.92 MHz OOK/ASK capture and replay. Files use the **Flipper Zero `.sub` (SubGHz) format** — directly portable to/from Flipper Zero.
+
+**SD card path:** `/sdcard/lab/rf433/`
+
+**Compatible .sub file sources:**
+- Flipper Zero Sub-GHz library: https://github.com/flipperdevices/flipperzero-firmware/tree/dev/assets/subghz
+- UberGuidoZ collection: https://github.com/UberGuidoZ/Flipper/tree/main/Sub-GHz
+
+> **Status:** RF433 capture/replay UI in development.
+
+#### PN532 NFC/RFID (DIP 3)
+
+13.56 MHz NFC/RFID card reading and emulation via I2C.
+
+**SD card path:** `/sdcard/lab/rfid/`
+
+> **Status:** PN532 driver integration in development.
+
+#### CC1101 Sub-GHz (DIP 1) / nRF24L01 2.4 GHz (DIP 2)
+
+Raw packet capture and replay for licensed and ISM band signals.
+
+**SD card path:** `/sdcard/lab/radio/`
+
+> **Status:** CC1101 and nRF24 drivers in development.
+
+---
+
 ### UI & System Features
 
 | Feature | Description |
@@ -1577,8 +1668,14 @@ All data is stored on the SD card. `/sdcard/lab/` is the root for all project da
     ├── htmls/                # Captive portal HTML pages
     │   ├── basic_portal.html # Seeded: dark-themed WiFi login page (posts to /login)
     │   └── *.html / *.htm    # Drop additional portal pages here -- each appears in the attack dropdown
+    ├── infrared/             # NM-RF-HAT IR remotes (Flipper Zero .ir format)
+    │   └── <Remote>.ir       # One file per remote — multiple named signals per file
     ├── pcaps/                # MITM/sniff PCAP captures
     │   └── mitm_<n>.pcap
+    ├── radio/                # NM-RF-HAT CC1101 / nRF24L01 captures
+    ├── rf433/                # NM-RF-HAT RF433 OOK captures (Flipper Zero .sub format)
+    │   └── <Signal>.sub
+    ├── rfid/                 # NM-RF-HAT NFC/RFID card dumps (PN532)
     ├── screenshots/          # UI screenshots (BMP)
     │   └── screen_<n>.bmp
     └── wardrives/            # GPS + WiFi wardrive logs (WiGLE CSV 1.6 format)
