@@ -1529,6 +1529,8 @@ static volatile bool airtag_scan_update_flag = false;
 static lv_obj_t *bt_sas_list = NULL;
 static lv_obj_t *bt_sas_status_label = NULL;
 static lv_obj_t *bt_sas_next_btn = NULL;
+static lv_obj_t *bt_sas_save_overlay = NULL;
+static lv_obj_t *bt_sas_save_ta = NULL;
 static volatile bool bt_sas_ui_active = false;
 static volatile bool bt_sas_needs_update = false;
 static int bt_sas_selected_idx = -1;
@@ -1816,6 +1818,8 @@ static void reset_function_page_children(void) {
     bt_sas_list = NULL;
     bt_sas_status_label = NULL;
     bt_sas_next_btn = NULL;
+    bt_sas_save_overlay = NULL;
+    bt_sas_save_ta = NULL;
     bt_sas_ui_active = false;
     bt_sas_selected_idx = -1;
     airtag_scan_status_label = NULL;
@@ -2041,6 +2045,7 @@ static void disco_task(void *arg);
 
 // BT Scan & Select
 static void show_bt_scan_select_screen(void);
+static void bt_sas_open_save_dialog(void);
 static void show_bt_attack_tiles_screen(void);
 static void bt_sas_refresh_list(void);
 static void show_bt_observer_screen(void);
@@ -23259,6 +23264,10 @@ static void bt_sas_exit_cb(lv_event_t *e)
         bt_stop_scan();
         vTaskDelay(pdMS_TO_TICKS(50));
     }
+    if (bt_sas_save_overlay && lv_obj_is_valid(bt_sas_save_overlay))
+        lv_obj_del(bt_sas_save_overlay);
+    bt_sas_save_overlay = NULL;
+    bt_sas_save_ta = NULL;
     bt_sas_ui_active = false;
     bt_sas_selected_idx = -1;
     show_bluetooth_screen();
@@ -23369,6 +23378,273 @@ static void bt_sas_refresh_list(void)
     }
 }
 
+// Write current bt_devices[] to /sdcard/lab/bluetooth/scans/<filename>.json
+static void bt_sas_do_save(const char *label)
+{
+    ensure_sd_mounted();
+    if (!sd_spi_mutex) return;
+
+    const gps_data_t *g = gps_best();
+    bool has_gps = (g->latitude != 0.0f || g->longitude != 0.0f);
+
+    // Build timestamp token from GPS UTC (HHMMSS) or seconds-since-boot
+    char ts_part[12];
+    if (g->time_utc[0]) {
+        int hh = 0, mm = 0, ss = 0;
+        sscanf(g->time_utc, "%d:%d:%d", &hh, &mm, &ss);
+        snprintf(ts_part, sizeof(ts_part), "%02d%02d%02d", hh, mm, ss);
+    } else {
+        snprintf(ts_part, sizeof(ts_part), "%06u",
+                 (unsigned)(esp_timer_get_time() / 1000000ULL) % 1000000u);
+    }
+
+    // Sanitize label — keep alphanumeric, dash, underscore; default "mark"
+    char safe_label[24];
+    int li = 0;
+    for (int i = 0; label && label[i] && li < 20; i++) {
+        char c = label[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_')
+            safe_label[li++] = c;
+    }
+    safe_label[li] = '\0';
+    if (li == 0) memcpy(safe_label, "mark", 5);
+
+    // Ensure directory exists
+    mkdir("/sdcard/lab", 0755);
+    mkdir("/sdcard/lab/bluetooth", 0755);
+    mkdir("/sdcard/lab/bluetooth/scans", 0755);
+
+    // Build base path with GPS coords (dot→p, minus→n)
+    char base[112];
+    if (has_gps) {
+        char lat_s[16], lon_s[16];
+        snprintf(lat_s, sizeof(lat_s), "%.4f", (double)g->latitude);
+        snprintf(lon_s, sizeof(lon_s), "%.4f", (double)g->longitude);
+        for (int i = 0; lat_s[i]; i++) { if (lat_s[i] == '.') lat_s[i] = 'p'; else if (lat_s[i] == '-') lat_s[i] = 'n'; }
+        for (int i = 0; lon_s[i]; i++) { if (lon_s[i] == '.') lon_s[i] = 'p'; else if (lon_s[i] == '-') lon_s[i] = 'n'; }
+        snprintf(base, sizeof(base), "/sdcard/lab/bluetooth/scans/btsc_%s_%s_%s_%s",
+                 ts_part, lat_s, lon_s, safe_label);
+    } else {
+        snprintf(base, sizeof(base), "/sdcard/lab/bluetooth/scans/btsc_%s_%s",
+                 ts_part, safe_label);
+    }
+
+    // Resolve filename collision with increment suffix
+    char path[120];
+    struct stat st;
+    snprintf(path, sizeof(path), "%s.json", base);
+    if (stat(path, &st) == 0) {
+        for (int n = 1; n < 100; n++) {
+            snprintf(path, sizeof(path), "%s_%d.json", base, n);
+            if (stat(path, &st) != 0) break;
+        }
+    }
+
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        ESP_LOGE(TAG, "BT save: SD mutex timeout");
+        return;
+    }
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        xSemaphoreGive(sd_spi_mutex);
+        ESP_LOGE(TAG, "BT save: cannot open %s", path);
+        return;
+    }
+
+    // JSON header
+    fprintf(f, "{\n");
+    fprintf(f, "  \"label\": \"%s\",\n", safe_label);
+    fprintf(f, "  \"timestamp\": \"%s\",\n", ts_part);
+    if (has_gps) {
+        fprintf(f, "  \"gps_lat\": %.7f,\n", (double)g->latitude);
+        fprintf(f, "  \"gps_lon\": %.7f,\n", (double)g->longitude);
+        fprintf(f, "  \"gps_alt\": %.1f,\n", (double)g->altitude);
+        fprintf(f, "  \"gps_valid\": %s,\n", g->valid ? "true" : "false");
+    } else {
+        fprintf(f, "  \"gps_valid\": false,\n");
+    }
+    fprintf(f, "  \"fw_version\": \"%s\",\n", FW_VERSION);
+    fprintf(f, "  \"device_count\": %d,\n", bt_device_count);
+    fprintf(f, "  \"devices\": [\n");
+
+    for (int i = 0; i < bt_device_count; i++) {
+        bt_device_info_t *dev = &bt_devices[i];
+        char mac[18];
+        snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 dev->addr[5], dev->addr[4], dev->addr[3],
+                 dev->addr[2], dev->addr[1], dev->addr[0]);
+        // JSON-escape device name
+        char jname[80];
+        int ji = 0;
+        for (int k = 0; dev->name[k] && ji < 74; k++) {
+            if (dev->name[k] == '"' || dev->name[k] == '\\') jname[ji++] = '\\';
+            jname[ji++] = dev->name[k];
+        }
+        jname[ji] = '\0';
+
+        const char *comma = (i < bt_device_count - 1) ? "," : "";
+        fprintf(f,
+            "    {\"mac\":\"%s\",\"addr_type\":%d,\"phy\":%d,\"rssi\":%d,"
+            "\"name\":\"%s\",\"company_id\":%u,"
+            "\"is_airtag\":%s,\"is_smarttag\":%s,"
+            "\"is_possible_airtag\":%s,\"is_fast_pair\":%s}%s\n",
+            mac, dev->addr_type, dev->phy, dev->rssi,
+            jname, dev->company_id,
+            dev->is_airtag ? "true" : "false",
+            dev->is_smarttag ? "true" : "false",
+            dev->is_possible_airtag ? "true" : "false",
+            dev->is_fast_pair ? "true" : "false",
+            comma);
+    }
+
+    fprintf(f, "  ]\n}\n");
+    fflush(f);
+    fclose(f);
+    xSemaphoreGive(sd_spi_mutex);
+    ESP_LOGI(TAG, "BT scan saved: %s (%d devices)", path, bt_device_count);
+
+    if (bt_sas_status_label && lv_obj_is_valid(bt_sas_status_label)) {
+        char conf[48];
+        snprintf(conf, sizeof(conf), "Saved: %d devices", bt_device_count);
+        lv_label_set_text(bt_sas_status_label, conf);
+        lv_obj_set_style_text_color(bt_sas_status_label, COLOR_MATERIAL_GREEN, 0);
+    }
+}
+
+static void bt_sas_save_confirm_cb(lv_event_t *e)
+{
+    (void)e;
+    const char *label = "mark";
+    if (bt_sas_save_ta && lv_obj_is_valid(bt_sas_save_ta))
+        label = lv_textarea_get_text(bt_sas_save_ta);
+    if (bt_sas_save_overlay && lv_obj_is_valid(bt_sas_save_overlay))
+        lv_obj_del(bt_sas_save_overlay);
+    bt_sas_save_overlay = NULL;
+    bt_sas_save_ta = NULL;
+    bt_sas_do_save(label);
+}
+
+static void bt_sas_save_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    if (bt_sas_save_overlay && lv_obj_is_valid(bt_sas_save_overlay))
+        lv_obj_del(bt_sas_save_overlay);
+    bt_sas_save_overlay = NULL;
+    bt_sas_save_ta = NULL;
+}
+
+static void bt_sas_open_save_dialog(void)
+{
+    if (bt_sas_save_overlay) return;
+    if (bt_device_count == 0) {
+        if (bt_sas_status_label && lv_obj_is_valid(bt_sas_status_label))
+            lv_label_set_text(bt_sas_status_label, "No devices to save");
+        return;
+    }
+
+    bt_sas_save_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(bt_sas_save_overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(bt_sas_save_overlay, 0, 0);
+    lv_obj_set_style_bg_color(bt_sas_save_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(bt_sas_save_overlay, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(bt_sas_save_overlay, 0, 0);
+    lv_obj_set_style_pad_all(bt_sas_save_overlay, 0, 0);
+    lv_obj_clear_flag(bt_sas_save_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(bt_sas_save_overlay, 0, 0);
+
+    lv_obj_t *kb = lv_keyboard_create(bt_sas_save_overlay);
+    lv_obj_set_width(kb, LCD_H_RES);
+    lv_obj_set_style_text_font(kb, &lv_font_montserrat_12, 0);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+
+    lv_obj_t *card = lv_obj_create(bt_sas_save_overlay);
+    lv_obj_set_size(card, LCD_H_RES - 16, LV_SIZE_CONTENT);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 4);
+    lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(card, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 8, 0);
+    lv_obj_set_style_pad_row(card, 6, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, LV_SYMBOL_SAVE "  Save BT Scan List");
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+
+    // GPS + device count info
+    char info_buf[64];
+    const gps_data_t *g = gps_best();
+    if (g->latitude != 0.0f || g->longitude != 0.0f)
+        snprintf(info_buf, sizeof(info_buf), "%d devices  |  %.4f, %.4f%s",
+                 bt_device_count, (double)g->latitude, (double)g->longitude,
+                 g->valid ? "" : " [stale]");
+    else
+        snprintf(info_buf, sizeof(info_buf), "%d devices  |  No GPS", bt_device_count);
+    lv_obj_t *info_lbl = lv_label_create(card);
+    lv_label_set_text(info_lbl, info_buf);
+    lv_obj_set_style_text_color(info_lbl, g->valid ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_text_font(info_lbl, &lv_font_montserrat_12, 0);
+
+    bt_sas_save_ta = lv_textarea_create(card);
+    lv_obj_set_width(bt_sas_save_ta, LCD_H_RES - 32);
+    lv_obj_set_height(bt_sas_save_ta, 36);
+    lv_textarea_set_max_length(bt_sas_save_ta, 20);
+    lv_textarea_set_one_line(bt_sas_save_ta, true);
+    lv_textarea_set_placeholder_text(bt_sas_save_ta, "mark");
+    lv_obj_set_style_text_font(bt_sas_save_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(bt_sas_save_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(bt_sas_save_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(bt_sas_save_ta, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_bg_opa(bt_sas_save_ta, LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(bt_sas_save_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(bt_sas_save_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(bt_sas_save_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_keyboard_set_textarea(kb, bt_sas_save_ta);
+
+    lv_obj_t *btn_row = lv_obj_create(card);
+    lv_obj_set_size(btn_row, LCD_H_RES - 32, 30);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel_btn, 90, 26);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_make(70, 70, 70), 0);
+    lv_obj_set_style_radius(cancel_btn, 6, 0);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, LV_SYMBOL_CLOSE "  Cancel");
+    lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(cancel_lbl);
+    lv_obj_add_event_cb(cancel_btn, bt_sas_save_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *save_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(save_btn, 90, 26);
+    lv_obj_set_style_bg_color(save_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_bg_color(save_btn, lv_color_make(30, 140, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(save_btn, 6, 0);
+    lv_obj_t *save_lbl = lv_label_create(save_btn);
+    lv_label_set_text(save_lbl, LV_SYMBOL_OK "  Save");
+    lv_obj_set_style_text_font(save_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(save_lbl);
+    lv_obj_add_event_cb(save_btn, bt_sas_save_confirm_cb, LV_EVENT_CLICKED, NULL);
+}
+
+static void bt_sas_save_list_cb(lv_event_t *e)
+{
+    (void)e;
+    bt_sas_open_save_dialog();
+}
+
 static void show_bt_scan_select_screen(void)
 {
     ui_locked = true;
@@ -23403,7 +23679,7 @@ static void show_bt_scan_select_screen(void)
     lv_obj_set_style_pad_gap(bt_sas_list, 3, 0);
     lv_obj_set_scrollbar_mode(bt_sas_list, LV_SCROLLBAR_MODE_AUTO);
 
-    // Bottom button row: Exit | Next →
+    // Bottom button row: [Exit] [Save List] [Actions →]
     lv_obj_t *btn_row = lv_obj_create(function_page);
     lv_obj_set_size(btn_row, lv_pct(100), 38);
     lv_obj_align(btn_row, LV_ALIGN_BOTTOM_MID, 0, -6);
@@ -23416,7 +23692,7 @@ static void show_bt_scan_select_screen(void)
     lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *exit_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(exit_btn, 100, 30);
+    lv_obj_set_size(exit_btn, 68, 30);
     lv_obj_set_style_bg_color(exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 40), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(exit_btn, 0, 0);
@@ -23428,8 +23704,21 @@ static void show_bt_scan_select_screen(void)
     lv_obj_center(exit_lbl);
     lv_obj_add_event_cb(exit_btn, bt_sas_exit_cb, LV_EVENT_CLICKED, NULL);
 
+    lv_obj_t *save_list_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(save_list_btn, 88, 30);
+    lv_obj_set_style_bg_color(save_list_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(save_list_btn, lv_color_make(30, 140, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(save_list_btn, 0, 0);
+    lv_obj_set_style_radius(save_list_btn, 8, 0);
+    lv_obj_t *save_list_lbl = lv_label_create(save_list_btn);
+    lv_label_set_text(save_list_lbl, LV_SYMBOL_SAVE "  Save List");
+    lv_obj_set_style_text_font(save_list_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(save_list_lbl, lv_color_white(), 0);
+    lv_obj_center(save_list_lbl);
+    lv_obj_add_event_cb(save_list_btn, bt_sas_save_list_cb, LV_EVENT_CLICKED, NULL);
+
     bt_sas_next_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(bt_sas_next_btn, 110, 30);
+    lv_obj_set_size(bt_sas_next_btn, 74, 30);
     lv_obj_set_style_bg_color(bt_sas_next_btn, UI_ACCENT_CYAN, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(bt_sas_next_btn, lv_color_lighten(UI_ACCENT_CYAN, 40), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(bt_sas_next_btn, 0, 0);
