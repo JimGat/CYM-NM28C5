@@ -22121,7 +22121,7 @@ static void show_bt_lookout_screen(void)
 
     // Status card
     lv_obj_t *card = lv_obj_create(function_page);
-    lv_obj_set_size(card, 220, 105);
+    lv_obj_set_size(card, 220, 90);
     lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 38);
     lv_obj_set_style_bg_color(card, ui_card_color(), 0);
     lv_obj_set_style_border_color(card, COLOR_MATERIAL_RED, 0);
@@ -22158,7 +22158,7 @@ static void show_bt_lookout_screen(void)
     // Start/Stop button
     bt_lookout_start_btn = lv_btn_create(function_page);
     lv_obj_set_size(bt_lookout_start_btn, 110, 30);
-    lv_obj_align(bt_lookout_start_btn, LV_ALIGN_TOP_MID, 0, 155);
+    lv_obj_align(bt_lookout_start_btn, LV_ALIGN_TOP_MID, 0, 140);
     lv_obj_set_style_bg_color(bt_lookout_start_btn,
         is_active ? COLOR_MATERIAL_RED : COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(bt_lookout_start_btn, 0, 0);
@@ -22182,7 +22182,7 @@ static void show_bt_lookout_screen(void)
     // Blackout button
     lv_obj_t *dark_btn = lv_btn_create(function_page);
     lv_obj_set_size(dark_btn, 110, 30);
-    lv_obj_align(dark_btn, LV_ALIGN_TOP_MID, 0, 195);
+    lv_obj_align(dark_btn, LV_ALIGN_TOP_MID, 0, 180);
     lv_obj_set_style_bg_color(dark_btn, lv_color_make(50, 50, 50), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(dark_btn, lv_color_make(80, 80, 80), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(dark_btn, 0, 0);
@@ -22206,7 +22206,7 @@ static void show_bt_lookout_screen(void)
     // Edit Watchlist + OUI Groups buttons — side by side, only visible when stopped
     bt_lookout_edit_btn = lv_btn_create(function_page);
     lv_obj_set_size(bt_lookout_edit_btn, 106, 28);
-    lv_obj_align(bt_lookout_edit_btn, LV_ALIGN_TOP_MID, -58, 235);
+    lv_obj_align(bt_lookout_edit_btn, LV_ALIGN_TOP_MID, -58, 218);
     lv_obj_set_style_bg_color(bt_lookout_edit_btn, lv_color_make(30, 80, 140), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(bt_lookout_edit_btn, lv_color_make(50, 110, 180), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(bt_lookout_edit_btn, 0, 0);
@@ -22227,7 +22227,7 @@ static void show_bt_lookout_screen(void)
 
     bt_lookout_oui_btn = lv_btn_create(function_page);
     lv_obj_set_size(bt_lookout_oui_btn, 106, 28);
-    lv_obj_align(bt_lookout_oui_btn, LV_ALIGN_TOP_MID, 58, 235);
+    lv_obj_align(bt_lookout_oui_btn, LV_ALIGN_TOP_MID, 58, 218);
     lv_obj_set_style_bg_color(bt_lookout_oui_btn, lv_color_make(70, 30, 120), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(bt_lookout_oui_btn, lv_color_make(100, 50, 160), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(bt_lookout_oui_btn, 0, 0);
@@ -22249,7 +22249,7 @@ static void show_bt_lookout_screen(void)
     // Blacklist editor button (centered on second row)
     lv_obj_t *bl_btn = lv_btn_create(function_page);
     lv_obj_set_size(bl_btn, 120, 28);
-    lv_obj_align(bl_btn, LV_ALIGN_TOP_MID, 0, 268);
+    lv_obj_align(bl_btn, LV_ALIGN_TOP_MID, 0, 250);
     lv_obj_set_style_bg_color(bl_btn, lv_color_make(140, 30, 30), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(bl_btn, lv_color_make(180, 50, 50), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(bl_btn, 0, 0);
@@ -22271,7 +22271,7 @@ static void show_bt_lookout_screen(void)
     // Back button
     lv_obj_t *back_btn = lv_btn_create(function_page);
     lv_obj_set_size(back_btn, 110, 28);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
     lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(back_btn, 0, 0);
