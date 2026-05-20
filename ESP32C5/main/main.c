@@ -20366,6 +20366,12 @@ static lv_obj_t *s_rfhat_status_lbl = NULL;
 static lv_obj_t *s_rfhat_en_btn     = NULL;
 static lv_obj_t *s_rfhat_dis_btn    = NULL;
 
+static void rfhat_dev_ok_cb(lv_event_t *e)
+{
+    lv_obj_t *popup = (lv_obj_t *)lv_event_get_user_data(e);
+    if (popup && lv_obj_is_valid(popup)) lv_obj_del(popup);
+}
+
 static void rfhat_toggle_cb(lv_event_t *e)
 {
     bool enable = (bool)(uintptr_t)lv_event_get_user_data(e);
@@ -20378,6 +20384,52 @@ static void rfhat_toggle_cb(lv_event_t *e)
     }
     // Re-draw home tiles so IR/Radio/RFID tiles appear or disappear
     show_main_tiles();
+
+    // Show development notice when enabling
+    if (enable) {
+        lv_obj_t *popup = lv_obj_create(lv_scr_act());
+        lv_obj_set_size(popup, 210, 190);
+        lv_obj_align(popup, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_bg_color(popup, ui_panel_color(), 0);
+        lv_obj_set_style_border_color(popup, COLOR_MATERIAL_AMBER, 0);
+        lv_obj_set_style_border_width(popup, 2, 0);
+        lv_obj_set_style_radius(popup, 10, 0);
+        lv_obj_set_style_pad_all(popup, 12, 0);
+        lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *icon = lv_label_create(popup);
+        lv_label_set_text(icon, LV_SYMBOL_WARNING " NM-RF-HAT");
+        lv_obj_set_style_text_font(icon, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(icon, COLOR_MATERIAL_AMBER, 0);
+        lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 0);
+
+        lv_obj_t *msg = lv_label_create(popup);
+        lv_label_set_text(msg,
+            "NM-RF-HAT is currently under\n"
+            "active development. Not all\n"
+            "modules are functional yet.\n\n"
+            "Please be patient and submit\n"
+            "feedback to @jimgat");
+        lv_obj_set_style_text_font(msg, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(msg, ui_text_color(), 0);
+        lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(msg, 186);
+        lv_obj_align(msg, LV_ALIGN_TOP_MID, 0, 28);
+
+        lv_obj_t *ok_btn = lv_btn_create(popup);
+        lv_obj_set_size(ok_btn, 100, 34);
+        lv_obj_align(ok_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
+        lv_obj_set_style_bg_color(ok_btn, COLOR_MATERIAL_AMBER, LV_STATE_DEFAULT);
+        lv_obj_set_style_border_width(ok_btn, 0, 0);
+        lv_obj_set_style_radius(ok_btn, 6, 0);
+        lv_obj_t *ok_lbl = lv_label_create(ok_btn);
+        lv_label_set_text(ok_lbl, "OK");
+        lv_obj_set_style_text_font(ok_lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ok_lbl, lv_color_black(), 0);
+        lv_obj_center(ok_lbl);
+        lv_obj_add_event_cb(ok_btn, rfhat_dev_ok_cb, LV_EVENT_CLICKED, popup);
+    }
 }
 
 static void rfhat_back_cb(lv_event_t *e) { (void)e; show_hardware_options_screen(); }
