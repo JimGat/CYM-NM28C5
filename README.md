@@ -5,7 +5,7 @@
 <h1 align="center">Cheap Yellow Monster</h1>
 
 <p align="center">
-  <b>v1.6.49</b>
+  <b>v1.6.54</b>
 </p>
 
 <p align="center">
@@ -468,14 +468,18 @@ Bluetooth
 ├── AirTag Scan
 ├── Drone Detector
 ├── BT Locator
+├── List Wizard         ← multi-select btsc_*.json files → Unique / Common set ops
 └── Bluetooth Lookout   ← continuous watchlist monitor
     ├── Edit Watchlist
+    ├── Edit Blacklist
     └── OUI Groups
 ```
 
 | Feature | Description |
 |---------|-------------|
-| **BT Scan & Select** | Active BLE scan — discovers all nearby devices; shows name or vendor (from OUI lookup), RSSI, partial MAC; tap to select a target; **Save List** button snapshots the entire scan list to a GPS-tagged JSON file on the SD card |
+| **BT Scan & Select** | Active BLE scan — discovers all nearby devices; shows name or vendor (from OUI lookup), RSSI, partial MAC; tap to select a target; **Save List** saves the full scan to a GPS-tagged JSON file on SD; **Rescan** restarts the scan in-place; **Actions →** opens attack tiles on selected target |
+| **List Wizard** | Multi-file BT scan list analysis. Reads all `btsc_*.json` files from SD, sorted newest-first. Select up to 4 files, set an optional RSSI threshold, then compute **Unique** (union — all devices across selected files) or **Common** (intersection — devices that appear in every selected file). Results shown in a scrollable list; save directly to the BT Lookout watchlist. Per-row delete with confirm dialog. |
+| **BT Blacklist** | Per-device suppression list at `/sdcard/lab/bluetooth/blacklist.csv`. Any device on the blacklist is silently ignored by BT Scan & Select, BT Lookout, BLE PCAP, and all other BT scan functions. Editor built into the BT Lookout screen (same Edit-button pattern as the Lookout watchlist editor). |
 | **BT Observer** | 10-second active BLE scan followed by sequential GATT walks on every discovered device (5 s timeout per device). Results shown in a scrollable live list; tap any row to open the full GATT detail view |
 | **BT Locator** | RSSI-based proximity tracking of a selected BLE device; updates every 10 s. Vibrator strength scales logarithmically with signal strength — silent below −69 dBm, 10% at −69 dBm, 100% at −40 dBm (requires vibrator hardware). |
 | **GATT Walker** | Full BLE GATT inspection — walks all services, characteristics, and descriptors; reads attribute values; computes FNV-32 device fingerprint; saves enriched JSON to SD card with service/characteristic names, decoded properties, ASCII data preview, OUI manufacturer, and optional GPS geotag |
@@ -502,15 +506,95 @@ Bluetooth
 
 **Step 3 — Actions:** Once a device is selected, tap **Actions →** to open the action tile screen. Available actions: **BT Locator** (RSSI proximity tracking), **GATT Walker** (full GATT inspection and JSON output), and **Add to BT Lookout** (add the device MAC to the continuous watchlist). The target name or MAC is shown in the screen title.
 
-**Save List** — a green button always visible in the bottom row (no device selection required). Tap it to open a label dialog (identical to the wardrive Mark waypoint dialog). Enter an optional label (defaults to `mark`). The full scan list is written as a JSON file to `/sdcard/lab/bluetooth/scans/` with the filename encoding the GPS coordinates and UTC time:
+**Bottom button row** (always visible, no device selection needed):
+
+- **Exit** — stop scan and return to Bluetooth menu
+- **Save List** — opens a label dialog; writes the full scan list to SD as a numbered JSON file
+- **Rescan** (amber) — stops the current scan, clears the device list, and immediately starts a fresh 10-second scan
+- **Actions →** (cyan, appears after device selection) — opens attack tile screen for the selected target
+
+**Save List — File format**
+
+Scan files are saved to `/sdcard/lab/bluetooth/scans/`. The filename encodes a monotonically-incrementing scan counter (NVS-persisted across reboots), the UTC time, GPS coordinates if available, and the user label:
 
 ```
-btsc_HHMMSS_LAT_LON_label.json        (with GPS fix)
-btsc_HHMMSS_label.json                (no GPS)
-btsc_HHMMSS_LAT_LON_label_1.json      (auto-incremented if name collides)
+btsc_00001_HHMMSS_LAT_LON_label.json   (with GPS — live or last-known)
+btsc_00001_HHMMSS_label.json           (no GPS ever recorded)
 ```
 
-Each file is a JSON object with a `devices[]` array — one entry per device — containing MAC, address type, PHY, RSSI, name, company ID, and all classification flags (`is_airtag`, `is_smarttag`, `is_possible_airtag`, `is_fast_pair`). The outer object also carries `label`, `timestamp`, GPS fields, `fw_version`, and `device_count`. These files are designed to be loaded by a future deduplication tool that merges and compares BT scan lists across sessions or locations.
+GPS location uses the persistent GPS subsystem: `gps_best()` returns the live fix when available, or the last-known location (saved to NVS on each valid fix and on shutdown) when GPS signal is lost. You always get the closest known position even after a dropout.
+
+**JSON schema:**
+
+```json
+{
+  "label": "JBL",
+  "timestamp": "143022",
+  "datetime": "2026-05-20 14:30:22",
+  "gps_lat": 37.4219984,
+  "gps_lon": -122.0840012,
+  "gps_alt": 12.3,
+  "gps_live": true,
+  "fw_version": "v1.6.54",
+  "scan_id": 3,
+  "device_count": 12,
+  "devices": [
+    {
+      "mac": "AA:BB:CC:DD:EE:FF",
+      "addr_type": 0,
+      "phy": 1,
+      "rssi": -62,
+      "name": "JBL Flip 6",
+      "company_id": 0,
+      "is_airtag": false,
+      "is_smarttag": false,
+      "is_possible_airtag": false,
+      "is_fast_pair": false
+    }
+  ]
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `label` | User-supplied label (alphanumeric + `-_`, defaults to `mark`) |
+| `timestamp` | `HHMMSS` UTC — used in filename |
+| `datetime` | `YYYY-MM-DD HH:MM:SS` UTC from GPS-synced system clock |
+| `gps_lat/lon/alt` | GPS coordinates — live fix or last-known persistent position |
+| `gps_live` | `true` if GPS was live at save time; `false` if using last-known |
+| `scan_id` | Monotonically increasing counter (NVS-persisted) — matches `%05u` prefix in filename |
+| `device_count` | Number of entries in `devices[]` |
+| `rssi` | Peak RSSI seen during scan (dBm) |
+| `addr_type` | 0 = public, 1 = random |
+| `phy` | 1 = 1M, 2 = 2M, 3 = coded |
+
+#### List Wizard — How It Works
+
+List Wizard reads all saved `btsc_*.json` scan files from `/sdcard/lab/bluetooth/scans/` and lets you compare them across sessions.
+
+**File list:** Files are displayed newest-first (by scan counter). Each row shows the user label, the full save date and time (`YYYY-MM-DD HH:MM`), and the device count. A small red trash button on the right of each row deletes the file after a confirm dialog.
+
+**Selection:** Tap up to 4 rows to select them (highlighted cyan). The status bar shows how many are selected.
+
+**RSSI Threshold:** Before computing a set operation, tap **Unique** or **Common** to open the RSSI threshold popup. A slider from −99 dBm (no filter, default) to 0 dBm lets you exclude weak/distant devices. The result title shows the active threshold if one is set.
+
+**Set operations:**
+- **Unique** — union of all selected files. Returns every distinct device (by MAC) that appeared in any of the selected scans, keeping the best RSSI seen across files.
+- **Common** — intersection. Returns only devices that appear in every selected file (above the RSSI threshold in each). Useful for finding devices that were present across multiple sessions or locations.
+
+**Result:** A scrollable list of MACs and names. At the bottom: **Close** or **Save to Lookout** — appends the result directly to `/sdcard/lab/bluetooth/lookout.csv` and reloads the BT Lookout watchlist.
+
+**BT Blacklist**
+
+The blacklist at `/sdcard/lab/bluetooth/blacklist.csv` contains devices that should be globally suppressed. Any device whose MAC (or OUI prefix if `oui_only=1`) appears in the blacklist is silently skipped by BT Scan & Select, BT Lookout, BLE PCAP, and all other BT scan paths.
+
+**CSV format** (same as lookout.csv — no header row):
+```
+AA:BB:CC:DD:EE:FF,0   # full MAC match
+AA:BB:CC,1            # OUI prefix match (first 3 octets only)
+```
+
+The editor is in the **BT Lookout** screen — tap the **Edit Blacklist** button (same pattern as Edit Watchlist). Rows are shown in a scrollable list with a delete button on each entry and an **Add** button for new entries.
 
 #### AirTag / SmartTag Locator — How It Works
 
@@ -1462,10 +1546,11 @@ All data is stored on the SD card. `/sdcard/lab/` is the root for all project da
     │   └── whisperpair/      # WhisperPair (CVE-2025-36911) probe/exploit logs
     │       └── wp_<timestamp>.json
     ├── bluetooth/
-    │   ├── lookout.csv       # Bluetooth Lookout watchlist
-    │   ├── spooflist.csv     # Device Spoof targets -- CSV: MAC,Name (one per line)
+    │   ├── lookout.csv       # BT Lookout watchlist: MAC,name,rssi_threshold,oui_only
+    │   ├── blacklist.csv     # BT Blacklist: MAC[,oui_only] — suppressed globally
+    │   ├── spooflist.csv     # Device Spoof targets: MAC,Name (one per line)
     │   └── scans/            # BT Scan & Select saved snapshots
-    │       └── btsc_HHMMSS_LAT_LON_label.json   # GPS-tagged JSON with devices[] array
+    │       └── btsc_00001_HHMMSS_LAT_LON_label.json   # GPS-tagged JSON; scan_id NVS-persisted
     ├── cellular/
     │   ├── tower_baseline.csv
     │   ├── tower_anomalies.csv
