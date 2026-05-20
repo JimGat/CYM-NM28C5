@@ -23618,52 +23618,46 @@ static void lw_del_btn_cb(lv_event_t *e) {
 static void lw_rebuild_list(void) {
     if (!lw_list_box || !lv_obj_is_valid(lw_list_box)) return;
     lv_obj_clean(lw_list_box);
+    if (lw_file_count == 0) {
+        lv_obj_t *empty = lv_label_create(lw_list_box);
+        lv_label_set_text(empty, "No scan files found.\nUse BT Scan & Select\nto save a list first.");
+        lv_obj_set_style_text_color(empty, COLOR_MATERIAL_AMBER, 0);
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_12, 0);
+        return;
+    }
     for (int i = 0; i < lw_file_count; i++) {
         lw_file_info_t *fi = &lw_files[i];
         char row[72];
         const char *flbl = fi->label[0] ? fi->label : "?";
-        if (fi->datetime[0] && fi->datetime[0] != '-') {
+        if (fi->datetime[0] && fi->datetime[0] != '-' && strcmp(fi->datetime, "unknown") != 0) {
             // "YYYY-MM-DD HH:MM:SS" → show "YYYY-MM-DD HH:MM" (drop seconds to fit)
             char dt[17];
             memcpy(dt, fi->datetime, 16); dt[16] = '\0';
             snprintf(row, sizeof(row), "%s  %s  %d devs", flbl, dt, fi->device_count);
-        } else if (fi->ts[0] && strlen(fi->ts) >= 6) {
+        } else if (fi->ts[0] && strlen(fi->ts) >= 6 && strcmp(fi->ts, "000000") != 0) {
             snprintf(row, sizeof(row), "%s  %c%c:%c%c:%c%c  %d devs",
                      flbl,
                      fi->ts[0],fi->ts[1],fi->ts[2],fi->ts[3],fi->ts[4],fi->ts[5],
                      fi->device_count);
         } else {
-            snprintf(row, sizeof(row), "%s  --  %d devs", flbl, fi->device_count);
+            snprintf(row, sizeof(row), "%s  --:--:--  %d devs", flbl, fi->device_count);
         }
-        // Row container: [select btn (flex grow)] [delete btn 28px]
+        // Two fixed columns: [select btn | 32px del column]
+        // Using explicit pixel widths (not flex_grow) so del button is visible on first render.
+        // lw_list_box pad=3 → content=234px. Del col=32. Sel col=202.
         lv_obj_t *row_cont = lv_obj_create(lw_list_box);
         lv_obj_set_size(row_cont, lv_pct(100), 28);
         lv_obj_set_style_bg_opa(row_cont, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(row_cont, 0, 0);
         lv_obj_set_style_pad_all(row_cont, 0, 0);
-        lv_obj_set_flex_flow(row_cont, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(row_cont, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_clear_flag(row_cont, LV_OBJ_FLAG_SCROLLABLE);
 
         bool sel = lw_selected[i];
-        lv_obj_t *btn = lv_btn_create(row_cont);
-        lv_obj_set_size(btn, lv_pct(100) - 30, 28);
-        lv_obj_set_flex_grow(btn, 1);
-        lv_obj_set_style_bg_color(btn, sel ? UI_ACCENT_CYAN : ui_card_color(), LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_color(btn, lv_color_lighten(UI_ACCENT_CYAN, 30), LV_STATE_PRESSED);
-        lv_obj_set_style_radius(btn, 4, 0);
-        lv_obj_set_style_border_width(btn, 0, 0);
-        lv_obj_set_style_pad_all(btn, 0, 0);
-        lv_obj_t *lbl = lv_label_create(btn);
-        lv_label_set_text(lbl, row);
-        lv_obj_set_style_text_color(lbl, sel ? lv_color_black() : ui_text_color(), 0);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
-        lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 4, 0);
-        lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
-        lv_obj_add_event_cb(btn, lw_item_cb, LV_EVENT_SHORT_CLICKED, (void*)(intptr_t)i);
 
+        // Right column — delete button, always anchored to the right edge
         lv_obj_t *del_btn = lv_btn_create(row_cont);
-        lv_obj_set_size(del_btn, 28, 28);
+        lv_obj_set_size(del_btn, 30, 28);
+        lv_obj_align(del_btn, LV_ALIGN_RIGHT_MID, 0, 0);
         lv_obj_set_style_bg_color(del_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
         lv_obj_set_style_bg_color(del_btn, lv_color_make(180,0,0), LV_STATE_PRESSED);
         lv_obj_set_style_radius(del_btn, 4, 0);
@@ -23675,6 +23669,25 @@ static void lw_rebuild_list(void) {
         lv_obj_center(del_lbl);
         lv_obj_add_event_cb(del_btn, lw_del_btn_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
         if (sel) lv_obj_add_flag(del_btn, LV_OBJ_FLAG_HIDDEN);
+
+        // Left column — select button with scrolling label
+        lv_obj_t *btn = lv_btn_create(row_cont);
+        lv_obj_set_size(btn, LCD_H_RES - 40, 28);  // 240-6(list pad)-32(del col)-2(gap)=202
+        lv_obj_align(btn, LV_ALIGN_LEFT_MID, 0, 0);
+        lv_obj_set_style_bg_color(btn, sel ? UI_ACCENT_CYAN : ui_card_color(), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(btn, lv_color_lighten(UI_ACCENT_CYAN, 30), LV_STATE_PRESSED);
+        lv_obj_set_style_radius(btn, 4, 0);
+        lv_obj_set_style_border_width(btn, 0, 0);
+        lv_obj_set_style_pad_hor(btn, 4, 0);
+        lv_obj_set_style_pad_ver(btn, 0, 0);
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, row);
+        lv_obj_set_style_text_color(lbl, sel ? lv_color_black() : ui_text_color(), 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_width(lbl, LCD_H_RES - 48);  // clip/scroll within btn content area
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+        lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 0, 0);
+        lv_obj_add_event_cb(btn, lw_item_cb, LV_EVENT_SHORT_CLICKED, (void*)(intptr_t)i);
     }
 }
 
@@ -24062,38 +24075,8 @@ static void show_list_wizard_screen(void) {
         }
     }
 
-    // Populate list
-    if (lw_file_count == 0) {
-        lv_obj_t *empty = lv_label_create(lw_list_box);
-        lv_label_set_text(empty, "No scan files found.\nUse BT Scan & Select\nto save a list first.");
-        lv_obj_set_style_text_color(empty, COLOR_MATERIAL_AMBER, 0);
-        lv_obj_set_style_text_font(empty, &lv_font_montserrat_12, 0);
-    } else {
-        for (int i = 0; i < lw_file_count; i++) {
-            lw_file_info_t *fi = &lw_files[i];
-            char row[64];
-            if (fi->ts[0] && strlen(fi->ts) >= 6)
-                snprintf(row, sizeof(row), "%s  %c%c:%c%c:%c%c  %d devs",
-                         fi->label[0] ? fi->label : "?",
-                         fi->ts[0],fi->ts[1],fi->ts[2],fi->ts[3],fi->ts[4],fi->ts[5],
-                         fi->device_count);
-            else
-                snprintf(row, sizeof(row), "%s  --:--  %d devs",
-                         fi->label[0] ? fi->label : "?", fi->device_count);
-            lv_obj_t *btn = lv_btn_create(lw_list_box);
-            lv_obj_set_size(btn, lv_pct(100), 28);
-            lv_obj_set_style_bg_color(btn, ui_card_color(), LV_STATE_DEFAULT);
-            lv_obj_set_style_bg_color(btn, lv_color_lighten(UI_ACCENT_CYAN, 30), LV_STATE_PRESSED);
-            lv_obj_set_style_radius(btn, 4, 0);
-            lv_obj_t *lbl = lv_label_create(btn);
-            lv_label_set_text(lbl, row);
-            lv_obj_set_style_text_color(lbl, ui_text_color(), 0);
-            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
-            lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 4, 0);
-            lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
-            lv_obj_add_event_cb(btn, lw_item_cb, LV_EVENT_SHORT_CLICKED, (void*)(intptr_t)i);
-        }
-    }
+    // Populate list using shared rebuild function (two-column layout with delete buttons)
+    lw_rebuild_list();
 
     char status[48];
     snprintf(status, sizeof(status), "%d file%s - select up to 4",
@@ -24594,14 +24577,18 @@ static void bt_sas_do_save(const char *label)
 static void bt_sas_save_confirm_cb(lv_event_t *e)
 {
     (void)e;
-    const char *label = "mark";
-    if (bt_sas_save_ta && lv_obj_is_valid(bt_sas_save_ta))
-        label = lv_textarea_get_text(bt_sas_save_ta);
+    // Copy text to local buffer before lv_obj_del invalidates the textarea's internal pointer
+    char label_buf[24] = "mark";
+    if (bt_sas_save_ta && lv_obj_is_valid(bt_sas_save_ta)) {
+        const char *txt = lv_textarea_get_text(bt_sas_save_ta);
+        if (txt && txt[0])
+            snprintf(label_buf, sizeof(label_buf), "%s", txt);
+    }
     if (bt_sas_save_overlay && lv_obj_is_valid(bt_sas_save_overlay))
         lv_obj_del(bt_sas_save_overlay);
     bt_sas_save_overlay = NULL;
     bt_sas_save_ta = NULL;
-    bt_sas_do_save(label);
+    bt_sas_do_save(label_buf);
 }
 
 static void bt_sas_save_cancel_cb(lv_event_t *e)
