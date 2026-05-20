@@ -1549,7 +1549,7 @@ static char bt_sas_target_name[32];
 #define LW_MAX_RESULT      512
 
 typedef struct {
-    char filename[32];   // filename only (no path)
+    char filename[80];   // filename only (no path); max real len ~62 chars
     char label[24];
     char ts[8];          // HHMMSS (legacy / filename fallback)
     char datetime[20];   // "YYYY-MM-DD HH:MM:SS" from JSON datetime field
@@ -23367,7 +23367,7 @@ static int lw_compute_union(int *sel_idx, int nsel, lw_dev_t *result, int max_re
     lw_dev_t *tmp = heap_caps_calloc(LW_MAX_RESULT, sizeof(lw_dev_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!tmp) return 0;
     for (int fi = 0; fi < nsel; fi++) {
-        char path[100];
+        char path[120];
         snprintf(path, sizeof(path), "%s/%s", LW_SCAN_DIR, lw_files[sel_idx[fi]].filename);
         int n = lw_parse_devices(path, tmp, LW_MAX_RESULT);
         for (int di = 0; di < n && count < max_result; di++) {
@@ -23390,7 +23390,7 @@ static int lw_compute_union(int *sel_idx, int nsel, lw_dev_t *result, int max_re
 static int lw_compute_intersection(int *sel_idx, int nsel, lw_dev_t *result, int max_result) {
     if (nsel == 0) return 0;
     // Start with devices from first file, applying RSSI threshold
-    char path[100];
+    char path[120];
     snprintf(path, sizeof(path), "%s/%s", LW_SCAN_DIR, lw_files[sel_idx[0]].filename);
     lw_dev_t *raw = heap_caps_calloc(LW_MAX_RESULT, sizeof(lw_dev_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!raw) return 0;
@@ -23526,7 +23526,7 @@ static void lw_del_confirm_cb(lv_event_t *e) {
     if (idx < 0 || idx >= lw_file_count || !lw_files) return;
 
     // Delete file from SD
-    char path[100];
+    char path[120];
     snprintf(path, sizeof(path), "%s/%s", LW_SCAN_DIR, lw_files[idx].filename);
     if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
         remove(path);
@@ -24033,8 +24033,8 @@ static void show_list_wizard_screen(void) {
                 int flen = strlen(fn);
                 if (flen < 6 || strcmp(fn + flen - 5, ".json") != 0) continue;
                 if (strncmp(fn, "btsc_", 5) != 0) continue;
-                strncpy(lw_files[lw_file_count].filename, fn, 31);
-                lw_files[lw_file_count].filename[31] = '\0';
+                strncpy(lw_files[lw_file_count].filename, fn, 79);
+                lw_files[lw_file_count].filename[79] = '\0';
                 lw_file_count++;
             }
             closedir(dir);
@@ -24052,7 +24052,7 @@ static void show_list_wizard_screen(void) {
         // Parse metadata for each file
         if (sd_spi_mutex) {
             for (int i = 0; i < lw_file_count; i++) {
-                char path[100];
+                char path[120];
                 snprintf(path, sizeof(path), "%s/%s", LW_SCAN_DIR, lw_files[i].filename);
                 if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
                     lw_parse_meta(path, &lw_files[i]);
