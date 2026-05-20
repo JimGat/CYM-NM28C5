@@ -5893,6 +5893,7 @@ void app_main(void)
                 lv_obj_set_style_text_color(wprev_lbl, lv_color_white(), 0);
                 lv_obj_center(wprev_lbl);
                 lv_obj_add_event_cb(wifi_sas_nav_prev, wifi_scan_prev_page_cb, LV_EVENT_CLICKED, NULL);
+                lv_obj_add_event_cb(wifi_sas_nav_prev, wifi_scan_prev_page_cb, LV_EVENT_LONG_PRESSED_REPEAT, NULL);
 
                 wifi_sas_nav_lbl = lv_label_create(wifi_sas_nav_bar);
                 lv_label_set_text(wifi_sas_nav_lbl, "");
@@ -5913,6 +5914,7 @@ void app_main(void)
                 lv_obj_set_style_text_color(wnext_lbl, lv_color_white(), 0);
                 lv_obj_center(wnext_lbl);
                 lv_obj_add_event_cb(wifi_sas_nav_next, wifi_scan_next_page_cb, LV_EVENT_CLICKED, NULL);
+                lv_obj_add_event_cb(wifi_sas_nav_next, wifi_scan_next_page_cb, LV_EVENT_LONG_PRESSED_REPEAT, NULL);
 
                 wifi_scan_rebuild_page();
 
@@ -24161,6 +24163,7 @@ static void lw_rebuild_list(void) {
         lv_obj_set_style_text_font(lup_lbl, &lv_font_montserrat_12, 0);
         lv_obj_center(lup_lbl);
         if (can_up) lv_obj_add_event_cb(lup, lw_scroll_up_cb, LV_EVENT_CLICKED, NULL);
+        if (can_up) lv_obj_add_event_cb(lup, lw_scroll_up_cb, LV_EVENT_LONG_PRESSED_REPEAT, NULL);
 
         lv_obj_t *lpos = lv_label_create(lw_list_box);
         lv_obj_add_flag(lpos, LV_OBJ_FLAG_FLOATING);
@@ -24187,6 +24190,7 @@ static void lw_rebuild_list(void) {
         lv_obj_set_style_text_font(ldn_lbl, &lv_font_montserrat_12, 0);
         lv_obj_center(ldn_lbl);
         if (can_dn) lv_obj_add_event_cb(ldn, lw_scroll_down_cb, LV_EVENT_CLICKED, NULL);
+        if (can_dn) lv_obj_add_event_cb(ldn, lw_scroll_down_cb, LV_EVENT_LONG_PRESSED_REPEAT, NULL);
     }
 }
 
@@ -25127,6 +25131,7 @@ static void bt_sas_refresh_list(void)
         lv_obj_set_style_text_font(up_lbl, &lv_font_montserrat_12, 0);
         lv_obj_center(up_lbl);
         if (can_up) lv_obj_add_event_cb(up, bt_sas_scroll_up_cb, LV_EVENT_CLICKED, NULL);
+        if (can_up) lv_obj_add_event_cb(up, bt_sas_scroll_up_cb, LV_EVENT_LONG_PRESSED_REPEAT, NULL);
 
         lv_obj_t *pos = lv_label_create(bt_sas_list);
         lv_obj_add_flag(pos, LV_OBJ_FLAG_FLOATING);
@@ -25153,6 +25158,7 @@ static void bt_sas_refresh_list(void)
         lv_obj_set_style_text_font(dn_lbl, &lv_font_montserrat_12, 0);
         lv_obj_center(dn_lbl);
         if (can_dn) lv_obj_add_event_cb(dn, bt_sas_scroll_down_cb, LV_EVENT_CLICKED, NULL);
+        if (can_dn) lv_obj_add_event_cb(dn, bt_sas_scroll_down_cb, LV_EVENT_LONG_PRESSED_REPEAT, NULL);
     }
 }
 
