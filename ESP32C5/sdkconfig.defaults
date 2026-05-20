@@ -26,6 +26,7 @@ CONFIG_BT_NIMBLE_HCI_EVT_LO_BUF_COUNT=4
 # PSRAM (8 MB SPIRAM on NM-CYD-C5)
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 # DMA reserve pool: 48 KB. WiFi static RX (4×1700=6.8KB) + TX (3×~1700=5.1KB)
 # + BLE LL controller (~18KB) + SD (~1.3KB) ≈ 31KB used; 48KB gives ~17KB margin.
 # BLE controller init was confirmed successful with this pool size in v1.6.27.

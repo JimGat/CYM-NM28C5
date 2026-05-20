@@ -3,6 +3,7 @@
 #include "esp_log.h"
 #include "esp_event.h"
 #include "esp_timer.h"
+#include "esp_attr.h"
 #include <string.h>
 
 static const char *TAG = "wifi_scanner";
@@ -12,9 +13,9 @@ static volatile bool g_scan_in_progress = false;
 static volatile bool g_scan_done = false;
 
 // Shared scan results (defined in wifi_common.c, used by other components)
-wifi_ap_record_t g_shared_scan_results[MAX_SCAN_RESULTS];
+EXT_RAM_BSS_ATTR wifi_ap_record_t g_shared_scan_results[MAX_SCAN_RESULTS];
 uint16_t g_shared_scan_count = 0;
-int g_shared_selected_indices[MAX_SCAN_RESULTS];
+EXT_RAM_BSS_ATTR int g_shared_selected_indices[MAX_SCAN_RESULTS];
 int g_shared_selected_count = 0;
 
 // Target BSSID monitoring (for deauth attacks)
