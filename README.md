@@ -5,7 +5,7 @@
 <h1 align="center">Cheap Yellow Monster</h1>
 
 <p align="center">
-  <b>v1.6.16</b>
+  <b>v1.6.49</b>
 </p>
 
 <p align="center">
@@ -94,9 +94,9 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **Chanalizer** | Wide 520 px WiFi channel map — auto-scrolling left/right with touch-drag pause; SSID color grouping, group legend, channel annotations; portrait 240 px viewport over 2.4 GHz + 5 GHz |
 | **WiFi Band Scope** | Promiscuous RSSI per-channel waterfall (2.4 GHz 13-ch or 5 GHz 25-ch); band toggle updates axis label and resets peaks; 60 ms dwell / 0.8 s full 2.4 sweep |
 | **Drone Detector** | Passive BLE scan for DJI/Remote ID drone advertisements |
-| **Wardriving** | GPS + WiFi logging, dual-band filter (2.4 GHz / 5 GHz / Both), optional BLE time-sliced scanning, WiGLE CSV 1.6, upload log tracking, raw PCAP toggle, GPS mark waypoints (GPX output), WiGLE and WDG Wars upload; GPS last-known position hold with 150 m stale accuracy when signal is lost |
+| **Wardriving** | GPS + WiFi logging, dual-band filter (2.4 GHz / 5 GHz / Both), optional BLE time-sliced scanning, WiGLE CSV 1.6, upload log tracking, raw PCAP toggle, GPS mark waypoints (GPX output), WiGLE and WDG Wars upload; GPS last-known position hold with 150 m stale accuracy when signal is lost; live dashboard shows separate WiFi network count and BLE device count |
 | **GPS** | NMEA RMC auto-syncs system clock (FAT timestamps); last-known position persisted to NVS (5-minute throttle); manual fallback editor in Settings → GPS Info; all data-collection features (wardrive, GATT Walker, marks) use best available GPS transparently |
-| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk, Bluetooth Lookout, BLE Spam (8 modes incl. Sour Apple), Device Spoof (general + directed), BLE Disconnect (directed), BLE PCAP (Kismet PCAPNG raw capture), **BlueDuck** (BLE HID DuckyScript keyboard injector), **HoneyPair** (BLE persona honeypot), **WhisperPair** (CVE-2025-36911 Google Fast Pair KBP bypass — passive detection, GATT probe, AES-128-ECB exploit) |
+| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk, Bluetooth Lookout, BLE Spam (8 modes incl. Sour Apple), Device Spoof (general + directed), BLE Disconnect (directed), BLE PCAP (Kismet PCAPNG raw capture; BLE 5.0 extended advertisement support), **BlueDuck** (BLE HID DuckyScript keyboard injector), **HoneyPair** (BLE persona honeypot), **WhisperPair** (CVE-2025-36911 Google Fast Pair KBP bypass — auto-scan, sequential run-all FP targets, AES-128-ECB exploit); BT Scan & Select supports **Save List** (GPS-tagged JSON snapshot of every device found) |
 | **BlueDuck** | BLE HID keyboard injector — pairs as any of 9 device personas; executes DuckyScript payloads from SD card (preloaded into PSRAM at boot, immune to SD DMA OOM during BLE); HUMAN_MODE variable-speed typing; Android (Win+H/B/N), Windows (Win+R/L, Ctrl+Shift+Esc), and iOS (Cmd+H/Space) keyboard shortcut support; session JSONL log to SD card; 13-script library included |
 | **HoneyPair** | Continuous BLE persona honeypot — cycles 9 consumer device personas every 5 min, logs all pairing attempts to JSONL; GATT/HID enumeration on any pairing device; persona MACs randomised and deduplicated |
 | **Deauth Monitor** | Passive detection of nearby deauth attacks |
@@ -475,7 +475,7 @@ Bluetooth
 
 | Feature | Description |
 |---------|-------------|
-| **BT Scan & Select** | Active BLE scan — discovers all nearby devices; shows name or vendor (from OUI lookup), RSSI, partial MAC; tap to select a target |
+| **BT Scan & Select** | Active BLE scan — discovers all nearby devices; shows name or vendor (from OUI lookup), RSSI, partial MAC; tap to select a target; **Save List** button snapshots the entire scan list to a GPS-tagged JSON file on the SD card |
 | **BT Observer** | 10-second active BLE scan followed by sequential GATT walks on every discovered device (5 s timeout per device). Results shown in a scrollable live list; tap any row to open the full GATT detail view |
 | **BT Locator** | RSSI-based proximity tracking of a selected BLE device; updates every 10 s. Vibrator strength scales logarithmically with signal strength — silent below −69 dBm, 10% at −69 dBm, 100% at −40 dBm (requires vibrator hardware). |
 | **GATT Walker** | Full BLE GATT inspection — walks all services, characteristics, and descriptors; reads attribute values; computes FNV-32 device fingerprint; saves enriched JSON to SD card with service/characteristic names, decoded properties, ASCII data preview, OUI manufacturer, and optional GPS geotag |
@@ -501,6 +501,16 @@ Bluetooth
 **Step 2 — Select:** Tap any row to select a target device. The row highlights in cyan and the status bar shows the selection. Tap again to deselect. Only one device can be selected at a time. **Scrolling the list does not select a device** — only a clean tap (no scroll movement) counts as a selection.
 
 **Step 3 — Actions:** Once a device is selected, tap **Actions →** to open the action tile screen. Available actions: **BT Locator** (RSSI proximity tracking), **GATT Walker** (full GATT inspection and JSON output), and **Add to BT Lookout** (add the device MAC to the continuous watchlist). The target name or MAC is shown in the screen title.
+
+**Save List** — a green button always visible in the bottom row (no device selection required). Tap it to open a label dialog (identical to the wardrive Mark waypoint dialog). Enter an optional label (defaults to `mark`). The full scan list is written as a JSON file to `/sdcard/lab/bluetooth/scans/` with the filename encoding the GPS coordinates and UTC time:
+
+```
+btsc_HHMMSS_LAT_LON_label.json        (with GPS fix)
+btsc_HHMMSS_label.json                (no GPS)
+btsc_HHMMSS_LAT_LON_label_1.json      (auto-incremented if name collides)
+```
+
+Each file is a JSON object with a `devices[]` array — one entry per device — containing MAC, address type, PHY, RSSI, name, company ID, and all classification flags (`is_airtag`, `is_smarttag`, `is_possible_airtag`, `is_fast_pair`). The outer object also carries `label`, `timestamp`, GPS fields, `fw_version`, and `device_count`. These files are designed to be loaded by a future deduplication tool that merges and compares BT scan lists across sessions or locations.
 
 #### AirTag / SmartTag Locator — How It Works
 
@@ -812,10 +822,12 @@ Tap **+ Add to Watchlist** on any group card. Each OUI is written to `lookout.cs
 
 **BLE PCAP** captures raw BLE advertising packets from the air and writes them to SD card in **Kismet PCAPNG format** — the same format used by Kismet Wireless, Wireshark, and other BLE analysis tools.
 
+The ESP32-C5 uses BLE 5.0 extended advertising (`CONFIG_BT_NIMBLE_EXT_ADV=y`), so the scanner uses `ble_gap_ext_disc()` and handles `BLE_GAP_EVENT_EXT_DISC` events — capturing both legacy (1M PHY) and extended (Coded PHY) advertisements that legacy-only scanners would miss.
+
 **Workflow:**
 1. Open **BLE PCAP** from the Bluetooth tile.
 2. A new `.pcapng` file is created in `/sdcard/lab/ble/captures/` (e.g. `ble_YYYYMMDD_HHMMSS.pcapng`).
-3. The screen shows a live packet counter. All advertising packets detected by the radio are captured.
+3. The screen shows a live packet counter. All advertising packets detected by the radio are captured, including BLE 5.0 extended advertisements.
 4. Tap **Stop** to flush and close the file cleanly.
 
 **File format:** PCAPNG with:
@@ -936,7 +948,7 @@ WhisperPair is found under **Bluetooth → BT Attacks → WhisperPair**. The aut
 
 ##### WhisperPair Screen
 
-The WhisperPair screen shows all Fast Pair–tagged devices detected during the most recent BLE scan. Each row shows:
+When opened, WhisperPair **automatically runs a BLE scan** to discover Fast Pair–capable devices. Any device advertising the `0xFE2C` service UUID is shown in the list. Each row shows:
 
 - Device index
 - Device name (truncated to 12 chars)
@@ -944,23 +956,23 @@ The WhisperPair screen shows all Fast Pair–tagged devices detected during the 
 - Partial MAC (last 3 octets)
 - `[FP]` badge
 
-**Two action buttons:**
+**Three action buttons:**
 
 | Button | Mode | Description |
 |--------|------|-------------|
 | **Probe** | GATT connect | Connects to the selected device, discovers the `0xFE2C` service and the KBP characteristic (`fe2c1234-...`), confirms exploitability, disconnects cleanly |
 | **Exploit** | KBP write | Connects, enables CCCD notifications, constructs and writes the crafted AES-128-ECB KBP packet, waits up to 5 s for a response notification |
+| **Run All** | Sequential | Runs the selected action (Probe or Exploit) against **every Fast Pair device in the list**, one at a time, cycling through them automatically with a chained callback. Results for each device are logged as they complete. |
 
 **Status and result display** update in real time below the device list. Results are also logged to SD.
 
 ##### Usage
 
 1. Open **Bluetooth → BT Attacks → WhisperPair**. Acknowledge the authorization disclaimer.
-2. If no Fast Pair devices are listed, return to **BT Scan & Select** and run a scan — `[FP]` devices will appear in the WhisperPair screen on return.
-3. Tap a row to select a target.
-4. Tap **Probe** to confirm the device has the KBP GATT characteristic (non-intrusive, read-only enumeration).
-5. Tap **Exploit** to deliver the KBP packet. Observe the target phone for a Fast Pair pairing popup.
-6. Results are logged to `/sdcard/lab/ble/whisperpair/`.
+2. WhisperPair auto-scans for Fast Pair devices. Wait for the scan to populate the list (typically 10 seconds).
+3. To target a single device: tap a row to select it, then tap **Probe** or **Exploit**.
+4. To target all found devices sequentially: tap **Run All** — the firmware chains through each `[FP]` device automatically.
+5. Results are logged to `/sdcard/lab/ble/whisperpair/`.
 
 ##### Output Log
 
@@ -1032,12 +1044,12 @@ The live dashboard shows:
 
 | Field | Description |
 |-------|-------------|
-| **Ch** | Current channel being scanned (shows **BLE** during a BLE time-slice pass) |
-| **APs** | Unique networks logged this session |
-| **Pts** | GPS points written to the CSV |
-| **Marks** | GPS waypoints saved this session |
-| **Lat / Lon** | Live GPS coordinates |
-| **Sats** | Satellite count |
+| **D-UCB** (green box) | Current channel being scanned — shows **BLE** during a BLE time-slice pass |
+| **WiFi** (cyan box) | Unique WiFi networks logged this session |
+| **BLE** (purple box) | BLE devices collected across all BLE passes this session |
+| **GPS bar** | Live coordinates (green) or last-known position (amber) with satellite count |
+
+The three stat boxes span the full screen width below the GPS bar. The BLE counter increments in real time during each 8-second BLE pass so you can confirm BLE scanning is working.
 
 **Stop** — ends the session, closes all open files, and returns to the Wardrive menu.
 
@@ -1095,7 +1107,7 @@ When **BLE Wardrive** is enabled, the firmware periodically pauses WiFi scanning
 3. All discovered BLE devices (deduplicated by MAC) are recorded with the current GPS fix.
 4. The radio switches back to WiFi, D-UCB is rebuilt, and scanning resumes.
 
-During the BLE pass, the dashboard channel indicator shows **BLE** instead of a channel number.
+During the BLE pass, the D-UCB box shows **BLE** and the purple **BLE** counter increments as devices are discovered — confirming the scan is active even though the WiFi table is idle.
 
 **BLE rows in the CSV** follow the same WiGLE 1.6 format as WiFi rows, with `Type=BLE`, `Channel=37`, `Frequency=2402`, and `[BLE]` as the auth mode:
 
@@ -1166,7 +1178,7 @@ AA:BB:CC:DD:EE:FF,"MyNetwork",[WPA2_PSK],2026-05-08 12:34:56,6,2437,-65,37.12345
 
 **With BLE:**
 1. Options → BLE Wardrive → On. Options → Band → Both.
-2. Start Wardrive. The channel indicator flashes **BLE** every 30 s for an 8-second scan.
+2. Start Wardrive. Every 30 seconds the D-UCB box shows **BLE** for an 8-second pass; the purple BLE counter ticks up with each device found.
 3. Both WiFi and BLE sightings appear in the same CSV.
 
 **Marking a point of interest:**
@@ -1451,7 +1463,9 @@ All data is stored on the SD card. `/sdcard/lab/` is the root for all project da
     │       └── wp_<timestamp>.json
     ├── bluetooth/
     │   ├── lookout.csv       # Bluetooth Lookout watchlist
-    │   └── spooflist.csv     # Device Spoof targets -- CSV: MAC,Name (one per line)
+    │   ├── spooflist.csv     # Device Spoof targets -- CSV: MAC,Name (one per line)
+    │   └── scans/            # BT Scan & Select saved snapshots
+    │       └── btsc_HHMMSS_LAT_LON_label.json   # GPS-tagged JSON with devices[] array
     ├── cellular/
     │   ├── tower_baseline.csv
     │   ├── tower_anomalies.csv
@@ -1643,6 +1657,10 @@ CYM-NM28C5/
 │   │   ├── main.c                # Core application — all UI screens, boot sequence,
 │   │   │                         #   WiFi/BLE logic, touch calibration, GPS, wardriving
 │   │   ├── attack_handshake.c/h  # WPA handshake capture (PCAP & HCCAPX)
+│   │   ├── ble_blueduck.c/h      # BlueDuck BLE HID keyboard — GATT service registration,
+│   │   │                         #   HID report handle lifecycle, persona management
+│   │   ├── ble_whisperpair.c/h   # WhisperPair CVE-2025-36911 — portable NimBLE GATT client,
+│   │   │                         #   AES-128-ECB KBP packet construction, FreeRTOS task lifecycle
 │   │   ├── bt_lookout.c/h        # Bluetooth Lookout — CSV watchlist, LED alerts, OUI matching
 │   │   ├── oui_lookup.c/h        # OUI vendor lookup — PSRAM binary search over ouilist.bin
 │   │   ├── gatt_walker.c/h       # GATT Walker — NimBLE GATT client, JSON output, FNV-32 fingerprint
