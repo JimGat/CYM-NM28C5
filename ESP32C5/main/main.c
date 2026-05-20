@@ -1813,6 +1813,7 @@ static void show_ir_jammer_screen(void);
 static void show_rf433_menu_screen(void);
 static void show_rf433_capture_screen(void);
 static void show_rf433_replay_screen(void);
+static void show_rf433_signal_list_screen(void);
 static void show_rf433_jammer_screen(void);
 static void show_vibrator_test_popup(void);
 static void run_touch_calibration(void);
@@ -36165,10 +36166,15 @@ static void show_rf433_jammer_screen(void)
 
 // ── RF433 Capture ─────────────────────────────────────────────────────────────
 
-static rf433_signal_t              *s_last_rf433_signal = NULL;
-static lv_obj_t                    *s_rf433_cap_status = NULL;
-static lv_obj_t                    *s_rf433_cap_save   = NULL;
-static volatile rf433_hat_err_t     s_rf433_cap_result = RF433_HAT_ERR_TIMEOUT;
+static rf433_signal_t              *s_last_rf433_signal  = NULL;
+static lv_obj_t                    *s_rf433_cap_status   = NULL;
+static lv_obj_t                    *s_rf433_cap_save_btn = NULL;
+static volatile rf433_hat_err_t     s_rf433_cap_result   = RF433_HAT_ERR_TIMEOUT;
+static lv_obj_t                    *s_rf433_save_popup   = NULL;
+static uint32_t                     s_rf433_cap_sig_idx  = 0;  // auto-name counter
+
+static char s_rf433_cap_remotes[RF433_HAT_MAX_REMOTES][RF433_HAT_REMOTE_NAME_LEN];
+static int  s_rf433_cap_remote_count = 0;
 
 static void s_rf433_ui_update(void *arg)
 {
@@ -36180,7 +36186,7 @@ static void s_rf433_ui_update(void *arg)
                  (unsigned long)(s_last_rf433_signal ? s_last_rf433_signal->count : 0));
         lv_label_set_text(s_rf433_cap_status, buf);
         lv_obj_set_style_text_color(s_rf433_cap_status, COLOR_MATERIAL_GREEN, 0);
-        if (s_rf433_cap_save) lv_obj_clear_state(s_rf433_cap_save, LV_STATE_DISABLED);
+        if (s_rf433_cap_save_btn) lv_obj_clear_state(s_rf433_cap_save_btn, LV_STATE_DISABLED);
     } else {
         lv_label_set_text(s_rf433_cap_status, "No signal - try again");
         lv_obj_set_style_text_color(s_rf433_cap_status, lv_color_hex(0xFF5722), 0);
@@ -36201,27 +36207,137 @@ static void s_rf433_done(rf433_hat_err_t result, const rf433_signal_t *sig, void
     lv_async_call(s_rf433_ui_update, NULL);
 }
 
-static void rf433_cap_start_cb(lv_event_t *e) {
+static void rf433_cap_start_cb(lv_event_t *e)
+{
     (void)e;
     if (!rf433_hat_is_init()) rf433_hat_init();
     if (s_rf433_cap_status) {
         lv_label_set_text(s_rf433_cap_status, "Listening... (10s)");
         lv_obj_set_style_text_color(s_rf433_cap_status, lv_color_hex(0xFFB300), 0);
     }
-    if (s_rf433_cap_save) lv_obj_add_state(s_rf433_cap_save, LV_STATE_DISABLED);
+    if (s_rf433_cap_save_btn) lv_obj_add_state(s_rf433_cap_save_btn, LV_STATE_DISABLED);
     rf433_hat_capture_start(s_rf433_done, NULL, 10000);
 }
 
-static void rf433_cap_save_cb(lv_event_t *e) {
-    (void)e;
-    static uint32_t idx = 0;
-    char name[RF433_HAT_NAME_LEN];
-    snprintf(name, sizeof(name), "rf_%04lu", (unsigned long)idx++);
+static void rf433_save_remote_pick_cb(lv_event_t *e)
+{
+    const char *picked = (const char *)lv_event_get_user_data(e);
     if (!s_last_rf433_signal) return;
-    snprintf(s_last_rf433_signal->name, RF433_HAT_NAME_LEN, "%s", name);
-    rf433_hat_err_t r = rf433_hat_save(s_last_rf433_signal, name);
-    if (s_rf433_cap_status)
-        lv_label_set_text(s_rf433_cap_status, r == RF433_HAT_OK ? "Saved (.sub)!" : "Save failed");
+
+    snprintf(s_last_rf433_signal->name, RF433_HAT_NAME_LEN,
+             "signal_%04lu", (unsigned long)s_rf433_cap_sig_idx);
+
+    const char *remote = picked;
+    char new_remote[RF433_HAT_REMOTE_NAME_LEN];
+
+    if (strcmp(picked, "__new__") == 0) {
+        // Auto-name the remote: "captured", "captured_2", "captured_3", ...
+        snprintf(new_remote, sizeof(new_remote), "captured");
+        struct stat st;
+        char test_path[160];
+        snprintf(test_path, sizeof(test_path),
+                 RF_HAT_RF433_SAVE_DIR "/%s", new_remote);
+        int suffix = 2;
+        while (stat(test_path, &st) == 0 && suffix < 100) {
+            snprintf(new_remote, sizeof(new_remote), "captured_%d", suffix++);
+            snprintf(test_path, sizeof(test_path),
+                     RF_HAT_RF433_SAVE_DIR "/%s", new_remote);
+        }
+        rf433_hat_create_remote(new_remote);
+        remote = new_remote;
+    }
+
+    rf433_hat_err_t r = rf433_hat_append_signal(remote, s_last_rf433_signal);
+    s_rf433_cap_sig_idx++;
+
+    if (s_rf433_cap_status) {
+        if (r == RF433_HAT_OK) {
+            char buf[96];
+            snprintf(buf, sizeof(buf), "Saved to %s/", remote);
+            lv_label_set_text(s_rf433_cap_status, buf);
+            lv_obj_set_style_text_color(s_rf433_cap_status, COLOR_MATERIAL_GREEN, 0);
+        } else {
+            lv_label_set_text(s_rf433_cap_status, "Save failed");
+            lv_obj_set_style_text_color(s_rf433_cap_status, lv_color_hex(0xFF5722), 0);
+        }
+    }
+
+    if (s_rf433_save_popup && lv_obj_is_valid(s_rf433_save_popup)) {
+        lv_obj_del(s_rf433_save_popup);
+        s_rf433_save_popup = NULL;
+    }
+    if (s_rf433_cap_save_btn) lv_obj_add_state(s_rf433_cap_save_btn, LV_STATE_DISABLED);
+}
+
+static void rf433_save_popup_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_rf433_save_popup && lv_obj_is_valid(s_rf433_save_popup)) {
+        lv_obj_del(s_rf433_save_popup);
+        s_rf433_save_popup = NULL;
+    }
+}
+
+static void rf433_cap_save_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_rf433_save_popup && lv_obj_is_valid(s_rf433_save_popup)) return;
+
+    s_rf433_cap_remote_count = rf433_hat_list_remotes(s_rf433_cap_remotes,
+                                                       RF433_HAT_MAX_REMOTES);
+
+    s_rf433_save_popup = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(s_rf433_save_popup, 210, 240);
+    lv_obj_align(s_rf433_save_popup, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(s_rf433_save_popup, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(s_rf433_save_popup, lv_color_hex(0x827717), 0);
+    lv_obj_set_style_border_width(s_rf433_save_popup, 2, 0);
+    lv_obj_set_style_radius(s_rf433_save_popup, 10, 0);
+    lv_obj_set_style_pad_all(s_rf433_save_popup, 8, 0);
+    lv_obj_clear_flag(s_rf433_save_popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(s_rf433_save_popup);
+    lv_label_set_text(title, "Save to remote:");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(title, ui_text_color(), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *list = lv_list_create(s_rf433_save_popup);
+    lv_obj_set_size(list, 190, 160);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 22);
+    lv_obj_set_style_bg_color(list, ui_panel_color(), 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+
+    lv_obj_t *new_row = lv_list_add_btn(list, LV_SYMBOL_PLUS, "New remote...");
+    lv_obj_set_style_text_font(new_row, &lv_font_montserrat_12, 0);
+    lv_obj_add_event_cb(new_row, rf433_save_remote_pick_cb, LV_EVENT_CLICKED, "__new__");
+
+    for (int i = 0; i < s_rf433_cap_remote_count; i++) {
+        lv_obj_t *row = lv_list_add_btn(list, LV_SYMBOL_DIRECTORY,
+                                         s_rf433_cap_remotes[i]);
+        lv_obj_set_style_text_font(row, &lv_font_montserrat_12, 0);
+        lv_obj_add_event_cb(row, rf433_save_remote_pick_cb, LV_EVENT_CLICKED,
+                            s_rf433_cap_remotes[i]);
+    }
+
+    if (s_rf433_cap_remote_count == 0) {
+        lv_obj_t *hint = lv_label_create(list);
+        lv_label_set_text(hint, "No remotes yet.\nTap 'New remote...'");
+        lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(hint, lv_color_hex(0x888888), 0);
+    }
+
+    lv_obj_t *cancel = lv_btn_create(s_rf433_save_popup);
+    lv_obj_set_size(cancel, 80, 28);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(cancel, lv_color_hex(0x424242), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(cancel, 0, 0);
+    lv_obj_set_style_radius(cancel, 6, 0);
+    lv_obj_t *clbl = lv_label_create(cancel);
+    lv_label_set_text(clbl, "Cancel");
+    lv_obj_set_style_text_font(clbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(clbl);
+    lv_obj_add_event_cb(cancel, rf433_save_popup_cancel_cb, LV_EVENT_CLICKED, NULL);
 }
 
 static void show_rf433_capture_screen(void)
@@ -36229,15 +36345,17 @@ static void show_rf433_capture_screen(void)
     create_function_page_base("RF433 Capture");
     apply_menu_bg();
 
+    s_rf433_save_popup = NULL;
+
     s_rf433_cap_status = lv_label_create(function_page);
     lv_label_set_text(s_rf433_cap_status,
-        "Press your remote/button\nthen press Capture.\nSaves Flipper-compatible .sub");
+        "Point remote at sensor,\nthen press Capture (10s).\nSaves Flipper-compatible .sub");
     lv_obj_set_style_text_font(s_rf433_cap_status, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_rf433_cap_status, ui_text_color(), 0);
     lv_obj_set_style_text_align(s_rf433_cap_status, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_rf433_cap_status, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(s_rf433_cap_status, LCD_H_RES - 16);
-    lv_obj_align(s_rf433_cap_status, LV_ALIGN_TOP_MID, 0, 44);
+    lv_obj_align(s_rf433_cap_status, LV_ALIGN_TOP_MID, 0, 50);
 
     lv_obj_t *cap_btn = lv_btn_create(function_page);
     lv_obj_set_size(cap_btn, 160, 42);
@@ -36252,52 +36370,35 @@ static void show_rf433_capture_screen(void)
     lv_obj_center(cap_lbl);
     lv_obj_add_event_cb(cap_btn, rf433_cap_start_cb, LV_EVENT_CLICKED, NULL);
 
-    s_rf433_cap_save = lv_btn_create(function_page);
-    lv_obj_set_size(s_rf433_cap_save, 160, 38);
-    lv_obj_align(s_rf433_cap_save, LV_ALIGN_CENTER, 0, 62);
-    lv_obj_set_style_bg_color(s_rf433_cap_save, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(s_rf433_cap_save, 0, 0);
-    lv_obj_set_style_radius(s_rf433_cap_save, 8, 0);
-    lv_obj_add_state(s_rf433_cap_save, LV_STATE_DISABLED);
-    lv_obj_t *save_lbl = lv_label_create(s_rf433_cap_save);
-    lv_label_set_text(save_lbl, LV_SYMBOL_SAVE "  Save (.sub)");
+    s_rf433_cap_save_btn = lv_btn_create(function_page);
+    lv_obj_set_size(s_rf433_cap_save_btn, 160, 38);
+    lv_obj_align(s_rf433_cap_save_btn, LV_ALIGN_CENTER, 0, 62);
+    lv_obj_set_style_bg_color(s_rf433_cap_save_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(s_rf433_cap_save_btn, 0, 0);
+    lv_obj_set_style_radius(s_rf433_cap_save_btn, 8, 0);
+    lv_obj_add_state(s_rf433_cap_save_btn, LV_STATE_DISABLED);
+    lv_obj_t *save_lbl = lv_label_create(s_rf433_cap_save_btn);
+    lv_label_set_text(save_lbl, LV_SYMBOL_SAVE "  Save to...");
     lv_obj_set_style_text_font(save_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(save_lbl, lv_color_white(), 0);
     lv_obj_center(save_lbl);
-    lv_obj_add_event_cb(s_rf433_cap_save, rf433_cap_save_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(s_rf433_cap_save_btn, rf433_cap_save_cb, LV_EVENT_CLICKED, NULL);
 
     rfhat_add_back_btn("RF433", show_rf433_menu_screen);
 }
 
-// ── RF433 Replay ──────────────────────────────────────────────────────────────
+// ── RF433 Replay — Level 1: remote (directory) list ──────────────────────────
 
-static char s_rf433_names[32][RF433_HAT_NAME_LEN];
-static int  s_rf433_name_count = 0;
-static int  s_rf433_sel_idx    = -1;
-static lv_obj_t *s_rf433_replay_status = NULL;
+static char s_rf433_remote_names[RF433_HAT_MAX_REMOTES][RF433_HAT_REMOTE_NAME_LEN];
+static int  s_rf433_remote_count = 0;
+static char s_rf433_cur_remote[RF433_HAT_REMOTE_NAME_LEN];
 
-static void rf433_replay_row_cb(lv_event_t *e) {
-    s_rf433_sel_idx = (int)(intptr_t)lv_event_get_user_data(e);
-    if (s_rf433_replay_status) {
-        char buf[48];
-        snprintf(buf, sizeof(buf), "Selected: %s", s_rf433_names[s_rf433_sel_idx]);
-        lv_label_set_text(s_rf433_replay_status, buf);
-    }
-}
-
-static void rf433_do_replay_cb(lv_event_t *e) {
-    (void)e;
-    if (s_rf433_sel_idx < 0 || s_rf433_sel_idx >= s_rf433_name_count) return;
-    if (!rf433_hat_is_init()) rf433_hat_init();
-    rf433_signal_t sig;
-    if (s_rf433_replay_status) lv_label_set_text(s_rf433_replay_status, "Transmitting x3...");
-    rf433_hat_err_t r = rf433_hat_load(&sig, s_rf433_names[s_rf433_sel_idx]);
-    if (r == RF433_HAT_OK) {
-        rf433_hat_replay(&sig, 3);
-        if (s_rf433_replay_status) lv_label_set_text(s_rf433_replay_status, "Sent x3!");
-    } else {
-        if (s_rf433_replay_status) lv_label_set_text(s_rf433_replay_status, "Load error");
-    }
+static void rf433_remote_row_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_rf433_remote_count) return;
+    strncpy(s_rf433_cur_remote, s_rf433_remote_names[idx], RF433_HAT_REMOTE_NAME_LEN - 1);
+    show_rf433_signal_list_screen();
 }
 
 static void show_rf433_replay_screen(void)
@@ -36305,29 +36406,109 @@ static void show_rf433_replay_screen(void)
     create_function_page_base("RF433 Replay");
     apply_menu_bg();
 
-    s_rf433_name_count = rf433_hat_list_saved(s_rf433_names, 32);
-    s_rf433_sel_idx = -1;
+    s_rf433_remote_count = rf433_hat_list_remotes(s_rf433_remote_names, RF433_HAT_MAX_REMOTES);
 
-    s_rf433_replay_status = lv_label_create(function_page);
-    lv_label_set_text(s_rf433_replay_status,
-        s_rf433_name_count ? "Tap signal, then Transmit." : "No saved signals.\nCapture one first.");
-    lv_obj_set_style_text_font(s_rf433_replay_status, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(s_rf433_replay_status, ui_text_color(), 0);
-    lv_obj_set_style_text_align(s_rf433_replay_status, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_long_mode(s_rf433_replay_status, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(s_rf433_replay_status, LCD_H_RES - 16);
-    lv_obj_align(s_rf433_replay_status, LV_ALIGN_TOP_MID, 0, 38);
+    lv_obj_t *hint = lv_label_create(function_page);
+    lv_label_set_text(hint, s_rf433_remote_count
+        ? "Tap a remote to browse signals."
+        : "No remotes found.\nCapture a signal first.");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint, ui_text_color(), 0);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(hint, LCD_H_RES - 16);
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 38);
 
     lv_obj_t *list = lv_list_create(function_page);
-    lv_obj_set_size(list, LCD_H_RES - 12, 140);
-    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 78);
+    lv_obj_set_size(list, LCD_H_RES - 12, 200);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 74);
     lv_obj_set_style_bg_color(list, ui_panel_color(), 0);
     lv_obj_set_style_border_color(list, lv_color_hex(0x444), 0);
     lv_obj_set_style_border_width(list, 1, 0);
-    for (int i = 0; i < s_rf433_name_count; i++) {
-        lv_obj_t *row = lv_list_add_btn(list, LV_SYMBOL_AUDIO, s_rf433_names[i]);
+
+    for (int i = 0; i < s_rf433_remote_count; i++) {
+        lv_obj_t *row = lv_list_add_btn(list, LV_SYMBOL_DIRECTORY,
+                                         s_rf433_remote_names[i]);
         lv_obj_set_style_text_font(row, &lv_font_montserrat_12, 0);
-        lv_obj_add_event_cb(row, rf433_replay_row_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        lv_obj_add_event_cb(row, rf433_remote_row_cb, LV_EVENT_CLICKED,
+                            (void*)(intptr_t)i);
+    }
+
+    rfhat_add_back_btn("RF433", show_rf433_menu_screen);
+}
+
+// ── RF433 Replay — Level 2: signal list inside a remote ──────────────────────
+
+static char     s_rf433_signal_names[RF433_HAT_MAX_SIGNALS][RF433_HAT_NAME_LEN];
+static int      s_rf433_signal_count = 0;
+static int      s_rf433_sel_signal   = -1;
+static lv_obj_t *s_rf433_sig_status  = NULL;
+static rf433_signal_t s_rf433_replay_sig;  // static — avoids large stack frame
+
+static void rf433_signal_row_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_rf433_signal_count) return;
+    s_rf433_sel_signal = idx;
+    if (s_rf433_sig_status) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "Selected: %s", s_rf433_signal_names[idx]);
+        lv_label_set_text(s_rf433_sig_status, buf);
+        lv_obj_set_style_text_color(s_rf433_sig_status, COLOR_MATERIAL_GREEN, 0);
+    }
+}
+
+static void rf433_do_replay_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_rf433_sel_signal < 0 || s_rf433_sel_signal >= s_rf433_signal_count) return;
+    if (!rf433_hat_is_init()) rf433_hat_init();
+    if (s_rf433_sig_status) lv_label_set_text(s_rf433_sig_status, "Transmitting x3...");
+    rf433_hat_err_t r = rf433_hat_load_signal_by_index(s_rf433_cur_remote,
+                                                        s_rf433_sel_signal,
+                                                        &s_rf433_replay_sig);
+    if (r == RF433_HAT_OK) {
+        rf433_hat_replay(&s_rf433_replay_sig, 3);
+        if (s_rf433_sig_status) lv_label_set_text(s_rf433_sig_status, "Sent x3!");
+    } else {
+        if (s_rf433_sig_status) {
+            lv_label_set_text(s_rf433_sig_status, "Load error");
+            lv_obj_set_style_text_color(s_rf433_sig_status, lv_color_hex(0xFF5722), 0);
+        }
+    }
+}
+
+static void show_rf433_signal_list_screen(void)
+{
+    create_function_page_base(s_rf433_cur_remote);
+    apply_menu_bg();
+
+    s_rf433_signal_count = rf433_hat_list_signals(s_rf433_cur_remote,
+                                                   s_rf433_signal_names,
+                                                   RF433_HAT_MAX_SIGNALS);
+    s_rf433_sel_signal = -1;
+
+    s_rf433_sig_status = lv_label_create(function_page);
+    lv_label_set_text(s_rf433_sig_status,
+        s_rf433_signal_count ? "Tap a signal, then Transmit." : "No signals in this remote.");
+    lv_obj_set_style_text_font(s_rf433_sig_status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_rf433_sig_status, ui_text_color(), 0);
+    lv_obj_set_style_text_align(s_rf433_sig_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_rf433_sig_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_rf433_sig_status, LCD_H_RES - 16);
+    lv_obj_align(s_rf433_sig_status, LV_ALIGN_TOP_MID, 0, 38);
+
+    lv_obj_t *list = lv_list_create(function_page);
+    lv_obj_set_size(list, LCD_H_RES - 12, 150);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 74);
+    lv_obj_set_style_bg_color(list, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(list, lv_color_hex(0x444), 0);
+    lv_obj_set_style_border_width(list, 1, 0);
+
+    for (int i = 0; i < s_rf433_signal_count; i++) {
+        lv_obj_t *row = lv_list_add_btn(list, LV_SYMBOL_AUDIO, s_rf433_signal_names[i]);
+        lv_obj_set_style_text_font(row, &lv_font_montserrat_12, 0);
+        lv_obj_add_event_cb(row, rf433_signal_row_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
     }
 
     lv_obj_t *tx_btn = lv_btn_create(function_page);
@@ -36343,5 +36524,5 @@ static void show_rf433_replay_screen(void)
     lv_obj_center(tx_lbl);
     lv_obj_add_event_cb(tx_btn, rf433_do_replay_cb, LV_EVENT_CLICKED, NULL);
 
-    rfhat_add_back_btn("RF433", show_rf433_menu_screen);
+    rfhat_add_back_btn(s_rf433_cur_remote, show_rf433_replay_screen);
 }
