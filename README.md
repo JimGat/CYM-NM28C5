@@ -478,9 +478,9 @@ Bluetooth
 | Feature | Description |
 |---------|-------------|
 | **BT Scan & Select** | Active BLE scan — discovers all nearby devices; shows name or vendor (from OUI lookup), RSSI, partial MAC; tap to select a target; **Save List** saves the full scan to a GPS-tagged JSON file on SD; **Rescan** restarts the scan in-place; **Actions →** opens attack tiles on selected target |
-| **List Wizard** | Multi-file BT scan list analysis. Reads all `btsc_*.json` files from SD, sorted newest-first. Select up to 4 files, set an optional RSSI threshold, then compute **Unique** (union — all devices across selected files) or **Common** (intersection — devices that appear in every selected file). Results shown in a scrollable list; save directly to the BT Lookout watchlist. Per-row delete with confirm dialog. |
-| **BT Blacklist** | Per-device suppression list at `/sdcard/lab/bluetooth/blacklist.csv`. Any device on the blacklist is silently ignored by BT Scan & Select, BT Lookout, BLE PCAP, and all other BT scan functions. Editor built into the BT Lookout screen (same Edit-button pattern as the Lookout watchlist editor). |
-| **BT Observer** | 10-second active BLE scan followed by sequential GATT walks on every discovered device (5 s timeout per device). Results shown in a scrollable live list; tap any row to open the full GATT detail view |
+| **List Wizard** | Multi-file BT scan list analysis. Reads all `btsc_*.json` files from SD, sorted newest-first. Select up to 4 files, set an optional RSSI threshold, then compute **Unique** (devices exclusive to exactly one file, min RSSI) or **Common** (devices in every selected file, avg RSSI). Results sorted by RSSI descending with a live **Change** re-filter button; save as new scan file or push to BT Lookout. Per-row delete with confirm dialog. |
+| **BT Blacklist** | Per-device suppression list at `/sdcard/lab/bluetooth/blacklist.csv`. Any device on the blacklist is silently ignored by BT Scan & Select, BT Lookout, BLE PCAP, and all other BT scan functions. Editor in the **BT Lookout** screen via the **Blacklist** button. |
+| **BT Observer** | Configurable-duration BLE scan (default 10 s, set via Settings → Timing) followed by sequential GATT walks on every discovered device (5 s timeout per device). Results shown in a scrollable live list; tap any row to open the full GATT detail view |
 | **BT Locator** | RSSI-based proximity tracking of a selected BLE device; updates every 10 s. Vibrator strength scales logarithmically with signal strength — silent below −69 dBm, 10% at −69 dBm, 100% at −40 dBm (requires vibrator hardware). |
 | **GATT Walker** | Full BLE GATT inspection — walks all services, characteristics, and descriptors; reads attribute values; computes FNV-32 device fingerprint; saves enriched JSON to SD card with service/characteristic names, decoded properties, ASCII data preview, OUI manufacturer, and optional GPS geotag |
 | **AirTag Scanner** | Passive BLE scan — detects Apple AirTags and Samsung SmartTags by manufacturer ID |
@@ -500,7 +500,7 @@ Bluetooth
 
 #### BT Scan & Select — How It Works
 
-**Step 1 — Scan:** Open **BT Scan & Select** from the Bluetooth menu. A 10-second active BLE scan runs, collecting all advertising devices. Each row shows device name (or vendor from OUI lookup, or `[Unknown]`), RSSI, and the last 3 octets of the MAC address. The list updates live every 500 ms during the scan.
+**Step 1 — Scan:** Open **BT Scan & Select** from the Bluetooth menu. An active BLE scan runs (duration configurable via Settings → Timing → BT Scan, default 10 s), collecting all advertising devices. Each row shows device name (or vendor from OUI lookup, or `[Unknown]`), RSSI, and the last 3 octets of the MAC address. The list updates live every 500 ms during the scan.
 
 **Step 2 — Select:** Tap any row to select a target device. The row highlights in cyan and the status bar shows the selection. Tap again to deselect. Only one device can be selected at a time. **Scrolling the list does not select a device** — only a clean tap (no scroll movement) counts as a selection.
 
@@ -510,7 +510,7 @@ Bluetooth
 
 - **Exit** — stop scan and return to Bluetooth menu
 - **Save List** — opens a label dialog; writes the full scan list to SD as a numbered JSON file
-- **Rescan** (amber) — stops the current scan, clears the device list, and immediately starts a fresh 10-second scan
+- **Rescan** (amber) — stops the current scan, clears the device list, and immediately starts a fresh scan at the configured duration
 - **Actions →** (cyan, appears after device selection) — opens attack tile screen for the selected target
 
 **Save List — File format**
@@ -576,13 +576,18 @@ List Wizard reads all saved `btsc_*.json` scan files from `/sdcard/lab/bluetooth
 
 **Selection:** Tap up to 4 rows to select them (highlighted cyan). The status bar shows how many are selected.
 
-**RSSI Threshold:** Before computing a set operation, tap **Unique** or **Common** to open the RSSI threshold popup. A slider from −99 dBm (no filter, default) to 0 dBm lets you exclude weak/distant devices. The result title shows the active threshold if one is set.
+**RSSI Threshold popup:** Before computing a set operation, tap **Unique** or **Common** to open the RSSI threshold popup. A slider from −99 dBm (no filter, default) to 0 dBm lets you exclude weak/distant devices.
 
 **Set operations:**
-- **Unique** — union of all selected files. Returns every distinct device (by MAC) that appeared in any of the selected scans, keeping the best RSSI seen across files.
-- **Common** — intersection. Returns only devices that appear in every selected file (above the RSSI threshold in each). Useful for finding devices that were present across multiple sessions or locations.
+- **Unique** (cyan) — devices exclusive to exactly one of the selected files. A device that appears in two or more files is excluded. RSSI shown is the **minimum** (signal floor) across all sightings of that device.
+- **Common** (green) — devices present in **every** selected file. RSSI shown is the **average** across all sightings in all selected files.
 
-**Result:** A scrollable list of MACs and names. At the bottom: **Close** or **Save to Lookout** — appends the result directly to `/sdcard/lab/bluetooth/lookout.csv` and reloads the BT Lookout watchlist.
+**Result overlay:** A scrollable list sorted by RSSI descending. Each row shows `RSSI  MAC  Name`. An orange **RSSI bar** at the top shows the active threshold with a **Change** button — tap it to open the threshold slider and instantly re-filter without re-reading the SD card (the accumulator stays live in PSRAM for the lifetime of the result overlay).
+
+**Bottom button row in result overlay:**
+- **Close** — dismiss the overlay, return to file list
+- **New List** — opens a label dialog and saves the result as a new `btsc_*.json` scan file (same format as BT Scan & Select)
+- **Lookout** — appends all result MACs to `/sdcard/lab/bluetooth/lookout.csv` and reloads the BT Lookout watchlist
 
 **BT Blacklist**
 
@@ -594,7 +599,7 @@ AA:BB:CC:DD:EE:FF,0   # full MAC match
 AA:BB:CC,1            # OUI prefix match (first 3 octets only)
 ```
 
-The editor is in the **BT Lookout** screen — tap the **Edit Blacklist** button (same pattern as Edit Watchlist). Rows are shown in a scrollable list with a delete button on each entry and an **Add** button for new entries.
+The editor is in the **BT Lookout** screen — tap the **Blacklist** button (dark red, below the Edit List / OUI Groups row). Rows are shown in a scrollable list with a delete button on each entry and an **Add** button for new entries.
 
 #### AirTag / SmartTag Locator — How It Works
 
@@ -797,12 +802,12 @@ Attributes longer than one MTU are read automatically in multiple chunks (`ATT_R
 
 #### BT Observer — How It Works
 
-**BT Observer** automates the scan-then-walk workflow: it runs a single 10-second active BLE scan, captures all discovered devices, then attempts a sequential GATT walk on each one (5 s connect timeout). Results are displayed in a live scrollable list and saved as JSON files to `/sdcard/lab/gattwalker/` — identical format to manual GATT Walker.
+**BT Observer** automates the scan-then-walk workflow: it runs a configurable-duration active BLE scan (default 10 s, set via Settings → Timing → BT Scan), captures all discovered devices, then attempts a sequential GATT walk on each one (5 s connect timeout). Results are displayed in a live scrollable list and saved as JSON files to `/sdcard/lab/gattwalker/` — identical format to manual GATT Walker.
 
 **Workflow:**
 
 1. Open **BT Observer** from the Bluetooth tile.
-2. The device starts a 10-second active BLE scan. Discovered devices appear in the list with name/vendor and RSSI.
+2. The device starts an active BLE scan (default 10 s). Discovered devices appear in the list with name/vendor and RSSI.
 3. After the scan window closes, the observer walks each device in turn. The list updates live as each walk completes: green checkmark with service/chr counts on success, red on failure.
 4. When all devices have been attempted (or the session is stopped), the status bar shows total enumerated count.
 5. Tap any row with a successful walk to open the full GATT detail view (same scrollable tree as the single-walk result screen).
@@ -814,7 +819,7 @@ Attributes longer than one MTU are read automatically in multiple chunks (`ATT_R
 | Target | One device (selected) | All devices in one scan session |
 | Connect timeout | Configurable (3–30 s, NVS) | Fixed 5 s per device |
 | Result screen | Auto-navigates to detail on complete | Tap-to-open per device |
-| Scan pass | Continuous (relies on existing scan) | Single 10 s burst, no re-scan |
+| Scan pass | Continuous (relies on existing scan) | Single scan burst (10–30 s, configurable), no re-scan |
 
 **Per-device JSON files** are saved using the same `/sdcard/lab/gattwalker/` path and enriched format as single walks (manufacturer, service/chr names, props_str, ascii).
 
@@ -1287,8 +1292,9 @@ AA:BB:CC:DD:EE:FF,"MyNetwork",[WPA2_PSK],2026-05-08 12:34:56,6,2437,-65,37.12345
 ```
 Settings
 ├── Compromised Data    (WiFi credential monitor)
-├── Timing              (WiFi scan dwell + GATT connect timeout — combined popup)
+├── Timing              (WiFi scan dwell + BT scan duration + GATT connect timeout — combined popup)
 │   ├── WiFi Scan/Ch    (min/max dwell time per channel — 50–1000 ms sliders)
+│   ├── BT Scan         (BLE initial scan duration — 10–30 s slider, default 10 s)
 │   └── GATT Timeout    (BLE connect timeout — 3–30 s slider)
 ├── Download Mode       (reboot into bootloader)
 ├── Screen              (screen timeout + brightness — combined popup)
@@ -1307,7 +1313,7 @@ All settings are persisted via **NVS** (Non-Volatile Storage) across reboots. Th
 
 | Setting | Description |
 |---------|-------------|
-| **Timing** | Combined timing popup — WiFi scan dwell time sliders and GATT connect timeout slider |
+| **Timing** | Combined timing popup — WiFi scan dwell time sliders, BT scan duration slider (10–30 s), and GATT connect timeout slider |
 | **Screen** | Combined screen popup — inactivity timeout dropdown and brightness overlay slider |
 | **SD Card** | Validate/provision (creates `/sdcard/lab/` structure, shows completion status); browse file tree; check free space |
 | **GPS Info** | Live GPS fix status — latitude, longitude, altitude, satellite count, UTC time, and UART reference. When no live fix, last-known coordinates are shown in amber with `*` suffix and `Accuracy: 150 m (stale)`. **Set Position** button opens manual coordinate editor (see below). Refreshes every second. |
@@ -1398,9 +1404,11 @@ Switching modes takes effect immediately on the active radio and is re-applied a
 
 #### Timing Settings
 
-Accessible via **Settings → Timing**. A single popup contains two sections:
+Accessible via **Settings → Timing**. A single popup contains three sections:
 
 **WiFi Scan / Channel** — min and max dwell time sliders (50–1000 ms) control how long the WiFi scanner dwells on each channel during active scans. Both values are NVS-persisted.
+
+**BT Scan Duration** — a slider (10–30 s, default 10 s, NVS key `bt_scan_dur`) sets how long the initial BLE scan runs when opening BT Scan & Select, BT Observer, or AirTag Scan. Longer values find more devices, especially in noisy or busy RF environments; shorter values make scans feel snappier.
 
 **GATT Connect Timeout** — a single slider sets the BLE connection timeout used by GATT Walker. BT Observer uses a separate fixed 5 s timeout and is not affected by this setting.
 
