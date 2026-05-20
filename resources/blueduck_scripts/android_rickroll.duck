@@ -17,5 +17,5 @@ CTRL l
 DELAY 500
 
 REM Never gonna give you up
-STRING youtube.com/watch?v=dQw4w9WgXcQ&autoplay=1
+STRING https://www.youtube.com/watch?v=dQw4w9WgXcQ
 ENTER

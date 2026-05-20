@@ -20737,7 +20737,7 @@ static const char SEED_RICKROLL_DUCK[] =
     "CTRL l\n"
     "DELAY 500\n"
     "\n"
-    "STRING youtube.com/watch?v=dQw4w9WgXcQ&autoplay=1\n"
+    "STRING https://www.youtube.com/watch?v=dQw4w9WgXcQ\n"
     "ENTER\n";
 
 typedef enum { SD_ITEM_DIR, SD_ITEM_FILE } sd_item_type_t;
