@@ -86,7 +86,7 @@
 #endif
 
 // ── SD card directories created by rf_hat modules ────────────────────────────
-#define RF_HAT_IR_SAVE_DIR     "/sdcard/lab/ir"
+#define RF_HAT_IR_SAVE_DIR     "/sdcard/lab/infrared"
 #define RF_HAT_RF433_SAVE_DIR  "/sdcard/lab/rf433"
 #define RF_HAT_RADIO_SAVE_DIR  "/sdcard/lab/radio"
 #define RF_HAT_RFID_SAVE_DIR   "/sdcard/lab/rfid"
