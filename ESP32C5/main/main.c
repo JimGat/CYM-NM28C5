@@ -1575,6 +1575,8 @@ static lw_dev_t *lw_result_buf    = NULL;   // heap_caps_calloc PSRAM
 static int       lw_result_count  = 0;
 static int8_t    lw_rssi_threshold = -99;   // -99 = no filter
 static lv_obj_t *lw_rssi_overlay  = NULL;
+static lv_obj_t *lw_del_overlay   = NULL;
+static int       lw_del_idx       = -1;     // file index pending delete confirm
 
 // ── BT Observer ─────────────────────────────────────────────────
 #define BTO_MAX_DEVICES 40
@@ -23454,6 +23456,9 @@ static void lw_back_cb(lv_event_t *e) {
     if (lw_result_buf) { heap_caps_free(lw_result_buf); lw_result_buf = NULL; }
     if (lw_result_overlay && lv_obj_is_valid(lw_result_overlay)) lv_obj_del(lw_result_overlay);
     lw_result_overlay = NULL;
+    if (lw_del_overlay && lv_obj_is_valid(lw_del_overlay)) lv_obj_del(lw_del_overlay);
+    lw_del_overlay = NULL;
+    lw_del_idx = -1;
     lw_list_box = NULL; lw_status_lbl = NULL;
     show_bluetooth_screen();
 }
@@ -23505,6 +23510,111 @@ static void lw_item_cb(lv_event_t *e) {
     lw_rebuild_list();
 }
 
+static void lw_del_cancel_cb(lv_event_t *e) {
+    (void)e;
+    if (lw_del_overlay && lv_obj_is_valid(lw_del_overlay)) lv_obj_del(lw_del_overlay);
+    lw_del_overlay = NULL;
+    lw_del_idx = -1;
+}
+
+static void lw_del_confirm_cb(lv_event_t *e) {
+    (void)e;
+    if (lw_del_overlay && lv_obj_is_valid(lw_del_overlay)) lv_obj_del(lw_del_overlay);
+    lw_del_overlay = NULL;
+    int idx = lw_del_idx;
+    lw_del_idx = -1;
+    if (idx < 0 || idx >= lw_file_count || !lw_files) return;
+
+    // Delete file from SD
+    char path[100];
+    snprintf(path, sizeof(path), "%s/%s", LW_SCAN_DIR, lw_files[idx].filename);
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        remove(path);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    // Remove entry from array and deselect
+    if (lw_selected[idx]) lw_select_count--;
+    for (int i = idx; i < lw_file_count - 1; i++) {
+        lw_files[i]    = lw_files[i+1];
+        lw_selected[i] = lw_selected[i+1];
+    }
+    lw_file_count--;
+    lw_selected[lw_file_count] = false;
+
+    if (lw_status_lbl && lv_obj_is_valid(lw_status_lbl)) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "%d selected (max 4) - choose operation", lw_select_count);
+        lv_label_set_text(lw_status_lbl, buf);
+    }
+    lw_rebuild_list();
+}
+
+static void lw_del_btn_cb(lv_event_t *e) {
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= lw_file_count || !lw_files) return;
+    lw_del_idx = idx;
+
+    if (lw_del_overlay && lv_obj_is_valid(lw_del_overlay)) lv_obj_del(lw_del_overlay);
+    lw_del_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(lw_del_overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(lw_del_overlay, 0, 0);
+    lv_obj_set_style_bg_color(lw_del_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(lw_del_overlay, LV_OPA_60, 0);
+    lv_obj_set_style_border_width(lw_del_overlay, 0, 0);
+    lv_obj_set_style_pad_all(lw_del_overlay, 0, 0);
+    lv_obj_clear_flag(lw_del_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(lw_del_overlay, 0, 0);
+
+    lv_obj_t *card = lv_obj_create(lw_del_overlay);
+    lv_obj_set_size(card, 200, 110);
+    lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+    lv_obj_set_style_border_color(card, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 10, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, "Delete scan file?");
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *name_lbl = lv_label_create(card);
+    const char *flbl = lw_files[idx].label[0] ? lw_files[idx].label : lw_files[idx].filename;
+    lv_label_set_text(name_lbl, flbl);
+    lv_obj_set_style_text_color(name_lbl, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_12, 0);
+    lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_CLIP);
+    lv_obj_set_width(name_lbl, 175);
+    lv_obj_align(name_lbl, LV_ALIGN_TOP_MID, 0, 22);
+
+    lv_obj_t *cancel_btn = lv_btn_create(card);
+    lv_obj_set_size(cancel_btn, 80, 28);
+    lv_obj_align(cancel_btn, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_make(70,70,70), 0);
+    lv_obj_set_style_radius(cancel_btn, 6, 0);
+    lv_obj_t *c_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(c_lbl, LV_SYMBOL_CLOSE " Cancel");
+    lv_obj_set_style_text_font(c_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(c_lbl);
+    lv_obj_add_event_cb(cancel_btn, lw_del_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *del_btn = lv_btn_create(card);
+    lv_obj_set_size(del_btn, 80, 28);
+    lv_obj_align(del_btn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(del_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_bg_color(del_btn, lv_color_make(180,0,0), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(del_btn, 6, 0);
+    lv_obj_t *d_lbl = lv_label_create(del_btn);
+    lv_label_set_text(d_lbl, LV_SYMBOL_TRASH " Delete");
+    lv_obj_set_style_text_font(d_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(d_lbl);
+    lv_obj_add_event_cb(del_btn, lw_del_confirm_cb, LV_EVENT_CLICKED, NULL);
+}
+
 static void lw_rebuild_list(void) {
     if (!lw_list_box || !lv_obj_is_valid(lw_list_box)) return;
     lv_obj_clean(lw_list_box);
@@ -23525,12 +23635,25 @@ static void lw_rebuild_list(void) {
         } else {
             snprintf(row, sizeof(row), "%s  --  %d devs", flbl, fi->device_count);
         }
-        lv_obj_t *btn = lv_btn_create(lw_list_box);
-        lv_obj_set_size(btn, lv_pct(100), 28);
+        // Row container: [select btn (flex grow)] [delete btn 28px]
+        lv_obj_t *row_cont = lv_obj_create(lw_list_box);
+        lv_obj_set_size(row_cont, lv_pct(100), 28);
+        lv_obj_set_style_bg_opa(row_cont, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(row_cont, 0, 0);
+        lv_obj_set_style_pad_all(row_cont, 0, 0);
+        lv_obj_set_flex_flow(row_cont, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row_cont, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row_cont, LV_OBJ_FLAG_SCROLLABLE);
+
         bool sel = lw_selected[i];
+        lv_obj_t *btn = lv_btn_create(row_cont);
+        lv_obj_set_size(btn, lv_pct(100) - 30, 28);
+        lv_obj_set_flex_grow(btn, 1);
         lv_obj_set_style_bg_color(btn, sel ? UI_ACCENT_CYAN : ui_card_color(), LV_STATE_DEFAULT);
         lv_obj_set_style_bg_color(btn, lv_color_lighten(UI_ACCENT_CYAN, 30), LV_STATE_PRESSED);
         lv_obj_set_style_radius(btn, 4, 0);
+        lv_obj_set_style_border_width(btn, 0, 0);
+        lv_obj_set_style_pad_all(btn, 0, 0);
         lv_obj_t *lbl = lv_label_create(btn);
         lv_label_set_text(lbl, row);
         lv_obj_set_style_text_color(lbl, sel ? lv_color_black() : ui_text_color(), 0);
@@ -23538,6 +23661,19 @@ static void lw_rebuild_list(void) {
         lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 4, 0);
         lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
         lv_obj_add_event_cb(btn, lw_item_cb, LV_EVENT_SHORT_CLICKED, (void*)(intptr_t)i);
+
+        lv_obj_t *del_btn = lv_btn_create(row_cont);
+        lv_obj_set_size(del_btn, 28, 28);
+        lv_obj_set_style_bg_color(del_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(del_btn, lv_color_make(180,0,0), LV_STATE_PRESSED);
+        lv_obj_set_style_radius(del_btn, 4, 0);
+        lv_obj_set_style_border_width(del_btn, 0, 0);
+        lv_obj_set_style_pad_all(del_btn, 0, 0);
+        lv_obj_t *del_lbl = lv_label_create(del_btn);
+        lv_label_set_text(del_lbl, LV_SYMBOL_TRASH);
+        lv_obj_set_style_text_font(del_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_center(del_lbl);
+        lv_obj_add_event_cb(del_btn, lw_del_btn_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
     }
 }
 
