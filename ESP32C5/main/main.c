@@ -1547,6 +1547,9 @@ static lv_obj_t *bt_sas_list = NULL;
 // BT scan windowed list
 static int bt_sas_scroll_top = 0;
 #define BT_SAS_WIN 7
+static lv_obj_t *bt_sas_nav_up  = NULL;
+static lv_obj_t *bt_sas_nav_pos = NULL;
+static lv_obj_t *bt_sas_nav_dn  = NULL;
 static lv_obj_t *bt_sas_status_label = NULL;
 static lv_obj_t *bt_sas_next_btn = NULL;
 static lv_obj_t *bt_sas_save_overlay = NULL;
@@ -1592,6 +1595,9 @@ static lv_obj_t  *lw_list_box     = NULL;
 // LW file list windowed
 static int lw_list_scroll_top = 0;
 #define LW_LIST_WIN 7
+static lv_obj_t *lw_nav_up  = NULL;
+static lv_obj_t *lw_nav_pos = NULL;
+static lv_obj_t *lw_nav_dn  = NULL;
 static lv_obj_t  *lw_status_lbl   = NULL;
 static volatile bool lw_ui_active = false;
 static int       lw_file_count    = 0;
@@ -24059,7 +24065,12 @@ static void lw_scroll_down_cb(lv_event_t *e)
 
 static void lw_rebuild_list(void) {
     if (!lw_list_box || !lv_obj_is_valid(lw_list_box)) return;
-    lv_obj_clean(lw_list_box);
+    // Delete only non-floating children so persistent nav buttons survive
+    uint32_t nch = lv_obj_get_child_cnt(lw_list_box);
+    for (uint32_t ci = nch; ci > 0; ci--) {
+        lv_obj_t *ch = lv_obj_get_child(lw_list_box, ci - 1);
+        if (!lv_obj_has_flag(ch, LV_OBJ_FLAG_FLOATING)) lv_obj_del(ch);
+    }
     if (lw_file_count == 0) {
         lv_obj_t *empty = lv_label_create(lw_list_box);
         lv_label_set_text(empty, "No scan files found.\nUse BT Scan & Select\nto save a list first.");
@@ -24144,53 +24155,62 @@ static void lw_rebuild_list(void) {
         lv_obj_add_event_cb(btn, lw_item_cb, LV_EVENT_SHORT_CLICKED, (void*)(intptr_t)i);
     }
 
-    // Floating nav arrows when file list exceeds window
+    // Persistent floating nav arrows — created once, updated each rebuild
+    bool can_up = lw_list_scroll_top > 0;
+    bool can_dn = lw_end < lw_file_count;
     if (lw_file_count > LW_LIST_WIN) {
-        bool can_up = lw_list_scroll_top > 0;
-        bool can_dn = lw_end < lw_file_count;
+        if (lw_nav_up == NULL) {
+            lw_nav_up = lv_btn_create(lw_list_box);
+            lv_obj_add_flag(lw_nav_up, LV_OBJ_FLAG_FLOATING);
+            lv_obj_set_size(lw_nav_up, 22, 22);
+            lv_obj_align(lw_nav_up, LV_ALIGN_TOP_RIGHT, -1, 1);
+            lv_obj_set_style_bg_color(lw_nav_up, lv_color_make(50, 50, 100), 0);
+            lv_obj_set_style_radius(lw_nav_up, 4, 0);
+            lv_obj_set_style_border_width(lw_nav_up, 0, 0);
+            lv_obj_set_style_pad_all(lw_nav_up, 0, 0);
+            lv_obj_t *lup_lbl = lv_label_create(lw_nav_up);
+            lv_label_set_text(lup_lbl, LV_SYMBOL_UP);
+            lv_obj_set_style_text_font(lup_lbl, &lv_font_montserrat_12, 0);
+            lv_obj_center(lup_lbl);
+            lv_obj_add_event_cb(lw_nav_up, lw_scroll_up_cb, LV_EVENT_CLICKED, NULL);
+            lv_obj_add_event_cb(lw_nav_up, lw_scroll_up_cb, LV_EVENT_LONG_PRESSED_REPEAT, NULL);
 
-        lv_obj_t *lup = lv_btn_create(lw_list_box);
-        lv_obj_add_flag(lup, LV_OBJ_FLAG_FLOATING);
-        lv_obj_set_size(lup, 22, 22);
-        lv_obj_align(lup, LV_ALIGN_TOP_RIGHT, -1, 1);
-        lv_obj_set_style_bg_color(lup, lv_color_make(50, 50, 100), 0);
-        lv_obj_set_style_bg_opa(lup, can_up ? LV_OPA_90 : LV_OPA_30, 0);
-        lv_obj_set_style_radius(lup, 4, 0);
-        lv_obj_set_style_border_width(lup, 0, 0);
-        lv_obj_set_style_pad_all(lup, 0, 0);
-        lv_obj_t *lup_lbl = lv_label_create(lup);
-        lv_label_set_text(lup_lbl, LV_SYMBOL_UP);
-        lv_obj_set_style_text_font(lup_lbl, &lv_font_montserrat_12, 0);
-        lv_obj_center(lup_lbl);
-        if (can_up) lv_obj_add_event_cb(lup, lw_scroll_up_cb, LV_EVENT_CLICKED, NULL);
-        if (can_up) lv_obj_add_event_cb(lup, lw_scroll_up_cb, LV_EVENT_LONG_PRESSED_REPEAT, NULL);
+            lw_nav_pos = lv_label_create(lw_list_box);
+            lv_obj_add_flag(lw_nav_pos, LV_OBJ_FLAG_FLOATING);
+            lv_obj_set_size(lw_nav_pos, 22, LV_SIZE_CONTENT);
+            lv_obj_set_style_text_font(lw_nav_pos, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(lw_nav_pos, lv_color_make(160, 160, 160), 0);
+            lv_obj_set_style_text_align(lw_nav_pos, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_align(lw_nav_pos, LV_ALIGN_RIGHT_MID, -1, 0);
 
-        lv_obj_t *lpos = lv_label_create(lw_list_box);
-        lv_obj_add_flag(lpos, LV_OBJ_FLAG_FLOATING);
+            lw_nav_dn = lv_btn_create(lw_list_box);
+            lv_obj_add_flag(lw_nav_dn, LV_OBJ_FLAG_FLOATING);
+            lv_obj_set_size(lw_nav_dn, 22, 22);
+            lv_obj_align(lw_nav_dn, LV_ALIGN_BOTTOM_RIGHT, -1, -1);
+            lv_obj_set_style_bg_color(lw_nav_dn, lv_color_make(50, 50, 100), 0);
+            lv_obj_set_style_radius(lw_nav_dn, 4, 0);
+            lv_obj_set_style_border_width(lw_nav_dn, 0, 0);
+            lv_obj_set_style_pad_all(lw_nav_dn, 0, 0);
+            lv_obj_t *ldn_lbl = lv_label_create(lw_nav_dn);
+            lv_label_set_text(ldn_lbl, LV_SYMBOL_DOWN);
+            lv_obj_set_style_text_font(ldn_lbl, &lv_font_montserrat_12, 0);
+            lv_obj_center(ldn_lbl);
+            lv_obj_add_event_cb(lw_nav_dn, lw_scroll_down_cb, LV_EVENT_CLICKED, NULL);
+            lv_obj_add_event_cb(lw_nav_dn, lw_scroll_down_cb, LV_EVENT_LONG_PRESSED_REPEAT, NULL);
+        }
+        // Update state every rebuild
+        lv_obj_set_style_bg_opa(lw_nav_up, can_up ? LV_OPA_90 : LV_OPA_30, 0);
         char lpbuf[10];
         snprintf(lpbuf, sizeof(lpbuf), "%d/%d", lw_end, lw_file_count);
-        lv_label_set_text(lpos, lpbuf);
-        lv_obj_set_size(lpos, 22, LV_SIZE_CONTENT);
-        lv_obj_set_style_text_font(lpos, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(lpos, lv_color_make(160, 160, 160), 0);
-        lv_obj_set_style_text_align(lpos, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_align(lpos, LV_ALIGN_RIGHT_MID, -1, 0);
-
-        lv_obj_t *ldn = lv_btn_create(lw_list_box);
-        lv_obj_add_flag(ldn, LV_OBJ_FLAG_FLOATING);
-        lv_obj_set_size(ldn, 22, 22);
-        lv_obj_align(ldn, LV_ALIGN_BOTTOM_RIGHT, -1, -1);
-        lv_obj_set_style_bg_color(ldn, lv_color_make(50, 50, 100), 0);
-        lv_obj_set_style_bg_opa(ldn, can_dn ? LV_OPA_90 : LV_OPA_30, 0);
-        lv_obj_set_style_radius(ldn, 4, 0);
-        lv_obj_set_style_border_width(ldn, 0, 0);
-        lv_obj_set_style_pad_all(ldn, 0, 0);
-        lv_obj_t *ldn_lbl = lv_label_create(ldn);
-        lv_label_set_text(ldn_lbl, LV_SYMBOL_DOWN);
-        lv_obj_set_style_text_font(ldn_lbl, &lv_font_montserrat_12, 0);
-        lv_obj_center(ldn_lbl);
-        if (can_dn) lv_obj_add_event_cb(ldn, lw_scroll_down_cb, LV_EVENT_CLICKED, NULL);
-        if (can_dn) lv_obj_add_event_cb(ldn, lw_scroll_down_cb, LV_EVENT_LONG_PRESSED_REPEAT, NULL);
+        lv_label_set_text(lw_nav_pos, lpbuf);
+        lv_obj_set_style_bg_opa(lw_nav_dn, can_dn ? LV_OPA_90 : LV_OPA_30, 0);
+        lv_obj_clear_flag(lw_nav_up,  LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(lw_nav_pos, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(lw_nav_dn,  LV_OBJ_FLAG_HIDDEN);
+    } else if (lw_nav_up && lv_obj_is_valid(lw_nav_up)) {
+        lv_obj_add_flag(lw_nav_up,  LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(lw_nav_pos, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(lw_nav_dn,  LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -24633,6 +24653,7 @@ static void show_list_wizard_screen(void) {
     lw_ui_active = true;
     lw_select_count = 0;
     lw_list_scroll_top = 0;
+    lw_nav_up = lw_nav_pos = lw_nav_dn = NULL;
     memset(lw_selected, 0, sizeof(lw_selected));
 
     // Allocate file info array in PSRAM
@@ -25049,7 +25070,12 @@ static void bt_sas_scroll_down_cb(lv_event_t *e)
 static void bt_sas_refresh_list(void)
 {
     if (!bt_sas_list || !lv_obj_is_valid(bt_sas_list)) return;
-    lv_obj_clean(bt_sas_list);
+    // Delete only non-floating children so persistent nav buttons survive
+    uint32_t nch = lv_obj_get_child_cnt(bt_sas_list);
+    for (uint32_t ci = nch; ci > 0; ci--) {
+        lv_obj_t *ch = lv_obj_get_child(bt_sas_list, ci - 1);
+        if (!lv_obj_has_flag(ch, LV_OBJ_FLAG_FLOATING)) lv_obj_del(ch);
+    }
 
     // Clamp window
     if (bt_device_count <= BT_SAS_WIN) {
@@ -25112,53 +25138,62 @@ static void bt_sas_refresh_list(void)
         lv_obj_add_event_cb(btn, bt_sas_device_cb, LV_EVENT_SHORT_CLICKED, (void*)(intptr_t)i);
     }
 
-    // Floating nav arrows when list exceeds window
+    // Persistent floating nav arrows — created once, updated each refresh
+    bool can_up = bt_sas_scroll_top > 0;
+    bool can_dn = end < bt_device_count;
     if (bt_device_count > BT_SAS_WIN) {
-        bool can_up = bt_sas_scroll_top > 0;
-        bool can_dn = end < bt_device_count;
+        if (bt_sas_nav_up == NULL) {
+            bt_sas_nav_up = lv_btn_create(bt_sas_list);
+            lv_obj_add_flag(bt_sas_nav_up, LV_OBJ_FLAG_FLOATING);
+            lv_obj_set_size(bt_sas_nav_up, 22, 22);
+            lv_obj_align(bt_sas_nav_up, LV_ALIGN_TOP_RIGHT, -1, 1);
+            lv_obj_set_style_bg_color(bt_sas_nav_up, lv_color_make(50, 50, 100), 0);
+            lv_obj_set_style_radius(bt_sas_nav_up, 4, 0);
+            lv_obj_set_style_border_width(bt_sas_nav_up, 0, 0);
+            lv_obj_set_style_pad_all(bt_sas_nav_up, 0, 0);
+            lv_obj_t *up_lbl = lv_label_create(bt_sas_nav_up);
+            lv_label_set_text(up_lbl, LV_SYMBOL_UP);
+            lv_obj_set_style_text_font(up_lbl, &lv_font_montserrat_12, 0);
+            lv_obj_center(up_lbl);
+            lv_obj_add_event_cb(bt_sas_nav_up, bt_sas_scroll_up_cb, LV_EVENT_CLICKED, NULL);
+            lv_obj_add_event_cb(bt_sas_nav_up, bt_sas_scroll_up_cb, LV_EVENT_LONG_PRESSED_REPEAT, NULL);
 
-        lv_obj_t *up = lv_btn_create(bt_sas_list);
-        lv_obj_add_flag(up, LV_OBJ_FLAG_FLOATING);
-        lv_obj_set_size(up, 22, 22);
-        lv_obj_align(up, LV_ALIGN_TOP_RIGHT, -1, 1);
-        lv_obj_set_style_bg_color(up, lv_color_make(50, 50, 100), 0);
-        lv_obj_set_style_bg_opa(up, can_up ? LV_OPA_90 : LV_OPA_30, 0);
-        lv_obj_set_style_radius(up, 4, 0);
-        lv_obj_set_style_border_width(up, 0, 0);
-        lv_obj_set_style_pad_all(up, 0, 0);
-        lv_obj_t *up_lbl = lv_label_create(up);
-        lv_label_set_text(up_lbl, LV_SYMBOL_UP);
-        lv_obj_set_style_text_font(up_lbl, &lv_font_montserrat_12, 0);
-        lv_obj_center(up_lbl);
-        if (can_up) lv_obj_add_event_cb(up, bt_sas_scroll_up_cb, LV_EVENT_CLICKED, NULL);
-        if (can_up) lv_obj_add_event_cb(up, bt_sas_scroll_up_cb, LV_EVENT_LONG_PRESSED_REPEAT, NULL);
+            bt_sas_nav_pos = lv_label_create(bt_sas_list);
+            lv_obj_add_flag(bt_sas_nav_pos, LV_OBJ_FLAG_FLOATING);
+            lv_obj_set_size(bt_sas_nav_pos, 22, LV_SIZE_CONTENT);
+            lv_obj_set_style_text_font(bt_sas_nav_pos, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(bt_sas_nav_pos, lv_color_make(160, 160, 160), 0);
+            lv_obj_set_style_text_align(bt_sas_nav_pos, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_align(bt_sas_nav_pos, LV_ALIGN_RIGHT_MID, -1, 0);
 
-        lv_obj_t *pos = lv_label_create(bt_sas_list);
-        lv_obj_add_flag(pos, LV_OBJ_FLAG_FLOATING);
+            bt_sas_nav_dn = lv_btn_create(bt_sas_list);
+            lv_obj_add_flag(bt_sas_nav_dn, LV_OBJ_FLAG_FLOATING);
+            lv_obj_set_size(bt_sas_nav_dn, 22, 22);
+            lv_obj_align(bt_sas_nav_dn, LV_ALIGN_BOTTOM_RIGHT, -1, -1);
+            lv_obj_set_style_bg_color(bt_sas_nav_dn, lv_color_make(50, 50, 100), 0);
+            lv_obj_set_style_radius(bt_sas_nav_dn, 4, 0);
+            lv_obj_set_style_border_width(bt_sas_nav_dn, 0, 0);
+            lv_obj_set_style_pad_all(bt_sas_nav_dn, 0, 0);
+            lv_obj_t *dn_lbl = lv_label_create(bt_sas_nav_dn);
+            lv_label_set_text(dn_lbl, LV_SYMBOL_DOWN);
+            lv_obj_set_style_text_font(dn_lbl, &lv_font_montserrat_12, 0);
+            lv_obj_center(dn_lbl);
+            lv_obj_add_event_cb(bt_sas_nav_dn, bt_sas_scroll_down_cb, LV_EVENT_CLICKED, NULL);
+            lv_obj_add_event_cb(bt_sas_nav_dn, bt_sas_scroll_down_cb, LV_EVENT_LONG_PRESSED_REPEAT, NULL);
+        }
+        // Update state every refresh
+        lv_obj_set_style_bg_opa(bt_sas_nav_up, can_up ? LV_OPA_90 : LV_OPA_30, 0);
         char pbuf[10];
         snprintf(pbuf, sizeof(pbuf), "%d/%d", end, bt_device_count);
-        lv_label_set_text(pos, pbuf);
-        lv_obj_set_size(pos, 22, LV_SIZE_CONTENT);
-        lv_obj_set_style_text_font(pos, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(pos, lv_color_make(160, 160, 160), 0);
-        lv_obj_set_style_text_align(pos, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_align(pos, LV_ALIGN_RIGHT_MID, -1, 0);
-
-        lv_obj_t *dn = lv_btn_create(bt_sas_list);
-        lv_obj_add_flag(dn, LV_OBJ_FLAG_FLOATING);
-        lv_obj_set_size(dn, 22, 22);
-        lv_obj_align(dn, LV_ALIGN_BOTTOM_RIGHT, -1, -1);
-        lv_obj_set_style_bg_color(dn, lv_color_make(50, 50, 100), 0);
-        lv_obj_set_style_bg_opa(dn, can_dn ? LV_OPA_90 : LV_OPA_30, 0);
-        lv_obj_set_style_radius(dn, 4, 0);
-        lv_obj_set_style_border_width(dn, 0, 0);
-        lv_obj_set_style_pad_all(dn, 0, 0);
-        lv_obj_t *dn_lbl = lv_label_create(dn);
-        lv_label_set_text(dn_lbl, LV_SYMBOL_DOWN);
-        lv_obj_set_style_text_font(dn_lbl, &lv_font_montserrat_12, 0);
-        lv_obj_center(dn_lbl);
-        if (can_dn) lv_obj_add_event_cb(dn, bt_sas_scroll_down_cb, LV_EVENT_CLICKED, NULL);
-        if (can_dn) lv_obj_add_event_cb(dn, bt_sas_scroll_down_cb, LV_EVENT_LONG_PRESSED_REPEAT, NULL);
+        lv_label_set_text(bt_sas_nav_pos, pbuf);
+        lv_obj_set_style_bg_opa(bt_sas_nav_dn, can_dn ? LV_OPA_90 : LV_OPA_30, 0);
+        lv_obj_clear_flag(bt_sas_nav_up,  LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(bt_sas_nav_pos, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(bt_sas_nav_dn,  LV_OBJ_FLAG_HIDDEN);
+    } else if (bt_sas_nav_up && lv_obj_is_valid(bt_sas_nav_up)) {
+        lv_obj_add_flag(bt_sas_nav_up,  LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(bt_sas_nav_pos, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(bt_sas_nav_dn,  LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -25467,6 +25502,7 @@ static void show_bt_scan_select_screen(void)
     bt_sas_ui_active = true;
     bt_sas_selected_idx = -1;
     bt_sas_scroll_top = 0;
+    bt_sas_nav_up = bt_sas_nav_pos = bt_sas_nav_dn = NULL;
 
     // Status label
     bt_sas_status_label = lv_label_create(function_page);
