@@ -501,7 +501,8 @@ static uint8_t screen_brightness_pct = 80;  // 10-100% (default 80)
 static lv_obj_t *brightness_overlay = NULL; // Software brightness overlay on lv_layer_top()
 static uint16_t scan_time_min_ms = 100;     // Active scan min time per channel (default 100)
 static uint16_t scan_time_max_ms = 300;     // Active scan max time per channel (default 300)
-static uint32_t g_gatt_timeout_ms = 30000; // GATT connect timeout (NVS-persisted)
+static uint32_t g_gatt_timeout_ms   = 30000; // GATT connect timeout (NVS-persisted)
+static uint16_t g_bt_scan_duration_s = 10;   // BT initial scan duration in seconds (NVS-persisted)
 static bool     g_rf_hat_enabled   = false; // NM-RF-HAT addon board present (NVS-persisted)
 static char     g_saved_wifi_ssid[33] = ""; // Home network SSID for file server STA mode
 static char     g_saved_wifi_pass[65] = ""; // Home network password
@@ -514,7 +515,8 @@ static char     g_saved_wifi_pass[65] = ""; // Home network password
 #define NVS_KEY_SCAN_MAX    "scan_max"
 #define NVS_KEY_DARK_MODE    "dark_mode"
 #define NVS_KEY_POWER_MODE   "pwr_mode"
-#define NVS_KEY_GATT_TIMEOUT "gatt_tmo"
+#define NVS_KEY_GATT_TIMEOUT  "gatt_tmo"
+#define NVS_KEY_BT_SCAN_DUR   "bt_scan_dur"
 #define NVS_KEY_WIFI_SSID    "wifi_ssid"
 #define NVS_KEY_WIFI_PASS    "wifi_pass"
 #define NVS_KEY_WIGLE_KEY    "wigle_key"
@@ -2856,6 +2858,9 @@ static void nvs_settings_load(void)
         if (nvs_get_u8(h, NVS_KEY_RF_HAT, &rfhat) == ESP_OK) g_rf_hat_enabled = (rfhat != 0);
         uint32_t btsc_ctr = 0;
         if (nvs_get_u32(h, NVS_KEY_BTSC_CTR, &btsc_ctr) == ESP_OK) g_btsc_counter = btsc_ctr;
+        uint8_t bt_scan_dur = 10;
+        if (nvs_get_u8(h, NVS_KEY_BT_SCAN_DUR, &bt_scan_dur) == ESP_OK)
+            g_bt_scan_duration_s = (bt_scan_dur >= 10 && bt_scan_dur <= 30) ? bt_scan_dur : 10;
         // Restore last-known GPS position so functions have a fallback before first fix
         int32_t gps_lat_i = 0, gps_lon_i = 0, gps_alt_i = 0;
         if (nvs_get_i32(h, NVS_KEY_GPS_LAT, &gps_lat_i) == ESP_OK &&
@@ -2954,6 +2959,17 @@ static void nvs_settings_save_gatt_timeout(uint32_t ms)
         nvs_commit(h);
         nvs_close(h);
         ESP_LOGI(TAG, "NVS: saved gatt_timeout = %ums", (unsigned)ms);
+    }
+}
+
+static void nvs_settings_save_bt_scan_dur(uint8_t seconds)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, NVS_KEY_BT_SCAN_DUR, seconds);
+        nvs_commit(h);
+        nvs_close(h);
+        ESP_LOGI(TAG, "NVS: saved bt_scan_dur = %us", (unsigned)seconds);
     }
 }
 
@@ -15890,8 +15906,10 @@ static void show_download_mode_screen(void)
 // ============================================================================
 
 static lv_obj_t *gatt_tmo_popup  = NULL;
-static lv_obj_t *gatt_tmo_slider = NULL;
-static lv_obj_t *gatt_tmo_label  = NULL;
+static lv_obj_t *gatt_tmo_slider    = NULL;
+static lv_obj_t *gatt_tmo_label     = NULL;
+static lv_obj_t *bt_scan_dur_slider = NULL;
+static lv_obj_t *bt_scan_dur_label  = NULL;
 
 static void gatt_tmo_slider_cb(lv_event_t *e)
 {
@@ -15901,6 +15919,16 @@ static void gatt_tmo_slider_cb(lv_event_t *e)
     char buf[36];
     snprintf(buf, sizeof(buf), "Timeout: %ldms", (long)val);
     lv_label_set_text(gatt_tmo_label, buf);
+}
+
+static void bt_scan_dur_slider_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!bt_scan_dur_slider || !bt_scan_dur_label) return;
+    int32_t val = lv_slider_get_value(bt_scan_dur_slider);
+    char buf[28];
+    snprintf(buf, sizeof(buf), "BT Scan: %lds", (long)val);
+    lv_label_set_text(bt_scan_dur_label, buf);
 }
 
 static void gatt_tmo_popup_close_cb(lv_event_t *e)
@@ -19511,25 +19539,30 @@ static void timing_popup_close_cb(lv_event_t *e)
     scantime_min_label  = scantime_max_label  = NULL;
     gatt_tmo_slider = NULL;
     gatt_tmo_label  = NULL;
+    bt_scan_dur_slider = NULL;
+    bt_scan_dur_label  = NULL;
 }
 
 static void timing_popup_save_cb(lv_event_t *e)
 {
-    if (!scantime_min_slider || !scantime_max_slider || !gatt_tmo_slider) return;
+    if (!scantime_min_slider || !scantime_max_slider || !gatt_tmo_slider || !bt_scan_dur_slider) return;
 
-    int32_t min_val  = lv_slider_get_value(scantime_min_slider);
-    int32_t max_val  = lv_slider_get_value(scantime_max_slider);
-    uint32_t gatt_ms = (uint32_t)lv_slider_get_value(gatt_tmo_slider);
+    int32_t min_val   = lv_slider_get_value(scantime_min_slider);
+    int32_t max_val   = lv_slider_get_value(scantime_max_slider);
+    uint32_t gatt_ms  = (uint32_t)lv_slider_get_value(gatt_tmo_slider);
+    uint8_t  bt_dur_s = (uint8_t)lv_slider_get_value(bt_scan_dur_slider);
 
     if (min_val >= max_val) max_val = min_val + 10;
-    scan_time_min_ms  = (uint16_t)min_val;
-    scan_time_max_ms  = (uint16_t)max_val;
-    g_gatt_timeout_ms = gatt_ms;
+    scan_time_min_ms      = (uint16_t)min_val;
+    scan_time_max_ms      = (uint16_t)max_val;
+    g_gatt_timeout_ms     = gatt_ms;
+    g_bt_scan_duration_s  = bt_dur_s;
 
     wifi_scanner_set_scan_time(scan_time_min_ms, scan_time_max_ms);
     nvs_settings_save_scan_time(scan_time_min_ms, scan_time_max_ms);
     gw_set_timeout(gatt_ms);
     nvs_settings_save_gatt_timeout(gatt_ms);
+    nvs_settings_save_bt_scan_dur(bt_dur_s);
 
     timing_popup_close_cb(e);
 }
@@ -19611,6 +19644,35 @@ static void show_timing_popup(void)
     lv_obj_set_style_bg_color(div, lv_color_make(70,70,70), 0);
     lv_obj_set_style_border_width(div, 0, 0);
     lv_obj_set_style_pad_all(div, 0, 0);
+
+    /* ── BT Scan duration section ─────────────────── */
+    lv_obj_t *bt_hdr = lv_label_create(dialog);
+    lv_label_set_text(bt_hdr, "BT Scan Duration");
+    lv_obj_set_style_text_color(bt_hdr, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_text_font(bt_hdr, &lv_font_montserrat_12, 0);
+
+    bt_scan_dur_label = lv_label_create(dialog);
+    snprintf(buf, sizeof(buf), "BT Scan: %us", (unsigned)g_bt_scan_duration_s);
+    lv_label_set_text(bt_scan_dur_label, buf);
+    lv_obj_set_style_text_color(bt_scan_dur_label, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_text_font(bt_scan_dur_label, &lv_font_montserrat_12, 0);
+
+    bt_scan_dur_slider = lv_slider_create(dialog);
+    lv_obj_set_width(bt_scan_dur_slider, 196);
+    lv_slider_set_range(bt_scan_dur_slider, 10, 30);
+    lv_slider_set_value(bt_scan_dur_slider, (int32_t)g_bt_scan_duration_s, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(bt_scan_dur_slider, lv_color_make(80,80,80), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bt_scan_dur_slider, COLOR_MATERIAL_ORANGE, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(bt_scan_dur_slider, COLOR_MATERIAL_ORANGE, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(bt_scan_dur_slider, 4, LV_PART_KNOB);
+    lv_obj_add_event_cb(bt_scan_dur_slider, bt_scan_dur_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    /* ── Divider ──────────────────────────────────── */
+    lv_obj_t *div2 = lv_obj_create(dialog);
+    lv_obj_set_size(div2, 196, 1);
+    lv_obj_set_style_bg_color(div2, lv_color_make(70,70,70), 0);
+    lv_obj_set_style_border_width(div2, 0, 0);
+    lv_obj_set_style_pad_all(div2, 0, 0);
 
     /* ── GATT connect timeout section ─────────────── */
     lv_obj_t *gatt_hdr = lv_label_create(dialog);
@@ -24666,7 +24728,7 @@ static void show_bt_locator_screen(void)
         bt_scan_active = false;
         lv_label_set_text(bt_locator_status_label, "Failed to start scan!");
     } else {
-        snprintf(bt_locator_status_text, sizeof(bt_locator_status_text), "BT scanning... 0 devices (10s)");
+        snprintf(bt_locator_status_text, sizeof(bt_locator_status_text), "BT scanning... 0 devices (%us)", (unsigned)g_bt_scan_duration_s);
         lv_label_set_text(bt_locator_status_label, bt_locator_status_text);
     }
     
@@ -25229,7 +25291,7 @@ static void show_bt_scan_select_screen(void)
         bt_scan_active = false;
         lv_label_set_text(bt_sas_status_label, "Scan start failed!");
     } else {
-        lv_label_set_text(bt_sas_status_label, "Scanning... 0 (10s)");
+        { char _ss[32]; snprintf(_ss, sizeof(_ss), "Scanning... 0 (%us)", (unsigned)g_bt_scan_duration_s); lv_label_set_text(bt_sas_status_label, _ss); }
     }
     ui_locked = false;
 }
@@ -25871,7 +25933,7 @@ static void bt_observer_task(void *pvParameters)
 {
     (void)pvParameters;
 
-    // ── Phase 1: 10s BLE scan ─────────────────────────────────────
+    // ── Phase 1: BLE scan (duration set by g_bt_scan_duration_s) ──
     bto_state = BTO_STATE_SCANNING;
     bt_reset_counters();
     bto_ui_needs_update = true;
@@ -25886,7 +25948,8 @@ static void bt_observer_task(void *pvParameters)
         return;
     }
 
-    for (int i = 0; i < 100 && bto_active; i++) {
+    int bto_scan_iters = (int)g_bt_scan_duration_s * 10;
+    for (int i = 0; i < bto_scan_iters && bto_active; i++) {
         vTaskDelay(pdMS_TO_TICKS(100));
         if (i % 5 == 0) bto_ui_needs_update = true;
     }
@@ -26109,7 +26172,7 @@ static void show_bt_locator_direct_track(void)
         bt_tracking_mode = false;
         lv_label_set_text(bt_locator_status_label, "Failed to start tracking!");
     } else {
-        snprintf(bt_locator_status_text, sizeof(bt_locator_status_text), "Scanning (10s)...");
+        snprintf(bt_locator_status_text, sizeof(bt_locator_status_text), "Scanning (%us)...", (unsigned)g_bt_scan_duration_s);
         lv_label_set_text(bt_locator_status_label, bt_locator_status_text);
     }
 
@@ -29732,7 +29795,7 @@ void attack_event_cb(lv_event_t *e)
             bt_scan_active = false;
             lv_label_set_text(ble_scan_status_label, "Failed to start scan task!");
         } else {
-            lv_label_set_text(ble_scan_status_label, "Scanning... 0 devices (10s)");
+            { char _ss[40]; snprintf(_ss, sizeof(_ss), "Scanning... 0 devices (%us)", (unsigned)g_bt_scan_duration_s); lv_label_set_text(ble_scan_status_label, _ss); }
         }
         
         ui_locked = false;
@@ -31548,31 +31611,32 @@ static void bt_scan_task(void *pvParameters)
     bt_reset_counters();
     ble_scan_finished = false;
     
-    ESP_LOGI(TAG, "BLE scan starting (10 seconds)...");
-    
+    int bt_scan_iters = (int)g_bt_scan_duration_s * 10;
+    ESP_LOGI(TAG, "BLE scan starting (%us)...", (unsigned)g_bt_scan_duration_s);
+
     int rc = bt_start_scan();
     if (rc != 0) {
         ESP_LOGE(TAG, "BLE scan start failed: %d", rc);
         bt_scan_active = false;
         bt_scan_task_handle = NULL;
-        
+
         // Set status for UI update (thread-safe)
         snprintf(ble_scan_status_text, sizeof(ble_scan_status_text), "Scan failed!");
         ble_scan_needs_ui_update = true;
         bt_locator_needs_ui_update = true;  // Also update BT Locator if active
-        
+
         vTaskDelete(NULL);
         return;
     }
-    
-    // Scan for 10 seconds, updating UI every 500ms via flag
-    for (int i = 0; i < 100 && bt_scan_active; i++) {
+
+    // Scan for g_bt_scan_duration_s seconds, updating UI every 500ms via flag
+    for (int i = 0; i < bt_scan_iters && bt_scan_active; i++) {
         vTaskDelay(pdMS_TO_TICKS(100));
-        
+
         // Update UI every 500ms via flag (thread-safe)
         if (i % 5 == 0) {
             snprintf(ble_scan_status_text, sizeof(ble_scan_status_text),
-                     "Scanning... %d (%ds)", bt_device_count, (100 - i) / 10);
+                     "Scanning... %d (%ds)", bt_device_count, (bt_scan_iters - i) / 10);
             ble_scan_needs_ui_update = true;
             bt_locator_needs_ui_update = true;
             bt_sas_needs_update = true;
