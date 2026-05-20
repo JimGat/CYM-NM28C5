@@ -24207,6 +24207,9 @@ static void lw_rebuild_list(void) {
         lv_obj_clear_flag(lw_nav_up,  LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(lw_nav_pos, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(lw_nav_dn,  LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(lw_nav_up);
+        lv_obj_move_foreground(lw_nav_pos);
+        lv_obj_move_foreground(lw_nav_dn);
     } else if (lw_nav_up && lv_obj_is_valid(lw_nav_up)) {
         lv_obj_add_flag(lw_nav_up,  LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(lw_nav_pos, LV_OBJ_FLAG_HIDDEN);
@@ -25190,6 +25193,9 @@ static void bt_sas_refresh_list(void)
         lv_obj_clear_flag(bt_sas_nav_up,  LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(bt_sas_nav_pos, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(bt_sas_nav_dn,  LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(bt_sas_nav_up);
+        lv_obj_move_foreground(bt_sas_nav_pos);
+        lv_obj_move_foreground(bt_sas_nav_dn);
     } else if (bt_sas_nav_up && lv_obj_is_valid(bt_sas_nav_up)) {
         lv_obj_add_flag(bt_sas_nav_up,  LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(bt_sas_nav_pos, LV_OBJ_FLAG_HIDDEN);
