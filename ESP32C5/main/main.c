@@ -23270,48 +23270,6 @@ static void ble_pcap_stop_cb(lv_event_t *e)
     show_bluetooth_screen();
 }
 
-// Toggle save-to-file on/off at runtime
-static void ble_pcap_save_sw_cb(lv_event_t *e)
-{
-    (void)e;
-    if (!ble_pcap_save_sw) return;
-    bool now_on = lv_obj_has_state(ble_pcap_save_sw, LV_STATE_CHECKED);
-    ble_pcap_save_enabled = now_on;
-
-    if (now_on && !ble_pcap_file) {
-        // Open a new file and write the headers
-        if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
-            uint32_t ts = (uint32_t)(esp_timer_get_time() / 1000000);
-            snprintf(ble_pcap_fname, sizeof(ble_pcap_fname),
-                     BLE_PCAP_DIR "/ble_%lu.pcapng", (unsigned long)ts);
-            ble_pcap_file = fopen(ble_pcap_fname, "wb");
-            if (ble_pcap_file) {
-                ble_pcap_write_shb(ble_pcap_file);
-                ble_pcap_write_idb(ble_pcap_file);
-                fflush(ble_pcap_file);
-            }
-            xSemaphoreGive(sd_spi_mutex);
-        }
-        if (ble_pcap_fn_lbl && lv_obj_is_valid(ble_pcap_fn_lbl)) {
-            const char *sn = strrchr(ble_pcap_fname, '/');
-            lv_label_set_text(ble_pcap_fn_lbl, sn ? sn + 1 : ble_pcap_fname);
-            lv_obj_set_style_text_color(ble_pcap_fn_lbl, UI_ACCENT_CYAN, 0);
-        }
-    } else if (!now_on && ble_pcap_file) {
-        // Close the current file — partial capture is saved
-        if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
-            fflush(ble_pcap_file);
-            fclose(ble_pcap_file);
-            ble_pcap_file = NULL;
-            xSemaphoreGive(sd_spi_mutex);
-        }
-        if (ble_pcap_fn_lbl && lv_obj_is_valid(ble_pcap_fn_lbl)) {
-            lv_label_set_text(ble_pcap_fn_lbl, "Monitor only — no file");
-            lv_obj_set_style_text_color(ble_pcap_fn_lbl, lv_color_make(160, 160, 160), 0);
-        }
-    }
-}
-
 static void show_ble_pcap_screen(void)
 {
     if (!ensure_ble_mode()) {
@@ -23330,24 +23288,24 @@ static void show_ble_pcap_screen(void)
         xSemaphoreGive(sd_spi_mutex);
     }
 
-    // If save is enabled, open file now; scan always starts regardless
-    ble_pcap_file = NULL;
-    ble_pcap_fname[0] = '\0';
-    if (ble_pcap_save_enabled) {
-        uint32_t ts = (uint32_t)(esp_timer_get_time() / 1000000);
-        snprintf(ble_pcap_fname, sizeof(ble_pcap_fname),
-                 BLE_PCAP_DIR "/ble_%lu.pcapng", (unsigned long)ts);
-        if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
-            ble_pcap_file = fopen(ble_pcap_fname, "wb");
-            if (ble_pcap_file) {
-                ble_pcap_write_shb(ble_pcap_file);
-                ble_pcap_write_idb(ble_pcap_file);
-                fflush(ble_pcap_file);
-            }
-            xSemaphoreGive(sd_spi_mutex);
+    // Open capture file — always write, stop only on exit
+    uint32_t ts = (uint32_t)(esp_timer_get_time() / 1000000);
+    snprintf(ble_pcap_fname, sizeof(ble_pcap_fname),
+             BLE_PCAP_DIR "/ble_%lu.pcapng", (unsigned long)ts);
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        ble_pcap_file = fopen(ble_pcap_fname, "wb");
+        if (ble_pcap_file) {
+            ble_pcap_write_shb(ble_pcap_file);
+            ble_pcap_write_idb(ble_pcap_file);
+            fflush(ble_pcap_file);
         }
-        if (!ble_pcap_file)
-            ESP_LOGW(TAG, "BLE PCAP: cannot open %s — monitoring only", ble_pcap_fname);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
+    if (!ble_pcap_file) {
+        ESP_LOGE(TAG, "BLE PCAP: cannot open %s", ble_pcap_fname);
+        show_bluetooth_screen();
+        return;
     }
 
     ble_pcap_queue     = xQueueCreate(64, sizeof(ble_pcap_pkt_t));
@@ -23356,45 +23314,17 @@ static void show_ble_pcap_screen(void)
 
     create_function_page_base("BLE PCAP");
 
-    // ── Save-to-file toggle row ────────────────────────────────────────
-    lv_obj_t *sw_row = lv_obj_create(function_page);
-    lv_obj_set_size(sw_row, LCD_H_RES - 8, 28);
-    lv_obj_align(sw_row, LV_ALIGN_TOP_MID, 0, 34);
-    lv_obj_set_style_bg_opa(sw_row, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(sw_row, 0, 0);
-    lv_obj_set_style_pad_all(sw_row, 0, 0);
-    lv_obj_clear_flag(sw_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_flex_flow(sw_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(sw_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-    lv_obj_t *sw_lbl = lv_label_create(sw_row);
-    lv_label_set_text(sw_lbl, "Save to file");
-    lv_obj_set_style_text_font(sw_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(sw_lbl, ui_text_color(), 0);
-
-    ble_pcap_save_sw = lv_switch_create(sw_row);
-    lv_obj_set_size(ble_pcap_save_sw, 40, 20);
-    lv_obj_set_style_bg_color(ble_pcap_save_sw, lv_color_make(80,80,80), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(ble_pcap_save_sw, COLOR_MATERIAL_GREEN, LV_PART_INDICATOR | LV_STATE_CHECKED);
-    lv_obj_set_style_bg_color(ble_pcap_save_sw, lv_color_white(), LV_PART_KNOB);
-    if (ble_pcap_save_enabled) lv_obj_add_state(ble_pcap_save_sw, LV_STATE_CHECKED);
-    lv_obj_add_event_cb(ble_pcap_save_sw, ble_pcap_save_sw_cb, LV_EVENT_VALUE_CHANGED, NULL);
-
-    // ── Filename / status label ────────────────────────────────────────
-    ble_pcap_fn_lbl = lv_label_create(function_page);
-    if (ble_pcap_file) {
-        const char *sn = strrchr(ble_pcap_fname, '/');
-        lv_label_set_text(ble_pcap_fn_lbl, sn ? sn + 1 : ble_pcap_fname);
-        lv_obj_set_style_text_color(ble_pcap_fn_lbl, UI_ACCENT_CYAN, 0);
-    } else {
-        lv_label_set_text(ble_pcap_fn_lbl, "Monitor only — no file");
-        lv_obj_set_style_text_color(ble_pcap_fn_lbl, lv_color_make(160, 160, 160), 0);
-    }
-    lv_obj_set_style_text_font(ble_pcap_fn_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_align(ble_pcap_fn_lbl, LV_ALIGN_TOP_MID, 0, 68);
-    lv_label_set_long_mode(ble_pcap_fn_lbl, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(ble_pcap_fn_lbl, LCD_H_RES - 8);
-    lv_obj_set_style_text_align(ble_pcap_fn_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    // Filename label
+    lv_obj_t *fn_lbl = lv_label_create(function_page);
+    const char *short_name = strrchr(ble_pcap_fname, '/');
+    short_name = short_name ? short_name + 1 : ble_pcap_fname;
+    lv_label_set_text(fn_lbl, short_name);
+    lv_obj_set_style_text_font(fn_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(fn_lbl, UI_ACCENT_CYAN, 0);
+    lv_obj_align(fn_lbl, LV_ALIGN_TOP_MID, 0, 36);
+    lv_label_set_long_mode(fn_lbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(fn_lbl, LCD_H_RES - 8);
+    lv_obj_set_style_text_align(fn_lbl, LV_TEXT_ALIGN_CENTER, 0);
 
     // Packet counter
     ble_pcap_cnt_label = lv_label_create(function_page);
