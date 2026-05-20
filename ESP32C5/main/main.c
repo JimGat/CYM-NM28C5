@@ -1551,7 +1551,8 @@ static char bt_sas_target_name[32];
 typedef struct {
     char filename[32];   // filename only (no path)
     char label[24];
-    char ts[8];          // HHMMSS
+    char ts[8];          // HHMMSS (legacy / filename fallback)
+    char datetime[20];   // "YYYY-MM-DD HH:MM:SS" from JSON datetime field
     uint32_t scan_id;
     int  device_count;
 } lw_file_info_t;
@@ -23295,18 +23296,23 @@ static void lw_parse_meta(const char *path, lw_file_info_t *info) {
     fclose(f);
     buf[n] = '\0';
 
+    // JSON is written with ": " (space after colon); skip past the opening quote
     char *p;
-    p = strstr(buf, "\"label\":\"");
-    if (p) { p += 9; int i=0; while(p[i] && p[i]!='"' && i<23) { info->label[i]=p[i]; i++; } info->label[i]='\0'; }
+    p = strstr(buf, "\"label\": \"");
+    if (p) { p += 10; int i=0; while(p[i] && p[i]!='"' && i<23) { info->label[i]=p[i]; i++; } info->label[i]='\0'; }
 
-    p = strstr(buf, "\"timestamp\":\"");
-    if (p) { p += 13; int i=0; while(p[i] && p[i]!='"' && i<7) { info->ts[i]=p[i]; i++; } info->ts[i]='\0'; }
+    p = strstr(buf, "\"datetime\": \"");
+    if (p) { p += 13; int i=0; while(p[i] && p[i]!='"' && i<19) { info->datetime[i]=p[i]; i++; } info->datetime[i]='\0'; }
 
-    p = strstr(buf, "\"scan_id\":");
-    if (p) { p += 10; info->scan_id = (uint32_t)atol(p); }
+    // Fallback: read legacy "timestamp" (HHMMSS) if datetime absent
+    p = strstr(buf, "\"timestamp\": \"");
+    if (p) { p += 14; int i=0; while(p[i] && p[i]!='"' && i<7) { info->ts[i]=p[i]; i++; } info->ts[i]='\0'; }
 
-    p = strstr(buf, "\"device_count\":");
-    if (p) { p += 15; info->device_count = atoi(p); }
+    p = strstr(buf, "\"scan_id\": ");
+    if (p) { p += 11; info->scan_id = (uint32_t)atol(p); }
+
+    p = strstr(buf, "\"device_count\": ");
+    if (p) { p += 16; info->device_count = atoi(p); }
 }
 
 static int lw_parse_devices(const char *path, lw_dev_t *out, int max_out) {
@@ -23504,15 +23510,21 @@ static void lw_rebuild_list(void) {
     lv_obj_clean(lw_list_box);
     for (int i = 0; i < lw_file_count; i++) {
         lw_file_info_t *fi = &lw_files[i];
-        char row[64];
-        if (fi->ts[0] && strlen(fi->ts) >= 6)
+        char row[72];
+        const char *flbl = fi->label[0] ? fi->label : "?";
+        if (fi->datetime[0] && fi->datetime[0] != '-') {
+            // "YYYY-MM-DD HH:MM:SS" → show "YYYY-MM-DD HH:MM" (drop seconds to fit)
+            char dt[17];
+            memcpy(dt, fi->datetime, 16); dt[16] = '\0';
+            snprintf(row, sizeof(row), "%s  %s  %d devs", flbl, dt, fi->device_count);
+        } else if (fi->ts[0] && strlen(fi->ts) >= 6) {
             snprintf(row, sizeof(row), "%s  %c%c:%c%c:%c%c  %d devs",
-                     fi->label[0] ? fi->label : "?",
+                     flbl,
                      fi->ts[0],fi->ts[1],fi->ts[2],fi->ts[3],fi->ts[4],fi->ts[5],
                      fi->device_count);
-        else
-            snprintf(row, sizeof(row), "%s  --:--:--  %d devs",
-                     fi->label[0] ? fi->label : "?", fi->device_count);
+        } else {
+            snprintf(row, sizeof(row), "%s  --  %d devs", flbl, fi->device_count);
+        }
         lv_obj_t *btn = lv_btn_create(lw_list_box);
         lv_obj_set_size(btn, lv_pct(100), 28);
         bool sel = lw_selected[i];
@@ -23890,10 +23902,10 @@ static void show_list_wizard_screen(void) {
             }
             closedir(dir);
         }
-        // Sort by filename (alphabetical = chronological with scan_id prefix)
+        // Sort by filename descending (scan_id prefix → newest first)
         for (int i = 0; i < lw_file_count - 1; i++) {
             for (int j = i+1; j < lw_file_count; j++) {
-                if (strcmp(lw_files[i].filename, lw_files[j].filename) > 0) {
+                if (strcmp(lw_files[i].filename, lw_files[j].filename) < 0) {
                     lw_file_info_t tmp = lw_files[i];
                     lw_files[i] = lw_files[j];
                     lw_files[j] = tmp;
@@ -24308,15 +24320,31 @@ static void bt_sas_do_save(const char *label)
         }
     }
 
-    // Build timestamp token from GPS UTC (HHMMSS) or seconds-since-boot
-    char ts_part[12];
-    if (g->time_utc[0]) {
-        int hh = 0, mm = 0, ss = 0;
-        sscanf(g->time_utc, "%d:%d:%d", &hh, &mm, &ss);
-        snprintf(ts_part, sizeof(ts_part), "%02d%02d%02d", hh, mm, ss);
-    } else {
-        snprintf(ts_part, sizeof(ts_part), "%06u",
-                 (unsigned)(esp_timer_get_time() / 1000000ULL) % 1000000u);
+    // Build timestamp from system clock (synced from GPS RMC on first fix;
+    // keeps ticking correctly even after GPS dropout via gps_best())
+    char ts_part[8];   // HHMMSS for filename
+    char datetime_str[80]; // "YYYY-MM-DD HH:MM:SS" for JSON (80b satisfies worst-case %d analysis)
+    {
+        time_t now = time(NULL);
+        struct tm t;
+        gmtime_r(&now, &t);
+        // If year is before 2024 the clock hasn't been GPS-synced; fall back to GPS struct
+        if (t.tm_year + 1900 < 2024 && g->time_utc[0]) {
+            int hh = 0, mm = 0, ss = 0;
+            sscanf(g->time_utc, "%d:%d:%d", &hh, &mm, &ss);
+            snprintf(ts_part, sizeof(ts_part), "%02d%02d%02d", hh, mm, ss);
+            snprintf(datetime_str, sizeof(datetime_str), "----  %02d:%02d:%02d", hh, mm, ss);
+        } else if (t.tm_year + 1900 < 2024) {
+            snprintf(ts_part, sizeof(ts_part), "%06u",
+                     (unsigned)(esp_timer_get_time() / 1000000ULL) % 1000000u);
+            snprintf(datetime_str, sizeof(datetime_str), "unknown");
+        } else {
+            snprintf(ts_part, sizeof(ts_part), "%02d%02d%02d",
+                     t.tm_hour, t.tm_min, t.tm_sec);
+            snprintf(datetime_str, sizeof(datetime_str), "%04d-%02d-%02d %02d:%02d:%02d",
+                     t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                     t.tm_hour, t.tm_min, t.tm_sec);
+        }
     }
 
     // Sanitize label — keep alphanumeric, dash, underscore; default "mark"
@@ -24363,17 +24391,19 @@ static void bt_sas_do_save(const char *label)
         return;
     }
 
+    bool gps_live = current_gps.valid;
     // JSON header
     fprintf(f, "{\n");
     fprintf(f, "  \"label\": \"%s\",\n", safe_label);
     fprintf(f, "  \"timestamp\": \"%s\",\n", ts_part);
+    fprintf(f, "  \"datetime\": \"%s\",\n", datetime_str);
     if (has_gps) {
         fprintf(f, "  \"gps_lat\": %.7f,\n", (double)g->latitude);
         fprintf(f, "  \"gps_lon\": %.7f,\n", (double)g->longitude);
         fprintf(f, "  \"gps_alt\": %.1f,\n", (double)g->altitude);
-        fprintf(f, "  \"gps_valid\": %s,\n", g->valid ? "true" : "false");
+        fprintf(f, "  \"gps_live\": %s,\n", gps_live ? "true" : "false");
     } else {
-        fprintf(f, "  \"gps_valid\": false,\n");
+        fprintf(f, "  \"gps_live\": false,\n");
     }
     fprintf(f, "  \"fw_version\": \"%s\",\n", FW_VERSION);
     fprintf(f, "  \"scan_id\": %u,\n", (unsigned)g_btsc_counter);
