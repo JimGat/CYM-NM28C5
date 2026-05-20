@@ -20822,8 +20822,8 @@ static const sd_provision_item_t SD_ITEMS[] = {
     { SD_ITEM_DIR,  "/sdcard/lab/ble/blueduck",              NULL },  /* BlueDuck session logs */
     { SD_ITEM_DIR,  "/sdcard/lab/ble/blueduck/scripts",      NULL },  /* DuckyScript payloads */
     { SD_ITEM_DIR,  "/sdcard/lab/ble/whisperpair",           NULL },  /* WhisperPair logs */
-    { SD_ITEM_DIR,  "/sdcard/lab/ir",                        NULL },  /* IR HAT captures */
-    { SD_ITEM_DIR,  "/sdcard/lab/rf433",                     NULL },  /* RF433 HAT captures (.sub) */
+    { SD_ITEM_DIR,  "/sdcard/lab/infrared",                  NULL },  /* IR HAT remotes (Flipper .ir format) */
+    { SD_ITEM_DIR,  "/sdcard/lab/rf433",                     NULL },  /* RF433 HAT captures (Flipper .sub format) */
     { SD_ITEM_DIR,  "/sdcard/lab/radio",                     NULL },  /* CC1101 / nRF24 captures */
     { SD_ITEM_DIR,  "/sdcard/lab/rfid",                      NULL },  /* RFID/NFC card dumps */
     /* ── Seed files (written only on creation; never overwrite existing) ── */
