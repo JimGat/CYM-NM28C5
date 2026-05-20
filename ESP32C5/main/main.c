@@ -1807,6 +1807,7 @@ static void show_cc1101_screen(void);
 static void show_nrf24_screen(void);
 static void show_ir_capture_screen(void);
 static void show_ir_replay_screen(void);
+static void show_ir_signal_list_screen(void);
 static void show_ir_tvbgone_screen(void);
 static void show_ir_jammer_screen(void);
 static void show_rf433_menu_screen(void);
@@ -35324,6 +35325,12 @@ static ir_signal_t           s_last_ir_signal;
 static lv_obj_t             *s_ir_cap_status_lbl = NULL;
 static lv_obj_t             *s_ir_cap_save_btn   = NULL;
 static volatile ir_hat_err_t s_ir_cap_result      = IR_HAT_ERR_TIMEOUT;
+static lv_obj_t             *s_ir_save_popup      = NULL;
+static uint32_t              s_ir_cap_signal_idx  = 0;  // auto-name counter
+
+// Remote names for save picker
+static char s_ir_cap_remotes[IR_HAT_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
+static int  s_ir_cap_remote_count = 0;
 
 static void s_ir_cap_ui_update(void *arg)
 {
@@ -35331,7 +35338,8 @@ static void s_ir_cap_ui_update(void *arg)
     if (!s_ir_cap_status_lbl) return;
     if (s_ir_cap_result == IR_HAT_OK) {
         char buf[64];
-        snprintf(buf, sizeof(buf), "Captured! %lu pulses", (unsigned long)s_last_ir_signal.count);
+        snprintf(buf, sizeof(buf), "Captured! %lu pulses",
+                 (unsigned long)s_last_ir_signal.count);
         lv_label_set_text(s_ir_cap_status_lbl, buf);
         lv_obj_set_style_text_color(s_ir_cap_status_lbl, COLOR_MATERIAL_GREEN, 0);
         if (s_ir_cap_save_btn) lv_obj_clear_state(s_ir_cap_save_btn, LV_STATE_DISABLED);
@@ -35350,7 +35358,8 @@ static void s_ir_capture_done(ir_hat_err_t result, const ir_signal_t *sig, void 
     lv_async_call(s_ir_cap_ui_update, NULL);
 }
 
-static void ir_cap_start_cb(lv_event_t *e) {
+static void ir_cap_start_cb(lv_event_t *e)
+{
     (void)e;
     if (!ir_hat_is_init()) ir_hat_init();
     if (s_ir_cap_status_lbl) {
@@ -35361,24 +35370,146 @@ static void ir_cap_start_cb(lv_event_t *e) {
     ir_hat_capture_start(s_ir_capture_done, NULL, 5000);
 }
 
-static void ir_cap_save_cb(lv_event_t *e) {
+// Called when user picks a remote from the save popup
+static void ir_save_remote_pick_cb(lv_event_t *e)
+{
+    const char *remote = (const char *)lv_event_get_user_data(e);
+    if (!remote) return;
+
+    // Auto-name the signal
+    snprintf(s_last_ir_signal.name, IR_HAT_NAME_LEN,
+             "signal_%04lu", (unsigned long)s_ir_cap_signal_idx);
+
+    // If "New Remote", generate a unique filename
+    char new_remote[IR_HAT_REMOTE_NAME_LEN];
+    if (strcmp(remote, "__new__") == 0) {
+        // Find a unique "captured_N" name
+        snprintf(new_remote, sizeof(new_remote), "captured");
+        int n = 1;
+        char test_path[160];
+        struct stat st;
+        snprintf(test_path, sizeof(test_path),
+                 "/sdcard/lab/infrared/%s.ir", new_remote);
+        while (stat(test_path, &st) == 0 && n < 100) {
+            snprintf(new_remote, sizeof(new_remote), "captured_%d", n++);
+            snprintf(test_path, sizeof(test_path),
+                     "/sdcard/lab/infrared/%s.ir", new_remote);
+        }
+        remote = new_remote;
+    }
+
+    ir_hat_err_t r = ir_hat_append_signal(remote, &s_last_ir_signal);
+    s_ir_cap_signal_idx++;
+
+    if (s_ir_cap_status_lbl) {
+        if (r == IR_HAT_OK) {
+            char buf[96];
+            snprintf(buf, sizeof(buf), "Saved to %s.ir", remote);
+            lv_label_set_text(s_ir_cap_status_lbl, buf);
+            lv_obj_set_style_text_color(s_ir_cap_status_lbl, COLOR_MATERIAL_GREEN, 0);
+        } else {
+            lv_label_set_text(s_ir_cap_status_lbl, "Save failed");
+            lv_obj_set_style_text_color(s_ir_cap_status_lbl, lv_color_hex(0xFF5722), 0);
+        }
+    }
+
+    // Close popup
+    if (s_ir_save_popup && lv_obj_is_valid(s_ir_save_popup)) {
+        lv_obj_del(s_ir_save_popup);
+        s_ir_save_popup = NULL;
+    }
+    // Re-disable save button so user captures a fresh signal before saving again
+    if (s_ir_cap_save_btn) lv_obj_add_state(s_ir_cap_save_btn, LV_STATE_DISABLED);
+}
+
+static void ir_save_popup_cancel_cb(lv_event_t *e)
+{
     (void)e;
-    static uint32_t idx = 0;
-    char name[IR_HAT_NAME_LEN];
-    snprintf(name, sizeof(name), "ir_%04lu", (unsigned long)idx++);
-    snprintf(s_last_ir_signal.name, IR_HAT_NAME_LEN, "%s", name);
-    ir_hat_err_t r = ir_hat_save(&s_last_ir_signal, name);
-    if (s_ir_cap_status_lbl)
-        lv_label_set_text(s_ir_cap_status_lbl, r == IR_HAT_OK ? "Saved to SD!" : "Save failed");
+    if (s_ir_save_popup && lv_obj_is_valid(s_ir_save_popup)) {
+        lv_obj_del(s_ir_save_popup);
+        s_ir_save_popup = NULL;
+    }
+}
+
+static void ir_cap_save_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_ir_save_popup && lv_obj_is_valid(s_ir_save_popup)) return; // already open
+
+    // Refresh remote list
+    s_ir_cap_remote_count = ir_hat_list_remotes(s_ir_cap_remotes, IR_HAT_MAX_REMOTES);
+
+    // Build popup
+    s_ir_save_popup = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(s_ir_save_popup, 210, 240);
+    lv_obj_align(s_ir_save_popup, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(s_ir_save_popup, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(s_ir_save_popup, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_border_width(s_ir_save_popup, 2, 0);
+    lv_obj_set_style_radius(s_ir_save_popup, 10, 0);
+    lv_obj_set_style_pad_all(s_ir_save_popup, 8, 0);
+    lv_obj_clear_flag(s_ir_save_popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(s_ir_save_popup);
+    lv_label_set_text(title, LV_SYMBOL_SAVE "  Save to remote:");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    // Scrollable list of remotes
+    lv_obj_t *list = lv_list_create(s_ir_save_popup);
+    lv_obj_set_size(list, 192, 178);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 24);
+    lv_obj_set_style_bg_color(list, ui_card_color(), 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    lv_obj_set_style_pad_all(list, 2, 0);
+
+    // "New Remote" entry at top
+    lv_obj_t *new_row = lv_list_add_btn(list, LV_SYMBOL_PLUS, "New remote");
+    lv_obj_set_style_text_font(new_row, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(new_row, lv_color_hex(0x1A3A2A), LV_STATE_DEFAULT);
+    lv_obj_add_event_cb(new_row, ir_save_remote_pick_cb, LV_EVENT_CLICKED, "__new__");
+
+    // Existing remotes
+    for (int i = 0; i < s_ir_cap_remote_count; i++) {
+        lv_obj_t *row = lv_list_add_btn(list, LV_SYMBOL_FILE, s_ir_cap_remotes[i]);
+        lv_obj_set_style_text_font(row, &lv_font_montserrat_12, 0);
+        lv_obj_add_event_cb(row, ir_save_remote_pick_cb, LV_EVENT_CLICKED,
+                            s_ir_cap_remotes[i]);
+    }
+
+    if (s_ir_cap_remote_count == 0) {
+        lv_obj_t *hint = lv_label_create(list);
+        lv_label_set_text(hint, "No remotes yet.\nTap New remote.");
+        lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(hint, lv_color_hex(0x888), 0);
+        lv_obj_center(hint);
+    }
+
+    // Cancel button
+    lv_obj_t *cancel = lv_btn_create(s_ir_save_popup);
+    lv_obj_set_size(cancel, 80, 28);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(cancel, lv_color_hex(0x555), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(cancel, 0, 0);
+    lv_obj_set_style_radius(cancel, 6, 0);
+    lv_obj_t *cl = lv_label_create(cancel);
+    lv_label_set_text(cl, "Cancel");
+    lv_obj_set_style_text_font(cl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(cl, lv_color_white(), 0);
+    lv_obj_center(cl);
+    lv_obj_add_event_cb(cancel, ir_save_popup_cancel_cb, LV_EVENT_CLICKED, NULL);
 }
 
 static void show_ir_capture_screen(void)
 {
     create_function_page_base("IR Capture");
     apply_menu_bg();
+    s_ir_save_popup = NULL;
 
     s_ir_cap_status_lbl = lv_label_create(function_page);
-    lv_label_set_text(s_ir_cap_status_lbl, "Point remote at sensor\nthen press Capture.");
+    lv_label_set_text(s_ir_cap_status_lbl,
+                      "Point remote at sensor\nthen press Capture.");
     lv_obj_set_style_text_font(s_ir_cap_status_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_ir_cap_status_lbl, ui_text_color(), 0);
     lv_obj_set_style_text_align(s_ir_cap_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
@@ -35407,7 +35538,7 @@ static void show_ir_capture_screen(void)
     lv_obj_set_style_radius(s_ir_cap_save_btn, 8, 0);
     lv_obj_add_state(s_ir_cap_save_btn, LV_STATE_DISABLED);
     lv_obj_t *save_lbl = lv_label_create(s_ir_cap_save_btn);
-    lv_label_set_text(save_lbl, LV_SYMBOL_SAVE "  Save to SD");
+    lv_label_set_text(save_lbl, LV_SYMBOL_SAVE "  Save to...");
     lv_obj_set_style_text_font(save_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(save_lbl, lv_color_white(), 0);
     lv_obj_center(save_lbl);
@@ -35416,36 +35547,18 @@ static void show_ir_capture_screen(void)
     rfhat_add_back_btn("Infrared", show_ir_menu_screen);
 }
 
-// ── IR Replay ─────────────────────────────────────────────────────────────────
+// ── IR Replay — Level 1: remote file browser ──────────────────────────────────
 
-static char s_ir_names[32][IR_HAT_NAME_LEN];
-static int  s_ir_name_count  = 0;
-static int  s_ir_sel_idx     = -1;
-static lv_obj_t *s_ir_replay_status = NULL;
+static char s_ir_remote_names[IR_HAT_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
+static int  s_ir_remote_count = 0;
+static char s_ir_cur_remote[IR_HAT_REMOTE_NAME_LEN];
 
-static void ir_replay_row_cb(lv_event_t *e)
+static void ir_remote_row_cb(lv_event_t *e)
 {
-    s_ir_sel_idx = (int)(intptr_t)lv_event_get_user_data(e);
-    if (s_ir_replay_status) {
-        char buf[48];
-        snprintf(buf, sizeof(buf), "Selected: %s", s_ir_names[s_ir_sel_idx]);
-        lv_label_set_text(s_ir_replay_status, buf);
-    }
-}
-
-static void ir_do_replay_cb(lv_event_t *e) {
-    (void)e;
-    if (s_ir_sel_idx < 0 || s_ir_sel_idx >= s_ir_name_count) return;
-    if (!ir_hat_is_init()) ir_hat_init();
-    ir_signal_t sig;
-    if (s_ir_replay_status) lv_label_set_text(s_ir_replay_status, "Transmitting...");
-    ir_hat_err_t r = ir_hat_load(&sig, s_ir_names[s_ir_sel_idx]);
-    if (r == IR_HAT_OK) {
-        ir_hat_replay(&sig);
-        if (s_ir_replay_status) lv_label_set_text(s_ir_replay_status, "Sent!");
-    } else {
-        if (s_ir_replay_status) lv_label_set_text(s_ir_replay_status, "Load error");
-    }
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_ir_remote_count) return;
+    strncpy(s_ir_cur_remote, s_ir_remote_names[idx], IR_HAT_REMOTE_NAME_LEN - 1);
+    show_ir_signal_list_screen();
 }
 
 static void show_ir_replay_screen(void)
@@ -35453,30 +35566,111 @@ static void show_ir_replay_screen(void)
     create_function_page_base("IR Replay");
     apply_menu_bg();
 
-    s_ir_name_count = ir_hat_list_saved(s_ir_names, 32);
-    s_ir_sel_idx = -1;
+    s_ir_remote_count = ir_hat_list_remotes(s_ir_remote_names, IR_HAT_MAX_REMOTES);
 
-    s_ir_replay_status = lv_label_create(function_page);
-    lv_label_set_text(s_ir_replay_status,
-        s_ir_name_count ? "Tap signal, then Transmit." : "No saved signals.\nCapture one first.");
-    lv_obj_set_style_text_font(s_ir_replay_status, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(s_ir_replay_status, ui_text_color(), 0);
-    lv_obj_set_style_text_align(s_ir_replay_status, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_long_mode(s_ir_replay_status, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(s_ir_replay_status, LCD_H_RES - 16);
-    lv_obj_align(s_ir_replay_status, LV_ALIGN_TOP_MID, 0, 38);
+    lv_obj_t *hint = lv_label_create(function_page);
+    lv_label_set_text(hint, s_ir_remote_count
+        ? "Select a remote file:"
+        : "No remotes found.\nCapture a signal first.");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint, ui_text_color(), 0);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(hint, LCD_H_RES - 16);
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 38);
 
-    // Scrollable list of saved files
     lv_obj_t *list = lv_list_create(function_page);
-    lv_obj_set_size(list, LCD_H_RES - 12, 140);
-    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 78);
+    lv_obj_set_size(list, LCD_H_RES - 12, LCD_V_RES - 30 - 38 - 16 - 44);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 68);
     lv_obj_set_style_bg_color(list, ui_panel_color(), 0);
     lv_obj_set_style_border_color(list, lv_color_hex(0x444), 0);
     lv_obj_set_style_border_width(list, 1, 0);
-    for (int i = 0; i < s_ir_name_count; i++) {
-        lv_obj_t *row = lv_list_add_btn(list, LV_SYMBOL_AUDIO, s_ir_names[i]);
+
+    for (int i = 0; i < s_ir_remote_count; i++) {
+        lv_obj_t *row = lv_list_add_btn(list, LV_SYMBOL_FILE, s_ir_remote_names[i]);
         lv_obj_set_style_text_font(row, &lv_font_montserrat_12, 0);
-        lv_obj_add_event_cb(row, ir_replay_row_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        lv_obj_add_event_cb(row, ir_remote_row_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+    }
+
+    rfhat_add_back_btn("Infrared", show_ir_menu_screen);
+}
+
+// ── IR Replay — Level 2: signal list within a remote ─────────────────────────
+
+static char     s_ir_signal_names[IR_HAT_MAX_SIGNALS][IR_HAT_NAME_LEN];
+static int      s_ir_signal_count = 0;
+static int      s_ir_sel_signal   = -1;
+static lv_obj_t *s_ir_sig_status  = NULL;
+static ir_signal_t s_ir_replay_sig;  // static to avoid 4 KB stack frame
+
+static void ir_signal_row_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_ir_signal_count) return;
+    s_ir_sel_signal = idx;
+    if (s_ir_sig_status) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "Selected: %s", s_ir_signal_names[idx]);
+        lv_label_set_text(s_ir_sig_status, buf);
+        lv_obj_set_style_text_color(s_ir_sig_status, COLOR_MATERIAL_AMBER, 0);
+    }
+}
+
+static void ir_do_replay_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_ir_sel_signal < 0 || s_ir_sel_signal >= s_ir_signal_count) return;
+    if (!ir_hat_is_init()) ir_hat_init();
+    if (s_ir_sig_status) {
+        lv_label_set_text(s_ir_sig_status, "Transmitting...");
+        lv_obj_set_style_text_color(s_ir_sig_status, ui_text_color(), 0);
+    }
+    ir_hat_err_t r = ir_hat_load_signal_by_index(s_ir_cur_remote,
+                                                  s_ir_sel_signal, &s_ir_replay_sig);
+    if (r == IR_HAT_OK) {
+        ir_hat_replay(&s_ir_replay_sig);
+        if (s_ir_sig_status) {
+            lv_label_set_text(s_ir_sig_status, "Sent!");
+            lv_obj_set_style_text_color(s_ir_sig_status, COLOR_MATERIAL_GREEN, 0);
+        }
+    } else {
+        if (s_ir_sig_status) {
+            lv_label_set_text(s_ir_sig_status, "Load error");
+            lv_obj_set_style_text_color(s_ir_sig_status, lv_color_hex(0xFF5722), 0);
+        }
+    }
+}
+
+static void show_ir_signal_list_screen(void)
+{
+    create_function_page_base(s_ir_cur_remote);
+    apply_menu_bg();
+
+    s_ir_signal_count = ir_hat_list_signals(s_ir_cur_remote,
+                                             s_ir_signal_names, IR_HAT_MAX_SIGNALS);
+    s_ir_sel_signal = -1;
+
+    s_ir_sig_status = lv_label_create(function_page);
+    lv_label_set_text(s_ir_sig_status,
+        s_ir_signal_count ? "Tap a signal, then Transmit." : "No signals in this remote.");
+    lv_obj_set_style_text_font(s_ir_sig_status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_ir_sig_status, ui_text_color(), 0);
+    lv_obj_set_style_text_align(s_ir_sig_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_ir_sig_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_ir_sig_status, LCD_H_RES - 16);
+    lv_obj_align(s_ir_sig_status, LV_ALIGN_TOP_MID, 0, 38);
+
+    lv_obj_t *list = lv_list_create(function_page);
+    lv_obj_set_size(list, LCD_H_RES - 12, LCD_V_RES - 30 - 38 - 16 - 80);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 68);
+    lv_obj_set_style_bg_color(list, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(list, lv_color_hex(0x444), 0);
+    lv_obj_set_style_border_width(list, 1, 0);
+
+    for (int i = 0; i < s_ir_signal_count; i++) {
+        lv_obj_t *row = lv_list_add_btn(list, LV_SYMBOL_AUDIO, s_ir_signal_names[i]);
+        lv_obj_set_style_text_font(row, &lv_font_montserrat_12, 0);
+        lv_obj_add_event_cb(row, ir_signal_row_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
     }
 
     lv_obj_t *tx_btn = lv_btn_create(function_page);
@@ -35492,7 +35686,7 @@ static void show_ir_replay_screen(void)
     lv_obj_center(tx_lbl);
     lv_obj_add_event_cb(tx_btn, ir_do_replay_cb, LV_EVENT_CLICKED, NULL);
 
-    rfhat_add_back_btn("Infrared", show_ir_menu_screen);
+    rfhat_add_back_btn(s_ir_cur_remote, show_ir_replay_screen);
 }
 
 // ── TV-B-Gone ─────────────────────────────────────────────────────────────────
