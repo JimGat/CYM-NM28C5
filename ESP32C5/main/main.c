@@ -24156,6 +24156,33 @@ static void bt_sas_exit_cb(lv_event_t *e)
     show_bluetooth_screen();
 }
 
+static void bt_sas_rescan_cb(lv_event_t *e)
+{
+    (void)e;
+    if (bt_scan_active) {
+        bt_scan_active = false;
+        bt_stop_scan();
+        vTaskDelay(pdMS_TO_TICKS(80));
+    }
+    // Clear results and selection
+    memset(bt_devices, 0, sizeof(bt_devices));
+    bt_device_count = 0;
+    bt_sas_selected_idx = -1;
+    if (bt_sas_next_btn && lv_obj_is_valid(bt_sas_next_btn))
+        lv_obj_add_flag(bt_sas_next_btn, LV_OBJ_FLAG_HIDDEN);
+    bt_sas_refresh_list();
+    if (bt_sas_status_label && lv_obj_is_valid(bt_sas_status_label))
+        lv_label_set_text(bt_sas_status_label, "Rescanning...");
+    bt_scan_active = true;
+    ble_scan_finished = false;
+    BaseType_t ret = xTaskCreate(bt_scan_task, "bt_scan_task", 4096, NULL, 5, &bt_scan_task_handle);
+    if (ret != pdPASS) {
+        bt_scan_active = false;
+        if (bt_sas_status_label && lv_obj_is_valid(bt_sas_status_label))
+            lv_label_set_text(bt_sas_status_label, "Rescan failed!");
+    }
+}
+
 static void bt_sas_device_cb(lv_event_t *e)
 {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
@@ -24563,52 +24590,65 @@ static void show_bt_scan_select_screen(void)
     lv_obj_set_style_pad_gap(bt_sas_list, 3, 0);
     lv_obj_set_scrollbar_mode(bt_sas_list, LV_SCROLLBAR_MODE_AUTO);
 
-    // Bottom button row: [Exit] [Save List] [Actions →]
+    // Bottom button row: [Exit] [Save List] [Rescan] [Actions →]
     lv_obj_t *btn_row = lv_obj_create(function_page);
     lv_obj_set_size(btn_row, lv_pct(100), 38);
     lv_obj_align(btn_row, LV_ALIGN_BOTTOM_MID, 0, -6);
     lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(btn_row, 0, 0);
-    lv_obj_set_style_pad_hor(btn_row, 6, 0);
+    lv_obj_set_style_pad_hor(btn_row, 4, 0);
     lv_obj_set_style_pad_ver(btn_row, 0, 0);
     lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *exit_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(exit_btn, 68, 30);
+    lv_obj_set_size(exit_btn, 56, 30);
     lv_obj_set_style_bg_color(exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 40), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(exit_btn, 0, 0);
     lv_obj_set_style_radius(exit_btn, 8, 0);
     lv_obj_t *exit_lbl = lv_label_create(exit_btn);
-    lv_label_set_text(exit_lbl, LV_SYMBOL_CLOSE "  Exit");
+    lv_label_set_text(exit_lbl, LV_SYMBOL_CLOSE " Exit");
     lv_obj_set_style_text_font(exit_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(exit_lbl, lv_color_white(), 0);
     lv_obj_center(exit_lbl);
     lv_obj_add_event_cb(exit_btn, bt_sas_exit_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *save_list_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(save_list_btn, 88, 30);
+    lv_obj_set_size(save_list_btn, 76, 30);
     lv_obj_set_style_bg_color(save_list_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(save_list_btn, lv_color_make(30, 140, 30), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(save_list_btn, 0, 0);
     lv_obj_set_style_radius(save_list_btn, 8, 0);
     lv_obj_t *save_list_lbl = lv_label_create(save_list_btn);
-    lv_label_set_text(save_list_lbl, LV_SYMBOL_SAVE "  Save List");
+    lv_label_set_text(save_list_lbl, LV_SYMBOL_SAVE " Save List");
     lv_obj_set_style_text_font(save_list_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(save_list_lbl, lv_color_white(), 0);
     lv_obj_center(save_list_lbl);
     lv_obj_add_event_cb(save_list_btn, bt_sas_save_list_cb, LV_EVENT_CLICKED, NULL);
 
+    lv_obj_t *rescan_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(rescan_btn, 66, 30);
+    lv_obj_set_style_bg_color(rescan_btn, lv_color_hex(0xF57C00), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(rescan_btn, lv_color_hex(0xBF5200), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(rescan_btn, 0, 0);
+    lv_obj_set_style_radius(rescan_btn, 8, 0);
+    lv_obj_t *rescan_lbl = lv_label_create(rescan_btn);
+    lv_label_set_text(rescan_lbl, LV_SYMBOL_REFRESH " Rescan");
+    lv_obj_set_style_text_font(rescan_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(rescan_lbl, lv_color_white(), 0);
+    lv_obj_center(rescan_lbl);
+    lv_obj_add_event_cb(rescan_btn, bt_sas_rescan_cb, LV_EVENT_CLICKED, NULL);
+
     bt_sas_next_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(bt_sas_next_btn, 74, 30);
+    lv_obj_set_size(bt_sas_next_btn, 62, 30);
     lv_obj_set_style_bg_color(bt_sas_next_btn, UI_ACCENT_CYAN, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(bt_sas_next_btn, lv_color_lighten(UI_ACCENT_CYAN, 40), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(bt_sas_next_btn, 0, 0);
     lv_obj_set_style_radius(bt_sas_next_btn, 8, 0);
     lv_obj_t *next_lbl = lv_label_create(bt_sas_next_btn);
-    lv_label_set_text(next_lbl, "Actions " LV_SYMBOL_RIGHT);
+    lv_label_set_text(next_lbl, "Actions" LV_SYMBOL_RIGHT);
     lv_obj_set_style_text_font(next_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(next_lbl, lv_color_black(), 0);
     lv_obj_center(next_lbl);
