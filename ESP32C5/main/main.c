@@ -1588,6 +1588,10 @@ static lv_obj_t *lw_del_overlay   = NULL;
 static int       lw_del_idx       = -1;     // file index pending delete confirm
 static lv_obj_t *lw_save_overlay  = NULL;   // "Create New List" name dialog
 static lv_obj_t *lw_save_ta       = NULL;
+static lw_rssi_acc_t *lw_acc_buf  = NULL;   // PSRAM: full accumulator from last SD read
+static int       lw_acc_total     = 0;      // number of entries in lw_acc_buf
+static int       lw_acc_nsel      = 0;      // number of files in last accumulate
+static bool      lw_acc_is_union  = false;  // true=Unique, false=Common
 
 // ── BT Observer ─────────────────────────────────────────────────
 #define BTO_MAX_DEVICES 40
@@ -23412,47 +23416,36 @@ static void lw_result_sort_rssi(lw_dev_t *arr, int n) {
             }
 }
 
-// Unique: devices that appear in EXACTLY ONE of the selected files.
-// Uses minimum RSSI (signal floor) for filter and sort. RSSI filter applied after MAC matching.
-static int lw_compute_union(int *sel_idx, int nsel, lw_dev_t *result, int max_result) {
-    lw_rssi_acc_t *acc = heap_caps_calloc(max_result, sizeof(lw_rssi_acc_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!acc) return 0;
-    int total = lw_accumulate(sel_idx, nsel, acc, max_result);
+// Filter lw_acc_buf → lw_result_buf without re-reading SD.
+// Unique: exactly one file (file_mask is power-of-two), min RSSI >= threshold.
+static int lw_filter_union(void) {
     int count = 0;
-    for (int i = 0; i < total && count < max_result; i++) {
-        // Exactly one bit set in file_mask → seen in only one file
-        uint8_t m = acc[i].file_mask;
-        if (m == 0 || (m & (m - 1)) != 0) continue;   // skip if in 0 or >1 files
-        if (acc[i].rssi_min < lw_rssi_threshold) continue;
-        memcpy(result[count].mac,  acc[i].mac,  18);
-        memcpy(result[count].name, acc[i].name, 32);
-        result[count].rssi = acc[i].rssi_min;
+    for (int i = 0; i < lw_acc_total && count < LW_MAX_RESULT; i++) {
+        uint8_t m = lw_acc_buf[i].file_mask;
+        if (m == 0 || (m & (m - 1)) != 0) continue;
+        if (lw_acc_buf[i].rssi_min < lw_rssi_threshold) continue;
+        memcpy(lw_result_buf[count].mac,  lw_acc_buf[i].mac,  18);
+        memcpy(lw_result_buf[count].name, lw_acc_buf[i].name, 32);
+        lw_result_buf[count].rssi = lw_acc_buf[i].rssi_min;
         count++;
     }
-    heap_caps_free(acc);
-    lw_result_sort_rssi(result, count);
     return count;
 }
 
-// Common: devices present in ALL selected files, sorted by average RSSI desc.
-static int lw_compute_intersection(int *sel_idx, int nsel, lw_dev_t *result, int max_result) {
-    if (nsel == 0) return 0;
-    lw_rssi_acc_t *acc = heap_caps_calloc(max_result, sizeof(lw_rssi_acc_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!acc) return 0;
-    int total = lw_accumulate(sel_idx, nsel, acc, max_result);
-    uint8_t all_mask = (uint8_t)((1u << nsel) - 1u);
+// Common: all files selected (file_mask == all_mask), avg RSSI >= threshold.
+static int lw_filter_intersection(void) {
+    if (lw_acc_nsel == 0) return 0;
+    uint8_t all_mask = (uint8_t)((1u << lw_acc_nsel) - 1u);
     int count = 0;
-    for (int i = 0; i < total && count < max_result; i++) {
-        if (acc[i].file_mask != all_mask) continue;   // not in all files
-        int8_t avg = (int8_t)(acc[i].rssi_sum / acc[i].appear_count);
+    for (int i = 0; i < lw_acc_total && count < LW_MAX_RESULT; i++) {
+        if (lw_acc_buf[i].file_mask != all_mask) continue;
+        int8_t avg = (int8_t)(lw_acc_buf[i].rssi_sum / lw_acc_buf[i].appear_count);
         if (avg < lw_rssi_threshold) continue;
-        memcpy(result[count].mac,  acc[i].mac,  18);
-        memcpy(result[count].name, acc[i].name, 32);
-        result[count].rssi = avg;                     // average signal
+        memcpy(lw_result_buf[count].mac,  lw_acc_buf[i].mac,  18);
+        memcpy(lw_result_buf[count].name, lw_acc_buf[i].name, 32);
+        lw_result_buf[count].rssi = avg;
         count++;
     }
-    heap_caps_free(acc);
-    lw_result_sort_rssi(result, count);
     return count;
 }
 
@@ -23695,6 +23688,8 @@ static void lw_back_cb(lv_event_t *e) {
     if (lw_files) { heap_caps_free(lw_files); lw_files = NULL; }
     if (lw_result_buf) { heap_caps_free(lw_result_buf); lw_result_buf = NULL; }
     lw_result_count = 0;
+    if (lw_acc_buf) { heap_caps_free(lw_acc_buf); lw_acc_buf = NULL; }
+    lw_acc_total = 0; lw_acc_nsel = 0;
     if (lw_result_overlay && lv_obj_is_valid(lw_result_overlay)) lv_obj_del(lw_result_overlay);
     lw_result_overlay = NULL;
     if (lw_save_overlay && lv_obj_is_valid(lw_save_overlay)) lv_obj_del(lw_save_overlay);
@@ -23729,6 +23724,9 @@ static void lw_save_lookout_cb(lv_event_t *e) {
 }
 
 static void lw_rebuild_list(void);
+static void lw_apply_rssi_and_show(void);
+static void lw_show_refilter_popup(void);
+static void lw_refilter_open_cb(lv_event_t *e);
 
 static void lw_item_cb(lv_event_t *e) {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
@@ -23934,36 +23932,20 @@ static void lw_rebuild_list(void) {
     }
 }
 
-static void lw_show_result(bool is_union) {
-    if (lw_select_count == 0) return;
-    // Gather selected indices
-    int sel_idx[LW_MAX_SELECT];
-    int nsel = 0;
-    for (int i = 0; i < lw_file_count && nsel < LW_MAX_SELECT; i++)
-        if (lw_selected[i]) sel_idx[nsel++] = i;
+// Re-filter lw_acc_buf with current lw_rssi_threshold and rebuild the result overlay.
+// Called on initial show and on every RSSI adjustment — never reads SD card.
+static void lw_apply_rssi_and_show(void) {
+    if (!lw_acc_buf || lw_acc_total == 0) return;
 
-    // Allocate result buffer in PSRAM
     if (lw_result_buf) { heap_caps_free(lw_result_buf); lw_result_buf = NULL; }
     lw_result_buf = heap_caps_calloc(LW_MAX_RESULT, sizeof(lw_dev_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!lw_result_buf) {
-        if (lw_status_lbl && lv_obj_is_valid(lw_status_lbl))
-            lv_label_set_text(lw_status_lbl, "Out of memory");
-        return;
-    }
+    if (!lw_result_buf) return;
 
-    // Compute (sd_spi_mutex held for entire file parse)
-    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
-        heap_caps_free(lw_result_buf); lw_result_buf = NULL;
-        return;
-    }
-    if (is_union)
-        lw_result_count = lw_compute_union(sel_idx, nsel, lw_result_buf, LW_MAX_RESULT);
-    else
-        lw_result_count = lw_compute_intersection(sel_idx, nsel, lw_result_buf, LW_MAX_RESULT);
-    xSemaphoreGive(sd_spi_mutex);
+    lw_result_count = lw_acc_is_union ? lw_filter_union() : lw_filter_intersection();
+    lw_result_sort_rssi(lw_result_buf, lw_result_count);
 
-    // Show result popup
     if (lw_result_overlay && lv_obj_is_valid(lw_result_overlay)) lv_obj_del(lw_result_overlay);
+    lw_result_overlay = NULL;
 
     lw_result_overlay = lv_obj_create(lv_scr_act());
     lv_obj_set_size(lw_result_overlay, LCD_H_RES, LCD_V_RES);
@@ -23975,34 +23957,69 @@ static void lw_show_result(bool is_union) {
     lv_obj_clear_flag(lw_result_overlay, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_radius(lw_result_overlay, 0, 0);
 
+    bool is_union = lw_acc_is_union;
+    lv_color_t accent = is_union ? UI_ACCENT_CYAN : COLOR_MATERIAL_GREEN;
+
     lv_obj_t *card = lv_obj_create(lw_result_overlay);
     lv_obj_set_size(card, LCD_H_RES - 12, LCD_V_RES - 16);
     lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_bg_color(card, ui_card_color(), 0);
-    lv_obj_set_style_border_color(card, is_union ? UI_ACCENT_CYAN : COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_border_color(card, accent, 0);
     lv_obj_set_style_border_width(card, 2, 0);
     lv_obj_set_style_radius(card, 10, 0);
     lv_obj_set_style_pad_all(card, 6, 0);
-    lv_obj_set_style_pad_row(card, 4, 0);
+    lv_obj_set_style_pad_row(card, 3, 0);
     lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
+    // Title row
     lv_obj_t *title = lv_label_create(card);
-    char title_buf[64];
-    if (lw_rssi_threshold <= -99)
-        snprintf(title_buf, sizeof(title_buf), "%s: %d devices",
-                 is_union ? "Unique" : "Common", lw_result_count);
-    else
-        snprintf(title_buf, sizeof(title_buf), "%s: %d devices (>=%ddBm)",
-                 is_union ? "Unique" : "Common", lw_result_count, (int)lw_rssi_threshold);
+    char title_buf[48];
+    snprintf(title_buf, sizeof(title_buf), "%s: %d devices",
+             is_union ? "Unique" : "Common", lw_result_count);
     lv_label_set_text(title, title_buf);
-    lv_obj_set_style_text_color(title, is_union ? UI_ACCENT_CYAN : COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_text_color(title, accent, 0);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
 
+    // RSSI filter bar — shows current threshold and Change button
+    lv_obj_t *rssi_bar = lv_obj_create(card);
+    lv_obj_set_size(rssi_bar, lv_pct(100), 26);
+    lv_obj_set_style_bg_color(rssi_bar, lv_color_make(40,40,40), 0);
+    lv_obj_set_style_bg_opa(rssi_bar, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(rssi_bar, 0, 0);
+    lv_obj_set_style_radius(rssi_bar, 4, 0);
+    lv_obj_set_style_pad_hor(rssi_bar, 6, 0);
+    lv_obj_set_style_pad_ver(rssi_bar, 0, 0);
+    lv_obj_clear_flag(rssi_bar, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *rssi_lbl = lv_label_create(rssi_bar);
+    char rssi_buf[32];
+    if (lw_rssi_threshold <= -99) snprintf(rssi_buf, sizeof(rssi_buf), "RSSI: all");
+    else snprintf(rssi_buf, sizeof(rssi_buf), "RSSI: >= %d dBm", (int)lw_rssi_threshold);
+    lv_label_set_text(rssi_lbl, rssi_buf);
+    lv_obj_set_style_text_color(rssi_lbl, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_text_font(rssi_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_align(rssi_lbl, LV_ALIGN_LEFT_MID, 0, 0);
+
+    lv_obj_t *rssi_btn = lv_btn_create(rssi_bar);
+    lv_obj_set_size(rssi_btn, 58, 20);
+    lv_obj_align(rssi_btn, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_set_style_bg_color(rssi_btn, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_bg_color(rssi_btn, lv_color_make(200,120,0), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(rssi_btn, 4, 0);
+    lv_obj_set_style_pad_all(rssi_btn, 0, 0);
+    lv_obj_t *rssi_btn_lbl = lv_label_create(rssi_btn);
+    lv_label_set_text(rssi_btn_lbl, "Change");
+    lv_obj_set_style_text_color(rssi_btn_lbl, lv_color_black(), 0);
+    lv_obj_set_style_text_font(rssi_btn_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(rssi_btn_lbl);
+    lv_obj_add_event_cb(rssi_btn, lw_refilter_open_cb, LV_EVENT_CLICKED, NULL);
+
     // Scrollable device list — each row: RSSI  MAC  Name
+    // Height: card_content(292) - title(20) - rssi_bar(26) - btn_row(30) - pad_rows(3*4=12) = 204px
     lv_obj_t *dev_list = lv_obj_create(card);
-    lv_obj_set_size(dev_list, lv_pct(100), LCD_V_RES - 30 - 50 - 24);
+    lv_obj_set_size(dev_list, lv_pct(100), LCD_V_RES - 16 - 12 - 20 - 26 - 30 - 20);
     lv_obj_set_style_bg_color(dev_list, ui_bg_color(), 0);
     lv_obj_set_style_border_color(dev_list, lv_color_make(60,60,60), 0);
     lv_obj_set_style_border_width(dev_list, 1, 0);
@@ -24038,7 +24055,7 @@ static void lw_show_result(bool is_union) {
 
     // Button row: [Close] [New List] [Lookout]
     lv_obj_t *btn_row = lv_obj_create(card);
-    lv_obj_set_size(btn_row, lv_pct(100), 32);
+    lv_obj_set_size(btn_row, lv_pct(100), 30);
     lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(btn_row, 0, 0);
     lv_obj_set_style_pad_all(btn_row, 0, 0);
@@ -24047,7 +24064,7 @@ static void lw_show_result(bool is_union) {
     lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *close_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(close_btn, 56, 28);
+    lv_obj_set_size(close_btn, 56, 26);
     lv_obj_set_style_bg_color(close_btn, lv_color_make(70,70,70), 0);
     lv_obj_set_style_radius(close_btn, 6, 0);
     lv_obj_t *close_lbl = lv_label_create(close_btn);
@@ -24058,7 +24075,7 @@ static void lw_show_result(bool is_union) {
 
     if (lw_result_count > 0) {
         lv_obj_t *new_btn = lv_btn_create(btn_row);
-        lv_obj_set_size(new_btn, 80, 28);
+        lv_obj_set_size(new_btn, 80, 26);
         lv_obj_set_style_bg_color(new_btn, UI_ACCENT_CYAN, 0);
         lv_obj_set_style_bg_color(new_btn, lv_color_lighten(UI_ACCENT_CYAN, 30), LV_STATE_PRESSED);
         lv_obj_set_style_radius(new_btn, 6, 0);
@@ -24070,7 +24087,7 @@ static void lw_show_result(bool is_union) {
         lv_obj_add_event_cb(new_btn, lw_create_list_cb, LV_EVENT_CLICKED, NULL);
 
         lv_obj_t *look_btn = lv_btn_create(btn_row);
-        lv_obj_set_size(look_btn, 76, 28);
+        lv_obj_set_size(look_btn, 76, 26);
         lv_obj_set_style_bg_color(look_btn, COLOR_MATERIAL_GREEN, 0);
         lv_obj_set_style_bg_color(look_btn, lv_color_make(30,140,30), LV_STATE_PRESSED);
         lv_obj_set_style_radius(look_btn, 6, 0);
@@ -24080,6 +24097,33 @@ static void lw_show_result(bool is_union) {
         lv_obj_center(look_lbl);
         lv_obj_add_event_cb(look_btn, lw_save_lookout_cb, LV_EVENT_CLICKED, NULL);
     }
+}
+
+// Read files from SD (once per Unique/Common button press), then display.
+static void lw_show_result(bool is_union) {
+    if (lw_select_count == 0) return;
+    int sel_idx[LW_MAX_SELECT];
+    int nsel = 0;
+    for (int i = 0; i < lw_file_count && nsel < LW_MAX_SELECT; i++)
+        if (lw_selected[i]) sel_idx[nsel++] = i;
+
+    if (lw_acc_buf) { heap_caps_free(lw_acc_buf); lw_acc_buf = NULL; }
+    lw_acc_buf = heap_caps_calloc(LW_MAX_RESULT, sizeof(lw_rssi_acc_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!lw_acc_buf) {
+        if (lw_status_lbl && lv_obj_is_valid(lw_status_lbl))
+            lv_label_set_text(lw_status_lbl, "Out of memory");
+        return;
+    }
+
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        heap_caps_free(lw_acc_buf); lw_acc_buf = NULL; return;
+    }
+    lw_acc_total = lw_accumulate(sel_idx, nsel, lw_acc_buf, LW_MAX_RESULT);
+    xSemaphoreGive(sd_spi_mutex);
+
+    lw_acc_is_union = is_union;
+    lw_acc_nsel     = nsel;
+    lw_apply_rssi_and_show();
 }
 
 // ── RSSI threshold popup (shown before Unique / Common computation) ──────────
@@ -24117,6 +24161,18 @@ static void lw_thresh_apply_cb(lv_event_t *e) {
     lw_thresh_slider = NULL;
     lw_thresh_val_lbl = NULL;
     lw_show_result(is_union);
+}
+
+// Refilter from existing accumulator — no SD reads, just re-applies threshold.
+static void lw_thresh_refilter_cb(lv_event_t *e) {
+    (void)e;
+    if (lw_thresh_slider && lv_obj_is_valid(lw_thresh_slider))
+        lw_rssi_threshold = (int8_t)lv_slider_get_value(lw_thresh_slider);
+    if (lw_rssi_overlay && lv_obj_is_valid(lw_rssi_overlay)) lv_obj_del(lw_rssi_overlay);
+    lw_rssi_overlay = NULL;
+    lw_thresh_slider = NULL;
+    lw_thresh_val_lbl = NULL;
+    lw_apply_rssi_and_show();
 }
 
 static void lw_show_rssi_popup(bool is_union) {
@@ -24210,6 +24266,99 @@ static void lw_show_rssi_popup(bool is_union) {
     lv_obj_set_style_text_color(apply_lbl, is_union ? lv_color_black() : lv_color_white(), 0);
     lv_obj_center(apply_lbl);
     lv_obj_add_event_cb(apply_btn, lw_thresh_apply_cb, LV_EVENT_CLICKED, (void*)(intptr_t)is_union);
+}
+
+// RSSI adjust popup from within the result overlay — reuses same slider card,
+// Apply calls lw_thresh_refilter_cb (no SD reads, just re-filters accumulator).
+static void lw_show_refilter_popup(void) {
+    if (lw_rssi_overlay && lv_obj_is_valid(lw_rssi_overlay)) lv_obj_del(lw_rssi_overlay);
+
+    lw_rssi_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(lw_rssi_overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(lw_rssi_overlay, 0, 0);
+    lv_obj_set_style_bg_color(lw_rssi_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(lw_rssi_overlay, LV_OPA_60, 0);
+    lv_obj_set_style_border_width(lw_rssi_overlay, 0, 0);
+    lv_obj_set_style_pad_all(lw_rssi_overlay, 0, 0);
+    lv_obj_clear_flag(lw_rssi_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(lw_rssi_overlay, 0, 0);
+
+    lv_color_t accent = lw_acc_is_union ? UI_ACCENT_CYAN : COLOR_MATERIAL_GREEN;
+
+    lv_obj_t *card = lv_obj_create(lw_rssi_overlay);
+    lv_obj_set_size(card, 210, 148);
+    lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+    lv_obj_set_style_border_color(card, accent, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 10, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, lw_acc_is_union ? "Unique - Adjust RSSI" : "Common - Adjust RSSI");
+    lv_obj_set_style_text_color(title, accent, 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *sub = lv_label_create(card);
+    lv_label_set_text(sub, "Exclude devices weaker than:");
+    lv_obj_set_style_text_color(sub, ui_text_color(), 0);
+    lv_obj_set_style_text_font(sub, &lv_font_montserrat_12, 0);
+    lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 22);
+
+    lw_thresh_val_lbl = lv_label_create(card);
+    char init_buf[24];
+    if (lw_rssi_threshold <= -99) snprintf(init_buf, sizeof(init_buf), "Any (no filter)");
+    else snprintf(init_buf, sizeof(init_buf), ">= %d dBm", (int)lw_rssi_threshold);
+    lv_label_set_text(lw_thresh_val_lbl, init_buf);
+    lv_obj_set_style_text_color(lw_thresh_val_lbl, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_text_font(lw_thresh_val_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_align(lw_thresh_val_lbl, LV_ALIGN_TOP_MID, 0, 40);
+
+    lw_thresh_slider = lv_slider_create(card);
+    lv_obj_set_size(lw_thresh_slider, 185, 14);
+    lv_slider_set_range(lw_thresh_slider, -99, 0);
+    lv_slider_set_value(lw_thresh_slider, (int)lw_rssi_threshold, LV_ANIM_OFF);
+    lv_obj_align(lw_thresh_slider, LV_ALIGN_TOP_MID, 0, 64);
+    lv_obj_set_style_bg_color(lw_thresh_slider, lv_color_make(60,60,60), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(lw_thresh_slider, accent, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(lw_thresh_slider, lv_color_white(), LV_PART_KNOB);
+    lv_obj_add_event_cb(lw_thresh_slider, lw_thresh_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *range_lbl = lv_label_create(card);
+    lv_label_set_text(range_lbl, "-99                   0 dBm");
+    lv_obj_set_style_text_color(range_lbl, lv_color_make(120,120,120), 0);
+    lv_obj_set_style_text_font(range_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_align(range_lbl, LV_ALIGN_TOP_MID, 0, 82);
+
+    lv_obj_t *cancel_btn = lv_btn_create(card);
+    lv_obj_set_size(cancel_btn, 80, 28);
+    lv_obj_align(cancel_btn, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_make(70,70,70), 0);
+    lv_obj_set_style_radius(cancel_btn, 6, 0);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, LV_SYMBOL_CLOSE "  Cancel");
+    lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(cancel_lbl);
+    lv_obj_add_event_cb(cancel_btn, lw_thresh_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *apply_btn = lv_btn_create(card);
+    lv_obj_set_size(apply_btn, 80, 28);
+    lv_obj_align(apply_btn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(apply_btn, accent, 0);
+    lv_obj_set_style_radius(apply_btn, 6, 0);
+    lv_obj_t *apply_lbl = lv_label_create(apply_btn);
+    lv_label_set_text(apply_lbl, LV_SYMBOL_OK "  Apply");
+    lv_obj_set_style_text_font(apply_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(apply_lbl, lw_acc_is_union ? lv_color_black() : lv_color_white(), 0);
+    lv_obj_center(apply_lbl);
+    lv_obj_add_event_cb(apply_btn, lw_thresh_refilter_cb, LV_EVENT_CLICKED, NULL);
+}
+
+static void lw_refilter_open_cb(lv_event_t *e) {
+    (void)e;
+    lw_show_refilter_popup();
 }
 
 static void lw_unique_cb(lv_event_t *e) { (void)e; lw_show_rssi_popup(true); }
