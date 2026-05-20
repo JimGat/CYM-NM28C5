@@ -526,6 +526,7 @@ static char     g_saved_wifi_pass[65] = ""; // Home network password
 #define NVS_KEY_GPS_LON      "gps_lon_i"
 #define NVS_KEY_GPS_ALT      "gps_alt_i"
 #define NVS_KEY_RF_HAT       "rf_hat"
+#define NVS_KEY_BTSC_CTR     "btsc_ctr"
 
 // Wardrive band selection
 typedef enum { WD_BAND_BOTH = 0, WD_BAND_24G, WD_BAND_5G } wd_band_t;
@@ -1081,6 +1082,9 @@ static wdp_ble_device_t *wdp_ble_devices = NULL;
 static volatile int      wdp_ble_count   = 0;
 static bool              g_wd_ble        = false;
 
+// BT Scan & Select file counter (persisted as NVS_KEY_BTSC_CTR)
+static uint32_t g_btsc_counter = 0;
+
 // BLE PCAP capture state
 typedef struct {
     uint8_t  addr[6];
@@ -1538,6 +1542,36 @@ static uint8_t bt_sas_target_addr[6];
 static uint8_t bt_sas_target_addr_type = 0;
 static char bt_sas_target_name[32];
 
+// ── List Wizard ──────────────────────────────────────────────────
+#define LW_SCAN_DIR        "/sdcard/lab/bluetooth/scans"
+#define LW_MAX_FILES       64
+#define LW_MAX_SELECT      4
+#define LW_MAX_RESULT      512
+
+typedef struct {
+    char filename[32];   // filename only (no path)
+    char label[24];
+    char ts[8];          // HHMMSS
+    uint32_t scan_id;
+    int  device_count;
+} lw_file_info_t;
+
+typedef struct {
+    char mac[18];        // "AA:BB:CC:DD:EE:FF"
+    char name[32];
+} lw_dev_t;
+
+static lv_obj_t  *lw_list_box     = NULL;
+static lv_obj_t  *lw_status_lbl   = NULL;
+static volatile bool lw_ui_active = false;
+static int       lw_file_count    = 0;
+static lw_file_info_t *lw_files   = NULL;   // heap_caps_calloc PSRAM
+static bool      lw_selected[LW_MAX_FILES];
+static int       lw_select_count  = 0;
+static lv_obj_t *lw_result_overlay = NULL;
+static lw_dev_t *lw_result_buf    = NULL;   // heap_caps_calloc PSRAM
+static int       lw_result_count  = 0;
+
 // ── BT Observer ─────────────────────────────────────────────────
 #define BTO_MAX_DEVICES 40
 
@@ -1592,6 +1626,17 @@ static lv_obj_t   *bt_lookout_oui_btn          = NULL;
 static lv_obj_t   *bt_lookout_popup_obj        = NULL;
 static lv_timer_t *bt_lookout_popup_tmr        = NULL;
 static TaskHandle_t bt_lookout_scan_loop_handle = NULL;
+
+// ── BT Blacklist ─────────────────────────────────────────────────
+#define BT_BLACKLIST_MAX 128
+#define BT_BLACKLIST_CSV_PATH "/sdcard/lab/bluetooth/blacklist.csv"
+typedef struct {
+    uint8_t mac[6];
+    bool    oui_only;
+} bt_blacklist_entry_t;
+static bt_blacklist_entry_t s_blacklist[BT_BLACKLIST_MAX];
+static int s_blacklist_count = 0;
+static lv_obj_t *s_blacklist_editor_overlay = NULL;
 
 // ── GATT Probe back-navigation target ────────────────────────────
 typedef enum { GW_PROBE_BACK_GATT_RESULT = 0, GW_PROBE_BACK_ATTACK_TILES, GW_PROBE_BACK_BTO_DETAIL } gw_probe_back_t;
@@ -2105,6 +2150,7 @@ static void show_lookout_editor_screen(void);
 static void lookout_edit_btn_cb(lv_event_t *e);
 static void show_oui_groups_screen(void);
 static void lookout_oui_btn_cb(lv_event_t *e);
+static void blacklist_edit_btn_cb(lv_event_t *e);
 
 // Deauth Monitor functions
 static void show_deauth_monitor_screen(void);
@@ -2130,6 +2176,12 @@ static void wscope_task(void *p);
 
 // HoneyPair
 static void show_honeypair_screen(void);
+
+// BT Blacklist
+static void bt_blacklist_load(void);
+static bool bt_blacklist_check(const uint8_t addr_val[6]);
+static bool bt_blacklist_append(const uint8_t addr_val[6], const char *name, bool oui_only);
+static void bt_blacklist_remove_idx(int idx);
 
 // WhisperPair
 static void show_whisperpair_screen(void);
@@ -2781,6 +2833,8 @@ static void nvs_settings_load(void)
         if (nvs_get_u8(h, NVS_KEY_WD_BLE, &wble) == ESP_OK) g_wd_ble = (wble != 0);
         uint8_t rfhat = 0;
         if (nvs_get_u8(h, NVS_KEY_RF_HAT, &rfhat) == ESP_OK) g_rf_hat_enabled = (rfhat != 0);
+        uint32_t btsc_ctr = 0;
+        if (nvs_get_u32(h, NVS_KEY_BTSC_CTR, &btsc_ctr) == ESP_OK) g_btsc_counter = btsc_ctr;
         // Restore last-known GPS position so functions have a fallback before first fix
         int32_t gps_lat_i = 0, gps_lon_i = 0, gps_alt_i = 0;
         if (nvs_get_i32(h, NVS_KEY_GPS_LAT, &gps_lat_i) == ESP_OK &&
@@ -22031,6 +22085,7 @@ static void show_bt_lookout_screen(void)
     if (!oui_lookup_is_loaded()) oui_lookup_init(OUI_DEFAULT_PATH);
     if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
         bt_lookout_load(BT_LOOKOUT_CSV_PATH);
+        bt_blacklist_load();
         xSemaphoreGive(sd_spi_mutex);
     }
 
@@ -22170,6 +22225,28 @@ static void show_bt_lookout_screen(void)
     lv_obj_add_event_cb(bt_lookout_oui_btn, lookout_oui_btn_cb, LV_EVENT_CLICKED, NULL);
     if (is_active) lv_obj_add_flag(bt_lookout_oui_btn, LV_OBJ_FLAG_HIDDEN);
 
+    // Blacklist editor button (centered on second row)
+    lv_obj_t *bl_btn = lv_btn_create(function_page);
+    lv_obj_set_size(bl_btn, 120, 28);
+    lv_obj_align(bl_btn, LV_ALIGN_TOP_MID, 0, 268);
+    lv_obj_set_style_bg_color(bl_btn, lv_color_make(140, 30, 30), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(bl_btn, lv_color_make(180, 50, 50), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(bl_btn, 0, 0);
+    lv_obj_set_style_radius(bl_btn, 8, 0);
+    lv_obj_set_flex_flow(bl_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(bl_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(bl_btn, 4, 0);
+    lv_obj_t *bl_icon = lv_label_create(bl_btn);
+    lv_label_set_text(bl_icon, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_font(bl_icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bl_icon, lv_color_white(), 0);
+    lv_obj_t *bl_lbl = lv_label_create(bl_btn);
+    lv_label_set_text(bl_lbl, "Blacklist");
+    lv_obj_set_style_text_font(bl_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(bl_lbl, lv_color_white(), 0);
+    lv_obj_add_event_cb(bl_btn, blacklist_edit_btn_cb, LV_EVENT_CLICKED, NULL);
+    if (is_active) lv_obj_add_flag(bl_btn, LV_OBJ_FLAG_HIDDEN);
+
     // Back button
     lv_obj_t *back_btn = lv_btn_create(function_page);
     lv_obj_set_size(back_btn, 110, 28);
@@ -22211,6 +22288,134 @@ static void lookout_edit_btn_cb(lv_event_t *e)
 {
     (void)e;
     show_lookout_editor_screen();
+}
+
+/* ── Blacklist editor overlay ─────────────────────────────────────── */
+
+static void blacklist_row_del_cb(lv_event_t *e) {
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    bt_blacklist_remove_idx(idx);
+    // Rebuild the overlay by re-opening it
+    if (s_blacklist_editor_overlay && lv_obj_is_valid(s_blacklist_editor_overlay)) {
+        lv_obj_del(s_blacklist_editor_overlay);
+        s_blacklist_editor_overlay = NULL;
+    }
+    blacklist_edit_btn_cb(NULL);
+}
+
+static void blacklist_editor_close_cb(lv_event_t *e) {
+    (void)e;
+    if (s_blacklist_editor_overlay && lv_obj_is_valid(s_blacklist_editor_overlay)) {
+        lv_obj_del(s_blacklist_editor_overlay);
+        s_blacklist_editor_overlay = NULL;
+    }
+}
+
+static void blacklist_edit_btn_cb(lv_event_t *e) {
+    (void)e;
+    if (s_blacklist_editor_overlay && lv_obj_is_valid(s_blacklist_editor_overlay)) {
+        lv_obj_del(s_blacklist_editor_overlay);
+        s_blacklist_editor_overlay = NULL;
+    }
+
+    // Dim overlay
+    s_blacklist_editor_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(s_blacklist_editor_overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(s_blacklist_editor_overlay, 0, 0);
+    lv_obj_set_style_bg_color(s_blacklist_editor_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_blacklist_editor_overlay, LV_OPA_80, 0);
+    lv_obj_set_style_border_width(s_blacklist_editor_overlay, 0, 0);
+    lv_obj_set_style_pad_all(s_blacklist_editor_overlay, 0, 0);
+    lv_obj_clear_flag(s_blacklist_editor_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(s_blacklist_editor_overlay, 0, 0);
+
+    // Card
+    lv_obj_t *card = lv_obj_create(s_blacklist_editor_overlay);
+    lv_obj_set_size(card, LCD_H_RES - 12, LCD_V_RES - 16);
+    lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+    lv_obj_set_style_border_color(card, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 6, 0);
+    lv_obj_set_style_pad_row(card, 4, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Title
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, "BT Blacklist");
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+
+    // Scrollable entry list
+    lv_obj_t *entry_list = lv_obj_create(card);
+    lv_obj_set_size(entry_list, lv_pct(100), LCD_V_RES - 30 - 40 - 24);
+    lv_obj_set_style_bg_color(entry_list, ui_bg_color(), 0);
+    lv_obj_set_style_border_color(entry_list, lv_color_make(60,60,60), 0);
+    lv_obj_set_style_border_width(entry_list, 1, 0);
+    lv_obj_set_flex_flow(entry_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(entry_list, 2, 0);
+    lv_obj_set_style_pad_gap(entry_list, 2, 0);
+    lv_obj_set_scrollbar_mode(entry_list, LV_SCROLLBAR_MODE_AUTO);
+
+    if (s_blacklist_count == 0) {
+        lv_obj_t *empty = lv_label_create(entry_list);
+        lv_label_set_text(empty, "Blacklist is empty.");
+        lv_obj_set_style_text_color(empty, COLOR_MATERIAL_AMBER, 0);
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_12, 0);
+    } else {
+        for (int i = 0; i < s_blacklist_count; i++) {
+            const bt_blacklist_entry_t *en = &s_blacklist[i];
+            lv_obj_t *row = lv_obj_create(entry_list);
+            lv_obj_set_size(row, lv_pct(100), 26);
+            lv_obj_set_style_bg_color(row, ui_card_color(), 0);
+            lv_obj_set_style_border_width(row, 0, 0);
+            lv_obj_set_style_pad_all(row, 2, 0);
+            lv_obj_set_style_radius(row, 4, 0);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+            char mac_str[22];
+            if (en->oui_only) {
+                snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:xx  OUI",
+                         en->mac[0], en->mac[1], en->mac[2]);
+            } else {
+                snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                         en->mac[0],en->mac[1],en->mac[2],en->mac[3],en->mac[4],en->mac[5]);
+            }
+            lv_obj_t *mac_lbl = lv_label_create(row);
+            lv_label_set_text(mac_lbl, mac_str);
+            lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(mac_lbl, ui_text_color(), 0);
+            lv_label_set_long_mode(mac_lbl, LV_LABEL_LONG_CLIP);
+            lv_obj_set_flex_grow(mac_lbl, 1);
+
+            lv_obj_t *del_btn = lv_btn_create(row);
+            lv_obj_set_size(del_btn, 26, 20);
+            lv_obj_set_style_bg_color(del_btn, COLOR_MATERIAL_RED, 0);
+            lv_obj_set_style_radius(del_btn, 4, 0);
+            lv_obj_set_style_pad_all(del_btn, 2, 0);
+            lv_obj_t *del_lbl = lv_label_create(del_btn);
+            lv_label_set_text(del_lbl, LV_SYMBOL_CLOSE);
+            lv_obj_set_style_text_font(del_lbl, &lv_font_montserrat_12, 0);
+            lv_obj_center(del_lbl);
+            lv_obj_add_event_cb(del_btn, blacklist_row_del_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        }
+    }
+
+    // Close button
+    lv_obj_t *close_btn = lv_btn_create(card);
+    lv_obj_set_size(close_btn, 90, 28);
+    lv_obj_set_style_bg_color(close_btn, lv_color_make(70,70,70), 0);
+    lv_obj_set_style_radius(close_btn, 6, 0);
+    lv_obj_t *close_lbl = lv_label_create(close_btn);
+    lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE "  Close");
+    lv_obj_set_style_text_font(close_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(close_lbl);
+    lv_obj_add_event_cb(close_btn, blacklist_editor_close_cb, LV_EVENT_CLICKED, NULL);
 }
 
 static void lookout_add_oui_btn_cb(lv_event_t *e)
@@ -23075,6 +23280,521 @@ static void show_ble_pcap_screen(void)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ── List Wizard ───────────────────────────────────────────────────────────────
+
+static void show_list_wizard_screen(void);
+
+static void lw_parse_meta(const char *path, lw_file_info_t *info) {
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char buf[512];
+    size_t n = fread(buf, 1, sizeof(buf)-1, f);
+    fclose(f);
+    buf[n] = '\0';
+
+    char *p;
+    p = strstr(buf, "\"label\":\"");
+    if (p) { p += 9; int i=0; while(p[i] && p[i]!='"' && i<23) { info->label[i]=p[i]; i++; } info->label[i]='\0'; }
+
+    p = strstr(buf, "\"timestamp\":\"");
+    if (p) { p += 13; int i=0; while(p[i] && p[i]!='"' && i<7) { info->ts[i]=p[i]; i++; } info->ts[i]='\0'; }
+
+    p = strstr(buf, "\"scan_id\":");
+    if (p) { p += 10; info->scan_id = (uint32_t)atol(p); }
+
+    p = strstr(buf, "\"device_count\":");
+    if (p) { p += 15; info->device_count = atoi(p); }
+}
+
+static int lw_parse_devices(const char *path, lw_dev_t *out, int max_out) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char line[256];
+    int count = 0;
+    while (fgets(line, sizeof(line), f) && count < max_out) {
+        char *mp = strstr(line, "\"mac\":\"");
+        if (!mp) continue;
+        mp += 7;
+        if (strlen(mp) < 17) continue;
+        char mac[18];
+        memcpy(mac, mp, 17); mac[17] = '\0';
+        // Validate: should look like XX:XX:XX:XX:XX:XX
+        bool ok = true;
+        for (int i = 0; i < 17 && ok; i++) {
+            if (i%3==2) { if (mac[i]!=':') ok=false; }
+            else { char c=mac[i]; if(!((c>='0'&&c<='9')||(c>='A'&&c<='F')||(c>='a'&&c<='f'))) ok=false; }
+        }
+        if (!ok) continue;
+        memcpy(out[count].mac, mac, 18);
+        // Try to extract name from same line
+        char *np = strstr(line, "\"name\":\"");
+        if (np) {
+            np += 8;
+            int ni = 0;
+            while (np[ni] && np[ni]!='"' && ni < 31) { out[count].name[ni]=np[ni]; ni++; }
+            out[count].name[ni] = '\0';
+        } else {
+            out[count].name[0] = '\0';
+        }
+        count++;
+    }
+    fclose(f);
+    return count;
+}
+
+static bool lw_mac_in(const char *mac, const lw_dev_t *arr, int n) {
+    for (int i = 0; i < n; i++)
+        if (strcmp(arr[i].mac, mac) == 0) return true;
+    return false;
+}
+
+static int lw_compute_union(int *sel_idx, int nsel, lw_dev_t *result, int max_result) {
+    int count = 0;
+    lw_dev_t *tmp = heap_caps_calloc(LW_MAX_RESULT, sizeof(lw_dev_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!tmp) return 0;
+    for (int fi = 0; fi < nsel; fi++) {
+        char path[100];
+        snprintf(path, sizeof(path), "%s/%s", LW_SCAN_DIR, lw_files[sel_idx[fi]].filename);
+        int n = lw_parse_devices(path, tmp, LW_MAX_RESULT);
+        for (int di = 0; di < n && count < max_result; di++) {
+            if (!lw_mac_in(tmp[di].mac, result, count)) {
+                result[count++] = tmp[di];
+            }
+        }
+    }
+    heap_caps_free(tmp);
+    return count;
+}
+
+static int lw_compute_intersection(int *sel_idx, int nsel, lw_dev_t *result, int max_result) {
+    if (nsel == 0) return 0;
+    // Start with devices from first file
+    char path[100];
+    snprintf(path, sizeof(path), "%s/%s", LW_SCAN_DIR, lw_files[sel_idx[0]].filename);
+    int count = lw_parse_devices(path, result, max_result);
+    // For each subsequent file, keep only MACs that appear in it too
+    lw_dev_t *tmp = heap_caps_calloc(LW_MAX_RESULT, sizeof(lw_dev_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!tmp) return count;
+    for (int fi = 1; fi < nsel; fi++) {
+        snprintf(path, sizeof(path), "%s/%s", LW_SCAN_DIR, lw_files[sel_idx[fi]].filename);
+        int n = lw_parse_devices(path, tmp, LW_MAX_RESULT);
+        int new_count = 0;
+        for (int di = 0; di < count; di++) {
+            if (lw_mac_in(result[di].mac, tmp, n)) {
+                if (di != new_count) result[new_count] = result[di];
+                new_count++;
+            }
+        }
+        count = new_count;
+    }
+    heap_caps_free(tmp);
+    return count;
+}
+
+static void lw_save_to_lookout(const lw_dev_t *devs, int count) {
+    if (!sd_spi_mutex) return;
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) return;
+    FILE *f = fopen(BT_LOOKOUT_CSV_PATH, "a");
+    if (!f) {
+        f = fopen(BT_LOOKOUT_CSV_PATH, "w");
+        if (f) { fprintf(f, "%s", BT_LOOKOUT_CSV_HEADER); fclose(f); }
+        f = fopen(BT_LOOKOUT_CSV_PATH, "a");
+    }
+    if (f) {
+        for (int i = 0; i < count; i++) {
+            fprintf(f, "%s,%s,-99,0\n", devs[i].mac, devs[i].name);
+        }
+        fflush(f);
+        fclose(f);
+    }
+    xSemaphoreGive(sd_spi_mutex);
+    bt_lookout_load(BT_LOOKOUT_CSV_PATH);
+    ESP_LOGI(TAG, "List Wizard: saved %d devices to lookout", count);
+}
+
+static void lw_back_cb(lv_event_t *e) {
+    (void)e;
+    lw_ui_active = false;
+    if (lw_files) { heap_caps_free(lw_files); lw_files = NULL; }
+    if (lw_result_buf) { heap_caps_free(lw_result_buf); lw_result_buf = NULL; }
+    if (lw_result_overlay && lv_obj_is_valid(lw_result_overlay)) lv_obj_del(lw_result_overlay);
+    lw_result_overlay = NULL;
+    lw_list_box = NULL; lw_status_lbl = NULL;
+    show_bluetooth_screen();
+}
+
+static void lw_result_close_cb(lv_event_t *e) {
+    (void)e;
+    if (lw_result_overlay && lv_obj_is_valid(lw_result_overlay)) lv_obj_del(lw_result_overlay);
+    lw_result_overlay = NULL;
+}
+
+static void lw_save_lookout_cb(lv_event_t *e) {
+    (void)e;
+    if (!lw_result_buf || lw_result_count == 0) return;
+    lw_save_to_lookout(lw_result_buf, lw_result_count);
+    if (lw_result_overlay && lv_obj_is_valid(lw_result_overlay)) lv_obj_del(lw_result_overlay);
+    lw_result_overlay = NULL;
+    if (lw_status_lbl && lv_obj_is_valid(lw_status_lbl)) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "Saved %d devices to Lookout", lw_result_count);
+        lv_label_set_text(lw_status_lbl, buf);
+        lv_obj_set_style_text_color(lw_status_lbl, COLOR_MATERIAL_GREEN, 0);
+    }
+    if (lw_result_buf) { heap_caps_free(lw_result_buf); lw_result_buf = NULL; }
+    lw_result_count = 0;
+}
+
+static void lw_rebuild_list(void);
+
+static void lw_item_cb(lv_event_t *e) {
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= lw_file_count) return;
+    if (lw_selected[idx]) {
+        lw_selected[idx] = false;
+        lw_select_count--;
+    } else {
+        if (lw_select_count >= LW_MAX_SELECT) {
+            if (lw_status_lbl && lv_obj_is_valid(lw_status_lbl))
+                lv_label_set_text(lw_status_lbl, "Max 4 lists selectable");
+            return;
+        }
+        lw_selected[idx] = true;
+        lw_select_count++;
+    }
+    if (lw_status_lbl && lv_obj_is_valid(lw_status_lbl)) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "%d selected (max 4) - choose operation", lw_select_count);
+        lv_label_set_text(lw_status_lbl, buf);
+    }
+    lw_rebuild_list();
+}
+
+static void lw_rebuild_list(void) {
+    if (!lw_list_box || !lv_obj_is_valid(lw_list_box)) return;
+    lv_obj_clean(lw_list_box);
+    for (int i = 0; i < lw_file_count; i++) {
+        lw_file_info_t *fi = &lw_files[i];
+        char row[64];
+        if (fi->ts[0] && strlen(fi->ts) >= 6)
+            snprintf(row, sizeof(row), "%s  %c%c:%c%c:%c%c  %d devs",
+                     fi->label[0] ? fi->label : "?",
+                     fi->ts[0],fi->ts[1],fi->ts[2],fi->ts[3],fi->ts[4],fi->ts[5],
+                     fi->device_count);
+        else
+            snprintf(row, sizeof(row), "%s  --:--:--  %d devs",
+                     fi->label[0] ? fi->label : "?", fi->device_count);
+        lv_obj_t *btn = lv_btn_create(lw_list_box);
+        lv_obj_set_size(btn, lv_pct(100), 28);
+        bool sel = lw_selected[i];
+        lv_obj_set_style_bg_color(btn, sel ? UI_ACCENT_CYAN : ui_card_color(), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(btn, lv_color_lighten(UI_ACCENT_CYAN, 30), LV_STATE_PRESSED);
+        lv_obj_set_style_radius(btn, 4, 0);
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, row);
+        lv_obj_set_style_text_color(lbl, sel ? lv_color_black() : ui_text_color(), 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 4, 0);
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
+        lv_obj_add_event_cb(btn, lw_item_cb, LV_EVENT_SHORT_CLICKED, (void*)(intptr_t)i);
+    }
+}
+
+static void lw_show_result(bool is_union) {
+    if (lw_select_count == 0) {
+        if (lw_status_lbl && lv_obj_is_valid(lw_status_lbl))
+            lv_label_set_text(lw_status_lbl, "Select at least 1 list first");
+        return;
+    }
+    // Gather selected indices
+    int sel_idx[LW_MAX_SELECT];
+    int nsel = 0;
+    for (int i = 0; i < lw_file_count && nsel < LW_MAX_SELECT; i++)
+        if (lw_selected[i]) sel_idx[nsel++] = i;
+
+    // Allocate result buffer in PSRAM
+    if (lw_result_buf) { heap_caps_free(lw_result_buf); lw_result_buf = NULL; }
+    lw_result_buf = heap_caps_calloc(LW_MAX_RESULT, sizeof(lw_dev_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!lw_result_buf) {
+        if (lw_status_lbl && lv_obj_is_valid(lw_status_lbl))
+            lv_label_set_text(lw_status_lbl, "Out of memory");
+        return;
+    }
+
+    // Compute (sd_spi_mutex held for entire file parse)
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        heap_caps_free(lw_result_buf); lw_result_buf = NULL;
+        return;
+    }
+    if (is_union)
+        lw_result_count = lw_compute_union(sel_idx, nsel, lw_result_buf, LW_MAX_RESULT);
+    else
+        lw_result_count = lw_compute_intersection(sel_idx, nsel, lw_result_buf, LW_MAX_RESULT);
+    xSemaphoreGive(sd_spi_mutex);
+
+    // Show result popup
+    if (lw_result_overlay && lv_obj_is_valid(lw_result_overlay)) lv_obj_del(lw_result_overlay);
+
+    lw_result_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(lw_result_overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(lw_result_overlay, 0, 0);
+    lv_obj_set_style_bg_color(lw_result_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(lw_result_overlay, LV_OPA_80, 0);
+    lv_obj_set_style_border_width(lw_result_overlay, 0, 0);
+    lv_obj_set_style_pad_all(lw_result_overlay, 0, 0);
+    lv_obj_clear_flag(lw_result_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(lw_result_overlay, 0, 0);
+
+    lv_obj_t *card = lv_obj_create(lw_result_overlay);
+    lv_obj_set_size(card, LCD_H_RES - 12, LCD_V_RES - 16);
+    lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+    lv_obj_set_style_border_color(card, is_union ? UI_ACCENT_CYAN : COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 6, 0);
+    lv_obj_set_style_pad_row(card, 4, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    char title_buf[48];
+    snprintf(title_buf, sizeof(title_buf), "%s Result: %d devices",
+             is_union ? "Unique" : "Common", lw_result_count);
+    lv_label_set_text(title, title_buf);
+    lv_obj_set_style_text_color(title, is_union ? UI_ACCENT_CYAN : COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+
+    // Scrollable MAC list
+    lv_obj_t *dev_list = lv_obj_create(card);
+    lv_obj_set_size(dev_list, lv_pct(100), LCD_V_RES - 30 - 50 - 24);
+    lv_obj_set_style_bg_color(dev_list, ui_bg_color(), 0);
+    lv_obj_set_style_border_color(dev_list, lv_color_make(60,60,60), 0);
+    lv_obj_set_style_border_width(dev_list, 1, 0);
+    lv_obj_set_flex_flow(dev_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(dev_list, 2, 0);
+    lv_obj_set_style_pad_gap(dev_list, 2, 0);
+    lv_obj_set_scrollbar_mode(dev_list, LV_SCROLLBAR_MODE_AUTO);
+
+    int show = lw_result_count < 60 ? lw_result_count : 60;
+    for (int i = 0; i < show; i++) {
+        char row[56];
+        if (lw_result_buf[i].name[0])
+            snprintf(row, sizeof(row), "%s  %s", lw_result_buf[i].mac, lw_result_buf[i].name);
+        else
+            snprintf(row, sizeof(row), "%s", lw_result_buf[i].mac);
+        lv_obj_t *lbl = lv_label_create(dev_list);
+        lv_label_set_text(lbl, row);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(lbl, ui_text_color(), 0);
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(lbl, lv_pct(100));
+    }
+    if (lw_result_count > 60) {
+        lv_obj_t *more = lv_label_create(dev_list);
+        char more_buf[32];
+        snprintf(more_buf, sizeof(more_buf), "...and %d more", lw_result_count - 60);
+        lv_label_set_text(more, more_buf);
+        lv_obj_set_style_text_color(more, COLOR_MATERIAL_AMBER, 0);
+        lv_obj_set_style_text_font(more, &lv_font_montserrat_12, 0);
+    }
+
+    // Button row: [Close] [Save to Lookout]
+    lv_obj_t *btn_row = lv_obj_create(card);
+    lv_obj_set_size(btn_row, lv_pct(100), 32);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *close_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(close_btn, 80, 28);
+    lv_obj_set_style_bg_color(close_btn, lv_color_make(70,70,70), 0);
+    lv_obj_set_style_radius(close_btn, 6, 0);
+    lv_obj_t *close_lbl = lv_label_create(close_btn);
+    lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE "  Close");
+    lv_obj_set_style_text_font(close_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(close_lbl);
+    lv_obj_add_event_cb(close_btn, lw_result_close_cb, LV_EVENT_CLICKED, NULL);
+
+    if (lw_result_count > 0) {
+        lv_obj_t *save_btn = lv_btn_create(btn_row);
+        lv_obj_set_size(save_btn, 130, 28);
+        lv_obj_set_style_bg_color(save_btn, COLOR_MATERIAL_GREEN, 0);
+        lv_obj_set_style_bg_color(save_btn, lv_color_make(30,140,30), LV_STATE_PRESSED);
+        lv_obj_set_style_radius(save_btn, 6, 0);
+        lv_obj_t *save_lbl = lv_label_create(save_btn);
+        lv_label_set_text(save_lbl, LV_SYMBOL_OK "  Save to Lookout");
+        lv_obj_set_style_text_font(save_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_center(save_lbl);
+        lv_obj_add_event_cb(save_btn, lw_save_lookout_cb, LV_EVENT_CLICKED, NULL);
+    }
+}
+
+static void lw_unique_cb(lv_event_t *e) { (void)e; lw_show_result(true); }
+static void lw_common_cb(lv_event_t *e) { (void)e; lw_show_result(false); }
+
+static void show_list_wizard_screen(void) {
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
+    create_function_page_base("List Wizard");
+    lw_ui_active = true;
+    lw_select_count = 0;
+    memset(lw_selected, 0, sizeof(lw_selected));
+
+    // Allocate file info array in PSRAM
+    if (lw_files) { heap_caps_free(lw_files); lw_files = NULL; }
+    lw_files = heap_caps_calloc(LW_MAX_FILES, sizeof(lw_file_info_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    lw_file_count = 0;
+
+    // Status label
+    lw_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(lw_status_lbl, "Loading scan files...");
+    lv_obj_set_style_text_color(lw_status_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(lw_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_align(lw_status_lbl, LV_ALIGN_TOP_LEFT, 5, 35);
+
+    // File list
+    lw_list_box = lv_obj_create(function_page);
+    lv_obj_set_size(lw_list_box, lv_pct(100), LCD_V_RES - 30 - 20 - 46);
+    lv_obj_align(lw_list_box, LV_ALIGN_TOP_MID, 0, 54);
+    lv_obj_set_style_bg_color(lw_list_box, ui_bg_color(), 0);
+    lv_obj_set_style_border_color(lw_list_box, lv_color_hex(0x1565C0), 0);
+    lv_obj_set_style_border_width(lw_list_box, 1, 0);
+    lv_obj_set_flex_flow(lw_list_box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(lw_list_box, 3, 0);
+    lv_obj_set_style_pad_gap(lw_list_box, 3, 0);
+    lv_obj_set_scrollbar_mode(lw_list_box, LV_SCROLLBAR_MODE_AUTO);
+
+    // Bottom buttons: [Back] [Unique] [Common]
+    lv_obj_t *btn_row = lv_obj_create(function_page);
+    lv_obj_set_size(btn_row, lv_pct(100), 38);
+    lv_obj_align(btn_row, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_hor(btn_row, 6, 0);
+    lv_obj_set_style_pad_ver(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(back_btn, 68, 30);
+    lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_CLOSE "  Back");
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
+    lv_obj_center(back_lbl);
+    lv_obj_add_event_cb(back_btn, lw_back_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *uniq_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(uniq_btn, 78, 30);
+    lv_obj_set_style_bg_color(uniq_btn, UI_ACCENT_CYAN, 0);
+    lv_obj_set_style_radius(uniq_btn, 8, 0);
+    lv_obj_t *uniq_lbl = lv_label_create(uniq_btn);
+    lv_label_set_text(uniq_lbl, "Unique");
+    lv_obj_set_style_text_font(uniq_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(uniq_lbl, lv_color_black(), 0);
+    lv_obj_center(uniq_lbl);
+    lv_obj_add_event_cb(uniq_btn, lw_unique_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *comm_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(comm_btn, 78, 30);
+    lv_obj_set_style_bg_color(comm_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_radius(comm_btn, 8, 0);
+    lv_obj_t *comm_lbl = lv_label_create(comm_btn);
+    lv_label_set_text(comm_lbl, "Common");
+    lv_obj_set_style_text_font(comm_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(comm_lbl, lv_color_white(), 0);
+    lv_obj_center(comm_lbl);
+    lv_obj_add_event_cb(comm_btn, lw_common_cb, LV_EVENT_CLICKED, NULL);
+
+    // Load and populate file list
+    ensure_sd_mounted();
+    if (lw_files) {
+        struct dirent *de;
+        DIR *dir = opendir(LW_SCAN_DIR);
+        if (dir) {
+            while ((de = readdir(dir)) != NULL && lw_file_count < LW_MAX_FILES) {
+                const char *fn = de->d_name;
+                int flen = strlen(fn);
+                if (flen < 6 || strcmp(fn + flen - 5, ".json") != 0) continue;
+                if (strncmp(fn, "btsc_", 5) != 0) continue;
+                strncpy(lw_files[lw_file_count].filename, fn, 31);
+                lw_files[lw_file_count].filename[31] = '\0';
+                lw_file_count++;
+            }
+            closedir(dir);
+        }
+        // Sort by filename (alphabetical = chronological with scan_id prefix)
+        for (int i = 0; i < lw_file_count - 1; i++) {
+            for (int j = i+1; j < lw_file_count; j++) {
+                if (strcmp(lw_files[i].filename, lw_files[j].filename) > 0) {
+                    lw_file_info_t tmp = lw_files[i];
+                    lw_files[i] = lw_files[j];
+                    lw_files[j] = tmp;
+                }
+            }
+        }
+        // Parse metadata for each file
+        if (sd_spi_mutex) {
+            for (int i = 0; i < lw_file_count; i++) {
+                char path[100];
+                snprintf(path, sizeof(path), "%s/%s", LW_SCAN_DIR, lw_files[i].filename);
+                if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+                    lw_parse_meta(path, &lw_files[i]);
+                    xSemaphoreGive(sd_spi_mutex);
+                }
+            }
+        }
+    }
+
+    // Populate list
+    if (lw_file_count == 0) {
+        lv_obj_t *empty = lv_label_create(lw_list_box);
+        lv_label_set_text(empty, "No scan files found.\nUse BT Scan & Select\nto save a list first.");
+        lv_obj_set_style_text_color(empty, COLOR_MATERIAL_AMBER, 0);
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_12, 0);
+    } else {
+        for (int i = 0; i < lw_file_count; i++) {
+            lw_file_info_t *fi = &lw_files[i];
+            char row[64];
+            if (fi->ts[0] && strlen(fi->ts) >= 6)
+                snprintf(row, sizeof(row), "%s  %c%c:%c%c:%c%c  %d devs",
+                         fi->label[0] ? fi->label : "?",
+                         fi->ts[0],fi->ts[1],fi->ts[2],fi->ts[3],fi->ts[4],fi->ts[5],
+                         fi->device_count);
+            else
+                snprintf(row, sizeof(row), "%s  --:--  %d devs",
+                         fi->label[0] ? fi->label : "?", fi->device_count);
+            lv_obj_t *btn = lv_btn_create(lw_list_box);
+            lv_obj_set_size(btn, lv_pct(100), 28);
+            lv_obj_set_style_bg_color(btn, ui_card_color(), LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(btn, lv_color_lighten(UI_ACCENT_CYAN, 30), LV_STATE_PRESSED);
+            lv_obj_set_style_radius(btn, 4, 0);
+            lv_obj_t *lbl = lv_label_create(btn);
+            lv_label_set_text(lbl, row);
+            lv_obj_set_style_text_color(lbl, ui_text_color(), 0);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+            lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 4, 0);
+            lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
+            lv_obj_add_event_cb(btn, lw_item_cb, LV_EVENT_SHORT_CLICKED, (void*)(intptr_t)i);
+        }
+    }
+
+    char status[48];
+    snprintf(status, sizeof(status), "%d file%s - select up to 4",
+             lw_file_count, lw_file_count == 1 ? "" : "s");
+    lv_label_set_text(lw_status_lbl, status);
+    lv_obj_set_style_text_color(lw_status_lbl, ui_text_color(), 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 // Bluetooth screen
 static void show_bluetooth_screen(void)
@@ -23124,6 +23844,10 @@ static void show_bluetooth_screen(void)
     lv_obj_t *hp_tile = create_tile(tiles, MY_SYMBOL_USER_SECRET, "Honey\nPair",
                                     lv_color_make(212, 175, 55), NULL, NULL);
     lv_obj_add_event_cb(hp_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"HoneyPair");
+
+    // List Wizard - compare and combine saved BT scan files
+    lv_obj_t *lw_tile = create_tile(tiles, MY_SYMBOL_FOLDER_PLUS, "List\nWizard", lv_color_hex(0x1565C0), NULL, NULL);
+    lv_obj_add_event_cb(lw_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"List Wizard");
 
 }
 
@@ -23387,6 +24111,17 @@ static void bt_sas_do_save(const char *label)
     const gps_data_t *g = gps_best();
     bool has_gps = (g->latitude != 0.0f || g->longitude != 0.0f);
 
+    // Increment and persist the scan file counter
+    g_btsc_counter++;
+    {
+        nvs_handle_t h;
+        if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+            nvs_set_u32(h, NVS_KEY_BTSC_CTR, g_btsc_counter);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+    }
+
     // Build timestamp token from GPS UTC (HHMMSS) or seconds-since-boot
     char ts_part[12];
     if (g->time_utc[0]) {
@@ -23415,30 +24150,19 @@ static void bt_sas_do_save(const char *label)
     mkdir("/sdcard/lab/bluetooth", 0755);
     mkdir("/sdcard/lab/bluetooth/scans", 0755);
 
-    // Build base path with GPS coords (dot→p, minus→n)
-    char base[112];
+    // Build path: counter prefix makes filenames unique — no collision suffix needed
+    char path[128];
     if (has_gps) {
         char lat_s[16], lon_s[16];
         snprintf(lat_s, sizeof(lat_s), "%.4f", (double)g->latitude);
         snprintf(lon_s, sizeof(lon_s), "%.4f", (double)g->longitude);
         for (int i = 0; lat_s[i]; i++) { if (lat_s[i] == '.') lat_s[i] = 'p'; else if (lat_s[i] == '-') lat_s[i] = 'n'; }
         for (int i = 0; lon_s[i]; i++) { if (lon_s[i] == '.') lon_s[i] = 'p'; else if (lon_s[i] == '-') lon_s[i] = 'n'; }
-        snprintf(base, sizeof(base), "/sdcard/lab/bluetooth/scans/btsc_%s_%s_%s_%s",
-                 ts_part, lat_s, lon_s, safe_label);
+        snprintf(path, sizeof(path), "/sdcard/lab/bluetooth/scans/btsc_%05u_%s_%s_%s_%s.json",
+                 (unsigned)g_btsc_counter, ts_part, lat_s, lon_s, safe_label);
     } else {
-        snprintf(base, sizeof(base), "/sdcard/lab/bluetooth/scans/btsc_%s_%s",
-                 ts_part, safe_label);
-    }
-
-    // Resolve filename collision with increment suffix
-    char path[120];
-    struct stat st;
-    snprintf(path, sizeof(path), "%s.json", base);
-    if (stat(path, &st) == 0) {
-        for (int n = 1; n < 100; n++) {
-            snprintf(path, sizeof(path), "%s_%d.json", base, n);
-            if (stat(path, &st) != 0) break;
-        }
+        snprintf(path, sizeof(path), "/sdcard/lab/bluetooth/scans/btsc_%05u_%s_%s.json",
+                 (unsigned)g_btsc_counter, ts_part, safe_label);
     }
 
     if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
@@ -23466,6 +24190,7 @@ static void bt_sas_do_save(const char *label)
         fprintf(f, "  \"gps_valid\": false,\n");
     }
     fprintf(f, "  \"fw_version\": \"%s\",\n", FW_VERSION);
+    fprintf(f, "  \"scan_id\": %u,\n", (unsigned)g_btsc_counter);
     fprintf(f, "  \"device_count\": %d,\n", bt_device_count);
     fprintf(f, "  \"devices\": [\n");
 
@@ -28387,6 +29112,11 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
 
+    if (strcmp(attack_name, "List Wizard") == 0) {
+        show_list_wizard_screen();
+        return;
+    }
+
     // Add BT Scan & Select target to BT Lookout watchlist
     if (strcmp(attack_name, "Add to Lookout") == 0) {
         char mac_str[18];
@@ -29304,6 +30034,117 @@ static bool bt_is_possible_airtag(const uint8_t *data, uint8_t len, bool has_nam
     return (subtype == 0x05 && len <= 12);
 }
 
+// ── BT Blacklist helpers ─────────────────────────────────────────────────────
+
+// Parse "XX:XX:XX:XX:XX:XX" into mac[6] big-endian
+static bool bl_mac_parse(const char *s, uint8_t mac[6]) {
+    return sscanf(s, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                  &mac[0],&mac[1],&mac[2],&mac[3],&mac[4],&mac[5]) == 6;
+}
+
+static void bt_blacklist_load(void) {
+    s_blacklist_count = 0;
+    FILE *f = fopen(BT_BLACKLIST_CSV_PATH, "r");
+    if (!f) return;   // no blacklist file is fine — treated as empty
+    char line[96];
+    bool first = true;
+    while (fgets(line, sizeof(line), f) && s_blacklist_count < BT_BLACKLIST_MAX) {
+        int len = strlen(line);
+        while (len > 0 && (line[len-1]=='\n'||line[len-1]=='\r')) line[--len] = '\0';
+        if (len == 0) continue;
+        if (first) { first = false; continue; }   // skip header
+        char *tok = strtok(line, ",");
+        if (!tok) continue;
+        uint8_t mac[6];
+        if (!bl_mac_parse(tok, mac)) continue;
+        tok = strtok(NULL, ",");   // name (ignored for blacklist)
+        tok = strtok(NULL, ",");   // rssi_threshold (ignored)
+        tok = strtok(NULL, ",");   // oui_only
+        bool oui_only = tok ? (atoi(tok) != 0) : false;
+        bt_blacklist_entry_t *e = &s_blacklist[s_blacklist_count++];
+        memcpy(e->mac, mac, 6);
+        e->oui_only = oui_only;
+    }
+    fclose(f);
+    ESP_LOGI(TAG, "Blacklist: loaded %d entries", s_blacklist_count);
+}
+
+// Returns true if addr_val (NimBLE LE byte order) is blacklisted
+static bool bt_blacklist_check(const uint8_t addr_val[6]) {
+    for (int i = 0; i < s_blacklist_count; i++) {
+        const bt_blacklist_entry_t *e = &s_blacklist[i];
+        if (e->oui_only) {
+            if (addr_val[5]==e->mac[0] && addr_val[4]==e->mac[1] && addr_val[3]==e->mac[2])
+                return true;
+        } else {
+            // Full MAC: blacklist stored big-endian, addr_val is LE (reversed)
+            if (addr_val[5]==e->mac[0] && addr_val[4]==e->mac[1] && addr_val[3]==e->mac[2] &&
+                addr_val[2]==e->mac[3] && addr_val[1]==e->mac[4] && addr_val[0]==e->mac[5])
+                return true;
+        }
+    }
+    return false;
+}
+
+static bool bt_blacklist_append(const uint8_t addr_val[6], const char *name, bool oui_only) {
+    // addr_val is NimBLE LE order — convert to big-endian for storage
+    uint8_t mac_be[6] = { addr_val[5], addr_val[4], addr_val[3], addr_val[2], addr_val[1], addr_val[0] };
+    // Dedup check
+    for (int i = 0; i < s_blacklist_count; i++) {
+        bt_blacklist_entry_t *e = &s_blacklist[i];
+        if (oui_only && e->oui_only &&
+            e->mac[0]==mac_be[0] && e->mac[1]==mac_be[1] && e->mac[2]==mac_be[2]) return true;
+        if (!oui_only && !e->oui_only && memcmp(e->mac, mac_be, 6)==0) return true;
+    }
+    if (s_blacklist_count < BT_BLACKLIST_MAX) {
+        bt_blacklist_entry_t *e = &s_blacklist[s_blacklist_count++];
+        memcpy(e->mac, mac_be, 6);
+        e->oui_only = oui_only;
+    }
+    // Write to CSV
+    FILE *f = fopen(BT_BLACKLIST_CSV_PATH, "a");
+    if (!f) {
+        f = fopen(BT_BLACKLIST_CSV_PATH, "w");
+        if (!f) return false;
+        fprintf(f, "MAC,Name,RSSI,OUI_Only\n");
+        fclose(f);
+        f = fopen(BT_BLACKLIST_CSV_PATH, "a");
+        if (!f) return false;
+    }
+    char mac_str[18];
+    snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac_be[0],mac_be[1],mac_be[2],mac_be[3],mac_be[4],mac_be[5]);
+    fprintf(f, "%s,%s,-99,%d\n", mac_str, name ? name : "", (int)oui_only);
+    fclose(f);
+    ESP_LOGI(TAG, "Blacklist: added %s", mac_str);
+    return true;
+}
+
+static void bt_blacklist_remove_idx(int idx) {
+    if (idx < 0 || idx >= s_blacklist_count) return;
+    // Remove from in-memory array
+    for (int i = idx; i < s_blacklist_count - 1; i++)
+        s_blacklist[i] = s_blacklist[i+1];
+    s_blacklist_count--;
+    // Rewrite CSV
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        FILE *f = fopen(BT_BLACKLIST_CSV_PATH, "w");
+        if (f) {
+            fprintf(f, "MAC,Name,RSSI,OUI_Only\n");
+            for (int i = 0; i < s_blacklist_count; i++) {
+                char mac_str[18];
+                snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                         s_blacklist[i].mac[0], s_blacklist[i].mac[1], s_blacklist[i].mac[2],
+                         s_blacklist[i].mac[3], s_blacklist[i].mac[4], s_blacklist[i].mac[5]);
+                fprintf(f, "%s,,-99,%d\n", mac_str, (int)s_blacklist[i].oui_only);
+            }
+            fclose(f);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    ESP_LOGI(TAG, "Blacklist: removed entry %d, now %d entries", idx, s_blacklist_count);
+}
+
 /**
  * BLE GAP event callback for scanning — handles both legacy and BLE 5 Coded PHY
  */
@@ -29342,6 +30183,9 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
     } else {
         return 0;
     }
+
+    // Blacklist check — silently drop blacklisted devices before any processing
+    if (bt_blacklist_check(addr_val)) return 0;
 
     // Dee Dee Detector — check every advertisement against watchlist,
     // regardless of whether BT Locator is also running.
