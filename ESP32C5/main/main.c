@@ -1051,6 +1051,7 @@ static volatile bool wardrive_ui_active = false;
 // Wardrive UI dashboard widgets
 static lv_obj_t *wd_ui_gps_label = NULL;
 static lv_obj_t *wd_ui_counter_label = NULL;
+static lv_obj_t *wd_ui_ble_label = NULL;
 static lv_obj_t *wd_ui_header = NULL;
 static lv_obj_t *wd_ui_table = NULL;
 static lv_obj_t *wd_ui_channel_label = NULL;
@@ -1788,6 +1789,7 @@ static void reset_function_page_children(void) {
     if (wd_ui_gps_label && lv_obj_is_valid(wd_ui_gps_label)) lv_obj_del(wd_ui_gps_label);
     wd_ui_gps_label = NULL;
     wd_ui_counter_label = NULL;
+    wd_ui_ble_label = NULL;
     wd_ui_channel_label = NULL;
     wd_ui_header = NULL;
     wd_ui_table = NULL;
@@ -6445,6 +6447,12 @@ void app_main(void)
                     lv_label_set_text(wd_ui_counter_label, cnt_buf);
                 }
 
+                if (wd_ui_ble_label && lv_obj_is_valid(wd_ui_ble_label)) {
+                    char ble_buf[16];
+                    snprintf(ble_buf, sizeof(ble_buf), "%d", wdp_ble_count);
+                    lv_label_set_text(wd_ui_ble_label, ble_buf);
+                }
+
                 if (wd_ui_table && lv_obj_is_valid(wd_ui_table)) {
                     int total = wdp_seen_count;
                     int show = (total > 50) ? 50 : total;
@@ -10627,6 +10635,13 @@ static void wd_ui_timer_cb(lv_timer_t *timer) {
         lv_label_set_text(wd_ui_counter_label, cnt_buf);
     }
 
+    // BLE device counter
+    if (wd_ui_ble_label) {
+        char ble_buf[16];
+        snprintf(ble_buf, sizeof(ble_buf), "%d", wdp_ble_count);
+        lv_label_set_text(wd_ui_ble_label, ble_buf);
+    }
+
     // Update table with last 50 networks
     if (wd_ui_table) {
         int total = wdp_seen_count;
@@ -10688,10 +10703,15 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_set_width(wd_ui_gps_label, LCD_H_RES);
     lv_obj_align(wd_ui_gps_label, LV_ALIGN_TOP_MID, 0, 35);
 
-    // ─── D-UCB Channel indicator (below GPS label) ───────────────
+    // ─── Three stat boxes: [D-UCB] [WiFi] [BLE] ─────────────────
+    // Layout at y=55, h=42. Three boxes across 240px:
+    //   x=4  w=72: D-UCB channel (green)
+    //   x=84 w=74: WiFi networks (cyan)
+    //   x=166 w=70: BLE devices (purple)
+
     lv_obj_t *wd_ch_box = lv_obj_create(function_page);
-    lv_obj_set_size(wd_ch_box, 90, 42);
-    lv_obj_align(wd_ch_box, LV_ALIGN_TOP_RIGHT, -126, 55);
+    lv_obj_set_size(wd_ch_box, 72, 42);
+    lv_obj_align(wd_ch_box, LV_ALIGN_TOP_LEFT, 4, 55);
     lv_obj_set_style_bg_color(wd_ch_box, lv_color_make(30, 30, 45), 0);
     lv_obj_set_style_border_color(wd_ch_box, lv_color_make(76, 175, 80), 0);
     lv_obj_set_style_border_width(wd_ch_box, 2, 0);
@@ -10711,10 +10731,10 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_set_style_text_font(wd_ui_channel_label, &lv_font_montserrat_16, 0);
     lv_obj_align(wd_ui_channel_label, LV_ALIGN_BOTTOM_MID, 0, -2);
 
-    // ─── Network counter (below GPS label) ───────────────────────
+    // ─── WiFi network counter ─────────────────────────────────────
     lv_obj_t *cnt_box = lv_obj_create(function_page);
-    lv_obj_set_size(cnt_box, 110, 42);
-    lv_obj_align(cnt_box, LV_ALIGN_TOP_RIGHT, -8, 55);
+    lv_obj_set_size(cnt_box, 74, 42);
+    lv_obj_align(cnt_box, LV_ALIGN_TOP_LEFT, 84, 55);
     lv_obj_set_style_bg_color(cnt_box, lv_color_make(30, 30, 45), 0);
     lv_obj_set_style_border_color(cnt_box, lv_color_make(0, 188, 212), 0);
     lv_obj_set_style_border_width(cnt_box, 2, 0);
@@ -10723,7 +10743,7 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_clear_flag(cnt_box, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *cnt_title = lv_label_create(cnt_box);
-    lv_label_set_text(cnt_title, "NETWORKS");
+    lv_label_set_text(cnt_title, "WiFi");
     lv_obj_set_style_text_color(cnt_title, lv_color_make(0, 188, 212), 0);
     lv_obj_set_style_text_font(cnt_title, &lv_font_montserrat_12, 0);
     lv_obj_align(cnt_title, LV_ALIGN_TOP_MID, 0, 2);
@@ -10733,6 +10753,29 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_set_style_text_color(wd_ui_counter_label, ui_text_color(), 0);
     lv_obj_set_style_text_font(wd_ui_counter_label, &lv_font_montserrat_20, 0);
     lv_obj_align(wd_ui_counter_label, LV_ALIGN_BOTTOM_MID, 0, -2);
+
+    // ─── BLE device counter ───────────────────────────────────────
+    lv_obj_t *ble_box = lv_obj_create(function_page);
+    lv_obj_set_size(ble_box, 70, 42);
+    lv_obj_align(ble_box, LV_ALIGN_TOP_LEFT, 166, 55);
+    lv_obj_set_style_bg_color(ble_box, lv_color_make(30, 30, 45), 0);
+    lv_obj_set_style_border_color(ble_box, lv_color_make(171, 71, 188), 0);
+    lv_obj_set_style_border_width(ble_box, 2, 0);
+    lv_obj_set_style_radius(ble_box, 10, 0);
+    lv_obj_set_style_pad_all(ble_box, 0, 0);
+    lv_obj_clear_flag(ble_box, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *ble_title = lv_label_create(ble_box);
+    lv_label_set_text(ble_title, "BLE");
+    lv_obj_set_style_text_color(ble_title, lv_color_make(171, 71, 188), 0);
+    lv_obj_set_style_text_font(ble_title, &lv_font_montserrat_12, 0);
+    lv_obj_align(ble_title, LV_ALIGN_TOP_MID, 0, 2);
+
+    wd_ui_ble_label = lv_label_create(ble_box);
+    lv_label_set_text(wd_ui_ble_label, "0");
+    lv_obj_set_style_text_color(wd_ui_ble_label, ui_text_color(), 0);
+    lv_obj_set_style_text_font(wd_ui_ble_label, &lv_font_montserrat_20, 0);
+    lv_obj_align(wd_ui_ble_label, LV_ALIGN_BOTTOM_MID, 0, -2);
 
     // ─── Recent networks table ────────────────────────────────────
     // y=101: boxes end at 55+42=97, 4px gap. height=164: stops 4px above stop btn.
@@ -10914,6 +10957,7 @@ static void wardrive_stop_btn_cb(lv_event_t *e)
     if (wd_ui_gps_label && lv_obj_is_valid(wd_ui_gps_label)) lv_obj_del(wd_ui_gps_label);
     wd_ui_gps_label = NULL;
     wd_ui_counter_label = NULL;
+    wd_ui_ble_label = NULL;
     wd_ui_channel_label = NULL;
     wd_ui_header = NULL;
     wd_ui_table = NULL;
