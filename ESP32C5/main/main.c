@@ -23674,6 +23674,7 @@ static void lw_rebuild_list(void) {
         lv_obj_set_style_text_font(del_lbl, &lv_font_montserrat_12, 0);
         lv_obj_center(del_lbl);
         lv_obj_add_event_cb(del_btn, lw_del_btn_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        if (sel) lv_obj_add_flag(del_btn, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
