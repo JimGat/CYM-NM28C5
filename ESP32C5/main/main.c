@@ -23412,17 +23412,21 @@ static void lw_result_sort_rssi(lw_dev_t *arr, int n) {
             }
 }
 
-// Unique: all distinct devices across any selected file, sorted by minimum RSSI desc.
+// Unique: devices that appear in EXACTLY ONE of the selected files.
+// Uses minimum RSSI (signal floor) for filter and sort. RSSI filter applied after MAC matching.
 static int lw_compute_union(int *sel_idx, int nsel, lw_dev_t *result, int max_result) {
     lw_rssi_acc_t *acc = heap_caps_calloc(max_result, sizeof(lw_rssi_acc_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!acc) return 0;
     int total = lw_accumulate(sel_idx, nsel, acc, max_result);
     int count = 0;
     for (int i = 0; i < total && count < max_result; i++) {
+        // Exactly one bit set in file_mask → seen in only one file
+        uint8_t m = acc[i].file_mask;
+        if (m == 0 || (m & (m - 1)) != 0) continue;   // skip if in 0 or >1 files
         if (acc[i].rssi_min < lw_rssi_threshold) continue;
         memcpy(result[count].mac,  acc[i].mac,  18);
         memcpy(result[count].name, acc[i].name, 32);
-        result[count].rssi = acc[i].rssi_min;   // signal floor
+        result[count].rssi = acc[i].rssi_min;
         count++;
     }
     heap_caps_free(acc);
