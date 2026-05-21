@@ -544,7 +544,8 @@ static const tvbg_code_t TVBG_CODES[] = {
 
 void ir_hat_tvbgone(ir_hat_progress_cb_t progress_cb, void *ctx)
 {
-    ir_signal_t sig;
+    // static: ir_signal_t is ~4140 bytes (1024 timings × 4 B) — too large for any task stack
+    static ir_signal_t sig;
     for (int i = 0; i < (int)TVBG_COUNT; i++) {
         const tvbg_code_t *c = &TVBG_CODES[i];
         memset(&sig, 0, sizeof(sig));

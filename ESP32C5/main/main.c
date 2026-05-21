@@ -35744,7 +35744,7 @@ static void tvbg_start_cb(lv_event_t *e)
     if (s_tvbg_status)    lv_label_set_text(s_tvbg_status, "Transmitting...");
     if (s_tvbg_start_btn) lv_obj_add_state(s_tvbg_start_btn, LV_STATE_DISABLED);
     if (s_tvbg_bar)       lv_bar_set_value(s_tvbg_bar, 0, LV_ANIM_OFF);
-    xTaskCreate(s_tvbg_task, "tvbgone", 4096, NULL, tskIDLE_PRIORITY + 2, NULL);
+    xTaskCreate(s_tvbg_task, "tvbgone", 6144, NULL, tskIDLE_PRIORITY + 2, NULL);
 }
 
 static void show_ir_tvbgone_screen(void)
