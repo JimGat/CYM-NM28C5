@@ -649,6 +649,14 @@ static const tvbg_code_t TVBG_CODES[] = {
 };
 #define TVBG_COUNT  (sizeof(TVBG_CODES)/sizeof(TVBG_CODES[0]))
 
+// Each code is sent TVBG_REPEATS times with TVBG_REPEAT_GAP_MS between
+// repeats. A 100ms single-shot is easily missed; TV IR receivers need
+// the same code burst 2-3x with time for AGC recovery between bursts.
+// 250ms between different codes matches original TV-B-Gone firmware.
+#define TVBG_REPEATS        3
+#define TVBG_REPEAT_GAP_MS  65
+#define TVBG_CODE_GAP_MS   250
+
 void ir_hat_tvbgone(ir_hat_progress_cb_t progress_cb, void *ctx)
 {
     // static: ir_signal_t is ~4140 bytes (1024 timings × 4 B) — too large for any task stack
@@ -661,9 +669,13 @@ void ir_hat_tvbgone(ir_hat_progress_cb_t progress_cb, void *ctx)
         sig.duty_cycle = IR_CARRIER_DUTY;
         sig.count      = c->count;
         memcpy(sig.times_us, c->t, c->count * sizeof(uint32_t));
-        ir_hat_replay(&sig);
+        for (int r = 0; r < TVBG_REPEATS; r++) {
+            ir_hat_replay(&sig);
+            if (r < TVBG_REPEATS - 1)
+                vTaskDelay(pdMS_TO_TICKS(TVBG_REPEAT_GAP_MS));
+        }
         if (progress_cb) progress_cb(i, (int)TVBG_COUNT, ctx);
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(TVBG_CODE_GAP_MS));
     }
 }
 
