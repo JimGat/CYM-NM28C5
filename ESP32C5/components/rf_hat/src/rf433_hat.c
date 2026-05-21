@@ -228,7 +228,7 @@ void rf433_hat_deinit(void)
 {
     rf433_hat_capture_cancel();
     s_capturing = false;
-    if (RF_HAT_RF433_RX_GPIO >= 0) gpio_isr_handler_remove(RF_HAT_RF433_RX_GPIO);
+    if (s_init && RF_HAT_RF433_RX_GPIO >= 0) gpio_isr_handler_remove(RF_HAT_RF433_RX_GPIO);
     if (s_frame_sem) { vSemaphoreDelete(s_frame_sem); s_frame_sem = NULL; }
     if (s_cap_buf)   { free(s_cap_buf); s_cap_buf = NULL; }
     s_init    = false;
