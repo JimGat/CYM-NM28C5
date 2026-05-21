@@ -1818,6 +1818,7 @@ static void show_ir_replay_screen(void);
 static void show_ir_signal_list_screen(void);
 static void show_ir_tvbgone_screen(void);
 static void show_ir_jammer_screen(void);
+static void show_ir_universal_screen(void);
 static void show_rf433_menu_screen(void);
 static void show_rf433_capture_screen(void);
 static void show_rf433_replay_screen(void);
@@ -35322,6 +35323,8 @@ static void ir_menu_tile_cb(lv_event_t *e)
         show_ir_tvbgone_screen();
     else if (strcmp(name, "Jammer") == 0)
         show_ir_jammer_screen();
+    else if (strcmp(name, "Universal") == 0)
+        show_ir_universal_screen();
 }
 
 static void show_ir_menu_screen(void)
@@ -35344,6 +35347,7 @@ static void show_ir_menu_screen(void)
     create_tile(tiles, LV_SYMBOL_PLAY,         "Replay",    lv_color_hex(0xBF360C), ir_menu_tile_cb, "Replay");
     create_tile(tiles, LV_SYMBOL_POWER,        "TV-B-Gone", lv_color_hex(0x4A148C), ir_menu_tile_cb, "TV-B-Gone");
     create_tile(tiles, LV_SYMBOL_WARNING,      "Jammer",    lv_color_hex(0xB71C1C), ir_menu_tile_cb, "Jammer");
+    create_tile(tiles, LV_SYMBOL_LOOP,         "Universal", lv_color_hex(0x00695C), ir_menu_tile_cb, "Universal");
 
     rfhat_add_back_btn("Home", show_main_tiles);
 }
@@ -35899,6 +35903,350 @@ static void show_ir_jammer_screen(void)
     lv_obj_set_style_text_color(jlbl, lv_color_white(), 0);
     lv_obj_center(jlbl);
     lv_obj_add_event_cb(s_ir_jam_btn, ir_jam_toggle_cb, LV_EVENT_CLICKED, NULL);
+
+    rfhat_add_back_btn("Infrared", show_ir_menu_screen);
+}
+
+// ── Universal Remote ──────────────────────────────────────────────────────────
+// Loads .ir files from /sdcard/lab/infrared/, each file = one TV brand.
+// Signals must use standard names: Power, Vol_up, Vol_dn, Ch_next, Ch_prev,
+// Mute, Input. Flipper Zero IRDB files use this naming convention directly.
+// Power Search cycles through all brands, replays Power, asks "Did it work?".
+// Confirmed brand is saved to NVS and used for all function buttons.
+
+#define NVS_NS_IR_REMOTE  "ir_remote"
+#define NVS_KEY_IR_BRAND  "brand"
+
+static char      s_ur_brand[IR_HAT_REMOTE_NAME_LEN] = {0};
+static lv_obj_t *s_ur_brand_lbl    = NULL;
+static lv_obj_t *s_ur_status_lbl   = NULL;
+static lv_obj_t *s_ur_search_popup = NULL;
+
+static char  s_ur_search_remotes[IR_HAT_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
+static int   s_ur_search_count = 0;
+static int   s_ur_search_idx   = 0;
+static lv_obj_t *s_ur_search_info_lbl  = NULL;
+static lv_obj_t *s_ur_search_q_lbl     = NULL;
+static lv_obj_t *s_ur_search_yes_btn   = NULL;
+static lv_obj_t *s_ur_search_skip_btn  = NULL;
+
+static void ur_nvs_load_brand(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_IR_REMOTE, NVS_READONLY, &h) != ESP_OK) return;
+    size_t len = IR_HAT_REMOTE_NAME_LEN;
+    nvs_get_str(h, NVS_KEY_IR_BRAND, s_ur_brand, &len);
+    nvs_close(h);
+}
+
+static void ur_nvs_save_brand(const char *brand)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_IR_REMOTE, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_str(h, NVS_KEY_IR_BRAND, brand);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static void ur_refresh_brand_ui(void)
+{
+    if (!s_ur_brand_lbl || !lv_obj_is_valid(s_ur_brand_lbl)) return;
+    if (s_ur_brand[0])
+        lv_label_set_text_fmt(s_ur_brand_lbl, LV_SYMBOL_PLAY " %s", s_ur_brand);
+    else
+        lv_label_set_text(s_ur_brand_lbl, "No brand - tap Search");
+}
+
+static ir_hat_err_t ur_try_signal(const char *remote, const char *sig_name)
+{
+    static ir_signal_t s_ur_sig;
+    if (!ir_hat_is_init()) ir_hat_init();
+    ir_hat_err_t r = ir_hat_load_signal(remote, sig_name, &s_ur_sig);
+    if (r == IR_HAT_OK) ir_hat_replay(&s_ur_sig);
+    return r;
+}
+
+static void ur_search_close(void)
+{
+    if (s_ur_search_popup && lv_obj_is_valid(s_ur_search_popup))
+        lv_obj_del(s_ur_search_popup);
+    s_ur_search_popup   = NULL;
+    s_ur_search_info_lbl  = NULL;
+    s_ur_search_q_lbl     = NULL;
+    s_ur_search_yes_btn   = NULL;
+    s_ur_search_skip_btn  = NULL;
+}
+
+static void ur_search_do_step(void *arg);  // forward
+
+static void ur_search_advance(void)
+{
+    if (s_ur_search_idx >= s_ur_search_count) {
+        ur_search_close();
+        if (s_ur_status_lbl && lv_obj_is_valid(s_ur_status_lbl))
+            lv_label_set_text(s_ur_status_lbl, "No match found");
+        return;
+    }
+    const char *brand = s_ur_search_remotes[s_ur_search_idx];
+    if (s_ur_search_info_lbl && lv_obj_is_valid(s_ur_search_info_lbl))
+        lv_label_set_text_fmt(s_ur_search_info_lbl, "%d/%d: %s\nSending Power...",
+            s_ur_search_idx + 1, s_ur_search_count, brand);
+    if (s_ur_search_q_lbl && lv_obj_is_valid(s_ur_search_q_lbl))
+        lv_label_set_text(s_ur_search_q_lbl, "");
+    if (s_ur_search_yes_btn && lv_obj_is_valid(s_ur_search_yes_btn))
+        lv_obj_add_flag(s_ur_search_yes_btn, LV_OBJ_FLAG_HIDDEN);
+    if (s_ur_search_skip_btn && lv_obj_is_valid(s_ur_search_skip_btn))
+        lv_obj_add_flag(s_ur_search_skip_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_async_call(ur_search_do_step, NULL);
+}
+
+static void ur_search_do_step(void *arg)
+{
+    (void)arg;
+    if (!s_ur_search_popup || !lv_obj_is_valid(s_ur_search_popup)) return;
+    if (s_ur_search_idx >= s_ur_search_count) return;
+    const char *brand = s_ur_search_remotes[s_ur_search_idx];
+    ur_try_signal(brand, "Power");
+    if (s_ur_search_info_lbl && lv_obj_is_valid(s_ur_search_info_lbl))
+        lv_label_set_text_fmt(s_ur_search_info_lbl, "%d/%d: %s",
+            s_ur_search_idx + 1, s_ur_search_count, brand);
+    if (s_ur_search_q_lbl && lv_obj_is_valid(s_ur_search_q_lbl))
+        lv_label_set_text(s_ur_search_q_lbl, "Did it work?");
+    if (s_ur_search_yes_btn && lv_obj_is_valid(s_ur_search_yes_btn))
+        lv_obj_clear_flag(s_ur_search_yes_btn, LV_OBJ_FLAG_HIDDEN);
+    if (s_ur_search_skip_btn && lv_obj_is_valid(s_ur_search_skip_btn))
+        lv_obj_clear_flag(s_ur_search_skip_btn, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void ur_search_yes_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_ur_search_idx >= 0 && s_ur_search_idx < s_ur_search_count) {
+        strncpy(s_ur_brand, s_ur_search_remotes[s_ur_search_idx],
+                IR_HAT_REMOTE_NAME_LEN - 1);
+        s_ur_brand[IR_HAT_REMOTE_NAME_LEN - 1] = '\0';
+        ur_nvs_save_brand(s_ur_brand);
+    }
+    ur_search_close();
+    ur_refresh_brand_ui();
+    if (s_ur_status_lbl && lv_obj_is_valid(s_ur_status_lbl))
+        lv_label_set_text_fmt(s_ur_status_lbl, "Saved: %s", s_ur_brand);
+}
+
+static void ur_search_skip_cb(lv_event_t *e)
+{
+    (void)e;
+    s_ur_search_idx++;
+    ur_search_advance();
+}
+
+static void ur_search_stop_cb(lv_event_t *e)
+{
+    (void)e;
+    ur_search_close();
+    if (s_ur_status_lbl && lv_obj_is_valid(s_ur_status_lbl))
+        lv_label_set_text(s_ur_status_lbl, "Search stopped");
+}
+
+static void ur_search_start_cb(lv_event_t *e)
+{
+    (void)e;
+    s_ur_search_count = ir_hat_list_remotes(s_ur_search_remotes, IR_HAT_MAX_REMOTES);
+    s_ur_search_idx   = 0;
+    if (s_ur_search_count == 0) {
+        if (s_ur_status_lbl && lv_obj_is_valid(s_ur_status_lbl))
+            lv_label_set_text(s_ur_status_lbl, "No remotes on SD card");
+        return;
+    }
+    ur_search_close();
+
+    s_ur_search_popup = lv_obj_create(function_page);
+    lv_obj_set_size(s_ur_search_popup, LCD_H_RES - 20, 190);
+    lv_obj_align(s_ur_search_popup, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(s_ur_search_popup, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(s_ur_search_popup, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_border_width(s_ur_search_popup, 2, 0);
+    lv_obj_set_style_radius(s_ur_search_popup, 10, 0);
+    lv_obj_set_style_pad_all(s_ur_search_popup, 8, 0);
+    lv_obj_clear_flag(s_ur_search_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_move_foreground(s_ur_search_popup);
+
+    lv_obj_t *title = lv_label_create(s_ur_search_popup);
+    lv_label_set_text(title, "Power Search");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(title, ui_text_color(), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    s_ur_search_info_lbl = lv_label_create(s_ur_search_popup);
+    lv_obj_set_style_text_font(s_ur_search_info_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_ur_search_info_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_align(s_ur_search_info_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_ur_search_info_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_ur_search_info_lbl, LCD_H_RES - 44);
+    lv_obj_align(s_ur_search_info_lbl, LV_ALIGN_TOP_MID, 0, 22);
+
+    s_ur_search_q_lbl = lv_label_create(s_ur_search_popup);
+    lv_label_set_text(s_ur_search_q_lbl, "");
+    lv_obj_set_style_text_font(s_ur_search_q_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_ur_search_q_lbl, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_text_align(s_ur_search_q_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_ur_search_q_lbl, LV_ALIGN_TOP_MID, 0, 72);
+
+    s_ur_search_yes_btn = lv_btn_create(s_ur_search_popup);
+    lv_obj_set_size(s_ur_search_yes_btn, 66, 34);
+    lv_obj_align(s_ur_search_yes_btn, LV_ALIGN_BOTTOM_LEFT, 0, -2);
+    lv_obj_set_style_bg_color(s_ur_search_yes_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_radius(s_ur_search_yes_btn, 6, 0);
+    lv_obj_t *yes_lbl = lv_label_create(s_ur_search_yes_btn);
+    lv_label_set_text(yes_lbl, "Yes!");
+    lv_obj_set_style_text_font(yes_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(yes_lbl);
+    lv_obj_add_flag(s_ur_search_yes_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_ur_search_yes_btn, ur_search_yes_cb, LV_EVENT_CLICKED, NULL);
+
+    s_ur_search_skip_btn = lv_btn_create(s_ur_search_popup);
+    lv_obj_set_size(s_ur_search_skip_btn, 66, 34);
+    lv_obj_align(s_ur_search_skip_btn, LV_ALIGN_BOTTOM_MID, 0, -2);
+    lv_obj_set_style_bg_color(s_ur_search_skip_btn, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_radius(s_ur_search_skip_btn, 6, 0);
+    lv_obj_t *skip_lbl = lv_label_create(s_ur_search_skip_btn);
+    lv_label_set_text(skip_lbl, "Skip");
+    lv_obj_set_style_text_font(skip_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(skip_lbl);
+    lv_obj_add_flag(s_ur_search_skip_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_ur_search_skip_btn, ur_search_skip_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *stop_btn = lv_btn_create(s_ur_search_popup);
+    lv_obj_set_size(stop_btn, 66, 34);
+    lv_obj_align(stop_btn, LV_ALIGN_BOTTOM_RIGHT, 0, -2);
+    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_radius(stop_btn, 6, 0);
+    lv_obj_t *stop_lbl = lv_label_create(stop_btn);
+    lv_label_set_text(stop_lbl, "Stop");
+    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(stop_lbl);
+    lv_obj_add_event_cb(stop_btn, ur_search_stop_cb, LV_EVENT_CLICKED, NULL);
+
+    ur_search_advance();
+}
+
+static void ur_func_btn_cb(lv_event_t *e)
+{
+    const char *sig_name = (const char *)lv_event_get_user_data(e);
+    if (!sig_name) return;
+    if (!s_ur_brand[0]) {
+        if (s_ur_status_lbl && lv_obj_is_valid(s_ur_status_lbl))
+            lv_label_set_text(s_ur_status_lbl, "No brand - tap Search first");
+        return;
+    }
+    ir_hat_err_t r = ur_try_signal(s_ur_brand, sig_name);
+    if (s_ur_status_lbl && lv_obj_is_valid(s_ur_status_lbl)) {
+        if (r == IR_HAT_OK)
+            lv_label_set_text_fmt(s_ur_status_lbl, "Sent: %s", sig_name);
+        else
+            lv_label_set_text_fmt(s_ur_status_lbl, "Not found: %s", sig_name);
+    }
+}
+
+static lv_obj_t *ur_make_func_btn(lv_obj_t *parent, const char *label,
+                                   lv_color_t color, int w, int h,
+                                   const char *sig_name)
+{
+    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, w, h);
+    lv_obj_set_style_bg_color(btn, color, 0);
+    lv_obj_set_style_radius(btn, 8, 0);
+    lv_obj_t *lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, label);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+    lv_obj_center(lbl);
+    lv_obj_add_event_cb(btn, ur_func_btn_cb, LV_EVENT_CLICKED, (void *)sig_name);
+    return btn;
+}
+
+static void show_ir_universal_screen(void)
+{
+    ur_nvs_load_brand();
+    s_ur_search_popup = NULL;
+
+    create_function_page_base("Universal Remote");
+    apply_menu_bg();
+
+    // Brand row: label (left) + Search button (right)
+    lv_obj_t *brand_row = lv_obj_create(function_page);
+    lv_obj_set_size(brand_row, LCD_H_RES, 32);
+    lv_obj_align(brand_row, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(brand_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(brand_row, 0, 0);
+    lv_obj_set_style_pad_all(brand_row, 2, 0);
+    lv_obj_clear_flag(brand_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_ur_brand_lbl = lv_label_create(brand_row);
+    lv_obj_set_style_text_font(s_ur_brand_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_ur_brand_lbl, ui_text_color(), 0);
+    lv_obj_align(s_ur_brand_lbl, LV_ALIGN_LEFT_MID, 4, 0);
+    ur_refresh_brand_ui();
+
+    lv_obj_t *search_btn = lv_btn_create(brand_row);
+    lv_obj_set_size(search_btn, 60, 26);
+    lv_obj_align(search_btn, LV_ALIGN_RIGHT_MID, -4, 0);
+    lv_obj_set_style_bg_color(search_btn, COLOR_MATERIAL_INDIGO, 0);
+    lv_obj_set_style_radius(search_btn, 6, 0);
+    lv_obj_t *search_lbl_w = lv_label_create(search_btn);
+    lv_label_set_text(search_lbl_w, "Search");
+    lv_obj_set_style_text_font(search_lbl_w, &lv_font_montserrat_12, 0);
+    lv_obj_center(search_lbl_w);
+    lv_obj_add_event_cb(search_btn, ur_search_start_cb, LV_EVENT_CLICKED, NULL);
+
+    // Status/feedback label
+    s_ur_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_ur_status_lbl, "");
+    lv_obj_set_style_text_font(s_ur_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_ur_status_lbl, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_text_align(s_ur_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_ur_status_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_ur_status_lbl, LCD_H_RES - 8);
+    lv_obj_align(s_ur_status_lbl, LV_ALIGN_TOP_MID, 0, 64);
+
+    // Function buttons — 2-column grid starting at y=82
+    // Available width: 240px, margins 4px each side → inner 232px
+    // Half-width: (232 - 5gap) / 2 = 113.5 → 113px
+    // Full-width: 232px
+    int bx = 4, by = 82;
+    int bw2 = 113, gap = 6;
+
+    // Power (full width, taller)
+    lv_obj_t *u_pow = ur_make_func_btn(function_page,
+        LV_SYMBOL_POWER " Power", lv_color_hex(0xB71C1C), 232, 46, "Power");
+    lv_obj_set_pos(u_pow, bx, by);
+    by += 46 + gap;
+
+    // VOL- | VOL+
+    lv_obj_t *u_voldn = ur_make_func_btn(function_page,
+        "VOL-", lv_color_hex(0x0D47A1), bw2, 36, "Vol_dn");
+    lv_obj_set_pos(u_voldn, bx, by);
+    lv_obj_t *u_volup = ur_make_func_btn(function_page,
+        "VOL+", lv_color_hex(0x0D47A1), bw2, 36, "Vol_up");
+    lv_obj_set_pos(u_volup, bx + bw2 + gap, by);
+    by += 36 + gap;
+
+    // CH- | CH+
+    lv_obj_t *u_chdn = ur_make_func_btn(function_page,
+        "CH-", lv_color_hex(0x1B5E20), bw2, 36, "Ch_prev");
+    lv_obj_set_pos(u_chdn, bx, by);
+    lv_obj_t *u_chup = ur_make_func_btn(function_page,
+        "CH+", lv_color_hex(0x1B5E20), bw2, 36, "Ch_next");
+    lv_obj_set_pos(u_chup, bx + bw2 + gap, by);
+    by += 36 + gap;
+
+    // Input | Mute
+    lv_obj_t *u_input = ur_make_func_btn(function_page,
+        "Input", lv_color_hex(0x4A148C), bw2, 36, "Input");
+    lv_obj_set_pos(u_input, bx, by);
+    lv_obj_t *u_mute = ur_make_func_btn(function_page,
+        "Mute", lv_color_hex(0x4A148C), bw2, 36, "Mute");
+    lv_obj_set_pos(u_mute, bx + bw2 + gap, by);
 
     rfhat_add_back_btn("Infrared", show_ir_menu_screen);
 }
