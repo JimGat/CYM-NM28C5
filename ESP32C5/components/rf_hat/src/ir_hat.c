@@ -192,29 +192,6 @@ ir_hat_err_t ir_hat_init(void)
 {
     if (s_init) return IR_HAT_OK;
 
-    // DEBUG: probe free RMT channels before allocation.
-    // ESP32-C5: 2 TX (ch0-1) + 2 RX (ch2-3), 48 words/channel.
-    // mem_block_symbols > 48 → mem_block_num > 1 → chaining.
-    // TX chaining at j=1 steals bit-2 (RX ch0) from the occupy_mask!
-    {
-        int free_tx = 0, free_rx = 0;
-        rmt_channel_handle_t p[4] = {};
-        rmt_tx_channel_config_t tcp = {
-            .clk_src = RMT_CLK_SRC_DEFAULT, .gpio_num = RF_HAT_IR_TX_GPIO,
-            .mem_block_symbols = 48, .resolution_hz = IR_RMT_RES_HZ,
-            .trans_queue_depth = 1, .flags.with_dma = false,
-        };
-        rmt_rx_channel_config_t rcp = {
-            .clk_src = RMT_CLK_SRC_DEFAULT, .gpio_num = RF_HAT_IR_RX_GPIO,
-            .mem_block_symbols = 48, .resolution_hz = IR_RMT_RES_HZ,
-            .flags.with_dma = false,
-        };
-        while (free_tx < 2 && rmt_new_tx_channel(&tcp, &p[free_tx]) == ESP_OK) free_tx++;
-        while (free_rx < 2 && rmt_new_rx_channel(&rcp, &p[free_tx + free_rx]) == ESP_OK) free_rx++;
-        ESP_LOGI(TAG, "RMT probe: free TX=%d, free RX=%d (ESP32-C5 has 2+2)", free_tx, free_rx);
-        for (int k = free_tx + free_rx - 1; k >= 0; k--) rmt_del_channel(p[k]);
-    }
-
     s_rx_queue = xQueueCreate(4, sizeof(rmt_rx_done_event_data_t));
     if (!s_rx_queue) return IR_HAT_ERR_HW;
 
