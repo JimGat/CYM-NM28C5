@@ -120,6 +120,9 @@ static esp_err_t init_led(void) {
     led_strip_rmt_config_t rmt_cfg = {
         .clk_src = LED_STRIP_RMT_CLK_SRC_DEFAULT,
         .resolution_hz = RMT_RES_HZ,
+        // ESP32-C5 has only 48 words/channel; without this cap the driver chains
+        // 2 TX channels (consuming all available TX channels) and leaves none for IR.
+        .mem_block_symbols = 48,
         .flags.with_dma = false,
     };
     
