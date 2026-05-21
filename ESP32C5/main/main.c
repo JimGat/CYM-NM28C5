@@ -6678,9 +6678,12 @@ void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_
         while (true) {
             if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                 esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
-                xSemaphoreGive(sd_spi_mutex);
-                // Wait for DMA completion ISR, then signal LVGL from task context
+                // Hold mutex until DMA completes. Releasing before the semaphore
+                // creates a window where another task can start an SPI transaction
+                // on the shared bus while display DMA is still running — causing
+                // the ST7789 column-counter to desync and produce a vertical tear.
                 xSemaphoreTake(flush_done_sem, pdMS_TO_TICKS(1000));
+                xSemaphoreGive(sd_spi_mutex);
                 lv_disp_flush_ready(drv);
                 return;
             }
