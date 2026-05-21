@@ -205,7 +205,10 @@ rf433_hat_err_t rf433_hat_init(void)
         .intr_type    = GPIO_INTR_ANYEDGE,
     };
     if (gpio_config(&rx_cfg) != ESP_OK) goto fail;
-    gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+    // ESP_ERR_INVALID_STATE means the service is already installed (e.g. after a
+    // deinit that didn't call gpio_uninstall_isr_service). That's fine — reuse it.
+    esp_err_t isr_err = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+    if (isr_err != ESP_OK && isr_err != ESP_ERR_INVALID_STATE) goto fail;
     gpio_isr_handler_add(RF_HAT_RF433_RX_GPIO, s_gpio_isr, NULL);
 
     s_setup_tx();

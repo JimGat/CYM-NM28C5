@@ -35937,16 +35937,19 @@ static int rf433_lbk_phase(int tx_pin, int rx_pin)
     gpio_config(&ocfg);
     gpio_config(&icfg);
 
-    // 30 ms continuous carrier so RX module AGC can lock before we start counting
+    // 200 ms continuous carrier so super-regenerative RX AGC fully locks.
+    // Cheap XY-MK-5V style modules need 100–300 ms with carrier present before
+    // their output stabilises — 30 ms is not enough.
     gpio_set_level(tx_pin, 1);
-    vTaskDelay(pdMS_TO_TICKS(30));
+    vTaskDelay(pdMS_TO_TICKS(200));
 
-    // 30 OOK cycles × 2 × 5 ms = 300 ms; sample RX after each half-cycle
+    // 20 OOK cycles × 2 × 15 ms = 600 ms; wider pulses give the demodulator
+    // enough time to respond between transitions.
     int transitions = 0;
     int prev = gpio_get_level(rx_pin);
-    for (int i = 0; i < 60; i++) {
+    for (int i = 0; i < 40; i++) {
         gpio_set_level(tx_pin, (i & 1) ? 0 : 1);
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(pdMS_TO_TICKS(15));
         int cur = gpio_get_level(rx_pin);
         if (cur != prev) { transitions++; prev = cur; }
     }
@@ -36045,7 +36048,7 @@ static void show_rf433_loopback_screen(void)
     lv_label_set_text(desc,
         "OOK loopback: transmits on TX GPIO,\n"
         "listens on RX GPIO for carrier echo.\n"
-        "Requires DIP 5 ON. ~750 ms.");
+        "Requires DIP 5 ON. ~2 s per phase.");
     lv_obj_set_style_text_font(desc, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(desc, ui_text_color(), 0);
     lv_obj_set_style_text_align(desc, LV_TEXT_ALIGN_CENTER, 0);
