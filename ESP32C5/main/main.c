@@ -35989,13 +35989,13 @@ static void rf433_lbk_task(void *arg)
 
     // Build result string — use LVGL recolor syntax
     char result[220];
-    if (a >= 8) {
+    if (a >= 6) {
         snprintf(result, sizeof(result),
             "#00C853 CONFIRMED#\n"
             "GPIO%d = TX   GPIO%d = RX\n"
             "Edges: %d (A) / %d (B)",
             RF_HAT_RF433_TX_GPIO, RF_HAT_RF433_RX_GPIO, a, b);
-    } else if (b >= 8) {
+    } else if (b >= 6) {
         snprintf(result, sizeof(result),
             "#FFD600 SWAPPED DETECTED#\n"
             "GPIO%d = TX   GPIO%d = RX\n"
