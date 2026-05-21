@@ -234,6 +234,31 @@ rfid_err_t pn532_driver_init(void)
             }
         }
 
+        // If SDA was stuck AND the drive-HIGH test showed it can't be overridden,
+        // the PN532 is using push-pull drive (UART TX or SPI MISO), not open-drain I2C.
+        // An I2C slave open-drain cannot sink more than ~1-2 mA; our GPIO sources ~40 mA.
+        // If sda_hi == 0 (SDA reads LOW even while we drove it HIGH), it's push-pull.
+        // Return now — skip I2C entirely to avoid the ~3s WDT-triggering delay.
+        if (sda_hi == 0) {
+            ESP_LOGE(TAG, "====================================================");
+            ESP_LOGE(TAG, "PN532 NOT IN I2C MODE — push-pull SDA detected");
+            ESP_LOGE(TAG, "GPIO%d reads LOW even while driven HIGH (our 40mA output lost).",
+                     RF_HAT_PN532_SDA_GPIO);
+            ESP_LOGE(TAG, "I2C slaves use open-drain; this is a push-pull TX/MISO driver.");
+            ESP_LOGE(TAG, "");
+            ESP_LOGE(TAG, "ACTION: Set the I2C mode jumper ON THE PN532 MODULE ITSELF:");
+            ESP_LOGE(TAG, "  Elechouse v4 board: tiny DIP switch ON the module (2 switches)");
+            ESP_LOGE(TAG, "    HSU/UART = SW1=OFF SW2=OFF  (factory default on many units)");
+            ESP_LOGE(TAG, "    SPI      = SW1=OFF SW2=ON");
+            ESP_LOGE(TAG, "    I2C      = SW1=ON  SW2=OFF  <-- SET THIS");
+            ESP_LOGE(TAG, "  Waveshare: slide switch labelled HSU/SPI/I2C — pick I2C");
+            ESP_LOGE(TAG, "  Bare chip: SEL0 pin HIGH, SEL1 pin LOW at power-on");
+            ESP_LOGE(TAG, "====================================================");
+            gpio_reset_pin((gpio_num_t)RF_HAT_PN532_SCL_GPIO);
+            gpio_reset_pin((gpio_num_t)RF_HAT_PN532_SDA_GPIO);
+            return RFID_ERR_HW;
+        }
+
         // Reset before I2C init — clears GPIO matrix routing and driver reservation.
         gpio_reset_pin((gpio_num_t)RF_HAT_PN532_SCL_GPIO);
         gpio_reset_pin((gpio_num_t)RF_HAT_PN532_SDA_GPIO);
@@ -282,12 +307,12 @@ rfid_err_t pn532_driver_init(void)
     }
     vTaskDelay(pdMS_TO_TICKS(20));
 
-    // Poll for RDY byte — PN532 signals 0x01 when it's ready to receive a command.
-    // Try up to 20 times (1 second total) in case the chip is still initializing.
+    // Poll for RDY byte — PN532 signals 0x01 when ready to receive a command.
+    // Only try 5 times (250ms): if the wakeup write NACK'd, more polls won't help.
     {
         uint8_t rdy = 0;
         esp_err_t re = ESP_ERR_TIMEOUT;
-        for (int i = 0; i < 20; i++) {
+        for (int i = 0; i < 5; i++) {
             re = i2c_master_receive(s_dev, &rdy, 1, pdMS_TO_TICKS(PN532_I2C_TIMEOUT));
             if (re == ESP_OK) {
                 ESP_LOGI(TAG, "I2C ready poll [%d]: RDY=0x%02X %s",
@@ -299,7 +324,7 @@ rfid_err_t pn532_driver_init(void)
             vTaskDelay(pdMS_TO_TICKS(50));
         }
         if (re != ESP_OK) {
-            ESP_LOGW(TAG, "PN532 not responding after 1s — check: DIP 3 ON, I2C jumper set on module");
+            ESP_LOGW(TAG, "PN532 not responding — check: DIP 3 ON, I2C mode jumper on module");
         } else if (rdy != 0x01) {
             ESP_LOGW(TAG, "PN532 responding but RDY=0x%02X (not 0x01) — may still need time", rdy);
         }
@@ -429,20 +454,18 @@ int pn532_i2c_scan(uint8_t *addrs_out, int max_addrs)
 {
     if (!s_init || !s_bus) return -1;
     int found = 0;
-    ESP_LOGI(TAG, "I2C scan: SDA=GPIO%d SCL=GPIO%d  probing 0x01-0x7F...",
+    // Only probe address 0x24 (PN532's hardwired I2C address).
+    // Scanning 0x01-0x7F takes 1.27s of 10ms timeouts — triggers WDT in main task.
+    ESP_LOGI(TAG, "I2C scan: SDA=GPIO%d SCL=GPIO%d  probing 0x24 (PN532)...",
              RF_HAT_PN532_SDA_GPIO, RF_HAT_PN532_SCL_GPIO);
-    for (uint16_t addr = 1; addr < 128; addr++) {
-        esp_err_t e = i2c_master_probe(s_bus, addr, 10);
-        if (e == ESP_OK) {
-            ESP_LOGI(TAG, "  [FOUND] 0x%02X", (unsigned)addr);
-            if (addrs_out && found < max_addrs)
-                addrs_out[found] = (uint8_t)addr;
-            found++;
-        }
+    esp_err_t e = i2c_master_probe(s_bus, PN532_I2C_ADDR, 10);
+    if (e == ESP_OK) {
+        ESP_LOGI(TAG, "  [FOUND] 0x%02X — PN532 on bus!", PN532_I2C_ADDR);
+        if (addrs_out && max_addrs > 0) addrs_out[0] = PN532_I2C_ADDR;
+        found = 1;
+    } else {
+        ESP_LOGW(TAG, "  0x24 not found (%s) — PN532 not in I2C mode or DIP 3 OFF",
+                 esp_err_to_name(e));
     }
-    if (found == 0)
-        ESP_LOGW(TAG, "  no devices found — check DIP 3 ON and PN532 I2C mode jumper");
-    else
-        ESP_LOGI(TAG, "  scan complete: %d device(s) found", found);
     return found;
 }
