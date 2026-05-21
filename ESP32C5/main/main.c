@@ -31482,29 +31482,10 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
  */
 static int bt_start_scan(void)
 {
-#if MYNEWT_VAL(BLE_EXT_ADV)
-    // Active scan on both 1M and Coded PHY simultaneously
-    struct ble_gap_ext_disc_params p1m = {
-        .itvl    = 0x60,   // 60 ms interval (0.625 ms units)
-        .window  = 0x60,   // 60 ms window — continuous
-        .passive = 0,      // active: send scan requests to get Scan Responses
-    };
-    struct ble_gap_ext_disc_params pcoded = {
-        .itvl    = 0x60,
-        .window  = 0x60,
-        .passive = 0,
-    };
-    int rc = ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC,
-                              0,    // duration: 0 = scan until cancelled
-                              0,    // period: 0 = no periodic scheduling
-                              0,    // filter_duplicates: we dedup ourselves
-                              BLE_HCI_SCAN_FILT_NO_WL,
-                              0,    // limited
-                              &p1m,
-                              &pcoded,
-                              bt_gap_event_callback, NULL);
-    return rc;
-#else
+    // ble_gap_ext_disc() (BLE 5 extended scan) returns BLE_ERR_MEM_CAPACITY on
+    // ESP32-C5 when internal RAM is tight after WiFi deinit + BLE init.  The
+    // controller needs extra buffers for variable-length extended advertising PDUs.
+    // Legacy ble_gap_disc() works correctly and finds all normal BLE devices.
     struct ble_gap_disc_params scan_params = {
         .itvl = 0x60,
         .window = 0x60,
@@ -31515,7 +31496,6 @@ static int bt_start_scan(void)
     };
     return ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &scan_params,
                         bt_gap_event_callback, NULL);
-#endif
 }
 
 /**
