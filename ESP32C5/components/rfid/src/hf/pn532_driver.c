@@ -178,10 +178,49 @@ rfid_err_t pn532_driver_init(void)
                      "— GPIO not connected or pull-up too strong",
                      scl_lo == 1 ? "SCL " : "", sda_lo == 1 ? "SDA " : "");
 
+        // ── I2C bus recovery (9-clock release) ───────────────────────────────
+        // SDA stuck LOW means the PN532 is holding SDA mid-transaction —
+        // clocking SCL 9 times lets the slave shift out its state and release.
+        if (sda_pu == 0) {
+            ESP_LOGW(TAG, "SDA stuck — bus recovery: clocking SCL 9x");
+            gpio_set_direction((gpio_num_t)RF_HAT_PN532_SCL_GPIO, GPIO_MODE_OUTPUT);
+            gpio_set_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO, 1);
+            gpio_set_pull_mode((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_PULLUP_ONLY);
+            gpio_set_direction((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_MODE_INPUT);
+            vTaskDelay(pdMS_TO_TICKS(1));
+            bool recovered = false;
+            for (int i = 0; i < 9; i++) {
+                gpio_set_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO, 0);
+                vTaskDelay(pdMS_TO_TICKS(1));
+                gpio_set_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO, 1);
+                vTaskDelay(pdMS_TO_TICKS(1));
+                if (gpio_get_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO)) {
+                    ESP_LOGI(TAG, "  SDA released after %d clock(s)", i + 1);
+                    recovered = true;
+                    break;
+                }
+            }
+            // STOP condition: SCL HIGH, SDA LOW→HIGH
+            gpio_set_direction((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_MODE_OUTPUT);
+            gpio_set_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO, 1);
+            gpio_set_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO, 0);
+            vTaskDelay(pdMS_TO_TICKS(1));
+            gpio_set_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO, 1);
+            vTaskDelay(pdMS_TO_TICKS(5));
+            gpio_set_direction((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_MODE_INPUT);
+            gpio_set_pull_mode((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_PULLUP_ONLY);
+            vTaskDelay(pdMS_TO_TICKS(10));
+            int sda_after = gpio_get_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO);
+            ESP_LOGI(TAG, "SDA after recovery: %d %s",
+                     sda_after, sda_after ? "(bus free)" : "(STILL STUCK — hardware fault)");
+            if (!recovered && !sda_after)
+                ESP_LOGE(TAG, "*** 9-clock recovery failed: SDA still held LOW by PN532 or PCB short");
+        }
+
         // Reset before I2C init
         gpio_reset_pin((gpio_num_t)RF_HAT_PN532_SCL_GPIO);
         gpio_reset_pin((gpio_num_t)RF_HAT_PN532_SDA_GPIO);
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 
     i2c_master_bus_config_t bus_cfg = {
