@@ -1823,6 +1823,7 @@ static void show_rf433_capture_screen(void);
 static void show_rf433_replay_screen(void);
 static void show_rf433_signal_list_screen(void);
 static void show_rf433_jammer_screen(void);
+static void show_rf433_loopback_screen(void);
 static void show_vibrator_test_popup(void);
 static void run_touch_calibration(void);
 void vibrator_on(void);
@@ -35906,18 +35907,203 @@ static void show_ir_jammer_screen(void)
     rfhat_add_back_btn("Infrared", show_ir_menu_screen);
 }
 
+// ── RF433 Loopback Test ───────────────────────────────────────────────────────
+//
+// Sends an OOK burst on the TX GPIO, counts rising/falling edges on the RX GPIO.
+// The TX and RX modules are adjacent on the HAT so carrier leakage is sufficient.
+// Tests both GPIO orientations and reports which (if any) shows loopback signal.
+
+static lv_obj_t *s_lbk_status_lbl = NULL;
+static lv_obj_t *s_lbk_result_lbl = NULL;
+static lv_obj_t *s_lbk_retry_btn  = NULL;
+
+// Drive tx_pin with OOK pattern, count transitions on rx_pin. Returns edge count.
+static int rf433_lbk_phase(int tx_pin, int rx_pin)
+{
+    gpio_config_t ocfg = {
+        .pin_bit_mask = 1ULL << tx_pin,
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config_t icfg = {
+        .pin_bit_mask = 1ULL << rx_pin,
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&ocfg);
+    gpio_config(&icfg);
+
+    // 30 ms continuous carrier so RX module AGC can lock before we start counting
+    gpio_set_level(tx_pin, 1);
+    vTaskDelay(pdMS_TO_TICKS(30));
+
+    // 30 OOK cycles × 2 × 5 ms = 300 ms; sample RX after each half-cycle
+    int transitions = 0;
+    int prev = gpio_get_level(rx_pin);
+    for (int i = 0; i < 60; i++) {
+        gpio_set_level(tx_pin, (i & 1) ? 0 : 1);
+        vTaskDelay(pdMS_TO_TICKS(5));
+        int cur = gpio_get_level(rx_pin);
+        if (cur != prev) { transitions++; prev = cur; }
+    }
+    gpio_set_level(tx_pin, 0);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    return transitions;
+}
+
+static void rf433_lbk_task(void *arg)
+{
+    // Phase 1 — current firmware config: GPIO8 TX → GPIO9 RX
+    if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        if (lv_obj_is_valid(s_lbk_status_lbl))
+            lv_label_set_text_fmt(s_lbk_status_lbl,
+                "Phase 1/2: GPIO%d TX -> GPIO%d RX...",
+                RF_HAT_RF433_TX_GPIO, RF_HAT_RF433_RX_GPIO);
+        xSemaphoreGive(lvgl_mutex);
+    }
+    int a = rf433_lbk_phase(RF_HAT_RF433_TX_GPIO, RF_HAT_RF433_RX_GPIO);
+
+    // Phase 2 — swapped: GPIO9 TX → GPIO8 RX
+    if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        if (lv_obj_is_valid(s_lbk_status_lbl))
+            lv_label_set_text_fmt(s_lbk_status_lbl,
+                "Phase 2/2: GPIO%d TX -> GPIO%d RX...",
+                RF_HAT_RF433_RX_GPIO, RF_HAT_RF433_TX_GPIO);
+        xSemaphoreGive(lvgl_mutex);
+    }
+    int b = rf433_lbk_phase(RF_HAT_RF433_RX_GPIO, RF_HAT_RF433_TX_GPIO);
+
+    ESP_LOGI(TAG, "[RF433 LBK] config-A (GPIO%d TX): %d transitions  "
+                  "config-B (GPIO%d TX): %d transitions",
+             RF_HAT_RF433_TX_GPIO, a, RF_HAT_RF433_RX_GPIO, b);
+
+    // Restore RF433 driver
+    rf433_hat_init();
+
+    // Build result string — use LVGL recolor syntax
+    char result[220];
+    if (a >= 8) {
+        snprintf(result, sizeof(result),
+            "#00C853 CONFIRMED#\n"
+            "GPIO%d = TX   GPIO%d = RX\n"
+            "Edges: %d (A) / %d (B)",
+            RF_HAT_RF433_TX_GPIO, RF_HAT_RF433_RX_GPIO, a, b);
+    } else if (b >= 8) {
+        snprintf(result, sizeof(result),
+            "#FFD600 SWAPPED DETECTED#\n"
+            "GPIO%d = TX   GPIO%d = RX\n"
+            "Edges: %d (A) / %d (B)\n"
+            "Update rf_hat_config.h defines!",
+            RF_HAT_RF433_RX_GPIO, RF_HAT_RF433_TX_GPIO, a, b);
+    } else {
+        snprintf(result, sizeof(result),
+            "#FF5722 NO LOOPBACK#\n"
+            "Check DIP 5 is ON.\n"
+            "Edges: %d (A) / %d (B)",
+            a, b);
+    }
+
+    if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        if (lv_obj_is_valid(s_lbk_status_lbl))
+            lv_label_set_text(s_lbk_status_lbl, "Complete.");
+        if (lv_obj_is_valid(s_lbk_result_lbl)) {
+            lv_label_set_recolor(s_lbk_result_lbl, true);
+            lv_label_set_text(s_lbk_result_lbl, result);
+        }
+        if (lv_obj_is_valid(s_lbk_retry_btn))
+            lv_obj_clear_flag(s_lbk_retry_btn, LV_OBJ_FLAG_HIDDEN);
+        xSemaphoreGive(lvgl_mutex);
+    }
+    vTaskDelete(NULL);
+}
+
+static void rf433_lbk_run(void)
+{
+    rf433_hat_capture_cancel();
+    rf433_hat_deinit();
+    if (lv_obj_is_valid(s_lbk_result_lbl)) lv_label_set_text(s_lbk_result_lbl, "");
+    if (lv_obj_is_valid(s_lbk_retry_btn))  lv_obj_add_flag(s_lbk_retry_btn, LV_OBJ_FLAG_HIDDEN);
+    if (lv_obj_is_valid(s_lbk_status_lbl)) lv_label_set_text(s_lbk_status_lbl, "Initializing...");
+    xTaskCreate(rf433_lbk_task, "rf433_lbk", 3072, NULL, tskIDLE_PRIORITY + 2, NULL);
+}
+
+static void rf433_lbk_retry_cb(lv_event_t *e) { rf433_lbk_run(); }
+
+static void show_rf433_loopback_screen(void)
+{
+    create_function_page_base("RF433 LBK Test");
+    apply_menu_bg();
+    s_lbk_status_lbl = NULL;
+    s_lbk_result_lbl = NULL;
+    s_lbk_retry_btn  = NULL;
+
+    lv_obj_t *desc = lv_label_create(function_page);
+    lv_label_set_text(desc,
+        "OOK loopback: transmits on TX GPIO,\n"
+        "listens on RX GPIO for carrier echo.\n"
+        "Requires DIP 5 ON. ~750 ms.");
+    lv_obj_set_style_text_font(desc, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(desc, ui_text_color(), 0);
+    lv_obj_set_style_text_align(desc, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(desc, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(desc, LCD_H_RES - 16);
+    lv_obj_align(desc, LV_ALIGN_TOP_MID, 0, 36);
+
+    s_lbk_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_lbk_status_lbl, "");
+    lv_obj_set_style_text_font(s_lbk_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_lbk_status_lbl, lv_color_hex(0x80CBC4), 0);
+    lv_obj_set_style_text_align(s_lbk_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_lbk_status_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_lbk_status_lbl, LCD_H_RES - 16);
+    lv_obj_align(s_lbk_status_lbl, LV_ALIGN_TOP_MID, 0, 118);
+
+    s_lbk_result_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_lbk_result_lbl, "");
+    lv_obj_set_style_text_font(s_lbk_result_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_align(s_lbk_result_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_lbk_result_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_lbk_result_lbl, LCD_H_RES - 16);
+    lv_obj_align(s_lbk_result_lbl, LV_ALIGN_TOP_MID, 0, 152);
+
+    s_lbk_retry_btn = lv_btn_create(function_page);
+    lv_obj_set_size(s_lbk_retry_btn, 140, 38);
+    lv_obj_align(s_lbk_retry_btn, LV_ALIGN_BOTTOM_MID, 0, -52);
+    lv_obj_set_style_bg_color(s_lbk_retry_btn, lv_color_hex(0x37474F), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(s_lbk_retry_btn, 0, 0);
+    lv_obj_set_style_radius(s_lbk_retry_btn, 8, 0);
+    lv_obj_t *rlbl = lv_label_create(s_lbk_retry_btn);
+    lv_label_set_text(rlbl, LV_SYMBOL_REFRESH "  Retry");
+    lv_obj_set_style_text_font(rlbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(rlbl, lv_color_white(), 0);
+    lv_obj_center(rlbl);
+    lv_obj_add_flag(s_lbk_retry_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_lbk_retry_btn, rf433_lbk_retry_cb, LV_EVENT_CLICKED, NULL);
+
+    rfhat_add_back_btn("RF433", show_rf433_menu_screen);
+
+    rf433_lbk_run();
+}
+
 // ── RF433 Menu ────────────────────────────────────────────────────────────────
 
 static void rf433_menu_tile_cb(lv_event_t *e)
 {
     const char *name = (const char *)lv_event_get_user_data(e);
     if (!name) return;
+    ESP_LOGI(TAG, "[UI] RF433 %s", name);
     if (strcmp(name, "Capture") == 0)
         show_rf433_capture_screen();
     else if (strcmp(name, "Replay") == 0)
         show_rf433_replay_screen();
     else if (strcmp(name, "Jammer") == 0)
         show_rf433_jammer_screen();
+    else if (strcmp(name, "LBK Test") == 0)
+        show_rf433_loopback_screen();
 }
 
 static void show_rf433_menu_screen(void)
@@ -35936,9 +36122,10 @@ static void show_rf433_menu_screen(void)
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
 
-    create_tile(tiles, LV_SYMBOL_AUDIO,   "Capture", lv_color_hex(0x827717), rf433_menu_tile_cb, "Capture");
-    create_tile(tiles, LV_SYMBOL_PLAY,    "Replay",  lv_color_hex(0x5D4037), rf433_menu_tile_cb, "Replay");
-    create_tile(tiles, LV_SYMBOL_WARNING, "Jammer",  lv_color_hex(0xB71C1C), rf433_menu_tile_cb, "Jammer");
+    create_tile(tiles, LV_SYMBOL_AUDIO,   "Capture",  lv_color_hex(0x827717), rf433_menu_tile_cb, "Capture");
+    create_tile(tiles, LV_SYMBOL_PLAY,    "Replay",   lv_color_hex(0x5D4037), rf433_menu_tile_cb, "Replay");
+    create_tile(tiles, LV_SYMBOL_WARNING, "Jammer",   lv_color_hex(0xB71C1C), rf433_menu_tile_cb, "Jammer");
+    create_tile(tiles, LV_SYMBOL_LOOP,    "LBK Test", lv_color_hex(0x00695C), rf433_menu_tile_cb, "LBK Test");
 
     rfhat_add_back_btn("Radio", show_radio_menu_screen);
 }
