@@ -12662,6 +12662,7 @@ static void main_tile_event_cb(lv_event_t *e)
 {
     const char *tile_name = (const char *)lv_event_get_user_data(e);
     if (!tile_name) return;
+    ESP_LOGI(TAG, "[UI] %s", tile_name);
 
     // Reset disco tap counter on any non-Settings tile
     if (strcmp(tile_name, "Settings") != 0) {
@@ -12723,7 +12724,8 @@ static void attack_tile_event_cb(lv_event_t *e)
 {
     const char *attack_name = (const char *)lv_event_get_user_data(e);
     if (!attack_name) return;
-    
+    ESP_LOGI(TAG, "[UI] %s", attack_name);
+
     // Route to existing attack handlers
     if (strcmp(attack_name, "Deauth") == 0) {
         // Redirect to "Deauther" handler in attack_event_cb with a synthetic event
@@ -15752,7 +15754,8 @@ static void wifi_monitor_tile_event_cb(lv_event_t *e)
 {
     const char *tile_name = (const char *)lv_event_get_user_data(e);
     if (!tile_name) return;
-    
+    ESP_LOGI(TAG, "[UI] %s", tile_name);
+
     if (strcmp(tile_name, "Evil Twin Passwords") == 0) {
         show_eviltwin_passwords_screen();
     } else if (strcmp(tile_name, "Portal Data") == 0) {
@@ -20689,7 +20692,8 @@ static void settings_tile_event_cb(lv_event_t *e)
 {
     const char *tile_name = (const char *)lv_event_get_user_data(e);
     if (!tile_name) return;
-    
+    ESP_LOGI(TAG, "[UI] %s", tile_name);
+
     if (strcmp(tile_name, "Compromised Data") == 0) {
         show_wifi_monitor_screen();
     } else if (strcmp(tile_name, "Timing") == 0) {
@@ -29566,6 +29570,7 @@ void attack_event_cb(lv_event_t *e)
 {
     const char *attack_name = (const char *)lv_event_get_user_data(e);
     if (!attack_name) return;
+    ESP_LOGI(TAG, "[UI] %s", attack_name);
 
     if (strcmp(attack_name, "Scan") == 0) {
         // Ensure WiFi mode is active (switch from BLE if needed)
