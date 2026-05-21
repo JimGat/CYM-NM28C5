@@ -112,12 +112,77 @@ rfid_err_t pn532_driver_init(void)
 {
     if (s_init) return RFID_OK;
 
-    // Release GPIO pins from any previous peripheral (RMT from IR/RF433) before
-    // I2C claims them. Without this, RMT idle-LOW holds SCL low and every I2C
-    // transaction times out instead of getting a clean NACK.
+    // Release GPIO pins from any previous peripheral (RMT from IR/RF433).
     gpio_reset_pin((gpio_num_t)RF_HAT_PN532_SCL_GPIO);
     gpio_reset_pin((gpio_num_t)RF_HAT_PN532_SDA_GPIO);
-    vTaskDelay(pdMS_TO_TICKS(10));
+
+    // ── GPIO level diagnostic ─────────────────────────────────────────────────
+    // Configure as input with pull-up and read line levels.
+    // Both lines must idle HIGH for I2C to work. A stuck-LOW reading means a
+    // physical short to GND, a device pulling the bus, or wrong GPIO mapping.
+    {
+        gpio_config_t gc = {
+            .pin_bit_mask = (1ULL << RF_HAT_PN532_SCL_GPIO) |
+                            (1ULL << RF_HAT_PN532_SDA_GPIO),
+            .mode         = GPIO_MODE_INPUT,
+            .pull_up_en   = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&gc);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        int scl_pu = gpio_get_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO);
+        int sda_pu = gpio_get_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO);
+        ESP_LOGI(TAG, "BUS IDLE (pull-up): SCL(GPIO%d)=%d  SDA(GPIO%d)=%d  [expect both 1]",
+                 RF_HAT_PN532_SCL_GPIO, scl_pu, RF_HAT_PN532_SDA_GPIO, sda_pu);
+
+        // Drive both HIGH as output, then switch to input and read back.
+        // If either reads LOW while driven HIGH → physical short to GND.
+        gpio_set_direction((gpio_num_t)RF_HAT_PN532_SCL_GPIO, GPIO_MODE_OUTPUT);
+        gpio_set_direction((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_MODE_OUTPUT);
+        gpio_set_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO, 1);
+        gpio_set_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(5));
+        gpio_set_direction((gpio_num_t)RF_HAT_PN532_SCL_GPIO, GPIO_MODE_INPUT);
+        gpio_set_direction((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_MODE_INPUT);
+        vTaskDelay(pdMS_TO_TICKS(5));
+        int scl_hi = gpio_get_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO);
+        int sda_hi = gpio_get_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO);
+        ESP_LOGI(TAG, "BUS DRIVE-HIGH:     SCL(GPIO%d)=%d  SDA(GPIO%d)=%d  [expect both 1]",
+                 RF_HAT_PN532_SCL_GPIO, scl_hi, RF_HAT_PN532_SDA_GPIO, sda_hi);
+
+        // Drive both LOW, read back — confirms GPIO output actually works.
+        gpio_set_direction((gpio_num_t)RF_HAT_PN532_SCL_GPIO, GPIO_MODE_OUTPUT);
+        gpio_set_direction((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_MODE_OUTPUT);
+        gpio_set_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO, 0);
+        gpio_set_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO, 0);
+        vTaskDelay(pdMS_TO_TICKS(5));
+        gpio_set_direction((gpio_num_t)RF_HAT_PN532_SCL_GPIO, GPIO_MODE_INPUT);
+        gpio_set_direction((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_MODE_INPUT);
+        vTaskDelay(pdMS_TO_TICKS(5));
+        int scl_lo = gpio_get_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO);
+        int sda_lo = gpio_get_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO);
+        ESP_LOGI(TAG, "BUS DRIVE-LOW:      SCL(GPIO%d)=%d  SDA(GPIO%d)=%d  [expect both 0]",
+                 RF_HAT_PN532_SCL_GPIO, scl_lo, RF_HAT_PN532_SDA_GPIO, sda_lo);
+
+        if (scl_pu == 0 || sda_pu == 0)
+            ESP_LOGE(TAG, "*** LINE STUCK LOW (pull-up): %s%s"
+                     "— short to GND, wrong GPIO, or device actively pulling bus",
+                     scl_pu == 0 ? "SCL " : "", sda_pu == 0 ? "SDA " : "");
+        if (scl_hi == 0 || sda_hi == 0)
+            ESP_LOGE(TAG, "*** LINE STUCK LOW (drive-HIGH): %s%s"
+                     "— hard short to GND on these GPIO pins",
+                     scl_hi == 0 ? "SCL " : "", sda_hi == 0 ? "SDA " : "");
+        if (scl_lo == 1 || sda_lo == 1)
+            ESP_LOGE(TAG, "*** LINE STUCK HIGH (drive-LOW): %s%s"
+                     "— GPIO not connected or pull-up too strong",
+                     scl_lo == 1 ? "SCL " : "", sda_lo == 1 ? "SDA " : "");
+
+        // Reset before I2C init
+        gpio_reset_pin((gpio_num_t)RF_HAT_PN532_SCL_GPIO);
+        gpio_reset_pin((gpio_num_t)RF_HAT_PN532_SDA_GPIO);
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
 
     i2c_master_bus_config_t bus_cfg = {
         .i2c_port = PN532_I2C_PORT,
