@@ -41,8 +41,14 @@ static rf433_signal_t   *s_cap_buf    = NULL;
 static bool s_init    = false;
 static bool s_tx_init = false;
 
-// Shared large I/O buffer — not re-entrant, all file ops from LVGL callback context.
-static char s_io_line[8192];
+// Large I/O buffer — PSRAM-allocated on first use (8 KB out of scarce internal DRAM).
+#define S_IO_LINE_LEN 8192
+static char *s_io_line = NULL;
+static inline bool s_ensure_io_line(void) {
+    if (s_io_line) return true;
+    s_io_line = heap_caps_malloc(S_IO_LINE_LEN, MALLOC_CAP_SPIRAM);
+    return s_io_line != NULL;
+}
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
@@ -84,7 +90,7 @@ static rf433_hat_err_t s_read_sub(FILE *f, rf433_signal_t *sig_out)
     sig_out->freq_hz = RF433_HAT_DEFAULT_FREQ_HZ;
     sig_out->count   = 0;
 
-    while (fgets(s_io_line, sizeof(s_io_line), f)) {
+    while (fgets(s_io_line, S_IO_LINE_LEN, f)) {
         if (strncmp(s_io_line, "Frequency:", 10) == 0)
             sig_out->freq_hz = (uint32_t)strtoul(s_io_line + 10, NULL, 10);
         else if (strncmp(s_io_line, "RAW_Data:", 9) == 0) {
@@ -314,6 +320,7 @@ rf433_hat_err_t rf433_hat_load_signal_by_index(const char *remote_name, int inde
                                                 rf433_signal_t *sig_out)
 {
     if (!remote_name || !sig_out || index < 0) return RF433_HAT_ERR_IO;
+    if (!s_ensure_io_line()) return RF433_HAT_ERR_IO;
 
     char dir[128];
     s_make_remote_dir(remote_name, dir, sizeof(dir));
@@ -354,6 +361,7 @@ rf433_hat_err_t rf433_hat_load_signal(const char *remote_name, const char *signa
                                        rf433_signal_t *sig_out)
 {
     if (!remote_name || !signal_name || !sig_out) return RF433_HAT_ERR_IO;
+    if (!s_ensure_io_line()) return RF433_HAT_ERR_IO;
 
     char path[160];
     s_make_signal_path(remote_name, signal_name, path, sizeof(path));
