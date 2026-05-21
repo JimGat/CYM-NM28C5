@@ -35280,6 +35280,39 @@ static void show_whisperpair_screen(void)
 // FOR AUTHORIZED SECURITY RESEARCH AND EDUCATION ONLY.
 // ============================================================================
 
+// ── Shared GPIO8/9 exclusive-ownership helpers ────────────────────────────────
+// IR (RMT peripheral) and RF433 (GPIO-ISR) both route through GPIO8 and GPIO9.
+// The RMT peripheral wires itself into the GPIO matrix: even after gpio_config()
+// reconfigures the pad as output, gpio_set_level() is overridden by the RMT
+// signal mux until rmt_del_channel() releases it. Calling the claim helper
+// before activating either module guarantees the competing driver has released
+// the GPIO matrix before raw GPIO or the other peripheral touches those pins.
+
+static void ir_hat_claim(void)
+{
+    if (rf433_hat_is_init()) rf433_hat_deinit();
+    if (!ir_hat_is_init()) ir_hat_init();
+}
+
+static void rf433_hat_claim(void)
+{
+    if (ir_hat_is_init()) ir_hat_deinit();
+    if (!rf433_hat_is_init()) rf433_hat_init();
+}
+
+// Back-to-parent wrappers that release GPIO8/9 before leaving the module menu.
+static void show_main_tiles_from_ir(void)
+{
+    if (ir_hat_is_init()) ir_hat_deinit();
+    show_main_tiles();
+}
+
+static void show_radio_menu_screen_from_rf433(void)
+{
+    if (rf433_hat_is_init()) rf433_hat_deinit();
+    show_radio_menu_screen();
+}
+
 // ── Shared back-button helper ─────────────────────────────────────────────────
 
 static void rfhat_menu_back_cb(lv_event_t *e)
@@ -35349,7 +35382,7 @@ static void show_ir_menu_screen(void)
     create_tile(tiles, LV_SYMBOL_WARNING,      "Jammer",    lv_color_hex(0xB71C1C), ir_menu_tile_cb, "Jammer");
     create_tile(tiles, LV_SYMBOL_LOOP,         "Universal", lv_color_hex(0x00695C), ir_menu_tile_cb, "Universal");
 
-    rfhat_add_back_btn("Home", show_main_tiles);
+    rfhat_add_back_btn("Home", show_main_tiles_from_ir);
 }
 
 // ── IR Capture ────────────────────────────────────────────────────────────────
@@ -35394,7 +35427,7 @@ static void s_ir_capture_done(ir_hat_err_t result, const ir_signal_t *sig, void 
 static void ir_cap_start_cb(lv_event_t *e)
 {
     (void)e;
-    if (!ir_hat_is_init()) ir_hat_init();
+    ir_hat_claim();
     if (s_ir_cap_status_lbl) {
         lv_label_set_text(s_ir_cap_status_lbl, "Listening... (5s)");
         lv_obj_set_style_text_color(s_ir_cap_status_lbl, lv_color_hex(0xFFB300), 0);
@@ -35653,7 +35686,7 @@ static void ir_do_replay_cb(lv_event_t *e)
 {
     (void)e;
     if (s_ir_sel_signal < 0 || s_ir_sel_signal >= s_ir_signal_count) return;
-    if (!ir_hat_is_init()) ir_hat_init();
+    ir_hat_claim();
     if (s_ir_sig_status) {
         lv_label_set_text(s_ir_sig_status, "Transmitting...");
         lv_obj_set_style_text_color(s_ir_sig_status, ui_text_color(), 0);
@@ -35771,7 +35804,7 @@ static void tvbg_start_cb(lv_event_t *e)
 {
     (void)e;
     if (s_tvbg_running) return;
-    if (!ir_hat_is_init()) ir_hat_init();
+    ir_hat_claim();
     s_tvbg_running = true;
     if (s_tvbg_status)    lv_label_set_text(s_tvbg_status, "Transmitting...");
     if (s_tvbg_start_btn) lv_obj_add_state(s_tvbg_start_btn, LV_STATE_DISABLED);
@@ -35846,7 +35879,7 @@ static void ir_jam_toggle_cb(lv_event_t *e)
             if (lbl) lv_label_set_text(lbl, LV_SYMBOL_WARNING "  START JAM");
         }
     } else {
-        if (!ir_hat_is_init()) ir_hat_init();
+        ir_hat_claim();
         ir_hat_jam_start(0);
         if (s_ir_jam_status) lv_label_set_text(s_ir_jam_status, "JAMMING - 38kHz active");
         if (s_ir_jam_status) lv_obj_set_style_text_color(s_ir_jam_status, lv_color_hex(0xFF5722), 0);
@@ -35960,7 +35993,7 @@ static void ur_refresh_brand_ui(void)
 static ir_hat_err_t ur_try_signal(const char *remote, const char *sig_name)
 {
     static ir_signal_t s_ur_sig;
-    if (!ir_hat_is_init()) ir_hat_init();
+    ir_hat_claim();
     ir_hat_err_t r = ir_hat_load_signal(remote, sig_name, &s_ur_sig);
     if (r == IR_HAT_OK) ir_hat_replay(&s_ur_sig);
     return r;
@@ -36351,6 +36384,9 @@ static void rf433_lbk_task(void *arg)
 
 static void rf433_lbk_run(void)
 {
+    // IR uses RMT on GPIO8/9: rmt_del_channel() must be called before raw GPIO
+    // access or gpio_set_level() is silently overridden by the RMT signal mux.
+    if (ir_hat_is_init()) ir_hat_deinit();
     rf433_hat_capture_cancel();
     rf433_hat_deinit();
     if (lv_obj_is_valid(s_lbk_result_lbl)) lv_label_set_text(s_lbk_result_lbl, "");
@@ -36455,7 +36491,7 @@ static void show_rf433_menu_screen(void)
     create_tile(tiles, LV_SYMBOL_WARNING, "Jammer",   lv_color_hex(0xB71C1C), rf433_menu_tile_cb, "Jammer");
     create_tile(tiles, LV_SYMBOL_LOOP,    "LBK Test", lv_color_hex(0x00695C), rf433_menu_tile_cb, "LBK Test");
 
-    rfhat_add_back_btn("Radio", show_radio_menu_screen);
+    rfhat_add_back_btn("Radio", show_radio_menu_screen_from_rf433);
 }
 
 // ── Radio Menu ────────────────────────────────────────────────────────────────
@@ -36756,7 +36792,7 @@ static void s_rf433_done(rf433_hat_err_t result, const rf433_signal_t *sig, void
 static void rf433_cap_start_cb(lv_event_t *e)
 {
     (void)e;
-    if (!rf433_hat_is_init()) rf433_hat_init();
+    rf433_hat_claim();
     if (s_rf433_cap_status) {
         lv_label_set_text(s_rf433_cap_status, "Listening... (10s)");
         lv_obj_set_style_text_color(s_rf433_cap_status, lv_color_hex(0xFFB300), 0);
@@ -37008,7 +37044,7 @@ static void rf433_do_replay_cb(lv_event_t *e)
 {
     (void)e;
     if (s_rf433_sel_signal < 0 || s_rf433_sel_signal >= s_rf433_signal_count) return;
-    if (!rf433_hat_is_init()) rf433_hat_init();
+    rf433_hat_claim();
     if (s_rf433_sig_status) lv_label_set_text(s_rf433_sig_status, "Transmitting x3...");
     rf433_hat_err_t r = rf433_hat_load_signal_by_index(s_rf433_cur_remote,
                                                         s_rf433_sel_signal,
