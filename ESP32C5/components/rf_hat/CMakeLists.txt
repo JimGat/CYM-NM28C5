@@ -4,7 +4,6 @@ idf_component_register(
         "src/ir_hat.c"
         "src/rf433_hat.c"
         "src/radio_hat.c"
-        "src/rfid_hat.c"
     INCLUDE_DIRS "include"
     REQUIRES
         nvs_flash
