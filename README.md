@@ -76,6 +76,8 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
     - [Data Transfer](#data-transfer)
   - [NM-RF-HAT](#5-nm-rf-hat)
     - [Infrared (DIP 4)](#infrared-dip-4)
+      - [Universal Remote](#universal-remote)
+      - [TV-B-Gone](#tv-b-gone)
     - [RF433 OOK/ASK (DIP 5)](#rf433-ookask-dip-5)
     - [PN532 NFC/RFID (DIP 3)](#pn532-nfcrfid-dip-3)
     - [CC1101 / nRF24L01 (DIP 1 / DIP 2)](#cc1101-sub-ghz-dip-1--nrf24l01-24-ghz-dip-2)
@@ -108,7 +110,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **Credentials** | Captive portal credential capture, WPA-SEC upload |
 | **TX Power Mode** | Selectable Normal / Max Power for WiFi and BLE — persisted across reboots |
 | **Data Transfer** | Self-hosted AP file server (TheLab) and WiFi client file server — browse, upload, create directories, and recursively delete folders from any browser; client IP logged to serial; IP shown on screen |
-| **NM-RF-HAT** | Hardware addon board for RF expansion — IR capture/replay/TV-B-Gone (Flipper-compatible .ir format), RF433 OOK (Flipper-compatible .sub format), Sub-GHz CC1101, 2.4 GHz nRF24L01, NFC/RFID PN532; DIP switch per module |
+| **NM-RF-HAT** | Hardware addon board for RF expansion — IR capture/replay/Universal Remote/TV-B-Gone (Flipper-compatible .ir format), RF433 OOK (Flipper-compatible .sub format), Sub-GHz CC1101, 2.4 GHz nRF24L01, NFC/RFID PN532; DIP switch per module |
 | **UI** | Material dark theme, touch gestures, screen dimming, screenshots — all screens portrait 240×320 |
 | **Storage** | SD card for handshakes, wardrive logs, GATT Walker JSON, screenshots, file tree browser |
 
@@ -1523,18 +1525,25 @@ IR capture and replay using the ESP32-C5's RMT peripheral. Files use the **Flipp
 
 ```
 NM-RF-HAT IR
-├── Capture       -- listen for any IR signal (5 s timeout), then save to a remote
-├── Replay        -- browse remotes -> signals -> transmit
+├── Capture       -- listen for any IR signal (5 s timeout), then save to a remote file
+├── Replay        -- browse remote files -> signals -> transmit
 │   ├── <Remote>.ir
 │   │   ├── Signal 1
 │   │   ├── Signal 2
 │   │   └── ...
 │   └── ...
-├── TV-B-Gone     -- transmit built-in power-off sequence for common TV brands
+├── Universal     -- multi-button remote: Power Search + Power/VOL/CH/Input/Mute buttons
+├── TV-B-Gone     -- transmit built-in power-off sequence for 16 common TV brands (3x repeats)
 └── IR Jammer     -- continuous 38 kHz carrier via LEDC hardware PWM
 ```
 
-**File format:** Each `.ir` file is a "remote" (e.g. `Samsung_TV.ir`) containing one or more named signals:
+**SD card path:** `/sdcard/lab/infrared/`
+
+---
+
+##### .ir File Format
+
+Each `.ir` file represents one remote (e.g. `Samsung_TV.ir`) and can contain any number of named signals separated by `#` lines:
 
 ```
 Filetype: IR signals file
@@ -1544,17 +1553,59 @@ name: Power
 type: raw
 frequency: 38000
 duty_cycle: 0.33
-data: 4500 4500 560 1680 560 560 ...
+data: 9000 4500 560 1680 560 560 560 1680 560 560 ...
+#
+name: Vol_up
+type: raw
+frequency: 38000
+duty_cycle: 0.33
+data: 9000 4500 560 560 560 1680 560 560 ...
 ```
 
-**SD card path:** `/sdcard/lab/infrared/`
+Signal values are alternating mark/space pulse durations in **microseconds**. `frequency` is the carrier in Hz (typically 38000). `duty_cycle` is typically 0.33 (ignored on raw TX — RMT uses fixed 33% duty).
+
+---
+
+##### Universal Remote
+
+The Universal Remote screen provides six one-tap buttons for the most common TV functions — **Power, VOL-, VOL+, CH-, CH+, Input, Mute** — using signals loaded from a brand `.ir` file on the SD card. The active brand is saved to NVS and restored automatically every time you open the screen.
+
+**Power Search** cycles through every `.ir` file in `/sdcard/lab/infrared/`, sends the `Power` signal from each brand, and asks "Did it work?" — tap **Yes** to lock in that brand, **Skip** to try the next, **Stop** to exit the search. The confirmed brand is saved immediately to NVS.
+
+**Signal name convention — Universal Remote requires these exact names:**
+
+| Button | Signal name in .ir file |
+|--------|------------------------|
+| Power  | `Power`                |
+| VOL-   | `Vol_dn`               |
+| VOL+   | `Vol_up`               |
+| CH-    | `Ch_prev`              |
+| CH+    | `Ch_next`              |
+| Input  | `Input`                |
+| Mute   | `Mute`                 |
+
+Only `Power` is required for the Power Search to work. The other signals are optional — a "Not found" status is shown if a button's signal is missing from the file.
+
+**The Flipper-IRDB already uses this naming convention.** Files downloaded from that database work directly with Universal Remote without any editing.
+
+---
+
+##### TV-B-Gone
+
+Built-in power-off sequence covering 16 common TV brands. Each code is sent 3 times with 65 ms between repeats and 250 ms between brands. DIP 4 must be ON. No SD card files required.
+
+---
+
+##### Getting .ir Files onto the SD Card
 
 **Compatible IR file sources:**
-- Flipper Zero IR library: https://github.com/flipperdevices/flipperzero-firmware/tree/dev/assets/infrared/assets
+- Flipper-IRDB (most comprehensive, correct signal names): https://github.com/logickworkshop/Flipper-IRDB
+- Flipper Zero built-in assets: https://github.com/flipperdevices/flipperzero-firmware/tree/dev/assets/infrared/assets
 - IRDB community database: https://github.com/probonopd/irdb
-- Flipper-irdb (comprehensive): https://github.com/logickworkshop/Flipper-IRDB
 
-Copy any `.ir` file from these repositories directly into `/sdcard/lab/infrared/` — no conversion needed. The signal will appear in the Replay remote list immediately.
+Copy any `.ir` file directly into `/sdcard/lab/infrared/` — no conversion needed. Files appear in the **Replay** remote list immediately, and the Power Search scans them automatically.
+
+> **Tip:** The Flipper-IRDB `TV` folder contains brand files with `Power`, `Vol_up`, `Vol_dn`, `Ch_next`, `Ch_prev`, `Mute`, and `Input` already named correctly for Universal Remote.
 
 #### RF433 OOK/ASK (DIP 5)
 
