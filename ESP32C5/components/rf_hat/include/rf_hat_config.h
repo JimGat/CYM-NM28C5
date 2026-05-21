@@ -31,7 +31,7 @@
 //  ----+-----------------+---------------------+--------------------
 //   1  | CC1101 Sub-GHz  | CSN (SPI CS)        | GDO0 (interrupt)
 //   2  | nRF24L01 2.4GHz | CSN (SPI CS)        | CE (chip enable)
-//   3  | PN532 NFC/RFID  | SDA (I2C)           | SCL (I2C)
+//   3  | PN532 NFC/RFID  | SCL (I2C)           | SDA (I2C)  ← swapped vs schematic
 //   4  | IR Infrared     | IR_DR (RX detector) | IR_DT (TX emitter) ← confirmed by LED
 //   5  | RF433 OOK/ASK   | 433_DR (RX from air)| 433_DT (TX to air) ← same nets as IR
 //   6  | Battery switch  | (not a module)      |
@@ -78,13 +78,13 @@
 #endif
 
 // ── PN532 NFC/RFID I2C (DIP 3) ───────────────────────────────────────────────
-// I2C mode: SCL=GPIO8 (NSS/SCL_PN532 net), SDA=GPIO9.
-// Same GPIO8/9 nets serve all other modules when DIP 3 is off.
+// Physical nets confirmed swapped vs. schematic label (same pattern as IR/RF433).
+// Empirical: SDA=GPIO8 (IO22, FPC2 Pin 7), SCL=GPIO9 (IO27, FPC2 Pin 9).
 #ifndef RF_HAT_PN532_SDA_GPIO
-#define RF_HAT_PN532_SDA_GPIO 9   // IO27, FPC2 Pin 9
+#define RF_HAT_PN532_SDA_GPIO 8   // IO22, FPC2 Pin 7 — swapped from schematic
 #endif
 #ifndef RF_HAT_PN532_SCL_GPIO
-#define RF_HAT_PN532_SCL_GPIO 8   // IO22, FPC2 Pin 7
+#define RF_HAT_PN532_SCL_GPIO 9   // IO27, FPC2 Pin 9 — swapped from schematic
 #endif
 
 // ── SD card directories created by rf_hat modules ────────────────────────────
