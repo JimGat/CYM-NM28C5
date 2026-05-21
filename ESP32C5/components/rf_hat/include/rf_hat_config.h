@@ -27,14 +27,14 @@
 // DIP switches cut module power — mutual exclusion is enforced in hardware.
 // The SPI shared bus (GPIO2/6/7) is also used by the on-board display and SD.
 //
-//  DIP | Module          | GPIO9 (IO27)       | GPIO8 (IO22)
-//  ----+-----------------+--------------------+-------------------
-//   1  | CC1101 Sub-GHz  | CSN (SPI CS)       | GDO0 (interrupt)
-//   2  | nRF24L01 2.4GHz | CSN (SPI CS)       | CE (chip enable)
-//   3  | PN532 NFC/RFID  | SDA (I2C)          | SCL (I2C)
-//   4  | IR Infrared     | IR_DT (TX to air)  | IR_DR (RX from air)
-//   5  | RF433 OOK/ASK   | 433_DT (TX to air) | 433_DR (RX from air)
-//   6  | Battery switch  | (not a module)     |
+//  DIP | Module          | GPIO9 (IO27)        | GPIO8 (IO22)
+//  ----+-----------------+---------------------+--------------------
+//   1  | CC1101 Sub-GHz  | CSN (SPI CS)        | GDO0 (interrupt)
+//   2  | nRF24L01 2.4GHz | CSN (SPI CS)        | CE (chip enable)
+//   3  | PN532 NFC/RFID  | SDA (I2C)           | SCL (I2C)
+//   4  | IR Infrared     | IR_DR (RX detector) | IR_DT (TX emitter) ← confirmed by LED
+//   5  | RF433 OOK/ASK   | 433_DR (RX from air)| 433_DT (TX to air) ← same nets as IR
+//   6  | Battery switch  | (not a module)      |
 // =============================================================================
 
 // ── IR (DIP 4) ───────────────────────────────────────────────────────────────
