@@ -202,6 +202,14 @@ static bool          s_ble_for_blueduck  = false; /* selects GATT table at bt_ni
 static uint8_t bt_found_devices[BT_MAX_DEVICES][6];
 static int bt_found_device_count = 0;
 
+// BLE callback diagnostics (reset each scan)
+static volatile uint32_t s_bt_cb_total     = 0; // total disc events received
+static volatile uint32_t s_bt_ext_events   = 0; // BLE_GAP_EVENT_EXT_DISC
+static volatile uint32_t s_bt_leg_events   = 0; // BLE_GAP_EVENT_DISC (legacy)
+static volatile uint32_t s_bt_parse_fail   = 0; // ble_hs_adv_parse_fields failed
+static volatile uint32_t s_bt_blacklisted  = 0; // dropped by blacklist
+static volatile uint32_t s_bt_already_seen = 0; // duplicate MAC
+
 // AirTag/SmartTag counters
 static int bt_airtag_count = 0;
 static int bt_smarttag_count = 0;
@@ -31363,6 +31371,7 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
         rssi            = d->rssi;
         phy             = d->prim_phy;
         is_scan_response = (d->props & BLE_HCI_ADV_SCAN_RSP_MASK) != 0;
+        s_bt_ext_events++;
     } else
 #endif
     if (event->type == BLE_GAP_EVENT_DISC) {
@@ -31374,12 +31383,17 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
         rssi            = d->rssi;
         phy             = BLE_HCI_LE_PHY_1M;
         is_scan_response = (d->event_type == BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP);
+        s_bt_leg_events++;
     } else {
         return 0;
     }
+    s_bt_cb_total++;
 
     // Blacklist check — silently drop blacklisted devices before any processing
-    if (bt_blacklist_check(addr_val)) return 0;
+    if (bt_blacklist_check(addr_val)) {
+        s_bt_blacklisted++;
+        return 0;
+    }
 
     // Dee Dee Detector — check every advertisement against watchlist,
     // regardless of whether BT Locator is also running.
@@ -31404,11 +31418,12 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
         return 0;
     }
 
-    // Parse advertising data
+    // Parse advertising data — extended adv may have adv_data_len==0 (data in ACAD);
+    // treat parse failure as empty fields so the device is still counted.
     struct ble_hs_adv_fields fields;
-    int rc = ble_hs_adv_parse_fields(&fields, adv_data, adv_data_len);
-    if (rc != 0) {
-        return 0;
+    memset(&fields, 0, sizeof(fields));
+    if (ble_hs_adv_parse_fields(&fields, adv_data, adv_data_len) != 0) {
+        s_bt_parse_fail++;
     }
 
     // Check if device already seen
@@ -31416,6 +31431,7 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
 
     // If already seen, only process scan responses to update names
     if (already_seen) {
+        s_bt_already_seen++;
         if (is_scan_response && fields.name != NULL && fields.name_len > 0) {
             int dev_idx = bt_find_device_index(addr_val);
             if (dev_idx >= 0 && bt_devices[dev_idx].name[0] == '\0') {
@@ -31976,12 +31992,15 @@ static void bt_locator_update_list(void)
 static void bt_scan_task(void *pvParameters)
 {
     bt_reset_counters();
+    s_bt_cb_total = s_bt_ext_events = s_bt_leg_events = 0;
+    s_bt_parse_fail = s_bt_blacklisted = s_bt_already_seen = 0;
     ble_scan_finished = false;
-    
+
     int bt_scan_iters = (int)g_bt_scan_duration_s * 10;
     ESP_LOGI(TAG, "BLE scan starting (%us)...", (unsigned)g_bt_scan_duration_s);
 
     int rc = bt_start_scan();
+    ESP_LOGI(TAG, "[BLE DBG] bt_start_scan rc=%d (0=OK)", rc);
     if (rc != 0) {
         ESP_LOGE(TAG, "BLE scan start failed: %d", rc);
         bt_scan_active = false;
@@ -32008,20 +32027,32 @@ static void bt_scan_task(void *pvParameters)
             bt_locator_needs_ui_update = true;
             bt_sas_needs_update = true;
         }
+
+        // Diagnostic log every 2 seconds
+        if (i % 20 == 19) {
+            ESP_LOGI(TAG, "[BLE DBG] t=%ds cb=%u ext=%u leg=%u parse_fail=%u blk=%u dup=%u new=%d",
+                     (i + 1) / 10,
+                     (unsigned)s_bt_cb_total, (unsigned)s_bt_ext_events, (unsigned)s_bt_leg_events,
+                     (unsigned)s_bt_parse_fail, (unsigned)s_bt_blacklisted, (unsigned)s_bt_already_seen,
+                     bt_device_count);
+        }
     }
-    
+
     bt_stop_scan();
     bt_scan_active = false;
-    
+
     // Final UI update via flag (thread-safe)
-    snprintf(ble_scan_status_text, sizeof(ble_scan_status_text), 
+    snprintf(ble_scan_status_text, sizeof(ble_scan_status_text),
              "%d devices (%d AT, %d ST)", bt_device_count, bt_airtag_count, bt_smarttag_count);
     ble_scan_finished = true;
     ble_scan_needs_ui_update = true;
     bt_locator_needs_ui_update = true;
     bt_sas_needs_update = true;
-    
+
     ESP_LOGI(TAG, "BLE scan complete: %d devices found", bt_device_count);
+    ESP_LOGI(TAG, "[BLE DBG] final: cb=%u ext=%u leg=%u parse_fail=%u blk=%u dup=%u",
+             (unsigned)s_bt_cb_total, (unsigned)s_bt_ext_events, (unsigned)s_bt_leg_events,
+             (unsigned)s_bt_parse_fail, (unsigned)s_bt_blacklisted, (unsigned)s_bt_already_seen);
     
     bt_scan_task_handle = NULL;
     vTaskDelete(NULL);
