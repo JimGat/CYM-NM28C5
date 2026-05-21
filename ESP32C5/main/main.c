@@ -32006,7 +32006,6 @@ static void bt_scan_task(void *pvParameters)
     ESP_LOGI(TAG, "BLE scan starting (%us)...", (unsigned)g_bt_scan_duration_s);
 
     int rc = bt_start_scan();
-    ESP_LOGI(TAG, "[BLE DBG] bt_start_scan rc=%d (0=OK)", rc);
     if (rc != 0) {
         ESP_LOGE(TAG, "BLE scan start failed: %d", rc);
         bt_scan_active = false;
@@ -32034,14 +32033,6 @@ static void bt_scan_task(void *pvParameters)
             bt_sas_needs_update = true;
         }
 
-        // Diagnostic log every 2 seconds
-        if (i % 20 == 19) {
-            ESP_LOGI(TAG, "[BLE DBG] t=%ds cb=%u ext=%u leg=%u parse_fail=%u blk=%u dup=%u new=%d",
-                     (i + 1) / 10,
-                     (unsigned)s_bt_cb_total, (unsigned)s_bt_ext_events, (unsigned)s_bt_leg_events,
-                     (unsigned)s_bt_parse_fail, (unsigned)s_bt_blacklisted, (unsigned)s_bt_already_seen,
-                     bt_device_count);
-        }
     }
 
     bt_stop_scan();
@@ -32056,9 +32047,6 @@ static void bt_scan_task(void *pvParameters)
     bt_sas_needs_update = true;
 
     ESP_LOGI(TAG, "BLE scan complete: %d devices found", bt_device_count);
-    ESP_LOGI(TAG, "[BLE DBG] final: cb=%u ext=%u leg=%u parse_fail=%u blk=%u dup=%u",
-             (unsigned)s_bt_cb_total, (unsigned)s_bt_ext_events, (unsigned)s_bt_leg_events,
-             (unsigned)s_bt_parse_fail, (unsigned)s_bt_blacklisted, (unsigned)s_bt_already_seen);
     
     bt_scan_task_handle = NULL;
     vTaskDelete(NULL);
@@ -35960,54 +35948,35 @@ static int rf433_lbk_phase(int tx_pin, int rx_pin)
 
 static void rf433_lbk_task(void *arg)
 {
-    // Phase 1 — current firmware config: GPIO8 TX → GPIO9 RX
     if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
         if (lv_obj_is_valid(s_lbk_status_lbl))
             lv_label_set_text_fmt(s_lbk_status_lbl,
-                "Phase 1/2: GPIO%d TX -> GPIO%d RX...",
+                "Testing GPIO%d TX -> GPIO%d RX...",
                 RF_HAT_RF433_TX_GPIO, RF_HAT_RF433_RX_GPIO);
         xSemaphoreGive(lvgl_mutex);
     }
-    int a = rf433_lbk_phase(RF_HAT_RF433_TX_GPIO, RF_HAT_RF433_RX_GPIO);
+    int edges = rf433_lbk_phase(RF_HAT_RF433_TX_GPIO, RF_HAT_RF433_RX_GPIO);
 
-    // Phase 2 — swapped: GPIO9 TX → GPIO8 RX
-    if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-        if (lv_obj_is_valid(s_lbk_status_lbl))
-            lv_label_set_text_fmt(s_lbk_status_lbl,
-                "Phase 2/2: GPIO%d TX -> GPIO%d RX...",
-                RF_HAT_RF433_RX_GPIO, RF_HAT_RF433_TX_GPIO);
-        xSemaphoreGive(lvgl_mutex);
-    }
-    int b = rf433_lbk_phase(RF_HAT_RF433_RX_GPIO, RF_HAT_RF433_TX_GPIO);
-
-    ESP_LOGI(TAG, "[RF433 LBK] config-A (GPIO%d TX): %d transitions  "
-                  "config-B (GPIO%d TX): %d transitions",
-             RF_HAT_RF433_TX_GPIO, a, RF_HAT_RF433_RX_GPIO, b);
+    ESP_LOGI(TAG, "[RF433 LBK] GPIO%d TX -> GPIO%d RX: %d transitions (%s)",
+             RF_HAT_RF433_TX_GPIO, RF_HAT_RF433_RX_GPIO,
+             edges, edges >= 6 ? "PASS" : "FAIL");
 
     // Restore RF433 driver
     rf433_hat_init();
 
     // Build result string — use LVGL recolor syntax
-    char result[220];
-    if (a >= 6) {
+    char result[160];
+    if (edges >= 6) {
         snprintf(result, sizeof(result),
-            "#00C853 CONFIRMED#\n"
-            "GPIO%d = TX   GPIO%d = RX\n"
-            "Edges: %d (A) / %d (B)",
-            RF_HAT_RF433_TX_GPIO, RF_HAT_RF433_RX_GPIO, a, b);
-    } else if (b >= 6) {
-        snprintf(result, sizeof(result),
-            "#FFD600 SWAPPED DETECTED#\n"
-            "GPIO%d = TX   GPIO%d = RX\n"
-            "Edges: %d (A) / %d (B)\n"
-            "Update rf_hat_config.h defines!",
-            RF_HAT_RF433_RX_GPIO, RF_HAT_RF433_TX_GPIO, a, b);
+            "#00C853 PASS#\n"
+            "GPIO%d TX  GPIO%d RX  Edges: %d",
+            RF_HAT_RF433_TX_GPIO, RF_HAT_RF433_RX_GPIO, edges);
     } else {
         snprintf(result, sizeof(result),
-            "#FF5722 NO LOOPBACK#\n"
-            "Check DIP 5 is ON.\n"
-            "Edges: %d (A) / %d (B)",
-            a, b);
+            "#FF5722 FAIL#\n"
+            "No carrier detected. Check DIP 5 ON.\n"
+            "Edges: %d (need >= 6)",
+            edges);
     }
 
     if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
@@ -36046,9 +36015,9 @@ static void show_rf433_loopback_screen(void)
 
     lv_obj_t *desc = lv_label_create(function_page);
     lv_label_set_text(desc,
-        "OOK loopback: transmits on TX GPIO,\n"
-        "listens on RX GPIO for carrier echo.\n"
-        "Requires DIP 5 ON. ~2 s per phase.");
+        "OOK loopback: GPIO8 TX -> GPIO9 RX.\n"
+        "Requires DIP 5 ON.\n"
+        "PASS = carrier received (>= 6 edges).  ~1.5s.");
     lv_obj_set_style_text_font(desc, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(desc, ui_text_color(), 0);
     lv_obj_set_style_text_align(desc, LV_TEXT_ALIGN_CENTER, 0);
