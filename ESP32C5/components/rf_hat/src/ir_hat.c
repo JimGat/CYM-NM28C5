@@ -653,9 +653,9 @@ static const tvbg_code_t TVBG_CODES[] = {
 // repeats. Gap must stay below the NEC de-bounce threshold (~108 ms) so the
 // TV treats repeats as a held-press rather than a new toggle command.
 // 3 repeats at 65 ms caused even-numbered toggles (off→on) on Toshiba units.
-#define TVBG_REPEATS        2
-#define TVBG_REPEAT_GAP_MS  45   // < NEC de-bounce; TV sees as held-press
-#define TVBG_CODE_GAP_MS   300   // gap between different brand codes
+#define TVBG_REPEATS        1
+#define TVBG_REPEAT_GAP_MS  45   // unused with REPEATS=1, kept for reference
+#define TVBG_CODE_GAP_MS   250   // gap between different brand codes
 
 static volatile bool s_tvbg_stop = false;
 
