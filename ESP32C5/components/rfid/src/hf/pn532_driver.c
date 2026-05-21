@@ -139,8 +139,20 @@ rfid_err_t pn532_driver_init(void)
         return RFID_ERR_HW;
     }
 
-    // Allow PN532 to stabilize after power-on (DIP switch just toggled)
-    vTaskDelay(pdMS_TO_TICKS(50));
+    // Allow PN532 to stabilize after power-on (DIP switch just toggled).
+    // PN532 OSC startup + init can take up to 100ms on some module variants.
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    // Wakeup probe: attempt a 1-byte read to see if PN532 is alive on the bus.
+    // A NACK here means it's off or in wrong mode (UART/SPI); an ACK means it's ready.
+    // Either way we continue — the caller handles the result.
+    {
+        uint8_t rdy = 0;
+        esp_err_t we = i2c_master_receive(s_dev, &rdy, 1, pdMS_TO_TICKS(PN532_I2C_TIMEOUT));
+        ESP_LOGI(TAG, "I2C wakeup probe: %s (rdy=0x%02X)",
+                 (we == ESP_OK) ? "ACK" : "NACK/timeout", rdy);
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
 
     s_init = true;
     ESP_LOGI(TAG, "I2C init: SCL=GPIO%d SDA=GPIO%d addr=0x%02X",

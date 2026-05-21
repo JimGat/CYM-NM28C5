@@ -60,7 +60,17 @@ rfid_err_t rfid_manager_init(void)
     }
     r = pn532_sam_configure();
     if (r != RFID_OK) {
-        ESP_LOGW(TAG, "SAM configure failed: %s — may still work", rfid_err_str(r));
+        // Retry once after a longer settling delay — some modules need more warmup
+        ESP_LOGW(TAG, "SAM configure attempt 1 failed (%s), retrying in 300 ms...",
+                 rfid_err_str(r));
+        vTaskDelay(pdMS_TO_TICKS(300));
+        r = pn532_sam_configure();
+        if (r != RFID_OK) {
+            ESP_LOGW(TAG, "SAM configure failed after retry: %s", rfid_err_str(r));
+            ESP_LOGW(TAG, "Check: DIP switch 3 ON, PN532 module in I2C mode (not UART/SPI)");
+        } else {
+            ESP_LOGI(TAG, "SAM configure OK on retry");
+        }
     }
     s_mgr_init = true;
     ESP_LOGI(TAG, "init OK");
