@@ -35757,10 +35757,12 @@ static void show_ir_signal_list_screen(void)
 
 // ── TV-B-Gone ─────────────────────────────────────────────────────────────────
 
-static lv_obj_t *s_tvbg_status  = NULL;
-static lv_obj_t *s_tvbg_bar     = NULL;
+static lv_obj_t *s_tvbg_status    = NULL;
+static lv_obj_t *s_tvbg_bar       = NULL;
 static lv_obj_t *s_tvbg_start_btn = NULL;
-static bool      s_tvbg_running = false;
+static lv_obj_t *s_tvbg_start_lbl  = NULL;
+static bool      s_tvbg_running    = false;
+static bool      s_tvbg_user_stop  = false;
 
 typedef struct { int idx; int total; } tvbg_prog_t;
 
@@ -35781,8 +35783,24 @@ static void s_tvbg_done_lvgl_cb(void *arg)
     (void)arg;
     s_tvbg_running = false;
     if (s_tvbg_status)    lv_label_set_text(s_tvbg_status, "Done - all codes sent");
-    if (s_tvbg_start_btn) lv_obj_clear_state(s_tvbg_start_btn, LV_STATE_DISABLED);
     if (s_tvbg_bar)       lv_bar_set_value(s_tvbg_bar, 100, LV_ANIM_ON);
+    if (s_tvbg_start_btn) {
+        lv_obj_set_style_bg_color(s_tvbg_start_btn, lv_color_hex(0x4A148C), LV_STATE_DEFAULT);
+        lv_obj_clear_state(s_tvbg_start_btn, LV_STATE_DISABLED);
+    }
+    if (s_tvbg_start_lbl) lv_label_set_text(s_tvbg_start_lbl, LV_SYMBOL_POWER "  Start");
+}
+
+static void s_tvbg_stopped_lvgl_cb(void *arg)
+{
+    (void)arg;
+    s_tvbg_running = false;
+    if (s_tvbg_status)    lv_label_set_text(s_tvbg_status, "Stopped");
+    if (s_tvbg_start_btn) {
+        lv_obj_set_style_bg_color(s_tvbg_start_btn, lv_color_hex(0x4A148C), LV_STATE_DEFAULT);
+        lv_obj_clear_state(s_tvbg_start_btn, LV_STATE_DISABLED);
+    }
+    if (s_tvbg_start_lbl) lv_label_set_text(s_tvbg_start_lbl, LV_SYMBOL_POWER "  Start");
 }
 
 static void s_tvbg_progress(int idx, int total, void *ctx)
@@ -35795,20 +35813,29 @@ static void s_tvbg_progress(int idx, int total, void *ctx)
 static void s_tvbg_task(void *arg)
 {
     (void)arg;
+    s_tvbg_user_stop = false;
     ir_hat_tvbgone(s_tvbg_progress, NULL);
-    lv_async_call(s_tvbg_done_lvgl_cb, NULL);
+    lv_async_call(s_tvbg_user_stop ? s_tvbg_stopped_lvgl_cb : s_tvbg_done_lvgl_cb, NULL);
     vTaskDelete(NULL);
 }
 
 static void tvbg_start_cb(lv_event_t *e)
 {
     (void)e;
-    if (s_tvbg_running) return;
+    if (s_tvbg_running) {
+        s_tvbg_user_stop = true;
+        ir_hat_tvbgone_stop();
+        if (s_tvbg_status) lv_label_set_text(s_tvbg_status, "Stopping...");
+        if (s_tvbg_start_btn) lv_obj_add_state(s_tvbg_start_btn, LV_STATE_DISABLED);
+        return;
+    }
     ir_hat_claim();
     s_tvbg_running = true;
     if (s_tvbg_status)    lv_label_set_text(s_tvbg_status, "Transmitting...");
-    if (s_tvbg_start_btn) lv_obj_add_state(s_tvbg_start_btn, LV_STATE_DISABLED);
     if (s_tvbg_bar)       lv_bar_set_value(s_tvbg_bar, 0, LV_ANIM_OFF);
+    if (s_tvbg_start_btn)
+        lv_obj_set_style_bg_color(s_tvbg_start_btn, lv_color_hex(0xB71C1C), LV_STATE_DEFAULT);
+    if (s_tvbg_start_lbl) lv_label_set_text(s_tvbg_start_lbl, LV_SYMBOL_STOP "  Stop");
     xTaskCreate(s_tvbg_task, "tvbgone", 6144, NULL, tskIDLE_PRIORITY + 2, NULL);
 }
 
@@ -35843,18 +35870,19 @@ static void show_ir_tvbgone_screen(void)
     lv_obj_set_style_text_align(s_tvbg_status, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(s_tvbg_status, LV_ALIGN_TOP_MID, 0, 152);
 
-    s_tvbg_running = false;
+    s_tvbg_running   = false;
+    s_tvbg_user_stop = false;
     s_tvbg_start_btn = lv_btn_create(function_page);
     lv_obj_set_size(s_tvbg_start_btn, 160, 42);
     lv_obj_align(s_tvbg_start_btn, LV_ALIGN_TOP_MID, 0, 178);
     lv_obj_set_style_bg_color(s_tvbg_start_btn, lv_color_hex(0x4A148C), LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(s_tvbg_start_btn, 0, 0);
     lv_obj_set_style_radius(s_tvbg_start_btn, 8, 0);
-    lv_obj_t *st_lbl = lv_label_create(s_tvbg_start_btn);
-    lv_label_set_text(st_lbl, LV_SYMBOL_POWER "  Start");
-    lv_obj_set_style_text_font(st_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(st_lbl, lv_color_white(), 0);
-    lv_obj_center(st_lbl);
+    s_tvbg_start_lbl = lv_label_create(s_tvbg_start_btn);
+    lv_label_set_text(s_tvbg_start_lbl, LV_SYMBOL_POWER "  Start");
+    lv_obj_set_style_text_font(s_tvbg_start_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_tvbg_start_lbl, lv_color_white(), 0);
+    lv_obj_center(s_tvbg_start_lbl);
     lv_obj_add_event_cb(s_tvbg_start_btn, tvbg_start_cb, LV_EVENT_CLICKED, NULL);
 
     rfhat_add_back_btn("Infrared", show_ir_menu_screen);

@@ -650,18 +650,24 @@ static const tvbg_code_t TVBG_CODES[] = {
 #define TVBG_COUNT  (sizeof(TVBG_CODES)/sizeof(TVBG_CODES[0]))
 
 // Each code is sent TVBG_REPEATS times with TVBG_REPEAT_GAP_MS between
-// repeats. A 100ms single-shot is easily missed; TV IR receivers need
-// the same code burst 2-3x with time for AGC recovery between bursts.
-// 250ms between different codes matches original TV-B-Gone firmware.
-#define TVBG_REPEATS        3
-#define TVBG_REPEAT_GAP_MS  65
-#define TVBG_CODE_GAP_MS   250
+// repeats. Gap must stay below the NEC de-bounce threshold (~108 ms) so the
+// TV treats repeats as a held-press rather than a new toggle command.
+// 3 repeats at 65 ms caused even-numbered toggles (off→on) on Toshiba units.
+#define TVBG_REPEATS        2
+#define TVBG_REPEAT_GAP_MS  45   // < NEC de-bounce; TV sees as held-press
+#define TVBG_CODE_GAP_MS   300   // gap between different brand codes
+
+static volatile bool s_tvbg_stop = false;
+
+void ir_hat_tvbgone_stop(void) { s_tvbg_stop = true; }
 
 void ir_hat_tvbgone(ir_hat_progress_cb_t progress_cb, void *ctx)
 {
     // static: ir_signal_t is ~4140 bytes (1024 timings × 4 B) — too large for any task stack
     static ir_signal_t sig;
+    s_tvbg_stop = false;
     for (int i = 0; i < (int)TVBG_COUNT; i++) {
+        if (s_tvbg_stop) break;
         const tvbg_code_t *c = &TVBG_CODES[i];
         memset(&sig, 0, sizeof(sig));
         snprintf(sig.name, IR_HAT_NAME_LEN, "tvbg_%d", i);
