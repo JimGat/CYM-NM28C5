@@ -112,6 +112,13 @@ rfid_err_t pn532_driver_init(void)
 {
     if (s_init) return RFID_OK;
 
+    // Release GPIO pins from any previous peripheral (RMT from IR/RF433) before
+    // I2C claims them. Without this, RMT idle-LOW holds SCL low and every I2C
+    // transaction times out instead of getting a clean NACK.
+    gpio_reset_pin((gpio_num_t)RF_HAT_PN532_SCL_GPIO);
+    gpio_reset_pin((gpio_num_t)RF_HAT_PN532_SDA_GPIO);
+    vTaskDelay(pdMS_TO_TICKS(10));
+
     i2c_master_bus_config_t bus_cfg = {
         .i2c_port = PN532_I2C_PORT,
         .sda_io_num = RF_HAT_PN532_SDA_GPIO,
