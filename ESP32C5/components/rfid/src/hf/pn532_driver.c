@@ -182,7 +182,7 @@ rfid_err_t pn532_driver_init(void)
         // SDA stuck LOW means the PN532 is holding SDA mid-transaction —
         // clocking SCL 9 times lets the slave shift out its state and release.
         if (sda_pu == 0) {
-            ESP_LOGW(TAG, "SDA stuck — bus recovery: clocking SCL 9x");
+            ESP_LOGW(TAG, "SDA stuck LOW — bus recovery: clocking SCL 9x");
             gpio_set_direction((gpio_num_t)RF_HAT_PN532_SCL_GPIO, GPIO_MODE_OUTPUT);
             gpio_set_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO, 1);
             gpio_set_pull_mode((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_PULLUP_ONLY);
@@ -212,15 +212,32 @@ rfid_err_t pn532_driver_init(void)
             vTaskDelay(pdMS_TO_TICKS(10));
             int sda_after = gpio_get_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO);
             ESP_LOGI(TAG, "SDA after recovery: %d %s",
-                     sda_after, sda_after ? "(bus free)" : "(STILL STUCK — hardware fault)");
+                     sda_after, sda_after ? "(bus free)" : "(STILL STUCK — power-cycle PN532 via DIP switch)");
             if (!recovered && !sda_after)
-                ESP_LOGE(TAG, "*** 9-clock recovery failed: SDA still held LOW by PN532 or PCB short");
+                ESP_LOGE(TAG, "*** 9-clock recovery failed: SDA still held LOW by PN532");
+
+            // Monitor SDA stability for 500ms after recovery.
+            // If PN532 immediately re-asserts LOW, software recovery alone is insufficient —
+            // the PN532 must be power-cycled (DIP switch OFF then ON) to reset its I2C FSM.
+            if (sda_after) {
+                int stuck_count = 0;
+                for (int i = 0; i < 10; i++) {
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                    if (!gpio_get_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO)) stuck_count++;
+                }
+                if (stuck_count > 0) {
+                    ESP_LOGE(TAG, "*** SDA re-asserted LOW %d/10 samples after recovery"
+                             " — PN532 needs power-cycle (toggle DIP switch 3)", stuck_count);
+                } else {
+                    ESP_LOGI(TAG, "SDA stable HIGH for 500ms after recovery — bus is clean");
+                }
+            }
         }
 
-        // Reset before I2C init
+        // Reset before I2C init — clears GPIO matrix routing and driver reservation.
         gpio_reset_pin((gpio_num_t)RF_HAT_PN532_SCL_GPIO);
         gpio_reset_pin((gpio_num_t)RF_HAT_PN532_SDA_GPIO);
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 
     i2c_master_bus_config_t bus_cfg = {
@@ -251,19 +268,42 @@ rfid_err_t pn532_driver_init(void)
     }
 
     // Allow PN532 to stabilize after power-on (DIP switch just toggled).
-    // PN532 OSC startup + init can take up to 100ms on some module variants.
-    vTaskDelay(pdMS_TO_TICKS(200));
+    // PN532 OSC startup + I2C controller init can take up to 400ms on some variants.
+    vTaskDelay(pdMS_TO_TICKS(400));
 
-    // Wakeup probe: attempt a 1-byte read to see if PN532 is alive on the bus.
-    // A NACK here means it's off or in wrong mode (UART/SPI); an ACK means it's ready.
-    // Either way we continue — the caller handles the result.
+    // PN532 I2C wakeup: send a WRITE of one 0x00 byte to address 0x24.
+    // Per PN532 Application Note and Adafruit library: the first I2C transaction
+    // after power-on must be a WRITE (not a READ) to bring the chip out of low-power
+    // mode. A NACK on this write is normal — the chip may not ACK the wakeup.
+    {
+        uint8_t wake = 0x00;
+        esp_err_t we = i2c_master_transmit(s_dev, &wake, 1, pdMS_TO_TICKS(PN532_I2C_TIMEOUT));
+        ESP_LOGI(TAG, "I2C wakeup write: %s", (we == ESP_OK) ? "ACK" : "NACK/timeout (normal)");
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    // Poll for RDY byte — PN532 signals 0x01 when it's ready to receive a command.
+    // Try up to 20 times (1 second total) in case the chip is still initializing.
     {
         uint8_t rdy = 0;
-        esp_err_t we = i2c_master_receive(s_dev, &rdy, 1, pdMS_TO_TICKS(PN532_I2C_TIMEOUT));
-        ESP_LOGI(TAG, "I2C wakeup probe: %s (rdy=0x%02X)",
-                 (we == ESP_OK) ? "ACK" : "NACK/timeout", rdy);
+        esp_err_t re = ESP_ERR_TIMEOUT;
+        for (int i = 0; i < 20; i++) {
+            re = i2c_master_receive(s_dev, &rdy, 1, pdMS_TO_TICKS(PN532_I2C_TIMEOUT));
+            if (re == ESP_OK) {
+                ESP_LOGI(TAG, "I2C ready poll [%d]: RDY=0x%02X %s",
+                         i, rdy, (rdy == 0x01) ? "(READY)" : "(not ready yet)");
+                if (rdy == 0x01) break;
+            } else {
+                ESP_LOGD(TAG, "I2C ready poll [%d]: %s", i, esp_err_to_name(re));
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        if (re != ESP_OK) {
+            ESP_LOGW(TAG, "PN532 not responding after 1s — check: DIP 3 ON, I2C jumper set on module");
+        } else if (rdy != 0x01) {
+            ESP_LOGW(TAG, "PN532 responding but RDY=0x%02X (not 0x01) — may still need time", rdy);
+        }
     }
-    vTaskDelay(pdMS_TO_TICKS(10));
 
     s_init = true;
     ESP_LOGI(TAG, "I2C init: SCL=GPIO%d SDA=GPIO%d addr=0x%02X",

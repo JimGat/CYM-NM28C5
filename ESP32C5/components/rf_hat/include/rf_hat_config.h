@@ -31,7 +31,7 @@
 //  ----+-----------------+---------------------+--------------------
 //   1  | CC1101 Sub-GHz  | GDO0 (interrupt)    | CSN (SPI CS)
 //   2  | nRF24L01 2.4GHz | CE (chip enable)    | CSN (SPI CS)
-//   3  | PN532 NFC/RFID  | SCL (I2C clock)     | SDA (I2C data)  ← per schematic
+//   3  | PN532 NFC/RFID  | SDA (I2C data)      | SCL (I2C clock) ← empirical (GPIO8 stuck LOW = SDA)
 //   4  | IR Infrared     | IR_DT (TX emitter)  | IR_DR (RX detector) ← confirmed by LED
 //   5  | RF433 OOK/ASK   | 433_DT (TX to air)  | 433_DR (RX from air) ← same nets as IR
 //   6  | Battery switch  | (not a module)      |
@@ -78,13 +78,18 @@
 #endif
 
 // ── PN532 NFC/RFID I2C (DIP 3) ───────────────────────────────────────────────
-// Matches schematic: GPIO8 (IO22, FPC2 Pin 7) = SCL, GPIO9 (IO27, FPC2 Pin 9) = SDA.
-// Note: IR/RF433 nets are empirically swapped vs schematic, but PN532 follows schematic.
+// Empirical observation (v1.8.54-57): GPIO8 is ALWAYS held LOW by the PN532
+// when DIP 3 is ON, regardless of which role (SCL or SDA) it is assigned.
+// GPIO9 is always HIGH (free). This matches SDA stuck mid-ACK behavior, where
+// the PN532 (as I2C slave) holds SDA LOW while waiting for more clocks.
+// Therefore GPIO8 = SDA and GPIO9 = SCL, opposite to the schematic label.
+// (Same empirical swap pattern as IR/RF433 — schematic net labels are inverted.)
+// The 9-clock bus recovery clocks GPIO9 (SCL) to release GPIO8 (SDA).
 #ifndef RF_HAT_PN532_SCL_GPIO
-#define RF_HAT_PN532_SCL_GPIO 8   // IO22, FPC2 Pin 7 — SCL (matches schematic)
+#define RF_HAT_PN532_SCL_GPIO 9   // IO27, FPC2 Pin 9 — SCL (empirically confirmed)
 #endif
 #ifndef RF_HAT_PN532_SDA_GPIO
-#define RF_HAT_PN532_SDA_GPIO 9   // IO27, FPC2 Pin 9 — SDA (matches schematic)
+#define RF_HAT_PN532_SDA_GPIO 8   // IO22, FPC2 Pin 7 — SDA (empirically confirmed)
 #endif
 
 // ── SD card directories created by rf_hat modules ────────────────────────────
