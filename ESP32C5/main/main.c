@@ -4951,10 +4951,14 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_lcd_panel_io_register_event_callbacks(lcd_io_handle, &cbs, &disp_drv));
 
     // Clear screen: memset writes exactly buf_size bytes (no overflow regardless of color depth)
+    // Wait for each DMA to complete before starting the next — on_color_trans_done fires for
+    // every draw_bitmap call; without the wait the binary semaphore accumulates a stale count
+    // of 1 that the first real lvgl_flush_cb take consumes prematurely (DMA race / tear fix).
     memset(buf1, 0, buf_size);
     for (int y = 0; y < LCD_V_RES; y += 15) {
         int lines = (y + 15 <= LCD_V_RES) ? 15 : (LCD_V_RES - y);
         esp_lcd_panel_draw_bitmap(panel_handle, 0, y, LCD_H_RES, y + lines, buf1);
+        xSemaphoreTake(flush_done_sem, pdMS_TO_TICKS(100));
     }
 
     lv_obj_t *scr = lv_scr_act();
@@ -6677,6 +6681,7 @@ void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_
 
         while (true) {
             if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                xSemaphoreTake(flush_done_sem, 0); // drain any stale count from init DMAs
                 esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
                 // Hold mutex until DMA completes. Releasing before the semaphore
                 // creates a window where another task can start an SPI transaction
