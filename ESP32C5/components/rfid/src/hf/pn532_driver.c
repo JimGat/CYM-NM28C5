@@ -273,3 +273,25 @@ rfid_err_t pn532_get_firmware_version(pn532_fw_version_t *out)
              resp[0], resp[1], resp[2], resp[3]);
     return RFID_OK;
 }
+
+int pn532_i2c_scan(uint8_t *addrs_out, int max_addrs)
+{
+    if (!s_init || !s_bus) return -1;
+    int found = 0;
+    ESP_LOGI(TAG, "I2C scan: SDA=GPIO%d SCL=GPIO%d  probing 0x01-0x7F...",
+             RF_HAT_PN532_SDA_GPIO, RF_HAT_PN532_SCL_GPIO);
+    for (uint16_t addr = 1; addr < 128; addr++) {
+        esp_err_t e = i2c_master_probe(s_bus, addr, 10);
+        if (e == ESP_OK) {
+            ESP_LOGI(TAG, "  [FOUND] 0x%02X", (unsigned)addr);
+            if (addrs_out && found < max_addrs)
+                addrs_out[found] = (uint8_t)addr;
+            found++;
+        }
+    }
+    if (found == 0)
+        ESP_LOGW(TAG, "  no devices found — check DIP 3 ON and PN532 I2C mode jumper");
+    else
+        ESP_LOGI(TAG, "  scan complete: %d device(s) found", found);
+    return found;
+}

@@ -36963,13 +36963,18 @@ static void show_rfid_hw_test_screen(void)
     lv_obj_set_style_text_font(t, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(t, lv_color_hex(0xFFB300), 0);
 
-    // GPIO info
+    // GPIO info — use actual defines so label is always current
     lv_obj_t *gpio_lbl = lv_label_create(panel);
-    lv_label_set_text(gpio_lbl, "SCL: GPIO8   SDA: GPIO9\nI2C addr: 0x24  100 kHz");
+    {
+        char glbl[64];
+        snprintf(glbl, sizeof(glbl), "SCL: GPIO%d   SDA: GPIO%d   addr: 0x24",
+                 RF_HAT_PN532_SCL_GPIO, RF_HAT_PN532_SDA_GPIO);
+        lv_label_set_text(gpio_lbl, glbl);
+    }
     lv_obj_set_style_text_font(gpio_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(gpio_lbl, ui_text_color(), 0);
 
-    // Result label (filled in after probe)
+    // Probe result label
     lv_obj_t *result_lbl = lv_label_create(panel);
     lv_label_set_text(result_lbl, "Probing...");
     lv_obj_set_style_text_font(result_lbl, &lv_font_montserrat_12, 0);
@@ -36977,9 +36982,17 @@ static void show_rfid_hw_test_screen(void)
     lv_label_set_long_mode(result_lbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(result_lbl, LCD_H_RES - 36);
 
+    // I2C scan result label
+    lv_obj_t *scan_lbl = lv_label_create(panel);
+    lv_label_set_text(scan_lbl, "Scanning bus...");
+    lv_obj_set_style_text_font(scan_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(scan_lbl, lv_color_hex(0xFFB300), 0);
+    lv_label_set_long_mode(scan_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(scan_lbl, LCD_H_RES - 36);
+
     rfhat_add_back_btn("RFID Menu", rfid_back_to_menu);
 
-    // Probe synchronously (we're not in the poll task, this is LVGL context)
+    // Run PN532 probe
     rfid_probe_result_t probe;
     rfid_err_t r = rfid_manager_probe(&probe);
 
@@ -36989,11 +37002,29 @@ static void show_rfid_hw_test_screen(void)
                  "%s\nIC=0x%02X  FW=%d.%d\nStatus: READY",
                  probe.desc, probe.ic, probe.fw_ver, probe.fw_rev);
         lv_obj_set_style_text_color(result_lbl, lv_color_hex(0x4CAF50), 0);
+        lv_label_set_text(scan_lbl, "");  // no scan needed
     } else {
-        snprintf(buf, sizeof(buf),
-                 "PN532 not responding\n%s\nCheck DIP 3 is ON",
-                 rfid_err_str(r));
+        snprintf(buf, sizeof(buf), "PN532 not responding\n%s", rfid_err_str(r));
         lv_obj_set_style_text_color(result_lbl, lv_color_hex(0xEF5350), 0);
+
+        // Run full I2C bus scan — identify any device on GPIO8/GPIO9
+        uint8_t found_addrs[8];
+        int n = rfid_manager_i2c_scan(found_addrs, 8);
+        if (n < 0) {
+            lv_label_set_text(scan_lbl, "Scan: manager not init");
+        } else if (n == 0) {
+            lv_label_set_text(scan_lbl,
+                "Scan: 0 devices on bus\nCheck DIP 3 ON + I2C mode jumper\n"
+                "or try FPC cable reseat");
+            lv_obj_set_style_text_color(scan_lbl, lv_color_hex(0xEF5350), 0);
+        } else {
+            char sbuf[80];
+            int pos = snprintf(sbuf, sizeof(sbuf), "Scan: found addr");
+            for (int i = 0; i < n && pos < (int)sizeof(sbuf) - 8; i++)
+                pos += snprintf(sbuf + pos, sizeof(sbuf) - pos, " 0x%02X", found_addrs[i]);
+            lv_label_set_text(scan_lbl, sbuf);
+            lv_obj_set_style_text_color(scan_lbl, lv_color_hex(0x4CAF50), 0);
+        }
     }
     lv_label_set_text(result_lbl, buf);
 }

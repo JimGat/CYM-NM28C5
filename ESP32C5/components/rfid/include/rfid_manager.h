@@ -65,3 +65,8 @@ typedef void (*rfid_key_progress_cb_t)(uint8_t sector, uint8_t total_sectors,
 rfid_err_t rfid_manager_test_mifare_keys(rfid_card_t *card,
                                           rfid_key_progress_cb_t progress_cb,
                                           void *ctx);
+
+// ── I2C bus diagnostic scan ───────────────────────────────────────────────────
+// Probes all 127 I2C addresses. Returns device count; fills addrs_out[max].
+// Logs results. Returns -1 if manager not initialised.
+int rfid_manager_i2c_scan(uint8_t *addrs_out, int max_addrs);

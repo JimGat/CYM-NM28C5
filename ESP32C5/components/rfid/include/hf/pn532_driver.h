@@ -49,3 +49,8 @@ rfid_err_t pn532_get_firmware_version(pn532_fw_version_t *out);
 rfid_err_t pn532_send_command(const uint8_t *cmd, uint8_t cmd_len);
 rfid_err_t pn532_read_response(uint8_t expected_cmd, uint8_t *buf, uint8_t *buf_len,
                                 uint8_t buf_max, uint32_t timeout_ms);
+
+// ── I2C bus diagnostic scan ───────────────────────────────────────────────────
+// Probes all 127 I2C addresses, logs every responder, stores up to max_addrs
+// in addrs_out[]. Returns number found, or -1 if driver not init'd.
+int pn532_i2c_scan(uint8_t *addrs_out, int max_addrs);
