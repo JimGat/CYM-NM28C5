@@ -48,10 +48,16 @@ static void          *s_cap_ctx    = NULL;
 static uint32_t       s_cap_tmo_ms = 5000;
 static ir_signal_t    s_cap_signal;
 
-// Shared large line buffer for file I/O — not re-entrant, but all file ops
-// happen from the LVGL callback context (single-threaded via lvgl_mutex).
-// Sized for 1024 timings × 7 chars each + "data: " header.
-static char s_io_line[8192];
+// Large line buffer for file I/O — allocated from PSRAM on first use to keep
+// 8 KB out of scarce internal DRAM (BLE extended scan needs ~16 KB controller
+// buffers that come from the same internal pool).
+#define S_IO_LINE_LEN 8192
+static char *s_io_line = NULL;
+static inline bool s_ensure_io_line(void) {
+    if (s_io_line) return true;
+    s_io_line = heap_caps_malloc(S_IO_LINE_LEN, MALLOC_CAP_SPIRAM);
+    return s_io_line != NULL;
+}
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -104,7 +110,7 @@ static void s_read_signal_body(FILE *f, ir_signal_t *sig_out)
     long pos;
     while (true) {
         pos = ftell(f);
-        if (!fgets(s_io_line, sizeof(s_io_line), f)) break;
+        if (!fgets(s_io_line, S_IO_LINE_LEN, f)) break;
         s_strip_newline(s_io_line);
 
         if (strncmp(s_io_line, "name: ", 6) == 0) {
@@ -370,6 +376,7 @@ ir_hat_err_t ir_hat_load_signal_by_index(const char *remote_name, int index,
                                           ir_signal_t *sig_out)
 {
     if (!remote_name || !sig_out || index < 0) return IR_HAT_ERR_IO;
+    if (!s_ensure_io_line()) return IR_HAT_ERR_IO;
 
     char path[160];
     s_make_path(remote_name, path, sizeof(path));
@@ -380,7 +387,7 @@ ir_hat_err_t ir_hat_load_signal_by_index(const char *remote_name, int index,
     int sig_idx = -1;
     bool found  = false;
 
-    while (fgets(s_io_line, sizeof(s_io_line), f)) {
+    while (fgets(s_io_line, S_IO_LINE_LEN, f)) {
         s_strip_newline(s_io_line);
         if (strncmp(s_io_line, "name: ", 6) == 0) {
             sig_idx++;
@@ -400,6 +407,7 @@ ir_hat_err_t ir_hat_load_signal(const char *remote_name, const char *signal_name
                                  ir_signal_t *sig_out)
 {
     if (!remote_name || !signal_name || !sig_out) return IR_HAT_ERR_IO;
+    if (!s_ensure_io_line()) return IR_HAT_ERR_IO;
 
     char path[160];
     s_make_path(remote_name, path, sizeof(path));
@@ -409,7 +417,7 @@ ir_hat_err_t ir_hat_load_signal(const char *remote_name, const char *signal_name
     memset(sig_out, 0, sizeof(*sig_out));
     bool found = false;
 
-    while (fgets(s_io_line, sizeof(s_io_line), f)) {
+    while (fgets(s_io_line, S_IO_LINE_LEN, f)) {
         s_strip_newline(s_io_line);
         if (strncmp(s_io_line, "name: ", 6) == 0) {
             if (strcmp(s_io_line + 6, signal_name) == 0) {
@@ -428,6 +436,7 @@ int ir_hat_list_signals(const char *remote_name,
                         char names[][IR_HAT_NAME_LEN], int max_count)
 {
     if (!remote_name || !names || max_count <= 0) return 0;
+    if (!s_ensure_io_line()) return 0;
 
     char path[160];
     s_make_path(remote_name, path, sizeof(path));
@@ -435,7 +444,7 @@ int ir_hat_list_signals(const char *remote_name,
     if (!f) return 0;
 
     int count = 0;
-    while (fgets(s_io_line, sizeof(s_io_line), f) && count < max_count) {
+    while (fgets(s_io_line, S_IO_LINE_LEN, f) && count < max_count) {
         if (strncmp(s_io_line, "name: ", 6) == 0) {
             s_strip_newline(s_io_line);
             strncpy(names[count], s_io_line + 6, IR_HAT_NAME_LEN - 1);
@@ -473,6 +482,7 @@ int ir_hat_list_remotes(char names[][IR_HAT_REMOTE_NAME_LEN], int max_count)
 ir_hat_err_t ir_hat_delete_signal(const char *remote_name, int del_index)
 {
     if (!remote_name || del_index < 0) return IR_HAT_ERR_IO;
+    if (!s_ensure_io_line()) return IR_HAT_ERR_IO;
 
     char src_path[160], tmp_path[160];
     s_make_path(remote_name, src_path, sizeof(src_path));
@@ -489,7 +499,7 @@ ir_hat_err_t ir_hat_delete_signal(const char *remote_name, int del_index)
     bool skip    = false;
     bool in_sig  = false;
 
-    while (fgets(s_io_line, sizeof(s_io_line), fin)) {
+    while (fgets(s_io_line, S_IO_LINE_LEN, fin)) {
         // Skip the source header lines — we already wrote a fresh one
         if (strncmp(s_io_line, "Filetype:", 9) == 0 ||
             strncmp(s_io_line, "Version:",  8) == 0) continue;
