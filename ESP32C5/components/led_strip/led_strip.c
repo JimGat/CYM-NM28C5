@@ -189,7 +189,9 @@ esp_err_t led_strip_new_rmt_device(const led_strip_config_t *led_cfg,
     rmt_tx_channel_config_t tx_cfg = {
         .clk_src           = RMT_CLK_SRC_DEFAULT,
         .gpio_num          = led_cfg->strip_gpio_num,
-        .mem_block_symbols = 64,
+        // ESP32-C5: SOC_RMT_MEM_WORDS_PER_CHANNEL = 48; >48 chains a second TX channel.
+        // 48 symbols fits 1 LED (24 data + 1 reset) in one channel, leaving the other free for IR.
+        .mem_block_symbols = 48,
         .resolution_hz     = res,
         .trans_queue_depth = 4,
         .flags.invert_out  = led_cfg->flags.invert_out,
