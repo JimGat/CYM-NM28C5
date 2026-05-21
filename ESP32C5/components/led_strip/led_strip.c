@@ -144,9 +144,19 @@ static esp_err_t rmt_strip_set_pixel_rgbw(led_strip_handle_t strip, uint32_t idx
 static esp_err_t rmt_strip_refresh(led_strip_handle_t strip)
 {
     rmt_led_strip_t *s = __containerof(strip, rmt_led_strip_t, base);
-    rmt_transmit_config_t tx_cfg = { .loop_count = 0 };
+    // queue_nonblocking: return ESP_ERR_NO_MEM immediately if the TX queue is full
+    // instead of blocking forever (which would hang the main/LVGL task).
+    // This can happen when a missed done-interrupt leaves the channel permanently busy.
+    rmt_transmit_config_t tx_cfg = { .loop_count = 0, .flags.queue_nonblocking = 1 };
     esp_err_t ret = rmt_transmit(s->chan, s->encoder, s->buf, s->max_leds * 3, &tx_cfg);
-    if (ret == ESP_OK) rmt_tx_wait_all_done(s->chan, pdMS_TO_TICKS(100));
+    if (ret == ESP_OK) {
+        if (rmt_tx_wait_all_done(s->chan, pdMS_TO_TICKS(100)) != ESP_OK) {
+            // Missed done-interrupt: channel is stuck with queued transactions.
+            // Reset the channel so future refreshes work correctly.
+            rmt_disable(s->chan);
+            rmt_enable(s->chan);
+        }
+    }
     return ret;
 }
 
