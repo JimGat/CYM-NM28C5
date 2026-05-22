@@ -3,6 +3,7 @@
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_task_wdt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
@@ -428,18 +429,23 @@ int pn532_i2c_scan(uint8_t *addrs_out, int max_addrs)
 {
     if (!s_init || !s_bus) return -1;
     int found = 0;
-    // Only probe address 0x24 (PN532's hardwired I2C address).
-    // Scanning 0x01-0x7F takes 1.27s of 10ms timeouts — triggers WDT in main task.
-    ESP_LOGI(TAG, "I2C scan: SDA=GPIO%d SCL=GPIO%d  probing 0x24 (PN532)...",
+    // Full scan 0x03-0x77 with WDT resets every 16 addresses.
+    // Each probe: 10ms timeout. 117 probes × 10ms = ~1.2s total, safe with resets.
+    ESP_LOGI(TAG, "I2C scan: SDA=GPIO%d SCL=GPIO%d  scanning 0x03-0x77...",
              RF_HAT_PN532_SDA_GPIO, RF_HAT_PN532_SCL_GPIO);
-    esp_err_t e = i2c_master_probe(s_bus, PN532_I2C_ADDR, 10);
-    if (e == ESP_OK) {
-        ESP_LOGI(TAG, "  [FOUND] 0x%02X — PN532 on bus!", PN532_I2C_ADDR);
-        if (addrs_out && max_addrs > 0) addrs_out[0] = PN532_I2C_ADDR;
-        found = 1;
-    } else {
-        ESP_LOGW(TAG, "  0x24 not found (%s) — PN532 not in I2C mode or DIP 3 OFF",
-                 esp_err_to_name(e));
+    for (uint8_t addr = 0x03; addr <= 0x77; addr++) {
+        if ((addr & 0x0F) == 0x03) esp_task_wdt_reset();
+        esp_err_t e = i2c_master_probe(s_bus, addr, 10);
+        if (e == ESP_OK) {
+            ESP_LOGI(TAG, "  [FOUND] 0x%02X%s", addr,
+                     addr == PN532_I2C_ADDR ? " — PN532!" : " — unexpected device");
+            if (addrs_out && found < max_addrs)
+                addrs_out[found] = addr;
+            found++;
+        }
     }
+    if (found == 0)
+        ESP_LOGW(TAG, "  No I2C devices found on GPIO%d/GPIO%d — PN532 not powered or not in I2C mode",
+                 RF_HAT_PN532_SDA_GPIO, RF_HAT_PN532_SCL_GPIO);
     return found;
 }

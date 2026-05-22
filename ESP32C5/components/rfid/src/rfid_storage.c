@@ -1,6 +1,7 @@
 #include "rfid_storage.h"
 #include "rfid_types.h"
 #include "esp_log.h"
+#include "esp_task_wdt.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -18,11 +19,13 @@ void rfid_storage_ensure_dirs(void)
     };
     struct stat st;
     for (int i = 0; i < (int)(sizeof(dirs)/sizeof(dirs[0])); i++) {
+        esp_task_wdt_reset();   // mkdir on FAT can take >1s; keep watchdog fed
         if (stat(dirs[i], &st) != 0) {
             if (mkdir(dirs[i], 0755) == 0)
                 ESP_LOGI(TAG, "created %s", dirs[i]);
         }
     }
+    esp_task_wdt_reset();
 }
 
 // ── Minimal JSON writer ────────────────────────────────────────────────────────
