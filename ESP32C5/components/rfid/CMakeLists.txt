@@ -7,6 +7,7 @@ idf_component_register(
         "src/flipper_lf_file.c"
         "src/hf/pn532_driver.c"
         "src/hf/pn532_reader.c"
+        "src/hf/pn532_target.c"
         "src/hf/mifare_classic.c"
         "src/lf/lf_stub.c"
     INCLUDE_DIRS "include"

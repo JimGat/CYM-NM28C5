@@ -112,6 +112,16 @@ typedef struct {
     char     timestamp[20];   // ISO8601
 } rfid_card_t;
 
+// ── Emulation status (used by pn532_target / rfid_manager) ───────────────────
+typedef enum {
+    RFID_EMU_WAITING,   // listening for reader
+    RFID_EMU_ACTIVE,    // reader is interacting
+    RFID_EMU_DONE,      // ended cleanly (stop requested)
+    RFID_EMU_ERROR,     // hardware error
+} rfid_emu_status_t;
+
+typedef void (*rfid_emu_cb_t)(rfid_emu_status_t status, void *ctx);
+
 // ── Error codes ───────────────────────────────────────────────────────────────
 typedef enum {
     RFID_OK = 0,

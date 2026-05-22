@@ -69,6 +69,15 @@ rfid_err_t rfid_manager_test_mifare_keys(rfid_card_t *card,
                                           rfid_key_progress_cb_t progress_cb,
                                           void *ctx);
 
+// ── Card emulation ────────────────────────────────────────────────────────────
+// Starts a FreeRTOS task that puts the PN532 into target mode, presenting
+// card's UID/ATQA/SAK to any nearby reader. cb fires on status changes.
+// Stop with rfid_manager_stop_emulate(); max stop latency = 3 s.
+rfid_err_t rfid_manager_start_emulate(const rfid_card_t *card,
+                                       rfid_emu_cb_t cb, void *ctx);
+void       rfid_manager_stop_emulate(void);
+bool       rfid_manager_is_emulating(void);
+
 // ── I2C bus diagnostic scan ───────────────────────────────────────────────────
 // Probes all 127 I2C addresses. Returns device count; fills addrs_out[max].
 // Logs results. Returns -1 if manager not initialised.

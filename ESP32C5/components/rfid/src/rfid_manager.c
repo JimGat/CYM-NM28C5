@@ -2,6 +2,7 @@
 #include "rfid_types.h"
 #include "hf/pn532_driver.h"
 #include "hf/pn532_reader.h"
+#include "hf/pn532_target.h"
 #include "hf/mifare_classic.h"
 #include "lf/lf_stub.h"
 #include "esp_log.h"
@@ -157,6 +158,55 @@ void rfid_manager_stop_poll(void)
 }
 
 bool rfid_manager_is_polling(void) { return s_poll_task != NULL; }
+
+// ── Card emulation ─────────────────────────────────────────────────────────────
+
+static TaskHandle_t  s_emu_task = NULL;
+static volatile bool s_emu_stop = false;
+static rfid_emu_cb_t s_emu_cb   = NULL;
+static void         *s_emu_ctx  = NULL;
+static rfid_card_t   s_emu_card;
+
+static void s_emu_task_fn(void *arg)
+{
+    (void)arg;
+    pn532_emulate_card(&s_emu_card, s_emu_cb, s_emu_ctx, &s_emu_stop);
+    s_emu_task = NULL;
+    vTaskDelete(NULL);
+}
+
+rfid_err_t rfid_manager_start_emulate(const rfid_card_t *card,
+                                       rfid_emu_cb_t cb, void *ctx)
+{
+    if (!s_mgr_init) return RFID_ERR_NOT_INIT;
+    if (!card) return RFID_ERR_HW;
+    rfid_manager_stop_emulate();
+    memcpy(&s_emu_card, card, sizeof(rfid_card_t));
+    s_emu_cb   = cb;
+    s_emu_ctx  = ctx;
+    s_emu_stop = false;
+    BaseType_t rc = xTaskCreate(s_emu_task_fn, "rfid_emu", 4096, NULL,
+                                 tskIDLE_PRIORITY + 2, &s_emu_task);
+    return (rc == pdPASS) ? RFID_OK : RFID_ERR_HW;
+}
+
+void rfid_manager_stop_emulate(void)
+{
+    if (!s_emu_task) return;
+    s_emu_stop = true;
+    uint32_t wait = 0;
+    // Allow up to 6 s (2× poll cycle) for task to exit cleanly
+    while (s_emu_task && wait < 6000) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        wait += 50;
+    }
+    if (s_emu_task) {
+        vTaskDelete(s_emu_task);
+        s_emu_task = NULL;
+    }
+}
+
+bool rfid_manager_is_emulating(void) { return s_emu_task != NULL; }
 
 // ── One-shot scan ─────────────────────────────────────────────────────────────
 

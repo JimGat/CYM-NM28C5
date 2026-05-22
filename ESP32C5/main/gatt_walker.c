@@ -765,7 +765,7 @@ static void s_make_timestamp(char *out, size_t len)
     } else {
         /* RTC not set — use uptime in seconds */
         uint32_t secs = (uint32_t)(esp_timer_get_time() / 1000000ULL);
-        snprintf(out, len, "00000000_%06u", secs % 1000000u);
+        snprintf(out, len, "00000000_%06u", (unsigned int)(secs % 1000000u));
     }
 }
 
