@@ -1,4 +1,5 @@
 #include "flipper_nfc_file.h"
+#include "rfid_storage.h"
 #include "rfid_types.h"
 #include "esp_log.h"
 #include <stdio.h>
@@ -33,6 +34,7 @@ static const char *s_device_type(const rfid_card_t *card)
 rfid_err_t flipper_nfc_export(const rfid_card_t *card, const char *path)
 {
     if (!card || !path) return RFID_ERR_HW;
+    rfid_storage_ensure_dirs();
 
     FILE *f = fopen(path, "w");
     if (!f) return RFID_ERR_IO;

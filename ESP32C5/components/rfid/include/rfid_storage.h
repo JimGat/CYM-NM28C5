@@ -10,6 +10,7 @@
 #include "rfid_types.h"
 
 // ── Directory layout ──────────────────────────────────────────────────────────
+#define RFID_DIR_BASE    "/sdcard/lab/rfid"
 #define RFID_DIR_HF      "/sdcard/lab/rfid/hf"
 #define RFID_DIR_LF      "/sdcard/lab/rfid/lf"
 #define RFID_DIR_KEYS    "/sdcard/lab/rfid/keys"

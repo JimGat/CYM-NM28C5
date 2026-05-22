@@ -14,6 +14,7 @@ static const char *TAG = "rfid_stor";
 void rfid_storage_ensure_dirs(void)
 {
     const char *dirs[] = {
+        RFID_DIR_BASE,
         RFID_DIR_HF, RFID_DIR_LF, RFID_DIR_KEYS,
         RFID_DIR_LOGS, RFID_DIR_IMPORT, RFID_DIR_EXPORT,
     };
