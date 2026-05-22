@@ -283,49 +283,38 @@ rfid_err_t pn532_driver_init(void)
         return RFID_ERR_HW;
     }
 
-    // Allow PN532 to stabilize after power-on (DIP switch just toggled).
-    // PN532 OSC startup + I2C controller init can take up to 400ms on some variants.
-    vTaskDelay(pdMS_TO_TICKS(400));
+    // Allow PN532 to stabilize after power-on. PN532 OSC startup + firmware init
+    // takes up to 800ms on some variants — don't poll too early.
+    vTaskDelay(pdMS_TO_TICKS(800));
 
-    // PN532 I2C wakeup: send a WRITE of one 0x00 byte to address 0x24.
-    // Per PN532 Application Note and Adafruit library: the first I2C transaction
-    // after power-on must be a WRITE (not a READ) to bring the chip out of low-power
-    // mode. A NACK on this write is normal — the chip may not ACK the wakeup.
-    // If it times out the bus is left stuck; reset immediately.
-    {
-        uint8_t wake = 0x00;
-        esp_err_t we = i2c_master_transmit(s_dev, &wake, 1, pdMS_TO_TICKS(PN532_I2C_TIMEOUT));
-        ESP_LOGI(TAG, "I2C wakeup write: %s", (we == ESP_OK) ? "ACK" : "NACK/timeout (normal)");
-        if (we != ESP_OK) {
-            // Timeout leaves bus stuck (no STOP generated). Reset clears it.
-            i2c_master_bus_reset(s_bus);
-            vTaskDelay(pdMS_TO_TICKS(50));
-        }
-    }
-    vTaskDelay(pdMS_TO_TICKS(20));
-
-    // Poll for RDY byte — PN532 signals 0x01 when ready to receive a command.
-    // Reset the bus on each failure so timeouts don't leave it stuck for the next poll.
+    // Poll RDY byte directly. The first I2C START condition (from i2c_master_receive)
+    // is sufficient to wake the PN532 from low-power mode — no separate wakeup write
+    // needed. The wakeup write approach left the bus stuck on TIMEOUT because no STOP
+    // condition was generated. Polling directly gets a clean NACK if not ready.
+    //
+    // PN532 returns 0x01 when ready, 0x00 when still booting.
+    // TIMEOUT = bus stuck (SDA held LOW) → reset; NACK = device not at 0x24.
     {
         uint8_t rdy = 0;
-        esp_err_t re = ESP_ERR_TIMEOUT;
-        for (int i = 0; i < 5; i++) {
-            re = i2c_master_receive(s_dev, &rdy, 1, pdMS_TO_TICKS(PN532_I2C_TIMEOUT));
+        bool ready = false;
+        ESP_LOGI(TAG, "Polling PN532 ready (up to 2s)...");
+        for (int i = 0; i < 20 && !ready; i++) {
+            esp_err_t re = i2c_master_receive(s_dev, &rdy, 1, pdMS_TO_TICKS(50));
             if (re == ESP_OK) {
-                ESP_LOGI(TAG, "I2C ready poll [%d]: RDY=0x%02X %s",
-                         i, rdy, (rdy == 0x01) ? "(READY)" : "(not ready yet)");
-                if (rdy == 0x01) break;
-            } else {
-                ESP_LOGD(TAG, "I2C ready poll [%d]: %s", i, esp_err_to_name(re));
+                ESP_LOGI(TAG, "  poll[%d]: RDY=0x%02X %s",
+                         i, rdy, rdy == 0x01 ? "(READY)" : "(not ready)");
+                if (rdy == 0x01) ready = true;
+            } else if (re == ESP_ERR_TIMEOUT) {
+                ESP_LOGW(TAG, "  poll[%d]: TIMEOUT — bus stuck, resetting", i);
                 i2c_master_bus_reset(s_bus);
+            } else {
+                // NACK: device not present or not responding at 0x24
+                ESP_LOGW(TAG, "  poll[%d]: NACK/err (%s)", i, esp_err_to_name(re));
             }
-            vTaskDelay(pdMS_TO_TICKS(50));
+            if (!ready) vTaskDelay(pdMS_TO_TICKS(100));
         }
-        if (re != ESP_OK) {
-            ESP_LOGW(TAG, "PN532 not responding — check: DIP 3 ON, I2C mode jumper on module");
-        } else if (rdy != 0x01) {
-            ESP_LOGW(TAG, "PN532 responding but RDY=0x%02X (not 0x01) — may still need time", rdy);
-        }
+        if (!ready)
+            ESP_LOGW(TAG, "PN532 not ready after 2s — check DIP 3 ON, I2C mode set on module");
     }
 
     s_init = true;
