@@ -117,9 +117,7 @@ rfid_err_t pn532_driver_init(void)
     gpio_reset_pin((gpio_num_t)RF_HAT_PN532_SDA_GPIO);
 
     // ── GPIO level diagnostic ─────────────────────────────────────────────────
-    // Configure as input with pull-up and read line levels.
-    // Both lines must idle HIGH for I2C to work. A stuck-LOW reading means a
-    // physical short to GND, a device pulling the bus, or wrong GPIO mapping.
+    // Read both lines as input with pull-up. Both must idle HIGH for I2C.
     {
         gpio_config_t gc = {
             .pin_bit_mask = (1ULL << RF_HAT_PN532_SCL_GPIO) |
@@ -136,22 +134,30 @@ rfid_err_t pn532_driver_init(void)
         ESP_LOGI(TAG, "BUS IDLE (pull-up): SCL(GPIO%d)=%d  SDA(GPIO%d)=%d  [expect both 1]",
                  RF_HAT_PN532_SCL_GPIO, scl_pu, RF_HAT_PN532_SDA_GPIO, sda_pu);
 
-        // Drive both HIGH as output, then switch to input and read back.
-        // If either reads LOW while driven HIGH → physical short to GND.
+        // Drive HIGH and read physical pad level WHILE STILL DRIVING.
+        // gpio_get_level() reads GPIO_IN_REG (actual pad voltage, not output latch).
+        // Open-drain slave: our 40mA output wins → reads 1 while driving.
+        // Push-pull slave:  device sinks >40mA → reads 0 while driving.
+        // This is the true push-pull vs open-drain discriminator.
         gpio_set_direction((gpio_num_t)RF_HAT_PN532_SCL_GPIO, GPIO_MODE_OUTPUT);
         gpio_set_direction((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_MODE_OUTPUT);
         gpio_set_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO, 1);
         gpio_set_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO, 1);
         vTaskDelay(pdMS_TO_TICKS(5));
+        int scl_driven = gpio_get_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO); // WHILE driving HIGH
+        int sda_driven = gpio_get_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO); // WHILE driving HIGH
+        // Now release and read what the device holds the line at (open-drain hold)
         gpio_set_direction((gpio_num_t)RF_HAT_PN532_SCL_GPIO, GPIO_MODE_INPUT);
         gpio_set_direction((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_MODE_INPUT);
         vTaskDelay(pdMS_TO_TICKS(5));
-        int scl_hi = gpio_get_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO);
-        int sda_hi = gpio_get_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO);
-        ESP_LOGI(TAG, "BUS DRIVE-HIGH:     SCL(GPIO%d)=%d  SDA(GPIO%d)=%d  [expect both 1]",
-                 RF_HAT_PN532_SCL_GPIO, scl_hi, RF_HAT_PN532_SDA_GPIO, sda_hi);
+        int scl_hi = gpio_get_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO); // after release
+        int sda_hi = gpio_get_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO); // after release
+        ESP_LOGI(TAG, "BUS DRIVE-HIGH (while driving): SCL=%d SDA=%d  [push-pull if 0]",
+                 scl_driven, sda_driven);
+        ESP_LOGI(TAG, "BUS DRIVE-HIGH (after release): SCL=%d SDA=%d  [open-drain pull if 0]",
+                 scl_hi, sda_hi);
 
-        // Drive both LOW, read back — confirms GPIO output actually works.
+        // Drive LOW — confirms GPIO output works and lines aren't stuck HIGH.
         gpio_set_direction((gpio_num_t)RF_HAT_PN532_SCL_GPIO, GPIO_MODE_OUTPUT);
         gpio_set_direction((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_MODE_OUTPUT);
         gpio_set_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO, 0);
@@ -165,98 +171,69 @@ rfid_err_t pn532_driver_init(void)
         ESP_LOGI(TAG, "BUS DRIVE-LOW:      SCL(GPIO%d)=%d  SDA(GPIO%d)=%d  [expect both 0]",
                  RF_HAT_PN532_SCL_GPIO, scl_lo, RF_HAT_PN532_SDA_GPIO, sda_lo);
 
-        if (scl_pu == 0 || sda_pu == 0)
-            ESP_LOGE(TAG, "*** LINE STUCK LOW (pull-up): %s%s"
-                     "— short to GND, wrong GPIO, or device actively pulling bus",
-                     scl_pu == 0 ? "SCL " : "", sda_pu == 0 ? "SDA " : "");
-        if (scl_hi == 0 || sda_hi == 0)
-            ESP_LOGE(TAG, "*** LINE STUCK LOW (drive-HIGH): %s%s"
-                     "— hard short to GND on these GPIO pins",
-                     scl_hi == 0 ? "SCL " : "", sda_hi == 0 ? "SDA " : "");
-        if (scl_lo == 1 || sda_lo == 1)
-            ESP_LOGE(TAG, "*** LINE STUCK HIGH (drive-LOW): %s%s"
-                     "— GPIO not connected or pull-up too strong",
-                     scl_lo == 1 ? "SCL " : "", sda_lo == 1 ? "SDA " : "");
-
-        // ── I2C bus recovery (9-clock release) ───────────────────────────────
-        // SDA stuck LOW means the PN532 is holding SDA mid-transaction —
-        // clocking SCL 9 times lets the slave shift out its state and release.
-        if (sda_pu == 0) {
-            ESP_LOGW(TAG, "SDA stuck LOW — bus recovery: clocking SCL 9x");
-            gpio_set_direction((gpio_num_t)RF_HAT_PN532_SCL_GPIO, GPIO_MODE_OUTPUT);
-            gpio_set_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO, 1);
-            gpio_set_pull_mode((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_PULLUP_ONLY);
-            gpio_set_direction((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_MODE_INPUT);
-            vTaskDelay(pdMS_TO_TICKS(1));
-            bool recovered = false;
-            for (int i = 0; i < 9; i++) {
-                gpio_set_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO, 0);
-                vTaskDelay(pdMS_TO_TICKS(1));
-                gpio_set_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO, 1);
-                vTaskDelay(pdMS_TO_TICKS(1));
-                if (gpio_get_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO)) {
-                    ESP_LOGI(TAG, "  SDA released after %d clock(s)", i + 1);
-                    recovered = true;
-                    break;
-                }
-            }
-            // STOP condition: SCL HIGH, SDA LOW→HIGH
-            gpio_set_direction((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_MODE_OUTPUT);
-            gpio_set_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO, 1);
-            gpio_set_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO, 0);
-            vTaskDelay(pdMS_TO_TICKS(1));
-            gpio_set_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO, 1);
-            vTaskDelay(pdMS_TO_TICKS(5));
-            gpio_set_direction((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_MODE_INPUT);
-            gpio_set_pull_mode((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_PULLUP_ONLY);
-            vTaskDelay(pdMS_TO_TICKS(10));
-            int sda_after = gpio_get_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO);
-            ESP_LOGI(TAG, "SDA after recovery: %d %s",
-                     sda_after, sda_after ? "(bus free)" : "(STILL STUCK — power-cycle PN532 via DIP switch)");
-            if (!recovered && !sda_after)
-                ESP_LOGE(TAG, "*** 9-clock recovery failed: SDA still held LOW by PN532");
-
-            // Monitor SDA stability for 500ms after recovery.
-            // If PN532 immediately re-asserts LOW, software recovery alone is insufficient —
-            // the PN532 must be power-cycled (DIP switch OFF then ON) to reset its I2C FSM.
-            if (sda_after) {
-                int stuck_count = 0;
-                for (int i = 0; i < 10; i++) {
-                    vTaskDelay(pdMS_TO_TICKS(50));
-                    if (!gpio_get_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO)) stuck_count++;
-                }
-                if (stuck_count > 0) {
-                    ESP_LOGE(TAG, "*** SDA re-asserted LOW %d/10 samples after recovery"
-                             " — PN532 needs power-cycle (toggle DIP switch 3)", stuck_count);
-                } else {
-                    ESP_LOGI(TAG, "SDA stable HIGH for 500ms after recovery — bus is clean");
-                }
-            }
-        }
-
-        // If SDA was stuck AND the drive-HIGH test showed it can't be overridden,
-        // the PN532 is using push-pull drive (UART TX or SPI MISO), not open-drain I2C.
-        // An I2C slave open-drain cannot sink more than ~1-2 mA; our GPIO sources ~40 mA.
-        // If sda_hi == 0 (SDA reads LOW even while we drove it HIGH), it's push-pull.
-        // Return now — skip I2C entirely to avoid the ~3s WDT-triggering delay.
-        if (sda_hi == 0) {
-            ESP_LOGE(TAG, "====================================================");
-            ESP_LOGE(TAG, "PN532 NOT IN I2C MODE — push-pull SDA detected");
-            ESP_LOGE(TAG, "GPIO%d reads LOW even while driven HIGH (our 40mA output lost).",
-                     RF_HAT_PN532_SDA_GPIO);
-            ESP_LOGE(TAG, "I2C slaves use open-drain; this is a push-pull TX/MISO driver.");
-            ESP_LOGE(TAG, "");
-            ESP_LOGE(TAG, "ACTION: Set the I2C mode jumper ON THE PN532 MODULE ITSELF:");
-            ESP_LOGE(TAG, "  Elechouse v4 board: tiny DIP switch ON the module (2 switches)");
-            ESP_LOGE(TAG, "    HSU/UART = SW1=OFF SW2=OFF  (factory default on many units)");
-            ESP_LOGE(TAG, "    SPI      = SW1=OFF SW2=ON");
-            ESP_LOGE(TAG, "    I2C      = SW1=ON  SW2=OFF  <-- SET THIS");
-            ESP_LOGE(TAG, "  Waveshare: slide switch labelled HSU/SPI/I2C — pick I2C");
-            ESP_LOGE(TAG, "  Bare chip: SEL0 pin HIGH, SEL1 pin LOW at power-on");
-            ESP_LOGE(TAG, "====================================================");
+        // True push-pull: something overrode our output drive → hard fault, cannot I2C
+        if (sda_driven == 0) {
+            ESP_LOGE(TAG, "SDA reads LOW while we drive it HIGH — push-pull output on bus.");
+            ESP_LOGE(TAG, "Check: is DIP 3 ON but PN532 powered via a different interface?");
             gpio_reset_pin((gpio_num_t)RF_HAT_PN532_SCL_GPIO);
             gpio_reset_pin((gpio_num_t)RF_HAT_PN532_SDA_GPIO);
             return RFID_ERR_HW;
+        }
+        if (scl_lo == 1 || sda_lo == 1)
+            ESP_LOGE(TAG, "*** LINE STUCK HIGH (drive-LOW): %s%s— GPIO not connected?",
+                     scl_lo == 1 ? "SCL " : "", sda_lo == 1 ? "SDA " : "");
+
+        // ── SDA stuck LOW (open-drain) — bus recovery ─────────────────────────
+        // sda_pu==0 means PN532 is holding SDA LOW (open-drain). Two causes:
+        //   (a) Power-on init: PN532 holds SDA LOW for up to ~400ms at startup.
+        //   (b) Stuck mid-transaction: I2C FSM halted; 9-clock recovery needed.
+        // Strategy: wait up to 500ms first (handles power-on case without recovery).
+        if (sda_pu == 0) {
+            ESP_LOGW(TAG, "SDA stuck LOW — waiting up to 500ms for PN532 power-on init...");
+            bool released = false;
+            for (int w = 0; w < 10 && !released; w++) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                released = gpio_get_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO);
+                if (released)
+                    ESP_LOGI(TAG, "  SDA released spontaneously after %dms (startup OK)", (w+1)*50);
+            }
+
+            if (!released) {
+                // Still stuck after 500ms → try 9-clock bus recovery
+                ESP_LOGW(TAG, "SDA still LOW — bus recovery: clocking SCL 9x");
+                gpio_set_direction((gpio_num_t)RF_HAT_PN532_SCL_GPIO, GPIO_MODE_OUTPUT);
+                gpio_set_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO, 1);
+                gpio_set_pull_mode((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_PULLUP_ONLY);
+                gpio_set_direction((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_MODE_INPUT);
+                vTaskDelay(pdMS_TO_TICKS(1));
+                for (int i = 0; i < 9; i++) {
+                    gpio_set_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO, 0);
+                    vTaskDelay(pdMS_TO_TICKS(1));
+                    gpio_set_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO, 1);
+                    vTaskDelay(pdMS_TO_TICKS(1));
+                    if (gpio_get_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO)) {
+                        ESP_LOGI(TAG, "  SDA released after %d clock(s)", i + 1);
+                        released = true;
+                        break;
+                    }
+                }
+                // STOP condition: SCL HIGH, SDA LOW→HIGH
+                gpio_set_direction((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_MODE_OUTPUT);
+                gpio_set_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO, 1);
+                gpio_set_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO, 0);
+                vTaskDelay(pdMS_TO_TICKS(1));
+                gpio_set_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO, 1);
+                vTaskDelay(pdMS_TO_TICKS(5));
+                gpio_set_direction((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_MODE_INPUT);
+                gpio_set_pull_mode((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_PULLUP_ONLY);
+                vTaskDelay(pdMS_TO_TICKS(20));
+                int sda_after = gpio_get_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO);
+                ESP_LOGI(TAG, "SDA after 9-clock recovery: %d %s",
+                         sda_after,
+                         sda_after ? "(bus free)" : "(STILL STUCK — toggle DIP 3 to power-cycle)");
+                if (!sda_after)
+                    ESP_LOGE(TAG, "*** Recovery failed — PN532 I2C FSM needs power-cycle");
+            }
         }
 
         // Reset before I2C init — clears GPIO matrix routing and driver reservation.
