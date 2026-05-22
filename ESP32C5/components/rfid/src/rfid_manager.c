@@ -59,7 +59,16 @@ rfid_err_t rfid_manager_init(void)
         ESP_LOGE(TAG, "PN532 driver init failed: %s", rfid_err_str(r));
         return r;
     }
-    r = pn532_sam_configure();
+    // Retry SAM configure up to 5x with 200ms gaps. The ESP-IDF I2C master driver
+    // sometimes rejects the first transaction after bus creation; a retry succeeds.
+    r = RFID_ERR_HW;
+    for (int attempt = 0; attempt < 5 && r != RFID_OK; attempt++) {
+        if (attempt > 0) {
+            ESP_LOGW(TAG, "SAM configure retry %d/5...", attempt + 1);
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+        r = pn532_sam_configure();
+    }
     if (r != RFID_OK) {
         // Keep I2C bus up so the UI retry timer can call rfid_manager_init() again
         // without re-creating the bus. Do NOT deinit the driver here.

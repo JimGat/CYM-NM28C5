@@ -14,7 +14,7 @@ static const char *TAG = "pn532";
 #define PN532_I2C_ADDR      0x24
 #define PN532_I2C_FREQ_HZ   100000
 #define PN532_I2C_PORT      I2C_NUM_0
-#define PN532_I2C_TIMEOUT   50     // ms per transfer
+#define PN532_I2C_TIMEOUT   500    // ms per transfer (passed as-is to xfer_timeout_ms — NOT ticks)
 
 // ── Frame bytes ───────────────────────────────────────────────────────────────
 #define PN532_PREAMBLE      0x00
@@ -48,7 +48,7 @@ static rfid_err_t s_wait_ready(uint32_t timeout_ms)
     uint8_t rdy;
     uint32_t elapsed = 0;
     while (elapsed < timeout_ms) {
-        esp_err_t e = i2c_master_receive(s_dev, &rdy, 1, pdMS_TO_TICKS(PN532_I2C_TIMEOUT));
+        esp_err_t e = i2c_master_receive(s_dev, &rdy, 1, PN532_I2C_TIMEOUT);
         if (e == ESP_OK && rdy == PN532_I2C_READY) return RFID_OK;
         vTaskDelay(pdMS_TO_TICKS(5));
         elapsed += 5;
@@ -82,7 +82,7 @@ static rfid_err_t s_write_frame(const uint8_t *cmd, uint8_t cmd_len)
     frame[idx++] = PN532_POSTAMBLE;
 
     esp_err_t e = i2c_master_transmit(s_dev, frame, (size_t)idx,
-                                       pdMS_TO_TICKS(PN532_I2C_TIMEOUT));
+                                       PN532_I2C_TIMEOUT);
     if (e != ESP_OK) {
         ESP_LOGW(TAG, "I2C write failed: %s", esp_err_to_name(e));
         return RFID_ERR_HW;
@@ -99,7 +99,7 @@ static rfid_err_t s_read_ack(void)
     rfid_err_t r = s_wait_ready(100);
     if (r != RFID_OK) return r;
 
-    esp_err_t e = i2c_master_receive(s_dev, buf, 7, pdMS_TO_TICKS(PN532_I2C_TIMEOUT));
+    esp_err_t e = i2c_master_receive(s_dev, buf, 7, PN532_I2C_TIMEOUT);
     if (e != ESP_OK) return RFID_ERR_HW;
 
     // buf[0] = RDY (already 0x01 from wait_ready), buf[1..6] = ACK frame
@@ -201,7 +201,7 @@ rfid_err_t pn532_read_response(uint8_t expected_cmd, uint8_t *buf, uint8_t *buf_
     if (read_len > sizeof(raw)) read_len = sizeof(raw);
 
     esp_err_t e = i2c_master_receive(s_dev, raw, read_len,
-                                      pdMS_TO_TICKS(PN532_I2C_TIMEOUT));
+                                      PN532_I2C_TIMEOUT);
     if (e != ESP_OK) return RFID_ERR_HW;
 
     // raw[0] = RDY, raw[1]=0x00, raw[2]=0x00, raw[3]=0xFF, raw[4]=LEN, raw[5]=LCS
