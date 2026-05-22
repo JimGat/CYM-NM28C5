@@ -21942,7 +21942,7 @@ static void gps_show_edit_overlay(lv_event_t *e)
     lv_obj_set_style_text_font(gps_edit_alt_ta, &lv_font_montserrat_12, 0);
     lv_obj_set_style_bg_color(gps_edit_alt_ta, ui_bg_color(), 0);
     lv_obj_set_style_text_color(gps_edit_alt_ta, ui_text_color(), 0);
-    lv_obj_set_style_border_color(gps_edit_alt_ta, lv_color_make(80, 80, 80), 0);
+    lv_obj_set_style_border_color(gps_edit_alt_ta, ui_accent_color(), 0);
     lv_obj_set_style_bg_opa(gps_edit_alt_ta, LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_obj_set_style_border_color(gps_edit_alt_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_obj_set_style_border_width(gps_edit_alt_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
@@ -23026,6 +23026,9 @@ static void show_add_oui_entry_screen(void)
     lv_textarea_set_max_length(add_oui_ta, 8);   /* "AA:BB:CC" */
     lv_textarea_set_placeholder_text(add_oui_ta, "AA:BB:CC");
     lv_obj_set_style_text_font(add_oui_ta, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_bg_color(add_oui_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(add_oui_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(add_oui_ta, ui_accent_color(), 0);
     lv_obj_set_style_bg_opa(add_oui_ta, LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_obj_set_style_border_color(add_oui_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_obj_set_style_border_width(add_oui_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
@@ -23040,6 +23043,9 @@ static void show_add_oui_entry_screen(void)
     lv_textarea_set_max_length(add_oui_name_ta, 31);
     lv_textarea_set_placeholder_text(add_oui_name_ta, "Label (optional)");
     lv_obj_set_style_text_font(add_oui_name_ta, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_bg_color(add_oui_name_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(add_oui_name_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(add_oui_name_ta, ui_accent_color(), 0);
     lv_obj_set_style_bg_opa(add_oui_name_ta, LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_obj_set_style_border_color(add_oui_name_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_obj_set_style_border_width(add_oui_name_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
@@ -23890,6 +23896,13 @@ static void lw_create_list_cb(lv_event_t *e) {
     lv_obj_set_width(kb, LCD_H_RES);
     lv_obj_set_style_text_font(kb, &lv_font_montserrat_12, 0);
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(kb, ui_bg_color(),    LV_PART_MAIN);
+    lv_obj_set_style_text_color(kb, ui_text_color(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(kb, lv_color_make(0, 100, 0), LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(kb, lv_color_make(0, 150, 0), LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(kb, ui_text_color(), LV_PART_ITEMS);
+    lv_obj_set_style_border_color(kb, ui_border_color(), LV_PART_ITEMS);
+    lv_obj_set_style_border_width(kb, 1, LV_PART_ITEMS);
 
     lv_obj_t *card = lv_obj_create(lw_save_overlay);
     lv_obj_set_size(card, LCD_H_RES - 16, LV_SIZE_CONTENT);
@@ -23921,7 +23934,11 @@ static void lw_create_list_cb(lv_event_t *e) {
     lv_obj_set_style_text_font(lw_save_ta, &lv_font_montserrat_12, 0);
     lv_obj_set_style_bg_color(lw_save_ta, ui_bg_color(), 0);
     lv_obj_set_style_text_color(lw_save_ta, ui_text_color(), 0);
-    lv_obj_set_style_border_color(lw_save_ta, UI_ACCENT_CYAN, 0);
+    lv_obj_set_style_border_color(lw_save_ta, ui_accent_color(), 0);
+    lv_obj_set_style_bg_opa(lw_save_ta,    LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(lw_save_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(lw_save_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(lw_save_ta,  LV_BORDER_SIDE_LEFT, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_keyboard_set_textarea(kb, lw_save_ta);
 
     lv_obj_t *btn_row = lv_obj_create(card);
@@ -25486,6 +25503,13 @@ static void bt_sas_open_save_dialog(void)
     lv_obj_set_width(kb, LCD_H_RES);
     lv_obj_set_style_text_font(kb, &lv_font_montserrat_12, 0);
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(kb, ui_bg_color(),    LV_PART_MAIN);
+    lv_obj_set_style_text_color(kb, ui_text_color(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(kb, lv_color_make(0, 100, 0), LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(kb, lv_color_make(0, 150, 0), LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(kb, ui_text_color(), LV_PART_ITEMS);
+    lv_obj_set_style_border_color(kb, ui_border_color(), LV_PART_ITEMS);
+    lv_obj_set_style_border_width(kb, 1, LV_PART_ITEMS);
 
     lv_obj_t *card = lv_obj_create(bt_sas_save_overlay);
     lv_obj_set_size(card, LCD_H_RES - 16, LV_SIZE_CONTENT);
@@ -25529,7 +25553,7 @@ static void bt_sas_open_save_dialog(void)
     lv_obj_set_style_text_font(bt_sas_save_ta, &lv_font_montserrat_12, 0);
     lv_obj_set_style_bg_color(bt_sas_save_ta, ui_bg_color(), 0);
     lv_obj_set_style_text_color(bt_sas_save_ta, ui_text_color(), 0);
-    lv_obj_set_style_border_color(bt_sas_save_ta, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_border_color(bt_sas_save_ta, ui_accent_color(), 0);
     lv_obj_set_style_bg_opa(bt_sas_save_ta, LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_obj_set_style_border_color(bt_sas_save_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_obj_set_style_border_width(bt_sas_save_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
@@ -28719,6 +28743,9 @@ static void show_spoof_add_entry_screen(void) {
     lv_textarea_set_max_length(s_spoof_mac_ta, 17);
     lv_textarea_set_placeholder_text(s_spoof_mac_ta, "AA:BB:CC:DD:EE:FF");
     lv_obj_set_style_text_font(s_spoof_mac_ta, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_bg_color(s_spoof_mac_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(s_spoof_mac_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(s_spoof_mac_ta, ui_accent_color(), 0);
     lv_obj_set_style_bg_opa(s_spoof_mac_ta, LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_obj_set_style_border_color(s_spoof_mac_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_obj_set_style_border_width(s_spoof_mac_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
@@ -28731,6 +28758,9 @@ static void show_spoof_add_entry_screen(void) {
     lv_textarea_set_max_length(s_spoof_name_ta, 32);
     lv_textarea_set_placeholder_text(s_spoof_name_ta, "Device name (optional)");
     lv_obj_set_style_text_font(s_spoof_name_ta, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_bg_color(s_spoof_name_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(s_spoof_name_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(s_spoof_name_ta, ui_accent_color(), 0);
     lv_obj_set_style_bg_opa(s_spoof_name_ta, LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_obj_set_style_border_color(s_spoof_name_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_obj_set_style_border_width(s_spoof_name_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
