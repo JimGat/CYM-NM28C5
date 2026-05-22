@@ -58,6 +58,7 @@ rfid_err_t pn532_scan_card(rfid_card_t *card, uint32_t timeout_ms)
     while (elapsed < timeout_ms) {
         rfid_err_t r = pn532_send_command(cmd, sizeof(cmd));
         if (r != RFID_OK) {
+            ESP_LOGW(TAG, "scan: send_cmd failed: %s", rfid_err_str(r));
             vTaskDelay(pdMS_TO_TICKS(step_ms));
             elapsed += step_ms;
             continue;
@@ -66,12 +67,15 @@ rfid_err_t pn532_scan_card(rfid_card_t *card, uint32_t timeout_ms)
         uint8_t resp[20];
         uint8_t rlen = 0;
         r = pn532_read_response(PN532_CMD_IN_LIST_PASSIVE, resp, &rlen,
-                                 sizeof(resp), 300);
+                                 sizeof(resp), 1000);
         if (r != RFID_OK || rlen < 1) {
+            ESP_LOGW(TAG, "scan: read_resp failed: %s rlen=%u", rfid_err_str(r), rlen);
             vTaskDelay(pdMS_TO_TICKS(step_ms));
             elapsed += step_ms;
             continue;
         }
+
+        ESP_LOGD(TAG, "scan: NbTg=%u rlen=%u", resp[0], rlen);
 
         // resp[0] = NbTg (number of targets found)
         if (resp[0] == 0) {
