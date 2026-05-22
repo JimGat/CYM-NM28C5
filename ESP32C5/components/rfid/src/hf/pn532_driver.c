@@ -275,15 +275,21 @@ rfid_err_t pn532_driver_init(void)
     // Per PN532 Application Note and Adafruit library: the first I2C transaction
     // after power-on must be a WRITE (not a READ) to bring the chip out of low-power
     // mode. A NACK on this write is normal — the chip may not ACK the wakeup.
+    // If it times out the bus is left stuck; reset immediately.
     {
         uint8_t wake = 0x00;
         esp_err_t we = i2c_master_transmit(s_dev, &wake, 1, pdMS_TO_TICKS(PN532_I2C_TIMEOUT));
         ESP_LOGI(TAG, "I2C wakeup write: %s", (we == ESP_OK) ? "ACK" : "NACK/timeout (normal)");
+        if (we != ESP_OK) {
+            // Timeout leaves bus stuck (no STOP generated). Reset clears it.
+            i2c_master_bus_reset(s_bus);
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
     }
     vTaskDelay(pdMS_TO_TICKS(20));
 
     // Poll for RDY byte — PN532 signals 0x01 when ready to receive a command.
-    // Only try 5 times (250ms): if the wakeup write NACK'd, more polls won't help.
+    // Reset the bus on each failure so timeouts don't leave it stuck for the next poll.
     {
         uint8_t rdy = 0;
         esp_err_t re = ESP_ERR_TIMEOUT;
@@ -295,6 +301,7 @@ rfid_err_t pn532_driver_init(void)
                 if (rdy == 0x01) break;
             } else {
                 ESP_LOGD(TAG, "I2C ready poll [%d]: %s", i, esp_err_to_name(re));
+                i2c_master_bus_reset(s_bus);
             }
             vTaskDelay(pdMS_TO_TICKS(50));
         }
@@ -430,9 +437,11 @@ int pn532_i2c_scan(uint8_t *addrs_out, int max_addrs)
     if (!s_init || !s_bus) return -1;
     int found = 0;
     // Full scan 0x03-0x77 with WDT resets every 16 addresses.
-    // Each probe: 10ms timeout. 117 probes × 10ms = ~1.2s total, safe with resets.
+    // Reset bus first — prior timeouts (wakeup, RDY polls) may leave it stuck.
     ESP_LOGI(TAG, "I2C scan: SDA=GPIO%d SCL=GPIO%d  scanning 0x03-0x77...",
              RF_HAT_PN532_SDA_GPIO, RF_HAT_PN532_SCL_GPIO);
+    i2c_master_bus_reset(s_bus);
+    vTaskDelay(pdMS_TO_TICKS(20));
     for (uint8_t addr = 0x03; addr <= 0x77; addr++) {
         if ((addr & 0x0F) == 0x03) esp_task_wdt_reset();
         esp_err_t e = i2c_master_probe(s_bus, addr, 10);
