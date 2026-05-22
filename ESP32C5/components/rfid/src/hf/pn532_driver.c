@@ -145,39 +145,11 @@ rfid_err_t pn532_driver_init(void)
         return RFID_ERR_HW;
     }
 
-    // Send 9 SCL clocks + STOP via I2C hardware to release any slave holding SDA LOW.
-    // This is the correct bus recovery path — I2C peripheral drives it, not GPIO matrix.
+    // Send 9 SCL clocks + STOP to release any slave holding SDA LOW, then settle.
+    // No blocking RDY poll here — PN532 takes 60-90s from cold power-on; the caller
+    // (rfid_manager_init / UI retry timer) handles the wait non-blockingly.
     i2c_master_bus_reset(s_bus);
     vTaskDelay(pdMS_TO_TICKS(20));
-
-    // Allow PN532 to stabilize after power-on (OSC + firmware init up to 800ms).
-    vTaskDelay(pdMS_TO_TICKS(800));
-
-    // Poll RDY byte. First I2C START wakes PN532 from low-power mode.
-    // TIMEOUT = bus stuck → reset; NACK = device not at 0x24.
-    {
-        uint8_t rdy = 0;
-        bool ready = false;
-        ESP_LOGI(TAG, "Polling PN532 ready (up to 5s)...");
-        for (int i = 0; i < 50 && !ready; i++) {
-            esp_err_t re = i2c_master_receive(s_dev, &rdy, 1, pdMS_TO_TICKS(50));
-            if (re == ESP_OK) {
-                ESP_LOGI(TAG, "  poll[%d]: RDY=0x%02X %s",
-                         i, rdy, rdy == 0x01 ? "(READY)" : "(not ready)");
-                if (rdy == 0x01) ready = true;
-            } else if (re == ESP_ERR_TIMEOUT) {
-                ESP_LOGW(TAG, "  poll[%d]: TIMEOUT — bus stuck, resetting", i);
-                i2c_master_bus_reset(s_bus);
-            } else {
-                // NACK: device not present or not responding at 0x24
-                ESP_LOGW(TAG, "  poll[%d]: NACK/err (%s)", i, esp_err_to_name(re));
-            }
-            if (!ready) vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        if (!ready)
-            ESP_LOGW(TAG, "PN532 not ready after 5s — check I2C mode jumper on module, SCL=GPIO%d SDA=GPIO%d",
-                     RF_HAT_PN532_SCL_GPIO, RF_HAT_PN532_SDA_GPIO);
-    }
 
     s_init = true;
     ESP_LOGI(TAG, "I2C init: SCL=GPIO%d SDA=GPIO%d addr=0x%02X",

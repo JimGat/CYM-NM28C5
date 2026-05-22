@@ -60,28 +60,11 @@ rfid_err_t rfid_manager_init(void)
     }
     r = pn532_sam_configure();
     if (r != RFID_OK) {
-        // Retry once after a longer settling delay — some modules need more warmup
-        ESP_LOGW(TAG, "SAM configure attempt 1 failed (%s), retrying in 300 ms...",
-                 rfid_err_str(r));
-        vTaskDelay(pdMS_TO_TICKS(300));
-        r = pn532_sam_configure();
-        if (r != RFID_OK) {
-            ESP_LOGW(TAG, "SAM configure failed after retry: %s", rfid_err_str(r));
-            uint8_t found_addrs[8];
-            int n = pn532_i2c_scan(found_addrs, 8);
-            if (n == 0) {
-                ESP_LOGW(TAG, "*** I2C scan: NO devices found");
-            } else {
-                ESP_LOGI(TAG, "*** I2C scan: %d device(s) found", n);
-                for (int i = 0; i < n; i++)
-                    ESP_LOGI(TAG, "***   addr=0x%02X", found_addrs[i]);
-            }
-            // PN532 not responding — don't mark as init'd so the UI can retry.
-            pn532_driver_deinit();
-            return RFID_ERR_HW;
-        } else {
-            ESP_LOGI(TAG, "SAM configure OK on retry");
-        }
+        // PN532 not ready yet (needs 60-90s from cold power-on).
+        // Keep I2C bus up so the UI retry timer can call rfid_manager_init() again
+        // without re-creating the bus. Do NOT deinit the driver here.
+        ESP_LOGW(TAG, "SAM configure failed (%s) — PN532 still warming up", rfid_err_str(r));
+        return RFID_ERR_HW;
     }
     s_mgr_init = true;
     ESP_LOGI(TAG, "init OK");

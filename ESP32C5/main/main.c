@@ -36769,7 +36769,8 @@ static lv_obj_t *s_rfid_scan_type_lbl   = NULL;
 static lv_obj_t *s_rfid_scan_atqa_lbl   = NULL;
 static lv_obj_t *s_rfid_scan_status_lbl = NULL;
 static lv_obj_t *s_rfid_scan_save_btn   = NULL;
-static bool s_rfid_has_card = false;
+static bool       s_rfid_has_card        = false;
+static lv_timer_t *s_rfid_init_retry_tmr = NULL;
 
 // Stop poll and null scan-screen labels before navigating away — prevents
 // in-flight lv_async_call callbacks from firing against deleted LVGL objects
@@ -36777,6 +36778,10 @@ static bool s_rfid_has_card = false;
 static void rfid_back_to_menu(void)
 {
     rfid_manager_stop_poll();
+    if (s_rfid_init_retry_tmr) {
+        lv_timer_del(s_rfid_init_retry_tmr);
+        s_rfid_init_retry_tmr = NULL;
+    }
     s_rfid_scan_uid_lbl    = NULL;
     s_rfid_scan_type_lbl   = NULL;
     s_rfid_scan_atqa_lbl   = NULL;
@@ -36835,6 +36840,23 @@ static void s_rfid_poll_cb(rfid_err_t result, const rfid_card_t *card, void *ctx
     ev->result = result;
     if (result == RFID_OK && card) ev->card = *card;
     lv_async_call(s_rfid_scan_lvgl_cb, ev);
+}
+
+// Fired every 5s while PN532 is still warming up; starts the poll when SAM configure succeeds.
+static void s_rfid_init_retry_cb(lv_timer_t *t)
+{
+    if (!s_rfid_scan_status_lbl) {
+        lv_timer_del(t);
+        s_rfid_init_retry_tmr = NULL;
+        return;
+    }
+    rfid_err_t r = rfid_manager_init();
+    if (r == RFID_OK) {
+        lv_label_set_text(s_rfid_scan_status_lbl, "Waiting for card...");
+        lv_timer_del(t);
+        s_rfid_init_retry_tmr = NULL;
+        rfid_manager_start_poll(s_rfid_poll_cb, NULL, 500);
+    }
 }
 
 static void s_rfid_save_cb(lv_event_t *e)
@@ -36947,8 +36969,15 @@ static void show_rfid_scan_screen(void)
 
     rfhat_add_back_btn("RFID Menu", rfid_back_to_menu);
 
-    // Start background poll — 500ms timeout per attempt
-    rfid_manager_start_poll(s_rfid_poll_cb, NULL, 500);
+    // PN532 needs 60-90s from cold power-on. Start poll immediately if already init'd;
+    // otherwise show warm-up status and let a 5s LVGL timer retry rfid_manager_init().
+    if (rfid_manager_is_init()) {
+        rfid_manager_start_poll(s_rfid_poll_cb, NULL, 500);
+    } else {
+        if (s_rfid_scan_status_lbl)
+            lv_label_set_text(s_rfid_scan_status_lbl, "PN532 warming up...");
+        s_rfid_init_retry_tmr = lv_timer_create(s_rfid_init_retry_cb, 5000, NULL);
+    }
 }
 
 // ── Hardware Test ─────────────────────────────────────────────────────────────
