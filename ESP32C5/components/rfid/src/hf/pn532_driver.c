@@ -150,10 +150,16 @@ rfid_err_t pn532_driver_init(void)
     }
 
     // Send 9 SCL clocks + STOP to release any slave holding SDA LOW, then settle.
-    // No blocking RDY poll here — PN532 takes 60-90s from cold power-on; the caller
-    // (rfid_manager_init / UI retry timer) handles the wait non-blockingly.
     i2c_master_bus_reset(s_bus);
     vTaskDelay(pdMS_TO_TICKS(20));
+
+    // PN532 I2C wakeup: after bus_reset the PN532 ignores command frames until
+    // it sees a proper wakeup (START + its address byte). i2c_master_probe()
+    // provides exactly that. 50 ms stabilisation is conservative (spec: <1 ms)
+    // but harmless. Without this, SAM configure returns ESP_ERR_INVALID_RESPONSE
+    // (device ACKs address, NACKs the first data byte of the command frame).
+    i2c_master_probe(s_bus, PN532_I2C_ADDR, 50);
+    vTaskDelay(pdMS_TO_TICKS(50));
 
     s_init = true;
     ESP_LOGI(TAG, "I2C init: SCL=GPIO%d SDA=GPIO%d addr=0x%02X",
