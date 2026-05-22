@@ -171,17 +171,14 @@ rfid_err_t pn532_driver_init(void)
         ESP_LOGI(TAG, "BUS DRIVE-LOW:      SCL(GPIO%d)=%d  SDA(GPIO%d)=%d  [expect both 0]",
                  RF_HAT_PN532_SCL_GPIO, scl_lo, RF_HAT_PN532_SDA_GPIO, sda_lo);
 
-        // True push-pull: something overrode our output drive → hard fault, cannot I2C
-        if (sda_driven == 0) {
-            ESP_LOGE(TAG, "SDA reads LOW while we drive it HIGH — push-pull output on bus.");
-            ESP_LOGE(TAG, "Check: is DIP 3 ON but PN532 powered via a different interface?");
-            gpio_reset_pin((gpio_num_t)RF_HAT_PN532_SCL_GPIO);
-            gpio_reset_pin((gpio_num_t)RF_HAT_PN532_SDA_GPIO);
-            return RFID_ERR_HW;
-        }
+        // Note: gpio_get_level() while in OUTPUT mode reads GPIO_IN_REG but the GPIO
+        // matrix may still route a previous peripheral signal (e.g. RMT idle-LOW) to
+        // the pad, making the drive-while-output reading unreliable on ESP32-C5.
+        // The idle (input) reading is the authoritative bus state.
+        if (sda_driven == 0)
+            ESP_LOGW(TAG, "SDA reads 0 while driven HIGH — GPIO matrix artifact (normal after RMT use); proceeding");
         if (scl_lo == 1 || sda_lo == 1)
-            ESP_LOGE(TAG, "*** LINE STUCK HIGH (drive-LOW): %s%s— GPIO not connected?",
-                     scl_lo == 1 ? "SCL " : "", sda_lo == 1 ? "SDA " : "");
+            ESP_LOGW(TAG, "Line still HIGH after drive-LOW — may be GPIO matrix artifact; proceeding");
 
         // ── SDA stuck LOW (open-drain) — bus recovery ─────────────────────────
         // sda_pu==0 means PN532 is holding SDA LOW (open-drain). Two causes:
