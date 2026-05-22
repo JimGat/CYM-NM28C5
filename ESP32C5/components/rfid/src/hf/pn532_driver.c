@@ -197,14 +197,25 @@ rfid_err_t pn532_driver_init(void)
             }
 
             if (!released) {
-                // Still stuck after 500ms → try 9-clock bus recovery
-                ESP_LOGW(TAG, "SDA still LOW — bus recovery: clocking SCL 9x");
+                // Still stuck after 500ms → manual bus recovery.
+                // gpio_reset_pin first: clears any GPIO matrix routing left over from
+                // prior RMT use that would prevent SCL from actually toggling.
+                gpio_reset_pin((gpio_num_t)RF_HAT_PN532_SCL_GPIO);
+                gpio_reset_pin((gpio_num_t)RF_HAT_PN532_SDA_GPIO);
+                vTaskDelay(pdMS_TO_TICKS(5));
+
+                ESP_LOGW(TAG, "SDA still LOW — bus recovery: clocking SCL up to 36x");
                 gpio_set_direction((gpio_num_t)RF_HAT_PN532_SCL_GPIO, GPIO_MODE_OUTPUT);
                 gpio_set_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO, 1);
                 gpio_set_pull_mode((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_PULLUP_ONLY);
                 gpio_set_direction((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_MODE_INPUT);
-                vTaskDelay(pdMS_TO_TICKS(1));
-                for (int i = 0; i < 9; i++) {
+                vTaskDelay(pdMS_TO_TICKS(2));
+
+                // Verify SCL drive is working after gpio_reset_pin
+                int scl_chk = gpio_get_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO);
+                ESP_LOGI(TAG, "  SCL drive-HIGH verify: %d (expect 1; 0 = GPIO matrix still stuck)", scl_chk);
+
+                for (int i = 0; i < 36; i++) {  // 4 bytes worth — handles multi-byte stuck states
                     gpio_set_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO, 0);
                     vTaskDelay(pdMS_TO_TICKS(1));
                     gpio_set_level((gpio_num_t)RF_HAT_PN532_SCL_GPIO, 1);
@@ -226,11 +237,16 @@ rfid_err_t pn532_driver_init(void)
                 gpio_set_pull_mode((gpio_num_t)RF_HAT_PN532_SDA_GPIO, GPIO_PULLUP_ONLY);
                 vTaskDelay(pdMS_TO_TICKS(20));
                 int sda_after = gpio_get_level((gpio_num_t)RF_HAT_PN532_SDA_GPIO);
-                ESP_LOGI(TAG, "SDA after 9-clock recovery: %d %s",
+                ESP_LOGI(TAG, "SDA after recovery: %d %s",
                          sda_after,
-                         sda_after ? "(bus free)" : "(STILL STUCK — toggle DIP 3 to power-cycle)");
-                if (!sda_after)
-                    ESP_LOGE(TAG, "*** Recovery failed — PN532 I2C FSM needs power-cycle");
+                         sda_after ? "(bus free)" : "(STILL STUCK)");
+                if (!sda_after) {
+                    ESP_LOGE(TAG, "*** SDA stuck after 36 clocks — PN532 needs power-cycle");
+                    ESP_LOGE(TAG, "*** Toggle DIP switch 3 OFF, wait 2 sec, then back ON");
+                    gpio_reset_pin((gpio_num_t)RF_HAT_PN532_SCL_GPIO);
+                    gpio_reset_pin((gpio_num_t)RF_HAT_PN532_SDA_GPIO);
+                    return RFID_ERR_HW;
+                }
             }
         }
 
