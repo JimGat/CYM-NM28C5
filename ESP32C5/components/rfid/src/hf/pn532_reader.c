@@ -69,7 +69,10 @@ rfid_err_t pn532_scan_card(rfid_card_t *card, uint32_t timeout_ms)
         r = pn532_read_response(PN532_CMD_IN_LIST_PASSIVE, resp, &rlen,
                                  sizeof(resp), 1000);
         if (r != RFID_OK || rlen < 1) {
-            ESP_LOGW(TAG, "scan: read_resp failed: %s rlen=%u", rfid_err_str(r), rlen);
+            if (r != RFID_ERR_TIMEOUT)
+                ESP_LOGW(TAG, "scan: read_resp failed: %s rlen=%u", rfid_err_str(r), rlen);
+            else
+                ESP_LOGD(TAG, "scan: no card (timeout)");
             vTaskDelay(pdMS_TO_TICKS(step_ms));
             elapsed += step_ms;
             continue;
