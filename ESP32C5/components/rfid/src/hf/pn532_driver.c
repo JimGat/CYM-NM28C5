@@ -83,7 +83,11 @@ static rfid_err_t s_write_frame(const uint8_t *cmd, uint8_t cmd_len)
 
     esp_err_t e = i2c_master_transmit(s_dev, frame, (size_t)idx,
                                        pdMS_TO_TICKS(PN532_I2C_TIMEOUT));
-    return (e == ESP_OK) ? RFID_OK : RFID_ERR_HW;
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "I2C write failed: %s", esp_err_to_name(e));
+        return RFID_ERR_HW;
+    }
+    return RFID_OK;
 }
 
 // Read and validate ACK frame (6 bytes after 1 RDY byte).
@@ -269,6 +273,21 @@ rfid_err_t pn532_get_firmware_version(pn532_fw_version_t *out)
     ESP_LOGI(TAG, "PN532 IC=0x%02X FW=%d.%d support=0x%02X",
              resp[0], resp[1], resp[2], resp[3]);
     return RFID_OK;
+}
+
+rfid_err_t pn532_probe_device(void)
+{
+    if (!s_init || !s_bus) return RFID_ERR_NOT_INIT;
+    // Raw address probe — does not send a command frame, just checks if the
+    // device ACKs the 7-bit address. Takes at most 50 ms.
+    esp_err_t e = i2c_master_probe(s_bus, PN532_I2C_ADDR, 50);
+    if (e == ESP_OK) {
+        ESP_LOGI(TAG, "[DIAG] I2C probe: PN532 ACK at 0x%02X", PN532_I2C_ADDR);
+        return RFID_OK;
+    }
+    ESP_LOGW(TAG, "[DIAG] I2C probe: no ACK at 0x%02X (%s) — DIP3 OFF or wrong mode",
+             PN532_I2C_ADDR, esp_err_to_name(e));
+    return RFID_ERR_HW;
 }
 
 int pn532_i2c_scan(uint8_t *addrs_out, int max_addrs)

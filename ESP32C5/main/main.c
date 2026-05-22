@@ -36856,6 +36856,14 @@ static void s_rfid_init_retry_cb(lv_timer_t *t)
         lv_timer_del(t);
         s_rfid_init_retry_tmr = NULL;
         rfid_manager_start_poll(s_rfid_poll_cb, NULL, 500);
+    } else {
+        if (rfid_manager_is_addr_ok()) {
+            lv_label_set_text(s_rfid_scan_status_lbl,
+                "PN532 found at 0x24 but SAM init failed\nCheck I2C mode jumper on module");
+        } else {
+            lv_label_set_text(s_rfid_scan_status_lbl,
+                "PN532 not found at 0x24\nCheck: DIP3 ON, I2C jumper set");
+        }
     }
 }
 

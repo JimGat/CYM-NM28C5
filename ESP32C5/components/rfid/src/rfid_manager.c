@@ -19,6 +19,7 @@ static void          *s_poll_ctx    = NULL;
 static uint32_t       s_poll_ms     = 500;
 static volatile bool  s_poll_stop   = false;
 static bool           s_mgr_init    = false;
+static bool           s_addr_ok     = false;  // last pn532_probe_device() result
 
 // Shared card buffer for poll task — PSRAM-allocated to keep s_poll_card out of DRAM
 static rfid_card_t *s_poll_card = NULL;
@@ -60,10 +61,16 @@ rfid_err_t rfid_manager_init(void)
     }
     r = pn532_sam_configure();
     if (r != RFID_OK) {
-        // PN532 not ready yet (needs 60-90s from cold power-on).
         // Keep I2C bus up so the UI retry timer can call rfid_manager_init() again
         // without re-creating the bus. Do NOT deinit the driver here.
-        ESP_LOGW(TAG, "SAM configure failed (%s) — PN532 still warming up", rfid_err_str(r));
+        s_addr_ok = (pn532_probe_device() == RFID_OK);
+        if (s_addr_ok) {
+            ESP_LOGW(TAG, "[DIAG] SAM configure failed — PN532 at 0x24 but not accepting commands"
+                         " (I2C mode jumper? bus noise?)");
+        } else {
+            ESP_LOGW(TAG, "[DIAG] SAM configure failed — PN532 not at 0x24"
+                         " (DIP3 OFF? wrong mode jumper?)");
+        }
         return RFID_ERR_HW;
     }
     s_mgr_init = true;
@@ -80,7 +87,8 @@ void rfid_manager_deinit(void)
     ESP_LOGI(TAG, "deinit");
 }
 
-bool rfid_manager_is_init(void) { return s_mgr_init; }
+bool rfid_manager_is_init(void)    { return s_mgr_init; }
+bool rfid_manager_is_addr_ok(void) { return s_addr_ok; }
 
 // ── Probe ─────────────────────────────────────────────────────────────────────
 

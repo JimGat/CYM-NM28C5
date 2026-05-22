@@ -50,6 +50,11 @@ rfid_err_t pn532_send_command(const uint8_t *cmd, uint8_t cmd_len);
 rfid_err_t pn532_read_response(uint8_t expected_cmd, uint8_t *buf, uint8_t *buf_len,
                                 uint8_t buf_max, uint32_t timeout_ms);
 
+// ── I2C address probe ─────────────────────────────────────────────────────────
+// Fast check: does the PN532 ACK its own address (0x24)? Takes ≤50 ms.
+// RFID_OK = device present; RFID_ERR_HW = no ACK (not powered or wrong mode).
+rfid_err_t pn532_probe_device(void);
+
 // ── I2C bus diagnostic scan ───────────────────────────────────────────────────
 // Probes all 127 I2C addresses, logs every responder, stores up to max_addrs
 // in addrs_out[]. Returns number found, or -1 if driver not init'd.

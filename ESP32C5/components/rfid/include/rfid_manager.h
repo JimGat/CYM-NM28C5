@@ -38,6 +38,9 @@ rfid_err_t rfid_manager_init(void);
 void       rfid_manager_deinit(void);
 
 bool       rfid_manager_is_init(void);
+// Returns true if the last init attempt found the PN532 ACKing at 0x24.
+// False means not powered (DIP3 OFF) or wrong protocol mode.
+bool       rfid_manager_is_addr_ok(void);
 
 // ── PN532 probe ───────────────────────────────────────────────────────────────
 rfid_err_t rfid_manager_probe(rfid_probe_result_t *out);
