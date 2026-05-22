@@ -67,17 +67,18 @@ rfid_err_t rfid_manager_init(void)
         r = pn532_sam_configure();
         if (r != RFID_OK) {
             ESP_LOGW(TAG, "SAM configure failed after retry: %s", rfid_err_str(r));
-            // Run I2C bus scan to identify what (if anything) is on the bus
             uint8_t found_addrs[8];
             int n = pn532_i2c_scan(found_addrs, 8);
             if (n == 0) {
-                ESP_LOGW(TAG, "*** I2C scan: NO devices found — PN532 not powered or not in I2C mode");
-                ESP_LOGW(TAG, "*** Check: DIP switch 3 ON, PN532 module I2C jumper set");
+                ESP_LOGW(TAG, "*** I2C scan: NO devices found");
             } else {
-                ESP_LOGI(TAG, "*** I2C scan: %d device(s) found (PN532 should be 0x24)", n);
+                ESP_LOGI(TAG, "*** I2C scan: %d device(s) found", n);
                 for (int i = 0; i < n; i++)
                     ESP_LOGI(TAG, "***   addr=0x%02X", found_addrs[i]);
             }
+            // PN532 not responding — don't mark as init'd so the UI can retry.
+            pn532_driver_deinit();
+            return RFID_ERR_HW;
         } else {
             ESP_LOGI(TAG, "SAM configure OK on retry");
         }

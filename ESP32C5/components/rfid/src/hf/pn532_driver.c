@@ -158,8 +158,8 @@ rfid_err_t pn532_driver_init(void)
     {
         uint8_t rdy = 0;
         bool ready = false;
-        ESP_LOGI(TAG, "Polling PN532 ready (up to 2s)...");
-        for (int i = 0; i < 20 && !ready; i++) {
+        ESP_LOGI(TAG, "Polling PN532 ready (up to 5s)...");
+        for (int i = 0; i < 50 && !ready; i++) {
             esp_err_t re = i2c_master_receive(s_dev, &rdy, 1, pdMS_TO_TICKS(50));
             if (re == ESP_OK) {
                 ESP_LOGI(TAG, "  poll[%d]: RDY=0x%02X %s",
@@ -175,7 +175,7 @@ rfid_err_t pn532_driver_init(void)
             if (!ready) vTaskDelay(pdMS_TO_TICKS(100));
         }
         if (!ready)
-            ESP_LOGW(TAG, "PN532 not ready after 2s — check I2C mode jumper on module, SCL=GPIO%d SDA=GPIO%d",
+            ESP_LOGW(TAG, "PN532 not ready after 5s — check I2C mode jumper on module, SCL=GPIO%d SDA=GPIO%d",
                      RF_HAT_PN532_SCL_GPIO, RF_HAT_PN532_SDA_GPIO);
     }
 

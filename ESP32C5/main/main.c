@@ -36690,9 +36690,6 @@ static void rfid_exit_to_home(void)
     show_main_tiles();
 }
 
-// Back to RFID menu (keep hardware active — menu is within the RFID session)
-static void rfid_back_to_menu(void) { show_rfid_menu_screen(); }
-
 // ── Helper: make a menu tile button ──────────────────────────────────────────
 static lv_obj_t *rfid_make_tile(lv_obj_t *parent, const char *icon_label,
                                   const char *title_label, uint32_t color,
@@ -36774,6 +36771,21 @@ static lv_obj_t *s_rfid_scan_status_lbl = NULL;
 static lv_obj_t *s_rfid_scan_save_btn   = NULL;
 static bool s_rfid_has_card = false;
 
+// Stop poll and null scan-screen labels before navigating away — prevents
+// in-flight lv_async_call callbacks from firing against deleted LVGL objects
+// (dangling pointer crash in _lv_obj_get_ext_draw_size).
+static void rfid_back_to_menu(void)
+{
+    rfid_manager_stop_poll();
+    s_rfid_scan_uid_lbl    = NULL;
+    s_rfid_scan_type_lbl   = NULL;
+    s_rfid_scan_atqa_lbl   = NULL;
+    s_rfid_scan_status_lbl = NULL;
+    s_rfid_scan_save_btn   = NULL;
+    s_rfid_has_card        = false;
+    show_rfid_menu_screen();
+}
+
 typedef struct { rfid_err_t result; rfid_card_t card; } rfid_scan_evt_t;
 
 static void s_rfid_scan_lvgl_cb(void *arg)
@@ -36816,7 +36828,9 @@ static void s_rfid_scan_lvgl_cb(void *arg)
 static void s_rfid_poll_cb(rfid_err_t result, const rfid_card_t *card, void *ctx)
 {
     (void)ctx;
-    rfid_scan_evt_t *ev = malloc(sizeof(rfid_scan_evt_t));
+    // rfid_scan_evt_t contains rfid_card_t (~5.7 KB); allocate from PSRAM to
+    // avoid hammering the 28 KB internal heap from the poll task.
+    rfid_scan_evt_t *ev = heap_caps_malloc(sizeof(rfid_scan_evt_t), MALLOC_CAP_SPIRAM);
     if (!ev) return;
     ev->result = result;
     if (result == RFID_OK && card) ev->card = *card;
