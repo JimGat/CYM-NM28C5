@@ -36872,6 +36872,7 @@ static void s_rfid_init_retry_cb(lv_timer_t *t)
 // ── Save-name popup ───────────────────────────────────────────────────────────
 static lv_obj_t *s_save_name_overlay = NULL;
 static lv_obj_t *s_save_name_ta      = NULL;
+static char      s_save_name_default[24];  // compact UID fallback when field left empty
 
 static void s_save_name_confirm_cb(lv_event_t *e)
 {
@@ -36881,12 +36882,11 @@ static void s_save_name_confirm_cb(lv_event_t *e)
         return;
     }
     const char *nm = s_save_name_ta ? lv_textarea_get_text(s_save_name_ta) : NULL;
-    if (nm && nm[0])
-        strncpy(s_rfid_last_card->name, nm, sizeof(s_rfid_last_card->name) - 1);
+    // Empty field → fall back to the UID-based default shown as placeholder
+    if (!nm || !nm[0]) nm = s_save_name_default;
+    strncpy(s_rfid_last_card->name, nm, sizeof(s_rfid_last_card->name) - 1);
     char path[RFID_FILENAME_LEN];
-    rfid_err_t r = rfid_storage_save(s_rfid_last_card,
-                                     (nm && nm[0]) ? nm : NULL,
-                                     path, sizeof(path));
+    rfid_err_t r = rfid_storage_save(s_rfid_last_card, nm, path, sizeof(path));
     if (s_save_name_overlay) { lv_obj_del(s_save_name_overlay); s_save_name_overlay = NULL; s_save_name_ta = NULL; }
     if (s_rfid_scan_status_lbl) {
         lv_label_set_text(s_rfid_scan_status_lbl, r == RFID_OK ? "Saved" : "Save failed (SD?)");
@@ -36904,9 +36904,8 @@ static void s_rfid_save_cb(lv_event_t *e)
     (void)e;
     if (!s_rfid_has_card || !s_rfid_last_card) return;
 
-    char default_name[24];
     rfid_format_uid_compact(s_rfid_last_card->uid, s_rfid_last_card->uid_len,
-                            default_name, sizeof(default_name));
+                            s_save_name_default, sizeof(s_save_name_default));
 
     s_save_name_overlay = lv_obj_create(lv_scr_act());
     lv_obj_set_size(s_save_name_overlay, LCD_H_RES, LCD_V_RES);
@@ -36918,11 +36917,19 @@ static void s_rfid_save_cb(lv_event_t *e)
     lv_obj_clear_flag(s_save_name_overlay, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_radius(s_save_name_overlay, 0, 0);
 
+    // Keyboard at bottom — styled to match project pattern
     lv_obj_t *kb = lv_keyboard_create(s_save_name_overlay);
     lv_obj_set_width(kb, LCD_H_RES);
     lv_obj_set_style_text_font(kb, &lv_font_montserrat_12, 0);
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_UPPER);
+    lv_obj_set_style_bg_color(kb, ui_bg_color(),    LV_PART_MAIN);
+    lv_obj_set_style_text_color(kb, ui_text_color(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(kb, lv_color_make(0, 100, 0), LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(kb, lv_color_make(0, 150, 0), LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(kb, ui_text_color(), LV_PART_ITEMS);
+    lv_obj_set_style_border_color(kb, ui_border_color(), LV_PART_ITEMS);
+    lv_obj_set_style_border_width(kb, 1, LV_PART_ITEMS);
 
     lv_obj_t *card = lv_obj_create(s_save_name_overlay);
     lv_obj_set_size(card, LCD_H_RES - 16, LV_SIZE_CONTENT);
@@ -36943,16 +36950,22 @@ static void s_rfid_save_cb(lv_event_t *e)
     lv_obj_set_style_text_color(title, lv_color_hex(0xCE93D8), 0);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
 
+    // Text area — same cursor style as wifi_connect_ta / portal_ssid_ta
     s_save_name_ta = lv_textarea_create(card);
     lv_obj_set_width(s_save_name_ta, LCD_H_RES - 32);
     lv_obj_set_height(s_save_name_ta, 36);
     lv_textarea_set_max_length(s_save_name_ta, RFID_CARD_NAME_LEN - 1);
     lv_textarea_set_one_line(s_save_name_ta, true);
-    lv_textarea_set_text(s_save_name_ta, default_name);
+    lv_textarea_set_text(s_save_name_ta, "");
+    lv_textarea_set_placeholder_text(s_save_name_ta, s_save_name_default);
     lv_obj_set_style_text_font(s_save_name_ta, &lv_font_montserrat_12, 0);
     lv_obj_set_style_bg_color(s_save_name_ta, ui_bg_color(), 0);
     lv_obj_set_style_text_color(s_save_name_ta, ui_text_color(), 0);
-    lv_obj_set_style_border_color(s_save_name_ta, lv_color_hex(0x6A1B9A), 0);
+    lv_obj_set_style_border_color(s_save_name_ta, ui_accent_color(), 0);
+    lv_obj_set_style_bg_opa(s_save_name_ta,    LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(s_save_name_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(s_save_name_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(s_save_name_ta,  LV_BORDER_SIDE_LEFT, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_keyboard_set_textarea(kb, s_save_name_ta);
 
     lv_obj_t *btn_row = lv_obj_create(card);
