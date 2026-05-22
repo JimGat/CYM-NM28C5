@@ -36788,7 +36788,8 @@ static void rfid_back_to_menu(void)
     s_rfid_scan_atqa_lbl   = NULL;
     s_rfid_scan_status_lbl = NULL;
     s_rfid_scan_save_btn   = NULL;
-    s_rfid_has_card        = false;
+    // s_rfid_has_card intentionally NOT cleared — last scanned card persists
+    // while navigating within the RFID sub-menus so Card Emulate can use it.
     show_rfid_menu_screen();
 }
 
@@ -37371,6 +37372,20 @@ static void s_rfid_emu_stop_cb(lv_event_t *e)
     if (s_rfid_emu_stop_btn) lv_obj_add_state(s_rfid_emu_stop_btn,   LV_STATE_DISABLED);
 }
 
+static void s_rfid_emu_select_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_rfid_entry_count) return;
+    if (!s_rfid_last_card)
+        s_rfid_last_card = heap_caps_calloc(1, sizeof(rfid_card_t), MALLOC_CAP_SPIRAM);
+    if (!s_rfid_last_card) return;
+    rfid_err_t r = rfid_storage_load(s_rfid_entries[idx].path, s_rfid_last_card);
+    if (r == RFID_OK) {
+        s_rfid_has_card = true;
+        show_rfid_emulate_screen();
+    }
+}
+
 static void show_rfid_emulate_screen(void)
 {
     rfid_manager_stop_poll();
@@ -37383,67 +37398,73 @@ static void show_rfid_emulate_screen(void)
     create_function_page_base("Card Emulate");
     apply_menu_bg();
 
-    if (!s_rfid_has_card || !s_rfid_last_card) {
-        lv_obj_t *info = lv_label_create(function_page);
-        lv_label_set_text(info, "No card scanned.\nGo to Scan & Read first.");
-        lv_obj_set_style_text_font(info, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(info, ui_text_color(), 0);
-        lv_obj_set_style_text_align(info, LV_TEXT_ALIGN_CENTER, 0);
-        lv_label_set_long_mode(info, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(info, LCD_H_RES - 20);
-        lv_obj_align(info, LV_ALIGN_CENTER, 0, -30);
-        rfhat_add_back_btn("RFID Menu", rfid_back_to_menu);
-        return;
+    s_rfid_entry_count = rfid_storage_list(RFID_BAND_HF, s_rfid_entries, RFID_MAX_LIST_DISPLAY);
+
+    int cur_y = 38;
+
+    if (s_rfid_has_card && s_rfid_last_card) {
+        // ── Card panel ──
+        lv_obj_t *panel = lv_obj_create(function_page);
+        lv_obj_set_size(panel, LCD_H_RES - 16, 68);
+        lv_obj_align(panel, LV_ALIGN_TOP_MID, 0, cur_y);
+        lv_obj_set_style_bg_color(panel, ui_panel_color(), 0);
+        lv_obj_set_style_border_color(panel, lv_color_hex(0x6A1B9A), 0);
+        lv_obj_set_style_border_width(panel, 1, 0);
+        lv_obj_set_style_radius(panel, 8, 0);
+        lv_obj_set_style_pad_all(panel, 6, 0);
+        lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_gap(panel, 2, 0);
+        lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+
+        char uid_str[32], line[80];
+        uint8_t emu_uid_len = s_rfid_last_card->uid_len < 3 ? s_rfid_last_card->uid_len : 3;
+        rfid_format_uid(s_rfid_last_card->uid, emu_uid_len, uid_str, sizeof(uid_str));
+        const char *note = (s_rfid_last_card->uid_len > 4) ? " (4B emu)" : "";
+        snprintf(line, sizeof(line), "UID: %s%s", uid_str, note);
+        lv_obj_t *l1 = lv_label_create(panel);
+        lv_label_set_text(l1, line);
+        lv_obj_set_style_text_font(l1, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l1, ui_text_color(), 0);
+
+        const char *lbl = s_rfid_last_card->name[0] ? s_rfid_last_card->name
+                                                     : s_rfid_last_card->protocol_str;
+        snprintf(line, sizeof(line), "%s  ATQA:%04X SAK:%02X",
+                 lbl, s_rfid_last_card->atqa, s_rfid_last_card->sak);
+        lv_obj_t *l2 = lv_label_create(panel);
+        lv_label_set_text(l2, line);
+        lv_obj_set_style_text_font(l2, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l2, lv_color_hex(0x9E9E9E), 0);
+        lv_label_set_long_mode(l2, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(l2, LCD_H_RES - 28);
+
+        snprintf(line, sizeof(line), "Type: %s", s_rfid_last_card->protocol_str);
+        lv_obj_t *l3 = lv_label_create(panel);
+        lv_label_set_text(l3, line);
+        lv_obj_set_style_text_font(l3, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l3, ui_text_color(), 0);
+
+        cur_y += 72;
+
+        // ── Status label ──
+        s_rfid_emu_status_lbl = lv_label_create(function_page);
+        lv_label_set_text(s_rfid_emu_status_lbl, "Ready");
+        lv_obj_set_style_text_font(s_rfid_emu_status_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(s_rfid_emu_status_lbl, lv_color_hex(0xB39DDB), 0);
+        lv_obj_align(s_rfid_emu_status_lbl, LV_ALIGN_TOP_MID, 0, cur_y);
+        cur_y += 18;
+    } else {
+        lv_obj_t *hint = lv_label_create(function_page);
+        lv_label_set_text(hint, "Tap a saved card below to select");
+        lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(hint, lv_color_hex(0x9E9E9E), 0);
+        lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, cur_y + 4);
+        cur_y += 26;
     }
 
-    // Card info panel
-    lv_obj_t *panel = lv_obj_create(function_page);
-    lv_obj_set_size(panel, LCD_H_RES - 16, 80);
-    lv_obj_align(panel, LV_ALIGN_TOP_MID, 0, 38);
-    lv_obj_set_style_bg_color(panel, ui_panel_color(), 0);
-    lv_obj_set_style_border_color(panel, lv_color_hex(0x6A1B9A), 0);
-    lv_obj_set_style_border_width(panel, 1, 0);
-    lv_obj_set_style_radius(panel, 8, 0);
-    lv_obj_set_style_pad_all(panel, 8, 0);
-    lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_gap(panel, 3, 0);
-    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
-
-    char uid_str[32], line[80];
-    // 7-byte UIDs emulate as 4-byte (only first 3 bytes of UID in TgInitAsTarget)
-    uint8_t emu_uid_len = s_rfid_last_card->uid_len < 3 ? s_rfid_last_card->uid_len : 3;
-    rfid_format_uid(s_rfid_last_card->uid, emu_uid_len, uid_str, sizeof(uid_str));
-    const char *note = (s_rfid_last_card->uid_len > 4) ? " (4-byte emulated)" : "";
-    snprintf(line, sizeof(line), "UID: %s%s", uid_str, note);
-    lv_obj_t *l1 = lv_label_create(panel);
-    lv_label_set_text(l1, line);
-    lv_obj_set_style_text_font(l1, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(l1, ui_text_color(), 0);
-
-    snprintf(line, sizeof(line), "Type: %s", s_rfid_last_card->protocol_str);
-    lv_obj_t *l2 = lv_label_create(panel);
-    lv_label_set_text(l2, line);
-    lv_obj_set_style_text_font(l2, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(l2, ui_text_color(), 0);
-
-    snprintf(line, sizeof(line), "ATQA: %04X  SAK: %02X",
-             s_rfid_last_card->atqa, s_rfid_last_card->sak);
-    lv_obj_t *l3 = lv_label_create(panel);
-    lv_label_set_text(l3, line);
-    lv_obj_set_style_text_font(l3, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(l3, lv_color_hex(0x9E9E9E), 0);
-
-    // Status label
-    s_rfid_emu_status_lbl = lv_label_create(function_page);
-    lv_label_set_text(s_rfid_emu_status_lbl, "Ready");
-    lv_obj_set_style_text_font(s_rfid_emu_status_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(s_rfid_emu_status_lbl, lv_color_hex(0xB39DDB), 0);
-    lv_obj_align(s_rfid_emu_status_lbl, LV_ALIGN_TOP_MID, 0, 128);
-
-    // Button row
+    // ── Emulate / Stop button row ──
     lv_obj_t *row = lv_obj_create(function_page);
-    lv_obj_set_size(row, LCD_H_RES - 16, 50);
-    lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 154);
+    lv_obj_set_size(row, LCD_H_RES - 16, 44);
+    lv_obj_align(row, LV_ALIGN_TOP_MID, 0, cur_y);
     lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(row, 0, 0);
     lv_obj_set_style_pad_all(row, 0, 0);
@@ -37451,9 +37472,10 @@ static void show_rfid_emulate_screen(void)
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_gap(row, 8, 0);
     lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    cur_y += 48;
 
     s_rfid_emu_btn = lv_btn_create(row);
-    lv_obj_set_size(s_rfid_emu_btn, 106, 40);
+    lv_obj_set_size(s_rfid_emu_btn, 106, 38);
     lv_obj_set_style_bg_color(s_rfid_emu_btn, lv_color_hex(0x6A1B9A), LV_STATE_DEFAULT);
     lv_obj_set_style_radius(s_rfid_emu_btn, 6, 0);
     lv_obj_set_style_border_width(s_rfid_emu_btn, 0, 0);
@@ -37461,9 +37483,11 @@ static void show_rfid_emulate_screen(void)
     lv_label_set_text(el, LV_SYMBOL_REFRESH " Emulate");
     lv_obj_center(el);
     lv_obj_add_event_cb(s_rfid_emu_btn, s_rfid_emu_start_cb, LV_EVENT_CLICKED, NULL);
+    if (!s_rfid_has_card || !s_rfid_last_card)
+        lv_obj_add_state(s_rfid_emu_btn, LV_STATE_DISABLED);
 
     s_rfid_emu_stop_btn = lv_btn_create(row);
-    lv_obj_set_size(s_rfid_emu_stop_btn, 80, 40);
+    lv_obj_set_size(s_rfid_emu_stop_btn, 80, 38);
     lv_obj_set_style_bg_color(s_rfid_emu_stop_btn, lv_color_hex(0xB71C1C), LV_STATE_DEFAULT);
     lv_obj_set_style_radius(s_rfid_emu_stop_btn, 6, 0);
     lv_obj_set_style_border_width(s_rfid_emu_stop_btn, 0, 0);
@@ -37472,6 +37496,65 @@ static void show_rfid_emulate_screen(void)
     lv_label_set_text(sl, LV_SYMBOL_STOP " Stop");
     lv_obj_center(sl);
     lv_obj_add_event_cb(s_rfid_emu_stop_btn, s_rfid_emu_stop_cb, LV_EVENT_CLICKED, NULL);
+
+    // ── Saved cards list ──
+    lv_obj_t *sec_hdr = lv_label_create(function_page);
+    lv_label_set_text(sec_hdr, "Saved Cards");
+    lv_obj_set_style_text_font(sec_hdr, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sec_hdr, lv_color_hex(0x4DB6AC), 0);
+    lv_obj_align(sec_hdr, LV_ALIGN_TOP_LEFT, 10, cur_y);
+    cur_y += 18;
+
+    int list_h = LCD_V_RES - cur_y - 52;
+    if (list_h < 36) list_h = 36;
+    lv_obj_t *clist = lv_obj_create(function_page);
+    lv_obj_set_size(clist, LCD_H_RES - 10, list_h);
+    lv_obj_align(clist, LV_ALIGN_TOP_MID, 0, cur_y);
+    lv_obj_set_style_bg_color(clist, ui_panel_color(), 0);
+    lv_obj_set_style_border_width(clist, 0, 0);
+    lv_obj_set_style_radius(clist, 4, 0);
+    lv_obj_set_style_pad_all(clist, 3, 0);
+    lv_obj_set_style_pad_gap(clist, 3, 0);
+    lv_obj_set_flex_flow(clist, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(clist, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_add_flag(clist, LV_OBJ_FLAG_SCROLLABLE);
+
+    if (s_rfid_entry_count == 0) {
+        lv_obj_t *empty = lv_label_create(clist);
+        lv_label_set_text(empty, "No saved cards -- scan and save first");
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(empty, ui_text_color(), 0);
+    } else {
+        char buf[64];
+        for (int i = 0; i < s_rfid_entry_count; i++) {
+            lv_obj_t *card_row = lv_obj_create(clist);
+            lv_obj_set_size(card_row, LCD_H_RES - 16, 40);
+            lv_obj_set_style_bg_color(card_row, ui_panel_color(), 0);
+            lv_obj_set_style_border_color(card_row, lv_color_hex(0x4A148C), 0);
+            lv_obj_set_style_border_width(card_row, 1, 0);
+            lv_obj_set_style_radius(card_row, 4, 0);
+            lv_obj_set_style_pad_all(card_row, 5, 0);
+            lv_obj_clear_flag(card_row, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(card_row, LV_OBJ_FLAG_CLICKABLE);
+
+            lv_obj_t *name_lbl = lv_label_create(card_row);
+            lv_label_set_text(name_lbl, s_rfid_entries[i].display_name);
+            lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(name_lbl, lv_color_hex(0xCE93D8), 0);
+            lv_obj_align(name_lbl, LV_ALIGN_TOP_LEFT, 0, 0);
+
+            snprintf(buf, sizeof(buf), "%s  %s",
+                     s_rfid_entries[i].uid_str, s_rfid_entries[i].protocol_str);
+            lv_obj_t *uid_lbl = lv_label_create(card_row);
+            lv_label_set_text(uid_lbl, buf);
+            lv_obj_set_style_text_font(uid_lbl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(uid_lbl, ui_text_color(), 0);
+            lv_obj_align(uid_lbl, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+            lv_obj_add_event_cb(card_row, s_rfid_emu_select_cb, LV_EVENT_CLICKED,
+                                (void *)(intptr_t)i);
+        }
+    }
 
     rfhat_add_back_btn("RFID Menu", rfid_back_to_menu);
 }
