@@ -36735,7 +36735,7 @@ static void show_rfid_menu_screen(void)
 
     lv_obj_t *hdr = lv_label_create(function_page);
     lv_label_set_text(hdr, MY_SYMBOL_MICROCHIP "  PN532  |  DIP 3  |  HF 13.56 MHz");
-    lv_obj_set_style_text_font(hdr, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(hdr, &g_font_icon14, 0);
     lv_obj_set_style_text_color(hdr, lv_color_hex(0x4DB6AC), 0);
     lv_obj_set_style_text_align(hdr, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(hdr, LV_ALIGN_TOP_MID, 0, 36);
