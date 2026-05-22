@@ -49,9 +49,9 @@ rfid_err_t flipper_nfc_export(const rfid_card_t *card, const char *path)
     for (int i = 0; i < card->uid_len; i++) fprintf(f, " %02X", card->uid[i]);
     fprintf(f, "\n");
 
-    // ATQA (2 bytes, LSB first on wire but Flipper shows MSB first in file)
+    // ATQA: Flipper uses wire order (LSB first: low byte, then high byte)
     fprintf(f, "ATQA: %02X %02X\n",
-            (card->atqa >> 8) & 0xFF, card->atqa & 0xFF);
+            card->atqa & 0xFF, (card->atqa >> 8) & 0xFF);
     fprintf(f, "SAK: %02X\n", card->sak);
 
     // MIFARE Classic block data
@@ -140,8 +140,9 @@ rfid_err_t flipper_nfc_import(const char *path, rfid_card_t *card_out)
             }
         } else if (strncmp(line, "ATQA:", 5) == 0) {
             unsigned int b0, b1;
+            // Flipper wire order: b0=LSB, b1=MSB
             if (sscanf(line + 5, " %2x %2x", &b0, &b1) == 2)
-                card_out->atqa = (uint16_t)(b0 << 8 | b1);
+                card_out->atqa = (uint16_t)(b0 | (b1 << 8));
         } else if (strncmp(line, "SAK:", 4) == 0) {
             unsigned int v;
             if (sscanf(line + 4, " %2x", &v) == 1)

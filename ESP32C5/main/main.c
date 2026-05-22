@@ -36869,16 +36869,122 @@ static void s_rfid_init_retry_cb(lv_timer_t *t)
     }
 }
 
+// ── Save-name popup ───────────────────────────────────────────────────────────
+static lv_obj_t *s_save_name_overlay = NULL;
+static lv_obj_t *s_save_name_ta      = NULL;
+
+static void s_save_name_confirm_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!s_rfid_has_card || !s_rfid_last_card) {
+        if (s_save_name_overlay) { lv_obj_del(s_save_name_overlay); s_save_name_overlay = NULL; }
+        return;
+    }
+    const char *nm = s_save_name_ta ? lv_textarea_get_text(s_save_name_ta) : NULL;
+    if (nm && nm[0])
+        strncpy(s_rfid_last_card->name, nm, sizeof(s_rfid_last_card->name) - 1);
+    char path[RFID_FILENAME_LEN];
+    rfid_err_t r = rfid_storage_save(s_rfid_last_card,
+                                     (nm && nm[0]) ? nm : NULL,
+                                     path, sizeof(path));
+    if (s_save_name_overlay) { lv_obj_del(s_save_name_overlay); s_save_name_overlay = NULL; s_save_name_ta = NULL; }
+    if (s_rfid_scan_status_lbl) {
+        lv_label_set_text(s_rfid_scan_status_lbl, r == RFID_OK ? "Saved" : "Save failed (SD?)");
+    }
+}
+
+static void s_save_name_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_save_name_overlay) { lv_obj_del(s_save_name_overlay); s_save_name_overlay = NULL; s_save_name_ta = NULL; }
+}
+
 static void s_rfid_save_cb(lv_event_t *e)
 {
     (void)e;
     if (!s_rfid_has_card || !s_rfid_last_card) return;
-    char path[RFID_FILENAME_LEN];
-    rfid_err_t r = rfid_storage_save(s_rfid_last_card, NULL, path, sizeof(path));
-    if (s_rfid_scan_status_lbl) {
-        if (r == RFID_OK) lv_label_set_text(s_rfid_scan_status_lbl, "Saved to SD card");
-        else              lv_label_set_text(s_rfid_scan_status_lbl, "Save failed (SD?)");
-    }
+
+    char default_name[24];
+    rfid_format_uid_compact(s_rfid_last_card->uid, s_rfid_last_card->uid_len,
+                            default_name, sizeof(default_name));
+
+    s_save_name_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(s_save_name_overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(s_save_name_overlay, 0, 0);
+    lv_obj_set_style_bg_color(s_save_name_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_save_name_overlay, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(s_save_name_overlay, 0, 0);
+    lv_obj_set_style_pad_all(s_save_name_overlay, 0, 0);
+    lv_obj_clear_flag(s_save_name_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(s_save_name_overlay, 0, 0);
+
+    lv_obj_t *kb = lv_keyboard_create(s_save_name_overlay);
+    lv_obj_set_width(kb, LCD_H_RES);
+    lv_obj_set_style_text_font(kb, &lv_font_montserrat_12, 0);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_UPPER);
+
+    lv_obj_t *card = lv_obj_create(s_save_name_overlay);
+    lv_obj_set_size(card, LCD_H_RES - 16, LV_SIZE_CONTENT);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 4);
+    lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x6A1B9A), 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 8, 0);
+    lv_obj_set_style_pad_row(card, 4, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, LV_SYMBOL_SAVE "  Name this card");
+    lv_obj_set_style_text_color(title, lv_color_hex(0xCE93D8), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
+
+    s_save_name_ta = lv_textarea_create(card);
+    lv_obj_set_width(s_save_name_ta, LCD_H_RES - 32);
+    lv_obj_set_height(s_save_name_ta, 36);
+    lv_textarea_set_max_length(s_save_name_ta, RFID_CARD_NAME_LEN - 1);
+    lv_textarea_set_one_line(s_save_name_ta, true);
+    lv_textarea_set_text(s_save_name_ta, default_name);
+    lv_obj_set_style_text_font(s_save_name_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(s_save_name_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(s_save_name_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(s_save_name_ta, lv_color_hex(0x6A1B9A), 0);
+    lv_keyboard_set_textarea(kb, s_save_name_ta);
+
+    lv_obj_t *btn_row = lv_obj_create(card);
+    lv_obj_set_size(btn_row, LCD_H_RES - 32, 32);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel_btn, 90, 28);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x455A64), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(cancel_btn, 6, 0);
+    lv_obj_set_style_border_width(cancel_btn, 0, 0);
+    lv_obj_t *cl = lv_label_create(cancel_btn);
+    lv_label_set_text(cl, "Cancel");
+    lv_obj_set_style_text_font(cl, &lv_font_montserrat_12, 0);
+    lv_obj_center(cl);
+    lv_obj_add_event_cb(cancel_btn, s_save_name_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *save_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(save_btn, 90, 28);
+    lv_obj_set_style_bg_color(save_btn, lv_color_hex(0x00695C), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(save_btn, 6, 0);
+    lv_obj_set_style_border_width(save_btn, 0, 0);
+    lv_obj_t *sl2 = lv_label_create(save_btn);
+    lv_label_set_text(sl2, LV_SYMBOL_SAVE " Save");
+    lv_obj_set_style_text_font(sl2, &lv_font_montserrat_12, 0);
+    lv_obj_center(sl2);
+    lv_obj_add_event_cb(save_btn, s_save_name_confirm_cb, LV_EVENT_CLICKED, NULL);
 }
 
 static void s_rfid_export_nfc_cb(lv_event_t *e)
@@ -37085,9 +37191,29 @@ static void show_rfid_hw_test_screen(void)
 // ── Saved Cards ───────────────────────────────────────────────────────────────
 
 #define RFID_MAX_LIST_DISPLAY  20
+#define RFID_MAX_IMPORT_FILES  10
 
 static rfid_card_entry_t s_rfid_entries[RFID_MAX_LIST_DISPLAY];
 static int               s_rfid_entry_count = 0;
+static char s_nfc_import_paths[RFID_MAX_IMPORT_FILES][RFID_FILENAME_LEN];
+static int  s_nfc_import_count = 0;
+
+static void s_rfid_nfc_import_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_nfc_import_count) return;
+    if (!s_rfid_last_card)
+        s_rfid_last_card = heap_caps_calloc(1, sizeof(rfid_card_t), MALLOC_CAP_SPIRAM);
+    if (!s_rfid_last_card) return;
+    rfid_err_t r = flipper_nfc_import(s_nfc_import_paths[idx], s_rfid_last_card);
+    if (r == RFID_OK) {
+        s_rfid_has_card = true;
+        show_rfid_emulate_screen();
+    } else {
+        ESP_LOGW("rfid_ui", "Flipper import failed for %s: %s",
+                 s_nfc_import_paths[idx], rfid_err_str(r));
+    }
+}
 
 static void show_rfid_saved_screen(void)
 {
@@ -37098,6 +37224,27 @@ static void show_rfid_saved_screen(void)
 
     s_rfid_entry_count = rfid_storage_list(RFID_BAND_HF,
                                             s_rfid_entries, RFID_MAX_LIST_DISPLAY);
+
+    // Scan import directory for .nfc files
+    s_nfc_import_count = 0;
+    {
+        DIR *d = opendir(RFID_DIR_IMPORT);
+        if (d) {
+            struct dirent *de;
+            while ((de = readdir(d)) != NULL && s_nfc_import_count < RFID_MAX_IMPORT_FILES) {
+                int nl = (int)strlen(de->d_name);
+                // Reject names that won't fit: prefix(24) + '/'(1) + name + '\0' <= 80
+                if (nl <= 4 || nl > (RFID_FILENAME_LEN - 26)) continue;
+                if (strcasecmp(de->d_name + nl - 4, ".nfc") != 0) continue;
+                char *dst = s_nfc_import_paths[s_nfc_import_count];
+                memcpy(dst, RFID_DIR_IMPORT, sizeof(RFID_DIR_IMPORT) - 1);
+                dst[sizeof(RFID_DIR_IMPORT) - 1] = '/';
+                memcpy(dst + sizeof(RFID_DIR_IMPORT), de->d_name, (size_t)nl + 1);
+                s_nfc_import_count++;
+            }
+            closedir(d);
+        }
+    }
 
     lv_obj_t *list = lv_obj_create(function_page);
     lv_obj_set_size(list, LCD_H_RES - 10, LCD_V_RES - 95);
@@ -37111,12 +37258,19 @@ static void show_rfid_saved_screen(void)
     lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_add_flag(list, LV_OBJ_FLAG_SCROLLABLE);
 
+    // ── Saved (JSON) cards ──
+    lv_obj_t *sec1 = lv_label_create(list);
+    lv_label_set_text(sec1, "-- Saved Cards --");
+    lv_obj_set_style_text_font(sec1, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sec1, lv_color_hex(0x4DB6AC), 0);
+
     if (s_rfid_entry_count == 0) {
         lv_obj_t *empty = lv_label_create(list);
-        lv_label_set_text(empty, "No saved cards.\nScan a card and press Save.");
+        lv_label_set_text(empty, "No saved cards. Scan a card and press Save.");
         lv_obj_set_style_text_font(empty, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(empty, ui_text_color(), 0);
     } else {
+        char buf[64];
         for (int i = 0; i < s_rfid_entry_count; i++) {
             lv_obj_t *row = lv_obj_create(list);
             lv_obj_set_size(row, LCD_H_RES - 18, 46);
@@ -37128,7 +37282,6 @@ static void show_rfid_saved_screen(void)
             lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
             lv_obj_t *name_lbl = lv_label_create(row);
-            char buf[64];
             snprintf(buf, sizeof(buf), "%s", s_rfid_entries[i].display_name);
             lv_label_set_text(name_lbl, buf);
             lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_12, 0);
@@ -37143,6 +37296,50 @@ static void show_rfid_saved_screen(void)
             lv_obj_set_style_text_font(info_lbl, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(info_lbl, ui_text_color(), 0);
             lv_obj_align(info_lbl, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+        }
+    }
+
+    // ── Flipper .nfc import queue ──
+    lv_obj_t *sec2 = lv_label_create(list);
+    lv_label_set_text(sec2, "-- Flipper Import (/rfid/import/) --");
+    lv_obj_set_style_text_font(sec2, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sec2, lv_color_hex(0xFFB300), 0);
+
+    if (s_nfc_import_count == 0) {
+        lv_obj_t *empty2 = lv_label_create(list);
+        lv_label_set_text(empty2, "No .nfc files in import folder.");
+        lv_obj_set_style_text_font(empty2, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(empty2, ui_text_color(), 0);
+    } else {
+        for (int i = 0; i < s_nfc_import_count; i++) {
+            // Extract filename for display
+            const char *slash = strrchr(s_nfc_import_paths[i], '/');
+            const char *fname = slash ? slash + 1 : s_nfc_import_paths[i];
+
+            lv_obj_t *row = lv_obj_create(list);
+            lv_obj_set_size(row, LCD_H_RES - 18, 40);
+            lv_obj_set_style_bg_color(row, ui_panel_color(), 0);
+            lv_obj_set_style_border_color(row, lv_color_hex(0xFFB300), 0);
+            lv_obj_set_style_border_width(row, 1, 0);
+            lv_obj_set_style_radius(row, 6, 0);
+            lv_obj_set_style_pad_all(row, 6, 0);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+
+            lv_obj_t *fn_lbl = lv_label_create(row);
+            lv_label_set_text(fn_lbl, fname);
+            lv_obj_set_style_text_font(fn_lbl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(fn_lbl, lv_color_hex(0xFFB300), 0);
+            lv_obj_align(fn_lbl, LV_ALIGN_TOP_LEFT, 0, 0);
+
+            lv_obj_t *hint_lbl = lv_label_create(row);
+            lv_label_set_text(hint_lbl, "Tap to load & emulate");
+            lv_obj_set_style_text_font(hint_lbl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(hint_lbl, ui_text_color(), 0);
+            lv_obj_align(hint_lbl, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+            lv_obj_add_event_cb(row, s_rfid_nfc_import_cb, LV_EVENT_CLICKED,
+                                (void *)(intptr_t)i);
         }
     }
 
