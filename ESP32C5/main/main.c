@@ -163,6 +163,7 @@ LV_IMG_DECLARE(deedee_img);
 #include "rf433_hat.h"
 #include "radio_hat.h"
 #include "cc1101.h"
+#include "nrf24.h"
 #include "rfid_manager.h"
 #include "rfid_types.h"
 #include "rfid_storage.h"
@@ -1533,6 +1534,69 @@ typedef struct {
 } cc1101_bs_ctx_t;
 static cc1101_bs_ctx_t *s_bs = NULL;  // 4 bytes DRAM; struct + canvas in PSRAM
 
+// ── nRF24L01 UI state (structs in PSRAM; only pointers live in DRAM) ─────────
+#define NRF24_CS_W       240
+#define NRF24_CS_SPEC_H   60
+#define NRF24_CS_WF_H    100
+#define NRF24_CS_NPTS    126
+#define NRF24_NUM_PAGES    2
+#define NRF24_SNIFF_MAX_PKTS 128
+#define NRF24_NRF24_SAVE_DIR "/sdcard/lab/nrf24"
+#define NRF24_SUB_PATH_LEN  80
+
+typedef struct {
+    volatile bool   active;
+    volatile bool   cancel;
+    volatile bool   sweep_done;
+    uint8_t         _pad;
+    bool            carrier[NRF24_CS_NPTS];
+    lv_color_t     *canv_buf;
+    lv_obj_t       *canvas;
+    lv_obj_t       *status_lbl;
+    lv_obj_t       *start_btn;
+    lv_timer_t     *tmr;
+    TaskHandle_t    task;
+} nrf24_cs_ctx_t;
+EXT_RAM_BSS_ATTR static nrf24_cs_ctx_t *s_ncs = NULL;
+
+typedef struct {
+    volatile bool    active;
+    volatile bool    cancel;
+    uint8_t          channel;
+    uint8_t          payload_len;
+    char             save_path[NRF24_SUB_PATH_LEN];
+    volatile int     pkt_count;
+    nrf24_packet_t   last_pkt;
+    lv_obj_t        *status_lbl;
+    lv_obj_t        *hex_lbl;
+    lv_obj_t        *count_lbl;
+    lv_obj_t        *start_btn;
+    lv_timer_t      *tmr;
+    TaskHandle_t     task;
+} nrf24_sniff_ctx_t;
+EXT_RAM_BSS_ATTR static nrf24_sniff_ctx_t *s_nsniff = NULL;
+
+typedef struct {
+    volatile bool    active;
+    volatile bool    cancel;
+    nrf24_sfhss_t    result;
+    volatile bool    result_ready;
+    lv_obj_t        *status_lbl;
+    lv_obj_t        *result_lbl;
+    lv_obj_t        *start_btn;
+    lv_timer_t      *tmr;
+    TaskHandle_t     task;
+} nrf24_futaba_ctx_t;
+EXT_RAM_BSS_ATTR static nrf24_futaba_ctx_t *s_nfut = NULL;
+
+EXT_RAM_BSS_ATTR static int       s_n24_page = 0;
+EXT_RAM_BSS_ATTR static lv_obj_t *s_n24_pages[NRF24_NUM_PAGES];
+EXT_RAM_BSS_ATTR static lv_obj_t *s_n24_page_lbl = NULL;
+EXT_RAM_BSS_ATTR static bool      s_n24_jam_active = false;
+EXT_RAM_BSS_ATTR static lv_obj_t *s_n24_jam_status = NULL;
+EXT_RAM_BSS_ATTR static lv_timer_t *s_n24_jam_tmr = NULL;
+EXT_RAM_BSS_ATTR static TaskHandle_t s_n24_jam_task = NULL;
+
 // AirTag Scanner state
 static TaskHandle_t airtag_scan_task_handle = NULL;
 static StaticTask_t airtag_scan_task_buffer;
@@ -1856,6 +1920,12 @@ static void show_cc1101_proximity_screen(void);
 static void show_cc1101_bruteforce_screen(void);
 static void show_cc1101_bandscope_screen(void);
 static void show_nrf24_screen(void);
+static void show_nrf24_hw_test_screen(void);
+static void show_nrf24_ch_scan_screen(void);
+static void show_nrf24_sniffer_screen(void);
+static void show_nrf24_saved_screen(void);
+static void show_nrf24_jammer_screen(void);
+static void show_nrf24_futaba_screen(void);
 static void show_ir_capture_screen(void);
 static void show_ir_replay_screen(void);
 static void show_ir_signal_list_screen(void);
@@ -2007,6 +2077,32 @@ static void reset_function_page_children(void) {
         if (s_bs->tmr) { lv_timer_del(s_bs->tmr); s_bs->tmr = NULL; }
         if (!s_bs->task) { if (s_bs->canv_buf) heap_caps_free(s_bs->canv_buf); heap_caps_free(s_bs); s_bs = NULL; }
     }
+    // nRF24 channel-scan cleanup
+    if (s_ncs) {
+        s_ncs->active = false; s_ncs->cancel = true;
+        s_ncs->canvas = NULL; s_ncs->status_lbl = NULL; s_ncs->start_btn = NULL;
+        if (s_ncs->tmr) { lv_timer_del(s_ncs->tmr); s_ncs->tmr = NULL; }
+        if (!s_ncs->task) { if (s_ncs->canv_buf) heap_caps_free(s_ncs->canv_buf); heap_caps_free(s_ncs); s_ncs = NULL; }
+    }
+    // nRF24 sniffer cleanup
+    if (s_nsniff) {
+        s_nsniff->active = false; s_nsniff->cancel = true;
+        s_nsniff->status_lbl = NULL; s_nsniff->hex_lbl = NULL;
+        s_nsniff->count_lbl = NULL; s_nsniff->start_btn = NULL;
+        if (s_nsniff->tmr) { lv_timer_del(s_nsniff->tmr); s_nsniff->tmr = NULL; }
+        if (!s_nsniff->task) { heap_caps_free(s_nsniff); s_nsniff = NULL; }
+    }
+    // nRF24 Futaba cleanup
+    if (s_nfut) {
+        s_nfut->active = false; s_nfut->cancel = true;
+        s_nfut->status_lbl = NULL; s_nfut->result_lbl = NULL; s_nfut->start_btn = NULL;
+        if (s_nfut->tmr) { lv_timer_del(s_nfut->tmr); s_nfut->tmr = NULL; }
+        if (!s_nfut->task) { heap_caps_free(s_nfut); s_nfut = NULL; }
+    }
+    // nRF24 jammer cleanup
+    s_n24_jam_active = false;
+    s_n24_jam_status = NULL;
+    if (s_n24_jam_tmr) { lv_timer_del(s_n24_jam_tmr); s_n24_jam_tmr = NULL; }
     deauth_monitor_rec_label = NULL;
     bt_locator_content = NULL;
     bt_locator_list = NULL;
@@ -38146,46 +38242,1101 @@ static void show_cc1101_bandscope_screen(void)
     rfhat_add_back_btn("CC1101", show_cc1101_screen);
 }
 
-// ── nRF24 Stub ────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// nRF24L01+  (NM-RF-HAT DIP 2: CE=GPIO8, CSN=GPIO9, SPI shared)
+// FOR AUTHORIZED SECURITY RESEARCH AND EDUCATION ONLY.
+// ─────────────────────────────────────────────────────────────────────────────
 
-static void show_nrf24_screen(void)
+// ── Hat claim / back-nav helpers ─────────────────────────────────────────────
+
+static void nrf24_hat_claim(void)
 {
-    create_function_page_base("nRF24L01 2.4GHz");
-    apply_menu_bg();
+    if (rfid_manager_is_init()) rfid_manager_deinit();
+    if (ir_hat_is_init())       ir_hat_deinit();
+    if (rf433_hat_is_init())    rf433_hat_deinit();
+    if (cc1101_is_init())       cc1101_deinit();   // frees GPIO8 + GPIO9
+}
 
+static void show_radio_menu_screen_from_nrf24(void)
+{
+    if (nrf24_is_init()) nrf24_deinit();
+    show_radio_menu_screen();
+}
+
+// ── Stub helper ───────────────────────────────────────────────────────────────
+
+static void s_n24_stub_screen(const char *title_text, const char *detail)
+{
+    create_function_page_base(title_text);
+    apply_menu_bg();
     lv_obj_t *card = lv_obj_create(function_page);
     lv_obj_set_size(card, LCD_H_RES - 20, LCD_V_RES - 80);
-    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 38);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 34);
     lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
     lv_obj_set_style_border_color(card, lv_color_hex(0x0D47A1), 0);
     lv_obj_set_style_border_width(card, 1, 0);
-    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_radius(card, 8, 0);
     lv_obj_set_style_pad_all(card, 12, 0);
     lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_gap(card, 10, 0);
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *hdr = lv_label_create(card);
+    lv_label_set_text(hdr, title_text);
+    lv_obj_set_style_text_font(hdr, &g_font_icon14, 0);
+    lv_obj_set_style_text_color(hdr, lv_color_hex(0x42A5F5), 0);
+    lv_obj_t *txt = lv_label_create(card);
+    lv_label_set_text(txt, detail);
+    lv_obj_set_style_text_font(txt, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(txt, ui_text_color(), 0);
+    lv_label_set_long_mode(txt, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(txt, LCD_H_RES - 44);
+    lv_obj_set_style_text_align(txt, LV_TEXT_ALIGN_CENTER, 0);
+    rfhat_add_back_btn("nRF24", show_nrf24_screen);
+}
 
-    lv_obj_t *title = lv_label_create(card);
-    lv_label_set_text(title, MY_SYMBOL_WAVE "  nRF24L01+ 2.4GHz");
-    lv_obj_set_style_text_font(title, &g_font_icon14, 0);
-    lv_obj_set_style_text_color(title, lv_color_hex(0x42A5F5), 0);
+// ── Page navigation ───────────────────────────────────────────────────────────
 
-    lv_obj_t *coming = lv_label_create(card);
-    lv_label_set_text(coming,
-        "Planned features:\n"
-        "  Channel Scanner\n"
-        "  MouseJack Attack\n"
-        "  Packet Sniffing\n"
-        "  Replay Attack\n"
-        "  Keyboard Injection\n\n"
-        "nRF24 driver in development.");
-    lv_obj_set_style_text_font(coming, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(coming, ui_text_color(), 0);
-    lv_label_set_long_mode(coming, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(coming, LCD_H_RES - 44);
+static const char *s_n24_page_strs[NRF24_NUM_PAGES] = { "1/2", "2/2" };
 
-    rfhat_add_back_btn("Radio", show_radio_menu_screen);
+static void s_n24_page_prev_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_n24_page <= 0) return;
+    lv_obj_add_flag(s_n24_pages[s_n24_page], LV_OBJ_FLAG_HIDDEN);
+    s_n24_page--;
+    lv_obj_clear_flag(s_n24_pages[s_n24_page], LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(s_n24_page_lbl, s_n24_page_strs[s_n24_page]);
+}
+
+static void s_n24_page_next_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_n24_page >= NRF24_NUM_PAGES - 1) return;
+    lv_obj_add_flag(s_n24_pages[s_n24_page], LV_OBJ_FLAG_HIDDEN);
+    s_n24_page++;
+    lv_obj_clear_flag(s_n24_pages[s_n24_page], LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(s_n24_page_lbl, s_n24_page_strs[s_n24_page]);
+}
+
+static lv_obj_t *s_n24_make_page(lv_obj_t *parent)
+{
+    lv_obj_t *p = lv_obj_create(parent);
+    lv_obj_set_size(p, LCD_H_RES, 188);
+    lv_obj_set_style_bg_opa(p, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(p, 0, 0);
+    lv_obj_set_style_pad_all(p, 4, 0);
+    lv_obj_set_style_pad_gap(p, 4, 0);
+    lv_obj_set_flex_flow(p, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(p, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+    return p;
+}
+
+// ── Tile dispatch callback ────────────────────────────────────────────────────
+
+static void s_n24_tile_cb(lv_event_t *e)
+{
+    const char *name = (const char *)lv_event_get_user_data(e);
+    if (!name) return;
+    if      (strcmp(name, "HWTest")  == 0) show_nrf24_hw_test_screen();
+    else if (strcmp(name, "ChScan")  == 0) show_nrf24_ch_scan_screen();
+    else if (strcmp(name, "Sniff")   == 0) show_nrf24_sniffer_screen();
+    else if (strcmp(name, "Saved")   == 0) show_nrf24_saved_screen();
+    else if (strcmp(name, "Jammer")  == 0) show_nrf24_jammer_screen();
+    else if (strcmp(name, "Futaba")  == 0) show_nrf24_futaba_screen();
+    else if (strcmp(name, "MouseJack") == 0)
+        s_n24_stub_screen(LV_SYMBOL_USB "  MouseJack",
+            "Hijack/inject packets into\nunprotected 2.4GHz keyboards\nand mice.\n\n"
+            "FOR AUTHORIZED TESTING\nONLY - illegal otherwise.\n\n"
+            "Coming in next version.");
+    else if (strcmp(name, "KbInject") == 0)
+        s_n24_stub_screen(LV_SYMBOL_KEYBOARD "  Keyboard Inject",
+            "Inject keystrokes via\nnRF24 to unprotected\nwireless keyboards.\n\n"
+            "FOR AUTHORIZED TESTING\nONLY - illegal otherwise.\n\n"
+            "Coming in next version.");
+    else if (strcmp(name, "Drone")   == 0)
+        s_n24_stub_screen(MY_SYMBOL_SATELLITE "  Drone Scanner",
+            "Detect and decode\n2.4GHz drone control\nprotocols (FlySky, DSMX).\n\n"
+            "Coming in next version.");
+    else if (strcmp(name, "GamePad") == 0)
+        s_n24_stub_screen(LV_SYMBOL_LOOP "  GamePad Monitor",
+            "Capture 2.4GHz wireless\ngamepad inputs\n(Logitech, generic HID).\n\n"
+            "Coming in next version.");
+}
+
+// ── Main nRF24 menu screen ────────────────────────────────────────────────────
+
+static void show_nrf24_screen(void)
+{
+    // Cancel any running nRF24 tasks
+    if (s_ncs)    { s_ncs->active = false;    s_ncs->cancel = true; }
+    if (s_nsniff) { s_nsniff->active = false; s_nsniff->cancel = true; }
+    if (s_nfut)   { s_nfut->active = false;   s_nfut->cancel = true; }
+    s_n24_jam_active = false;
+    s_n24_jam_status = NULL;
+    if (s_n24_jam_tmr) { lv_timer_del(s_n24_jam_tmr); s_n24_jam_tmr = NULL; }
+
+    nrf24_hat_claim();
+    s_n24_page = 0;
+
+    create_function_page_base("nRF24L01 2.4GHz");
+    apply_menu_bg();
+
+    // Tile container
+    lv_obj_t *tc = lv_obj_create(function_page);
+    lv_obj_set_size(tc, LCD_H_RES, 192);
+    lv_obj_align(tc, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(tc, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(tc, 0, 0);
+    lv_obj_set_style_pad_all(tc, 0, 0);
+    lv_obj_clear_flag(tc, LV_OBJ_FLAG_SCROLLABLE);
+
+    for (int i = 0; i < NRF24_NUM_PAGES; i++) {
+        s_n24_pages[i] = s_n24_make_page(tc);
+        if (i > 0) lv_obj_add_flag(s_n24_pages[i], LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // Page 1: Core tools
+    lv_obj_t *p1 = s_n24_pages[0];
+    create_tile(p1, LV_SYMBOL_SETTINGS,      "HW\nTest",     lv_color_hex(0x37474F), s_n24_tile_cb, "HWTest");
+    create_tile(p1, MY_SYMBOL_WAVE,          "Ch\nScan",     lv_color_hex(0x006064), s_n24_tile_cb, "ChScan");
+    create_tile(p1, LV_SYMBOL_EYE_OPEN,      "Sniffer",      lv_color_hex(0x1B5E20), s_n24_tile_cb, "Sniff");
+    create_tile(p1, LV_SYMBOL_SAVE,          "Saved\nFiles", lv_color_hex(0x4A148C), s_n24_tile_cb, "Saved");
+    create_tile(p1, MY_SYMBOL_SKULL_CROSS,   "Jammer",       UI_ACCENT_RED,          s_n24_tile_cb, "Jammer");
+    create_tile(p1, MY_SYMBOL_CAR,           "Futaba\nS-FHSS",lv_color_hex(0xE65100),s_n24_tile_cb, "Futaba");
+
+    // Page 2: Research stubs (with legal warnings where required)
+    lv_obj_t *p2 = s_n24_pages[1];
+    create_tile(p2, LV_SYMBOL_USB,           "Mouse\nJack",  UI_ACCENT_RED,          s_n24_tile_cb, "MouseJack");
+    create_tile(p2, LV_SYMBOL_KEYBOARD,      "Kb\nInject",   UI_ACCENT_RED,          s_n24_tile_cb, "KbInject");
+    create_tile(p2, MY_SYMBOL_SATELLITE,     "Drone\nScan",  lv_color_hex(0x1565C0), s_n24_tile_cb, "Drone");
+    create_tile(p2, LV_SYMBOL_LOOP,          "Game\nPad",    lv_color_hex(0x1B5E20), s_n24_tile_cb, "GamePad");
+
+    // Navigation bar
+    lv_obj_t *nav = lv_obj_create(function_page);
+    lv_obj_set_size(nav, LCD_H_RES - 10, 34);
+    lv_obj_align(nav, LV_ALIGN_BOTTOM_MID, 0, -12);
+    lv_obj_set_style_bg_opa(nav, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(nav, 0, 0);
+    lv_obj_set_style_pad_all(nav, 0, 0);
+    lv_obj_set_flex_flow(nav, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(nav, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(nav, 6, 0);
+    lv_obj_clear_flag(nav, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back_btn = lv_btn_create(nav);
+    lv_obj_set_size(back_btn, 70, 28);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60,60,60), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 6, 0);
+    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " Radio");
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
+    lv_obj_add_event_cb(back_btn, rfhat_menu_back_cb, LV_EVENT_CLICKED, (void*)show_radio_menu_screen_from_nrf24);
+
+    lv_obj_t *prev_btn = lv_btn_create(nav);
+    lv_obj_set_size(prev_btn, 32, 28);
+    lv_obj_set_style_bg_color(prev_btn, lv_color_make(50,50,80), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(prev_btn, 0, 0);
+    lv_obj_set_style_radius(prev_btn, 6, 0);
+    lv_obj_t *prev_lbl = lv_label_create(prev_btn);
+    lv_label_set_text(prev_lbl, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(prev_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(prev_lbl, lv_color_white(), 0);
+    lv_obj_center(prev_lbl);
+    lv_obj_add_event_cb(prev_btn, s_n24_page_prev_cb, LV_EVENT_CLICKED, NULL);
+
+    s_n24_page_lbl = lv_label_create(nav);
+    lv_label_set_text(s_n24_page_lbl, "1/2");
+    lv_obj_set_style_text_font(s_n24_page_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_n24_page_lbl, lv_color_hex(0x42A5F5), 0);
+
+    lv_obj_t *next_btn = lv_btn_create(nav);
+    lv_obj_set_size(next_btn, 32, 28);
+    lv_obj_set_style_bg_color(next_btn, lv_color_make(50,50,80), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(next_btn, 0, 0);
+    lv_obj_set_style_radius(next_btn, 6, 0);
+    lv_obj_t *next_lbl = lv_label_create(next_btn);
+    lv_label_set_text(next_lbl, LV_SYMBOL_RIGHT);
+    lv_obj_set_style_text_font(next_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(next_lbl, lv_color_white(), 0);
+    lv_obj_center(next_lbl);
+    lv_obj_add_event_cb(next_btn, s_n24_page_next_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// ── HW Test ───────────────────────────────────────────────────────────────────
+
+static void show_nrf24_hw_test_screen(void)
+{
+    create_function_page_base("nRF24 HW Test");
+    apply_menu_bg();
+
+    lv_obj_t *card = lv_obj_create(function_page);
+    lv_obj_set_size(card, LCD_H_RES - 20, LCD_V_RES - 80);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 34);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x0D47A1), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 8, 0);
+    lv_obj_set_style_pad_all(card, 10, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(card, 8, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *hdr = lv_label_create(card);
+    lv_label_set_text(hdr, MY_SYMBOL_WAVE "  nRF24L01+ HW Test");
+    lv_obj_set_style_text_font(hdr, &g_font_icon14, 0);
+    lv_obj_set_style_text_color(hdr, lv_color_hex(0x42A5F5), 0);
+
+    nrf24_hat_claim();
+    esp_err_t err = nrf24_init();
+    lv_obj_t *res = lv_label_create(card);
+    lv_obj_set_style_text_font(res, &lv_font_montserrat_12, 0);
+    lv_label_set_long_mode(res, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(res, LCD_H_RES - 44);
+    lv_obj_set_style_text_align(res, LV_TEXT_ALIGN_CENTER, 0);
+
+    char buf[192];
+    if (err == ESP_OK) {
+        uint8_t st  = nrf24_get_status();
+        uint8_t cfg = nrf24_read_reg(0x00);
+        uint8_t ch  = nrf24_read_reg(0x05);
+        uint8_t rfs = nrf24_read_reg(0x06);
+        snprintf(buf, sizeof(buf),
+                 LV_SYMBOL_OK "  Detected\n\n"
+                 "STATUS:   0x%02X\n"
+                 "CONFIG:   0x%02X\n"
+                 "RF_CH:    %u  (%.0f MHz)\n"
+                 "RF_SETUP: 0x%02X\n\n"
+                 "DIP 2: CE=GPIO8  CSN=GPIO9",
+                 st, cfg, ch, 2400.0f + ch, rfs);
+        lv_label_set_text(res, buf);
+        lv_obj_set_style_text_color(res, lv_color_hex(0x66BB6A), 0);
+    } else {
+        snprintf(buf, sizeof(buf),
+                 LV_SYMBOL_WARNING "  Not detected\n\n"
+                 "Check DIP switch 2\nand module seating.\n\nErr: %s",
+                 esp_err_to_name(err));
+        lv_label_set_text(res, buf);
+        lv_obj_set_style_text_color(res, UI_ACCENT_RED, 0);
+    }
+
+    rfhat_add_back_btn("nRF24", show_nrf24_screen);
+}
+
+// ── Channel Scanner ───────────────────────────────────────────────────────────
+
+static void s_ncs_scan_cb(uint8_t ch, bool carrier, void *ctx_v)
+{
+    nrf24_cs_ctx_t *ctx = (nrf24_cs_ctx_t *)ctx_v;
+    if (!ctx || ch >= NRF24_CS_NPTS) return;
+    if (carrier) ctx->carrier[ch] = true;
+    else         ctx->carrier[ch] = false;
+}
+
+static void s_ncs_task_fn(void *arg)
+{
+    nrf24_cs_ctx_t *ctx = (nrf24_cs_ctx_t *)arg;
+    while (ctx->active) {
+        ctx->cancel = false;
+        nrf24_scan_channels(0, NRF24_CS_NPTS - 1, s_ncs_scan_cb, ctx, &ctx->cancel);
+        if (ctx->active) ctx->sweep_done = true;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (ctx->canv_buf) heap_caps_free(ctx->canv_buf);
+    ctx->task = NULL;
+    heap_caps_free(ctx);
+    if (s_ncs == ctx) s_ncs = NULL;
+    vTaskDelete(NULL);
+}
+
+static void s_ncs_ui_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    nrf24_cs_ctx_t *ctx = s_ncs;
+    if (!ctx || !ctx->canvas || !ctx->canv_buf) return;
+    if (!ctx->sweep_done) return;
+    ctx->sweep_done = false;
+
+    int spec_h  = NRF24_CS_SPEC_H;
+    int wf_h    = NRF24_CS_WF_H;
+    int canvas_h = spec_h + 1 + wf_h;
+
+    // Snapshot carrier array
+    bool snap[NRF24_CS_NPTS];
+    memcpy(snap, ctx->carrier, sizeof(snap));
+
+    // Draw spectrum (top spec_h rows)
+    for (int y = 0; y < spec_h; y++) {
+        for (int x = 0; x < NRF24_CS_W; x++) {
+            int ch = x * NRF24_CS_NPTS / NRF24_CS_W;
+            if (ch >= NRF24_CS_NPTS) ch = NRF24_CS_NPTS - 1;
+            bool hit = snap[ch];
+            int bar_y = spec_h - 1;   // full height bar when carrier detected
+            lv_color_t col;
+            if (hit && y >= (spec_h - bar_y - 1)) {
+                // Heat color: active channel = bright yellow/white
+                col = scope_heat_color(220);
+            } else if (hit) {
+                col = scope_heat_color(150);
+            } else {
+                col = lv_color_make(10, 10, 20);
+            }
+            ctx->canv_buf[y * NRF24_CS_W + x] = col;
+        }
+    }
+    // Separator
+    for (int x = 0; x < NRF24_CS_W; x++)
+        ctx->canv_buf[spec_h * NRF24_CS_W + x] = lv_color_make(60, 60, 60);
+
+    // Waterfall: scroll down one row
+    int wf_start = spec_h + 1;
+    if (wf_h > 1)
+        memmove(&ctx->canv_buf[(wf_start + 1) * NRF24_CS_W],
+                &ctx->canv_buf[wf_start * NRF24_CS_W],
+                (wf_h - 1) * NRF24_CS_W * sizeof(lv_color_t));
+    // New top row
+    for (int x = 0; x < NRF24_CS_W; x++) {
+        int ch = x * NRF24_CS_NPTS / NRF24_CS_W;
+        if (ch >= NRF24_CS_NPTS) ch = NRF24_CS_NPTS - 1;
+        ctx->canv_buf[wf_start * NRF24_CS_W + x] =
+            snap[ch] ? scope_heat_color(200) : lv_color_make(0, 0, 16);
+    }
+
+    lv_obj_invalidate(ctx->canvas);
+
+    // Update status label
+    int active_count = 0;
+    for (int i = 0; i < NRF24_CS_NPTS; i++) if (snap[i]) active_count++;
+    if (ctx->status_lbl) {
+        char sb[48];
+        snprintf(sb, sizeof(sb), "2400-2526 MHz | Active: %d ch", active_count);
+        lv_label_set_text(ctx->status_lbl, sb);
+    }
+}
+
+static void s_ncs_startstop_cb(lv_event_t *e)
+{
+    (void)e;
+    nrf24_cs_ctx_t *ctx = s_ncs;
+    if (!ctx) return;
+    if (!ctx->active) {
+        ctx->active = true;
+        ctx->cancel = false;
+        if (ctx->start_btn) {
+            lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
+            if (lbl) lv_label_set_text(lbl, "Stop");
+        }
+        xTaskCreate(s_ncs_task_fn, "nrf24_cs", 3072, ctx, 5, &ctx->task);
+    } else {
+        ctx->active = false;
+        ctx->cancel = true;
+        if (ctx->start_btn) {
+            lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
+            if (lbl) lv_label_set_text(lbl, "Start");
+        }
+    }
+}
+
+static void show_nrf24_ch_scan_screen(void)
+{
+    if (s_ncs) { s_ncs->active = false; s_ncs->cancel = true; }
+
+    if (!nrf24_is_init()) {
+        nrf24_hat_claim();
+        if (nrf24_init() != ESP_OK) {
+            s_n24_stub_screen(MY_SYMBOL_WAVE "  Ch Scan",
+                "nRF24 not detected.\nCheck DIP switch 2.");
+            return;
+        }
+    }
+
+    int canvas_h = NRF24_CS_SPEC_H + 1 + NRF24_CS_WF_H;
+
+    nrf24_cs_ctx_t *ctx = heap_caps_calloc(1, sizeof(nrf24_cs_ctx_t), MALLOC_CAP_SPIRAM);
+    if (!ctx) { s_n24_stub_screen("nRF24 Error", "Out of memory"); return; }
+    s_ncs = ctx;
+
+    ctx->canv_buf = heap_caps_calloc(NRF24_CS_W * canvas_h, sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+    if (!ctx->canv_buf) {
+        heap_caps_free(ctx); s_ncs = NULL;
+        s_n24_stub_screen("nRF24 Error", "Out of memory (canvas)");
+        return;
+    }
+
+    create_function_page_base("nRF24 Ch Scan");
+    apply_menu_bg();
+
+    lv_obj_t *hdr = lv_label_create(function_page);
+    lv_label_set_text(hdr, MY_SYMBOL_WAVE "  2.4 GHz Channel Scanner");
+    lv_obj_set_style_text_font(hdr, &g_font_icon14, 0);
+    lv_obj_set_style_text_color(hdr, lv_color_hex(0x42A5F5), 0);
+    lv_obj_align(hdr, LV_ALIGN_TOP_MID, 0, 4);
+
+    ctx->canvas = lv_canvas_create(function_page);
+    lv_canvas_set_buffer(ctx->canvas, ctx->canv_buf, NRF24_CS_W, canvas_h, LV_IMG_CF_TRUE_COLOR);
+    lv_obj_align(ctx->canvas, LV_ALIGN_TOP_MID, 0, 28);
+
+    // Clear canvas to dark
+    for (int i = 0; i < NRF24_CS_W * canvas_h; i++)
+        ctx->canv_buf[i] = lv_color_make(0, 0, 16);
+
+    ctx->status_lbl = lv_label_create(function_page);
+    lv_label_set_text(ctx->status_lbl, "Press Start to scan");
+    lv_obj_set_style_text_font(ctx->status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0x90CAF9), 0);
+    lv_obj_align(ctx->status_lbl, LV_ALIGN_TOP_MID, 0, 28 + canvas_h + 4);
+
+    ctx->start_btn = lv_btn_create(function_page);
+    lv_obj_set_size(ctx->start_btn, 100, 28);
+    lv_obj_align(ctx->start_btn, LV_ALIGN_TOP_MID, 0, 28 + canvas_h + 18);
+    lv_obj_set_style_bg_color(ctx->start_btn, lv_color_hex(0x0D47A1), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(ctx->start_btn, 0, 0);
+    lv_obj_set_style_radius(ctx->start_btn, 6, 0);
+    lv_obj_t *sl = lv_label_create(ctx->start_btn);
+    lv_label_set_text(sl, "Start");
+    lv_obj_set_style_text_font(sl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sl, lv_color_white(), 0);
+    lv_obj_center(sl);
+    lv_obj_add_event_cb(ctx->start_btn, s_ncs_startstop_cb, LV_EVENT_CLICKED, NULL);
+
+    ctx->tmr = lv_timer_create(s_ncs_ui_timer_cb, 150, NULL);
+    rfhat_add_back_btn("nRF24", show_nrf24_screen);
+}
+
+// ── Sniffer ───────────────────────────────────────────────────────────────────
+
+static void s_nsniff_rx_cb(const nrf24_packet_t *pkt, void *ctx_v)
+{
+    nrf24_sniff_ctx_t *ctx = (nrf24_sniff_ctx_t *)ctx_v;
+    if (!ctx) return;
+    memcpy(&ctx->last_pkt, pkt, sizeof(*pkt));
+    ctx->pkt_count++;
+}
+
+static void s_nsniff_task_fn(void *arg)
+{
+    nrf24_sniff_ctx_t *ctx = (nrf24_sniff_ctx_t *)arg;
+
+    // Create save dir and file path
+    mkdir(NRF24_NRF24_SAVE_DIR, 0755);
+    snprintf(ctx->save_path, NRF24_SUB_PATH_LEN,
+             NRF24_NRF24_SAVE_DIR "/CH%02u_%llu.nrf24",
+             ctx->channel, (unsigned long long)esp_timer_get_time() / 1000000ULL);
+
+    nrf24_capture_t cap = {
+        .channel     = ctx->channel,
+        .payload_len = ctx->payload_len,
+        .addr_len    = 3,
+    };
+    const uint8_t bcast[3] = { 0xAA, 0xAA, 0xAA };
+    memcpy(cap.addr, bcast, 3);
+
+    // Collect packets
+    nrf24_packet_t *pkts = heap_caps_calloc(NRF24_SNIFF_MAX_PKTS,
+                                             sizeof(nrf24_packet_t), MALLOC_CAP_SPIRAM);
+    cap.pkts = pkts;
+
+    nrf24_sniff(ctx->channel, ctx->payload_len,
+                s_nsniff_rx_cb, ctx, 0, &ctx->cancel);
+
+    // Save whatever was captured
+    if (pkts) {
+        int n = ctx->pkt_count < NRF24_SNIFF_MAX_PKTS ? ctx->pkt_count : NRF24_SNIFF_MAX_PKTS;
+        memcpy(pkts, &ctx->last_pkt, sizeof(nrf24_packet_t));
+        cap.count = n > 0 ? 1 : 0;  // simplified: save last packet
+        if (cap.count > 0) nrf24_capture_save(&cap, ctx->save_path);
+        heap_caps_free(pkts);
+    }
+
+    ctx->active = false;
+    ctx->task = NULL;
+    if (s_nsniff) { s_nsniff->tmr = NULL; }
+    heap_caps_free(ctx);
+    if (s_nsniff == ctx) s_nsniff = NULL;
+    vTaskDelete(NULL);
+}
+
+static void s_nsniff_ui_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    nrf24_sniff_ctx_t *ctx = s_nsniff;
+    if (!ctx) return;
+
+    if (ctx->count_lbl) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "Packets: %d", ctx->pkt_count);
+        lv_label_set_text(ctx->count_lbl, buf);
+    }
+    if (ctx->hex_lbl && ctx->pkt_count > 0) {
+        char hex[96] = "";
+        int n = ctx->last_pkt.len > 16 ? 16 : ctx->last_pkt.len;
+        for (int i = 0; i < n; i++) {
+            char tmp[4];
+            snprintf(tmp, sizeof(tmp), "%02X ", ctx->last_pkt.data[i]);
+            strncat(hex, tmp, sizeof(hex) - strlen(hex) - 1);
+        }
+        if (ctx->last_pkt.len > 16) strncat(hex, "...", sizeof(hex) - strlen(hex) - 1);
+        lv_label_set_text(ctx->hex_lbl, hex);
+    }
+    if (ctx->status_lbl) {
+        const char *st = ctx->active ? "Listening..." : "Stopped";
+        lv_label_set_text(ctx->status_lbl, st);
+        lv_obj_set_style_text_color(ctx->status_lbl,
+            ctx->active ? lv_color_hex(0xFFB300) : lv_color_hex(0x66BB6A), 0);
+    }
+    if (!ctx->active && ctx->task == NULL) {
+        // Task finished — update button label
+        if (ctx->start_btn) {
+            lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
+            if (lbl) lv_label_set_text(lbl, "Start");
+        }
+        if (ctx->status_lbl && ctx->pkt_count > 0)
+            lv_label_set_text(ctx->status_lbl, "Saved!");
+    }
+}
+
+static void s_nsniff_start_cb(lv_event_t *e)
+{
+    (void)e;
+    nrf24_sniff_ctx_t *ctx = s_nsniff;
+    if (!ctx) return;
+    if (!ctx->active && !ctx->task) {
+        ctx->active = true; ctx->cancel = false; ctx->pkt_count = 0;
+        if (ctx->start_btn) {
+            lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
+            if (lbl) lv_label_set_text(lbl, "Stop");
+        }
+        xTaskCreate(s_nsniff_task_fn, "nrf24_sniff", 4096, ctx, 5, &ctx->task);
+    } else {
+        ctx->active = false; ctx->cancel = true;
+    }
+}
+
+static void show_nrf24_sniffer_screen(void)
+{
+    if (s_nsniff) { s_nsniff->active = false; s_nsniff->cancel = true; }
+
+    if (!nrf24_is_init()) {
+        nrf24_hat_claim();
+        if (nrf24_init() != ESP_OK) {
+            s_n24_stub_screen(LV_SYMBOL_EYE_OPEN "  Sniffer", "nRF24 not detected.");
+            return;
+        }
+    }
+
+    nrf24_sniff_ctx_t *ctx = heap_caps_calloc(1, sizeof(nrf24_sniff_ctx_t), MALLOC_CAP_SPIRAM);
+    if (!ctx) { s_n24_stub_screen("nRF24 Error", "Out of memory"); return; }
+    ctx->channel     = 76;
+    ctx->payload_len = 32;
+    s_nsniff = ctx;
+
+    create_function_page_base("nRF24 Sniffer");
+    apply_menu_bg();
+
+    lv_obj_t *card = lv_obj_create(function_page);
+    lv_obj_set_size(card, LCD_H_RES - 16, LCD_V_RES - 88);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x1B5E20), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 8, 0);
+    lv_obj_set_style_pad_all(card, 10, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(card, 6, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *hdr = lv_label_create(card);
+    lv_label_set_text(hdr, LV_SYMBOL_EYE_OPEN "  Promiscuous Sniffer");
+    lv_obj_set_style_text_font(hdr, &g_font_icon14, 0);
+    lv_obj_set_style_text_color(hdr, lv_color_hex(0x66BB6A), 0);
+
+    lv_obj_t *info = lv_label_create(card);
+    lv_label_set_text(info, "Ch 76 | Addr: AA AA AA | 32B payload");
+    lv_obj_set_style_text_font(info, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(info, lv_color_make(150, 150, 150), 0);
+
+    ctx->status_lbl = lv_label_create(card);
+    lv_label_set_text(ctx->status_lbl, "Ready");
+    lv_obj_set_style_text_font(ctx->status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0x66BB6A), 0);
+
+    ctx->count_lbl = lv_label_create(card);
+    lv_label_set_text(ctx->count_lbl, "Packets: 0");
+    lv_obj_set_style_text_font(ctx->count_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->count_lbl, lv_color_hex(0x42A5F5), 0);
+
+    lv_obj_t *hex_hdr = lv_label_create(card);
+    lv_label_set_text(hex_hdr, "Last packet:");
+    lv_obj_set_style_text_font(hex_hdr, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hex_hdr, lv_color_make(150, 150, 150), 0);
+
+    ctx->hex_lbl = lv_label_create(card);
+    lv_label_set_text(ctx->hex_lbl, "--");
+    lv_obj_set_style_text_font(ctx->hex_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->hex_lbl, lv_color_hex(0xFFD54F), 0);
+    lv_label_set_long_mode(ctx->hex_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(ctx->hex_lbl, LCD_H_RES - 36);
+
+    ctx->start_btn = lv_btn_create(card);
+    lv_obj_set_size(ctx->start_btn, 100, 28);
+    lv_obj_set_style_bg_color(ctx->start_btn, lv_color_hex(0x1B5E20), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(ctx->start_btn, lv_color_hex(0x2E7D32), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(ctx->start_btn, 0, 0);
+    lv_obj_set_style_radius(ctx->start_btn, 6, 0);
+    lv_obj_t *sl = lv_label_create(ctx->start_btn);
+    lv_label_set_text(sl, "Start");
+    lv_obj_set_style_text_font(sl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sl, lv_color_white(), 0);
+    lv_obj_center(sl);
+    lv_obj_add_event_cb(ctx->start_btn, s_nsniff_start_cb, LV_EVENT_CLICKED, NULL);
+
+    ctx->tmr = lv_timer_create(s_nsniff_ui_timer_cb, 200, NULL);
+    rfhat_add_back_btn("nRF24", show_nrf24_screen);
+}
+
+// ── Saved Files ───────────────────────────────────────────────────────────────
+
+typedef struct { char path[NRF24_SUB_PATH_LEN]; } nrf24_saved_path_t;
+EXT_RAM_BSS_ATTR static nrf24_saved_path_t *s_n24_saved_paths = NULL;
+EXT_RAM_BSS_ATTR static int                 s_n24_saved_count  = 0;
+
+static void s_n24_saved_play_cb(lv_event_t *e)
+{
+    const char *path = (const char *)lv_event_get_user_data(e);
+    if (!path) return;
+    // Load and replay (stub — show hex of first packet)
+    nrf24_capture_t cap = {0};
+    if (nrf24_capture_load(path, &cap) == ESP_OK) {
+        // Simple feedback: navigate to sniffer with info
+        nrf24_capture_free(&cap);
+    }
+}
+
+static void show_nrf24_saved_screen(void)
+{
+    if (s_n24_saved_paths) { free(s_n24_saved_paths); s_n24_saved_paths = NULL; }
+    s_n24_saved_count = 0;
+
+    // Scan directory
+    mkdir(NRF24_NRF24_SAVE_DIR, 0755);
+    DIR *d = opendir(NRF24_NRF24_SAVE_DIR);
+    if (d) {
+        struct dirent *ent;
+        int cnt = 0;
+        while ((ent = readdir(d)) != NULL) {
+            size_t nlen = strlen(ent->d_name);
+            if (nlen > 6 && strcmp(ent->d_name + nlen - 6, ".nrf24") == 0) cnt++;
+        }
+        if (cnt > 0) {
+            s_n24_saved_paths = heap_caps_calloc(cnt, sizeof(nrf24_saved_path_t), MALLOC_CAP_SPIRAM);
+            if (s_n24_saved_paths) {
+                rewinddir(d);
+                int idx = 0;
+                while ((ent = readdir(d)) != NULL && idx < cnt) {
+                    size_t nlen = strlen(ent->d_name);
+                    if (nlen > 6 && strcmp(ent->d_name + nlen - 6, ".nrf24") == 0) {
+                        snprintf(s_n24_saved_paths[idx].path, NRF24_SUB_PATH_LEN,
+                                 "%s/%.55s", NRF24_NRF24_SAVE_DIR, ent->d_name);
+                        idx++;
+                    }
+                }
+                s_n24_saved_count = idx;
+            }
+        }
+        closedir(d);
+    }
+
+    create_function_page_base("nRF24 Saved");
+    apply_menu_bg();
+
+    lv_obj_t *list = lv_obj_create(function_page);
+    lv_obj_set_size(list, LCD_H_RES - 10, LCD_V_RES - 78);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_set_style_bg_color(list, ui_panel_color(), 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    lv_obj_set_style_pad_all(list, 4, 0);
+    lv_obj_set_style_pad_gap(list, 4, 0);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+
+    if (s_n24_saved_count == 0) {
+        lv_obj_t *empty = lv_label_create(list);
+        lv_label_set_text(empty, "No .nrf24 files found\nin " NRF24_NRF24_SAVE_DIR);
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(empty, lv_color_make(150, 150, 150), 0);
+        lv_obj_align(empty, LV_ALIGN_CENTER, 0, 0);
+    } else {
+        for (int i = 0; i < s_n24_saved_count; i++) {
+            lv_obj_t *row = lv_obj_create(list);
+            lv_obj_set_size(row, LCD_H_RES - 18, 36);
+            lv_obj_set_style_bg_color(row, lv_color_make(30, 40, 50), 0);
+            lv_obj_set_style_border_width(row, 0, 0);
+            lv_obj_set_style_radius(row, 4, 0);
+            lv_obj_set_style_pad_all(row, 4, 0);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+            const char *fn = strrchr(s_n24_saved_paths[i].path, '/');
+            fn = fn ? fn + 1 : s_n24_saved_paths[i].path;
+            lv_obj_t *name_lbl = lv_label_create(row);
+            lv_label_set_text(name_lbl, fn);
+            lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(name_lbl, lv_color_hex(0x90CAF9), 0);
+            lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+            lv_obj_set_width(name_lbl, LCD_H_RES - 80);
+
+            lv_obj_t *play_btn = lv_btn_create(row);
+            lv_obj_set_size(play_btn, 36, 24);
+            lv_obj_set_style_bg_color(play_btn, lv_color_hex(0x1B5E20), LV_STATE_DEFAULT);
+            lv_obj_set_style_border_width(play_btn, 0, 0);
+            lv_obj_set_style_radius(play_btn, 4, 0);
+            lv_obj_t *pl = lv_label_create(play_btn);
+            lv_label_set_text(pl, LV_SYMBOL_PLAY);
+            lv_obj_set_style_text_font(pl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(pl, lv_color_white(), 0);
+            lv_obj_center(pl);
+            lv_obj_add_event_cb(play_btn, s_n24_saved_play_cb, LV_EVENT_CLICKED,
+                                (void*)s_n24_saved_paths[i].path);
+        }
+    }
+
+    rfhat_add_back_btn("nRF24", show_nrf24_screen);
+}
+
+// ── Jammer ────────────────────────────────────────────────────────────────────
+
+static void s_n24_jam_task_fn(void *arg)
+{
+    (void)arg;
+    nrf24_jam_sweep(&s_n24_jam_active);
+    s_n24_jam_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void s_n24_jam_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!s_n24_jam_status) return;
+    static int blink = 0;
+    if (s_n24_jam_active) {
+        lv_label_set_text(s_n24_jam_status, blink++ & 1 ? "JAMMING..." : "JAMMING   ");
+        lv_obj_set_style_text_color(s_n24_jam_status, UI_ACCENT_RED, 0);
+    } else {
+        lv_label_set_text(s_n24_jam_status, "Stopped");
+        lv_obj_set_style_text_color(s_n24_jam_status, lv_color_hex(0x66BB6A), 0);
+    }
+}
+
+static void s_n24_jam_start_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!nrf24_is_init()) return;
+    s_n24_jam_active = true;
+    if (!s_n24_jam_task)
+        xTaskCreate(s_n24_jam_task_fn, "nrf24_jam", 2048, NULL, 6, &s_n24_jam_task);
+}
+
+static void s_n24_jam_stop_cb(lv_event_t *e)
+{
+    (void)e;
+    s_n24_jam_active = false;
+    nrf24_standby();
+}
+
+static void s_n24_jam_dismiss_cb(lv_event_t *e)
+{
+    lv_obj_t *overlay = (lv_obj_t *)lv_event_get_user_data(e);
+    if (overlay) lv_obj_del(overlay);
+}
+
+static void show_nrf24_jammer_screen(void)
+{
+    if (!nrf24_is_init()) {
+        nrf24_hat_claim();
+        if (nrf24_init() != ESP_OK) {
+            s_n24_stub_screen(MY_SYMBOL_SKULL_CROSS "  Jammer", "nRF24 not detected.");
+            return;
+        }
+    }
+    s_n24_jam_active = false;
+
+    create_function_page_base("nRF24 Jammer");
+    apply_menu_bg();
+
+    // Legal disclaimer overlay
+    lv_obj_t *overlay = lv_obj_create(function_page);
+    lv_obj_set_size(overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_align(overlay, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_80, 0);
+    lv_obj_set_style_border_width(overlay, 0, 0);
+    lv_obj_set_style_pad_all(overlay, 12, 0);
+    lv_obj_set_flex_flow(overlay, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(overlay, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(overlay, 8, 0);
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *warn = lv_label_create(overlay);
+    lv_label_set_text(warn, LV_SYMBOL_WARNING "  LEGAL WARNING");
+    lv_obj_set_style_text_font(warn, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(warn, UI_ACCENT_RED, 0);
+
+    lv_obj_t *txt = lv_label_create(overlay);
+    lv_label_set_text(txt,
+        "2.4GHz jamming is ILLEGAL\n"
+        "in most jurisdictions.\n\n"
+        "Use ONLY in authorized\n"
+        "environments: Faraday\n"
+        "cage, RF shielded lab,\n"
+        "or with explicit consent.\n\n"
+        "Unauthorized use violates\n"
+        "FCC/ETSI/local law.");
+    lv_obj_set_style_text_font(txt, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(txt, lv_color_white(), 0);
+    lv_obj_set_style_text_align(txt, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(txt, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(txt, LCD_H_RES - 28);
+
+    lv_obj_t *ack_btn = lv_btn_create(overlay);
+    lv_obj_set_size(ack_btn, 140, 30);
+    lv_obj_set_style_bg_color(ack_btn, lv_color_hex(0xB71C1C), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(ack_btn, lv_color_hex(0xD32F2F), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(ack_btn, 0, 0);
+    lv_obj_set_style_radius(ack_btn, 6, 0);
+    lv_obj_t *ack_lbl = lv_label_create(ack_btn);
+    lv_label_set_text(ack_lbl, "I understand - Proceed");
+    lv_obj_set_style_text_font(ack_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ack_lbl, lv_color_white(), 0);
+    lv_obj_center(ack_lbl);
+    lv_obj_add_event_cb(ack_btn, s_n24_jam_dismiss_cb, LV_EVENT_CLICKED, overlay);
+
+    // Jammer control panel (behind overlay)
+    lv_obj_t *card = lv_obj_create(function_page);
+    lv_obj_set_size(card, LCD_H_RES - 16, LCD_V_RES - 88);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 34);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(card, UI_ACCENT_RED, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 8, 0);
+    lv_obj_set_style_pad_all(card, 10, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(card, 10, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *hdr = lv_label_create(card);
+    lv_label_set_text(hdr, MY_SYMBOL_SKULL_CROSS "  2.4GHz Sweeper");
+    lv_obj_set_style_text_font(hdr, &g_font_icon14, 0);
+    lv_obj_set_style_text_color(hdr, UI_ACCENT_RED, 0);
+
+    s_n24_jam_status = lv_label_create(card);
+    lv_label_set_text(s_n24_jam_status, "Ready");
+    lv_obj_set_style_text_font(s_n24_jam_status, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_n24_jam_status, lv_color_hex(0x66BB6A), 0);
+
+    lv_obj_t *note = lv_label_create(card);
+    lv_label_set_text(note, "Sweeps all 126 channels\nwith max-power carrier");
+    lv_obj_set_style_text_font(note, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(note, lv_color_make(150, 150, 150), 0);
+    lv_obj_set_style_text_align(note, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *btn_row = lv_obj_create(card);
+    lv_obj_set_size(btn_row, LCD_H_RES - 36, 36);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(btn_row, 12, 0);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *start_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(start_btn, 80, 32);
+    lv_obj_set_style_bg_color(start_btn, lv_color_hex(0xB71C1C), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(start_btn, lv_color_hex(0xD32F2F), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(start_btn, 0, 0);
+    lv_obj_set_style_radius(start_btn, 6, 0);
+    lv_obj_t *sl = lv_label_create(start_btn); lv_label_set_text(sl, "JAM");
+    lv_obj_set_style_text_font(sl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(sl, lv_color_white(), 0);
+    lv_obj_center(sl);
+    lv_obj_add_event_cb(start_btn, s_n24_jam_start_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *stop_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(stop_btn, 80, 32);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_make(50, 50, 50), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_make(70, 70, 70), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(stop_btn, 0, 0);
+    lv_obj_set_style_radius(stop_btn, 6, 0);
+    lv_obj_t *stl = lv_label_create(stop_btn); lv_label_set_text(stl, "STOP");
+    lv_obj_set_style_text_font(stl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(stl, lv_color_white(), 0);
+    lv_obj_center(stl);
+    lv_obj_add_event_cb(stop_btn, s_n24_jam_stop_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_move_foreground(overlay);
+
+    s_n24_jam_tmr = lv_timer_create(s_n24_jam_timer_cb, 400, NULL);
+    rfhat_add_back_btn("nRF24", show_nrf24_screen);
+}
+
+// ── Futaba S-FHSS Scanner ─────────────────────────────────────────────────────
+
+static void s_nfut_task_fn(void *arg)
+{
+    nrf24_futaba_ctx_t *ctx = (nrf24_futaba_ctx_t *)arg;
+    nrf24_sfhss_scan(&ctx->result, 10000, &ctx->cancel);
+    ctx->result_ready = true;
+    ctx->active = false;
+    ctx->task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void s_nfut_ui_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    nrf24_futaba_ctx_t *ctx = s_nfut;
+    if (!ctx) return;
+
+    if (ctx->status_lbl) {
+        if (ctx->active) {
+            lv_label_set_text(ctx->status_lbl, "Scanning S-FHSS channels...");
+            lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0xFFB300), 0);
+        } else if (ctx->result_ready) {
+            if (ctx->result.found) {
+                lv_label_set_text(ctx->status_lbl, "S-FHSS Found!");
+                lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0x66BB6A), 0);
+            } else {
+                lv_label_set_text(ctx->status_lbl, "No S-FHSS signal");
+                lv_obj_set_style_text_color(ctx->status_lbl, lv_color_make(150, 150, 150), 0);
+            }
+        } else {
+            lv_label_set_text(ctx->status_lbl, "Press Scan to start");
+        }
+    }
+
+    if (ctx->result_lbl && ctx->result_ready) {
+        if (ctx->result.found) {
+            char buf[160];
+            snprintf(buf, sizeof(buf),
+                     "Ch: %u (%.0f MHz)\n"
+                     "Raw: %02X %02X %02X %02X %02X\n"
+                     "     %02X %02X %02X %02X %02X\n"
+                     "Srv: %u %u %u %u",
+                     ctx->result.channel,
+                     2400.0f + ctx->result.channel,
+                     ctx->result.raw[0], ctx->result.raw[1],
+                     ctx->result.raw[2], ctx->result.raw[3],
+                     ctx->result.raw[4], ctx->result.raw[5],
+                     ctx->result.raw[6], ctx->result.raw[7],
+                     ctx->result.raw[8], ctx->result.raw[9],
+                     ctx->result.servo[0], ctx->result.servo[1],
+                     ctx->result.servo[2], ctx->result.servo[3]);
+            lv_label_set_text(ctx->result_lbl, buf);
+        } else {
+            lv_label_set_text(ctx->result_lbl, "No Futaba S-FHSS\ntransmitter detected.");
+        }
+    }
+
+    if (!ctx->active && ctx->start_btn) {
+        lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
+        if (lbl) lv_label_set_text(lbl, "Scan");
+    }
+}
+
+static void s_nfut_start_cb(lv_event_t *e)
+{
+    (void)e;
+    nrf24_futaba_ctx_t *ctx = s_nfut;
+    if (!ctx || ctx->active) return;
+    ctx->active       = true;
+    ctx->cancel       = false;
+    ctx->result_ready = false;
+    memset(&ctx->result, 0, sizeof(ctx->result));
+    if (ctx->start_btn) {
+        lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
+        if (lbl) lv_label_set_text(lbl, "...");
+    }
+    xTaskCreate(s_nfut_task_fn, "nrf24_fut", 3072, ctx, 5, &ctx->task);
+}
+
+static void show_nrf24_futaba_screen(void)
+{
+    if (s_nfut) { s_nfut->active = false; s_nfut->cancel = true; }
+
+    if (!nrf24_is_init()) {
+        nrf24_hat_claim();
+        if (nrf24_init() != ESP_OK) {
+            s_n24_stub_screen(MY_SYMBOL_CAR "  Futaba S-FHSS",
+                "nRF24 not detected.");
+            return;
+        }
+    }
+
+    nrf24_futaba_ctx_t *ctx = heap_caps_calloc(1, sizeof(nrf24_futaba_ctx_t), MALLOC_CAP_SPIRAM);
+    if (!ctx) { s_n24_stub_screen("nRF24 Error", "Out of memory"); return; }
+    s_nfut = ctx;
+
+    create_function_page_base("Futaba S-FHSS");
+    apply_menu_bg();
+
+    lv_obj_t *card = lv_obj_create(function_page);
+    lv_obj_set_size(card, LCD_H_RES - 16, LCD_V_RES - 88);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0xE65100), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 8, 0);
+    lv_obj_set_style_pad_all(card, 10, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(card, 8, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *hdr = lv_label_create(card);
+    lv_label_set_text(hdr, MY_SYMBOL_CAR "  Futaba S-FHSS 2.4GHz");
+    lv_obj_set_style_text_font(hdr, &g_font_icon14, 0);
+    lv_obj_set_style_text_color(hdr, lv_color_hex(0xFF8F00), 0);
+
+    lv_obj_t *info = lv_label_create(card);
+    lv_label_set_text(info, "1 Mbps | 10-byte | Addr: 55 0F 71");
+    lv_obj_set_style_text_font(info, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(info, lv_color_make(150, 150, 150), 0);
+
+    ctx->status_lbl = lv_label_create(card);
+    lv_label_set_text(ctx->status_lbl, "Press Scan to start");
+    lv_obj_set_style_text_font(ctx->status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0x66BB6A), 0);
+
+    ctx->result_lbl = lv_label_create(card);
+    lv_label_set_text(ctx->result_lbl, "--");
+    lv_obj_set_style_text_font(ctx->result_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->result_lbl, lv_color_hex(0xFFD54F), 0);
+    lv_label_set_long_mode(ctx->result_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(ctx->result_lbl, LCD_H_RES - 36);
+
+    ctx->start_btn = lv_btn_create(card);
+    lv_obj_set_size(ctx->start_btn, 100, 28);
+    lv_obj_set_style_bg_color(ctx->start_btn, lv_color_hex(0xE65100), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(ctx->start_btn, lv_color_hex(0xF4511E), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(ctx->start_btn, 0, 0);
+    lv_obj_set_style_radius(ctx->start_btn, 6, 0);
+    lv_obj_t *sl = lv_label_create(ctx->start_btn);
+    lv_label_set_text(sl, "Scan");
+    lv_obj_set_style_text_font(sl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sl, lv_color_white(), 0);
+    lv_obj_center(sl);
+    lv_obj_add_event_cb(ctx->start_btn, s_nfut_start_cb, LV_EVENT_CLICKED, NULL);
+
+    ctx->tmr = lv_timer_create(s_nfut_ui_timer_cb, 200, NULL);
+    rfhat_add_back_btn("nRF24", show_nrf24_screen);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
