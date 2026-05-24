@@ -36676,6 +36676,35 @@ static lv_obj_t *s_cc1101_jam_status = NULL;
 static bool      s_cc1101_jamming    = false;
 static lv_timer_t *s_cc1101_jam_tmr = NULL;
 
+// Freq scan header label (kept across redraws; updated by freq button)
+static lv_obj_t *s_cc1101_freq_hdr = NULL;
+
+// RAW Capture screen state
+typedef enum { CC1101_CAP_IDLE=0, CC1101_CAP_RUNNING, CC1101_CAP_DONE, CC1101_CAP_FAIL } cc1101_cap_state_t;
+static volatile cc1101_cap_state_t s_cc1101_cap_state  = CC1101_CAP_IDLE;
+static cc1101_raw_t  s_cc1101_cap_raw   = {0};
+static char          s_cc1101_cap_path[64] = {0};
+static TaskHandle_t  s_cc1101_cap_task  = NULL;
+static lv_obj_t     *s_cc1101_cap_status_lbl = NULL;
+static lv_obj_t     *s_cc1101_cap_count_lbl  = NULL;
+static lv_obj_t     *s_cc1101_cap_btn        = NULL;
+static lv_timer_t   *s_cc1101_cap_tmr        = NULL;
+
+// RAW Replay screen state (shared between Replay and Saved screens)
+typedef enum { CC1101_REP_IDLE=0, CC1101_REP_RUNNING, CC1101_REP_DONE, CC1101_REP_FAIL } cc1101_rep_state_t;
+static volatile cc1101_rep_state_t s_cc1101_rep_state  = CC1101_REP_IDLE;
+static TaskHandle_t  s_cc1101_rep_task  = NULL;
+static lv_obj_t     *s_cc1101_rep_status = NULL;
+static lv_timer_t   *s_cc1101_rep_tmr   = NULL;
+
+// Saved files list — PSRAM-allocated in show_cc1101_saved_screen, freed on parent exit
+#define CC1101_MAX_SUB_FILES 10
+#define CC1101_SUB_PATH_LEN  80
+typedef char cc1101_sub_path_t[CC1101_SUB_PATH_LEN];
+static cc1101_sub_path_t *s_cc1101_sub_paths = NULL;  // PSRAM alloc, 10×80 bytes
+static int   s_cc1101_sub_count = 0;
+static char  s_cc1101_saved_sel_path[CC1101_SUB_PATH_LEN] = {0};
+
 // ── Helper: generic "coming soon" sub-screen ──────────────────────────────────
 
 static void s_cc1101_stub_screen(const char *title_text, const char *detail)
@@ -36780,13 +36809,25 @@ static void s_cc1101_tile_cb(lv_event_t *e)
 static void show_cc1101_screen(void)
 {
     // Clean up any running timers from sub-screens
-    if (s_cc1101_tmr) { lv_timer_del(s_cc1101_tmr); s_cc1101_tmr = NULL; }
+    if (s_cc1101_tmr)     { lv_timer_del(s_cc1101_tmr);     s_cc1101_tmr     = NULL; }
     if (s_cc1101_jam_tmr) { lv_timer_del(s_cc1101_jam_tmr); s_cc1101_jam_tmr = NULL; }
-    s_cc1101_rssi_bar = NULL;
-    s_cc1101_rssi_lbl = NULL;
-    s_cc1101_jam_status = NULL;
-    s_cc1101_ht_status = NULL;
-    s_cc1101_jamming = false;
+    if (s_cc1101_cap_tmr) { lv_timer_del(s_cc1101_cap_tmr); s_cc1101_cap_tmr = NULL; }
+    if (s_cc1101_rep_tmr) { lv_timer_del(s_cc1101_rep_tmr); s_cc1101_rep_tmr = NULL; }
+    if (s_cc1101_cap_task) cc1101_capture_cancel();
+    if (s_cc1101_rep_task) cc1101_replay_cancel();
+    if (s_cc1101_sub_paths) { free(s_cc1101_sub_paths); s_cc1101_sub_paths = NULL; }
+    s_cc1101_rssi_bar        = NULL;
+    s_cc1101_rssi_lbl        = NULL;
+    s_cc1101_freq_hdr        = NULL;
+    s_cc1101_jam_status      = NULL;
+    s_cc1101_ht_status       = NULL;
+    s_cc1101_jamming         = false;
+    s_cc1101_cap_status_lbl  = NULL;
+    s_cc1101_cap_count_lbl   = NULL;
+    s_cc1101_cap_btn         = NULL;
+    s_cc1101_rep_status      = NULL;
+    s_cc1101_cap_state       = CC1101_CAP_IDLE;
+    s_cc1101_rep_state       = CC1101_REP_IDLE;
 
     cc1101_hat_claim();
     s_cc1101_page = 0;
@@ -37027,6 +37068,11 @@ static void s_cc1101_freq_btn_cb(lv_event_t *e)
     float mhz = *(float *)lv_event_get_user_data(e);
     s_cc1101_freq_mhz = mhz;
     if (cc1101_is_init()) cc1101_set_freq_mhz(mhz);
+    if (s_cc1101_freq_hdr) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), MY_SYMBOL_SATELLITE "  %.2f MHz", (double)mhz);
+        lv_label_set_text(s_cc1101_freq_hdr, buf);
+    }
 }
 
 static void show_cc1101_freq_scan_screen(void)
@@ -37059,12 +37105,12 @@ static void show_cc1101_freq_scan_screen(void)
     lv_obj_set_style_pad_row(card, 8, 0);
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *hdr = lv_label_create(card);
+    s_cc1101_freq_hdr = lv_label_create(card);
     char freq_buf[32]; snprintf(freq_buf, sizeof(freq_buf),
                                 MY_SYMBOL_SATELLITE "  %.2f MHz", (double)s_cc1101_freq_mhz);
-    lv_label_set_text(hdr, freq_buf);
-    lv_obj_set_style_text_font(hdr, &g_font_icon14, 0);
-    lv_obj_set_style_text_color(hdr, lv_color_hex(0x26C6DA), 0);
+    lv_label_set_text(s_cc1101_freq_hdr, freq_buf);
+    lv_obj_set_style_text_font(s_cc1101_freq_hdr, &g_font_icon14, 0);
+    lv_obj_set_style_text_color(s_cc1101_freq_hdr, lv_color_hex(0x26C6DA), 0);
 
     // RSSI bar
     s_cc1101_rssi_bar = lv_bar_create(card);
@@ -37120,32 +37166,453 @@ static void show_cc1101_freq_scan_screen(void)
     rfhat_add_back_btn("CC1101", show_cc1101_screen);
 }
 
-// ── Capture (stub — ISR capture needs task, v1.8.81+) ────────────────────────
+// ── Capture — task, timer, callbacks, screen ─────────────────────────────────
+
+static void s_cc1101_cap_timer_cb(lv_timer_t *tmr)
+{
+    cc1101_cap_state_t st = s_cc1101_cap_state;
+    if (st == CC1101_CAP_RUNNING) {
+        int edges = cc1101_capture_count();
+        char buf[48];
+        snprintf(buf, sizeof(buf), "Listening... %d edges", edges);
+        if (s_cc1101_cap_status_lbl) lv_label_set_text(s_cc1101_cap_status_lbl, buf);
+        return;
+    }
+    // Terminal state — stop timer
+    if (s_cc1101_cap_tmr) { lv_timer_del(s_cc1101_cap_tmr); s_cc1101_cap_tmr = NULL; }
+    if (st == CC1101_CAP_DONE) {
+        const char *slash = strrchr(s_cc1101_cap_path, '/');
+        const char *fname = slash ? slash + 1 : s_cc1101_cap_path;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Saved %d pulses", s_cc1101_cap_raw.count);
+        if (s_cc1101_cap_status_lbl) lv_label_set_text(s_cc1101_cap_status_lbl, buf);
+        if (s_cc1101_cap_count_lbl)  lv_label_set_text(s_cc1101_cap_count_lbl, fname);
+        if (s_cc1101_cap_btn) {
+            lv_obj_clear_state(s_cc1101_cap_btn, LV_STATE_DISABLED);
+            lv_obj_t *l = lv_obj_get_child(s_cc1101_cap_btn, 0);
+            if (l) lv_label_set_text(l, LV_SYMBOL_AUDIO "  Capture Again (10s)");
+        }
+    } else {
+        if (s_cc1101_cap_status_lbl) lv_label_set_text(s_cc1101_cap_status_lbl, "No signal / timeout");
+        if (s_cc1101_cap_count_lbl)  lv_label_set_text(s_cc1101_cap_count_lbl, "Point remote at CC1101");
+        if (s_cc1101_cap_btn) {
+            lv_obj_clear_state(s_cc1101_cap_btn, LV_STATE_DISABLED);
+            lv_obj_t *l = lv_obj_get_child(s_cc1101_cap_btn, 0);
+            if (l) lv_label_set_text(l, LV_SYMBOL_AUDIO "  Try Again (10s)");
+        }
+    }
+    (void)tmr;
+}
+
+static void s_cc1101_cap_task_fn(void *arg)
+{
+    cc1101_raw_t raw = {0};
+    esp_err_t err = cc1101_raw_capture(&raw, 10000);
+    if (err == ESP_OK && raw.count > 0) {
+        cc1101_raw_free(&s_cc1101_cap_raw);
+        s_cc1101_cap_raw = raw;
+        int uptime_s = (int)(esp_timer_get_time() / 1000000);
+        snprintf(s_cc1101_cap_path, 64,
+                 "/sdcard/lab/radio/%.0fMHz_%d.sub", (double)raw.freq_mhz, uptime_s);
+        cc1101_sub_save(&s_cc1101_cap_raw, s_cc1101_cap_path);
+        s_cc1101_cap_state = CC1101_CAP_DONE;
+    } else {
+        cc1101_raw_free(&raw);
+        s_cc1101_cap_state = CC1101_CAP_FAIL;
+    }
+    s_cc1101_cap_task = NULL;
+    vTaskDelete(NULL);
+    (void)arg;
+}
+
+static void s_cc1101_cap_start_cb(lv_event_t *e)
+{
+    if (s_cc1101_cap_state == CC1101_CAP_RUNNING) return;
+    if (!cc1101_is_init() && cc1101_init() != ESP_OK) return;
+    cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);
+    cc1101_set_freq_mhz(s_cc1101_freq_mhz);
+    s_cc1101_cap_state = CC1101_CAP_RUNNING;
+    if (s_cc1101_cap_btn) lv_obj_add_state(s_cc1101_cap_btn, LV_STATE_DISABLED);
+    if (s_cc1101_cap_status_lbl) lv_label_set_text(s_cc1101_cap_status_lbl, "Listening... 0 edges");
+    if (s_cc1101_cap_count_lbl)  lv_label_set_text(s_cc1101_cap_count_lbl,  "10s timeout");
+    if (s_cc1101_cap_tmr) { lv_timer_del(s_cc1101_cap_tmr); s_cc1101_cap_tmr = NULL; }
+    s_cc1101_cap_tmr = lv_timer_create(s_cc1101_cap_timer_cb, 250, NULL);
+    xTaskCreate(s_cc1101_cap_task_fn, "cc1101_cap", 4096, NULL, 5, &s_cc1101_cap_task);
+    (void)e;
+}
 
 static void show_cc1101_capture_screen(void)
 {
-    s_cc1101_stub_screen(MY_SYMBOL_SATELLITE "  RAW Capture",
-        "Capture OOK/FSK signals\nand save as Flipper .sub\n\n"
-        "Coming in next version.\n\n"
-        "Hardware and driver ready.");
+    if (s_cc1101_cap_task) cc1101_capture_cancel();
+    if (s_cc1101_cap_tmr) { lv_timer_del(s_cc1101_cap_tmr); s_cc1101_cap_tmr = NULL; }
+    s_cc1101_cap_status_lbl = NULL;
+    s_cc1101_cap_count_lbl  = NULL;
+    s_cc1101_cap_btn        = NULL;
+    s_cc1101_cap_state      = CC1101_CAP_IDLE;
+
+    if (!cc1101_is_init() && cc1101_init() != ESP_OK) {
+        s_cc1101_stub_screen("RAW Capture - No CC1101",
+                             "Run HW Test first.\n\nCheck DIP switch 1.");
+        return;
+    }
+    cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);
+    cc1101_set_freq_mhz(s_cc1101_freq_mhz);
+
+    create_function_page_base("CC1101 Capture");
+    apply_menu_bg();
+
+    lv_obj_t *card = lv_obj_create(function_page);
+    lv_obj_set_size(card, LCD_H_RES - 16, LCD_V_RES - 88);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 34);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x006064), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 8, 0);
+    lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(card, 10, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    char freq_buf[32];
+    snprintf(freq_buf, sizeof(freq_buf),
+             MY_SYMBOL_SATELLITE "  %.2f MHz RAW", (double)s_cc1101_freq_mhz);
+    lv_obj_t *hdr = lv_label_create(card);
+    lv_label_set_text(hdr, freq_buf);
+    lv_obj_set_style_text_font(hdr, &g_font_icon14, 0);
+    lv_obj_set_style_text_color(hdr, lv_color_hex(0x26C6DA), 0);
+
+    s_cc1101_cap_status_lbl = lv_label_create(card);
+    lv_label_set_text(s_cc1101_cap_status_lbl,
+        "Point remote at CC1101\nthen press Capture.");
+    lv_obj_set_style_text_font(s_cc1101_cap_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_cc1101_cap_status_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_align(s_cc1101_cap_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_cc1101_cap_status_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_cc1101_cap_status_lbl, LCD_H_RES - 40);
+
+    s_cc1101_cap_count_lbl = lv_label_create(card);
+    lv_label_set_text(s_cc1101_cap_count_lbl,
+        s_cc1101_cap_raw.count > 0
+            ? "Last capture ready for replay" : "Saves Flipper .sub to SD");
+    lv_obj_set_style_text_font(s_cc1101_cap_count_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_cc1101_cap_count_lbl, lv_color_hex(0x80CBC4), 0);
+    lv_obj_set_style_text_align(s_cc1101_cap_count_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_cc1101_cap_count_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_cc1101_cap_count_lbl, LCD_H_RES - 40);
+
+    s_cc1101_cap_btn = lv_btn_create(card);
+    lv_obj_set_size(s_cc1101_cap_btn, 190, 44);
+    lv_obj_set_style_bg_color(s_cc1101_cap_btn, lv_color_hex(0xE65100), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(s_cc1101_cap_btn, lv_color_hex(0xBF360C), LV_STATE_PRESSED);
+    lv_obj_set_style_bg_color(s_cc1101_cap_btn, lv_color_make(60,60,60), LV_STATE_DISABLED);
+    lv_obj_set_style_border_width(s_cc1101_cap_btn, 0, 0);
+    lv_obj_set_style_radius(s_cc1101_cap_btn, 8, 0);
+    lv_obj_t *cap_lbl = lv_label_create(s_cc1101_cap_btn);
+    lv_label_set_text(cap_lbl, LV_SYMBOL_AUDIO "  Capture (10s)");
+    lv_obj_set_style_text_font(cap_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(cap_lbl, lv_color_white(), 0);
+    lv_obj_center(cap_lbl);
+    lv_obj_add_event_cb(s_cc1101_cap_btn, s_cc1101_cap_start_cb, LV_EVENT_CLICKED, NULL);
+
+    rfhat_add_back_btn("CC1101", show_cc1101_screen);
 }
 
-// ── Replay ────────────────────────────────────────────────────────────────────
+// ── Replay — task, timer, callbacks, screen ───────────────────────────────────
+
+static void s_cc1101_rep_timer_cb(lv_timer_t *tmr)
+{
+    cc1101_rep_state_t st = s_cc1101_rep_state;
+    if (st == CC1101_REP_RUNNING) return;
+    if (s_cc1101_rep_tmr) { lv_timer_del(s_cc1101_rep_tmr); s_cc1101_rep_tmr = NULL; }
+    if (s_cc1101_rep_status) {
+        lv_label_set_text(s_cc1101_rep_status,
+            st == CC1101_REP_DONE ? "Replay done" : "Replay failed");
+        lv_obj_set_style_text_color(s_cc1101_rep_status,
+            st == CC1101_REP_DONE ? lv_color_hex(0x66BB6A) : UI_ACCENT_RED, 0);
+    }
+    (void)tmr;
+}
+
+static void s_cc1101_rep_task_fn(void *arg)
+{
+    int repeats = (int)(intptr_t)arg;
+    if (!cc1101_is_init()) cc1101_init();
+    esp_err_t err = ESP_FAIL;
+    if (cc1101_is_init()) {
+        cc1101_set_freq_mhz(s_cc1101_cap_raw.freq_mhz);
+        err = cc1101_raw_replay(&s_cc1101_cap_raw, repeats);
+    }
+    s_cc1101_rep_state = (err == ESP_OK) ? CC1101_REP_DONE : CC1101_REP_FAIL;
+    s_cc1101_rep_task  = NULL;
+    vTaskDelete(NULL);
+}
+
+static void s_cc1101_rep_btn_cb(lv_event_t *e)
+{
+    if (s_cc1101_rep_state == CC1101_REP_RUNNING) return;
+    if (s_cc1101_cap_raw.count == 0) return;
+    int repeats = (int)(intptr_t)lv_event_get_user_data(e);
+    s_cc1101_rep_state = CC1101_REP_RUNNING;
+    if (s_cc1101_rep_status) {
+        lv_label_set_text(s_cc1101_rep_status, "Replaying...");
+        lv_obj_set_style_text_color(s_cc1101_rep_status, lv_color_hex(0xFFB300), 0);
+    }
+    if (s_cc1101_rep_tmr) { lv_timer_del(s_cc1101_rep_tmr); s_cc1101_rep_tmr = NULL; }
+    s_cc1101_rep_tmr = lv_timer_create(s_cc1101_rep_timer_cb, 250, NULL);
+    xTaskCreate(s_cc1101_rep_task_fn, "cc1101_rep", 4096,
+                (void*)(intptr_t)repeats, 5, &s_cc1101_rep_task);
+}
 
 static void show_cc1101_replay_screen(void)
 {
-    s_cc1101_stub_screen(LV_SYMBOL_PLAY "  RAW Replay",
-        "Replay saved .sub files\nvia CC1101 async TX mode\n\n"
-        "Coming in next version.");
+    if (s_cc1101_rep_tmr) { lv_timer_del(s_cc1101_rep_tmr); s_cc1101_rep_tmr = NULL; }
+    s_cc1101_rep_status = NULL;
+    s_cc1101_rep_state  = CC1101_REP_IDLE;
+
+    create_function_page_base("CC1101 Replay");
+    apply_menu_bg();
+
+    lv_obj_t *card = lv_obj_create(function_page);
+    lv_obj_set_size(card, LCD_H_RES - 16, LCD_V_RES - 88);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 34);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x1B5E20), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 8, 0);
+    lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(card, 10, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *hdr = lv_label_create(card);
+    lv_label_set_text(hdr, LV_SYMBOL_PLAY "  RAW Replay");
+    lv_obj_set_style_text_font(hdr, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(hdr, lv_color_hex(0x66BB6A), 0);
+
+    if (s_cc1101_cap_raw.count == 0) {
+        lv_obj_t *msg = lv_label_create(card);
+        lv_label_set_text(msg, "No signal captured yet.\n\nGo to Capture first,\nthen come back here.");
+        lv_obj_set_style_text_font(msg, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(msg, ui_text_color(), 0);
+        lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(msg, LCD_H_RES - 40);
+        rfhat_add_back_btn("CC1101", show_cc1101_screen);
+        return;
+    }
+
+    // Signal info
+    char info[64];
+    snprintf(info, sizeof(info), "%.2f MHz  |  %d pulses",
+             (double)s_cc1101_cap_raw.freq_mhz, s_cc1101_cap_raw.count);
+    lv_obj_t *info_lbl = lv_label_create(card);
+    lv_label_set_text(info_lbl, info);
+    lv_obj_set_style_text_font(info_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(info_lbl, lv_color_hex(0x80CBC4), 0);
+
+    // Status
+    s_cc1101_rep_status = lv_label_create(card);
+    lv_label_set_text(s_cc1101_rep_status, "Ready — tap a repeat count");
+    lv_obj_set_style_text_font(s_cc1101_rep_status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_cc1101_rep_status, lv_color_hex(0x66BB6A), 0);
+
+    // Repeat-count buttons
+    static const int s_rep_vals[3] = {1, 3, 5};
+    static const char *s_rep_lbls[3] = {LV_SYMBOL_PLAY " x1", LV_SYMBOL_PLAY " x3", LV_SYMBOL_PLAY " x5"};
+    lv_obj_t *row = lv_obj_create(card);
+    lv_obj_set_size(row, LCD_H_RES - 40, 44);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *rb = lv_btn_create(row);
+        lv_obj_set_size(rb, 68, 38);
+        lv_obj_set_style_bg_color(rb, lv_color_hex(0x1B5E20), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(rb, lv_color_hex(0x388E3C), LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(rb, lv_color_hex(0x66BB6A), 0);
+        lv_obj_set_style_border_width(rb, 1, 0);
+        lv_obj_set_style_radius(rb, 6, 0);
+        lv_obj_t *rl = lv_label_create(rb);
+        lv_label_set_text(rl, s_rep_lbls[i]);
+        lv_obj_set_style_text_font(rl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(rl, lv_color_white(), 0);
+        lv_obj_center(rl);
+        lv_obj_add_event_cb(rb, s_cc1101_rep_btn_cb, LV_EVENT_CLICKED,
+                            (void*)(intptr_t)s_rep_vals[i]);
+    }
+
+    rfhat_add_back_btn("CC1101", show_cc1101_screen);
 }
 
-// ── Saved Files ───────────────────────────────────────────────────────────────
+// ── Saved Files — file replay task, play/delete callbacks, screen ────────────
+
+static void s_cc1101_saved_rep_task_fn(void *arg)
+{
+    int repeats = (int)(intptr_t)arg;
+    cc1101_raw_t raw = {0};
+    esp_err_t err = cc1101_sub_load(s_cc1101_saved_sel_path, &raw);
+    if (err == ESP_OK) {
+        if (!cc1101_is_init()) cc1101_init();
+        if (cc1101_is_init()) {
+            cc1101_set_freq_mhz(raw.freq_mhz);
+            err = cc1101_raw_replay(&raw, repeats);
+        } else {
+            err = ESP_FAIL;
+        }
+        cc1101_raw_free(&raw);
+    }
+    s_cc1101_rep_state = (err == ESP_OK) ? CC1101_REP_DONE : CC1101_REP_FAIL;
+    s_cc1101_rep_task  = NULL;
+    vTaskDelete(NULL);
+}
+
+static void s_cc1101_saved_play_cb(lv_event_t *e)
+{
+    if (s_cc1101_rep_state == CC1101_REP_RUNNING) return;
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_cc1101_sub_count) return;
+    strncpy(s_cc1101_saved_sel_path, s_cc1101_sub_paths[idx], 79);
+    s_cc1101_rep_state = CC1101_REP_RUNNING;
+    if (s_cc1101_rep_status) {
+        lv_label_set_text(s_cc1101_rep_status, "Loading + Replaying...");
+        lv_obj_set_style_text_color(s_cc1101_rep_status, lv_color_hex(0xFFB300), 0);
+    }
+    if (s_cc1101_rep_tmr) { lv_timer_del(s_cc1101_rep_tmr); s_cc1101_rep_tmr = NULL; }
+    s_cc1101_rep_tmr = lv_timer_create(s_cc1101_rep_timer_cb, 250, NULL);
+    xTaskCreate(s_cc1101_saved_rep_task_fn, "cc1101_srep", 4096,
+                (void*)(intptr_t)1, 5, &s_cc1101_rep_task);
+}
+
+static void s_cc1101_saved_del_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_cc1101_sub_count) return;
+    remove(s_cc1101_sub_paths[idx]);
+    show_cc1101_saved_screen();
+}
 
 static void show_cc1101_saved_screen(void)
 {
-    s_cc1101_stub_screen(LV_SYMBOL_SAVE "  Saved Files",
-        "Browse and manage .sub\nfiles from /sdcard/lab/radio\n\n"
-        "Coming in next version.");
+    if (s_cc1101_rep_tmr) { lv_timer_del(s_cc1101_rep_tmr); s_cc1101_rep_tmr = NULL; }
+    s_cc1101_rep_status = NULL;
+    s_cc1101_rep_state  = CC1101_REP_IDLE;
+
+    // Allocate path list from PSRAM (avoid 800-byte DRAM BSS cost)
+    if (!s_cc1101_sub_paths)
+        s_cc1101_sub_paths = heap_caps_malloc(
+            CC1101_MAX_SUB_FILES * CC1101_SUB_PATH_LEN, MALLOC_CAP_SPIRAM);
+
+    // Enumerate .sub files ("/sdcard/lab/radio/" = 18 chars; 80-18-1 = 61 chars for name)
+    s_cc1101_sub_count = 0;
+    DIR *sdir = opendir("/sdcard/lab/radio");
+    if (sdir) {
+        struct dirent *de;
+        while ((de = readdir(sdir)) != NULL && s_cc1101_sub_count < CC1101_MAX_SUB_FILES) {
+            int nl = (int)strlen(de->d_name);
+            if (nl < 5 || nl > 61) continue;
+            if (strcasecmp(de->d_name + nl - 4, ".sub") != 0) continue;
+            char *dst = s_cc1101_sub_paths[s_cc1101_sub_count];
+            memcpy(dst, "/sdcard/lab/radio/", 18);
+            memcpy(dst + 18, de->d_name, (size_t)(nl + 1));
+            s_cc1101_sub_count++;
+        }
+        closedir(sdir);
+    }
+
+    create_function_page_base("Saved .sub Files");
+    apply_menu_bg();
+
+    // Status / feedback label
+    s_cc1101_rep_status = lv_label_create(function_page);
+    lv_label_set_text(s_cc1101_rep_status,
+        s_cc1101_sub_count ? "Tap " LV_SYMBOL_PLAY " to replay" : "");
+    lv_obj_set_style_text_font(s_cc1101_rep_status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_cc1101_rep_status, lv_color_hex(0x80CBC4), 0);
+    lv_obj_align(s_cc1101_rep_status, LV_ALIGN_TOP_MID, 0, 34);
+
+    lv_obj_t *list = lv_obj_create(function_page);
+    lv_obj_set_size(list, LCD_H_RES - 10, LCD_V_RES - 100);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 52);
+    lv_obj_set_style_bg_color(list, ui_panel_color(), 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    lv_obj_set_style_radius(list, 0, 0);
+    lv_obj_set_style_pad_all(list, 4, 0);
+    lv_obj_set_style_pad_gap(list, 4, 0);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_add_flag(list, LV_OBJ_FLAG_SCROLLABLE);
+
+    if (s_cc1101_sub_count == 0) {
+        lv_obj_t *empty = lv_label_create(list);
+        lv_label_set_text(empty, "No .sub files found.\nCapture a signal first.");
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(empty, ui_text_color(), 0);
+        lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(empty, LCD_H_RES - 20);
+    } else {
+        for (int i = 0; i < s_cc1101_sub_count; i++) {
+            const char *slash = strrchr(s_cc1101_sub_paths[i], '/');
+            const char *fname = slash ? slash + 1 : s_cc1101_sub_paths[i];
+
+            lv_obj_t *row = lv_obj_create(list);
+            lv_obj_set_size(row, LCD_H_RES - 18, 44);
+            lv_obj_set_style_bg_color(row, ui_panel_color(), 0);
+            lv_obj_set_style_border_color(row, lv_color_hex(0x1B5E20), 0);
+            lv_obj_set_style_border_width(row, 1, 0);
+            lv_obj_set_style_radius(row, 6, 0);
+            lv_obj_set_style_pad_hor(row, 6, 0);
+            lv_obj_set_style_pad_ver(row, 0, 0);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+            lv_obj_t *name_lbl = lv_label_create(row);
+            lv_label_set_text(name_lbl, fname);
+            lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(name_lbl, ui_text_color(), 0);
+            lv_obj_set_width(name_lbl, LCD_H_RES - 108);
+            lv_obj_align(name_lbl, LV_ALIGN_LEFT_MID, 0, 0);
+            lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+
+            // Play button
+            lv_obj_t *pb = lv_btn_create(row);
+            lv_obj_set_size(pb, 34, 32);
+            lv_obj_align(pb, LV_ALIGN_RIGHT_MID, -38, 0);
+            lv_obj_set_style_bg_color(pb, lv_color_hex(0x1B5E20), LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(pb, lv_color_hex(0x388E3C), LV_STATE_PRESSED);
+            lv_obj_set_style_border_width(pb, 0, 0);
+            lv_obj_set_style_radius(pb, 4, 0);
+            lv_obj_t *pl = lv_label_create(pb);
+            lv_label_set_text(pl, LV_SYMBOL_PLAY);
+            lv_obj_set_style_text_font(pl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(pl, lv_color_white(), 0);
+            lv_obj_center(pl);
+            lv_obj_add_event_cb(pb, s_cc1101_saved_play_cb, LV_EVENT_CLICKED,
+                                (void*)(intptr_t)i);
+
+            // Delete button
+            lv_obj_t *db = lv_btn_create(row);
+            lv_obj_set_size(db, 34, 32);
+            lv_obj_align(db, LV_ALIGN_RIGHT_MID, 0, 0);
+            lv_obj_set_style_bg_color(db, lv_color_hex(0xB71C1C), LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(db, lv_color_hex(0xE53935), LV_STATE_PRESSED);
+            lv_obj_set_style_border_width(db, 0, 0);
+            lv_obj_set_style_radius(db, 4, 0);
+            lv_obj_t *dl = lv_label_create(db);
+            lv_label_set_text(dl, LV_SYMBOL_CLOSE);
+            lv_obj_set_style_text_font(dl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(dl, lv_color_white(), 0);
+            lv_obj_center(dl);
+            lv_obj_add_event_cb(db, s_cc1101_saved_del_cb, LV_EVENT_CLICKED,
+                                (void*)(intptr_t)i);
+        }
+    }
+
+    rfhat_add_back_btn("CC1101", show_cc1101_screen);
 }
 
 // ── Protocol Decode ───────────────────────────────────────────────────────────

@@ -116,3 +116,11 @@ esp_err_t cc1101_scan_spectrum(float start_mhz, float stop_mhz, float step_mhz,
                                uint32_t dwell_ms,
                                cc1101_scan_cb_t cb, void *ctx,
                                volatile bool *cancel);
+
+// ── Capture / replay control ──────────────────────────────────────────────────
+// Safe to call from any task; causes capture loop to exit within 10 ms.
+void cc1101_capture_cancel(void);
+// Live edge count during an in-progress capture (volatile read).
+int  cc1101_capture_count(void);
+// Signal an in-progress raw_replay to stop between repetitions.
+void cc1101_replay_cancel(void);

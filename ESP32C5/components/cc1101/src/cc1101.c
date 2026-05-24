@@ -28,10 +28,11 @@ static bool                s_isr_installed = false;  // gpio_install_isr_service
 // ── ISR raw-capture state (IRAM_ATTR) ─────────────────────────────────────────
 #define CC1101_RAW_MAX_EDGES  2048
 
-static volatile bool     s_cap_active = false;
-static volatile uint32_t s_cap_count  = 0;
-static volatile int64_t  s_cap_last_us = 0;
-static int32_t          *s_cap_buf    = NULL;   // PSRAM buffer
+static volatile bool     s_cap_active    = false;
+static volatile uint32_t s_cap_count     = 0;
+static volatile int64_t  s_cap_last_us   = 0;
+static int32_t          *s_cap_buf       = NULL;   // PSRAM buffer
+static volatile bool     s_replay_cancel = false;
 
 static void IRAM_ATTR s_gdo0_isr(void *arg)
 {
@@ -432,9 +433,9 @@ esp_err_t cc1101_raw_capture(cc1101_raw_t *out, uint32_t timeout_ms)
     gpio_intr_enable(RF_HAT_CC1101_GDO0_GPIO);
     cc1101_rx();
 
-    // Wait for capture to fill or timeout
+    // Wait for capture to fill or timeout; cc1101_capture_cancel() clears s_cap_active
     uint32_t elapsed = 0;
-    while (elapsed < timeout_ms && s_cap_count < CC1101_RAW_MAX_EDGES - 1) {
+    while (elapsed < timeout_ms && s_cap_count < CC1101_RAW_MAX_EDGES - 1 && s_cap_active) {
         vTaskDelay(pdMS_TO_TICKS(10));
         elapsed += 10;
     }
@@ -461,6 +462,8 @@ esp_err_t cc1101_raw_replay(const cc1101_raw_t *sig, int repeat_count)
 {
     if (!s_init || !sig || sig->count == 0) return ESP_ERR_INVALID_ARG;
 
+    s_replay_cancel = false;
+
     // Async TX mode: GDO0 becomes serial data input from ESP32
     cc1101_write_reg(CC1101_PKTCTRL0, CC1101_PKT_ASYNC_SERIAL);
     cc1101_write_reg(CC1101_IOCFG0,   0x2E);  // GDO0: drive LOW (hardwired 0)
@@ -471,8 +474,8 @@ esp_err_t cc1101_raw_replay(const cc1101_raw_t *sig, int repeat_count)
 
     cc1101_tx();
 
-    for (int rep = 0; rep < repeat_count; rep++) {
-        for (int i = 0; i < sig->count; i++) {
+    for (int rep = 0; rep < repeat_count && !s_replay_cancel; rep++) {
+        for (int i = 0; i < sig->count && !s_replay_cancel; i++) {
             int32_t t = sig->timings[i];
             if (t > 0) {
                 gpio_set_level(RF_HAT_CC1101_GDO0_GPIO, 1);
@@ -491,8 +494,12 @@ esp_err_t cc1101_raw_replay(const cc1101_raw_t *sig, int repeat_count)
     gpio_set_direction(RF_HAT_CC1101_GDO0_GPIO, GPIO_MODE_INPUT);
     cc1101_write_reg(CC1101_IOCFG0, CC1101_GDO0_RX_DATA);
     cc1101_write_reg(CC1101_PKTCTRL0, CC1101_PKT_ASYNC_SERIAL);
-    return ESP_OK;
+    return s_replay_cancel ? ESP_ERR_TIMEOUT : ESP_OK;
 }
+
+void cc1101_capture_cancel(void) { s_cap_active = false; }
+int  cc1101_capture_count(void)  { return (int)s_cap_count; }
+void cc1101_replay_cancel(void)  { s_replay_cancel = true; }
 
 void cc1101_raw_free(cc1101_raw_t *r)
 {
