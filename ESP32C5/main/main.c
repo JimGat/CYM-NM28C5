@@ -1510,6 +1510,29 @@ static portMUX_TYPE  wscope_mux         = portMUX_INITIALIZER_UNLOCKED;
 static int8_t        wscope_ch_peak[WSCOPE_CH_MAX];
 static uint16_t      wscope_ch_cnt[WSCOPE_CH_MAX];
 
+// ── CC1101 Band Scope state (struct in PSRAM; only the pointer lives in DRAM) ─
+#define CC1101_BS_NPTS   40
+#define CC1101_BS_SPEC_H 65
+#define CC1101_BS_WF_H   99
+#define CC1101_BS_W      240
+typedef struct {
+    volatile bool  active;
+    volatile bool  cancel;
+    volatile bool  sweep_done;
+    uint8_t        _pad;
+    int            scan_idx;
+    float          center;
+    float          span;
+    int8_t         rssi[CC1101_BS_NPTS];
+    lv_color_t    *canv_buf;
+    lv_obj_t      *canvas;
+    lv_obj_t      *status_lbl;
+    lv_obj_t      *start_btn;
+    lv_timer_t    *tmr;
+    TaskHandle_t   task;
+} cc1101_bs_ctx_t;
+static cc1101_bs_ctx_t *s_bs = NULL;  // 4 bytes DRAM; struct + canvas in PSRAM
+
 // AirTag Scanner state
 static TaskHandle_t airtag_scan_task_handle = NULL;
 static StaticTask_t airtag_scan_task_buffer;
@@ -1831,6 +1854,7 @@ static void show_cc1101_alarm_screen(void);
 static void show_cc1101_wardrive_screen(void);
 static void show_cc1101_proximity_screen(void);
 static void show_cc1101_bruteforce_screen(void);
+static void show_cc1101_bandscope_screen(void);
 static void show_nrf24_screen(void);
 static void show_ir_capture_screen(void);
 static void show_ir_replay_screen(void);
@@ -1976,6 +2000,13 @@ static void reset_function_page_children(void) {
     wscope_canvas = NULL; wscope_status_lbl = NULL; wscope_active = false;
     if (wscope_ui_timer) { lv_timer_del(wscope_ui_timer); wscope_ui_timer = NULL; }
     if (wscope_buf)      { heap_caps_free(wscope_buf);     wscope_buf = NULL; }
+    // CC1101 Band Scope cleanup (safe to call from any screen transition)
+    if (s_bs) {
+        s_bs->active = false; s_bs->cancel = true;
+        s_bs->canvas = NULL; s_bs->status_lbl = NULL; s_bs->start_btn = NULL;
+        if (s_bs->tmr) { lv_timer_del(s_bs->tmr); s_bs->tmr = NULL; }
+        if (!s_bs->task) { if (s_bs->canv_buf) heap_caps_free(s_bs->canv_buf); heap_caps_free(s_bs); s_bs = NULL; }
+    }
     deauth_monitor_rec_label = NULL;
     bt_locator_content = NULL;
     bt_locator_list = NULL;
@@ -36804,6 +36835,7 @@ static void s_cc1101_tile_cb(lv_event_t *e)
     else if (strcmp(name, "Alarm")     == 0) show_cc1101_alarm_screen();
     else if (strcmp(name, "Wardrive")  == 0) show_cc1101_wardrive_screen();
     else if (strcmp(name, "Proximity") == 0) show_cc1101_proximity_screen();
+    else if (strcmp(name, "BndScope")  == 0) show_cc1101_bandscope_screen();
 }
 
 static void show_cc1101_screen(void)
@@ -36816,6 +36848,12 @@ static void show_cc1101_screen(void)
     if (s_cc1101_cap_task) cc1101_capture_cancel();
     if (s_cc1101_rep_task) cc1101_replay_cancel();
     if (s_cc1101_sub_paths) { free(s_cc1101_sub_paths); s_cc1101_sub_paths = NULL; }
+    if (s_bs) {
+        s_bs->active = false; s_bs->cancel = true;
+        s_bs->canvas = NULL; s_bs->status_lbl = NULL; s_bs->start_btn = NULL;
+        if (s_bs->tmr) { lv_timer_del(s_bs->tmr); s_bs->tmr = NULL; }
+        if (!s_bs->task) { if (s_bs->canv_buf) heap_caps_free(s_bs->canv_buf); heap_caps_free(s_bs); s_bs = NULL; }
+    }
     s_cc1101_rssi_bar        = NULL;
     s_cc1101_rssi_lbl        = NULL;
     s_cc1101_freq_hdr        = NULL;
@@ -36872,6 +36910,7 @@ static void show_cc1101_screen(void)
     lv_obj_t *p3 = s_cc1101_pages[2];
     create_tile(p3, MY_SYMBOL_SKULL_CROSS,  "Jammer",      UI_ACCENT_RED,          s_cc1101_tile_cb, "Jammer");
     create_tile(p3, LV_SYMBOL_SHUFFLE,     "Brute\nForce", lv_color_hex(0xE65100), s_cc1101_tile_cb, "Brute");
+    create_tile(p3, MY_SYMBOL_SATELLITE,   "Band\nScope",  lv_color_hex(0x006064), s_cc1101_tile_cb, "BndScope");
 
     // Navigation bar: [<] [1/3] [>] | [Back]
     lv_obj_t *nav = lv_obj_create(function_page);
@@ -37871,6 +37910,240 @@ static void show_cc1101_bruteforce_screen(void)
         "Transmit fixed-code range\nfor garage doors / gates\n(Princeton PT2262 format)\n\n"
         "FOR AUTHORIZED TESTING\nONLY - illegal otherwise.\n\n"
         "Coming in next version.");
+}
+
+// ── CC1101 Band Scope ─────────────────────────────────────────────────────────
+// Spectrum + scrolling waterfall; FreeRTOS task sweeps cc1101_scan_spectrum()
+// continuously; 100 ms LVGL timer redraws the PSRAM canvas on each sweep.
+
+static void s_bs_scan_cb(float freq_mhz, int8_t rssi_dbm, void *ctx_v)
+{
+    (void)freq_mhz;
+    cc1101_bs_ctx_t *ctx = (cc1101_bs_ctx_t *)ctx_v;
+    int idx = ctx->scan_idx++;
+    if ((unsigned)idx < CC1101_BS_NPTS)
+        ctx->rssi[idx] = rssi_dbm;
+}
+
+static void s_bs_task_fn(void *arg)
+{
+    cc1101_bs_ctx_t *ctx = (cc1101_bs_ctx_t *)arg;
+    while (ctx->active) {
+        ctx->cancel   = false;
+        ctx->scan_idx = 0;
+        float start = ctx->center - ctx->span / 2.0f;
+        float stop  = ctx->center + ctx->span / 2.0f;
+        float step  = ctx->span / (float)CC1101_BS_NPTS;
+        cc1101_scan_spectrum(start, stop, step, 15, s_bs_scan_cb, ctx, &ctx->cancel);
+        if (ctx->active && !ctx->cancel)
+            ctx->sweep_done = true;
+    }
+    if (ctx->canv_buf) heap_caps_free(ctx->canv_buf);
+    ctx->task = NULL;
+    heap_caps_free(ctx);
+    if (s_bs == ctx) s_bs = NULL;
+    vTaskDelete(NULL);
+}
+
+static void s_bs_ui_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    cc1101_bs_ctx_t *ctx = s_bs;
+    if (!ctx || !ctx->canvas || !ctx->canv_buf) return;
+    if (!ctx->sweep_done && ctx->active) return;
+    ctx->sweep_done = false;
+
+    int8_t rssi[CC1101_BS_NPTS];
+    memcpy(rssi, ctx->rssi, CC1101_BS_NPTS);
+
+    // Clear spectrum section
+    lv_color_t bg = lv_color_make(4, 4, 12);
+    for (int y = 0; y < CC1101_BS_SPEC_H; y++)
+        for (int x = 0; x < CC1101_BS_W; x++)
+            ctx->canv_buf[y * CC1101_BS_W + x] = bg;
+
+    // Draw spectrum bars
+    float pppt = (float)CC1101_BS_W / CC1101_BS_NPTS;
+    for (int i = 0; i < CC1101_BS_NPTS; i++) {
+        int v = (int)((rssi[i] + 115) * 255 / 105);
+        if (v < 0) v = 0;
+        if (v > 255) v = 255;
+        int bar_h = v * (CC1101_BS_SPEC_H - 2) / 255;
+        lv_color_t col = scope_heat_color((uint8_t)v);
+        int x0 = (int)((float)i * pppt);
+        int x1 = (int)((float)(i + 1) * pppt) - 1;
+        if (x1 >= CC1101_BS_W) x1 = CC1101_BS_W - 1;
+        for (int y = CC1101_BS_SPEC_H - bar_h; y < CC1101_BS_SPEC_H; y++)
+            for (int x = x0; x <= x1; x++)
+                ctx->canv_buf[y * CC1101_BS_W + x] = col;
+        // Peak dot (white pixel row above bar)
+        if (bar_h > 0) {
+            int py = CC1101_BS_SPEC_H - bar_h - 1;
+            if (py < 0) py = 0;
+            for (int x = x0; x <= x1; x++)
+                ctx->canv_buf[py * CC1101_BS_W + x] = lv_color_white();
+        }
+    }
+
+    // Separator line between spectrum and waterfall
+    lv_color_t sep = lv_color_hex(0x223344);
+    for (int x = 0; x < CC1101_BS_W; x++)
+        ctx->canv_buf[CC1101_BS_SPEC_H * CC1101_BS_W + x] = sep;
+
+    // Waterfall: scroll existing rows down 1, paint new row at top
+    int wf_start = CC1101_BS_SPEC_H + 1;
+    memmove(ctx->canv_buf + CC1101_BS_W * (wf_start + 1),
+            ctx->canv_buf + CC1101_BS_W * wf_start,
+            CC1101_BS_W * (CC1101_BS_WF_H - 1) * sizeof(lv_color_t));
+    for (int x = 0; x < CC1101_BS_W; x++) {
+        int i = (int)((float)x / pppt);
+        if (i >= CC1101_BS_NPTS) i = CC1101_BS_NPTS - 1;
+        int v = (int)((rssi[i] + 115) * 255 / 105);
+        if (v < 0) v = 0;
+        if (v > 255) v = 255;
+        ctx->canv_buf[wf_start * CC1101_BS_W + x] = scope_heat_color((uint8_t)v);
+    }
+    lv_obj_invalidate(ctx->canvas);
+
+    if (ctx->status_lbl) {
+        if (ctx->active) {
+            float s = ctx->center - ctx->span / 2.0f;
+            float e = ctx->center + ctx->span / 2.0f;
+            char buf[40];
+            snprintf(buf, sizeof(buf), "%.0f - %.0f MHz  |  %.0f pts / sweep",
+                     (double)s, (double)e, (double)CC1101_BS_NPTS);
+            lv_label_set_text(ctx->status_lbl, buf);
+        } else {
+            lv_label_set_text(ctx->status_lbl, "Stopped");
+        }
+    }
+}
+
+static void s_bs_preset_cb(lv_event_t *e)
+{
+    float mhz = *(const float *)lv_event_get_user_data(e);
+    cc1101_bs_ctx_t *ctx = s_bs;
+    if (!ctx) return;
+    ctx->center = mhz;
+    ctx->cancel = true;   // abort current sweep; task restarts with new center
+    if (ctx->status_lbl)
+        lv_label_set_text(ctx->status_lbl, "Retuning...");
+}
+
+static void s_bs_startstop_cb(lv_event_t *e)
+{
+    (void)e;
+    cc1101_bs_ctx_t *ctx = s_bs;
+    if (!ctx) return;
+    if (ctx->active) {
+        ctx->active = false;
+        ctx->cancel = true;
+        if (ctx->start_btn)
+            lv_label_set_text(lv_obj_get_child(ctx->start_btn, 0),
+                              LV_SYMBOL_PLAY " Start");
+    } else {
+        ctx->active = true;
+        if (ctx->start_btn)
+            lv_label_set_text(lv_obj_get_child(ctx->start_btn, 0),
+                              LV_SYMBOL_STOP " Stop");
+        xTaskCreate(s_bs_task_fn, "bs_scan", 3072, ctx, 5, &ctx->task);
+    }
+}
+
+static void show_cc1101_bandscope_screen(void)
+{
+    if (!cc1101_is_init()) {
+        if (cc1101_init() != ESP_OK) {
+            s_cc1101_stub_screen(MY_SYMBOL_SATELLITE "  Band Scope - No CC1101",
+                                 "Run HW Test first.\nCheck DIP 1.");
+            return;
+        }
+    }
+
+    // Cancel any previous context still live (rapid re-entry guard)
+    if (s_bs) {
+        s_bs->active = false; s_bs->cancel = true;
+        s_bs->canvas = NULL; s_bs->status_lbl = NULL; s_bs->start_btn = NULL;
+        if (s_bs->tmr)   { lv_timer_del(s_bs->tmr); s_bs->tmr = NULL; }
+        if (!s_bs->task) { if (s_bs->canv_buf) heap_caps_free(s_bs->canv_buf); heap_caps_free(s_bs); s_bs = NULL; }
+    }
+
+    s_bs = heap_caps_calloc(1, sizeof(cc1101_bs_ctx_t), MALLOC_CAP_SPIRAM);
+    if (!s_bs) return;
+    s_bs->center = 433.92f;
+    s_bs->span   = 20.0f;
+
+    int canvas_h = CC1101_BS_SPEC_H + 1 + CC1101_BS_WF_H;  // 165 px
+    s_bs->canv_buf = heap_caps_calloc((size_t)(CC1101_BS_W * canvas_h),
+                                       sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+    if (!s_bs->canv_buf) { heap_caps_free(s_bs); s_bs = NULL; return; }
+
+    create_function_page_base("CC1101 Band Scope");
+    apply_menu_bg();
+
+    // Canvas — fills full width, starts just below the page title bar
+    s_bs->canvas = lv_canvas_create(function_page);
+    lv_canvas_set_buffer(s_bs->canvas, s_bs->canv_buf,
+                         CC1101_BS_W, canvas_h, LV_IMG_CF_TRUE_COLOR);
+    lv_obj_set_pos(s_bs->canvas, 0, 28);
+    lv_obj_set_size(s_bs->canvas, CC1101_BS_W, canvas_h);
+
+    int cy = 28 + canvas_h;  // y coordinate immediately below canvas (193)
+
+    // Freq preset buttons: 315 / 433 / 868 / 915
+    static const float   presets[]     = {315.0f, 433.92f, 868.0f, 915.0f};
+    static const char   *preset_lbls[] = {"315", "433", "868", "915"};
+    lv_obj_t *prow = lv_obj_create(function_page);
+    lv_obj_set_size(prow, LCD_H_RES, 30);
+    lv_obj_set_pos(prow, 0, cy + 5);
+    lv_obj_set_style_bg_opa(prow, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(prow, 0, 0);
+    lv_obj_set_style_pad_all(prow, 0, 0);
+    lv_obj_set_flex_flow(prow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(prow, LV_FLEX_ALIGN_SPACE_EVENLY,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(prow, LV_OBJ_FLAG_SCROLLABLE);
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t *btn = lv_btn_create(prow);
+        lv_obj_set_size(btn, 52, 26);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x006064), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x00838F), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(btn, 0, 0);
+        lv_obj_set_style_radius(btn, 6, 0);
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, preset_lbls[i]);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        lv_obj_center(lbl);
+        lv_obj_add_event_cb(btn, s_bs_preset_cb, LV_EVENT_CLICKED,
+                            (void *)&presets[i]);
+    }
+
+    // Status / range label
+    s_bs->status_lbl = lv_label_create(function_page);
+    lv_obj_set_pos(s_bs->status_lbl, 4, cy + 40);
+    lv_obj_set_size(s_bs->status_lbl, LCD_H_RES - 8, 14);
+    lv_label_set_text(s_bs->status_lbl, "Tap a preset, then Start");
+    lv_obj_set_style_text_font(s_bs->status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_bs->status_lbl, lv_color_hex(0xAAAAAA), 0);
+    lv_obj_set_style_text_align(s_bs->status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+
+    // Start / Stop toggle button
+    s_bs->start_btn = lv_btn_create(function_page);
+    lv_obj_set_size(s_bs->start_btn, 110, 26);
+    lv_obj_set_pos(s_bs->start_btn, (LCD_H_RES - 110) / 2, cy + 57);
+    lv_obj_set_style_bg_color(s_bs->start_btn, lv_color_hex(0x1B5E20), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(s_bs->start_btn, lv_color_hex(0x2E7D32), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(s_bs->start_btn, 0, 0);
+    lv_obj_set_style_radius(s_bs->start_btn, 6, 0);
+    lv_obj_t *sl = lv_label_create(s_bs->start_btn);
+    lv_label_set_text(sl, LV_SYMBOL_PLAY " Start");
+    lv_obj_set_style_text_font(sl, &lv_font_montserrat_12, 0);
+    lv_obj_center(sl);
+    lv_obj_add_event_cb(s_bs->start_btn, s_bs_startstop_cb, LV_EVENT_CLICKED, NULL);
+
+    s_bs->tmr = lv_timer_create(s_bs_ui_timer_cb, 100, NULL);
+
+    rfhat_add_back_btn("CC1101", show_cc1101_screen);
 }
 
 // ── nRF24 Stub ────────────────────────────────────────────────────────────────
