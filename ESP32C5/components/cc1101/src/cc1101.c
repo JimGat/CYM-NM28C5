@@ -23,6 +23,7 @@ extern SemaphoreHandle_t sd_spi_mutex;
 static spi_device_handle_t s_spi = NULL;
 static bool                s_init = false;
 static float               s_freq_mhz = 433.92f;
+static bool                s_isr_installed = false;  // gpio_install_isr_service called
 
 // ── ISR raw-capture state (IRAM_ATTR) ─────────────────────────────────────────
 #define CC1101_RAW_MAX_EDGES  2048
@@ -155,15 +156,18 @@ void cc1101_deinit(void)
 {
     if (!s_init) return;
     s_cap_active = false;
-    gpio_isr_handler_remove(RF_HAT_CC1101_GDO0_GPIO);
-    gpio_intr_disable(RF_HAT_CC1101_GDO0_GPIO);
+    // Only remove ISR handler if the service was ever installed (raw capture used)
+    if (s_isr_installed) {
+        gpio_intr_disable(RF_HAT_CC1101_GDO0_GPIO);
+        gpio_isr_handler_remove(RF_HAT_CC1101_GDO0_GPIO);
+        s_isr_installed = false;
+    }
     cc1101_strobe(CC1101_SIDLE);
     spi_bus_remove_device(s_spi);
     s_spi = NULL;
     s_init = false;
-    // Reset GPIO8 to safe input state
+    // Reset GDO0 (GPIO8) to safe floating input; CS (GPIO9) is released by spi_bus_remove_device
     gpio_reset_pin(RF_HAT_CC1101_GDO0_GPIO);
-    gpio_reset_pin(RF_HAT_CC1101_CS_GPIO);
     ESP_LOGI(TAG, "CC1101 deinit");
 }
 
@@ -412,6 +416,10 @@ esp_err_t cc1101_raw_capture(cc1101_raw_t *out, uint32_t timeout_ms)
     // Configure GDO0 as input with edge interrupt
     gpio_set_direction(RF_HAT_CC1101_GDO0_GPIO, GPIO_MODE_INPUT);
     gpio_set_intr_type(RF_HAT_CC1101_GDO0_GPIO, GPIO_INTR_ANYEDGE);
+    if (!s_isr_installed) {
+        gpio_install_isr_service(0);
+        s_isr_installed = true;
+    }
     gpio_isr_handler_add(RF_HAT_CC1101_GDO0_GPIO, s_gdo0_isr, NULL);
 
     // Put CC1101 in async serial RX mode
