@@ -1553,6 +1553,7 @@ typedef struct {
     volatile bool   sweep_done;
     uint8_t         _pad;
     uint32_t        sweep_count;
+    uint16_t        scan_cursor;   // animated scan-line column (0..NRF24_CS_W-1)
     bool            carrier[NRF24_CS_NPTS];
     lv_color_t     *canv_buf;
     lv_obj_t       *canvas;
@@ -24501,9 +24502,9 @@ static void lw_rebuild_list(void) {
 
             lw_nav_pos = lv_label_create(lw_list_box);
             lv_obj_add_flag(lw_nav_pos, LV_OBJ_FLAG_FLOATING);
-            lv_obj_set_size(lw_nav_pos, 22, LV_SIZE_CONTENT);
+            lv_obj_set_size(lw_nav_pos, 44, LV_SIZE_CONTENT);
             lv_obj_set_style_text_font(lw_nav_pos, &lv_font_montserrat_12, 0);
-            lv_obj_set_style_text_color(lw_nav_pos, lv_color_make(160, 160, 160), 0);
+            lv_obj_set_style_text_color(lw_nav_pos, lv_color_make(255, 230, 0), 0);
             lv_obj_set_style_text_align(lw_nav_pos, LV_TEXT_ALIGN_CENTER, 0);
             lv_obj_align(lw_nav_pos, LV_ALIGN_RIGHT_MID, -1, 0);
 
@@ -24524,8 +24525,8 @@ static void lw_rebuild_list(void) {
         }
         // Update state every rebuild
         lv_obj_set_style_bg_opa(lw_nav_up, can_up ? LV_OPA_90 : LV_OPA_30, 0);
-        char lpbuf[10];
-        snprintf(lpbuf, sizeof(lpbuf), "%d/%d", lw_end, lw_file_count);
+        char lpbuf[24];
+        snprintf(lpbuf, sizeof(lpbuf), "%d/%d", lw_list_scroll_top + 1, lw_file_count);
         lv_label_set_text(lw_nav_pos, lpbuf);
         lv_obj_set_style_bg_opa(lw_nav_dn, can_dn ? LV_OPA_90 : LV_OPA_30, 0);
         lv_obj_clear_flag(lw_nav_up,  LV_OBJ_FLAG_HIDDEN);
@@ -25497,9 +25498,9 @@ static void bt_sas_refresh_list(void)
 
             bt_sas_nav_pos = lv_label_create(bt_sas_list);
             lv_obj_add_flag(bt_sas_nav_pos, LV_OBJ_FLAG_FLOATING);
-            lv_obj_set_size(bt_sas_nav_pos, 22, LV_SIZE_CONTENT);
+            lv_obj_set_size(bt_sas_nav_pos, 44, LV_SIZE_CONTENT);
             lv_obj_set_style_text_font(bt_sas_nav_pos, &lv_font_montserrat_12, 0);
-            lv_obj_set_style_text_color(bt_sas_nav_pos, lv_color_make(160, 160, 160), 0);
+            lv_obj_set_style_text_color(bt_sas_nav_pos, lv_color_make(255, 230, 0), 0);
             lv_obj_set_style_text_align(bt_sas_nav_pos, LV_TEXT_ALIGN_CENTER, 0);
             lv_obj_align(bt_sas_nav_pos, LV_ALIGN_RIGHT_MID, -1, 0);
 
@@ -25520,8 +25521,8 @@ static void bt_sas_refresh_list(void)
         }
         // Update state every refresh
         lv_obj_set_style_bg_opa(bt_sas_nav_up, can_up ? LV_OPA_90 : LV_OPA_30, 0);
-        char pbuf[10];
-        snprintf(pbuf, sizeof(pbuf), "%d/%d", end, bt_device_count);
+        char pbuf[24];
+        snprintf(pbuf, sizeof(pbuf), "%d/%d", bt_sas_scroll_top + 1, bt_device_count);
         lv_label_set_text(bt_sas_nav_pos, pbuf);
         lv_obj_set_style_bg_opa(bt_sas_nav_dn, can_dn ? LV_OPA_90 : LV_OPA_30, 0);
         lv_obj_clear_flag(bt_sas_nav_up,  LV_OBJ_FLAG_HIDDEN);
@@ -39127,7 +39128,28 @@ static void s_ncs_ui_timer_cb(lv_timer_t *t)
                  ctx ? (int)ctx->sweep_done : -1,
                  ctx ? (unsigned long)ctx->sweep_count : 0UL);
     if (!ctx || !ctx->canvas || !ctx->canv_buf) return;
-    if (!ctx->sweep_done) return;
+
+    // Always advance the animated scan cursor (shows activity even with no carrier)
+    ctx->scan_cursor = (ctx->scan_cursor + 4) % NRF24_CS_W;
+
+    if (!ctx->sweep_done) {
+        // No new sweep yet — just redraw cursor column to animate it
+        if (ctx->active) {
+            int spec_h = NRF24_CS_SPEC_H;
+            int x = ctx->scan_cursor;
+            for (int y = 0; y < spec_h; y++) {
+                lv_color_t base = ctx->canv_buf[y * NRF24_CS_W + x];
+                // Brighten the cursor column slightly
+                ctx->canv_buf[y * NRF24_CS_W + x] = lv_color_mix(lv_color_make(0, 80, 120), base, 80);
+            }
+            lv_obj_invalidate(ctx->canvas);
+        }
+        // Update status even without new sweep (shows "Stopped" if inactive)
+        if (ctx->status_lbl && !ctx->active) {
+            lv_label_set_text(ctx->status_lbl, "Stopped -- tap Start to resume");
+        }
+        return;
+    }
     ctx->sweep_done = false;
 
     int spec_h  = NRF24_CS_SPEC_H;
