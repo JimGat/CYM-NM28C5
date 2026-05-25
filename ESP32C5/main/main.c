@@ -36982,6 +36982,7 @@ static volatile cc1101_cap_state_t s_cc1101_cap_state  = CC1101_CAP_IDLE;
 static cc1101_raw_t  s_cc1101_cap_raw   = {0};
 static char          s_cc1101_cap_path[64] = {0};
 static TaskHandle_t  s_cc1101_cap_task  = NULL;
+static lv_obj_t     *s_cc1101_cap_freq_lbl   = NULL;
 static lv_obj_t     *s_cc1101_cap_status_lbl = NULL;
 static lv_obj_t     *s_cc1101_cap_count_lbl  = NULL;
 static lv_obj_t     *s_cc1101_cap_btn        = NULL;
@@ -37166,6 +37167,7 @@ static void show_cc1101_screen(void)
     s_cc1101_rssi_bar        = NULL;
     s_cc1101_rssi_lbl        = NULL;
     s_cc1101_freq_hdr        = NULL;
+    s_cc1101_cap_freq_lbl    = NULL;
     s_cc1101_jam_status      = NULL;
     s_cc1101_ht_status       = NULL;
     s_cc1101_jamming         = false;
@@ -37200,11 +37202,11 @@ static void show_cc1101_screen(void)
     // Page 1: Capture & Analysis
     lv_obj_t *p1 = s_cc1101_pages[0];
     create_tile(p1, LV_SYMBOL_SETTINGS,     "HW\nTest",    lv_color_hex(0x37474F), s_cc1101_tile_cb, "HW Test");
-    create_tile(p1, MY_SYMBOL_SATELLITE,    "Freq\nScan",  lv_color_hex(0x006064), s_cc1101_tile_cb, "Freq Scan");
+    create_tile(p1, MY_SYMBOL_SATELLITE,   "Band\nScope",  lv_color_hex(0x006064), s_cc1101_tile_cb, "BndScope");
     create_tile(p1, LV_SYMBOL_EYE_OPEN,    "Capture\nRAW",lv_color_hex(0x1B5E20), s_cc1101_tile_cb, "Capture");
     create_tile(p1, LV_SYMBOL_PLAY,        "Replay\nRAW", lv_color_hex(0x1A237E), s_cc1101_tile_cb, "Replay");
     create_tile(p1, LV_SYMBOL_SAVE,        "Saved\nFiles",lv_color_hex(0x4A148C), s_cc1101_tile_cb, "Saved");
-    create_tile(p1, LV_SYMBOL_LIST,        "Decode\nProto",lv_color_hex(0x0D47A1),s_cc1101_tile_cb, "Decode");
+    create_tile(p1, MY_SYMBOL_SITEMAP,     "Z-Wave\nScout",lv_color_hex(0x1565C0),s_cc1101_tile_cb, "ZWave");
 
     // Page 2: Protocol Decoders
     lv_obj_t *p2 = s_cc1101_pages[1];
@@ -37219,8 +37221,8 @@ static void show_cc1101_screen(void)
     lv_obj_t *p3 = s_cc1101_pages[2];
     create_tile(p3, MY_SYMBOL_SKULL_CROSS,  "Jammer",      UI_ACCENT_RED,          s_cc1101_tile_cb, "Jammer");
     create_tile(p3, LV_SYMBOL_SHUFFLE,     "Brute\nForce", lv_color_hex(0xE65100), s_cc1101_tile_cb, "Brute");
-    create_tile(p3, MY_SYMBOL_SATELLITE,   "Band\nScope",  lv_color_hex(0x006064), s_cc1101_tile_cb, "BndScope");
-    create_tile(p3, MY_SYMBOL_SITEMAP,     "Z-Wave\nScout",lv_color_hex(0x1565C0), s_cc1101_tile_cb, "ZWave");
+    create_tile(p3, MY_SYMBOL_SATELLITE,   "Freq\nScan",   lv_color_hex(0x006064), s_cc1101_tile_cb, "Freq Scan");
+    create_tile(p3, LV_SYMBOL_LIST,        "Decode\nProto",lv_color_hex(0x0D47A1), s_cc1101_tile_cb, "Decode");
 
     // Navigation bar: [<] [1/3] [>] | [Back]
     lv_obj_t *nav = lv_obj_create(function_page);
@@ -37417,10 +37419,14 @@ static void s_cc1101_freq_btn_cb(lv_event_t *e)
     float mhz = *(float *)lv_event_get_user_data(e);
     s_cc1101_freq_mhz = mhz;
     if (cc1101_is_init()) cc1101_set_freq_mhz(mhz);
+    char buf[40];
     if (s_cc1101_freq_hdr) {
-        char buf[32];
         snprintf(buf, sizeof(buf), MY_SYMBOL_SATELLITE "  %.2f MHz", (double)mhz);
         lv_label_set_text(s_cc1101_freq_hdr, buf);
+    }
+    if (s_cc1101_cap_freq_lbl) {
+        snprintf(buf, sizeof(buf), MY_SYMBOL_SATELLITE "  %.2f MHz RAW", (double)mhz);
+        lv_label_set_text(s_cc1101_cap_freq_lbl, buf);
     }
 }
 
@@ -37626,10 +37632,37 @@ static void show_cc1101_capture_screen(void)
     char freq_buf[32];
     snprintf(freq_buf, sizeof(freq_buf),
              MY_SYMBOL_SATELLITE "  %.2f MHz RAW", (double)s_cc1101_freq_mhz);
-    lv_obj_t *hdr = lv_label_create(card);
-    lv_label_set_text(hdr, freq_buf);
-    lv_obj_set_style_text_font(hdr, &g_font_icon14, 0);
-    lv_obj_set_style_text_color(hdr, lv_color_hex(0x26C6DA), 0);
+    s_cc1101_cap_freq_lbl = lv_label_create(card);
+    lv_label_set_text(s_cc1101_cap_freq_lbl, freq_buf);
+    lv_obj_set_style_text_font(s_cc1101_cap_freq_lbl, &g_font_icon14, 0);
+    lv_obj_set_style_text_color(s_cc1101_cap_freq_lbl, lv_color_hex(0x26C6DA), 0);
+
+    // Frequency preset buttons
+    lv_obj_t *cap_freq_row = lv_obj_create(card);
+    lv_obj_set_size(cap_freq_row, LCD_H_RES - 20, 36);
+    lv_obj_set_style_bg_opa(cap_freq_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(cap_freq_row, 0, 0);
+    lv_obj_set_style_pad_all(cap_freq_row, 0, 0);
+    lv_obj_set_flex_flow(cap_freq_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(cap_freq_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(cap_freq_row, LV_OBJ_FLAG_SCROLLABLE);
+    static float s_cap_freq_vals[4];
+    for (int i = 0; i < 4; i++) {
+        s_cap_freq_vals[i] = s_freq_presets[i].mhz;
+        lv_obj_t *fb = lv_btn_create(cap_freq_row);
+        lv_obj_set_size(fb, 48, 28);
+        lv_obj_set_style_bg_color(fb, lv_color_make(30,60,80), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(fb, lv_color_make(0,100,120), LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(fb, lv_color_hex(0x26C6DA), 0);
+        lv_obj_set_style_border_width(fb, 1, 0);
+        lv_obj_set_style_radius(fb, 4, 0);
+        lv_obj_t *fl = lv_label_create(fb);
+        lv_label_set_text(fl, s_freq_presets[i].label);
+        lv_obj_set_style_text_font(fl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(fl, lv_color_white(), 0);
+        lv_obj_center(fl);
+        lv_obj_add_event_cb(fb, s_cc1101_freq_btn_cb, LV_EVENT_CLICKED, &s_cap_freq_vals[i]);
+    }
 
     s_cc1101_cap_status_lbl = lv_label_create(card);
     lv_label_set_text(s_cc1101_cap_status_lbl,
