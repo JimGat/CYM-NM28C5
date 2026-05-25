@@ -1,6 +1,6 @@
 idf_component_register(
     SRCS "src/cc1101.c"
-    INCLUDE_DIRS "include"
+    INCLUDE_DIRS "include" "src"
     REQUIRES
         log
         freertos

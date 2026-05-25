@@ -163,6 +163,7 @@ LV_IMG_DECLARE(deedee_img);
 #include "rf433_hat.h"
 #include "radio_hat.h"
 #include "cc1101.h"
+#include "cc1101_regs.h"
 #include "nrf24.h"
 #include "esp_ieee802154.h"
 #include "rfid_manager.h"
@@ -1963,6 +1964,7 @@ static void show_cc1101_wardrive_screen(void);
 static void show_cc1101_proximity_screen(void);
 static void show_cc1101_bruteforce_screen(void);
 static void show_cc1101_bandscope_screen(void);
+static void show_cc1101_zwave_screen(void);
 static void show_nrf24_screen(void);
 static void show_nrf24_hw_test_screen(void);
 static void show_nrf24_ch_scan_screen(void);
@@ -36900,6 +36902,41 @@ static cc1101_sub_path_t *s_cc1101_sub_paths = NULL;  // PSRAM alloc, 10×80 byt
 static int   s_cc1101_sub_count = 0;
 static char  s_cc1101_saved_sel_path[CC1101_SUB_PATH_LEN] = {0};
 
+// ── Z-Wave Scout state ────────────────────────────────────────────────────────
+#define ZWAVE_MAX_NETS       32
+#define ZWAVE_SAVE_DIR       "/sdcard/lab/zwave"
+#define ZWAVE_PKTLEN         12   // fixed bytes captured per frame (after sync)
+#define ZWAVE_STATUS_BYTES    2   // RSSI + LQI appended by CC1101 PKTCTRL1
+
+typedef struct {
+    uint32_t home_id;
+    uint8_t  src_nodes[8];
+    uint8_t  node_count;
+    int8_t   rssi_best;
+    uint16_t frame_count;
+    uint8_t  cmd_class;
+    double   lat, lon;
+    char     ts[24];
+} zwave_net_t;
+
+typedef struct {
+    lv_obj_t        *status_lbl;
+    lv_obj_t        *frame_lbl;
+    lv_obj_t        *net_lbl;
+    lv_obj_t        *gps_lbl;
+    lv_obj_t        *start_btn;
+    lv_timer_t      *tmr;
+    bool             active;
+    volatile bool    cancel;
+    TaskHandle_t     task;
+    int              frame_count;
+    int              net_count;
+    zwave_net_t      nets[ZWAVE_MAX_NETS];
+    char             csv_path[80];
+} zwave_ctx_t;
+
+EXT_RAM_BSS_ATTR static zwave_ctx_t *s_zwave = NULL;
+
 // ── Helper: generic "coming soon" sub-screen ──────────────────────────────────
 
 static void s_cc1101_stub_screen(const char *title_text, const char *detail)
@@ -37000,6 +37037,7 @@ static void s_cc1101_tile_cb(lv_event_t *e)
     else if (strcmp(name, "Wardrive")  == 0) show_cc1101_wardrive_screen();
     else if (strcmp(name, "Proximity") == 0) show_cc1101_proximity_screen();
     else if (strcmp(name, "BndScope")  == 0) show_cc1101_bandscope_screen();
+    else if (strcmp(name, "ZWave")     == 0) show_cc1101_zwave_screen();
 }
 
 static void show_cc1101_screen(void)
@@ -37017,6 +37055,13 @@ static void show_cc1101_screen(void)
         s_bs->canvas = NULL; s_bs->status_lbl = NULL; s_bs->start_btn = NULL;
         if (s_bs->tmr) { lv_timer_del(s_bs->tmr); s_bs->tmr = NULL; }
         if (!s_bs->task) { if (s_bs->canv_buf) heap_caps_free(s_bs->canv_buf); heap_caps_free(s_bs); s_bs = NULL; }
+    }
+    if (s_zwave) {
+        s_zwave->cancel = true; s_zwave->active = false;
+        s_zwave->status_lbl = NULL; s_zwave->frame_lbl = NULL;
+        s_zwave->net_lbl = NULL; s_zwave->gps_lbl = NULL; s_zwave->start_btn = NULL;
+        if (s_zwave->tmr) { lv_timer_del(s_zwave->tmr); s_zwave->tmr = NULL; }
+        if (!s_zwave->task) { heap_caps_free(s_zwave); s_zwave = NULL; }
     }
     s_cc1101_rssi_bar        = NULL;
     s_cc1101_rssi_lbl        = NULL;
@@ -37075,6 +37120,7 @@ static void show_cc1101_screen(void)
     create_tile(p3, MY_SYMBOL_SKULL_CROSS,  "Jammer",      UI_ACCENT_RED,          s_cc1101_tile_cb, "Jammer");
     create_tile(p3, LV_SYMBOL_SHUFFLE,     "Brute\nForce", lv_color_hex(0xE65100), s_cc1101_tile_cb, "Brute");
     create_tile(p3, MY_SYMBOL_SATELLITE,   "Band\nScope",  lv_color_hex(0x006064), s_cc1101_tile_cb, "BndScope");
+    create_tile(p3, MY_SYMBOL_SITEMAP,     "Z-Wave\nScout",lv_color_hex(0x1565C0), s_cc1101_tile_cb, "ZWave");
 
     // Navigation bar: [<] [1/3] [>] | [Back]
     lv_obj_t *nav = lv_obj_create(function_page);
@@ -38308,6 +38354,351 @@ static void show_cc1101_bandscope_screen(void)
     s_bs->tmr = lv_timer_create(s_bs_ui_timer_cb, 100, NULL);
 
     rfhat_add_back_btn("CC1101", show_cc1101_screen);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Z-Wave Scout — 908.42 MHz passive listener + GPS-tagged CSV collector
+// FOR AUTHORIZED SECURITY RESEARCH AND EDUCATION ONLY.
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void s_zw_config_cc1101(void)
+{
+    cc1101_idle();
+    cc1101_strobe(CC1101_SFRX);
+    cc1101_write_reg(CC1101_FREQ2,    0x22);  // 908.42 MHz
+    cc1101_write_reg(CC1101_FREQ1,    0xED);
+    cc1101_write_reg(CC1101_FREQ0,    0xB6);
+    cc1101_write_reg(CC1101_MDMCFG4,  0x88);  // BW=203 kHz, DRATE_E=8
+    cc1101_write_reg(CC1101_MDMCFG3,  0x83);  // DRATE_M=131 -> 9.6 kbps
+    cc1101_write_reg(CC1101_MDMCFG2,  0x12);  // GFSK, 16/16 sync word
+    cc1101_write_reg(CC1101_MDMCFG1,  0x22);  // 4 preamble bytes
+    cc1101_write_reg(CC1101_MDMCFG0,  0xF8);
+    cc1101_write_reg(CC1101_DEVIATN,  0x44);  // ~38 kHz deviation
+    cc1101_write_reg(CC1101_SYNC1,    0xAA);  // Z-Wave: last preamble byte
+    cc1101_write_reg(CC1101_SYNC0,    0x01);  // Z-Wave: SOF singlecast
+    cc1101_write_reg(CC1101_PKTLEN,   ZWAVE_PKTLEN);
+    cc1101_write_reg(CC1101_PKTCTRL1, 0x04);  // append RSSI+LQI
+    cc1101_write_reg(CC1101_PKTCTRL0, 0x00);  // fixed len, no CRC, no whitening
+    cc1101_write_reg(CC1101_FIFOTHR,  0x47);
+    cc1101_write_reg(CC1101_FSCTRL1,  0x0C);
+    cc1101_write_reg(CC1101_FSCTRL0,  0x00);
+    cc1101_write_reg(CC1101_FREND1,   0xB6);
+    cc1101_write_reg(CC1101_FREND0,   0x10);
+    cc1101_write_reg(CC1101_FSCAL3,   0xEA);
+    cc1101_write_reg(CC1101_FSCAL2,   0x2A);
+    cc1101_write_reg(CC1101_FSCAL1,   0x00);
+    cc1101_write_reg(CC1101_FSCAL0,   0x1F);
+    cc1101_write_reg(CC1101_AGCCTRL2, 0x43);
+    cc1101_write_reg(CC1101_AGCCTRL1, 0x49);
+    cc1101_write_reg(CC1101_AGCCTRL0, 0x91);
+    cc1101_write_reg(CC1101_TEST2,    0x81);
+    cc1101_write_reg(CC1101_TEST1,    0x35);
+    cc1101_write_reg(CC1101_TEST0,    0x09);
+    cc1101_write_reg(CC1101_MCSM1,    0x0F);  // stay in RX after packet
+    cc1101_write_reg(CC1101_MCSM0,    0x18);  // calibrate on IDLE->RX
+    cc1101_rx();
+}
+
+static int8_t s_zw_rssi_dbm(uint8_t rssi_reg)
+{
+    return (rssi_reg >= 128) ? (int8_t)((rssi_reg - 256) / 2 - 74)
+                             : (int8_t)(rssi_reg / 2 - 74);
+}
+
+static bool s_zw_frame_valid(const uint8_t *buf)
+{
+    uint8_t len = buf[0];
+    if (len < 8 || len > 60) return false;
+    uint32_t home = ((uint32_t)buf[1] << 24) | ((uint32_t)buf[2] << 16) |
+                    ((uint32_t)buf[3] <<  8) |  (uint32_t)buf[4];
+    return (home != 0 && home != 0xFFFFFFFF);
+}
+
+static void s_zw_record_net(zwave_ctx_t *ctx, uint32_t home_id,
+                             uint8_t src, uint8_t dst, uint8_t cmd_class,
+                             int8_t rssi, FILE *f)
+{
+    // Find or create network entry
+    zwave_net_t *net = NULL;
+    for (int i = 0; i < ctx->net_count; i++) {
+        if (ctx->nets[i].home_id == home_id) { net = &ctx->nets[i]; break; }
+    }
+    if (!net) {
+        if (ctx->net_count >= ZWAVE_MAX_NETS) return;
+        net = &ctx->nets[ctx->net_count++];
+        memset(net, 0, sizeof(*net));
+        net->home_id   = home_id;
+        net->rssi_best = rssi;
+        net->cmd_class = cmd_class;
+        const gps_data_t *g = gps_best();
+        net->lat = g->valid ? g->latitude  : 0.0;
+        net->lon = g->valid ? g->longitude : 0.0;
+        time_t now = time(NULL); struct tm t; gmtime_r(&now, &t);
+        strftime(net->ts, sizeof(net->ts), "%Y-%m-%dT%H:%M:%SZ", &t);
+    }
+    if (rssi > net->rssi_best) {
+        net->rssi_best = rssi;
+        const gps_data_t *g = gps_best();
+        if (g->valid) { net->lat = g->latitude; net->lon = g->longitude; }
+    }
+    // Track unique src nodes
+    bool found = false;
+    for (int i = 0; i < net->node_count; i++) {
+        if (net->src_nodes[i] == src) { found = true; break; }
+    }
+    if (!found && net->node_count < 8) net->src_nodes[net->node_count++] = src;
+    net->frame_count++;
+
+    // Write CSV row
+    if (f) {
+        const gps_data_t *g = gps_best();
+        fprintf(f, "%08X,%u,%u,0x%02X,%d,%.6f,%.6f,%s\n",
+                (unsigned)home_id, (unsigned)src, (unsigned)dst,
+                (unsigned)cmd_class, (int)rssi,
+                g->valid ? (double)g->latitude  : net->lat,
+                g->valid ? (double)g->longitude : net->lon,
+                net->ts);
+        fflush(f);
+    }
+}
+
+static void s_zw_task_fn(void *arg)
+{
+    zwave_ctx_t *ctx = (zwave_ctx_t *)arg;
+    s_zw_config_cc1101();
+
+    mkdir(ZWAVE_SAVE_DIR, 0755);
+    time_t now = time(NULL); struct tm t; gmtime_r(&now, &t);
+    snprintf(ctx->csv_path, sizeof(ctx->csv_path),
+             ZWAVE_SAVE_DIR "/zwave_%04d%02d%02d_%02d%02d%02d.csv",
+             t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+             t.tm_hour, t.tm_min, t.tm_sec);
+    FILE *f = fopen(ctx->csv_path, "w");
+    if (f) fprintf(f, "HomeID,SrcNodeID,DestNodeID,CmdClass,RSSI_dBm,Lat,Lon,Timestamp\n");
+
+    const int FIFO_EXPECTED = ZWAVE_PKTLEN + ZWAVE_STATUS_BYTES;  // 14 bytes
+    while (!ctx->cancel) {
+        uint8_t marc = cc1101_get_marc_state();
+        if (marc == 0x11) {  // RXFIFO_OVERFLOW
+            cc1101_strobe(CC1101_SIDLE);
+            cc1101_strobe(CC1101_SFRX);
+            cc1101_rx();
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        uint8_t rxb = cc1101_read_status(CC1101_RXBYTES) & 0x7F;
+        if (rxb < (uint8_t)FIFO_EXPECTED) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        uint8_t buf[14];
+        for (int i = 0; i < FIFO_EXPECTED; i++)
+            buf[i] = cc1101_read_reg(CC1101_RXFIFO);
+        if (s_zw_frame_valid(buf)) {
+            uint32_t home = ((uint32_t)buf[1] << 24) | ((uint32_t)buf[2] << 16) |
+                            ((uint32_t)buf[3] <<  8) |  (uint32_t)buf[4];
+            s_zw_record_net(ctx, home, buf[5], buf[8], buf[9],
+                            s_zw_rssi_dbm(buf[ZWAVE_PKTLEN]), f);
+            ctx->frame_count++;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    cc1101_idle();
+    if (f) fclose(f);
+    ctx->active = false;
+    ctx->task   = NULL;
+    vTaskDelete(NULL);
+}
+
+static void s_zw_ui_timer_cb(lv_timer_t *tmr)
+{
+    (void)tmr;
+    if (!s_zwave) return;
+
+    // Build frame / network counts
+    if (s_zwave->frame_lbl) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "Frames: %d", s_zwave->frame_count);
+        lv_label_set_text(s_zwave->frame_lbl, buf);
+    }
+    if (s_zwave->net_lbl) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "Networks: %d", s_zwave->net_count);
+        lv_label_set_text(s_zwave->net_lbl, buf);
+    }
+
+    // GPS indicator
+    if (s_zwave->gps_lbl) {
+        const gps_data_t *g = gps_best();
+        char gbuf[40];
+        if (g->valid)
+            snprintf(gbuf, sizeof(gbuf), LV_SYMBOL_GPS " %.4f, %.4f",
+                     (double)g->latitude, (double)g->longitude);
+        else
+            snprintf(gbuf, sizeof(gbuf), LV_SYMBOL_GPS " No fix");
+        lv_label_set_text(s_zwave->gps_lbl, gbuf);
+    }
+
+    // Status
+    if (s_zwave->status_lbl) {
+        if (s_zwave->active)
+            lv_label_set_text(s_zwave->status_lbl, "Listening on 908.42 MHz...");
+        else if (s_zwave->frame_count > 0)
+            lv_label_set_text(s_zwave->status_lbl, "Stopped. Tap Start to resume.");
+        else
+            lv_label_set_text(s_zwave->status_lbl, "Tap Start to listen.");
+    }
+
+    // Task finished unexpectedly — update button label
+    if (!s_zwave->task && s_zwave->active) {
+        s_zwave->active = false;
+        if (s_zwave->start_btn)
+            lv_label_set_text(lv_obj_get_child(s_zwave->start_btn, 0),
+                              LV_SYMBOL_PLAY " Start");
+    }
+}
+
+static void s_zw_startstop_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!s_zwave) return;
+    if (s_zwave->active) {
+        s_zwave->cancel = true;
+        if (s_zwave->start_btn)
+            lv_label_set_text(lv_obj_get_child(s_zwave->start_btn, 0),
+                              LV_SYMBOL_PLAY " Start");
+        s_zwave->active = false;
+    } else {
+        s_zwave->cancel      = false;
+        s_zwave->active      = true;
+        s_zwave->frame_count = 0;
+        s_zwave->net_count   = 0;
+        memset(s_zwave->nets, 0, sizeof(s_zwave->nets));
+        xTaskCreate(s_zw_task_fn, "zw_scout", 4096, s_zwave, 5, &s_zwave->task);
+        if (s_zwave->start_btn)
+            lv_label_set_text(lv_obj_get_child(s_zwave->start_btn, 0),
+                              LV_SYMBOL_STOP " Stop");
+    }
+}
+
+static void s_zw_back_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_zwave) {
+        s_zwave->cancel = true;
+        s_zwave->active = false;
+        s_zwave->status_lbl = NULL;
+        s_zwave->frame_lbl  = NULL;
+        s_zwave->net_lbl    = NULL;
+        s_zwave->gps_lbl    = NULL;
+        s_zwave->start_btn  = NULL;
+        if (s_zwave->tmr) { lv_timer_del(s_zwave->tmr); s_zwave->tmr = NULL; }
+        if (!s_zwave->task) { heap_caps_free(s_zwave); s_zwave = NULL; }
+    }
+    show_cc1101_screen();
+}
+
+static void show_cc1101_zwave_screen(void)
+{
+    if (!cc1101_is_init()) {
+        if (cc1101_init() != ESP_OK) {
+            s_cc1101_stub_screen(MY_SYMBOL_SITEMAP "  Z-Wave Scout - No CC1101",
+                                 "Run HW Test first.\nCheck DIP 1.");
+            return;
+        }
+    }
+
+    // Guard: cancel previous context if still live
+    if (s_zwave) {
+        s_zwave->cancel = true; s_zwave->active = false;
+        s_zwave->status_lbl = NULL; s_zwave->frame_lbl = NULL;
+        s_zwave->net_lbl = NULL; s_zwave->gps_lbl = NULL; s_zwave->start_btn = NULL;
+        if (s_zwave->tmr) { lv_timer_del(s_zwave->tmr); s_zwave->tmr = NULL; }
+        if (!s_zwave->task) { heap_caps_free(s_zwave); s_zwave = NULL; }
+    }
+
+    s_zwave = heap_caps_calloc(1, sizeof(zwave_ctx_t), MALLOC_CAP_SPIRAM);
+    if (!s_zwave) return;
+
+    create_function_page_base("CC1101 Z-Wave Scout");
+    apply_menu_bg();
+
+    // Info card
+    lv_obj_t *card = lv_obj_create(function_page);
+    lv_obj_set_size(card, LCD_H_RES - 16, LCD_V_RES - 100);
+    lv_obj_set_pos(card, 8, 34);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x1565C0), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 8, 0);
+    lv_obj_set_style_pad_all(card, 10, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_gap(card, 6, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Status row
+    s_zwave->status_lbl = lv_label_create(card);
+    lv_label_set_text(s_zwave->status_lbl, "Tap Start to listen.");
+    lv_obj_set_style_text_font(s_zwave->status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_zwave->status_lbl, lv_color_hex(0xAAAAAA), 0);
+    lv_obj_set_width(s_zwave->status_lbl, LCD_H_RES - 36);
+    lv_label_set_long_mode(s_zwave->status_lbl, LV_LABEL_LONG_WRAP);
+
+    // Frame count
+    s_zwave->frame_lbl = lv_label_create(card);
+    lv_label_set_text(s_zwave->frame_lbl, "Frames: 0");
+    lv_obj_set_style_text_font(s_zwave->frame_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_zwave->frame_lbl, lv_color_hex(0x42A5F5), 0);
+
+    // Network count
+    s_zwave->net_lbl = lv_label_create(card);
+    lv_label_set_text(s_zwave->net_lbl, "Networks: 0");
+    lv_obj_set_style_text_font(s_zwave->net_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_zwave->net_lbl, lv_color_hex(0x66BB6A), 0);
+
+    // GPS row
+    s_zwave->gps_lbl = lv_label_create(card);
+    lv_label_set_text(s_zwave->gps_lbl, LV_SYMBOL_GPS " No fix");
+    lv_obj_set_style_text_font(s_zwave->gps_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_zwave->gps_lbl, lv_color_hex(0xFFB300), 0);
+
+    // Freq note
+    lv_obj_t *freq_lbl = lv_label_create(card);
+    lv_label_set_text(freq_lbl, "908.42 MHz GFSK 9.6kbps (US)");
+    lv_obj_set_style_text_font(freq_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(freq_lbl, lv_color_hex(0x757575), 0);
+
+    // Start button
+    s_zwave->start_btn = lv_btn_create(function_page);
+    lv_obj_set_size(s_zwave->start_btn, 120, 28);
+    lv_obj_set_pos(s_zwave->start_btn, (LCD_H_RES - 120) / 2, LCD_V_RES - 62);
+    lv_obj_set_style_bg_color(s_zwave->start_btn, lv_color_hex(0x1B5E20), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(s_zwave->start_btn, lv_color_hex(0x2E7D32), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(s_zwave->start_btn, 0, 0);
+    lv_obj_set_style_radius(s_zwave->start_btn, 6, 0);
+    lv_obj_t *slbl = lv_label_create(s_zwave->start_btn);
+    lv_label_set_text(slbl, LV_SYMBOL_PLAY " Start");
+    lv_obj_set_style_text_font(slbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(slbl);
+    lv_obj_add_event_cb(s_zwave->start_btn, s_zw_startstop_cb, LV_EVENT_CLICKED, NULL);
+
+    // Back button
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 70, 28);
+    lv_obj_set_pos(back_btn, 8, LCD_V_RES - 62);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 6, 0);
+    lv_obj_t *blbl = lv_label_create(back_btn);
+    lv_label_set_text(blbl, LV_SYMBOL_LEFT " Back");
+    lv_obj_set_style_text_font(blbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(blbl);
+    lv_obj_add_event_cb(back_btn, s_zw_back_cb, LV_EVENT_CLICKED, NULL);
+
+    s_zwave->tmr = lv_timer_create(s_zw_ui_timer_cb, 500, NULL);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
