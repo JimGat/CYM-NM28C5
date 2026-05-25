@@ -1685,14 +1685,18 @@ typedef struct {
     int          sent;
 } zgwd_flood_ctx_t;
 
-EXT_RAM_BSS_ATTR static zgwd_ctx_t      *s_zgwd      = NULL;
-EXT_RAM_BSS_ATTR static zgwd_loc_ctx_t  *s_zgwd_loc  = NULL;
-EXT_RAM_BSS_ATTR static zgwd_flood_ctx_t *s_zgwd_fld = NULL;
+EXT_RAM_BSS_ATTR static zgwd_ctx_t       *s_zgwd      = NULL;
+EXT_RAM_BSS_ATTR static zgwd_loc_ctx_t   *s_zgwd_loc  = NULL;
+EXT_RAM_BSS_ATTR static zgwd_flood_ctx_t *s_zgwd_fld  = NULL;
+// PAN data saved when navigating to detail/locator/flood, restored on return to scout
+EXT_RAM_BSS_ATTR static zgwd_pan_entry_t  s_zgwd_saved_pans[ZGWD_MAX_PANS];
+static int s_zgwd_saved_pan_count   = 0;
+static int s_zgwd_saved_frame_count = 0;
 static QueueHandle_t  s_zgwd_rx_q  = NULL;
 static SemaphoreHandle_t s_zgwd_tx_sem = NULL;
-static uint8_t s_zgwd_seq = 0;   // rolling MAC sequence number
-static lv_obj_t *s_zgwd_da_lbl = NULL;  // disassoc result label on PAN detail screen
-static volatile int s_zgwd_da_result = 0; // -1=running, 0=idle, N=sent N frames
+static uint8_t s_zgwd_seq = 0;
+static lv_obj_t *s_zgwd_da_lbl = NULL;
+static volatile int s_zgwd_da_result = 0;
 
 // AirTag Scanner state
 static TaskHandle_t airtag_scan_task_handle = NULL;
@@ -41657,7 +41661,9 @@ static void show_rf433_signal_list_screen(void)
 static IRAM_ATTR void s_zgwd_rx_done_cb(uint8_t *frame,
                                          esp_ieee802154_frame_info_t *fi)
 {
-    if (!s_zgwd_rx_q || !s_zgwd || !s_zgwd->scanning) {
+    bool scout_active = s_zgwd && s_zgwd->scanning;
+    bool locator_active = s_zgwd_loc && s_zgwd_loc->running;
+    if (!s_zgwd_rx_q || (!scout_active && !locator_active)) {
         esp_ieee802154_receive_handle_done(frame);
         return;
     }
@@ -42058,6 +42064,10 @@ static void s_zgwd_card_tap_cb(lv_event_t *e)
     zgwd_ctx_t *ctx = s_zgwd;
     if (!ctx || idx < 0 || idx >= ctx->pan_count) return;
     s_zgwd_sel_pan = ctx->pans[idx];   // copy before navigation clears s_zgwd
+    s_zgwd_saved_pan_count   = ctx->pan_count;
+    s_zgwd_saved_frame_count = ctx->frame_count;
+    if (ctx->pan_count > 0)
+        memcpy(s_zgwd_saved_pans, ctx->pans, ctx->pan_count * sizeof(zgwd_pan_entry_t));
     show_zgwd_pan_detail(idx);
 }
 
@@ -42156,6 +42166,8 @@ static void s_zgwd_start(zgwd_ctx_t *ctx, bool active_mode)
     ctx->frame_count = 0;
     ctx->pan_count   = 0;
     memset(ctx->pans, 0, sizeof(ctx->pans));
+    s_zgwd_saved_pan_count   = 0;
+    s_zgwd_saved_frame_count = 0;
     if (ctx->pan_list && lv_obj_is_valid(ctx->pan_list))
         lv_obj_clean(ctx->pan_list);
     // Disable both buttons while scanning; passive btn becomes Stop
@@ -42279,6 +42291,11 @@ static void show_zigbee_wardrive_screen(void)
 
     create_function_page_base("Zigbee Scout");
     s_zgwd = ctx;
+    if (s_zgwd_saved_pan_count > 0) {
+        ctx->pan_count   = s_zgwd_saved_pan_count;
+        ctx->frame_count = s_zgwd_saved_frame_count;
+        memcpy(ctx->pans, s_zgwd_saved_pans, s_zgwd_saved_pan_count * sizeof(zgwd_pan_entry_t));
+    }
     apply_menu_bg();
 
     ctx->status_lbl = lv_label_create(function_page);
