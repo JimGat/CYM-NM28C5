@@ -12375,6 +12375,7 @@ static void disco_task(void *arg)
         disco_led_needs_update = true;
         disco_color_idx   = c;
         disco_needs_update = true;
+        vibrator_pulse(55);
 
         // 3/4 beat = 370ms (37 × 10ms ticks — FreeRTOS at 100Hz, 1 tick = 10ms)
         for (int i = 0; i < 37 && disco_mode_active; i++)
@@ -41920,7 +41921,7 @@ static void s_zgwd_task_fn(void *arg)
         s_zgwd_tx_sem = xSemaphoreCreateBinary();
 
     // Quiesce WS2812 RMT channel before 802.15.4 enable (which calls rmt_tx_wait_all_done)
-    if (g_led_strip) { led_strip_clear(g_led_strip); vTaskDelay(pdMS_TO_TICKS(5)); }
+    if (g_led_strip) { led_strip_clear(g_led_strip); vTaskDelay(pdMS_TO_TICKS(100)); }
 
     if (esp_ieee802154_enable() != ESP_OK) {
         ESP_LOGE(TAG, "[ZGWD] 802.15.4 enable failed");
@@ -42394,7 +42395,7 @@ static void s_zgwd_disassoc_task_fn(void *arg)
 
     if (!s_zgwd_tx_sem) s_zgwd_tx_sem = xSemaphoreCreateBinary();
 
-    if (g_led_strip) { led_strip_clear(g_led_strip); vTaskDelay(pdMS_TO_TICKS(5)); }
+    if (g_led_strip) { led_strip_clear(g_led_strip); vTaskDelay(pdMS_TO_TICKS(100)); }
 
     if (esp_ieee802154_enable() == ESP_OK) {
         esp_ieee802154_set_promiscuous(false);
@@ -42617,7 +42618,7 @@ static void s_zgwd_loc_task_fn(void *arg)
     if (!s_zgwd_rx_q)
         s_zgwd_rx_q = xQueueCreate(ZGWD_Q_DEPTH, sizeof(zgwd_frame_msg_t));
 
-    if (g_led_strip) { led_strip_clear(g_led_strip); vTaskDelay(pdMS_TO_TICKS(5)); }
+    if (g_led_strip) { led_strip_clear(g_led_strip); vTaskDelay(pdMS_TO_TICKS(100)); }
 
     if (esp_ieee802154_enable() != ESP_OK) {
         ESP_LOGE(TAG, "[LOC] 802.15.4 enable failed");
