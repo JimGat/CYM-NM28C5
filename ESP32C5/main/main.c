@@ -21224,7 +21224,8 @@ static const sd_provision_item_t SD_ITEMS[] = {
     { SD_ITEM_DIR,  "/sdcard/lab/alerts",                    NULL },
     { SD_ITEM_DIR,  "/sdcard/lab/config",                    NULL },
     { SD_ITEM_DIR,  "/sdcard/lab/bluetooth",                 NULL },
-    { SD_ITEM_DIR,  "/sdcard/lab/gattwalker",                 NULL },  /* GATT Walker JSON output */
+    { SD_ITEM_DIR,  "/sdcard/lab/bluetooth/scans",           NULL },  /* BT Scan & Select btsc_*.json snapshots */
+    { SD_ITEM_DIR,  "/sdcard/lab/gattwalker",                NULL },  /* GATT Walker JSON output */
     { SD_ITEM_DIR,  "/sdcard/lab/screenshots",               NULL },  /* screenshot capture */
     { SD_ITEM_DIR,  "/sdcard/lab/dronedetect",               NULL },  /* Drone Detector logs */
     { SD_ITEM_DIR,  "/sdcard/lab/ble",                       NULL },  /* BLE subsystem root */
@@ -21235,7 +21236,10 @@ static const sd_provision_item_t SD_ITEMS[] = {
     { SD_ITEM_DIR,  "/sdcard/lab/ble/whisperpair",           NULL },  /* WhisperPair logs */
     { SD_ITEM_DIR,  "/sdcard/lab/infrared",                  NULL },  /* IR HAT remotes (Flipper .ir format) */
     { SD_ITEM_DIR,  "/sdcard/lab/rf433",                     NULL },  /* RF433 HAT captures (Flipper .sub format) */
-    { SD_ITEM_DIR,  "/sdcard/lab/radio",                     NULL },  /* CC1101 / nRF24 captures */
+    { SD_ITEM_DIR,  "/sdcard/lab/radio",                     NULL },  /* CC1101 captures (Flipper .sub) */
+    { SD_ITEM_DIR,  "/sdcard/lab/nrf24",                     NULL },  /* nRF24L01 sniffer captures */
+    { SD_ITEM_DIR,  "/sdcard/lab/zigbee",                    NULL },  /* Zigbee Scout wardrive CSV + PCAP */
+    { SD_ITEM_DIR,  "/sdcard/lab/zwave",                     NULL },  /* Z-Wave Scout capture CSV */
     { SD_ITEM_DIR,  "/sdcard/lab/rfid",                      NULL },  /* RFID/NFC card dumps */
     /* ── Seed files (written only on creation; never overwrite existing) ── */
     { SD_ITEM_FILE, "/sdcard/lab/white.txt",                 "" },
@@ -21261,6 +21265,11 @@ static const sd_provision_item_t SD_ITEMS[] = {
       "band_downgrade_alert=true\nunknown_tower_alert=true\n"
       "ble_unknown_device_alert=false\nwifi_unknown_oui_alert=false\n" },
     { SD_ITEM_FILE, "/sdcard/lab/bluetooth/lookout.csv",     BT_LOOKOUT_CSV_HEADER },
+    { SD_ITEM_FILE, "/sdcard/lab/bluetooth/blacklist.csv",   "mac,name,oui_only\n" },
+    { SD_ITEM_FILE, "/sdcard/lab/wigle.txt",
+      "# Paste your WiGLE API key on the next line\n" },
+    { SD_ITEM_FILE, "/sdcard/lab/wdgwars.txt",
+      "# Paste your WDG Wars API key on the next line\n" },
     { SD_ITEM_FILE, "/sdcard/lab/htmls/basic_portal.html",  SEED_PORTAL_HTML },
     { SD_ITEM_FILE, "/sdcard/lab/ble/blueduck/scripts/android_rickroll.duck", SEED_RICKROLL_DUCK },
 };
