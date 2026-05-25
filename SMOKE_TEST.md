@@ -94,8 +94,39 @@ item P (pass), F (fail), or S (skip — feature not reachable in this session).
 
 | # | Check | Result |
 |---|-------|--------|
-| 8.1 | CC1101 menu opens without error | |
-| 8.2 | Spectrum scan runs and shows activity | |
+| 8.1 | CC1101 menu opens; 2-page tile layout renders correctly | |
+| 8.2 | HW Test: STATUS shows valid (not 0x00 or 0xFF); PARTNUM=0x00; VERSION=0x14 | |
+| 8.3 | Freq Scan: canvas renders; spectrum bars appear; active-channel count > 0 | |
+| 8.4 | RAW Capture: 10 s window; Save prompt appears; file saved to /sdcard/lab/radio/ | |
+| 8.5 | Saved Files: .sub file from 8.4 appears in list; Play executes without error | |
+| 8.6 | Band Scope: spectrum + waterfall canvas update continuously without crash | |
+| 8.7 | Jammer: disclaimer screen appears; Back returns cleanly without activating | |
+
+---
+
+## 8b. PN532 NFC/RFID (NM-RF-HAT, DIP 3)
+
+| # | Check | Result |
+|---|-------|--------|
+| 8b.1 | RFID menu opens; Scan screen shows "Ready - hold card near antenna" | |
+| 8b.2 | Tap Scan and hold an NFC card: UID, ATQA, SAK, type appear on screen | |
+| 8b.3 | Tap Save; name popup appears; card saves to /sdcard/lab/rfid/hf/ | |
+| 8b.4 | Export .nfc: file appears in /sdcard/lab/rfid/export/ | |
+| 8b.5 | Saved Cards: saved card appears in list; Load restores card data | |
+| 8b.6 | Emulate: selecting a saved card and tapping Emulate runs without crash | |
+
+---
+
+## 8c. nRF24L01+ 2.4 GHz (NM-RF-HAT, DIP 2)
+
+| # | Check | Result |
+|---|-------|--------|
+| 8c.1 | nRF24 menu opens; 2-page tile layout renders correctly | |
+| 8c.2 | HW Test: STATUS shows valid (not 0x00 or 0xFF); registers read without error | |
+| 8c.3 | Ch Scan: canvas renders; spectrum + waterfall update; active-channel count shown | |
+| 8c.4 | Sniffer: starts without crash; status updates; stop returns cleanly | |
+| 8c.5 | Jammer: disclaimer screen appears; Back returns cleanly without activating | |
+| 8c.6 | Futaba S-FHSS: scan starts; result displayed (or "not found" after timeout) | |
 
 ---
 
@@ -155,6 +186,7 @@ item P (pass), F (fail), or S (skip — feature not reachable in this session).
 - **Battery level** — ADC disabled; shows nothing. Not a failure.
 - **DIP-exclusive HAT modules** — only one of IR/RF433/CC1101/nRF24/PN532 can be
   active at a time (hardware power exclusion). Test only the one with DIP on.
+- **nRF24 stub screens** (MouseJack, Kb Inject, Drone, GamePad) — show Coming Soon screens; no RF functionality yet.
 
 ---
 

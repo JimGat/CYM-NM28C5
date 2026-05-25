@@ -5,7 +5,7 @@
 <h1 align="center">Cheap Yellow Monster</h1>
 
 <p align="center">
-  <b>v1.6.54</b>
+  <b>v1.8.85</b>
 </p>
 
 <p align="center">
@@ -110,7 +110,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **Credentials** | Captive portal credential capture, WPA-SEC upload |
 | **TX Power Mode** | Selectable Normal / Max Power for WiFi and BLE — persisted across reboots |
 | **Data Transfer** | Self-hosted AP file server (TheLab) and WiFi client file server — browse, upload, create directories, and recursively delete folders from any browser; client IP logged to serial; IP shown on screen |
-| **NM-RF-HAT** | Hardware addon board for RF expansion — IR capture/replay/Universal Remote/TV-B-Gone (Flipper-compatible .ir format), RF433 OOK (Flipper-compatible .sub format), Sub-GHz CC1101, 2.4 GHz nRF24L01, NFC/RFID PN532; DIP switch per module |
+| **NM-RF-HAT** | Hardware addon board for RF expansion -- IR capture/replay/Universal Remote/TV-B-Gone (Flipper .ir format); RF433 OOK capture/replay (Flipper .sub format); CC1101 Sub-GHz: Freq Scan/RAW Capture+Replay/Band Scope/Jammer (Flipper .sub); nRF24L01+ 2.4 GHz: Ch Scan/Sniffer/Jammer/Futaba S-FHSS (Flipper .nrf24); PN532 NFC/RFID: scan/save/emulate/.nfc import+export (Flipper .nfc); DIP switch per module |
 | **UI** | Material dark theme, touch gestures, screen dimming, screenshots — all screens portrait 240×320 |
 | **Storage** | SD card for handshakes, wardrive logs, GATT Walker JSON, screenshots, file tree browser |
 
@@ -1504,9 +1504,7 @@ Uploads all wardrive CSV files from `/sdcard/lab/wardrives/` to [WiGLE](https://
 
 ### 5. NM-RF-HAT
 
-The **NM-RF-HAT** is an optional RF expansion board that connects to the NM-CYD-C5 via its FPC2 header. It provides five RF modules gated by a 6-position DIP switch — only one module is powered at a time (hardware exclusion). Enable support via **Settings → NM-RF-HAT**.
-
-> **Status:** Active development — IR is functional; RF433, CC1101, nRF24, and PN532 modules are in progress.
+The **NM-RF-HAT** is an optional RF expansion board that connects to the NM-CYD-C5 via its FPC2 header. It provides five RF modules gated by a 6-position DIP switch -- only one module is powered at a time (hardware exclusion). Enable support via **Settings → NM-RF-HAT**.
 
 #### Modules
 
@@ -1617,23 +1615,58 @@ Copy any `.ir` file directly into `/sdcard/lab/infrared/` — no conversion need
 - Flipper Zero Sub-GHz library: https://github.com/flipperdevices/flipperzero-firmware/tree/dev/assets/subghz
 - UberGuidoZ collection: https://github.com/UberGuidoZ/Flipper/tree/main/Sub-GHz
 
-> **Status:** RF433 capture/replay UI in development.
-
 #### PN532 NFC/RFID (DIP 3)
 
-13.56 MHz NFC/RFID card reading and emulation via I2C.
+13.56 MHz NFC/RFID card scanning, saving, exporting, importing, and emulation via I2C (GPIO8=SCL, GPIO9=SDA). Supports ISO14443A cards: NTAG213/215/216, MIFARE Ultralight, MIFARE Classic.
 
-**SD card path:** `/sdcard/lab/rfid/`
+**SD card paths:**
+- `/sdcard/lab/rfid/hf/` -- saved card JSON files
+- `/sdcard/lab/rfid/import/` -- drop Flipper Zero `.nfc` files here to import
+- `/sdcard/lab/rfid/export/` -- Flipper Zero `.nfc` exports written here
+- `/sdcard/lab/rfid/keys/` -- reserved for future key files
+- `/sdcard/lab/rfid/logs/` -- reserved for scan logs
 
-> **Status:** PN532 driver integration in development.
+**Workflow:**
+- **Card Scan:** tap Scan and hold a card near the antenna; UID, ATQA, SAK, and inferred card type appear on screen.
+- **Save:** tap Save; a name popup appears; card is saved as JSON to `/sdcard/lab/rfid/hf/`.
+- **Export .nfc:** tap Export to write a Flipper Zero `.nfc` format file to `/sdcard/lab/rfid/export/`.
+- **Import .nfc:** drop Flipper Zero `.nfc` files in `/sdcard/lab/rfid/import/`; they appear in the Saved Cards list alongside locally scanned cards.
+- **Card Emulate:** select a saved card from the Saved Cards list and tap Emulate; the PN532 presents the card's UID to any reader via `TgInitAsTarget`. Works for UID-only readers. MIFARE Classic authentication (CRYPTO1) is not emulated -- readers that require full auth will not complete the handshake.
+- **Saved Cards:** scrollable list with Load, Emulate, and Delete per card.
 
-#### CC1101 Sub-GHz (DIP 1) / nRF24L01 2.4 GHz (DIP 2)
+> **Note:** The PN532 module on the NM-RF-HAT has shorter read range than a dedicated PN532 breakout board. Hold cards very close -- nearly touching the antenna -- for reliable reads. This is a hardware limitation of the RF-HAT form factor, not a firmware issue.
 
-Raw packet capture and replay for licensed and ISM band signals.
+#### CC1101 Sub-GHz (DIP 1)
 
-**SD card path:** `/sdcard/lab/radio/`
+Sub-1 GHz (300-928 MHz) OOK/ASK capture, replay, spectrum scan, and jamming. Uses a 2-page paged tile menu (prev/next navigation with page indicator).
 
-> **Status:** CC1101 and nRF24 drivers in development.
+**SD card path:** `/sdcard/lab/radio/` -- Flipper Zero `.sub` format
+
+**Features:**
+- **HW Test:** reads CC1101 PARTNUM (0x00) and VERSION (0x14) registers; shows MARCSTATE to confirm chip identity and SPI link.
+- **Freq Scan:** canvas-based spectrum view; RSSI bar per channel across the full 300-928 MHz tunable range; carrier detect; Start/Stop control.
+- **RAW Capture:** 10-second OOK/ASK signal capture window; Save/Discard prompt after capture; saves to `/sdcard/lab/radio/` as Flipper Zero `.sub` format.
+- **RAW Replay:** lists `.sub` files from SD; play at 1x/3x/5x speed.
+- **Saved Files:** list with Play and Delete per file.
+- **Jammer:** legal disclaimer screen required before activation; sweeps channels in PTX mode.
+- **Band Scope:** 126-point spectrum + 8-row scrolling waterfall canvas; 130 us dwell per channel; continuous sweep; live active-channel count.
+
+#### nRF24L01+ 2.4 GHz (DIP 2)
+
+2.4 GHz channel scan, packet sniffing, and jamming. Uses a 2-page paged tile menu (same pattern as CC1101).
+
+**SD card path:** `/sdcard/lab/nrf24/` -- Flipper-compatible `.nrf24` text format
+
+**Features:**
+- **HW Test:** reads STATUS, CONFIG, RF_CH, and RF_SETUP registers over SPI; confirms chip is responding.
+- **Ch Scan:** 126-channel carrier-detect sweep (2400-2525 MHz); canvas shows spectrum bar + 8-row waterfall; Start/Stop; live active-channel count.
+- **Sniffer:** promiscuous RX on configurable channel; captures packets; hex dump of last packet; auto-saves to `/sdcard/lab/nrf24/` in Flipper-compatible `.nrf24` text format.
+- **Saved Files:** lists `.nrf24` files with Play and Delete per entry.
+- **Jammer:** legal disclaimer required; rapid PTX channel sweep across all 126 channels.
+- **Futaba S-FHSS:** scans 25 S-FHSS channels (2404-2504 MHz, 4 MHz steps) at 1 Mbps; decodes 10-byte payload; extracts up to 8 servo channel values (11-bit, 0-2047); displays result on screen.
+- **Stub screens** (with authorization disclaimers): MouseJack, Keyboard Inject, Drone, GamePad -- Coming Soon.
+
+**nRF24 component:** `ESP32C5/components/nrf24/` (nrf24.c, nrf24.h, CMakeLists.txt)
 
 ---
 
@@ -1723,10 +1756,21 @@ All data is stored on the SD card. `/sdcard/lab/` is the root for all project da
     │   └── <Remote>.ir       # One file per remote — multiple named signals per file
     ├── pcaps/                # MITM/sniff PCAP captures
     │   └── mitm_<n>.pcap
-    ├── radio/                # NM-RF-HAT CC1101 / nRF24L01 captures
+    ├── nrf24/                # NM-RF-HAT nRF24L01+ captures (Flipper-compatible .nrf24 format)
+    │   └── <capture>.nrf24
+    ├── radio/                # NM-RF-HAT CC1101 captures (Flipper .sub format)
+    │   └── <freq>MHz_<ts>.sub
     ├── rf433/                # NM-RF-HAT RF433 OOK captures (Flipper Zero .sub format)
     │   └── <Signal>.sub
-    ├── rfid/                 # NM-RF-HAT NFC/RFID card dumps (PN532)
+    ├── rfid/                 # NM-RF-HAT NFC/RFID (PN532)
+    │   ├── hf/               # 13.56 MHz card saves (JSON)
+    │   │   └── <name>.json
+    │   ├── import/           # Drop Flipper .nfc files here to import
+    │   │   └── *.nfc
+    │   ├── export/           # Flipper .nfc exports
+    │   │   └── *.nfc
+    │   ├── keys/             # (reserved)
+    │   └── logs/             # (reserved)
     ├── screenshots/          # UI screenshots (BMP)
     │   └── screen_<n>.bmp
     └── wardrives/            # GPS + WiFi wardrive logs (WiGLE CSV 1.6 format)
@@ -1919,6 +1963,8 @@ CYM-NM28C5/
 │   │   ├── pcap_serializer/      # PCAP file writer (Wireshark-compatible)
 │   │   ├── hccapx_serializer/    # HCCAPX file writer (hashcat)
 │   │   ├── led_strip/            # Local WS2812 RMT driver (replaces legacy managed component)
+│   │   ├── rfid/                 # NFC/RFID card management (PN532 I2C driver, Flipper .nfc file I/O, JSON card storage)
+│   │   ├── nrf24/                # nRF24L01+ 2.4 GHz driver (SPI, channel scan, packet sniffer, S-FHSS decoder, Flipper .nrf24 I/O)
 │   │   └── espressif__esp_lcd_ili9341/  # ST7789 LCD panel driver (Espressif component, local copy)
 │   ├── binaries-esp32c5/         # Pre-built flashable binaries (bootloader, partition-table, app)
 │   ├── docs/
@@ -1974,17 +2020,15 @@ This entry will appear in the Launcher OTA favorites list and install the latest
 
 ## On Signal Jamming
 
-> **This project does not and will never include signal jamming or any feature that deliberately denies or disrupts authorized radio communications. This is a firm, non-negotiable design boundary — not a liability footnote.**
+Signal jamming features are included in the NM-RF-HAT menu (CC1101 Sub-GHz jammer, nRF24L01+ 2.4 GHz channel sweep jammer, IR jammer, RF433 jammer) for use in **authorized test environments only** -- for example, a Faraday cage or under a written test authorization from the operator of the frequency band. Every jammer entry point is gated behind an explicit legal disclaimer screen that must be acknowledged before activation.
 
-Signal jamming is categorically different from every other capability in this firmware. Attacks like deauth, evil twin, and BLE spam operate at the protocol layer and can be targeted, scoped, and stopped. Jamming operates at the physical RF layer — it is inherently indiscriminate, cannot be aimed, cannot be recalled, and cannot distinguish a test network from a hospital cardiac monitor or an emergency services radio.
+Jamming operates at the physical RF layer and is inherently indiscriminate. Unlike protocol-layer attacks (deauth, BLE spam), it cannot be targeted, cannot be recalled once transmitting, and cannot distinguish a test device from emergency communications equipment. Use only in an environment where you have complete control over the RF spectrum -- a shielded room, an RF test chamber, or a hardware-isolated test bench. Never operate a jammer in a residential building, vehicle, public space, or any environment with uncontrolled RF exposure.
 
 The [FCC is explicit](https://www.fcc.gov/enforcement/areas/jammers): *"The Communications Act of 1934, as amended, prohibits the operation, manufacture, importation, marketing, and sale of equipment designed to jam or otherwise interfere with authorized radio communications... These jamming devices pose significant risks to public safety and potentially compromise other radio communications services."*
 
 The consequences are equally clear. Per the [FCC Jammer Enforcement](https://www.fcc.gov/general/jammer-enforcement) page: *"Signal jamming devices can prevent you and others from making 9-1-1 and other emergency calls and pose serious risks to public safety communications... The use or marketing of a jammer in the United States may subject you to substantial monetary penalties, seizure of the unlawful equipment, and criminal sanctions including imprisonment."*
 
-This is not a uniquely American position. Every jurisdiction with a radio communications law — which is effectively every country on Earth — treats jamming as a serious criminal offense precisely because the harm is real and uncontrollable.
-
-The security research community does itself no favors when it conflates "security tool" with "RF jammer." If you are looking for jamming firmware, this is not it, and no future version of this project will be.
+This is not a uniquely American position. Every jurisdiction with a radio communications law -- which is effectively every country on Earth -- treats jamming as a serious criminal offense precisely because the harm is real and uncontrollable. The disclaimer screens exist to make the legal exposure clear; they do not make operation legal outside an authorized environment.
 
 ---
 
