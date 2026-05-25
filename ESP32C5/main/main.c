@@ -41999,7 +41999,7 @@ static void s_zgwd_task_fn(void *arg)
                     }
                 }
 
-                if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5));
+                bool sd_got = sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, portMAX_DELAY) == pdTRUE;
                 if (csv) {
                     fprintf(csv, "%llu,%u,0x%04X,%d,%u,%u,%u,%llu,%u\n",
                             (unsigned long long)ts, ch, (unsigned)pan,
@@ -42009,15 +42009,15 @@ static void s_zgwd_task_fn(void *arg)
                             (unsigned)parsed.stack_profile);
                 }
                 if (pcap) s_zgwd_pcap_write_frame(pcap, &msg, ts);
-                if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+                if (sd_got) xSemaphoreGive(sd_spi_mutex);
             }
         }
 
         if ((ch_idx & 0x0F) == 0x0F) {
-            if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(10));
+            bool sd_fl = sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, portMAX_DELAY) == pdTRUE;
             if (csv)  fflush(csv);
             if (pcap) fflush(pcap);
-            if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+            if (sd_fl) xSemaphoreGive(sd_spi_mutex);
         }
 
         ch_idx = (ch_idx + 1) % num_ch;
