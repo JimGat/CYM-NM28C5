@@ -41919,6 +41919,9 @@ static void s_zgwd_task_fn(void *arg)
     if (!s_zgwd_tx_sem)
         s_zgwd_tx_sem = xSemaphoreCreateBinary();
 
+    // Quiesce WS2812 RMT channel before 802.15.4 enable (which calls rmt_tx_wait_all_done)
+    if (g_led_strip) { led_strip_clear(g_led_strip); vTaskDelay(pdMS_TO_TICKS(5)); }
+
     if (esp_ieee802154_enable() != ESP_OK) {
         ESP_LOGE(TAG, "[ZGWD] 802.15.4 enable failed");
         goto zgwd_done;
@@ -42391,6 +42394,8 @@ static void s_zgwd_disassoc_task_fn(void *arg)
 
     if (!s_zgwd_tx_sem) s_zgwd_tx_sem = xSemaphoreCreateBinary();
 
+    if (g_led_strip) { led_strip_clear(g_led_strip); vTaskDelay(pdMS_TO_TICKS(5)); }
+
     if (esp_ieee802154_enable() == ESP_OK) {
         esp_ieee802154_set_promiscuous(false);
         esp_ieee802154_set_coordinator(false);
@@ -42611,6 +42616,8 @@ static void s_zgwd_loc_task_fn(void *arg)
 
     if (!s_zgwd_rx_q)
         s_zgwd_rx_q = xQueueCreate(ZGWD_Q_DEPTH, sizeof(zgwd_frame_msg_t));
+
+    if (g_led_strip) { led_strip_clear(g_led_strip); vTaskDelay(pdMS_TO_TICKS(5)); }
 
     if (esp_ieee802154_enable() != ESP_OK) {
         ESP_LOGE(TAG, "[LOC] 802.15.4 enable failed");
