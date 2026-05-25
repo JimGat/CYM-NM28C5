@@ -1665,10 +1665,12 @@ typedef struct {
     lv_obj_t    *rssi_lbl;
     lv_obj_t    *pan_lbl;
     lv_timer_t  *tmr;
+    TaskHandle_t task;
     int          pan_idx;
-    int8_t       last_rssi;
+    volatile int8_t last_rssi;
+    volatile bool   got_rssi;
     uint8_t      channel;
-    bool         running;
+    volatile bool running;
 } zgwd_loc_ctx_t;
 
 // Association flood sub-context
@@ -1689,6 +1691,8 @@ EXT_RAM_BSS_ATTR static zgwd_flood_ctx_t *s_zgwd_fld = NULL;
 static QueueHandle_t  s_zgwd_rx_q  = NULL;
 static SemaphoreHandle_t s_zgwd_tx_sem = NULL;
 static uint8_t s_zgwd_seq = 0;   // rolling MAC sequence number
+static lv_obj_t *s_zgwd_da_lbl = NULL;  // disassoc result label on PAN detail screen
+static volatile int s_zgwd_da_result = 0; // -1=running, 0=idle, N=sent N frames
 
 // AirTag Scanner state
 static TaskHandle_t airtag_scan_task_handle = NULL;
@@ -2213,8 +2217,10 @@ static void reset_function_page_children(void) {
     if (s_zgwd_loc) {
         s_zgwd_loc->running = false;
         if (s_zgwd_loc->tmr) { lv_timer_del(s_zgwd_loc->tmr); s_zgwd_loc->tmr = NULL; }
-        heap_caps_free(s_zgwd_loc); s_zgwd_loc = NULL;
+        s_zgwd_loc->rssi_bar = NULL; s_zgwd_loc->rssi_lbl = NULL; s_zgwd_loc->pan_lbl = NULL;
+        if (!s_zgwd_loc->task) { heap_caps_free(s_zgwd_loc); s_zgwd_loc = NULL; }
     }
+    s_zgwd_da_lbl = NULL; s_zgwd_da_result = 0;
     if (s_zgwd_fld) {
         s_zgwd_fld->cancel = true;
         if (s_zgwd_fld->tmr) { lv_timer_del(s_zgwd_fld->tmr); s_zgwd_fld->tmr = NULL; }
@@ -42334,33 +42340,83 @@ static void show_zigbee_wardrive_screen(void)
 }
 
 // ── PAN detail screen ─────────────────────────────────────────────────────────
-static void s_zgwd_detail_back_cb(lv_event_t *e) { (void)e; show_main_tiles(); }
+static void s_zgwd_da_poll_timer_cb(lv_timer_t *t)
+{
+    int r = s_zgwd_da_result;
+    if (r == -1 || r == 0) return;  // still running or idle
+    lv_timer_del(t);
+    if (!s_zgwd_da_lbl || !lv_obj_is_valid(s_zgwd_da_lbl)) { s_zgwd_da_result = 0; return; }
+    char buf[56];
+    if (r > 0)
+        snprintf(buf, sizeof(buf), "Sent disassoc to %d device(s)", r);
+    else
+        snprintf(buf, sizeof(buf), "Radio enable failed");
+    lv_label_set_text(s_zgwd_da_lbl, buf);
+    lv_obj_set_style_text_color(s_zgwd_da_lbl,
+        r > 0 ? lv_color_hex(0x66BB6A) : lv_color_hex(0xEF5350), 0);
+    s_zgwd_da_result = 0;
+}
+
+static void s_zgwd_detail_back_cb(lv_event_t *e) { (void)e; show_zigbee_wardrive_screen(); }
+
+// Disassoc task — stop WiFi, enable 802.15.4, send, disable, restart WiFi
+static void s_zgwd_disassoc_task_fn(void *arg)
+{
+    zgwd_pan_entry_t *pe = (zgwd_pan_entry_t *)arg;
+    int sent = 0;
+
+    if (current_radio_mode == RADIO_MODE_WIFI) {
+        esp_wifi_set_promiscuous(false);
+        esp_wifi_stop(); esp_wifi_deinit();
+        wifi_initialized = false;
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+
+    if (!s_zgwd_tx_sem) s_zgwd_tx_sem = xSemaphoreCreateBinary();
+
+    if (esp_ieee802154_enable() == ESP_OK) {
+        esp_ieee802154_set_promiscuous(false);
+        esp_ieee802154_set_coordinator(false);
+        esp_ieee802154_set_panid(pe->pan_id);
+        esp_ieee802154_set_short_address(0x0000);  // spoof coordinator
+        esp_ieee802154_set_channel(pe->channel);
+        for (int i = 0; i < pe->device_count; i++) {
+            for (int r = 0; r < 3; r++) {
+                s_zgwd_send_disassoc(pe->pan_id, pe->devices[i]);
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+            sent++;
+            ESP_LOGI(TAG, "[ZGWD] Disassoc sent to 0x%04X on PAN 0x%04X",
+                     pe->devices[i], pe->pan_id);
+        }
+        esp_ieee802154_sleep();
+        esp_ieee802154_disable();
+    }
+
+    ensure_wifi_mode();
+    apply_wifi_power_settings();
+    s_zgwd_da_result = (sent > 0) ? sent : -2;  // -2 = enable failed
+    vTaskDelete(NULL);
+}
 
 static void s_zgwd_disassoc_all_cb(lv_event_t *e)
 {
     (void)e;
     zgwd_pan_entry_t *pe = &s_zgwd_sel_pan;
-    if (!s_zgwd_tx_sem) s_zgwd_tx_sem = xSemaphoreCreateBinary();
-    // Radio must already be enabled from the scout session; if not, just log
-    if (pe->device_count == 0) {
-        ESP_LOGW(TAG, "[ZGWD] No devices to disassoc");
-        return;
-    }
-    // Set channel to target PAN's channel
-    esp_ieee802154_set_channel(pe->channel);
-    esp_ieee802154_set_panid(pe->pan_id);
-    esp_ieee802154_set_short_address(0x0000); // spoof coordinator address
-    for (int i = 0; i < pe->device_count; i++) {
-        for (int r = 0; r < 3; r++) {   // 3 retries per device
-            s_zgwd_send_disassoc(pe->pan_id, pe->devices[i]);
-            vTaskDelay(pdMS_TO_TICKS(50));
+    if (s_zgwd_da_lbl) {
+        if (pe->device_count == 0) {
+            lv_label_set_text(s_zgwd_da_lbl, "No tracked devices (need data traffic)");
+            lv_obj_set_style_text_color(s_zgwd_da_lbl, lv_color_hex(0xFF8F00), 0);
+            return;
         }
-        ESP_LOGI(TAG, "[ZGWD] Disassoc sent to 0x%04X on PAN 0x%04X",
-                 pe->devices[i], pe->pan_id);
+        lv_label_set_text(s_zgwd_da_lbl, "Sending disassoc frames...");
+        lv_obj_set_style_text_color(s_zgwd_da_lbl, lv_color_hex(0x42A5F5), 0);
     }
-    // Restore
-    esp_ieee802154_set_panid(0xFFFF);
-    esp_ieee802154_set_short_address(0xFFFE);
+    s_zgwd_da_result = -1;
+    // Run in task — we need to stop WiFi which blocks
+    static zgwd_pan_entry_t da_pan_copy;
+    da_pan_copy = *pe;
+    xTaskCreate(s_zgwd_disassoc_task_fn, "zgwd_da", 3072, &da_pan_copy, 2, NULL);
 }
 
 static void s_zgwd_go_locate_cb(lv_event_t *e) { (void)e; show_zgwd_locator(0); }
@@ -42429,6 +42485,16 @@ static void show_zgwd_pan_detail(int pan_idx)
         lv_color_hex(0x1565C0), LV_ALIGN_TOP_LEFT, 8, y, btn_w, 30);
     lv_obj_add_event_cb(loc_btn, s_zgwd_go_locate_cb, LV_EVENT_CLICKED, NULL);
 
+    // Disassoc result label (appears below action row)
+    s_zgwd_da_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_zgwd_da_lbl, pe->device_count == 0 ?
+        "No devices tracked (active scan finds more)" : "");
+    lv_obj_set_style_text_font(s_zgwd_da_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_zgwd_da_lbl, lv_color_hex(0x78909C), 0);
+    lv_label_set_long_mode(s_zgwd_da_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_zgwd_da_lbl, LCD_H_RES - 16);
+    lv_obj_align(s_zgwd_da_lbl, LV_ALIGN_TOP_LEFT, 8, y + 36);
+
     lv_obj_t *da_btn = s_zgwd_make_btn(function_page, LV_SYMBOL_WARNING " Disassoc",
         lv_color_hex(0xB71C1C), LV_ALIGN_TOP_MID, 0, y, btn_w, 30);
     lv_obj_add_event_cb(da_btn, s_zgwd_disassoc_all_cb, LV_EVENT_CLICKED, NULL);
@@ -42452,45 +42518,80 @@ static void show_zgwd_pan_detail(int pan_idx)
     lv_obj_set_style_text_color(blbl, ui_text_color(), 0);
     lv_obj_center(blbl);
     lv_obj_add_event_cb(back, s_zgwd_detail_back_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_timer_create(s_zgwd_da_poll_timer_cb, 300, NULL);
 }
 
 // ── RSSI Locator screen ───────────────────────────────────────────────────────
+// Locator task: stop WiFi → enable 802.15.4 → park on channel → receive loop
+// When cancelled: sleep → disable → restart WiFi → task=NULL
+static void s_zgwd_loc_task_fn(void *arg)
+{
+    zgwd_loc_ctx_t *loc = (zgwd_loc_ctx_t *)arg;
+
+    if (current_radio_mode == RADIO_MODE_WIFI) {
+        esp_wifi_set_promiscuous(false);
+        esp_wifi_stop(); esp_wifi_deinit();
+        wifi_initialized = false;
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+
+    if (!s_zgwd_rx_q)
+        s_zgwd_rx_q = xQueueCreate(ZGWD_Q_DEPTH, sizeof(zgwd_frame_msg_t));
+
+    if (esp_ieee802154_enable() != ESP_OK) {
+        ESP_LOGE(TAG, "[LOC] 802.15.4 enable failed");
+        goto loc_done;
+    }
+    esp_ieee802154_set_promiscuous(true);
+    esp_ieee802154_set_panid(0xFFFF);
+    esp_ieee802154_set_short_address(0xFFFE);
+    esp_ieee802154_set_channel(loc->channel);
+    esp_ieee802154_receive();
+
+    while (loc->running) {
+        zgwd_frame_msg_t msg;
+        if (xQueueReceive(s_zgwd_rx_q, &msg, pdMS_TO_TICKS(100)) == pdTRUE) {
+            loc->last_rssi = msg.rssi;
+            loc->got_rssi  = true;
+        }
+    }
+
+    esp_ieee802154_sleep();
+    esp_ieee802154_disable();
+
+loc_done:
+    ensure_wifi_mode();
+    apply_wifi_power_settings();
+    loc->task = NULL;
+    vTaskDelete(NULL);
+}
+
 static void s_zgwd_loc_timer_cb(lv_timer_t *t)
 {
     (void)t;
     zgwd_loc_ctx_t *loc = s_zgwd_loc;
-    if (!loc || !loc->running) return;
-
-    // Drain queue, accept frames from locator's channel
-    zgwd_frame_msg_t msg;
-    bool got = false;
-    while (s_zgwd_rx_q && xQueueReceive(s_zgwd_rx_q, &msg, 0) == pdTRUE) {
-        if (msg.channel == loc->channel) {
-            loc->last_rssi = msg.rssi;
-            got = true;
-        }
-    }
+    if (!loc) return;
 
     if (loc->rssi_lbl) {
         char buf[32];
-        if (got || loc->last_rssi != 0)
+        if (loc->got_rssi)
             snprintf(buf, sizeof(buf), "RSSI: %d dBm", (int)loc->last_rssi);
         else
-            snprintf(buf, sizeof(buf), "Waiting...");
+            snprintf(buf, sizeof(buf), "Waiting for signal...");
         lv_label_set_text(loc->rssi_lbl, buf);
     }
 
-    if (loc->rssi_bar && (got || loc->last_rssi != 0)) {
-        // Map -90..-40 dBm → 0..100
-        int pct = (int)(loc->last_rssi + 90) * 100 / 50;
-        if (pct < 0) pct = 0;
-        if (pct > 100) pct = 100;
-        lv_bar_set_value(loc->rssi_bar, pct, LV_ANIM_ON);
-
-        // Vibration: silent below -75 dBm
+    if (loc->got_rssi) {
+        if (loc->rssi_bar) {
+            int pct = (int)(loc->last_rssi + 90) * 100 / 50;
+            if (pct < 0) pct = 0;
+            if (pct > 100) pct = 100;
+            lv_bar_set_value(loc->rssi_bar, pct, LV_ANIM_ON);
+        }
         if (loc->last_rssi > -75) {
             int vpct = 10 + (loc->last_rssi + 75) * 90 / 35;
-            if (vpct < 10)  vpct = 10;
+            if (vpct < 10) vpct = 10;
             if (vpct > 100) vpct = 100;
             g_vibtest_strength_pct = vpct;
             vibrator_pulse(80);
@@ -42501,16 +42602,16 @@ static void s_zgwd_loc_timer_cb(lv_timer_t *t)
 static void s_zgwd_loc_back_cb(lv_event_t *e)
 {
     (void)e;
+    vibrator_off();
+    g_vibtest_strength_pct = 100;
     if (s_zgwd_loc) {
         s_zgwd_loc->running = false;
         if (s_zgwd_loc->tmr) { lv_timer_del(s_zgwd_loc->tmr); s_zgwd_loc->tmr = NULL; }
-        heap_caps_free(s_zgwd_loc);
-        s_zgwd_loc = NULL;
+        s_zgwd_loc->rssi_bar = NULL; s_zgwd_loc->rssi_lbl = NULL; s_zgwd_loc->pan_lbl = NULL;
+        // Don't free yet — task still calls disable/wifi-restart then sets task=NULL
+        // reset_function_page_children (via show_zigbee_wardrive_screen) will free it
     }
-    vibrator_off();
-    g_vibtest_strength_pct = 100;
-    esp_ieee802154_sleep();
-    show_main_tiles();
+    show_zigbee_wardrive_screen();
 }
 
 static void show_zgwd_locator(int pan_idx)
@@ -42527,7 +42628,6 @@ static void show_zgwd_locator(int pan_idx)
     s_zgwd_loc = loc;
     apply_menu_bg();
 
-    // PAN label
     char buf[40];
     snprintf(buf, sizeof(buf), "PAN 0x%04X  Ch %u", pe->pan_id, pe->channel);
     loc->pan_lbl = lv_label_create(function_page);
@@ -42536,7 +42636,6 @@ static void show_zgwd_locator(int pan_idx)
     lv_obj_set_style_text_color(loc->pan_lbl, lv_color_hex(0x4DB6AC), 0);
     lv_obj_align(loc->pan_lbl, LV_ALIGN_TOP_MID, 0, 35);
 
-    // RSSI bar
     loc->rssi_bar = lv_bar_create(function_page);
     lv_obj_set_size(loc->rssi_bar, LCD_H_RES - 32, 24);
     lv_obj_align(loc->rssi_bar, LV_ALIGN_CENTER, 0, -20);
@@ -42546,9 +42645,8 @@ static void show_zgwd_locator(int pan_idx)
     lv_obj_set_style_bg_color(loc->rssi_bar, lv_color_hex(0x333333), 0);
     lv_obj_set_style_radius(loc->rssi_bar, 4, 0);
 
-    // RSSI text
     loc->rssi_lbl = lv_label_create(function_page);
-    lv_label_set_text(loc->rssi_lbl, "Waiting...");
+    lv_label_set_text(loc->rssi_lbl, "Starting up...");
     lv_obj_set_style_text_font(loc->rssi_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(loc->rssi_lbl, lv_color_hex(0xFFFFFF), 0);
     lv_obj_align(loc->rssi_lbl, LV_ALIGN_CENTER, 0, 20);
@@ -42561,7 +42659,6 @@ static void show_zgwd_locator(int pan_idx)
     lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(hint, LCD_H_RES - 20);
 
-    // Back button
     lv_obj_t *back = lv_btn_create(function_page);
     lv_obj_set_size(back, LCD_H_RES - 16, 30);
     lv_obj_align(back, LV_ALIGN_BOTTOM_MID, 0, -4);
@@ -42576,15 +42673,9 @@ static void show_zgwd_locator(int pan_idx)
     lv_obj_center(blbl);
     lv_obj_add_event_cb(back, s_zgwd_loc_back_cb, LV_EVENT_CLICKED, NULL);
 
-    // Start listening on this channel
-    if (!s_zgwd_rx_q)
-        s_zgwd_rx_q = xQueueCreate(ZGWD_Q_DEPTH, sizeof(zgwd_frame_msg_t));
-    esp_ieee802154_enable();
-    esp_ieee802154_set_promiscuous(true);
-    esp_ieee802154_set_channel(pe->channel);
-    esp_ieee802154_receive();
-
     loc->tmr = lv_timer_create(s_zgwd_loc_timer_cb, 500, NULL);
+    // Radio enable happens in task (needs WiFi stop first — can't block LVGL task)
+    xTaskCreate(s_zgwd_loc_task_fn, "zgwd_loc", 3072, loc, 2, &loc->task);
 }
 
 // ── Association Flood screen ──────────────────────────────────────────────────
