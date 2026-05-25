@@ -84,6 +84,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
     - [PN532 NFC/RFID (DIP 3)](#pn532-nfcrfid-dip-3)
     - [CC1101 / nRF24L01 (DIP 1 / DIP 2)](#cc1101-sub-ghz-dip-1--nrf24l01-24-ghz-dip-2)
       - [Z-Wave Scout](#z-wave-scout)
+- [3D Printable Cases](#3d-printable-cases)
 - [Data & Storage](#data--storage)
 - [Touch Calibration](#touch-calibration)
 - [Building & Flashing](#building--flashing)
@@ -315,6 +316,49 @@ An ERM (eccentric rotating mass) vibrator motor can be added to the NM-CYD-C5 vi
   <img src="docs/screenshots/Vibrator Installed.jpg" width="480" alt="Vibrator motor installed in device"/>
   <br/><em>Motor installed in device</em>
 </p>
+
+---
+
+## 3D Printable Cases
+
+The community has designed several enclosures for the NM-CYD-C5 with NM-RF-HAT. All three are designed to fit the full stack — board + RF-HAT + GPS module.
+
+> **DIP switch access note:** Two of the cases below enclose the NM-RF-HAT's DIP switches inside the enclosure, requiring you to open or partially disassemble the case to switch between RF modules. If you plan to switch modules frequently, consider relocating the DIP switches to an external position — solder short extension wires to the switch pads and mount a panel-mount DIP switch on the case exterior — before printing your enclosure.
+
+---
+
+### Case 1 — NM-RF-HAT + CYD2USB + ATGM336H + 18650 Battery
+
+**[MakerWorld — Case for NM-RF-HAT / CYD2USB / ATGM336H / 18650](https://makerworld.com/en/models/2670158-case-for-nm-rf-hat-cyd2usb-atgm336h-18650)**
+
+Integrates the NM-CYD-C5, NM-RF-HAT, ATGM336H GPS module, and an 18650 lithium cell in a single enclosure. Designed for fully self-contained field use with onboard battery.
+
+- 18650 cell bay for extended runtime
+- ATGM336H GPS module compartment
+- Note: DIP switches may require case access to switch modules
+
+---
+
+### Case 2 — Magnetic Enclosure (6×2mm Magnets)
+
+**[Printables — CYD NM-RF-HAT Enclosure / Magnetic 6×2mm](https://www.printables.com/model/1638712-cyd-nm-rf-hat-enclosure-case-magnetic-6x2mm-magnet)**
+
+Snap-together enclosure using six 6×2mm embedded magnets for tool-free opening. Good balance between protection and module accessibility.
+
+- Magnetic lid opens without screws or clips
+- Clean exterior with access provisions
+- Note: DIP switches are internal — relocate if switching modules frequently
+
+---
+
+### Case 3 — The Cool One
+
+**[Thingiverse — CYM-NM28C5 Enclosure](https://www.thingiverse.com/thing:7305463)**
+
+Community favorite. Well-proportioned, solid construction, designed specifically for this project's use case.
+
+- Designed with the CYM firmware in mind
+- DIP switches accessible from exterior — no disassembly required to switch modules
 
 ---
 
@@ -1359,7 +1403,9 @@ Settings
 │   └── Brightness      (software brightness overlay 10–100%)
 ├── SD Card             (provision / file tree / free space)
 ├── GPS Info            (live fix status)
-├── Power Mode          (Normal / Max TX power)
+├── Hardware Options    ← hardware addon configuration
+│   ├── Power Mode      (Normal / Max TX power)
+│   └── NM-RF-HAT       (Enable / Disable the RF expansion board)
 └── Data Transfer       (file server sub-menu)
     ├── AP File Server  (start TheLab AP, serve /sdcard/ on 192.168.4.1)
     ├── WiFi Client     (join a saved network, serve /sdcard/ on DHCP IP)
@@ -1374,7 +1420,7 @@ All settings are persisted via **NVS** (Non-Volatile Storage) across reboots. Th
 | **Screen** | Combined screen popup — inactivity timeout dropdown and brightness overlay slider |
 | **SD Card** | Validate/provision (creates `/sdcard/lab/` structure, shows completion status); browse file tree; check free space |
 | **GPS Info** | Live GPS fix status — latitude, longitude, altitude, satellite count, UTC time, and UART reference. When no live fix, last-known coordinates are shown in amber with `*` suffix and `Accuracy: 150 m (stale)`. **Set Position** button opens manual coordinate editor (see below). Refreshes every second. |
-| **Power Mode** | TX Power Mode selector — Normal or Max Power (see below) |
+| **Hardware Options** | Sub-menu for hardware addon configuration — **Power Mode** (Normal / Max TX power) and **NM-RF-HAT** enable/disable toggle. NVS-persisted. |
 | **Data Transfer** | File server sub-menu — AP mode or WiFi client mode (see below) |
 | **Vibrator Test** | Test tile for the vibrator motor — drives GPIO 26 (SPEAK_IN → SC8002B amp) at 333 Hz via LEDC PWM. Popup exposes ON / OFF buttons and a **Strength slider** (10–100%, where 100% = 50% duty cycle, the half-wave rectified maximum). Strength persists within the session. API: `vibrator_on()`, `vibrator_off()`, `vibrator_pulse(ms)`, `vibrator_burst(count, on_ms, gap_ms)`. Requires the 1N5819 + 1N4148 diode circuit on the SPEAK header — see Vibrator Motor Circuit section. |
 
@@ -1634,7 +1680,20 @@ The Scout rotates through all 16 channels (11–26) with an 800 ms dwell per cha
 
 ### 7. NM-RF-HAT
 
-The **NM-RF-HAT** is an optional RF expansion board that connects to the NM-CYD-C5 via its FPC2 header. It provides five RF modules gated by a 6-position DIP switch -- only one module is powered at a time (hardware exclusion). Enable support via **Settings → NM-RF-HAT**.
+The **NM-RF-HAT** is an optional RF expansion board that connects to the NM-CYD-C5 via its FPC2 header. It provides five RF modules gated by a 6-position DIP switch — only one module is powered at a time (hardware exclusion via P-channel MOSFETs).
+
+#### Enabling the NM-RF-HAT
+
+The RF-HAT menu tiles are hidden by default and must be enabled once after connecting the board:
+
+1. Connect the NM-RF-HAT to the NM-CYD-C5 via the FPC2 ribbon connector.
+2. Set the DIP switch for the module you want to use (only one ON at a time).
+3. On the device, go to **Settings → Hardware Options → NM-RF-HAT**.
+4. Tap **Enable**.
+5. A confirmation popup appears — tap **OK**.
+6. The RF-HAT tiles (CC1101, nRF24, IR, RF433, PN532 NFC) now appear on the main menu.
+
+The setting is saved to NVS and survives reboots — you only need to enable it once. To hide the tiles again, return to **Settings → Hardware Options → NM-RF-HAT** and tap **Disable**.
 
 #### Modules
 
