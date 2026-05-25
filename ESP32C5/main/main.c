@@ -1106,7 +1106,7 @@ typedef struct {
 } wdp_ble_device_t;
 static wdp_ble_device_t *wdp_ble_devices = NULL;
 static volatile int      wdp_ble_count   = 0;
-static bool              g_wd_ble        = false;
+static bool              g_wd_ble        = true;   // always on — coex handles RF sharing
 
 // BT Scan & Select file counter (persisted as NVS_KEY_BTSC_CTR)
 static uint32_t g_btsc_counter = 0;
@@ -3095,7 +3095,7 @@ static void nvs_settings_load(void)
         uint8_t wp = 0;
         if (nvs_get_u8(h, NVS_KEY_WD_PCAP, &wp) == ESP_OK) g_wd_pcap = (wp != 0);
         uint8_t wble = 0;
-        if (nvs_get_u8(h, NVS_KEY_WD_BLE, &wble) == ESP_OK) g_wd_ble = (wble != 0);
+        // g_wd_ble is always true — no longer user-configurable
         uint8_t rfhat = 0;
         if (nvs_get_u8(h, NVS_KEY_RF_HAT, &rfhat) == ESP_OK) g_rf_hat_enabled = (rfhat != 0);
         uint32_t btsc_ctr = 0;
@@ -10738,27 +10738,28 @@ static void wardrive_promisc_task(void *pvParameters) {
     esp_wifi_set_promiscuous_rx_cb(wdp_promiscuous_cb);
     esp_wifi_set_promiscuous(true);
 
-    // Start BLE scan immediately via coex — let the coex stack share the radio
-    // rather than manually time-slicing at the application level.
-    if (g_wd_ble && wdp_ble_devices && bt_nimble_init() == ESP_OK) {
+    // Start BLE scan immediately via coex — coex stack shares the radio automatically.
+    // Scan window = 40ms / interval = 320ms → 12.5% BLE duty, 87.5% RF time for WiFi.
+    // 0x0040 = 64 units × 0.625ms = 40ms; 0x0200 = 512 units × 0.625ms = 320ms.
+    if (wdp_ble_devices && bt_nimble_init() == ESP_OK) {
 #if MYNEWT_VAL(BLE_EXT_ADV)
-        struct ble_gap_ext_disc_params bpe = { .itvl = 0x60, .window = 0x60, .passive = 0 };
+        struct ble_gap_ext_disc_params bpe = { .itvl = 0x0200, .window = 0x0040, .passive = 0 };
         if (ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 0, 0, 0,
                              BLE_HCI_SCAN_FILT_NO_WL, 0,
                              &bpe, &bpe, wdp_ble_gap_cb, NULL) == 0) {
             ble_continuous = true; wd_used_coex_ble = true;
-            ESP_LOGI(TAG, "[WDP] BLE coex ext_disc running continuously");
+            ESP_LOGI(TAG, "[WDP] BLE coex ext_disc running (12.5%% duty, 40ms/320ms)");
         }
 #else
-        struct ble_gap_disc_params bp = { .itvl = 0x60, .window = 0x60,
+        struct ble_gap_disc_params bp = { .itvl = 0x0200, .window = 0x0040,
             .filter_policy = BLE_HCI_SCAN_FILT_NO_WL, .passive = 0, .filter_duplicates = 0 };
         if (ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &bp, wdp_ble_gap_cb, NULL) == 0) {
             ble_continuous = true; wd_used_coex_ble = true;
-            ESP_LOGI(TAG, "[WDP] BLE coex disc running continuously");
+            ESP_LOGI(TAG, "[WDP] BLE coex disc running (12.5%% duty, 40ms/320ms)");
         }
 #endif
         if (!ble_continuous)
-            ESP_LOGW(TAG, "[WDP] BLE coex scan start failed — will use burst fallback");
+            ESP_LOGW(TAG, "[WDP] BLE coex scan start failed");
     }
 
     int64_t last_stats_us = esp_timer_get_time();
@@ -18084,18 +18085,18 @@ static void wd_opts_save_cb(lv_event_t *e)
     (void)e;
     if (wd_opts_band_dd) g_wd_band = (wd_band_t)lv_dropdown_get_selected(wd_opts_band_dd);
     if (wd_opts_pcap_sw) g_wd_pcap = lv_obj_has_state(wd_opts_pcap_sw, LV_STATE_CHECKED);
-    if (wd_opts_ble_sw)  g_wd_ble  = lv_obj_has_state(wd_opts_ble_sw,  LV_STATE_CHECKED);
+    // g_wd_ble always true — BLE toggle removed
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_u8(h, NVS_KEY_WD_BAND, (uint8_t)g_wd_band);
         nvs_set_u8(h, NVS_KEY_WD_PCAP, g_wd_pcap ? 1 : 0);
-        nvs_set_u8(h, NVS_KEY_WD_BLE,  g_wd_ble  ? 1 : 0);
+        // NVS_KEY_WD_BLE no longer saved — BLE is always on
         nvs_commit(h);
         nvs_close(h);
     }
     wd_opts_band_dd = NULL;
     wd_opts_pcap_sw = NULL;
-    wd_opts_ble_sw  = NULL;
+    wd_opts_ble_sw  = NULL;  // always NULL now — BLE toggle removed
     show_wardrive_menu_screen();
 }
 
@@ -18104,7 +18105,7 @@ static void wd_opts_back_cb(lv_event_t *e)
     (void)e;
     wd_opts_band_dd = NULL;
     wd_opts_pcap_sw = NULL;
-    wd_opts_ble_sw  = NULL;
+    wd_opts_ble_sw  = NULL;  // always NULL now — BLE toggle removed
     show_wardrive_menu_screen();
 }
 
@@ -18158,30 +18159,7 @@ static void show_wardrive_options_screen(void)
     lv_obj_align(wd_opts_pcap_sw, LV_ALIGN_RIGHT_MID, 0, 0);
     if (g_wd_pcap) lv_obj_add_state(wd_opts_pcap_sw, LV_STATE_CHECKED);
 
-    // BLE toggle row
-    lv_obj_t *ble_row = lv_obj_create(content);
-    lv_obj_set_size(ble_row, LCD_H_RES - 32, 30);
-    lv_obj_set_style_bg_opa(ble_row, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(ble_row, 0, 0);
-    lv_obj_set_style_pad_all(ble_row, 0, 0);
-    lv_obj_clear_flag(ble_row, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *ble_lbl = lv_label_create(ble_row);
-    lv_label_set_text(ble_lbl, "BLE scan (time-sliced)");
-    lv_obj_set_style_text_font(ble_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(ble_lbl, ui_text_color(), 0);
-    lv_obj_align(ble_lbl, LV_ALIGN_LEFT_MID, 0, 0);
-
-    wd_opts_ble_sw = lv_switch_create(ble_row);
-    lv_obj_align(wd_opts_ble_sw, LV_ALIGN_RIGHT_MID, 0, 0);
-    if (g_wd_ble) lv_obj_add_state(wd_opts_ble_sw, LV_STATE_CHECKED);
-
-    lv_obj_t *ble_note = lv_label_create(content);
-    lv_label_set_text(ble_note, LV_SYMBOL_WARNING " BLE pauses WiFi every 30s");
-    lv_obj_set_style_text_color(ble_note, lv_color_make(140, 140, 140), 0);
-    lv_obj_set_style_text_font(ble_note, &lv_font_montserrat_12, 0);
-    lv_label_set_long_mode(ble_note, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(ble_note, LCD_H_RES - 32);
+    // BLE is always on via coex — no toggle needed
 
     // Save button
     lv_obj_t *save_btn = lv_btn_create(function_page);
