@@ -12815,15 +12815,8 @@ static void radio_reset_to_idle(void)
         esp_wifi_set_mode(WIFI_MODE_STA);
         esp_wifi_start();
         vTaskDelay(pdMS_TO_TICKS(300));  // let STA task finish starting before scan is allowed
+        esp_wifi_set_country_code("01", false);   /* MANUAL — prevent regdomain update from AP on next STA connect */
         apply_wifi_power_settings();
-
-        wifi_country_t wifi_country = {
-            .cc = "PH",
-            .schan = 1,
-            .nchan = 14,
-            .policy = WIFI_COUNTRY_POLICY_AUTO,
-        };
-        esp_wifi_set_country(&wifi_country);
 
         current_radio_mode = RADIO_MODE_WIFI;
         wifi_initialized = true;
@@ -13660,17 +13653,18 @@ static void wifi_connect_btn_cb(lv_event_t *e)
     }
     
     esp_wifi_set_config(WIFI_IF_STA, &sta_config);
-    
+    esp_wifi_set_country_code("01", false);   /* re-pin MANUAL; AP country IE can reset to AUTO */
+
     // Register event handlers
     esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_CONNECTED, &sta_connect_event_handler, NULL);
     esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &sta_connect_event_handler, NULL);
-    
+
     // Start LVGL timer to poll connection state (every 200ms)
     if (sta_connect_check_timer) {
         lv_timer_del(sta_connect_check_timer);
     }
     sta_connect_check_timer = lv_timer_create(sta_connect_check_timer_cb, 200, NULL);
-    
+
     // Start connection
     ESP_LOGI(TAG, "Connecting to '%s'...", wifi_connect_ssid);
     esp_wifi_clear_fast_connect();
@@ -16566,6 +16560,7 @@ static lv_obj_t      *s_wcs_pass_ta    = NULL;
 static lv_obj_t      *s_wcs_conn_btn   = NULL;  /* connect/disconnect toggle button */
 static lv_obj_t      *s_wcs_conn_lbl   = NULL;  /* label inside that button */
 static bool           s_wcs_connected  = false; /* true once STA has an IP */
+static bool           s_wcs_retried    = false; /* auto-retry used for this connect attempt */
 static void s_wcs_set_btn_state(bool connected);  /* forward decl — defined below connect_cb */
 static lv_obj_t      *s_wcs_keyboard   = NULL;
 static lv_obj_t      *s_wcs_active_ta  = NULL;
@@ -17088,6 +17083,17 @@ static void s_fileserv_poll_ip_cb(lv_timer_t *t)
     bool associated = (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK);
     uint32_t elapsed = (xTaskGetTickCount() * portTICK_PERIOD_MS) - s_fileserv_connect_ms;
 
+    /* Auto-retry once within the first 5 s — first connect often drops due to
+       regdomain IE from the AP; after the update the second attempt always works. */
+    if (!associated && elapsed > 1500 && elapsed < 5000 && !s_wcs_retried) {
+        s_wcs_retried = true;
+        esp_wifi_set_country_code("01", false);
+        esp_wifi_connect();
+        if (s_fileserv_status_lbl)
+            lv_label_set_text_static(s_fileserv_status_lbl, "Connecting...");
+        return;
+    }
+
     if (!associated && elapsed > 12000) {
         /* 12 s with no association — give up and tell user */
         lv_timer_del(t);
@@ -17464,6 +17470,7 @@ static void s_wcs_connect_cb(lv_event_t *e)
     if (s_fileserv_ip_lbl) lv_label_set_text(s_fileserv_ip_lbl, "");
 
     s_fileserv_connect_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    s_wcs_retried = false;
 
     ensure_wifi_mode();
     wifi_config_t sta_cfg = {};
@@ -17471,6 +17478,7 @@ static void s_wcs_connect_cb(lv_event_t *e)
     strncpy((char *)sta_cfg.sta.password, pass, sizeof(sta_cfg.sta.password) - 1);
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
+    esp_wifi_set_country_code("01", false);   /* re-pin MANUAL before connect; regdomain IE from AP can reset to AUTO */
     esp_wifi_clear_fast_connect();
     esp_wifi_connect();
 
