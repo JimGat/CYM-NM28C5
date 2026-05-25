@@ -41889,22 +41889,8 @@ static void s_zgwd_task_fn(void *arg)
     bool active_mode = ctx->active_mode;
     ESP_LOGI(TAG, "[ZGWD] Zigbee Scout started mode=%s", active_mode ? "ACTIVE" : "PASSIVE");
 
-    if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
-    struct stat st = {0};
-    if (stat("/sdcard/lab", &st) == -1) mkdir("/sdcard/lab", 0777);
-    if (stat(ZGWD_SAVE_DIR, &st) == -1) mkdir(ZGWD_SAVE_DIR, 0755);
-
-    uint64_t ts_base = (uint64_t)(esp_timer_get_time() / 1000000);
-    snprintf(ctx->csv_path, sizeof(ctx->csv_path),
-             ZGWD_SAVE_DIR "/zgwd%llu.csv", (unsigned long long)ts_base);
-    snprintf(ctx->pcap_path, sizeof(ctx->pcap_path),
-             ZGWD_SAVE_DIR "/zgwd%llu.pcap", (unsigned long long)ts_base);
-
-    FILE *csv  = fopen(ctx->csv_path, "w");
-    FILE *pcap = fopen(ctx->pcap_path, "wb");
-    if (csv)  fprintf(csv, "timestamp_us,channel,pan_id,rssi,lqi,frame_len,frame_type,ext_pan_id,stack_profile\n");
-    if (pcap) s_zgwd_pcap_write_global_hdr(pcap);
-    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+    FILE *csv  = NULL;
+    FILE *pcap = NULL;
 
     if (current_radio_mode == RADIO_MODE_WIFI) {
         esp_wifi_set_promiscuous(false);
@@ -41921,12 +41907,30 @@ static void s_zgwd_task_fn(void *arg)
         s_zgwd_tx_sem = xSemaphoreCreateBinary();
 
     // Quiesce WS2812 RMT channel before 802.15.4 enable (which calls rmt_tx_wait_all_done)
-    if (g_led_strip) { led_strip_clear(g_led_strip); vTaskDelay(pdMS_TO_TICKS(100)); }
+    if (g_led_strip) { led_strip_clear(g_led_strip); vTaskDelay(pdMS_TO_TICKS(5)); }
 
     if (esp_ieee802154_enable() != ESP_OK) {
         ESP_LOGE(TAG, "[ZGWD] 802.15.4 enable failed");
         goto zgwd_done;
     }
+
+    // Open SD files after radio is up — SPI DMA must not be in flight during PHY enable
+    if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
+    struct stat st = {0};
+    if (stat("/sdcard/lab", &st) == -1) mkdir("/sdcard/lab", 0777);
+    if (stat(ZGWD_SAVE_DIR, &st) == -1) mkdir(ZGWD_SAVE_DIR, 0755);
+
+    uint64_t ts_base = (uint64_t)(esp_timer_get_time() / 1000000);
+    snprintf(ctx->csv_path, sizeof(ctx->csv_path),
+             ZGWD_SAVE_DIR "/zgwd%llu.csv", (unsigned long long)ts_base);
+    snprintf(ctx->pcap_path, sizeof(ctx->pcap_path),
+             ZGWD_SAVE_DIR "/zgwd%llu.pcap", (unsigned long long)ts_base);
+
+    csv  = fopen(ctx->csv_path, "w");
+    pcap = fopen(ctx->pcap_path, "wb");
+    if (csv)  fprintf(csv, "timestamp_us,channel,pan_id,rssi,lqi,frame_len,frame_type,ext_pan_id,stack_profile\n");
+    if (pcap) s_zgwd_pcap_write_global_hdr(pcap);
+    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
     esp_ieee802154_set_promiscuous(true);
     esp_ieee802154_set_coordinator(false);
     esp_ieee802154_set_panid(0xFFFF);
