@@ -12815,7 +12815,7 @@ static void radio_reset_to_idle(void)
         esp_wifi_set_mode(WIFI_MODE_STA);
         esp_wifi_start();
         vTaskDelay(pdMS_TO_TICKS(300));  // let STA task finish starting before scan is allowed
-        esp_wifi_set_country_code("01", false);   /* MANUAL — prevent regdomain update from AP on next STA connect */
+        { wifi_country_t _wc = { .cc="01",.schan=1,.nchan=13,.policy=WIFI_COUNTRY_POLICY_MANUAL }; esp_wifi_set_country(&_wc); }   /* MANUAL — prevent regdomain update from AP on next STA connect */
         apply_wifi_power_settings();
 
         current_radio_mode = RADIO_MODE_WIFI;
@@ -13653,7 +13653,7 @@ static void wifi_connect_btn_cb(lv_event_t *e)
     }
     
     esp_wifi_set_config(WIFI_IF_STA, &sta_config);
-    esp_wifi_set_country_code("01", false);   /* re-pin MANUAL; AP country IE can reset to AUTO */
+    { wifi_country_t _wc = { .cc="01",.schan=1,.nchan=13,.policy=WIFI_COUNTRY_POLICY_MANUAL }; esp_wifi_set_country(&_wc); }   /* re-pin MANUAL; AP country IE can reset to AUTO */
 
     // Register event handlers
     esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_CONNECTED, &sta_connect_event_handler, NULL);
@@ -17087,7 +17087,7 @@ static void s_fileserv_poll_ip_cb(lv_timer_t *t)
        regdomain IE from the AP; after the update the second attempt always works. */
     if (!associated && elapsed > 1500 && elapsed < 5000 && !s_wcs_retried) {
         s_wcs_retried = true;
-        esp_wifi_set_country_code("01", false);
+        { wifi_country_t _wc = { .cc="01",.schan=1,.nchan=13,.policy=WIFI_COUNTRY_POLICY_MANUAL }; esp_wifi_set_country(&_wc); }
         esp_wifi_connect();
         if (s_fileserv_status_lbl)
             lv_label_set_text_static(s_fileserv_status_lbl, "Connecting...");
@@ -17478,7 +17478,7 @@ static void s_wcs_connect_cb(lv_event_t *e)
     strncpy((char *)sta_cfg.sta.password, pass, sizeof(sta_cfg.sta.password) - 1);
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
-    esp_wifi_set_country_code("01", false);   /* re-pin MANUAL before connect; regdomain IE from AP can reset to AUTO */
+    { wifi_country_t _wc = { .cc="01",.schan=1,.nchan=13,.policy=WIFI_COUNTRY_POLICY_MANUAL }; esp_wifi_set_country(&_wc); }   /* re-pin MANUAL before connect; regdomain IE from AP can reset to AUTO */
     esp_wifi_clear_fast_connect();
     esp_wifi_connect();
 
@@ -31464,7 +31464,7 @@ static bool ensure_wifi_mode(void)
                     esp_restart();
                     return false;
                 }
-                esp_wifi_set_country_code("01", false);
+                { wifi_country_t _wc = { .cc="01",.schan=1,.nchan=13,.policy=WIFI_COUNTRY_POLICY_MANUAL }; esp_wifi_set_country(&_wc); }
                 vTaskDelay(pdMS_TO_TICKS(400));
                 apply_wifi_power_settings();
                 current_radio_mode = RADIO_MODE_WIFI;
