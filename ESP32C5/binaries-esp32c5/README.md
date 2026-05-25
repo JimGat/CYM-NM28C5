@@ -1,6 +1,96 @@
 # CYM-NM28C5 Pre-built Firmware Binaries
 
-**Firmware version: v1.6.14**
+**Firmware version: v1.8.85**
+
+---
+
+## Release Notes — v1.8.85
+
+### nRF24L01+ 2.4 GHz Full Implementation
+
+Full nRF24L01+ implementation under **NM-RF-HAT → 2.4 GHz (DIP 2)**. Requires NM-RF-HAT with DIP 2 on.
+
+- **HW Test:** reads STATUS, CONFIG, RF_CH, RF_SETUP registers over SPI; confirms chip is responding.
+- **Channel Scan:** 126-channel carrier-detect sweep (2400-2525 MHz); canvas shows spectrum bar + 8-row waterfall. Start/Stop button; live active-channel count.
+- **Packet Sniffer:** promiscuous RX on configurable channel; captures packets; hex dump of last packet; auto-saves captures to `/sdcard/lab/nrf24/` in Flipper-compatible `.nrf24` text format.
+- **Saved Files:** lists `.nrf24` files, Play/Delete per entry.
+- **Jammer:** legal disclaimer required; rapid PTX channel sweep across all 126 channels.
+- **Futaba S-FHSS decoder:** scans 25 S-FHSS channels (2404-2504 MHz, 4 MHz spacing) at 1 Mbps; decodes 10-byte payload; extracts up to 8 servo channels (11-bit values 0-2047).
+- **Stub screens** (with authorization disclaimers): MouseJack, Keyboard Inject, Drone, GamePad.
+
+Flipper `.nrf24` file format -- directly compatible with Flipper Zero nRF24 sub-GHz sniff captures.
+
+---
+
+## Release Notes — v1.8.80-83
+
+### CC1101 Sub-GHz Full Implementation
+
+Full CC1101 implementation under **NM-RF-HAT → Sub-GHz (DIP 1)**. Requires NM-RF-HAT with DIP 1 on.
+
+Paged 2-page tile menu:
+
+- **HW Test:** verifies PARTNUM (`0x00`) and VERSION (`0x14`) registers; shows MARCSTATE.
+- **Freq Scan:** canvas-based spectrum -- RSSI bar per channel across the CC1101's full 300-928 MHz tunable range with carrier detect; live sweep with Start/Stop.
+- **RAW Capture:** 10-second OOK/ASK signal capture window; Save/Discard prompt after; saves to `/sdcard/lab/radio/` as Flipper Zero `.sub` format.
+- **RAW Replay:** lists `.sub` files from SD, play at 1x/3x/5x speed.
+- **Saved Files:** lists `.sub` files, Play/Delete per entry.
+- **Jammer:** legal disclaimer required; transmits on configurable frequency.
+- **Band Scope:** 126-point spectrum + 8-row scrolling waterfall canvas; continuous sweep, 130 us dwell, active-channel count.
+
+Files: `/sdcard/lab/radio/` -- Flipper Zero `.sub` format (compatible with Flipper Sub-GHz RAW captures).
+
+---
+
+## Release Notes — v1.8.70-77
+
+### PN532 NFC/RFID Full Implementation
+
+Full PN532 NFC/RFID card management under **NM-RF-HAT → NFC/RFID (DIP 3)**. Requires NM-RF-HAT with DIP 3 on and the PN532 module's I2C mode jumper set.
+
+- **Card Scan:** detects ISO14443A cards -- NTAG213/215/216, MIFARE Ultralight, MIFARE Classic. Shows UID, ATQA, SAK, inferred card type.
+- **Save:** name-at-save popup after each scan; card saved as JSON to `/sdcard/lab/rfid/hf/`.
+- **Export .nfc:** exports scanned card in Flipper Zero `.nfc` text format to `/sdcard/lab/rfid/export/`.
+- **Import .nfc:** drop Flipper Zero `.nfc` files in `/sdcard/lab/rfid/import/`; they appear in the Saved Cards list alongside locally scanned cards.
+- **Card Emulation:** select a saved card from the list and present it to a reader via PN532 `TgInitAsTarget`. Works for UID-only readers; MIFARE Classic authentication is not emulated (PN532 target mode has no CRYPTO1 engine).
+- **Saved Cards:** scrollable list -- Load, Emulate, Delete per card.
+
+> **Note:** The PN532 module on the NM-RF-HAT has shorter read range than a dedicated PN532 breakout board. Hold cards very close (nearly touching the antenna) for reliable reads. This is a hardware limitation of the RF-HAT form factor.
+
+---
+
+## Release Notes — v1.6.16
+
+### WhisperPair Scanner (CVE-2025-36911)
+
+**FOR AUTHORIZED SECURITY RESEARCH ONLY.** Adds detection and exploitation of the WhisperPair vulnerability in Google's Fast Pair protocol, disclosed January 2026 by COSIC/KU Leuven. Affected devices (Sony, JBL, Jabra, Bose, Marshall, Xiaomi, Nothing, OnePlus, Soundcore, Logitech, Google) accept Key-Based Pairing requests without verifying pairing mode, allowing unauthorized pairing within ~14m.
+
+**Detection (passive):** BLE scanner now flags devices advertising Fast Pair service UUID `0xFE2C` with a `[FP]` tag in the scan list. No connection required.
+
+**WhisperPair screen** (`BT Attacks → WhisperPair`, behind authorization disclaimer):
+- Shows all `[FP]` devices found in the most recent BLE scan
+- **Probe (safe):** Connects via GATT, writes a plaintext KBP block to characteristic `fe2c1234-8366-4814-8eb0-01de32100bea`. If the device sends a notification response → **VULNERABLE**; no response within 5 s → patched. No pairing is established.
+- **Exploit (AES):** Full CVE-2025-36911 attack — AES-128-ECB encrypted KBP packet (using ESP32-C5 ROM hardware AES, key = random Salt zero-padded to 128 bits) triggers unauthorized pairing bypass on vulnerable devices.
+
+**GATT Walker integration:** If a GATT walk discovers the `0xFE2C` service, the result screen flags it with `⚠ Fast Pair (CVE-2025-36911)`.
+
+**Janos portability:** `ble_whisperpair.c/h` is self-contained — no LVGL dependency. Swap `ets_aes_*` for `mbedtls_aes_crypt_ecb` and replace `heap_caps_malloc` with `malloc` for other platforms.
+
+Results logged to `/sdcard/lab/ble/whisperpair/` as JSON with MAC, mode, result, KBP packet hex, and notification response hex.
+
+---
+
+## Release Notes — v1.6.15
+
+### BlueDuck — Home Button Crash Fix (Heap Fragmentation)
+
+**Root cause:** Pressing Home from the BlueDuck screen crashed with `esp_wifi_init failed (0x101)` and forced a device restart. The 600 ms BLE settle delay introduced in v1.6.12 was insufficient — the crash was still occurring 1.8 seconds after NimBLE stopped. The problem was heap fragmentation, not timing.
+
+After BLE teardown, the internal SRAM heap is fragmented: total free bytes may be adequate but the WiFi driver needs 10 × 1700-byte contiguous DMA-capable blocks from internal SRAM, and fragmentation prevents those allocations from succeeding (only 7 of 10 rx buffers could be allocated).
+
+**Fix:** When switching WiFi → BLE, `esp_wifi_deinit()` is no longer called. Only `esp_wifi_stop()` runs, leaving the WiFi driver initialized (with DMA buffers still allocated) but stopped. When returning from BLE, `esp_wifi_start()` restarts the already-initialized driver without any DMA reallocation. Heap fragmentation becomes irrelevant to the WiFi restart path.
+
+The BLE settle delay is reduced from 600 ms → 200 ms (radio handover only; memory is no longer the constraint).
 
 ---
 

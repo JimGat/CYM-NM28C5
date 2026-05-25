@@ -89,10 +89,15 @@ static esp_err_t init_wifi(void) {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
-    /* Pin regulatory domain so the driver never updates it mid-association from
-       a Country IE in a probe response — that update was causing the first
-       connect to drop at assoc->init (0x2c0 comeback) every boot. */
-    esp_wifi_set_country_code("01", false);
+    /* Pin world regulatory domain (channels 1-13, MANUAL) so the driver never
+       updates it mid-association from an AP's Country IE.  nchan=13 covers EU
+       (incl. Poland) and US (1-11 subset) equally.  ieee80211d disabled = MANUAL
+       policy so no AP can reset this at runtime. */
+    {
+        wifi_country_t wc = { .cc = "01", .schan = 1, .nchan = 13,
+                              .policy = WIFI_COUNTRY_POLICY_MANUAL };
+        esp_wifi_set_country(&wc);
+    }
     vTaskDelay(pdMS_TO_TICKS(400));   // let background tasks run after start
     apply_wifi_power_settings();
 

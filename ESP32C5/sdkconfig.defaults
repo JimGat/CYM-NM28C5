@@ -4,14 +4,46 @@
 # Main task stack — must be large enough for LVGL UI construction + large local buffers
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
+# Coexistence: WiFi + BLE + 802.15.4 share the single RF front-end via software
+# arbitration. Required for wardrive simultaneous WiFi+BLE scanning and for the
+# Zigbee Scout passive 802.15.4 capture feature.
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+
+# IEEE 802.15.4 (Zigbee/Thread passive scanner via built-in ESP32-C5 radio)
+CONFIG_IEEE802154_ENABLED=y
+
 # Bluetooth / NimBLE
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_NIMBLE_EXT_ADV=y
+# NimBLE host buffers (MSYS/ACL/HCI) MUST be in internal DRAM — not PSRAM.
+# The BLE LL ISR (ROM code) accesses MSYS pool at interrupt level; PSRAM addresses
+# get corrupted by ROM pointer tagging → Load access fault. EXTERNAL mode is
+# incompatible with ESP32-C5 BLE ROM. Use INTERNAL to force DRAM allocation.
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_INTERNAL=y
+# Reduce NimBLE host buffer counts to fit in ~5 KB of general internal heap.
+# MSYS1(6×128=768) + MSYS2(5×320=1600) + ACL(5×255=1275) + HCI_HI(8×70=560) +
+# HCI_LO(4×70=280) = 4483 bytes — fits with ~700 B margin.
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=6
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=5
+CONFIG_BT_NIMBLE_MSYS1_BLOCK_COUNT=6
+CONFIG_BT_NIMBLE_ACL_BUF_COUNT=5
+CONFIG_BT_NIMBLE_HCI_EVT_HI_BUF_COUNT=8
+CONFIG_BT_NIMBLE_HCI_EVT_LO_BUF_COUNT=4
 
 # PSRAM (8 MB SPIRAM on NM-CYD-C5)
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+# DMA reserve pool: 48 KB. WiFi static RX (4×1700=6.8KB) + TX (3×~1700=5.1KB)
+# + BLE LL controller (~18KB) + SD (~1.3KB) ≈ 31KB used; 48KB gives ~17KB margin.
+# BLE controller init was confirmed successful with this pool size in v1.6.27.
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=49152
+# WiFi RX: 4 static buffers. TX: 3 static buffers (minimum tested to work).
+# Both BLE LL env and HCI UART transport allocate from the DMA pool regardless
+# of NIMBLE_MEM_ALLOC_MODE. WiFi + BLE together need ~31KB; 48KB pool gives ~17KB margin.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=3
 
 # LVGL fonts used by the UI
 CONFIG_LV_FONT_MONTSERRAT_12=y
@@ -50,3 +82,9 @@ CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 # WiGLE and WDGWars, while consuming ~60 % less flash/parse overhead
 # than the full Mozilla bundle.
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
+
+# LVGL custom memory allocator — route all LVGL heap through our PSRAM-preferring
+# wrapper (lvgl_malloc/free/realloc) so LVGL objects land in PSRAM instead of the
+# scarce internal DRAM/RTCRAM, preventing heap corruption under WiFi/BLE pressure.
+CONFIG_LV_MEM_CUSTOM=y
+CONFIG_LV_MEM_CUSTOM_INCLUDE="lvgl_memory.h"

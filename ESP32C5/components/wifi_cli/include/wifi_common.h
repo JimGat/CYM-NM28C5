@@ -18,8 +18,8 @@ extern "C" {
 #endif
 
 // Maximum limits
-#define MAX_AP_CNT 64
-#define MAX_SCAN_RESULTS 64
+#define MAX_AP_CNT 128
+#define MAX_SCAN_RESULTS 128
 #define MAX_PROBES 200
 #define MAX_CLIENTS_PER_AP 50
 #define MAX_TARGET_BSSIDS 50

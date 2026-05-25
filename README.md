@@ -5,7 +5,7 @@
 <h1 align="center">Cheap Yellow Monster</h1>
 
 <p align="center">
-  <b>v1.6.14</b>
+  <b>v2.4.2</b>
 </p>
 
 <p align="center">
@@ -56,10 +56,13 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
   - [Bluetooth](#2-bluetooth)
     - [BLE PCAP — How It Works](#ble-pcap--how-it-works)
     - [BT Scan & Select — How It Works](#bt-scan--select--how-it-works)
+    - [Multi-Session Counter-Surveillance Workflow](#multi-session-counter-surveillance-workflow)
     - [AirTag / SmartTag Locator — How It Works](#airtag--smarttag-locator--how-it-works)
     - [GATT Walker — How It Works](#gatt-walker--how-it-works)
     - [BT Observer — How It Works](#bt-observer--how-it-works)
     - [Bluetooth Lookout — How It Works](#bluetooth-lookout--how-it-works)
+    - [BlueDuck — BLE HID Keyboard Injector](#blueduck--ble-hid-keyboard-injector)
+    - [WhisperPair — CVE-2025-36911 Fast Pair Bypass](#whisperpair--cve-2025-36911-fast-pair-bypass)
   - [Wardriving](#3-wardriving)
     - [Starting a Wardrive](#starting-a-wardrive)
     - [Mark Button — GPS Waypoints](#mark-button--gps-waypoints)
@@ -72,6 +75,15 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
     - [TX Power Mode](#tx-power-mode)
     - [GATT Connect Timeout](#gatt-connect-timeout)
     - [Data Transfer](#data-transfer)
+  - [Zigbee Scout](#6-zigbee-scout)
+  - [NM-RF-HAT](#7-nm-rf-hat)
+    - [Infrared (DIP 4)](#infrared-dip-4)
+      - [Universal Remote](#universal-remote)
+      - [TV-B-Gone](#tv-b-gone)
+    - [RF433 OOK/ASK (DIP 5)](#rf433-ookask-dip-5)
+    - [PN532 NFC/RFID (DIP 3)](#pn532-nfcrfid-dip-3)
+    - [CC1101 / nRF24L01 (DIP 1 / DIP 2)](#cc1101-sub-ghz-dip-1--nrf24l01-24-ghz-dip-2)
+      - [Z-Wave Scout](#z-wave-scout)
 - [Data & Storage](#data--storage)
 - [Touch Calibration](#touch-calibration)
 - [Building & Flashing](#building--flashing)
@@ -92,16 +104,17 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **Chanalizer** | Wide 520 px WiFi channel map — auto-scrolling left/right with touch-drag pause; SSID color grouping, group legend, channel annotations; portrait 240 px viewport over 2.4 GHz + 5 GHz |
 | **WiFi Band Scope** | Promiscuous RSSI per-channel waterfall (2.4 GHz 13-ch or 5 GHz 25-ch); band toggle updates axis label and resets peaks; 60 ms dwell / 0.8 s full 2.4 sweep |
 | **Drone Detector** | Passive BLE scan for DJI/Remote ID drone advertisements |
-| **Wardriving** | GPS + WiFi logging, dual-band filter (2.4 GHz / 5 GHz / Both), optional BLE time-sliced scanning, WiGLE CSV 1.6, upload log tracking, raw PCAP toggle, GPS mark waypoints (GPX output), WiGLE and WDG Wars upload; GPS last-known position hold with 150 m stale accuracy when signal is lost |
+| **Wardriving** | GPS + WiFi logging, dual-band filter (2.4 GHz / 5 GHz / Both), optional BLE time-sliced scanning, WiGLE CSV 1.6, upload log tracking, raw PCAP toggle, GPS mark waypoints (GPX output), WiGLE and WDG Wars upload; GPS last-known position hold with 150 m stale accuracy when signal is lost; live dashboard shows separate WiFi network count and BLE device count |
 | **GPS** | NMEA RMC auto-syncs system clock (FAT timestamps); last-known position persisted to NVS (5-minute throttle); manual fallback editor in Settings → GPS Info; all data-collection features (wardrive, GATT Walker, marks) use best available GPS transparently |
-| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk, Bluetooth Lookout, BLE Spam (8 modes incl. Sour Apple), Device Spoof (general + directed), BLE Disconnect (directed), BLE PCAP (Kismet PCAPNG raw capture), **BlueDuck** (BLE HID DuckyScript keyboard injector), **HoneyPair** (BLE persona honeypot) |
+| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk, Bluetooth Lookout, BLE Spam (8 modes incl. Sour Apple), Device Spoof (general + directed), BLE Disconnect (directed), BLE PCAP (Kismet PCAPNG raw capture; BLE 5.0 extended advertisement support), **BlueDuck** (BLE HID DuckyScript keyboard injector), **HoneyPair** (BLE persona honeypot), **WhisperPair** (CVE-2025-36911 Google Fast Pair KBP bypass — auto-scan, sequential run-all FP targets, AES-128-ECB exploit); BT Scan & Select supports **Save List** (GPS-tagged JSON snapshot of every device found); **Matter [M] detection** passive tagging of Thread/BLE Matter devices by GATT service `0xFFF6` |
+| **Zigbee Scout** | IEEE 802.15.4 passive wardrive using the ESP32-C5's built-in PHY; logs PAN IDs, channel, RSSI, device addresses, and NWK/APS frame metadata to WiGLE-compatible CSV + PCAP; RSSI locator locks onto a specific PAN; logs to `/sdcard/lab/zigbee/` |
 | **BlueDuck** | BLE HID keyboard injector — pairs as any of 9 device personas; executes DuckyScript payloads from SD card (preloaded into PSRAM at boot, immune to SD DMA OOM during BLE); HUMAN_MODE variable-speed typing; Android (Win+H/B/N), Windows (Win+R/L, Ctrl+Shift+Esc), and iOS (Cmd+H/Space) keyboard shortcut support; session JSONL log to SD card; 13-script library included |
 | **HoneyPair** | Continuous BLE persona honeypot — cycles 9 consumer device personas every 5 min, logs all pairing attempts to JSONL; GATT/HID enumeration on any pairing device; persona MACs randomised and deduplicated |
 | **Deauth Monitor** | Passive detection of nearby deauth attacks |
 | **Credentials** | Captive portal credential capture, WPA-SEC upload |
 | **TX Power Mode** | Selectable Normal / Max Power for WiFi and BLE — persisted across reboots |
 | **Data Transfer** | Self-hosted AP file server (TheLab) and WiFi client file server — browse, upload, create directories, and recursively delete folders from any browser; client IP logged to serial; IP shown on screen |
-| **NM-RF-HAT** | Hardware addon board support *(coming soon)* — software-configurable RF module options for NRF, IR, and RFID expansion |
+| **NM-RF-HAT** | Hardware addon board for RF expansion -- IR capture/replay/Universal Remote/TV-B-Gone (Flipper .ir format); RF433 OOK capture/replay (Flipper .sub format); CC1101 Sub-GHz: Freq Scan/RAW Capture+Replay/Band Scope/Jammer (Flipper .sub); nRF24L01+ 2.4 GHz: Ch Scan/Sniffer/Jammer/Futaba S-FHSS (Flipper .nrf24); PN532 NFC/RFID: scan/save/emulate/.nfc import+export (Flipper .nfc); DIP switch per module |
 | **UI** | Material dark theme, touch gestures, screen dimming, screenshots — all screens portrait 240×320 |
 | **Storage** | SD card for handshakes, wardrive logs, GATT Walker JSON, screenshots, file tree browser |
 
@@ -138,6 +151,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **SD Card** | MicroSD **FAT32, max 32 GB** (shared SPI2 bus with display and touch) | SPI @ 20 MHz |
 | **GPS** | [ATGM336H GPS+BDS Dual-Mode Module](https://www.amazon.com/dp/B09LQDG1HY) (Teyleten Robot, ASIN B09LQDG1HY; search "ATGM336H UART" if unavailable) — outputs NMEA 0183 GGA + RMC at 9600 baud, 3.3 V, onboard ceramic patch antenna | UART1 @ 9600 baud |
 | **LED** | WS2812 NeoPixel (single, GPIO 27) | RMT / GPIO |
+| **Vibrator** | ERM vibrator motor via SC8002B class-D amp (SPEAK header, GPIO 26) — optional add-on; requires 1N5819 + 1N4148 diode circuit; see Vibrator Motor Circuit section | LEDC PWM |
 
 Board reference: https://github.com/RockBase-iot/NM-CYD-C5
 
@@ -169,6 +183,8 @@ Board reference: https://github.com/RockBase-iot/NM-CYD-C5
                       │                  │
     NeoPixel ─────────┤ GPIO 27          │
                       │                  │
+    SPEAK_IN (SC8002B)┤ GPIO 26          │ (vibrator motor driver)
+                      │                  │
     Console ──────────┤ USB (JTAG/CDC)   │
                       └──────────────────┘
 
@@ -191,6 +207,7 @@ Board reference: https://github.com/RockBase-iot/NM-CYD-C5
 | 23 | ST7789 Display CS | SPI | Active LOW |
 | 24 | ST7789 DC (Data/Cmd) | Output | |
 | 25 | Backlight | Output | ⚠️ Strapping, HIGH=on |
+| 26 | SPEAK_IN → SC8002B amp | LEDC PWM | Vibrator motor driver; 333 Hz / 50% duty max; see Vibrator Motor Circuit |
 | 27 | NeoPixel Data | RMT/GPIO | WS2812 LED |
 
 > **GPIO 6 / ADC1_CH5 conflict:** The battery voltage ADC (`BATTERY_ADC_CHANNEL ADC_CHANNEL_5`) maps to GPIO 6, which is also SPI SCK. Calling `adc_oneshot_config_channel` on this pin silently reconfigures it away from SPI, killing SPI clock for display and touch. The battery ADC is **permanently disabled** in firmware for this board revision (`if (false && init_battery_adc()...)`).
@@ -274,6 +291,8 @@ An ERM (eccentric rotating mass) vibrator motor can be added to the NM-CYD-C5 vi
 | SPEAK header connector | JST GH 1.25 mm 2-pin (HCZZ0015-2) | **1.25 mm pitch** — the 1.0 mm SH connector is too small and will not fit. |
 
 **How it works:** GPIO 26 drives the SC8002B input with LEDC PWM at **333 Hz / 50% duty** (half-wave max = 50% duty). The 1N5819 rectifies the BTL output to give the motor a clean DC-biased drive. The 1N4148 across the motor clamps the inductive kick on every PWM off-cycle. Strength is adjustable 10–100% via **Settings → Vibrator Test** without reflashing.
+
+**Why not drive the motor directly from GPIO:** ERM vibrator motors draw 100–200 mA at startup and 50–150 mA running — well beyond the ESP32-C5's safe GPIO limit of ~20 mA continuous (40 mA absolute maximum per pin, ~40 mA total chip budget across all outputs). Connecting a motor directly to a GPIO risks brownout or pin damage. The SC8002B acts as a current-buffered power stage: the GPIO sources only ~1 mA into the amplifier input, while the amp's BTL outputs can deliver up to ~1.5 A peak from the board's power rail. After half-wave rectification at 3.3 V supply (minus ~0.3 V Schottky drop = ~3.0 V motor drive), into a typical small ERM motor (~8–16 Ω), peak pulse current is **200–375 mA** and average current at 50% PWM duty is **100–180 mA** — roughly 10–15× what a GPIO could safely supply. The 1N4148 flyback diode is essential for the same reason: when the PWM pulse ends the motor's inductance produces a reverse voltage spike that would otherwise be absorbed by (and damage) the SC8002B output.
 
 **Circuit photos:**
 
@@ -449,7 +468,8 @@ Bluetooth
 │           └── BLE Disconnect  (flood target with TERMINATE_IND)
 ├── BT Attacks          ← general attacks (no target needed)
 │   ├── BLE Spam        (Apple Prox. Pair / Samsung / Google / Windows / All / AirTag / SmartTag / Sour Apple)
-│   └── Device Spoof    (select from spooflist.csv or add new entry via keyboard)
+│   ├── Device Spoof    (select from spooflist.csv or add new entry via keyboard)
+│   └── WhisperPair     ← CVE-2025-36911 Fast Pair KBP pairing bypass (detect / probe / exploit)
 ├── BlueDuck            ← BLE HID keyboard injector + DuckyScript engine
 │   ├── Script selector (scans /sdcard/lab/ble/blueduck/scripts/)
 │   ├── Persona picker  (9 device identities + auto-rotate)
@@ -459,15 +479,19 @@ Bluetooth
 ├── AirTag Scan
 ├── Drone Detector
 ├── BT Locator
+├── List Wizard         ← multi-select btsc_*.json files → Unique / Common set ops
 └── Bluetooth Lookout   ← continuous watchlist monitor
     ├── Edit Watchlist
+    ├── Edit Blacklist
     └── OUI Groups
 ```
 
 | Feature | Description |
 |---------|-------------|
-| **BT Scan & Select** | Active BLE scan — discovers all nearby devices; shows name or vendor (from OUI lookup), RSSI, partial MAC; tap to select a target |
-| **BT Observer** | 10-second active BLE scan followed by sequential GATT walks on every discovered device (5 s timeout per device). Results shown in a scrollable live list; tap any row to open the full GATT detail view |
+| **BT Scan & Select** | Active BLE scan — discovers all nearby devices; shows name or vendor (from OUI lookup), RSSI, partial MAC; tap to select a target; **Save List** saves the full scan to a GPS-tagged JSON file on SD; **Rescan** restarts the scan in-place; **Actions →** opens attack tiles on selected target. Devices advertising GATT service `0xFFF6` (Matter Commissioning) are tagged `[M]` — passive detection of Thread/BLE Matter IoT devices with no connection required. |
+| **List Wizard** | Multi-file BT scan list analysis. Reads all `btsc_*.json` files from SD, sorted newest-first. Select up to 4 files, set an optional RSSI threshold, then compute **Unique** (devices exclusive to exactly one file, min RSSI) or **Common** (devices in every selected file, avg RSSI). Results sorted by RSSI descending with a live **Change** re-filter button; save as new scan file or push to BT Lookout. Per-row delete with confirm dialog. |
+| **BT Blacklist** | Per-device suppression list at `/sdcard/lab/bluetooth/blacklist.csv`. Any device on the blacklist is silently ignored by BT Scan & Select, BT Lookout, BLE PCAP, and all other BT scan functions. Editor in the **BT Lookout** screen via the **Blacklist** button. |
+| **BT Observer** | Configurable-duration BLE scan (default 10 s, set via Settings → Timing) followed by sequential GATT walks on every discovered device (5 s timeout per device). Results shown in a scrollable live list; tap any row to open the full GATT detail view |
 | **BT Locator** | RSSI-based proximity tracking of a selected BLE device; updates every 10 s. Vibrator strength scales logarithmically with signal strength — silent below −69 dBm, 10% at −69 dBm, 100% at −40 dBm (requires vibrator hardware). |
 | **GATT Walker** | Full BLE GATT inspection — walks all services, characteristics, and descriptors; reads attribute values; computes FNV-32 device fingerprint; saves enriched JSON to SD card with service/characteristic names, decoded properties, ASCII data preview, OUI manufacturer, and optional GPS geotag |
 | **AirTag Scanner** | Passive BLE scan — detects Apple AirTags and Samsung SmartTags by manufacturer ID |
@@ -481,16 +505,158 @@ Bluetooth
 | **BLE PCAP** | Captures raw BLE advertising packets to SD card in Kismet PCAPNG format (link type 256 — `LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR`). Includes a 10-byte pseudo-header per packet: RF channel 37, RSSI, noise floor, and BLE access address. Queue-based write path keeps the SD bus free for the UI. Live packet count shown on screen. |
 | **BlueDuck** | BLE HID keyboard injector. Pairs with any nearby BLE-capable device, then executes DuckyScript payloads — sending keystrokes as if from a Bluetooth keyboard. Nine built-in device personas (Wireless Keyboard, AirPods Pro, Fitbit, Galaxy Buds, Garmin Fenix, Apple Watch, JBL speaker, Logitech MX Keys, Samsung TV). Auto-rotate mode cycles personas every 5 minutes. Scripts are preloaded into PSRAM at scan time (immune to SD DMA OOM during BLE). HUMAN_MODE with SLOW/NORMAL/FAST variable-speed typing. Full Android (Win+H/B/N), Windows (Win+R/L, Ctrl+Shift+Esc, Win+Shift+S), and iOS (Cmd+H/Space) keyboard shortcut support — 13-script library in `resources/blueduck_scripts/`. Session stats shown live; all events logged to `/sdcard/lab/ble/blueduck/`. |
 | **HoneyPair** | BLE persona honeypot. Continuously cycles through 9 consumer device personas (AirPods, Galaxy Buds, Garmin watch, etc.), logging every device that initiates a pairing request. Persona MACs are randomised and deduplicated across sessions; auto-rotate every 5 minutes prevents stale scan-response caching. GATT/HID enumeration runs on any device that completes pairing. All events logged to `/sdcard/lab/ble/honeypair/`. |
+| **WhisperPair** | CVE-2025-36911 Google Fast Pair Key-Based Pairing (KBP) bypass scanner. Passively detects Fast Pair–capable devices during BLE scan (tagged `[FP]` in scan list). Three attack modes: **Detect** (passive advertisement fingerprinting), **Probe** (GATT connect + service enumeration, confirms 0xFE2C service presence), and **Exploit** (writes a crafted AES-128-ECB encrypted KBP packet to trigger unsolicited pairing on vulnerable devices). All results logged to `/sdcard/lab/ble/whisperpair/`. *For authorized security research only.* |
 
 > **Note:** WiFi and BLE share the same radio. The firmware automatically switches between `RADIO_MODE_WIFI` and `RADIO_MODE_BLE` as needed.
 
 #### BT Scan & Select — How It Works
 
-**Step 1 — Scan:** Open **BT Scan & Select** from the Bluetooth menu. A 10-second active BLE scan runs, collecting all advertising devices. Each row shows device name (or vendor from OUI lookup, or `[Unknown]`), RSSI, and the last 3 octets of the MAC address. The list updates live every 500 ms during the scan.
+**Step 1 — Scan:** Open **BT Scan & Select** from the Bluetooth menu. An active BLE scan runs (duration configurable via Settings → Timing → BT Scan, default 10 s), collecting all advertising devices. Each row shows device name (or vendor from OUI lookup, or `[Unknown]`), RSSI, and the last 3 octets of the MAC address. The list updates live every 500 ms during the scan.
 
 **Step 2 — Select:** Tap any row to select a target device. The row highlights in cyan and the status bar shows the selection. Tap again to deselect. Only one device can be selected at a time. **Scrolling the list does not select a device** — only a clean tap (no scroll movement) counts as a selection.
 
 **Step 3 — Actions:** Once a device is selected, tap **Actions →** to open the action tile screen. Available actions: **BT Locator** (RSSI proximity tracking), **GATT Walker** (full GATT inspection and JSON output), and **Add to BT Lookout** (add the device MAC to the continuous watchlist). The target name or MAC is shown in the screen title.
+
+**Bottom button row** (always visible, no device selection needed):
+
+- **Exit** — stop scan and return to Bluetooth menu
+- **Save List** — opens a label dialog; writes the full scan list to SD as a numbered JSON file
+- **Rescan** (amber) — stops the current scan, clears the device list, and immediately starts a fresh scan at the configured duration
+- **Actions →** (cyan, appears after device selection) — opens attack tile screen for the selected target
+
+**Save List — File format**
+
+Scan files are saved to `/sdcard/lab/bluetooth/scans/`. The filename encodes a monotonically-incrementing scan counter (NVS-persisted across reboots), the UTC time, GPS coordinates if available, and the user label:
+
+```
+btsc_00001_HHMMSS_LAT_LON_label.json   (with GPS — live or last-known)
+btsc_00001_HHMMSS_label.json           (no GPS ever recorded)
+```
+
+GPS location uses the persistent GPS subsystem: `gps_best()` returns the live fix when available, or the last-known location (saved to NVS on each valid fix and on shutdown) when GPS signal is lost. You always get the closest known position even after a dropout.
+
+**JSON schema:**
+
+```json
+{
+  "label": "JBL",
+  "timestamp": "143022",
+  "datetime": "2026-05-20 14:30:22",
+  "gps_lat": 37.4219984,
+  "gps_lon": -122.0840012,
+  "gps_alt": 12.3,
+  "gps_live": true,
+  "fw_version": "v1.6.54",
+  "scan_id": 3,
+  "device_count": 12,
+  "devices": [
+    {
+      "mac": "AA:BB:CC:DD:EE:FF",
+      "addr_type": 0,
+      "phy": 1,
+      "rssi": -62,
+      "name": "JBL Flip 6",
+      "company_id": 0,
+      "is_airtag": false,
+      "is_smarttag": false,
+      "is_possible_airtag": false,
+      "is_fast_pair": false
+    }
+  ]
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `label` | User-supplied label (alphanumeric + `-_`, defaults to `mark`) |
+| `timestamp` | `HHMMSS` UTC — used in filename |
+| `datetime` | `YYYY-MM-DD HH:MM:SS` UTC from GPS-synced system clock |
+| `gps_lat/lon/alt` | GPS coordinates — live fix or last-known persistent position |
+| `gps_live` | `true` if GPS was live at save time; `false` if using last-known |
+| `scan_id` | Monotonically increasing counter (NVS-persisted) — matches `%05u` prefix in filename |
+| `device_count` | Number of entries in `devices[]` |
+| `rssi` | Peak RSSI seen during scan (dBm) |
+| `addr_type` | 0 = public, 1 = random |
+| `phy` | 1 = 1M, 2 = 2M, 3 = coded |
+
+#### List Wizard — How It Works
+
+List Wizard reads all saved `btsc_*.json` scan files from `/sdcard/lab/bluetooth/scans/` and lets you compare them across sessions.
+
+**File list:** Files are displayed newest-first (by scan counter). Each row shows the user label, the full save date and time (`YYYY-MM-DD HH:MM`), and the device count. A small red trash button on the right of each row deletes the file after a confirm dialog.
+
+**Selection:** Tap up to 4 rows to select them (highlighted cyan). The status bar shows how many are selected.
+
+**RSSI Threshold popup:** Before computing a set operation, tap **Unique** or **Common** to open the RSSI threshold popup. A slider from −99 dBm (no filter, default) to 0 dBm lets you exclude weak/distant devices.
+
+**Set operations:**
+- **Unique** (cyan) — devices exclusive to exactly one of the selected files. A device that appears in two or more files is excluded. RSSI shown is the **minimum** (signal floor) across all sightings of that device.
+- **Common** (green) — devices present in **every** selected file. RSSI shown is the **average** across all sightings in all selected files.
+
+**Result overlay:** A scrollable list sorted by RSSI descending. Each row shows `RSSI  MAC  Name`. An orange **RSSI bar** at the top shows the active threshold with a **Change** button — tap it to open the threshold slider and instantly re-filter without re-reading the SD card (the accumulator stays live in PSRAM for the lifetime of the result overlay).
+
+**Bottom button row in result overlay:**
+- **Close** — dismiss the overlay, return to file list
+- **New List** — opens a label dialog and saves the result as a new `btsc_*.json` scan file (same format as BT Scan & Select)
+- **Lookout** — appends all result MACs to `/sdcard/lab/bluetooth/lookout.csv` and reloads the BT Lookout watchlist
+
+**BT Blacklist**
+
+The blacklist at `/sdcard/lab/bluetooth/blacklist.csv` contains devices that should be globally suppressed. Any device whose MAC (or OUI prefix if `oui_only=1`) appears in the blacklist is silently skipped by BT Scan & Select, BT Lookout, BLE PCAP, and all other BT scan paths.
+
+**CSV format** (same as lookout.csv — no header row):
+```
+AA:BB:CC:DD:EE:FF,0   # full MAC match
+AA:BB:CC,1            # OUI prefix match (first 3 octets only)
+```
+
+The editor is in the **BT Lookout** screen — tap the **Blacklist** button (dark red, below the Edit List / OUI Groups row). Rows are shown in a scrollable list with a delete button on each entry and an **Add** button for new entries.
+
+#### Multi-Session Counter-Surveillance Workflow
+
+Use **BT Scan & Select** + **List Wizard** to detect whether a specific person or vehicle is carrying a fixed-MAC BLE tracker — an AirTag, Oura Ring, Fitbit, Garmin watch, or any other BLE device that does not randomize its MAC. The technique is simple: scan the same target environment twice and look for devices that appear in both sessions.
+
+**Step 1 — First scan**
+
+Open **BT Scan & Select** from the Bluetooth tile. Let the scan run for the configured duration (default 10 s; increase to 30 s in Settings → Timing for better coverage). When done, tap **Save List**, enter a descriptive label (e.g. `coffee_shop_1030`), and tap **Save**. The file is written to `/sdcard/lab/bluetooth/scans/`.
+
+**Step 2 — Second scan (different time or location)**
+
+Move to a second location — or wait for the target to leave and return — then scan again. Save with a new label (e.g. `coffee_shop_1430`). Any legitimate ambient device (smart speaker, neighbor's phone) should *not* appear in both scans. A tracker that follows the person *will*.
+
+**Step 3 — Common device analysis**
+
+Open **List Wizard** from the Bluetooth tile. Select both saved scan files (tap each row to highlight cyan). Optionally raise the RSSI threshold to exclude weak devices you were not physically near. Tap **Common**.
+
+List Wizard returns every device that appeared in **both** scans. Sort by RSSI descending — devices near the top were strong, nearby, and consistent across sessions.
+
+**Step 4 — Identify the tracker**
+
+Look for devices with recognizable characteristics:
+
+| Device | MAC behavior | How to spot |
+|--------|-------------|-------------|
+| Apple AirTag | Rotates every ~24 h when unpaired from owner | Name `AirTag`, manufacturer `Apple`, `is_airtag: true` flag |
+| Oura Ring | Static MAC | OUI `70:C8:8B` (Oura Health) or name `Oura Ring` |
+| Fitbit | Static MAC | OUI `E8:AB:F3` / `EC:5C:68` (Google/Fitbit) or name `Charge`, `Versa`, `Sense` |
+| Garmin watch | Static MAC | OUI `C4:5A:B1` / `58:93:D8` (Garmin) or name `fenix`, `vivosmart` |
+| Tile tracker | Static MAC | OUI from Tile, Inc.; name `Tile` |
+| General fixed-MAC | Static | Same full MAC across both sessions; not in OUI Groups above |
+
+Devices that rotated their MAC between sessions will **not** appear in Common — they are not reliable tracking vectors.
+
+**Step 5 — Add suspects to BT Lookout**
+
+In the result overlay, tap **Lookout** to append all Common results to the BT Lookout watchlist. Then open **Bluetooth Lookout** and tap **Start**. From this point, any time the suspected tracker comes within BLE range, the device fires 3 × 1-second vibrator pulses and shows a popup with the device name, MAC, vendor, and RSSI.
+
+**Tips**
+
+- Set the RSSI threshold to −70 dBm or higher to exclude devices that were only marginally visible (passers-by, parked cars one block away).
+- If the target is a vehicle, scan the same parking lot or route. BLE range is ~10–30 m — you need to be near the vehicle for the tracker to register.
+- Use the **New List** button to save the Common result as a new scan file for later reference or comparison against a third session.
+- OUI Groups in BT Lookout lets you monitor all devices from a specific manufacturer (e.g. all Garmin OUIs) without needing a specific MAC — useful when the tracker may have cycled its address.
+
+---
 
 #### AirTag / SmartTag Locator — How It Works
 
@@ -693,12 +859,12 @@ Attributes longer than one MTU are read automatically in multiple chunks (`ATT_R
 
 #### BT Observer — How It Works
 
-**BT Observer** automates the scan-then-walk workflow: it runs a single 10-second active BLE scan, captures all discovered devices, then attempts a sequential GATT walk on each one (5 s connect timeout). Results are displayed in a live scrollable list and saved as JSON files to `/sdcard/lab/gattwalker/` — identical format to manual GATT Walker.
+**BT Observer** automates the scan-then-walk workflow: it runs a configurable-duration active BLE scan (default 10 s, set via Settings → Timing → BT Scan), captures all discovered devices, then attempts a sequential GATT walk on each one (5 s connect timeout). Results are displayed in a live scrollable list and saved as JSON files to `/sdcard/lab/gattwalker/` — identical format to manual GATT Walker.
 
 **Workflow:**
 
 1. Open **BT Observer** from the Bluetooth tile.
-2. The device starts a 10-second active BLE scan. Discovered devices appear in the list with name/vendor and RSSI.
+2. The device starts an active BLE scan (default 10 s). Discovered devices appear in the list with name/vendor and RSSI.
 3. After the scan window closes, the observer walks each device in turn. The list updates live as each walk completes: green checkmark with service/chr counts on success, red on failure.
 4. When all devices have been attempted (or the session is stopped), the status bar shows total enumerated count.
 5. Tap any row with a successful walk to open the full GATT detail view (same scrollable tree as the single-walk result screen).
@@ -710,7 +876,7 @@ Attributes longer than one MTU are read automatically in multiple chunks (`ATT_R
 | Target | One device (selected) | All devices in one scan session |
 | Connect timeout | Configurable (3–30 s, NVS) | Fixed 5 s per device |
 | Result screen | Auto-navigates to detail on complete | Tap-to-open per device |
-| Scan pass | Continuous (relies on existing scan) | Single 10 s burst, no re-scan |
+| Scan pass | Continuous (relies on existing scan) | Single scan burst (10–30 s, configurable), no re-scan |
 
 **Per-device JSON files** are saved using the same `/sdcard/lab/gattwalker/` path and enriched format as single walks (manufacturer, service/chr names, props_str, ascii).
 
@@ -802,10 +968,12 @@ Tap **+ Add to Watchlist** on any group card. Each OUI is written to `lookout.cs
 
 **BLE PCAP** captures raw BLE advertising packets from the air and writes them to SD card in **Kismet PCAPNG format** — the same format used by Kismet Wireless, Wireshark, and other BLE analysis tools.
 
+The ESP32-C5 uses BLE 5.0 extended advertising (`CONFIG_BT_NIMBLE_EXT_ADV=y`), so the scanner uses `ble_gap_ext_disc()` and handles `BLE_GAP_EVENT_EXT_DISC` events — capturing both legacy (1M PHY) and extended (Coded PHY) advertisements that legacy-only scanners would miss.
+
 **Workflow:**
 1. Open **BLE PCAP** from the Bluetooth tile.
 2. A new `.pcapng` file is created in `/sdcard/lab/ble/captures/` (e.g. `ble_YYYYMMDD_HHMMSS.pcapng`).
-3. The screen shows a live packet counter. All advertising packets detected by the radio are captured.
+3. The screen shows a live packet counter. All advertising packets detected by the radio are captured, including BLE 5.0 extended advertisements.
 4. Tap **Stop** to flush and close the file cleanly.
 
 **File format:** PCAPNG with:
@@ -891,6 +1059,108 @@ The reconstructed PDU contains the advertising PDU header (event type + address 
 
 ---
 
+#### WhisperPair — CVE-2025-36911 Fast Pair Bypass
+
+> **Legal notice — authorized use only.** WhisperPair is a security research tool. Only run it against devices you own or have explicit written authorization to test. Unauthorized use may violate the Computer Fraud and Abuse Act (CFAA), the UK Computer Misuse Act, or equivalent legislation in your jurisdiction. The authors provide this tool for authorized penetration testing, academic research, and defensive security education only.
+
+**WhisperPair** implements detection and exploitation of **CVE-2025-36911**, a vulnerability in the Google Fast Pair Key-Based Pairing (KBP) protocol disclosed in January 2026 by COSIC/KU Leuven. The flaw allows any BLE device to trigger unsolicited pairing popups on Android phones and other Fast Pair–enabled devices without any user interaction on the target.
+
+##### Background — CVE-2025-36911
+
+Google Fast Pair uses a Key-Based Pairing (KBP) handshake to accelerate the Bluetooth pairing UX. The protocol is advertised via the `0xFE2C` BLE service UUID. The vulnerability: **Fast Pair providers (earbuds, speakers, accessories) accept KBP packets without verifying that the device is in explicit pairing mode.** An attacker can construct a valid-looking KBP packet encrypted with AES-128-ECB using the salt as the key and deliver it over BLE to any nearby Fast Pair device, triggering an Android pairing prompt on the victim's phone.
+
+**Affected devices:** Any Google Fast Pair–enabled accessory (Google Pixel Buds, Samsung Galaxy Buds, Sony WF/WH series, Bose, JBL, and thousands of other accessories using the GFP SDK) running unpatched firmware.
+
+**CVSS:** 6.5 Medium — does not require authentication, exploitable at BLE range (~10 m), results in unsolicited UI interaction on victim devices.
+
+##### How It Works
+
+Fast Pair providers broadcast a `0xFE2C` service UUID in their BLE advertisements. A KBP packet is 16 bytes:
+
+```
+Byte 0:   Type = 0x00 (Key-Based Pairing Request)
+Byte 1:   Flags = 0x00
+Bytes 2–7: Provider MAC address (target device address, big-endian)
+Bytes 8–15: Salt (8 random bytes, attacker-chosen)
+```
+
+The packet is encrypted with AES-128-ECB where the key is `Salt || 0x00 × 8` (salt padded to 16 bytes). The provider decrypts and processes this packet — triggering the pairing flow — without checking whether it is in discoverable/pairing mode.
+
+##### Access in CYM
+
+WhisperPair is found under **Bluetooth → BT Attacks → WhisperPair**. The authorization disclaimer must be acknowledged before the screen opens.
+
+**Passive detection** is automatic during any BLE scan. Devices advertising the `0xFE2C` Fast Pair service are tagged with `[FP]` in the BT Scan & Select list. GATT Walker also flags these devices with a `⚠ Fast Pair (CVE-2025-36911)` warning when the 0xFE2C service is discovered during a walk.
+
+##### WhisperPair Screen
+
+When opened, WhisperPair **automatically runs a BLE scan** to discover Fast Pair–capable devices. Any device advertising the `0xFE2C` service UUID is shown in the list. Each row shows:
+
+- Device index
+- Device name (truncated to 12 chars)
+- RSSI
+- Partial MAC (last 3 octets)
+- `[FP]` badge
+
+**Three action buttons:**
+
+| Button | Mode | Description |
+|--------|------|-------------|
+| **Probe** | GATT connect | Connects to the selected device, discovers the `0xFE2C` service and the KBP characteristic (`fe2c1234-...`), confirms exploitability, disconnects cleanly |
+| **Exploit** | KBP write | Connects, enables CCCD notifications, constructs and writes the crafted AES-128-ECB KBP packet, waits up to 5 s for a response notification |
+| **Run All** | Sequential | Runs the selected action (Probe or Exploit) against **every Fast Pair device in the list**, one at a time, cycling through them automatically with a chained callback. Results for each device are logged as they complete. |
+
+**Status and result display** update in real time below the device list. Results are also logged to SD.
+
+##### Usage
+
+1. Open **Bluetooth → BT Attacks → WhisperPair**. Acknowledge the authorization disclaimer.
+2. WhisperPair auto-scans for Fast Pair devices. Wait for the scan to populate the list (typically 10 seconds).
+3. To target a single device: tap a row to select it, then tap **Probe** or **Exploit**.
+4. To target all found devices sequentially: tap **Run All** — the firmware chains through each `[FP]` device automatically.
+5. Results are logged to `/sdcard/lab/ble/whisperpair/`.
+
+##### Output Log
+
+Each probe or exploit attempt produces a JSON entry in `/sdcard/lab/ble/whisperpair/`:
+
+```json
+{
+  "timestamp": "20260518_193200",
+  "mac": "AA:BB:CC:DD:EE:FF",
+  "name": "Galaxy Buds2 Pro",
+  "rssi": -54,
+  "mode": "exploit",
+  "kbp_chr_found": true,
+  "result": "notify_received",
+  "notify_hex": "1A2B3C4D5E6F7A8B9C0D1E2F3A4B5C6D",
+  "gps": { "valid": true, "lat": 37.1234567, "lon": -122.4567890 }
+}
+```
+
+`result` values:
+
+| Value | Meaning |
+|-------|---------|
+| `notify_received` | Provider responded with a KBP notification — device is vulnerable |
+| `no_notify` | KBP packet written but no notification received within 5 s — may be patched |
+| `chr_not_found` | 0xFE2C service present but KBP characteristic not found |
+| `connect_failed` | BLE connection could not be established |
+| `probe_ok` | Probe mode: KBP characteristic confirmed present |
+
+##### Porting to Janos
+
+The `ble_whisperpair.c/h` module is self-contained and portable. Dependencies:
+
+- **NimBLE** — `ble_gap_connect`, `ble_gattc_disc_svc_by_uuid`, `ble_gattc_disc_chrs_by_uuid`, `ble_gattc_write_flat` (standard NimBLE API, available in ESP-IDF and Zephyr)
+- **ROM AES** — `ets_aes_enable/setkey_enc/block/disable` from `esp32c5/rom/aes.h` — on other targets, substitute any AES-128-ECB implementation (mbedTLS `mbedtls_aes_crypt_ecb` or a bare-metal block cipher)
+- **FreeRTOS** — task + semaphore for async BLE serialization (replaceable with any RTOS primitives or a state machine)
+- **SD logging** — optional; the core exploit logic has no SD dependency
+
+To port: copy `ble_whisperpair.c/h`, replace the AES calls with your platform's AES-128-ECB, replace the FreeRTOS semaphores with your RTOS equivalents, and wire `wp_init(mutex)` + `wp_start(target, mode, cb)` into your UI. The GATT client pattern is identical to `gatt_walker.c` and can share the same connection infrastructure.
+
+---
+
 ### 3. Wardriving
 
 GPS-enabled WiFi (and optionally BLE) mapping. Requires an **ATGM336H** (or compatible NMEA module) wired to IO4/IO5 — see [GPS Wiring](#gps-wiring--atgm336h).
@@ -920,12 +1190,12 @@ The live dashboard shows:
 
 | Field | Description |
 |-------|-------------|
-| **Ch** | Current channel being scanned (shows **BLE** during a BLE time-slice pass) |
-| **APs** | Unique networks logged this session |
-| **Pts** | GPS points written to the CSV |
-| **Marks** | GPS waypoints saved this session |
-| **Lat / Lon** | Live GPS coordinates |
-| **Sats** | Satellite count |
+| **D-UCB** (green box) | Current channel being scanned — shows **BLE** during a BLE time-slice pass |
+| **WiFi** (cyan box) | Unique WiFi networks logged this session |
+| **BLE** (purple box) | BLE devices collected across all BLE passes this session |
+| **GPS bar** | Live coordinates (green) or last-known position (amber) with satellite count |
+
+The three stat boxes span the full screen width below the GPS bar. The BLE counter increments in real time during each 8-second BLE pass so you can confirm BLE scanning is working.
 
 **Stop** — ends the session, closes all open files, and returns to the Wardrive menu.
 
@@ -983,7 +1253,7 @@ When **BLE Wardrive** is enabled, the firmware periodically pauses WiFi scanning
 3. All discovered BLE devices (deduplicated by MAC) are recorded with the current GPS fix.
 4. The radio switches back to WiFi, D-UCB is rebuilt, and scanning resumes.
 
-During the BLE pass, the dashboard channel indicator shows **BLE** instead of a channel number.
+During the BLE pass, the D-UCB box shows **BLE** and the purple **BLE** counter increments as devices are discovered — confirming the scan is active even though the WiFi table is idle.
 
 **BLE rows in the CSV** follow the same WiGLE 1.6 format as WiFi rows, with `Type=BLE`, `Channel=37`, `Frequency=2402`, and `[BLE]` as the auth mode:
 
@@ -1054,7 +1324,7 @@ AA:BB:CC:DD:EE:FF,"MyNetwork",[WPA2_PSK],2026-05-08 12:34:56,6,2437,-65,37.12345
 
 **With BLE:**
 1. Options → BLE Wardrive → On. Options → Band → Both.
-2. Start Wardrive. The channel indicator flashes **BLE** every 30 s for an 8-second scan.
+2. Start Wardrive. Every 30 seconds the D-UCB box shows **BLE** for an 8-second pass; the purple BLE counter ticks up with each device found.
 3. Both WiFi and BLE sightings appear in the same CSV.
 
 **Marking a point of interest:**
@@ -1079,8 +1349,9 @@ AA:BB:CC:DD:EE:FF,"MyNetwork",[WPA2_PSK],2026-05-08 12:34:56,6,2437,-65,37.12345
 ```
 Settings
 ├── Compromised Data    (WiFi credential monitor)
-├── Timing              (WiFi scan dwell + GATT connect timeout — combined popup)
+├── Timing              (WiFi scan dwell + BT scan duration + GATT connect timeout — combined popup)
 │   ├── WiFi Scan/Ch    (min/max dwell time per channel — 50–1000 ms sliders)
+│   ├── BT Scan         (BLE initial scan duration — 10–30 s slider, default 10 s)
 │   └── GATT Timeout    (BLE connect timeout — 3–30 s slider)
 ├── Download Mode       (reboot into bootloader)
 ├── Screen              (screen timeout + brightness — combined popup)
@@ -1099,7 +1370,7 @@ All settings are persisted via **NVS** (Non-Volatile Storage) across reboots. Th
 
 | Setting | Description |
 |---------|-------------|
-| **Timing** | Combined timing popup — WiFi scan dwell time sliders and GATT connect timeout slider |
+| **Timing** | Combined timing popup — WiFi scan dwell time sliders, BT scan duration slider (10–30 s), and GATT connect timeout slider |
 | **Screen** | Combined screen popup — inactivity timeout dropdown and brightness overlay slider |
 | **SD Card** | Validate/provision (creates `/sdcard/lab/` structure, shows completion status); browse file tree; check free space |
 | **GPS Info** | Live GPS fix status — latitude, longitude, altitude, satellite count, UTC time, and UART reference. When no live fix, last-known coordinates are shown in amber with `*` suffix and `Accuracy: 150 m (stale)`. **Set Position** button opens manual coordinate editor (see below). Refreshes every second. |
@@ -1190,9 +1461,11 @@ Switching modes takes effect immediately on the active radio and is re-applied a
 
 #### Timing Settings
 
-Accessible via **Settings → Timing**. A single popup contains two sections:
+Accessible via **Settings → Timing**. A single popup contains three sections:
 
 **WiFi Scan / Channel** — min and max dwell time sliders (50–1000 ms) control how long the WiFi scanner dwells on each channel during active scans. Both values are NVS-persisted.
+
+**BT Scan Duration** — a slider (10–30 s, default 10 s, NVS key `bt_scan_dur`) sets how long the initial BLE scan runs when opening BT Scan & Select, BT Observer, or AirTag Scan. Longer values find more devices, especially in noisy or busy RF environments; shorter values make scans feel snappier.
 
 **GATT Connect Timeout** — a single slider sets the BLE connection timeout used by GATT Walker. BT Observer uses a separate fixed 5 s timeout and is not affected by this setting.
 
@@ -1247,13 +1520,17 @@ All client IP addresses are logged to serial output so you can see which device 
 The device joins an existing WiFi network as a station (STA) and serves files on the IP address assigned by your router's DHCP server. The IP is displayed prominently on screen as soon as a lease is obtained.
 
 1. Tap **WiFi Client** — the screen shows pre-filled SSID and password fields (populated from the last saved connection).
-2. Edit SSID / password if needed — tap either field to bring up the on-screen keyboard.
+2. Edit SSID / password if needed — tap either field to bring up the on-screen keyboard. Tap the **eye icon** on the password field to reveal/mask the password.
 3. Tap **Connect** — the device connects to your network. Credentials are saved to NVS so next time the fields are pre-filled.
 4. Once connected the screen shows the assigned IP: `IP: 192.168.x.x => http://192.168.x.x`
 5. Open that URL on any device on the same network to browse, upload, create folders, or delete files.
 6. Tap **Back** to disconnect and stop the server.
 
+**First-connect reliability:** The firmware pins the regulatory domain to International (channels 1–13, MANUAL policy) immediately before and after each connect attempt. An auto-retry fires once at 1.5–5 s if the initial association is dropped by a country-IE-induced regdomain update — this is transparent and produces no visible delay.
+
 > **Note:** The WiFi radio must be available (not in BLE mode) to use the file server. If BLE is active, the firmware switches radio modes automatically.
+
+> **International channels:** The regulatory domain is set to `01` (ITU world region) with `nchan=13`, covering channels 1–11 (US) and 1–13 (EU/Poland/Australia) without restriction. All access points on channels 12–13 are accessible without any configuration change.
 
 **Wardrive Upload**
 
@@ -1278,6 +1555,272 @@ Uploads all wardrive CSV files from `/sdcard/lab/wardrives/` to [WiGLE](https://
 5. Each result is written to `/sdcard/lab/wardrives/upload_log.csv`; the **Manage Data** screen reads this file to color-code rows
 
 > **Tip:** Use **Wardrive → Manage Data → Upload** instead of **Settings → Data Transfer → Wardrive Upload** when you want to see file status before and after uploading. Both paths use the same upload screen and log.
+
+### 6. Zigbee Scout
+
+**Zigbee Scout** uses the ESP32-C5's built-in IEEE 802.15.4 radio to passively scan and wardrive Zigbee networks — no external hardware required. It operates independently of the NM-RF-HAT.
+
+```
+Bluetooth → Zigbee Scout
+├── Start Scan     -- passive receive on all 16 channels, rotates every 800 ms
+├── PAN List       -- tap any PAN to lock onto it (RSSI locator mode)
+├── Stop
+└── (auto-logs to /sdcard/lab/zigbee/)
+```
+
+**What it captures:**
+
+| Field | Description |
+|-------|-------------|
+| PAN ID | 16-bit Zigbee PAN identifier (e.g. `0x1A2B`) |
+| Channel | IEEE 802.15.4 channel (11–26, 2405–2480 MHz) |
+| RSSI | Signal strength in dBm |
+| Coordinator | Extended address of the PAN coordinator (if seen in a beacon) |
+| Node count | Number of unique device addresses seen in the PAN |
+| Frame types | Beacon, Data, ACK, Command frame counts |
+| NWK/APS metadata | Network/application layer frame type, destination address |
+| GPS | Coordinates at time of reception |
+
+**PAN List screen:**
+
+After a scan, tap any row in the PAN List to open the PAN detail view:
+
+- Full 64-bit extended coordinator address (if seen)
+- Device short address list (16-bit node IDs seen transmitting)
+- Frame type breakdown (Beacon / Data / ACK / Command)
+- RSSI locator: locks the channel and shows live RSSI for that PAN — walk toward the coordinator using the RSSI reading
+
+**RSSI Locator:**
+
+Tap **Locate** on any PAN entry. Zigbee Scout locks the 802.15.4 radio to that PAN's channel and displays a live RSSI reading updated every 500 ms. Use it to find the physical location of a Zigbee hub or coordinator. Vibrator strength scales with RSSI when the vibrator motor is installed.
+
+**Output files:**
+
+```
+/sdcard/lab/zigbee/
+├── zgwd_YYYYMMDD_HHMMSS.csv       -- wardrive CSV (one row per PAN sighting)
+└── zgwd_YYYYMMDD_HHMMSS.pcap      -- PCAP capture (Wireshark DLT 195 = IEEE 802.15.4)
+```
+
+**CSV columns:**
+
+| Column | Description |
+|--------|-------------|
+| `timestamp` | UTC from GPS-synced clock |
+| `pan_id` | 16-bit PAN ID in hex |
+| `channel` | 802.15.4 channel number (11–26) |
+| `rssi` | dBm at time of sighting |
+| `coordinator` | Extended coordinator address or `unknown` |
+| `lat`, `lon`, `alt` | GPS coordinates (last-known fallback if no fix) |
+| `gps_live` | `1` if GPS was live; `0` if last-known |
+
+The PCAP file uses **DLT 195** (`LINKTYPE_IEEE802_15_4_WITHFCS`) and can be opened directly in Wireshark with the IEEE 802.15.4 dissector. OTA frame bytes including the 2-byte FCS are preserved.
+
+**IEEE 802.15.4 channels and Zigbee:**
+
+| Channel | Frequency | Notes |
+|---------|-----------|-------|
+| 11 | 2405 MHz | First Zigbee channel |
+| 15 | 2425 MHz | Common default for many Zigbee hubs |
+| 20 | 2450 MHz | |
+| 25 | 2475 MHz | |
+| 26 | 2480 MHz | Last Zigbee channel; used by some Thread networks |
+
+The Scout rotates through all 16 channels (11–26) with an 800 ms dwell per channel, completing a full sweep in ~13 seconds. Each PAN seen on any channel is de-duplicated by PAN ID in the live list.
+
+> **Note:** Zigbee Scout uses the ESP32-C5's hardware 802.15.4 PHY (`esp_ieee802154_*` API). WiFi and BLE are disabled while Zigbee Scout is running. The radio switches back automatically when you exit the screen.
+
+---
+
+### 7. NM-RF-HAT
+
+The **NM-RF-HAT** is an optional RF expansion board that connects to the NM-CYD-C5 via its FPC2 header. It provides five RF modules gated by a 6-position DIP switch -- only one module is powered at a time (hardware exclusion). Enable support via **Settings → NM-RF-HAT**.
+
+#### Modules
+
+| DIP | Module | Frequency | GPIO9 (IO27) | GPIO8 (IO22) |
+|-----|--------|-----------|-------------|-------------|
+| 1 | CC1101 | Sub-1 GHz (300–928 MHz) | SPI CSN | GDO0 |
+| 2 | nRF24L01 | 2.4 GHz | SPI CSN | CE |
+| 3 | PN532 | 13.56 MHz NFC/RFID | I2C SDA | I2C SCL |
+| 4 | IR Infrared | 36–40 kHz carrier | TX (IR LED) | RX (demod) |
+| 5 | RF433 OOK/ASK | 433.92 MHz | TX | RX |
+| 6 | Battery switch | — | — | — |
+
+#### Infrared (DIP 4)
+
+IR capture and replay using the ESP32-C5's RMT peripheral. Files use the **Flipper Zero `.ir` format** — directly portable between this device and a Flipper Zero (mount point differs; content is identical).
+
+```
+NM-RF-HAT IR
+├── Capture       -- listen for any IR signal (5 s timeout), then save to a remote file
+├── Replay        -- browse remote files -> signals -> transmit
+│   ├── <Remote>.ir
+│   │   ├── Signal 1
+│   │   ├── Signal 2
+│   │   └── ...
+│   └── ...
+├── Universal     -- multi-button remote: Power Search + Power/VOL/CH/Input/Mute buttons
+├── TV-B-Gone     -- transmit built-in power-off sequence for 16 common TV brands (3x repeats)
+└── IR Jammer     -- continuous 38 kHz carrier via LEDC hardware PWM
+```
+
+**SD card path:** `/sdcard/lab/infrared/`
+
+---
+
+##### .ir File Format
+
+Each `.ir` file represents one remote (e.g. `Samsung_TV.ir`) and can contain any number of named signals separated by `#` lines:
+
+```
+Filetype: IR signals file
+Version: 1
+#
+name: Power
+type: raw
+frequency: 38000
+duty_cycle: 0.33
+data: 9000 4500 560 1680 560 560 560 1680 560 560 ...
+#
+name: Vol_up
+type: raw
+frequency: 38000
+duty_cycle: 0.33
+data: 9000 4500 560 560 560 1680 560 560 ...
+```
+
+Signal values are alternating mark/space pulse durations in **microseconds**. `frequency` is the carrier in Hz (typically 38000). `duty_cycle` is typically 0.33 (ignored on raw TX — RMT uses fixed 33% duty).
+
+---
+
+##### Universal Remote
+
+The Universal Remote screen provides six one-tap buttons for the most common TV functions — **Power, VOL-, VOL+, CH-, CH+, Input, Mute** — using signals loaded from a brand `.ir` file on the SD card. The active brand is saved to NVS and restored automatically every time you open the screen.
+
+**Power Search** cycles through every `.ir` file in `/sdcard/lab/infrared/`, sends the `Power` signal from each brand, and asks "Did it work?" — tap **Yes** to lock in that brand, **Skip** to try the next, **Stop** to exit the search. The confirmed brand is saved immediately to NVS.
+
+**Signal name convention — Universal Remote requires these exact names:**
+
+| Button | Signal name in .ir file |
+|--------|------------------------|
+| Power  | `Power`                |
+| VOL-   | `Vol_dn`               |
+| VOL+   | `Vol_up`               |
+| CH-    | `Ch_prev`              |
+| CH+    | `Ch_next`              |
+| Input  | `Input`                |
+| Mute   | `Mute`                 |
+
+Only `Power` is required for the Power Search to work. The other signals are optional — a "Not found" status is shown if a button's signal is missing from the file.
+
+**The Flipper-IRDB already uses this naming convention.** Files downloaded from that database work directly with Universal Remote without any editing.
+
+---
+
+##### TV-B-Gone
+
+Built-in power-off sequence covering 16 common TV brands. Each code is sent 3 times with 65 ms between repeats and 250 ms between brands. DIP 4 must be ON. No SD card files required.
+
+---
+
+##### Getting .ir Files onto the SD Card
+
+**Compatible IR file sources:**
+- Flipper-IRDB (most comprehensive, correct signal names): https://github.com/logickworkshop/Flipper-IRDB
+- Flipper Zero built-in assets: https://github.com/flipperdevices/flipperzero-firmware/tree/dev/assets/infrared/assets
+- IRDB community database: https://github.com/probonopd/irdb
+
+Copy any `.ir` file directly into `/sdcard/lab/infrared/` — no conversion needed. Files appear in the **Replay** remote list immediately, and the Power Search scans them automatically.
+
+> **Tip:** The Flipper-IRDB `TV` folder contains brand files with `Power`, `Vol_up`, `Vol_dn`, `Ch_next`, `Ch_prev`, `Mute`, and `Input` already named correctly for Universal Remote.
+
+#### RF433 OOK/ASK (DIP 5)
+
+433.92 MHz OOK/ASK capture and replay. Files use the **Flipper Zero `.sub` (SubGHz) format** — directly portable to/from Flipper Zero.
+
+**SD card path:** `/sdcard/lab/rf433/`
+
+**Compatible .sub file sources:**
+- Flipper Zero Sub-GHz library: https://github.com/flipperdevices/flipperzero-firmware/tree/dev/assets/subghz
+- UberGuidoZ collection: https://github.com/UberGuidoZ/Flipper/tree/main/Sub-GHz
+
+#### PN532 NFC/RFID (DIP 3)
+
+13.56 MHz NFC/RFID card scanning, saving, exporting, importing, and emulation via I2C (GPIO8=SCL, GPIO9=SDA). Supports ISO14443A cards: NTAG213/215/216, MIFARE Ultralight, MIFARE Classic.
+
+**SD card paths:**
+- `/sdcard/lab/rfid/hf/` -- saved card JSON files
+- `/sdcard/lab/rfid/import/` -- drop Flipper Zero `.nfc` files here to import
+- `/sdcard/lab/rfid/export/` -- Flipper Zero `.nfc` exports written here
+- `/sdcard/lab/rfid/keys/` -- reserved for future key files
+- `/sdcard/lab/rfid/logs/` -- reserved for scan logs
+
+**Workflow:**
+- **Card Scan:** tap Scan and hold a card near the antenna; UID, ATQA, SAK, and inferred card type appear on screen.
+- **Save:** tap Save; a name popup appears; card is saved as JSON to `/sdcard/lab/rfid/hf/`.
+- **Export .nfc:** tap Export to write a Flipper Zero `.nfc` format file to `/sdcard/lab/rfid/export/`.
+- **Import .nfc:** drop Flipper Zero `.nfc` files in `/sdcard/lab/rfid/import/`; they appear in the Saved Cards list alongside locally scanned cards.
+- **Card Emulate:** select a saved card from the Saved Cards list and tap Emulate; the PN532 presents the card's UID to any reader via `TgInitAsTarget`. Works for UID-only readers. MIFARE Classic authentication (CRYPTO1) is not emulated -- readers that require full auth will not complete the handshake.
+- **Saved Cards:** scrollable list with Load, Emulate, and Delete per card.
+
+> **Note:** The PN532 module on the NM-RF-HAT has shorter read range than a dedicated PN532 breakout board. Hold cards very close -- nearly touching the antenna -- for reliable reads. This is a hardware limitation of the RF-HAT form factor, not a firmware issue.
+
+#### CC1101 Sub-GHz (DIP 1)
+
+Sub-1 GHz (300-928 MHz) OOK/ASK capture, replay, spectrum scan, and jamming. Uses a 2-page paged tile menu (prev/next navigation with page indicator).
+
+**SD card path:** `/sdcard/lab/radio/` -- Flipper Zero `.sub` format
+
+**Features:**
+- **HW Test:** reads CC1101 PARTNUM (0x00) and VERSION (0x14) registers; shows MARCSTATE to confirm chip identity and SPI link.
+- **Freq Scan:** canvas-based spectrum view; RSSI bar per channel across the full 300-928 MHz tunable range; carrier detect; Start/Stop control.
+- **RAW Capture:** 10-second OOK/ASK signal capture window; Save/Discard prompt after capture; saves to `/sdcard/lab/radio/` as Flipper Zero `.sub` format.
+- **RAW Replay:** lists `.sub` files from SD; play at 1x/3x/5x speed.
+- **Saved Files:** list with Play and Delete per file.
+- **Jammer:** legal disclaimer screen required before activation; sweeps channels in PTX mode.
+- **Band Scope:** 126-point spectrum + 8-row scrolling waterfall canvas; 130 us dwell per channel; continuous sweep; live active-channel count. Tap the canvas to show frequency + RSSI for that bin.
+- **Z-Wave Scout:** passive wardrive on the Z-Wave frequency (908.42 MHz US / 868.42 MHz EU). Configures CC1101 for GFSK 9.6 kbps, sync word `0xAA01`. Logs frame metadata (node IDs, command class, RSSI, GPS coordinates) to `/sdcard/lab/zwave/` as a timestamped CSV. GPS-tagged entries are compatible with WiGLE for mapping Z-Wave device density.
+
+##### Z-Wave Scout
+
+Z-Wave Scout puts the CC1101 into passive receive mode at the Z-Wave primary channel (908.42 MHz, 9.6 kbps GFSK, `0xAA01` sync word). All received frames are decoded at the link layer: source and destination node IDs, hop count, command class byte, and RSSI. Results are displayed live on screen and logged to `/sdcard/lab/zwave/zwave_YYYYMMDD_HHMMSS.csv`.
+
+**CSV columns:**
+
+| Column | Description |
+|--------|-------------|
+| `timestamp` | UTC from GPS-synced clock |
+| `rssi` | Signal strength in dBm |
+| `src_node` | Z-Wave source node ID (1–232) |
+| `dst_node` | Z-Wave destination node ID or `0xFF` for broadcast |
+| `hop_count` | Remaining hops in the routing header |
+| `cmd_class` | First command class byte (e.g. `0x25` = Binary Switch, `0x26` = Multilevel Switch) |
+| `lat`, `lon` | GPS coordinates at time of reception (last-known fallback if no fix) |
+| `gps_live` | `1` if GPS was live; `0` if using last-known |
+
+**Tap Stop** to close the log file cleanly. Entries without GPS use the last-known NVS position with `gps_live=0`.
+
+> **Note:** Z-Wave uses 908.42 MHz in the US and 868.42 MHz in Europe/Australia. The Scout is pre-configured for the US frequency. Edit `ZWAVE_FREQ_MHZ` in `main.c` to change regions.
+
+#### nRF24L01+ 2.4 GHz (DIP 2)
+
+2.4 GHz channel scan, packet sniffing, and jamming. Uses a 2-page paged tile menu (same pattern as CC1101).
+
+**SD card path:** `/sdcard/lab/nrf24/` -- Flipper-compatible `.nrf24` text format
+
+**Features:**
+- **HW Test:** reads STATUS, CONFIG, RF_CH, and RF_SETUP registers over SPI; confirms chip is responding.
+- **Ch Scan:** 126-channel carrier-detect sweep (2400-2525 MHz); canvas shows spectrum bar + 8-row waterfall; Start/Stop; live active-channel count.
+- **Sniffer:** promiscuous RX on configurable channel; captures packets; hex dump of last packet; auto-saves to `/sdcard/lab/nrf24/` in Flipper-compatible `.nrf24` text format.
+- **Saved Files:** lists `.nrf24` files with Play and Delete per entry.
+- **Jammer:** legal disclaimer required; rapid PTX channel sweep across all 126 channels.
+- **Futaba S-FHSS:** scans 25 S-FHSS channels (2404-2504 MHz, 4 MHz steps) at 1 Mbps; decodes 10-byte payload; extracts up to 8 servo channel values (11-bit, 0-2047); displays result on screen.
+- **Stub screens** (with authorization disclaimers): MouseJack, Keyboard Inject, Drone, GamePad -- Coming Soon.
+
+**nRF24 component:** `ESP32C5/components/nrf24/` (nrf24.c, nrf24.h, CMakeLists.txt)
+
+---
 
 ### UI & System Features
 
@@ -1317,7 +1860,7 @@ All data is stored on the SD card. `/sdcard/lab/` is the root for all project da
 ├── calibrate.txt             # Create this file to trigger touch re-calibration on next boot
 └── lab/                      # Root for all project data
     ├── ouilist.bin           # OUI vendor table -- adds manufacturer names to BLE scan results
-    ├── white.txt             # MAC/SSID whitelist (one per line)
+    ├── white.txt             # WiFi BSSID/SSID whitelist -- networks protected from all attacks (one per line, MAC or SSID)
     ├── eviltwin.txt          # Credentials captured by Evil Twin / Captive Portal (auto-appended)
     ├── portals.txt           # Captive portal config
     ├── wpa-sec.txt           # wpa-sec.org API key (paste key on line 1)
@@ -1331,12 +1874,18 @@ All data is stored on the SD card. `/sdcard/lab/` is the root for all project da
     │   │   └── ble_<timestamp>.pcapng
     │   ├── honeypair/        # HoneyPair session logs
     │   │   └── honeypair_<timestamp>.jsonl
-    │   └── blueduck/         # BlueDuck DuckyScript payloads (upcoming)
-    │       └── scripts/
-    │           └── *.duck
+    │   ├── blueduck/         # BlueDuck session logs + DuckyScript payloads
+    │   │   ├── scripts/      # Drop .duck scripts here (seeded: android_rickroll.duck)
+    │   │   │   └── *.duck
+    │   │   └── blueduck_<timestamp>.jsonl
+    │   └── whisperpair/      # WhisperPair (CVE-2025-36911) probe/exploit logs
+    │       └── wp_<timestamp>.json
     ├── bluetooth/
-    │   ├── lookout.csv       # Bluetooth Lookout watchlist
-    │   └── spooflist.csv     # Device Spoof targets -- CSV: MAC,Name (one per line)
+    │   ├── lookout.csv       # BT Lookout watchlist: MAC,name,rssi_threshold,oui_only
+    │   ├── blacklist.csv     # BT Blacklist: MAC[,oui_only] — suppressed globally
+    │   ├── spooflist.csv     # Device Spoof targets: MAC,Name (one per line)
+    │   └── scans/            # BT Scan & Select saved snapshots
+    │       └── btsc_00001_HHMMSS_LAT_LON_label.json   # GPS-tagged JSON; scan_id NVS-persisted
     ├── cellular/
     │   ├── tower_baseline.csv
     │   ├── tower_anomalies.csv
@@ -1353,9 +1902,32 @@ All data is stored on the SD card. `/sdcard/lab/` is the root for all project da
     │   ├── *.pcap            # Wireshark-compatible captures
     │   └── *.hccapx          # Hashcat-compatible format
     ├── htmls/                # Captive portal HTML pages
-    │   └── *.html / *.htm    # Drop any portal page here -- each file appears in the attack dropdown
+    │   ├── basic_portal.html # Seeded: dark-themed WiFi login page (posts to /login)
+    │   └── *.html / *.htm    # Drop additional portal pages here -- each appears in the attack dropdown
+    ├── infrared/             # NM-RF-HAT IR remotes (Flipper Zero .ir format)
+    │   └── <Remote>.ir       # One file per remote — multiple named signals per file
     ├── pcaps/                # MITM/sniff PCAP captures
     │   └── mitm_<n>.pcap
+    ├── nrf24/                # NM-RF-HAT nRF24L01+ captures (Flipper-compatible .nrf24 format)
+    │   └── <capture>.nrf24
+    ├── radio/                # NM-RF-HAT CC1101 captures (Flipper .sub format)
+    │   └── <freq>MHz_<ts>.sub
+    ├── rf433/                # NM-RF-HAT RF433 OOK captures (Flipper Zero .sub format)
+    │   └── <Signal>.sub
+    ├── zigbee/               # Zigbee Scout wardrive logs (ESP32-C5 802.15.4 PHY)
+    │   ├── zgwd_<timestamp>.csv   # One row per PAN sighting (PAN ID, channel, RSSI, GPS)
+    │   └── zgwd_<timestamp>.pcap  # PCAP DLT 195 (IEEE 802.15.4 with FCS)
+    ├── zwave/                # Z-Wave Scout captures (CC1101 908.42 MHz)
+    │   └── zwave_<timestamp>.csv  # One row per received frame (node IDs, cmd class, GPS)
+    ├── rfid/                 # NM-RF-HAT NFC/RFID (PN532)
+    │   ├── hf/               # 13.56 MHz card saves (JSON)
+    │   │   └── <name>.json
+    │   ├── import/           # Drop Flipper .nfc files here to import
+    │   │   └── *.nfc
+    │   ├── export/           # Flipper .nfc exports
+    │   │   └── *.nfc
+    │   ├── keys/             # (reserved)
+    │   └── logs/             # (reserved)
     ├── screenshots/          # UI screenshots (BMP)
     │   └── screen_<n>.bmp
     └── wardrives/            # GPS + WiFi wardrive logs (WiGLE CSV 1.6 format)
@@ -1527,6 +2099,10 @@ CYM-NM28C5/
 │   │   ├── main.c                # Core application — all UI screens, boot sequence,
 │   │   │                         #   WiFi/BLE logic, touch calibration, GPS, wardriving
 │   │   ├── attack_handshake.c/h  # WPA handshake capture (PCAP & HCCAPX)
+│   │   ├── ble_blueduck.c/h      # BlueDuck BLE HID keyboard — GATT service registration,
+│   │   │                         #   HID report handle lifecycle, persona management
+│   │   ├── ble_whisperpair.c/h   # WhisperPair CVE-2025-36911 — portable NimBLE GATT client,
+│   │   │                         #   AES-128-ECB KBP packet construction, FreeRTOS task lifecycle
 │   │   ├── bt_lookout.c/h        # Bluetooth Lookout — CSV watchlist, LED alerts, OUI matching
 │   │   ├── oui_lookup.c/h        # OUI vendor lookup — PSRAM binary search over ouilist.bin
 │   │   ├── gatt_walker.c/h       # GATT Walker — NimBLE GATT client, JSON output, FNV-32 fingerprint
@@ -1544,6 +2120,8 @@ CYM-NM28C5/
 │   │   ├── pcap_serializer/      # PCAP file writer (Wireshark-compatible)
 │   │   ├── hccapx_serializer/    # HCCAPX file writer (hashcat)
 │   │   ├── led_strip/            # Local WS2812 RMT driver (replaces legacy managed component)
+│   │   ├── rfid/                 # NFC/RFID card management (PN532 I2C driver, Flipper .nfc file I/O, JSON card storage)
+│   │   ├── nrf24/                # nRF24L01+ 2.4 GHz driver (SPI, channel scan, packet sniffer, S-FHSS decoder, Flipper .nrf24 I/O)
 │   │   └── espressif__esp_lcd_ili9341/  # ST7789 LCD panel driver (Espressif component, local copy)
 │   ├── binaries-esp32c5/         # Pre-built flashable binaries (bootloader, partition-table, app)
 │   ├── docs/
@@ -1599,17 +2177,15 @@ This entry will appear in the Launcher OTA favorites list and install the latest
 
 ## On Signal Jamming
 
-> **This project does not and will never include signal jamming or any feature that deliberately denies or disrupts authorized radio communications. This is a firm, non-negotiable design boundary — not a liability footnote.**
+Signal jamming features are included in the NM-RF-HAT menu (CC1101 Sub-GHz jammer, nRF24L01+ 2.4 GHz channel sweep jammer, IR jammer, RF433 jammer) for use in **authorized test environments only** -- for example, a Faraday cage or under a written test authorization from the operator of the frequency band. Every jammer entry point is gated behind an explicit legal disclaimer screen that must be acknowledged before activation.
 
-Signal jamming is categorically different from every other capability in this firmware. Attacks like deauth, evil twin, and BLE spam operate at the protocol layer and can be targeted, scoped, and stopped. Jamming operates at the physical RF layer — it is inherently indiscriminate, cannot be aimed, cannot be recalled, and cannot distinguish a test network from a hospital cardiac monitor or an emergency services radio.
+Jamming operates at the physical RF layer and is inherently indiscriminate. Unlike protocol-layer attacks (deauth, BLE spam), it cannot be targeted, cannot be recalled once transmitting, and cannot distinguish a test device from emergency communications equipment. Use only in an environment where you have complete control over the RF spectrum -- a shielded room, an RF test chamber, or a hardware-isolated test bench. Never operate a jammer in a residential building, vehicle, public space, or any environment with uncontrolled RF exposure.
 
 The [FCC is explicit](https://www.fcc.gov/enforcement/areas/jammers): *"The Communications Act of 1934, as amended, prohibits the operation, manufacture, importation, marketing, and sale of equipment designed to jam or otherwise interfere with authorized radio communications... These jamming devices pose significant risks to public safety and potentially compromise other radio communications services."*
 
 The consequences are equally clear. Per the [FCC Jammer Enforcement](https://www.fcc.gov/general/jammer-enforcement) page: *"Signal jamming devices can prevent you and others from making 9-1-1 and other emergency calls and pose serious risks to public safety communications... The use or marketing of a jammer in the United States may subject you to substantial monetary penalties, seizure of the unlawful equipment, and criminal sanctions including imprisonment."*
 
-This is not a uniquely American position. Every jurisdiction with a radio communications law — which is effectively every country on Earth — treats jamming as a serious criminal offense precisely because the harm is real and uncontrollable.
-
-The security research community does itself no favors when it conflates "security tool" with "RF jammer." If you are looking for jamming firmware, this is not it, and no future version of this project will be.
+This is not a uniquely American position. Every jurisdiction with a radio communications law -- which is effectively every country on Earth -- treats jamming as a serious criminal offense precisely because the harm is real and uncontrollable. The disclaimer screens exist to make the legal exposure clear; they do not make operation legal outside an authorized environment.
 
 ---
 
@@ -1625,4 +2201,4 @@ This project is intended for **educational and authorized security research purp
   <b>Made with ☕ and ESP-IDF</b>
 </p>
 
-I love your Face!
+<p align="center">KAL, I love your face!</p>

@@ -345,6 +345,33 @@ Touch detection (no IRQ):
 
 ---
 
+## NM-RF-HAT Expansion Board
+
+The NM-RF-HAT connects via the **FPC2** 14-pin flat-flex connector. Only GPIO8 and GPIO9
+carry RF module signals; all other FPC2 lines are the shared SPI bus or GPIO4/5 (unused
+by any RF module). Full pinout: `GPIO Map Between NM-RF-HAT and NM-CYD-C5.md`.
+
+| GPIO | RF-HAT Role                        | DIP | Notes                              |
+|------|------------------------------------|-----|------------------------------------|
+| 2    | SPI MISO (shared with display/SD)  | 1,2 | CC1101 MISO / nRF24 MISO          |
+| 6    | SPI CLK  (shared)                  | 1,2 | CC1101 SCLK / nRF24 SCK           |
+| 7    | SPI MOSI (shared)                  | 1,2 | CC1101 MOSI / nRF24 MOSI          |
+| 8    | Multi-role data A (IO22 / Pin 7)   | all | GDO0 / CE / SCL / **IR-TX** / RF433-TX |
+| 9    | Multi-role data B (IO27 / Pin 9)   | all | CSN / CSN / SDA / **IR-RX** / RF433-RX |
+| 10   | SD card CS (always active)         | —   | Unaffected by any DIP setting      |
+
+**IR and RF433 GPIO orientation (empirically confirmed v1.8.35):**
+- GPIO8 (IO22, Pin 7) = **transmit** — green emitter LED lights during TX
+- GPIO9 (IO27, Pin 9) = **receive** — blue detector LED responds to incoming IR
+- The schematic labels (IR_DT on IO27, IR_DR on IO22) are reversed relative to actual
+  board behavior. Firmware `rf_hat_config.h` uses the confirmed values.
+
+**RMT constraint on ESP32-C5:** `SOC_RMT_MEM_WORDS_PER_CHANNEL = 48`. All RMT users
+(WS2812, IR TX, IR RX) must set `mem_block_symbols = 48` — using 64 chains adjacent
+channels and exhausts RX slots, preventing IR capture from initializing.
+
+---
+
 ## Version History
 
 | Date       | Change                                                                    |
@@ -363,6 +390,9 @@ Touch detection (no IRQ):
 | 2026-05-14 | v1.3.3: touch calibration upgraded to 4-point (TL/TR/BL/BR at 10 px from  |
 |            | edges). v1.3.4: removed raw ADC range check from xpt2046.c — physical edge |
 |            | reads legitimately exceed 4000; Z1 pressure is the sole touch gate.       |
+| 2026-05-21 | NM-RF-HAT section added. IR TX/RX GPIO corrected by empirical LED          |
+|            | observation: GPIO8 = emitter (green), GPIO9 = detector (blue). RF433 same. |
+|            | RMT mem_block_symbols = 48 constraint documented for ESP32-C5.             |
 
 ---
 
