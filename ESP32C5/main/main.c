@@ -235,6 +235,7 @@ typedef struct {
     bool is_smarttag;
     bool is_possible_airtag;  /* Apple 0x05 Nearby Action — AirTag in owner-proximity/paused mode */
     bool is_fast_pair;         /* Google Fast Pair — service UUID 0xFE2C; potentially CVE-2025-36911 vulnerable */
+    bool is_matter;            /* Matter commissioning beacon — service UUID 0xFFF6 in advertisement */
 } bt_device_info_t;
 
 static bt_device_info_t bt_devices[BT_MAX_DEVICES];
@@ -1705,6 +1706,7 @@ static int bt_sas_selected_idx = -1;
 static uint8_t bt_sas_target_addr[6];
 static uint8_t bt_sas_target_addr_type = 0;
 static char bt_sas_target_name[32];
+static bool bt_sas_target_is_matter = false;
 
 // ── List Wizard ──────────────────────────────────────────────────
 #define LW_SCAN_DIR        "/sdcard/lab/bluetooth/scans"
@@ -2213,6 +2215,7 @@ static void sniffer_ap_click_cb(lv_event_t *e);
 static void sniffer_observe_close_cb(lv_event_t *e);
 static void sniffer_refresh_ap_list(void);
 static void sniffer_client_click_cb(lv_event_t *e);
+static bool wifi_is_matter_oui(const uint8_t *bssid);
 static void show_targeted_deauth_screen(void);
 static void targeted_deauth_timer_cb(lv_timer_t *timer);
 static void targeted_deauth_stop_cb(lv_event_t *e);
@@ -7889,15 +7892,18 @@ static void sniffer_refresh_ap_list(void) {
         const sniffer_ap_t *ap = &aps[i];
         
         // Create clickable AP row (text style, black background, arrow to hint clickability)
+        bool ap_matter = wifi_is_matter_oui(ap->bssid);
         char ap_text[128];
         if (ap->ssid[0] != '\0') {
-            snprintf(ap_text, sizeof(ap_text), LV_SYMBOL_WIFI " %s (%d) Ch:%d %ddBm " LV_SYMBOL_RIGHT,
-                     ap->ssid, ap->client_count, ap->channel, ap->rssi);
+            snprintf(ap_text, sizeof(ap_text), LV_SYMBOL_WIFI " %s%s (%d) Ch:%d %ddBm " LV_SYMBOL_RIGHT,
+                     ap->ssid, ap_matter ? " [M?]" : "",
+                     ap->client_count, ap->channel, ap->rssi);
         } else {
-            snprintf(ap_text, sizeof(ap_text), LV_SYMBOL_WIFI " [Hidden] (%d) Ch:%d %ddBm " LV_SYMBOL_RIGHT,
+            snprintf(ap_text, sizeof(ap_text), LV_SYMBOL_WIFI " [Hidden]%s (%d) Ch:%d %ddBm " LV_SYMBOL_RIGHT,
+                     ap_matter ? " [M?]" : "",
                      ap->client_count, ap->channel, ap->rssi);
         }
-        
+
         lv_obj_t *ap_row = lv_list_add_text(sniffer_ap_list, ap_text);
         lv_obj_set_style_bg_color(ap_row, ui_bg_color(), LV_STATE_DEFAULT);
         lv_obj_set_style_bg_color(ap_row, lv_color_make(40, 40, 60), LV_STATE_PRESSED);
@@ -25335,6 +25341,7 @@ static void bt_sas_device_cb(lv_event_t *e)
         bt_sas_selected_idx = idx;
         memcpy(bt_sas_target_addr, bt_devices[idx].addr, 6);
         bt_sas_target_addr_type = bt_devices[idx].addr_type;
+        bt_sas_target_is_matter = bt_devices[idx].is_matter;
         if (bt_devices[idx].name[0] != '\0')
             snprintf(bt_sas_target_name, sizeof(bt_sas_target_name), "%s", bt_devices[idx].name);
         else
@@ -25440,9 +25447,18 @@ static void bt_sas_refresh_list(void)
         lv_obj_set_style_border_color(btn, UI_ACCENT_CYAN, 0);
         lv_obj_set_style_radius(btn, 4, 0);
 
+        // Append [M] if Matter commissioning beacon was seen
+        if (dev->is_matter) {
+            size_t cur = strlen(item_text);
+            snprintf(item_text + cur, sizeof(item_text) - cur, " [M]");
+        }
+
         lv_obj_t *lbl = lv_label_create(btn);
         lv_label_set_text(lbl, item_text);
-        lv_obj_set_style_text_color(lbl, selected ? lv_color_black() : ui_text_color(), 0);
+        lv_color_t lbl_color = selected         ? lv_color_black()
+                             : dev->is_matter   ? lv_color_make(100, 180, 255)
+                             : ui_text_color();
+        lv_obj_set_style_text_color(lbl, lbl_color, 0);
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
         lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 4, 0);
         lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
@@ -27344,18 +27360,21 @@ static void gw_update_screen_ui(void)
             const gw_result_t *r = gw_get_result();
             char t[80];
             if (r) {
-                /* Check if Fast Pair service (0xFE2C) was discovered — flag CVE-2025-36911 */
+                /* Check discovered services for Fast Pair (0xFE2C) and Matter (0xFFF6/0xFFF7) */
                 bool has_fast_pair = false;
-                for (int si = 0; si < r->svc_count && !has_fast_pair; si++) {
+                bool has_matter    = false;
+                for (int si = 0; si < r->svc_count; si++) {
                     unsigned uuid_val = 0;
                     if (strncmp(r->svcs[si].uuid_str, "0x", 2) == 0)
                         sscanf(r->svcs[si].uuid_str + 2, "%x", &uuid_val);
                     if (uuid_val == 0xFE2C) has_fast_pair = true;
+                    if (uuid_val == 0xFFF6 || uuid_val == 0xFFF7) has_matter = true;
                 }
-                snprintf(t, sizeof(t), "%d svcs  %d chrs\nFP: 0x%08lX%s\n%s",
+                snprintf(t, sizeof(t), "%d svcs  %d chrs\nFP: 0x%08lX%s%s\n%s",
                          r->svc_count, (int)gw_ui_chr_count,
                          r->fingerprint,
                          has_fast_pair ? "\n" LV_SYMBOL_WARNING " Fast Pair (CVE-2025-36911)" : "",
+                         has_matter    ? "\n[M] Matter device (0xFFF6)" : "",
                          r->filepath + 8 /* skip /sdcard/ */);
             } else {
                 snprintf(t, sizeof(t), "Done");
@@ -27390,10 +27409,18 @@ static void show_gatt_walker_screen(void)
              bt_sas_target_addr[5], bt_sas_target_addr[4], bt_sas_target_addr[3],
              bt_sas_target_addr[2], bt_sas_target_addr[1], bt_sas_target_addr[0]);
 
+    // MAC + optional [M] Matter flag
+    char mac_line[32];
+    if (bt_sas_target_is_matter)
+        snprintf(mac_line, sizeof(mac_line), "%s  [M]", mac_str);
+    else
+        snprintf(mac_line, sizeof(mac_line), "%s", mac_str);
+
     lv_obj_t *mac_lbl = lv_label_create(function_page);
-    lv_label_set_text(mac_lbl, mac_str);
+    lv_label_set_text(mac_lbl, mac_line);
     lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(mac_lbl, lv_color_make(160, 160, 160), 0);
+    lv_obj_set_style_text_color(mac_lbl,
+        bt_sas_target_is_matter ? lv_color_make(100, 180, 255) : lv_color_make(160, 160, 160), 0);
     lv_obj_align(mac_lbl, LV_ALIGN_TOP_MID, 0, 35);
 
     /* Status label */
@@ -31608,6 +31635,58 @@ static void bt_blacklist_remove_idx(int idx) {
     ESP_LOGI(TAG, "Blacklist: removed entry %d, now %d entries", idx, s_blacklist_count);
 }
 
+// ── Matter device detection ───────────────────────────────────────────────────
+
+// Returns true when the BLE advertisement carries the Matter commissioning
+// service UUID 0xFFF6 (defined in Matter spec section 5.4.2).
+static bool bt_is_matter_adv(const struct ble_hs_adv_fields *fields)
+{
+    if (!fields) return false;
+    if (fields->svc_data_uuid16 && fields->svc_data_uuid16_len >= 2) {
+        uint16_t uuid = fields->svc_data_uuid16[0] |
+                        ((uint16_t)fields->svc_data_uuid16[1] << 8);
+        if (uuid == 0xFFF6) return true;
+    }
+    for (int i = 0; i < fields->num_uuids16; i++) {
+        if (ble_uuid_u16(&fields->uuids16[i].u) == 0xFFF6) return true;
+    }
+    return false;
+}
+
+// OUI prefix table for known Matter-capable smart home manufacturers.
+// Returns true on a match — use [M?] since OUI alone is not definitive.
+static bool wifi_is_matter_oui(const uint8_t *bssid)
+{
+    static const uint8_t matter_ouis[][3] = {
+        {0x00, 0x17, 0x88},  // Signify (Philips Hue)
+        {0xEC, 0xB5, 0xFA},  // Signify
+        {0x18, 0xB4, 0x30},  // Google/Nest
+        {0xD4, 0xF5, 0x47},  // Google
+        {0xF4, 0xF5, 0xD8},  // Google
+        {0xFC, 0x65, 0xDE},  // Amazon Echo
+        {0x50, 0xF5, 0xDA},  // Amazon Echo
+        {0x44, 0x65, 0x0D},  // Amazon Echo
+        {0xF0, 0x98, 0x9D},  // Eero (Amazon)
+        {0xF0, 0xD2, 0xF1},  // IKEA Tradfri
+        {0x70, 0xD3, 0x79},  // IKEA Tradfri
+        {0x9C, 0x5E, 0x1F},  // IKEA Tradfri
+        {0x00, 0x55, 0xDA},  // Nanoleaf
+        {0xC4, 0xDD, 0x57},  // Nanoleaf
+        {0x54, 0xAF, 0x97},  // TP-Link/Kasa
+        {0x50, 0xC7, 0xBF},  // TP-Link/Kasa
+        {0x00, 0x21, 0x2F},  // Samsung SmartThings
+        {0xAC, 0x74, 0xB1},  // Samsung SmartThings
+        {0x00, 0x50, 0xC2},  // Eve Systems
+        {0xA4, 0xC1, 0x38},  // Silicon Labs (common Matter chip reference)
+    };
+    for (size_t i = 0; i < sizeof(matter_ouis) / sizeof(matter_ouis[0]); i++) {
+        if (bssid[0] == matter_ouis[i][0] &&
+            bssid[1] == matter_ouis[i][1] &&
+            bssid[2] == matter_ouis[i][2]) return true;
+    }
+    return false;
+}
+
 /**
  * BLE GAP event callback for scanning — handles both legacy and BLE 5 Coded PHY
  */
@@ -31720,6 +31799,7 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
         dev->is_smarttag        = false;
         dev->is_possible_airtag = false;
         dev->is_fast_pair       = false;
+        dev->is_matter          = false;
 
         bool has_name = (fields.name != NULL && fields.name_len > 0);
         if (has_name) {
@@ -31746,6 +31826,11 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
         /* Fast Pair detection: service data UUID 0xFE2C in advertisement */
         if (wp_is_fast_pair_adv(&fields)) {
             dev->is_fast_pair = true;
+        }
+
+        /* Matter detection: service UUID 0xFFF6 (Matter commissioning beacon) */
+        if (bt_is_matter_adv(&fields)) {
+            dev->is_matter = true;
         }
 
         bt_device_count++;
@@ -31975,6 +32060,7 @@ static void ble_scan_update_list(void)
                              : dev->is_smarttag         ? " ST"
                              : dev->is_possible_airtag  ? " ?AT"
                              : dev->is_fast_pair        ? " FP"
+                             : dev->is_matter           ? " [M]"
                              : "";
 
         char item_text[88];
@@ -31992,8 +32078,10 @@ static void ble_scan_update_list(void)
         lv_obj_t *item = lv_label_create(ble_scan_list);
         lv_label_set_text(item, item_text);
         lv_obj_set_width(item, lv_pct(100));
-        // Coded PHY devices shown in green to distinguish long-range finds
-        lv_color_t row_color = coded ? lv_color_make(80, 220, 80) : ui_text_color();
+        // Coded PHY = green, Matter commissioning = cyan-blue, else default
+        lv_color_t row_color = coded            ? lv_color_make(80, 220, 80)
+                             : dev->is_matter   ? lv_color_make(100, 180, 255)
+                             : ui_text_color();
         lv_obj_set_style_text_color(item, row_color, 0);
         lv_obj_set_style_text_font(item, &lv_font_montserrat_12, 0);
         lv_obj_set_style_pad_ver(item, 1, 0);
