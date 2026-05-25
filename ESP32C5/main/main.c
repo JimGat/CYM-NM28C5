@@ -38376,17 +38376,18 @@ static void show_cc1101_bandscope_screen(void)
         if (!s_bs->task) { if (s_bs->canv_buf) heap_caps_free(s_bs->canv_buf); heap_caps_free(s_bs); s_bs = NULL; }
     }
 
-    s_bs = heap_caps_calloc(1, sizeof(cc1101_bs_ctx_t), MALLOC_CAP_SPIRAM);
-    if (!s_bs) return;
-    s_bs->center = 433.92f;
-    s_bs->span   = 20.0f;
+    cc1101_bs_ctx_t *ctx = heap_caps_calloc(1, sizeof(cc1101_bs_ctx_t), MALLOC_CAP_SPIRAM);
+    if (!ctx) return;
+    ctx->center = 433.92f;
+    ctx->span   = 20.0f;
 
     int canvas_h = CC1101_BS_SPEC_H + 1 + CC1101_BS_WF_H;  // 165 px
-    s_bs->canv_buf = heap_caps_calloc((size_t)(CC1101_BS_W * canvas_h),
-                                       sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
-    if (!s_bs->canv_buf) { heap_caps_free(s_bs); s_bs = NULL; return; }
+    ctx->canv_buf = heap_caps_calloc((size_t)(CC1101_BS_W * canvas_h),
+                                      sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+    if (!ctx->canv_buf) { heap_caps_free(ctx); return; }
 
     create_function_page_base("CC1101 Band Scope");
+    s_bs = ctx; // assign AFTER reset_function_page_children has run inside create_function_page_base
     apply_menu_bg();
 
     // Canvas — fills full width, starts just below the page title bar
@@ -38716,10 +38717,11 @@ static void show_cc1101_zwave_screen(void)
         if (!s_zwave->task) { heap_caps_free(s_zwave); s_zwave = NULL; }
     }
 
-    s_zwave = heap_caps_calloc(1, sizeof(zwave_ctx_t), MALLOC_CAP_SPIRAM);
-    if (!s_zwave) return;
+    zwave_ctx_t *ctx_zw = heap_caps_calloc(1, sizeof(zwave_ctx_t), MALLOC_CAP_SPIRAM);
+    if (!ctx_zw) return;
 
     create_function_page_base("CC1101 Z-Wave Scout");
+    s_zwave = ctx_zw; // assign AFTER reset_function_page_children has run inside create_function_page_base
     apply_menu_bg();
 
     // Info card
@@ -39437,9 +39439,8 @@ static void show_nrf24_sniffer_screen(void)
     if (!ctx) { s_n24_stub_screen("nRF24 Error", "Out of memory"); return; }
     ctx->channel     = 76;
     ctx->payload_len = 32;
-    s_nsniff = ctx;
-
     create_function_page_base("nRF24 Sniffer");
+    s_nsniff = ctx; // assign AFTER reset_function_page_children has run inside create_function_page_base
     apply_menu_bg();
 
     lv_obj_t *card = lv_obj_create(function_page);
@@ -39890,9 +39891,8 @@ static void show_nrf24_futaba_screen(void)
 
     nrf24_futaba_ctx_t *ctx = heap_caps_calloc(1, sizeof(nrf24_futaba_ctx_t), MALLOC_CAP_SPIRAM);
     if (!ctx) { s_n24_stub_screen("nRF24 Error", "Out of memory"); return; }
-    s_nfut = ctx;
-
     create_function_page_base("Futaba S-FHSS");
+    s_nfut = ctx; // assign AFTER reset_function_page_children has run inside create_function_page_base
     apply_menu_bg();
 
     lv_obj_t *card = lv_obj_create(function_page);
