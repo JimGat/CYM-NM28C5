@@ -9535,6 +9535,12 @@ static void wd_mark_open_note_dialog(void)
     lv_obj_set_width(kb, LCD_H_RES);
     lv_obj_set_style_text_font(kb, &lv_font_montserrat_12, 0);
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(kb, ui_bg_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(kb, ui_text_color(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(kb, lv_color_make(0, 100, 0), LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(kb, lv_color_make(0, 150, 0), LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(kb, ui_text_color(), LV_PART_ITEMS);
+    lv_obj_set_style_border_color(kb, ui_border_color(), LV_PART_ITEMS);
 
     // Card sits above the keyboard
     lv_obj_t *card = lv_obj_create(wd_mark_note_overlay);
