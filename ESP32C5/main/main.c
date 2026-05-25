@@ -17235,6 +17235,16 @@ static void show_ap_file_server_screen(void)
 /* s_wcs_ssid_ta, s_wcs_pass_ta, s_wcs_keyboard, s_wcs_active_ta, s_wcs_scan_popup,
    s_wcs_scan_timer all declared earlier (before s_fileserv_stop_cb). */
 
+static void s_wcs_eye_cb(lv_event_t *e)
+{
+    lv_obj_t *btn = lv_event_get_target(e);
+    if (!s_wcs_pass_ta || !lv_obj_is_valid(s_wcs_pass_ta)) return;
+    bool pw_mode = lv_textarea_get_password_mode(s_wcs_pass_ta);
+    lv_textarea_set_password_mode(s_wcs_pass_ta, !pw_mode);
+    lv_obj_t *lbl = lv_obj_get_child(btn, 0);
+    if (lbl) lv_label_set_text(lbl, pw_mode ? MY_SYMBOL_EYE_SLASH : MY_SYMBOL_EYE);
+}
+
 static void s_wcs_scan_close_cb(lv_event_t *e)
 {
     (void)e;
@@ -17615,6 +17625,25 @@ static void show_wifi_client_server_screen(void)
     lv_obj_add_event_cb(s_wcs_keyboard, s_wcs_kb_event_cb, LV_EVENT_READY,  NULL);
     lv_obj_add_event_cb(s_wcs_keyboard, s_wcs_kb_event_cb, LV_EVENT_CANCEL, NULL);
     lv_obj_add_flag(s_wcs_keyboard, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_update_layout(function_page);
+    lv_area_t wcs_ta;
+    lv_obj_get_coords(s_wcs_pass_ta, &wcs_ta);
+    lv_coord_t wcs_bh = wcs_ta.y2 - wcs_ta.y1 + 1;
+    lv_obj_t *wcs_eye_btn = lv_btn_create(function_page);
+    lv_obj_set_size(wcs_eye_btn, 38, wcs_bh);
+    lv_obj_set_pos(wcs_eye_btn, wcs_ta.x2 - 38, wcs_ta.y1);
+    lv_obj_set_style_bg_color(wcs_eye_btn, lv_color_make(0, 100, 0), 0);
+    lv_obj_set_style_bg_color(wcs_eye_btn, lv_color_make(0, 150, 0), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(wcs_eye_btn, 4, 0);
+    lv_obj_set_style_border_width(wcs_eye_btn, 0, 0);
+    lv_obj_set_style_pad_all(wcs_eye_btn, 0, 0);
+    lv_obj_t *wcs_eye_lbl = lv_label_create(wcs_eye_btn);
+    lv_label_set_text(wcs_eye_lbl, MY_SYMBOL_EYE);
+    lv_obj_set_style_text_font(wcs_eye_lbl, &g_font_icon14, 0);
+    lv_obj_set_style_text_color(wcs_eye_lbl, lv_color_make(255, 255, 255), 0);
+    lv_obj_center(wcs_eye_lbl);
+    lv_obj_add_event_cb(wcs_eye_btn, s_wcs_eye_cb, LV_EVENT_CLICKED, NULL);
 
     s_wcs_active_ta = s_wcs_ssid_ta;
 }
