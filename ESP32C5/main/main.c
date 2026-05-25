@@ -1587,6 +1587,7 @@ typedef struct {
     lv_obj_t        *start_btn;
     lv_timer_t      *tmr;
     TaskHandle_t     task;
+    int              scan_ticks;
 } nrf24_futaba_ctx_t;
 EXT_RAM_BSS_ATTR static nrf24_futaba_ctx_t *s_nfut = NULL;
 
@@ -38739,15 +38740,9 @@ static void show_nrf24_ch_scan_screen(void)
     create_function_page_base("nRF24 Ch Scan");
     apply_menu_bg();
 
-    lv_obj_t *hdr = lv_label_create(function_page);
-    lv_label_set_text(hdr, MY_SYMBOL_WAVE "  2.4 GHz Channel Scanner");
-    lv_obj_set_style_text_font(hdr, &g_font_icon14, 0);
-    lv_obj_set_style_text_color(hdr, lv_color_hex(0x42A5F5), 0);
-    lv_obj_align(hdr, LV_ALIGN_TOP_MID, 0, 4);
-
     ctx->canvas = lv_canvas_create(function_page);
     lv_canvas_set_buffer(ctx->canvas, ctx->canv_buf, NRF24_CS_W, canvas_h, LV_IMG_CF_TRUE_COLOR);
-    lv_obj_align(ctx->canvas, LV_ALIGN_TOP_MID, 0, 28);
+    lv_obj_align(ctx->canvas, LV_ALIGN_TOP_MID, 0, 34);
 
     // Clear canvas to dark
     for (int i = 0; i < NRF24_CS_W * canvas_h; i++)
@@ -38757,11 +38752,11 @@ static void show_nrf24_ch_scan_screen(void)
     lv_label_set_text(ctx->status_lbl, "Press Start to scan");
     lv_obj_set_style_text_font(ctx->status_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0x90CAF9), 0);
-    lv_obj_align(ctx->status_lbl, LV_ALIGN_TOP_MID, 0, 28 + canvas_h + 4);
+    lv_obj_align(ctx->status_lbl, LV_ALIGN_TOP_MID, 0, 34 + canvas_h + 4);
 
     ctx->start_btn = lv_btn_create(function_page);
     lv_obj_set_size(ctx->start_btn, 100, 28);
-    lv_obj_align(ctx->start_btn, LV_ALIGN_TOP_MID, 0, 28 + canvas_h + 18);
+    lv_obj_align(ctx->start_btn, LV_ALIGN_TOP_MID, 0, 34 + canvas_h + 18);
     lv_obj_set_style_bg_color(ctx->start_btn, lv_color_hex(0x0D47A1), LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(ctx->start_btn, 0, 0);
     lv_obj_set_style_radius(ctx->start_btn, 6, 0);
@@ -39281,7 +39276,11 @@ static void s_nfut_ui_timer_cb(lv_timer_t *t)
 
     if (ctx->status_lbl) {
         if (ctx->active) {
-            lv_label_set_text(ctx->status_lbl, "Scanning S-FHSS channels...");
+            ctx->scan_ticks++;
+            // 10s scan / 200ms timer = 50 ticks; show elapsed seconds
+            char scan_buf[36];
+            snprintf(scan_buf, sizeof(scan_buf), "Scanning... (%ds / 10s)", ctx->scan_ticks / 5);
+            lv_label_set_text(ctx->status_lbl, scan_buf);
             lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0xFFB300), 0);
         } else if (ctx->result_ready) {
             if (ctx->result.found) {
@@ -39333,6 +39332,7 @@ static void s_nfut_start_cb(lv_event_t *e)
     ctx->active       = true;
     ctx->cancel       = false;
     ctx->result_ready = false;
+    ctx->scan_ticks   = 0;
     memset(&ctx->result, 0, sizeof(ctx->result));
     if (ctx->start_btn) {
         lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
@@ -41275,17 +41275,10 @@ static void show_zigbee_wardrive_screen(void)
     create_function_page_base("Zigbee Scout");
     apply_menu_bg();
 
-    // Header
-    lv_obj_t *hdr = lv_label_create(function_page);
-    lv_label_set_text(hdr, MY_SYMBOL_SITEMAP "  Zigbee Scout");
-    lv_obj_set_style_text_font(hdr, &g_font_icon14, 0);
-    lv_obj_set_style_text_color(hdr, lv_color_hex(0x00BCD4), 0);
-    lv_obj_align(hdr, LV_ALIGN_TOP_MID, 0, 4);
-
     // Card
     lv_obj_t *card = lv_obj_create(function_page);
-    lv_obj_set_size(card, LCD_H_RES - 16, LCD_V_RES - 96);
-    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 26);
+    lv_obj_set_size(card, LCD_H_RES - 16, LCD_V_RES - 84);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 34);
     lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
     lv_obj_set_style_border_color(card, lv_color_hex(0x00695C), 0);
     lv_obj_set_style_border_width(card, 1, 0);

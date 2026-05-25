@@ -405,7 +405,7 @@ void nrf24_jam_sweep(volatile bool *active)
         nrf24_write_reg(REG_STATUS, 0x70);
         nrf24_flush_tx();
         ch = (ch >= 125) ? 0 : ch + 1;
-        taskYIELD();
+        vTaskDelay(1);  // 1 tick (~10ms) — lets IDLE reset task WDT between bursts
     }
     nrf24_standby();
 }
