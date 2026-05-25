@@ -38340,9 +38340,15 @@ static void s_bs_canvas_tap_cb(lv_event_t *e)
     lv_obj_get_coords(ctx->canvas, &area);
     int x = pt.x - area.x1;
     if (x < 0 || x >= CC1101_BS_W) return;
-    float freq = (ctx->center - ctx->span / 2.0f) + ((float)x / (float)(CC1101_BS_W - 1)) * ctx->span;
-    char buf[28];
-    snprintf(buf, sizeof(buf), "Tap: %.2f MHz", (double)freq);
+    // Snap to the nearest CC1101 measurement bin (not pixel-interpolated)
+    float pppt = (float)CC1101_BS_W / (float)CC1101_BS_NPTS;
+    int bin = (int)((float)x / pppt);
+    if (bin >= CC1101_BS_NPTS) bin = CC1101_BS_NPTS - 1;
+    float step = ctx->span / (float)CC1101_BS_NPTS;
+    float freq = (ctx->center - ctx->span / 2.0f) + ((float)bin + 0.5f) * step;
+    int rssi_dbm = (int)ctx->rssi[bin];
+    char buf[36];
+    snprintf(buf, sizeof(buf), "%.2f MHz  %d dBm", (double)freq, rssi_dbm);
     lv_label_set_text(ctx->status_lbl, buf);
     lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0xFFEB3B), 0);
     ctx->tap_expire_us = esp_timer_get_time() + 2000000ULL;
