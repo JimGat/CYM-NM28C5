@@ -10655,6 +10655,7 @@ static void wardrive_promisc_task(void *pvParameters) {
     ESP_LOGI(TAG, "Wardrive promisc task started");
     log_heap_stats("wardrive-start");
     bool wd_used_coex_ble = false;  // true if BLE was init'd while WiFi stayed up
+    bool ble_continuous   = false;  // true if BLE coex scan is running throughout wardrive
 
     wardrive_file_counter = (int)(esp_timer_get_time() / 1000000);
     snprintf(wd_marks_fname, sizeof(wd_marks_fname),
@@ -10737,6 +10738,29 @@ static void wardrive_promisc_task(void *pvParameters) {
     esp_wifi_set_promiscuous_rx_cb(wdp_promiscuous_cb);
     esp_wifi_set_promiscuous(true);
 
+    // Start BLE scan immediately via coex — let the coex stack share the radio
+    // rather than manually time-slicing at the application level.
+    if (g_wd_ble && wdp_ble_devices && bt_nimble_init() == ESP_OK) {
+#if MYNEWT_VAL(BLE_EXT_ADV)
+        struct ble_gap_ext_disc_params bpe = { .itvl = 0x60, .window = 0x60, .passive = 0 };
+        if (ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 0, 0, 0,
+                             BLE_HCI_SCAN_FILT_NO_WL, 0,
+                             &bpe, &bpe, wdp_ble_gap_cb, NULL) == 0) {
+            ble_continuous = true; wd_used_coex_ble = true;
+            ESP_LOGI(TAG, "[WDP] BLE coex ext_disc running continuously");
+        }
+#else
+        struct ble_gap_disc_params bp = { .itvl = 0x60, .window = 0x60,
+            .filter_policy = BLE_HCI_SCAN_FILT_NO_WL, .passive = 0, .filter_duplicates = 0 };
+        if (ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &bp, wdp_ble_gap_cb, NULL) == 0) {
+            ble_continuous = true; wd_used_coex_ble = true;
+            ESP_LOGI(TAG, "[WDP] BLE coex disc running continuously");
+        }
+#endif
+        if (!ble_continuous)
+            ESP_LOGW(TAG, "[WDP] BLE coex scan start failed — will use burst fallback");
+    }
+
     int64_t last_stats_us = esp_timer_get_time();
     int64_t last_ble_us   = esp_timer_get_time();
     int networks_since_flush = 0;
@@ -10790,8 +10814,8 @@ static void wardrive_promisc_task(void *pvParameters) {
         wdp_ducb_update(ch_idx, reward);
         wd_ui_update_flag = true;
 
-        // ── BLE time-slice pass ──────────────────────────────────
-        if (g_wd_ble && wdp_ble_devices &&
+        // ── BLE burst fallback (only when coex continuous scan unavailable) ─
+        if (!ble_continuous && g_wd_ble && wdp_ble_devices &&
             (esp_timer_get_time() - last_ble_us) >= (int64_t)WDP_BLE_INTERVAL_S * 1000000LL) {
             last_ble_us = esp_timer_get_time();
 
@@ -10917,6 +10941,12 @@ static void wardrive_promisc_task(void *pvParameters) {
                      current_gps.valid ? "Y" : "N", current_gps.satellites);
             last_stats_us = now;
         }
+    }
+
+    // Stop continuous BLE scan before turning off WiFi promiscuous
+    if (ble_continuous) {
+        ble_gap_disc_cancel();
+        ESP_LOGI(TAG, "[WDP] BLE coex scan stopped");
     }
 
     esp_wifi_set_promiscuous(false);
