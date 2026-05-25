@@ -1629,8 +1629,7 @@ typedef struct {
 
 typedef struct {
     lv_obj_t    *status_lbl;
-    lv_obj_t    *count_lbl;
-    lv_obj_t    *pan_lbl;
+    lv_obj_t    *pan_list;      // scrollable PAN list (Observer-style)
     lv_obj_t    *start_btn;
     lv_timer_t  *tmr;
     bool         active;
@@ -2156,6 +2155,13 @@ static void reset_function_page_children(void) {
     s_n24_jam_active = false;
     s_n24_jam_status = NULL;
     if (s_n24_jam_tmr) { lv_timer_del(s_n24_jam_tmr); s_n24_jam_tmr = NULL; }
+    // Zigbee Scout cleanup — main thread owns the free (task only sets task=NULL)
+    if (s_zgwd) {
+        s_zgwd->cancel = true; s_zgwd->active = false;
+        s_zgwd->status_lbl = NULL; s_zgwd->pan_list = NULL; s_zgwd->start_btn = NULL;
+        if (s_zgwd->tmr) { lv_timer_del(s_zgwd->tmr); s_zgwd->tmr = NULL; }
+        if (!s_zgwd->task) { heap_caps_free(s_zgwd); s_zgwd = NULL; }
+    }
     deauth_monitor_rec_label = NULL;
     bt_locator_content = NULL;
     bt_locator_list = NULL;
@@ -41795,9 +41801,7 @@ zgwd_done:
              ctx->frame_count, ctx->pan_count);
 
     ctx->active = false;
-    ctx->task   = NULL;
-    heap_caps_free(ctx);
-    if (s_zgwd == ctx) s_zgwd = NULL;
+    ctx->task   = NULL;  // signal main thread; reset_function_page_children owns the free
     vTaskDelete(NULL);
 }
 
@@ -41809,30 +41813,62 @@ static void s_zgwd_ui_timer_cb(lv_timer_t *t)
     if (!ctx) return;
 
     if (ctx->status_lbl) {
-        char sb[48];
+        char sb[52];
         if (ctx->active)
-            snprintf(sb, sizeof(sb), "Ch %u  |  Frames: %d", ctx->current_channel,
-                     ctx->frame_count);
+            snprintf(sb, sizeof(sb), "Ch %u  Frames: %d  PANs: %d",
+                     ctx->current_channel, ctx->frame_count, ctx->pan_count);
         else
-            snprintf(sb, sizeof(sb), "Stopped  |  Frames: %d", ctx->frame_count);
+            snprintf(sb, sizeof(sb), "Stopped  Frames: %d  PANs: %d",
+                     ctx->frame_count, ctx->pan_count);
         lv_label_set_text(ctx->status_lbl, sb);
     }
-    if (ctx->pan_lbl) {
-        char pb[48];
-        snprintf(pb, sizeof(pb), "PANs found: %d", ctx->pan_count);
-        lv_label_set_text(ctx->pan_lbl, pb);
-        if (ctx->pan_count > 0) {
-            // Show the most recently found PAN
-            int last = ctx->pan_count - 1;
-            char detail[64];
-            snprintf(detail, sizeof(detail), "PANs: %d  |  Last: 0x%04X ch%u",
-                     ctx->pan_count, ctx->pans[last].pan_id, ctx->pans[last].channel);
-            lv_label_set_text(ctx->pan_lbl, detail);
+
+    if (ctx->pan_list && lv_obj_is_valid(ctx->pan_list)) {
+        lv_obj_clean(ctx->pan_list);
+        if (ctx->pan_count == 0) {
+            lv_obj_t *hint = lv_label_create(ctx->pan_list);
+            lv_label_set_text(hint, ctx->active ? "Scanning..." : "No PANs detected");
+            lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(hint, lv_color_make(120, 120, 120), 0);
+        }
+        for (int i = ctx->pan_count - 1; i >= 0; i--) {
+            zgwd_pan_entry_t *pe = &ctx->pans[i];
+            lv_obj_t *card = lv_obj_create(ctx->pan_list);
+            lv_obj_set_size(card, lv_pct(100), LV_SIZE_CONTENT);
+            lv_obj_set_style_pad_all(card, 5, 0);
+            lv_obj_set_style_pad_gap(card, 2, 0);
+            lv_obj_set_style_radius(card, 5, 0);
+            lv_obj_set_style_border_width(card, 1, 0);
+            lv_obj_set_style_border_color(card, lv_color_hex(0x00695C), 0);
+            lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+            lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+
+            char r1[40];
+            snprintf(r1, sizeof(r1), "PAN 0x%04X  Ch %u  %u frm",
+                     pe->pan_id, pe->channel, (unsigned)pe->frame_count);
+            lv_obj_t *l1 = lv_label_create(card);
+            lv_label_set_text(l1, r1);
+            lv_obj_set_style_text_font(l1, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(l1, lv_color_hex(0x4DB6AC), 0);
+            lv_label_set_long_mode(l1, LV_LABEL_LONG_CLIP);
+            lv_obj_set_width(l1, lv_pct(100));
+
+            char r2[32];
+            snprintf(r2, sizeof(r2), "RSSI %d..%d dBm",
+                     (int)pe->rssi_min, (int)pe->rssi_max);
+            lv_obj_t *l2 = lv_label_create(card);
+            lv_label_set_text(l2, r2);
+            lv_obj_set_style_text_font(l2, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(l2, lv_color_make(140, 140, 140), 0);
+            lv_label_set_long_mode(l2, LV_LABEL_LONG_CLIP);
+            lv_obj_set_width(l2, lv_pct(100));
         }
     }
-    if (!ctx->active && ctx->task == NULL && ctx->start_btn) {
+
+    if (!ctx->active && ctx->start_btn) {
         lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
-        if (lbl) lv_label_set_text(lbl, "Start");
+        if (lbl) lv_label_set_text(lbl, LV_SYMBOL_PLAY "  Start");
     }
 }
 
@@ -41850,11 +41886,13 @@ static void s_zgwd_startstop_cb(lv_event_t *e)
         ctx->frame_count = 0;
         ctx->pan_count   = 0;
         memset(ctx->pans, 0, sizeof(ctx->pans));
+        if (ctx->pan_list && lv_obj_is_valid(ctx->pan_list))
+            lv_obj_clean(ctx->pan_list);
         if (ctx->start_btn) {
             lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
-            if (lbl) lv_label_set_text(lbl, "Stop");
+            if (lbl) lv_label_set_text(lbl, LV_SYMBOL_STOP "  Stop");
         }
-        xTaskCreate(s_zgwd_task_fn, "zgwd", 4096, ctx, 5, &ctx->task);
+        xTaskCreate(s_zgwd_task_fn, "zgwd", 4096, ctx, 2, &ctx->task);
     } else {
         // Stop
         ctx->cancel = true;
@@ -41870,19 +41908,18 @@ static void s_zgwd_back_cb(lv_event_t *e)
     if (ctx) {
         ctx->cancel = true;
         ctx->active = false;
+        ctx->status_lbl = NULL;
+        ctx->pan_list   = NULL;
+        ctx->start_btn  = NULL;
+        if (ctx->tmr) { lv_timer_del(ctx->tmr); ctx->tmr = NULL; }
     }
-    // Timer cleanup
-    if (ctx && ctx->tmr) { lv_timer_del(ctx->tmr); ctx->tmr = NULL; }
-    show_main_tiles();
+    show_main_tiles();  // → reset_function_page_children frees ctx if task=NULL
 }
 
 // ── Main Zigbee Scout screen ──────────────────────────────────────────────────
 static void show_zigbee_wardrive_screen(void)
 {
-    // Cancel any running scan
-    if (s_zgwd) { s_zgwd->cancel = true; s_zgwd->active = false; }
-
-    // Create RX queue (may already exist if returning to screen mid-scan)
+    // Create RX queue (persists across visits)
     if (!s_zgwd_rx_q)
         s_zgwd_rx_q = xQueueCreate(ZGWD_Q_DEPTH, sizeof(zgwd_frame_msg_t));
 
@@ -41891,64 +41928,58 @@ static void show_zigbee_wardrive_screen(void)
         ESP_LOGE(TAG, "[ZGWD] OOM");
         return;
     }
-    s_zgwd = ctx;
 
+    // MUST call create_function_page_base BEFORE assigning s_zgwd.
+    // create_function_page_base → reset_function_page_children cancels+frees any previous
+    // s_zgwd with task=NULL; with task still running it nulls UI pointers and leaves ctx alive.
     create_function_page_base("Zigbee Scout");
+    s_zgwd = ctx;   // assign AFTER cleanup has run
     apply_menu_bg();
 
-    // Card
-    lv_obj_t *card = lv_obj_create(function_page);
-    lv_obj_set_size(card, LCD_H_RES - 16, LCD_V_RES - 84);
-    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 34);
-    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
-    lv_obj_set_style_border_color(card, lv_color_hex(0x00695C), 0);
-    lv_obj_set_style_border_width(card, 1, 0);
-    lv_obj_set_style_radius(card, 8, 0);
-    lv_obj_set_style_pad_all(card, 10, 0);
-    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_gap(card, 8, 0);
-    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *sub = lv_label_create(card);
-    lv_label_set_text(sub, "802.15.4 passive scan | Ch 11-26 | 2.4GHz");
-    lv_obj_set_style_text_font(sub, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(sub, lv_color_make(150, 150, 150), 0);
-
-    ctx->status_lbl = lv_label_create(card);
-    lv_label_set_text(ctx->status_lbl, "Press Start to scan");
+    // ── Status line (single clipped line below title bar) ────────────────────
+    ctx->status_lbl = lv_label_create(function_page);
+    lv_label_set_text(ctx->status_lbl, "802.15.4 Ch 11-26  |  Press Start");
     lv_obj_set_style_text_font(ctx->status_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0x42A5F5), 0);
+    lv_label_set_long_mode(ctx->status_lbl, LV_LABEL_LONG_CLIP);
+    lv_obj_set_width(ctx->status_lbl, LCD_H_RES - 8);
+    lv_obj_align(ctx->status_lbl, LV_ALIGN_TOP_LEFT, 4, 32);
 
-    ctx->pan_lbl = lv_label_create(card);
-    lv_label_set_text(ctx->pan_lbl, "PANs found: 0");
-    lv_obj_set_style_text_font(ctx->pan_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(ctx->pan_lbl, lv_color_hex(0x66BB6A), 0);
+    // ── Scrollable PAN list ───────────────────────────────────────────────────
+    ctx->pan_list = lv_obj_create(function_page);
+    lv_obj_set_size(ctx->pan_list, LCD_H_RES, LCD_V_RES - 50 - 36 - 34);
+    lv_obj_align(ctx->pan_list, LV_ALIGN_TOP_MID, 0, 50);
+    lv_obj_set_style_bg_color(ctx->pan_list, ui_bg_color(), 0);
+    lv_obj_set_style_border_color(ctx->pan_list, lv_color_hex(0x00695C), 0);
+    lv_obj_set_style_border_width(ctx->pan_list, 1, 0);
+    lv_obj_set_style_border_side(ctx->pan_list, LV_BORDER_SIDE_TOP | LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_radius(ctx->pan_list, 0, 0);
+    lv_obj_set_style_pad_all(ctx->pan_list, 3, 0);
+    lv_obj_set_style_pad_gap(ctx->pan_list, 3, 0);
+    lv_obj_set_flex_flow(ctx->pan_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scrollbar_mode(ctx->pan_list, LV_SCROLLBAR_MODE_AUTO);
 
-    lv_obj_t *note = lv_label_create(card);
-    lv_label_set_text(note, "Stops WiFi while scanning.\nSaves CSV + PCAP to SD card.");
-    lv_obj_set_style_text_font(note, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(note, lv_color_make(120, 120, 120), 0);
-    lv_obj_set_style_text_align(note, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(note, LCD_H_RES - 36);
+    lv_obj_t *hint0 = lv_label_create(ctx->pan_list);
+    lv_label_set_text(hint0, "Press Start to begin passive scan");
+    lv_obj_set_style_text_font(hint0, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint0, lv_color_make(120, 120, 120), 0);
 
-    ctx->start_btn = lv_btn_create(card);
-    lv_obj_set_size(ctx->start_btn, 110, 30);
+    // ── Start / Stop button ───────────────────────────────────────────────────
+    ctx->start_btn = lv_btn_create(function_page);
+    lv_obj_set_size(ctx->start_btn, 140, 32);
+    lv_obj_align(ctx->start_btn, LV_ALIGN_BOTTOM_MID, 0, -38);
     lv_obj_set_style_bg_color(ctx->start_btn, lv_color_hex(0x00695C), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(ctx->start_btn, lv_color_hex(0x00796B), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(ctx->start_btn, 0, 0);
     lv_obj_set_style_radius(ctx->start_btn, 6, 0);
     lv_obj_t *bl = lv_label_create(ctx->start_btn);
-    lv_label_set_text(bl, "Start");
+    lv_label_set_text(bl, LV_SYMBOL_PLAY "  Start");
     lv_obj_set_style_text_font(bl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(bl, lv_color_white(), 0);
     lv_obj_center(bl);
     lv_obj_add_event_cb(ctx->start_btn, s_zgwd_startstop_cb, LV_EVENT_CLICKED, NULL);
 
-    ctx->tmr = lv_timer_create(s_zgwd_ui_timer_cb, 500, NULL);
-
-    // Back button
+    // ── Back button ───────────────────────────────────────────────────────────
     lv_obj_t *back_btn = lv_btn_create(function_page);
     lv_obj_set_size(back_btn, LCD_H_RES - 16, 30);
     lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -4);
@@ -41963,4 +41994,6 @@ static void show_zigbee_wardrive_screen(void)
     lv_obj_set_style_text_color(back_lbl, ui_text_color(), 0);
     lv_obj_center(back_lbl);
     lv_obj_add_event_cb(back_btn, s_zgwd_back_cb, LV_EVENT_CLICKED, NULL);
+
+    ctx->tmr = lv_timer_create(s_zgwd_ui_timer_cb, 500, NULL);
 }
