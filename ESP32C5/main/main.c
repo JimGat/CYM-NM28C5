@@ -42177,7 +42177,7 @@ static void s_zgwd_start(zgwd_ctx_t *ctx, bool active_mode)
     }
     if (ctx->active_btn)
         lv_obj_add_state(ctx->active_btn, LV_STATE_DISABLED);
-    xTaskCreate(s_zgwd_task_fn, "zgwd", 4096, ctx, 2, &ctx->task);
+    xTaskCreate(s_zgwd_task_fn, "zgwd", 8192, ctx, 2, &ctx->task);
 }
 
 static void s_zgwd_passive_cb(lv_event_t *e)
