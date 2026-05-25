@@ -42399,24 +42399,80 @@ static void s_zgwd_disassoc_task_fn(void *arg)
     vTaskDelete(NULL);
 }
 
-static void s_zgwd_disassoc_all_cb(lv_event_t *e)
+static void s_zgwd_disassoc_proceed_cb(lv_event_t *e)
 {
-    (void)e;
+    lv_obj_t *popup = (lv_obj_t *)lv_event_get_user_data(e);
+    if (popup && lv_obj_is_valid(popup)) lv_obj_del(popup);
+
     zgwd_pan_entry_t *pe = &s_zgwd_sel_pan;
-    if (s_zgwd_da_lbl) {
-        if (pe->device_count == 0) {
-            lv_label_set_text(s_zgwd_da_lbl, "No tracked devices (need data traffic)");
+    if (pe->device_count == 0) {
+        if (s_zgwd_da_lbl && lv_obj_is_valid(s_zgwd_da_lbl)) {
+            lv_label_set_text(s_zgwd_da_lbl, "No tracked devices (active scan finds more)");
             lv_obj_set_style_text_color(s_zgwd_da_lbl, lv_color_hex(0xFF8F00), 0);
-            return;
         }
+        return;
+    }
+    if (s_zgwd_da_lbl && lv_obj_is_valid(s_zgwd_da_lbl)) {
         lv_label_set_text(s_zgwd_da_lbl, "Sending disassoc frames...");
         lv_obj_set_style_text_color(s_zgwd_da_lbl, lv_color_hex(0x42A5F5), 0);
     }
     s_zgwd_da_result = -1;
-    // Run in task — we need to stop WiFi which blocks
     static zgwd_pan_entry_t da_pan_copy;
     da_pan_copy = *pe;
     xTaskCreate(s_zgwd_disassoc_task_fn, "zgwd_da", 3072, &da_pan_copy, 2, NULL);
+}
+
+static void s_zgwd_disassoc_all_cb(lv_event_t *e)
+{
+    (void)e;
+
+    lv_obj_t *popup = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(popup, 220, 170);
+    lv_obj_center(popup);
+    lv_obj_set_style_bg_color(popup, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_border_color(popup, lv_color_hex(0xB71C1C), 0);
+    lv_obj_set_style_border_width(popup, 2, 0);
+    lv_obj_set_style_radius(popup, 8, 0);
+    lv_obj_set_style_pad_all(popup, 10, 0);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *ttl = lv_label_create(popup);
+    lv_label_set_text(ttl, "! DISASSOCIATION WARNING");
+    lv_obj_set_style_text_font(ttl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ttl, lv_color_hex(0xEF5350), 0);
+    lv_obj_align(ttl, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *msg = lv_label_create(popup);
+    lv_label_set_text(msg, "This transmits 802.15.4 frames\nthat force devices off the\nnetwork. Only use on networks\nyou own or have explicit\nwritten permission to test.");
+    lv_obj_set_style_text_font(msg, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(msg, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_align(msg, LV_ALIGN_TOP_MID, 0, 18);
+    lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(msg, 200);
+
+    lv_obj_t *ok_btn = lv_btn_create(popup);
+    lv_obj_set_size(ok_btn, 90, 28);
+    lv_obj_align(ok_btn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(ok_btn, lv_color_hex(0xB71C1C), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(ok_btn, 5, 0);
+    lv_obj_t *ok_lbl = lv_label_create(ok_btn);
+    lv_label_set_text(ok_lbl, "Proceed");
+    lv_obj_set_style_text_font(ok_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ok_lbl, lv_color_white(), 0);
+    lv_obj_center(ok_lbl);
+    lv_obj_add_event_cb(ok_btn, s_zgwd_disassoc_proceed_cb, LV_EVENT_CLICKED, popup);
+
+    lv_obj_t *cancel_btn = lv_btn_create(popup);
+    lv_obj_set_size(cancel_btn, 90, 28);
+    lv_obj_align(cancel_btn, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x424242), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(cancel_btn, 5, 0);
+    lv_obj_t *can_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(can_lbl, "Cancel");
+    lv_obj_set_style_text_font(can_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(can_lbl, lv_color_white(), 0);
+    lv_obj_center(can_lbl);
+    lv_obj_add_event_cb(cancel_btn, s_zgwd_popup_dismiss_cb, LV_EVENT_CLICKED, popup);
 }
 
 static void s_zgwd_go_locate_cb(lv_event_t *e) { (void)e; show_zgwd_locator(0); }
