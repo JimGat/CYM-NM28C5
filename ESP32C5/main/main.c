@@ -13867,7 +13867,6 @@ static void show_wifi_connect_screen(void)
         wifi_connect_ta = lv_textarea_create(pass_row);
         lv_obj_set_flex_grow(wifi_connect_ta, 1);
         lv_textarea_set_one_line(wifi_connect_ta, true);
-        lv_textarea_set_password_mode(wifi_connect_ta, true);
         lv_textarea_set_text(wifi_connect_ta, "");
         lv_textarea_set_placeholder_text(wifi_connect_ta, "Enter password...");
         lv_obj_set_style_bg_color(wifi_connect_ta, ui_bg_color(), 0);
@@ -13887,7 +13886,7 @@ static void show_wifi_connect_screen(void)
         lv_obj_set_style_border_width(eye_btn, 0, 0);
         lv_obj_set_style_pad_all(eye_btn, 0, 0);
         lv_obj_t *eye_lbl = lv_label_create(eye_btn);
-        lv_label_set_text(eye_lbl, MY_SYMBOL_EYE);
+        lv_label_set_text(eye_lbl, MY_SYMBOL_EYE_SLASH);
         lv_obj_set_style_text_font(eye_lbl, &g_font_icon14, 0);
         lv_obj_set_style_text_color(eye_lbl, lv_color_make(180, 180, 180), 0);
         lv_obj_center(eye_lbl);
