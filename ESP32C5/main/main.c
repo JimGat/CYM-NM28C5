@@ -39259,16 +39259,16 @@ static void show_nrf24_ch_scan_screen(void)
     ESP_LOGI("NCS", "ctx=%p canvas_h=%d canv_bytes=%d", ctx, canvas_h,
              (int)(NRF24_CS_W * canvas_h * sizeof(lv_color_t)));
     if (!ctx) { s_n24_stub_screen("nRF24 Error", "Out of memory"); return; }
-    s_ncs = ctx;
 
     ctx->canv_buf = heap_caps_calloc(NRF24_CS_W * canvas_h, sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
     if (!ctx->canv_buf) {
-        heap_caps_free(ctx); s_ncs = NULL;
+        heap_caps_free(ctx);
         s_n24_stub_screen("nRF24 Error", "Out of memory (canvas)");
         return;
     }
 
     create_function_page_base("nRF24 Ch Scan");
+    s_ncs = ctx; // assign AFTER reset_function_page_children has run inside create_function_page_base
     apply_menu_bg();
 
     ctx->canvas = lv_canvas_create(function_page);
