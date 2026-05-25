@@ -4,6 +4,14 @@
 # Main task stack — must be large enough for LVGL UI construction + large local buffers
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
+# Coexistence: WiFi + BLE + 802.15.4 share the single RF front-end via software
+# arbitration. Required for wardrive simultaneous WiFi+BLE scanning and for the
+# Zigbee Scout passive 802.15.4 capture feature.
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+
+# IEEE 802.15.4 (Zigbee/Thread passive scanner via built-in ESP32-C5 radio)
+CONFIG_IEEE802154_ENABLED=y
+
 # Bluetooth / NimBLE
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y

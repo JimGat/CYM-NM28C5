@@ -164,6 +164,7 @@ LV_IMG_DECLARE(deedee_img);
 #include "radio_hat.h"
 #include "cc1101.h"
 #include "nrf24.h"
+#include "esp_ieee802154.h"
 #include "rfid_manager.h"
 #include "rfid_types.h"
 #include "rfid_storage.h"
@@ -1269,7 +1270,7 @@ static volatile int     wdup_wdg_dup_cnt     = 0;
 static volatile int     wdup_wdg_fail_cnt    = 0;
 // wd_manage_paths declared here so wdup_task (explicit mode) can reference it
 #define WD_MANAGE_MAX_FILES 64
-static char              wd_manage_paths[WD_MANAGE_MAX_FILES][320];
+EXT_RAM_BSS_ATTR static char wd_manage_paths[WD_MANAGE_MAX_FILES][320];
 
 // SD Card settings screen state
 typedef struct { char line[96]; } sd_prov_update_t;
@@ -1597,6 +1598,48 @@ EXT_RAM_BSS_ATTR static lv_obj_t *s_n24_jam_status = NULL;
 EXT_RAM_BSS_ATTR static lv_timer_t *s_n24_jam_tmr = NULL;
 EXT_RAM_BSS_ATTR static TaskHandle_t s_n24_jam_task = NULL;
 
+// ── Zigbee Scout (passive 802.15.4 wardrive, built-in ESP32-C5 radio) ────────
+#define ZGWD_DWELL_MS      250   // ms to receive on each channel
+#define ZGWD_MAX_PANS       64   // unique PAN IDs tracked
+#define ZGWD_Q_DEPTH        24   // ISR→task frame queue depth
+#define ZGWD_SAVE_DIR  "/sdcard/lab/zigbee"
+
+typedef struct {
+    uint16_t pan_id;
+    uint8_t  channel;
+    int8_t   rssi_min;
+    int8_t   rssi_max;
+    uint16_t frame_count;
+} zgwd_pan_entry_t;
+
+typedef struct {
+    uint8_t  data[128];
+    uint8_t  len;
+    int8_t   rssi;
+    uint8_t  lqi;
+    uint8_t  channel;
+} zgwd_frame_msg_t;
+
+typedef struct {
+    lv_obj_t    *status_lbl;
+    lv_obj_t    *count_lbl;
+    lv_obj_t    *pan_lbl;
+    lv_obj_t    *start_btn;
+    lv_timer_t  *tmr;
+    bool         active;
+    volatile bool cancel;
+    TaskHandle_t task;
+    int          frame_count;
+    int          pan_count;
+    uint8_t      current_channel;
+    zgwd_pan_entry_t pans[ZGWD_MAX_PANS];
+    char         csv_path[80];
+    char         pcap_path[80];
+} zgwd_ctx_t;
+
+EXT_RAM_BSS_ATTR static zgwd_ctx_t *s_zgwd = NULL;
+static QueueHandle_t s_zgwd_rx_q = NULL;
+
 // AirTag Scanner state
 static TaskHandle_t airtag_scan_task_handle = NULL;
 static StaticTask_t airtag_scan_task_buffer;
@@ -1749,7 +1792,7 @@ typedef enum {
     BTO_STATE_STOPPED,
 } bto_state_t;
 
-static bto_device_t     bto_devices[BTO_MAX_DEVICES];
+EXT_RAM_BSS_ATTR static bto_device_t bto_devices[BTO_MAX_DEVICES];
 static volatile int     bto_device_count    = 0;
 static volatile int     bto_current_idx     = -1;
 static volatile bto_state_t bto_state       = BTO_STATE_IDLE;
@@ -1926,6 +1969,7 @@ static void show_nrf24_sniffer_screen(void);
 static void show_nrf24_saved_screen(void);
 static void show_nrf24_jammer_screen(void);
 static void show_nrf24_futaba_screen(void);
+static void show_zigbee_wardrive_screen(void);
 static void show_ir_capture_screen(void);
 static void show_ir_replay_screen(void);
 static void show_ir_signal_list_screen(void);
@@ -10600,6 +10644,7 @@ static void wardrive_promisc_task(void *pvParameters) {
     (void)pvParameters;
     ESP_LOGI(TAG, "Wardrive promisc task started");
     log_heap_stats("wardrive-start");
+    bool wd_used_coex_ble = false;  // true if BLE was init'd while WiFi stayed up
 
     wardrive_file_counter = (int)(esp_timer_get_time() / 1000000);
     snprintf(wd_marks_fname, sizeof(wd_marks_fname),
@@ -10740,11 +10785,23 @@ static void wardrive_promisc_task(void *pvParameters) {
             (esp_timer_get_time() - last_ble_us) >= (int64_t)WDP_BLE_INTERVAL_S * 1000000LL) {
             last_ble_us = esp_timer_get_time();
 
-            // Pause WiFi promiscuous
-            esp_wifi_set_promiscuous(false);
+            // With CONFIG_ESP_COEX_SW_COEXIST_ENABLE, attempt BLE while keeping
+            // WiFi promiscuous running. Coex manager arbitrates the shared RF
+            // front-end. WiFi RX/TX buffers (RX=4, TX=3) + BLE ~31KB < 48KB DMA.
+            // bt_nimble_init() is idempotent if NimBLE is already initialized.
+            bool ble_scan_ok = false;
+            bool via_coex    = false;
+            if (current_radio_mode == RADIO_MODE_WIFI && bt_nimble_init() == ESP_OK) {
+                via_coex = true;
+                wd_used_coex_ble = true;
+                ble_scan_ok = true;
+            } else {
+                // Fall back: pause WiFi and do a full radio switch.
+                esp_wifi_set_promiscuous(false);
+                ble_scan_ok = ensure_ble_mode();
+            }
 
-            // Switch to BLE
-            if (ensure_ble_mode()) {
+            if (ble_scan_ok) {
                 wdp_current_channel = -1;  // signal UI: BLE pass in progress
                 wd_ui_update_flag = true;
 
@@ -10775,19 +10832,21 @@ static void wardrive_promisc_task(void *pvParameters) {
 
             if (!wardrive_active) break;
 
-            // Switch back to WiFi
-            ensure_wifi_mode();
-            wifi_country_t wifi_country = {
-                .cc = "PH", .schan = 1, .nchan = 14,
-                .policy = WIFI_COUNTRY_POLICY_AUTO,
-            };
-            esp_wifi_set_country(&wifi_country);
-            apply_wifi_power_settings();
-            wdp_ducb_init();  // rebuild channel list after reinit
-
-            esp_wifi_set_promiscuous_filter(&filt);
-            esp_wifi_set_promiscuous_rx_cb(wdp_promiscuous_cb);
-            esp_wifi_set_promiscuous(true);
+            if (!via_coex) {
+                // Radio-switch path: restore WiFi (it was stopped for BLE).
+                ensure_wifi_mode();
+                wifi_country_t wifi_country = {
+                    .cc = "PH", .schan = 1, .nchan = 14,
+                    .policy = WIFI_COUNTRY_POLICY_AUTO,
+                };
+                esp_wifi_set_country(&wifi_country);
+                apply_wifi_power_settings();
+                wdp_ducb_init();  // rebuild channel list after reinit
+                esp_wifi_set_promiscuous_filter(&filt);
+                esp_wifi_set_promiscuous_rx_cb(wdp_promiscuous_cb);
+                esp_wifi_set_promiscuous(true);
+            }
+            // Coex path: WiFi promiscuous kept running — continue as-is.
         }
         // ─────────────────────────────────────────────────────────
 
@@ -10861,6 +10920,11 @@ static void wardrive_promisc_task(void *pvParameters) {
         wdp_ble_devices = NULL;
     }
     wdp_ble_count = 0;
+
+    // If BLE was initialized via coex (WiFi never stopped), clean it up now.
+    if (wd_used_coex_ble && nimble_initialized) {
+        bt_nimble_deinit();
+    }
 
     wardrive_active = false;
     wardrive_task_handle = NULL;
@@ -12868,6 +12932,8 @@ static void main_tile_event_cb(lv_event_t *e)
     // NM-RF-HAT tiles
     } else if (strcmp(tile_name, "IR Menu") == 0) {
         show_dip_switch_popup(4, "Infrared (IR)", show_ir_menu_screen);
+    } else if (strcmp(tile_name, "Zigbee") == 0) {
+        show_zigbee_wardrive_screen();
     } else if (strcmp(tile_name, "Radio Menu") == 0) {
         show_radio_menu_screen();
     } else if (strcmp(tile_name, "RFID Menu") == 0) {
@@ -13066,6 +13132,7 @@ static void show_main_tiles(void)
     create_tile(tiles_container, MY_SYMBOL_CAR,         "Wardrive",     COLOR_MATERIAL_RED,     main_tile_event_cb, "Wardrive");
     create_tile(tiles_container, LV_SYMBOL_SETTINGS,    "Settings",     UI_ACCENT_GREEN,        main_tile_event_cb, "Settings");
     create_tile(tiles_container, LV_SYMBOL_POWER,       "Go Dark",      lv_color_hex(0x8A8FA8), main_tile_event_cb, "Go Dark");
+    create_tile(tiles_container, MY_SYMBOL_SITEMAP,     "Zigbee",       lv_color_hex(0x00695C), main_tile_event_cb, "Zigbee");
     // NM-RF-HAT tiles — shown only when the addon board is enabled in Hardware Options
     if (g_rf_hat_enabled) {
         create_tile(tiles_container, MY_SYMBOL_WAVE,      "Infrared",   lv_color_hex(0xE65100), main_tile_event_cb, "IR Menu");
@@ -18965,7 +19032,7 @@ static void show_new_folder_screen(void)
 static char      s_delbr_cwd[300];
 static lv_obj_t *s_delbr_list     = NULL;
 static lv_obj_t *s_delbr_path_lbl = NULL;
-static char      s_delbr_dirs[DELBR_MAX_DIRS][256];
+EXT_RAM_BSS_ATTR static char s_delbr_dirs[DELBR_MAX_DIRS][256];
 static int       s_delbr_dir_count = 0;
 static char      s_delbr_del_target[300];
 
@@ -21439,7 +21506,7 @@ static void show_sd_free_space_screen(void)
 static char      s_sd_tree_cwd[300];
 static lv_obj_t *s_sd_tree_list  = NULL;
 static lv_obj_t *s_sd_path_lbl   = NULL;
-static char      s_sd_dir_paths[SD_TREE_MAX_DIRS][256];
+EXT_RAM_BSS_ATTR static char s_sd_dir_paths[SD_TREE_MAX_DIRS][256];
 static int       s_sd_dir_count  = 0;
 
 static void sd_tree_populate(const char *path);
@@ -38632,7 +38699,7 @@ static void s_ncs_startstop_cb(lv_event_t *e)
             lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
             if (lbl) lv_label_set_text(lbl, "Stop");
         }
-        xTaskCreate(s_ncs_task_fn, "nrf24_cs", 3072, ctx, 5, &ctx->task);
+        xTaskCreate(s_ncs_task_fn, "nrf24_cs", 4096, ctx, 5, &ctx->task);
     } else {
         ctx->active = false;
         ctx->cancel = true;
@@ -38707,6 +38774,13 @@ static void show_nrf24_ch_scan_screen(void)
 
     ctx->tmr = lv_timer_create(s_ncs_ui_timer_cb, 150, NULL);
     rfhat_add_back_btn("nRF24", show_nrf24_screen);
+
+    // Auto-start scanning immediately on screen open
+    ctx->active = true;
+    ctx->cancel = false;
+    lv_label_set_text(sl, "Stop");
+    lv_label_set_text(ctx->status_lbl, "Scanning...");
+    xTaskCreate(s_ncs_task_fn, "nrf24_cs", 4096, ctx, 5, &ctx->task);
 }
 
 // ── Sniffer ───────────────────────────────────────────────────────────────────
@@ -38853,12 +38927,12 @@ static void show_nrf24_sniffer_screen(void)
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *hdr = lv_label_create(card);
-    lv_label_set_text(hdr, LV_SYMBOL_EYE_OPEN "  Promiscuous Sniffer");
+    lv_label_set_text(hdr, LV_SYMBOL_EYE_OPEN "  nRF24 Protocol Sniffer");
     lv_obj_set_style_text_font(hdr, &g_font_icon14, 0);
     lv_obj_set_style_text_color(hdr, lv_color_hex(0x66BB6A), 0);
 
     lv_obj_t *info = lv_label_create(card);
-    lv_label_set_text(info, "Ch 76 | Addr: AA AA AA | 32B payload");
+    lv_label_set_text(info, "Ch 76 | nRF24 protocol only | Addr AA:AA:AA");
     lv_obj_set_style_text_font(info, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(info, lv_color_make(150, 150, 150), 0);
 
@@ -39264,7 +39338,7 @@ static void s_nfut_start_cb(lv_event_t *e)
         lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
         if (lbl) lv_label_set_text(lbl, "...");
     }
-    xTaskCreate(s_nfut_task_fn, "nrf24_fut", 3072, ctx, 5, &ctx->task);
+    xTaskCreate(s_nfut_task_fn, "nrf24_fut", 4096, ctx, 5, &ctx->task);
 }
 
 static void show_nrf24_futaba_screen(void)
@@ -40878,4 +40952,401 @@ static void show_rf433_signal_list_screen(void)
     lv_obj_add_event_cb(tx_btn, rf433_do_replay_cb, LV_EVENT_CLICKED, NULL);
 
     rfhat_add_back_btn(s_rf433_cur_remote, show_rf433_replay_screen);
+}
+
+// =============================================================================
+// Zigbee Scout — passive 802.15.4 wardrive using ESP32-C5 built-in radio
+// FOR AUTHORIZED SECURITY RESEARCH AND EDUCATION ONLY.
+// Channels 11-26 (2405-2480 MHz, 5 MHz steps). Saves CSV + PCAP to SD card.
+// WiFi is stopped before 802.15.4 is enabled; restarted on exit.
+// =============================================================================
+
+// ── 802.15.4 RX callback (ISR context — must be in IRAM) ─────────────────────
+
+static IRAM_ATTR void s_zgwd_rx_done_cb(uint8_t *frame,
+                                         esp_ieee802154_frame_info_t *fi)
+{
+    if (!s_zgwd_rx_q || !s_zgwd || !s_zgwd->active) {
+        esp_ieee802154_receive_handle_done(frame);
+        return;
+    }
+    // frame[0] = total length including 2-byte FCS slot (occupied by RSSI/LQI).
+    // frame[1..frame[0]-2] = MAC data (MHR + payload), frame[frame[0]-1..frame[0]] = RSSI/LQI.
+    uint8_t raw_len = frame[0];
+    uint8_t mac_len = (raw_len >= 2) ? (raw_len - 2) : 0;
+    if (mac_len > 127) mac_len = 127;
+
+    zgwd_frame_msg_t msg;
+    msg.len     = mac_len;
+    msg.rssi    = fi->rssi;
+    msg.lqi     = fi->lqi;
+    msg.channel = fi->channel;
+    if (mac_len > 0) memcpy(msg.data, frame + 1, mac_len);
+
+    BaseType_t woken = pdFALSE;
+    xQueueSendFromISR(s_zgwd_rx_q, &msg, &woken);
+    esp_ieee802154_receive_handle_done(frame);
+    portYIELD_FROM_ISR(woken);
+}
+
+// Required 802.15.4 weak-symbol stubs (only rx done is used here)
+void IRAM_ATTR esp_ieee802154_receive_done(uint8_t *frame,
+                                            esp_ieee802154_frame_info_t *frame_info)
+{
+    s_zgwd_rx_done_cb(frame, frame_info);
+}
+void IRAM_ATTR esp_ieee802154_receive_sfd_done(void) {}
+void IRAM_ATTR esp_ieee802154_transmit_done(const uint8_t *f, const uint8_t *a,
+                                             esp_ieee802154_frame_info_t *i)
+{ (void)f; (void)a; (void)i; }
+void IRAM_ATTR esp_ieee802154_transmit_failed(const uint8_t *f,
+                                               esp_ieee802154_tx_error_t e)
+{ (void)f; (void)e; }
+void IRAM_ATTR esp_ieee802154_transmit_sfd_done(uint8_t *f) { (void)f; }
+void IRAM_ATTR esp_ieee802154_energy_detect_done(int8_t p)  { (void)p; }
+void IRAM_ATTR esp_ieee802154_receive_at_done(void) {}
+esp_err_t esp_ieee802154_enh_ack_generator(uint8_t *f,
+                                            esp_ieee802154_frame_info_t *fi,
+                                            uint8_t *enhack)
+{ (void)f; (void)fi; (void)enhack; return ESP_FAIL; }
+
+// ── PCAP file helpers ─────────────────────────────────────────────────────────
+#define ZGWD_DLT_IEEE802_15_4_NOFCS  230
+
+static void s_zgwd_pcap_write_global_hdr(FILE *f)
+{
+    // PCAP global header (magic, major, minor, thiszone, sigfigs, snaplen, dlt)
+    uint32_t hdr[6] = { 0xA1B2C3D4, (2 << 16) | 4, 0, 0, 256, ZGWD_DLT_IEEE802_15_4_NOFCS };
+    fwrite(hdr, sizeof(hdr), 1, f);
+}
+
+static void s_zgwd_pcap_write_frame(FILE *f, const zgwd_frame_msg_t *msg,
+                                     uint64_t ts_us)
+{
+    uint32_t sec  = (uint32_t)(ts_us / 1000000ULL);
+    uint32_t usec = (uint32_t)(ts_us % 1000000ULL);
+    uint32_t rec[4] = { sec, usec, msg->len, msg->len };
+    fwrite(rec, sizeof(rec), 1, f);
+    fwrite(msg->data, 1, msg->len, f);
+}
+
+// ── PAN ID extractor from raw 802.15.4 MAC frame ─────────────────────────────
+static uint16_t s_zgwd_extract_pan(const uint8_t *mac, uint8_t len)
+{
+    if (len < 5) return 0xFFFF;
+    uint16_t fc = (uint16_t)mac[0] | ((uint16_t)mac[1] << 8);
+    uint8_t  dst_mode = (fc >> 10) & 0x03;
+    if (dst_mode != 0) return (uint16_t)mac[3] | ((uint16_t)mac[4] << 8);
+    return 0xFFFF;
+}
+
+// ── Wardrive background task ──────────────────────────────────────────────────
+static void s_zgwd_task_fn(void *arg)
+{
+    zgwd_ctx_t *ctx = (zgwd_ctx_t *)arg;
+    ESP_LOGI(TAG, "[ZGWD] Zigbee Scout started");
+
+    // Ensure save directory
+    if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
+    struct stat st = {0};
+    if (stat("/sdcard/lab", &st) == -1) mkdir("/sdcard/lab", 0777);
+    if (stat(ZGWD_SAVE_DIR, &st) == -1) mkdir(ZGWD_SAVE_DIR, 0755);
+
+    uint64_t ts_base = (uint64_t)(esp_timer_get_time() / 1000000);
+    snprintf(ctx->csv_path, sizeof(ctx->csv_path),
+             ZGWD_SAVE_DIR "/zgwd%llu.csv", (unsigned long long)ts_base);
+    snprintf(ctx->pcap_path, sizeof(ctx->pcap_path),
+             ZGWD_SAVE_DIR "/zgwd%llu.pcap", (unsigned long long)ts_base);
+
+    FILE *csv  = fopen(ctx->csv_path, "w");
+    FILE *pcap = fopen(ctx->pcap_path, "wb");
+    if (csv)  fprintf(csv, "timestamp_us,channel,pan_id,rssi,lqi,frame_len\n");
+    if (pcap) s_zgwd_pcap_write_global_hdr(pcap);
+    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+
+    // Stop WiFi to free the shared RF front-end for 802.15.4
+    if (current_radio_mode == RADIO_MODE_WIFI) {
+        esp_wifi_set_promiscuous(false);
+        esp_wifi_stop();
+        esp_wifi_deinit();
+        wifi_initialized = false;
+        current_radio_mode = RADIO_MODE_NONE;
+    } else if (current_radio_mode == RADIO_MODE_BLE) {
+        bt_nimble_deinit();
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+
+    // Initialize 802.15.4
+    if (esp_ieee802154_enable() != ESP_OK) {
+        ESP_LOGE(TAG, "[ZGWD] 802.15.4 enable failed");
+        goto zgwd_done;
+    }
+    esp_ieee802154_set_promiscuous(true);
+    esp_ieee802154_set_coordinator(false);
+    esp_ieee802154_set_panid(0xFFFF);
+    esp_ieee802154_set_short_address(0xFFFF);
+
+    // Channel-sweep loop
+    const uint8_t channels[] = { 11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26 };
+    const int     num_ch     = (int)(sizeof(channels)/sizeof(channels[0]));
+    int           ch_idx     = 0;
+
+    while (!ctx->cancel) {
+        uint8_t ch = channels[ch_idx];
+        ctx->current_channel = ch;
+
+        esp_ieee802154_set_channel(ch);
+        esp_ieee802154_receive();
+
+        TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(ZGWD_DWELL_MS);
+        while (!ctx->cancel && xTaskGetTickCount() < deadline) {
+            zgwd_frame_msg_t msg;
+            if (xQueueReceive(s_zgwd_rx_q, &msg, pdMS_TO_TICKS(20)) == pdTRUE) {
+                uint64_t ts = (uint64_t)esp_timer_get_time();
+                ctx->frame_count++;
+
+                // Extract PAN ID
+                uint16_t pan = s_zgwd_extract_pan(msg.data, msg.len);
+
+                // Track unique PANs
+                if (pan != 0xFFFF) {
+                    bool found = false;
+                    for (int i = 0; i < ctx->pan_count; i++) {
+                        if (ctx->pans[i].pan_id == pan) {
+                            if (msg.rssi < ctx->pans[i].rssi_min) ctx->pans[i].rssi_min = msg.rssi;
+                            if (msg.rssi > ctx->pans[i].rssi_max) ctx->pans[i].rssi_max = msg.rssi;
+                            ctx->pans[i].frame_count++;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found && ctx->pan_count < ZGWD_MAX_PANS) {
+                        zgwd_pan_entry_t *pe = &ctx->pans[ctx->pan_count++];
+                        pe->pan_id     = pan;
+                        pe->channel    = ch;
+                        pe->rssi_min   = msg.rssi;
+                        pe->rssi_max   = msg.rssi;
+                        pe->frame_count = 1;
+                    }
+                }
+
+                if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5));
+                if (csv) {
+                    if (pan != 0xFFFF)
+                        fprintf(csv, "%llu,%u,0x%04X,%d,%u,%u\n",
+                                (unsigned long long)ts, ch, pan,
+                                (int)msg.rssi, (unsigned)msg.lqi, (unsigned)msg.len);
+                    else
+                        fprintf(csv, "%llu,%u,--,%d,%u,%u\n",
+                                (unsigned long long)ts, ch,
+                                (int)msg.rssi, (unsigned)msg.lqi, (unsigned)msg.len);
+                }
+                if (pcap) s_zgwd_pcap_write_frame(pcap, &msg, ts);
+                if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+            }
+        }
+
+        // Flush to SD every 16 channels
+        if ((ch_idx & 0x0F) == 0x0F) {
+            if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(10));
+            if (csv)  fflush(csv);
+            if (pcap) fflush(pcap);
+            if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+        }
+
+        ch_idx = (ch_idx + 1) % num_ch;
+    }
+
+    esp_ieee802154_sleep();
+    esp_ieee802154_disable();
+
+zgwd_done:
+    if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
+    if (csv)  { fflush(csv);  fclose(csv);  }
+    if (pcap) { fflush(pcap); fclose(pcap); }
+    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+
+    // Restart WiFi
+    ensure_wifi_mode();
+    apply_wifi_power_settings();
+
+    ESP_LOGI(TAG, "[ZGWD] Stopped. Frames:%d PANs:%d",
+             ctx->frame_count, ctx->pan_count);
+
+    ctx->active = false;
+    ctx->task   = NULL;
+    heap_caps_free(ctx);
+    if (s_zgwd == ctx) s_zgwd = NULL;
+    vTaskDelete(NULL);
+}
+
+// ── UI timer (updates display while scanning) ─────────────────────────────────
+static void s_zgwd_ui_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    zgwd_ctx_t *ctx = s_zgwd;
+    if (!ctx) return;
+
+    if (ctx->status_lbl) {
+        char sb[48];
+        if (ctx->active)
+            snprintf(sb, sizeof(sb), "Ch %u  |  Frames: %d", ctx->current_channel,
+                     ctx->frame_count);
+        else
+            snprintf(sb, sizeof(sb), "Stopped  |  Frames: %d", ctx->frame_count);
+        lv_label_set_text(ctx->status_lbl, sb);
+    }
+    if (ctx->pan_lbl) {
+        char pb[48];
+        snprintf(pb, sizeof(pb), "PANs found: %d", ctx->pan_count);
+        lv_label_set_text(ctx->pan_lbl, pb);
+        if (ctx->pan_count > 0) {
+            // Show the most recently found PAN
+            int last = ctx->pan_count - 1;
+            char detail[64];
+            snprintf(detail, sizeof(detail), "PANs: %d  |  Last: 0x%04X ch%u",
+                     ctx->pan_count, ctx->pans[last].pan_id, ctx->pans[last].channel);
+            lv_label_set_text(ctx->pan_lbl, detail);
+        }
+    }
+    if (!ctx->active && ctx->task == NULL && ctx->start_btn) {
+        lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
+        if (lbl) lv_label_set_text(lbl, "Start");
+    }
+}
+
+// ── Start / Stop callback ─────────────────────────────────────────────────────
+static void s_zgwd_startstop_cb(lv_event_t *e)
+{
+    (void)e;
+    zgwd_ctx_t *ctx = s_zgwd;
+    if (!ctx) return;
+
+    if (!ctx->active && !ctx->task) {
+        // Start
+        ctx->active  = true;
+        ctx->cancel  = false;
+        ctx->frame_count = 0;
+        ctx->pan_count   = 0;
+        memset(ctx->pans, 0, sizeof(ctx->pans));
+        if (ctx->start_btn) {
+            lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
+            if (lbl) lv_label_set_text(lbl, "Stop");
+        }
+        xTaskCreate(s_zgwd_task_fn, "zgwd", 4096, ctx, 5, &ctx->task);
+    } else {
+        // Stop
+        ctx->cancel = true;
+        ctx->active = false;
+    }
+}
+
+// ── Back button callback — stop scan then go home ─────────────────────────────
+static void s_zgwd_back_cb(lv_event_t *e)
+{
+    (void)e;
+    zgwd_ctx_t *ctx = s_zgwd;
+    if (ctx) {
+        ctx->cancel = true;
+        ctx->active = false;
+    }
+    // Timer cleanup
+    if (ctx && ctx->tmr) { lv_timer_del(ctx->tmr); ctx->tmr = NULL; }
+    show_main_tiles();
+}
+
+// ── Main Zigbee Scout screen ──────────────────────────────────────────────────
+static void show_zigbee_wardrive_screen(void)
+{
+    // Cancel any running scan
+    if (s_zgwd) { s_zgwd->cancel = true; s_zgwd->active = false; }
+
+    // Create RX queue (may already exist if returning to screen mid-scan)
+    if (!s_zgwd_rx_q)
+        s_zgwd_rx_q = xQueueCreate(ZGWD_Q_DEPTH, sizeof(zgwd_frame_msg_t));
+
+    zgwd_ctx_t *ctx = heap_caps_calloc(1, sizeof(zgwd_ctx_t), MALLOC_CAP_SPIRAM);
+    if (!ctx) {
+        ESP_LOGE(TAG, "[ZGWD] OOM");
+        return;
+    }
+    s_zgwd = ctx;
+
+    create_function_page_base("Zigbee Scout");
+    apply_menu_bg();
+
+    // Header
+    lv_obj_t *hdr = lv_label_create(function_page);
+    lv_label_set_text(hdr, MY_SYMBOL_SITEMAP "  Zigbee Scout");
+    lv_obj_set_style_text_font(hdr, &g_font_icon14, 0);
+    lv_obj_set_style_text_color(hdr, lv_color_hex(0x00BCD4), 0);
+    lv_obj_align(hdr, LV_ALIGN_TOP_MID, 0, 4);
+
+    // Card
+    lv_obj_t *card = lv_obj_create(function_page);
+    lv_obj_set_size(card, LCD_H_RES - 16, LCD_V_RES - 96);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 26);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x00695C), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 8, 0);
+    lv_obj_set_style_pad_all(card, 10, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(card, 8, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *sub = lv_label_create(card);
+    lv_label_set_text(sub, "802.15.4 passive scan | Ch 11-26 | 2.4GHz");
+    lv_obj_set_style_text_font(sub, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sub, lv_color_make(150, 150, 150), 0);
+
+    ctx->status_lbl = lv_label_create(card);
+    lv_label_set_text(ctx->status_lbl, "Press Start to scan");
+    lv_obj_set_style_text_font(ctx->status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0x42A5F5), 0);
+
+    ctx->pan_lbl = lv_label_create(card);
+    lv_label_set_text(ctx->pan_lbl, "PANs found: 0");
+    lv_obj_set_style_text_font(ctx->pan_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->pan_lbl, lv_color_hex(0x66BB6A), 0);
+
+    lv_obj_t *note = lv_label_create(card);
+    lv_label_set_text(note, "Stops WiFi while scanning.\nSaves CSV + PCAP to SD card.");
+    lv_obj_set_style_text_font(note, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(note, lv_color_make(120, 120, 120), 0);
+    lv_obj_set_style_text_align(note, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(note, LCD_H_RES - 36);
+
+    ctx->start_btn = lv_btn_create(card);
+    lv_obj_set_size(ctx->start_btn, 110, 30);
+    lv_obj_set_style_bg_color(ctx->start_btn, lv_color_hex(0x00695C), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(ctx->start_btn, lv_color_hex(0x00796B), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(ctx->start_btn, 0, 0);
+    lv_obj_set_style_radius(ctx->start_btn, 6, 0);
+    lv_obj_t *bl = lv_label_create(ctx->start_btn);
+    lv_label_set_text(bl, "Start");
+    lv_obj_set_style_text_font(bl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(bl, lv_color_white(), 0);
+    lv_obj_center(bl);
+    lv_obj_add_event_cb(ctx->start_btn, s_zgwd_startstop_cb, LV_EVENT_CLICKED, NULL);
+
+    ctx->tmr = lv_timer_create(s_zgwd_ui_timer_cb, 500, NULL);
+
+    // Back button
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, LCD_H_RES - 16, 30);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_set_style_bg_color(back_btn, ui_panel_color(), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(back_btn, ui_card_pressed_color(), LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(back_btn, ui_border_color(), 0);
+    lv_obj_set_style_border_width(back_btn, 1, 0);
+    lv_obj_set_style_radius(back_btn, 6, 0);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT "  Home");
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(back_lbl, ui_text_color(), 0);
+    lv_obj_center(back_lbl);
+    lv_obj_add_event_cb(back_btn, s_zgwd_back_cb, LV_EVENT_CLICKED, NULL);
 }
