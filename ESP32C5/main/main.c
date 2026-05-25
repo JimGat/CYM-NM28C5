@@ -1534,6 +1534,7 @@ typedef struct {
     lv_obj_t      *start_btn;
     lv_timer_t    *tmr;
     TaskHandle_t   task;
+    uint64_t       tap_expire_us;
 } cc1101_bs_ctx_t;
 static cc1101_bs_ctx_t *s_bs = NULL;  // 4 bytes DRAM; struct + canvas in PSRAM
 
@@ -1561,6 +1562,7 @@ typedef struct {
     lv_obj_t       *start_btn;
     lv_timer_t     *tmr;
     TaskHandle_t    task;
+    uint64_t        tap_expire_us;
 } nrf24_cs_ctx_t;
 EXT_RAM_BSS_ATTR static nrf24_cs_ctx_t *s_ncs = NULL;
 
@@ -37584,7 +37586,7 @@ static void s_cc1101_cap_start_cb(lv_event_t *e)
     if (s_cc1101_cap_count_lbl)  lv_label_set_text(s_cc1101_cap_count_lbl,  "10s timeout");
     if (s_cc1101_cap_tmr) { lv_timer_del(s_cc1101_cap_tmr); s_cc1101_cap_tmr = NULL; }
     s_cc1101_cap_tmr = lv_timer_create(s_cc1101_cap_timer_cb, 250, NULL);
-    xTaskCreate(s_cc1101_cap_task_fn, "cc1101_cap", 4096, NULL, 5, &s_cc1101_cap_task);
+    xTaskCreate(s_cc1101_cap_task_fn, "cc1101_cap", 4096, NULL, 2, &s_cc1101_cap_task);
     (void)e;
 }
 
@@ -37708,7 +37710,7 @@ static void s_cc1101_rep_btn_cb(lv_event_t *e)
     if (s_cc1101_rep_tmr) { lv_timer_del(s_cc1101_rep_tmr); s_cc1101_rep_tmr = NULL; }
     s_cc1101_rep_tmr = lv_timer_create(s_cc1101_rep_timer_cb, 250, NULL);
     xTaskCreate(s_cc1101_rep_task_fn, "cc1101_rep", 4096,
-                (void*)(intptr_t)repeats, 5, &s_cc1101_rep_task);
+                (void*)(intptr_t)repeats, 2, &s_cc1101_rep_task);
 }
 
 static void show_cc1101_replay_screen(void)
@@ -37832,7 +37834,7 @@ static void s_cc1101_saved_play_cb(lv_event_t *e)
     if (s_cc1101_rep_tmr) { lv_timer_del(s_cc1101_rep_tmr); s_cc1101_rep_tmr = NULL; }
     s_cc1101_rep_tmr = lv_timer_create(s_cc1101_rep_timer_cb, 250, NULL);
     xTaskCreate(s_cc1101_saved_rep_task_fn, "cc1101_srep", 4096,
-                (void*)(intptr_t)1, 5, &s_cc1101_rep_task);
+                (void*)(intptr_t)1, 2, &s_cc1101_rep_task);
 }
 
 static void s_cc1101_saved_del_cb(lv_event_t *e)
@@ -38246,10 +38248,7 @@ static void s_bs_task_fn(void *arg)
         if (ctx->active && !ctx->cancel)
             ctx->sweep_done = true;
     }
-    if (ctx->canv_buf) heap_caps_free(ctx->canv_buf);
-    ctx->task = NULL;
-    heap_caps_free(ctx);
-    if (s_bs == ctx) s_bs = NULL;
+    ctx->task = NULL;  // signal main to free; do not free here (reset_function_page_children owns it)
     vTaskDelete(NULL);
 }
 
@@ -38258,7 +38257,7 @@ static void s_bs_ui_timer_cb(lv_timer_t *t)
     (void)t;
     cc1101_bs_ctx_t *ctx = s_bs;
     if (!ctx || !ctx->canvas || !ctx->canv_buf) return;
-    if (!ctx->sweep_done && ctx->active) return;
+    if (!ctx->sweep_done) return;  // no data yet (also prevents painting before Start)
     ctx->sweep_done = false;
 
     int8_t rssi[CC1101_BS_NPTS];
@@ -38313,7 +38312,8 @@ static void s_bs_ui_timer_cb(lv_timer_t *t)
     }
     lv_obj_invalidate(ctx->canvas);
 
-    if (ctx->status_lbl) {
+    if (ctx->status_lbl && esp_timer_get_time() >= ctx->tap_expire_us) {
+        lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0xAAAAAA), 0);
         if (ctx->active) {
             float s = ctx->center - ctx->span / 2.0f;
             float e = ctx->center + ctx->span / 2.0f;
@@ -38325,6 +38325,27 @@ static void s_bs_ui_timer_cb(lv_timer_t *t)
             lv_label_set_text(ctx->status_lbl, "Stopped");
         }
     }
+}
+
+static void s_bs_canvas_tap_cb(lv_event_t *e)
+{
+    (void)e;
+    cc1101_bs_ctx_t *ctx = s_bs;
+    if (!ctx || !ctx->status_lbl || !ctx->canvas) return;
+    lv_indev_t *indev = lv_indev_get_act();
+    if (!indev) return;
+    lv_point_t pt;
+    lv_indev_get_point(indev, &pt);
+    lv_area_t area;
+    lv_obj_get_coords(ctx->canvas, &area);
+    int x = pt.x - area.x1;
+    if (x < 0 || x >= CC1101_BS_W) return;
+    float freq = (ctx->center - ctx->span / 2.0f) + ((float)x / (float)(CC1101_BS_W - 1)) * ctx->span;
+    char buf[28];
+    snprintf(buf, sizeof(buf), "Tap: %.2f MHz", (double)freq);
+    lv_label_set_text(ctx->status_lbl, buf);
+    lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0xFFEB3B), 0);
+    ctx->tap_expire_us = esp_timer_get_time() + 2000000ULL;
 }
 
 static void s_bs_preset_cb(lv_event_t *e)
@@ -38354,7 +38375,7 @@ static void s_bs_startstop_cb(lv_event_t *e)
         if (ctx->start_btn)
             lv_label_set_text(lv_obj_get_child(ctx->start_btn, 0),
                               LV_SYMBOL_STOP " Stop");
-        xTaskCreate(s_bs_task_fn, "bs_scan", 3072, ctx, 5, &ctx->task);
+        xTaskCreate(s_bs_task_fn, "bs_scan", 3072, ctx, 2, &ctx->task);
     }
 }
 
@@ -38396,6 +38417,8 @@ static void show_cc1101_bandscope_screen(void)
                          CC1101_BS_W, canvas_h, LV_IMG_CF_TRUE_COLOR);
     lv_obj_set_pos(s_bs->canvas, 0, 28);
     lv_obj_set_size(s_bs->canvas, CC1101_BS_W, canvas_h);
+    lv_obj_add_flag(s_bs->canvas, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_bs->canvas, s_bs_canvas_tap_cb, LV_EVENT_CLICKED, NULL);
 
     int cy = 28 + canvas_h;  // y coordinate immediately below canvas (193)
 
@@ -38674,7 +38697,7 @@ static void s_zw_startstop_cb(lv_event_t *e)
         s_zwave->frame_count = 0;
         s_zwave->net_count   = 0;
         memset(s_zwave->nets, 0, sizeof(s_zwave->nets));
-        xTaskCreate(s_zw_task_fn, "zw_scout", 4096, s_zwave, 5, &s_zwave->task);
+        xTaskCreate(s_zw_task_fn, "zw_scout", 4096, s_zwave, 2, &s_zwave->task);
         if (s_zwave->start_btn)
             lv_label_set_text(lv_obj_get_child(s_zwave->start_btn, 0),
                               LV_SYMBOL_STOP " Stop");
@@ -39201,15 +39224,38 @@ static void s_ncs_ui_timer_cb(lv_timer_t *t)
 
     lv_obj_invalidate(ctx->canvas);
 
-    // Update status label
+    // Update status label (skip if a canvas tap is showing freq info)
     int active_count = 0;
     for (int i = 0; i < NRF24_CS_NPTS; i++) if (snap[i]) active_count++;
-    if (ctx->status_lbl) {
+    if (ctx->status_lbl && esp_timer_get_time() >= ctx->tap_expire_us) {
+        lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0x90CAF9), 0);
         char sb[64];
         snprintf(sb, sizeof(sb), "2400-2526 MHz | Active: %d ch | Sweep: %lu",
                  active_count, (unsigned long)ctx->sweep_count);
         lv_label_set_text(ctx->status_lbl, sb);
     }
+}
+
+static void s_ncs_canvas_tap_cb(lv_event_t *e)
+{
+    (void)e;
+    nrf24_cs_ctx_t *ctx = s_ncs;
+    if (!ctx || !ctx->status_lbl || !ctx->canvas) return;
+    lv_indev_t *indev = lv_indev_get_act();
+    if (!indev) return;
+    lv_point_t pt;
+    lv_indev_get_point(indev, &pt);
+    lv_area_t area;
+    lv_obj_get_coords(ctx->canvas, &area);
+    int x = pt.x - area.x1;
+    if (x < 0 || x >= NRF24_CS_W) return;
+    int ch = (x * NRF24_CS_NPTS) / NRF24_CS_W;
+    if (ch >= NRF24_CS_NPTS) ch = NRF24_CS_NPTS - 1;
+    char buf[28];
+    snprintf(buf, sizeof(buf), "CH %d  %d MHz", ch, 2400 + ch);
+    lv_label_set_text(ctx->status_lbl, buf);
+    lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0xFFEB3B), 0);
+    ctx->tap_expire_us = esp_timer_get_time() + 2000000ULL;
 }
 
 static void s_ncs_startstop_cb(lv_event_t *e)
@@ -39276,6 +39322,8 @@ static void show_nrf24_ch_scan_screen(void)
     ctx->canvas = lv_canvas_create(function_page);
     lv_canvas_set_buffer(ctx->canvas, ctx->canv_buf, NRF24_CS_W, canvas_h, LV_IMG_CF_TRUE_COLOR);
     lv_obj_align(ctx->canvas, LV_ALIGN_TOP_MID, 0, 34);
+    lv_obj_add_flag(ctx->canvas, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(ctx->canvas, s_ncs_canvas_tap_cb, LV_EVENT_CLICKED, NULL);
 
     // Clear canvas to dark
     for (int i = 0; i < NRF24_CS_W * canvas_h; i++)
@@ -39417,7 +39465,7 @@ static void s_nsniff_start_cb(lv_event_t *e)
             lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
             if (lbl) lv_label_set_text(lbl, "Stop");
         }
-        xTaskCreate(s_nsniff_task_fn, "nrf24_sniff", 4096, ctx, 5, &ctx->task);
+        xTaskCreate(s_nsniff_task_fn, "nrf24_sniff", 4096, ctx, 2, &ctx->task);
     } else {
         ctx->active = false; ctx->cancel = true;
     }
@@ -39873,7 +39921,7 @@ static void s_nfut_start_cb(lv_event_t *e)
         lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
         if (lbl) lv_label_set_text(lbl, "...");
     }
-    xTaskCreate(s_nfut_task_fn, "nrf24_fut", 4096, ctx, 5, &ctx->task);
+    xTaskCreate(s_nfut_task_fn, "nrf24_fut", 4096, ctx, 2, &ctx->task);
 }
 
 static void show_nrf24_futaba_screen(void)

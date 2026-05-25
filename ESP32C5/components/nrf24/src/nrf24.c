@@ -544,7 +544,7 @@ esp_err_t nrf24_sfhss_scan(nrf24_sfhss_t *out, uint32_t timeout_ms,
                 }
                 return ESP_OK;
             }
-            vTaskDelay(pdMS_TO_TICKS(1));
+            vTaskDelay(pdMS_TO_TICKS(20));  // yield to let main task reset WDT between channel hops
         }
     }
     return out->found ? ESP_OK : ESP_ERR_TIMEOUT;
