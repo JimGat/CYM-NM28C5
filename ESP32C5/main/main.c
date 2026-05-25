@@ -13847,36 +13847,11 @@ static void show_wifi_connect_screen(void)
         lv_obj_set_style_text_font(pass_val, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(pass_val, COLOR_MATERIAL_GREEN, 0);
     } else {
-        // Header row: "Password:" label on left, eye toggle on right
-        lv_obj_t *pass_hdr = lv_obj_create(content);
-        lv_obj_set_size(pass_hdr, lv_pct(100), LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_opa(pass_hdr, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(pass_hdr, 0, 0);
-        lv_obj_set_style_pad_all(pass_hdr, 0, 0);
-        lv_obj_clear_flag(pass_hdr, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_flex_flow(pass_hdr, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(pass_hdr, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-        lv_obj_t *pass_title = lv_label_create(pass_hdr);
+        lv_obj_t *pass_title = lv_label_create(content);
         lv_label_set_text(pass_title, "Password:");
         lv_obj_set_style_text_font(pass_title, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(pass_title, ui_text_color(), 0);
 
-        lv_obj_t *eye_btn = lv_btn_create(pass_hdr);
-        lv_obj_set_size(eye_btn, 32, 22);
-        lv_obj_set_style_bg_color(eye_btn, lv_color_make(40, 40, 40), 0);
-        lv_obj_set_style_bg_color(eye_btn, lv_color_make(70, 70, 70), LV_STATE_PRESSED);
-        lv_obj_set_style_radius(eye_btn, 5, 0);
-        lv_obj_set_style_border_width(eye_btn, 0, 0);
-        lv_obj_set_style_pad_all(eye_btn, 0, 0);
-        lv_obj_t *eye_lbl = lv_label_create(eye_btn);
-        lv_label_set_text(eye_lbl, MY_SYMBOL_EYE_SLASH);
-        lv_obj_set_style_text_font(eye_lbl, &g_font_icon14, 0);
-        lv_obj_set_style_text_color(eye_lbl, lv_color_make(180, 180, 180), 0);
-        lv_obj_center(eye_lbl);
-        lv_obj_add_event_cb(eye_btn, wifi_connect_eye_cb, LV_EVENT_CLICKED, NULL);
-
-        // Textarea full width below the header row
         wifi_connect_ta = lv_textarea_create(content);
         lv_obj_set_width(wifi_connect_ta, lv_pct(100));
         lv_textarea_set_one_line(wifi_connect_ta, true);
@@ -13947,6 +13922,30 @@ static void show_wifi_connect_screen(void)
     lv_obj_center(next_lbl);
     lv_obj_add_event_cb(wifi_connect_next_btn, wifi_connect_next_btn_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_flag(wifi_connect_next_btn, LV_OBJ_FLAG_HIDDEN);
+
+    // Eye button: overlays right edge of the password textarea.
+    // Added as a direct child of function_page (no flex) after forcing layout
+    // so lv_obj_get_coords returns the textarea's final screen position.
+    if (!password_found && wifi_connect_ta) {
+        lv_obj_update_layout(function_page);
+        lv_area_t ta;
+        lv_obj_get_coords(wifi_connect_ta, &ta);
+        lv_coord_t bh = ta.y2 - ta.y1 + 1;
+        lv_obj_t *eye_btn = lv_btn_create(function_page);
+        lv_obj_set_size(eye_btn, 38, bh);
+        lv_obj_set_pos(eye_btn, ta.x2 - 38, ta.y1);
+        lv_obj_set_style_bg_color(eye_btn, lv_color_make(0, 100, 0), 0);
+        lv_obj_set_style_bg_color(eye_btn, lv_color_make(0, 150, 0), LV_STATE_PRESSED);
+        lv_obj_set_style_radius(eye_btn, 4, 0);
+        lv_obj_set_style_border_width(eye_btn, 0, 0);
+        lv_obj_set_style_pad_all(eye_btn, 0, 0);
+        lv_obj_t *eye_lbl = lv_label_create(eye_btn);
+        lv_label_set_text(eye_lbl, MY_SYMBOL_EYE_SLASH);
+        lv_obj_set_style_text_font(eye_lbl, &g_font_icon14, 0);
+        lv_obj_set_style_text_color(eye_lbl, lv_color_make(255, 255, 255), 0);
+        lv_obj_center(eye_lbl);
+        lv_obj_add_event_cb(eye_btn, wifi_connect_eye_cb, LV_EVENT_CLICKED, NULL);
+    }
 }
 
 // ============================================================================
