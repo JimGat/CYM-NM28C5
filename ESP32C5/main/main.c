@@ -39090,15 +39090,19 @@ static void s_ncs_scan_cb(uint8_t ch, bool carrier, void *ctx_v)
 static void s_ncs_task_fn(void *arg)
 {
     nrf24_cs_ctx_t *ctx = (nrf24_cs_ctx_t *)arg;
+    ESP_LOGI("NCS", "task start ctx=%p active=%d", ctx, (int)ctx->active);
     while (ctx->active) {
         ctx->cancel = false;
         nrf24_scan_channels(0, NRF24_CS_NPTS - 1, s_ncs_scan_cb, ctx, &ctx->cancel);
         if (ctx->active) {
             ctx->sweep_done = true;
             ctx->sweep_count++;
+            if (ctx->sweep_count <= 3 || ctx->sweep_count % 50 == 0)
+                ESP_LOGI("NCS", "sweep %lu done active=%d", (unsigned long)ctx->sweep_count, (int)ctx->active);
         }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+    ESP_LOGI("NCS", "task exit sweep_count=%lu", (unsigned long)ctx->sweep_count);
     ctx->task = NULL;
     vTaskDelete(NULL);
 }
@@ -39107,6 +39111,13 @@ static void s_ncs_ui_timer_cb(lv_timer_t *t)
 {
     (void)t;
     nrf24_cs_ctx_t *ctx = s_ncs;
+    static uint32_t s_ncs_fires = 0;
+    s_ncs_fires++;
+    if (s_ncs_fires <= 5 || s_ncs_fires % 40 == 0)
+        ESP_LOGI("NCS", "timer #%lu ctx=%p sweep_done=%d sweep_count=%lu",
+                 (unsigned long)s_ncs_fires, ctx,
+                 ctx ? (int)ctx->sweep_done : -1,
+                 ctx ? (unsigned long)ctx->sweep_count : 0UL);
     if (!ctx || !ctx->canvas || !ctx->canv_buf) return;
     if (!ctx->sweep_done) return;
     ctx->sweep_done = false;
@@ -39173,32 +39184,39 @@ static void s_ncs_startstop_cb(lv_event_t *e)
 {
     (void)e;
     nrf24_cs_ctx_t *ctx = s_ncs;
-    if (!ctx) return;
+    if (!ctx) { ESP_LOGW("NCS", "startstop: ctx is NULL"); return; }
     if (!ctx->active) {
+        ESP_LOGI("NCS", "startstop: starting task sweep_count=%lu", (unsigned long)ctx->sweep_count);
         ctx->active = true;
         ctx->cancel = false;
         if (ctx->start_btn) {
             lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
             if (lbl) lv_label_set_text(lbl, "Stop");
         }
-        xTaskCreate(s_ncs_task_fn, "nrf24_cs", 4096, ctx, 5, &ctx->task);
+        xTaskCreate(s_ncs_task_fn, "nrf24_cs", 4096, ctx, 2, &ctx->task);
     } else {
+        ESP_LOGI("NCS", "startstop: stopping sweep_count=%lu", (unsigned long)ctx->sweep_count);
         ctx->active = false;
         ctx->cancel = true;
         if (ctx->start_btn) {
             lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
             if (lbl) lv_label_set_text(lbl, "Start");
         }
+        if (ctx->status_lbl)
+            lv_label_set_text(ctx->status_lbl, "Stopped -- tap Start to resume");
     }
 }
 
 static void show_nrf24_ch_scan_screen(void)
 {
+    ESP_LOGI("NCS", "enter: s_ncs=%p nrf24_is_init=%d", s_ncs, (int)nrf24_is_init());
     if (s_ncs) { s_ncs->active = false; s_ncs->cancel = true; }
 
     if (!nrf24_is_init()) {
         nrf24_hat_claim();
-        if (nrf24_init() != ESP_OK) {
+        esp_err_t ierr = nrf24_init();
+        ESP_LOGI("NCS", "nrf24_init -> %s", esp_err_to_name(ierr));
+        if (ierr != ESP_OK) {
             s_n24_stub_screen(MY_SYMBOL_WAVE "  Ch Scan",
                 "nRF24 not detected.\nCheck DIP switch 2.");
             return;
@@ -39208,6 +39226,8 @@ static void show_nrf24_ch_scan_screen(void)
     int canvas_h = NRF24_CS_SPEC_H + 1 + NRF24_CS_WF_H;
 
     nrf24_cs_ctx_t *ctx = heap_caps_calloc(1, sizeof(nrf24_cs_ctx_t), MALLOC_CAP_SPIRAM);
+    ESP_LOGI("NCS", "ctx=%p canvas_h=%d canv_bytes=%d", ctx, canvas_h,
+             (int)(NRF24_CS_W * canvas_h * sizeof(lv_color_t)));
     if (!ctx) { s_n24_stub_screen("nRF24 Error", "Out of memory"); return; }
     s_ncs = ctx;
 
@@ -39251,12 +39271,15 @@ static void show_nrf24_ch_scan_screen(void)
     ctx->tmr = lv_timer_create(s_ncs_ui_timer_cb, 150, NULL);
     rfhat_add_back_btn("nRF24", show_nrf24_screen);
 
-    // Auto-start scanning immediately on screen open
+    // Auto-start scanning immediately on screen open (priority 2 = below LVGL main at 1? No:
+    // app_main runs at ESP_TASK_MAIN_PRIO=1; priority 2 gives scan task slight CPU edge but
+    // the 10ms vTaskDelay between sweeps keeps LVGL responsive)
     ctx->active = true;
     ctx->cancel = false;
     lv_label_set_text(sl, "Stop");
     lv_label_set_text(ctx->status_lbl, "Scanning...");
-    xTaskCreate(s_ncs_task_fn, "nrf24_cs", 4096, ctx, 5, &ctx->task);
+    BaseType_t tc = xTaskCreate(s_ncs_task_fn, "nrf24_cs", 4096, ctx, 2, &ctx->task);
+    ESP_LOGI("NCS", "xTaskCreate -> %s task=%p", tc == pdPASS ? "OK" : "FAIL", ctx->task);
 }
 
 // ── Sniffer ───────────────────────────────────────────────────────────────────
