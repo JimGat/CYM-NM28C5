@@ -1552,6 +1552,7 @@ typedef struct {
     volatile bool   cancel;
     volatile bool   sweep_done;
     uint8_t         _pad;
+    uint32_t        sweep_count;
     bool            carrier[NRF24_CS_NPTS];
     lv_color_t     *canv_buf;
     lv_obj_t       *canvas;
@@ -39092,13 +39093,13 @@ static void s_ncs_task_fn(void *arg)
     while (ctx->active) {
         ctx->cancel = false;
         nrf24_scan_channels(0, NRF24_CS_NPTS - 1, s_ncs_scan_cb, ctx, &ctx->cancel);
-        if (ctx->active) ctx->sweep_done = true;
+        if (ctx->active) {
+            ctx->sweep_done = true;
+            ctx->sweep_count++;
+        }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-    if (ctx->canv_buf) heap_caps_free(ctx->canv_buf);
     ctx->task = NULL;
-    heap_caps_free(ctx);
-    if (s_ncs == ctx) s_ncs = NULL;
     vTaskDelete(NULL);
 }
 
@@ -39161,8 +39162,9 @@ static void s_ncs_ui_timer_cb(lv_timer_t *t)
     int active_count = 0;
     for (int i = 0; i < NRF24_CS_NPTS; i++) if (snap[i]) active_count++;
     if (ctx->status_lbl) {
-        char sb[48];
-        snprintf(sb, sizeof(sb), "2400-2526 MHz | Active: %d ch", active_count);
+        char sb[64];
+        snprintf(sb, sizeof(sb), "2400-2526 MHz | Active: %d ch | Sweep: %lu",
+                 active_count, (unsigned long)ctx->sweep_count);
         lv_label_set_text(ctx->status_lbl, sb);
     }
 }
