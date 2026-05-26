@@ -231,6 +231,10 @@ void rf433_hat_deinit(void)
     if (s_init && RF_HAT_RF433_RX_GPIO >= 0) gpio_isr_handler_remove(RF_HAT_RF433_RX_GPIO);
     if (s_frame_sem) { vSemaphoreDelete(s_frame_sem); s_frame_sem = NULL; }
     if (s_cap_buf)   { free(s_cap_buf); s_cap_buf = NULL; }
+    // Reset shared TX/RX GPIOs to safe floating inputs so later claimers start
+    // from a neutral state.
+    gpio_reset_pin(RF_HAT_RF433_TX_GPIO);
+    gpio_reset_pin(RF_HAT_RF433_RX_GPIO);
     s_init    = false;
     s_tx_init = false;
 }

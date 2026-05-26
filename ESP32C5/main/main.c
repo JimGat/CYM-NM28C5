@@ -36880,7 +36880,7 @@ static int rf433_lbk_phase(int tx_pin, int rx_pin)
     gpio_config_t icfg = {
         .pin_bit_mask = 1ULL << rx_pin,
         .mode         = GPIO_MODE_INPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type    = GPIO_INTR_DISABLE,
     };
@@ -36957,9 +36957,12 @@ static void rf433_lbk_task(void *arg)
 
 static void rf433_lbk_run(void)
 {
-    // IR uses RMT on GPIO8/9: rmt_del_channel() must be called before raw GPIO
-    // access or gpio_set_level() is silently overridden by the RMT signal mux.
-    if (ir_hat_is_init()) ir_hat_deinit();
+    // Claim exclusive GPIO8/9 ownership before raw GPIO loopback.
+    // Every peripheral that can mux onto these shared lines must be torn down.
+    if (cc1101_is_init())       cc1101_deinit();
+    if (nrf24_is_init())        nrf24_deinit();
+    if (rfid_manager_is_init()) rfid_manager_deinit();
+    if (ir_hat_is_jamming() || ir_hat_is_init()) ir_hat_deinit();
     rf433_hat_capture_cancel();
     rf433_hat_deinit();
     if (lv_obj_is_valid(s_lbk_result_lbl)) lv_label_set_text(s_lbk_result_lbl, "");
