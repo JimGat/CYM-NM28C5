@@ -253,11 +253,23 @@ fail:
 
 void ir_hat_deinit(void)
 {
+    // If the IR jammer (LEDC on GPIO8) is running, stop it here.
+    // ir_hat_jam_start() sets s_init=false so ir_hat_is_init() returns false even
+    // while the jammer is active. Inline the LEDC stop here to avoid the
+    // unwanted ir_hat_init() that ir_hat_jam_stop() performs.
+    if (s_jamming) {
+        ledc_stop(LEDC_LOW_SPEED_MODE, IR_JAM_LEDC_CHANNEL, 0);
+        s_jamming = false;
+    }
     ir_hat_capture_cancel();
     if (s_tx_chan) { rmt_disable(s_tx_chan); rmt_del_channel(s_tx_chan); s_tx_chan = NULL; }
     if (s_rx_chan) { rmt_disable(s_rx_chan); rmt_del_channel(s_rx_chan); s_rx_chan = NULL; }
     if (s_tx_enc)  { rmt_del_encoder(s_tx_enc);  s_tx_enc  = NULL; }
     if (s_rx_queue){ vQueueDelete(s_rx_queue);    s_rx_queue = NULL; }
+    // Reset shared GPIO8/9 to safe floating inputs so the next HAT module
+    // starts from a known-neutral IO-matrix state.
+    gpio_reset_pin(RF_HAT_IR_TX_GPIO);
+    gpio_reset_pin(RF_HAT_IR_RX_GPIO);
     s_init = false;
 }
 
