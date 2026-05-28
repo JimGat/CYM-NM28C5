@@ -373,47 +373,53 @@ bool nrf24_carrier_detect(void)
 void nrf24_jam_sweep(volatile bool *active)
 {
     if (!s_drv) return;
-    static const uint8_t payload[32] = {
-        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
-        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
-        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
-        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
-    };
-    // PTX mode, no CRC (faster TX), no AA, 2 Mbps, max power
+
+    // PTX mode, no CRC, no AA, 2 Mbps, max power
     nrf24_write_reg(REG_EN_AA,      0x00);
     nrf24_write_reg(REG_SETUP_RETR, 0x00);
     nrf24_write_reg(REG_RF_SETUP,   RF_SETUP_DR_HIGH | RF_SETUP_PWR(3));
-    nrf24_write_reg(REG_CONFIG,     CONFIG_PWR_UP);  // no CRC bit = faster bursts
+    nrf24_write_reg(REG_CONFIG,     CONFIG_PWR_UP);
     vTaskDelay(pdMS_TO_TICKS(2));
 
     uint8_t tx_cmd[33] = { CMD_W_PAYLOAD };
-    memcpy(tx_cmd + 1, payload, 32);
+    memset(tx_cmd + 1, 0xFF, 32);
     uint8_t rx_tmp[33];
 
-    uint8_t ch = 0;
-    int yield_ctr = 0;
-    while (active && *active) {
-        nrf24_write_reg(REG_RF_CH, ch);
-        nrf24_flush_tx();
-        // Fill all 3 FIFO slots for maximum on-air time per channel
-        for (int i = 0; i < 3; i++) {
-            csn_low();
-            spi_xfer_buf(tx_cmd, rx_tmp, 33);
-            csn_high();
-        }
-        // CE high: burst-TX all 3 packets (~384 µs at 2 Mbps) plus margin
-        ce_high();
-        esp_rom_delay_us(500);
-        ce_low();
-        nrf24_write_reg(REG_STATUS, 0x70);  // clear TX_DS / MAX_RT
+    nrf24_flush_tx();
 
+    // Burst-TX pipeline: CE stays HIGH the entire sweep.
+    // The nRF24 reads RF_CH at each packet boundary, so we update RF_CH + FIFO
+    // while the previous packet is still transmitting (~148 µs at 2 Mbps).
+    // SPI setup per channel (~50 µs) finishes well before the packet ends,
+    // so the chip never stalls — it immediately starts the next packet on the
+    // new channel as soon as the current one finishes.
+    // Effective rate: ~54 full-band sweeps/second vs ~5 with the CE-pulse approach.
+
+    uint8_t ch = 0;
+    nrf24_write_reg(REG_RF_CH, ch);
+    csn_low(); spi_xfer_buf(tx_cmd, rx_tmp, 33); csn_high();
+    ce_high();  // CE stays HIGH: burst TX, never stop transmitting
+
+    while (active && *active) {
         ch = (ch >= 125) ? 0 : ch + 1;
-        // Yield every 10 channels so IDLE/WDT get CPU; avoids per-channel 10 ms stall
-        if (++yield_ctr >= 10) {
-            yield_ctr = 0;
+
+        // Write next channel and payload while current packet is in-flight
+        nrf24_write_reg(REG_RF_CH, ch);
+        csn_low(); spi_xfer_buf(tx_cmd, rx_tmp, 33); csn_high();
+        nrf24_write_reg(REG_STATUS, 0x70);
+
+        // Yield once per full sweep: briefly lower CE so vTaskDelay can run
+        // and IDLE task resets the WDT (~18 ms gap per sweep is acceptable)
+        if (ch == 0) {
+            ce_low();
             vTaskDelay(1);
+            ce_high();
+            nrf24_write_reg(REG_RF_CH, ch);
+            csn_low(); spi_xfer_buf(tx_cmd, rx_tmp, 33); csn_high();
         }
     }
+
+    ce_low();
     nrf24_standby();
 }
 
