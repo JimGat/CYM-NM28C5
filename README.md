@@ -5,7 +5,7 @@
 <h1 align="center">Cheap Yellow Monster</h1>
 
 <p align="center">
-  <b>v2.4.2</b>
+  <b>v2.4.14</b>
 </p>
 
 <p align="center">
@@ -84,6 +84,8 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
     - [PN532 NFC/RFID (DIP 3)](#pn532-nfcrfid-dip-3)
     - [CC1101 / nRF24L01 (DIP 1 / DIP 2)](#cc1101-sub-ghz-dip-1--nrf24l01-24-ghz-dip-2)
       - [Z-Wave Scout](#z-wave-scout)
+      - [TPMS Monitor](#tpms-monitor)
+      - [nRF24 Packet Sniffer](#nrf24-packet-sniffer)
 - [3D Printable Cases](#3d-printable-cases)
 - [Data & Storage](#data--storage)
 - [Touch Calibration](#touch-calibration)
@@ -115,7 +117,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **Credentials** | Captive portal credential capture, WPA-SEC upload |
 | **TX Power Mode** | Selectable Normal / Max Power for WiFi and BLE — persisted across reboots |
 | **Data Transfer** | Self-hosted AP file server (TheLab) and WiFi client file server — browse, upload, create directories, and recursively delete folders from any browser; client IP logged to serial; IP shown on screen |
-| **NM-RF-HAT** | Hardware addon board for RF expansion -- IR capture/replay/Universal Remote/TV-B-Gone (Flipper .ir format); RF433 OOK capture/replay (Flipper .sub format); CC1101 Sub-GHz: Freq Scan/RAW Capture+Replay/Band Scope/Jammer (Flipper .sub); nRF24L01+ 2.4 GHz: Ch Scan/Sniffer/Jammer/Futaba S-FHSS (Flipper .nrf24); PN532 NFC/RFID: scan/save/emulate/.nfc import+export (Flipper .nfc); DIP switch per module |
+| **NM-RF-HAT** | Hardware addon board for RF expansion -- IR capture/replay/Universal Remote/TV-B-Gone (Flipper .ir format); RF433 OOK capture/replay (Flipper .sub format); CC1101 Sub-GHz: Freq Scan/RAW Capture+Replay/Band Scope/Jammer/TPMS Monitor 315+433 MHz (Flipper .sub); nRF24L01+ 2.4 GHz: Ch Scan/Packet Sniffer/Jammer/Futaba S-FHSS (Flipper .nrf24); PN532 NFC/RFID: scan/save/emulate/.nfc import+export (Flipper .nfc); DIP switch per module |
 | **UI** | Material dark theme, touch gestures, screen dimming, screenshots — all screens portrait 240×320 |
 | **Storage** | SD card for handshakes, wardrive logs, GATT Walker JSON, screenshots, file tree browser |
 
@@ -1840,6 +1842,7 @@ Sub-1 GHz (300-928 MHz) OOK/ASK capture, replay, spectrum scan, and jamming. Use
 - **Jammer:** legal disclaimer screen required before activation; sweeps channels in PTX mode.
 - **Band Scope:** 126-point spectrum + 8-row scrolling waterfall canvas; 130 us dwell per channel; continuous sweep; live active-channel count. Tap the canvas to show frequency + RSSI for that bin.
 - **Z-Wave Scout:** passive wardrive on the Z-Wave frequency (908.42 MHz US / 868.42 MHz EU). Configures CC1101 for GFSK 9.6 kbps, sync word `0xAA01`. Logs frame metadata (node IDs, command class, RSSI, GPS coordinates) to `/sdcard/lab/zwave/` as a timestamped CSV. GPS-tagged entries are compatible with WiGLE for mapping Z-Wave device density.
+- **TPMS Monitor:** receives Tire Pressure Monitoring System transmissions at 315 MHz (US) or 433.92 MHz (EU). Decodes Schrader-family OOK packets — identifies each sensor by its unique 32-bit ID, displays pressure in PSI and kPa, temperature in °C, battery-low and alarm flags, and RSSI. Tracks up to 5 unique sensors per session. Logs all valid packets to `/sdcard/lab/tpms/` as a timestamped CSV.
 
 ##### Z-Wave Scout
 
@@ -1862,6 +1865,66 @@ Z-Wave Scout puts the CC1101 into passive receive mode at the Z-Wave primary cha
 
 > **Note:** Z-Wave uses 908.42 MHz in the US and 868.42 MHz in Europe/Australia. The Scout is pre-configured for the US frequency. Edit `ZWAVE_FREQ_MHZ` in `main.c` to change regions.
 
+##### TPMS Monitor
+
+<a name="tpms-monitor"></a>
+
+The TPMS Monitor passively receives Tire Pressure Monitoring System (TPMS) sensor transmissions and decodes them in real time. Sensors are the small RF transmitters built into car wheels — they broadcast pressure, temperature, and status every 60–90 seconds at rest and more frequently while driving.
+
+**Frequency selection (on-screen):**
+
+| Button | Band | Typical use |
+|--------|------|-------------|
+| **315 MHz** | OOK ~9.97 kbps | US-market vehicles |
+| **433 MHz** | OOK ~9.97 kbps | EU/Asia-market vehicles |
+
+Tap the active-frequency button (highlighted blue) to switch. If a scan is running, it stops automatically so the new frequency can be applied before the next Start.
+
+**Operation:**
+
+1. Fit DIP 1 (CC1101) ON.
+2. Open **NM-RF-HAT → CC1101 → TPMS Monitor**.
+3. Tap **315 MHz** or **433 MHz** to match your vehicle's market.
+4. Tap **Start** — the status line shows *Listening…* and a packet counter updates live.
+5. Drive or spin each tyre. Most sensors transmit within 30–60 seconds of the wheel moving. Stationary sensors transmit every 60–90 seconds.
+6. Each unique sensor appears as its own row showing sensor ID, pressure, temperature, flags, and RSSI.
+7. Tap **Stop** to end the session and close the log file cleanly.
+
+**Decoded fields per sensor:**
+
+| Field | Description |
+|-------|-------------|
+| Sensor ID | 32-bit hardcoded sensor ID (hex) — unique per tyre/sensor unit |
+| Pressure | In both PSI and kPa |
+| Temperature | In °C (raw − 40 offset) |
+| Battery low | Bit 0 of flags byte — shown as `[BATT]` |
+| Alarm | Bit 5 of flags byte — shown as `[ALARM]` |
+| RSSI | Signal strength at time of last reception |
+| CRC | `[OK]` = packet CRC matched; `[?]` = CRC mismatch (shown but not logged) |
+
+**Display color coding:**
+
+- **Amber label** — pressure below 28 PSI (low tyre warning)
+- **Green ID** — last packet CRC passed
+- **Grey ID** — last packet CRC failed (data shown as reference only)
+
+**SD card logging:** `/sdcard/lab/tpms/tpms_YYYYMMDD_HHMMSS.csv`
+
+| Column | Description |
+|--------|-------------|
+| `timestamp` | UTC from GPS-synced clock |
+| `sensor_id` | 32-bit sensor ID in hex |
+| `psi` | Pressure in PSI (1 decimal place) |
+| `kpa` | Pressure in kPa (integer) |
+| `temp_c` | Temperature in °C |
+| `flags` | Raw flags byte (hex) |
+| `rssi` | Signal strength in dBm |
+| `crc_ok` | `1` = CRC passed, `0` = mismatch |
+
+Only CRC-valid packets are written to CSV. CRC-fail rows are shown on screen (labelled `[?]`) so you can see when *something* was received, but they are excluded from the log.
+
+> **Note:** The Schrader sync word (`D391`) covers the majority of US and EU OEM sensors. After-market sensors and some Asian-market brands may use different sync words and will not be decoded — the CRC-fail `[?]` row indicates a packet was received at that frequency but the format differs.
+
 #### nRF24L01+ 2.4 GHz (DIP 2)
 
 2.4 GHz channel scan, packet sniffing, and jamming. Uses a 2-page paged tile menu (same pattern as CC1101).
@@ -1871,13 +1934,43 @@ Z-Wave Scout puts the CC1101 into passive receive mode at the Z-Wave primary cha
 **Features:**
 - **HW Test:** reads STATUS, CONFIG, RF_CH, and RF_SETUP registers over SPI; confirms chip is responding.
 - **Ch Scan:** 126-channel carrier-detect sweep (2400-2525 MHz); canvas shows spectrum bar + 8-row waterfall; Start/Stop; live active-channel count.
-- **Sniffer:** promiscuous RX on configurable channel; captures packets; hex dump of last packet; auto-saves to `/sdcard/lab/nrf24/` in Flipper-compatible `.nrf24` text format.
+- **Packet Sniffer:** promiscuous-mode RX on channel 76 (2476 MHz) with CRC disabled and a 32-byte packet size. Uses the `AA:AA:AA` address trick — because the nRF24 preamble byte is always `0xAA` or `0x55` (matching the MSB of the first address byte), loading `AA:AA:AA` into the RX address makes the correlator treat any `0xAA`-preamble packet as an address match, giving a wide-open receive window that catches transmissions from unknown devices without knowing their addresses. Packets are accumulated across the session and auto-saved to `/sdcard/lab/nrf24/` in Flipper-compatible `.nrf24` text format on Stop.
 - **Saved Files:** lists `.nrf24` files with Play and Delete per entry.
 - **Jammer:** legal disclaimer required; rapid PTX channel sweep across all 126 channels.
 - **Futaba S-FHSS:** scans 25 S-FHSS channels (2404-2504 MHz, 4 MHz steps) at 1 Mbps; decodes 10-byte payload; extracts up to 8 servo channel values (11-bit, 0-2047); displays result on screen.
 - **Stub screens** (with authorization disclaimers): MouseJack, Keyboard Inject, Drone, GamePad -- Coming Soon.
 
 **nRF24 component:** `ESP32C5/components/nrf24/` (nrf24.c, nrf24.h, CMakeLists.txt)
+
+##### nRF24 Packet Sniffer
+
+<a name="nrf24-packet-sniffer"></a>
+
+The Packet Sniffer puts the nRF24L01+ into a wide-open promiscuous receive mode that captures transmissions from devices whose addresses are unknown.
+
+**How it works — the `AA:AA:AA` address trick:**
+
+The nRF24 always prepends a 1-byte preamble before the address field. The preamble is `0xAA` (10101010) if the first bit of the address is 1, or `0x55` (01010101) if it is 0. By loading `AA:AA:AA` (all bits 1) as the receive address, the preamble flows seamlessly into the address bytes — the chip's correlator sees a continuous `10101010 10101010 10101010 10101010` pattern and treats *any* `0xAA`-preamble packet as an address match. Combined with CRC disabled, this gives the widest possible receive window without needing to know a target's address.
+
+**Fixed parameters:**
+
+| Parameter | Value | Reason |
+|-----------|-------|--------|
+| Channel | 76 (2476 MHz) | Centre of 2.4 GHz ISM, low WiFi overlap |
+| Data rate | 1 Mbps | Broadest device compatibility |
+| Packet size | 32 bytes | Maximum nRF24 payload |
+| CRC | Disabled | Allows capture of partial / foreign-format frames |
+| Address | `AA:AA:AA` | Preamble-alignment trick (see above) |
+
+**Operation:**
+
+1. Fit DIP 2 (nRF24L01+) ON.
+2. Open **NM-RF-HAT → nRF24 → Packet Sniffer**.
+3. Tap **Start** — the screen shows a live packet counter and hex dump of each received frame.
+4. Bring target RF devices into range (other nRF24 modules, FHSS remotes, wireless keyboards/mice at rest between hops, etc.).
+5. Tap **Stop** — all captured packets are saved automatically to `/sdcard/lab/nrf24/` in Flipper Zero-compatible `.nrf24` text format.
+
+> **Note:** Because CRC is disabled, some captures will be noise artifacts or corrupted frames. Use the hex dump to inspect payload patterns. Devices that use frequency hopping (e.g. Futaba S-FHSS) are better served by the dedicated **Futaba S-FHSS** screen which follows each hop.
 
 ---
 
@@ -1978,6 +2071,8 @@ All data is stored on the SD card. `/sdcard/lab/` is the root for all project da
     │   └── zgwd_<timestamp>.pcap  # PCAP DLT 195 (IEEE 802.15.4 with FCS)
     ├── zwave/                # Z-Wave Scout captures (CC1101 908.42 MHz)
     │   └── zwave_<timestamp>.csv  # One row per received frame (node IDs, cmd class, GPS)
+    ├── tpms/                 # TPMS Monitor captures (CC1101 315/433 MHz)
+    │   └── tpms_<timestamp>.csv   # One row per valid Schrader packet (sensor ID, PSI, kPa, temp, flags, RSSI)
     ├── rfid/                 # NM-RF-HAT NFC/RFID (PN532)
     │   ├── hf/               # 13.56 MHz card saves (JSON)
     │   │   └── <name>.json
