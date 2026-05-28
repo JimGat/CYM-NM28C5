@@ -36911,35 +36911,53 @@ static int rf433_lbk_phase(int tx_pin, int rx_pin)
 
 static void rf433_lbk_task(void *arg)
 {
+    int tx_pin = RF_HAT_RF433_TX_GPIO;
+    int rx_pin = RF_HAT_RF433_RX_GPIO;
+
+    // Sample RX idle level before driving TX — reveals pull-up/module state
+    gpio_config_t pre_cfg = {
+        .pin_bit_mask = 1ULL << rx_pin,
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&pre_cfg);
+    int idle_rx = gpio_get_level(rx_pin);
+    ESP_LOGI(TAG, "[RF433 LBK] RX GPIO%d idle level = %d", rx_pin, idle_rx);
+
     if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
         if (lv_obj_is_valid(s_lbk_status_lbl))
             lv_label_set_text_fmt(s_lbk_status_lbl,
-                "Testing GPIO%d TX -> GPIO%d RX...",
-                RF_HAT_RF433_TX_GPIO, RF_HAT_RF433_RX_GPIO);
+                "GPIO%d idle=%d  Testing TX%d->RX%d...",
+                rx_pin, idle_rx, tx_pin, rx_pin);
         xSemaphoreGive(lvgl_mutex);
     }
-    int edges = rf433_lbk_phase(RF_HAT_RF433_TX_GPIO, RF_HAT_RF433_RX_GPIO);
 
-    ESP_LOGI(TAG, "[RF433 LBK] GPIO%d TX -> GPIO%d RX: %d transitions (%s)",
-             RF_HAT_RF433_TX_GPIO, RF_HAT_RF433_RX_GPIO,
-             edges, edges >= 6 ? "PASS" : "FAIL");
+    int edges = rf433_lbk_phase(tx_pin, rx_pin);
+
+    ESP_LOGI(TAG, "[RF433 LBK] GPIO%d TX -> GPIO%d RX: %d transitions (%s)  idle_rx=%d",
+             tx_pin, rx_pin, edges, edges >= 6 ? "PASS" : "FAIL", idle_rx);
 
     // Restore RF433 driver
     rf433_hat_init();
 
-    // Build result string — use LVGL recolor syntax
-    char result[160];
+    // Build result — LVGL recolor syntax
+    char result[256];
     if (edges >= 6) {
         snprintf(result, sizeof(result),
-            "#00C853 PASS#\n"
-            "GPIO%d TX  GPIO%d RX  Edges: %d",
-            RF_HAT_RF433_TX_GPIO, RF_HAT_RF433_RX_GPIO, edges);
+            "#00C853 PASS# - carrier received\n"
+            "TX=GPIO%d  RX=GPIO%d\n"
+            "RX idle: %d  Edges: %d / 40\n"
+            "(>= 6 required)",
+            tx_pin, rx_pin, idle_rx, edges);
     } else {
         snprintf(result, sizeof(result),
-            "#FF5722 FAIL#\n"
-            "No carrier detected. Check DIP 5 ON.\n"
-            "Edges: %d (need >= 6)",
-            edges);
+            "#FF5722 FAIL# - weak/no carrier\n"
+            "TX=GPIO%d  RX=GPIO%d\n"
+            "RX idle: %d  Edges: %d / 40\n"
+            "Check DIP 5 ON, module seated",
+            tx_pin, rx_pin, idle_rx, edges);
     }
 
     if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
@@ -37463,25 +37481,47 @@ static void s_cc1101_ht_run_cb(lv_event_t *e)
 
     esp_err_t err = cc1101_init();
     if (err == ESP_OK) {
-        uint8_t pn  = cc1101_get_partnum();
-        uint8_t ver = cc1101_get_version();
+        uint8_t pn   = cc1101_get_partnum();
+        uint8_t ver  = cc1101_get_version();
         int8_t  rssi = cc1101_get_rssi_dbm();
         uint8_t marc = cc1101_get_marc_state();
         float   freq = cc1101_get_freq_mhz();
+        uint8_t mdm2 = cc1101_read_reg(CC1101_MDMCFG2);
+        uint8_t mdm4 = cc1101_read_reg(CC1101_MDMCFG4);
+        uint8_t pkt0 = cc1101_read_reg(CC1101_PKTCTRL0);
+        uint8_t lqi  = cc1101_read_status(CC1101_LQI);
+        uint8_t rxb  = cc1101_read_status(CC1101_RXBYTES) & 0x7F;
+        uint8_t pks  = cc1101_read_status(CC1101_PKTSTATUS);
+        // Decode modulation from MDMCFG2 bits [6:4]
+        static const char *mod_lut[8] = {
+            "2-FSK","GFSK","?","OOK","4-FSK","?","?","MSK"
+        };
+        const char *mod = mod_lut[(mdm2 >> 4) & 0x07];
+        // Decode MARCSTATE name
+        const char *marc_name =
+            (marc == 0x01) ? "IDLE" : (marc == 0x0D) ? "RX" :
+            (marc == 0x13) ? "TX"  : (marc == 0x00) ? "SLEEP" : "OTHER";
+
+        ESP_LOGI("CC1101_HWT",
+                 "PARTNUM=0x%02X VERSION=0x%02X MARC=0x%02X(%s) RSSI=%d dBm "
+                 "FREQ=%.2f MHz MDMCFG2=0x%02X MDMCFG4=0x%02X PKTCTRL0=0x%02X "
+                 "LQI=0x%02X RXBYTES=%u PKTSTATUS=0x%02X",
+                 pn, ver, marc, marc_name, (int)rssi, (double)freq,
+                 mdm2, mdm4, pkt0, lqi, rxb, pks);
 
         lv_label_set_text(s_cc1101_ht_status, "PASS - CC1101 detected");
         lv_obj_set_style_text_color(s_cc1101_ht_status, lv_color_hex(0x66BB6A), 0);
 
-        char buf[40];
-        snprintf(buf, sizeof(buf), "PARTNUM: 0x%02X (exp 0x00)", pn);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "PARTNUM: 0x%02X  VERSION: 0x%02X", pn, ver);
         lv_label_set_text(s_cc1101_ht_pn, buf);
-        snprintf(buf, sizeof(buf), "VERSION: 0x%02X (exp 0x14)", ver);
+        snprintf(buf, sizeof(buf), "MARC: 0x%02X (%s)  LQI: 0x%02X", marc, marc_name, lqi);
         lv_label_set_text(s_cc1101_ht_ver, buf);
-        snprintf(buf, sizeof(buf), "MARCSTATE: 0x%02X", marc);
+        snprintf(buf, sizeof(buf), "MDMCFG2: 0x%02X  Mod: %s  PKTCTRL0: 0x%02X", mdm2, mod, pkt0);
         lv_label_set_text(s_cc1101_ht_marc, buf);
-        snprintf(buf, sizeof(buf), "RSSI: %d dBm", (int)rssi);
+        snprintf(buf, sizeof(buf), "RSSI: %d dBm  RXBYTES: %u", (int)rssi, rxb);
         lv_label_set_text(s_cc1101_ht_rssi, buf);
-        snprintf(buf, sizeof(buf), "Freq: %.2f MHz", (double)freq);
+        snprintf(buf, sizeof(buf), "Freq: %.2f MHz  PKTSTATUS: 0x%02X", (double)freq, pks);
         lv_label_set_text(s_cc1101_ht_freq, buf);
     } else {
         lv_label_set_text(s_cc1101_ht_status, "FAIL - No CC1101 found");
@@ -39289,27 +39329,38 @@ static void show_nrf24_hw_test_screen(void)
     lv_obj_set_width(res, LCD_H_RES - 44);
     lv_obj_set_style_text_align(res, LV_TEXT_ALIGN_CENTER, 0);
 
-    char buf[256];
+    char buf[512];
     if (err == ESP_OK) {
         uint8_t st   = nrf24_get_status();
-        uint8_t cfg  = nrf24_read_reg(0x00);
-        uint8_t ch   = nrf24_read_reg(0x05);
-        uint8_t rfs  = nrf24_read_reg(0x06);
-        uint8_t enaa = nrf24_read_reg(0x01);
-        uint8_t fifo = nrf24_read_reg(0x17);
-        // Decode data rate: RF_SETUP bit5=DR_LOW, bit3=DR_HIGH
+        uint8_t cfg  = nrf24_read_reg(0x00);  // CONFIG
+        uint8_t enaa = nrf24_read_reg(0x01);  // EN_AA
+        uint8_t aw   = nrf24_read_reg(0x03);  // SETUP_AW
+        uint8_t ch   = nrf24_read_reg(0x05);  // RF_CH
+        uint8_t rfs  = nrf24_read_reg(0x06);  // RF_SETUP
+        uint8_t obs  = nrf24_read_reg(0x08);  // OBSERVE_TX (lost/retr counts)
+        uint8_t rpd  = nrf24_read_reg(0x09);  // RPD (received power detector)
+        uint8_t fifo = nrf24_read_reg(0x17);  // FIFO_STATUS
+        uint8_t aw_bytes = (aw & 0x03) + 2;  // 01→3B 10→4B 11→5B
         const char *dr = (rfs & 0x20) ? "250k" : (rfs & 0x08) ? "2M" : "1M";
-        // Decode PA level: RF_SETUP bits [2:1]
         static const char *pa_lut[4] = {"-18dBm","-12dBm","-6dBm","0dBm"};
         const char *pa = pa_lut[(rfs >> 1) & 0x03];
+        ESP_LOGI("NRF24_HWT",
+                 "STATUS=0x%02X CONFIG=0x%02X EN_AA=0x%02X SETUP_AW=0x%02X "
+                 "RF_CH=%u RF_SETUP=0x%02X OBSERVE_TX=0x%02X RPD=0x%02X FIFO=0x%02X",
+                 st, cfg, enaa, aw, ch, rfs, obs, rpd, fifo);
         snprintf(buf, sizeof(buf),
-                 LV_SYMBOL_OK "  Detected\n\n"
-                 "STATUS: 0x%02X  CONFIG: 0x%02X\n"
-                 "RF_CH: %u (%.0f MHz)\n"
-                 "Rate: %s  PA: %s\n"
-                 "EN_AA: 0x%02X  FIFO: 0x%02X\n\n"
+                 LV_SYMBOL_OK "  nRF24L01+ Detected\n\n"
+                 "STATUS:   0x%02X\n"
+                 "CONFIG:   0x%02X  EN_AA: 0x%02X\n"
+                 "RF_CH:    %u  (%.0f MHz)\n"
+                 "RF_SETUP: 0x%02X  Rate: %s\n"
+                 "PA (int): %s  (no ext PA)\n"
+                 "SETUP_AW: 0x%02X  (%u-byte addr)\n"
+                 "FIFO:     0x%02X  RPD: %u\n"
+                 "OBSERVE_TX: 0x%02X\n\n"
                  "DIP 2: CE=GPIO8  CSN=GPIO9",
-                 st, cfg, ch, 2400.0f + ch, dr, pa, enaa, fifo);
+                 st, cfg, enaa, ch, 2400.0f + ch,
+                 rfs, dr, pa, aw, aw_bytes, fifo, rpd, obs);
         lv_label_set_text(res, buf);
         lv_obj_set_style_text_color(res, lv_color_hex(0x66BB6A), 0);
     } else {
