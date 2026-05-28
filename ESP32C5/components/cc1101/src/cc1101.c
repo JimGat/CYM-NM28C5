@@ -325,7 +325,7 @@ void cc1101_apply_preset(cc1101_preset_t preset)
     cc1101_write_reg(CC1101_FSCTRL1,  0x06);
     cc1101_write_reg(CC1101_FSCTRL0,  0x00);
     cc1101_write_reg(CC1101_MCSM2,    0x07);
-    cc1101_write_reg(CC1101_MCSM1,    0x30);   // Stay in RX after RX; go to RX after TX
+    cc1101_write_reg(CC1101_MCSM1,    0x30);   // RXOFF=IDLE, TXOFF=IDLE (async presets use this; packet presets override to 0x3C)
     cc1101_write_reg(CC1101_MCSM0,    0x18);   // Calibrate when going from IDLE to RX/TX
     cc1101_write_reg(CC1101_FOCCFG,   0x16);
     cc1101_write_reg(CC1101_BSCFG,    0x6C);
@@ -402,25 +402,43 @@ void cc1101_apply_preset(cc1101_preset_t preset)
         case CC1101_PRESET_OOK_10K_315MHZ:
         case CC1101_PRESET_OOK_10K_433MHZ:
             cc1101_set_freq_mhz(preset == CC1101_PRESET_OOK_10K_315MHZ ? 315.0f : 433.92f);
-            // ~9.97 kbps: DRATE_E=8, DRATE_M=146; BW=203 kHz: CHANBW_E=2, CHANBW_M=0
-            cc1101_write_reg(CC1101_MDMCFG4, 0x88);
-            cc1101_write_reg(CC1101_MDMCFG3, 0x92);
-            // OOK, 16/16 sync word detection, no Manchester
-            cc1101_write_reg(CC1101_MDMCFG2, 0x32);
-            cc1101_write_reg(CC1101_MDMCFG1, 0x22);  // 4 preamble bytes
-            // Sync word D391 (Schrader-compatible)
+            cc1101_write_reg(CC1101_MDMCFG4, 0x88);   // BW=203 kHz, DRATE_E=8
+            cc1101_write_reg(CC1101_MDMCFG3, 0x92);   // ~9.97 kbps
+            cc1101_write_reg(CC1101_MDMCFG2, 0x32);   // OOK, 16/16 sync, no Manchester
+            cc1101_write_reg(CC1101_MDMCFG1, 0x22);   // 4 preamble bytes
+            cc1101_write_reg(CC1101_SYNC1,   0xD3);   // Sync D391 (Schrader)
+            cc1101_write_reg(CC1101_SYNC0,   0x91);
+            cc1101_write_reg(CC1101_PKTLEN,   0x08);   // fixed 8-byte packet
+            cc1101_write_reg(CC1101_PKTCTRL0, 0x00);   // fixed length, no CRC, no whitening
+            cc1101_write_reg(CC1101_PKTCTRL1, 0x00);   // no addr check, no status append
+            cc1101_write_reg(CC1101_IOCFG0,   CC1101_GDO0_PKT_SYNC);
+            cc1101_write_reg(CC1101_FIFOTHR,  0x0F);   // RX FIFO threshold 16 bytes
+            cc1101_write_reg(CC1101_DEVIATN,  0x00);
+            cc1101_write_reg(CC1101_FREND0,   0x11);   // OOK: 2-entry PATABLE
+            cc1101_write_reg(CC1101_MCSM1,    0x3C);   // RXOFF=RX: stay in RX after each packet
+            cc1101_write_reg(CC1101_AGCCTRL2, 0x07);   // max LNA gain
+            cc1101_write_reg(CC1101_AGCCTRL1, 0x40);
+            cc1101_write_reg(CC1101_AGCCTRL0, 0x91);
+            break;
+
+        // FSK TPMS — same packet structure/sync, 2-FSK ±25 kHz (Continental, Hella, TRW variants)
+        case CC1101_PRESET_FSK_10K_315MHZ:
+        case CC1101_PRESET_FSK_10K_433MHZ:
+            cc1101_set_freq_mhz(preset == CC1101_PRESET_FSK_10K_315MHZ ? 315.0f : 433.92f);
+            cc1101_write_reg(CC1101_MDMCFG4, 0x88);   // BW=203 kHz, DRATE_E=8
+            cc1101_write_reg(CC1101_MDMCFG3, 0x92);   // ~9.97 kbps
+            cc1101_write_reg(CC1101_MDMCFG2, 0x12);   // GFSK, 16/16 sync, no Manchester
+            cc1101_write_reg(CC1101_MDMCFG1, 0x22);   // 4 preamble bytes
             cc1101_write_reg(CC1101_SYNC1,   0xD3);
             cc1101_write_reg(CC1101_SYNC0,   0x91);
-            // Packet mode: fixed 8-byte length, no CRC, no whitening
             cc1101_write_reg(CC1101_PKTLEN,   0x08);
-            cc1101_write_reg(CC1101_PKTCTRL0, 0x00);  // fixed length (overrides base async)
-            cc1101_write_reg(CC1101_PKTCTRL1, 0x00);  // no addr check, no status append
-            // GDO0 = asserts when sync word found, deasserts at end of packet
+            cc1101_write_reg(CC1101_PKTCTRL0, 0x00);
+            cc1101_write_reg(CC1101_PKTCTRL1, 0x00);
             cc1101_write_reg(CC1101_IOCFG0,   CC1101_GDO0_PKT_SYNC);
-            cc1101_write_reg(CC1101_FIFOTHR,  0x0F);  // FIFO threshold = 16 bytes
-            cc1101_write_reg(CC1101_DEVIATN,  0x00);
-            cc1101_write_reg(CC1101_FREND0,   0x11);  // OOK: 2-entry PATABLE
-            cc1101_write_reg(CC1101_AGCCTRL2, 0x07);  // max LNA gain for sensitivity
+            cc1101_write_reg(CC1101_FIFOTHR,  0x0F);
+            cc1101_write_reg(CC1101_DEVIATN,  0x35);   // ±25 kHz deviation
+            cc1101_write_reg(CC1101_MCSM1,    0x3C);   // RXOFF=RX: stay in RX after each packet
+            cc1101_write_reg(CC1101_AGCCTRL2, 0x43);
             cc1101_write_reg(CC1101_AGCCTRL1, 0x40);
             cc1101_write_reg(CC1101_AGCCTRL0, 0x91);
             break;
@@ -442,11 +460,17 @@ int cc1101_rx_packet(uint8_t *buf, uint8_t pktlen, int8_t *rssi_out,
     while (!(cancel && *cancel)) {
         if (esp_timer_get_time() >= deadline) break;
 
-        // Recover from RX FIFO overflow (MARCSTATE == 0x11)
         uint8_t marc = cc1101_get_marc_state();
+        // Recover from RX FIFO overflow (MARCSTATE == 0x11)
         if (marc == 0x11) {
             cc1101_strobe(CC1101_SIDLE);
             cc1101_strobe(CC1101_SFRX);
+            cc1101_strobe(CC1101_SRX);
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        // Re-arm if preset forgot MCSM1 stay-in-RX or something else drove us IDLE
+        if (marc == 0x01) {
             cc1101_strobe(CC1101_SRX);
             vTaskDelay(pdMS_TO_TICKS(5));
             continue;

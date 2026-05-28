@@ -86,8 +86,10 @@ typedef enum {
     CC1101_PRESET_FSK_38K_433MHZ,   // 433.92 MHz 2-FSK 38.4 kBaud (POCSAG)
     CC1101_PRESET_FSK_9K6_433MHZ,   // 433.92 MHz 2-FSK 9.6 kBaud (TPMS/Weather)
     CC1101_PRESET_OOK_4K8_915MHZ,   // 915 MHz OOK 4.8 kBaud (US ISM)
-    CC1101_PRESET_OOK_10K_315MHZ,   // 315 MHz OOK ~9.97 kBaud, sync D391 (US TPMS)
+    CC1101_PRESET_OOK_10K_315MHZ,   // 315 MHz OOK ~9.97 kBaud, sync D391 (US TPMS — Schrader/TRW)
     CC1101_PRESET_OOK_10K_433MHZ,   // 433.92 MHz OOK ~9.97 kBaud, sync D391 (EU TPMS OOK)
+    CC1101_PRESET_FSK_10K_315MHZ,   // 315 MHz 2-FSK ~9.97 kBaud, sync D391 (Continental/Hella TPMS)
+    CC1101_PRESET_FSK_10K_433MHZ,   // 433.92 MHz 2-FSK ~9.97 kBaud, sync D391 (EU TPMS FSK)
 } cc1101_preset_t;
 void cc1101_apply_preset(cc1101_preset_t preset);
 

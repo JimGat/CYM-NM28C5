@@ -1628,11 +1628,14 @@ typedef struct {
 typedef struct {
     volatile bool    active;
     volatile bool    cancel;
-    bool             freq_315;    // true = 315 MHz US, false = 433.92 MHz EU
+    bool             freq_315;      // true = 315 MHz US, false = 433.92 MHz EU
+    bool             fsk_mode;      // false = OOK (Schrader), true = FSK (Continental/Hella)
     tpms_sensor_t    sensors[TPMS_MAX_SENSORS];
     volatile int     sensor_count;
-    volatile int     pkt_total;
-    volatile int     pkt_valid;
+    volatile int     pkt_total;     // raw sync-word matches received from CC1101
+    volatile int     pkt_crc_fail;  // decoded OK but software CRC mismatch
+    volatile int     pkt_valid;     // passed decode + CRC
+    volatile int8_t  last_rssi_dbm; // last RSSI reading (updated even between packets)
     char             log_path[TPMS_SAVE_PATH_LEN];
     lv_obj_t        *freq_315_btn;
     lv_obj_t        *freq_433_btn;
@@ -38343,16 +38346,24 @@ static void s_tpms_ui_timer_cb(lv_timer_t *t)
     if (!ctx) return;
 
     if (ctx->count_lbl) {
-        char buf[48];
-        snprintf(buf, sizeof(buf), "Pkts: %d  Decoded: %d  Sensors: %d",
-                 ctx->pkt_total, ctx->pkt_valid, ctx->sensor_count);
+        char buf[56];
+        snprintf(buf, sizeof(buf), "SYN:%d  CRC-F:%d  OK:%d  S:%d",
+                 ctx->pkt_total, ctx->pkt_crc_fail, ctx->pkt_valid, ctx->sensor_count);
         lv_label_set_text(ctx->count_lbl, buf);
     }
     if (ctx->status_lbl) {
-        const char *st = ctx->active ? "Listening..." : "Stopped";
-        lv_label_set_text(ctx->status_lbl, st);
-        lv_obj_set_style_text_color(ctx->status_lbl,
-            ctx->active ? lv_color_hex(0xFFB300) : lv_color_hex(0x66BB6A), 0);
+        if (ctx->active) {
+            char sbuf[32];
+            snprintf(sbuf, sizeof(sbuf), "%s %dMHz  %ddBm",
+                     ctx->fsk_mode ? "FSK" : "OOK",
+                     ctx->freq_315 ? 315 : 433,
+                     (int)ctx->last_rssi_dbm);
+            lv_label_set_text(ctx->status_lbl, sbuf);
+            lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0xFFB300), 0);
+        } else {
+            lv_label_set_text(ctx->status_lbl, "Stopped");
+            lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0x66BB6A), 0);
+        }
     }
 
     // Refresh all visible sensor rows (age counter updates every 500 ms)
@@ -38370,29 +38381,61 @@ static void s_tpms_task_fn(void *arg)
     cc1101_tpms_ctx_t *ctx = (cc1101_tpms_ctx_t *)arg;
     uint8_t pkt[TPMS_PKT_LEN];
 
-    // Apply CC1101 preset for selected frequency
-    cc1101_apply_preset(ctx->freq_315 ? CC1101_PRESET_OOK_10K_315MHZ
-                                       : CC1101_PRESET_OOK_10K_433MHZ);
+    // Apply CC1101 preset — OOK (Schrader/TRW) or FSK (Continental/Hella)
+    cc1101_preset_t preset;
+    if (ctx->fsk_mode)
+        preset = ctx->freq_315 ? CC1101_PRESET_FSK_10K_315MHZ : CC1101_PRESET_FSK_10K_433MHZ;
+    else
+        preset = ctx->freq_315 ? CC1101_PRESET_OOK_10K_315MHZ : CC1101_PRESET_OOK_10K_433MHZ;
+    cc1101_apply_preset(preset);
     cc1101_rx();
+
+    ESP_LOGI("TPMS", "Started: %d MHz  mode=%s  preset=%d",
+             ctx->freq_315 ? 315 : 433, ctx->fsk_mode ? "FSK" : "OOK", (int)preset);
 
     // Open SD log file
     mkdir(TPMS_SAVE_DIR, 0755);
-    snprintf(ctx->log_path, TPMS_SAVE_PATH_LEN, TPMS_SAVE_DIR "/%lluMHz_%llu.csv",
-             ctx->freq_315 ? 315ULL : 433ULL,
+    snprintf(ctx->log_path, TPMS_SAVE_PATH_LEN, TPMS_SAVE_DIR "/%uMHz_%s_%llu.csv",
+             ctx->freq_315 ? 315u : 433u, ctx->fsk_mode ? "fsk" : "ook",
              (unsigned long long)esp_timer_get_time() / 1000000ULL);
     ctx->log_fp = fopen(ctx->log_path, "w");
     if (ctx->log_fp)
-        fprintf(ctx->log_fp, "time_s,freq_mhz,sensor_id,psi,kpa,temp_c,rssi_dbm,crc_ok,flags_hex\n");
+        fprintf(ctx->log_fp, "time_s,freq_mhz,mode,sensor_id,psi,kpa,temp_c,rssi_dbm,crc_ok,flags_hex,raw_hex\n");
 
     while (ctx->active && !ctx->cancel) {
         int8_t rssi = 0;
         int n = cc1101_rx_packet(pkt, TPMS_PKT_LEN, &rssi, 500, &ctx->cancel);
-        if (n != TPMS_PKT_LEN) continue;
 
+        if (n != TPMS_PKT_LEN) {
+            // No packet this window — update live RSSI for UI
+            ctx->last_rssi_dbm = cc1101_get_rssi_dbm();
+            continue;
+        }
+
+        ctx->last_rssi_dbm = rssi;
         ctx->pkt_total++;
+
+        // Always log raw bytes — essential for diagnosis
+        ESP_LOGI("TPMS", "RAW +%ddBm [%s %dMHz]: %02X%02X%02X%02X %02X %02X %02X %02X",
+                 rssi, ctx->fsk_mode ? "FSK" : "OOK", ctx->freq_315 ? 315 : 433,
+                 pkt[0], pkt[1], pkt[2], pkt[3], pkt[4], pkt[5], pkt[6], pkt[7]);
+
         tpms_sensor_t decoded = { .rssi_dbm = rssi };
 
-        if (!tpms_decode(pkt, &decoded)) continue;
+        if (!tpms_decode(pkt, &decoded)) {
+            ESP_LOGI("TPMS", "  → decode reject (id=0 or psi out of range)");
+            continue;
+        }
+
+        if (!decoded.crc_ok) {
+            ctx->pkt_crc_fail++;
+            ESP_LOGW("TPMS", "  → CRC FAIL  ID=%08lX  PSI=%.1f",
+                     (unsigned long)decoded.sensor_id, (double)decoded.psi);
+        } else {
+            ESP_LOGI("TPMS", "  → ID=%08lX  PSI=%.1f  %dC  flags=0x%02X  CRC OK",
+                     (unsigned long)decoded.sensor_id, (double)decoded.psi,
+                     (int)decoded.temp_c, (unsigned)decoded.flags);
+        }
 
         ctx->pkt_valid++;
         decoded.rssi_dbm    = rssi;
@@ -38410,13 +38453,15 @@ static void s_tpms_task_fn(void *arg)
 
         // Log to SD
         if (ctx->log_fp) {
-            fprintf(ctx->log_fp, "%lu,%.2f,%08lX,%.2f,%d,%d,%d,%d,0x%02X\n",
+            fprintf(ctx->log_fp, "%lu,%.2f,%s,%08lX,%.2f,%d,%d,%d,%d,0x%02X,%02X%02X%02X%02X%02X%02X%02X%02X\n",
                     (unsigned long)(decoded.last_seen_us / 1000000ULL),
                     (double)(ctx->freq_315 ? 315.0f : 433.92f),
+                    ctx->fsk_mode ? "fsk" : "ook",
                     (unsigned long)decoded.sensor_id,
                     (double)decoded.psi, (int)(decoded.kpa + 0.5f),
                     (int)decoded.temp_c, (int)decoded.rssi_dbm,
-                    decoded.crc_ok ? 1 : 0, (unsigned)decoded.flags);
+                    decoded.crc_ok ? 1 : 0, (unsigned)decoded.flags,
+                    pkt[0],pkt[1],pkt[2],pkt[3],pkt[4],pkt[5],pkt[6],pkt[7]);
             fflush(ctx->log_fp);
         }
 
@@ -38437,7 +38482,8 @@ static void s_tpms_start_cb(lv_event_t *e)
     if (!ctx) return;
     if (!ctx->active && !ctx->task) {
         ctx->active = true; ctx->cancel = false;
-        ctx->pkt_total = 0; ctx->pkt_valid = 0; ctx->sensor_count = 0;
+        ctx->pkt_total = 0; ctx->pkt_crc_fail = 0; ctx->pkt_valid = 0;
+        ctx->sensor_count = 0; ctx->last_rssi_dbm = 0;
         memset(ctx->sensors, 0, sizeof(ctx->sensors));
         if (ctx->start_btn) {
             lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
