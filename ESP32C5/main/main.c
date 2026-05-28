@@ -36956,7 +36956,7 @@ static void rf433_lbk_task(void *arg)
             "#FF5722 FAIL# - weak/no carrier\n"
             "TX=GPIO%d  RX=GPIO%d\n"
             "RX idle: %d  Edges: %d / 40\n"
-            "Check DIP 5 ON, module seated",
+            "Check DIP 5 ON",
             tx_pin, rx_pin, idle_rx, edges);
     }
 
@@ -37526,7 +37526,7 @@ static void s_cc1101_ht_run_cb(lv_event_t *e)
     } else {
         lv_label_set_text(s_cc1101_ht_status, "FAIL - No CC1101 found");
         lv_obj_set_style_text_color(s_cc1101_ht_status, UI_ACCENT_RED, 0);
-        lv_label_set_text(s_cc1101_ht_pn,   "Check DIP 1 and wiring");
+        lv_label_set_text(s_cc1101_ht_pn,   "Check DIP 1 ON");
         lv_label_set_text(s_cc1101_ht_ver,   "GPIO9=CS  GPIO8=GDO0");
         lv_label_set_text(s_cc1101_ht_marc,  "SPI2_HOST shared bus");
         lv_label_set_text(s_cc1101_ht_rssi,  "");
@@ -39354,7 +39354,7 @@ static void show_nrf24_hw_test_screen(void)
                  "CONFIG:   0x%02X  EN_AA: 0x%02X\n"
                  "RF_CH:    %u  (%.0f MHz)\n"
                  "RF_SETUP: 0x%02X  Rate: %s\n"
-                 "PA (int): %s  (no ext PA)\n"
+                 "PA level: %s\n"
                  "SETUP_AW: 0x%02X  (%u-byte addr)\n"
                  "FIFO:     0x%02X  RPD: %u\n"
                  "OBSERVE_TX: 0x%02X\n\n"
@@ -39366,7 +39366,7 @@ static void show_nrf24_hw_test_screen(void)
     } else {
         snprintf(buf, sizeof(buf),
                  LV_SYMBOL_WARNING "  Not detected\n\n"
-                 "Check DIP switch 2\nand module seating.\n\nErr: %s",
+                 "Check DIP switch 2 ON.\n\nErr: %s",
                  esp_err_to_name(err));
         lv_label_set_text(res, buf);
         lv_obj_set_style_text_color(res, UI_ACCENT_RED, 0);
