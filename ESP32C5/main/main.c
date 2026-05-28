@@ -38488,10 +38488,12 @@ static void show_cc1101_tpms_screen(void)
     apply_menu_bg();
 
     // ── Frequency toggle — 2-line buttons showing region + typical brands ─────
-    // 315 MHz  US/Korea: Schrader, Continental, Huf, most Ford/GM/Chrysler OEM
+    // Buttons at y=34 to clear the title bar. Width=112 leaves an 8px gap between
+    // them (same as original). Sub-label uses TOP_MID at fixed pixel offset so it
+    // can't overflow; LV_LABEL_LONG_DOT clips gracefully if text is too wide.
     ctx->freq_315_btn = lv_btn_create(function_page);
-    lv_obj_set_size(ctx->freq_315_btn, 116, 40);
-    lv_obj_align(ctx->freq_315_btn, LV_ALIGN_TOP_LEFT, 4, 4);
+    lv_obj_set_size(ctx->freq_315_btn, 112, 40);
+    lv_obj_align(ctx->freq_315_btn, LV_ALIGN_TOP_LEFT, 4, 34);
     lv_obj_set_style_bg_color(ctx->freq_315_btn, lv_color_hex(0x1565C0), LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(ctx->freq_315_btn, 0, 0);
     lv_obj_set_style_radius(ctx->freq_315_btn, 6, 0);
@@ -38501,19 +38503,20 @@ static void show_cc1101_tpms_screen(void)
         lv_label_set_text(lf, "315 MHz");
         lv_obj_set_style_text_font(lf, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(lf, lv_color_white(), 0);
-        lv_obj_align(lf, LV_ALIGN_TOP_MID, 0, 4);
+        lv_obj_align(lf, LV_ALIGN_TOP_MID, 0, 3);
         lv_obj_t *ls = lv_label_create(ctx->freq_315_btn);
         lv_label_set_text(ls, "Schrader/Ford/GM");
         lv_obj_set_style_text_font(ls, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(ls, lv_color_hex(0xBBDEFB), 0);
-        lv_obj_align(ls, LV_ALIGN_BOTTOM_MID, 0, -4);
+        lv_obj_set_width(ls, 108);
+        lv_label_set_long_mode(ls, LV_LABEL_LONG_DOT);
+        lv_obj_align(ls, LV_ALIGN_TOP_MID, 0, 22);
     }
     lv_obj_add_event_cb(ctx->freq_315_btn, s_tpms_freq_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)1);
 
-    // 433 MHz  EU/Asia: Beru, TRW, Hella, most VW/BMW/Toyota OEM
     ctx->freq_433_btn = lv_btn_create(function_page);
-    lv_obj_set_size(ctx->freq_433_btn, 116, 40);
-    lv_obj_align(ctx->freq_433_btn, LV_ALIGN_TOP_RIGHT, -4, 4);
+    lv_obj_set_size(ctx->freq_433_btn, 112, 40);
+    lv_obj_align(ctx->freq_433_btn, LV_ALIGN_TOP_RIGHT, -4, 34);
     lv_obj_set_style_bg_color(ctx->freq_433_btn, lv_color_hex(0x37474F), LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(ctx->freq_433_btn, 0, 0);
     lv_obj_set_style_radius(ctx->freq_433_btn, 6, 0);
@@ -38523,19 +38526,21 @@ static void show_cc1101_tpms_screen(void)
         lv_label_set_text(lf, "433 MHz");
         lv_obj_set_style_text_font(lf, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(lf, lv_color_white(), 0);
-        lv_obj_align(lf, LV_ALIGN_TOP_MID, 0, 4);
+        lv_obj_align(lf, LV_ALIGN_TOP_MID, 0, 3);
         lv_obj_t *ls = lv_label_create(ctx->freq_433_btn);
         lv_label_set_text(ls, "Beru/VW/BMW/Toyota");
         lv_obj_set_style_text_font(ls, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(ls, lv_color_hex(0xB0BEC5), 0);
-        lv_obj_align(ls, LV_ALIGN_BOTTOM_MID, 0, -4);
+        lv_obj_set_width(ls, 108);
+        lv_label_set_long_mode(ls, LV_LABEL_LONG_DOT);
+        lv_obj_align(ls, LV_ALIGN_TOP_MID, 0, 22);
     }
     lv_obj_add_event_cb(ctx->freq_433_btn, s_tpms_freq_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)0);
 
     // ── Start / Stop button ────────────────────────────────────────────────────
     ctx->start_btn = lv_btn_create(function_page);
     lv_obj_set_size(ctx->start_btn, 80, 24);
-    lv_obj_align(ctx->start_btn, LV_ALIGN_TOP_LEFT, 4, 48);
+    lv_obj_align(ctx->start_btn, LV_ALIGN_TOP_LEFT, 4, 78);
     lv_obj_set_style_bg_color(ctx->start_btn, lv_color_hex(0x1B5E20), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(ctx->start_btn, lv_color_hex(0x2E7D32), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(ctx->start_btn, 0, 0);
@@ -38551,29 +38556,30 @@ static void show_cc1101_tpms_screen(void)
     lv_label_set_text(ctx->status_lbl, "Ready");
     lv_obj_set_style_text_font(ctx->status_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0x66BB6A), 0);
-    lv_obj_align(ctx->status_lbl, LV_ALIGN_TOP_LEFT, 92, 54);
+    lv_obj_align(ctx->status_lbl, LV_ALIGN_TOP_LEFT, 92, 84);
 
     ctx->count_lbl = lv_label_create(function_page);
     lv_label_set_text(ctx->count_lbl, "Pkts: 0  Decoded: 0  Sensors: 0");
     lv_obj_set_style_text_font(ctx->count_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(ctx->count_lbl, lv_color_make(140, 140, 140), 0);
-    lv_obj_align(ctx->count_lbl, LV_ALIGN_TOP_MID, 0, 76);
+    lv_obj_align(ctx->count_lbl, LV_ALIGN_TOP_MID, 0, 106);
     lv_obj_set_width(ctx->count_lbl, LCD_H_RES - 8);
     lv_label_set_long_mode(ctx->count_lbl, LV_LABEL_LONG_WRAP);
 
     // ── Sensor grid ───────────────────────────────────────────────────────────
     // White-background cards; bg colour updates per sensor state on each decode.
     // [OK] = CRC verified; [?] = CRC mismatch.  Sensors transmit every 60-90s.
+    // Layout: 5 × 32px cards with 2px gap, starting at y=122. Bottom = 122+4*34+32=288.
     for (int i = 0; i < TPMS_MAX_SENSORS; i++) {
         lv_obj_t *card = lv_obj_create(function_page);
-        lv_obj_set_size(card, LCD_H_RES - 8, 37);
-        lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 94 + i * 39);
+        lv_obj_set_size(card, LCD_H_RES - 8, 32);
+        lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 122 + i * 34);
         lv_obj_set_style_bg_color(card, lv_color_hex(0x2A2A2A), LV_STATE_DEFAULT);
         lv_obj_set_style_border_color(card, lv_color_hex(0x444444), LV_STATE_DEFAULT);
         lv_obj_set_style_border_width(card, 1, 0);
         lv_obj_set_style_radius(card, 4, 0);
         lv_obj_set_style_pad_left(card, 5, 0);
-        lv_obj_set_style_pad_top(card, 3, 0);
+        lv_obj_set_style_pad_top(card, 2, 0);
         lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
         ctx->sensor_lbl[i] = lv_label_create(card);
