@@ -39775,9 +39775,11 @@ static void show_nrf24_sniffer_screen(void)
     lv_obj_set_style_text_color(hdr, lv_color_hex(0x66BB6A), 0);
 
     lv_obj_t *info = lv_label_create(card);
-    lv_label_set_text(info, "Ch 76 | nRF24 protocol only | Addr AA:AA:AA");
+    lv_label_set_text(info, "Ch 76 | No CRC | 32B | Addr AA:AA:AA");
     lv_obj_set_style_text_font(info, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(info, lv_color_make(150, 150, 150), 0);
+    lv_obj_set_width(info, LCD_H_RES - 36);
+    lv_label_set_long_mode(info, LV_LABEL_LONG_WRAP);
 
     ctx->status_lbl = lv_label_create(card);
     lv_label_set_text(ctx->status_lbl, "Ready");
