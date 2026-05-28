@@ -2258,7 +2258,8 @@ static void reset_function_page_children(void) {
         s_tpms->scroll_cont = NULL;
         for (int _i = 0; _i < TPMS_MAX_SENSORS; _i++) s_tpms->sensor_lbl[_i] = NULL;
         if (s_tpms->tmr) { lv_timer_del(s_tpms->tmr); s_tpms->tmr = NULL; }
-        if (s_tpms->log_fp) { fclose(s_tpms->log_fp); s_tpms->log_fp = NULL; }
+        /* log_fp is owned exclusively by the task; it closes it on exit.
+         * Closing here while the task may be mid-fprintf causes a crash. */
         if (!s_tpms->task) { heap_caps_free(s_tpms); s_tpms = NULL; }
     }
     // nRF24 Futaba cleanup
@@ -12681,11 +12682,12 @@ static void create_function_page_base(const char *name)
     bd_status_lbl = NULL; bd_stats_lbl = NULL; bd_start_btn = NULL;
     bd_persona_dd = NULL; bd_script_dd = NULL; bd_human_sw = NULL; bd_speed_dd = NULL;
 
+    // Delete timers before freeing LVGL objects; same ordering invariant as show_menu().
+    reset_function_page_children();
     if (function_page) {
         lv_obj_del(function_page);
         function_page = NULL;
     }
-    reset_function_page_children();
 
     // Clean up home bg image when leaving a menu screen
     if (home_bg_img) {
@@ -12933,12 +12935,13 @@ void show_menu(void)
     bd_status_lbl = NULL; bd_stats_lbl = NULL; bd_start_btn = NULL;
     bd_persona_dd = NULL; bd_script_dd = NULL; bd_human_sw = NULL; bd_speed_dd = NULL;
 
-    // Delete function page if it exists
+    // Delete timers before freeing LVGL objects to prevent timer callbacks
+    // from firing against freed widget pointers.
+    reset_function_page_children();
     if (function_page) {
         lv_obj_del(function_page);
         function_page = NULL;
     }
-    reset_function_page_children();
 
     // Show main tiles and title bar
     show_main_tiles();
