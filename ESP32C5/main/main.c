@@ -38380,12 +38380,15 @@ static void s_tpms_ui_timer_cb(lv_timer_t *t)
     for (int i = 0; i < ctx->sensor_count && i < TPMS_MAX_SENSORS; i++)
         s_tpms_update_label(ctx, i);
 
-    // Auto-scroll to reveal a newly-detected sensor
+    // Auto-scroll: reveal new card at the bottom of the visible window.
+    // Scroll only as far as needed so that older sensors above stay visible.
     if (ctx->scroll_cont && ctx->sensor_count > ctx->last_scroll_count) {
         ctx->last_scroll_count = ctx->sensor_count;
-        lv_coord_t card_stride = TPMS_CARD_H + TPMS_CARD_GAP;
-        lv_coord_t new_y = (ctx->sensor_count - 1) * card_stride;
-        lv_obj_scroll_to_y(ctx->scroll_cont, new_y, LV_ANIM_ON);
+        lv_coord_t card_stride   = TPMS_CARD_H + TPMS_CARD_GAP;
+        lv_coord_t new_card_bot  = ctx->sensor_count * card_stride - TPMS_CARD_GAP;
+        lv_coord_t scroll_needed = new_card_bot - TPMS_SCROLL_H;
+        if (scroll_needed > 0)
+            lv_obj_scroll_to_y(ctx->scroll_cont, scroll_needed, LV_ANIM_ON);
     }
 
     if (!ctx->active && ctx->task == NULL && ctx->start_btn) {
