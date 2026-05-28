@@ -39354,7 +39354,7 @@ static void show_nrf24_hw_test_screen(void)
                  "CONFIG:   0x%02X  EN_AA: 0x%02X\n"
                  "RF_CH:    %u  (%.0f MHz)\n"
                  "RF_SETUP: 0x%02X  Rate: %s\n"
-                 "nRF24 PA: %s → AT2401C → ~+20dBm\n"
+                 "nRF24 PA: %s -> AT2401C -> ~+20dBm\n"
                  "SETUP_AW: 0x%02X  (%u-byte addr)\n"
                  "FIFO:     0x%02X  RPD: %u\n"
                  "OBSERVE_TX: 0x%02X\n\n"
