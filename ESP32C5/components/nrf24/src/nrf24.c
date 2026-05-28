@@ -387,39 +387,38 @@ void nrf24_jam_sweep(volatile bool *active)
 
     nrf24_flush_tx();
 
-    // Burst-TX pipeline: CE stays HIGH the entire sweep.
-    // The nRF24 reads RF_CH at each packet boundary, so we update RF_CH + FIFO
-    // while the previous packet is still transmitting (~148 µs at 2 Mbps).
-    // SPI setup per channel (~50 µs) finishes well before the packet ends,
-    // so the chip never stalls — it immediately starts the next packet on the
-    // new channel as soon as the current one finishes.
-    // Effective rate: ~54 full-band sweeps/second vs ~5 with the CE-pulse approach.
+    // CE-pulse approach: CE goes low between every channel so the chip returns
+    // to STANDBY-I and re-latches RF_CH before each packet.  The "CE stays HIGH"
+    // pipeline does NOT work — the nRF24 locks its PLL when CE first rises and
+    // ignores subsequent RF_CH writes while CE is held high, so every packet
+    // lands on the initial channel (ch 0 = 2400 MHz).
+    //
+    // Timing per channel at 2 Mbps, 32-byte payload:
+    //   ~30 µs  SPI (RF_CH + STATUS + payload)
+    //   ~15 µs  CE pulse (spec min 10 µs)
+    //   ~175 µs wait for packet to clear FIFO (packet air time ≈ 165 µs)
+    //   ────────────────────────────────────────────────
+    //   ~220 µs total → ~4500 packets/s across 126 channels → ~36 sweeps/s
 
     uint8_t ch = 0;
-    nrf24_write_reg(REG_RF_CH, ch);
-    csn_low(); spi_xfer_buf(tx_cmd, rx_tmp, 33); csn_high();
-    ce_high();  // CE stays HIGH: burst TX, never stop transmitting
-
     while (active && *active) {
-        ch = (ch >= 125) ? 0 : ch + 1;
-
-        // Write next channel and payload while current packet is in-flight
         nrf24_write_reg(REG_RF_CH, ch);
-        csn_low(); spi_xfer_buf(tx_cmd, rx_tmp, 33); csn_high();
         nrf24_write_reg(REG_STATUS, 0x70);
+        csn_low(); spi_xfer_buf(tx_cmd, rx_tmp, 33); csn_high();
 
-        // Yield once per full sweep: briefly lower CE so vTaskDelay can run
-        // and IDLE task resets the WDT (~18 ms gap per sweep is acceptable)
-        if (ch == 0) {
-            ce_low();
-            vTaskDelay(1);
-            ce_high();
-            nrf24_write_reg(REG_RF_CH, ch);
-            csn_low(); spi_xfer_buf(tx_cmd, rx_tmp, 33); csn_high();
-        }
+        ce_high();
+        esp_rom_delay_us(15);   // chip latches RF_CH and starts TX
+        ce_low();
+
+        esp_rom_delay_us(175);  // wait for packet to finish before next CE rise
+
+        ch = (ch >= 125) ? 0 : ch + 1;
+        if (ch == 0)
+            vTaskDelay(pdMS_TO_TICKS(20));  // yield once per sweep for WDT
     }
 
     ce_low();
+    nrf24_flush_tx();
     nrf24_standby();
 }
 
