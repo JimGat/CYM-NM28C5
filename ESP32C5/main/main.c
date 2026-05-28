@@ -39677,9 +39677,6 @@ static void s_nsniff_task_fn(void *arg)
 
     ctx->active = false;
     ctx->task = NULL;
-    if (s_nsniff) { s_nsniff->tmr = NULL; }
-    heap_caps_free(ctx);
-    if (s_nsniff == ctx) s_nsniff = NULL;
     vTaskDelete(NULL);
 }
 
@@ -39773,7 +39770,7 @@ static void show_nrf24_sniffer_screen(void)
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *hdr = lv_label_create(card);
-    lv_label_set_text(hdr, LV_SYMBOL_EYE_OPEN "  nRF24 Protocol Sniffer");
+    lv_label_set_text(hdr, LV_SYMBOL_EYE_OPEN "  Packet Sniffer");
     lv_obj_set_style_text_font(hdr, &g_font_icon14, 0);
     lv_obj_set_style_text_color(hdr, lv_color_hex(0x66BB6A), 0);
 
