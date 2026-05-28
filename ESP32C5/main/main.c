@@ -39998,7 +39998,7 @@ static void s_n24_jam_start_cb(lv_event_t *e)
     if (!nrf24_is_init()) return;
     s_n24_jam_active = true;
     if (!s_n24_jam_task)
-        xTaskCreate(s_n24_jam_task_fn, "nrf24_jam", 2048, NULL, 6, &s_n24_jam_task);
+        xTaskCreate(s_n24_jam_task_fn, "nrf24_jam", 3072, NULL, 2, &s_n24_jam_task);
 }
 
 static void s_n24_jam_stop_cb(lv_event_t *e)
