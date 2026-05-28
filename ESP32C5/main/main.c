@@ -1608,6 +1608,44 @@ EXT_RAM_BSS_ATTR static lv_obj_t *s_n24_jam_status = NULL;
 EXT_RAM_BSS_ATTR static lv_timer_t *s_n24_jam_tmr = NULL;
 EXT_RAM_BSS_ATTR static TaskHandle_t s_n24_jam_task = NULL;
 
+// ── CC1101 TPMS Monitor ───────────────────────────────────────────────────────
+#define TPMS_MAX_SENSORS   5
+#define TPMS_PKT_LEN       8
+#define TPMS_SAVE_DIR      "/sdcard/lab/tpms"
+#define TPMS_SAVE_PATH_LEN 80
+
+typedef struct {
+    uint32_t  sensor_id;
+    float     psi;
+    float     kpa;
+    int8_t    temp_c;
+    uint8_t   flags;       // bit 0 = low battery, bit 5 = alarm
+    int8_t    rssi_dbm;
+    uint64_t  last_seen_us;
+    bool      crc_ok;
+} tpms_sensor_t;
+
+typedef struct {
+    volatile bool    active;
+    volatile bool    cancel;
+    bool             freq_315;    // true = 315 MHz US, false = 433.92 MHz EU
+    tpms_sensor_t    sensors[TPMS_MAX_SENSORS];
+    volatile int     sensor_count;
+    volatile int     pkt_total;
+    volatile int     pkt_valid;
+    char             log_path[TPMS_SAVE_PATH_LEN];
+    lv_obj_t        *freq_315_btn;
+    lv_obj_t        *freq_433_btn;
+    lv_obj_t        *start_btn;
+    lv_obj_t        *status_lbl;
+    lv_obj_t        *count_lbl;
+    lv_obj_t        *sensor_lbl[TPMS_MAX_SENSORS];
+    lv_timer_t      *tmr;
+    TaskHandle_t     task;
+    FILE            *log_fp;
+} cc1101_tpms_ctx_t;
+EXT_RAM_BSS_ATTR static cc1101_tpms_ctx_t *s_tpms = NULL;
+
 // ── Zigbee Scout (passive/active 802.15.4 scanner, built-in ESP32-C5 radio) ──
 #define ZGWD_DWELL_MS        250   // ms to receive on each channel
 #define ZGWD_MAX_PANS         64   // unique PAN IDs tracked
@@ -2201,6 +2239,17 @@ static void reset_function_page_children(void) {
         s_nsniff->count_lbl = NULL; s_nsniff->start_btn = NULL;
         if (s_nsniff->tmr) { lv_timer_del(s_nsniff->tmr); s_nsniff->tmr = NULL; }
         if (!s_nsniff->task) { heap_caps_free(s_nsniff); s_nsniff = NULL; }
+    }
+    // CC1101 TPMS cleanup
+    if (s_tpms) {
+        s_tpms->active = false; s_tpms->cancel = true;
+        s_tpms->status_lbl = NULL; s_tpms->count_lbl = NULL;
+        s_tpms->start_btn = NULL;
+        s_tpms->freq_315_btn = NULL; s_tpms->freq_433_btn = NULL;
+        for (int _i = 0; _i < TPMS_MAX_SENSORS; _i++) s_tpms->sensor_lbl[_i] = NULL;
+        if (s_tpms->tmr) { lv_timer_del(s_tpms->tmr); s_tpms->tmr = NULL; }
+        if (s_tpms->log_fp) { fclose(s_tpms->log_fp); s_tpms->log_fp = NULL; }
+        if (!s_tpms->task) { heap_caps_free(s_tpms); s_tpms = NULL; }
     }
     // nRF24 Futaba cleanup
     if (s_nfut) {
@@ -38215,12 +38264,283 @@ static void show_cc1101_decode_screen(void)
 
 // ── TPMS Decoder ─────────────────────────────────────────────────────────────
 
+// CRC-8 (poly 0x07, init 0x00) over first `len` bytes
+static uint8_t tpms_crc8(const uint8_t *data, int len)
+{
+    uint8_t crc = 0;
+    for (int i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++)
+            crc = (crc & 0x80) ? (crc << 1) ^ 0x07 : (crc << 1);
+    }
+    return crc;
+}
+
+// Decode an 8-byte TPMS packet. Returns true if sensor_id is plausible.
+static bool tpms_decode(const uint8_t *pkt, tpms_sensor_t *out)
+{
+    // Bytes [0..3]: sensor ID (big-endian), [4]: raw pressure, [5]: raw temp, [6]: flags, [7]: CRC
+    out->sensor_id = ((uint32_t)pkt[0] << 24) | ((uint32_t)pkt[1] << 16) |
+                     ((uint32_t)pkt[2] <<  8) |  (uint32_t)pkt[3];
+    if (out->sensor_id == 0 || out->sensor_id == 0xFFFFFFFF) return false;
+
+    // Pressure: Schrader EG53MA4/generic → PSI = raw × 0.36
+    out->psi = pkt[4] * 0.36f;
+    out->kpa = out->psi * 6.89476f;
+    if (out->psi < 0.0f || out->psi > 120.0f) return false;  // sanity
+
+    // Temperature: raw − 40 °C (common Schrader encoding)
+    out->temp_c = (int8_t)pkt[5] - 40;
+    out->flags  = pkt[6];
+
+    // CRC-8 over bytes [0..6] vs byte [7]
+    out->crc_ok = (tpms_crc8(pkt, 7) == pkt[7]);
+    return true;
+}
+
+static void s_tpms_update_label(cc1101_tpms_ctx_t *ctx, int idx)
+{
+    if (!ctx || idx < 0 || idx >= TPMS_MAX_SENSORS || !ctx->sensor_lbl[idx]) return;
+    const tpms_sensor_t *s = &ctx->sensors[idx];
+    uint32_t age_s = (uint32_t)((esp_timer_get_time() - s->last_seen_us) / 1000000ULL);
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+             "%08lX   %.1f PSI / %d kPa\n%+dC  %d dBm  %s  %lus ago",
+             (unsigned long)s->sensor_id,
+             (double)s->psi, (int)(s->kpa + 0.5f),
+             (int)s->temp_c, (int)s->rssi_dbm,
+             s->crc_ok ? "[OK]" : "[?]",
+             (unsigned long)age_s);
+    lv_label_set_text(ctx->sensor_lbl[idx], buf);
+    // Colour: green if good pressure, yellow if low (<28 PSI), grey if CRC failed
+    lv_color_t col = s->psi < 28.0f ? lv_color_hex(0xFFB300) :
+                     s->crc_ok      ? lv_color_hex(0x66BB6A) :
+                                      lv_color_hex(0x9E9E9E);
+    lv_obj_set_style_text_color(ctx->sensor_lbl[idx], col, 0);
+}
+
+static void s_tpms_ui_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    cc1101_tpms_ctx_t *ctx = s_tpms;
+    if (!ctx) return;
+
+    if (ctx->count_lbl) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "Pkts: %d  Decoded: %d  Sensors: %d",
+                 ctx->pkt_total, ctx->pkt_valid, ctx->sensor_count);
+        lv_label_set_text(ctx->count_lbl, buf);
+    }
+    if (ctx->status_lbl) {
+        const char *st = ctx->active ? "Listening..." : "Stopped";
+        lv_label_set_text(ctx->status_lbl, st);
+        lv_obj_set_style_text_color(ctx->status_lbl,
+            ctx->active ? lv_color_hex(0xFFB300) : lv_color_hex(0x66BB6A), 0);
+    }
+
+    // Refresh all visible sensor rows (age counter updates every 500 ms)
+    for (int i = 0; i < ctx->sensor_count && i < TPMS_MAX_SENSORS; i++)
+        s_tpms_update_label(ctx, i);
+
+    if (!ctx->active && ctx->task == NULL && ctx->start_btn) {
+        lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
+        if (lbl) lv_label_set_text(lbl, "Start");
+    }
+}
+
+static void s_tpms_task_fn(void *arg)
+{
+    cc1101_tpms_ctx_t *ctx = (cc1101_tpms_ctx_t *)arg;
+    uint8_t pkt[TPMS_PKT_LEN];
+
+    // Apply CC1101 preset for selected frequency
+    cc1101_apply_preset(ctx->freq_315 ? CC1101_PRESET_OOK_10K_315MHZ
+                                       : CC1101_PRESET_OOK_10K_433MHZ);
+    cc1101_rx();
+
+    // Open SD log file
+    mkdir(TPMS_SAVE_DIR, 0755);
+    snprintf(ctx->log_path, TPMS_SAVE_PATH_LEN, TPMS_SAVE_DIR "/%lluMHz_%llu.csv",
+             ctx->freq_315 ? 315ULL : 433ULL,
+             (unsigned long long)esp_timer_get_time() / 1000000ULL);
+    ctx->log_fp = fopen(ctx->log_path, "w");
+    if (ctx->log_fp)
+        fprintf(ctx->log_fp, "time_s,freq_mhz,sensor_id,psi,kpa,temp_c,rssi_dbm,crc_ok,flags_hex\n");
+
+    while (ctx->active && !ctx->cancel) {
+        int8_t rssi = 0;
+        int n = cc1101_rx_packet(pkt, TPMS_PKT_LEN, &rssi, 500, &ctx->cancel);
+        if (n != TPMS_PKT_LEN) continue;
+
+        ctx->pkt_total++;
+        tpms_sensor_t decoded = { .rssi_dbm = rssi };
+
+        if (!tpms_decode(pkt, &decoded)) continue;
+
+        ctx->pkt_valid++;
+        decoded.rssi_dbm    = rssi;
+        decoded.last_seen_us = esp_timer_get_time();
+
+        // Update or insert sensor slot
+        int slot = -1;
+        for (int i = 0; i < ctx->sensor_count; i++) {
+            if (ctx->sensors[i].sensor_id == decoded.sensor_id) { slot = i; break; }
+        }
+        if (slot < 0 && ctx->sensor_count < TPMS_MAX_SENSORS)
+            slot = ctx->sensor_count++;
+        if (slot >= 0)
+            ctx->sensors[slot] = decoded;
+
+        // Log to SD
+        if (ctx->log_fp) {
+            fprintf(ctx->log_fp, "%lu,%.2f,%08lX,%.2f,%d,%d,%d,%d,0x%02X\n",
+                    (unsigned long)(decoded.last_seen_us / 1000000ULL),
+                    (double)(ctx->freq_315 ? 315.0f : 433.92f),
+                    (unsigned long)decoded.sensor_id,
+                    (double)decoded.psi, (int)(decoded.kpa + 0.5f),
+                    (int)decoded.temp_c, (int)decoded.rssi_dbm,
+                    decoded.crc_ok ? 1 : 0, (unsigned)decoded.flags);
+            fflush(ctx->log_fp);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    if (ctx->log_fp) { fclose(ctx->log_fp); ctx->log_fp = NULL; }
+    cc1101_idle();
+    ctx->active = false;
+    ctx->task   = NULL;
+    vTaskDelete(NULL);
+}
+
+static void s_tpms_start_cb(lv_event_t *e)
+{
+    (void)e;
+    cc1101_tpms_ctx_t *ctx = s_tpms;
+    if (!ctx) return;
+    if (!ctx->active && !ctx->task) {
+        ctx->active = true; ctx->cancel = false;
+        ctx->pkt_total = 0; ctx->pkt_valid = 0; ctx->sensor_count = 0;
+        memset(ctx->sensors, 0, sizeof(ctx->sensors));
+        if (ctx->start_btn) {
+            lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
+            if (lbl) lv_label_set_text(lbl, "Stop");
+        }
+        xTaskCreate(s_tpms_task_fn, "tpms_scan", 4096, ctx, 2, &ctx->task);
+    } else {
+        ctx->active = false; ctx->cancel = true;
+    }
+}
+
+static void s_tpms_freq_cb(lv_event_t *e)
+{
+    cc1101_tpms_ctx_t *ctx = s_tpms;
+    if (!ctx) return;
+    bool want_315 = (bool)(uintptr_t)lv_event_get_user_data(e);
+    if (ctx->freq_315 == want_315) return;
+    ctx->freq_315 = want_315;
+    // Stop any running scan so it restarts on the new frequency
+    ctx->active = false; ctx->cancel = true;
+    // Update button colours
+    if (ctx->freq_315_btn)
+        lv_obj_set_style_bg_color(ctx->freq_315_btn,
+            want_315 ? lv_color_hex(0x1565C0) : lv_color_hex(0x37474F), LV_STATE_DEFAULT);
+    if (ctx->freq_433_btn)
+        lv_obj_set_style_bg_color(ctx->freq_433_btn,
+            want_315 ? lv_color_hex(0x37474F) : lv_color_hex(0x1565C0), LV_STATE_DEFAULT);
+}
+
 static void show_cc1101_tpms_screen(void)
 {
-    s_cc1101_stub_screen(MY_SYMBOL_CAR "  TPMS Tire Monitor",
-        "Decode TPMS tire pressure\nsensors on 315/433 MHz\n\n"
-        "Reports: PSI, temp, sensor ID\n\n"
-        "Coming in next version.");
+    if (s_tpms) { s_tpms->active = false; s_tpms->cancel = true; }
+
+    if (!cc1101_is_init()) {
+        if (cc1101_init() != ESP_OK) {
+            s_cc1101_stub_screen(MY_SYMBOL_CAR "  TPMS Monitor",
+                "CC1101 not detected.\n\nCheck DIP 1 ON.");
+            return;
+        }
+    }
+
+    cc1101_tpms_ctx_t *ctx = heap_caps_calloc(1, sizeof(cc1101_tpms_ctx_t), MALLOC_CAP_SPIRAM);
+    if (!ctx) { s_cc1101_stub_screen("TPMS Error", "Out of memory"); return; }
+    ctx->freq_315 = true;
+
+    create_function_page_base("TPMS Monitor");
+    s_tpms = ctx;
+    apply_menu_bg();
+
+    // ── Frequency toggle ───────────────────────────────────────────────────────
+    ctx->freq_315_btn = lv_btn_create(function_page);
+    lv_obj_set_size(ctx->freq_315_btn, 112, 26);
+    lv_obj_align(ctx->freq_315_btn, LV_ALIGN_TOP_LEFT, 4, 34);
+    lv_obj_set_style_bg_color(ctx->freq_315_btn, lv_color_hex(0x1565C0), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(ctx->freq_315_btn, 0, 0);
+    lv_obj_set_style_radius(ctx->freq_315_btn, 6, 0);
+    lv_obj_t *l315 = lv_label_create(ctx->freq_315_btn);
+    lv_label_set_text(l315, "315 MHz (US)");
+    lv_obj_set_style_text_font(l315, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(l315, lv_color_white(), 0);
+    lv_obj_center(l315);
+    lv_obj_add_event_cb(ctx->freq_315_btn, s_tpms_freq_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)1);
+
+    ctx->freq_433_btn = lv_btn_create(function_page);
+    lv_obj_set_size(ctx->freq_433_btn, 112, 26);
+    lv_obj_align(ctx->freq_433_btn, LV_ALIGN_TOP_RIGHT, -4, 34);
+    lv_obj_set_style_bg_color(ctx->freq_433_btn, lv_color_hex(0x37474F), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(ctx->freq_433_btn, 0, 0);
+    lv_obj_set_style_radius(ctx->freq_433_btn, 6, 0);
+    lv_obj_t *l433 = lv_label_create(ctx->freq_433_btn);
+    lv_label_set_text(l433, "433 MHz (EU)");
+    lv_obj_set_style_text_font(l433, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(l433, lv_color_white(), 0);
+    lv_obj_center(l433);
+    lv_obj_add_event_cb(ctx->freq_433_btn, s_tpms_freq_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)0);
+
+    // ── Start / Stop button ────────────────────────────────────────────────────
+    ctx->start_btn = lv_btn_create(function_page);
+    lv_obj_set_size(ctx->start_btn, 80, 26);
+    lv_obj_align(ctx->start_btn, LV_ALIGN_TOP_LEFT, 4, 64);
+    lv_obj_set_style_bg_color(ctx->start_btn, lv_color_hex(0x1B5E20), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(ctx->start_btn, lv_color_hex(0x2E7D32), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(ctx->start_btn, 0, 0);
+    lv_obj_set_style_radius(ctx->start_btn, 6, 0);
+    lv_obj_t *sl = lv_label_create(ctx->start_btn);
+    lv_label_set_text(sl, "Start");
+    lv_obj_set_style_text_font(sl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sl, lv_color_white(), 0);
+    lv_obj_center(sl);
+    lv_obj_add_event_cb(ctx->start_btn, s_tpms_start_cb, LV_EVENT_CLICKED, NULL);
+
+    ctx->status_lbl = lv_label_create(function_page);
+    lv_label_set_text(ctx->status_lbl, "Ready");
+    lv_obj_set_style_text_font(ctx->status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0x66BB6A), 0);
+    lv_obj_align(ctx->status_lbl, LV_ALIGN_TOP_LEFT, 92, 70);
+
+    ctx->count_lbl = lv_label_create(function_page);
+    lv_label_set_text(ctx->count_lbl, "Pkts: 0  Decoded: 0  Sensors: 0");
+    lv_obj_set_style_text_font(ctx->count_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->count_lbl, lv_color_make(140, 140, 140), 0);
+    lv_obj_align(ctx->count_lbl, LV_ALIGN_TOP_MID, 0, 94);
+    lv_obj_set_width(ctx->count_lbl, LCD_H_RES - 8);
+    lv_label_set_long_mode(ctx->count_lbl, LV_LABEL_LONG_WRAP);
+
+    // ── Sensor list ───────────────────────────────────────────────────────────
+    // Note: sensors transmit every 60-90s at rest; more often when driving.
+    // [OK] = CRC verified; [?] = CRC mismatch (data may still be correct).
+    for (int i = 0; i < TPMS_MAX_SENSORS; i++) {
+        ctx->sensor_lbl[i] = lv_label_create(function_page);
+        lv_label_set_text(ctx->sensor_lbl[i], "--");
+        lv_obj_set_style_text_font(ctx->sensor_lbl[i], &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(ctx->sensor_lbl[i], lv_color_make(80, 80, 80), 0);
+        lv_obj_align(ctx->sensor_lbl[i], LV_ALIGN_TOP_LEFT, 8, 114 + i * 30);
+        lv_obj_set_width(ctx->sensor_lbl[i], LCD_H_RES - 16);
+        lv_label_set_long_mode(ctx->sensor_lbl[i], LV_LABEL_LONG_WRAP);
+    }
+
+    ctx->tmr = lv_timer_create(s_tpms_ui_timer_cb, 500, NULL);
+    rfhat_add_back_btn("CC1101", show_cc1101_screen);
 }
 
 // ── Weather Station Decoder ───────────────────────────────────────────────────

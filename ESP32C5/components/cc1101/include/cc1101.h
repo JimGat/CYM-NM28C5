@@ -86,6 +86,8 @@ typedef enum {
     CC1101_PRESET_FSK_38K_433MHZ,   // 433.92 MHz 2-FSK 38.4 kBaud (POCSAG)
     CC1101_PRESET_FSK_9K6_433MHZ,   // 433.92 MHz 2-FSK 9.6 kBaud (TPMS/Weather)
     CC1101_PRESET_OOK_4K8_915MHZ,   // 915 MHz OOK 4.8 kBaud (US ISM)
+    CC1101_PRESET_OOK_10K_315MHZ,   // 315 MHz OOK ~9.97 kBaud, sync D391 (US TPMS)
+    CC1101_PRESET_OOK_10K_433MHZ,   // 433.92 MHz OOK ~9.97 kBaud, sync D391 (EU TPMS OOK)
 } cc1101_preset_t;
 void cc1101_apply_preset(cc1101_preset_t preset);
 
@@ -116,6 +118,13 @@ esp_err_t cc1101_scan_spectrum(float start_mhz, float stop_mhz, float step_mhz,
                                uint32_t dwell_ms,
                                cc1101_scan_cb_t cb, void *ctx,
                                volatile bool *cancel);
+
+// ── Packet receive (TPMS / fixed-length packet mode) ─────────────────────────
+// Configure CC1101 with a packet-mode preset first (e.g. CC1101_PRESET_OOK_10K_315MHZ),
+// then call cc1101_rx() once, then loop calling this.
+// Returns pktlen on success, -1 on timeout / cancel / FIFO overflow.
+int cc1101_rx_packet(uint8_t *buf, uint8_t pktlen, int8_t *rssi_out,
+                     uint32_t timeout_ms, volatile bool *cancel);
 
 // ── Capture / replay control ──────────────────────────────────────────────────
 // Safe to call from any task; causes capture loop to exit within 10 ms.

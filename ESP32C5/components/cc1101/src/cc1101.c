@@ -397,10 +397,94 @@ void cc1101_apply_preset(cc1101_preset_t preset)
             cc1101_write_reg(CC1101_DEVIATN,  0x35);
             cc1101_write_reg(CC1101_AGCCTRL2, 0x43);
             break;
+
+        // TPMS packet-mode presets — override async-serial base config for FIFO packet RX
+        case CC1101_PRESET_OOK_10K_315MHZ:
+        case CC1101_PRESET_OOK_10K_433MHZ:
+            cc1101_set_freq_mhz(preset == CC1101_PRESET_OOK_10K_315MHZ ? 315.0f : 433.92f);
+            // ~9.97 kbps: DRATE_E=8, DRATE_M=146; BW=203 kHz: CHANBW_E=2, CHANBW_M=0
+            cc1101_write_reg(CC1101_MDMCFG4, 0x88);
+            cc1101_write_reg(CC1101_MDMCFG3, 0x92);
+            // OOK, 16/16 sync word detection, no Manchester
+            cc1101_write_reg(CC1101_MDMCFG2, 0x32);
+            cc1101_write_reg(CC1101_MDMCFG1, 0x22);  // 4 preamble bytes
+            // Sync word D391 (Schrader-compatible)
+            cc1101_write_reg(CC1101_SYNC1,   0xD3);
+            cc1101_write_reg(CC1101_SYNC0,   0x91);
+            // Packet mode: fixed 8-byte length, no CRC, no whitening
+            cc1101_write_reg(CC1101_PKTLEN,   0x08);
+            cc1101_write_reg(CC1101_PKTCTRL0, 0x00);  // fixed length (overrides base async)
+            cc1101_write_reg(CC1101_PKTCTRL1, 0x00);  // no addr check, no status append
+            // GDO0 = asserts when sync word found, deasserts at end of packet
+            cc1101_write_reg(CC1101_IOCFG0,   CC1101_GDO0_PKT_SYNC);
+            cc1101_write_reg(CC1101_FIFOTHR,  0x0F);  // FIFO threshold = 16 bytes
+            cc1101_write_reg(CC1101_DEVIATN,  0x00);
+            cc1101_write_reg(CC1101_FREND0,   0x11);  // OOK: 2-entry PATABLE
+            cc1101_write_reg(CC1101_AGCCTRL2, 0x07);  // max LNA gain for sensitivity
+            cc1101_write_reg(CC1101_AGCCTRL1, 0x40);
+            cc1101_write_reg(CC1101_AGCCTRL0, 0x91);
+            break;
     }
 
     // Set max TX power
     cc1101_set_output_power_dbm(10);
+}
+
+// ── Packet receive ────────────────────────────────────────────────────────────
+
+int cc1101_rx_packet(uint8_t *buf, uint8_t pktlen, int8_t *rssi_out,
+                     uint32_t timeout_ms, volatile bool *cancel)
+{
+    if (!s_init || !buf || pktlen == 0 || pktlen > 64) return -1;
+
+    int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+
+    while (!(cancel && *cancel)) {
+        if (esp_timer_get_time() >= deadline) break;
+
+        // Recover from RX FIFO overflow (MARCSTATE == 0x11)
+        uint8_t marc = cc1101_get_marc_state();
+        if (marc == 0x11) {
+            cc1101_strobe(CC1101_SIDLE);
+            cc1101_strobe(CC1101_SFRX);
+            cc1101_strobe(CC1101_SRX);
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
+        uint8_t rxbytes = cc1101_read_status(CC1101_RXBYTES);
+        if (rxbytes & 0x80) {
+            // Overflow flag in RXBYTES
+            cc1101_strobe(CC1101_SIDLE);
+            cc1101_strobe(CC1101_SFRX);
+            cc1101_strobe(CC1101_SRX);
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
+        if (rxbytes >= pktlen) {
+            // Burst-read pktlen bytes from RX FIFO
+            // Address = RXFIFO | READ | BURST = 0x3F | 0x80 | 0x40 = 0xFF
+            uint8_t tx_buf[65];
+            uint8_t rx_buf[65];
+            memset(tx_buf, 0, pktlen + 1);
+            tx_buf[0] = CC1101_RXFIFO | CC1101_READ | CC1101_BURST;
+            spi_transaction_t t = {
+                .length    = (pktlen + 1) * 8,
+                .tx_buffer = tx_buf,
+                .rx_buffer = rx_buf,
+            };
+            if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
+            spi_device_polling_transmit(s_spi, &t);
+            if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+            memcpy(buf, rx_buf + 1, pktlen);
+            if (rssi_out) *rssi_out = cc1101_get_rssi_dbm();
+            return pktlen;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return -1;
 }
 
 // ── RAW Capture ───────────────────────────────────────────────────────────────
