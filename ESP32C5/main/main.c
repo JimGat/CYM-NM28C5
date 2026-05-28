@@ -1576,6 +1576,7 @@ typedef struct {
     char             save_path[NRF24_SUB_PATH_LEN];
     volatile int     pkt_count;
     nrf24_packet_t   last_pkt;
+    nrf24_packet_t  *pkts;       // PSRAM buffer; set before nrf24_sniff, used by callback
     lv_obj_t        *status_lbl;
     lv_obj_t        *hex_lbl;
     lv_obj_t        *count_lbl;
@@ -39288,20 +39289,27 @@ static void show_nrf24_hw_test_screen(void)
     lv_obj_set_width(res, LCD_H_RES - 44);
     lv_obj_set_style_text_align(res, LV_TEXT_ALIGN_CENTER, 0);
 
-    char buf[192];
+    char buf[256];
     if (err == ESP_OK) {
-        uint8_t st  = nrf24_get_status();
-        uint8_t cfg = nrf24_read_reg(0x00);
-        uint8_t ch  = nrf24_read_reg(0x05);
-        uint8_t rfs = nrf24_read_reg(0x06);
+        uint8_t st   = nrf24_get_status();
+        uint8_t cfg  = nrf24_read_reg(0x00);
+        uint8_t ch   = nrf24_read_reg(0x05);
+        uint8_t rfs  = nrf24_read_reg(0x06);
+        uint8_t enaa = nrf24_read_reg(0x01);
+        uint8_t fifo = nrf24_read_reg(0x17);
+        // Decode data rate: RF_SETUP bit5=DR_LOW, bit3=DR_HIGH
+        const char *dr = (rfs & 0x20) ? "250k" : (rfs & 0x08) ? "2M" : "1M";
+        // Decode PA level: RF_SETUP bits [2:1]
+        static const char *pa_lut[4] = {"-18dBm","-12dBm","-6dBm","0dBm"};
+        const char *pa = pa_lut[(rfs >> 1) & 0x03];
         snprintf(buf, sizeof(buf),
                  LV_SYMBOL_OK "  Detected\n\n"
-                 "STATUS:   0x%02X\n"
-                 "CONFIG:   0x%02X\n"
-                 "RF_CH:    %u  (%.0f MHz)\n"
-                 "RF_SETUP: 0x%02X\n\n"
+                 "STATUS: 0x%02X  CONFIG: 0x%02X\n"
+                 "RF_CH: %u (%.0f MHz)\n"
+                 "Rate: %s  PA: %s\n"
+                 "EN_AA: 0x%02X  FIFO: 0x%02X\n\n"
                  "DIP 2: CE=GPIO8  CSN=GPIO9",
-                 st, cfg, ch, 2400.0f + ch, rfs);
+                 st, cfg, ch, 2400.0f + ch, dr, pa, enaa, fifo);
         lv_label_set_text(res, buf);
         lv_obj_set_style_text_color(res, lv_color_hex(0x66BB6A), 0);
     } else {
@@ -39574,6 +39582,9 @@ static void s_nsniff_rx_cb(const nrf24_packet_t *pkt, void *ctx_v)
     nrf24_sniff_ctx_t *ctx = (nrf24_sniff_ctx_t *)ctx_v;
     if (!ctx) return;
     memcpy(&ctx->last_pkt, pkt, sizeof(*pkt));
+    int idx = ctx->pkt_count;
+    if (ctx->pkts && idx < NRF24_SNIFF_MAX_PKTS)
+        memcpy(&ctx->pkts[idx], pkt, sizeof(*pkt));
     ctx->pkt_count++;
 }
 
@@ -39595,20 +39606,21 @@ static void s_nsniff_task_fn(void *arg)
     const uint8_t bcast[3] = { 0xAA, 0xAA, 0xAA };
     memcpy(cap.addr, bcast, 3);
 
-    // Collect packets
+    // Allocate packet buffer and share with callback via ctx->pkts
     nrf24_packet_t *pkts = heap_caps_calloc(NRF24_SNIFF_MAX_PKTS,
                                              sizeof(nrf24_packet_t), MALLOC_CAP_SPIRAM);
-    cap.pkts = pkts;
+    ctx->pkts = pkts;
+    cap.pkts  = pkts;
 
     nrf24_sniff(ctx->channel, ctx->payload_len,
                 s_nsniff_rx_cb, ctx, 0, &ctx->cancel);
 
-    // Save whatever was captured
+    // Save all captured packets (up to NRF24_SNIFF_MAX_PKTS)
     if (pkts) {
         int n = ctx->pkt_count < NRF24_SNIFF_MAX_PKTS ? ctx->pkt_count : NRF24_SNIFF_MAX_PKTS;
-        memcpy(pkts, &ctx->last_pkt, sizeof(nrf24_packet_t));
-        cap.count = n > 0 ? 1 : 0;  // simplified: save last packet
-        if (cap.count > 0) nrf24_capture_save(&cap, ctx->save_path);
+        cap.count = n;
+        if (n > 0) nrf24_capture_save(&cap, ctx->save_path);
+        ctx->pkts = NULL;
         heap_caps_free(pkts);
     }
 
@@ -39764,16 +39776,13 @@ typedef struct { char path[NRF24_SUB_PATH_LEN]; } nrf24_saved_path_t;
 EXT_RAM_BSS_ATTR static nrf24_saved_path_t *s_n24_saved_paths = NULL;
 EXT_RAM_BSS_ATTR static int                 s_n24_saved_count  = 0;
 
+static void show_nrf24_file_detail_screen(const char *path);  // forward decl
+
 static void s_n24_saved_play_cb(lv_event_t *e)
 {
     const char *path = (const char *)lv_event_get_user_data(e);
     if (!path) return;
-    // Load and replay (stub — show hex of first packet)
-    nrf24_capture_t cap = {0};
-    if (nrf24_capture_load(path, &cap) == ESP_OK) {
-        // Simple feedback: navigate to sniffer with info
-        nrf24_capture_free(&cap);
-    }
+    show_nrf24_file_detail_screen(path);
 }
 
 static void show_nrf24_saved_screen(void)
@@ -39865,6 +39874,98 @@ static void show_nrf24_saved_screen(void)
     }
 
     rfhat_add_back_btn("nRF24", show_nrf24_screen);
+}
+
+// ── File Detail Viewer ────────────────────────────────────────────────────────
+
+static void show_nrf24_file_detail_screen(const char *path)
+{
+    nrf24_capture_t cap = {0};
+    esp_err_t load_err = nrf24_capture_load(path, &cap);
+
+    create_function_page_base("nRF24 File View");
+    apply_menu_bg();
+
+    lv_obj_t *card = lv_obj_create(function_page);
+    lv_obj_set_size(card, LCD_H_RES - 16, LCD_V_RES - 80);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x4A148C), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 8, 0);
+    lv_obj_set_style_pad_all(card, 8, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(card, 5, 0);
+
+    if (load_err != ESP_OK) {
+        lv_obj_t *el = lv_label_create(card);
+        lv_label_set_text(el, LV_SYMBOL_WARNING "  Failed to load file");
+        lv_obj_set_style_text_font(el, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(el, UI_ACCENT_RED, 0);
+        rfhat_add_back_btn("Saved", show_nrf24_saved_screen);
+        return;
+    }
+
+    // Filename header
+    const char *fn = strrchr(path, '/');
+    fn = fn ? fn + 1 : path;
+    lv_obj_t *fn_lbl = lv_label_create(card);
+    lv_label_set_text(fn_lbl, fn);
+    lv_obj_set_style_text_font(fn_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(fn_lbl, lv_color_hex(0x90CAF9), 0);
+    lv_label_set_long_mode(fn_lbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(fn_lbl, LCD_H_RES - 36);
+
+    // Metadata line
+    char meta[96];
+    snprintf(meta, sizeof(meta),
+             "Ch %u  %.0f MHz | %d pkts | Pld %uB\n"
+             "Addr: %02X:%02X:%02X",
+             cap.channel, 2400.0f + cap.channel, cap.count, cap.payload_len,
+             cap.addr[0], cap.addr[1], cap.addr[2]);
+    lv_obj_t *ml = lv_label_create(card);
+    lv_label_set_text(ml, meta);
+    lv_obj_set_style_text_font(ml, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ml, lv_color_hex(0xFFD54F), 0);
+    lv_label_set_long_mode(ml, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(ml, LCD_H_RES - 36);
+
+    // Separator
+    lv_obj_t *sep = lv_obj_create(card);
+    lv_obj_set_size(sep, LCD_H_RES - 36, 1);
+    lv_obj_set_style_bg_color(sep, lv_color_make(60, 60, 80), 0);
+    lv_obj_set_style_border_width(sep, 0, 0);
+
+    // Show first 5 packets in hex (up to 16 bytes each)
+    int show_n = cap.count < 5 ? cap.count : 5;
+    for (int p = 0; p < show_n; p++) {
+        char hex[96];
+        int off = snprintf(hex, sizeof(hex), "#%d: ", p + 1);
+        int nbytes = cap.pkts[p].len > 16 ? 16 : cap.pkts[p].len;
+        for (int b = 0; b < nbytes && off < (int)sizeof(hex) - 4; b++)
+            off += snprintf(hex + off, sizeof(hex) - off, "%02X ", cap.pkts[p].data[b]);
+        if (cap.pkts[p].len > 16 && off < (int)sizeof(hex) - 4)
+            snprintf(hex + off, sizeof(hex) - off, "...");
+        lv_obj_t *pl = lv_label_create(card);
+        lv_label_set_text(pl, hex);
+        lv_obj_set_style_text_font(pl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(pl, lv_color_hex(0x66BB6A), 0);
+        lv_label_set_long_mode(pl, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(pl, LCD_H_RES - 36);
+    }
+    if (cap.count > 5) {
+        char mbuf[32];
+        snprintf(mbuf, sizeof(mbuf), "... %d more packet%s",
+                 cap.count - 5, cap.count - 5 == 1 ? "" : "s");
+        lv_obj_t *more = lv_label_create(card);
+        lv_label_set_text(more, mbuf);
+        lv_obj_set_style_text_font(more, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(more, lv_color_make(150, 150, 150), 0);
+    }
+
+    nrf24_capture_free(&cap);
+    rfhat_add_back_btn("Saved", show_nrf24_saved_screen);
 }
 
 // ── Jammer ────────────────────────────────────────────────────────────────────

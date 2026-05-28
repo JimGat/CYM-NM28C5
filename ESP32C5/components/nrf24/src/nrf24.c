@@ -100,8 +100,9 @@ static void spi_xfer_buf(const uint8_t *tx, uint8_t *rx, size_t len)
         .rx_buffer = rx,
     };
     if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
-    spi_device_polling_transmit(s_drv->spi, &t);
+    esp_err_t err = spi_device_polling_transmit(s_drv->spi, &t);
     if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+    if (err != ESP_OK) ESP_LOGE(TAG, "SPI xfer failed (%zu B): %s", len, esp_err_to_name(err));
 }
 
 uint8_t nrf24_read_reg(uint8_t reg)
