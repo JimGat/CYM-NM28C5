@@ -38303,20 +38303,37 @@ static void s_tpms_update_label(cc1101_tpms_ctx_t *ctx, int idx)
     if (!ctx || idx < 0 || idx >= TPMS_MAX_SENSORS || !ctx->sensor_lbl[idx]) return;
     const tpms_sensor_t *s = &ctx->sensors[idx];
     uint32_t age_s = (uint32_t)((esp_timer_get_time() - s->last_seen_us) / 1000000ULL);
+
+    char flags[12] = "";
+    if (s->flags & 0x01) strlcat(flags, " BATT", sizeof(flags));
+    if (s->flags & 0x20) strlcat(flags, " ALM",  sizeof(flags));
+
     char buf[128];
     snprintf(buf, sizeof(buf),
-             "%08lX   %.1f PSI / %d kPa\n%+dC  %d dBm  %s  %lus ago",
+             "%08lX   %.1f PSI / %d kPa\n%+dC  %ddBm  %s%s  %lus",
              (unsigned long)s->sensor_id,
              (double)s->psi, (int)(s->kpa + 0.5f),
              (int)s->temp_c, (int)s->rssi_dbm,
              s->crc_ok ? "[OK]" : "[?]",
+             flags,
              (unsigned long)age_s);
     lv_label_set_text(ctx->sensor_lbl[idx], buf);
-    // Colour: green if good pressure, yellow if low (<28 PSI), grey if CRC failed
-    lv_color_t col = s->psi < 28.0f ? lv_color_hex(0xFFB300) :
-                     s->crc_ok      ? lv_color_hex(0x66BB6A) :
-                                      lv_color_hex(0x9E9E9E);
-    lv_obj_set_style_text_color(ctx->sensor_lbl[idx], col, 0);
+
+    // Card bg + text colour based on state (card is parent of the label)
+    lv_obj_t *card = lv_obj_get_parent(ctx->sensor_lbl[idx]);
+    if (s->psi < 28.0f) {
+        // Low pressure: amber card, dark amber text
+        if (card) lv_obj_set_style_bg_color(card, lv_color_hex(0xFFF3E0), LV_STATE_DEFAULT);
+        lv_obj_set_style_text_color(ctx->sensor_lbl[idx], lv_color_hex(0xBF360C), 0);
+    } else if (!s->crc_ok) {
+        // CRC fail: neutral white card, grey text
+        if (card) lv_obj_set_style_bg_color(card, lv_color_hex(0xF5F5F5), LV_STATE_DEFAULT);
+        lv_obj_set_style_text_color(ctx->sensor_lbl[idx], lv_color_hex(0x757575), 0);
+    } else {
+        // Good pressure + CRC ok: light green card, dark text
+        if (card) lv_obj_set_style_bg_color(card, lv_color_hex(0xF1F8E9), LV_STATE_DEFAULT);
+        lv_obj_set_style_text_color(ctx->sensor_lbl[idx], lv_color_hex(0x1B5E20), 0);
+    }
 }
 
 static void s_tpms_ui_timer_cb(lv_timer_t *t)
@@ -38470,37 +38487,55 @@ static void show_cc1101_tpms_screen(void)
     s_tpms = ctx;
     apply_menu_bg();
 
-    // ── Frequency toggle ───────────────────────────────────────────────────────
+    // ── Frequency toggle — 2-line buttons showing region + typical brands ─────
+    // 315 MHz  US/Korea: Schrader, Continental, Huf, most Ford/GM/Chrysler OEM
     ctx->freq_315_btn = lv_btn_create(function_page);
-    lv_obj_set_size(ctx->freq_315_btn, 112, 26);
-    lv_obj_align(ctx->freq_315_btn, LV_ALIGN_TOP_LEFT, 4, 34);
+    lv_obj_set_size(ctx->freq_315_btn, 116, 40);
+    lv_obj_align(ctx->freq_315_btn, LV_ALIGN_TOP_LEFT, 4, 4);
     lv_obj_set_style_bg_color(ctx->freq_315_btn, lv_color_hex(0x1565C0), LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(ctx->freq_315_btn, 0, 0);
     lv_obj_set_style_radius(ctx->freq_315_btn, 6, 0);
-    lv_obj_t *l315 = lv_label_create(ctx->freq_315_btn);
-    lv_label_set_text(l315, "315 MHz (US)");
-    lv_obj_set_style_text_font(l315, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(l315, lv_color_white(), 0);
-    lv_obj_center(l315);
+    lv_obj_set_style_pad_all(ctx->freq_315_btn, 0, 0);
+    {
+        lv_obj_t *lf = lv_label_create(ctx->freq_315_btn);
+        lv_label_set_text(lf, "315 MHz");
+        lv_obj_set_style_text_font(lf, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(lf, lv_color_white(), 0);
+        lv_obj_align(lf, LV_ALIGN_TOP_MID, 0, 4);
+        lv_obj_t *ls = lv_label_create(ctx->freq_315_btn);
+        lv_label_set_text(ls, "Schrader/Ford/GM");
+        lv_obj_set_style_text_font(ls, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(ls, lv_color_hex(0xBBDEFB), 0);
+        lv_obj_align(ls, LV_ALIGN_BOTTOM_MID, 0, -4);
+    }
     lv_obj_add_event_cb(ctx->freq_315_btn, s_tpms_freq_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)1);
 
+    // 433 MHz  EU/Asia: Beru, TRW, Hella, most VW/BMW/Toyota OEM
     ctx->freq_433_btn = lv_btn_create(function_page);
-    lv_obj_set_size(ctx->freq_433_btn, 112, 26);
-    lv_obj_align(ctx->freq_433_btn, LV_ALIGN_TOP_RIGHT, -4, 34);
+    lv_obj_set_size(ctx->freq_433_btn, 116, 40);
+    lv_obj_align(ctx->freq_433_btn, LV_ALIGN_TOP_RIGHT, -4, 4);
     lv_obj_set_style_bg_color(ctx->freq_433_btn, lv_color_hex(0x37474F), LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(ctx->freq_433_btn, 0, 0);
     lv_obj_set_style_radius(ctx->freq_433_btn, 6, 0);
-    lv_obj_t *l433 = lv_label_create(ctx->freq_433_btn);
-    lv_label_set_text(l433, "433 MHz (EU)");
-    lv_obj_set_style_text_font(l433, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(l433, lv_color_white(), 0);
-    lv_obj_center(l433);
+    lv_obj_set_style_pad_all(ctx->freq_433_btn, 0, 0);
+    {
+        lv_obj_t *lf = lv_label_create(ctx->freq_433_btn);
+        lv_label_set_text(lf, "433 MHz");
+        lv_obj_set_style_text_font(lf, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(lf, lv_color_white(), 0);
+        lv_obj_align(lf, LV_ALIGN_TOP_MID, 0, 4);
+        lv_obj_t *ls = lv_label_create(ctx->freq_433_btn);
+        lv_label_set_text(ls, "Beru/VW/BMW/Toyota");
+        lv_obj_set_style_text_font(ls, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(ls, lv_color_hex(0xB0BEC5), 0);
+        lv_obj_align(ls, LV_ALIGN_BOTTOM_MID, 0, -4);
+    }
     lv_obj_add_event_cb(ctx->freq_433_btn, s_tpms_freq_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)0);
 
     // ── Start / Stop button ────────────────────────────────────────────────────
     ctx->start_btn = lv_btn_create(function_page);
-    lv_obj_set_size(ctx->start_btn, 80, 26);
-    lv_obj_align(ctx->start_btn, LV_ALIGN_TOP_LEFT, 4, 64);
+    lv_obj_set_size(ctx->start_btn, 80, 24);
+    lv_obj_align(ctx->start_btn, LV_ALIGN_TOP_LEFT, 4, 48);
     lv_obj_set_style_bg_color(ctx->start_btn, lv_color_hex(0x1B5E20), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(ctx->start_btn, lv_color_hex(0x2E7D32), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(ctx->start_btn, 0, 0);
@@ -38516,27 +38551,38 @@ static void show_cc1101_tpms_screen(void)
     lv_label_set_text(ctx->status_lbl, "Ready");
     lv_obj_set_style_text_font(ctx->status_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0x66BB6A), 0);
-    lv_obj_align(ctx->status_lbl, LV_ALIGN_TOP_LEFT, 92, 70);
+    lv_obj_align(ctx->status_lbl, LV_ALIGN_TOP_LEFT, 92, 54);
 
     ctx->count_lbl = lv_label_create(function_page);
     lv_label_set_text(ctx->count_lbl, "Pkts: 0  Decoded: 0  Sensors: 0");
     lv_obj_set_style_text_font(ctx->count_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(ctx->count_lbl, lv_color_make(140, 140, 140), 0);
-    lv_obj_align(ctx->count_lbl, LV_ALIGN_TOP_MID, 0, 94);
+    lv_obj_align(ctx->count_lbl, LV_ALIGN_TOP_MID, 0, 76);
     lv_obj_set_width(ctx->count_lbl, LCD_H_RES - 8);
     lv_label_set_long_mode(ctx->count_lbl, LV_LABEL_LONG_WRAP);
 
-    // ── Sensor list ───────────────────────────────────────────────────────────
-    // Note: sensors transmit every 60-90s at rest; more often when driving.
-    // [OK] = CRC verified; [?] = CRC mismatch (data may still be correct).
+    // ── Sensor grid ───────────────────────────────────────────────────────────
+    // White-background cards; bg colour updates per sensor state on each decode.
+    // [OK] = CRC verified; [?] = CRC mismatch.  Sensors transmit every 60-90s.
     for (int i = 0; i < TPMS_MAX_SENSORS; i++) {
-        ctx->sensor_lbl[i] = lv_label_create(function_page);
+        lv_obj_t *card = lv_obj_create(function_page);
+        lv_obj_set_size(card, LCD_H_RES - 8, 37);
+        lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 94 + i * 39);
+        lv_obj_set_style_bg_color(card, lv_color_hex(0x2A2A2A), LV_STATE_DEFAULT);
+        lv_obj_set_style_border_color(card, lv_color_hex(0x444444), LV_STATE_DEFAULT);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_radius(card, 4, 0);
+        lv_obj_set_style_pad_left(card, 5, 0);
+        lv_obj_set_style_pad_top(card, 3, 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+        ctx->sensor_lbl[i] = lv_label_create(card);
         lv_label_set_text(ctx->sensor_lbl[i], "--");
         lv_obj_set_style_text_font(ctx->sensor_lbl[i], &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(ctx->sensor_lbl[i], lv_color_make(80, 80, 80), 0);
-        lv_obj_align(ctx->sensor_lbl[i], LV_ALIGN_TOP_LEFT, 8, 114 + i * 30);
-        lv_obj_set_width(ctx->sensor_lbl[i], LCD_H_RES - 16);
+        lv_obj_set_style_text_color(ctx->sensor_lbl[i], lv_color_hex(0x555555), 0);
+        lv_obj_set_width(ctx->sensor_lbl[i], LCD_H_RES - 20);
         lv_label_set_long_mode(ctx->sensor_lbl[i], LV_LABEL_LONG_WRAP);
+        lv_obj_align(ctx->sensor_lbl[i], LV_ALIGN_TOP_LEFT, 0, 0);
     }
 
     ctx->tmr = lv_timer_create(s_tpms_ui_timer_cb, 500, NULL);
