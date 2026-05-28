@@ -51,6 +51,12 @@
       .steps { display:grid; gap:8px; margin:12px 0 0; padding:0; }
       .steps li { list-style:none; padding:10px 12px; border-radius:12px; line-height:1.5; }
       .badge { display:inline-block; padding:2px 10px; border-radius:999px; border:1px solid rgba(90,242,158,.4); background:rgba(90,242,158,.12); color:var(--ok); font-size:12px; }
+      .channel-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+      .channel-label { font-size:13px; font-weight:600; color:var(--muted); }
+      .channel-btn { min-height:32px; padding:6px 14px; border-radius:8px; font-size:13px; font-weight:600; color:var(--text); background:rgba(255,255,255,.04); box-shadow:inset 0 0 0 1px var(--border); }
+      .channel-btn.active { color:#0a0f1c; background:linear-gradient(135deg, var(--accent), #56a0ff); box-shadow:0 6px 18px rgba(64,240,255,.3); }
+      .dev-warn { padding:10px 12px; border-radius:12px; font-size:12.5px; line-height:1.45; border:1px solid rgba(255,165,0,.45); background:rgba(255,165,0,.07); color:#ffa040; }
+      .dev-warn strong { color:#ffc060; }
       .link-grid { display:grid; gap:10px; margin-top:12px; }
       .link-grid a { display:flex; justify-content:space-between; gap:12px; min-height:46px; padding:12px 14px; border-radius:12px; text-decoration:none; }
       .link-grid a span { color:var(--muted); font-size:13px; }
@@ -80,6 +86,12 @@
           <div class="card">
             <h2>Control</h2>
             <div class="controls">
+              <div class="channel-row">
+                <span class="channel-label">Channel</span>
+                <button class="channel-btn active" data-ch="stable">Stable</button>
+                <button class="channel-btn" data-ch="dev">Dev</button>
+              </div>
+              <div id="devWarning" class="dev-warn" style="display:none;"><strong>Development build</strong> &mdash; binaries fetched live from the <code>Jimgat_Dev</code> branch. May be unstable.</div>
               <div class="actions">
                 <button id="connectBtn">Connect</button>
                 <button id="flashBtn" class="ghost" disabled>Flash</button>
@@ -185,10 +197,14 @@
         monitorLog: document.getElementById("monitorLog"),
         monitorInput: document.getElementById("monitorInput"),
         monitorSendBtn: document.getElementById("monitorSendBtn"),
+        devWarning: document.getElementById("devWarning"),
       };
 
-      const state = { manifest:null, port:null, onDisconnect:null, transport:null, esploader:null, chip:null, connected:false, flashing:false, monitorPort:null, monitorReader:null, monitorWriter:null, monitorPipe:null, monitorDisconnect:null, monitorConnected:false };
-      const PAGE_VERSION = "1.1.0";
+      const state = { manifest:null, channel:"stable", port:null, onDisconnect:null, transport:null, esploader:null, chip:null, connected:false, flashing:false, monitorPort:null, monitorReader:null, monitorWriter:null, monitorPipe:null, monitorDisconnect:null, monitorConnected:false };
+      const PAGE_VERSION = "1.2.0";
+      const RAW_BASE = "https://raw.githubusercontent.com/JimGat/CYM-NM28C5/Jimgat_Dev/ESP32C5";
+      const DEV_MANIFEST_URL = `${RAW_BASE}/docs/manifest.json`;
+      const RAW_BIN = `${RAW_BASE}/binaries-esp32c5`;
       const CONNECT_TIMEOUT_MS = 20000;
       const CONNECT_RETRY_DELAY_MS = 500;
       const monitorEncoder = new TextEncoder();
@@ -242,19 +258,32 @@
       };
 
       const loadManifest = async () => {
-        const url = new URL("manifest.json", window.location.href).toString();
-        const res = await fetch(url, { cache: "no-store" });
-        if (!res.ok) throw new Error(`Manifest fetch failed: ${res.status} ${res.statusText}`);
-        state.manifest = normalizeManifest(await res.json());
+        let url, raw;
+        if (state.channel === "dev") {
+          url = DEV_MANIFEST_URL;
+          const res = await fetch(url, { cache: "no-store" });
+          if (!res.ok) throw new Error(`Dev manifest fetch failed: ${res.status} ${res.statusText}`);
+          raw = await res.json();
+          if (Array.isArray(raw?.parts)) {
+            raw.parts = raw.parts.map(p => ({ ...p, path: `${RAW_BIN}/${p.path.replace(/^.*[\\/]/, "")}` }));
+          }
+        } else {
+          url = new URL("manifest.json", window.location.href).toString();
+          const res = await fetch(url, { cache: "no-store" });
+          if (!res.ok) throw new Error(`Manifest fetch failed: ${res.status} ${res.statusText}`);
+          raw = await res.json();
+        }
+        state.manifest = normalizeManifest(raw);
         if (!state.manifest.parts.length) throw new Error("Manifest has no flash parts.");
         ui.manifest.style.display = "inline-flex";
         ui.manifest.textContent = `${state.manifest.parts.length} image(s)`;
-        ui.version.innerHTML = `<strong>Version</strong> ${state.manifest.version}`;
+        const chLabel = state.channel === "dev" ? " <span style=\"color:#ffa040;font-size:11px;\">(dev)</span>" : "";
+        ui.version.innerHTML = `<strong>Version</strong> ${state.manifest.version}${chLabel}`;
         ui.release.innerHTML = `<span class="badge">Manifest loaded</span> ${state.manifest.name} &mdash; ${state.manifest.version} &mdash; ${state.manifest.parts.length} file(s) &mdash; chip ${state.manifest.chipFamily}`;
-        ui.pageVersion.textContent = `Web flasher v${PAGE_VERSION} - build ${state.manifest.build}`;
+        ui.pageVersion.textContent = `Web flasher v${PAGE_VERSION} - build ${state.manifest.build}${state.channel === "dev" ? " (dev)" : ""}`;
         document.title = `${state.manifest.name} ${state.manifest.version}`;
         setStatus("Manifest loaded.");
-        log(`Manifest: ${url}`);
+        log(`Manifest [${state.channel}]: ${url}`);
       };
 
       const ensureSupport = () => {
@@ -452,6 +481,22 @@
         event.preventDefault();
         sendMonitor().catch((err) => { setMonitorStatus(err.message || "Send failed.", "error"); monitorLine(`Error: ${err?.message || err}`); });
       });
+
+      const switchChannel = (ch) => {
+        if (ch === state.channel) return;
+        state.channel = ch;
+        state.manifest = null;
+        document.querySelectorAll(".channel-btn").forEach(b => b.classList.toggle("active", b.dataset.ch === ch));
+        ui.devWarning.style.display = ch === "dev" ? "" : "none";
+        loadManifest().catch((err) => {
+          ui.release.textContent = "Manifest not available.";
+          ui.version.innerHTML = "<strong>Version</strong> unavailable";
+          ui.pageVersion.textContent = `Web flasher v${PAGE_VERSION} - manifest unavailable`;
+          setStatus(err.message || "Manifest load failed", "error");
+        });
+      };
+
+      document.querySelectorAll(".channel-btn").forEach(b => b.addEventListener("click", () => switchChannel(b.dataset.ch)));
 
       setRepoLink();
       loadManifest().catch((err) => {

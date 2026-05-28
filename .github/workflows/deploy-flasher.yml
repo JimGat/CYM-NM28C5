@@ -10,7 +10,7 @@ name: Deploy Web Flasher
 
 on:
   push:
-    branches: [main, master, Jimgat_Dev]
+    branches: [main, master]
     paths:
       - "ESP32C5/docs/index.html"
       - "ESP32C5/docs/manifest.json"
