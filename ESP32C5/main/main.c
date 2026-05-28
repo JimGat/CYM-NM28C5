@@ -1609,8 +1609,12 @@ EXT_RAM_BSS_ATTR static lv_timer_t *s_n24_jam_tmr = NULL;
 EXT_RAM_BSS_ATTR static TaskHandle_t s_n24_jam_task = NULL;
 
 // ── CC1101 TPMS Monitor ───────────────────────────────────────────────────────
-#define TPMS_MAX_SENSORS   5
+#define TPMS_MAX_SENSORS   20
 #define TPMS_PKT_LEN       8
+#define TPMS_CARD_H        32
+#define TPMS_CARD_GAP      2
+#define TPMS_SCROLL_Y      122
+#define TPMS_SCROLL_H      (LCD_V_RES - 34 - TPMS_SCROLL_Y)
 #define TPMS_SAVE_DIR      "/sdcard/lab/tpms"
 #define TPMS_SAVE_PATH_LEN 80
 
@@ -1642,7 +1646,9 @@ typedef struct {
     lv_obj_t        *start_btn;
     lv_obj_t        *status_lbl;
     lv_obj_t        *count_lbl;
+    lv_obj_t        *scroll_cont;               // scrollable sensor list container
     lv_obj_t        *sensor_lbl[TPMS_MAX_SENSORS];
+    volatile int     last_scroll_count;          // for auto-scroll-to-new
     lv_timer_t      *tmr;
     TaskHandle_t     task;
     FILE            *log_fp;
@@ -2249,6 +2255,7 @@ static void reset_function_page_children(void) {
         s_tpms->status_lbl = NULL; s_tpms->count_lbl = NULL;
         s_tpms->start_btn = NULL;
         s_tpms->freq_315_btn = NULL; s_tpms->freq_433_btn = NULL;
+        s_tpms->scroll_cont = NULL;
         for (int _i = 0; _i < TPMS_MAX_SENSORS; _i++) s_tpms->sensor_lbl[_i] = NULL;
         if (s_tpms->tmr) { lv_timer_del(s_tpms->tmr); s_tpms->tmr = NULL; }
         if (s_tpms->log_fp) { fclose(s_tpms->log_fp); s_tpms->log_fp = NULL; }
@@ -38370,6 +38377,14 @@ static void s_tpms_ui_timer_cb(lv_timer_t *t)
     for (int i = 0; i < ctx->sensor_count && i < TPMS_MAX_SENSORS; i++)
         s_tpms_update_label(ctx, i);
 
+    // Auto-scroll to reveal a newly-detected sensor
+    if (ctx->scroll_cont && ctx->sensor_count > ctx->last_scroll_count) {
+        ctx->last_scroll_count = ctx->sensor_count;
+        lv_coord_t card_stride = TPMS_CARD_H + TPMS_CARD_GAP;
+        lv_coord_t new_y = (ctx->sensor_count - 1) * card_stride;
+        lv_obj_scroll_to_y(ctx->scroll_cont, new_y, LV_ANIM_ON);
+    }
+
     if (!ctx->active && ctx->task == NULL && ctx->start_btn) {
         lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
         if (lbl) lv_label_set_text(lbl, "Start");
@@ -38483,8 +38498,18 @@ static void s_tpms_start_cb(lv_event_t *e)
     if (!ctx->active && !ctx->task) {
         ctx->active = true; ctx->cancel = false;
         ctx->pkt_total = 0; ctx->pkt_crc_fail = 0; ctx->pkt_valid = 0;
-        ctx->sensor_count = 0; ctx->last_rssi_dbm = 0;
+        ctx->sensor_count = 0; ctx->last_rssi_dbm = 0; ctx->last_scroll_count = 0;
         memset(ctx->sensors, 0, sizeof(ctx->sensors));
+        // Reset all cards to idle state and scroll back to top
+        for (int _i = 0; _i < TPMS_MAX_SENSORS; _i++) {
+            if (ctx->sensor_lbl[_i]) {
+                lv_label_set_text(ctx->sensor_lbl[_i], "--");
+                lv_obj_set_style_text_color(ctx->sensor_lbl[_i], lv_color_hex(0x555555), 0);
+                lv_obj_t *_card = lv_obj_get_parent(ctx->sensor_lbl[_i]);
+                if (_card) lv_obj_set_style_bg_color(_card, lv_color_hex(0x2A2A2A), LV_STATE_DEFAULT);
+            }
+        }
+        if (ctx->scroll_cont) lv_obj_scroll_to_y(ctx->scroll_cont, 0, LV_ANIM_OFF);
         if (ctx->start_btn) {
             lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
             if (lbl) lv_label_set_text(lbl, "Stop");
@@ -38612,20 +38637,34 @@ static void show_cc1101_tpms_screen(void)
     lv_obj_set_width(ctx->count_lbl, LCD_H_RES - 8);
     lv_label_set_long_mode(ctx->count_lbl, LV_LABEL_LONG_WRAP);
 
-    // ── Sensor grid ───────────────────────────────────────────────────────────
-    // White-background cards; bg colour updates per sensor state on each decode.
-    // [OK] = CRC verified; [?] = CRC mismatch.  Sensors transmit every 60-90s.
-    // Layout: 5 × 32px cards with 2px gap, starting at y=122. Bottom = 122+4*34+32=288.
+    // ── Scrollable sensor list ────────────────────────────────────────────────
+    // Up to TPMS_MAX_SENSORS (20) cards in a scrollable container.
+    // Visible window = TPMS_SCROLL_H (~164px, ~4 cards); swipe to see more.
+    // [OK] = CRC ok; [CRC?] = mismatch; amber = low pressure.
+    ctx->scroll_cont = lv_obj_create(function_page);
+    lv_obj_set_size(ctx->scroll_cont, LCD_H_RES, TPMS_SCROLL_H);
+    lv_obj_align(ctx->scroll_cont, LV_ALIGN_TOP_LEFT, 0, TPMS_SCROLL_Y);
+    lv_obj_set_style_bg_color(ctx->scroll_cont, lv_color_hex(0x121212), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(ctx->scroll_cont, 0, 0);
+    lv_obj_set_style_pad_all(ctx->scroll_cont, 0, 0);
+    lv_obj_set_style_pad_row(ctx->scroll_cont, TPMS_CARD_GAP, 0);
+    lv_obj_set_flex_flow(ctx->scroll_cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(ctx->scroll_cont, LV_FLEX_ALIGN_START,
+                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_scroll_dir(ctx->scroll_cont, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(ctx->scroll_cont, LV_SCROLLBAR_MODE_ACTIVE);
+
     for (int i = 0; i < TPMS_MAX_SENSORS; i++) {
-        lv_obj_t *card = lv_obj_create(function_page);
-        lv_obj_set_size(card, LCD_H_RES - 8, 32);
-        lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 122 + i * 34);
+        lv_obj_t *card = lv_obj_create(ctx->scroll_cont);
+        lv_obj_set_size(card, LCD_H_RES - 8, TPMS_CARD_H);
         lv_obj_set_style_bg_color(card, lv_color_hex(0x2A2A2A), LV_STATE_DEFAULT);
         lv_obj_set_style_border_color(card, lv_color_hex(0x444444), LV_STATE_DEFAULT);
         lv_obj_set_style_border_width(card, 1, 0);
         lv_obj_set_style_radius(card, 4, 0);
         lv_obj_set_style_pad_left(card, 5, 0);
         lv_obj_set_style_pad_top(card, 2, 0);
+        lv_obj_set_style_pad_right(card, 0, 0);
+        lv_obj_set_style_pad_bottom(card, 0, 0);
         lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
         ctx->sensor_lbl[i] = lv_label_create(card);
