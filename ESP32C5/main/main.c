@@ -40942,14 +40942,17 @@ static void s_rfid_read_done_lvgl_cb(void *arg)
 static void s_rfid_read_all_task(void *arg)
 {
     rfid_card_t *card = (rfid_card_t *)arg;
-    // Rescan to re-select the card (poll_stop cleared the target slot)
-    rfid_card_t tmp;
-    rfid_err_t r = rfid_manager_scan_card(&tmp, 2000);
-    if (r == RFID_OK) {
-        // Preserve existing UID/name; update protocol if refined by GET_VERSION
-        card->protocol = tmp.protocol;
-        if (!card->page_count) card->page_count = tmp.page_count;
-        r = rfid_manager_read_card_data(card);
+    // rfid_card_t is ~5.7 KB — allocate from PSRAM instead of stack to avoid overflow.
+    rfid_card_t *tmp = heap_caps_malloc(sizeof(rfid_card_t), MALLOC_CAP_SPIRAM);
+    rfid_err_t r = RFID_ERR_HW;
+    if (tmp) {
+        r = rfid_manager_scan_card(tmp, 2000);
+        if (r == RFID_OK) {
+            card->protocol = tmp->protocol;
+            if (!card->page_count) card->page_count = tmp->page_count;
+            r = rfid_manager_read_card_data(card);
+        }
+        free(tmp);
     }
     rfid_read_done_t *d = malloc(sizeof(rfid_read_done_t));
     if (d) { d->r = r; d->page_count = card->page_count; lv_async_call(s_rfid_read_done_lvgl_cb, d); }
@@ -40963,7 +40966,7 @@ static void s_rfid_read_all_cb(lv_event_t *e)
     rfid_manager_stop_poll();
     if (s_rfid_scan_status_lbl) lv_label_set_text(s_rfid_scan_status_lbl, "Hold card — reading...");
     if (s_rfid_scan_read_btn)   lv_obj_add_state(s_rfid_scan_read_btn, LV_STATE_DISABLED);
-    xTaskCreate(s_rfid_read_all_task, "rfid_read", 4096, s_rfid_last_card,
+    xTaskCreate(s_rfid_read_all_task, "rfid_read", 6144, s_rfid_last_card,
                 tskIDLE_PRIORITY + 2, NULL);
 }
 
@@ -41763,7 +41766,7 @@ static void s_rfid_clone_start_cb(lv_event_t *e)
     if (!ctx) return;
     ctx->src = s_rfid_last_card;
     ctx->skip_below = 4;  // skip OTP pages 0-3 on genuine NTAG; use 0 for Magic/CUID
-    xTaskCreate(s_rfid_clone_task, "rfid_clone", 4096, ctx, tskIDLE_PRIORITY + 2, NULL);
+    xTaskCreate(s_rfid_clone_task, "rfid_clone", 6144, ctx, tskIDLE_PRIORITY + 2, NULL);
 }
 
 static void s_rfid_clone_select_cb(lv_event_t *e)

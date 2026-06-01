@@ -308,16 +308,20 @@ rfid_err_t rfid_manager_clone_ntag(const rfid_card_t *src, uint8_t skip_below)
             return RFID_ERR_NOT_SUPPORTED;
     }
 
-    // Scan for the blank card in the field (5 s timeout)
-    rfid_card_t blank;
-    rfid_err_t r = pn532_scan_card(&blank, 5000);
+    // rfid_card_t is ~5.7 KB — allocate from PSRAM to avoid stack overflow in caller task.
+    rfid_card_t *blank = heap_caps_calloc(1, sizeof(rfid_card_t), MALLOC_CAP_SPIRAM);
+    if (!blank) return RFID_ERR_HW;
+
+    rfid_err_t r = pn532_scan_card(blank, 5000);
     if (r != RFID_OK) {
         ESP_LOGW(TAG, "clone: no blank card detected: %s", rfid_err_str(r));
+        free(blank);
         return r;
     }
 
     ESP_LOGI(TAG, "clone: blank card detected proto=%s, writing %u pages (skip<=%u)",
-             blank.protocol_str, src->page_count, skip_below);
+             blank->protocol_str, src->page_count, skip_below);
+    free(blank);
     return ntag_clone_to_blank(src, skip_below);
 }
 
