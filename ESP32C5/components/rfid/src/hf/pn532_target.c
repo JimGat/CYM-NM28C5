@@ -121,10 +121,19 @@ rfid_err_t pn532_emulate_card(const rfid_card_t *card,
                 s_ul_read_resp(card, rcmd[1], tresp, &tresp_len);
                 ESP_LOGD(TAG, "READ page %u", rcmd[1]);
             } else if (rcmd_len >= 1 && rcmd[0] == 0x60) {
-                // GET_VERSION — return a minimal NTAG213 version response
-                static const uint8_t ver[] = {0x00,0x04,0x04,0x02,0x01,0x00,0x0F,0x03};
-                memcpy(tresp, ver, sizeof(ver));
-                tresp_len = sizeof(ver);
+                // GET_VERSION — return protocol-specific NTAG version response
+                // Bytes: fixed_hdr(0x00), vendor(0x04=NXP), type(0x04=NTAG),
+                //        major(0x02), minor(0x01), 0x00, storage_size, proto(0x03)
+                uint8_t storage_size;
+                switch (card->protocol) {
+                    case RFID_PROTO_NTAG215: storage_size = 0x11; break;
+                    case RFID_PROTO_NTAG216: storage_size = 0x13; break;
+                    default:                 storage_size = 0x0F; break;  // NTAG213
+                }
+                tresp[0] = 0x00; tresp[1] = 0x04; tresp[2] = 0x04;
+                tresp[3] = 0x02; tresp[4] = 0x01; tresp[5] = 0x00;
+                tresp[6] = storage_size; tresp[7] = 0x03;
+                tresp_len = 8;
             } else {
                 // Unknown command — NAK
                 tresp[0] = 0x00;

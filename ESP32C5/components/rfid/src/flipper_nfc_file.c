@@ -147,13 +147,23 @@ rfid_err_t flipper_nfc_import(const char *path, rfid_card_t *card_out)
             unsigned int v;
             if (sscanf(line + 4, " %2x", &v) == 1)
                 card_out->sak = (uint8_t)v;
+        } else if (strncmp(line, "NTAG/Ultralight type:", 21) == 0) {
+            const char *t = line + 21;
+            while (*t == ' ') t++;
+            if (strstr(t, "NTAG216"))       card_out->protocol = RFID_PROTO_NTAG216;
+            else if (strstr(t, "NTAG215"))  card_out->protocol = RFID_PROTO_NTAG215;
+            else if (strstr(t, "NTAG213"))  card_out->protocol = RFID_PROTO_NTAG213;
+            else if (strstr(t, "Ultralight")) card_out->protocol = RFID_PROTO_MIFARE_ULTRALIGHT;
+            else                            card_out->protocol = RFID_PROTO_NTAG213;
         } else if (strncmp(line, "Device type:", 12) == 0) {
             const char *dt = line + 12;
             while (*dt == ' ') dt++;
             if (strstr(dt, "MIFARE Classic")) {
                 card_out->protocol = RFID_PROTO_MIFARE_CLASSIC_1K;
             } else if (strstr(dt, "NTAG") || strstr(dt, "Ultralight")) {
-                card_out->protocol = RFID_PROTO_NTAG213;
+                // Coarse default — overridden by "NTAG/Ultralight type:" line if present
+                if (card_out->protocol == RFID_PROTO_UNKNOWN)
+                    card_out->protocol = RFID_PROTO_NTAG213;
             }
         } else if (strncmp(line, "Mifare Classic type:", 20) == 0) {
             if (strstr(line + 20, "4K"))

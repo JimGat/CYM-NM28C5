@@ -69,6 +69,22 @@ rfid_err_t rfid_manager_test_mifare_keys(rfid_card_t *card,
                                           rfid_key_progress_cb_t progress_cb,
                                           void *ctx);
 
+// ── Generic card memory read ──────────────────────────────────────────────────
+// Read all memory for the detected card (blocks or pages depending on protocol).
+// For NTAG/Ultralight: calls GET_VERSION to refine protocol, then reads all pages.
+// For MIFARE Classic: reads all blocks using the default key dictionary.
+// card must already have uid/protocol populated by rfid_manager_scan_card().
+// Returns RFID_ERR_NOT_SUPPORTED for protocols without a read implementation.
+rfid_err_t rfid_manager_read_card_data(rfid_card_t *card);
+
+// ── NTAG clone ────────────────────────────────────────────────────────────────
+// Write src card pages [skip_below .. src->page_count) to a currently-selected
+// blank NTAG/UL card. Scans for a blank card first with a 5-second timeout.
+// skip_below=4 for genuine NTAG (skips OTP UID/lock pages 0-3).
+// skip_below=0 for Magic/CUID writable blanks (writes all pages).
+// Returns RFID_ERR_NOT_SUPPORTED if src is not an NTAG/UL protocol.
+rfid_err_t rfid_manager_clone_ntag(const rfid_card_t *src, uint8_t skip_below);
+
 // ── Card emulation ────────────────────────────────────────────────────────────
 // Starts a FreeRTOS task that puts the PN532 into target mode, presenting
 // card's UID/ATQA/SAK to any nearby reader. cb fires on status changes.
