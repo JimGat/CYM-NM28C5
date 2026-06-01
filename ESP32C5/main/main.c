@@ -12982,7 +12982,7 @@ static void home_btn_event_cb(lv_event_t *e)
 static lv_obj_t *create_tile(lv_obj_t *parent, const char *icon, const char *text, lv_color_t accent, lv_event_cb_t callback, const char *user_data)
 {
     lv_obj_t *tile = lv_btn_create(parent);
-    lv_obj_set_size(tile, 70, 87);
+    lv_obj_set_size(tile, 70, 74);
     lv_obj_set_style_bg_color(tile, ui_card_color(), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(tile, ui_card_pressed_color(), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(tile, 1, 0);
@@ -16136,10 +16136,10 @@ static void show_wifi_menu_screen(void)
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
-    lv_obj_set_style_pad_all(tiles, 5, 0);
-    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_style_pad_all(tiles, 4, 0);
+    lv_obj_set_style_pad_gap(tiles, 4, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
     lv_obj_t *scan_tile = create_tile(tiles, LV_SYMBOL_WIFI,       "Scan &\nAttack",   UI_ACCENT_BLUE,   main_tile_event_cb, "WiFi Scan & Attack");
     (void)scan_tile;
@@ -22226,8 +22226,8 @@ static void show_sd_card_screen(void)
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
-    lv_obj_set_style_pad_all(tiles, 10, 0);
-    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_style_pad_all(tiles, 4, 0);
+    lv_obj_set_style_pad_gap(tiles, 4, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
@@ -37456,13 +37456,13 @@ static void s_cc1101_stub_screen(const char *title_text, const char *detail)
 
 // ── Paged tile menu ───────────────────────────────────────────────────────────
 
-#define CC1101_NUM_PAGES  3
+#define CC1101_NUM_PAGES  2
 
 static int        s_cc1101_page = 0;
 static lv_obj_t  *s_cc1101_pages[CC1101_NUM_PAGES] = {NULL};
 static lv_obj_t  *s_cc1101_page_lbl = NULL;
 
-static const char *s_cc1101_page_strs[CC1101_NUM_PAGES] = { "1/3", "2/3", "3/3" };
+static const char *s_cc1101_page_strs[CC1101_NUM_PAGES] = { "1/2", "2/2" };
 
 static void s_cc1101_page_prev_cb(lv_event_t *e)
 {
@@ -37487,7 +37487,7 @@ static void s_cc1101_page_next_cb(lv_event_t *e)
 static lv_obj_t *s_cc1101_make_page(lv_obj_t *parent)
 {
     lv_obj_t *pg = lv_obj_create(parent);
-    lv_obj_set_size(pg, LCD_H_RES, 182);   // 2 rows × 87 + 4 gap + 4 pad
+    lv_obj_set_size(pg, LCD_H_RES, 238);   // 3 rows × 74 + 2×4 gap + 2×4 pad
     lv_obj_align(pg, LV_ALIGN_TOP_MID, 0, 0);
     lv_obj_set_style_bg_opa(pg, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(pg, 0, 0);
@@ -37564,9 +37564,9 @@ static void show_cc1101_screen(void)
     create_function_page_base("CC1101 Sub-GHz");
     apply_menu_bg();
 
-    // Tile container (holds all 3 pages, only one visible at a time)
+    // Tile container (holds all pages, only one visible at a time)
     lv_obj_t *tc = lv_obj_create(function_page);
-    lv_obj_set_size(tc, LCD_H_RES, 190);
+    lv_obj_set_size(tc, LCD_H_RES, 244);
     lv_obj_align(tc, LV_ALIGN_TOP_MID, 0, 30);
     lv_obj_set_style_bg_opa(tc, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tc, 0, 0);
@@ -37579,30 +37579,27 @@ static void show_cc1101_screen(void)
         if (i > 0) lv_obj_add_flag(s_cc1101_pages[i], LV_OBJ_FLAG_HIDDEN);
     }
 
-    // Page 1: Capture & Analysis
+    // Page 1: Tools & Decoders (9 tiles)
     lv_obj_t *p1 = s_cc1101_pages[0];
-    create_tile(p1, LV_SYMBOL_SETTINGS,     "HW\nTest",    lv_color_hex(0x37474F), s_cc1101_tile_cb, "HW Test");
-    create_tile(p1, MY_SYMBOL_SATELLITE,   "Band\nScope",  lv_color_hex(0x006064), s_cc1101_tile_cb, "BndScope");
-    create_tile(p1, LV_SYMBOL_EYE_OPEN,    "Capture\nRAW",lv_color_hex(0x1B5E20), s_cc1101_tile_cb, "Capture");
-    create_tile(p1, LV_SYMBOL_PLAY,        "Replay\nRAW", lv_color_hex(0x1A237E), s_cc1101_tile_cb, "Replay");
-    create_tile(p1, LV_SYMBOL_SAVE,        "Saved\nFiles",lv_color_hex(0x4A148C), s_cc1101_tile_cb, "Saved");
-    create_tile(p1, MY_SYMBOL_SITEMAP,     "Z-Wave\nScout",lv_color_hex(0x1565C0),s_cc1101_tile_cb, "ZWave");
+    create_tile(p1, LV_SYMBOL_SETTINGS,      "HW\nTest",     lv_color_hex(0x37474F), s_cc1101_tile_cb, "HW Test");
+    create_tile(p1, MY_SYMBOL_SATELLITE,     "Band\nScope",  lv_color_hex(0x006064), s_cc1101_tile_cb, "BndScope");
+    create_tile(p1, MY_SYMBOL_SATELLITE,     "Freq\nScan",   lv_color_hex(0x00796B), s_cc1101_tile_cb, "Freq Scan");
+    create_tile(p1, LV_SYMBOL_EYE_OPEN,     "Capture\nRAW", lv_color_hex(0x1B5E20), s_cc1101_tile_cb, "Capture");
+    create_tile(p1, LV_SYMBOL_PLAY,         "Replay\nRAW",  lv_color_hex(0x1A237E), s_cc1101_tile_cb, "Replay");
+    create_tile(p1, LV_SYMBOL_SAVE,         "Saved\nFiles", lv_color_hex(0x4A148C), s_cc1101_tile_cb, "Saved");
+    create_tile(p1, MY_SYMBOL_SITEMAP,      "Z-Wave\nScout",lv_color_hex(0x1565C0), s_cc1101_tile_cb, "ZWave");
+    create_tile(p1, MY_SYMBOL_CAR,          "TPMS\nTires",  lv_color_hex(0x00695C), s_cc1101_tile_cb, "TPMS");
+    create_tile(p1, MY_SYMBOL_SATELLITE_DISH,"Weather\nStn",lv_color_hex(0x006064), s_cc1101_tile_cb, "Weather");
 
-    // Page 2: Protocol Decoders
+    // Page 2: Decoders & Attacks (7 tiles)
     lv_obj_t *p2 = s_cc1101_pages[1];
-    create_tile(p2, MY_SYMBOL_CAR,          "TPMS\nTires",  lv_color_hex(0x1565C0), s_cc1101_tile_cb, "TPMS");
-    create_tile(p2, MY_SYMBOL_SATELLITE_DISH,"Weather\nStn",lv_color_hex(0x00695C), s_cc1101_tile_cb, "Weather");
-    create_tile(p2, MY_SYMBOL_TOWER,        "POCSAG\nPager",lv_color_hex(0x4527A0), s_cc1101_tile_cb, "POCSAG");
-    create_tile(p2, LV_SYMBOL_WARNING,     "Alarm\nSensor",lv_color_hex(0xB71C1C), s_cc1101_tile_cb, "Alarm");
-    create_tile(p2, MY_SYMBOL_CAR,         "RF\nWardrive", lv_color_hex(0x827717), s_cc1101_tile_cb, "Wardrive");
-    create_tile(p2, MY_SYMBOL_PERSON_WALKING,"Prox\nTrack",lv_color_hex(0x880E4F), s_cc1101_tile_cb, "Proximity");
-
-    // Page 3: Attacks (disclaimer displayed when entered)
-    lv_obj_t *p3 = s_cc1101_pages[2];
-    create_tile(p3, MY_SYMBOL_SKULL_CROSS,  "Jammer",      UI_ACCENT_RED,          s_cc1101_tile_cb, "Jammer");
-    create_tile(p3, LV_SYMBOL_SHUFFLE,     "Brute\nForce", lv_color_hex(0xE65100), s_cc1101_tile_cb, "Brute");
-    create_tile(p3, MY_SYMBOL_SATELLITE,   "Freq\nScan",   lv_color_hex(0x006064), s_cc1101_tile_cb, "Freq Scan");
-    create_tile(p3, LV_SYMBOL_LIST,        "Decode\nProto",lv_color_hex(0x0D47A1), s_cc1101_tile_cb, "Decode");
+    create_tile(p2, MY_SYMBOL_TOWER,         "POCSAG\nPager",lv_color_hex(0x4527A0), s_cc1101_tile_cb, "POCSAG");
+    create_tile(p2, LV_SYMBOL_WARNING,       "Alarm\nSensor",lv_color_hex(0xB71C1C), s_cc1101_tile_cb, "Alarm");
+    create_tile(p2, MY_SYMBOL_CAR,           "RF\nWardrive", lv_color_hex(0x827717), s_cc1101_tile_cb, "Wardrive");
+    create_tile(p2, MY_SYMBOL_PERSON_WALKING,"Prox\nTrack",  lv_color_hex(0x880E4F), s_cc1101_tile_cb, "Proximity");
+    create_tile(p2, LV_SYMBOL_LIST,          "Decode\nProto",lv_color_hex(0x0D47A1), s_cc1101_tile_cb, "Decode");
+    create_tile(p2, MY_SYMBOL_SKULL_CROSS,   "Jammer",       UI_ACCENT_RED,          s_cc1101_tile_cb, "Jammer");
+    create_tile(p2, LV_SYMBOL_SHUFFLE,       "Brute\nForce", lv_color_hex(0xE65100), s_cc1101_tile_cb, "Brute");
 
     // Navigation bar: [<] [1/3] [>] | [Back]
     lv_obj_t *nav = lv_obj_create(function_page);
@@ -37645,7 +37642,7 @@ static void show_cc1101_screen(void)
 
     // Page indicator
     s_cc1101_page_lbl = lv_label_create(nav);
-    lv_label_set_text(s_cc1101_page_lbl, "1/3");
+    lv_label_set_text(s_cc1101_page_lbl, "1/2");
     lv_obj_set_style_text_font(s_cc1101_page_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_cc1101_page_lbl, lv_color_hex(0x66BB6A), 0);
 
