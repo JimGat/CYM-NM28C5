@@ -126,6 +126,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **NM-RF-HAT** | Hardware addon board for RF expansion -- IR capture/replay/Universal Remote/TV-B-Gone (Flipper .ir); RF433 OOK capture/replay/Fox Hunt (Flipper .sub); CC1101 Sub-GHz: Band Scope (SDR freq marker + Hunt), Fox Hunt (RSSI bug-hunter haptic, 300-928 MHz tunable), RAW Capture+Replay, Z-Wave Scout, TPMS 315+433 MHz (Flipper .sub); nRF24L01+ 2.4 GHz: Ch Scan/Sniffer/Jammer/Futaba S-FHSS/Fox Hunt (Flipper .nrf24); PN532 NFC/RFID: scan+Read All, NTAG213/215/216 full page dump, Clone/Write to blank NTAG, MIFARE Classic key-dict test, save/emulate/.nfc import+export (Flipper .nfc); DIP switch per module |
 | **Fox Hunt** | Ham radio-style RF proximity tracker on all three sub-GHz radios. CC1101: tunable 300-928 MHz, RSSI bar + peak hold, adjustable squelch, bug-hunter haptic (pulse rate proportional to RSSI above squelch — from 2 s/pulse at threshold to continuous at 38 dB above). nRF24: carrier-detect rate bar across 2400-2525 MHz in 1 MHz steps. RF433: GPIO edge-count activity bar at 433.92 MHz. All three use the vibrator for proximity feedback. Band Scope → Fox Hunt tap-through with SDR-style draggable yellow frequency marker. |
 | **SD Card Remount** | Settings → SD Card → Remount SD Card: unmounts and re-mounts at 20/10/5 MHz fallback without physical eject — useful after a crash or RF-HAT FPC contact issue. |
+| **CC1101 Crystal Cal** | CC1101 HW Test → Crystal Calibration. Consumer 26 MHz crystals drift ±8.7-17 kHz at 433 MHz (±20-40 ppm). CAL TX 433 button transmits a continuous OOK carrier for measurement on a service monitor. Set Offset popup accepts ±20.000 kHz correction. All CC1101 frequency calls transparently apply the offset. Persists to NVS. |
 | **UI** | Material dark theme, touch gestures, screen dimming, screenshots — all screens portrait 240×320 |
 | **Storage** | SD card for handshakes, wardrive logs, GATT Walker JSON, screenshots, file tree browser |
 
@@ -202,7 +203,7 @@ Home
 ├── Radio [RF-HAT]
 │   ├── CC1101 Sub-GHz [DIP 1]  — 2 pages
 │   │   ├── Page 1
-│   │   │   ├── HW Test
+│   │   │   ├── HW Test  (crystal calibration offset + CAL TX 433 carrier)
 │   │   │   ├── Band Scope (SDR freq marker + Hunt button)
 │   │   │   ├── Fox Hunt (300-928 MHz tunable, haptic)
 │   │   │   ├── Capture RAW
@@ -1978,7 +1979,7 @@ Sub-1 GHz (300-928 MHz) OOK/ASK capture, replay, spectrum scan, and jamming. Use
 **SD card path:** `/sdcard/lab/radio/` -- Flipper Zero `.sub` format
 
 **Features:**
-- **HW Test:** reads CC1101 PARTNUM (0x00) and VERSION (0x14) registers; shows MARCSTATE to confirm chip identity and SPI link.
+- **HW Test:** reads CC1101 PARTNUM (0x00) and VERSION (0x14) registers; shows MARCSTATE to confirm chip identity and SPI link. Also exposes **crystal calibration** (see below).
 - **Freq Scan:** canvas-based spectrum view; RSSI bar per channel across the full 300-928 MHz tunable range; carrier detect; Start/Stop control.
 - **RAW Capture:** 10-second OOK/ASK signal capture window; Save/Discard prompt after capture; saves to `/sdcard/lab/radio/` as Flipper Zero `.sub` format.
 - **RAW Replay:** lists `.sub` files from SD; play at 1x/3x/5x speed.
@@ -1988,6 +1989,50 @@ Sub-1 GHz (300-928 MHz) OOK/ASK capture, replay, spectrum scan, and jamming. Use
 - **Fox Hunt:** ham radio-style proximity tracker tunable across 300-928 MHz. Four preset buttons (315 / 433 / 868 / 915 MHz) plus ±0.1/±1 MHz fine-tune buttons. RSSI bar with peak hold (tap Clear Peak to reset). Adjustable squelch (±5 dBm per tap). Haptic feedback in bug-hunter style: slow pulses (1 every 2 s) just above squelch, racing pulses (10/s) at strong signals — vibration intensity also scales with RSSI. Status label: `-- SILENT / > WEAK / >> MEDIUM / >>> STRONG - CLOSE!`
 - **Z-Wave Scout:** passive wardrive on the Z-Wave frequency (908.42 MHz US / 868.42 MHz EU). Configures CC1101 for GFSK 9.6 kbps, sync word `0xAA01`. Logs frame metadata (node IDs, command class, RSSI, GPS coordinates) to `/sdcard/lab/zwave/` as a timestamped CSV. GPS-tagged entries are compatible with WiGLE for mapping Z-Wave device density.
 - **TPMS Monitor:** receives Tire Pressure Monitoring System transmissions at 315 MHz (US) or 433.92 MHz (EU). Decodes Schrader-family OOK packets — identifies each sensor by its unique 32-bit ID, displays pressure in PSI and kPa, temperature in °C, battery-low and alarm flags, and RSSI. Tracks up to **20 unique sensors** in a scrollable grid. Logs all valid packets to `/sdcard/lab/tpms/` as a timestamped CSV.
+
+##### CC1101 Crystal Frequency Calibration
+
+<a name="cc1101-calibration"></a>
+
+Consumer-grade CC1101 modules use a 26 MHz crystal with ±20-40 ppm tolerance. At common ISM frequencies this produces the following absolute error:
+
+| Frequency | ±20 ppm | ±40 ppm |
+|-----------|---------|---------|
+| 315 MHz   | ±6.3 kHz | ±12.6 kHz |
+| 433 MHz   | ±8.7 kHz | ±17.3 kHz |
+| 868 MHz   | ±17.4 kHz | ±34.7 kHz |
+| 915 MHz   | ±18.3 kHz | ±36.6 kHz |
+
+For most applications (TPMS decoding, wardrive scanning, general capture) this is acceptable — the CC1101's wide receive filter accommodates the drift. For precise frequency measurement, jamming experiments, or calibrated fox hunting, apply the crystal offset.
+
+**Calibration workflow (HW Test → Crystal Calibration section):**
+
+1. Fit DIP 1 (CC1101) ON and open **CC1101 → HW Test**.
+2. In the Crystal Calibration panel at the bottom:
+   - The current offset is shown in kHz and Hz. Orange = non-zero correction active.
+3. Tap **CAL TX 433** — the CC1101 transmits a continuous OOK carrier at 433.920 MHz (adjusted by current offset). Button turns red while active.
+4. On a calibrated service monitor, spectrum analyzer, or known-good SDR:
+   - Note the actual measured frequency.
+   - Compute error: `error = measured_freq − 433.920 MHz` (in kHz).
+5. Tap **Set Offset** — enter the negative of the error:
+   - Chip measured at 433.933 MHz (+13 kHz high) → enter **-13.000**
+   - Chip measured at 433.908 MHz (-12 kHz low) → enter **+12.000**
+6. Tap **Save** — the offset is stored in NVS and applied immediately to the CAL TX.
+7. Verify on the monitor: the measured frequency should now read 433.920 MHz.
+
+**How the offset works:**
+
+All `cc1101_set_freq_mhz()` calls in the firmware are routed through `cc1101_freq_cal()`:
+```
+hardware_freq = desired_freq + offset_hz / 1,000,000
+```
+- If offset = −13000 Hz (−13.0 kHz): all frequencies are programmed 13 kHz LOW
+- The crystal's +13 kHz error then brings the actual output back to the intended value
+- Range: ±20.000 kHz (resolves to 1 Hz steps internally; stored as int32 in NVS)
+
+The correction applies to every screen: Fox Hunt tuning, TPMS preset frequencies, Capture/Replay, Band Scope center presets, Z-Wave Scout, and the CAL TX itself.
+
+> **Note:** The FSCTRL0 hardware register also provides frequency offset correction (±202 kHz range, ~1.59 kHz per step). This firmware uses software correction via `cc1101_freq_cal()` instead, giving finer resolution (1 Hz steps) and making the offset visible in the displayed frequency values rather than hidden in hardware registers.
 
 ##### Z-Wave Scout
 

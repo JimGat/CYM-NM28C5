@@ -374,6 +374,8 @@ Key features added since the previous HERMES version:
 | v2.4.26 | All tile-based menus standardized: pad=4, gap=4, CENTER align, SCROLLABLE cleared |
 | v2.4.27 | **Fox Hunt** — CC1101 (tunable 300-928 MHz, RSSI+squelch, bug-hunter haptic, preset+fine-tune buttons); nRF24 (carrier-detect rate, channel ±1/±10); RF433 (GPIO9 edge count, ISR-based); Band Scope SDR freq marker (yellow line at center freq, drag to move, Hunt button in row with Start/Stop); CC1101/nRF24/RF433 menus updated with Fox Hunt tile |
 | v2.4.28 | Fix: Unicode status chars (●▲★) → ASCII (--/>>/>>>); Band Scope line restricted to spectrum section only (no waterfall ghosting); hunt_btn always visible in action row; marker initialized at center freq on open |
+| v2.4.29 | Fix: CC1101 Fox Hunt stuck at -98 dBm after Band Scope→Hunt (band scope task race with apply_preset); deferred CC1101 setup to first timer tick; Hunt button block char → plain text |
+| v2.4.30 | **CC1101 Crystal Calibration**: g_cc1101_freq_offset_hz (int32 Hz, ±20000, NVS key "cc1101_off"); cc1101_freq_cal() wrapper applied to all cc1101_set_freq_mhz() calls in main.c; HW Test screen Crystal Calibration panel with [Set Offset] numeric kHz popup + [CAL TX 433] continuous OOK carrier (PKTCTRL0=0x02 infinite, FIFO filled with 0xFF, 50ms refill timer) |
 
 **Architecture notes for new features:**
 - **Fox Hunt timers** are static file-scope (`s_fox_tmr`, `s_n24fox_tmr`, `s_rf433_fox_tmr`). They are cleaned up at the TOP of `show_cc1101_screen()`, `show_nrf24_screen()`, and `show_rf433_menu_screen()` respectively — not in `reset_function_page_children()`.
