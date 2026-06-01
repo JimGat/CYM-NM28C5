@@ -1534,9 +1534,13 @@ typedef struct {
     lv_obj_t      *canvas;
     lv_obj_t      *status_lbl;
     lv_obj_t      *start_btn;
+    lv_obj_t      *hunt_btn;       // "Hunt this freq" button, shown on canvas tap
     lv_timer_t    *tmr;
     TaskHandle_t   task;
     uint64_t       tap_expire_us;
+    float          tap_freq_mhz;   // frequency marker (SDR-style draggable indicator)
+    int            canvas_h;       // stored for line-drawing in timer callback
+    bool           marker_set;     // true once user has placed the marker
 } cc1101_bs_ctx_t;
 static cc1101_bs_ctx_t *s_bs = NULL;  // 4 bytes DRAM; struct + canvas in PSRAM
 
@@ -1607,6 +1611,30 @@ EXT_RAM_BSS_ATTR static bool      s_n24_jam_active = false;
 EXT_RAM_BSS_ATTR static lv_obj_t *s_n24_jam_status = NULL;
 EXT_RAM_BSS_ATTR static lv_timer_t *s_n24_jam_tmr = NULL;
 EXT_RAM_BSS_ATTR static TaskHandle_t s_n24_jam_task = NULL;
+
+// ── nRF24 Fox Hunt state (declared early — cleanup in show_nrf24_screen) ──────
+static lv_obj_t   *s_n24fox_bar    = NULL;
+static lv_obj_t   *s_n24fox_lbl    = NULL;
+static lv_obj_t   *s_n24fox_ch_lbl = NULL;
+static lv_obj_t   *s_n24fox_hbtn   = NULL;
+static lv_obj_t   *s_n24fox_status = NULL;
+static lv_timer_t *s_n24fox_tmr    = NULL;
+static uint8_t    s_n24fox_channel  = 76;
+static bool       s_n24fox_haptic   = true;
+static int        s_n24fox_hits     = 0;
+static int        s_n24fox_samples  = 0;
+#define N24FOX_WINDOW  20
+
+// ── RF433 Fox Hunt state (declared very early — cleanup in show_rf433_menu_screen) ──
+static volatile int  s_rf433_fox_edges         = 0;
+static lv_obj_t     *s_rf433_fox_bar           = NULL;
+static lv_obj_t     *s_rf433_fox_lbl           = NULL;
+static lv_obj_t     *s_rf433_fox_hbtn          = NULL;
+static lv_obj_t     *s_rf433_fox_status        = NULL;
+static lv_timer_t   *s_rf433_fox_tmr           = NULL;
+static bool          s_rf433_fox_haptic        = true;
+static int           s_rf433_fox_rate          = 0;
+static bool          s_rf433_fox_isr_installed = false;
 
 // ── CC1101 TPMS Monitor ───────────────────────────────────────────────────────
 #define TPMS_MAX_SENSORS   20
@@ -2068,7 +2096,9 @@ static void show_cc1101_weather_screen(void);
 static void show_cc1101_pocsag_screen(void);
 static void show_cc1101_alarm_screen(void);
 static void show_cc1101_wardrive_screen(void);
-static void show_cc1101_proximity_screen(void);
+static void show_cc1101_foxhunt_screen(void);
+static void show_nrf24_foxhunt_screen(void);
+static void show_rf433_foxhunt_screen(void);
 static void show_cc1101_bruteforce_screen(void);
 static void show_cc1101_bandscope_screen(void);
 static void show_cc1101_zwave_screen(void);
@@ -37267,10 +37297,23 @@ static void rf433_menu_tile_cb(lv_event_t *e)
         show_rf433_jammer_screen();
     else if (strcmp(name, "LBK Test") == 0)
         show_rf433_loopback_screen();
+    else if (strcmp(name, "FoxHunt") == 0)
+        show_rf433_foxhunt_screen();
 }
 
 static void show_rf433_menu_screen(void)
 {
+    // RF433 Fox Hunt cleanup
+    if (s_rf433_fox_tmr) { lv_timer_del(s_rf433_fox_tmr); s_rf433_fox_tmr = NULL; }
+    if (s_rf433_fox_isr_installed) {
+        gpio_isr_handler_remove(RF_HAT_RF433_RX_GPIO);
+        s_rf433_fox_isr_installed = false;
+    }
+    vibrator_off();
+    s_rf433_fox_bar = NULL; s_rf433_fox_lbl = NULL;
+    s_rf433_fox_hbtn = NULL; s_rf433_fox_status = NULL;
+    s_rf433_fox_edges = 0;
+
     create_function_page_base("RF433 OOK");
     apply_menu_bg();
 
@@ -37289,6 +37332,7 @@ static void show_rf433_menu_screen(void)
     create_tile(tiles, LV_SYMBOL_PLAY,    "Replay",   lv_color_hex(0x5D4037), rf433_menu_tile_cb, "Replay");
     create_tile(tiles, LV_SYMBOL_WARNING, "Jammer",   lv_color_hex(0xB71C1C), rf433_menu_tile_cb, "Jammer");
     create_tile(tiles, LV_SYMBOL_LOOP,    "LBK Test", lv_color_hex(0x00695C), rf433_menu_tile_cb, "LBK Test");
+    create_tile(tiles, MY_SYMBOL_PERSON_WALKING, "Fox\nHunt", lv_color_hex(0xE65100), rf433_menu_tile_cb, "FoxHunt");
 
     rfhat_add_back_btn("Radio", show_radio_menu_screen_from_rf433);
 }
@@ -37348,6 +37392,22 @@ static float s_cc1101_freq_mhz = 433.92f;
 static lv_obj_t *s_cc1101_rssi_bar   = NULL;
 static lv_obj_t *s_cc1101_rssi_lbl   = NULL;
 static lv_timer_t *s_cc1101_tmr      = NULL;
+
+// ── Fox Hunt shared state (declared early — cleanup referenced by show_cc1101_screen) ──
+static lv_obj_t  *s_fox_rssi_bar     = NULL;
+static lv_obj_t  *s_fox_rssi_lbl     = NULL;
+static lv_obj_t  *s_fox_peak_lbl     = NULL;
+static lv_obj_t  *s_fox_freq_lbl     = NULL;
+static lv_obj_t  *s_fox_squelch_lbl  = NULL;
+static lv_obj_t  *s_fox_haptic_btn   = NULL;
+static lv_obj_t  *s_fox_status_lbl   = NULL;
+static lv_timer_t *s_fox_tmr         = NULL;
+static int8_t    s_fox_squelch_dbm   = -90;
+static int8_t    s_fox_peak_dbm      = -120;
+static bool      s_fox_haptic_on     = true;
+static int       s_fox_haptic_ctr    = 0;
+static uint8_t   s_fox_saved_vib_pct = 100;
+
 
 // HW test screen labels (nulled on leaving)
 static lv_obj_t *s_cc1101_ht_status = NULL;
@@ -37514,6 +37574,7 @@ static void s_cc1101_tile_cb(lv_event_t *e)
     if (!name) return;
     if      (strcmp(name, "HW Test")   == 0) show_cc1101_hw_test_screen();
     else if (strcmp(name, "Freq Scan") == 0) show_cc1101_freq_scan_screen();
+    else if (strcmp(name, "FoxHunt")  == 0) show_cc1101_foxhunt_screen();
     else if (strcmp(name, "Capture")   == 0) show_cc1101_capture_screen();
     else if (strcmp(name, "Replay")    == 0) show_cc1101_replay_screen();
     else if (strcmp(name, "Saved")     == 0) show_cc1101_saved_screen();
@@ -37525,7 +37586,6 @@ static void s_cc1101_tile_cb(lv_event_t *e)
     else if (strcmp(name, "POCSAG")    == 0) show_cc1101_pocsag_screen();
     else if (strcmp(name, "Alarm")     == 0) show_cc1101_alarm_screen();
     else if (strcmp(name, "Wardrive")  == 0) show_cc1101_wardrive_screen();
-    else if (strcmp(name, "Proximity") == 0) show_cc1101_proximity_screen();
     else if (strcmp(name, "BndScope")  == 0) show_cc1101_bandscope_screen();
     else if (strcmp(name, "ZWave")     == 0) show_cc1101_zwave_screen();
 }
@@ -37540,6 +37600,13 @@ static void show_cc1101_screen(void)
     if (s_cc1101_cap_task) cc1101_capture_cancel();
     if (s_cc1101_rep_task) cc1101_replay_cancel();
     if (s_cc1101_sub_paths) { free(s_cc1101_sub_paths); s_cc1101_sub_paths = NULL; }
+    // Fox hunt cleanup
+    if (s_fox_tmr) { lv_timer_del(s_fox_tmr); s_fox_tmr = NULL; }
+    vibrator_off();
+    g_vibtest_strength_pct = s_fox_saved_vib_pct;
+    s_fox_rssi_bar = NULL; s_fox_rssi_lbl = NULL; s_fox_peak_lbl = NULL;
+    s_fox_freq_lbl = NULL; s_fox_squelch_lbl = NULL; s_fox_haptic_btn = NULL;
+    s_fox_status_lbl = NULL;
     if (s_bs) {
         s_bs->active = false; s_bs->cancel = true;
         s_bs->canvas = NULL; s_bs->status_lbl = NULL; s_bs->start_btn = NULL;
@@ -37592,7 +37659,7 @@ static void show_cc1101_screen(void)
     lv_obj_t *p1 = s_cc1101_pages[0];
     create_tile(p1, LV_SYMBOL_SETTINGS,      "HW\nTest",     lv_color_hex(0x37474F), s_cc1101_tile_cb, "HW Test");
     create_tile(p1, MY_SYMBOL_SATELLITE,     "Band\nScope",  lv_color_hex(0x006064), s_cc1101_tile_cb, "BndScope");
-    create_tile(p1, MY_SYMBOL_SATELLITE,     "Freq\nScan",   lv_color_hex(0x00796B), s_cc1101_tile_cb, "Freq Scan");
+    create_tile(p1, MY_SYMBOL_PERSON_WALKING,"Fox\nHunt",    lv_color_hex(0xE65100), s_cc1101_tile_cb, "FoxHunt");
     create_tile(p1, LV_SYMBOL_EYE_OPEN,     "Capture\nRAW", lv_color_hex(0x1B5E20), s_cc1101_tile_cb, "Capture");
     create_tile(p1, LV_SYMBOL_PLAY,         "Replay\nRAW",  lv_color_hex(0x1A237E), s_cc1101_tile_cb, "Replay");
     create_tile(p1, LV_SYMBOL_SAVE,         "Saved\nFiles", lv_color_hex(0x4A148C), s_cc1101_tile_cb, "Saved");
@@ -37605,7 +37672,6 @@ static void show_cc1101_screen(void)
     create_tile(p2, MY_SYMBOL_TOWER,         "POCSAG\nPager",lv_color_hex(0x4527A0), s_cc1101_tile_cb, "POCSAG");
     create_tile(p2, LV_SYMBOL_WARNING,       "Alarm\nSensor",lv_color_hex(0xB71C1C), s_cc1101_tile_cb, "Alarm");
     create_tile(p2, MY_SYMBOL_CAR,           "RF\nWardrive", lv_color_hex(0x827717), s_cc1101_tile_cb, "Wardrive");
-    create_tile(p2, MY_SYMBOL_PERSON_WALKING,"Prox\nTrack",  lv_color_hex(0x880E4F), s_cc1101_tile_cb, "Proximity");
     create_tile(p2, LV_SYMBOL_LIST,          "Decode\nProto",lv_color_hex(0x0D47A1), s_cc1101_tile_cb, "Decode");
     create_tile(p2, MY_SYMBOL_SKULL_CROSS,   "Jammer",       UI_ACCENT_RED,          s_cc1101_tile_cb, "Jammer");
     create_tile(p2, LV_SYMBOL_SHUFFLE,       "Brute\nForce", lv_color_hex(0xE65100), s_cc1101_tile_cb, "Brute");
@@ -38861,14 +38927,371 @@ static void show_cc1101_wardrive_screen(void)
         "Coming in next version.");
 }
 
-// ── Signal Proximity Tracker ──────────────────────────────────────────────────
+// ── Fox Hunt (CC1101 RSSI-based signal tracker with haptic feedback) ──────────
 
-static void show_cc1101_proximity_screen(void)
+static void s_fox_timer_cb(lv_timer_t *tmr)
 {
-    s_cc1101_stub_screen(MY_SYMBOL_PERSON_WALKING "  Proximity Tracker",
-        "Track signal source by RSSI\nwith haptic proximity\nfeedback via vibrator\n\n"
-        "Coming in next version.");
+    (void)tmr;
+    if (!cc1101_is_init()) return;
+    int8_t rssi = cc1101_get_rssi_dbm();
+
+    if (rssi > s_fox_peak_dbm) s_fox_peak_dbm = rssi;
+
+    char buf[40];
+    if (s_fox_rssi_lbl) {
+        snprintf(buf, sizeof(buf), "%d dBm", (int)rssi);
+        lv_label_set_text(s_fox_rssi_lbl, buf);
+    }
+    if (s_fox_peak_lbl) {
+        snprintf(buf, sizeof(buf), "Peak: %d dBm", (int)s_fox_peak_dbm);
+        lv_label_set_text(s_fox_peak_lbl, buf);
+    }
+    if (s_fox_rssi_bar) {
+        int pct = (int)rssi + 120;
+        if (pct < 0)  pct = 0;
+        if (pct > 90) pct = 90;
+        lv_bar_set_value(s_fox_rssi_bar, pct * 100 / 90, LV_ANIM_OFF);
+    }
+
+    // Colour-code status label by proximity
+    if (s_fox_status_lbl) {
+        int above = (int)rssi - (int)s_fox_squelch_dbm;
+        if (above <= 0) {
+            lv_label_set_text(s_fox_status_lbl, "● SILENT");
+            lv_obj_set_style_text_color(s_fox_status_lbl, lv_color_hex(0x757575), 0);
+        } else if (above < 10) {
+            lv_label_set_text(s_fox_status_lbl, "● WEAK");
+            lv_obj_set_style_text_color(s_fox_status_lbl, lv_color_hex(0x4CAF50), 0);
+        } else if (above < 25) {
+            lv_label_set_text(s_fox_status_lbl, "▲ MEDIUM");
+            lv_obj_set_style_text_color(s_fox_status_lbl, lv_color_hex(0xFFEB3B), 0);
+        } else {
+            lv_label_set_text(s_fox_status_lbl, "★ STRONG — CLOSE!");
+            lv_obj_set_style_text_color(s_fox_status_lbl, lv_color_hex(0xF44336), 0);
+        }
+    }
+
+    // Bug-hunter haptic: pulse rate proportional to RSSI above squelch
+    if (s_fox_haptic_on && (int)rssi > (int)s_fox_squelch_dbm) {
+        int above = (int)rssi - (int)s_fox_squelch_dbm;
+        // Period in 50ms ticks: 40=2s slow at squelch, 2=100ms fast when strong
+        int period = 40 - above;
+        if (period < 2) period = 2;
+        s_fox_haptic_ctr++;
+        if (s_fox_haptic_ctr >= period) {
+            s_fox_haptic_ctr = 0;
+            int vib_pct = 10 + above * 90 / 40;
+            if (vib_pct > 100) vib_pct = 100;
+            g_vibtest_strength_pct = (uint8_t)vib_pct;
+            vibrator_pulse(50);
+        }
+    } else {
+        s_fox_haptic_ctr = 0;
+    }
 }
+
+static void s_fox_squelch_adj_cb(lv_event_t *e)
+{
+    int delta = (int)(intptr_t)lv_event_get_user_data(e);
+    s_fox_squelch_dbm = (int8_t)((int)s_fox_squelch_dbm + delta);
+    if (s_fox_squelch_dbm < -120) s_fox_squelch_dbm = -120;
+    if (s_fox_squelch_dbm > -30)  s_fox_squelch_dbm = -30;
+    if (s_fox_squelch_lbl) {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "Squelch: %d dBm", (int)s_fox_squelch_dbm);
+        lv_label_set_text(s_fox_squelch_lbl, buf);
+    }
+    s_fox_haptic_ctr = 0;
+}
+
+static void s_fox_clear_peak_cb(lv_event_t *e)
+{
+    (void)e;
+    s_fox_peak_dbm = -120;
+}
+
+static void s_fox_haptic_toggle_cb(lv_event_t *e)
+{
+    (void)e;
+    s_fox_haptic_on = !s_fox_haptic_on;
+    if (!s_fox_haptic_on) { vibrator_off(); s_fox_haptic_ctr = 0; }
+    if (s_fox_haptic_btn) {
+        lv_obj_t *l = lv_obj_get_child(s_fox_haptic_btn, 0);
+        if (l) lv_label_set_text(l, s_fox_haptic_on
+            ? LV_SYMBOL_AUDIO " Haptic: ON"
+            : LV_SYMBOL_MUTE  " Haptic: OFF");
+        lv_obj_set_style_bg_color(s_fox_haptic_btn,
+            s_fox_haptic_on ? lv_color_hex(0x1565C0) : lv_color_hex(0x455A64),
+            LV_STATE_DEFAULT);
+    }
+}
+
+static void s_fox_freq_adj_cb(lv_event_t *e)
+{
+    float delta = *(float *)lv_event_get_user_data(e);
+    s_cc1101_freq_mhz += delta;
+    // Clamp to CC1101 valid bands
+    if (s_cc1101_freq_mhz < 300.0f) s_cc1101_freq_mhz = 300.0f;
+    if (s_cc1101_freq_mhz > 928.0f) s_cc1101_freq_mhz = 928.0f;
+    if (cc1101_is_init()) cc1101_set_freq_mhz(s_cc1101_freq_mhz);
+    s_fox_peak_dbm = -120;
+    s_fox_haptic_ctr = 0;
+    if (s_fox_freq_lbl) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.3f MHz", (double)s_cc1101_freq_mhz);
+        lv_label_set_text(s_fox_freq_lbl, buf);
+    }
+}
+
+static void s_fox_preset_cb(lv_event_t *e)
+{
+    float mhz = *(float *)lv_event_get_user_data(e);
+    s_cc1101_freq_mhz = mhz;
+    if (cc1101_is_init()) cc1101_set_freq_mhz(mhz);
+    s_fox_peak_dbm = -120;
+    s_fox_haptic_ctr = 0;
+    if (s_fox_freq_lbl) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.3f MHz", (double)mhz);
+        lv_label_set_text(s_fox_freq_lbl, buf);
+    }
+}
+
+static void show_cc1101_foxhunt_screen(void)
+{
+    if (s_fox_tmr) { lv_timer_del(s_fox_tmr); s_fox_tmr = NULL; }
+    s_fox_rssi_bar   = NULL; s_fox_rssi_lbl  = NULL;
+    s_fox_peak_lbl   = NULL; s_fox_freq_lbl  = NULL;
+    s_fox_squelch_lbl= NULL; s_fox_haptic_btn= NULL;
+    s_fox_status_lbl = NULL;
+    s_fox_peak_dbm   = -120;
+    s_fox_haptic_ctr = 0;
+
+    if (!cc1101_is_init() && cc1101_init() != ESP_OK) {
+        s_cc1101_stub_screen(MY_SYMBOL_PERSON_WALKING "  Fox Hunt — No CC1101",
+                             "Check DIP 1 ON.\nRun HW Test first.");
+        return;
+    }
+    cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);
+    cc1101_set_freq_mhz(s_cc1101_freq_mhz);
+    cc1101_rx();
+
+    s_fox_saved_vib_pct = g_vibtest_strength_pct;
+
+    create_function_page_base("CC1101 Fox Hunt");
+    apply_menu_bg();
+
+    int y = 32;
+
+    // ── Frequency display ──────────────────────────────────────────────────────
+    lv_obj_t *freq_row = lv_obj_create(function_page);
+    lv_obj_set_size(freq_row, LCD_H_RES - 10, 26);
+    lv_obj_align(freq_row, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_set_style_bg_opa(freq_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(freq_row, 0, 0);
+    lv_obj_set_style_pad_all(freq_row, 0, 0);
+    lv_obj_set_flex_flow(freq_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(freq_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(freq_row, 6, 0);
+    lv_obj_clear_flag(freq_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_fox_freq_lbl = lv_label_create(freq_row);
+    { char buf[32]; snprintf(buf, sizeof(buf), "%.3f MHz", (double)s_cc1101_freq_mhz);
+      lv_label_set_text(s_fox_freq_lbl, buf); }
+    lv_obj_set_style_text_font(s_fox_freq_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(s_fox_freq_lbl, lv_color_hex(0x26C6DA), 0);
+    y += 28;
+
+    // ── Frequency preset buttons: 315 / 433 / 868 / 915 ───────────────────────
+    lv_obj_t *preset_row = lv_obj_create(function_page);
+    lv_obj_set_size(preset_row, LCD_H_RES - 10, 26);
+    lv_obj_align(preset_row, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_set_style_bg_opa(preset_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(preset_row, 0, 0);
+    lv_obj_set_style_pad_all(preset_row, 0, 0);
+    lv_obj_set_flex_flow(preset_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(preset_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(preset_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    static float s_fox_preset_vals[4];
+    static const float fox_preset_mhz[4]  = {315.0f, 433.92f, 868.35f, 915.0f};
+    static const char *fox_preset_lbl[4]  = {"315", "433", "868", "915"};
+    for (int i = 0; i < 4; i++) {
+        s_fox_preset_vals[i] = fox_preset_mhz[i];
+        lv_obj_t *pb = lv_btn_create(preset_row);
+        lv_obj_set_size(pb, 50, 22);
+        lv_obj_set_style_bg_color(pb, lv_color_make(30,60,80), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(pb, lv_color_make(0,100,120), LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(pb, lv_color_hex(0x26C6DA), 0);
+        lv_obj_set_style_border_width(pb, 1, 0);
+        lv_obj_set_style_radius(pb, 4, 0);
+        lv_obj_t *pl = lv_label_create(pb);
+        lv_label_set_text(pl, fox_preset_lbl[i]);
+        lv_obj_set_style_text_font(pl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(pl, lv_color_white(), 0);
+        lv_obj_center(pl);
+        lv_obj_add_event_cb(pb, s_fox_preset_cb, LV_EVENT_CLICKED, &s_fox_preset_vals[i]);
+    }
+    y += 28;
+
+    // ── Fine-tune buttons: −1 / −0.1 / +0.1 / +1 MHz ─────────────────────────
+    lv_obj_t *tune_row = lv_obj_create(function_page);
+    lv_obj_set_size(tune_row, LCD_H_RES - 10, 26);
+    lv_obj_align(tune_row, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_set_style_bg_opa(tune_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(tune_row, 0, 0);
+    lv_obj_set_style_pad_all(tune_row, 0, 0);
+    lv_obj_set_flex_flow(tune_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(tune_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tune_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    static float s_fox_tune_vals[4];
+    static const float fox_tune_delta[4] = {-1.0f, -0.1f, 0.1f, 1.0f};
+    static const char *fox_tune_lbl[4]   = {"-1", "-.1", "+.1", "+1"};
+    for (int i = 0; i < 4; i++) {
+        s_fox_tune_vals[i] = fox_tune_delta[i];
+        lv_obj_t *tb = lv_btn_create(tune_row);
+        lv_obj_set_size(tb, 50, 22);
+        lv_obj_set_style_bg_color(tb, lv_color_make(40,50,70), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(tb, lv_color_make(60,80,110), LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(tb, lv_color_hex(0x546E7A), 0);
+        lv_obj_set_style_border_width(tb, 1, 0);
+        lv_obj_set_style_radius(tb, 4, 0);
+        lv_obj_t *tl = lv_label_create(tb);
+        lv_label_set_text(tl, fox_tune_lbl[i]);
+        lv_obj_set_style_text_font(tl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(tl, lv_color_white(), 0);
+        lv_obj_center(tl);
+        lv_obj_add_event_cb(tb, s_fox_freq_adj_cb, LV_EVENT_CLICKED, &s_fox_tune_vals[i]);
+    }
+    lv_obj_t *mhz_lbl = lv_label_create(function_page);
+    lv_label_set_text(mhz_lbl, "MHz");
+    lv_obj_set_style_text_font(mhz_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(mhz_lbl, lv_color_hex(0x78909C), 0);
+    lv_obj_align(mhz_lbl, LV_ALIGN_TOP_RIGHT, -6, y + 5);
+    y += 30;
+
+    // ── RSSI bar ───────────────────────────────────────────────────────────────
+    s_fox_rssi_bar = lv_bar_create(function_page);
+    lv_obj_set_size(s_fox_rssi_bar, LCD_H_RES - 16, 16);
+    lv_obj_align(s_fox_rssi_bar, LV_ALIGN_TOP_MID, 0, y);
+    lv_bar_set_range(s_fox_rssi_bar, 0, 100);
+    lv_bar_set_value(s_fox_rssi_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(s_fox_rssi_bar, lv_color_make(30,30,30), 0);
+    lv_obj_set_style_bg_color(s_fox_rssi_bar, lv_color_hex(0x00E676), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(s_fox_rssi_bar, 4, 0);
+    lv_obj_set_style_radius(s_fox_rssi_bar, 4, LV_PART_INDICATOR);
+    y += 18;
+
+    // ── RSSI number + peak ─────────────────────────────────────────────────────
+    lv_obj_t *rssi_row = lv_obj_create(function_page);
+    lv_obj_set_size(rssi_row, LCD_H_RES - 10, 18);
+    lv_obj_align(rssi_row, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_set_style_bg_opa(rssi_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(rssi_row, 0, 0);
+    lv_obj_set_style_pad_all(rssi_row, 0, 0);
+    lv_obj_set_flex_flow(rssi_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(rssi_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(rssi_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_fox_rssi_lbl = lv_label_create(rssi_row);
+    lv_label_set_text(s_fox_rssi_lbl, "--- dBm");
+    lv_obj_set_style_text_font(s_fox_rssi_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_fox_rssi_lbl, lv_color_hex(0x00E676), 0);
+
+    s_fox_peak_lbl = lv_label_create(rssi_row);
+    lv_label_set_text(s_fox_peak_lbl, "Peak: ---");
+    lv_obj_set_style_text_font(s_fox_peak_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_fox_peak_lbl, lv_color_hex(0xFFB300), 0);
+    y += 20;
+
+    // ── Squelch row ────────────────────────────────────────────────────────────
+    lv_obj_t *sq_row = lv_obj_create(function_page);
+    lv_obj_set_size(sq_row, LCD_H_RES - 10, 26);
+    lv_obj_align(sq_row, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_set_style_bg_opa(sq_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(sq_row, 0, 0);
+    lv_obj_set_style_pad_all(sq_row, 0, 0);
+    lv_obj_set_flex_flow(sq_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(sq_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(sq_row, 6, 0);
+    lv_obj_clear_flag(sq_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_fox_squelch_lbl = lv_label_create(sq_row);
+    { char buf[28]; snprintf(buf, sizeof(buf), "Squelch: %d dBm", (int)s_fox_squelch_dbm);
+      lv_label_set_text(s_fox_squelch_lbl, buf); }
+    lv_obj_set_style_text_font(s_fox_squelch_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_fox_squelch_lbl, ui_text_color(), 0);
+    lv_obj_set_flex_grow(s_fox_squelch_lbl, 1);
+
+    static int sq_deltas[2] = {-5, 5};
+    static const char *sq_lbls[2] = {"-5", "+5"};
+    for (int i = 0; i < 2; i++) {
+        lv_obj_t *sqb = lv_btn_create(sq_row);
+        lv_obj_set_size(sqb, 36, 22);
+        lv_obj_set_style_bg_color(sqb, lv_color_make(50,50,70), LV_STATE_DEFAULT);
+        lv_obj_set_style_border_width(sqb, 0, 0);
+        lv_obj_set_style_radius(sqb, 4, 0);
+        lv_obj_t *sql = lv_label_create(sqb);
+        lv_label_set_text(sql, sq_lbls[i]);
+        lv_obj_set_style_text_font(sql, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(sql, lv_color_white(), 0);
+        lv_obj_center(sql);
+        lv_obj_add_event_cb(sqb, s_fox_squelch_adj_cb, LV_EVENT_CLICKED, (void *)(intptr_t)sq_deltas[i]);
+    }
+    y += 28;
+
+    // ── Haptic toggle + Clear Peak ──────────────────────────────────────────────
+    lv_obj_t *ctrl_row = lv_obj_create(function_page);
+    lv_obj_set_size(ctrl_row, LCD_H_RES - 10, 28);
+    lv_obj_align(ctrl_row, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_set_style_bg_opa(ctrl_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ctrl_row, 0, 0);
+    lv_obj_set_style_pad_all(ctrl_row, 0, 0);
+    lv_obj_set_flex_flow(ctrl_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(ctrl_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(ctrl_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_fox_haptic_btn = lv_btn_create(ctrl_row);
+    lv_obj_set_size(s_fox_haptic_btn, 118, 24);
+    lv_obj_set_style_bg_color(s_fox_haptic_btn, lv_color_hex(0x1565C0), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(s_fox_haptic_btn, 0, 0);
+    lv_obj_set_style_radius(s_fox_haptic_btn, 6, 0);
+    lv_obj_t *hbl = lv_label_create(s_fox_haptic_btn);
+    lv_label_set_text(hbl, LV_SYMBOL_AUDIO " Haptic: ON");
+    lv_obj_set_style_text_font(hbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(hbl);
+    lv_obj_add_event_cb(s_fox_haptic_btn, s_fox_haptic_toggle_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *clr_btn = lv_btn_create(ctrl_row);
+    lv_obj_set_size(clr_btn, 100, 24);
+    lv_obj_set_style_bg_color(clr_btn, lv_color_hex(0x37474F), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(clr_btn, 0, 0);
+    lv_obj_set_style_radius(clr_btn, 6, 0);
+    lv_obj_t *cll = lv_label_create(clr_btn);
+    lv_label_set_text(cll, LV_SYMBOL_REFRESH " Clear Peak");
+    lv_obj_set_style_text_font(cll, &lv_font_montserrat_12, 0);
+    lv_obj_center(cll);
+    lv_obj_add_event_cb(clr_btn, s_fox_clear_peak_cb, LV_EVENT_CLICKED, NULL);
+    y += 30;
+
+    // ── Status label ───────────────────────────────────────────────────────────
+    s_fox_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_fox_status_lbl, "● SILENT");
+    lv_obj_set_style_text_font(s_fox_status_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_fox_status_lbl, lv_color_hex(0x757575), 0);
+    lv_obj_set_style_text_align(s_fox_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_fox_status_lbl, LV_ALIGN_TOP_MID, 0, y);
+
+    s_fox_tmr = lv_timer_create(s_fox_timer_cb, 50, NULL);
+
+    // Save vibration strength; restore on exit via back button
+    rfhat_add_back_btn("CC1101", show_cc1101_screen);
+}
+
+// On exiting the fox hunt screen the back button calls show_cc1101_screen.
+// Restore vibration and clean up in that path via the existing rfhat_add_back_btn.
+// (The timer is cleaned up by reset_function_page_children / create_function_page_base.)
 
 // ── Jammer (Attack — FOR AUTHORIZED USE ONLY) ────────────────────────────────
 
@@ -39152,6 +39575,23 @@ static void s_bs_ui_timer_cb(lv_timer_t *t)
         if (v > 255) v = 255;
         ctx->canv_buf[wf_start * CC1101_BS_W + x] = scope_heat_color((uint8_t)v);
     }
+    // SDR-style frequency marker: solid yellow vertical line at tap_freq_mhz
+    if (ctx->marker_set && ctx->tap_freq_mhz > 0.0f) {
+        float freq_start = ctx->center - ctx->span / 2.0f;
+        int line_x = (int)((ctx->tap_freq_mhz - freq_start) / ctx->span * (float)CC1101_BS_W);
+        if (line_x >= 0 && line_x < CC1101_BS_W) {
+            lv_color_t yellow = lv_color_hex(0xFFEB3B);
+            int ch = ctx->canvas_h;
+            for (int ly = 0; ly < ch; ly++)
+                ctx->canv_buf[ly * CC1101_BS_W + line_x] = yellow;
+            // Draw a 2-px wide line for visibility
+            if (line_x + 1 < CC1101_BS_W) {
+                for (int ly = 0; ly < ch; ly++)
+                    ctx->canv_buf[ly * CC1101_BS_W + line_x + 1] = yellow;
+            }
+        }
+    }
+
     lv_obj_invalidate(ctx->canvas);
 
     if (ctx->status_lbl && esp_timer_get_time() >= ctx->tap_expire_us) {
@@ -39166,12 +39606,12 @@ static void s_bs_ui_timer_cb(lv_timer_t *t)
         } else {
             lv_label_set_text(ctx->status_lbl, "Stopped");
         }
+        if (ctx->hunt_btn) lv_obj_add_flag(ctx->hunt_btn, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
 static void s_bs_canvas_tap_cb(lv_event_t *e)
 {
-    (void)e;
     cc1101_bs_ctx_t *ctx = s_bs;
     if (!ctx || !ctx->status_lbl || !ctx->canvas) return;
     lv_indev_t *indev = lv_indev_get_act();
@@ -39182,18 +39622,36 @@ static void s_bs_canvas_tap_cb(lv_event_t *e)
     lv_obj_get_coords(ctx->canvas, &area);
     int x = pt.x - area.x1;
     if (x < 0 || x >= CC1101_BS_W) return;
-    // Snap to the nearest CC1101 measurement bin (not pixel-interpolated)
+
+    // Snap to the nearest CC1101 measurement bin
     float pppt = (float)CC1101_BS_W / (float)CC1101_BS_NPTS;
     int bin = (int)((float)x / pppt);
     if (bin >= CC1101_BS_NPTS) bin = CC1101_BS_NPTS - 1;
     float step = ctx->span / (float)CC1101_BS_NPTS;
     float freq = (ctx->center - ctx->span / 2.0f) + ((float)bin + 0.5f) * step;
     int rssi_dbm = (int)ctx->rssi[bin];
+
     char buf[36];
     snprintf(buf, sizeof(buf), "%.2f MHz  %d dBm", (double)freq, rssi_dbm);
     lv_label_set_text(ctx->status_lbl, buf);
     lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0xFFEB3B), 0);
-    ctx->tap_expire_us = esp_timer_get_time() + 2000000ULL;
+    ctx->tap_freq_mhz = freq;
+    ctx->marker_set   = true;
+    ctx->tap_expire_us = esp_timer_get_time() + 4000000ULL;
+
+    // Hunt button appears only on finger-lift (CLICKED), not during drag (PRESSING)
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        if (ctx->hunt_btn) lv_obj_clear_flag(ctx->hunt_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void s_bs_hunt_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    cc1101_bs_ctx_t *ctx = s_bs;
+    if (!ctx) return;
+    s_cc1101_freq_mhz = ctx->tap_freq_mhz;
+    show_cc1101_foxhunt_screen();
 }
 
 static void s_bs_preset_cb(lv_event_t *e)
@@ -39250,7 +39708,9 @@ static void show_cc1101_bandscope_screen(void)
     ctx->center = 433.92f;
     ctx->span   = 20.0f;
 
-    int canvas_h = CC1101_BS_SPEC_H + 1 + CC1101_BS_WF_H;  // 165 px
+    int canvas_h = CC1101_BS_SPEC_H + 1 + CC1101_BS_WF_H;
+    ctx->canvas_h  = canvas_h;
+    ctx->marker_set = false;
     ctx->canv_buf = heap_caps_calloc((size_t)(CC1101_BS_W * canvas_h),
                                       sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
     if (!ctx->canv_buf) { heap_caps_free(ctx); return; }
@@ -39266,7 +39726,9 @@ static void show_cc1101_bandscope_screen(void)
     lv_obj_set_pos(s_bs->canvas, 0, 28);
     lv_obj_set_size(s_bs->canvas, CC1101_BS_W, canvas_h);
     lv_obj_add_flag(s_bs->canvas, LV_OBJ_FLAG_CLICKABLE);
+    // CLICKED = place marker + show Hunt button; PRESSING = drag marker in real time
     lv_obj_add_event_cb(s_bs->canvas, s_bs_canvas_tap_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(s_bs->canvas, s_bs_canvas_tap_cb, LV_EVENT_PRESSING, NULL);
 
     int cy = 28 + canvas_h;  // y coordinate immediately below canvas (193)
 
@@ -39322,6 +39784,20 @@ static void show_cc1101_bandscope_screen(void)
     lv_obj_add_event_cb(s_bs->start_btn, s_bs_startstop_cb, LV_EVENT_CLICKED, NULL);
 
     s_bs->tmr = lv_timer_create(s_bs_ui_timer_cb, 100, NULL);
+
+    // "Hunt this freq" button — hidden until user taps a canvas bin
+    s_bs->hunt_btn = lv_btn_create(function_page);
+    lv_obj_set_size(s_bs->hunt_btn, 110, 24);
+    lv_obj_set_pos(s_bs->hunt_btn, (LCD_H_RES - 110) / 2, cy + 57 + 28);
+    lv_obj_set_style_bg_color(s_bs->hunt_btn, lv_color_hex(0xE65100), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(s_bs->hunt_btn, 0, 0);
+    lv_obj_set_style_radius(s_bs->hunt_btn, 6, 0);
+    lv_obj_t *hl = lv_label_create(s_bs->hunt_btn);
+    lv_label_set_text(hl, MY_SYMBOL_PERSON_WALKING " Hunt this freq");
+    lv_obj_set_style_text_font(hl, &lv_font_montserrat_12, 0);
+    lv_obj_center(hl);
+    lv_obj_add_flag(s_bs->hunt_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_bs->hunt_btn, s_bs_hunt_btn_cb, LV_EVENT_CLICKED, NULL);
 
     rfhat_add_back_btn("CC1101", show_cc1101_screen);
 }
@@ -39752,7 +40228,7 @@ static void s_n24_page_next_cb(lv_event_t *e)
 static lv_obj_t *s_n24_make_page(lv_obj_t *parent)
 {
     lv_obj_t *p = lv_obj_create(parent);
-    lv_obj_set_size(p, LCD_H_RES, 188);
+    lv_obj_set_size(p, LCD_H_RES, 238);  // 3 rows × 74 + 2×4 gap + 2×4 pad
     lv_obj_set_style_bg_opa(p, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(p, 0, 0);
     lv_obj_set_style_pad_all(p, 4, 0);
@@ -39775,6 +40251,7 @@ static void s_n24_tile_cb(lv_event_t *e)
     else if (strcmp(name, "Saved")   == 0) show_nrf24_saved_screen();
     else if (strcmp(name, "Jammer")  == 0) show_nrf24_jammer_screen();
     else if (strcmp(name, "Futaba")  == 0) show_nrf24_futaba_screen();
+    else if (strcmp(name, "FoxHunt") == 0) show_nrf24_foxhunt_screen();
     else if (strcmp(name, "MouseJack") == 0)
         s_n24_stub_screen(LV_SYMBOL_USB "  MouseJack",
             "Hijack/inject packets into\nunprotected 2.4GHz keyboards\nand mice.\n\n"
@@ -39806,6 +40283,11 @@ static void show_nrf24_screen(void)
     s_n24_jam_active = false;
     s_n24_jam_status = NULL;
     if (s_n24_jam_tmr) { lv_timer_del(s_n24_jam_tmr); s_n24_jam_tmr = NULL; }
+    // nRF24 Fox Hunt cleanup
+    if (s_n24fox_tmr) { lv_timer_del(s_n24fox_tmr); s_n24fox_tmr = NULL; }
+    vibrator_off();
+    s_n24fox_bar = NULL; s_n24fox_lbl = NULL; s_n24fox_ch_lbl = NULL;
+    s_n24fox_hbtn = NULL; s_n24fox_status = NULL;
 
     nrf24_hat_claim();
     s_n24_page = 0;
@@ -39815,7 +40297,7 @@ static void show_nrf24_screen(void)
 
     // Tile container
     lv_obj_t *tc = lv_obj_create(function_page);
-    lv_obj_set_size(tc, LCD_H_RES, 192);
+    lv_obj_set_size(tc, LCD_H_RES, 244);
     lv_obj_align(tc, LV_ALIGN_TOP_MID, 0, 30);
     lv_obj_set_style_bg_opa(tc, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tc, 0, 0);
@@ -39835,6 +40317,7 @@ static void show_nrf24_screen(void)
     create_tile(p1, LV_SYMBOL_SAVE,          "Saved\nFiles", lv_color_hex(0x4A148C), s_n24_tile_cb, "Saved");
     create_tile(p1, MY_SYMBOL_SKULL_CROSS,   "Jammer",       UI_ACCENT_RED,          s_n24_tile_cb, "Jammer");
     create_tile(p1, MY_SYMBOL_CAR,           "Futaba\nS-FHSS",lv_color_hex(0xE65100),s_n24_tile_cb, "Futaba");
+    create_tile(p1, MY_SYMBOL_PERSON_WALKING,"Fox\nHunt",    lv_color_hex(0xE65100),s_n24_tile_cb, "FoxHunt");
 
     // Page 2: Research stubs (with legal warnings where required)
     lv_obj_t *p2 = s_n24_pages[1];
@@ -41005,6 +41488,387 @@ static void rfid_tile_emulate_cb(lv_event_t *e)  { (void)e; show_rfid_emulate_sc
 static void rfid_tile_keytest_cb(lv_event_t *e)  { (void)e; show_rfid_key_test_screen(); }
 static void rfid_tile_saved_cb(lv_event_t *e)    { (void)e; show_rfid_saved_screen(); }
 static void rfid_tile_hwtest_cb(lv_event_t *e)   { (void)e; show_rfid_hw_test_screen(); }
+
+// ── nRF24 Fox Hunt (carrier-detect proximity tracker) ─────────────────────────
+
+static void s_n24fox_update_ch_label(void)
+{
+    if (!s_n24fox_ch_lbl) return;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "CH %u  [%u MHz]",
+             (unsigned)s_n24fox_channel, (unsigned)(2400 + s_n24fox_channel));
+    lv_label_set_text(s_n24fox_ch_lbl, buf);
+}
+
+static void s_n24fox_set_channel(uint8_t ch)
+{
+    s_n24fox_channel = ch;
+    if (ch > 125) s_n24fox_channel = 125;
+    nrf24_set_channel(s_n24fox_channel);
+    nrf24_rx_mode();
+    s_n24fox_hits = 0; s_n24fox_samples = 0;
+    s_n24fox_update_ch_label();
+}
+
+static void s_n24fox_timer_cb(lv_timer_t *tmr)
+{
+    (void)tmr;
+    // Sample carrier detect 3× with brief settle between reads
+    int det = 0;
+    for (int i = 0; i < 3; i++) {
+        esp_rom_delay_us(140);   // ≥130 µs for RPD latch
+        if (nrf24_carrier_detect()) det++;
+    }
+    s_n24fox_hits    = (s_n24fox_hits    * (N24FOX_WINDOW - 1) + det * 100 / 3) / N24FOX_WINDOW;
+    s_n24fox_samples = 1;  // just used for first-run guard
+
+    int pct = s_n24fox_hits;
+    if (pct > 100) pct = 100;
+    if (s_n24fox_bar) lv_bar_set_value(s_n24fox_bar, pct, LV_ANIM_OFF);
+    if (s_n24fox_lbl) {
+        char buf[24]; snprintf(buf, sizeof(buf), "Signal: %d%%", pct);
+        lv_label_set_text(s_n24fox_lbl, buf);
+    }
+    if (s_n24fox_status) {
+        if (pct == 0) {
+            lv_label_set_text(s_n24fox_status, "● SILENT");
+            lv_obj_set_style_text_color(s_n24fox_status, lv_color_hex(0x757575), 0);
+        } else if (pct < 30) {
+            lv_label_set_text(s_n24fox_status, "● WEAK");
+            lv_obj_set_style_text_color(s_n24fox_status, lv_color_hex(0x4CAF50), 0);
+        } else if (pct < 70) {
+            lv_label_set_text(s_n24fox_status, "▲ MEDIUM");
+            lv_obj_set_style_text_color(s_n24fox_status, lv_color_hex(0xFFEB3B), 0);
+        } else {
+            lv_label_set_text(s_n24fox_status, "★ STRONG — CLOSE!");
+            lv_obj_set_style_text_color(s_n24fox_status, lv_color_hex(0xF44336), 0);
+        }
+    }
+    if (s_n24fox_haptic && det > 0) {
+        int vib = 10 + pct * 90 / 100;
+        g_vibtest_strength_pct = (uint8_t)vib;
+        vibrator_pulse(40);
+    }
+}
+
+static void s_n24fox_ch_adj_cb(lv_event_t *e)
+{
+    int delta = (int)(intptr_t)lv_event_get_user_data(e);
+    int ch = (int)s_n24fox_channel + delta;
+    if (ch < 0) ch = 0;
+    if (ch > 125) ch = 125;
+    s_n24fox_set_channel((uint8_t)ch);
+}
+
+static void s_n24fox_haptic_toggle_cb(lv_event_t *e)
+{
+    (void)e;
+    s_n24fox_haptic = !s_n24fox_haptic;
+    if (!s_n24fox_haptic) { vibrator_off(); }
+    if (s_n24fox_hbtn) {
+        lv_obj_t *l = lv_obj_get_child(s_n24fox_hbtn, 0);
+        if (l) lv_label_set_text(l, s_n24fox_haptic
+            ? LV_SYMBOL_AUDIO " Haptic: ON"
+            : LV_SYMBOL_MUTE  " Haptic: OFF");
+        lv_obj_set_style_bg_color(s_n24fox_hbtn,
+            s_n24fox_haptic ? lv_color_hex(0x1565C0) : lv_color_hex(0x455A64),
+            LV_STATE_DEFAULT);
+    }
+}
+
+static void show_nrf24_foxhunt_screen(void)
+{
+    if (s_n24fox_tmr) { lv_timer_del(s_n24fox_tmr); s_n24fox_tmr = NULL; }
+    s_n24fox_bar = NULL; s_n24fox_lbl = NULL;
+    s_n24fox_ch_lbl = NULL; s_n24fox_hbtn = NULL; s_n24fox_status = NULL;
+    s_n24fox_hits = 0; s_n24fox_samples = 0;
+
+    if (!nrf24_chip_present()) {
+        s_cc1101_stub_screen(MY_SYMBOL_PERSON_WALKING "  nRF24 Fox Hunt — No nRF24",
+                             "Check DIP 2 ON.\nRun HW Test first.");
+        return;
+    }
+    nrf24_set_channel(s_n24fox_channel);
+    nrf24_set_data_rate(NRF24_DR_1M);
+    nrf24_rx_mode();
+
+    uint8_t saved_vib = g_vibtest_strength_pct;
+
+    create_function_page_base("nRF24 Fox Hunt");
+    apply_menu_bg();
+    int y = 34;
+
+    // Channel display
+    s_n24fox_ch_lbl = lv_label_create(function_page);
+    s_n24fox_update_ch_label();
+    lv_obj_set_style_text_font(s_n24fox_ch_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(s_n24fox_ch_lbl, lv_color_hex(0x26C6DA), 0);
+    lv_obj_align(s_n24fox_ch_lbl, LV_ALIGN_TOP_MID, 0, y);
+    y += 24;
+
+    // Channel up/down buttons
+    lv_obj_t *ch_row = lv_obj_create(function_page);
+    lv_obj_set_size(ch_row, LCD_H_RES - 10, 28);
+    lv_obj_align(ch_row, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_set_style_bg_opa(ch_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ch_row, 0, 0);
+    lv_obj_set_style_pad_all(ch_row, 0, 0);
+    lv_obj_set_flex_flow(ch_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(ch_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(ch_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    static int n24fox_deltas[4] = {-10, -1, 1, 10};
+    static const char *n24fox_dlbls[4] = {"-10", "-1", "+1", "+10"};
+    // Common freqs: 0=2400 BT adv, 39=2439 WiFi ch7, 76=2476 ISM, 100=2500
+    static int n24fox_presets[3] = {0, 76, 100};
+    static const char *n24fox_plbls[3] = {"2.4G", "2476", "2.5G"};
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t *cb = lv_btn_create(ch_row);
+        lv_obj_set_size(cb, 46, 22);
+        lv_obj_set_style_bg_color(cb, lv_color_make(30,60,80), LV_STATE_DEFAULT);
+        lv_obj_set_style_border_color(cb, lv_color_hex(0x26C6DA), 0);
+        lv_obj_set_style_border_width(cb, 1, 0);
+        lv_obj_set_style_radius(cb, 4, 0);
+        lv_obj_t *cl = lv_label_create(cb);
+        lv_label_set_text(cl, n24fox_dlbls[i]);
+        lv_obj_set_style_text_font(cl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(cl, lv_color_white(), 0);
+        lv_obj_center(cl);
+        lv_obj_add_event_cb(cb, s_n24fox_ch_adj_cb, LV_EVENT_CLICKED, (void *)(intptr_t)n24fox_deltas[i]);
+    }
+    y += 30;
+
+    // Preset row: common channels
+    lv_obj_t *pr_row = lv_obj_create(function_page);
+    lv_obj_set_size(pr_row, LCD_H_RES - 10, 26);
+    lv_obj_align(pr_row, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_set_style_bg_opa(pr_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(pr_row, 0, 0);
+    lv_obj_set_style_pad_all(pr_row, 0, 0);
+    lv_obj_set_flex_flow(pr_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(pr_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(pr_row, LV_OBJ_FLAG_SCROLLABLE);
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *pb = lv_btn_create(pr_row);
+        lv_obj_set_size(pb, 62, 22);
+        lv_obj_set_style_bg_color(pb, lv_color_make(50,40,80), LV_STATE_DEFAULT);
+        lv_obj_set_style_border_color(pb, lv_color_hex(0xAB47BC), 0);
+        lv_obj_set_style_border_width(pb, 1, 0);
+        lv_obj_set_style_radius(pb, 4, 0);
+        lv_obj_t *pl = lv_label_create(pb);
+        lv_label_set_text(pl, n24fox_plbls[i]);
+        lv_obj_set_style_text_font(pl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(pl, lv_color_white(), 0);
+        lv_obj_center(pl);
+        lv_obj_add_event_cb(pb, s_n24fox_ch_adj_cb, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)(n24fox_presets[i] - (int)s_n24fox_channel));
+    }
+    y += 30;
+
+    // Signal bar
+    s_n24fox_bar = lv_bar_create(function_page);
+    lv_obj_set_size(s_n24fox_bar, LCD_H_RES - 16, 16);
+    lv_obj_align(s_n24fox_bar, LV_ALIGN_TOP_MID, 0, y);
+    lv_bar_set_range(s_n24fox_bar, 0, 100);
+    lv_bar_set_value(s_n24fox_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(s_n24fox_bar, lv_color_make(30,30,30), 0);
+    lv_obj_set_style_bg_color(s_n24fox_bar, lv_color_hex(0xAB47BC), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(s_n24fox_bar, 4, 0);
+    lv_obj_set_style_radius(s_n24fox_bar, 4, LV_PART_INDICATOR);
+    y += 20;
+
+    s_n24fox_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_n24fox_lbl, "Signal: 0%");
+    lv_obj_set_style_text_font(s_n24fox_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_n24fox_lbl, lv_color_hex(0xAB47BC), 0);
+    lv_obj_align(s_n24fox_lbl, LV_ALIGN_TOP_MID, 0, y);
+    y += 22;
+
+    // Haptic toggle
+    s_n24fox_hbtn = lv_btn_create(function_page);
+    lv_obj_set_size(s_n24fox_hbtn, 160, 26);
+    lv_obj_align(s_n24fox_hbtn, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_set_style_bg_color(s_n24fox_hbtn, lv_color_hex(0x1565C0), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(s_n24fox_hbtn, 0, 0);
+    lv_obj_set_style_radius(s_n24fox_hbtn, 6, 0);
+    lv_obj_t *hbl2 = lv_label_create(s_n24fox_hbtn);
+    lv_label_set_text(hbl2, LV_SYMBOL_AUDIO " Haptic: ON");
+    lv_obj_set_style_text_font(hbl2, &lv_font_montserrat_12, 0);
+    lv_obj_center(hbl2);
+    lv_obj_add_event_cb(s_n24fox_hbtn, s_n24fox_haptic_toggle_cb, LV_EVENT_CLICKED, NULL);
+    y += 30;
+
+    s_n24fox_status = lv_label_create(function_page);
+    lv_label_set_text(s_n24fox_status, "● SILENT");
+    lv_obj_set_style_text_font(s_n24fox_status, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_n24fox_status, lv_color_hex(0x757575), 0);
+    lv_obj_set_style_text_align(s_n24fox_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_n24fox_status, LV_ALIGN_TOP_MID, 0, y);
+
+    s_n24fox_tmr = lv_timer_create(s_n24fox_timer_cb, 100, NULL);
+    (void)saved_vib;
+
+    rfhat_add_back_btn("nRF24", show_nrf24_screen);
+}
+
+// ── RF433 Fox Hunt (activity-level proximity tracker, fixed 433.92 MHz) ───────
+// Note: R4A_433 receiver demodulates OOK to GPIO9. No RSSI available;
+// edge count per second is used as a signal-activity proxy.
+
+IRAM_ATTR static void s_rf433_fox_isr(void *arg)
+{
+    (void)arg;
+    s_rf433_fox_edges++;
+}
+
+static void s_rf433_fox_timer_cb(lv_timer_t *tmr)
+{
+    (void)tmr;
+    // Read and reset edge count (500ms window)
+    int edges = s_rf433_fox_edges;
+    s_rf433_fox_edges = 0;
+    int rate = edges * 2;  // edges/s
+    // Exponential smooth: 70% old + 30% new
+    s_rf433_fox_rate = (s_rf433_fox_rate * 7 + rate * 3) / 10;
+
+    // Map 0..2000 edges/s to 0..100%
+    int pct = s_rf433_fox_rate * 100 / 2000;
+    if (pct > 100) pct = 100;
+
+    if (s_rf433_fox_bar) lv_bar_set_value(s_rf433_fox_bar, pct, LV_ANIM_OFF);
+    if (s_rf433_fox_lbl) {
+        char buf[32]; snprintf(buf, sizeof(buf), "%d edges/s", s_rf433_fox_rate);
+        lv_label_set_text(s_rf433_fox_lbl, buf);
+    }
+    if (s_rf433_fox_status) {
+        if (pct == 0) {
+            lv_label_set_text(s_rf433_fox_status, "● SILENT");
+            lv_obj_set_style_text_color(s_rf433_fox_status, lv_color_hex(0x757575), 0);
+        } else if (pct < 25) {
+            lv_label_set_text(s_rf433_fox_status, "● WEAK");
+            lv_obj_set_style_text_color(s_rf433_fox_status, lv_color_hex(0x4CAF50), 0);
+        } else if (pct < 60) {
+            lv_label_set_text(s_rf433_fox_status, "▲ MEDIUM");
+            lv_obj_set_style_text_color(s_rf433_fox_status, lv_color_hex(0xFFEB3B), 0);
+        } else {
+            lv_label_set_text(s_rf433_fox_status, "★ STRONG — CLOSE!");
+            lv_obj_set_style_text_color(s_rf433_fox_status, lv_color_hex(0xF44336), 0);
+        }
+    }
+    if (s_rf433_fox_haptic && pct > 5) {
+        int vib = 10 + pct * 90 / 100;
+        g_vibtest_strength_pct = (uint8_t)vib;
+        vibrator_pulse(40);
+    }
+}
+
+static void s_rf433_fox_haptic_toggle_cb(lv_event_t *e)
+{
+    (void)e;
+    s_rf433_fox_haptic = !s_rf433_fox_haptic;
+    if (!s_rf433_fox_haptic) vibrator_off();
+    if (s_rf433_fox_hbtn) {
+        lv_obj_t *l = lv_obj_get_child(s_rf433_fox_hbtn, 0);
+        if (l) lv_label_set_text(l, s_rf433_fox_haptic
+            ? LV_SYMBOL_AUDIO " Haptic: ON"
+            : LV_SYMBOL_MUTE  " Haptic: OFF");
+        lv_obj_set_style_bg_color(s_rf433_fox_hbtn,
+            s_rf433_fox_haptic ? lv_color_hex(0x1565C0) : lv_color_hex(0x455A64),
+            LV_STATE_DEFAULT);
+    }
+}
+
+static void show_rf433_foxhunt_screen(void)
+{
+    if (s_rf433_fox_tmr) { lv_timer_del(s_rf433_fox_tmr); s_rf433_fox_tmr = NULL; }
+    if (s_rf433_fox_isr_installed) {
+        gpio_isr_handler_remove(RF_HAT_RF433_RX_GPIO);
+        s_rf433_fox_isr_installed = false;
+    }
+    s_rf433_fox_bar = NULL; s_rf433_fox_lbl = NULL;
+    s_rf433_fox_hbtn = NULL; s_rf433_fox_status = NULL;
+    s_rf433_fox_edges = 0; s_rf433_fox_rate = 0;
+
+    // Configure GPIO9 (RF433 RX) as input
+    gpio_config_t io_cfg = {
+        .pin_bit_mask  = (1ULL << RF_HAT_RF433_RX_GPIO),
+        .mode          = GPIO_MODE_INPUT,
+        .pull_up_en    = GPIO_PULLUP_DISABLE,
+        .pull_down_en  = GPIO_PULLDOWN_DISABLE,
+        .intr_type     = GPIO_INTR_ANYEDGE,
+    };
+    gpio_config(&io_cfg);
+    esp_err_t isr_err = gpio_install_isr_service(0);
+    if (isr_err == ESP_OK || isr_err == ESP_ERR_INVALID_STATE) {
+        gpio_isr_handler_add(RF_HAT_RF433_RX_GPIO, s_rf433_fox_isr, NULL);
+        s_rf433_fox_isr_installed = true;
+    }
+
+    uint8_t saved_vib = g_vibtest_strength_pct;
+
+    create_function_page_base("RF433 Fox Hunt");
+    apply_menu_bg();
+    int y = 34;
+
+    // Fixed-freq header
+    lv_obj_t *freq_lbl = lv_label_create(function_page);
+    lv_label_set_text(freq_lbl, "Fixed: 433.92 MHz OOK");
+    lv_obj_set_style_text_font(freq_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(freq_lbl, lv_color_hex(0xFF8F00), 0);
+    lv_obj_align(freq_lbl, LV_ALIGN_TOP_MID, 0, y);
+    y += 26;
+
+    lv_obj_t *note = lv_label_create(function_page);
+    lv_label_set_text(note, "Activity level only — no true RSSI");
+    lv_obj_set_style_text_font(note, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(note, lv_color_hex(0x78909C), 0);
+    lv_obj_align(note, LV_ALIGN_TOP_MID, 0, y);
+    y += 22;
+
+    // Activity bar
+    s_rf433_fox_bar = lv_bar_create(function_page);
+    lv_obj_set_size(s_rf433_fox_bar, LCD_H_RES - 16, 16);
+    lv_obj_align(s_rf433_fox_bar, LV_ALIGN_TOP_MID, 0, y);
+    lv_bar_set_range(s_rf433_fox_bar, 0, 100);
+    lv_bar_set_value(s_rf433_fox_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(s_rf433_fox_bar, lv_color_make(30,30,30), 0);
+    lv_obj_set_style_bg_color(s_rf433_fox_bar, lv_color_hex(0xFF8F00), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(s_rf433_fox_bar, 4, 0);
+    lv_obj_set_style_radius(s_rf433_fox_bar, 4, LV_PART_INDICATOR);
+    y += 20;
+
+    s_rf433_fox_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_rf433_fox_lbl, "0 edges/s");
+    lv_obj_set_style_text_font(s_rf433_fox_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_rf433_fox_lbl, lv_color_hex(0xFF8F00), 0);
+    lv_obj_align(s_rf433_fox_lbl, LV_ALIGN_TOP_MID, 0, y);
+    y += 22;
+
+    s_rf433_fox_hbtn = lv_btn_create(function_page);
+    lv_obj_set_size(s_rf433_fox_hbtn, 160, 26);
+    lv_obj_align(s_rf433_fox_hbtn, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_set_style_bg_color(s_rf433_fox_hbtn, lv_color_hex(0x1565C0), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(s_rf433_fox_hbtn, 0, 0);
+    lv_obj_set_style_radius(s_rf433_fox_hbtn, 6, 0);
+    lv_obj_t *hbl3 = lv_label_create(s_rf433_fox_hbtn);
+    lv_label_set_text(hbl3, LV_SYMBOL_AUDIO " Haptic: ON");
+    lv_obj_set_style_text_font(hbl3, &lv_font_montserrat_12, 0);
+    lv_obj_center(hbl3);
+    lv_obj_add_event_cb(s_rf433_fox_hbtn, s_rf433_fox_haptic_toggle_cb, LV_EVENT_CLICKED, NULL);
+    y += 30;
+
+    s_rf433_fox_status = lv_label_create(function_page);
+    lv_label_set_text(s_rf433_fox_status, "● SILENT");
+    lv_obj_set_style_text_font(s_rf433_fox_status, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_rf433_fox_status, lv_color_hex(0x757575), 0);
+    lv_obj_set_style_text_align(s_rf433_fox_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_rf433_fox_status, LV_ALIGN_TOP_MID, 0, y);
+
+    s_rf433_fox_tmr = lv_timer_create(s_rf433_fox_timer_cb, 500, NULL);
+    (void)saved_vib;
+
+    rfhat_add_back_btn("RF433", show_rf433_menu_screen);
+}
 
 // ── RFID Main Menu ─────────────────────────────────────────────────────────────
 
