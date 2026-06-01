@@ -16099,11 +16099,12 @@ static void show_global_attacks_screen(void)
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
-    lv_obj_set_style_pad_all(tiles, 10, 0);
-    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_style_pad_all(tiles, 4, 0);
+    lv_obj_set_style_pad_gap(tiles, 4, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
-    
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
+
     // Blackout tile - Red (dangerous)
     lv_obj_t *blackout_tile = create_tile(tiles, LV_SYMBOL_POWER, "Blackout", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(blackout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Blackout");
@@ -16140,6 +16141,7 @@ static void show_wifi_menu_screen(void)
     lv_obj_set_style_pad_gap(tiles, 4, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *scan_tile = create_tile(tiles, LV_SYMBOL_WIFI,       "Scan &\nAttack",   UI_ACCENT_BLUE,   main_tile_event_cb, "WiFi Scan & Attack");
     (void)scan_tile;
@@ -16168,11 +16170,12 @@ static void show_sniff_karma_screen(void)
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
-    lv_obj_set_style_pad_all(tiles, 10, 0);
-    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_style_pad_all(tiles, 4, 0);
+    lv_obj_set_style_pad_gap(tiles, 4, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
-    
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
+
     // Network Observer tile - Purple
     lv_obj_t *sniffer_tile = create_tile(tiles, MY_SYMBOL_BINOCULARS, "WiFi\nObserver", COLOR_MATERIAL_PURPLE, NULL, NULL);
     lv_obj_add_event_cb(sniffer_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Sniffer");
@@ -18271,10 +18274,11 @@ static void show_wardrive_menu_screen(void)
     lv_obj_align(tiles, LV_ALIGN_TOP_MID, 0, 30);
     lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
-    lv_obj_set_style_pad_all(tiles, 8, 0);
-    lv_obj_set_style_pad_gap(tiles, 8, 0);
+    lv_obj_set_style_pad_all(tiles, 4, 0);
+    lv_obj_set_style_pad_gap(tiles, 4, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
 
     create_tile(tiles, MY_SYMBOL_CAR,      "Start\nWardrive", COLOR_MATERIAL_RED,    wd_menu_tile_cb, "Start");
     create_tile(tiles, LV_SYMBOL_SETTINGS, "Options",         UI_ACCENT_GREEN,       wd_menu_tile_cb, "Options");
@@ -19611,6 +19615,7 @@ static void show_data_transfer_screen(void)
     lv_obj_set_style_pad_gap(tiles, 4, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
 
     create_tile(tiles, MY_SYMBOL_SERVER,  "AP File\nServer",   UI_ACCENT_CYAN,          data_transfer_tile_cb, "AP File Server");
     create_tile(tiles, MY_SYMBOL_LAPTOP, "WiFi\nClient",      COLOR_MATERIAL_GREEN,     data_transfer_tile_cb, "WiFi Client");
@@ -22230,6 +22235,7 @@ static void show_sd_card_screen(void)
     lv_obj_set_style_pad_gap(tiles, 4, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
 
     create_tile(tiles, LV_SYMBOL_OK,          "Validate &\nProvision", COLOR_MATERIAL_TEAL,
                 sd_card_tile_event_cb, "Validate");
@@ -22705,10 +22711,11 @@ static void show_wifi_monitor_screen(void)
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
-    lv_obj_set_style_pad_all(tiles, 10, 0);
-    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_style_pad_all(tiles, 4, 0);
+    lv_obj_set_style_pad_gap(tiles, 4, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
     
     // Evil Twin Passwords - Blue
     create_tile(tiles, MY_SYMBOL_KEY,      "Evil Twin\nPasswords", COLOR_TILE_BLUE, wifi_monitor_tile_event_cb, "Evil Twin Passwords");
@@ -25478,10 +25485,11 @@ static void show_bluetooth_screen(void)
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
-    lv_obj_set_style_pad_all(tiles, 6, 0);
-    lv_obj_set_style_pad_gap(tiles, 6, 0);
+    lv_obj_set_style_pad_all(tiles, 4, 0);
+    lv_obj_set_style_pad_gap(tiles, 4, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
 
     // BT Scan & Select - first tile, cyan
     lv_obj_t *btsas_tile = create_tile(tiles, MY_SYMBOL_CROSSHAIRS,   "BT Scan\n& Select", UI_ACCENT_CYAN, NULL, NULL);
@@ -29625,10 +29633,11 @@ static void show_bt_attacks_screen(void)
     lv_obj_align(tiles, LV_ALIGN_TOP_MID, 0, 30);
     lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
-    lv_obj_set_style_pad_all(tiles, 10, 0);
-    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_style_pad_all(tiles, 4, 0);
+    lv_obj_set_style_pad_gap(tiles, 4, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *spam_tile = create_tile(tiles, MY_SYMBOL_PAPER_PLANE, "BLE\nSpam", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(spam_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spam");
@@ -41022,7 +41031,7 @@ static void show_rfid_menu_screen(void)
     lv_obj_set_style_bg_opa(grid, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(grid, 0, 0);
     lv_obj_set_style_pad_all(grid, 4, 0);
-    lv_obj_set_style_pad_gap(grid, 5, 0);
+    lv_obj_set_style_pad_gap(grid, 4, 0);
     lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
