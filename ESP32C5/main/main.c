@@ -37407,6 +37407,7 @@ static int8_t    s_fox_peak_dbm      = -120;
 static bool      s_fox_haptic_on     = true;
 static int       s_fox_haptic_ctr    = 0;
 static uint8_t   s_fox_saved_vib_pct = 100;
+static bool      s_fox_setup_done    = false;  // deferred CC1101 init after task exit
 
 
 // HW test screen labels (nulled on leaving)
@@ -37602,6 +37603,7 @@ static void show_cc1101_screen(void)
     if (s_cc1101_sub_paths) { free(s_cc1101_sub_paths); s_cc1101_sub_paths = NULL; }
     // Fox hunt cleanup
     if (s_fox_tmr) { lv_timer_del(s_fox_tmr); s_fox_tmr = NULL; }
+    s_fox_setup_done = false;
     vibrator_off();
     g_vibtest_strength_pct = s_fox_saved_vib_pct;
     s_fox_rssi_bar = NULL; s_fox_rssi_lbl = NULL; s_fox_peak_lbl = NULL;
@@ -38933,6 +38935,19 @@ static void s_fox_timer_cb(lv_timer_t *tmr)
 {
     (void)tmr;
     if (!cc1101_is_init()) return;
+
+    // Deferred CC1101 setup: create_function_page_base() cancels any running scan
+    // task (band scope), but the task may still be mid-sweep for up to ~15 ms.
+    // By deferring apply_preset/rx to the first timer tick (50 ms later), we
+    // guarantee the task has exited and the CC1101 is ours to configure.
+    if (!s_fox_setup_done) {
+        cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);
+        cc1101_set_freq_mhz(s_cc1101_freq_mhz);
+        cc1101_rx();
+        s_fox_setup_done = true;
+        return;  // skip RSSI read this tick; let AGC settle for the next tick
+    }
+
     int8_t rssi = cc1101_get_rssi_dbm();
 
     if (rssi > s_fox_peak_dbm) s_fox_peak_dbm = rssi;
@@ -39068,16 +39083,17 @@ static void show_cc1101_foxhunt_screen(void)
     s_fox_haptic_ctr = 0;
 
     if (!cc1101_is_init() && cc1101_init() != ESP_OK) {
-        s_cc1101_stub_screen(MY_SYMBOL_PERSON_WALKING "  Fox Hunt — No CC1101",
+        s_cc1101_stub_screen("Fox Hunt — No CC1101",
                              "Check DIP 1 ON.\nRun HW Test first.");
         return;
     }
-    cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);
-    cc1101_set_freq_mhz(s_cc1101_freq_mhz);
-    cc1101_rx();
 
+    s_fox_setup_done    = false;  // CC1101 will be configured on the first timer tick
     s_fox_saved_vib_pct = g_vibtest_strength_pct;
 
+    // create_function_page_base cancels any running band scope / scan task via
+    // reset_function_page_children. CC1101 setup is deferred to the first timer
+    // tick (50 ms later) so that task exits before we configure the radio.
     create_function_page_base("CC1101 Fox Hunt");
     apply_menu_bg();
 
@@ -39795,7 +39811,7 @@ static void show_cc1101_bandscope_screen(void)
     lv_obj_set_style_border_width(s_bs->hunt_btn, 0, 0);
     lv_obj_set_style_radius(s_bs->hunt_btn, 6, 0);
     lv_obj_t *hl = lv_label_create(s_bs->hunt_btn);
-    lv_label_set_text(hl, MY_SYMBOL_PERSON_WALKING " Hunt freq");
+    lv_label_set_text(hl, "Hunt freq");
     lv_obj_set_style_text_font(hl, &lv_font_montserrat_12, 0);
     lv_obj_center(hl);
     lv_obj_add_event_cb(s_bs->hunt_btn, s_bs_hunt_btn_cb, LV_EVENT_CLICKED, NULL);
