@@ -2005,20 +2005,36 @@ Consumer-grade CC1101 modules use a 26 MHz crystal with ±20-40 ppm tolerance. A
 
 For most applications (TPMS decoding, wardrive scanning, general capture) this is acceptable — the CC1101's wide receive filter accommodates the drift. For precise frequency measurement, jamming experiments, or calibrated fox hunting, apply the crystal offset.
 
+**Service monitor / spectrum analyzer settings for calibration:**
+
+| Setting | Value |
+|---------|-------|
+| Center frequency | **433.920 MHz** |
+| Span | 100 kHz (±50 kHz around center — covers worst-case crystal error) |
+| Mode | CW / Carrier detect / Spectrum |
+| Expected signal | Continuous OOK carrier (duty = 100% while CAL TX is active) |
+| Peak hold | ON recommended — helps capture the carrier center |
+
+The CAL TX emits a continuous RF carrier at exactly the programmed frequency (433.920 MHz ± current offset). Without any offset correction, expect to see the carrier peak 5–20 kHz away from 433.920 MHz on a typical module.
+
 **Calibration workflow (HW Test → Crystal Calibration section):**
 
 1. Fit DIP 1 (CC1101) ON and open **CC1101 → HW Test**.
 2. In the Crystal Calibration panel at the bottom:
-   - The current offset is shown in kHz and Hz. Orange = non-zero correction active.
-3. Tap **CAL TX 433** — the CC1101 transmits a continuous OOK carrier at 433.920 MHz (adjusted by current offset). Button turns red while active.
-4. On a calibrated service monitor, spectrum analyzer, or known-good SDR:
-   - Note the actual measured frequency.
-   - Compute error: `error = measured_freq − 433.920 MHz` (in kHz).
-5. Tap **Set Offset** — enter the negative of the error:
-   - Chip measured at 433.933 MHz (+13 kHz high) → enter **-13.000**
-   - Chip measured at 433.908 MHz (-12 kHz low) → enter **+12.000**
-6. Tap **Save** — the offset is stored in NVS and applied immediately to the CAL TX.
-7. Verify on the monitor: the measured frequency should now read 433.920 MHz.
+   - Current offset shown as "Offset: +0.000 kHz (+0 Hz)" — orange when non-zero.
+3. Tap **CAL TX 433** — button turns red ("TX ACTIVE"). The CC1101 transmits a continuous OOK carrier at **433.920 MHz** (adjusted by current offset). Keep DIP 1 ON throughout.
+4. On your service monitor / SDR / spectrum analyzer (set to 433.920 MHz center, 100 kHz span):
+   - Locate the carrier peak.
+   - Read the actual frequency in MHz or offset in kHz.
+5. Tap **Set Offset** — enter the correction in **kHz** (decimal accepted):
+   - Carrier measured at **433.933 MHz** (chip runs 13 kHz HIGH) → enter **-13.000**
+   - Carrier measured at **433.908 MHz** (chip runs 12 kHz LOW) → enter **+12.000**
+   - Formula: `offset = 433.920 − measured_freq_MHz × 1000` (kHz)
+6. Tap **Save** — offset stored in NVS and applied to CAL TX immediately.
+7. Verify: CAL TX carrier should now appear at exactly **433.920 MHz** on the monitor.
+8. Tap **CAL TX 433** again to stop transmission.
+
+**Quick verification after calibration:** Open Fox Hunt, set to 433.920 MHz, hold CYM near a known 433.920 MHz source (e.g., a calibrated signal generator) — RSSI should peak at that frequency and not at a nearby offset. The Band Scope frequency marker can also be used to confirm the visual frequency alignment.
 
 **How the offset works:**
 
