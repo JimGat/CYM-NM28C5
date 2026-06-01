@@ -22072,6 +22072,136 @@ static void show_sd_format_confirm1(void)
     lv_obj_center(yes_lbl);
 }
 
+// ─── SD Remount screen ───────────────────────────────────────────────────────
+
+static lv_obj_t *s_sd_remount_status = NULL;
+static lv_obj_t *s_sd_remount_btn    = NULL;
+
+typedef struct { bool ok; uint32_t freq_khz; } sd_remount_result_t;
+
+static void s_sd_remount_done_cb(void *arg)
+{
+    sd_remount_result_t *r = (sd_remount_result_t *)arg;
+    if (s_sd_remount_status) {
+        char buf[80];
+        if (r->ok)
+            snprintf(buf, sizeof(buf), "Mounted @ %lu MHz",
+                     (unsigned long)(r->freq_khz / 1000));
+        else
+            snprintf(buf, sizeof(buf), "Failed — card not responding.\n"
+                     "Eject and reinsert, then retry.");
+        lv_label_set_text(s_sd_remount_status, buf);
+        lv_obj_set_style_text_color(s_sd_remount_status,
+            r->ok ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_RED, 0);
+    }
+    if (s_sd_remount_btn) lv_obj_clear_state(s_sd_remount_btn, LV_STATE_DISABLED);
+    free(r);
+}
+
+static void s_sd_remount_update_cb(void *arg)
+{
+    char *msg = (char *)arg;
+    if (s_sd_remount_status) {
+        lv_label_set_text(s_sd_remount_status, msg);
+        lv_obj_set_style_text_color(s_sd_remount_status, ui_text_color(), 0);
+    }
+    free(msg);
+}
+
+static void s_sd_remount_task(void *arg)
+{
+    (void)arg;
+    wifi_wardrive_unmount_sd();
+    sd_mounted_lazy = false;
+
+    static const uint32_t freqs[]       = {20000, 10000, 5000};
+    static const char    *freq_labels[] = {"Trying 20 MHz...", "Trying 10 MHz...", "Trying 5 MHz..."};
+
+    bool     ok      = false;
+    uint32_t ok_freq = 0;
+    for (int i = 0; i < 3 && !ok; i++) {
+        char *msg = strdup(freq_labels[i]);
+        if (msg) lv_async_call(s_sd_remount_update_cb, msg);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_err_t r = wifi_wardrive_init_sd_ex(freqs[i], false);
+        if (r == ESP_OK) {
+            ok      = true;
+            ok_freq = freqs[i];
+            sd_mounted_lazy = true;
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(600));
+        }
+    }
+
+    sd_remount_result_t *res = malloc(sizeof(sd_remount_result_t));
+    if (res) { res->ok = ok; res->freq_khz = ok_freq; lv_async_call(s_sd_remount_done_cb, res); }
+    vTaskDelete(NULL);
+}
+
+static void s_sd_remount_trigger_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_sd_remount_status) {
+        lv_label_set_text(s_sd_remount_status, "Unmounting...");
+        lv_obj_set_style_text_color(s_sd_remount_status, ui_text_color(), 0);
+    }
+    if (s_sd_remount_btn) lv_obj_add_state(s_sd_remount_btn, LV_STATE_DISABLED);
+    xTaskCreate(s_sd_remount_task, "sd_remount", 4096, NULL, tskIDLE_PRIORITY + 2, NULL);
+}
+
+static void show_sd_remount_screen(void)
+{
+    s_sd_remount_status = NULL;
+    s_sd_remount_btn    = NULL;
+
+    create_function_page_base("Remount SD Card");
+
+    lv_obj_t *icon = lv_label_create(function_page);
+    lv_label_set_text(icon, LV_SYMBOL_SD_CARD);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(icon,
+        wifi_wardrive_is_sd_mounted() ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 40);
+
+    s_sd_remount_status = lv_label_create(function_page);
+    lv_label_set_text(s_sd_remount_status,
+        wifi_wardrive_is_sd_mounted()
+        ? "Card is mounted.\nTap Remount to cycle and re-mount.\n(Useful after a crash or stuck state.)"
+        : "Card not mounted.\nTap Remount to attempt mount.");
+    lv_obj_set_style_text_font(s_sd_remount_status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_sd_remount_status, ui_text_color(), 0);
+    lv_obj_set_style_text_align(s_sd_remount_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_sd_remount_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_sd_remount_status, LCD_H_RES - 20);
+    lv_obj_align(s_sd_remount_status, LV_ALIGN_TOP_MID, 0, 120);
+
+    s_sd_remount_btn = lv_btn_create(function_page);
+    lv_obj_set_size(s_sd_remount_btn, 170, 40);
+    lv_obj_align(s_sd_remount_btn, LV_ALIGN_TOP_MID, 0, 210);
+    lv_obj_set_style_bg_color(s_sd_remount_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(s_sd_remount_btn, lv_color_darken(COLOR_MATERIAL_GREEN, 30),
+                               LV_STATE_DISABLED);
+    lv_obj_set_style_radius(s_sd_remount_btn, 8, 0);
+    lv_obj_set_style_border_width(s_sd_remount_btn, 0, 0);
+    lv_obj_t *bl = lv_label_create(s_sd_remount_btn);
+    lv_label_set_text(bl, LV_SYMBOL_REFRESH " Remount SD Card");
+    lv_obj_set_style_text_font(bl, &lv_font_montserrat_14, 0);
+    lv_obj_center(bl);
+    lv_obj_add_event_cb(s_sd_remount_btn, s_sd_remount_trigger_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 90, 34);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_add_event_cb(back_btn, sd_back_to_menu_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *bbl = lv_label_create(back_btn);
+    lv_label_set_text(bbl, "Back");
+    lv_obj_set_style_text_color(bbl, ui_text_color(), 0);
+    lv_obj_center(bbl);
+}
+
 // ─── SD Card sub-menu ────────────────────────────────────────────────────────
 
 static void sd_card_tile_event_cb(lv_event_t *e)
@@ -22083,6 +22213,7 @@ static void sd_card_tile_event_cb(lv_event_t *e)
     else if (strcmp(name, "Tree") == 0)        show_sd_tree_screen();
     else if (strcmp(name, "New Folder") == 0)  show_new_folder_screen();
     else if (strcmp(name, "Delete File") == 0) show_delete_file_screen();
+    else if (strcmp(name, "Remount") == 0)     show_sd_remount_screen();
     else if (strcmp(name, "Format") == 0)      show_sd_format_confirm1();
 }
 
@@ -22110,6 +22241,8 @@ static void show_sd_card_screen(void)
                 sd_card_tile_event_cb, "New Folder");
     create_tile(tiles, LV_SYMBOL_TRASH,       "Delete\nFile",          COLOR_MATERIAL_RED,
                 sd_card_tile_event_cb, "Delete File");
+    create_tile(tiles, LV_SYMBOL_REFRESH,     "Remount\nSD Card",      lv_color_hex(0x00897B),
+                sd_card_tile_event_cb, "Remount");
     create_tile(tiles, LV_SYMBOL_WARNING,     "Format\nSD Card",       lv_color_hex(0xB71C1C),
                 sd_card_tile_event_cb, "Format");
 }

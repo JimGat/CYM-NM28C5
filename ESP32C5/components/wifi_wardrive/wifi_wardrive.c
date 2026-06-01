@@ -348,6 +348,14 @@ bool wifi_wardrive_is_sd_mounted(void) {
     return sd_card_mounted;
 }
 
+void wifi_wardrive_unmount_sd(void) {
+    if (!sd_card_mounted || !sd_card) return;
+    esp_vfs_fat_sdcard_unmount("/sdcard", sd_card);
+    sd_card_mounted = false;
+    sd_card = NULL;
+    ESP_LOGI(TAG, "[SD] unmounted");
+}
+
 esp_err_t wifi_wardrive_format_sd(void) {
     if (!sd_card_mounted || !sd_card) {
         ESP_LOGW(TAG, "[SD] format: card not mounted");

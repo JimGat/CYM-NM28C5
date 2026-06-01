@@ -59,6 +59,11 @@ esp_err_t wifi_wardrive_init_sd_ex(uint32_t freq_khz, bool format_if_failed);
 bool wifi_wardrive_is_sd_mounted(void);
 
 /**
+ * @brief Unmount the SD card cleanly. Safe to call when not mounted (no-op).
+ */
+void wifi_wardrive_unmount_sd(void);
+
+/**
  * @brief Format the SD card FAT filesystem (card must be mounted)
  */
 esp_err_t wifi_wardrive_format_sd(void);
