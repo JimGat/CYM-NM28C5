@@ -166,6 +166,7 @@ item P (pass), F (fail), or S (skip — feature not reachable in this session).
 | 12.1 | Screen timeout slider saves and survives reboot | |
 | 12.2 | Dark mode toggle persists across reboot | |
 | 12.3 | RF HAT enable/disable toggle saves | |
+| 12.4 | Settings → SD Card → Remount SD Card: tap Remount, status shows "Trying 20 MHz..." then result | |
 
 ---
 
@@ -180,13 +181,58 @@ item P (pass), F (fail), or S (skip — feature not reachable in this session).
 
 ---
 
+## 14. NTAG213 / NFC (DIP 3)
+
+| # | Check | Result |
+|---|-------|--------|
+| 14.1 | RFID/NFC → Scan & Read: hold NTAG213 tag near antenna; UID, type "NTAG213", pages=45 shown | |
+| 14.2 | Tap Read All: status shows "Read: 45 pages OK"; Save button enabled | |
+| 14.3 | Tap Save: name popup appears; card saved to /sdcard/lab/rfid/hf/ | |
+| 14.4 | Tap Export .nfc: file written to /sdcard/lab/rfid/export/ with "Pages total: 45" | |
+| 14.5 | RFID/NFC → Clone/Write: load saved card; present blank NTAG213; tap Clone to Blank Card; status shows pages written | |
+| 14.6 | RFID/NFC → HW Test: shows IC=0x32, FW=1.6 status READY | |
+| 14.7 | MIFARE Classic 1K: Scan & Read detects card; Read All runs key dict test, at least sector 0 reads (factory key FF×6) | |
+| 14.8 | Navigate away from any RFID screen: no crash (timer ordering, task ownership) | |
+
+---
+
+## 15. Fox Hunt (CC1101, DIP 1)
+
+| # | Check | Result |
+|---|-------|--------|
+| 15.1 | CC1101 → Fox Hunt opens; frequency shows 433.920 MHz; RSSI bar visible | |
+| 15.2 | Tap 315 MHz preset: frequency display updates, haptic fires if signal above squelch | |
+| 15.3 | Fine-tune +0.1 MHz: frequency increments by 0.100 MHz | |
+| 15.4 | Squelch +5: squelch label updates | |
+| 15.5 | Haptic ON/OFF toggle: button label changes color and text | |
+| 15.6 | Status label shows ASCII text only (no box characters) | |
+| 15.7 | Back → CC1101 menu: vibration stops, no crash | |
+
+---
+
+## 16. Fox Hunt (CC1101 Band Scope → Hunt, DIP 1)
+
+| # | Check | Result |
+|---|-------|--------|
+| 16.1 | Band Scope opens; yellow vertical line visible at center frequency immediately | |
+| 16.2 | Drag finger across canvas: yellow line follows finger in real time | |
+| 16.3 | Release finger: frequency + RSSI shown in status label for ~2 s | |
+| 16.4 | Yellow line stays within spectrum section only (does not extend into waterfall) | |
+| 16.5 | Waterfall scrolls cleanly — no yellow ghost trails from previous line position | |
+| 16.6 | Hunt freq button (next to Start/Stop) is visible and not obscured by nav bar | |
+| 16.7 | Tap Hunt freq: navigates to Fox Hunt screen at the tapped frequency | |
+
+---
+
 ## Known Skip Conditions
 
-- **Wardrive Upload** (Settings → Data Transfer) — placeholder, not implemented.
+- **Wardrive Upload** (Settings → Data Transfer) — placeholder tile; not yet implemented.
 - **Battery level** — ADC disabled; shows nothing. Not a failure.
 - **DIP-exclusive HAT modules** — only one of IR/RF433/CC1101/nRF24/PN532 can be
   active at a time (hardware power exclusion). Test only the one with DIP on.
 - **nRF24 stub screens** (MouseJack, Kb Inject, Drone, GamePad) — show Coming Soon screens; no RF functionality yet.
+- **CC1101 stub screens** (Weather, POCSAG, Alarm, RF Wardrive, Brute Force) — show Coming Soon screens.
+- **RF433 Fox Hunt** — activity-based only (no true RSSI); edges/s = 0 with no 433 MHz source nearby is expected.
 
 ---
 

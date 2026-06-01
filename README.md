@@ -5,7 +5,7 @@
 <h1 align="center">Cheap Yellow Monster</h1>
 
 <p align="center">
-  <b>v2.4.14</b>
+  <b>v2.4.28</b>
 </p>
 
 <p align="center">
@@ -42,6 +42,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 ## Table of Contents
 
 - [Features Overview](#features-overview)
+- [Menu Map](#menu-map)
 - [Screenshots](#screenshots)
 - [Hardware](#hardware)
 - [Pinout](#pinout)
@@ -82,10 +83,15 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
       - [TV-B-Gone](#tv-b-gone)
     - [RF433 OOK/ASK (DIP 5)](#rf433-ookask-dip-5)
     - [PN532 NFC/RFID (DIP 3)](#pn532-nfcrfid-dip-3)
-    - [CC1101 / nRF24L01 (DIP 1 / DIP 2)](#cc1101-sub-ghz-dip-1--nrf24l01-24-ghz-dip-2)
+      - [NTAG213/215/216 Full Dump](#ntag213215216-full-dump-workflow)
+    - [CC1101 Sub-GHz (DIP 1)](#cc1101-sub-ghz-dip-1)
+      - [Band Scope — SDR Frequency Marker](#band-scope)
+      - [Fox Hunt](#fox-hunt)
       - [Z-Wave Scout](#z-wave-scout)
       - [TPMS Monitor](#tpms-monitor)
+    - [nRF24L01+ 2.4 GHz (DIP 2)](#nrf24l01-24-ghz-dip-2)
       - [nRF24 Packet Sniffer](#nrf24-packet-sniffer)
+      - [Fox Hunt (nRF24)](#fox-hunt-1)
 - [3D Printable Cases](#3d-printable-cases)
 - [Data & Storage](#data--storage)
 - [Touch Calibration](#touch-calibration)
@@ -117,9 +123,129 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **Credentials** | Captive portal credential capture, WPA-SEC upload |
 | **TX Power Mode** | Selectable Normal / Max Power for WiFi and BLE — persisted across reboots |
 | **Data Transfer** | Self-hosted AP file server (TheLab) and WiFi client file server — browse, upload, create directories, and recursively delete folders from any browser; client IP logged to serial; IP shown on screen |
-| **NM-RF-HAT** | Hardware addon board for RF expansion -- IR capture/replay/Universal Remote/TV-B-Gone (Flipper .ir format); RF433 OOK capture/replay (Flipper .sub format); CC1101 Sub-GHz: Freq Scan/RAW Capture+Replay/Band Scope/Jammer/TPMS Monitor 315+433 MHz (Flipper .sub); nRF24L01+ 2.4 GHz: Ch Scan/Packet Sniffer/Jammer/Futaba S-FHSS (Flipper .nrf24); PN532 NFC/RFID: scan/save/emulate/.nfc import+export (Flipper .nfc); DIP switch per module |
+| **NM-RF-HAT** | Hardware addon board for RF expansion -- IR capture/replay/Universal Remote/TV-B-Gone (Flipper .ir); RF433 OOK capture/replay/Fox Hunt (Flipper .sub); CC1101 Sub-GHz: Band Scope (SDR freq marker + Hunt), Fox Hunt (RSSI bug-hunter haptic, 300-928 MHz tunable), RAW Capture+Replay, Z-Wave Scout, TPMS 315+433 MHz (Flipper .sub); nRF24L01+ 2.4 GHz: Ch Scan/Sniffer/Jammer/Futaba S-FHSS/Fox Hunt (Flipper .nrf24); PN532 NFC/RFID: scan+Read All, NTAG213/215/216 full page dump, Clone/Write to blank NTAG, MIFARE Classic key-dict test, save/emulate/.nfc import+export (Flipper .nfc); DIP switch per module |
+| **Fox Hunt** | Ham radio-style RF proximity tracker on all three sub-GHz radios. CC1101: tunable 300-928 MHz, RSSI bar + peak hold, adjustable squelch, bug-hunter haptic (pulse rate proportional to RSSI above squelch — from 2 s/pulse at threshold to continuous at 38 dB above). nRF24: carrier-detect rate bar across 2400-2525 MHz in 1 MHz steps. RF433: GPIO edge-count activity bar at 433.92 MHz. All three use the vibrator for proximity feedback. Band Scope → Fox Hunt tap-through with SDR-style draggable yellow frequency marker. |
+| **SD Card Remount** | Settings → SD Card → Remount SD Card: unmounts and re-mounts at 20/10/5 MHz fallback without physical eject — useful after a crash or RF-HAT FPC contact issue. |
 | **UI** | Material dark theme, touch gestures, screen dimming, screenshots — all screens portrait 240×320 |
 | **Storage** | SD card for handshakes, wardrive logs, GATT Walker JSON, screenshots, file tree browser |
+
+---
+
+## Menu Map
+
+Complete navigation tree as of v2.4.28. Items marked `[stub]` are placeholders with "Coming in next version" screens. Items marked `[RF-HAT]` require the NM-RF-HAT expansion board enabled in Settings → Hardware Options.
+
+```
+Home
+├── WiFi
+│   ├── Scan & Attack
+│   ├── WiFi Attacks
+│   │   ├── Blackout (Evil Twin)
+│   │   ├── Handshaker
+│   │   └── Portal
+│   ├── Deauth Monitor
+│   ├── WiFi Observer (Sniffer / Karma)
+│   ├── Drone Detect
+│   ├── Chanalizer
+│   └── WiFi Scope
+├── Bluetooth
+│   ├── BT Scan & Select
+│   ├── BT Observer
+│   ├── AirTag Scan
+│   ├── BT Locator
+│   ├── BT Lookout
+│   ├── BT Attacks
+│   │   ├── BLE Spam
+│   │   ├── Device Spoof
+│   │   ├── Blue Duck (BLE HID DuckyScript)
+│   │   └── Whisper Pair (CVE-2025-36911)
+│   ├── BLE PCAP
+│   ├── Honey Pair
+│   └── List Wizard
+├── Wardrive
+│   ├── Start Wardrive
+│   ├── Options
+│   └── Manage Data
+├── Settings
+│   ├── Compromised Data
+│   │   ├── Evil Twin Passwords
+│   │   ├── Portal Data
+│   │   └── Handshakes
+│   ├── Timing
+│   ├── Download Mode
+│   ├── Screen
+│   │   └── Recalibrate Touch
+│   ├── SD Card
+│   │   ├── Validate & Provision
+│   │   ├── Free Space
+│   │   ├── File Tree
+│   │   ├── New Folder
+│   │   ├── Delete File
+│   │   ├── Remount SD Card
+│   │   └── Format SD Card
+│   ├── GPS Info
+│   ├── Hardware Options
+│   │   └── NM-RF-HAT Enable / Disable
+│   ├── Data Transfer
+│   │   ├── AP File Server
+│   │   ├── WiFi Client
+│   │   └── Wardrive Upload [stub]
+│   └── Vibrator Test
+├── Go Dark (display off)
+├── Zigbee Scout
+├── Infrared [RF-HAT DIP 4]
+│   ├── Capture
+│   ├── Replay  →  <Remote>.ir  →  Signal list
+│   ├── Universal Remote
+│   ├── TV-B-Gone
+│   └── IR Jammer
+├── Radio [RF-HAT]
+│   ├── CC1101 Sub-GHz [DIP 1]  — 2 pages
+│   │   ├── Page 1
+│   │   │   ├── HW Test
+│   │   │   ├── Band Scope (SDR freq marker + Hunt button)
+│   │   │   ├── Fox Hunt (300-928 MHz tunable, haptic)
+│   │   │   ├── Capture RAW
+│   │   │   ├── Replay RAW
+│   │   │   ├── Saved Files
+│   │   │   ├── Z-Wave Scout
+│   │   │   ├── TPMS Monitor (315 / 433 MHz, 20 sensors)
+│   │   │   └── Weather Station [stub]
+│   │   └── Page 2
+│   │       ├── POCSAG Pager [stub]
+│   │       ├── Alarm Sensor [stub]
+│   │       ├── RF Wardrive [stub]
+│   │       ├── Decode Proto [stub]
+│   │       ├── Jammer
+│   │       └── Brute Force [stub]
+│   ├── nRF24L01+ 2.4 GHz [DIP 2]  — 2 pages
+│   │   ├── Page 1
+│   │   │   ├── HW Test
+│   │   │   ├── Ch Scan (2400-2525 MHz, carrier detect)
+│   │   │   ├── Sniffer
+│   │   │   ├── Saved Files
+│   │   │   ├── Jammer
+│   │   │   ├── Futaba S-FHSS
+│   │   │   └── Fox Hunt (channel tunable, haptic)
+│   │   └── Page 2
+│   │       ├── MouseJack [stub]
+│   │       ├── Kb Inject [stub]
+│   │       ├── Drone Scan [stub]
+│   │       └── Game Pad [stub]
+│   └── RF433 OOK/ASK [DIP 5]
+│       ├── Capture
+│       ├── Replay
+│       ├── Jammer
+│       ├── LBK Test (loopback)
+│       └── Fox Hunt (433.92 MHz fixed, edge-count activity)
+└── RFID/NFC [RF-HAT DIP 3]
+    ├── Scan & Read  →  Read All (full page dump)  →  Save / Export .nfc
+    ├── Clone/Write  →  Select source  →  Clone to blank NTAG
+    ├── Card Emulate →  Select saved card  →  Emulate / Stop
+    ├── Key Test     →  MIFARE Classic dict attack
+    ├── Saved Cards  →  load / emulate / Flipper .nfc import
+    └── HW Test      →  PN532 I2C probe, I2C bus scan
+```
 
 ---
 
@@ -1800,6 +1926,13 @@ Copy any `.ir` file directly into `/sdcard/lab/infrared/` — no conversion need
 
 433.92 MHz OOK/ASK capture and replay. Files use the **Flipper Zero `.sub` (SubGHz) format** — directly portable to/from Flipper Zero.
 
+**Features:**
+- **Capture:** records OOK signal transitions via GPIO9 (R4A_433 RX output); saves as Flipper `.sub`.
+- **Replay:** plays back `.sub` files via the T2-433M OOK transmitter.
+- **Jammer:** continuous OOK transmission to saturate the 433 MHz band.
+- **LBK Test:** loopback self-test verifying GPIO8 TX and GPIO9 RX path.
+- **Fox Hunt:** proximity tracker at fixed 433.92 MHz. The R4A_433 module demodulates incoming OOK signals to a digital output — edge transitions per second are counted as a signal-activity proxy. Higher activity = stronger 433 MHz signal nearby. Haptic feedback: vibrator pulses scale with activity. Note: no true RSSI — this is activity-based only.
+
 **SD card path:** `/sdcard/lab/rf433/`
 
 **Compatible .sub file sources:**
@@ -1817,13 +1950,24 @@ Copy any `.ir` file directly into `/sdcard/lab/infrared/` — no conversion need
 - `/sdcard/lab/rfid/keys/` -- reserved for future key files
 - `/sdcard/lab/rfid/logs/` -- reserved for scan logs
 
-**Workflow:**
-- **Card Scan:** tap Scan and hold a card near the antenna; UID, ATQA, SAK, and inferred card type appear on screen.
-- **Save:** tap Save; a name popup appears; card is saved as JSON to `/sdcard/lab/rfid/hf/`.
-- **Export .nfc:** tap Export to write a Flipper Zero `.nfc` format file to `/sdcard/lab/rfid/export/`.
-- **Import .nfc:** drop Flipper Zero `.nfc` files in `/sdcard/lab/rfid/import/`; they appear in the Saved Cards list alongside locally scanned cards.
-- **Card Emulate:** select a saved card from the Saved Cards list and tap Emulate; the PN532 presents the card's UID to any reader via `TgInitAsTarget`. Works for UID-only readers. MIFARE Classic authentication (CRYPTO1) is not emulated -- readers that require full auth will not complete the handshake.
-- **Saved Cards:** scrollable list with Load, Emulate, and Delete per card.
+**Screens:**
+
+| Screen | Function |
+|--------|----------|
+| **Scan & Read** | Scan a card — shows UID, ATQA, SAK, card type. Tap **Read All** to dump full memory (NTAG213: 45 pages; MIFARE Classic: all sectors via default key dict). Save as JSON; Export as Flipper `.nfc`. |
+| **Clone / Write** | Select a saved card (or scan → read → go back), then present a blank NTAG card — taps Clone to write pages 4-44 (user data; skips OTP pages 0-3 on genuine NXP tags). Use a Magic/CUID blank card to clone all pages including UID. |
+| **Card Emulate** | Select a saved card; PN532 enters `TgInitAsTarget` mode presenting the card's UID to any nearby reader. Responds to NTAG READ (0x30) commands using saved page data. MIFARE Classic CRYPTO1 auth is not supported in emulation — works for UID-only and NDEF/NTAG readers. |
+| **Key Test** | Present a MIFARE Classic 1K/4K card; runs default key dictionary (16 entries) against each sector; fills card struct with unlocked blocks. For authorized testing on own cards only. |
+| **Saved Cards** | Scrollable list of saved JSON cards with display name, UID, and protocol. Drop Flipper `.nfc` files in `/sdcard/lab/rfid/import/` to make them appear as importable entries — tap to load and emulate directly. |
+| **HW Test** | PN532 I2C probe — reads IC identifier, firmware version, support bitmask. Full I2C bus scan shown on failure to help diagnose wiring/DIP issues. |
+
+**NTAG213/215/216 full dump workflow:**
+1. Tap **Scan & Read** and hold card near antenna.
+2. Card type appears: NTAG213 (45 pages), NTAG215 (135 pages), NTAG216 (231 pages). Protocol is confirmed by GET_VERSION (0x60) — falls back to UID heuristic if not supported.
+3. Tap **Read All** — reads all pages via PN532 InDataExchange READ (0x30) in 4-page strides.
+4. Tap **Save** to store as JSON, or **Export .nfc** for Flipper Zero format with correct `Pages total:` count.
+
+**Flipper Zero .nfc compatibility:** export and import both support NTAG213, NTAG215, NTAG216 type tags exactly — `NTAG/Ultralight type:` line preserves the exact type on re-import.
 
 > **Note:** The PN532 module on the NM-RF-HAT has shorter read range than a dedicated PN532 breakout board. Hold cards very close -- nearly touching the antenna -- for reliable reads. This is a hardware limitation of the RF-HAT form factor, not a firmware issue.
 
@@ -1840,9 +1984,10 @@ Sub-1 GHz (300-928 MHz) OOK/ASK capture, replay, spectrum scan, and jamming. Use
 - **RAW Replay:** lists `.sub` files from SD; play at 1x/3x/5x speed.
 - **Saved Files:** list with Play and Delete per file.
 - **Jammer:** legal disclaimer screen required before activation; sweeps channels in PTX mode.
-- **Band Scope:** 126-point spectrum + 8-row scrolling waterfall canvas; 130 us dwell per channel; continuous sweep; live active-channel count. Tap the canvas to show frequency + RSSI for that bin.
+- **Band Scope:** 40-point spectrum + scrolling waterfall canvas; continuous sweep; live active-channel count. **SDR-style frequency marker:** a solid yellow vertical line appears at the center frequency on open; drag your finger across the canvas to move the line in real time (like SDRSharp or GQRX). Tap the canvas to show frequency + RSSI in the status label. **Hunt button** (right of Start/Stop) jumps directly to Fox Hunt at the marked frequency — tap a signal in the Band Scope, then tap Hunt to track it.
+- **Fox Hunt:** ham radio-style proximity tracker tunable across 300-928 MHz. Four preset buttons (315 / 433 / 868 / 915 MHz) plus ±0.1/±1 MHz fine-tune buttons. RSSI bar with peak hold (tap Clear Peak to reset). Adjustable squelch (±5 dBm per tap). Haptic feedback in bug-hunter style: slow pulses (1 every 2 s) just above squelch, racing pulses (10/s) at strong signals — vibration intensity also scales with RSSI. Status label: `-- SILENT / > WEAK / >> MEDIUM / >>> STRONG - CLOSE!`
 - **Z-Wave Scout:** passive wardrive on the Z-Wave frequency (908.42 MHz US / 868.42 MHz EU). Configures CC1101 for GFSK 9.6 kbps, sync word `0xAA01`. Logs frame metadata (node IDs, command class, RSSI, GPS coordinates) to `/sdcard/lab/zwave/` as a timestamped CSV. GPS-tagged entries are compatible with WiGLE for mapping Z-Wave device density.
-- **TPMS Monitor:** receives Tire Pressure Monitoring System transmissions at 315 MHz (US) or 433.92 MHz (EU). Decodes Schrader-family OOK packets — identifies each sensor by its unique 32-bit ID, displays pressure in PSI and kPa, temperature in °C, battery-low and alarm flags, and RSSI. Tracks up to 5 unique sensors per session. Logs all valid packets to `/sdcard/lab/tpms/` as a timestamped CSV.
+- **TPMS Monitor:** receives Tire Pressure Monitoring System transmissions at 315 MHz (US) or 433.92 MHz (EU). Decodes Schrader-family OOK packets — identifies each sensor by its unique 32-bit ID, displays pressure in PSI and kPa, temperature in °C, battery-low and alarm flags, and RSSI. Tracks up to **20 unique sensors** in a scrollable grid. Logs all valid packets to `/sdcard/lab/tpms/` as a timestamped CSV.
 
 ##### Z-Wave Scout
 
@@ -1869,7 +2014,7 @@ Z-Wave Scout puts the CC1101 into passive receive mode at the Z-Wave primary cha
 
 <a name="tpms-monitor"></a>
 
-The TPMS Monitor passively receives Tire Pressure Monitoring System (TPMS) sensor transmissions and decodes them in real time. Sensors are the small RF transmitters built into car wheels — they broadcast pressure, temperature, and status every 60–90 seconds at rest and more frequently while driving.
+The TPMS Monitor passively receives Tire Pressure Monitoring System (TPMS) sensor transmissions and decodes them in real time. Sensors are the small RF transmitters built into car wheels — they broadcast pressure, temperature, and status every 60–90 seconds at rest and more frequently while driving. Up to **20 unique sensors** are tracked per session in a scrollable grid; new sensors automatically scroll into view at the bottom.
 
 **Frequency selection (on-screen):**
 
@@ -1938,6 +2083,7 @@ Only CRC-valid packets are written to CSV. CRC-fail rows are shown on screen (la
 - **Saved Files:** lists `.nrf24` files with Play and Delete per entry.
 - **Jammer:** legal disclaimer required; rapid PTX channel sweep across all 126 channels.
 - **Futaba S-FHSS:** scans 25 S-FHSS channels (2404-2504 MHz, 4 MHz steps) at 1 Mbps; decodes 10-byte payload; extracts up to 8 servo channel values (11-bit, 0-2047); displays result on screen.
+- **Fox Hunt:** carrier-detect proximity tracker tunable across 2400-2525 MHz in 1 MHz steps (channels 0-125). Channel ±1/±10 step buttons plus quick presets (2400 / 2476 / 2500 MHz). Rolling 20-sample carrier-detect rate displayed as a bar + percentage. Haptic: vibrator pulses on each detection with intensity proportional to hit rate.
 - **Stub screens** (with authorization disclaimers): MouseJack, Keyboard Inject, Drone, GamePad -- Coming Soon.
 
 **nRF24 component:** `ESP32C5/components/nrf24/` (nrf24.c, nrf24.h, CMakeLists.txt)
