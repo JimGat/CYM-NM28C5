@@ -38957,16 +38957,16 @@ static void s_fox_timer_cb(lv_timer_t *tmr)
     if (s_fox_status_lbl) {
         int above = (int)rssi - (int)s_fox_squelch_dbm;
         if (above <= 0) {
-            lv_label_set_text(s_fox_status_lbl, "● SILENT");
+            lv_label_set_text(s_fox_status_lbl, "-- SILENT");
             lv_obj_set_style_text_color(s_fox_status_lbl, lv_color_hex(0x757575), 0);
         } else if (above < 10) {
-            lv_label_set_text(s_fox_status_lbl, "● WEAK");
+            lv_label_set_text(s_fox_status_lbl, " > WEAK");
             lv_obj_set_style_text_color(s_fox_status_lbl, lv_color_hex(0x4CAF50), 0);
         } else if (above < 25) {
-            lv_label_set_text(s_fox_status_lbl, "▲ MEDIUM");
+            lv_label_set_text(s_fox_status_lbl, ">> MEDIUM");
             lv_obj_set_style_text_color(s_fox_status_lbl, lv_color_hex(0xFFEB3B), 0);
         } else {
-            lv_label_set_text(s_fox_status_lbl, "★ STRONG — CLOSE!");
+            lv_label_set_text(s_fox_status_lbl, ">>> STRONG - CLOSE!");
             lv_obj_set_style_text_color(s_fox_status_lbl, lv_color_hex(0xF44336), 0);
         }
     }
@@ -39277,7 +39277,7 @@ static void show_cc1101_foxhunt_screen(void)
 
     // ── Status label ───────────────────────────────────────────────────────────
     s_fox_status_lbl = lv_label_create(function_page);
-    lv_label_set_text(s_fox_status_lbl, "● SILENT");
+    lv_label_set_text(s_fox_status_lbl, "-- SILENT");
     lv_obj_set_style_text_font(s_fox_status_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_fox_status_lbl, lv_color_hex(0x757575), 0);
     lv_obj_set_style_text_align(s_fox_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
@@ -39575,18 +39575,17 @@ static void s_bs_ui_timer_cb(lv_timer_t *t)
         if (v > 255) v = 255;
         ctx->canv_buf[wf_start * CC1101_BS_W + x] = scope_heat_color((uint8_t)v);
     }
-    // SDR-style frequency marker: solid yellow vertical line at tap_freq_mhz
+    // SDR-style frequency marker: solid yellow vertical line in spectrum section ONLY.
+    // Drawing into the waterfall section would ghost: memmove scroll carries line
+    // pixels down with each frame, making ghost trails in the history.
     if (ctx->marker_set && ctx->tap_freq_mhz > 0.0f) {
         float freq_start = ctx->center - ctx->span / 2.0f;
         int line_x = (int)((ctx->tap_freq_mhz - freq_start) / ctx->span * (float)CC1101_BS_W);
         if (line_x >= 0 && line_x < CC1101_BS_W) {
             lv_color_t yellow = lv_color_hex(0xFFEB3B);
-            int ch = ctx->canvas_h;
-            for (int ly = 0; ly < ch; ly++)
+            for (int ly = 0; ly < CC1101_BS_SPEC_H; ly++) {
                 ctx->canv_buf[ly * CC1101_BS_W + line_x] = yellow;
-            // Draw a 2-px wide line for visibility
-            if (line_x + 1 < CC1101_BS_W) {
-                for (int ly = 0; ly < ch; ly++)
+                if (line_x + 1 < CC1101_BS_W)
                     ctx->canv_buf[ly * CC1101_BS_W + line_x + 1] = yellow;
             }
         }
@@ -39606,7 +39605,6 @@ static void s_bs_ui_timer_cb(lv_timer_t *t)
         } else {
             lv_label_set_text(ctx->status_lbl, "Stopped");
         }
-        if (ctx->hunt_btn) lv_obj_add_flag(ctx->hunt_btn, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -39637,12 +39635,7 @@ static void s_bs_canvas_tap_cb(lv_event_t *e)
     lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0xFFEB3B), 0);
     ctx->tap_freq_mhz = freq;
     ctx->marker_set   = true;
-    ctx->tap_expire_us = esp_timer_get_time() + 4000000ULL;
-
-    // Hunt button appears only on finger-lift (CLICKED), not during drag (PRESSING)
-    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
-        if (ctx->hunt_btn) lv_obj_clear_flag(ctx->hunt_btn, LV_OBJ_FLAG_HIDDEN);
-    }
+    ctx->tap_expire_us = esp_timer_get_time() + 2000000ULL;
 }
 
 static void s_bs_hunt_btn_cb(lv_event_t *e)
@@ -39770,9 +39763,20 @@ static void show_cc1101_bandscope_screen(void)
     lv_obj_set_style_text_align(s_bs->status_lbl, LV_TEXT_ALIGN_CENTER, 0);
 
     // Start / Stop toggle button
-    s_bs->start_btn = lv_btn_create(function_page);
-    lv_obj_set_size(s_bs->start_btn, 110, 26);
-    lv_obj_set_pos(s_bs->start_btn, (LCD_H_RES - 110) / 2, cy + 57);
+    // Start/Stop and Hunt buttons in a shared row at cy+57
+    lv_obj_t *action_row = lv_obj_create(function_page);
+    lv_obj_set_size(action_row, LCD_H_RES - 10, 26);
+    lv_obj_set_pos(action_row, 5, cy + 57);
+    lv_obj_set_style_bg_opa(action_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(action_row, 0, 0);
+    lv_obj_set_style_pad_all(action_row, 0, 0);
+    lv_obj_set_flex_flow(action_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(action_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(action_row, 6, 0);
+    lv_obj_clear_flag(action_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_bs->start_btn = lv_btn_create(action_row);
+    lv_obj_set_size(s_bs->start_btn, 108, 26);
     lv_obj_set_style_bg_color(s_bs->start_btn, lv_color_hex(0x1B5E20), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(s_bs->start_btn, lv_color_hex(0x2E7D32), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(s_bs->start_btn, 0, 0);
@@ -39783,21 +39787,24 @@ static void show_cc1101_bandscope_screen(void)
     lv_obj_center(sl);
     lv_obj_add_event_cb(s_bs->start_btn, s_bs_startstop_cb, LV_EVENT_CLICKED, NULL);
 
-    s_bs->tmr = lv_timer_create(s_bs_ui_timer_cb, 100, NULL);
-
-    // "Hunt this freq" button — hidden until user taps a canvas bin
-    s_bs->hunt_btn = lv_btn_create(function_page);
-    lv_obj_set_size(s_bs->hunt_btn, 110, 24);
-    lv_obj_set_pos(s_bs->hunt_btn, (LCD_H_RES - 110) / 2, cy + 57 + 28);
+    // Hunt button — always visible, right of Start/Stop; hunts current marker freq
+    s_bs->hunt_btn = lv_btn_create(action_row);
+    lv_obj_set_size(s_bs->hunt_btn, 108, 26);
     lv_obj_set_style_bg_color(s_bs->hunt_btn, lv_color_hex(0xE65100), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(s_bs->hunt_btn, lv_color_hex(0xBF360C), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(s_bs->hunt_btn, 0, 0);
     lv_obj_set_style_radius(s_bs->hunt_btn, 6, 0);
     lv_obj_t *hl = lv_label_create(s_bs->hunt_btn);
-    lv_label_set_text(hl, MY_SYMBOL_PERSON_WALKING " Hunt this freq");
+    lv_label_set_text(hl, MY_SYMBOL_PERSON_WALKING " Hunt freq");
     lv_obj_set_style_text_font(hl, &lv_font_montserrat_12, 0);
     lv_obj_center(hl);
-    lv_obj_add_flag(s_bs->hunt_btn, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(s_bs->hunt_btn, s_bs_hunt_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    // Initialize marker at center frequency so line appears on open
+    s_bs->tap_freq_mhz = ctx->center;
+    s_bs->marker_set   = true;
+
+    s_bs->tmr = lv_timer_create(s_bs_ui_timer_cb, 100, NULL);
 
     rfhat_add_back_btn("CC1101", show_cc1101_screen);
 }
@@ -41531,16 +41538,16 @@ static void s_n24fox_timer_cb(lv_timer_t *tmr)
     }
     if (s_n24fox_status) {
         if (pct == 0) {
-            lv_label_set_text(s_n24fox_status, "● SILENT");
+            lv_label_set_text(s_n24fox_status, "-- SILENT");
             lv_obj_set_style_text_color(s_n24fox_status, lv_color_hex(0x757575), 0);
         } else if (pct < 30) {
-            lv_label_set_text(s_n24fox_status, "● WEAK");
+            lv_label_set_text(s_n24fox_status, " > WEAK");
             lv_obj_set_style_text_color(s_n24fox_status, lv_color_hex(0x4CAF50), 0);
         } else if (pct < 70) {
-            lv_label_set_text(s_n24fox_status, "▲ MEDIUM");
+            lv_label_set_text(s_n24fox_status, ">> MEDIUM");
             lv_obj_set_style_text_color(s_n24fox_status, lv_color_hex(0xFFEB3B), 0);
         } else {
-            lv_label_set_text(s_n24fox_status, "★ STRONG — CLOSE!");
+            lv_label_set_text(s_n24fox_status, ">>> STRONG - CLOSE!");
             lv_obj_set_style_text_color(s_n24fox_status, lv_color_hex(0xF44336), 0);
         }
     }
@@ -41699,7 +41706,7 @@ static void show_nrf24_foxhunt_screen(void)
     y += 30;
 
     s_n24fox_status = lv_label_create(function_page);
-    lv_label_set_text(s_n24fox_status, "● SILENT");
+    lv_label_set_text(s_n24fox_status, "-- SILENT");
     lv_obj_set_style_text_font(s_n24fox_status, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_n24fox_status, lv_color_hex(0x757575), 0);
     lv_obj_set_style_text_align(s_n24fox_status, LV_TEXT_ALIGN_CENTER, 0);
@@ -41742,16 +41749,16 @@ static void s_rf433_fox_timer_cb(lv_timer_t *tmr)
     }
     if (s_rf433_fox_status) {
         if (pct == 0) {
-            lv_label_set_text(s_rf433_fox_status, "● SILENT");
+            lv_label_set_text(s_rf433_fox_status, "-- SILENT");
             lv_obj_set_style_text_color(s_rf433_fox_status, lv_color_hex(0x757575), 0);
         } else if (pct < 25) {
-            lv_label_set_text(s_rf433_fox_status, "● WEAK");
+            lv_label_set_text(s_rf433_fox_status, " > WEAK");
             lv_obj_set_style_text_color(s_rf433_fox_status, lv_color_hex(0x4CAF50), 0);
         } else if (pct < 60) {
-            lv_label_set_text(s_rf433_fox_status, "▲ MEDIUM");
+            lv_label_set_text(s_rf433_fox_status, ">> MEDIUM");
             lv_obj_set_style_text_color(s_rf433_fox_status, lv_color_hex(0xFFEB3B), 0);
         } else {
-            lv_label_set_text(s_rf433_fox_status, "★ STRONG — CLOSE!");
+            lv_label_set_text(s_rf433_fox_status, ">>> STRONG - CLOSE!");
             lv_obj_set_style_text_color(s_rf433_fox_status, lv_color_hex(0xF44336), 0);
         }
     }
@@ -41858,7 +41865,7 @@ static void show_rf433_foxhunt_screen(void)
     y += 30;
 
     s_rf433_fox_status = lv_label_create(function_page);
-    lv_label_set_text(s_rf433_fox_status, "● SILENT");
+    lv_label_set_text(s_rf433_fox_status, "-- SILENT");
     lv_obj_set_style_text_font(s_rf433_fox_status, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_rf433_fox_status, lv_color_hex(0x757575), 0);
     lv_obj_set_style_text_align(s_rf433_fox_status, LV_TEXT_ALIGN_CENTER, 0);
