@@ -38030,16 +38030,16 @@ static void show_cc1101_hw_test_screen(void)
     apply_menu_bg();
 
     lv_obj_t *card = lv_obj_create(function_page);
-    lv_obj_set_size(card, LCD_H_RES - 16, LCD_V_RES - 88);
+    lv_obj_set_size(card, LCD_H_RES - 16, LCD_V_RES - 80);  // fills to nav bar
     lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 34);
     lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
     lv_obj_set_style_border_color(card, lv_color_hex(0x1B5E20), 0);
     lv_obj_set_style_border_width(card, 1, 0);
     lv_obj_set_style_radius(card, 8, 0);
-    lv_obj_set_style_pad_all(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 8, 0);
     lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_set_style_pad_row(card, 5, 0);
+    lv_obj_set_style_pad_row(card, 2, 0);  // compact rows so calibration section is visible
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
     // Title
