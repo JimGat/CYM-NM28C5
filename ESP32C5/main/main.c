@@ -548,6 +548,19 @@ static char     g_saved_wifi_pass[65] = ""; // Home network password
 #define NVS_KEY_GPS_ALT      "gps_alt_i"
 #define NVS_KEY_RF_HAT       "rf_hat"
 #define NVS_KEY_BTSC_CTR     "btsc_ctr"
+#define NVS_KEY_CC1101_OFF   "cc1101_off"  // int32 Hz, ±20000 crystal calibration offset
+
+// ── CC1101 crystal calibration — declared here so NVS load can access them ────
+// Consumer 26 MHz crystals vary ±20-40 ppm; at 433 MHz that is ±8.7-17 kHz.
+// Positive offset = chip measures HIGHER than programmed.
+// Correction: enter negative (chip high) or positive (chip low) kHz value.
+static int32_t g_cc1101_freq_offset_hz = 0;
+
+static inline float cc1101_freq_cal(float mhz) {
+    return mhz + (float)g_cc1101_freq_offset_hz / 1000000.0f;
+}
+
+static void nvs_save_cc1101_offset(void);   // forward — implemented near HW test screen
 
 // Wardrive band selection
 typedef enum { WD_BAND_BOTH = 0, WD_BAND_24G, WD_BAND_5G } wd_band_t;
@@ -2084,6 +2097,7 @@ static void show_ir_menu_screen(void);
 static void show_radio_menu_screen(void);
 static void show_rfid_menu_screen(void);
 static void show_cc1101_screen(void);
+static void s_cal_tx_stop(void);      // calibration TX stop, called from show_cc1101_screen cleanup
 static void show_cc1101_hw_test_screen(void);
 static void show_cc1101_freq_scan_screen(void);
 static void show_cc1101_capture_screen(void);
@@ -3270,6 +3284,11 @@ static void nvs_settings_load(void)
         if (nvs_get_u8(h, NVS_KEY_RF_HAT, &rfhat) == ESP_OK) g_rf_hat_enabled = (rfhat != 0);
         uint32_t btsc_ctr = 0;
         if (nvs_get_u32(h, NVS_KEY_BTSC_CTR, &btsc_ctr) == ESP_OK) g_btsc_counter = btsc_ctr;
+        int32_t cc1101_off = 0;
+        if (nvs_get_i32(h, NVS_KEY_CC1101_OFF, &cc1101_off) == ESP_OK) {
+            if (cc1101_off >= -20000 && cc1101_off <= 20000)
+                g_cc1101_freq_offset_hz = cc1101_off;
+        }
         uint8_t bt_scan_dur = 10;
         if (nvs_get_u8(h, NVS_KEY_BT_SCAN_DUR, &bt_scan_dur) == ESP_OK)
             g_bt_scan_duration_s = (bt_scan_dur >= 10 && bt_scan_dur <= 30) ? bt_scan_dur : 10;
@@ -37388,6 +37407,14 @@ static void show_radio_menu_screen(void)
 // Current frequency (MHz) — shared across CC1101 sub-screens
 static float s_cc1101_freq_mhz = 433.92f;
 
+// ── CC1101 Calibration TX state ───────────────────────────────────────────────
+static bool       s_cc1101_cal_tx_active = false;
+static lv_timer_t *s_cc1101_cal_tx_tmr  = NULL;
+static lv_obj_t   *s_cc1101_ht_offset_lbl = NULL;
+static lv_obj_t   *s_cc1101_ht_cal_btn    = NULL;
+static lv_obj_t   *s_offset_overlay = NULL;
+static lv_obj_t   *s_offset_ta      = NULL;
+
 // Freq scan screen
 static lv_obj_t *s_cc1101_rssi_bar   = NULL;
 static lv_obj_t *s_cc1101_rssi_lbl   = NULL;
@@ -37601,6 +37628,11 @@ static void show_cc1101_screen(void)
     if (s_cc1101_cap_task) cc1101_capture_cancel();
     if (s_cc1101_rep_task) cc1101_replay_cancel();
     if (s_cc1101_sub_paths) { free(s_cc1101_sub_paths); s_cc1101_sub_paths = NULL; }
+    // Calibration TX cleanup (HW test screen)
+    s_cal_tx_stop();
+    s_cc1101_ht_offset_lbl = NULL;
+    s_cc1101_ht_cal_btn    = NULL;
+    if (s_offset_overlay) { lv_obj_del(s_offset_overlay); s_offset_overlay = NULL; s_offset_ta = NULL; }
     // Fox hunt cleanup
     if (s_fox_tmr) { lv_timer_del(s_fox_tmr); s_fox_tmr = NULL; }
     s_fox_setup_done = false;
@@ -37804,8 +37836,196 @@ static void s_cc1101_ht_run_cb(lv_event_t *e)
     (void)e;
 }
 
+// NVS save for CC1101 crystal offset
+static void nvs_save_cc1101_offset(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, NVS_KEY_CC1101_OFF, g_cc1101_freq_offset_hz);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+// ── Calibration TX (continuous OOK carrier for frequency measurement) ─────────
+
+static void s_cal_tx_stop(void)
+{
+    s_cc1101_cal_tx_active = false;
+    if (s_cc1101_cal_tx_tmr) { lv_timer_del(s_cc1101_cal_tx_tmr); s_cc1101_cal_tx_tmr = NULL; }
+    if (cc1101_is_init()) cc1101_idle();
+    if (s_cc1101_ht_cal_btn) {
+        lv_obj_t *l = lv_obj_get_child(s_cc1101_ht_cal_btn, 0);
+        if (l) lv_label_set_text(l, LV_SYMBOL_PLAY " CAL TX 433");
+        lv_obj_set_style_bg_color(s_cc1101_ht_cal_btn, lv_color_hex(0x827717), LV_STATE_DEFAULT);
+    }
+}
+
+static void s_cal_tx_refill_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!s_cc1101_cal_tx_active || !cc1101_is_init()) return;
+    uint8_t tx_used = cc1101_read_status(0x3A) & 0x7F;  // TXBYTES status register
+    int space = 64 - (int)tx_used;
+    if (space > 0) {
+        int fill = (space > 32) ? 32 : space;
+        for (int i = 0; i < fill; i++) cc1101_write_reg(CC1101_TXFIFO, 0xFF);
+    }
+    uint8_t marc = cc1101_get_marc_state();
+    if (marc != 19 && marc != 18) cc1101_strobe(CC1101_STX);
+}
+
+static void s_cal_tx_toggle_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_cc1101_cal_tx_active) { s_cal_tx_stop(); return; }
+    if (!cc1101_is_init() && cc1101_init() != ESP_OK) return;
+    cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);
+    cc1101_set_freq_mhz(cc1101_freq_cal(433.920f));
+    cc1101_write_reg(CC1101_PKTCTRL0, 0x02);  // infinite packet, no CRC
+    for (int i = 0; i < 64; i++) cc1101_write_reg(CC1101_TXFIFO, 0xFF);
+    cc1101_strobe(CC1101_STX);
+    s_cc1101_cal_tx_active = true;
+    s_cc1101_cal_tx_tmr = lv_timer_create(s_cal_tx_refill_cb, 50, NULL);
+    if (s_cc1101_ht_cal_btn) {
+        lv_obj_t *l = lv_obj_get_child(s_cc1101_ht_cal_btn, 0);
+        if (l) lv_label_set_text(l, LV_SYMBOL_STOP " TX ACTIVE");
+        lv_obj_set_style_bg_color(s_cc1101_ht_cal_btn, UI_ACCENT_RED, LV_STATE_DEFAULT);
+    }
+}
+
+static void s_offset_confirm_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_offset_ta) {
+        const char *txt = lv_textarea_get_text(s_offset_ta);
+        float khz = 0.0f;
+        if (sscanf(txt, "%f", &khz) == 1) {
+            int32_t hz = (int32_t)(khz * 1000.0f);
+            if (hz < -20000) hz = -20000;
+            if (hz >  20000) hz =  20000;
+            g_cc1101_freq_offset_hz = hz;
+            nvs_save_cc1101_offset();
+            if (s_cc1101_ht_offset_lbl) {
+                char buf[48];
+                snprintf(buf, sizeof(buf), "Offset: %+.3f kHz (%+ld Hz)",
+                         (double)(hz / 1000.0f), (long)hz);
+                lv_label_set_text(s_cc1101_ht_offset_lbl, buf);
+                lv_obj_set_style_text_color(s_cc1101_ht_offset_lbl,
+                    hz == 0 ? lv_color_hex(0x9E9E9E) : lv_color_hex(0xFFB300), 0);
+            }
+        }
+    }
+    if (s_offset_overlay) { lv_obj_del(s_offset_overlay); s_offset_overlay = NULL; s_offset_ta = NULL; }
+}
+
+static void s_offset_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_offset_overlay) { lv_obj_del(s_offset_overlay); s_offset_overlay = NULL; s_offset_ta = NULL; }
+}
+
+static void s_offset_entry_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_offset_overlay) return;
+    s_offset_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(s_offset_overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(s_offset_overlay, 0, 0);
+    lv_obj_set_style_bg_color(s_offset_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_offset_overlay, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(s_offset_overlay, 0, 0);
+    lv_obj_set_style_pad_all(s_offset_overlay, 0, 0);
+    lv_obj_set_style_radius(s_offset_overlay, 0, 0);
+    lv_obj_clear_flag(s_offset_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *kb = lv_keyboard_create(s_offset_overlay);
+    lv_obj_set_width(kb, LCD_H_RES);
+    lv_obj_set_style_text_font(kb, &lv_font_montserrat_12, 0);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);
+    lv_obj_set_style_bg_color(kb, ui_bg_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(kb, ui_text_color(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(kb, lv_color_make(0, 80, 0), LV_PART_ITEMS);
+    lv_obj_set_style_text_color(kb, ui_text_color(), LV_PART_ITEMS);
+
+    lv_obj_t *card = lv_obj_create(s_offset_overlay);
+    lv_obj_set_size(card, LCD_H_RES - 16, LV_SIZE_CONTENT);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 4);
+    lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x827717), 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 8, 0);
+    lv_obj_set_style_pad_row(card, 4, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, "Crystal Freq Offset (kHz)");
+    lv_obj_set_style_text_color(title, lv_color_hex(0xFFD54F), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
+
+    lv_obj_t *hint = lv_label_create(card);
+    lv_label_set_text(hint,
+        "Chip measures HIGH by X kHz -> enter -X\n"
+        "Chip measures LOW by X kHz  -> enter +X\n"
+        "Range: +-20.000 kHz  (e.g. -15.3)");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint, lv_color_hex(0xB0BEC5), 0);
+
+    s_offset_ta = lv_textarea_create(card);
+    lv_obj_set_width(s_offset_ta, LCD_H_RES - 32);
+    lv_obj_set_height(s_offset_ta, 36);
+    lv_textarea_set_max_length(s_offset_ta, 10);
+    lv_textarea_set_one_line(s_offset_ta, true);
+    char cur[16]; snprintf(cur, sizeof(cur), "%.3f", (double)(g_cc1101_freq_offset_hz / 1000.0f));
+    lv_textarea_set_text(s_offset_ta, cur);
+    lv_textarea_set_placeholder_text(s_offset_ta, "0.000");
+    lv_obj_set_style_text_font(s_offset_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(s_offset_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(s_offset_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(s_offset_ta, lv_color_hex(0x827717), 0);
+    lv_keyboard_set_textarea(kb, s_offset_ta);
+
+    lv_obj_t *btn_row = lv_obj_create(card);
+    lv_obj_set_size(btn_row, LCD_H_RES - 32, 32);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel_btn, 90, 28);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x455A64), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(cancel_btn, 0, 0);
+    lv_obj_set_style_radius(cancel_btn, 6, 0);
+    lv_obj_t *cl = lv_label_create(cancel_btn);
+    lv_label_set_text(cl, "Cancel");
+    lv_obj_set_style_text_font(cl, &lv_font_montserrat_12, 0);
+    lv_obj_center(cl);
+    lv_obj_add_event_cb(cancel_btn, s_offset_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *ok_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(ok_btn, 90, 28);
+    lv_obj_set_style_bg_color(ok_btn, lv_color_hex(0x827717), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(ok_btn, 0, 0);
+    lv_obj_set_style_radius(ok_btn, 6, 0);
+    lv_obj_t *okl = lv_label_create(ok_btn);
+    lv_label_set_text(okl, LV_SYMBOL_OK " Save");
+    lv_obj_set_style_text_font(okl, &lv_font_montserrat_12, 0);
+    lv_obj_center(okl);
+    lv_obj_add_event_cb(ok_btn, s_offset_confirm_cb, LV_EVENT_CLICKED, NULL);
+}
+
 static void show_cc1101_hw_test_screen(void)
 {
+    s_cal_tx_stop();
+    s_cc1101_ht_offset_lbl = NULL;
+    s_cc1101_ht_cal_btn    = NULL;
+
     create_function_page_base("CC1101 HW Test");
     apply_menu_bg();
 
@@ -37862,6 +38082,64 @@ static void show_cc1101_hw_test_screen(void)
     lv_obj_center(run_lbl);
     lv_obj_add_event_cb(run_btn, s_cc1101_ht_run_cb, LV_EVENT_CLICKED, NULL);
 
+    // ── Crystal calibration section ───────────────────────────────────────────
+    lv_obj_t *sep = lv_obj_create(card);
+    lv_obj_set_size(sep, LCD_H_RES - 36, 1);
+    lv_obj_set_style_bg_color(sep, lv_color_hex(0x827717), 0);
+    lv_obj_set_style_border_width(sep, 0, 0);
+    lv_obj_set_style_pad_all(sep, 0, 0);
+
+    lv_obj_t *cal_hdr = lv_label_create(card);
+    lv_label_set_text(cal_hdr, "Crystal Calibration");
+    lv_obj_set_style_text_font(cal_hdr, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(cal_hdr, lv_color_hex(0xFFD54F), 0);
+
+    s_cc1101_ht_offset_lbl = lv_label_create(card);
+    {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "Offset: %+.3f kHz (%+ld Hz)",
+                 (double)(g_cc1101_freq_offset_hz / 1000.0f),
+                 (long)g_cc1101_freq_offset_hz);
+        lv_label_set_text(s_cc1101_ht_offset_lbl, buf);
+    }
+    lv_obj_set_style_text_font(s_cc1101_ht_offset_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_cc1101_ht_offset_lbl,
+        g_cc1101_freq_offset_hz == 0 ? lv_color_hex(0x9E9E9E) : lv_color_hex(0xFFB300), 0);
+
+    // Button row: [Set Offset] [CAL TX 433]
+    lv_obj_t *cal_row = lv_obj_create(card);
+    lv_obj_set_size(cal_row, LCD_H_RES - 36, 32);
+    lv_obj_set_style_bg_opa(cal_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(cal_row, 0, 0);
+    lv_obj_set_style_pad_all(cal_row, 0, 0);
+    lv_obj_set_flex_flow(cal_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(cal_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(cal_row, 8, 0);
+    lv_obj_clear_flag(cal_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *set_btn = lv_btn_create(cal_row);
+    lv_obj_set_size(set_btn, 104, 28);
+    lv_obj_set_style_bg_color(set_btn, lv_color_hex(0x4E342E), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_color(set_btn, lv_color_hex(0x827717), 0);
+    lv_obj_set_style_border_width(set_btn, 1, 0);
+    lv_obj_set_style_radius(set_btn, 6, 0);
+    lv_obj_t *sl2 = lv_label_create(set_btn);
+    lv_label_set_text(sl2, LV_SYMBOL_EDIT " Set Offset");
+    lv_obj_set_style_text_font(sl2, &lv_font_montserrat_12, 0);
+    lv_obj_center(sl2);
+    lv_obj_add_event_cb(set_btn, s_offset_entry_cb, LV_EVENT_CLICKED, NULL);
+
+    s_cc1101_ht_cal_btn = lv_btn_create(cal_row);
+    lv_obj_set_size(s_cc1101_ht_cal_btn, 104, 28);
+    lv_obj_set_style_bg_color(s_cc1101_ht_cal_btn, lv_color_hex(0x827717), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(s_cc1101_ht_cal_btn, 0, 0);
+    lv_obj_set_style_radius(s_cc1101_ht_cal_btn, 6, 0);
+    lv_obj_t *ctl = lv_label_create(s_cc1101_ht_cal_btn);
+    lv_label_set_text(ctl, LV_SYMBOL_PLAY " CAL TX 433");
+    lv_obj_set_style_text_font(ctl, &lv_font_montserrat_12, 0);
+    lv_obj_center(ctl);
+    lv_obj_add_event_cb(s_cc1101_ht_cal_btn, s_cal_tx_toggle_cb, LV_EVENT_CLICKED, NULL);
+
     rfhat_add_back_btn("CC1101", show_cc1101_screen);
 }
 
@@ -37894,7 +38172,7 @@ static void s_cc1101_freq_btn_cb(lv_event_t *e)
 {
     float mhz = *(float *)lv_event_get_user_data(e);
     s_cc1101_freq_mhz = mhz;
-    if (cc1101_is_init()) cc1101_set_freq_mhz(mhz);
+    if (cc1101_is_init()) cc1101_set_freq_mhz(cc1101_freq_cal(mhz));
     char buf[40];
     if (s_cc1101_freq_hdr) {
         snprintf(buf, sizeof(buf), MY_SYMBOL_SATELLITE "  %.2f MHz", (double)mhz);
@@ -37917,7 +38195,7 @@ static void show_cc1101_freq_scan_screen(void)
         }
     }
     cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);
-    cc1101_set_freq_mhz(s_cc1101_freq_mhz);
+    cc1101_set_freq_mhz(cc1101_freq_cal(s_cc1101_freq_mhz));
     cc1101_rx();
 
     create_function_page_base("CC1101 Freq Scan");
@@ -38061,7 +38339,7 @@ static void s_cc1101_cap_start_cb(lv_event_t *e)
     if (s_cc1101_cap_state == CC1101_CAP_RUNNING) return;
     if (!cc1101_is_init() && cc1101_init() != ESP_OK) return;
     cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);
-    cc1101_set_freq_mhz(s_cc1101_freq_mhz);
+    cc1101_set_freq_mhz(cc1101_freq_cal(s_cc1101_freq_mhz));
     s_cc1101_cap_state = CC1101_CAP_RUNNING;
     if (s_cc1101_cap_btn) lv_obj_add_state(s_cc1101_cap_btn, LV_STATE_DISABLED);
     if (s_cc1101_cap_status_lbl) lv_label_set_text(s_cc1101_cap_status_lbl, "Listening... 0 edges");
@@ -38087,7 +38365,7 @@ static void show_cc1101_capture_screen(void)
         return;
     }
     cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);
-    cc1101_set_freq_mhz(s_cc1101_freq_mhz);
+    cc1101_set_freq_mhz(cc1101_freq_cal(s_cc1101_freq_mhz));
 
     create_function_page_base("CC1101 Capture");
     apply_menu_bg();
@@ -38198,7 +38476,7 @@ static void s_cc1101_rep_task_fn(void *arg)
     if (!cc1101_is_init()) cc1101_init();
     esp_err_t err = ESP_FAIL;
     if (cc1101_is_init()) {
-        cc1101_set_freq_mhz(s_cc1101_cap_raw.freq_mhz);
+        cc1101_set_freq_mhz(cc1101_freq_cal(s_cc1101_cap_raw.freq_mhz));
         err = cc1101_raw_replay(&s_cc1101_cap_raw, repeats);
     }
     s_cc1101_rep_state = (err == ESP_OK) ? CC1101_REP_DONE : CC1101_REP_FAIL;
@@ -38317,7 +38595,7 @@ static void s_cc1101_saved_rep_task_fn(void *arg)
     if (err == ESP_OK) {
         if (!cc1101_is_init()) cc1101_init();
         if (cc1101_is_init()) {
-            cc1101_set_freq_mhz(raw.freq_mhz);
+            cc1101_set_freq_mhz(cc1101_freq_cal(raw.freq_mhz));
             err = cc1101_raw_replay(&raw, repeats);
         } else {
             err = ESP_FAIL;
@@ -38942,7 +39220,7 @@ static void s_fox_timer_cb(lv_timer_t *tmr)
     // guarantee the task has exited and the CC1101 is ours to configure.
     if (!s_fox_setup_done) {
         cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);
-        cc1101_set_freq_mhz(s_cc1101_freq_mhz);
+        cc1101_set_freq_mhz(cc1101_freq_cal(s_cc1101_freq_mhz));
         cc1101_rx();
         s_fox_setup_done = true;
         return;  // skip RSSI read this tick; let AGC settle for the next tick
@@ -39048,7 +39326,7 @@ static void s_fox_freq_adj_cb(lv_event_t *e)
     // Clamp to CC1101 valid bands
     if (s_cc1101_freq_mhz < 300.0f) s_cc1101_freq_mhz = 300.0f;
     if (s_cc1101_freq_mhz > 928.0f) s_cc1101_freq_mhz = 928.0f;
-    if (cc1101_is_init()) cc1101_set_freq_mhz(s_cc1101_freq_mhz);
+    if (cc1101_is_init()) cc1101_set_freq_mhz(cc1101_freq_cal(s_cc1101_freq_mhz));
     s_fox_peak_dbm = -120;
     s_fox_haptic_ctr = 0;
     if (s_fox_freq_lbl) {
@@ -39062,7 +39340,7 @@ static void s_fox_preset_cb(lv_event_t *e)
 {
     float mhz = *(float *)lv_event_get_user_data(e);
     s_cc1101_freq_mhz = mhz;
-    if (cc1101_is_init()) cc1101_set_freq_mhz(mhz);
+    if (cc1101_is_init()) cc1101_set_freq_mhz(cc1101_freq_cal(mhz));
     s_fox_peak_dbm = -120;
     s_fox_haptic_ctr = 0;
     if (s_fox_freq_lbl) {
