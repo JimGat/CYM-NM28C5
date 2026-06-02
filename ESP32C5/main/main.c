@@ -39707,7 +39707,7 @@ static void s_cc1101_jam_start_cb(lv_event_t *e)
         lv_obj_set_style_text_color(s_cc1101_jam_status, UI_ACCENT_RED, 0);
     }
     if (!s_cc1101_jam_tmr)
-        s_cc1101_jam_tmr = lv_timer_create(s_cc1101_jam_timer_cb, 100, NULL);
+        s_cc1101_jam_tmr = lv_timer_create(s_cc1101_jam_timer_cb, 500, NULL);
     (void)e;
 }
 
@@ -39847,7 +39847,7 @@ static void show_cc1101_jammer_screen(void)
     lv_obj_set_style_text_color(s_cc1101_jam_freq_lbl, lv_color_hex(0x757575), 0);
 
     lv_obj_t *note = lv_label_create(card);
-    lv_label_set_text(note, "6-step sweep, 200 kHz steps\n100 ms dwell per step");
+    lv_label_set_text(note, "6-step sweep, 200 kHz steps\n500 ms dwell — 3 s full cycle");
     lv_obj_set_style_text_font(note, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(note, lv_color_make(120,120,120), 0);
     lv_obj_set_style_text_align(note, LV_TEXT_ALIGN_CENTER, 0);
