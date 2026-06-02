@@ -346,11 +346,11 @@
     </footer>
 
     <script type="module">
-      // tasmota-webserial-esptool v9.2.23 — Tasmota fork of esptool-js that fixes the
-      // ESP32-C5 OPI PSRAM / Flash ID: 0 issue (esptool-js mainline issue #217, still open).
-      // ESPConnect uses this same library. Uses flashData() API instead of writeFlash().
-      // esm.sh used as CDN — automatically resolves bare module specifiers for browser use.
-      import { ESPLoader, Transport } from "https://esm.sh/tasmota-webserial-esptool@9.2.23";
+      // tasmota-webserial-esptool v9.2.23 — Tasmota fork that fixes ESP32-C5 OPI PSRAM /
+      // Flash ID: 0 (esptool-js issue #217, still open). Same library ESPConnect uses.
+      // NOTE: Transport is NOT exported — ESPLoader accepts SerialPort directly via {port:}.
+      // esm.sh CDN bundles all deps into a proper browser ES module.
+      import { ESPLoader } from "https://esm.sh/tasmota-webserial-esptool@9.2.23";
 
       const ui = {
         status: document.getElementById("statusText"),
@@ -376,8 +376,8 @@
         devWarning: document.getElementById("devWarning"),
       };
 
-      const state = { manifest:null, channel:"stable", port:null, onDisconnect:null, transport:null, esploader:null, chip:null, connected:false, flashing:false, monitorPort:null, monitorReader:null, monitorWriter:null, monitorPipe:null, monitorDisconnect:null, monitorConnected:false };
-      const PAGE_VERSION = "1.4.0";  // migrated to tasmota-webserial-esptool for ESP32-C5 OPI PSRAM fix
+      const state = { manifest:null, channel:"stable", port:null, onDisconnect:null, esploader:null, chip:null, connected:false, flashing:false, monitorPort:null, monitorReader:null, monitorWriter:null, monitorPipe:null, monitorDisconnect:null, monitorConnected:false };
+      const PAGE_VERSION = "1.5.0";  // tasmota API: ESPLoader takes SerialPort directly (no Transport)
       const RAW_BASE = "https://raw.githubusercontent.com/JimGat/CYM-NM28C5/Jimgat_Dev/ESP32C5";
       const DEV_MANIFEST_URL = `${RAW_BASE}/docs/manifest.json`;
       const RAW_BIN = `${RAW_BASE}/binaries-esp32c5`;
@@ -474,8 +474,8 @@
           state.port = await navigator.serial.requestPort({});
           state.onDisconnect = () => { disconnect().catch(() => {}); setStatus("Device disconnected. Reconnect to flash.", "error"); };
           try { state.port.addEventListener("disconnect", state.onDisconnect); } catch {}
-          state.transport = new Transport(state.port, true);
-          const loaderOptions = { transport: state.transport, baudrate: parseInt(ui.baud.value, 10), terminal: { clean() {}, writeLine: log, write: log }, debugLogging: false };
+          // tasmota: pass SerialPort directly — no Transport wrapper needed
+          const loaderOptions = { port: state.port, baudrate: parseInt(ui.baud.value, 10), terminal: { clean() {}, writeLine: log, write: log }, debugLogging: false };
           setStatus(`Syncing with chip (hold BOOT + RESET). Timeout ${Math.round(CONNECT_TIMEOUT_MS / 1000)}s`);
           log("Syncing with chip");
           const start = Date.now();
@@ -580,11 +580,9 @@
 
       const disconnect = async () => {
         if (state.port && state.onDisconnect) try { state.port.removeEventListener("disconnect", state.onDisconnect); } catch {}
-        try {
-          if (state.transport) await state.transport.disconnect();
-          else if (state.port?.close) await state.port.close();
-        } catch {}
-        state.port = null; state.onDisconnect = null; state.transport = null; state.esploader = null; state.chip = null; state.connected = false;
+        try { if (state.esploader?.transport?.device) await state.esploader.transport.device.close(); } catch {}
+        try { if (state.port) await state.port.close(); } catch {}
+        state.port = null; state.onDisconnect = null; state.esploader = null; state.chip = null; state.connected = false;
         ui.chip.style.display = "none";
         ui.flashBtn.disabled = true;
         ui.connectBtn.textContent = "Connect";
