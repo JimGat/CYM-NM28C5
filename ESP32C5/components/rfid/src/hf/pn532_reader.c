@@ -52,18 +52,16 @@ rfid_protocol_t pn532_identify_protocol(uint16_t atqa, uint8_t sak, uint8_t uid_
         if (sak == 0x09) return RFID_PROTO_MIFARE_CLASSIC_1K;  // Mini
         return RFID_PROTO_MIFARE_CLASSIC_1K;
     }
-    // SAK=0x00 = MIFARE Ultralight / NTAG family
+    // SAK=0x00 = MIFARE Ultralight / NTAG family.
+    // MIFARE Ultralight and NTAG213/215/216 are indistinguishable from ATQA+SAK
+    // alone — both present as ATQA=0x0044, SAK=0x00.  The PN532 on this hardware
+    // returns the ATQA bytes in reverse order (0x4400 instead of 0x0044).
+    //
+    // Safe default: always start as MIFARE Ultralight (16 pages).
+    // GET_VERSION (called immediately after in pn532_scan_card) will upgrade to
+    // NTAG213/215/216 if the card supports it.  If GET_VERSION fails (genuine
+    // Ultralight or cheap clone) we stay at 16 pages which is always correct.
     if (sak == 0x00) {
-        // NTAG213/215/216 and MIFARE Ultralight both have ATQA=0x0044, SAK=0x00.
-        // 7-byte UID → NTAG213 (refined to 215/216 by GET_VERSION later).
-        // 4-byte UID → Ultralight.
-        // Accept both the standard form (0x0044) and our observed byte-swapped
-        // form (0x4400) to be robust against PN532 ATQA byte ordering.
-        if (a == 0x0044 || a == 0x4400) {
-            if (uid_len == 7) return RFID_PROTO_NTAG213;
-            return RFID_PROTO_MIFARE_ULTRALIGHT;
-        }
-        // Other SAK=0x00 cards (e.g. some ISO15693 or proprietary)
         return RFID_PROTO_MIFARE_ULTRALIGHT;
     }
     // SAK=0x10 or 0x11 = MIFARE Plus
