@@ -1643,6 +1643,12 @@ static int        s_n24fox_hits     = 0;
 static int        s_n24fox_samples  = 0;
 #define N24FOX_WINDOW  20
 
+// ── RF433 OOK Scan state (declared early — cleanup in show_rf433_menu_screen) ──
+static lv_obj_t    *s_rf433_scan_status = NULL;
+static lv_obj_t    *s_rf433_scan_list   = NULL;
+static TaskHandle_t s_rf433_scan_task   = NULL;
+static volatile bool s_rf433_scan_stop  = false;
+
 // ── RF433 Fox Hunt state (declared very early — cleanup in show_rf433_menu_screen) ──
 static volatile int  s_rf433_fox_edges         = 0;
 static lv_obj_t     *s_rf433_fox_bar           = NULL;
@@ -2118,6 +2124,7 @@ static void show_cc1101_wardrive_screen(void);
 static void show_cc1101_foxhunt_screen(void);
 static void show_nrf24_foxhunt_screen(void);
 static void show_rf433_foxhunt_screen(void);
+static void show_rf433_ook_scan_screen(void);
 static void show_cc1101_bruteforce_screen(void);
 static void show_cc1101_bandscope_screen(void);
 static void show_cc1101_zwave_screen(void);
@@ -37323,16 +37330,20 @@ static void rf433_menu_tile_cb(lv_event_t *e)
         show_rf433_loopback_screen();
     else if (strcmp(name, "FoxHunt") == 0)
         show_rf433_foxhunt_screen();
+    else if (strcmp(name, "OOKScan") == 0)
+        show_rf433_ook_scan_screen();
 }
 
 static void show_rf433_menu_screen(void)
 {
-    // RF433 Fox Hunt cleanup
+    // RF433 Fox Hunt + OOK Scan cleanup
     if (s_rf433_fox_tmr) { lv_timer_del(s_rf433_fox_tmr); s_rf433_fox_tmr = NULL; }
     if (s_rf433_fox_isr_installed) {
         gpio_isr_handler_remove(RF_HAT_RF433_RX_GPIO);
         s_rf433_fox_isr_installed = false;
     }
+    if (s_rf433_scan_task) { s_rf433_scan_stop = true; }
+    s_rf433_scan_status = NULL; s_rf433_scan_list = NULL;
     vibrator_off();
     s_rf433_fox_bar = NULL; s_rf433_fox_lbl = NULL;
     s_rf433_fox_hbtn = NULL; s_rf433_fox_status = NULL;
@@ -37356,7 +37367,8 @@ static void show_rf433_menu_screen(void)
     create_tile(tiles, LV_SYMBOL_PLAY,    "Replay",   lv_color_hex(0x5D4037), rf433_menu_tile_cb, "Replay");
     create_tile(tiles, LV_SYMBOL_WARNING, "Jammer",   lv_color_hex(0xB71C1C), rf433_menu_tile_cb, "Jammer");
     create_tile(tiles, LV_SYMBOL_LOOP,    "LBK Test", lv_color_hex(0x00695C), rf433_menu_tile_cb, "LBK Test");
-    create_tile(tiles, MY_SYMBOL_PERSON_WALKING, "Fox\nHunt", lv_color_hex(0xE65100), rf433_menu_tile_cb, "FoxHunt");
+    create_tile(tiles, MY_SYMBOL_PERSON_WALKING, "Fox\nHunt",  lv_color_hex(0xE65100), rf433_menu_tile_cb, "FoxHunt");
+    create_tile(tiles, LV_SYMBOL_EYE_OPEN,      "OOK\nScan", lv_color_hex(0xFF8F00), rf433_menu_tile_cb, "OOKScan");
 
     rfhat_add_back_btn("Radio", show_radio_menu_screen_from_rf433);
 }
@@ -37411,6 +37423,16 @@ static void show_radio_menu_screen(void)
 
 // Current frequency (MHz) — shared across CC1101 sub-screens
 static float s_cc1101_freq_mhz = 433.92f;
+
+// ── CC1101 Weather + Alarm task state (declared early for cleanup in show_cc1101_screen) ──
+static lv_obj_t   *s_wx_status  = NULL;
+static lv_obj_t   *s_wx_list    = NULL;
+static TaskHandle_t s_wx_task   = NULL;
+static volatile bool s_wx_stop  = false;
+static lv_obj_t   *s_alm_status = NULL;
+static lv_obj_t   *s_alm_list   = NULL;
+static TaskHandle_t s_alm_task  = NULL;
+static volatile bool s_alm_stop = false;
 
 // ── CC1101 Calibration TX state ───────────────────────────────────────────────
 static bool       s_cc1101_cal_tx_active = false;
@@ -37668,6 +37690,11 @@ static void show_cc1101_screen(void)
     if (s_cc1101_cap_task) cc1101_capture_cancel();
     if (s_cc1101_rep_task) cc1101_replay_cancel();
     if (s_cc1101_sub_paths) { free(s_cc1101_sub_paths); s_cc1101_sub_paths = NULL; }
+    // Weather + Alarm scan task cleanup
+    if (s_wx_task)  { s_wx_stop  = true; }
+    if (s_alm_task) { s_alm_stop = true; }
+    s_wx_status = NULL;  s_wx_list  = NULL;
+    s_alm_status = NULL; s_alm_list = NULL;
     // Calibration TX cleanup (HW test screen)
     s_cal_tx_stop();
     s_cc1101_ht_offset_lbl = NULL;
@@ -39235,13 +39262,356 @@ static void show_cc1101_tpms_screen(void)
     rfhat_add_back_btn("CC1101", show_cc1101_screen);
 }
 
-// ── Weather Station Decoder ───────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// OOK PROTOCOL DECODERS — EV1527 (alarm sensors) + Fine Offset (weather)
+// Used by CC1101 Alarm Screen, CC1101 Weather Screen, and RF433 OOK Scan.
+// All decoders take the same int32_t pulse array (positive=HIGH µs, negative=LOW µs)
+// produced by cc1101_raw_capture() / rf433_ook_capture().
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── EV1527 universal OOK sensor decoder ──────────────────────────────────────
+// Covers EV1527, PT2262/PT2272, HS1527, SC5262 and compatible chips.
+// Used in ~90% of cheap wireless alarm sensors, door contacts, PIR detectors.
+// Frame: 1T sync-high, 31T sync-low, 28 data bits (24-bit addr + 4-bit data).
+// Bit encoding: '1' = 3T HIGH + 1T LOW,  '0' = 1T HIGH + 3T LOW,  T≈350 µs.
+static bool ook_decode_ev1527(const int32_t *p, int n,
+                               uint32_t *addr_out, uint8_t *data_out)
+{
+    for (int i = 0; i + 28*2 + 2 < n; i++) {
+        int hi =  p[i];      // should be ~350 µs (1T)
+        int lo = -p[i+1];    // should be ~10500 µs (30T sync gap)
+        if (hi < 150 || hi > 700) continue;
+        if (lo < 7000 || lo > 16000) continue;
+        // Sync found — decode 28 bits
+        uint32_t bits = 0;
+        bool ok = true;
+        int j = i + 2;
+        for (int b = 0; b < 28 && j + 1 < n; b++, j += 2) {
+            int bhi =  p[j];
+            int blo = -p[j+1];
+            if (bhi <= 0 || blo <= 0) { ok = false; break; }
+            if (bhi > 700 && blo < 700)      bits = (bits << 1) | 1; // '1'
+            else if (bhi < 700 && blo > 700) bits = (bits << 1);     // '0'
+            else { ok = false; break; }
+        }
+        if (ok) {
+            *addr_out = (bits >> 4) & 0xFFFFFF;
+            *data_out = bits & 0x0F;
+            return true;
+        }
+    }
+    return false;
+}
+
+// ── Fine Offset weather sensor decoder ────────────────────────────────────────
+// Covers WH65, WH57, WH80, WS80, Froggit WH31, Ecowitt variants, and clones.
+// Frame: 8 × 500 µs preamble pulses → 2000 µs sync gap → 40 PWM data bits.
+// Bit encoding: '1' = 500 µs HIGH + 1000 µs LOW, '0' = 500 µs HIGH + 500 µs LOW.
+// Byte layout: [ID(8)] [BAT(1) TYPE(3) TEMP_H(4)] [TEMP_L(8)] [HUM(8)] [CRC8(8)]
+// Temperature: (((byte1&0x0F)<<8)|byte2) - 400 → temp_10 = tenths of °C
+// CRC: CRC-8 poly=0x31 init=0x00 over bytes 0-3
+
+static uint8_t ook_crc8_fo(const uint8_t *d, int len)
+{
+    uint8_t crc = 0;
+    for (int i = 0; i < len; i++) {
+        crc ^= d[i];
+        for (int b = 0; b < 8; b++)
+            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x31) : (uint8_t)(crc << 1);
+    }
+    return crc;
+}
+
+typedef struct {
+    uint8_t  id;
+    int16_t  temp_10;   // tenths of °C (e.g. 233 = 23.3 °C)
+    uint8_t  humidity;
+    bool     battery_ok;
+} ook_weather_pkt_t;
+
+static bool ook_decode_fineoffset(const int32_t *p, int n, ook_weather_pkt_t *out)
+{
+    // Scan for sync gap: large negative pulse (>1500 µs LOW)
+    // preceded by short HIGH pulses (~500 µs preamble)
+    for (int i = 3; i + 40*2 < n; i++) {
+        if (p[i] > -1400) continue;         // sync gap: LOW >1400 µs
+        if (p[i-1] < 200 || p[i-1] > 900) continue; // preamble pulse check
+        // Decode 40 PWM bits
+        uint8_t bytes[5] = {0};
+        int j = i + 1;
+        bool ok = true;
+        for (int b = 0; b < 40 && j + 1 < n; b++, j += 2) {
+            int bhi =  p[j];
+            int blo = -p[j+1];
+            if (bhi <= 0 || blo <= 0) { ok = false; break; }
+            uint8_t bit = (blo > 700) ? 1 : 0;
+            bytes[b/8] |= (bit << (7 - b%8));
+        }
+        if (!ok) continue;
+        if (ook_crc8_fo(bytes, 4) != bytes[4]) continue;
+        out->id         = bytes[0];
+        out->battery_ok = !(bytes[1] >> 7);
+        int16_t raw_t   = (int16_t)(((bytes[1] & 0x0F) << 8) | bytes[2]);
+        out->temp_10    = raw_t - 400;
+        out->humidity   = bytes[3];
+        return true;
+    }
+    return false;
+}
+
+// ── Shared OOK sensor result store ───────────────────────────────────────────
+#define OOK_MAX_ALARM_SENSORS    8
+#define OOK_MAX_WEATHER_SENSORS  6
+
+typedef struct {
+    uint32_t addr;
+    uint8_t  data;
+    int8_t   rssi;      // CC1101 RSSI; -127 for RF433 (no RSSI)
+    uint32_t count;
+    int64_t  last_us;
+} ook_alarm_entry_t;
+
+typedef struct {
+    uint8_t  id;
+    int16_t  temp_10;
+    uint8_t  humidity;
+    bool     battery_ok;
+    int8_t   rssi;
+    uint32_t count;
+    int64_t  last_us;
+} ook_weather_entry_t;
+
+static ook_alarm_entry_t   s_ook_alarms[OOK_MAX_ALARM_SENSORS];
+static int                 s_ook_alarm_count = 0;
+static ook_weather_entry_t s_ook_weather[OOK_MAX_WEATHER_SENSORS];
+static int                 s_ook_weather_count = 0;
+
+static void ook_alarm_update(uint32_t addr, uint8_t data, int8_t rssi)
+{
+    for (int i = 0; i < s_ook_alarm_count; i++) {
+        if (s_ook_alarms[i].addr == addr) {
+            s_ook_alarms[i].data   = data;
+            s_ook_alarms[i].rssi   = rssi;
+            s_ook_alarms[i].count++;
+            s_ook_alarms[i].last_us = esp_timer_get_time();
+            return;
+        }
+    }
+    if (s_ook_alarm_count >= OOK_MAX_ALARM_SENSORS) return;
+    ook_alarm_entry_t *e = &s_ook_alarms[s_ook_alarm_count++];
+    e->addr    = addr;
+    e->data    = data;
+    e->rssi    = rssi;
+    e->count   = 1;
+    e->last_us = esp_timer_get_time();
+}
+
+static void ook_weather_update(const ook_weather_pkt_t *pkt, int8_t rssi)
+{
+    for (int i = 0; i < s_ook_weather_count; i++) {
+        if (s_ook_weather[i].id == pkt->id) {
+            s_ook_weather[i].temp_10    = pkt->temp_10;
+            s_ook_weather[i].humidity   = pkt->humidity;
+            s_ook_weather[i].battery_ok = pkt->battery_ok;
+            s_ook_weather[i].rssi       = rssi;
+            s_ook_weather[i].count++;
+            s_ook_weather[i].last_us    = esp_timer_get_time();
+            return;
+        }
+    }
+    if (s_ook_weather_count >= OOK_MAX_WEATHER_SENSORS) return;
+    ook_weather_entry_t *e = &s_ook_weather[s_ook_weather_count++];
+    e->id         = pkt->id;
+    e->temp_10    = pkt->temp_10;
+    e->humidity   = pkt->humidity;
+    e->battery_ok = pkt->battery_ok;
+    e->rssi       = rssi;
+    e->count      = 1;
+    e->last_us    = esp_timer_get_time();
+}
+
+// Format a last-seen duration from microseconds
+static void ook_age_str(int64_t last_us, char *buf, size_t sz)
+{
+    if (last_us == 0) { snprintf(buf, sz, "--"); return; }
+    int64_t sec = (esp_timer_get_time() - last_us) / 1000000LL;
+    if (sec < 60) snprintf(buf, sz, "%llds", (long long)sec);
+    else          snprintf(buf, sz, "%lldm", (long long)(sec/60));
+}
+
+// ── RF433 OOK raw capture (GPIO9, R4A_433 demodulated output) ─────────────────
+// ISR shared with Fox Hunt but installed/removed per session — not concurrent.
+static volatile bool     s_rf433_ook_cap_active = false;
+static volatile int32_t  s_rf433_ook_buf[2048];
+static volatile int      s_rf433_ook_wr   = 0;
+static volatile int64_t  s_rf433_ook_last = 0;
+
+IRAM_ATTR static void s_rf433_ook_cap_isr(void *arg)
+{
+    if (!s_rf433_ook_cap_active || s_rf433_ook_wr >= 2047) return;
+    int64_t now = esp_timer_get_time();
+    if (s_rf433_ook_last == 0) { s_rf433_ook_last = now; return; }
+    int64_t dt = now - s_rf433_ook_last;
+    s_rf433_ook_last = now;
+    int lv = gpio_get_level((gpio_num_t)RF_HAT_RF433_RX_GPIO);
+    s_rf433_ook_buf[s_rf433_ook_wr++] = lv ? (int32_t)dt : -(int32_t)dt;
+}
+
+static esp_err_t rf433_ook_capture(int32_t *out, int *count_out, uint32_t timeout_ms)
+{
+    s_rf433_ook_wr = 0;
+    s_rf433_ook_last = 0;
+    s_rf433_ook_cap_active = true;
+
+    gpio_config_t io = {
+        .pin_bit_mask  = 1ULL << RF_HAT_RF433_RX_GPIO,
+        .mode          = GPIO_MODE_INPUT,
+        .pull_up_en    = GPIO_PULLUP_DISABLE,
+        .pull_down_en  = GPIO_PULLDOWN_DISABLE,
+        .intr_type     = GPIO_INTR_ANYEDGE,
+    };
+    gpio_config(&io);
+    esp_err_t e = gpio_install_isr_service(0);
+    if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) { s_rf433_ook_cap_active = false; return e; }
+    gpio_isr_handler_add((gpio_num_t)RF_HAT_RF433_RX_GPIO, s_rf433_ook_cap_isr, NULL);
+
+    vTaskDelay(pdMS_TO_TICKS(timeout_ms));
+
+    s_rf433_ook_cap_active = false;
+    gpio_isr_handler_remove((gpio_num_t)RF_HAT_RF433_RX_GPIO);
+
+    *count_out = s_rf433_ook_wr;
+    if (*count_out > 0)
+        memcpy(out, (const void *)s_rf433_ook_buf, *count_out * sizeof(int32_t));
+    return (*count_out > 10) ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+// ── CC1101 Weather Station ────────────────────────────────────────────────────
+
+typedef struct { bool changed; } wx_update_t;
+
+static void s_wx_lvgl_cb(void *arg)
+{
+    free(arg);
+    if (!s_wx_list || !s_wx_status) return;
+    lv_obj_clean(s_wx_list);
+    for (int i = 0; i < s_ook_weather_count; i++) {
+        ook_weather_entry_t *e = &s_ook_weather[i];
+        lv_obj_t *row = lv_obj_create(s_wx_list);
+        lv_obj_set_size(row, LCD_H_RES - 18, 52);
+        lv_obj_set_style_bg_color(row, ui_panel_color(), 0);
+        lv_obj_set_style_border_color(row, lv_color_hex(0x00695C), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_radius(row, 6, 0);
+        lv_obj_set_style_pad_all(row, 5, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        char line1[48], line2[48], age[12];
+        ook_age_str(e->last_us, age, sizeof(age));
+        int t_int = e->temp_10 / 10, t_frac = abs(e->temp_10 % 10);
+        snprintf(line1, sizeof(line1), "ID:%02X  %d.%d C  %d%% RH",
+                 e->id, t_int, t_frac, e->humidity);
+        snprintf(line2, sizeof(line2), "%s  %ddBm  Batt:%s  x%u  %s",
+                 e->battery_ok ? "OK" : "LOW",
+                 e->rssi, e->battery_ok ? "OK" : "LOW",
+                 e->count, age);
+        lv_obj_t *l1 = lv_label_create(row);
+        lv_label_set_text(l1, line1);
+        lv_obj_set_style_text_font(l1, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(l1, lv_color_hex(0x80CBC4), 0);
+        lv_obj_align(l1, LV_ALIGN_TOP_LEFT, 0, 0);
+        lv_obj_t *l2 = lv_label_create(row);
+        lv_label_set_text(l2, line2);
+        lv_obj_set_style_text_font(l2, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l2, ui_text_color(), 0);
+        lv_obj_align(l2, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    }
+    if (s_ook_weather_count == 0) {
+        lv_obj_t *m = lv_label_create(s_wx_list);
+        lv_label_set_text(m, "No weather sensors heard yet.\nCommon brands: Fine Offset,\nAcuRite, Froggit, Ecowitt.");
+        lv_obj_set_style_text_font(m, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(m, ui_text_color(), 0);
+    }
+}
+
+static void s_wx_task_fn(void *arg)
+{
+    (void)arg;
+    cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);
+    cc1101_set_freq_mhz(cc1101_freq_cal(433.92f));
+
+    while (!s_wx_stop) {
+        cc1101_raw_t raw = {0};
+        esp_err_t r = cc1101_raw_capture(&raw, 800);
+        if (r == ESP_OK && raw.count > 10) {
+            ook_weather_pkt_t pkt;
+            bool found = false;
+            // Scan all starting positions for Fine Offset
+            for (int start = 0; start < raw.count - 5 && !s_wx_stop; start++) {
+                if (ook_decode_fineoffset(raw.timings + start, raw.count - start, &pkt)) {
+                    int8_t rssi = cc1101_get_rssi_dbm();
+                    ook_weather_update(&pkt, rssi);
+                    found = true;
+                    if (s_wx_status) {
+                        wx_update_t *u = malloc(sizeof(wx_update_t));
+                        if (u) { u->changed = true; lv_async_call(s_wx_lvgl_cb, u); }
+                    }
+                    break;
+                }
+            }
+            if (!found && s_wx_status) {
+                // Update status with RSSI even if no decode
+            }
+            cc1101_raw_free(&raw);
+        }
+        if (!s_wx_stop) vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    cc1101_idle();
+    s_wx_task = NULL;
+    vTaskDelete(NULL);
+}
 
 static void show_cc1101_weather_screen(void)
 {
-    s_cc1101_stub_screen(MY_SYMBOL_SATELLITE_DISH "  Weather Station",
-        "Decode 433 MHz ISM weather\nsensors (WH1080, Oregon,\nAcuRite, others)\n\n"
-        "Coming in next version.");
+    if (s_wx_task) { s_wx_stop = true; vTaskDelay(pdMS_TO_TICKS(100)); }
+    s_wx_stop = false;
+    s_wx_status = NULL;
+    s_wx_list = NULL;
+    s_ook_weather_count = 0;
+
+    if (!cc1101_is_init() && cc1101_init() != ESP_OK) {
+        s_cc1101_stub_screen("Weather Station - No CC1101", "Check DIP 1 ON.");
+        return;
+    }
+
+    create_function_page_base("Weather Station");
+    apply_menu_bg();
+
+    s_wx_status = lv_label_create(function_page);
+    lv_label_set_text(s_wx_status, "Listening 433.920 MHz OOK...\nFine Offset / WH65 / WH57 / WS80");
+    lv_obj_set_style_text_font(s_wx_status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_wx_status, lv_color_hex(0x4DB6AC), 0);
+    lv_obj_set_style_text_align(s_wx_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_wx_status, LV_ALIGN_TOP_MID, 0, 34);
+
+    s_wx_list = lv_obj_create(function_page);
+    lv_obj_set_size(s_wx_list, LCD_H_RES - 10, LCD_V_RES - 110);
+    lv_obj_align(s_wx_list, LV_ALIGN_TOP_MID, 0, 76);
+    lv_obj_set_style_bg_opa(s_wx_list, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_wx_list, 0, 0);
+    lv_obj_set_style_pad_all(s_wx_list, 4, 0);
+    lv_obj_set_style_pad_gap(s_wx_list, 4, 0);
+    lv_obj_set_flex_flow(s_wx_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_add_flag(s_wx_list, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *m = lv_label_create(s_wx_list);
+    lv_label_set_text(m, "Waiting for weather sensor burst...");
+    lv_obj_set_style_text_font(m, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(m, ui_text_color(), 0);
+
+    rfhat_add_back_btn("CC1101", show_cc1101_screen);
+
+    xTaskCreate(s_wx_task_fn, "cc1101_wx", 4096, NULL, tskIDLE_PRIORITY + 2, &s_wx_task);
 }
 
 // ── POCSAG Pager Decoder ──────────────────────────────────────────────────────
@@ -39255,11 +39625,167 @@ static void show_cc1101_pocsag_screen(void)
 
 // ── Alarm Sensor Detection ────────────────────────────────────────────────────
 
+static lv_obj_t *s_alm_freq_btn[2] = {NULL, NULL};  // [0]=315, [1]=433
+static float     s_alm_freq_mhz = 433.92f;
+
+static void s_alm_lvgl_cb(void *arg)
+{
+    free(arg);
+    if (!s_alm_list) return;
+    lv_obj_clean(s_alm_list);
+    for (int i = 0; i < s_ook_alarm_count; i++) {
+        ook_alarm_entry_t *e = &s_ook_alarms[i];
+        lv_obj_t *row = lv_obj_create(s_alm_list);
+        lv_obj_set_size(row, LCD_H_RES - 18, 48);
+        lv_obj_set_style_bg_color(row, ui_panel_color(), 0);
+        lv_obj_set_style_border_color(row, lv_color_hex(0xB71C1C), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_radius(row, 6, 0);
+        lv_obj_set_style_pad_all(row, 5, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        char line1[48], line2[40], age[12];
+        ook_age_str(e->last_us, age, sizeof(age));
+        snprintf(line1, sizeof(line1), "Addr: 0x%06lX   Ch: %X",
+                 (unsigned long)e->addr, e->data & 0xF);
+        snprintf(line2, sizeof(line2), "%ddBm   x%u   %s ago",
+                 e->rssi, e->count, age);
+        lv_obj_t *l1 = lv_label_create(row);
+        lv_label_set_text(l1, line1);
+        lv_obj_set_style_text_font(l1, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(l1, lv_color_hex(0xFF8A80), 0);
+        lv_obj_align(l1, LV_ALIGN_TOP_LEFT, 0, 0);
+        lv_obj_t *l2 = lv_label_create(row);
+        lv_label_set_text(l2, line2);
+        lv_obj_set_style_text_font(l2, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l2, ui_text_color(), 0);
+        lv_obj_align(l2, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    }
+    if (s_ook_alarm_count == 0) {
+        lv_obj_t *m = lv_label_create(s_alm_list);
+        lv_label_set_text(m, "No sensors heard yet.\nTrigger a door/PIR/smoke\nsensor to see its address.");
+        lv_obj_set_style_text_font(m, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(m, ui_text_color(), 0);
+    }
+}
+
+static void s_alm_task_fn(void *arg)
+{
+    (void)arg;
+    cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);
+    cc1101_set_freq_mhz(cc1101_freq_cal(s_alm_freq_mhz));
+
+    while (!s_alm_stop) {
+        cc1101_raw_t raw = {0};
+        esp_err_t r = cc1101_raw_capture(&raw, 600);
+        if (r == ESP_OK && raw.count > 10) {
+            uint32_t addr; uint8_t data;
+            for (int start = 0; start < raw.count - 56 && !s_alm_stop; start++) {
+                if (ook_decode_ev1527(raw.timings + start, raw.count - start, &addr, &data)) {
+                    int8_t rssi = cc1101_get_rssi_dbm();
+                    ook_alarm_update(addr, data, rssi);
+                    wx_update_t *u = malloc(sizeof(wx_update_t));
+                    if (u) { u->changed = true; lv_async_call(s_alm_lvgl_cb, u); }
+                    start += 56;  // skip past this packet
+                }
+            }
+            cc1101_raw_free(&raw);
+        }
+        if (!s_alm_stop) vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    cc1101_idle();
+    s_alm_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void s_alm_freq_cb(lv_event_t *e)
+{
+    float *f = (float *)lv_event_get_user_data(e);
+    s_alm_freq_mhz = *f;
+    // restart task at new frequency
+    if (s_alm_task) { s_alm_stop = true; }
+    s_ook_alarm_count = 0;
+    vTaskDelay(pdMS_TO_TICKS(50));
+    s_alm_stop = false;
+    if (s_alm_status) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "Listening %.2f MHz OOK (EV1527)...", (double)*f);
+        lv_label_set_text(s_alm_status, buf);
+    }
+    xTaskCreate(s_alm_task_fn, "cc1101_alm", 4096, NULL, tskIDLE_PRIORITY + 2, &s_alm_task);
+}
+
 static void show_cc1101_alarm_screen(void)
 {
-    s_cc1101_stub_screen(LV_SYMBOL_WARNING "  Alarm Sensors",
-        "Detect wireless alarm\nsensors and door/window\ncontacts on 315/433 MHz\n\n"
-        "Coming in next version.");
+    if (s_alm_task) { s_alm_stop = true; vTaskDelay(pdMS_TO_TICKS(100)); }
+    s_alm_stop = false;
+    s_alm_status = NULL;
+    s_alm_list = NULL;
+    s_ook_alarm_count = 0;
+
+    if (!cc1101_is_init() && cc1101_init() != ESP_OK) {
+        s_cc1101_stub_screen("Alarm Sensors - No CC1101", "Check DIP 1 ON.");
+        return;
+    }
+
+    create_function_page_base("Alarm Sensors");
+    apply_menu_bg();
+
+    // Frequency selector
+    lv_obj_t *freq_row = lv_obj_create(function_page);
+    lv_obj_set_size(freq_row, LCD_H_RES - 10, 28);
+    lv_obj_align(freq_row, LV_ALIGN_TOP_MID, 0, 34);
+    lv_obj_set_style_bg_opa(freq_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(freq_row, 0, 0);
+    lv_obj_set_style_pad_all(freq_row, 0, 0);
+    lv_obj_set_flex_flow(freq_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(freq_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(freq_row, 8, 0);
+    lv_obj_clear_flag(freq_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    static float alm_freqs[2] = {315.0f, 433.92f};
+    static const char *alm_flbls[2] = {"315 MHz", "433 MHz"};
+    for (int i = 0; i < 2; i++) {
+        s_alm_freq_btn[i] = lv_btn_create(freq_row);
+        lv_obj_set_size(s_alm_freq_btn[i], 88, 24);
+        bool sel = (alm_freqs[i] == s_alm_freq_mhz);
+        lv_obj_set_style_bg_color(s_alm_freq_btn[i],
+            sel ? lv_color_hex(0xB71C1C) : lv_color_make(50,50,50), LV_STATE_DEFAULT);
+        lv_obj_set_style_border_color(s_alm_freq_btn[i], lv_color_hex(0xB71C1C), 0);
+        lv_obj_set_style_border_width(s_alm_freq_btn[i], sel ? 0 : 1, 0);
+        lv_obj_set_style_radius(s_alm_freq_btn[i], 4, 0);
+        lv_obj_t *fl = lv_label_create(s_alm_freq_btn[i]);
+        lv_label_set_text(fl, alm_flbls[i]);
+        lv_obj_set_style_text_font(fl, &lv_font_montserrat_12, 0);
+        lv_obj_center(fl);
+        lv_obj_add_event_cb(s_alm_freq_btn[i], s_alm_freq_cb, LV_EVENT_CLICKED, &alm_freqs[i]);
+    }
+
+    s_alm_status = lv_label_create(function_page);
+    lv_label_set_text(s_alm_status, "Listening 433.92 MHz OOK (EV1527)...");
+    lv_obj_set_style_text_font(s_alm_status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_alm_status, lv_color_hex(0xEF9A9A), 0);
+    lv_obj_set_style_text_align(s_alm_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_alm_status, LV_ALIGN_TOP_MID, 0, 66);
+
+    s_alm_list = lv_obj_create(function_page);
+    lv_obj_set_size(s_alm_list, LCD_H_RES - 10, LCD_V_RES - 118);
+    lv_obj_align(s_alm_list, LV_ALIGN_TOP_MID, 0, 86);
+    lv_obj_set_style_bg_opa(s_alm_list, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_alm_list, 0, 0);
+    lv_obj_set_style_pad_all(s_alm_list, 4, 0);
+    lv_obj_set_style_pad_gap(s_alm_list, 4, 0);
+    lv_obj_set_flex_flow(s_alm_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_add_flag(s_alm_list, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *m = lv_label_create(s_alm_list);
+    lv_label_set_text(m, "Waiting for sensor transmission...");
+    lv_obj_set_style_text_font(m, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(m, ui_text_color(), 0);
+
+    rfhat_add_back_btn("CC1101", show_cc1101_screen);
+
+    xTaskCreate(s_alm_task_fn, "cc1101_alm", 4096, NULL, tskIDLE_PRIORITY + 2, &s_alm_task);
 }
 
 // ── RF Wardrive ───────────────────────────────────────────────────────────────
@@ -42335,6 +42861,115 @@ static void show_rf433_foxhunt_screen(void)
     (void)saved_vib;
 
     rfhat_add_back_btn("RF433", show_rf433_menu_screen);
+}
+
+// ── RF433 OOK Scan — EV1527 alarm sensor decoder via R4A_433 ─────────────────
+// The R4A_433 superheterodyne receiver is more sensitive than CC1101 at 433.92 MHz
+// for short OOK bursts from alarm sensors. No RSSI available (hardware limit).
+
+static void s_rf433_scan_lvgl_cb(void *arg)
+{
+    free(arg);
+    if (!s_rf433_scan_list) return;
+    lv_obj_clean(s_rf433_scan_list);
+    for (int i = 0; i < s_ook_alarm_count; i++) {
+        ook_alarm_entry_t *e = &s_ook_alarms[i];
+        lv_obj_t *row = lv_obj_create(s_rf433_scan_list);
+        lv_obj_set_size(row, LCD_H_RES - 18, 46);
+        lv_obj_set_style_bg_color(row, ui_panel_color(), 0);
+        lv_obj_set_style_border_color(row, lv_color_hex(0xFF8F00), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_radius(row, 6, 0);
+        lv_obj_set_style_pad_all(row, 5, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        char line1[48], line2[40], age[12];
+        ook_age_str(e->last_us, age, sizeof(age));
+        snprintf(line1, sizeof(line1), "Addr: 0x%06lX   Ch: %X",
+                 (unsigned long)e->addr, e->data & 0xF);
+        snprintf(line2, sizeof(line2), "x%u   %s ago   (no RSSI)", e->count, age);
+        lv_obj_t *l1 = lv_label_create(row);
+        lv_label_set_text(l1, line1);
+        lv_obj_set_style_text_font(l1, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(l1, lv_color_hex(0xFFCC80), 0);
+        lv_obj_align(l1, LV_ALIGN_TOP_LEFT, 0, 0);
+        lv_obj_t *l2 = lv_label_create(row);
+        lv_label_set_text(l2, line2);
+        lv_obj_set_style_text_font(l2, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l2, ui_text_color(), 0);
+        lv_obj_align(l2, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    }
+    if (s_ook_alarm_count == 0) {
+        lv_obj_t *m = lv_label_create(s_rf433_scan_list);
+        lv_label_set_text(m, "Waiting for sensor burst...\nTrigger a door/PIR/smoke sensor.");
+        lv_obj_set_style_text_font(m, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(m, ui_text_color(), 0);
+    }
+}
+
+static void s_rf433_scan_task_fn(void *arg)
+{
+    (void)arg;
+    static int32_t buf[2048];
+    while (!s_rf433_scan_stop) {
+        int count = 0;
+        rf433_ook_capture(buf, &count, 700);
+        if (count > 10 && !s_rf433_scan_stop) {
+            uint32_t addr; uint8_t data;
+            for (int start = 0; start < count - 56; start++) {
+                if (ook_decode_ev1527(buf + start, count - start, &addr, &data)) {
+                    ook_alarm_update(addr, data, -127);  // -127 = no RSSI
+                    wx_update_t *u = malloc(sizeof(wx_update_t));
+                    if (u) { u->changed = true; lv_async_call(s_rf433_scan_lvgl_cb, u); }
+                    start += 56;
+                }
+            }
+        }
+        if (!s_rf433_scan_stop) vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    s_rf433_scan_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void show_rf433_ook_scan_screen(void)
+{
+    if (s_rf433_scan_task) { s_rf433_scan_stop = true; vTaskDelay(pdMS_TO_TICKS(100)); }
+    s_rf433_scan_stop = false;
+    s_rf433_scan_status = NULL;
+    s_rf433_scan_list   = NULL;
+    s_ook_alarm_count   = 0;
+
+    create_function_page_base("RF433 OOK Scan");
+    apply_menu_bg();
+
+    s_rf433_scan_status = lv_label_create(function_page);
+    lv_label_set_text(s_rf433_scan_status,
+        "R4A_433 receiver — 433.92 MHz fixed\n"
+        "Decoding EV1527 alarm sensors");
+    lv_obj_set_style_text_font(s_rf433_scan_status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_rf433_scan_status, lv_color_hex(0xFF8F00), 0);
+    lv_obj_set_style_text_align(s_rf433_scan_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_rf433_scan_status, LV_ALIGN_TOP_MID, 0, 34);
+
+    s_rf433_scan_list = lv_obj_create(function_page);
+    lv_obj_set_size(s_rf433_scan_list, LCD_H_RES - 10, LCD_V_RES - 108);
+    lv_obj_align(s_rf433_scan_list, LV_ALIGN_TOP_MID, 0, 78);
+    lv_obj_set_style_bg_opa(s_rf433_scan_list, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_rf433_scan_list, 0, 0);
+    lv_obj_set_style_pad_all(s_rf433_scan_list, 4, 0);
+    lv_obj_set_style_pad_gap(s_rf433_scan_list, 4, 0);
+    lv_obj_set_flex_flow(s_rf433_scan_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_add_flag(s_rf433_scan_list, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *m = lv_label_create(s_rf433_scan_list);
+    lv_label_set_text(m, "Waiting for sensor burst...");
+    lv_obj_set_style_text_font(m, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(m, ui_text_color(), 0);
+
+    rfhat_add_back_btn("RF433", show_rf433_menu_screen);
+
+    xTaskCreate(s_rf433_scan_task_fn, "rf433_scan", 6144, NULL,
+                tskIDLE_PRIORITY + 2, &s_rf433_scan_task);
 }
 
 // ── RFID Main Menu ─────────────────────────────────────────────────────────────
