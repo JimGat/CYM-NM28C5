@@ -43114,9 +43114,18 @@ static bool s_ndef_extract(const rfid_card_t *card, char *out, size_t out_max)
         } else {
             tlv_len = buf[pos++];
         }
-        if (pos + tlv_len > len) break;
-
-        if (tlv_type != 0x03) { pos += tlv_len; continue; }  // skip non-NDEF
+        // Non-NDEF TLVs: skip if they go past our buffer
+        if (tlv_type != 0x03) {
+            if (pos + tlv_len > len) break;
+            pos += tlv_len;
+            continue;
+        }
+        // NDEF TLV (0x03): attempt parse even if TLV claims more bytes than our
+        // buffer holds. This happens when an NTAG213 card is misidentified as
+        // Ultralight (16 pages vs 45) — the NDEF may extend beyond page 15.
+        // We parse whatever bytes we have; the URL will be decoded up to what's
+        // buffered (fix is in ntag_read_all auto-upgrade to NTAG213 on probe).
+        // suppress "if (pos + tlv_len > len) break;" for NDEF type
 
         // Parse NDEF record at buf[pos..pos+tlv_len]
         uint8_t *rec = buf + pos;
