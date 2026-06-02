@@ -109,15 +109,30 @@ This is the single source of truth — propagates to IDF boot log AND `FW_VERSIO
 
 **Post-build:** CMakeLists.txt automatically copies binaries to `ESP32C5/binaries-esp32c5/` after every build.
 
-**Flash workflow:** User flashes via **ESPConnect** web flasher (Chrome/Edge, WebSerial):
-https://thelastoutpostworkshop.github.io/ESPConnect/
+**Flash workflow:** Use the custom web flasher at **https://jimgat.github.io/CYM-NM28C5/**  
+(Chrome or Edge required — WebSerial API)
 
 Flash addresses:
-- `0x2000` — `bootloader.bin`
-- `0x8000` — `partition-table.bin`
+- `0x2000`  — `bootloader.bin`
+- `0x8000`  — `partition-table.bin`
 - `0x10000` — `CYM-NM28C5.bin`
 
+**Flash buttons:** "Flash All" writes all three. "Quick Flash" writes only the app binary (0x10000) — for dev-cycle updates where bootloader/partitions are unchanged.
+
 **NEVER run `idf.py -p /dev/ttyACM0 flash`.** User does not have local USB flash set up. Always commit binaries and push to GitHub.
+
+**Custom flasher implementation (ESP32C5/docs/index.html):**  
+Standard `esptool-js` cannot communicate with the NM-CYD-C5's SPI flash because the ESP32-C5 eco2 with OPI PSRAM leaves the MSPI controller in Octal-SPI mode after boot. esptool-js issue #217 (open). Fixed by using `tasmota-webserial-esptool@9.2.23` (the same library ESPConnect uses) via the esm.sh CDN. 
+
+Correct connection sequence (tasmota API — NOT like esptool-js):
+1. `connectWithPort(port, logger)` — factory only; creates ESPLoader, opens port
+2. `esploader.initialize()` — initializes `__inputBuffer`, detects USB-serial chip
+3. `esploader.connectWithResetStrategies()` — resets chip to ROM mode, syncs
+4. `esploader.detectChip()` — identifies ESP32-C5 revision
+5. **Manual stub upload** (bypasses esm.sh ESM JSON module bug): `await import("./esp32c5.json")` returns `{default:{...}}` in browser ESM but the library code accesses `.text` directly (undefined), making `atob(undefined)` = `atob("undefined")` fail. Fix: catch the `atob` error, fetch the stub JSON directly from `https://raw.githubusercontent.com/Jason2866/WebSerial_ESPTool/development/src/stubs/esp32c5.json`, decode manually, upload via `memBegin/memBlock/memFinish`, read "OHAI" handshake, set `IS_STUB = true`.
+6. All flash operations use `flashData(buf, progressCb, address, false)` on the stub loader. `compress: false` avoids the compressed-flash code path that has a separate `_inputBuffer` initialization bug. After writing: `esploader.hardResetToFirmware()`.
+
+**Quick Flash** filters the manifest parts to `address === 0x10000` before fetching — only the app binary is downloaded and flashed.
 
 **After every build:**
 1. `git add ESP32C5/CMakeLists.txt ESP32C5/binaries-esp32c5/ ESP32C5/main/main.c [other changed files]`
