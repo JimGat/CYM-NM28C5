@@ -561,6 +561,13 @@ static char     g_saved_wifi_pass[65] = ""; // Home network password
 // Range: ±300 ppm covers even poorly-spec'd modules (≈±130 kHz at 433, ±275 kHz at 915)
 static int32_t g_cc1101_freq_offset_millippm = 0;  // ppm × 1000, signed
 
+// CC1101 band mode: false = 315/433 MHz (NM-RF-HAT onboard module),
+//                   true  = 868/915 MHz (standalone high-band CC1101).
+// Toggled via Settings → Hardware Options → CC1101 Band (future option).
+// Controls visibility of frequency preset and jammer band buttons.
+// NVS key: "cc1101_hb" (u8, 0/1) — not yet wired to settings UI.
+static bool g_cc1101_highband = false;
+
 static inline float cc1101_freq_cal(float mhz) {
     return mhz * (1.0f + (float)g_cc1101_freq_offset_millippm / 1000000000.0f);
 }
@@ -38357,6 +38364,9 @@ static void show_cc1101_freq_scan_screen(void)
         lv_obj_set_style_text_color(fl, lv_color_white(), 0);
         lv_obj_center(fl);
         lv_obj_add_event_cb(fb, s_cc1101_freq_btn_cb, LV_EVENT_CLICKED, &s_freq_vals[i]);
+        // Hide bands not available in the current CC1101 band mode
+        bool is_high = (s_freq_presets[i].mhz >= 800.0f);
+        if (g_cc1101_highband != is_high) lv_obj_add_flag(fb, LV_OBJ_FLAG_HIDDEN);
     }
 
     lv_obj_t *hint = lv_label_create(card);
@@ -38511,6 +38521,8 @@ static void show_cc1101_capture_screen(void)
         lv_obj_set_style_text_color(fl, lv_color_white(), 0);
         lv_obj_center(fl);
         lv_obj_add_event_cb(fb, s_cc1101_freq_btn_cb, LV_EVENT_CLICKED, &s_cap_freq_vals[i]);
+        bool is_high = (s_freq_presets[i].mhz >= 800.0f);
+        if (g_cc1101_highband != is_high) lv_obj_add_flag(fb, LV_OBJ_FLAG_HIDDEN);
     }
 
     s_cc1101_cap_status_lbl = lv_label_create(card);
@@ -40020,6 +40032,8 @@ static void show_cc1101_foxhunt_screen(void)
         lv_obj_set_style_text_color(pl, lv_color_white(), 0);
         lv_obj_center(pl);
         lv_obj_add_event_cb(pb, s_fox_preset_cb, LV_EVENT_CLICKED, &s_fox_preset_vals[i]);
+        bool is_high = (fox_preset_mhz[i] >= 800.0f);
+        if (g_cc1101_highband != is_high) lv_obj_add_flag(pb, LV_OBJ_FLAG_HIDDEN);
     }
     y += 28;
 
@@ -40304,6 +40318,14 @@ static void show_cc1101_jammer_screen(void)
     }
     s_cc1101_jamming = false;
 
+    // Clamp active band to one valid for the current band mode
+    if (!g_cc1101_highband &&
+        (s_jam_band == JAM_BAND_868 || s_jam_band == JAM_BAND_915))
+        s_jam_band = JAM_BAND_433N;
+    if (g_cc1101_highband &&
+        (s_jam_band == JAM_BAND_315 || s_jam_band == JAM_BAND_433W || s_jam_band == JAM_BAND_433N))
+        s_jam_band = JAM_BAND_868;
+
     create_function_page_base("CC1101 Jammer");
     apply_menu_bg();
 
@@ -40384,6 +40406,8 @@ static void show_cc1101_jammer_screen(void)
     lv_obj_clear_flag(band_row, LV_OBJ_FLAG_SCROLLABLE);
 
     // 5 bands: 315 / 433W (wide) / 433N (narrow ±80 kHz) / 868 / 915
+    // Low-band mode (default): 315, 433W, 433N visible; 868, 915 hidden.
+    // High-band mode: 868, 915 visible; 315, 433W, 433N hidden.
     static const char *band_lbls[5] = {"315", "433W", "433N", "868", "915"};
     static jam_band_t band_vals[5] = {JAM_BAND_315, JAM_BAND_433W, JAM_BAND_433N, JAM_BAND_868, JAM_BAND_915};
     lv_obj_t *band_btns[5];
@@ -40403,6 +40427,9 @@ static void show_cc1101_jammer_screen(void)
         lv_obj_center(bl);
         s_jam_band_btns[i] = band_btns[i];
         lv_obj_add_event_cb(band_btns[i], s_jam_band_cb, LV_EVENT_CLICKED, &band_vals[i]);
+        // Hide bands not applicable in the current CC1101 band mode
+        bool is_high = (band_vals[i] == JAM_BAND_868 || band_vals[i] == JAM_BAND_915);
+        if (g_cc1101_highband != is_high) lv_obj_add_flag(band_btns[i], LV_OBJ_FLAG_HIDDEN);
     }
     // 433N tooltip label
     lv_obj_t *n_hint = lv_label_create(card);
@@ -40742,6 +40769,8 @@ static void show_cc1101_bandscope_screen(void)
         lv_obj_center(lbl);
         lv_obj_add_event_cb(btn, s_bs_preset_cb, LV_EVENT_CLICKED,
                             (void *)&presets[i]);
+        bool is_high = (presets[i] >= 800.0f);
+        if (g_cc1101_highband != is_high) lv_obj_add_flag(btn, LV_OBJ_FLAG_HIDDEN);
     }
 
     // Status / range label
