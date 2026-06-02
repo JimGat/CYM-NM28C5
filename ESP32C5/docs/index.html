@@ -42,20 +42,6 @@
         pointer-events:none;
       }
 
-      /* Dexter watching from the bottom-left */
-      .dexter {
-        position:fixed;
-        bottom:0;
-        left:0;
-        height:280px;
-        pointer-events:none;
-        z-index:200;
-        filter:drop-shadow(0 0 24px rgba(57,255,20,0.45));
-        transform-origin:bottom left;
-        transition:transform .3s ease;
-      }
-      .dexter:hover { transform:scale(1.06) rotate(2deg); }
-
       /* DeeDee sneaking in from the bottom-right */
       .deedee {
         position:fixed;
@@ -243,13 +229,11 @@
         header { grid-template-columns:1fr; }
         .logo-wrap { grid-row:auto; justify-content:center; margin-bottom:12px; }
         .logo-img { height:100px; }
-        .dexter { height:160px; }
         .deedee { height:190px; }
       }
     </style>
   </head>
   <body>
-    <img class="dexter" src="lab5_logo.png" alt="Dexter">
     <img class="deedee" src="deedee.png" alt="DeeDee">
 
     <div class="container">
