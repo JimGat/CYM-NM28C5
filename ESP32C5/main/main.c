@@ -43322,7 +43322,24 @@ static void s_rfid_scan_lvgl_cb(void *arg)
     rfid_scan_evt_t *ev = (rfid_scan_evt_t *)arg;
 
     if (ev->result == RFID_OK) {
-        if (s_rfid_last_card) *s_rfid_last_card = ev->card;
+        if (s_rfid_last_card) {
+            // Preserve Read All block data when the same card is re-polled.
+            // The poll scan result has no blocks (page_count small, blocks[]=invalid).
+            // Overwriting blindly erased the 45-page read and made Clone silently fail.
+            bool same_uid = (s_rfid_last_card->uid_len > 0 &&
+                             ev->card.uid_len == s_rfid_last_card->uid_len &&
+                             memcmp(ev->card.uid, s_rfid_last_card->uid,
+                                    ev->card.uid_len) == 0);
+            if (same_uid) {
+                // Same card still present — only refresh identity fields
+                s_rfid_last_card->atqa = ev->card.atqa;
+                s_rfid_last_card->sak  = ev->card.sak;
+                // protocol, page_count, blocks[] preserved from last Read All
+            } else {
+                // Different card — full replace (clears old block data)
+                *s_rfid_last_card = ev->card;
+            }
+        }
 
         char uid_str[32];
         rfid_format_uid(ev->card.uid, ev->card.uid_len, uid_str, sizeof(uid_str));
@@ -44142,8 +44159,11 @@ static void s_rfid_clone_start_cb(lv_event_t *e)
     for (uint16_t i = 0; i < s_rfid_last_card->page_count && i < RFID_MAX_BLOCKS; i++)
         if (s_rfid_last_card->blocks[i].valid) { has_pages = true; break; }
     if (!has_pages) {
-        if (s_rfid_clone_status)
-            lv_label_set_text(s_rfid_clone_status, "No page data — Scan & Read All first");
+        if (s_rfid_clone_status) {
+            lv_label_set_text(s_rfid_clone_status,
+                              "No page data found!\nGo to Scan & Read, hold card, wait for auto-read.");
+            lv_obj_set_style_text_color(s_rfid_clone_status, lv_color_hex(0xFF5252), 0);
+        }
         return;
     }
     if (s_rfid_clone_status) {
@@ -44237,8 +44257,8 @@ static void show_rfid_clone_screen(void)
 
         s_rfid_clone_status = lv_label_create(function_page);
         lv_label_set_text(s_rfid_clone_status, valid_pages > 0
-            ? "Ready — present blank NTAG, tap Clone"
-            : "No pages read — use Scan & Read All first");
+            ? "Ready - hold blank NTAG on antenna, tap Clone"
+            : "No pages read - use Scan & Read All first");
         lv_obj_set_style_text_font(s_rfid_clone_status, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(s_rfid_clone_status,
             valid_pages > 0 ? lv_color_hex(0xB39DDB) : lv_color_hex(0xFFB300), 0);
