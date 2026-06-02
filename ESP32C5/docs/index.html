@@ -10,69 +10,255 @@
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
     <style>
-      :root { --bg:#0a0f1c; --card:#10182a; --accent:#40f0ff; --accent2:#ff7bd4; --text:#e8f1ff; --muted:#9db2d4; --border:rgba(255,255,255,.08); --error:#ff6b6b; --ok:#5af29e; }
+      :root {
+        --bg:#050e05;
+        --card:rgba(4,14,4,0.88);
+        --accent:#39ff14;
+        --accent2:#ffe600;
+        --text:#d8ffd8;
+        --muted:#7ab87a;
+        --border:rgba(57,255,20,0.18);
+        --error:#ff5555;
+        --ok:#39ff14;
+      }
       * { box-sizing:border-box; }
-      body { margin:0; min-height:100vh; padding:32px 18px 64px; font-family:"Space Grotesk",system-ui,sans-serif; color:var(--text); background:radial-gradient(circle at 20% 20%, rgba(64,240,255,.06), transparent 30%), radial-gradient(circle at 80% 0%, rgba(255,123,212,.08), transparent 30%), var(--bg); }
+
+      body {
+        margin:0;
+        min-height:100vh;
+        padding:32px 18px 120px;
+        font-family:"Space Grotesk",system-ui,sans-serif;
+        color:var(--text);
+        background:url('lab_bg.png') center/cover fixed no-repeat;
+      }
+
+      /* Dark overlay so text stays readable over the lab backdrop */
+      body::before {
+        content:'';
+        position:fixed;
+        inset:0;
+        background:rgba(0,6,0,0.62);
+        z-index:0;
+        pointer-events:none;
+      }
+
+      /* Dexter watching from the bottom-left */
+      .dexter {
+        position:fixed;
+        bottom:0;
+        left:0;
+        height:280px;
+        pointer-events:none;
+        z-index:200;
+        filter:drop-shadow(0 0 24px rgba(57,255,20,0.45));
+        transform-origin:bottom left;
+        transition:transform .3s ease;
+      }
+      .dexter:hover { transform:scale(1.06) rotate(2deg); }
+
+      /* DeeDee sneaking in from the bottom-right */
+      .deedee {
+        position:fixed;
+        bottom:0;
+        right:0;
+        height:310px;
+        pointer-events:none;
+        z-index:200;
+        filter:drop-shadow(0 0 18px rgba(57,255,20,0.25));
+        transform-origin:bottom right;
+        transition:transform .3s ease;
+      }
+      .deedee:hover { transform:scale(1.04) rotate(-2deg); }
+
+      .container { max-width:1160px; margin:0 auto; display:grid; gap:16px; position:relative; z-index:1; }
+
       a { color:inherit; }
       code, .mono, .log { font-family:Consolas,"Liberation Mono",monospace; }
-      .container { max-width:1200px; margin:0 auto; display:grid; gap:18px; }
-      header, .card { border:1px solid var(--border); box-shadow:0 12px 36px rgba(0,0,0,.35); }
-      header { border-radius:20px; padding:24px 24px 28px; background:linear-gradient(135deg, rgba(64,240,255,.08), rgba(255,123,212,.05)); box-shadow:0 20px 60px rgba(0,0,0,.45); }
-      .eyebrow, .pill { display:inline-flex; align-items:center; gap:6px; border:1px solid var(--border); color:var(--muted); background:rgba(255,255,255,.04); }
-      .eyebrow { padding:6px 12px; border-radius:999px; font-size:12px; letter-spacing:.06em; text-transform:uppercase; }
-      h1 { margin:12px 0 10px; font-size:clamp(32px, 4vw, 44px); letter-spacing:-.02em; }
-      p { margin:0; color:var(--muted); line-height:1.55; }
-      .hero-meta, .status-line, .actions { display:flex; flex-wrap:wrap; gap:10px; }
-      .hero-meta { margin-top:14px; }
-      .pill { padding:6px 10px; border-radius:10px; font-size:13px; background:rgba(255,255,255,.03); }
+
+      /* ── Header ── */
+      header {
+        border:1px solid var(--border);
+        border-radius:20px;
+        padding:20px 24px 24px;
+        background:var(--card);
+        backdrop-filter:blur(10px);
+        box-shadow:0 0 40px rgba(57,255,20,0.08), 0 20px 60px rgba(0,0,0,0.55);
+        display:grid;
+        grid-template-columns:auto 1fr;
+        gap:0 24px;
+        align-items:center;
+      }
+      .logo-wrap {
+        grid-row:1/4;
+        display:flex;
+        align-items:center;
+      }
+      .logo-img {
+        height:130px;
+        width:auto;
+        display:block;
+        filter:drop-shadow(0 0 16px rgba(57,255,20,0.4));
+      }
+      .eyebrow {
+        display:inline-flex;
+        align-items:center;
+        gap:6px;
+        padding:5px 12px;
+        border-radius:999px;
+        font-size:11.5px;
+        letter-spacing:.07em;
+        text-transform:uppercase;
+        border:1px solid var(--border);
+        color:var(--muted);
+        background:rgba(57,255,20,0.05);
+        width:fit-content;
+      }
+      header p { margin:6px 0 0; color:var(--muted); line-height:1.5; font-size:14px; }
+      .hero-meta { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+      .pill {
+        display:inline-flex;
+        align-items:center;
+        gap:6px;
+        padding:5px 10px;
+        border-radius:10px;
+        font-size:13px;
+        border:1px solid var(--border);
+        background:rgba(57,255,20,0.04);
+      }
       .pill strong { color:var(--text); }
+
+      /* ── Layout ── */
       .split { display:grid; grid-template-columns:1.3fr 1fr; gap:14px; }
       .stack { display:grid; gap:14px; align-content:start; }
-      .card { border-radius:16px; padding:18px; background:var(--card); }
-      .card h2 { margin:0 0 10px; font-size:18px; }
+
+      /* ── Cards ── */
+      .card {
+        border-radius:16px;
+        padding:18px;
+        background:var(--card);
+        backdrop-filter:blur(10px);
+        border:1px solid var(--border);
+        box-shadow:0 0 20px rgba(57,255,20,0.05), 0 10px 30px rgba(0,0,0,0.4);
+      }
+      .card h2 { margin:0 0 10px; font-size:17px; color:var(--accent); text-shadow:0 0 12px rgba(57,255,20,0.4); }
       .controls { display:flex; flex-direction:column; gap:14px; }
-      button, .button-link { display:inline-flex; align-items:center; justify-content:center; min-height:44px; padding:12px 18px; border-radius:12px; font-size:14px; font-weight:600; text-decoration:none; transition:transform .08s ease, opacity .2s; }
-      button { border:none; cursor:pointer; color:#0a0f1c; background:linear-gradient(135deg, var(--accent), #56a0ff); box-shadow:0 12px 32px rgba(64,240,255,.3); }
-      button:hover:not(:disabled), .button-link:hover { transform:translateY(-1px); }
-      button:disabled { opacity:.6; cursor:not-allowed; box-shadow:none; }
-      .ghost, .button-link { color:var(--text); background:rgba(255,255,255,.04); box-shadow:inset 0 0 0 1px var(--border); }
-      .check, select, .text-input { border:1px solid rgba(255,255,255,.14); background:rgba(255,255,255,.04); color:var(--text); border-radius:12px; }
+
+      /* ── Buttons ── */
+      button, .button-link {
+        display:inline-flex;
+        align-items:center;
+        justify-content:center;
+        min-height:44px;
+        padding:12px 18px;
+        border-radius:12px;
+        font-size:14px;
+        font-weight:600;
+        text-decoration:none;
+        transition:transform .08s ease, box-shadow .2s;
+      }
+      button {
+        border:none;
+        cursor:pointer;
+        color:#050e05;
+        background:linear-gradient(135deg, var(--accent), #80ff50);
+        box-shadow:0 8px 24px rgba(57,255,20,0.35);
+      }
+      button:hover:not(:disabled), .button-link:hover { transform:translateY(-1px); box-shadow:0 12px 32px rgba(57,255,20,0.5); }
+      button:disabled { opacity:.5; cursor:not-allowed; box-shadow:none; }
+      .ghost, .button-link {
+        color:var(--text);
+        background:rgba(57,255,20,0.05);
+        box-shadow:inset 0 0 0 1px var(--border);
+      }
+      .ghost:hover { background:rgba(57,255,20,0.1); }
+
+      /* ── Form controls ── */
+      .check, select, .text-input {
+        border:1px solid rgba(57,255,20,0.2);
+        background:rgba(57,255,20,0.04);
+        color:var(--text);
+        border-radius:12px;
+      }
       .check { display:inline-flex; align-items:center; gap:10px; padding:10px 12px; font-size:13px; font-weight:600; user-select:none; cursor:pointer; }
       .check input { width:16px; height:16px; accent-color:var(--accent); }
       select, .text-input { padding:10px 12px; font-size:13px; }
       .text-input { flex:1; min-width:220px; }
-      select:focus, .text-input:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 2px rgba(64,240,255,.2); }
-      .hint, .steps li, .link-grid a { border:1px solid rgba(255,255,255,.1); background:rgba(255,255,255,.03); }
-      .hint { padding:10px 12px; border-radius:12px; font-size:12.5px; line-height:1.45; }
+      select:focus, .text-input:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 2px rgba(57,255,20,0.2); }
+
+      /* ── Misc ── */
+      .status-line, .actions { display:flex; flex-wrap:wrap; gap:10px; }
+      .hint { padding:10px 12px; border-radius:12px; font-size:12.5px; line-height:1.45; border:1px solid rgba(57,255,20,0.12); background:rgba(57,255,20,0.03); }
       .hint strong { color:var(--text); }
-      .log { min-height:140px; max-height:240px; overflow-y:auto; padding:12px; border-radius:12px; border:1px solid var(--border); background:rgba(0,0,0,.35); color:#b8c7e6; font-size:13px; line-height:1.45; white-space:pre-wrap; word-break:break-word; }
-      .progress { width:100%; height:10px; overflow:hidden; border-radius:999px; border:1px solid var(--border); background:rgba(255,255,255,.05); }
-      .progress span { display:block; width:0%; height:100%; background:linear-gradient(90deg, var(--accent), var(--accent2)); transition:width .12s ease; }
+      .log {
+        min-height:140px;
+        max-height:240px;
+        overflow-y:auto;
+        padding:12px;
+        border-radius:12px;
+        border:1px solid var(--border);
+        background:rgba(0,8,0,0.5);
+        color:#80c080;
+        font-size:13px;
+        line-height:1.45;
+        white-space:pre-wrap;
+        word-break:break-word;
+      }
+      .progress { width:100%; height:10px; overflow:hidden; border-radius:999px; border:1px solid var(--border); background:rgba(57,255,20,0.06); }
+      .progress span { display:block; width:0%; height:100%; background:linear-gradient(90deg, var(--accent), var(--accent2)); transition:width .12s ease; box-shadow:0 0 8px rgba(57,255,20,0.6); }
+
       .steps { display:grid; gap:8px; margin:12px 0 0; padding:0; }
-      .steps li { list-style:none; padding:10px 12px; border-radius:12px; line-height:1.5; }
-      .badge { display:inline-block; padding:2px 10px; border-radius:999px; border:1px solid rgba(90,242,158,.4); background:rgba(90,242,158,.12); color:var(--ok); font-size:12px; }
+      .steps li { list-style:none; padding:10px 12px; border-radius:12px; line-height:1.5; border:1px solid rgba(57,255,20,0.1); background:rgba(57,255,20,0.03); }
+
+      .badge { display:inline-block; padding:2px 10px; border-radius:999px; border:1px solid rgba(57,255,20,0.4); background:rgba(57,255,20,0.12); color:var(--ok); font-size:12px; }
+
       .channel-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
       .channel-label { font-size:13px; font-weight:600; color:var(--muted); }
-      .channel-btn { min-height:32px; padding:6px 14px; border-radius:8px; font-size:13px; font-weight:600; color:var(--text); background:rgba(255,255,255,.04); box-shadow:inset 0 0 0 1px var(--border); }
-      .channel-btn.active { color:#0a0f1c; background:linear-gradient(135deg, var(--accent), #56a0ff); box-shadow:0 6px 18px rgba(64,240,255,.3); }
-      .dev-warn { padding:10px 12px; border-radius:12px; font-size:12.5px; line-height:1.45; border:1px solid rgba(255,165,0,.45); background:rgba(255,165,0,.07); color:#ffa040; }
-      .dev-warn strong { color:#ffc060; }
+      .channel-btn { min-height:32px; padding:6px 14px; border-radius:8px; font-size:13px; font-weight:600; color:var(--text); background:rgba(57,255,20,0.04); box-shadow:inset 0 0 0 1px var(--border); }
+      .channel-btn.active { color:#050e05; background:linear-gradient(135deg, var(--accent), #80ff50); box-shadow:0 4px 14px rgba(57,255,20,0.35); }
+
+      .dev-warn { padding:10px 12px; border-radius:12px; font-size:12.5px; line-height:1.45; border:1px solid rgba(255,200,0,.4); background:rgba(255,200,0,.06); color:#ffc040; }
+      .dev-warn strong { color:#ffe060; }
+
       .link-grid { display:grid; gap:10px; margin-top:12px; }
-      .link-grid a { display:flex; justify-content:space-between; gap:12px; min-height:46px; padding:12px 14px; border-radius:12px; text-decoration:none; }
+      .link-grid a { display:flex; justify-content:space-between; gap:12px; min-height:46px; padding:12px 14px; border-radius:12px; text-decoration:none; border:1px solid rgba(57,255,20,0.1); background:rgba(57,255,20,0.03); }
+      .link-grid a:hover { border-color:rgba(57,255,20,0.3); background:rgba(57,255,20,0.07); }
       .link-grid a span { color:var(--muted); font-size:13px; }
+
       .error { color:var(--error); }
-      footer { margin-top:18px; color:var(--muted); font-size:13px; text-align:center; }
+
+      footer {
+        position:relative;
+        z-index:1;
+        margin-top:18px;
+        color:var(--muted);
+        font-size:13px;
+        text-align:center;
+      }
       footer a { text-decoration:none; border-bottom:1px solid transparent; }
       footer a:hover { border-bottom-color:currentColor; }
-      @media (max-width:980px) { body { padding:20px 14px 60px; } .split { grid-template-columns:1fr; } }
+
+      @media (max-width:980px) {
+        body { padding:20px 14px 180px; }
+        .split { grid-template-columns:1fr; }
+        header { grid-template-columns:1fr; }
+        .logo-wrap { grid-row:auto; justify-content:center; margin-bottom:12px; }
+        .logo-img { height:100px; }
+        .dexter { height:160px; }
+        .deedee { height:190px; }
+      }
     </style>
   </head>
   <body>
+    <img class="dexter" src="lab5_logo.png" alt="Dexter">
+    <img class="deedee" src="deedee.png" alt="DeeDee">
+
     <div class="container">
       <header>
-        <div class="eyebrow">Cheap Yellow Monster &nbsp; NM-CYD-C5 &nbsp; ESP32-C5</div>
-        <h1>Flash Cheap Yellow Monster straight from your browser</h1>
-        <p>Web Serial flasher powered by esptool-js. Flash the current release firmware for the NM-CYD-C5 (ESP32-C5) WiFi 6 &amp; BLE security toolkit directly from your browser — no software install required.</p>
+        <div class="logo-wrap">
+          <img class="logo-img" src="lab5_logo.png" alt="LAB5 — Control the Chaos">
+        </div>
+        <div class="eyebrow">Cheap Yellow Monster &nbsp;·&nbsp; NM-CYD-C5 &nbsp;·&nbsp; ESP32-C5</div>
+        <p>Web Serial flasher powered by esptool-js. Flash the current release firmware for the NM-CYD-C5 WiFi 6 &amp; BLE security toolkit directly from your browser — no software install required.</p>
         <div class="hero-meta">
           <span class="pill"><strong>Chip</strong> ESP32-C5</span>
           <span class="pill"><strong>Board</strong> NM-CYD-C5</span>
