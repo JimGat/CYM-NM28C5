@@ -385,7 +385,7 @@
       };
 
       const state = { manifest:null, channel:"stable", port:null, onDisconnect:null, esploader:null, chip:null, connected:false, flashing:false, monitorPort:null, monitorReader:null, monitorWriter:null, monitorPipe:null, monitorDisconnect:null, monitorConnected:false };
-      const PAGE_VERSION = "2.2.0";  // add debug() to logger
+      const PAGE_VERSION = "2.3.0";  // release transport reader lock between connect and flash
       const RAW_BASE = "https://raw.githubusercontent.com/JimGat/CYM-NM28C5/Jimgat_Dev/ESP32C5";
       const DEV_MANIFEST_URL = `${RAW_BASE}/docs/manifest.json`;
       const RAW_BIN = `${RAW_BASE}/binaries-esp32c5`;
@@ -549,6 +549,23 @@
               catch (e) { log(`Erase warning: ${e?.message || e}`); }
             } else { log("Erase skipped (not supported by this library version)."); }
           }
+
+          // Release the transport reader held by connectWithPort() so flashData() can read ACKs.
+          // Without this, flashData() hangs forever waiting for the flash-begin ACK.
+          try {
+            const t = state.esploader.transport;
+            if (t) {
+              // Cancel any SLIP/raw reader the connect phase left open
+              if (t.reader)      { try { await t.reader.cancel(); }      catch {} try { t.reader.releaseLock(); }      catch {} t.reader = null; }
+              if (t.slipReader)  { try { await t.slipReader.cancel(); }  catch {} try { t.slipReader.releaseLock(); }  catch {} t.slipReader = null; }
+            }
+            // Also release directly on the port readable stream
+            if (state.port.readable.locked) {
+              const tmp = state.port.readable.getReader();
+              tmp.releaseLock();
+            }
+          } catch (e) { log(`Transport reader reset: ${e?.message || e}`); }
+          await sleep(200);
 
           // Try writeFlash() first (handles transport init properly); fall back to flashData()
           const totalBytes = files.reduce((s, f) => s + f.data.length, 0);
