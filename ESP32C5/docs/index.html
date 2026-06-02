@@ -387,7 +387,7 @@
       };
 
       const state = { manifest:null, channel:"stable", port:null, onDisconnect:null, esploader:null, chip:null, connected:false, flashing:false, monitorPort:null, monitorReader:null, monitorWriter:null, monitorPipe:null, monitorDisconnect:null, monitorConnected:false };
-      const PAGE_VERSION = "2.4.0";  // full tasmota API: init+reset+detectChip+runStub then flash on stub
+      const PAGE_VERSION = "2.5.0";  // manual stub upload bypasses esm.sh JSON module bug
       const RAW_BASE = "https://raw.githubusercontent.com/JimGat/CYM-NM28C5/Jimgat_Dev/ESP32C5";
       const DEV_MANIFEST_URL = `${RAW_BASE}/docs/manifest.json`;
       const RAW_BIN = `${RAW_BASE}/binaries-esp32c5`;
@@ -514,12 +514,47 @@
           state.chip = state.esploader.chipName || "ESP32-C5";
           log(`Chip: ${state.chip}`);
 
-          // Step 4: Upload flash stub — this fixes OPI PSRAM / Flash ID:0 on ESP32-C5
+          // Step 4: Upload flash stub — fixes OPI PSRAM / Flash ID:0 on ESP32-C5.
+          // runStub() uses dynamic JSON import which esm.sh bundling breaks:
+          // import("./esp32c5.json") returns {default:{text,...}} in browser ESM,
+          // so stubcode.text is undefined, atob(undefined) = atob("undefined") = fails.
+          // Fix: catch the atob error and upload the stub manually from GitHub.
           setStatus(`Uploading flash stub for ${state.chip}...`);
-          log("Uploading flash stub (fixes OPI PSRAM)...");
-          const stub = await state.esploader.runStub(true);
-          state.esploader = stub;  // All flash ops MUST use the stub loader
-          log("Stub running");
+          log("Uploading flash stub...");
+          try {
+            const stub = await state.esploader.runStub(true);
+            state.esploader = stub;
+            log("Stub running (library path)");
+          } catch (e) {
+            if (!e.message?.includes("atob") && !e.message?.includes("correctly encoded")) throw e;
+            log("runStub() hit esm.sh JSON module bug — uploading stub manually...");
+            // Fetch stub JSON directly from the tasmota repo
+            const sResp = await fetch(
+              "https://raw.githubusercontent.com/Jason2866/WebSerial_ESPTool/main/src/stubs/esp32c5.json",
+              { cache: "force-cache" }
+            );
+            if (!sResp.ok) throw new Error(`Stub fetch failed: ${sResp.status}`);
+            const sData = await sResp.json();
+            const dec = (s) => Array.from(atob(s), c => c.charCodeAt(0));
+            const textBytes = dec(sData.text);
+            const dataBytes = dec(sData.data);
+            const RAM_BLOCK = 0x1800;
+            const upload = async (bytes, addr) => {
+              const blocks = Math.ceil(bytes.length / RAM_BLOCK);
+              await state.esploader.memBegin(bytes.length, blocks, RAM_BLOCK, addr);
+              for (let i = 0; i < blocks; i++)
+                await state.esploader.memBlock(bytes.slice(i * RAM_BLOCK, (i + 1) * RAM_BLOCK), i);
+            };
+            await upload(textBytes, sData.text_start);
+            if (dataBytes.length > 0) await upload(dataBytes, sData.data_start);
+            await state.esploader.memFinish(sData.entry);
+            // Read OHAI handshake from stub
+            const p = await state.esploader.readPacket(1000);
+            const greeting = String.fromCharCode(...p);
+            if (greeting !== "OHAI") throw new Error(`Stub start failed: "${greeting}"`);
+            state.esploader.IS_STUB = true;
+            log("Stub running (manual upload path)");
+          }
 
           state.connected = true;
           ui.chip.style.display = "inline-flex";
