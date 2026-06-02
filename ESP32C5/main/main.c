@@ -37169,6 +37169,7 @@ static void rf433_lbk_task(void *arg)
         .intr_type    = GPIO_INTR_ANYEDGE,
     };
     gpio_config(&icfg);
+    gpio_install_isr_service(0);  // no-op if already installed; required on first-ever run
     s_lbk_edges = 0;
     gpio_isr_handler_add(rx_pin, s_lbk_edge_isr, NULL);
 
