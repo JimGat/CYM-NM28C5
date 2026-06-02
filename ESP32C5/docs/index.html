@@ -385,7 +385,7 @@
       };
 
       const state = { manifest:null, channel:"stable", port:null, onDisconnect:null, esploader:null, chip:null, connected:false, flashing:false, monitorPort:null, monitorReader:null, monitorWriter:null, monitorPipe:null, monitorDisconnect:null, monitorConnected:false };
-      const PAGE_VERSION = "2.1.0";  // back to v9.2.23, no compress, no debug introspection
+      const PAGE_VERSION = "2.2.0";  // add debug() to logger
       const RAW_BASE = "https://raw.githubusercontent.com/JimGat/CYM-NM28C5/Jimgat_Dev/ESP32C5";
       const DEV_MANIFEST_URL = `${RAW_BASE}/docs/manifest.json`;
       const RAW_BIN = `${RAW_BASE}/binaries-esp32c5`;
@@ -486,8 +486,8 @@
           setStatus("Syncing with chip — hold BOOT + tap RESET if needed");
           log("Connecting via tasmota connectWithPort...");
 
-          // tasmota logger interface: needs .log() not .writeLine()/.write()
-          const terminal = { clean() {}, writeLine: log, write: log, log, error: log };
+          // tasmota logger: needs log, error, debug methods
+          const terminal = { clean() {}, writeLine: log, write: log, log, error: log, debug: () => {} };
           const timeout = new Promise((_, rej) =>
             setTimeout(() => rej(new Error(`Connect timeout after ${CONNECT_TIMEOUT_MS/1000}s — hold BOOT and tap RESET`)), CONNECT_TIMEOUT_MS));
           state.esploader = await Promise.race([connectWithPort(state.port, terminal), timeout]);
