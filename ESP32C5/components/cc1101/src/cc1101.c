@@ -251,10 +251,14 @@ void cc1101_set_output_power_dbm(int8_t dbm)
     else if (dbm >= -15) pa = 0x1D;
     else if (dbm >= -20) pa = 0x0D;
     else                 pa = 0x03;
-    // Write PATABLE via burst write
-    uint8_t tx_data[2] = { CC1101_PATABLE | CC1101_BURST | CC1101_WRITE, pa };
+    // Write PATABLE[0] AND PATABLE[1] via burst write (3 bytes total).
+    // OOK presets set FREND0=0x11, routing OOK '1' bits through PATABLE[1].
+    // Without writing PATABLE[1], OOK TX has no power (PATABLE[1] = 0 after SRES).
+    // FSK presets use FREND0[2:0]=0 (PATABLE[0]), so PATABLE[1] is unused there —
+    // writing it here is harmless.  Max CC1101 output at 433 MHz: 0xC0 ≈ +10 dBm.
+    uint8_t tx_data[3] = { CC1101_PATABLE | CC1101_BURST | CC1101_WRITE, pa, pa };
     spi_transaction_t t = {
-        .length    = 16,
+        .length    = 24,   // 3 bytes × 8
         .tx_buffer = tx_data,
     };
     if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
