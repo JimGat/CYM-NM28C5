@@ -43061,10 +43061,111 @@ static lv_obj_t *s_rfid_scan_uid_lbl    = NULL;
 static lv_obj_t *s_rfid_scan_type_lbl   = NULL;
 static lv_obj_t *s_rfid_scan_atqa_lbl   = NULL;
 static lv_obj_t *s_rfid_scan_status_lbl = NULL;
+static lv_obj_t *s_rfid_scan_ndef_lbl   = NULL;  // decoded NDEF URL / text
+static lv_obj_t *s_rfid_scan_panel      = NULL;  // card info panel (for border flash)
 static lv_obj_t *s_rfid_scan_save_btn   = NULL;
 static lv_obj_t *s_rfid_scan_read_btn   = NULL;
 static bool       s_rfid_has_card        = false;
 static lv_timer_t *s_rfid_init_retry_tmr = NULL;
+// Auto-read timer: fires 1 s after first card detection to trigger Read All
+// automatically, so the user only needs to hold the card still.
+static lv_timer_t *s_rfid_autoread_tmr  = NULL;
+
+// ── Minimal NDEF TLV decoder ──────────────────────────────────────────────────
+// Scans card pages 4..page_count for NDEF Message TLV (0x03).
+// Extracts first URI ('U') or Text ('T') well-known record.
+// Returns true and fills out[] if something was found.
+static bool s_ndef_extract(const rfid_card_t *card, char *out, size_t out_max)
+{
+    if (!card || out_max < 8) return false;
+
+    // Build linear byte array from pages 4 onwards (user data area)
+    static const char *s_uri_prefixes[] = {
+        "", "http://www.", "https://www.", "http://", "https://",
+        "tel:", "mailto:", "ftp://", "ftps://", "sftp://",
+        "smb://", "nfs://", "ftp://", "dav://", "news:",
+        "telnet://", "imap:", "rtsp://", "urn:", "pop:",
+        "sip:", "sips:", "tftp:", "btspp://", "btl2cap://",
+        "btgoep://", "tcpobex://", "irdaobex://", "file://",
+        "urn:epc:id:", "urn:epc:tag:", "urn:epc:pat:", "urn:epc:raw:",
+        "urn:epc:", "urn:nfc:",
+    };
+
+    uint8_t buf[200];
+    int len = 0;
+    for (uint16_t pg = 4; pg < card->page_count && pg < RFID_MAX_BLOCKS
+                          && len < (int)sizeof(buf) - 4; pg++) {
+        if (!card->blocks[pg].valid) break;
+        memcpy(buf + len, card->blocks[pg].data, 4);
+        len += 4;
+    }
+
+    // Parse TLV chain
+    int pos = 0;
+    while (pos < len - 1) {
+        uint8_t tlv_type = buf[pos++];
+        if (tlv_type == 0xFE) break;  // Terminator
+        if (tlv_type == 0x00) continue;  // Null / padding
+
+        int tlv_len;
+        if (buf[pos] == 0xFF && pos + 2 < len) {
+            tlv_len = ((int)buf[pos+1] << 8) | buf[pos+2];
+            pos += 3;
+        } else {
+            tlv_len = buf[pos++];
+        }
+        // Non-NDEF TLVs: skip if they go past our buffer
+        if (tlv_type != 0x03) {
+            if (pos + tlv_len > len) break;
+            pos += tlv_len;
+            continue;
+        }
+        // NDEF TLV (0x03): attempt parse even if TLV claims more bytes than our
+        // buffer holds. This happens when an NTAG213 card is misidentified as
+        // Ultralight (16 pages vs 45) — the NDEF may extend beyond page 15.
+        // We parse whatever bytes we have; the URL will be decoded up to what's
+        // buffered (fix is in ntag_read_all auto-upgrade to NTAG213 on probe).
+        // suppress "if (pos + tlv_len > len) break;" for NDEF type
+
+        // Parse NDEF record at buf[pos..pos+tlv_len]
+        uint8_t *rec = buf + pos;
+        uint8_t tnf  = rec[0] & 0x07;
+        bool    sr   = (rec[0] >> 4) & 1;  // short record
+        bool    il   = (rec[0] >> 3) & 1;  // ID length present
+        uint8_t type_len = rec[1];
+        int     off = 2;
+        uint32_t payload_len = sr ? rec[off++]
+                                  : (((uint32_t)rec[off] << 24) | ((uint32_t)rec[off+1] << 16) |
+                                     ((uint32_t)rec[off+2] << 8) | rec[off+3]);
+        if (!sr) off += 4;
+        if (il)  off++;  // skip ID length byte
+        uint8_t *type_bytes = rec + off;
+        off += type_len;
+        uint8_t *payload = rec + off;
+
+        if (tnf == 0x01 && type_len == 1 && type_bytes[0] == 'U' && payload_len > 0) {
+            // Well-Known URI record
+            uint8_t code = payload[0];
+            const char *prefix = (code < 35) ? s_uri_prefixes[code] : "";
+            snprintf(out, out_max, "%s%.*s", prefix,
+                     (int)(payload_len - 1), (char *)(payload + 1));
+            return true;
+        }
+        if (tnf == 0x01 && type_len == 1 && type_bytes[0] == 'T' && payload_len > 1) {
+            // Well-Known Text record — skip status byte + language code
+            uint8_t lang_len = payload[0] & 0x3F;
+            int text_start = 1 + lang_len;
+            if ((uint32_t)text_start < payload_len) {
+                snprintf(out, out_max, "%.*s",
+                         (int)(payload_len - (uint32_t)text_start),
+                         (char *)(payload + text_start));
+                return true;
+            }
+        }
+        break;  // only parse first record
+    }
+    return false;
+}
 
 // ── Read All helpers ──────────────────────────────────────────────────────────
 static void s_rfid_poll_cb(rfid_err_t result, const rfid_card_t *card, void *ctx);  // forward
@@ -43075,14 +43176,66 @@ static void s_rfid_read_done_lvgl_cb(void *arg)
     rfid_read_done_t *d = (rfid_read_done_t *)arg;
     if (s_rfid_scan_status_lbl) {
         if (d->r == RFID_OK) {
-            char buf[40];
-            snprintf(buf, sizeof(buf), "Read: %u pages OK", (unsigned)d->page_count);
+            char buf[48];
+            snprintf(buf, sizeof(buf), LV_SYMBOL_OK " Read: %u pages OK",
+                     (unsigned)d->page_count);
             lv_label_set_text(s_rfid_scan_status_lbl, buf);
+            lv_obj_set_style_text_color(s_rfid_scan_status_lbl,
+                                        lv_color_hex(0x00E676), 0);
         } else {
-            lv_label_set_text(s_rfid_scan_status_lbl, "Read failed — hold card closer");
+            lv_label_set_text(s_rfid_scan_status_lbl, "Read failed - hold card closer");
+            lv_obj_set_style_text_color(s_rfid_scan_status_lbl,
+                                        lv_color_hex(0xFF5252), 0);
         }
     }
-    if (s_rfid_scan_read_btn) lv_obj_clear_state(s_rfid_scan_read_btn, LV_STATE_DISABLED);
+
+    // Decode NDEF and show URL / text if found
+    // Update type label — may have been upgraded (e.g. Ultralight → NTAG213)
+    if (d->r == RFID_OK && s_rfid_last_card && s_rfid_scan_type_lbl) {
+        char type_buf[48];
+        snprintf(type_buf, sizeof(type_buf), "Type: %s  (%u pages)",
+                 s_rfid_last_card->protocol_str, s_rfid_last_card->page_count);
+        lv_label_set_text(s_rfid_scan_type_lbl, type_buf);
+        lv_obj_set_style_text_color(s_rfid_scan_type_lbl, lv_color_hex(0x00E676), 0);
+    }
+
+    if (d->r == RFID_OK && s_rfid_last_card && s_rfid_scan_ndef_lbl) {
+        // Always log raw page 4 bytes for diagnosis
+        if (s_rfid_last_card->blocks[4].valid) {
+            uint8_t *p4 = s_rfid_last_card->blocks[4].data;
+            ESP_LOGI("rfid_scan", "page4: %02X %02X %02X %02X  page5: %02X %02X %02X %02X  "
+                     "page6: %02X %02X %02X %02X",
+                     p4[0], p4[1], p4[2], p4[3],
+                     s_rfid_last_card->blocks[5].data[0], s_rfid_last_card->blocks[5].data[1],
+                     s_rfid_last_card->blocks[5].data[2], s_rfid_last_card->blocks[5].data[3],
+                     s_rfid_last_card->blocks[6].data[0], s_rfid_last_card->blocks[6].data[1],
+                     s_rfid_last_card->blocks[6].data[2], s_rfid_last_card->blocks[6].data[3]);
+        }
+        char ndef_buf[128];
+        if (s_ndef_extract(s_rfid_last_card, ndef_buf, sizeof(ndef_buf))) {
+            ESP_LOGI("rfid_scan", "NDEF decoded: %s", ndef_buf);
+            lv_label_set_text(s_rfid_scan_ndef_lbl, ndef_buf);
+            lv_obj_set_style_text_color(s_rfid_scan_ndef_lbl,
+                                        lv_color_hex(0x40C4FF), 0);
+        } else {
+            ESP_LOGW("rfid_scan", "No NDEF URL/text found in %u pages "
+                     "(page4 TLV byte: 0x%02X)",
+                     d->page_count,
+                     s_rfid_last_card->blocks[4].valid
+                       ? s_rfid_last_card->blocks[4].data[0] : 0xFF);
+            lv_label_set_text(s_rfid_scan_ndef_lbl, "No NDEF content found");
+            lv_obj_set_style_text_color(s_rfid_scan_ndef_lbl,
+                                        lv_color_hex(0xFF8F00), 0);
+        }
+    }
+
+    if (s_rfid_scan_read_btn) {
+        lv_obj_clear_state(s_rfid_scan_read_btn, LV_STATE_DISABLED);
+        // Keep green if read succeeded, revert to dark if failed
+        lv_obj_set_style_bg_color(s_rfid_scan_read_btn,
+            d->r == RFID_OK ? lv_color_hex(0x1B5E20) : lv_color_hex(0x4E342E),
+            LV_STATE_DEFAULT);
+    }
     free(d);
     rfid_manager_start_poll(s_rfid_poll_cb, NULL, 500);
 }
@@ -43110,12 +43263,28 @@ static void s_rfid_read_all_task(void *arg)
 static void s_rfid_read_all_cb(lv_event_t *e)
 {
     (void)e;
+    // Cancel auto-read timer if it's still pending (manual tap takes priority)
+    if (s_rfid_autoread_tmr) { lv_timer_del(s_rfid_autoread_tmr); s_rfid_autoread_tmr = NULL; }
     if (!s_rfid_has_card || !s_rfid_last_card) return;
     rfid_manager_stop_poll();
-    if (s_rfid_scan_status_lbl) lv_label_set_text(s_rfid_scan_status_lbl, "Hold card — reading...");
+    if (s_rfid_scan_status_lbl) lv_label_set_text(s_rfid_scan_status_lbl, "Hold card - reading...");
     if (s_rfid_scan_read_btn)   lv_obj_add_state(s_rfid_scan_read_btn, LV_STATE_DISABLED);
     xTaskCreate(s_rfid_read_all_task, "rfid_read", 6144, s_rfid_last_card,
                 tskIDLE_PRIORITY + 2, NULL);
+}
+
+static void s_rfid_autoread_tmr_cb(lv_timer_t *t)
+{
+    // Auto-read fires 1 s after first stable card detection.
+    // Only triggers if card is still present (s_rfid_has_card) and
+    // no read is already in progress (Read button still enabled).
+    lv_timer_del(t);
+    s_rfid_autoread_tmr = NULL;
+    if (!s_rfid_has_card || !s_rfid_last_card) return;
+    if (s_rfid_scan_read_btn &&
+        lv_obj_has_state(s_rfid_scan_read_btn, LV_STATE_DISABLED)) return;
+    ESP_LOGI("rfid_scan", "auto-read triggered after stable detection");
+    s_rfid_read_all_cb(NULL);
 }
 
 // Stop poll and null scan-screen labels before navigating away — prevents
@@ -43129,10 +43298,16 @@ static void rfid_back_to_menu(void)
         lv_timer_del(s_rfid_init_retry_tmr);
         s_rfid_init_retry_tmr = NULL;
     }
+    if (s_rfid_autoread_tmr) {
+        lv_timer_del(s_rfid_autoread_tmr);
+        s_rfid_autoread_tmr = NULL;
+    }
     s_rfid_scan_uid_lbl    = NULL;
     s_rfid_scan_type_lbl   = NULL;
     s_rfid_scan_atqa_lbl   = NULL;
     s_rfid_scan_status_lbl = NULL;
+    s_rfid_scan_ndef_lbl   = NULL;
+    s_rfid_scan_panel      = NULL;
     s_rfid_scan_save_btn   = NULL;
     s_rfid_scan_read_btn   = NULL;
     // s_rfid_has_card intentionally NOT cleared — last scanned card persists
@@ -43147,8 +43322,24 @@ static void s_rfid_scan_lvgl_cb(void *arg)
     rfid_scan_evt_t *ev = (rfid_scan_evt_t *)arg;
 
     if (ev->result == RFID_OK) {
-        if (s_rfid_last_card) *s_rfid_last_card = ev->card;
-        s_rfid_has_card = true;
+        if (s_rfid_last_card) {
+            // Preserve Read All block data when the same card is re-polled.
+            // The poll scan result has no blocks (page_count small, blocks[]=invalid).
+            // Overwriting blindly erased the 45-page read and made Clone silently fail.
+            bool same_uid = (s_rfid_last_card->uid_len > 0 &&
+                             ev->card.uid_len == s_rfid_last_card->uid_len &&
+                             memcmp(ev->card.uid, s_rfid_last_card->uid,
+                                    ev->card.uid_len) == 0);
+            if (same_uid) {
+                // Same card still present — only refresh identity fields
+                s_rfid_last_card->atqa = ev->card.atqa;
+                s_rfid_last_card->sak  = ev->card.sak;
+                // protocol, page_count, blocks[] preserved from last Read All
+            } else {
+                // Different card — full replace (clears old block data)
+                *s_rfid_last_card = ev->card;
+            }
+        }
 
         char uid_str[32];
         rfid_format_uid(ev->card.uid, ev->card.uid_len, uid_str, sizeof(uid_str));
@@ -43162,21 +43353,59 @@ static void s_rfid_scan_lvgl_cb(void *arg)
         if (s_rfid_scan_type_lbl) {
             snprintf(info, sizeof(info), "Type: %s", ev->card.protocol_str);
             lv_label_set_text(s_rfid_scan_type_lbl, info);
+            lv_obj_set_style_text_color(s_rfid_scan_type_lbl, lv_color_hex(0x00E676), 0);
         }
         if (s_rfid_scan_atqa_lbl) {
             snprintf(info, sizeof(info), "ATQA: %04X  SAK: %02X",
                      ev->card.atqa, ev->card.sak);
             lv_label_set_text(s_rfid_scan_atqa_lbl, info);
         }
-        if (s_rfid_scan_status_lbl)
-            lv_label_set_text(s_rfid_scan_status_lbl, "Card detected — tap Read All for pages");
+        if (s_rfid_scan_status_lbl) {
+            lv_label_set_text(s_rfid_scan_status_lbl,
+                              LV_SYMBOL_OK " Card found - tap Read to read pages");
+            lv_obj_set_style_text_color(s_rfid_scan_status_lbl,
+                                        lv_color_hex(0x00E676), 0);
+        }
+        // Flash panel border green on card detection
+        if (s_rfid_scan_panel)
+            lv_obj_set_style_border_color(s_rfid_scan_panel,
+                                          lv_color_hex(0x00E676), 0);
         if (s_rfid_scan_save_btn)
             lv_obj_clear_state(s_rfid_scan_save_btn, LV_STATE_DISABLED);
-        if (s_rfid_scan_read_btn)
+        if (s_rfid_scan_read_btn) {
             lv_obj_clear_state(s_rfid_scan_read_btn, LV_STATE_DISABLED);
+            // Turn green to indicate card is present and ready to read
+            lv_obj_set_style_bg_color(s_rfid_scan_read_btn,
+                                      lv_color_hex(0x1B5E20), LV_STATE_DEFAULT);
+        }
+
+        // Start auto-read timer on FIRST detection (not on subsequent polls
+        // while card stays present, and not if already reading).
+        bool was_already_detected = s_rfid_has_card;
+        s_rfid_has_card = true;
+        if (!was_already_detected && !s_rfid_autoread_tmr) {
+            // Card just appeared — auto-read in 1 second if still present
+            s_rfid_autoread_tmr = lv_timer_create(s_rfid_autoread_tmr_cb, 1000, NULL);
+            lv_timer_set_repeat_count(s_rfid_autoread_tmr, 1);
+        }
     } else {
-        if (s_rfid_scan_status_lbl)
+        // Card removed — cancel pending auto-read
+        if (s_rfid_autoread_tmr) {
+            lv_timer_del(s_rfid_autoread_tmr);
+            s_rfid_autoread_tmr = NULL;
+        }
+        if (s_rfid_scan_status_lbl) {
             lv_label_set_text(s_rfid_scan_status_lbl, "Waiting for card...");
+            lv_obj_set_style_text_color(s_rfid_scan_status_lbl,
+                                        lv_color_hex(0xFFB300), 0);
+        }
+        if (s_rfid_scan_panel)
+            lv_obj_set_style_border_color(s_rfid_scan_panel,
+                                          lv_color_hex(0x00695C), 0);
+        // Revert Read button to dark when card is removed
+        if (s_rfid_scan_read_btn)
+            lv_obj_set_style_bg_color(s_rfid_scan_read_btn,
+                                      lv_color_hex(0x4E342E), LV_STATE_DEFAULT);
     }
     free(ev);
 }
@@ -43371,24 +43600,32 @@ static void show_rfid_scan_screen(void)
     s_rfid_scan_type_lbl   = NULL;
     s_rfid_scan_atqa_lbl   = NULL;
     s_rfid_scan_status_lbl = NULL;
+    s_rfid_scan_ndef_lbl   = NULL;
+    s_rfid_scan_panel      = NULL;
     s_rfid_scan_save_btn   = NULL;
     s_rfid_has_card        = false;
 
     create_function_page_base("Scan & Read Card");
     apply_menu_bg();
 
-    // Card info panel
-    lv_obj_t *panel = lv_obj_create(function_page);
-    lv_obj_set_size(panel, LCD_H_RES - 16, 112);
-    lv_obj_align(panel, LV_ALIGN_TOP_MID, 0, 38);
-    lv_obj_set_style_bg_color(panel, ui_panel_color(), 0);
-    lv_obj_set_style_border_color(panel, lv_color_hex(0x00695C), 0);
-    lv_obj_set_style_border_width(panel, 1, 0);
-    lv_obj_set_style_radius(panel, 8, 0);
-    lv_obj_set_style_pad_all(panel, 8, 0);
-    lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_gap(panel, 4, 0);
-    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+    // Card info panel — taller to accommodate NDEF URL label
+    s_rfid_scan_panel = lv_obj_create(function_page);
+    lv_obj_set_size(s_rfid_scan_panel, LCD_H_RES - 16, 148);
+    lv_obj_align(s_rfid_scan_panel, LV_ALIGN_TOP_MID, 0, 34);
+    lv_obj_set_style_bg_color(s_rfid_scan_panel, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(s_rfid_scan_panel, lv_color_hex(0x00695C), 0);
+    lv_obj_set_style_border_width(s_rfid_scan_panel, 2, 0);
+    lv_obj_set_style_radius(s_rfid_scan_panel, 8, 0);
+    lv_obj_set_style_pad_all(s_rfid_scan_panel, 8, 0);
+    lv_obj_set_flex_flow(s_rfid_scan_panel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_gap(s_rfid_scan_panel, 3, 0);
+    lv_obj_clear_flag(s_rfid_scan_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *panel = s_rfid_scan_panel;  // alias for code below
+
+    s_rfid_scan_status_lbl = lv_label_create(panel);
+    lv_label_set_text(s_rfid_scan_status_lbl, "Hold card near antenna...");
+    lv_obj_set_style_text_font(s_rfid_scan_status_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_rfid_scan_status_lbl, lv_color_hex(0xFFB300), 0);
 
     s_rfid_scan_uid_lbl = lv_label_create(panel);
     lv_label_set_text(s_rfid_scan_uid_lbl, "UID: --");
@@ -43405,15 +43642,18 @@ static void show_rfid_scan_screen(void)
     lv_obj_set_style_text_font(s_rfid_scan_atqa_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_rfid_scan_atqa_lbl, ui_text_color(), 0);
 
-    s_rfid_scan_status_lbl = lv_label_create(panel);
-    lv_label_set_text(s_rfid_scan_status_lbl, "Waiting for card...");
-    lv_obj_set_style_text_font(s_rfid_scan_status_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(s_rfid_scan_status_lbl, lv_color_hex(0xFFB300), 0);
+    // NDEF content label — shows decoded URL or text after Read All
+    s_rfid_scan_ndef_lbl = lv_label_create(panel);
+    lv_label_set_text(s_rfid_scan_ndef_lbl, "Tap Read after card detected");
+    lv_obj_set_style_text_font(s_rfid_scan_ndef_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_rfid_scan_ndef_lbl, lv_color_hex(0x757575), 0);
+    lv_obj_set_width(s_rfid_scan_ndef_lbl, LCD_H_RES - 32);
+    lv_label_set_long_mode(s_rfid_scan_ndef_lbl, LV_LABEL_LONG_WRAP);
 
     // Action buttons row
     lv_obj_t *row = lv_obj_create(function_page);
     lv_obj_set_size(row, LCD_H_RES - 16, 44);
-    lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 158);
+    lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 190);
     lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(row, 0, 0);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
@@ -43868,11 +44108,27 @@ static void s_rfid_clone_done_lvgl_cb(void *arg)
 {
     rfid_clone_done_t *d = (rfid_clone_done_t *)arg;
     if (s_rfid_clone_status) {
-        char buf[64];
-        if (d->r == RFID_OK)
+        char buf[120];
+        if (d->r == RFID_OK) {
             snprintf(buf, sizeof(buf), "Cloned! %u pages written", (unsigned)d->pages_written);
-        else
+            lv_obj_set_style_text_color(s_rfid_clone_status, lv_color_hex(0x00E676), 0);
+        } else if (d->r == RFID_ERR_NOT_SUPPORTED) {
+            snprintf(buf, sizeof(buf),
+                     "Wrong card type! Need blank NTAG or Ultralight.\n"
+                     "MIFARE Classic cannot receive NTAG data.");
+            lv_obj_set_style_text_color(s_rfid_clone_status, lv_color_hex(0xFF5252), 0);
+        } else if (d->r == RFID_ERR_TIMEOUT) {
+            snprintf(buf, sizeof(buf), "No card detected (5s timeout).\nHold card on antenna.");
+            lv_obj_set_style_text_color(s_rfid_clone_status, lv_color_hex(0xFFB300), 0);
+        } else if (d->r == RFID_ERR_NAK) {
+            snprintf(buf, sizeof(buf),
+                     "Write failed - card rejected all pages.\n"
+                     "Use blank NTAG213/215/216 or Magic card.");
+            lv_obj_set_style_text_color(s_rfid_clone_status, lv_color_hex(0xFF5252), 0);
+        } else {
             snprintf(buf, sizeof(buf), "Error: %s", rfid_err_str(d->r));
+            lv_obj_set_style_text_color(s_rfid_clone_status, lv_color_hex(0xFF5252), 0);
+        }
         lv_label_set_text(s_rfid_clone_status, buf);
     }
     if (s_rfid_clone_btn) lv_obj_clear_state(s_rfid_clone_btn, LV_STATE_DISABLED);
@@ -43903,12 +44159,19 @@ static void s_rfid_clone_start_cb(lv_event_t *e)
     for (uint16_t i = 0; i < s_rfid_last_card->page_count && i < RFID_MAX_BLOCKS; i++)
         if (s_rfid_last_card->blocks[i].valid) { has_pages = true; break; }
     if (!has_pages) {
-        if (s_rfid_clone_status)
-            lv_label_set_text(s_rfid_clone_status, "No page data — Scan & Read All first");
+        if (s_rfid_clone_status) {
+            lv_label_set_text(s_rfid_clone_status,
+                              "No page data found!\nGo to Scan & Read, hold card, wait for auto-read.");
+            lv_obj_set_style_text_color(s_rfid_clone_status, lv_color_hex(0xFF5252), 0);
+        }
         return;
     }
-    if (s_rfid_clone_status)
-        lv_label_set_text(s_rfid_clone_status, "Present blank NTAG card (5 s)...");
+    if (s_rfid_clone_status) {
+        lv_label_set_text(s_rfid_clone_status,
+                          "Hold blank NTAG213/215/216 on antenna (5s)...\n"
+                          "MIFARE Classic will not work.");
+        lv_obj_set_style_text_color(s_rfid_clone_status, lv_color_hex(0xFFB300), 0);
+    }
     if (s_rfid_clone_btn) lv_obj_add_state(s_rfid_clone_btn, LV_STATE_DISABLED);
     rfid_clone_ctx_t *ctx = malloc(sizeof(rfid_clone_ctx_t));
     if (!ctx) return;
@@ -43994,8 +44257,8 @@ static void show_rfid_clone_screen(void)
 
         s_rfid_clone_status = lv_label_create(function_page);
         lv_label_set_text(s_rfid_clone_status, valid_pages > 0
-            ? "Ready — present blank NTAG, tap Clone"
-            : "No pages read — use Scan & Read All first");
+            ? "Ready - hold blank NTAG on antenna, tap Clone"
+            : "No pages read - use Scan & Read All first");
         lv_obj_set_style_text_font(s_rfid_clone_status, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(s_rfid_clone_status,
             valid_pages > 0 ? lv_color_hex(0xB39DDB) : lv_color_hex(0xFFB300), 0);

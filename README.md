@@ -1957,29 +1957,49 @@ Copy any `.ir` file directly into `/sdcard/lab/infrared/` — no conversion need
 - `/sdcard/lab/rfid/hf/` -- saved card JSON files
 - `/sdcard/lab/rfid/import/` -- drop Flipper Zero `.nfc` files here to import
 - `/sdcard/lab/rfid/export/` -- Flipper Zero `.nfc` exports written here
-- `/sdcard/lab/rfid/keys/` -- reserved for future key files
-- `/sdcard/lab/rfid/logs/` -- reserved for scan logs
 
 **Screens:**
 
 | Screen | Function |
 |--------|----------|
-| **Scan & Read** | Scan a card — shows UID, ATQA, SAK, card type. Tap **Read All** to dump full memory (NTAG213: 45 pages; MIFARE Classic: all sectors via default key dict). Save as JSON; Export as Flipper `.nfc`. |
-| **Clone / Write** | Select a saved card (or scan → read → go back), then present a blank NTAG card — taps Clone to write pages 4-44 (user data; skips OTP pages 0-3 on genuine NXP tags). Use a Magic/CUID blank card to clone all pages including UID. |
-| **Card Emulate** | Select a saved card; PN532 enters `TgInitAsTarget` mode presenting the card's UID to any nearby reader. Responds to NTAG READ (0x30) commands using saved page data. MIFARE Classic CRYPTO1 auth is not supported in emulation — works for UID-only and NDEF/NTAG readers. |
-| **Key Test** | Present a MIFARE Classic 1K/4K card; runs default key dictionary (16 entries) against each sector; fills card struct with unlocked blocks. For authorized testing on own cards only. |
-| **Saved Cards** | Scrollable list of saved JSON cards with display name, UID, and protocol. Drop Flipper `.nfc` files in `/sdcard/lab/rfid/import/` to make them appear as importable entries — tap to load and emulate directly. |
-| **HW Test** | PN532 I2C probe — reads IC identifier, firmware version, support bitmask. Full I2C bus scan shown on failure to help diagnose wiring/DIP issues. |
+| **Scan & Read** | Hold a card near the antenna — detected in under a second. Panel border turns green, card type and UID appear. **Auto-reads after 1 second** of stable detection (no button tap needed). If NDEF content is present, the URL or text is decoded and shown on screen. Read button turns green when card is ready; tap it to re-read manually. |
+| **Clone / Write** | Read a source card on Scan & Read, then open Clone/Write. The source card's data is shown. Hold a **blank NTAG213/215/216** card on the antenna and tap **Clone to Blank Card** to write pages 4-44. MIFARE Classic cards are rejected with a clear error — they cannot receive NTAG data. Use a Magic/CUID blank card to clone all pages including UID. |
+| **Card Emulate** | Select a saved card; PN532 enters `TgInitAsTarget` mode presenting the card's UID to any nearby reader. Responds to NTAG READ (0x30) commands using saved page data. MIFARE Classic CRYPTO1 auth is not supported in emulation. |
+| **Key Test** | Present a MIFARE Classic 1K/4K card; runs default key dictionary against each sector; displays unlocked block data. For authorized testing on own cards only. |
+| **Saved Cards** | Scrollable list of saved JSON cards. Drop Flipper `.nfc` files in `/sdcard/lab/rfid/import/` to import directly. |
+| **HW Test** | PN532 I2C probe — reads IC identifier, firmware version, support bitmask. Full I2C bus scan on failure. |
 
-**NTAG213/215/216 full dump workflow:**
-1. Tap **Scan & Read** and hold card near antenna.
-2. Card type appears: NTAG213 (45 pages), NTAG215 (135 pages), NTAG216 (231 pages). Protocol is confirmed by GET_VERSION (0x60) — falls back to UID heuristic if not supported.
-3. Tap **Read All** — reads all pages via PN532 InDataExchange READ (0x30) in 4-page strides.
-4. Tap **Save** to store as JSON, or **Export .nfc** for Flipper Zero format with correct `Pages total:` count.
+**Scan & Read workflow:**
+1. Open **Scan & Read**. Hold any NFC card near the antenna (nearly touching).
+2. Panel border turns green within ~1 second. UID, ATQA, SAK, and card type appear.
+3. After 1 further second of stable detection, **Read All fires automatically** — no tap required.
+4. If the card contains an NDEF message (URL, text), it is decoded and shown in blue on the card panel.
+5. Type label updates after read — e.g. if initially shown as "MIFARE Ultralight", may upgrade to "NTAG213 (45 pages)" once all pages are confirmed.
+6. Tap **Save** to store as JSON, or **Export .nfc** for Flipper Zero format.
 
-**Flipper Zero .nfc compatibility:** export and import both support NTAG213, NTAG215, NTAG216 type tags exactly — `NTAG/Ultralight type:` line preserves the exact type on re-import.
+**NTAG type identification — how it works:**
+The PN532 on the NM-RF-HAT runs firmware v1.6 which cannot forward the NXP GET_VERSION command (0x60) to the card. NTAG213, NTAG215, NTAG216, and MIFARE Ultralight all have identical ATQA and SAK values, so they cannot be distinguished from the initial scan alone. The firmware handles this automatically:
+1. Initial scan classifies all SAK=0x00 cards as "MIFARE Ultralight" (safe 16-page default).
+2. After reading 16 pages, the firmware probes page 16. A genuine 16-page Ultralight returns NAK (page doesn't exist). An NTAG213/215/216 returns data.
+3. If page 16 is readable, the card is upgraded to NTAG213 and all remaining pages (up to 45) are read automatically.
+4. The type label and page count update on screen after the read completes.
 
-> **Note:** The PN532 module on the NM-RF-HAT has shorter read range than a dedicated PN532 breakout board. Hold cards very close -- nearly touching the antenna -- for reliable reads. This is a hardware limitation of the RF-HAT form factor, not a firmware issue.
+**Clone/Write compatibility:**
+Only blank NTAG213, NTAG215, NTAG216, MIFARE Ultralight, and Magic/CUID cards can receive a clone. **MIFARE Classic cards are incompatible** — they use Crypto-1 sector authentication and do not accept NTAG WRITE commands. Presenting a Classic during Clone shows a red error: "Wrong card type! Need blank NTAG or Ultralight."
+
+**Serial log messages — normal vs actionable:**
+
+| Log message | Meaning | Action needed |
+|-------------|---------|---------------|
+| `scan: GET_VERSION failed — keeping heuristic type MIFARE Ultralight` | PN532 fw1.6 cannot forward GET_VERSION (0x60). Card identified by ATQA+SAK heuristic; NTAG auto-upgrade via page-16 probe handles the rest. | None — expected behavior |
+| `page16 readable — upgrading Ultralight → NTAG213` | Card confirmed as NTAG213; reading all 45 pages | None — auto-upgrade working |
+| `NDEF decoded: https://...` | URL extracted from card's NDEF message | None — URL shown on screen |
+| `No NDEF URL/text found in 16 pages` | Card read successfully but contains no NDEF message (blank card or non-NDEF format) | None — card may be blank |
+| `I2C write failed: ESP_ERR_INVALID_RESPONSE` | PN532 locked up after extended idle scanning. Recovery attempted automatically. | None if followed by recovery success |
+
+**Flipper Zero .nfc compatibility:** export and import support NTAG213, NTAG215, NTAG216 — `NTAG/Ultralight type:` line preserves the exact type on re-import.
+
+> **Note:** The PN532 on the NM-RF-HAT has shorter read range than a dedicated PN532 breakout board. Hold cards nearly touching the antenna. This is a hardware limitation of the RF-HAT PCB antenna geometry, not a firmware issue. The PN532 firmware is v1.6 and is not field-upgradeable — NXP does not distribute firmware update tools publicly.
 
 #### CC1101 Sub-GHz (DIP 1)
 
