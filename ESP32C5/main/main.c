@@ -1641,6 +1641,7 @@ static uint8_t    s_n24fox_channel  = 76;
 static bool       s_n24fox_haptic   = true;
 static int        s_n24fox_hits     = 0;
 static int        s_n24fox_samples  = 0;
+static uint8_t    s_n24fox_saved_vib_pct = 100;  // restored on exit
 #define N24FOX_WINDOW  20
 
 // ── RF433 OOK Scan state (declared early — cleanup in show_rf433_menu_screen) ──
@@ -1659,6 +1660,8 @@ static lv_timer_t   *s_rf433_fox_tmr           = NULL;
 static bool          s_rf433_fox_haptic        = true;
 static int           s_rf433_fox_rate          = 0;
 static bool          s_rf433_fox_isr_installed = false;
+static uint8_t       s_rf433_fox_saved_vib_pct = 100;  // restored on exit
+static int           s_rf433_fox_hap_ctr       = 0;
 
 // ── CC1101 TPMS Monitor ───────────────────────────────────────────────────────
 #define TPMS_MAX_SENSORS   20
@@ -37345,9 +37348,10 @@ static void show_rf433_menu_screen(void)
     if (s_rf433_scan_task) { s_rf433_scan_stop = true; }
     s_rf433_scan_status = NULL; s_rf433_scan_list = NULL;
     vibrator_off();
+    g_vibtest_strength_pct = s_rf433_fox_saved_vib_pct;
     s_rf433_fox_bar = NULL; s_rf433_fox_lbl = NULL;
     s_rf433_fox_hbtn = NULL; s_rf433_fox_status = NULL;
-    s_rf433_fox_edges = 0;
+    s_rf433_fox_edges = 0; s_rf433_fox_hap_ctr = 0;
 
     create_function_page_base("RF433 OOK");
     apply_menu_bg();
@@ -39854,19 +39858,18 @@ static void s_fox_timer_cb(lv_timer_t *tmr)
         }
     }
 
-    // Bug-hunter haptic: pulse rate proportional to RSSI above squelch
+    // Bug-hunter haptic: pulse rate proportional to RSSI above squelch.
+    // Always fire at 100% strength so the motor actually spins up.
     if (s_fox_haptic_on && (int)rssi > (int)s_fox_squelch_dbm) {
         int above = (int)rssi - (int)s_fox_squelch_dbm;
-        // Period in 50ms ticks: 40=2s slow at squelch, 2=100ms fast when strong
-        int period = 40 - above;
+        // Period in 50ms ticks: 30=1.5s slow near squelch, 2=100ms fast when strong
+        int period = 30 - above;
         if (period < 2) period = 2;
         s_fox_haptic_ctr++;
         if (s_fox_haptic_ctr >= period) {
             s_fox_haptic_ctr = 0;
-            int vib_pct = 10 + above * 90 / 40;
-            if (vib_pct > 100) vib_pct = 100;
-            g_vibtest_strength_pct = (uint8_t)vib_pct;
-            vibrator_pulse(50);
+            g_vibtest_strength_pct = 100;
+            vibrator_pulse(150);
         }
     } else {
         s_fox_haptic_ctr = 0;
@@ -41279,6 +41282,7 @@ static void show_nrf24_screen(void)
     // nRF24 Fox Hunt cleanup
     if (s_n24fox_tmr) { lv_timer_del(s_n24fox_tmr); s_n24fox_tmr = NULL; }
     vibrator_off();
+    g_vibtest_strength_pct = s_n24fox_saved_vib_pct;
     s_n24fox_bar = NULL; s_n24fox_lbl = NULL; s_n24fox_ch_lbl = NULL;
     s_n24fox_hbtn = NULL; s_n24fox_status = NULL;
 
@@ -42538,9 +42542,8 @@ static void s_n24fox_timer_cb(lv_timer_t *tmr)
         }
     }
     if (s_n24fox_haptic && det > 0) {
-        int vib = 10 + pct * 90 / 100;
-        g_vibtest_strength_pct = (uint8_t)vib;
-        vibrator_pulse(40);
+        g_vibtest_strength_pct = 100;
+        vibrator_pulse(150);
     }
 }
 
@@ -42585,7 +42588,7 @@ static void show_nrf24_foxhunt_screen(void)
     nrf24_set_data_rate(NRF24_DR_1M);
     nrf24_rx_mode();
 
-    uint8_t saved_vib = g_vibtest_strength_pct;
+    s_n24fox_saved_vib_pct = g_vibtest_strength_pct;
 
     create_function_page_base("nRF24 Fox Hunt");
     apply_menu_bg();
@@ -42699,7 +42702,6 @@ static void show_nrf24_foxhunt_screen(void)
     lv_obj_align(s_n24fox_status, LV_ALIGN_TOP_MID, 0, y);
 
     s_n24fox_tmr = lv_timer_create(s_n24fox_timer_cb, 100, NULL);
-    (void)saved_vib;
 
     rfhat_add_back_btn("nRF24", show_nrf24_screen);
 }
@@ -42717,10 +42719,10 @@ IRAM_ATTR static void s_rf433_fox_isr(void *arg)
 static void s_rf433_fox_timer_cb(lv_timer_t *tmr)
 {
     (void)tmr;
-    // Read and reset edge count (500ms window)
+    // Read and reset edge count (100ms window)
     int edges = s_rf433_fox_edges;
     s_rf433_fox_edges = 0;
-    int rate = edges * 2;  // edges/s
+    int rate = edges * 10;  // edges/s (100ms window * 10)
     // Exponential smooth: 70% old + 30% new
     s_rf433_fox_rate = (s_rf433_fox_rate * 7 + rate * 3) / 10;
 
@@ -42748,10 +42750,20 @@ static void s_rf433_fox_timer_cb(lv_timer_t *tmr)
             lv_obj_set_style_text_color(s_rf433_fox_status, lv_color_hex(0xF44336), 0);
         }
     }
+    // Bug-hunter haptic: 100ms ticks, rate scales with signal level.
+    // Always 100% strength so the motor spins up reliably.
     if (s_rf433_fox_haptic && pct > 5) {
-        int vib = 10 + pct * 90 / 100;
-        g_vibtest_strength_pct = (uint8_t)vib;
-        vibrator_pulse(40);
+        // period: 15 ticks=1.5s near threshold, 2 ticks=200ms at full
+        int period = 15 - pct * 13 / 100;
+        if (period < 2) period = 2;
+        s_rf433_fox_hap_ctr++;
+        if (s_rf433_fox_hap_ctr >= period) {
+            s_rf433_fox_hap_ctr = 0;
+            g_vibtest_strength_pct = 100;
+            vibrator_pulse(150);
+        }
+    } else {
+        s_rf433_fox_hap_ctr = 0;
     }
 }
 
@@ -42797,7 +42809,7 @@ static void show_rf433_foxhunt_screen(void)
         s_rf433_fox_isr_installed = true;
     }
 
-    uint8_t saved_vib = g_vibtest_strength_pct;
+    s_rf433_fox_saved_vib_pct = g_vibtest_strength_pct;
 
     create_function_page_base("RF433 Fox Hunt");
     apply_menu_bg();
@@ -42857,8 +42869,8 @@ static void show_rf433_foxhunt_screen(void)
     lv_obj_set_style_text_align(s_rf433_fox_status, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(s_rf433_fox_status, LV_ALIGN_TOP_MID, 0, y);
 
-    s_rf433_fox_tmr = lv_timer_create(s_rf433_fox_timer_cb, 500, NULL);
-    (void)saved_vib;
+    s_rf433_fox_hap_ctr = 0;
+    s_rf433_fox_tmr = lv_timer_create(s_rf433_fox_timer_cb, 100, NULL);
 
     rfhat_add_back_btn("RF433", show_rf433_menu_screen);
 }
@@ -42944,7 +42956,7 @@ static void show_rf433_ook_scan_screen(void)
 
     s_rf433_scan_status = lv_label_create(function_page);
     lv_label_set_text(s_rf433_scan_status,
-        "R4A_433 receiver — 433.92 MHz fixed\n"
+        "R4A_433 receiver - 433.92 MHz fixed\n"
         "Decoding EV1527 alarm sensors");
     lv_obj_set_style_text_font(s_rf433_scan_status, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_rf433_scan_status, lv_color_hex(0xFF8F00), 0);
