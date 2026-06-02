@@ -37453,16 +37453,39 @@ static lv_obj_t *s_cc1101_ht_freq  = NULL;
 // Jammer screen state
 static lv_obj_t *s_cc1101_jam_status   = NULL;
 static lv_obj_t *s_cc1101_jam_freq_lbl = NULL;
-static lv_obj_t *s_jam_band_btns[4]    = {NULL, NULL, NULL, NULL};
+static lv_obj_t *s_jam_band_btns[5]    = {NULL, NULL, NULL, NULL, NULL};
 static bool      s_cc1101_jamming      = false;
 
-// Jammer band selection and sweep tables (declared early for s_jam_band_cb)
-typedef enum { JAM_BAND_315=0, JAM_BAND_433, JAM_BAND_868, JAM_BAND_915 } jam_band_t;
-static jam_band_t s_jam_band = JAM_BAND_433;
-static const float s_jam_315[6] = { 314.7f, 314.9f, 315.0f, 315.1f, 315.3f, 315.5f };
-static const float s_jam_433[6] = { 433.1f, 433.3f, 433.5f, 433.7f, 433.9f, 434.1f };
-static const float s_jam_868[6] = { 867.6f, 867.8f, 868.0f, 868.2f, 868.4f, 868.6f };
-static const float s_jam_915[6] = { 914.7f, 914.9f, 915.0f, 915.1f, 915.3f, 915.5f };
+// Jammer band selection and sweep tables (12 steps each)
+typedef enum { JAM_BAND_315=0, JAM_BAND_433W, JAM_BAND_433N, JAM_BAND_868, JAM_BAND_915 } jam_band_t;
+#define JAM_STEPS  12
+static jam_band_t s_jam_band = JAM_BAND_433W;
+
+// 315 MHz  — 12 steps, 50 kHz spacing (314.65–315.20 MHz)
+static const float s_jam_315[JAM_STEPS] = {
+    314.65f, 314.70f, 314.75f, 314.80f, 314.85f, 314.90f,
+    314.95f, 315.00f, 315.05f, 315.10f, 315.15f, 315.20f };
+
+// 433 MHz wide — 12 steps, 100 kHz spacing (433.0–434.1 MHz)
+static const float s_jam_433[JAM_STEPS] = {
+    433.0f, 433.1f, 433.2f, 433.3f, 433.4f, 433.5f,
+    433.6f, 433.7f, 433.8f, 433.9f, 434.0f, 434.1f };
+
+// 433 MHz narrow — 12 steps, 15 kHz spacing centred on 433.920 (±80 kHz)
+static const float s_jam_433n[JAM_STEPS] = {
+    433.840f, 433.855f, 433.870f, 433.885f, 433.900f, 433.915f,
+    433.930f, 433.945f, 433.960f, 433.975f, 433.990f, 434.005f };
+
+// 868 MHz  — 12 steps, 100 kHz spacing (867.5–868.6 MHz)
+static const float s_jam_868[JAM_STEPS] = {
+    867.5f, 867.6f, 867.7f, 867.8f, 867.9f, 868.0f,
+    868.1f, 868.2f, 868.3f, 868.4f, 868.5f, 868.6f };
+
+// 915 MHz  — 12 steps, 50 kHz spacing (914.75–915.30 MHz)
+static const float s_jam_915[JAM_STEPS] = {
+    914.75f, 914.80f, 914.85f, 914.90f, 914.95f, 915.00f,
+    915.05f, 915.10f, 915.15f, 915.20f, 915.25f, 915.30f };
+
 static const float *s_jam_table = s_jam_433;
 static int s_jam_freq_idx = 0;
 static lv_timer_t *s_cc1101_jam_tmr = NULL;
@@ -37677,7 +37700,7 @@ static void show_cc1101_screen(void)
     s_cc1101_cap_freq_lbl    = NULL;
     s_cc1101_jam_status      = NULL;
     s_cc1101_jam_freq_lbl    = NULL;
-    for (int i = 0; i < 4; i++) s_jam_band_btns[i] = NULL;
+    for (int i = 0; i < 5; i++) s_jam_band_btns[i] = NULL;
     s_cc1101_ht_status       = NULL;
     s_cc1101_jamming         = false;
     s_cc1101_cap_status_lbl  = NULL;
@@ -39635,7 +39658,7 @@ static void s_jam_band_cb(lv_event_t *e)
     jam_band_t new_band = *(jam_band_t *)lv_event_get_user_data(e);
     if (new_band == s_jam_band) return;
     s_jam_band = new_band;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 5; i++) {
         if (!s_jam_band_btns[i] || !lv_obj_is_valid(s_jam_band_btns[i])) continue;
         bool sel = ((jam_band_t)i == s_jam_band);
         lv_obj_set_style_bg_color(s_jam_band_btns[i],
@@ -39673,7 +39696,7 @@ static void s_jam_fill_and_tx(float freq_mhz)
 static void s_cc1101_jam_timer_cb(lv_timer_t *tmr)
 {
     if (!s_cc1101_jamming || !cc1101_is_init()) { s_cc1101_jam_stop(); return; }
-    s_jam_freq_idx = (s_jam_freq_idx + 1) % 6;
+    s_jam_freq_idx = (s_jam_freq_idx + 1) % JAM_STEPS;
     float f = s_jam_table[s_jam_freq_idx];
     s_jam_fill_and_tx(f);
     if (s_cc1101_jam_freq_lbl) {
@@ -39691,10 +39714,11 @@ static void s_cc1101_jam_start_cb(lv_event_t *e)
     }
     // Apply band-appropriate preset
     switch (s_jam_band) {
-        case JAM_BAND_315: cc1101_apply_preset(CC1101_PRESET_OOK_4K8_315MHZ); s_jam_table = s_jam_315; break;
-        case JAM_BAND_868: cc1101_apply_preset(CC1101_PRESET_OOK_4K8_868MHZ); s_jam_table = s_jam_868; break;
-        case JAM_BAND_915: cc1101_apply_preset(CC1101_PRESET_OOK_4K8_915MHZ); s_jam_table = s_jam_915; break;
-        default:           cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ); s_jam_table = s_jam_433; break;
+        case JAM_BAND_315:  cc1101_apply_preset(CC1101_PRESET_OOK_4K8_315MHZ); s_jam_table = s_jam_315;  break;
+        case JAM_BAND_433N: cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ); s_jam_table = s_jam_433n; break;
+        case JAM_BAND_868:  cc1101_apply_preset(CC1101_PRESET_OOK_4K8_868MHZ); s_jam_table = s_jam_868;  break;
+        case JAM_BAND_915:  cc1101_apply_preset(CC1101_PRESET_OOK_4K8_915MHZ); s_jam_table = s_jam_915;  break;
+        default:            cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ); s_jam_table = s_jam_433;  break;
     }
     cc1101_set_output_power_dbm(10);
     // Wideband noise via CC1101 random-TX mode:
@@ -39714,7 +39738,7 @@ static void s_cc1101_jam_start_cb(lv_event_t *e)
         lv_obj_set_style_text_color(s_cc1101_jam_status, UI_ACCENT_RED, 0);
     }
     if (!s_cc1101_jam_tmr)
-        s_cc1101_jam_tmr = lv_timer_create(s_cc1101_jam_timer_cb, 125, NULL);
+        s_cc1101_jam_tmr = lv_timer_create(s_cc1101_jam_timer_cb, 62, NULL);
     (void)e;
 }
 
@@ -39821,12 +39845,13 @@ static void show_cc1101_jammer_screen(void)
     lv_obj_set_flex_align(band_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(band_row, LV_OBJ_FLAG_SCROLLABLE);
 
-    static const char *band_lbls[4] = {"315", "433", "868", "915"};
-    static jam_band_t band_vals[4] = {JAM_BAND_315, JAM_BAND_433, JAM_BAND_868, JAM_BAND_915};
-    lv_obj_t *band_btns[4];
-    for (int i = 0; i < 4; i++) {
+    // 5 bands: 315 / 433W (wide) / 433N (narrow ±80 kHz) / 868 / 915
+    static const char *band_lbls[5] = {"315", "433W", "433N", "868", "915"};
+    static jam_band_t band_vals[5] = {JAM_BAND_315, JAM_BAND_433W, JAM_BAND_433N, JAM_BAND_868, JAM_BAND_915};
+    lv_obj_t *band_btns[5];
+    for (int i = 0; i < 5; i++) {
         band_btns[i] = lv_btn_create(band_row);
-        lv_obj_set_size(band_btns[i], 46, 24);
+        lv_obj_set_size(band_btns[i], 38, 24);  // 5 × 38 + 4 × 4 gap = 206 ≤ 208 px ✓
         bool sel = ((jam_band_t)i == s_jam_band);
         lv_obj_set_style_bg_color(band_btns[i],
             sel ? UI_ACCENT_RED : lv_color_make(50,50,50), LV_STATE_DEFAULT);
@@ -39841,6 +39866,11 @@ static void show_cc1101_jammer_screen(void)
         s_jam_band_btns[i] = band_btns[i];
         lv_obj_add_event_cb(band_btns[i], s_jam_band_cb, LV_EVENT_CLICKED, &band_vals[i]);
     }
+    // 433N tooltip label
+    lv_obj_t *n_hint = lv_label_create(card);
+    lv_label_set_text(n_hint, "433N = narrow +-80 kHz @ 433.920");
+    lv_obj_set_style_text_font(n_hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(n_hint, lv_color_hex(0x757575), 0);
 
     // ── Status + live frequency ────────────────────────────────────────────────
     s_cc1101_jam_status = lv_label_create(card);
@@ -39854,7 +39884,7 @@ static void show_cc1101_jammer_screen(void)
     lv_obj_set_style_text_color(s_cc1101_jam_freq_lbl, lv_color_hex(0x757575), 0);
 
     lv_obj_t *note = lv_label_create(card);
-    lv_label_set_text(note, "6-step sweep, 200 kHz steps\n125 ms dwell -- 750 ms cycle\n~250 kHz noise/hop");
+    lv_label_set_text(note, "12-step sweep -- 62 ms/step -- 744 ms cycle\n~250 kHz random noise per hop");
     lv_obj_set_style_text_font(note, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(note, lv_color_make(120,120,120), 0);
     lv_obj_set_style_text_align(note, LV_TEXT_ALIGN_CENTER, 0);
