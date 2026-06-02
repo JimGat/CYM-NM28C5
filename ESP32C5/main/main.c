@@ -39721,14 +39721,21 @@ static void s_cc1101_jam_start_cb(lv_event_t *e)
         default:            cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ); s_jam_table = s_jam_433;  break;
     }
     cc1101_set_output_power_dbm(10);
-    // Wideband noise via CC1101 random-TX mode:
+    // 2-FSK random PRBS — widest modulation the CC1101 can produce:
     //   PKTCTRL0 = 0x0A → DATA_FORMAT=10 (random PRBS, no FIFO) + LENGTH=10 (infinite)
     //   MDMCFG4  = 0x07 → channel filter BW=812 kHz, DR_E=7
-    //   MDMCFG3  = 0x3B → DR_M=59 → data rate ≈250 kbps
-    // OOK at 250 kbps random: ±125 kHz sidebands ≈ 250 kHz visible noise per hop.
+    //   MDMCFG3  = 0x3B → DR_M=59 → ≈250 kbps
+    //   MDMCFG2  = 0x00 → 2-FSK, no sync, no Manchester (overrides OOK preset)
+    //   DEVIATN  = 0x77 → max deviation ≈±381 kHz
+    //   FREND0   = 0x10 → single-level PA for FSK (not OOK 2-level PATABLE)
+    // Carson's rule BW: 2×(381+125) ≈ 1012 kHz per hop — the entire 433N
+    // narrow band (165 kHz) is buried under each individual hop.
     cc1101_write_reg(CC1101_PKTCTRL0, 0x0A);  // random TX, infinite
     cc1101_write_reg(CC1101_MDMCFG4,  0x07);  // BW=812 kHz, DR_E=7
     cc1101_write_reg(CC1101_MDMCFG3,  0x3B);  // DR_M=59 → ≈250 kbps
+    cc1101_write_reg(CC1101_MDMCFG2,  0x00);  // 2-FSK, no sync, no Manchester
+    cc1101_write_reg(CC1101_DEVIATN,   0x77);  // max deviation ≈±381 kHz
+    cc1101_write_reg(CC1101_FREND0,    0x10);  // FSK single-level PA
     s_cc1101_jamming = true;
     s_jam_freq_idx = 0;
     s_jam_fill_and_tx(s_jam_table[0]);
@@ -39884,7 +39891,7 @@ static void show_cc1101_jammer_screen(void)
     lv_obj_set_style_text_color(s_cc1101_jam_freq_lbl, lv_color_hex(0x757575), 0);
 
     lv_obj_t *note = lv_label_create(card);
-    lv_label_set_text(note, "12-step sweep -- 62 ms/step -- 744 ms cycle\n~250 kHz random noise per hop");
+    lv_label_set_text(note, "12-step sweep -- 31 ms/step -- 372 ms cycle\n2-FSK +-381 kHz ~1 MHz noise per hop");
     lv_obj_set_style_text_font(note, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(note, lv_color_make(120,120,120), 0);
     lv_obj_set_style_text_align(note, LV_TEXT_ALIGN_CENTER, 0);
