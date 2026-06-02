@@ -325,8 +325,19 @@ rfid_err_t rfid_manager_clone_ntag(const rfid_card_t *src, uint8_t skip_below)
         return r;
     }
 
-    ESP_LOGI(TAG, "clone: blank card detected proto=%s, writing %u pages (skip<=%u)",
-             blank->protocol_str, src->page_count, skip_below);
+    // Verify target card is NTAG/Ultralight compatible (SAK=0x00).
+    // MIFARE Classic (SAK=0x08), DESFire, or other cards cannot receive
+    // NTAG page writes — reject with a clear error before attempting.
+    if (blank->sak != 0x00) {
+        ESP_LOGW(TAG, "clone: incompatible target — SAK=0x%02X (%s). "
+                 "Need blank NTAG213/215/216 or Ultralight (SAK=0x00).",
+                 blank->sak, blank->protocol_str);
+        free(blank);
+        return RFID_ERR_NOT_SUPPORTED;
+    }
+
+    ESP_LOGI(TAG, "clone: target card proto=%s SAK=0x%02X — writing %u pages (skip<=%u)",
+             blank->protocol_str, blank->sak, src->page_count, skip_below);
     free(blank);
     return ntag_clone_to_blank(src, skip_below);
 }

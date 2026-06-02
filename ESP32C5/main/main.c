@@ -44091,11 +44091,27 @@ static void s_rfid_clone_done_lvgl_cb(void *arg)
 {
     rfid_clone_done_t *d = (rfid_clone_done_t *)arg;
     if (s_rfid_clone_status) {
-        char buf[64];
-        if (d->r == RFID_OK)
+        char buf[120];
+        if (d->r == RFID_OK) {
             snprintf(buf, sizeof(buf), "Cloned! %u pages written", (unsigned)d->pages_written);
-        else
+            lv_obj_set_style_text_color(s_rfid_clone_status, lv_color_hex(0x00E676), 0);
+        } else if (d->r == RFID_ERR_NOT_SUPPORTED) {
+            snprintf(buf, sizeof(buf),
+                     "Wrong card type! Need blank NTAG or Ultralight.\n"
+                     "MIFARE Classic cannot receive NTAG data.");
+            lv_obj_set_style_text_color(s_rfid_clone_status, lv_color_hex(0xFF5252), 0);
+        } else if (d->r == RFID_ERR_TIMEOUT) {
+            snprintf(buf, sizeof(buf), "No card detected (5s timeout).\nHold card on antenna.");
+            lv_obj_set_style_text_color(s_rfid_clone_status, lv_color_hex(0xFFB300), 0);
+        } else if (d->r == RFID_ERR_NAK) {
+            snprintf(buf, sizeof(buf),
+                     "Write failed - card rejected all pages.\n"
+                     "Use blank NTAG213/215/216 or Magic card.");
+            lv_obj_set_style_text_color(s_rfid_clone_status, lv_color_hex(0xFF5252), 0);
+        } else {
             snprintf(buf, sizeof(buf), "Error: %s", rfid_err_str(d->r));
+            lv_obj_set_style_text_color(s_rfid_clone_status, lv_color_hex(0xFF5252), 0);
+        }
         lv_label_set_text(s_rfid_clone_status, buf);
     }
     if (s_rfid_clone_btn) lv_obj_clear_state(s_rfid_clone_btn, LV_STATE_DISABLED);
@@ -44130,8 +44146,12 @@ static void s_rfid_clone_start_cb(lv_event_t *e)
             lv_label_set_text(s_rfid_clone_status, "No page data — Scan & Read All first");
         return;
     }
-    if (s_rfid_clone_status)
-        lv_label_set_text(s_rfid_clone_status, "Present blank NTAG card (5 s)...");
+    if (s_rfid_clone_status) {
+        lv_label_set_text(s_rfid_clone_status,
+                          "Hold blank NTAG213/215/216 on antenna (5s)...\n"
+                          "MIFARE Classic will not work.");
+        lv_obj_set_style_text_color(s_rfid_clone_status, lv_color_hex(0xFFB300), 0);
+    }
     if (s_rfid_clone_btn) lv_obj_add_state(s_rfid_clone_btn, LV_STATE_DISABLED);
     rfid_clone_ctx_t *ctx = malloc(sizeof(rfid_clone_ctx_t));
     if (!ctx) return;
