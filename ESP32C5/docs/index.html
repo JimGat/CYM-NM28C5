@@ -346,7 +346,9 @@
     </footer>
 
     <script type="module">
-      import { ESPLoader, Transport } from "https://unpkg.com/esptool-js/bundle.js";
+      // v0.6.0 fixes "unable to flash certain C5 chips" (esptool-js issue #217 — Flash ID: 0)
+      // Breaking change in v0.6.0: writeFlash fileArray.data is Uint8Array not binary string.
+      import { ESPLoader, Transport } from "https://unpkg.com/esptool-js@0.6.0/bundle.js";
 
       const ui = {
         status: document.getElementById("statusText"),
@@ -373,7 +375,7 @@
       };
 
       const state = { manifest:null, channel:"stable", port:null, onDisconnect:null, transport:null, esploader:null, chip:null, connected:false, flashing:false, monitorPort:null, monitorReader:null, monitorWriter:null, monitorPipe:null, monitorDisconnect:null, monitorConnected:false };
-      const PAGE_VERSION = "1.2.0";
+      const PAGE_VERSION = "1.3.0";  // esptool-js upgraded to v0.6.0 for ESP32-C5 fix
       const RAW_BASE = "https://raw.githubusercontent.com/JimGat/CYM-NM28C5/Jimgat_Dev/ESP32C5";
       const DEV_MANIFEST_URL = `${RAW_BASE}/docs/manifest.json`;
       const RAW_BIN = `${RAW_BASE}/binaries-esp32c5`;
@@ -417,12 +419,7 @@
         ui.monitorLog.scrollTop = ui.monitorLog.scrollHeight;
       };
 
-      const bufferToBinaryString = (buffer) => {
-        const bytes = new Uint8Array(buffer);
-        let result = "";
-        for (let i = 0; i < bytes.length; i += 0x8000) result += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-        return result;
-      };
+      // Removed bufferToBinaryString — esptool-js v0.6.0 uses Uint8Array directly.
 
       const normalizeManifest = (raw) => {
         const parts = Array.isArray(raw?.parts) && raw.parts.length ? raw.parts : (raw?.builds?.[0]?.parts || []);
@@ -523,7 +520,7 @@
           log(`Fetching ${url} @ 0x${part.offset.toString(16)}`);
           const res = await fetch(url, { cache: "no-store", redirect: "follow" });
           if (!res.ok) throw new Error(`Fetch failed for ${part.path}: ${res.status} ${res.statusText}`);
-          files.push({ data: bufferToBinaryString(await res.arrayBuffer()), address: part.offset });
+          files.push({ data: new Uint8Array(await res.arrayBuffer()), address: part.offset });
         }
         return files;
       };
@@ -549,7 +546,8 @@
               ui.progress.style.width = `${pct}%`;
               setStatus(`Flashing ${fileIndex + 1}/${files.length} - ${pct}%`);
             },
-            calculateMD5Hash: (image) => CryptoJS.MD5(CryptoJS.enc.Latin1.parse(image)),
+            // v0.6.0: image is Uint8Array; convert to CryptoJS WordArray for MD5
+            calculateMD5Hash: (image) => CryptoJS.MD5(CryptoJS.lib.WordArray.create(image)),
           });
           await state.esploader.after();
           ui.progress.style.width = "100%";
