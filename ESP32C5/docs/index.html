@@ -357,11 +357,9 @@
     </footer>
 
     <script type="module">
-      // tasmota-webserial-esptool v9.2.23 — Tasmota fork that fixes ESP32-C5 OPI PSRAM /
-      // Flash ID: 0 (esptool-js issue #217, still open). Same library ESPConnect uses.
-      // API: use connectWithPort(port, terminal) — NOT new ESPLoader() + .main().
-      // esm.sh CDN bundles all deps into a proper browser ES module.
-      import { connectWithPort } from "https://esm.sh/tasmota-webserial-esptool@9.2.23";
+      // tasmota-webserial-esptool v7.3.7 — the exact version ESPConnect uses.
+      // v9.x has an _inputBuffer bug during flashData(). v7.3.7 is the stable release.
+      import { connectWithPort } from "https://esm.sh/tasmota-webserial-esptool@7.3.7";
 
       const ui = {
         status: document.getElementById("statusText"),
@@ -388,7 +386,7 @@
       };
 
       const state = { manifest:null, channel:"stable", port:null, onDisconnect:null, esploader:null, chip:null, connected:false, flashing:false, monitorPort:null, monitorReader:null, monitorWriter:null, monitorPipe:null, monitorDisconnect:null, monitorConnected:false };
-      const PAGE_VERSION = "1.9.0";  // debug: log ESPLoader methods
+      const PAGE_VERSION = "2.0.0";  // downgrade to tasmota v7.3.7 (ESPConnect's version)
       const RAW_BASE = "https://raw.githubusercontent.com/JimGat/CYM-NM28C5/Jimgat_Dev/ESP32C5";
       const DEV_MANIFEST_URL = `${RAW_BASE}/docs/manifest.json`;
       const RAW_BIN = `${RAW_BASE}/binaries-esp32c5`;
