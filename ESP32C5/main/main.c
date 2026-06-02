@@ -43179,15 +43179,32 @@ static void s_rfid_read_done_lvgl_cb(void *arg)
 
     // Decode NDEF and show URL / text if found
     if (d->r == RFID_OK && s_rfid_last_card && s_rfid_scan_ndef_lbl) {
+        // Always log raw page 4 bytes for diagnosis
+        if (s_rfid_last_card->blocks[4].valid) {
+            uint8_t *p4 = s_rfid_last_card->blocks[4].data;
+            ESP_LOGI("rfid_scan", "page4: %02X %02X %02X %02X  page5: %02X %02X %02X %02X  "
+                     "page6: %02X %02X %02X %02X",
+                     p4[0], p4[1], p4[2], p4[3],
+                     s_rfid_last_card->blocks[5].data[0], s_rfid_last_card->blocks[5].data[1],
+                     s_rfid_last_card->blocks[5].data[2], s_rfid_last_card->blocks[5].data[3],
+                     s_rfid_last_card->blocks[6].data[0], s_rfid_last_card->blocks[6].data[1],
+                     s_rfid_last_card->blocks[6].data[2], s_rfid_last_card->blocks[6].data[3]);
+        }
         char ndef_buf[128];
         if (s_ndef_extract(s_rfid_last_card, ndef_buf, sizeof(ndef_buf))) {
+            ESP_LOGI("rfid_scan", "NDEF decoded: %s", ndef_buf);
             lv_label_set_text(s_rfid_scan_ndef_lbl, ndef_buf);
             lv_obj_set_style_text_color(s_rfid_scan_ndef_lbl,
                                         lv_color_hex(0x40C4FF), 0);
         } else {
-            lv_label_set_text(s_rfid_scan_ndef_lbl, "(no NDEF URL/text found)");
+            ESP_LOGW("rfid_scan", "No NDEF URL/text found in %u pages "
+                     "(page4 TLV byte: 0x%02X)",
+                     d->page_count,
+                     s_rfid_last_card->blocks[4].valid
+                       ? s_rfid_last_card->blocks[4].data[0] : 0xFF);
+            lv_label_set_text(s_rfid_scan_ndef_lbl, "No NDEF content found");
             lv_obj_set_style_text_color(s_rfid_scan_ndef_lbl,
-                                        lv_color_hex(0x757575), 0);
+                                        lv_color_hex(0xFF8F00), 0);
         }
     }
 
