@@ -37156,24 +37156,29 @@ static int rf433_lbk_phase(int tx_pin, int rx_pin)
     gpio_config(&ocfg);
     gpio_config(&icfg);
 
-    // 200 ms continuous carrier so super-regenerative RX AGC fully locks.
-    // Cheap XY-MK-5V style modules need 100–300 ms with carrier present before
-    // their output stabilises — 30 ms is not enough.
-    gpio_set_level(tx_pin, 1);
-    vTaskDelay(pdMS_TO_TICKS(200));
-
-    // 20 OOK cycles × 2 × 15 ms = 600 ms; wider pulses give the demodulator
-    // enough time to respond between transitions.
+    // R4A_433 is a superheterodyne receiver with AGC.
+    // AGC lock: ~50-200 ms after carrier appears → output goes LOW.
+    // AGC release: ~300-700 ms after carrier disappears → output returns HIGH.
+    // The old 15 ms half-period was shorter than AGC hold time, so GPIO9 never
+    // transitioned back to idle during OFF periods → 0 transitions every time.
+    // Fix: 300 ms ON (AGC locks, output goes LOW), 800 ms OFF (AGC releases,
+    // output returns HIGH). 6 full ON/OFF cycles with 2 samples each = 12 events.
     int transitions = 0;
     int prev = gpio_get_level(rx_pin);
-    for (int i = 0; i < 40; i++) {
-        gpio_set_level(tx_pin, (i & 1) ? 0 : 1);
-        vTaskDelay(pdMS_TO_TICKS(15));
+    for (int i = 0; i < 6; i++) {
+        // ON: carrier → AGC locks → GPIO9 should go LOW
+        gpio_set_level(tx_pin, 1);
+        vTaskDelay(pdMS_TO_TICKS(300));
         int cur = gpio_get_level(rx_pin);
+        if (cur != prev) { transitions++; prev = cur; }
+        // OFF: silence → AGC releases → GPIO9 should return HIGH
+        gpio_set_level(tx_pin, 0);
+        vTaskDelay(pdMS_TO_TICKS(800));
+        cur = gpio_get_level(rx_pin);
         if (cur != prev) { transitions++; prev = cur; }
     }
     gpio_set_level(tx_pin, 0);
-    vTaskDelay(pdMS_TO_TICKS(20));
+    vTaskDelay(pdMS_TO_TICKS(50));
     return transitions;
 }
 
@@ -37197,7 +37202,8 @@ static void rf433_lbk_task(void *arg)
     if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
         if (lv_obj_is_valid(s_lbk_status_lbl))
             lv_label_set_text_fmt(s_lbk_status_lbl,
-                "GPIO%d idle=%d  Testing TX%d->RX%d...",
+                "GPIO%d idle=%d  Testing... (~7s)\n"
+                "TX%d->RX%d  6 ON/OFF cycles",
                 rx_pin, idle_rx, tx_pin, rx_pin);
         xSemaphoreGive(lvgl_mutex);
     }
@@ -37205,25 +37211,25 @@ static void rf433_lbk_task(void *arg)
     int edges = rf433_lbk_phase(tx_pin, rx_pin);
 
     ESP_LOGI(TAG, "[RF433 LBK] GPIO%d TX -> GPIO%d RX: %d transitions (%s)  idle_rx=%d",
-             tx_pin, rx_pin, edges, edges >= 6 ? "PASS" : "FAIL", idle_rx);
+             tx_pin, rx_pin, edges, edges >= 4 ? "PASS" : "FAIL", idle_rx);
 
     // Restore RF433 driver
     rf433_hat_init();
 
     // Build result — LVGL recolor syntax
     char result[256];
-    if (edges >= 6) {
+    if (edges >= 4) {
         snprintf(result, sizeof(result),
             "#00C853 PASS# - carrier received\n"
             "TX=GPIO%d  RX=GPIO%d\n"
-            "RX idle: %d  Edges: %d / 40\n"
-            "(>= 6 required)",
+            "RX idle: %d  Edges: %d / 12\n"
+            "(>= 4 required)",
             tx_pin, rx_pin, idle_rx, edges);
     } else {
         snprintf(result, sizeof(result),
             "#FF5722 FAIL# - weak/no carrier\n"
             "TX=GPIO%d  RX=GPIO%d\n"
-            "RX idle: %d  Edges: %d / 40\n"
+            "RX idle: %d  Edges: %d / 12\n"
             "Check DIP 5 ON",
             tx_pin, rx_pin, idle_rx, edges);
     }
@@ -37251,6 +37257,7 @@ static void rf433_lbk_run(void)
     if (rfid_manager_is_init()) rfid_manager_deinit();
     if (ir_hat_is_jamming() || ir_hat_is_init()) ir_hat_deinit();
     rf433_hat_capture_cancel();
+    if (rf433_hat_is_jamming()) rf433_hat_jam_stop();  // stop esp_timer before taking GPIO8
     rf433_hat_deinit();
     if (lv_obj_is_valid(s_lbk_result_lbl)) lv_label_set_text(s_lbk_result_lbl, "");
     if (lv_obj_is_valid(s_lbk_retry_btn))  lv_obj_add_flag(s_lbk_retry_btn, LV_OBJ_FLAG_HIDDEN);
