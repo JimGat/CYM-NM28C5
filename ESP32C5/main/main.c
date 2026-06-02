@@ -43171,7 +43171,7 @@ static void s_rfid_read_done_lvgl_cb(void *arg)
             lv_obj_set_style_text_color(s_rfid_scan_status_lbl,
                                         lv_color_hex(0x00E676), 0);
         } else {
-            lv_label_set_text(s_rfid_scan_status_lbl, "Read failed — hold card closer");
+            lv_label_set_text(s_rfid_scan_status_lbl, "Read failed - hold card closer");
             lv_obj_set_style_text_color(s_rfid_scan_status_lbl,
                                         lv_color_hex(0xFF5252), 0);
         }
@@ -43221,7 +43221,7 @@ static void s_rfid_read_all_cb(lv_event_t *e)
     (void)e;
     if (!s_rfid_has_card || !s_rfid_last_card) return;
     rfid_manager_stop_poll();
-    if (s_rfid_scan_status_lbl) lv_label_set_text(s_rfid_scan_status_lbl, "Hold card — reading...");
+    if (s_rfid_scan_status_lbl) lv_label_set_text(s_rfid_scan_status_lbl, "Hold card - reading...");
     if (s_rfid_scan_read_btn)   lv_obj_add_state(s_rfid_scan_read_btn, LV_STATE_DISABLED);
     xTaskCreate(s_rfid_read_all_task, "rfid_read", 6144, s_rfid_last_card,
                 tskIDLE_PRIORITY + 2, NULL);
@@ -43282,7 +43282,7 @@ static void s_rfid_scan_lvgl_cb(void *arg)
         }
         if (s_rfid_scan_status_lbl) {
             lv_label_set_text(s_rfid_scan_status_lbl,
-                              LV_SYMBOL_OK " Card found — tap Read to read pages");
+                              LV_SYMBOL_OK " Card found - tap Read to read pages");
             lv_obj_set_style_text_color(s_rfid_scan_status_lbl,
                                         lv_color_hex(0x00E676), 0);
         }
