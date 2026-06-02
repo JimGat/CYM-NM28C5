@@ -38479,6 +38479,7 @@ static void s_cc1101_rep_task_fn(void *arg)
     if (!cc1101_is_init()) cc1101_init();
     esp_err_t err = ESP_FAIL;
     if (cc1101_is_init()) {
+        cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);  // ensures PATABLE correct for OOK TX
         cc1101_set_freq_mhz(cc1101_freq_cal(s_cc1101_cap_raw.freq_mhz));
         err = cc1101_raw_replay(&s_cc1101_cap_raw, repeats);
     }
@@ -38598,6 +38599,7 @@ static void s_cc1101_saved_rep_task_fn(void *arg)
     if (err == ESP_OK) {
         if (!cc1101_is_init()) cc1101_init();
         if (cc1101_is_init()) {
+            cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);  // ensures PATABLE correct for OOK TX
             cc1101_set_freq_mhz(cc1101_freq_cal(raw.freq_mhz));
             err = cc1101_raw_replay(&raw, repeats);
         } else {
