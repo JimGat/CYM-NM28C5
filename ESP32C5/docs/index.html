@@ -357,7 +357,9 @@
     </footer>
 
     <script type="module">
-      // tasmota-webserial-esptool v9.2.23 via esm.sh — fixes ESP32-C5 OPI PSRAM Flash ID:0
+      // tasmota-webserial-esptool v9.2.23 — fixes ESP32-C5 OPI PSRAM Flash ID:0
+      // Full API: connectWithPort (factory only) → initialize() → connectWithResetStrategies()
+      //           → detectChip() → runStub() → flashData() on the STUB LOADER
       import { connectWithPort } from "https://esm.sh/tasmota-webserial-esptool@9.2.23";
 
       const ui = {
@@ -385,7 +387,7 @@
       };
 
       const state = { manifest:null, channel:"stable", port:null, onDisconnect:null, esploader:null, chip:null, connected:false, flashing:false, monitorPort:null, monitorReader:null, monitorWriter:null, monitorPipe:null, monitorDisconnect:null, monitorConnected:false };
-      const PAGE_VERSION = "2.3.0";  // release transport reader lock between connect and flash
+      const PAGE_VERSION = "2.4.0";  // full tasmota API: init+reset+detectChip+runStub then flash on stub
       const RAW_BASE = "https://raw.githubusercontent.com/JimGat/CYM-NM28C5/Jimgat_Dev/ESP32C5";
       const DEV_MANIFEST_URL = `${RAW_BASE}/docs/manifest.json`;
       const RAW_BIN = `${RAW_BASE}/binaries-esp32c5`;
@@ -483,16 +485,41 @@
           state.onDisconnect = () => { disconnect().catch(() => {}); setStatus("Device disconnected. Reconnect to flash.", "error"); };
           try { state.port.addEventListener("disconnect", state.onDisconnect); } catch {}
 
-          setStatus("Syncing with chip — hold BOOT + tap RESET if needed");
-          log("Connecting via tasmota connectWithPort...");
+          // Open port at ROM baud rate if not already open
+          if (!state.port.readable || !state.port.writable) {
+            await state.port.open({ baudRate: 115200 });
+          }
 
-          // tasmota logger: needs log, error, debug methods
+          // tasmota logger interface
           const terminal = { clean() {}, writeLine: log, write: log, log, error: log, debug: () => {} };
-          const timeout = new Promise((_, rej) =>
-            setTimeout(() => rej(new Error(`Connect timeout after ${CONNECT_TIMEOUT_MS/1000}s — hold BOOT and tap RESET`)), CONNECT_TIMEOUT_MS));
-          state.esploader = await Promise.race([connectWithPort(state.port, terminal), timeout]);
 
-          state.chip = state.esploader?.chip_name || state.esploader?.chip || "ESP32-C5";
+          // connectWithPort is a FACTORY only — creates ESPLoader, does NOT connect to chip
+          state.esploader = await connectWithPort(state.port, terminal);
+
+          // Step 1: Initialize internal buffers (sets up __inputBuffer, reader, etc.)
+          setStatus("Initializing transport...");
+          log("Initializing transport...");
+          await state.esploader.initialize();
+
+          // Step 2: Reset chip to ROM mode and sync
+          setStatus(`Entering ROM mode — hold BOOT + tap RESET if needed (${CONNECT_TIMEOUT_MS/1000}s)`);
+          log("Entering ROM bootloader...");
+          const connTimeout = new Promise((_, rej) =>
+            setTimeout(() => rej(new Error("ROM mode timeout — hold BOOT, tap RESET, release BOOT")), CONNECT_TIMEOUT_MS));
+          await Promise.race([state.esploader.connectWithResetStrategies(), connTimeout]);
+
+          // Step 3: Detect chip
+          setStatus("Detecting chip...");
+          await state.esploader.detectChip();
+          state.chip = state.esploader.chipName || "ESP32-C5";
+          log(`Chip: ${state.chip}`);
+
+          // Step 4: Upload flash stub — this fixes OPI PSRAM / Flash ID:0 on ESP32-C5
+          setStatus(`Uploading flash stub for ${state.chip}...`);
+          log("Uploading flash stub (fixes OPI PSRAM)...");
+          const stub = await state.esploader.runStub(true);
+          state.esploader = stub;  // All flash ops MUST use the stub loader
+          log("Stub running");
 
           state.connected = true;
           ui.chip.style.display = "inline-flex";
@@ -550,24 +577,7 @@
             } else { log("Erase skipped (not supported by this library version)."); }
           }
 
-          // Release the transport reader held by connectWithPort() so flashData() can read ACKs.
-          // Without this, flashData() hangs forever waiting for the flash-begin ACK.
-          try {
-            const t = state.esploader.transport;
-            if (t) {
-              // Cancel any SLIP/raw reader the connect phase left open
-              if (t.reader)      { try { await t.reader.cancel(); }      catch {} try { t.reader.releaseLock(); }      catch {} t.reader = null; }
-              if (t.slipReader)  { try { await t.slipReader.cancel(); }  catch {} try { t.slipReader.releaseLock(); }  catch {} t.slipReader = null; }
-            }
-            // Also release directly on the port readable stream
-            if (state.port.readable.locked) {
-              const tmp = state.port.readable.getReader();
-              tmp.releaseLock();
-            }
-          } catch (e) { log(`Transport reader reset: ${e?.message || e}`); }
-          await sleep(200);
-
-          // Try writeFlash() first (handles transport init properly); fall back to flashData()
+          // Try writeFlash() first; fall back to flashData() (stub must be running at this point)
           const totalBytes = files.reduce((s, f) => s + f.data.length, 0);
           if (typeof state.esploader.writeFlash === "function") {
             log("Using writeFlash() API");
