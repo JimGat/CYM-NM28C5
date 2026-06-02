@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
+    <!-- CryptoJS removed — tasmota-webserial-esptool handles MD5 internally -->
     <style>
       :root {
         --bg:#050e05;
@@ -346,9 +346,10 @@
     </footer>
 
     <script type="module">
-      // v0.6.0 fixes "unable to flash certain C5 chips" (esptool-js issue #217 — Flash ID: 0)
-      // Breaking change in v0.6.0: writeFlash fileArray.data is Uint8Array not binary string.
-      import { ESPLoader, Transport } from "https://unpkg.com/esptool-js@0.6.0/bundle.js";
+      // tasmota-webserial-esptool v9.2.23 — Tasmota fork of esptool-js that fixes the
+      // ESP32-C5 OPI PSRAM / Flash ID: 0 issue (esptool-js mainline issue #217, still open).
+      // ESPConnect uses this same library. Uses flashData() API instead of writeFlash().
+      import { ESPLoader, Transport } from "https://cdn.jsdelivr.net/npm/tasmota-webserial-esptool@9.2.23/dist/index.js";
 
       const ui = {
         status: document.getElementById("statusText"),
@@ -375,7 +376,7 @@
       };
 
       const state = { manifest:null, channel:"stable", port:null, onDisconnect:null, transport:null, esploader:null, chip:null, connected:false, flashing:false, monitorPort:null, monitorReader:null, monitorWriter:null, monitorPipe:null, monitorDisconnect:null, monitorConnected:false };
-      const PAGE_VERSION = "1.3.0";  // esptool-js upgraded to v0.6.0 for ESP32-C5 fix
+      const PAGE_VERSION = "1.4.0";  // migrated to tasmota-webserial-esptool for ESP32-C5 OPI PSRAM fix
       const RAW_BASE = "https://raw.githubusercontent.com/JimGat/CYM-NM28C5/Jimgat_Dev/ESP32C5";
       const DEV_MANIFEST_URL = `${RAW_BASE}/docs/manifest.json`;
       const RAW_BIN = `${RAW_BASE}/binaries-esp32c5`;
@@ -419,7 +420,6 @@
         ui.monitorLog.scrollTop = ui.monitorLog.scrollHeight;
       };
 
-      // Removed bufferToBinaryString — esptool-js v0.6.0 uses Uint8Array directly.
 
       const normalizeManifest = (raw) => {
         const parts = Array.isArray(raw?.parts) && raw.parts.length ? raw.parts : (raw?.builds?.[0]?.parts || []);
@@ -534,21 +534,35 @@
         ui.progress.style.width = "0%";
         try {
           const files = await fetchFiles();
-          setStatus("Uploading stub and flashing");
           log("Preparing flash writes");
-          await state.esploader.writeFlash({
-            fileArray: files,
-            flashSize: "16MB",
-            eraseAll: !!ui.eraseAll.checked,
-            compress: true,
-            reportProgress: (fileIndex, written, total) => {
-              const pct = Math.min(100, Math.round((written / total) * 100));
-              ui.progress.style.width = `${pct}%`;
-              setStatus(`Flashing ${fileIndex + 1}/${files.length} - ${pct}%`);
-            },
-            // v0.6.0: image is Uint8Array; convert to CryptoJS WordArray for MD5
-            calculateMD5Hash: (image) => CryptoJS.MD5(CryptoJS.lib.WordArray.create(image)),
-          });
+
+          // Erase full flash first if requested
+          if (ui.eraseAll.checked) {
+            setStatus("Erasing flash (may take 20-30 s)...");
+            log("Erasing flash...");
+            try { await state.esploader.eraseFlash(); log("Flash erased."); }
+            catch (e) { log(`Erase warning: ${e?.message || e}`); }
+          }
+
+          // tasmota-webserial-esptool uses flashData() per file (ArrayBuffer, not Uint8Array)
+          const totalBytes = files.reduce((s, f) => s + f.data.length, 0);
+          let writtenTotal = 0;
+          for (let i = 0; i < files.length; i++) {
+            const file = files[i];
+            log(`Flashing image ${i + 1}/${files.length} @ 0x${file.address.toString(16)} (${file.data.length} bytes)`);
+            await state.esploader.flashData(
+              file.data.buffer,           // ArrayBuffer from Uint8Array
+              (written, total) => {
+                const pct = Math.min(100, Math.round(((writtenTotal + written) / totalBytes) * 100));
+                ui.progress.style.width = `${pct}%`;
+                setStatus(`Flashing ${i + 1}/${files.length} - ${pct}%`);
+              },
+              file.address,
+              true                        // compress
+            );
+            writtenTotal += file.data.length;
+          }
+
           await state.esploader.after();
           ui.progress.style.width = "100%";
           setStatus("Flash complete. Press RESET if the board does not reboot.");
