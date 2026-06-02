@@ -247,12 +247,45 @@ esp_err_t wifi_wardrive_init_sd_ex(uint32_t freq_khz, bool format_if_failed) {
         .disk_status_check_enable = false
     };
 
-    /* Assert CS HIGH for 200 ms before touching the bus.
-       This ensures the card is fully deselected and has had time to settle,
-       which is especially important for fresh/blank cards that are slow to
-       respond to CMD0 after power-on. */
+    /* SD SPI reset preamble — 80 dummy clock cycles with CS deasserted.
+     *
+     * Why: During firmware flash (ESP32 in UART download mode), GPIO10 (SD_CS)
+     * can float LOW, causing the SD card to start a command that never completes.
+     * On the next boot the card is stuck mid-command and ignores CMD0 until it
+     * sees ≥74 idle clocks with CS HIGH (SD SPI specification requirement).
+     *
+     * Implementation: add a temporary no-CS SPI device on the already-initialised
+     * SPI2_HOST (shared with display) and send 10 bytes of 0xFF = 80 clock pulses.
+     * The SPI master driver arbitrates the bus correctly with the display.
+     * On failure (bus not yet init'd on very early calls) the step is skipped. */
     gpio_set_direction(SD_CS_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level(SD_CS_PIN, 1);
+    gpio_set_level(SD_CS_PIN, 1);   // CS HIGH before we start clocking
+    {
+        spi_device_handle_t hclk;
+        spi_device_interface_config_t clk_cfg = {
+            .clock_speed_hz = 400000,   // 400 kHz – SD spec init rate
+            .mode           = 0,
+            .spics_io_num   = -1,       // no CS pin – SD_CS stays HIGH throughout
+            .queue_size     = 1,
+        };
+        if (spi_bus_add_device(SPI2_HOST, &clk_cfg, &hclk) == ESP_OK) {
+            uint8_t dummies[10];
+            memset(dummies, 0xFF, sizeof(dummies));   // all-ones = idle pattern
+            spi_transaction_t t = {
+                .length    = sizeof(dummies) * 8,     // 80 bits = 80 clocks
+                .tx_buffer = dummies,
+            };
+            spi_device_polling_transmit(hclk, &t);
+            spi_bus_remove_device(hclk);
+            ESP_LOGI(TAG, "[SD] Pre-init: sent 80 idle clocks (CS HIGH) to reset SD SPI state");
+        } else {
+            ESP_LOGW(TAG, "[SD] Pre-init: could not add dummy device (bus not ready?), skipping");
+        }
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));   // brief settle after idle clocks
+
+    /* Standard settle delay: hold CS HIGH so the card exits any stuck state
+       and returns to command-ready before we assert CMD0. */
     vTaskDelay(pdMS_TO_TICKS(200));
 
     ESP_LOGI(TAG, "[SD] Configuring SPI host at %lu kHz...", (unsigned long)freq_khz);
