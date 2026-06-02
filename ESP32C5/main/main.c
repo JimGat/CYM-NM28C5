@@ -38107,18 +38107,20 @@ static void show_cc1101_hw_test_screen(void)
         g_cc1101_freq_offset_hz == 0 ? lv_color_hex(0x9E9E9E) : lv_color_hex(0xFFB300), 0);
 
     // Button row: [Set Offset] [CAL TX 433]
+    // Button row: width = card inner (LCD_H_RES-16 card - 2×8 pad = 208 px)
+    // Two buttons of 96 px + 6 px gap = 198 px ≤ 208 px ✓
     lv_obj_t *cal_row = lv_obj_create(card);
-    lv_obj_set_size(cal_row, LCD_H_RES - 36, 32);
+    lv_obj_set_size(cal_row, lv_pct(100), 32);
     lv_obj_set_style_bg_opa(cal_row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(cal_row, 0, 0);
     lv_obj_set_style_pad_all(cal_row, 0, 0);
     lv_obj_set_flex_flow(cal_row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(cal_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(cal_row, 8, 0);
+    lv_obj_set_style_pad_column(cal_row, 6, 0);
     lv_obj_clear_flag(cal_row, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *set_btn = lv_btn_create(cal_row);
-    lv_obj_set_size(set_btn, 104, 28);
+    lv_obj_set_size(set_btn, 96, 28);
     lv_obj_set_style_bg_color(set_btn, lv_color_hex(0x4E342E), LV_STATE_DEFAULT);
     lv_obj_set_style_border_color(set_btn, lv_color_hex(0x827717), 0);
     lv_obj_set_style_border_width(set_btn, 1, 0);
@@ -38130,7 +38132,7 @@ static void show_cc1101_hw_test_screen(void)
     lv_obj_add_event_cb(set_btn, s_offset_entry_cb, LV_EVENT_CLICKED, NULL);
 
     s_cc1101_ht_cal_btn = lv_btn_create(cal_row);
-    lv_obj_set_size(s_cc1101_ht_cal_btn, 104, 28);
+    lv_obj_set_size(s_cc1101_ht_cal_btn, 96, 28);
     lv_obj_set_style_bg_color(s_cc1101_ht_cal_btn, lv_color_hex(0x827717), LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(s_cc1101_ht_cal_btn, 0, 0);
     lv_obj_set_style_radius(s_cc1101_ht_cal_btn, 6, 0);
