@@ -348,9 +348,9 @@
     <script type="module">
       // tasmota-webserial-esptool v9.2.23 — Tasmota fork that fixes ESP32-C5 OPI PSRAM /
       // Flash ID: 0 (esptool-js issue #217, still open). Same library ESPConnect uses.
-      // NOTE: Transport is NOT exported — ESPLoader accepts SerialPort directly via {port:}.
+      // API: use connectWithPort(port, terminal) — NOT new ESPLoader() + .main().
       // esm.sh CDN bundles all deps into a proper browser ES module.
-      import { ESPLoader } from "https://esm.sh/tasmota-webserial-esptool@9.2.23";
+      import { connectWithPort } from "https://esm.sh/tasmota-webserial-esptool@9.2.23";
 
       const ui = {
         status: document.getElementById("statusText"),
@@ -377,7 +377,7 @@
       };
 
       const state = { manifest:null, channel:"stable", port:null, onDisconnect:null, esploader:null, chip:null, connected:false, flashing:false, monitorPort:null, monitorReader:null, monitorWriter:null, monitorPipe:null, monitorDisconnect:null, monitorConnected:false };
-      const PAGE_VERSION = "1.5.0";  // tasmota API: ESPLoader takes SerialPort directly (no Transport)
+      const PAGE_VERSION = "1.6.0";  // tasmota API: connectWithPort() is the entry point
       const RAW_BASE = "https://raw.githubusercontent.com/JimGat/CYM-NM28C5/Jimgat_Dev/ESP32C5";
       const DEV_MANIFEST_URL = `${RAW_BASE}/docs/manifest.json`;
       const RAW_BIN = `${RAW_BASE}/binaries-esp32c5`;
@@ -474,27 +474,19 @@
           state.port = await navigator.serial.requestPort({});
           state.onDisconnect = () => { disconnect().catch(() => {}); setStatus("Device disconnected. Reconnect to flash.", "error"); };
           try { state.port.addEventListener("disconnect", state.onDisconnect); } catch {}
-          // tasmota: pass SerialPort directly — no Transport wrapper needed
-          const loaderOptions = { port: state.port, baudrate: parseInt(ui.baud.value, 10), terminal: { clean() {}, writeLine: log, write: log }, debugLogging: false };
-          setStatus(`Syncing with chip (hold BOOT + RESET). Timeout ${Math.round(CONNECT_TIMEOUT_MS / 1000)}s`);
-          log("Syncing with chip");
-          const start = Date.now();
-          let lastErr = null;
-          while (Date.now() - start < CONNECT_TIMEOUT_MS) {
-            try {
-              state.esploader = new ESPLoader(loaderOptions);
-              state.chip = await state.esploader.main();
-              lastErr = null;
-              break;
-            } catch (err) {
-              lastErr = err;
-              const remaining = Math.ceil(Math.max(0, CONNECT_TIMEOUT_MS - (Date.now() - start)) / 1000);
-              setStatus(`Failed to connect. Hold BOOT + tap RESET, retrying... (${remaining}s)`);
-              log(`Error: ${err?.message || err}`);
-              await sleep(CONNECT_RETRY_DELAY_MS);
-            }
-          }
-          if (lastErr) throw lastErr;
+
+          setStatus("Syncing with chip — hold BOOT + tap RESET if needed");
+          log("Connecting via tasmota connectWithPort...");
+
+          // tasmota API: connectWithPort(port, terminal) handles all handshaking internally
+          const terminal = { clean() {}, writeLine: log, write: log };
+          const timeout = new Promise((_, rej) =>
+            setTimeout(() => rej(new Error(`Connect timeout after ${CONNECT_TIMEOUT_MS/1000}s — hold BOOT and tap RESET`)), CONNECT_TIMEOUT_MS));
+          state.esploader = await Promise.race([connectWithPort(state.port, terminal), timeout]);
+
+          // chip name is a property on the loader, not the return value of main()
+          state.chip = state.esploader?.chip_name || state.esploader?.chip || "ESP32-C5";
+
           state.connected = true;
           ui.chip.style.display = "inline-flex";
           ui.chip.textContent = `Chip ${state.chip}`;
