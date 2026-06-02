@@ -84,6 +84,13 @@ rfid_err_t rfid_manager_init(void)
         }
         return RFID_ERR_HW;
     }
+
+    // Apply sensitivity tuning: raise RxGain to 48 dB max, lower RxThreshold.
+    // Non-fatal if this fails — basic operation still works at default sensitivity.
+    rfid_err_t sr = pn532_rf_configure_sensitivity();
+    if (sr != RFID_OK)
+        ESP_LOGW(TAG, "sensitivity config failed (non-fatal): %s", rfid_err_str(sr));
+
     s_mgr_init = true;
     ESP_LOGI(TAG, "init OK");
     return RFID_OK;

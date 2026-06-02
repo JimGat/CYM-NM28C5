@@ -258,6 +258,83 @@ rfid_err_t pn532_rf_field_off(void)
     return pn532_read_response(PN532_CMD_RF_CONFIGURATION, resp, &rlen, sizeof(resp), 100);
 }
 
+rfid_err_t pn532_rf_field_cycle(void)
+{
+    // Toggle RF off→on to reset card state — helps ISO14443A cards that are
+    // slow to respond after extended no-field exposure or marginal coupling.
+    rfid_err_t r = pn532_rf_field_off();
+    vTaskDelay(pdMS_TO_TICKS(5));
+    if (r != RFID_OK) return r;
+    return pn532_rf_field_on();
+}
+
+rfid_err_t pn532_rf_configure_sensitivity(void)
+{
+    // RFConfiguration(0x0A) — ISO14443A 106 kbps analog settings.
+    // Raises RxGain from default 38 dB → 48 dB (maximum) and lowers
+    // RxThreshold MinLevel from 8 → 6 for better weak-coupling detection
+    // on compact PCB antennas like the NM-RF-HAT.
+    //
+    // Default values (from PN532 UM10232 Table 119):
+    //   CIU_RFCfg=0x59(38dB), GsNOn=0xF4, CWGsP=0x85, ModGsP=0x15,
+    //   Demod=0x8A, RxThreshold=0x8A(MinLevel=8), ManualRCV=0x0B
+    //
+    // Modified:
+    //   CIU_RFCfg: bits[6:4]=111 → 48dB max gain  (was 0x59 = 38dB)
+    //   RxThreshold: MinLevel=6  → 0x6A            (was 0x8A = MinLevel=8)
+    //   All other bytes unchanged from datasheet defaults.
+    uint8_t cmd[] = {
+        PN532_CMD_RF_CONFIGURATION, 0x0A,
+        0x7F,   // CIU_RFCfg:      RxGain=111 (48 dB max) vs default 0x59 (38 dB)
+        0xF4,   // CIU_GsNOn:      default
+        0x85,   // CIU_CWGsP:      default
+        0x15,   // CIU_ModGsP:     default
+        0x8A,   // CIU_Demod:      default
+        0x6A,   // CIU_RxThreshold:MinLevel=6 vs default 0x8A(MinLevel=8)
+        0x0B,   // CIU_ManualRCV:  default
+    };
+    rfid_err_t r = pn532_send_command(cmd, sizeof(cmd));
+    if (r != RFID_OK) {
+        ESP_LOGW(TAG, "rf_configure_sensitivity: send failed: %s", rfid_err_str(r));
+        return r;
+    }
+    uint8_t resp[1]; uint8_t rlen = 0;
+    r = pn532_read_response(PN532_CMD_RF_CONFIGURATION, resp, &rlen, sizeof(resp), 100);
+    if (r == RFID_OK)
+        ESP_LOGI(TAG, "RF sensitivity configured: RxGain=48dB RxThreshold=0x6A");
+    else
+        ESP_LOGW(TAG, "rf_configure_sensitivity: response failed: %s", rfid_err_str(r));
+    return r;
+}
+
+rfid_err_t pn532_recover(void)
+{
+    // Attempt to recover from PN532 lockup (I2C NACK after extended idle scan).
+    // Sequence: bus reset → probe → SAM configure → sensitivity config.
+    ESP_LOGW(TAG, "[RECOVER] PN532 I2C lockup detected — attempting recovery");
+    if (!s_bus) return RFID_ERR_NOT_INIT;
+
+    i2c_master_bus_reset(s_bus);
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    esp_err_t e = i2c_master_probe(s_bus, PN532_I2C_ADDR, 50);
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "[RECOVER] PN532 not responding at 0x24 after bus reset");
+        return RFID_ERR_HW;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    rfid_err_t r = pn532_sam_configure();
+    if (r != RFID_OK) {
+        ESP_LOGE(TAG, "[RECOVER] SAM configure failed after bus reset: %s", rfid_err_str(r));
+        return r;
+    }
+    r = pn532_rf_configure_sensitivity();
+    if (r == RFID_OK)
+        ESP_LOGI(TAG, "[RECOVER] Recovery successful");
+    return r;
+}
+
 rfid_err_t pn532_get_firmware_version(pn532_fw_version_t *out)
 {
     if (!s_init) return RFID_ERR_NOT_INIT;

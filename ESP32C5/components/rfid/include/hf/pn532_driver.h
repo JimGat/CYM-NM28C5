@@ -32,6 +32,19 @@ rfid_err_t pn532_sam_configure(void);
 // ── RF field control ──────────────────────────────────────────────────────────
 rfid_err_t pn532_rf_field_on(void);
 rfid_err_t pn532_rf_field_off(void);
+// Toggle field off → 5 ms → on. Helps reset slow-responding cards.
+rfid_err_t pn532_rf_field_cycle(void);
+
+// ── Sensitivity tuning ────────────────────────────────────────────────────────
+// Apply optimised RF analog settings for compact PCB antennas:
+// RxGain raised to 48 dB (max), RxThreshold lowered for weak coupling.
+// Must be called after pn532_sam_configure().
+rfid_err_t pn532_rf_configure_sensitivity(void);
+
+// ── Lockup recovery ───────────────────────────────────────────────────────────
+// Bus reset + probe + SAM configure + sensitivity config.
+// Call when send_command returns RFID_ERR_HW during a scan loop.
+rfid_err_t pn532_recover(void);
 
 // ── Firmware probe ────────────────────────────────────────────────────────────
 typedef struct {
