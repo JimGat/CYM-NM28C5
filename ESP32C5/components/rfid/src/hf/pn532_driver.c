@@ -212,13 +212,20 @@ rfid_err_t pn532_read_response(uint8_t expected_cmd, uint8_t *buf, uint8_t *buf_
     }
     uint8_t len = raw[4];
     if (raw[6] != PN532_TFI_PN532) {
-        // Log full raw frame to help diagnose the mismatch root cause.
-        // raw[0]=RDY, raw[1..3]=preamble, raw[4]=LEN, raw[5]=LCS, raw[6]=TFI
-        ESP_LOGW(TAG, "TFI mismatch: got 0x%02X want 0xD5 — "
-                 "raw[0..9]: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
-                 raw[6],
-                 raw[0], raw[1], raw[2], raw[3], raw[4],
-                 raw[5], raw[6], raw[7], raw[8], raw[9]);
+        // Detect the PN532 ERROR FRAME (00 00 FF 01 FF 7F 81 00):
+        // LEN=0x01, LCS=0xFF, data=0x7F, DCS=0x81 — means "syntax error /
+        // command not supported." PN532 firmware v1.6 returns this for
+        // RFConfiguration(0x0A) and InDataExchange with GET_VERSION (0x60).
+        // Log at DEBUG (not WARNING) since it is expected and not actionable.
+        if (raw[4] == 0x01 && raw[5] == 0xFF && raw[6] == 0x7F) {
+            ESP_LOGD(TAG, "PN532 ERROR FRAME (cmd unsupported, fw1.6)");
+        } else {
+            ESP_LOGW(TAG, "TFI mismatch: got 0x%02X want 0xD5 — "
+                     "raw[0..9]: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                     raw[6],
+                     raw[0], raw[1], raw[2], raw[3], raw[4],
+                     raw[5], raw[6], raw[7], raw[8], raw[9]);
+        }
         return RFID_ERR_HW;
     }
     if (raw[7] != (uint8_t)(expected_cmd + 1)) {

@@ -43190,6 +43190,15 @@ static void s_rfid_read_done_lvgl_cb(void *arg)
     }
 
     // Decode NDEF and show URL / text if found
+    // Update type label — may have been upgraded (e.g. Ultralight → NTAG213)
+    if (d->r == RFID_OK && s_rfid_last_card && s_rfid_scan_type_lbl) {
+        char type_buf[48];
+        snprintf(type_buf, sizeof(type_buf), "Type: %s  (%u pages)",
+                 s_rfid_last_card->protocol_str, s_rfid_last_card->page_count);
+        lv_label_set_text(s_rfid_scan_type_lbl, type_buf);
+        lv_obj_set_style_text_color(s_rfid_scan_type_lbl, lv_color_hex(0x00E676), 0);
+    }
+
     if (d->r == RFID_OK && s_rfid_last_card && s_rfid_scan_ndef_lbl) {
         // Always log raw page 4 bytes for diagnosis
         if (s_rfid_last_card->blocks[4].valid) {
@@ -43220,7 +43229,13 @@ static void s_rfid_read_done_lvgl_cb(void *arg)
         }
     }
 
-    if (s_rfid_scan_read_btn) lv_obj_clear_state(s_rfid_scan_read_btn, LV_STATE_DISABLED);
+    if (s_rfid_scan_read_btn) {
+        lv_obj_clear_state(s_rfid_scan_read_btn, LV_STATE_DISABLED);
+        // Keep green if read succeeded, revert to dark if failed
+        lv_obj_set_style_bg_color(s_rfid_scan_read_btn,
+            d->r == RFID_OK ? lv_color_hex(0x1B5E20) : lv_color_hex(0x4E342E),
+            LV_STATE_DEFAULT);
+    }
     free(d);
     rfid_manager_start_poll(s_rfid_poll_cb, NULL, 500);
 }
@@ -43340,8 +43355,12 @@ static void s_rfid_scan_lvgl_cb(void *arg)
                                           lv_color_hex(0x00E676), 0);
         if (s_rfid_scan_save_btn)
             lv_obj_clear_state(s_rfid_scan_save_btn, LV_STATE_DISABLED);
-        if (s_rfid_scan_read_btn)
+        if (s_rfid_scan_read_btn) {
             lv_obj_clear_state(s_rfid_scan_read_btn, LV_STATE_DISABLED);
+            // Turn green to indicate card is present and ready to read
+            lv_obj_set_style_bg_color(s_rfid_scan_read_btn,
+                                      lv_color_hex(0x1B5E20), LV_STATE_DEFAULT);
+        }
 
         // Start auto-read timer on FIRST detection (not on subsequent polls
         // while card stays present, and not if already reading).
@@ -43366,6 +43385,10 @@ static void s_rfid_scan_lvgl_cb(void *arg)
         if (s_rfid_scan_panel)
             lv_obj_set_style_border_color(s_rfid_scan_panel,
                                           lv_color_hex(0x00695C), 0);
+        // Revert Read button to dark when card is removed
+        if (s_rfid_scan_read_btn)
+            lv_obj_set_style_bg_color(s_rfid_scan_read_btn,
+                                      lv_color_hex(0x4E342E), LV_STATE_DEFAULT);
     }
     free(ev);
 }
