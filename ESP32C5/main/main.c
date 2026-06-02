@@ -39677,8 +39677,14 @@ static void s_cc1101_jam_timer_cb(lv_timer_t *tmr)
     s_jam_freq_idx = (s_jam_freq_idx + 1) % 6;
     float f = s_jam_table[s_jam_freq_idx];
     s_jam_fill_and_tx(f);
+    // Read back actual programmed frequency from CC1101 FREQ registers to verify
+    float actual = cc1101_get_freq_mhz();
+    ESP_LOGI("JAM", "idx=%d target=%.3f programmed=%.3f MHz (MARC=%u)",
+             s_jam_freq_idx, (double)cc1101_freq_cal(f), (double)actual,
+             (unsigned)cc1101_get_marc_state());
     if (s_cc1101_jam_freq_lbl) {
-        char buf[24]; snprintf(buf, sizeof(buf), "%.1f MHz", (double)f);
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.3f MHz (reg: %.3f)", (double)f, (double)actual);
         lv_label_set_text(s_cc1101_jam_freq_lbl, buf);
     }
     (void)tmr;
