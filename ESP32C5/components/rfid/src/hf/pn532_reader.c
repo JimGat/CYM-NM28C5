@@ -1,5 +1,6 @@
 #include "hf/pn532_reader.h"
 #include "hf/pn532_driver.h"
+#include "hf/ntag.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -117,20 +118,29 @@ rfid_err_t pn532_scan_card(rfid_card_t *card, uint32_t timeout_ms)
             card->block_count = 64;
         } else if (card->protocol == RFID_PROTO_MIFARE_CLASSIC_4K) {
             card->block_count = 256;
-        } else if (card->protocol == RFID_PROTO_NTAG213) {
-            card->page_count = 45;
-        } else if (card->protocol == RFID_PROTO_NTAG215) {
-            card->page_count = 135;
-        } else if (card->protocol == RFID_PROTO_NTAG216) {
-            card->page_count = 231;
-        } else if (card->protocol == RFID_PROTO_MIFARE_ULTRALIGHT) {
-            card->page_count = 16;
+        } else {
+            // NTAG/Ultralight: try GET_VERSION to distinguish 213/215/216
+            if (card->protocol == RFID_PROTO_NTAG213 ||
+                card->protocol == RFID_PROTO_MIFARE_ULTRALIGHT) {
+                uint8_t version[8];
+                if (ntag_get_version(version) == RFID_OK) {
+                    rfid_protocol_t refined = ntag_protocol_from_version(version);
+                    if (refined != RFID_PROTO_UNKNOWN) {
+                        card->protocol = refined;
+                        strncpy(card->protocol_str, rfid_protocol_str(refined),
+                                sizeof(card->protocol_str) - 1);
+                    }
+                }
+                // If GET_VERSION fails, keep the heuristic result (NTAG213 / UL)
+            }
+            card->page_count = ntag_page_count_for_protocol(card->protocol);
+            if (card->page_count == 0) card->page_count = 16;  // fallback for unknown UL
         }
 
         char uid_str[32];
         rfid_format_uid(card->uid, card->uid_len, uid_str, sizeof(uid_str));
-        ESP_LOGI(TAG, "Card: UID=%s ATQA=%04X SAK=%02X proto=%s",
-                 uid_str, atqa, sak, card->protocol_str);
+        ESP_LOGI(TAG, "Card: UID=%s ATQA=%04X SAK=%02X proto=%s pages=%u",
+                 uid_str, atqa, sak, card->protocol_str, card->page_count);
         return RFID_OK;
     }
 

@@ -1,0 +1,71 @@
+name: Deploy Web Flasher
+
+# Deploys the web flasher page to GitHub Pages using the pre-built binaries
+# already committed to the repository (ESP32C5/binaries-esp32c5/).
+# Runs on every push that touches the flasher or the binaries, and on
+# workflow_dispatch so you can trigger it manually from the Actions tab.
+#
+# Requires one-time repo setup:
+#   Settings → Pages → Source → GitHub Actions
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "ESP32C5/docs/index.html"
+      - "ESP32C5/docs/manifest.json"
+      - "ESP32C5/binaries-esp32c5/*.bin"
+      - ".github/workflows/deploy-flasher.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one deployment at a time; new runs queue, not cancel.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build & deploy
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build site
+        run: |
+          mkdir -p _site/binaries-esp32c5
+
+          # Fix manifest paths: local source uses "../binaries-esp32c5/" (relative
+          # to ESP32C5/docs/) but GitHub Pages serves everything from one flat root,
+          # so binaries live at "binaries-esp32c5/" with no "../".
+          sed 's|"\.\./binaries-esp32c5/|"binaries-esp32c5/|g' \
+            ESP32C5/docs/manifest.json > _site/manifest.json
+
+          # Same fix for the direct-download hrefs in the page.
+          sed 's|"\.\./binaries-esp32c5/|"binaries-esp32c5/|g' \
+            ESP32C5/docs/index.html > _site/index.html
+
+          cp ESP32C5/binaries-esp32c5/*.bin _site/binaries-esp32c5/
+
+          echo "--- site contents ---"
+          find _site -type f | sort
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: "_site"
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

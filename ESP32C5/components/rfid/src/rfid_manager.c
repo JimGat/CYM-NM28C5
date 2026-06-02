@@ -4,6 +4,7 @@
 #include "hf/pn532_reader.h"
 #include "hf/pn532_target.h"
 #include "hf/mifare_classic.h"
+#include "hf/ntag.h"
 #include "lf/lf_stub.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -263,6 +264,65 @@ rfid_err_t rfid_manager_test_mifare_keys(rfid_card_t *card,
         if (progress_cb) progress_cb(s, num_sectors, found, ctx);
     }
     return RFID_OK;
+}
+
+// ── Generic card memory read ──────────────────────────────────────────────────
+
+rfid_err_t rfid_manager_read_card_data(rfid_card_t *card)
+{
+    if (!s_mgr_init) return RFID_ERR_NOT_INIT;
+    if (!card) return RFID_ERR_HW;
+
+    switch (card->protocol) {
+        case RFID_PROTO_NTAG213:
+        case RFID_PROTO_NTAG215:
+        case RFID_PROTO_NTAG216:
+        case RFID_PROTO_MIFARE_ULTRALIGHT:
+            return ntag_read_all(card);
+
+        case RFID_PROTO_MIFARE_CLASSIC_1K:
+        case RFID_PROTO_MIFARE_CLASSIC_4K:
+            return mifare_read_all(card, MIFARE_DEFAULT_KEYS,
+                                   MIFARE_DEFAULT_KEY_COUNT);
+
+        default:
+            ESP_LOGW(TAG, "read_card_data: no reader for proto %d", (int)card->protocol);
+            return RFID_ERR_NOT_SUPPORTED;
+    }
+}
+
+// ── NTAG clone ────────────────────────────────────────────────────────────────
+
+rfid_err_t rfid_manager_clone_ntag(const rfid_card_t *src, uint8_t skip_below)
+{
+    if (!s_mgr_init) return RFID_ERR_NOT_INIT;
+    if (!src) return RFID_ERR_HW;
+
+    switch (src->protocol) {
+        case RFID_PROTO_NTAG213:
+        case RFID_PROTO_NTAG215:
+        case RFID_PROTO_NTAG216:
+        case RFID_PROTO_MIFARE_ULTRALIGHT:
+            break;
+        default:
+            return RFID_ERR_NOT_SUPPORTED;
+    }
+
+    // rfid_card_t is ~5.7 KB — allocate from PSRAM to avoid stack overflow in caller task.
+    rfid_card_t *blank = heap_caps_calloc(1, sizeof(rfid_card_t), MALLOC_CAP_SPIRAM);
+    if (!blank) return RFID_ERR_HW;
+
+    rfid_err_t r = pn532_scan_card(blank, 5000);
+    if (r != RFID_OK) {
+        ESP_LOGW(TAG, "clone: no blank card detected: %s", rfid_err_str(r));
+        free(blank);
+        return r;
+    }
+
+    ESP_LOGI(TAG, "clone: blank card detected proto=%s, writing %u pages (skip<=%u)",
+             blank->protocol_str, src->page_count, skip_below);
+    free(blank);
+    return ntag_clone_to_blank(src, skip_below);
 }
 
 // ── I2C diagnostic scan ───────────────────────────────────────────────────────

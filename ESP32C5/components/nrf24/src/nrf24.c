@@ -100,8 +100,9 @@ static void spi_xfer_buf(const uint8_t *tx, uint8_t *rx, size_t len)
         .rx_buffer = rx,
     };
     if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
-    spi_device_polling_transmit(s_drv->spi, &t);
+    esp_err_t err = spi_device_polling_transmit(s_drv->spi, &t);
     if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+    if (err != ESP_OK) ESP_LOGE(TAG, "SPI xfer failed (%zu B): %s", len, esp_err_to_name(err));
 }
 
 uint8_t nrf24_read_reg(uint8_t reg)
@@ -372,41 +373,52 @@ bool nrf24_carrier_detect(void)
 void nrf24_jam_sweep(volatile bool *active)
 {
     if (!s_drv) return;
-    static const uint8_t payload[32] = {
-        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
-        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
-        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
-        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
-    };
-    // PTX mode, no CRC, no AA, max power
-    nrf24_write_reg(REG_EN_AA,    0x00);
+
+    // PTX mode, no CRC, no AA, 2 Mbps, max power
+    nrf24_write_reg(REG_EN_AA,      0x00);
     nrf24_write_reg(REG_SETUP_RETR, 0x00);
-    nrf24_write_reg(REG_RF_SETUP,
-                    RF_SETUP_DR_HIGH | RF_SETUP_PWR(3));  // 2 Mbps, 0 dBm
-    nrf24_write_reg(REG_CONFIG, CONFIG_PWR_UP | CONFIG_EN_CRC);
+    nrf24_write_reg(REG_RF_SETUP,   RF_SETUP_DR_HIGH | RF_SETUP_PWR(3));
+    nrf24_write_reg(REG_CONFIG,     CONFIG_PWR_UP);
     vTaskDelay(pdMS_TO_TICKS(2));
 
     uint8_t tx_cmd[33] = { CMD_W_PAYLOAD };
-    memcpy(tx_cmd + 1, payload, 32);
+    memset(tx_cmd + 1, 0xFF, 32);
     uint8_t rx_tmp[33];
+
+    nrf24_flush_tx();
+
+    // CE-pulse approach: CE goes low between every channel so the chip returns
+    // to STANDBY-I and re-latches RF_CH before each packet.  The "CE stays HIGH"
+    // pipeline does NOT work — the nRF24 locks its PLL when CE first rises and
+    // ignores subsequent RF_CH writes while CE is held high, so every packet
+    // lands on the initial channel (ch 0 = 2400 MHz).
+    //
+    // Timing per channel at 2 Mbps, 32-byte payload:
+    //   ~30 µs  SPI (RF_CH + STATUS + payload)
+    //   ~15 µs  CE pulse (spec min 10 µs)
+    //   ~175 µs wait for packet to clear FIFO (packet air time ≈ 165 µs)
+    //   ────────────────────────────────────────────────
+    //   ~220 µs total → ~4500 packets/s across 126 channels → ~36 sweeps/s
 
     uint8_t ch = 0;
     while (active && *active) {
         nrf24_write_reg(REG_RF_CH, ch);
-        // Write TX FIFO
-        csn_low();
-        spi_xfer_buf(tx_cmd, rx_tmp, 33);
-        csn_high();
-        // Pulse CE to trigger TX
-        ce_high();
-        esp_rom_delay_us(15);
-        ce_low();
-        // Clear TX_DS/MAX_RT flags
         nrf24_write_reg(REG_STATUS, 0x70);
-        nrf24_flush_tx();
+        csn_low(); spi_xfer_buf(tx_cmd, rx_tmp, 33); csn_high();
+
+        ce_high();
+        esp_rom_delay_us(15);   // chip latches RF_CH and starts TX
+        ce_low();
+
+        esp_rom_delay_us(175);  // wait for packet to finish before next CE rise
+
         ch = (ch >= 125) ? 0 : ch + 1;
-        vTaskDelay(1);  // 1 tick (~10ms) — lets IDLE reset task WDT between bursts
+        if (ch == 0)
+            vTaskDelay(pdMS_TO_TICKS(20));  // yield once per sweep for WDT
     }
+
+    ce_low();
+    nrf24_flush_tx();
     nrf24_standby();
 }
 
@@ -479,7 +491,7 @@ esp_err_t nrf24_sniff(uint8_t channel, uint8_t payload_len,
             s_drv->cap_count++;
             if (cb) cb(&pkt, ctx);
         }
-        vTaskDelay(pdMS_TO_TICKS(1));
+        vTaskDelay(pdMS_TO_TICKS(20));  // must yield ≥1 tick at 100 Hz (pdMS_TO_TICKS(1)=0)
     }
     ce_low();
     nrf24_flush_rx();

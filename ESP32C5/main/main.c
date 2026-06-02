@@ -548,6 +548,24 @@ static char     g_saved_wifi_pass[65] = ""; // Home network password
 #define NVS_KEY_GPS_ALT      "gps_alt_i"
 #define NVS_KEY_RF_HAT       "rf_hat"
 #define NVS_KEY_BTSC_CTR     "btsc_ctr"
+#define NVS_KEY_CC1101_PPM   "cc1101_ppm"  // int32 milli-PPM (ppm × 1000), ±300000 = ±300 ppm
+
+// ── CC1101 crystal calibration — declared here so NVS load can access them ────
+// CC1101 uses a 26 MHz crystal whose error multiplies with the PLL.
+// A given PPM error produces MORE Hz deviation at higher frequencies:
+//   433 MHz × 138 ppm = 60 kHz offset
+//   915 MHz × 138 ppm = 126 kHz offset  ← same crystal, 2× the Hz error
+// Correction MUST be stored in PPM, not Hz, so it scales correctly to all bands.
+// millippm = measured_deviation_kHz × 1,000,000 / 433.920 (when calibrating at 433 MHz)
+// Applied: f_programmed = f_desired × (1 + millippm / 1e9)
+// Range: ±300 ppm covers even poorly-spec'd modules (≈±130 kHz at 433, ±275 kHz at 915)
+static int32_t g_cc1101_freq_offset_millippm = 0;  // ppm × 1000, signed
+
+static inline float cc1101_freq_cal(float mhz) {
+    return mhz * (1.0f + (float)g_cc1101_freq_offset_millippm / 1000000000.0f);
+}
+
+static void nvs_save_cc1101_offset(void);   // forward — implemented near HW test screen
 
 // Wardrive band selection
 typedef enum { WD_BAND_BOTH = 0, WD_BAND_24G, WD_BAND_5G } wd_band_t;
@@ -1534,9 +1552,13 @@ typedef struct {
     lv_obj_t      *canvas;
     lv_obj_t      *status_lbl;
     lv_obj_t      *start_btn;
+    lv_obj_t      *hunt_btn;       // "Hunt this freq" button, shown on canvas tap
     lv_timer_t    *tmr;
     TaskHandle_t   task;
     uint64_t       tap_expire_us;
+    float          tap_freq_mhz;   // frequency marker (SDR-style draggable indicator)
+    int            canvas_h;       // stored for line-drawing in timer callback
+    bool           marker_set;     // true once user has placed the marker
 } cc1101_bs_ctx_t;
 static cc1101_bs_ctx_t *s_bs = NULL;  // 4 bytes DRAM; struct + canvas in PSRAM
 
@@ -1576,6 +1598,7 @@ typedef struct {
     char             save_path[NRF24_SUB_PATH_LEN];
     volatile int     pkt_count;
     nrf24_packet_t   last_pkt;
+    nrf24_packet_t  *pkts;       // PSRAM buffer; set before nrf24_sniff, used by callback
     lv_obj_t        *status_lbl;
     lv_obj_t        *hex_lbl;
     lv_obj_t        *count_lbl;
@@ -1606,6 +1629,86 @@ EXT_RAM_BSS_ATTR static bool      s_n24_jam_active = false;
 EXT_RAM_BSS_ATTR static lv_obj_t *s_n24_jam_status = NULL;
 EXT_RAM_BSS_ATTR static lv_timer_t *s_n24_jam_tmr = NULL;
 EXT_RAM_BSS_ATTR static TaskHandle_t s_n24_jam_task = NULL;
+
+// ── nRF24 Fox Hunt state (declared early — cleanup in show_nrf24_screen) ──────
+static lv_obj_t   *s_n24fox_bar    = NULL;
+static lv_obj_t   *s_n24fox_lbl    = NULL;
+static lv_obj_t   *s_n24fox_ch_lbl = NULL;
+static lv_obj_t   *s_n24fox_hbtn   = NULL;
+static lv_obj_t   *s_n24fox_status = NULL;
+static lv_timer_t *s_n24fox_tmr    = NULL;
+static uint8_t    s_n24fox_channel  = 76;
+static bool       s_n24fox_haptic   = true;
+static int        s_n24fox_hits     = 0;
+static int        s_n24fox_samples  = 0;
+static uint8_t    s_n24fox_saved_vib_pct = 100;  // restored on exit
+#define N24FOX_WINDOW  20
+
+// ── RF433 OOK Scan state (declared early — cleanup in show_rf433_menu_screen) ──
+static lv_obj_t    *s_rf433_scan_status = NULL;
+static lv_obj_t    *s_rf433_scan_list   = NULL;
+static TaskHandle_t s_rf433_scan_task   = NULL;
+static volatile bool s_rf433_scan_stop  = false;
+
+// ── RF433 Fox Hunt state (declared very early — cleanup in show_rf433_menu_screen) ──
+static volatile int  s_rf433_fox_edges         = 0;
+static lv_obj_t     *s_rf433_fox_bar           = NULL;
+static lv_obj_t     *s_rf433_fox_lbl           = NULL;
+static lv_obj_t     *s_rf433_fox_hbtn          = NULL;
+static lv_obj_t     *s_rf433_fox_status        = NULL;
+static lv_timer_t   *s_rf433_fox_tmr           = NULL;
+static bool          s_rf433_fox_haptic        = true;
+static int           s_rf433_fox_rate          = 0;
+static bool          s_rf433_fox_isr_installed = false;
+static uint8_t       s_rf433_fox_saved_vib_pct = 100;  // restored on exit
+static int           s_rf433_fox_hap_ctr       = 0;
+
+// ── CC1101 TPMS Monitor ───────────────────────────────────────────────────────
+#define TPMS_MAX_SENSORS   20
+#define TPMS_PKT_LEN       8
+#define TPMS_CARD_H        32
+#define TPMS_CARD_GAP      2
+#define TPMS_SCROLL_Y      122
+#define TPMS_SCROLL_H      (LCD_V_RES - 34 - TPMS_SCROLL_Y)
+#define TPMS_SAVE_DIR      "/sdcard/lab/tpms"
+#define TPMS_SAVE_PATH_LEN 80
+
+typedef struct {
+    uint32_t  sensor_id;
+    float     psi;
+    float     kpa;
+    int8_t    temp_c;
+    uint8_t   flags;       // bit 0 = low battery, bit 5 = alarm
+    int8_t    rssi_dbm;
+    uint64_t  last_seen_us;
+    bool      crc_ok;
+} tpms_sensor_t;
+
+typedef struct {
+    volatile bool    active;
+    volatile bool    cancel;
+    bool             freq_315;      // true = 315 MHz US, false = 433.92 MHz EU
+    bool             fsk_mode;      // false = OOK (Schrader), true = FSK (Continental/Hella)
+    tpms_sensor_t    sensors[TPMS_MAX_SENSORS];
+    volatile int     sensor_count;
+    volatile int     pkt_total;     // raw sync-word matches received from CC1101
+    volatile int     pkt_crc_fail;  // decoded OK but software CRC mismatch
+    volatile int     pkt_valid;     // passed decode + CRC
+    volatile int8_t  last_rssi_dbm; // last RSSI reading (updated even between packets)
+    char             log_path[TPMS_SAVE_PATH_LEN];
+    lv_obj_t        *freq_315_btn;
+    lv_obj_t        *freq_433_btn;
+    lv_obj_t        *start_btn;
+    lv_obj_t        *status_lbl;
+    lv_obj_t        *count_lbl;
+    lv_obj_t        *scroll_cont;               // scrollable sensor list container
+    lv_obj_t        *sensor_lbl[TPMS_MAX_SENSORS];
+    volatile int     last_scroll_count;          // for auto-scroll-to-new
+    lv_timer_t      *tmr;
+    TaskHandle_t     task;
+    FILE            *log_fp;
+} cc1101_tpms_ctx_t;
+EXT_RAM_BSS_ATTR static cc1101_tpms_ctx_t *s_tpms = NULL;
 
 // ── Zigbee Scout (passive/active 802.15.4 scanner, built-in ESP32-C5 radio) ──
 #define ZGWD_DWELL_MS        250   // ms to receive on each channel
@@ -2008,6 +2111,7 @@ static void show_ir_menu_screen(void);
 static void show_radio_menu_screen(void);
 static void show_rfid_menu_screen(void);
 static void show_cc1101_screen(void);
+static void s_cal_tx_stop(void);      // calibration TX stop, called from show_cc1101_screen cleanup
 static void show_cc1101_hw_test_screen(void);
 static void show_cc1101_freq_scan_screen(void);
 static void show_cc1101_capture_screen(void);
@@ -2020,7 +2124,10 @@ static void show_cc1101_weather_screen(void);
 static void show_cc1101_pocsag_screen(void);
 static void show_cc1101_alarm_screen(void);
 static void show_cc1101_wardrive_screen(void);
-static void show_cc1101_proximity_screen(void);
+static void show_cc1101_foxhunt_screen(void);
+static void show_nrf24_foxhunt_screen(void);
+static void show_rf433_foxhunt_screen(void);
+static void show_rf433_ook_scan_screen(void);
 static void show_cc1101_bruteforce_screen(void);
 static void show_cc1101_bandscope_screen(void);
 static void show_cc1101_zwave_screen(void);
@@ -2200,6 +2307,19 @@ static void reset_function_page_children(void) {
         s_nsniff->count_lbl = NULL; s_nsniff->start_btn = NULL;
         if (s_nsniff->tmr) { lv_timer_del(s_nsniff->tmr); s_nsniff->tmr = NULL; }
         if (!s_nsniff->task) { heap_caps_free(s_nsniff); s_nsniff = NULL; }
+    }
+    // CC1101 TPMS cleanup
+    if (s_tpms) {
+        s_tpms->active = false; s_tpms->cancel = true;
+        s_tpms->status_lbl = NULL; s_tpms->count_lbl = NULL;
+        s_tpms->start_btn = NULL;
+        s_tpms->freq_315_btn = NULL; s_tpms->freq_433_btn = NULL;
+        s_tpms->scroll_cont = NULL;
+        for (int _i = 0; _i < TPMS_MAX_SENSORS; _i++) s_tpms->sensor_lbl[_i] = NULL;
+        if (s_tpms->tmr) { lv_timer_del(s_tpms->tmr); s_tpms->tmr = NULL; }
+        /* log_fp is owned exclusively by the task; it closes it on exit.
+         * Closing here while the task may be mid-fprintf causes a crash. */
+        if (!s_tpms->task) { heap_caps_free(s_tpms); s_tpms = NULL; }
     }
     // nRF24 Futaba cleanup
     if (s_nfut) {
@@ -3179,6 +3299,11 @@ static void nvs_settings_load(void)
         if (nvs_get_u8(h, NVS_KEY_RF_HAT, &rfhat) == ESP_OK) g_rf_hat_enabled = (rfhat != 0);
         uint32_t btsc_ctr = 0;
         if (nvs_get_u32(h, NVS_KEY_BTSC_CTR, &btsc_ctr) == ESP_OK) g_btsc_counter = btsc_ctr;
+        int32_t cc1101_ppm = 0;
+        if (nvs_get_i32(h, NVS_KEY_CC1101_PPM, &cc1101_ppm) == ESP_OK) {
+            if (cc1101_ppm >= -300000 && cc1101_ppm <= 300000)
+                g_cc1101_freq_offset_millippm = cc1101_ppm;
+        }
         uint8_t bt_scan_dur = 10;
         if (nvs_get_u8(h, NVS_KEY_BT_SCAN_DUR, &bt_scan_dur) == ESP_OK)
             g_bt_scan_duration_s = (bt_scan_dur >= 10 && bt_scan_dur <= 30) ? bt_scan_dur : 10;
@@ -12621,11 +12746,12 @@ static void create_function_page_base(const char *name)
     bd_status_lbl = NULL; bd_stats_lbl = NULL; bd_start_btn = NULL;
     bd_persona_dd = NULL; bd_script_dd = NULL; bd_human_sw = NULL; bd_speed_dd = NULL;
 
+    // Delete timers before freeing LVGL objects; same ordering invariant as show_menu().
+    reset_function_page_children();
     if (function_page) {
         lv_obj_del(function_page);
         function_page = NULL;
     }
-    reset_function_page_children();
 
     // Clean up home bg image when leaving a menu screen
     if (home_bg_img) {
@@ -12873,12 +12999,13 @@ void show_menu(void)
     bd_status_lbl = NULL; bd_stats_lbl = NULL; bd_start_btn = NULL;
     bd_persona_dd = NULL; bd_script_dd = NULL; bd_human_sw = NULL; bd_speed_dd = NULL;
 
-    // Delete function page if it exists
+    // Delete timers before freeing LVGL objects to prevent timer callbacks
+    // from firing against freed widget pointers.
+    reset_function_page_children();
     if (function_page) {
         lv_obj_del(function_page);
         function_page = NULL;
     }
-    reset_function_page_children();
 
     // Show main tiles and title bar
     show_main_tiles();
@@ -12919,7 +13046,7 @@ static void home_btn_event_cb(lv_event_t *e)
 static lv_obj_t *create_tile(lv_obj_t *parent, const char *icon, const char *text, lv_color_t accent, lv_event_cb_t callback, const char *user_data)
 {
     lv_obj_t *tile = lv_btn_create(parent);
-    lv_obj_set_size(tile, 70, 87);
+    lv_obj_set_size(tile, 70, 74);
     lv_obj_set_style_bg_color(tile, ui_card_color(), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(tile, ui_card_pressed_color(), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(tile, 1, 0);
@@ -16036,11 +16163,12 @@ static void show_global_attacks_screen(void)
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
-    lv_obj_set_style_pad_all(tiles, 10, 0);
-    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_style_pad_all(tiles, 4, 0);
+    lv_obj_set_style_pad_gap(tiles, 4, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
-    
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
+
     // Blackout tile - Red (dangerous)
     lv_obj_t *blackout_tile = create_tile(tiles, LV_SYMBOL_POWER, "Blackout", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(blackout_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Blackout");
@@ -16073,10 +16201,11 @@ static void show_wifi_menu_screen(void)
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
-    lv_obj_set_style_pad_all(tiles, 5, 0);
-    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_style_pad_all(tiles, 4, 0);
+    lv_obj_set_style_pad_gap(tiles, 4, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *scan_tile = create_tile(tiles, LV_SYMBOL_WIFI,       "Scan &\nAttack",   UI_ACCENT_BLUE,   main_tile_event_cb, "WiFi Scan & Attack");
     (void)scan_tile;
@@ -16105,11 +16234,12 @@ static void show_sniff_karma_screen(void)
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
-    lv_obj_set_style_pad_all(tiles, 10, 0);
-    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_style_pad_all(tiles, 4, 0);
+    lv_obj_set_style_pad_gap(tiles, 4, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
-    
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
+
     // Network Observer tile - Purple
     lv_obj_t *sniffer_tile = create_tile(tiles, MY_SYMBOL_BINOCULARS, "WiFi\nObserver", COLOR_MATERIAL_PURPLE, NULL, NULL);
     lv_obj_add_event_cb(sniffer_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Sniffer");
@@ -18208,10 +18338,11 @@ static void show_wardrive_menu_screen(void)
     lv_obj_align(tiles, LV_ALIGN_TOP_MID, 0, 30);
     lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
-    lv_obj_set_style_pad_all(tiles, 8, 0);
-    lv_obj_set_style_pad_gap(tiles, 8, 0);
+    lv_obj_set_style_pad_all(tiles, 4, 0);
+    lv_obj_set_style_pad_gap(tiles, 4, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
 
     create_tile(tiles, MY_SYMBOL_CAR,      "Start\nWardrive", COLOR_MATERIAL_RED,    wd_menu_tile_cb, "Start");
     create_tile(tiles, LV_SYMBOL_SETTINGS, "Options",         UI_ACCENT_GREEN,       wd_menu_tile_cb, "Options");
@@ -19548,6 +19679,7 @@ static void show_data_transfer_screen(void)
     lv_obj_set_style_pad_gap(tiles, 4, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
 
     create_tile(tiles, MY_SYMBOL_SERVER,  "AP File\nServer",   UI_ACCENT_CYAN,          data_transfer_tile_cb, "AP File Server");
     create_tile(tiles, MY_SYMBOL_LAPTOP, "WiFi\nClient",      COLOR_MATERIAL_GREEN,     data_transfer_tile_cb, "WiFi Client");
@@ -22009,6 +22141,136 @@ static void show_sd_format_confirm1(void)
     lv_obj_center(yes_lbl);
 }
 
+// ─── SD Remount screen ───────────────────────────────────────────────────────
+
+static lv_obj_t *s_sd_remount_status = NULL;
+static lv_obj_t *s_sd_remount_btn    = NULL;
+
+typedef struct { bool ok; uint32_t freq_khz; } sd_remount_result_t;
+
+static void s_sd_remount_done_cb(void *arg)
+{
+    sd_remount_result_t *r = (sd_remount_result_t *)arg;
+    if (s_sd_remount_status) {
+        char buf[80];
+        if (r->ok)
+            snprintf(buf, sizeof(buf), "Mounted @ %lu MHz",
+                     (unsigned long)(r->freq_khz / 1000));
+        else
+            snprintf(buf, sizeof(buf), "Failed — card not responding.\n"
+                     "Eject and reinsert, then retry.");
+        lv_label_set_text(s_sd_remount_status, buf);
+        lv_obj_set_style_text_color(s_sd_remount_status,
+            r->ok ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_RED, 0);
+    }
+    if (s_sd_remount_btn) lv_obj_clear_state(s_sd_remount_btn, LV_STATE_DISABLED);
+    free(r);
+}
+
+static void s_sd_remount_update_cb(void *arg)
+{
+    char *msg = (char *)arg;
+    if (s_sd_remount_status) {
+        lv_label_set_text(s_sd_remount_status, msg);
+        lv_obj_set_style_text_color(s_sd_remount_status, ui_text_color(), 0);
+    }
+    free(msg);
+}
+
+static void s_sd_remount_task(void *arg)
+{
+    (void)arg;
+    wifi_wardrive_unmount_sd();
+    sd_mounted_lazy = false;
+
+    static const uint32_t freqs[]       = {20000, 10000, 5000};
+    static const char    *freq_labels[] = {"Trying 20 MHz...", "Trying 10 MHz...", "Trying 5 MHz..."};
+
+    bool     ok      = false;
+    uint32_t ok_freq = 0;
+    for (int i = 0; i < 3 && !ok; i++) {
+        char *msg = strdup(freq_labels[i]);
+        if (msg) lv_async_call(s_sd_remount_update_cb, msg);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_err_t r = wifi_wardrive_init_sd_ex(freqs[i], false);
+        if (r == ESP_OK) {
+            ok      = true;
+            ok_freq = freqs[i];
+            sd_mounted_lazy = true;
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(600));
+        }
+    }
+
+    sd_remount_result_t *res = malloc(sizeof(sd_remount_result_t));
+    if (res) { res->ok = ok; res->freq_khz = ok_freq; lv_async_call(s_sd_remount_done_cb, res); }
+    vTaskDelete(NULL);
+}
+
+static void s_sd_remount_trigger_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_sd_remount_status) {
+        lv_label_set_text(s_sd_remount_status, "Unmounting...");
+        lv_obj_set_style_text_color(s_sd_remount_status, ui_text_color(), 0);
+    }
+    if (s_sd_remount_btn) lv_obj_add_state(s_sd_remount_btn, LV_STATE_DISABLED);
+    xTaskCreate(s_sd_remount_task, "sd_remount", 4096, NULL, tskIDLE_PRIORITY + 2, NULL);
+}
+
+static void show_sd_remount_screen(void)
+{
+    s_sd_remount_status = NULL;
+    s_sd_remount_btn    = NULL;
+
+    create_function_page_base("Remount SD Card");
+
+    lv_obj_t *icon = lv_label_create(function_page);
+    lv_label_set_text(icon, LV_SYMBOL_SD_CARD);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(icon,
+        wifi_wardrive_is_sd_mounted() ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 40);
+
+    s_sd_remount_status = lv_label_create(function_page);
+    lv_label_set_text(s_sd_remount_status,
+        wifi_wardrive_is_sd_mounted()
+        ? "Card is mounted.\nTap Remount to cycle and re-mount.\n(Useful after a crash or stuck state.)"
+        : "Card not mounted.\nTap Remount to attempt mount.");
+    lv_obj_set_style_text_font(s_sd_remount_status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_sd_remount_status, ui_text_color(), 0);
+    lv_obj_set_style_text_align(s_sd_remount_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_sd_remount_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_sd_remount_status, LCD_H_RES - 20);
+    lv_obj_align(s_sd_remount_status, LV_ALIGN_TOP_MID, 0, 120);
+
+    s_sd_remount_btn = lv_btn_create(function_page);
+    lv_obj_set_size(s_sd_remount_btn, 170, 40);
+    lv_obj_align(s_sd_remount_btn, LV_ALIGN_TOP_MID, 0, 210);
+    lv_obj_set_style_bg_color(s_sd_remount_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(s_sd_remount_btn, lv_color_darken(COLOR_MATERIAL_GREEN, 30),
+                               LV_STATE_DISABLED);
+    lv_obj_set_style_radius(s_sd_remount_btn, 8, 0);
+    lv_obj_set_style_border_width(s_sd_remount_btn, 0, 0);
+    lv_obj_t *bl = lv_label_create(s_sd_remount_btn);
+    lv_label_set_text(bl, LV_SYMBOL_REFRESH " Remount SD Card");
+    lv_obj_set_style_text_font(bl, &lv_font_montserrat_14, 0);
+    lv_obj_center(bl);
+    lv_obj_add_event_cb(s_sd_remount_btn, s_sd_remount_trigger_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *back_btn = lv_btn_create(function_page);
+    lv_obj_set_size(back_btn, 90, 34);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(back_btn, 0, 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_add_event_cb(back_btn, sd_back_to_menu_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *bbl = lv_label_create(back_btn);
+    lv_label_set_text(bbl, "Back");
+    lv_obj_set_style_text_color(bbl, ui_text_color(), 0);
+    lv_obj_center(bbl);
+}
+
 // ─── SD Card sub-menu ────────────────────────────────────────────────────────
 
 static void sd_card_tile_event_cb(lv_event_t *e)
@@ -22020,6 +22282,7 @@ static void sd_card_tile_event_cb(lv_event_t *e)
     else if (strcmp(name, "Tree") == 0)        show_sd_tree_screen();
     else if (strcmp(name, "New Folder") == 0)  show_new_folder_screen();
     else if (strcmp(name, "Delete File") == 0) show_delete_file_screen();
+    else if (strcmp(name, "Remount") == 0)     show_sd_remount_screen();
     else if (strcmp(name, "Format") == 0)      show_sd_format_confirm1();
 }
 
@@ -22032,10 +22295,11 @@ static void show_sd_card_screen(void)
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
-    lv_obj_set_style_pad_all(tiles, 10, 0);
-    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_style_pad_all(tiles, 4, 0);
+    lv_obj_set_style_pad_gap(tiles, 4, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
 
     create_tile(tiles, LV_SYMBOL_OK,          "Validate &\nProvision", COLOR_MATERIAL_TEAL,
                 sd_card_tile_event_cb, "Validate");
@@ -22047,6 +22311,8 @@ static void show_sd_card_screen(void)
                 sd_card_tile_event_cb, "New Folder");
     create_tile(tiles, LV_SYMBOL_TRASH,       "Delete\nFile",          COLOR_MATERIAL_RED,
                 sd_card_tile_event_cb, "Delete File");
+    create_tile(tiles, LV_SYMBOL_REFRESH,     "Remount\nSD Card",      lv_color_hex(0x00897B),
+                sd_card_tile_event_cb, "Remount");
     create_tile(tiles, LV_SYMBOL_WARNING,     "Format\nSD Card",       lv_color_hex(0xB71C1C),
                 sd_card_tile_event_cb, "Format");
 }
@@ -22509,10 +22775,11 @@ static void show_wifi_monitor_screen(void)
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
-    lv_obj_set_style_pad_all(tiles, 10, 0);
-    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_style_pad_all(tiles, 4, 0);
+    lv_obj_set_style_pad_gap(tiles, 4, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
     
     // Evil Twin Passwords - Blue
     create_tile(tiles, MY_SYMBOL_KEY,      "Evil Twin\nPasswords", COLOR_TILE_BLUE, wifi_monitor_tile_event_cb, "Evil Twin Passwords");
@@ -25282,10 +25549,11 @@ static void show_bluetooth_screen(void)
     lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
-    lv_obj_set_style_pad_all(tiles, 6, 0);
-    lv_obj_set_style_pad_gap(tiles, 6, 0);
+    lv_obj_set_style_pad_all(tiles, 4, 0);
+    lv_obj_set_style_pad_gap(tiles, 4, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
 
     // BT Scan & Select - first tile, cyan
     lv_obj_t *btsas_tile = create_tile(tiles, MY_SYMBOL_CROSSHAIRS,   "BT Scan\n& Select", UI_ACCENT_CYAN, NULL, NULL);
@@ -29429,10 +29697,11 @@ static void show_bt_attacks_screen(void)
     lv_obj_align(tiles, LV_ALIGN_TOP_MID, 0, 30);
     lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
-    lv_obj_set_style_pad_all(tiles, 10, 0);
-    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_style_pad_all(tiles, 4, 0);
+    lv_obj_set_style_pad_gap(tiles, 4, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *spam_tile = create_tile(tiles, MY_SYMBOL_PAPER_PLANE, "BLE\nSpam", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(spam_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spam");
@@ -36910,35 +37179,53 @@ static int rf433_lbk_phase(int tx_pin, int rx_pin)
 
 static void rf433_lbk_task(void *arg)
 {
+    int tx_pin = RF_HAT_RF433_TX_GPIO;
+    int rx_pin = RF_HAT_RF433_RX_GPIO;
+
+    // Sample RX idle level before driving TX — reveals pull-up/module state
+    gpio_config_t pre_cfg = {
+        .pin_bit_mask = 1ULL << rx_pin,
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&pre_cfg);
+    int idle_rx = gpio_get_level(rx_pin);
+    ESP_LOGI(TAG, "[RF433 LBK] RX GPIO%d idle level = %d", rx_pin, idle_rx);
+
     if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
         if (lv_obj_is_valid(s_lbk_status_lbl))
             lv_label_set_text_fmt(s_lbk_status_lbl,
-                "Testing GPIO%d TX -> GPIO%d RX...",
-                RF_HAT_RF433_TX_GPIO, RF_HAT_RF433_RX_GPIO);
+                "GPIO%d idle=%d  Testing TX%d->RX%d...",
+                rx_pin, idle_rx, tx_pin, rx_pin);
         xSemaphoreGive(lvgl_mutex);
     }
-    int edges = rf433_lbk_phase(RF_HAT_RF433_TX_GPIO, RF_HAT_RF433_RX_GPIO);
 
-    ESP_LOGI(TAG, "[RF433 LBK] GPIO%d TX -> GPIO%d RX: %d transitions (%s)",
-             RF_HAT_RF433_TX_GPIO, RF_HAT_RF433_RX_GPIO,
-             edges, edges >= 6 ? "PASS" : "FAIL");
+    int edges = rf433_lbk_phase(tx_pin, rx_pin);
+
+    ESP_LOGI(TAG, "[RF433 LBK] GPIO%d TX -> GPIO%d RX: %d transitions (%s)  idle_rx=%d",
+             tx_pin, rx_pin, edges, edges >= 6 ? "PASS" : "FAIL", idle_rx);
 
     // Restore RF433 driver
     rf433_hat_init();
 
-    // Build result string — use LVGL recolor syntax
-    char result[160];
+    // Build result — LVGL recolor syntax
+    char result[256];
     if (edges >= 6) {
         snprintf(result, sizeof(result),
-            "#00C853 PASS#\n"
-            "GPIO%d TX  GPIO%d RX  Edges: %d",
-            RF_HAT_RF433_TX_GPIO, RF_HAT_RF433_RX_GPIO, edges);
+            "#00C853 PASS# - carrier received\n"
+            "TX=GPIO%d  RX=GPIO%d\n"
+            "RX idle: %d  Edges: %d / 40\n"
+            "(>= 6 required)",
+            tx_pin, rx_pin, idle_rx, edges);
     } else {
         snprintf(result, sizeof(result),
-            "#FF5722 FAIL#\n"
-            "No carrier detected. Check DIP 5 ON.\n"
-            "Edges: %d (need >= 6)",
-            edges);
+            "#FF5722 FAIL# - weak/no carrier\n"
+            "TX=GPIO%d  RX=GPIO%d\n"
+            "RX idle: %d  Edges: %d / 40\n"
+            "Check DIP 5 ON",
+            tx_pin, rx_pin, idle_rx, edges);
     }
 
     if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
@@ -37044,10 +37331,28 @@ static void rf433_menu_tile_cb(lv_event_t *e)
         show_rf433_jammer_screen();
     else if (strcmp(name, "LBK Test") == 0)
         show_rf433_loopback_screen();
+    else if (strcmp(name, "FoxHunt") == 0)
+        show_rf433_foxhunt_screen();
+    else if (strcmp(name, "OOKScan") == 0)
+        show_rf433_ook_scan_screen();
 }
 
 static void show_rf433_menu_screen(void)
 {
+    // RF433 Fox Hunt + OOK Scan cleanup
+    if (s_rf433_fox_tmr) { lv_timer_del(s_rf433_fox_tmr); s_rf433_fox_tmr = NULL; }
+    if (s_rf433_fox_isr_installed) {
+        gpio_isr_handler_remove(RF_HAT_RF433_RX_GPIO);
+        s_rf433_fox_isr_installed = false;
+    }
+    if (s_rf433_scan_task) { s_rf433_scan_stop = true; }
+    s_rf433_scan_status = NULL; s_rf433_scan_list = NULL;
+    vibrator_off();
+    g_vibtest_strength_pct = s_rf433_fox_saved_vib_pct;
+    s_rf433_fox_bar = NULL; s_rf433_fox_lbl = NULL;
+    s_rf433_fox_hbtn = NULL; s_rf433_fox_status = NULL;
+    s_rf433_fox_edges = 0; s_rf433_fox_hap_ctr = 0;
+
     create_function_page_base("RF433 OOK");
     apply_menu_bg();
 
@@ -37066,6 +37371,8 @@ static void show_rf433_menu_screen(void)
     create_tile(tiles, LV_SYMBOL_PLAY,    "Replay",   lv_color_hex(0x5D4037), rf433_menu_tile_cb, "Replay");
     create_tile(tiles, LV_SYMBOL_WARNING, "Jammer",   lv_color_hex(0xB71C1C), rf433_menu_tile_cb, "Jammer");
     create_tile(tiles, LV_SYMBOL_LOOP,    "LBK Test", lv_color_hex(0x00695C), rf433_menu_tile_cb, "LBK Test");
+    create_tile(tiles, MY_SYMBOL_PERSON_WALKING, "Fox\nHunt",  lv_color_hex(0xE65100), rf433_menu_tile_cb, "FoxHunt");
+    create_tile(tiles, LV_SYMBOL_EYE_OPEN,      "OOK\nScan", lv_color_hex(0xFF8F00), rf433_menu_tile_cb, "OOKScan");
 
     rfhat_add_back_btn("Radio", show_radio_menu_screen_from_rf433);
 }
@@ -37121,10 +37428,45 @@ static void show_radio_menu_screen(void)
 // Current frequency (MHz) — shared across CC1101 sub-screens
 static float s_cc1101_freq_mhz = 433.92f;
 
+// ── CC1101 Weather + Alarm task state (declared early for cleanup in show_cc1101_screen) ──
+static lv_obj_t   *s_wx_status  = NULL;
+static lv_obj_t   *s_wx_list    = NULL;
+static TaskHandle_t s_wx_task   = NULL;
+static volatile bool s_wx_stop  = false;
+static lv_obj_t   *s_alm_status = NULL;
+static lv_obj_t   *s_alm_list   = NULL;
+static TaskHandle_t s_alm_task  = NULL;
+static volatile bool s_alm_stop = false;
+
+// ── CC1101 Calibration TX state ───────────────────────────────────────────────
+static bool       s_cc1101_cal_tx_active = false;
+static lv_timer_t *s_cc1101_cal_tx_tmr  = NULL;
+static lv_obj_t   *s_cc1101_ht_offset_lbl = NULL;
+static lv_obj_t   *s_cc1101_ht_cal_btn    = NULL;
+static lv_obj_t   *s_offset_overlay = NULL;
+static lv_obj_t   *s_offset_ta      = NULL;
+
 // Freq scan screen
 static lv_obj_t *s_cc1101_rssi_bar   = NULL;
 static lv_obj_t *s_cc1101_rssi_lbl   = NULL;
 static lv_timer_t *s_cc1101_tmr      = NULL;
+
+// ── Fox Hunt shared state (declared early — cleanup referenced by show_cc1101_screen) ──
+static lv_obj_t  *s_fox_rssi_bar     = NULL;
+static lv_obj_t  *s_fox_rssi_lbl     = NULL;
+static lv_obj_t  *s_fox_peak_lbl     = NULL;
+static lv_obj_t  *s_fox_freq_lbl     = NULL;
+static lv_obj_t  *s_fox_squelch_lbl  = NULL;
+static lv_obj_t  *s_fox_haptic_btn   = NULL;
+static lv_obj_t  *s_fox_status_lbl   = NULL;
+static lv_timer_t *s_fox_tmr         = NULL;
+static int8_t    s_fox_squelch_dbm   = -90;
+static int8_t    s_fox_peak_dbm      = -120;
+static bool      s_fox_haptic_on     = true;
+static int       s_fox_haptic_ctr    = 0;
+static uint8_t   s_fox_saved_vib_pct = 100;
+static bool      s_fox_setup_done    = false;  // deferred CC1101 init after task exit
+
 
 // HW test screen labels (nulled on leaving)
 static lv_obj_t *s_cc1101_ht_status = NULL;
@@ -37135,8 +37477,43 @@ static lv_obj_t *s_cc1101_ht_rssi  = NULL;
 static lv_obj_t *s_cc1101_ht_freq  = NULL;
 
 // Jammer screen state
-static lv_obj_t *s_cc1101_jam_status = NULL;
-static bool      s_cc1101_jamming    = false;
+static lv_obj_t *s_cc1101_jam_status   = NULL;
+static lv_obj_t *s_cc1101_jam_freq_lbl = NULL;
+static lv_obj_t *s_jam_band_btns[5]    = {NULL, NULL, NULL, NULL, NULL};
+static bool      s_cc1101_jamming      = false;
+
+// Jammer band selection and sweep tables (12 steps each)
+typedef enum { JAM_BAND_315=0, JAM_BAND_433W, JAM_BAND_433N, JAM_BAND_868, JAM_BAND_915 } jam_band_t;
+#define JAM_STEPS  12
+static jam_band_t s_jam_band = JAM_BAND_433N;
+
+// 315 MHz  — 12 steps, 50 kHz spacing (314.65–315.20 MHz)
+static const float s_jam_315[JAM_STEPS] = {
+    314.65f, 314.70f, 314.75f, 314.80f, 314.85f, 314.90f,
+    314.95f, 315.00f, 315.05f, 315.10f, 315.15f, 315.20f };
+
+// 433 MHz wide — 12 steps, 100 kHz spacing (433.0–434.1 MHz)
+static const float s_jam_433[JAM_STEPS] = {
+    433.0f, 433.1f, 433.2f, 433.3f, 433.4f, 433.5f,
+    433.6f, 433.7f, 433.8f, 433.9f, 434.0f, 434.1f };
+
+// 433 MHz narrow — 12 steps, 15 kHz spacing centred on 433.920 (±80 kHz)
+static const float s_jam_433n[JAM_STEPS] = {
+    433.840f, 433.855f, 433.870f, 433.885f, 433.900f, 433.915f,
+    433.930f, 433.945f, 433.960f, 433.975f, 433.990f, 434.005f };
+
+// 868 MHz  — 12 steps, 100 kHz spacing (867.5–868.6 MHz)
+static const float s_jam_868[JAM_STEPS] = {
+    867.5f, 867.6f, 867.7f, 867.8f, 867.9f, 868.0f,
+    868.1f, 868.2f, 868.3f, 868.4f, 868.5f, 868.6f };
+
+// 915 MHz  — 12 steps, 50 kHz spacing (914.75–915.30 MHz)
+static const float s_jam_915[JAM_STEPS] = {
+    914.75f, 914.80f, 914.85f, 914.90f, 914.95f, 915.00f,
+    915.05f, 915.10f, 915.15f, 915.20f, 915.25f, 915.30f };
+
+static const float *s_jam_table = s_jam_433;
+static int s_jam_freq_idx = 0;
 static lv_timer_t *s_cc1101_jam_tmr = NULL;
 
 // Freq scan header label (kept across redraws; updated by freq button)
@@ -37242,13 +37619,13 @@ static void s_cc1101_stub_screen(const char *title_text, const char *detail)
 
 // ── Paged tile menu ───────────────────────────────────────────────────────────
 
-#define CC1101_NUM_PAGES  3
+#define CC1101_NUM_PAGES  2
 
 static int        s_cc1101_page = 0;
 static lv_obj_t  *s_cc1101_pages[CC1101_NUM_PAGES] = {NULL};
 static lv_obj_t  *s_cc1101_page_lbl = NULL;
 
-static const char *s_cc1101_page_strs[CC1101_NUM_PAGES] = { "1/3", "2/3", "3/3" };
+static const char *s_cc1101_page_strs[CC1101_NUM_PAGES] = { "1/2", "2/2" };
 
 static void s_cc1101_page_prev_cb(lv_event_t *e)
 {
@@ -37273,7 +37650,7 @@ static void s_cc1101_page_next_cb(lv_event_t *e)
 static lv_obj_t *s_cc1101_make_page(lv_obj_t *parent)
 {
     lv_obj_t *pg = lv_obj_create(parent);
-    lv_obj_set_size(pg, LCD_H_RES, 182);   // 2 rows × 87 + 4 gap + 4 pad
+    lv_obj_set_size(pg, LCD_H_RES, 238);   // 3 rows × 74 + 2×4 gap + 2×4 pad
     lv_obj_align(pg, LV_ALIGN_TOP_MID, 0, 0);
     lv_obj_set_style_bg_opa(pg, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(pg, 0, 0);
@@ -37291,6 +37668,7 @@ static void s_cc1101_tile_cb(lv_event_t *e)
     if (!name) return;
     if      (strcmp(name, "HW Test")   == 0) show_cc1101_hw_test_screen();
     else if (strcmp(name, "Freq Scan") == 0) show_cc1101_freq_scan_screen();
+    else if (strcmp(name, "FoxHunt")  == 0) show_cc1101_foxhunt_screen();
     else if (strcmp(name, "Capture")   == 0) show_cc1101_capture_screen();
     else if (strcmp(name, "Replay")    == 0) show_cc1101_replay_screen();
     else if (strcmp(name, "Saved")     == 0) show_cc1101_saved_screen();
@@ -37302,7 +37680,6 @@ static void s_cc1101_tile_cb(lv_event_t *e)
     else if (strcmp(name, "POCSAG")    == 0) show_cc1101_pocsag_screen();
     else if (strcmp(name, "Alarm")     == 0) show_cc1101_alarm_screen();
     else if (strcmp(name, "Wardrive")  == 0) show_cc1101_wardrive_screen();
-    else if (strcmp(name, "Proximity") == 0) show_cc1101_proximity_screen();
     else if (strcmp(name, "BndScope")  == 0) show_cc1101_bandscope_screen();
     else if (strcmp(name, "ZWave")     == 0) show_cc1101_zwave_screen();
 }
@@ -37317,6 +37694,24 @@ static void show_cc1101_screen(void)
     if (s_cc1101_cap_task) cc1101_capture_cancel();
     if (s_cc1101_rep_task) cc1101_replay_cancel();
     if (s_cc1101_sub_paths) { free(s_cc1101_sub_paths); s_cc1101_sub_paths = NULL; }
+    // Weather + Alarm scan task cleanup
+    if (s_wx_task)  { s_wx_stop  = true; }
+    if (s_alm_task) { s_alm_stop = true; }
+    s_wx_status = NULL;  s_wx_list  = NULL;
+    s_alm_status = NULL; s_alm_list = NULL;
+    // Calibration TX cleanup (HW test screen)
+    s_cal_tx_stop();
+    s_cc1101_ht_offset_lbl = NULL;
+    s_cc1101_ht_cal_btn    = NULL;
+    if (s_offset_overlay) { lv_obj_del(s_offset_overlay); s_offset_overlay = NULL; s_offset_ta = NULL; }
+    // Fox hunt cleanup
+    if (s_fox_tmr) { lv_timer_del(s_fox_tmr); s_fox_tmr = NULL; }
+    s_fox_setup_done = false;
+    vibrator_off();
+    g_vibtest_strength_pct = s_fox_saved_vib_pct;
+    s_fox_rssi_bar = NULL; s_fox_rssi_lbl = NULL; s_fox_peak_lbl = NULL;
+    s_fox_freq_lbl = NULL; s_fox_squelch_lbl = NULL; s_fox_haptic_btn = NULL;
+    s_fox_status_lbl = NULL;
     if (s_bs) {
         s_bs->active = false; s_bs->cancel = true;
         s_bs->canvas = NULL; s_bs->status_lbl = NULL; s_bs->start_btn = NULL;
@@ -37335,6 +37730,8 @@ static void show_cc1101_screen(void)
     s_cc1101_freq_hdr        = NULL;
     s_cc1101_cap_freq_lbl    = NULL;
     s_cc1101_jam_status      = NULL;
+    s_cc1101_jam_freq_lbl    = NULL;
+    for (int i = 0; i < 5; i++) s_jam_band_btns[i] = NULL;
     s_cc1101_ht_status       = NULL;
     s_cc1101_jamming         = false;
     s_cc1101_cap_status_lbl  = NULL;
@@ -37350,9 +37747,9 @@ static void show_cc1101_screen(void)
     create_function_page_base("CC1101 Sub-GHz");
     apply_menu_bg();
 
-    // Tile container (holds all 3 pages, only one visible at a time)
+    // Tile container (holds all pages, only one visible at a time)
     lv_obj_t *tc = lv_obj_create(function_page);
-    lv_obj_set_size(tc, LCD_H_RES, 190);
+    lv_obj_set_size(tc, LCD_H_RES, 244);
     lv_obj_align(tc, LV_ALIGN_TOP_MID, 0, 30);
     lv_obj_set_style_bg_opa(tc, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tc, 0, 0);
@@ -37365,30 +37762,26 @@ static void show_cc1101_screen(void)
         if (i > 0) lv_obj_add_flag(s_cc1101_pages[i], LV_OBJ_FLAG_HIDDEN);
     }
 
-    // Page 1: Capture & Analysis
+    // Page 1: Tools & Decoders (9 tiles)
     lv_obj_t *p1 = s_cc1101_pages[0];
-    create_tile(p1, LV_SYMBOL_SETTINGS,     "HW\nTest",    lv_color_hex(0x37474F), s_cc1101_tile_cb, "HW Test");
-    create_tile(p1, MY_SYMBOL_SATELLITE,   "Band\nScope",  lv_color_hex(0x006064), s_cc1101_tile_cb, "BndScope");
-    create_tile(p1, LV_SYMBOL_EYE_OPEN,    "Capture\nRAW",lv_color_hex(0x1B5E20), s_cc1101_tile_cb, "Capture");
-    create_tile(p1, LV_SYMBOL_PLAY,        "Replay\nRAW", lv_color_hex(0x1A237E), s_cc1101_tile_cb, "Replay");
-    create_tile(p1, LV_SYMBOL_SAVE,        "Saved\nFiles",lv_color_hex(0x4A148C), s_cc1101_tile_cb, "Saved");
-    create_tile(p1, MY_SYMBOL_SITEMAP,     "Z-Wave\nScout",lv_color_hex(0x1565C0),s_cc1101_tile_cb, "ZWave");
+    create_tile(p1, LV_SYMBOL_SETTINGS,      "HW\nTest",     lv_color_hex(0x37474F), s_cc1101_tile_cb, "HW Test");
+    create_tile(p1, MY_SYMBOL_SATELLITE,     "Band\nScope",  lv_color_hex(0x006064), s_cc1101_tile_cb, "BndScope");
+    create_tile(p1, MY_SYMBOL_PERSON_WALKING,"Fox\nHunt",    lv_color_hex(0xE65100), s_cc1101_tile_cb, "FoxHunt");
+    create_tile(p1, LV_SYMBOL_EYE_OPEN,     "Capture\nRAW", lv_color_hex(0x1B5E20), s_cc1101_tile_cb, "Capture");
+    create_tile(p1, LV_SYMBOL_PLAY,         "Replay\nRAW",  lv_color_hex(0x1A237E), s_cc1101_tile_cb, "Replay");
+    create_tile(p1, LV_SYMBOL_SAVE,         "Saved\nFiles", lv_color_hex(0x4A148C), s_cc1101_tile_cb, "Saved");
+    create_tile(p1, MY_SYMBOL_SITEMAP,      "Z-Wave\nScout",lv_color_hex(0x1565C0), s_cc1101_tile_cb, "ZWave");
+    create_tile(p1, MY_SYMBOL_CAR,          "TPMS\nTires",  lv_color_hex(0x00695C), s_cc1101_tile_cb, "TPMS");
+    create_tile(p1, MY_SYMBOL_SATELLITE_DISH,"Weather\nStn",lv_color_hex(0x006064), s_cc1101_tile_cb, "Weather");
 
-    // Page 2: Protocol Decoders
+    // Page 2: Decoders & Attacks (7 tiles)
     lv_obj_t *p2 = s_cc1101_pages[1];
-    create_tile(p2, MY_SYMBOL_CAR,          "TPMS\nTires",  lv_color_hex(0x1565C0), s_cc1101_tile_cb, "TPMS");
-    create_tile(p2, MY_SYMBOL_SATELLITE_DISH,"Weather\nStn",lv_color_hex(0x00695C), s_cc1101_tile_cb, "Weather");
-    create_tile(p2, MY_SYMBOL_TOWER,        "POCSAG\nPager",lv_color_hex(0x4527A0), s_cc1101_tile_cb, "POCSAG");
-    create_tile(p2, LV_SYMBOL_WARNING,     "Alarm\nSensor",lv_color_hex(0xB71C1C), s_cc1101_tile_cb, "Alarm");
-    create_tile(p2, MY_SYMBOL_CAR,         "RF\nWardrive", lv_color_hex(0x827717), s_cc1101_tile_cb, "Wardrive");
-    create_tile(p2, MY_SYMBOL_PERSON_WALKING,"Prox\nTrack",lv_color_hex(0x880E4F), s_cc1101_tile_cb, "Proximity");
-
-    // Page 3: Attacks (disclaimer displayed when entered)
-    lv_obj_t *p3 = s_cc1101_pages[2];
-    create_tile(p3, MY_SYMBOL_SKULL_CROSS,  "Jammer",      UI_ACCENT_RED,          s_cc1101_tile_cb, "Jammer");
-    create_tile(p3, LV_SYMBOL_SHUFFLE,     "Brute\nForce", lv_color_hex(0xE65100), s_cc1101_tile_cb, "Brute");
-    create_tile(p3, MY_SYMBOL_SATELLITE,   "Freq\nScan",   lv_color_hex(0x006064), s_cc1101_tile_cb, "Freq Scan");
-    create_tile(p3, LV_SYMBOL_LIST,        "Decode\nProto",lv_color_hex(0x0D47A1), s_cc1101_tile_cb, "Decode");
+    create_tile(p2, MY_SYMBOL_TOWER,         "POCSAG\nPager",lv_color_hex(0x4527A0), s_cc1101_tile_cb, "POCSAG");
+    create_tile(p2, LV_SYMBOL_WARNING,       "Alarm\nSensor",lv_color_hex(0xB71C1C), s_cc1101_tile_cb, "Alarm");
+    create_tile(p2, MY_SYMBOL_CAR,           "RF\nWardrive", lv_color_hex(0x827717), s_cc1101_tile_cb, "Wardrive");
+    create_tile(p2, LV_SYMBOL_LIST,          "Decode\nProto",lv_color_hex(0x0D47A1), s_cc1101_tile_cb, "Decode");
+    create_tile(p2, MY_SYMBOL_SKULL_CROSS,   "Jammer",       UI_ACCENT_RED,          s_cc1101_tile_cb, "Jammer");
+    create_tile(p2, LV_SYMBOL_SHUFFLE,       "Brute\nForce", lv_color_hex(0xE65100), s_cc1101_tile_cb, "Brute");
 
     // Navigation bar: [<] [1/3] [>] | [Back]
     lv_obj_t *nav = lv_obj_create(function_page);
@@ -37431,7 +37824,7 @@ static void show_cc1101_screen(void)
 
     // Page indicator
     s_cc1101_page_lbl = lv_label_create(nav);
-    lv_label_set_text(s_cc1101_page_lbl, "1/3");
+    lv_label_set_text(s_cc1101_page_lbl, "1/2");
     lv_obj_set_style_text_font(s_cc1101_page_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_cc1101_page_lbl, lv_color_hex(0x66BB6A), 0);
 
@@ -37462,30 +37855,52 @@ static void s_cc1101_ht_run_cb(lv_event_t *e)
 
     esp_err_t err = cc1101_init();
     if (err == ESP_OK) {
-        uint8_t pn  = cc1101_get_partnum();
-        uint8_t ver = cc1101_get_version();
+        uint8_t pn   = cc1101_get_partnum();
+        uint8_t ver  = cc1101_get_version();
         int8_t  rssi = cc1101_get_rssi_dbm();
         uint8_t marc = cc1101_get_marc_state();
         float   freq = cc1101_get_freq_mhz();
+        uint8_t mdm2 = cc1101_read_reg(CC1101_MDMCFG2);
+        uint8_t mdm4 = cc1101_read_reg(CC1101_MDMCFG4);
+        uint8_t pkt0 = cc1101_read_reg(CC1101_PKTCTRL0);
+        uint8_t lqi  = cc1101_read_status(CC1101_LQI);
+        uint8_t rxb  = cc1101_read_status(CC1101_RXBYTES) & 0x7F;
+        uint8_t pks  = cc1101_read_status(CC1101_PKTSTATUS);
+        // Decode modulation from MDMCFG2 bits [6:4]
+        static const char *mod_lut[8] = {
+            "2-FSK","GFSK","?","OOK","4-FSK","?","?","MSK"
+        };
+        const char *mod = mod_lut[(mdm2 >> 4) & 0x07];
+        // Decode MARCSTATE name
+        const char *marc_name =
+            (marc == 0x01) ? "IDLE" : (marc == 0x0D) ? "RX" :
+            (marc == 0x13) ? "TX"  : (marc == 0x00) ? "SLEEP" : "OTHER";
+
+        ESP_LOGI("CC1101_HWT",
+                 "PARTNUM=0x%02X VERSION=0x%02X MARC=0x%02X(%s) RSSI=%d dBm "
+                 "FREQ=%.2f MHz MDMCFG2=0x%02X MDMCFG4=0x%02X PKTCTRL0=0x%02X "
+                 "LQI=0x%02X RXBYTES=%u PKTSTATUS=0x%02X",
+                 pn, ver, marc, marc_name, (int)rssi, (double)freq,
+                 mdm2, mdm4, pkt0, lqi, rxb, pks);
 
         lv_label_set_text(s_cc1101_ht_status, "PASS - CC1101 detected");
         lv_obj_set_style_text_color(s_cc1101_ht_status, lv_color_hex(0x66BB6A), 0);
 
-        char buf[40];
-        snprintf(buf, sizeof(buf), "PARTNUM: 0x%02X (exp 0x00)", pn);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "PARTNUM: 0x%02X  VERSION: 0x%02X", pn, ver);
         lv_label_set_text(s_cc1101_ht_pn, buf);
-        snprintf(buf, sizeof(buf), "VERSION: 0x%02X (exp 0x14)", ver);
+        snprintf(buf, sizeof(buf), "MARC: 0x%02X (%s)  LQI: 0x%02X", marc, marc_name, lqi);
         lv_label_set_text(s_cc1101_ht_ver, buf);
-        snprintf(buf, sizeof(buf), "MARCSTATE: 0x%02X", marc);
+        snprintf(buf, sizeof(buf), "MDMCFG2: 0x%02X  Mod: %s  PKTCTRL0: 0x%02X", mdm2, mod, pkt0);
         lv_label_set_text(s_cc1101_ht_marc, buf);
-        snprintf(buf, sizeof(buf), "RSSI: %d dBm", (int)rssi);
+        snprintf(buf, sizeof(buf), "RSSI: %d dBm  RXBYTES: %u", (int)rssi, rxb);
         lv_label_set_text(s_cc1101_ht_rssi, buf);
-        snprintf(buf, sizeof(buf), "Freq: %.2f MHz", (double)freq);
+        snprintf(buf, sizeof(buf), "Freq: %.2f MHz  PKTSTATUS: 0x%02X", (double)freq, pks);
         lv_label_set_text(s_cc1101_ht_freq, buf);
     } else {
         lv_label_set_text(s_cc1101_ht_status, "FAIL - No CC1101 found");
         lv_obj_set_style_text_color(s_cc1101_ht_status, UI_ACCENT_RED, 0);
-        lv_label_set_text(s_cc1101_ht_pn,   "Check DIP 1 and wiring");
+        lv_label_set_text(s_cc1101_ht_pn,   "Check DIP 1 ON");
         lv_label_set_text(s_cc1101_ht_ver,   "GPIO9=CS  GPIO8=GDO0");
         lv_label_set_text(s_cc1101_ht_marc,  "SPI2_HOST shared bus");
         lv_label_set_text(s_cc1101_ht_rssi,  "");
@@ -37494,22 +37909,223 @@ static void s_cc1101_ht_run_cb(lv_event_t *e)
     (void)e;
 }
 
+// NVS save for CC1101 crystal offset
+static void nvs_save_cc1101_offset(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, NVS_KEY_CC1101_PPM, g_cc1101_freq_offset_millippm);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+// ── Calibration TX (continuous OOK carrier for frequency measurement) ─────────
+
+static void s_cal_tx_stop(void)
+{
+    s_cc1101_cal_tx_active = false;
+    if (s_cc1101_cal_tx_tmr) { lv_timer_del(s_cc1101_cal_tx_tmr); s_cc1101_cal_tx_tmr = NULL; }
+    if (cc1101_is_init()) cc1101_idle();
+    if (s_cc1101_ht_cal_btn) {
+        lv_obj_t *l = lv_obj_get_child(s_cc1101_ht_cal_btn, 0);
+        if (l) lv_label_set_text(l, LV_SYMBOL_PLAY " CAL TX 433");
+        lv_obj_set_style_bg_color(s_cc1101_ht_cal_btn, lv_color_hex(0x827717), LV_STATE_DEFAULT);
+    }
+}
+
+// Timer callback: re-strobe TX every 100 ms (same pattern as jammer, faster rate).
+// OOK in async mode produces a brief RF burst on each STX strobe — visible on
+// spectrum scope or service monitor with peak hold at the calibrated frequency.
+static void s_cal_tx_restrobe_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!s_cc1101_cal_tx_active || !cc1101_is_init()) return;
+    cc1101_tx();  // flush TX FIFO + re-strobe STX (identical to jammer approach)
+}
+
+static void s_cal_tx_toggle_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_cc1101_cal_tx_active) { s_cal_tx_stop(); return; }
+    if (!cc1101_is_init() && cc1101_init() != ESP_OK) return;
+
+    cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);
+    cc1101_set_freq_mhz(cc1101_freq_cal(433.920f));
+    // CRITICAL: set PA table for OOK output power.
+    // After cc1101_init() sends SRES, PATABLE resets to [0xC0, 0x00, ...].
+    // OOK mode routes '1' bits through PATABLE[1] (FREND0=0x11). Without this
+    // call PATABLE[1]=0x00 → no RF output despite TX being active.
+    cc1101_set_output_power_dbm(10);
+    cc1101_tx();  // flush TX FIFO + STX (same as jammer)
+
+    s_cc1101_cal_tx_active = true;
+    s_cc1101_cal_tx_tmr = lv_timer_create(s_cal_tx_restrobe_cb, 100, NULL);
+    if (s_cc1101_ht_cal_btn) {
+        lv_obj_t *l = lv_obj_get_child(s_cc1101_ht_cal_btn, 0);
+        if (l) lv_label_set_text(l, LV_SYMBOL_STOP " TX ACTIVE");
+        lv_obj_set_style_bg_color(s_cc1101_ht_cal_btn, UI_ACCENT_RED, LV_STATE_DEFAULT);
+    }
+}
+
+static void s_offset_confirm_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_offset_ta) {
+        const char *txt = lv_textarea_get_text(s_offset_ta);
+        float khz = 0.0f;
+        if (sscanf(txt, "%f", &khz) == 1) {
+            // Convert kHz measured at 433.920 MHz calibration frequency to millippm.
+            // millippm = khz × 1000 Hz / 433920000 Hz × 1e9 = khz × 1e6 / 433.920
+            int32_t mppm = (int32_t)(khz * 1000000.0f / 433.920f);
+            if (mppm < -300000) mppm = -300000;  // -300 ppm (≈-130 kHz @ 433)
+            if (mppm >  300000) mppm =  300000;  // +300 ppm (≈+130 kHz @ 433)
+            g_cc1101_freq_offset_millippm = mppm;
+            nvs_save_cc1101_offset();
+            if (s_cc1101_ht_offset_lbl) {
+                char buf[64];
+                if (mppm == 0) {
+                    snprintf(buf, sizeof(buf), "Offset: 0.0 ppm (uncalibrated)");
+                } else {
+                    float ppm = mppm / 1000.0f;
+                    snprintf(buf, sizeof(buf), "Offset: %+.1f ppm (%+.1f kHz @ 433 MHz)",
+                             (double)ppm, (double)khz);
+                }
+                lv_label_set_text(s_cc1101_ht_offset_lbl, buf);
+                lv_obj_set_style_text_color(s_cc1101_ht_offset_lbl,
+                    mppm == 0 ? lv_color_hex(0x9E9E9E) : lv_color_hex(0xFFB300), 0);
+            }
+        }
+    }
+    if (s_offset_overlay) { lv_obj_del(s_offset_overlay); s_offset_overlay = NULL; s_offset_ta = NULL; }
+}
+
+static void s_offset_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_offset_overlay) { lv_obj_del(s_offset_overlay); s_offset_overlay = NULL; s_offset_ta = NULL; }
+}
+
+static void s_offset_entry_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_offset_overlay) return;
+    s_offset_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(s_offset_overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(s_offset_overlay, 0, 0);
+    lv_obj_set_style_bg_color(s_offset_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_offset_overlay, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(s_offset_overlay, 0, 0);
+    lv_obj_set_style_pad_all(s_offset_overlay, 0, 0);
+    lv_obj_set_style_radius(s_offset_overlay, 0, 0);
+    lv_obj_clear_flag(s_offset_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *kb = lv_keyboard_create(s_offset_overlay);
+    lv_obj_set_width(kb, LCD_H_RES);
+    lv_obj_set_style_text_font(kb, &lv_font_montserrat_12, 0);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);
+    lv_obj_set_style_bg_color(kb, ui_bg_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(kb, ui_text_color(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(kb, lv_color_make(0, 80, 0), LV_PART_ITEMS);
+    lv_obj_set_style_text_color(kb, ui_text_color(), LV_PART_ITEMS);
+
+    lv_obj_t *card = lv_obj_create(s_offset_overlay);
+    lv_obj_set_size(card, LCD_H_RES - 16, LV_SIZE_CONTENT);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 4);
+    lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x827717), 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 8, 0);
+    lv_obj_set_style_pad_row(card, 4, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, "Crystal Freq Offset (kHz)");
+    lv_obj_set_style_text_color(title, lv_color_hex(0xFFD54F), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
+
+    lv_obj_t *hint = lv_label_create(card);
+    lv_label_set_text(hint,
+        "Enter kHz deviation at CAL TX (433.920 MHz)\n"
+        "Chip LOW by X kHz  -> enter +X (e.g. +60.0)\n"
+        "Chip HIGH by X kHz -> enter -X\n"
+        "Range: +-130 kHz = +-300 ppm (scales to all bands)");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint, lv_color_hex(0xB0BEC5), 0);
+
+    s_offset_ta = lv_textarea_create(card);
+    lv_obj_set_width(s_offset_ta, LCD_H_RES - 32);
+    lv_obj_set_height(s_offset_ta, 36);
+    lv_textarea_set_max_length(s_offset_ta, 10);
+    lv_textarea_set_one_line(s_offset_ta, true);
+    // Pre-fill with current offset converted back to kHz at 433.920 MHz
+    float cur_khz = (float)g_cc1101_freq_offset_millippm * 433.920f / 1000000.0f;
+    char cur[16]; snprintf(cur, sizeof(cur), "%.1f", (double)cur_khz);
+    lv_textarea_set_text(s_offset_ta, cur);
+    lv_textarea_set_placeholder_text(s_offset_ta, "0.0");
+    lv_obj_set_style_text_font(s_offset_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(s_offset_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(s_offset_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(s_offset_ta, lv_color_hex(0x827717), 0);
+    lv_keyboard_set_textarea(kb, s_offset_ta);
+    // Keyboard created before card so card was drawn on top — move keyboard to front
+    lv_obj_move_foreground(kb);
+
+    lv_obj_t *btn_row = lv_obj_create(card);
+    lv_obj_set_size(btn_row, LCD_H_RES - 32, 32);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel_btn, 90, 28);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x455A64), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(cancel_btn, 0, 0);
+    lv_obj_set_style_radius(cancel_btn, 6, 0);
+    lv_obj_t *cl = lv_label_create(cancel_btn);
+    lv_label_set_text(cl, "Cancel");
+    lv_obj_set_style_text_font(cl, &lv_font_montserrat_12, 0);
+    lv_obj_center(cl);
+    lv_obj_add_event_cb(cancel_btn, s_offset_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *ok_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(ok_btn, 90, 28);
+    lv_obj_set_style_bg_color(ok_btn, lv_color_hex(0x827717), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(ok_btn, 0, 0);
+    lv_obj_set_style_radius(ok_btn, 6, 0);
+    lv_obj_t *okl = lv_label_create(ok_btn);
+    lv_label_set_text(okl, LV_SYMBOL_OK " Save");
+    lv_obj_set_style_text_font(okl, &lv_font_montserrat_12, 0);
+    lv_obj_center(okl);
+    lv_obj_add_event_cb(ok_btn, s_offset_confirm_cb, LV_EVENT_CLICKED, NULL);
+}
+
 static void show_cc1101_hw_test_screen(void)
 {
+    s_cal_tx_stop();
+    s_cc1101_ht_offset_lbl = NULL;
+    s_cc1101_ht_cal_btn    = NULL;
+
     create_function_page_base("CC1101 HW Test");
     apply_menu_bg();
 
     lv_obj_t *card = lv_obj_create(function_page);
-    lv_obj_set_size(card, LCD_H_RES - 16, LCD_V_RES - 88);
+    lv_obj_set_size(card, LCD_H_RES - 16, LCD_V_RES - 80);  // fills to nav bar
     lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 34);
     lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
     lv_obj_set_style_border_color(card, lv_color_hex(0x1B5E20), 0);
     lv_obj_set_style_border_width(card, 1, 0);
     lv_obj_set_style_radius(card, 8, 0);
-    lv_obj_set_style_pad_all(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 8, 0);
     lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_set_style_pad_row(card, 5, 0);
+    lv_obj_set_style_pad_row(card, 2, 0);  // compact rows so calibration section is visible
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
     // Title
@@ -37552,6 +38168,71 @@ static void show_cc1101_hw_test_screen(void)
     lv_obj_center(run_lbl);
     lv_obj_add_event_cb(run_btn, s_cc1101_ht_run_cb, LV_EVENT_CLICKED, NULL);
 
+    // ── Crystal calibration section ───────────────────────────────────────────
+    lv_obj_t *sep = lv_obj_create(card);
+    lv_obj_set_size(sep, LCD_H_RES - 36, 1);
+    lv_obj_set_style_bg_color(sep, lv_color_hex(0x827717), 0);
+    lv_obj_set_style_border_width(sep, 0, 0);
+    lv_obj_set_style_pad_all(sep, 0, 0);
+
+    lv_obj_t *cal_hdr = lv_label_create(card);
+    lv_label_set_text(cal_hdr, "Crystal Calibration");
+    lv_obj_set_style_text_font(cal_hdr, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(cal_hdr, lv_color_hex(0xFFD54F), 0);
+
+    s_cc1101_ht_offset_lbl = lv_label_create(card);
+    {
+        char buf[64];
+        if (g_cc1101_freq_offset_millippm == 0) {
+            snprintf(buf, sizeof(buf), "Offset: 0.0 ppm (uncalibrated)");
+        } else {
+            float ppm  = g_cc1101_freq_offset_millippm / 1000.0f;
+            float khz  = ppm * 433.920f / 1000.0f;
+            snprintf(buf, sizeof(buf), "Offset: %+.1f ppm (%+.1f kHz @ 433 MHz)",
+                     (double)ppm, (double)khz);
+        }
+        lv_label_set_text(s_cc1101_ht_offset_lbl, buf);
+    }
+    lv_obj_set_style_text_font(s_cc1101_ht_offset_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_cc1101_ht_offset_lbl,
+        g_cc1101_freq_offset_millippm == 0 ? lv_color_hex(0x9E9E9E) : lv_color_hex(0xFFB300), 0);
+
+    // Button row: [Set Offset] [CAL TX 433]
+    // Button row: width = card inner (LCD_H_RES-16 card - 2×8 pad = 208 px)
+    // Two buttons of 96 px + 6 px gap = 198 px ≤ 208 px ✓
+    lv_obj_t *cal_row = lv_obj_create(card);
+    lv_obj_set_size(cal_row, lv_pct(100), 32);
+    lv_obj_set_style_bg_opa(cal_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(cal_row, 0, 0);
+    lv_obj_set_style_pad_all(cal_row, 0, 0);
+    lv_obj_set_flex_flow(cal_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(cal_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(cal_row, 6, 0);
+    lv_obj_clear_flag(cal_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *set_btn = lv_btn_create(cal_row);
+    lv_obj_set_size(set_btn, 96, 28);
+    lv_obj_set_style_bg_color(set_btn, lv_color_hex(0x4E342E), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_color(set_btn, lv_color_hex(0x827717), 0);
+    lv_obj_set_style_border_width(set_btn, 1, 0);
+    lv_obj_set_style_radius(set_btn, 6, 0);
+    lv_obj_t *sl2 = lv_label_create(set_btn);
+    lv_label_set_text(sl2, LV_SYMBOL_EDIT " Set Offset");
+    lv_obj_set_style_text_font(sl2, &lv_font_montserrat_12, 0);
+    lv_obj_center(sl2);
+    lv_obj_add_event_cb(set_btn, s_offset_entry_cb, LV_EVENT_CLICKED, NULL);
+
+    s_cc1101_ht_cal_btn = lv_btn_create(cal_row);
+    lv_obj_set_size(s_cc1101_ht_cal_btn, 96, 28);
+    lv_obj_set_style_bg_color(s_cc1101_ht_cal_btn, lv_color_hex(0x827717), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(s_cc1101_ht_cal_btn, 0, 0);
+    lv_obj_set_style_radius(s_cc1101_ht_cal_btn, 6, 0);
+    lv_obj_t *ctl = lv_label_create(s_cc1101_ht_cal_btn);
+    lv_label_set_text(ctl, LV_SYMBOL_PLAY " CAL TX 433");
+    lv_obj_set_style_text_font(ctl, &lv_font_montserrat_12, 0);
+    lv_obj_center(ctl);
+    lv_obj_add_event_cb(s_cc1101_ht_cal_btn, s_cal_tx_toggle_cb, LV_EVENT_CLICKED, NULL);
+
     rfhat_add_back_btn("CC1101", show_cc1101_screen);
 }
 
@@ -37584,7 +38265,7 @@ static void s_cc1101_freq_btn_cb(lv_event_t *e)
 {
     float mhz = *(float *)lv_event_get_user_data(e);
     s_cc1101_freq_mhz = mhz;
-    if (cc1101_is_init()) cc1101_set_freq_mhz(mhz);
+    if (cc1101_is_init()) cc1101_set_freq_mhz(cc1101_freq_cal(mhz));
     char buf[40];
     if (s_cc1101_freq_hdr) {
         snprintf(buf, sizeof(buf), MY_SYMBOL_SATELLITE "  %.2f MHz", (double)mhz);
@@ -37607,7 +38288,7 @@ static void show_cc1101_freq_scan_screen(void)
         }
     }
     cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);
-    cc1101_set_freq_mhz(s_cc1101_freq_mhz);
+    cc1101_set_freq_mhz(cc1101_freq_cal(s_cc1101_freq_mhz));
     cc1101_rx();
 
     create_function_page_base("CC1101 Freq Scan");
@@ -37751,7 +38432,7 @@ static void s_cc1101_cap_start_cb(lv_event_t *e)
     if (s_cc1101_cap_state == CC1101_CAP_RUNNING) return;
     if (!cc1101_is_init() && cc1101_init() != ESP_OK) return;
     cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);
-    cc1101_set_freq_mhz(s_cc1101_freq_mhz);
+    cc1101_set_freq_mhz(cc1101_freq_cal(s_cc1101_freq_mhz));
     s_cc1101_cap_state = CC1101_CAP_RUNNING;
     if (s_cc1101_cap_btn) lv_obj_add_state(s_cc1101_cap_btn, LV_STATE_DISABLED);
     if (s_cc1101_cap_status_lbl) lv_label_set_text(s_cc1101_cap_status_lbl, "Listening... 0 edges");
@@ -37777,7 +38458,7 @@ static void show_cc1101_capture_screen(void)
         return;
     }
     cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);
-    cc1101_set_freq_mhz(s_cc1101_freq_mhz);
+    cc1101_set_freq_mhz(cc1101_freq_cal(s_cc1101_freq_mhz));
 
     create_function_page_base("CC1101 Capture");
     apply_menu_bg();
@@ -37888,7 +38569,8 @@ static void s_cc1101_rep_task_fn(void *arg)
     if (!cc1101_is_init()) cc1101_init();
     esp_err_t err = ESP_FAIL;
     if (cc1101_is_init()) {
-        cc1101_set_freq_mhz(s_cc1101_cap_raw.freq_mhz);
+        cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);  // ensures PATABLE correct for OOK TX
+        cc1101_set_freq_mhz(cc1101_freq_cal(s_cc1101_cap_raw.freq_mhz));
         err = cc1101_raw_replay(&s_cc1101_cap_raw, repeats);
     }
     s_cc1101_rep_state = (err == ESP_OK) ? CC1101_REP_DONE : CC1101_REP_FAIL;
@@ -38007,7 +38689,8 @@ static void s_cc1101_saved_rep_task_fn(void *arg)
     if (err == ESP_OK) {
         if (!cc1101_is_init()) cc1101_init();
         if (cc1101_is_init()) {
-            cc1101_set_freq_mhz(raw.freq_mhz);
+            cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);  // ensures PATABLE correct for OOK TX
+            cc1101_set_freq_mhz(cc1101_freq_cal(raw.freq_mhz));
             err = cc1101_raw_replay(&raw, repeats);
         } else {
             err = ESP_FAIL;
@@ -38174,21 +38857,765 @@ static void show_cc1101_decode_screen(void)
 
 // ── TPMS Decoder ─────────────────────────────────────────────────────────────
 
-static void show_cc1101_tpms_screen(void)
+// CRC-8 (poly 0x07, init 0x00) over first `len` bytes
+static uint8_t tpms_crc8(const uint8_t *data, int len)
 {
-    s_cc1101_stub_screen(MY_SYMBOL_CAR "  TPMS Tire Monitor",
-        "Decode TPMS tire pressure\nsensors on 315/433 MHz\n\n"
-        "Reports: PSI, temp, sensor ID\n\n"
-        "Coming in next version.");
+    uint8_t crc = 0;
+    for (int i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++)
+            crc = (crc & 0x80) ? (crc << 1) ^ 0x07 : (crc << 1);
+    }
+    return crc;
 }
 
-// ── Weather Station Decoder ───────────────────────────────────────────────────
+// Decode an 8-byte TPMS packet. Returns true if sensor_id is plausible.
+static bool tpms_decode(const uint8_t *pkt, tpms_sensor_t *out)
+{
+    // Bytes [0..3]: sensor ID (big-endian), [4]: raw pressure, [5]: raw temp, [6]: flags, [7]: CRC
+    out->sensor_id = ((uint32_t)pkt[0] << 24) | ((uint32_t)pkt[1] << 16) |
+                     ((uint32_t)pkt[2] <<  8) |  (uint32_t)pkt[3];
+    if (out->sensor_id == 0 || out->sensor_id == 0xFFFFFFFF) return false;
+
+    // Pressure: Schrader EG53MA4/generic → PSI = raw × 0.36
+    out->psi = pkt[4] * 0.36f;
+    out->kpa = out->psi * 6.89476f;
+    if (out->psi < 0.0f || out->psi > 120.0f) return false;  // sanity
+
+    // Temperature: raw − 40 °C (common Schrader encoding)
+    out->temp_c = (int8_t)pkt[5] - 40;
+    out->flags  = pkt[6];
+
+    // CRC-8 over bytes [0..6] vs byte [7]
+    out->crc_ok = (tpms_crc8(pkt, 7) == pkt[7]);
+    return true;
+}
+
+static void s_tpms_update_label(cc1101_tpms_ctx_t *ctx, int idx)
+{
+    if (!ctx || idx < 0 || idx >= TPMS_MAX_SENSORS || !ctx->sensor_lbl[idx]) return;
+    const tpms_sensor_t *s = &ctx->sensors[idx];
+    uint32_t age_s = (uint32_t)((esp_timer_get_time() - s->last_seen_us) / 1000000ULL);
+
+    char flags[12] = "";
+    if (s->flags & 0x01) strlcat(flags, " BATT", sizeof(flags));
+    if (s->flags & 0x20) strlcat(flags, " ALM",  sizeof(flags));
+
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+             "%08lX   %.1f PSI / %d kPa\n%+dC  %ddBm  %s%s  %lus",
+             (unsigned long)s->sensor_id,
+             (double)s->psi, (int)(s->kpa + 0.5f),
+             (int)s->temp_c, (int)s->rssi_dbm,
+             s->crc_ok ? "[OK]" : "[?]",
+             flags,
+             (unsigned long)age_s);
+    lv_label_set_text(ctx->sensor_lbl[idx], buf);
+
+    // Card bg + text colour based on state (card is parent of the label)
+    lv_obj_t *card = lv_obj_get_parent(ctx->sensor_lbl[idx]);
+    if (s->psi < 28.0f) {
+        // Low pressure: amber card, dark amber text
+        if (card) lv_obj_set_style_bg_color(card, lv_color_hex(0xFFF3E0), LV_STATE_DEFAULT);
+        lv_obj_set_style_text_color(ctx->sensor_lbl[idx], lv_color_hex(0xBF360C), 0);
+    } else if (!s->crc_ok) {
+        // CRC fail: neutral white card, grey text
+        if (card) lv_obj_set_style_bg_color(card, lv_color_hex(0xF5F5F5), LV_STATE_DEFAULT);
+        lv_obj_set_style_text_color(ctx->sensor_lbl[idx], lv_color_hex(0x757575), 0);
+    } else {
+        // Good pressure + CRC ok: light green card, dark text
+        if (card) lv_obj_set_style_bg_color(card, lv_color_hex(0xF1F8E9), LV_STATE_DEFAULT);
+        lv_obj_set_style_text_color(ctx->sensor_lbl[idx], lv_color_hex(0x1B5E20), 0);
+    }
+}
+
+static void s_tpms_ui_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    cc1101_tpms_ctx_t *ctx = s_tpms;
+    if (!ctx) return;
+
+    if (ctx->count_lbl) {
+        char buf[56];
+        snprintf(buf, sizeof(buf), "SYN:%d  CRC-F:%d  OK:%d  S:%d",
+                 ctx->pkt_total, ctx->pkt_crc_fail, ctx->pkt_valid, ctx->sensor_count);
+        lv_label_set_text(ctx->count_lbl, buf);
+    }
+    if (ctx->status_lbl) {
+        if (ctx->active) {
+            char sbuf[32];
+            snprintf(sbuf, sizeof(sbuf), "%s %dMHz  %ddBm",
+                     ctx->fsk_mode ? "FSK" : "OOK",
+                     ctx->freq_315 ? 315 : 433,
+                     (int)ctx->last_rssi_dbm);
+            lv_label_set_text(ctx->status_lbl, sbuf);
+            lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0xFFB300), 0);
+        } else {
+            lv_label_set_text(ctx->status_lbl, "Stopped");
+            lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0x66BB6A), 0);
+        }
+    }
+
+    // Refresh all visible sensor rows (age counter updates every 500 ms)
+    for (int i = 0; i < ctx->sensor_count && i < TPMS_MAX_SENSORS; i++)
+        s_tpms_update_label(ctx, i);
+
+    // Auto-scroll: reveal new card at the bottom of the visible window.
+    // Scroll only as far as needed so that older sensors above stay visible.
+    if (ctx->scroll_cont && ctx->sensor_count > ctx->last_scroll_count) {
+        ctx->last_scroll_count = ctx->sensor_count;
+        lv_coord_t card_stride   = TPMS_CARD_H + TPMS_CARD_GAP;
+        lv_coord_t new_card_bot  = ctx->sensor_count * card_stride - TPMS_CARD_GAP;
+        lv_coord_t scroll_needed = new_card_bot - TPMS_SCROLL_H;
+        if (scroll_needed > 0)
+            lv_obj_scroll_to_y(ctx->scroll_cont, scroll_needed, LV_ANIM_ON);
+    }
+
+    if (!ctx->active && ctx->task == NULL && ctx->start_btn) {
+        lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
+        if (lbl) lv_label_set_text(lbl, "Start");
+    }
+}
+
+static void s_tpms_task_fn(void *arg)
+{
+    cc1101_tpms_ctx_t *ctx = (cc1101_tpms_ctx_t *)arg;
+    uint8_t pkt[TPMS_PKT_LEN];
+
+    // Apply CC1101 preset — OOK (Schrader/TRW) or FSK (Continental/Hella)
+    cc1101_preset_t preset;
+    if (ctx->fsk_mode)
+        preset = ctx->freq_315 ? CC1101_PRESET_FSK_10K_315MHZ : CC1101_PRESET_FSK_10K_433MHZ;
+    else
+        preset = ctx->freq_315 ? CC1101_PRESET_OOK_10K_315MHZ : CC1101_PRESET_OOK_10K_433MHZ;
+    cc1101_apply_preset(preset);
+    cc1101_rx();
+
+    ESP_LOGI("TPMS", "Started: %d MHz  mode=%s  preset=%d",
+             ctx->freq_315 ? 315 : 433, ctx->fsk_mode ? "FSK" : "OOK", (int)preset);
+
+    // Open SD log file
+    mkdir(TPMS_SAVE_DIR, 0755);
+    snprintf(ctx->log_path, TPMS_SAVE_PATH_LEN, TPMS_SAVE_DIR "/%uMHz_%s_%llu.csv",
+             ctx->freq_315 ? 315u : 433u, ctx->fsk_mode ? "fsk" : "ook",
+             (unsigned long long)esp_timer_get_time() / 1000000ULL);
+    ctx->log_fp = fopen(ctx->log_path, "w");
+    if (ctx->log_fp)
+        fprintf(ctx->log_fp, "time_s,freq_mhz,mode,sensor_id,psi,kpa,temp_c,rssi_dbm,crc_ok,flags_hex,raw_hex\n");
+
+    while (ctx->active && !ctx->cancel) {
+        int8_t rssi = 0;
+        int n = cc1101_rx_packet(pkt, TPMS_PKT_LEN, &rssi, 500, &ctx->cancel);
+
+        if (n != TPMS_PKT_LEN) {
+            // No packet this window — update live RSSI for UI
+            ctx->last_rssi_dbm = cc1101_get_rssi_dbm();
+            continue;
+        }
+
+        ctx->last_rssi_dbm = rssi;
+        ctx->pkt_total++;
+
+        // Always log raw bytes — essential for diagnosis
+        ESP_LOGI("TPMS", "RAW +%ddBm [%s %dMHz]: %02X%02X%02X%02X %02X %02X %02X %02X",
+                 rssi, ctx->fsk_mode ? "FSK" : "OOK", ctx->freq_315 ? 315 : 433,
+                 pkt[0], pkt[1], pkt[2], pkt[3], pkt[4], pkt[5], pkt[6], pkt[7]);
+
+        tpms_sensor_t decoded = { .rssi_dbm = rssi };
+
+        if (!tpms_decode(pkt, &decoded)) {
+            ESP_LOGI("TPMS", "  → decode reject (id=0 or psi out of range)");
+            continue;
+        }
+
+        if (!decoded.crc_ok) {
+            ctx->pkt_crc_fail++;
+            ESP_LOGW("TPMS", "  → CRC FAIL  ID=%08lX  PSI=%.1f",
+                     (unsigned long)decoded.sensor_id, (double)decoded.psi);
+        } else {
+            ESP_LOGI("TPMS", "  → ID=%08lX  PSI=%.1f  %dC  flags=0x%02X  CRC OK",
+                     (unsigned long)decoded.sensor_id, (double)decoded.psi,
+                     (int)decoded.temp_c, (unsigned)decoded.flags);
+        }
+
+        ctx->pkt_valid++;
+        decoded.rssi_dbm    = rssi;
+        decoded.last_seen_us = esp_timer_get_time();
+
+        // Update or insert sensor slot
+        int slot = -1;
+        for (int i = 0; i < ctx->sensor_count; i++) {
+            if (ctx->sensors[i].sensor_id == decoded.sensor_id) { slot = i; break; }
+        }
+        if (slot < 0 && ctx->sensor_count < TPMS_MAX_SENSORS)
+            slot = ctx->sensor_count++;
+        if (slot >= 0)
+            ctx->sensors[slot] = decoded;
+
+        // Log to SD
+        if (ctx->log_fp) {
+            fprintf(ctx->log_fp, "%lu,%.2f,%s,%08lX,%.2f,%d,%d,%d,%d,0x%02X,%02X%02X%02X%02X%02X%02X%02X%02X\n",
+                    (unsigned long)(decoded.last_seen_us / 1000000ULL),
+                    (double)(ctx->freq_315 ? 315.0f : 433.92f),
+                    ctx->fsk_mode ? "fsk" : "ook",
+                    (unsigned long)decoded.sensor_id,
+                    (double)decoded.psi, (int)(decoded.kpa + 0.5f),
+                    (int)decoded.temp_c, (int)decoded.rssi_dbm,
+                    decoded.crc_ok ? 1 : 0, (unsigned)decoded.flags,
+                    pkt[0],pkt[1],pkt[2],pkt[3],pkt[4],pkt[5],pkt[6],pkt[7]);
+            fflush(ctx->log_fp);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    if (ctx->log_fp) { fclose(ctx->log_fp); ctx->log_fp = NULL; }
+    cc1101_idle();
+    ctx->active = false;
+    ctx->task   = NULL;
+    vTaskDelete(NULL);
+}
+
+static void s_tpms_start_cb(lv_event_t *e)
+{
+    (void)e;
+    cc1101_tpms_ctx_t *ctx = s_tpms;
+    if (!ctx) return;
+    if (!ctx->active && !ctx->task) {
+        ctx->active = true; ctx->cancel = false;
+        ctx->pkt_total = 0; ctx->pkt_crc_fail = 0; ctx->pkt_valid = 0;
+        ctx->sensor_count = 0; ctx->last_rssi_dbm = 0; ctx->last_scroll_count = 0;
+        memset(ctx->sensors, 0, sizeof(ctx->sensors));
+        // Reset all cards to idle state and scroll back to top
+        for (int _i = 0; _i < TPMS_MAX_SENSORS; _i++) {
+            if (ctx->sensor_lbl[_i]) {
+                lv_label_set_text(ctx->sensor_lbl[_i], "--");
+                lv_obj_set_style_text_color(ctx->sensor_lbl[_i], lv_color_hex(0x555555), 0);
+                lv_obj_t *_card = lv_obj_get_parent(ctx->sensor_lbl[_i]);
+                if (_card) lv_obj_set_style_bg_color(_card, lv_color_hex(0x2A2A2A), LV_STATE_DEFAULT);
+            }
+        }
+        if (ctx->scroll_cont) lv_obj_scroll_to_y(ctx->scroll_cont, 0, LV_ANIM_OFF);
+        if (ctx->start_btn) {
+            lv_obj_t *lbl = lv_obj_get_child(ctx->start_btn, 0);
+            if (lbl) lv_label_set_text(lbl, "Stop");
+        }
+        xTaskCreate(s_tpms_task_fn, "tpms_scan", 4096, ctx, 2, &ctx->task);
+    } else {
+        ctx->active = false; ctx->cancel = true;
+    }
+}
+
+static void s_tpms_freq_cb(lv_event_t *e)
+{
+    cc1101_tpms_ctx_t *ctx = s_tpms;
+    if (!ctx) return;
+    bool want_315 = (bool)(uintptr_t)lv_event_get_user_data(e);
+    if (ctx->freq_315 == want_315) return;
+    ctx->freq_315 = want_315;
+    // Stop any running scan so it restarts on the new frequency
+    ctx->active = false; ctx->cancel = true;
+    // Update button colours
+    if (ctx->freq_315_btn)
+        lv_obj_set_style_bg_color(ctx->freq_315_btn,
+            want_315 ? lv_color_hex(0x1565C0) : lv_color_hex(0x37474F), LV_STATE_DEFAULT);
+    if (ctx->freq_433_btn)
+        lv_obj_set_style_bg_color(ctx->freq_433_btn,
+            want_315 ? lv_color_hex(0x37474F) : lv_color_hex(0x1565C0), LV_STATE_DEFAULT);
+}
+
+static void show_cc1101_tpms_screen(void)
+{
+    if (s_tpms) { s_tpms->active = false; s_tpms->cancel = true; }
+
+    if (!cc1101_is_init()) {
+        if (cc1101_init() != ESP_OK) {
+            s_cc1101_stub_screen(MY_SYMBOL_CAR "  TPMS Monitor",
+                "CC1101 not detected.\n\nCheck DIP 1 ON.");
+            return;
+        }
+    }
+
+    cc1101_tpms_ctx_t *ctx = heap_caps_calloc(1, sizeof(cc1101_tpms_ctx_t), MALLOC_CAP_SPIRAM);
+    if (!ctx) { s_cc1101_stub_screen("TPMS Error", "Out of memory"); return; }
+    ctx->freq_315 = true;
+
+    create_function_page_base("TPMS Monitor");
+    s_tpms = ctx;
+    apply_menu_bg();
+
+    // ── Frequency toggle — 2-line buttons showing region + typical brands ─────
+    // Buttons at y=34 to clear the title bar. Width=112 leaves an 8px gap between
+    // them (same as original). Sub-label uses TOP_MID at fixed pixel offset so it
+    // can't overflow; LV_LABEL_LONG_DOT clips gracefully if text is too wide.
+    ctx->freq_315_btn = lv_btn_create(function_page);
+    lv_obj_set_size(ctx->freq_315_btn, 112, 40);
+    lv_obj_align(ctx->freq_315_btn, LV_ALIGN_TOP_LEFT, 4, 34);
+    lv_obj_set_style_bg_color(ctx->freq_315_btn, lv_color_hex(0x1565C0), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(ctx->freq_315_btn, 0, 0);
+    lv_obj_set_style_radius(ctx->freq_315_btn, 6, 0);
+    lv_obj_set_style_pad_all(ctx->freq_315_btn, 0, 0);
+    {
+        lv_obj_t *lf = lv_label_create(ctx->freq_315_btn);
+        lv_label_set_text(lf, "315 MHz");
+        lv_obj_set_style_text_font(lf, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(lf, lv_color_white(), 0);
+        lv_obj_align(lf, LV_ALIGN_TOP_MID, 0, 3);
+        lv_obj_t *ls = lv_label_create(ctx->freq_315_btn);
+        lv_label_set_text(ls, "Schrader/Ford/GM");
+        lv_obj_set_style_text_font(ls, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(ls, lv_color_hex(0xBBDEFB), 0);
+        lv_obj_set_width(ls, 108);
+        lv_label_set_long_mode(ls, LV_LABEL_LONG_DOT);
+        lv_obj_align(ls, LV_ALIGN_TOP_MID, 0, 22);
+    }
+    lv_obj_add_event_cb(ctx->freq_315_btn, s_tpms_freq_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)1);
+
+    ctx->freq_433_btn = lv_btn_create(function_page);
+    lv_obj_set_size(ctx->freq_433_btn, 112, 40);
+    lv_obj_align(ctx->freq_433_btn, LV_ALIGN_TOP_RIGHT, -4, 34);
+    lv_obj_set_style_bg_color(ctx->freq_433_btn, lv_color_hex(0x37474F), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(ctx->freq_433_btn, 0, 0);
+    lv_obj_set_style_radius(ctx->freq_433_btn, 6, 0);
+    lv_obj_set_style_pad_all(ctx->freq_433_btn, 0, 0);
+    {
+        lv_obj_t *lf = lv_label_create(ctx->freq_433_btn);
+        lv_label_set_text(lf, "433 MHz");
+        lv_obj_set_style_text_font(lf, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(lf, lv_color_white(), 0);
+        lv_obj_align(lf, LV_ALIGN_TOP_MID, 0, 3);
+        lv_obj_t *ls = lv_label_create(ctx->freq_433_btn);
+        lv_label_set_text(ls, "Beru/VW/BMW/Toyota");
+        lv_obj_set_style_text_font(ls, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(ls, lv_color_hex(0xB0BEC5), 0);
+        lv_obj_set_width(ls, 108);
+        lv_label_set_long_mode(ls, LV_LABEL_LONG_DOT);
+        lv_obj_align(ls, LV_ALIGN_TOP_MID, 0, 22);
+    }
+    lv_obj_add_event_cb(ctx->freq_433_btn, s_tpms_freq_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)0);
+
+    // ── Start / Stop button ────────────────────────────────────────────────────
+    ctx->start_btn = lv_btn_create(function_page);
+    lv_obj_set_size(ctx->start_btn, 80, 24);
+    lv_obj_align(ctx->start_btn, LV_ALIGN_TOP_LEFT, 4, 78);
+    lv_obj_set_style_bg_color(ctx->start_btn, lv_color_hex(0x1B5E20), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(ctx->start_btn, lv_color_hex(0x2E7D32), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(ctx->start_btn, 0, 0);
+    lv_obj_set_style_radius(ctx->start_btn, 6, 0);
+    lv_obj_t *sl = lv_label_create(ctx->start_btn);
+    lv_label_set_text(sl, "Start");
+    lv_obj_set_style_text_font(sl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sl, lv_color_white(), 0);
+    lv_obj_center(sl);
+    lv_obj_add_event_cb(ctx->start_btn, s_tpms_start_cb, LV_EVENT_CLICKED, NULL);
+
+    ctx->status_lbl = lv_label_create(function_page);
+    lv_label_set_text(ctx->status_lbl, "Ready");
+    lv_obj_set_style_text_font(ctx->status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0x66BB6A), 0);
+    lv_obj_align(ctx->status_lbl, LV_ALIGN_TOP_LEFT, 92, 84);
+
+    ctx->count_lbl = lv_label_create(function_page);
+    lv_label_set_text(ctx->count_lbl, "Pkts: 0  Decoded: 0  Sensors: 0");
+    lv_obj_set_style_text_font(ctx->count_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->count_lbl, lv_color_make(140, 140, 140), 0);
+    lv_obj_align(ctx->count_lbl, LV_ALIGN_TOP_MID, 0, 106);
+    lv_obj_set_width(ctx->count_lbl, LCD_H_RES - 8);
+    lv_label_set_long_mode(ctx->count_lbl, LV_LABEL_LONG_WRAP);
+
+    // ── Scrollable sensor list ────────────────────────────────────────────────
+    // Up to TPMS_MAX_SENSORS (20) cards in a scrollable container.
+    // Visible window = TPMS_SCROLL_H (~164px, ~4 cards); swipe to see more.
+    // [OK] = CRC ok; [CRC?] = mismatch; amber = low pressure.
+    ctx->scroll_cont = lv_obj_create(function_page);
+    lv_obj_set_size(ctx->scroll_cont, LCD_H_RES, TPMS_SCROLL_H);
+    lv_obj_align(ctx->scroll_cont, LV_ALIGN_TOP_LEFT, 0, TPMS_SCROLL_Y);
+    lv_obj_set_style_bg_color(ctx->scroll_cont, lv_color_hex(0x121212), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(ctx->scroll_cont, 0, 0);
+    lv_obj_set_style_pad_all(ctx->scroll_cont, 0, 0);
+    lv_obj_set_style_pad_row(ctx->scroll_cont, TPMS_CARD_GAP, 0);
+    lv_obj_set_flex_flow(ctx->scroll_cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(ctx->scroll_cont, LV_FLEX_ALIGN_START,
+                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_scroll_dir(ctx->scroll_cont, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(ctx->scroll_cont, LV_SCROLLBAR_MODE_ACTIVE);
+
+    for (int i = 0; i < TPMS_MAX_SENSORS; i++) {
+        lv_obj_t *card = lv_obj_create(ctx->scroll_cont);
+        lv_obj_set_size(card, LCD_H_RES - 8, TPMS_CARD_H);
+        lv_obj_set_style_bg_color(card, lv_color_hex(0x2A2A2A), LV_STATE_DEFAULT);
+        lv_obj_set_style_border_color(card, lv_color_hex(0x444444), LV_STATE_DEFAULT);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_radius(card, 4, 0);
+        lv_obj_set_style_pad_left(card, 5, 0);
+        lv_obj_set_style_pad_top(card, 2, 0);
+        lv_obj_set_style_pad_right(card, 0, 0);
+        lv_obj_set_style_pad_bottom(card, 0, 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+        ctx->sensor_lbl[i] = lv_label_create(card);
+        lv_label_set_text(ctx->sensor_lbl[i], "--");
+        lv_obj_set_style_text_font(ctx->sensor_lbl[i], &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(ctx->sensor_lbl[i], lv_color_hex(0x555555), 0);
+        lv_obj_set_width(ctx->sensor_lbl[i], LCD_H_RES - 20);
+        lv_label_set_long_mode(ctx->sensor_lbl[i], LV_LABEL_LONG_WRAP);
+        lv_obj_align(ctx->sensor_lbl[i], LV_ALIGN_TOP_LEFT, 0, 0);
+    }
+
+    ctx->tmr = lv_timer_create(s_tpms_ui_timer_cb, 500, NULL);
+    rfhat_add_back_btn("CC1101", show_cc1101_screen);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// OOK PROTOCOL DECODERS — EV1527 (alarm sensors) + Fine Offset (weather)
+// Used by CC1101 Alarm Screen, CC1101 Weather Screen, and RF433 OOK Scan.
+// All decoders take the same int32_t pulse array (positive=HIGH µs, negative=LOW µs)
+// produced by cc1101_raw_capture() / rf433_ook_capture().
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── EV1527 universal OOK sensor decoder ──────────────────────────────────────
+// Covers EV1527, PT2262/PT2272, HS1527, SC5262 and compatible chips.
+// Used in ~90% of cheap wireless alarm sensors, door contacts, PIR detectors.
+// Frame: 1T sync-high, 31T sync-low, 28 data bits (24-bit addr + 4-bit data).
+// Bit encoding: '1' = 3T HIGH + 1T LOW,  '0' = 1T HIGH + 3T LOW,  T≈350 µs.
+static bool ook_decode_ev1527(const int32_t *p, int n,
+                               uint32_t *addr_out, uint8_t *data_out)
+{
+    for (int i = 0; i + 28*2 + 2 < n; i++) {
+        int hi =  p[i];      // should be ~350 µs (1T)
+        int lo = -p[i+1];    // should be ~10500 µs (30T sync gap)
+        if (hi < 150 || hi > 700) continue;
+        if (lo < 7000 || lo > 16000) continue;
+        // Sync found — decode 28 bits
+        uint32_t bits = 0;
+        bool ok = true;
+        int j = i + 2;
+        for (int b = 0; b < 28 && j + 1 < n; b++, j += 2) {
+            int bhi =  p[j];
+            int blo = -p[j+1];
+            if (bhi <= 0 || blo <= 0) { ok = false; break; }
+            if (bhi > 700 && blo < 700)      bits = (bits << 1) | 1; // '1'
+            else if (bhi < 700 && blo > 700) bits = (bits << 1);     // '0'
+            else { ok = false; break; }
+        }
+        if (ok) {
+            *addr_out = (bits >> 4) & 0xFFFFFF;
+            *data_out = bits & 0x0F;
+            return true;
+        }
+    }
+    return false;
+}
+
+// ── Fine Offset weather sensor decoder ────────────────────────────────────────
+// Covers WH65, WH57, WH80, WS80, Froggit WH31, Ecowitt variants, and clones.
+// Frame: 8 × 500 µs preamble pulses → 2000 µs sync gap → 40 PWM data bits.
+// Bit encoding: '1' = 500 µs HIGH + 1000 µs LOW, '0' = 500 µs HIGH + 500 µs LOW.
+// Byte layout: [ID(8)] [BAT(1) TYPE(3) TEMP_H(4)] [TEMP_L(8)] [HUM(8)] [CRC8(8)]
+// Temperature: (((byte1&0x0F)<<8)|byte2) - 400 → temp_10 = tenths of °C
+// CRC: CRC-8 poly=0x31 init=0x00 over bytes 0-3
+
+static uint8_t ook_crc8_fo(const uint8_t *d, int len)
+{
+    uint8_t crc = 0;
+    for (int i = 0; i < len; i++) {
+        crc ^= d[i];
+        for (int b = 0; b < 8; b++)
+            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x31) : (uint8_t)(crc << 1);
+    }
+    return crc;
+}
+
+typedef struct {
+    uint8_t  id;
+    int16_t  temp_10;   // tenths of °C (e.g. 233 = 23.3 °C)
+    uint8_t  humidity;
+    bool     battery_ok;
+} ook_weather_pkt_t;
+
+static bool ook_decode_fineoffset(const int32_t *p, int n, ook_weather_pkt_t *out)
+{
+    // Scan for sync gap: large negative pulse (>1500 µs LOW)
+    // preceded by short HIGH pulses (~500 µs preamble)
+    for (int i = 3; i + 40*2 < n; i++) {
+        if (p[i] > -1400) continue;         // sync gap: LOW >1400 µs
+        if (p[i-1] < 200 || p[i-1] > 900) continue; // preamble pulse check
+        // Decode 40 PWM bits
+        uint8_t bytes[5] = {0};
+        int j = i + 1;
+        bool ok = true;
+        for (int b = 0; b < 40 && j + 1 < n; b++, j += 2) {
+            int bhi =  p[j];
+            int blo = -p[j+1];
+            if (bhi <= 0 || blo <= 0) { ok = false; break; }
+            uint8_t bit = (blo > 700) ? 1 : 0;
+            bytes[b/8] |= (bit << (7 - b%8));
+        }
+        if (!ok) continue;
+        if (ook_crc8_fo(bytes, 4) != bytes[4]) continue;
+        out->id         = bytes[0];
+        out->battery_ok = !(bytes[1] >> 7);
+        int16_t raw_t   = (int16_t)(((bytes[1] & 0x0F) << 8) | bytes[2]);
+        out->temp_10    = raw_t - 400;
+        out->humidity   = bytes[3];
+        return true;
+    }
+    return false;
+}
+
+// ── Shared OOK sensor result store ───────────────────────────────────────────
+#define OOK_MAX_ALARM_SENSORS    8
+#define OOK_MAX_WEATHER_SENSORS  6
+
+typedef struct {
+    uint32_t addr;
+    uint8_t  data;
+    int8_t   rssi;      // CC1101 RSSI; -127 for RF433 (no RSSI)
+    uint32_t count;
+    int64_t  last_us;
+} ook_alarm_entry_t;
+
+typedef struct {
+    uint8_t  id;
+    int16_t  temp_10;
+    uint8_t  humidity;
+    bool     battery_ok;
+    int8_t   rssi;
+    uint32_t count;
+    int64_t  last_us;
+} ook_weather_entry_t;
+
+static ook_alarm_entry_t   s_ook_alarms[OOK_MAX_ALARM_SENSORS];
+static int                 s_ook_alarm_count = 0;
+static ook_weather_entry_t s_ook_weather[OOK_MAX_WEATHER_SENSORS];
+static int                 s_ook_weather_count = 0;
+
+static void ook_alarm_update(uint32_t addr, uint8_t data, int8_t rssi)
+{
+    for (int i = 0; i < s_ook_alarm_count; i++) {
+        if (s_ook_alarms[i].addr == addr) {
+            s_ook_alarms[i].data   = data;
+            s_ook_alarms[i].rssi   = rssi;
+            s_ook_alarms[i].count++;
+            s_ook_alarms[i].last_us = esp_timer_get_time();
+            return;
+        }
+    }
+    if (s_ook_alarm_count >= OOK_MAX_ALARM_SENSORS) return;
+    ook_alarm_entry_t *e = &s_ook_alarms[s_ook_alarm_count++];
+    e->addr    = addr;
+    e->data    = data;
+    e->rssi    = rssi;
+    e->count   = 1;
+    e->last_us = esp_timer_get_time();
+}
+
+static void ook_weather_update(const ook_weather_pkt_t *pkt, int8_t rssi)
+{
+    for (int i = 0; i < s_ook_weather_count; i++) {
+        if (s_ook_weather[i].id == pkt->id) {
+            s_ook_weather[i].temp_10    = pkt->temp_10;
+            s_ook_weather[i].humidity   = pkt->humidity;
+            s_ook_weather[i].battery_ok = pkt->battery_ok;
+            s_ook_weather[i].rssi       = rssi;
+            s_ook_weather[i].count++;
+            s_ook_weather[i].last_us    = esp_timer_get_time();
+            return;
+        }
+    }
+    if (s_ook_weather_count >= OOK_MAX_WEATHER_SENSORS) return;
+    ook_weather_entry_t *e = &s_ook_weather[s_ook_weather_count++];
+    e->id         = pkt->id;
+    e->temp_10    = pkt->temp_10;
+    e->humidity   = pkt->humidity;
+    e->battery_ok = pkt->battery_ok;
+    e->rssi       = rssi;
+    e->count      = 1;
+    e->last_us    = esp_timer_get_time();
+}
+
+// Format a last-seen duration from microseconds
+static void ook_age_str(int64_t last_us, char *buf, size_t sz)
+{
+    if (last_us == 0) { snprintf(buf, sz, "--"); return; }
+    int64_t sec = (esp_timer_get_time() - last_us) / 1000000LL;
+    if (sec < 60) snprintf(buf, sz, "%llds", (long long)sec);
+    else          snprintf(buf, sz, "%lldm", (long long)(sec/60));
+}
+
+// ── RF433 OOK raw capture (GPIO9, R4A_433 demodulated output) ─────────────────
+// ISR shared with Fox Hunt but installed/removed per session — not concurrent.
+static volatile bool     s_rf433_ook_cap_active = false;
+static volatile int32_t  s_rf433_ook_buf[2048];
+static volatile int      s_rf433_ook_wr   = 0;
+static volatile int64_t  s_rf433_ook_last = 0;
+
+IRAM_ATTR static void s_rf433_ook_cap_isr(void *arg)
+{
+    if (!s_rf433_ook_cap_active || s_rf433_ook_wr >= 2047) return;
+    int64_t now = esp_timer_get_time();
+    if (s_rf433_ook_last == 0) { s_rf433_ook_last = now; return; }
+    int64_t dt = now - s_rf433_ook_last;
+    s_rf433_ook_last = now;
+    int lv = gpio_get_level((gpio_num_t)RF_HAT_RF433_RX_GPIO);
+    s_rf433_ook_buf[s_rf433_ook_wr++] = lv ? (int32_t)dt : -(int32_t)dt;
+}
+
+static esp_err_t rf433_ook_capture(int32_t *out, int *count_out, uint32_t timeout_ms)
+{
+    s_rf433_ook_wr = 0;
+    s_rf433_ook_last = 0;
+    s_rf433_ook_cap_active = true;
+
+    gpio_config_t io = {
+        .pin_bit_mask  = 1ULL << RF_HAT_RF433_RX_GPIO,
+        .mode          = GPIO_MODE_INPUT,
+        .pull_up_en    = GPIO_PULLUP_DISABLE,
+        .pull_down_en  = GPIO_PULLDOWN_DISABLE,
+        .intr_type     = GPIO_INTR_ANYEDGE,
+    };
+    gpio_config(&io);
+    esp_err_t e = gpio_install_isr_service(0);
+    if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) { s_rf433_ook_cap_active = false; return e; }
+    gpio_isr_handler_add((gpio_num_t)RF_HAT_RF433_RX_GPIO, s_rf433_ook_cap_isr, NULL);
+
+    vTaskDelay(pdMS_TO_TICKS(timeout_ms));
+
+    s_rf433_ook_cap_active = false;
+    gpio_isr_handler_remove((gpio_num_t)RF_HAT_RF433_RX_GPIO);
+
+    *count_out = s_rf433_ook_wr;
+    if (*count_out > 0)
+        memcpy(out, (const void *)s_rf433_ook_buf, *count_out * sizeof(int32_t));
+    return (*count_out > 10) ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+// ── CC1101 Weather Station ────────────────────────────────────────────────────
+
+typedef struct { bool changed; } wx_update_t;
+
+static void s_wx_lvgl_cb(void *arg)
+{
+    free(arg);
+    if (!s_wx_list || !s_wx_status) return;
+    lv_obj_clean(s_wx_list);
+    for (int i = 0; i < s_ook_weather_count; i++) {
+        ook_weather_entry_t *e = &s_ook_weather[i];
+        lv_obj_t *row = lv_obj_create(s_wx_list);
+        lv_obj_set_size(row, LCD_H_RES - 18, 52);
+        lv_obj_set_style_bg_color(row, ui_panel_color(), 0);
+        lv_obj_set_style_border_color(row, lv_color_hex(0x00695C), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_radius(row, 6, 0);
+        lv_obj_set_style_pad_all(row, 5, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        char line1[48], line2[48], age[12];
+        ook_age_str(e->last_us, age, sizeof(age));
+        int t_int = e->temp_10 / 10, t_frac = abs(e->temp_10 % 10);
+        snprintf(line1, sizeof(line1), "ID:%02X  %d.%d C  %d%% RH",
+                 e->id, t_int, t_frac, e->humidity);
+        snprintf(line2, sizeof(line2), "%s  %ddBm  Batt:%s  x%u  %s",
+                 e->battery_ok ? "OK" : "LOW",
+                 e->rssi, e->battery_ok ? "OK" : "LOW",
+                 e->count, age);
+        lv_obj_t *l1 = lv_label_create(row);
+        lv_label_set_text(l1, line1);
+        lv_obj_set_style_text_font(l1, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(l1, lv_color_hex(0x80CBC4), 0);
+        lv_obj_align(l1, LV_ALIGN_TOP_LEFT, 0, 0);
+        lv_obj_t *l2 = lv_label_create(row);
+        lv_label_set_text(l2, line2);
+        lv_obj_set_style_text_font(l2, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l2, ui_text_color(), 0);
+        lv_obj_align(l2, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    }
+    if (s_ook_weather_count == 0) {
+        lv_obj_t *m = lv_label_create(s_wx_list);
+        lv_label_set_text(m, "No weather sensors heard yet.\nCommon brands: Fine Offset,\nAcuRite, Froggit, Ecowitt.");
+        lv_obj_set_style_text_font(m, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(m, ui_text_color(), 0);
+    }
+}
+
+static void s_wx_task_fn(void *arg)
+{
+    (void)arg;
+    cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);
+    cc1101_set_freq_mhz(cc1101_freq_cal(433.92f));
+
+    while (!s_wx_stop) {
+        cc1101_raw_t raw = {0};
+        esp_err_t r = cc1101_raw_capture(&raw, 800);
+        if (r == ESP_OK && raw.count > 10) {
+            ook_weather_pkt_t pkt;
+            bool found = false;
+            // Scan all starting positions for Fine Offset
+            for (int start = 0; start < raw.count - 5 && !s_wx_stop; start++) {
+                if (ook_decode_fineoffset(raw.timings + start, raw.count - start, &pkt)) {
+                    int8_t rssi = cc1101_get_rssi_dbm();
+                    ook_weather_update(&pkt, rssi);
+                    found = true;
+                    if (s_wx_status) {
+                        wx_update_t *u = malloc(sizeof(wx_update_t));
+                        if (u) { u->changed = true; lv_async_call(s_wx_lvgl_cb, u); }
+                    }
+                    break;
+                }
+            }
+            if (!found && s_wx_status) {
+                // Update status with RSSI even if no decode
+            }
+            cc1101_raw_free(&raw);
+        }
+        if (!s_wx_stop) vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    cc1101_idle();
+    s_wx_task = NULL;
+    vTaskDelete(NULL);
+}
 
 static void show_cc1101_weather_screen(void)
 {
-    s_cc1101_stub_screen(MY_SYMBOL_SATELLITE_DISH "  Weather Station",
-        "Decode 433 MHz ISM weather\nsensors (WH1080, Oregon,\nAcuRite, others)\n\n"
-        "Coming in next version.");
+    if (s_wx_task) { s_wx_stop = true; vTaskDelay(pdMS_TO_TICKS(100)); }
+    s_wx_stop = false;
+    s_wx_status = NULL;
+    s_wx_list = NULL;
+    s_ook_weather_count = 0;
+
+    if (!cc1101_is_init() && cc1101_init() != ESP_OK) {
+        s_cc1101_stub_screen("Weather Station - No CC1101", "Check DIP 1 ON.");
+        return;
+    }
+
+    create_function_page_base("Weather Station");
+    apply_menu_bg();
+
+    s_wx_status = lv_label_create(function_page);
+    lv_label_set_text(s_wx_status, "Listening 433.920 MHz OOK...\nFine Offset / WH65 / WH57 / WS80");
+    lv_obj_set_style_text_font(s_wx_status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_wx_status, lv_color_hex(0x4DB6AC), 0);
+    lv_obj_set_style_text_align(s_wx_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_wx_status, LV_ALIGN_TOP_MID, 0, 34);
+
+    s_wx_list = lv_obj_create(function_page);
+    lv_obj_set_size(s_wx_list, LCD_H_RES - 10, LCD_V_RES - 110);
+    lv_obj_align(s_wx_list, LV_ALIGN_TOP_MID, 0, 76);
+    lv_obj_set_style_bg_opa(s_wx_list, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_wx_list, 0, 0);
+    lv_obj_set_style_pad_all(s_wx_list, 4, 0);
+    lv_obj_set_style_pad_gap(s_wx_list, 4, 0);
+    lv_obj_set_flex_flow(s_wx_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_add_flag(s_wx_list, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *m = lv_label_create(s_wx_list);
+    lv_label_set_text(m, "Waiting for weather sensor burst...");
+    lv_obj_set_style_text_font(m, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(m, ui_text_color(), 0);
+
+    rfhat_add_back_btn("CC1101", show_cc1101_screen);
+
+    xTaskCreate(s_wx_task_fn, "cc1101_wx", 4096, NULL, tskIDLE_PRIORITY + 2, &s_wx_task);
 }
 
 // ── POCSAG Pager Decoder ──────────────────────────────────────────────────────
@@ -38202,11 +39629,167 @@ static void show_cc1101_pocsag_screen(void)
 
 // ── Alarm Sensor Detection ────────────────────────────────────────────────────
 
+static lv_obj_t *s_alm_freq_btn[2] = {NULL, NULL};  // [0]=315, [1]=433
+static float     s_alm_freq_mhz = 433.92f;
+
+static void s_alm_lvgl_cb(void *arg)
+{
+    free(arg);
+    if (!s_alm_list) return;
+    lv_obj_clean(s_alm_list);
+    for (int i = 0; i < s_ook_alarm_count; i++) {
+        ook_alarm_entry_t *e = &s_ook_alarms[i];
+        lv_obj_t *row = lv_obj_create(s_alm_list);
+        lv_obj_set_size(row, LCD_H_RES - 18, 48);
+        lv_obj_set_style_bg_color(row, ui_panel_color(), 0);
+        lv_obj_set_style_border_color(row, lv_color_hex(0xB71C1C), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_radius(row, 6, 0);
+        lv_obj_set_style_pad_all(row, 5, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        char line1[48], line2[40], age[12];
+        ook_age_str(e->last_us, age, sizeof(age));
+        snprintf(line1, sizeof(line1), "Addr: 0x%06lX   Ch: %X",
+                 (unsigned long)e->addr, e->data & 0xF);
+        snprintf(line2, sizeof(line2), "%ddBm   x%u   %s ago",
+                 e->rssi, e->count, age);
+        lv_obj_t *l1 = lv_label_create(row);
+        lv_label_set_text(l1, line1);
+        lv_obj_set_style_text_font(l1, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(l1, lv_color_hex(0xFF8A80), 0);
+        lv_obj_align(l1, LV_ALIGN_TOP_LEFT, 0, 0);
+        lv_obj_t *l2 = lv_label_create(row);
+        lv_label_set_text(l2, line2);
+        lv_obj_set_style_text_font(l2, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l2, ui_text_color(), 0);
+        lv_obj_align(l2, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    }
+    if (s_ook_alarm_count == 0) {
+        lv_obj_t *m = lv_label_create(s_alm_list);
+        lv_label_set_text(m, "No sensors heard yet.\nTrigger a door/PIR/smoke\nsensor to see its address.");
+        lv_obj_set_style_text_font(m, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(m, ui_text_color(), 0);
+    }
+}
+
+static void s_alm_task_fn(void *arg)
+{
+    (void)arg;
+    cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);
+    cc1101_set_freq_mhz(cc1101_freq_cal(s_alm_freq_mhz));
+
+    while (!s_alm_stop) {
+        cc1101_raw_t raw = {0};
+        esp_err_t r = cc1101_raw_capture(&raw, 600);
+        if (r == ESP_OK && raw.count > 10) {
+            uint32_t addr; uint8_t data;
+            for (int start = 0; start < raw.count - 56 && !s_alm_stop; start++) {
+                if (ook_decode_ev1527(raw.timings + start, raw.count - start, &addr, &data)) {
+                    int8_t rssi = cc1101_get_rssi_dbm();
+                    ook_alarm_update(addr, data, rssi);
+                    wx_update_t *u = malloc(sizeof(wx_update_t));
+                    if (u) { u->changed = true; lv_async_call(s_alm_lvgl_cb, u); }
+                    start += 56;  // skip past this packet
+                }
+            }
+            cc1101_raw_free(&raw);
+        }
+        if (!s_alm_stop) vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    cc1101_idle();
+    s_alm_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void s_alm_freq_cb(lv_event_t *e)
+{
+    float *f = (float *)lv_event_get_user_data(e);
+    s_alm_freq_mhz = *f;
+    // restart task at new frequency
+    if (s_alm_task) { s_alm_stop = true; }
+    s_ook_alarm_count = 0;
+    vTaskDelay(pdMS_TO_TICKS(50));
+    s_alm_stop = false;
+    if (s_alm_status) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "Listening %.2f MHz OOK (EV1527)...", (double)*f);
+        lv_label_set_text(s_alm_status, buf);
+    }
+    xTaskCreate(s_alm_task_fn, "cc1101_alm", 4096, NULL, tskIDLE_PRIORITY + 2, &s_alm_task);
+}
+
 static void show_cc1101_alarm_screen(void)
 {
-    s_cc1101_stub_screen(LV_SYMBOL_WARNING "  Alarm Sensors",
-        "Detect wireless alarm\nsensors and door/window\ncontacts on 315/433 MHz\n\n"
-        "Coming in next version.");
+    if (s_alm_task) { s_alm_stop = true; vTaskDelay(pdMS_TO_TICKS(100)); }
+    s_alm_stop = false;
+    s_alm_status = NULL;
+    s_alm_list = NULL;
+    s_ook_alarm_count = 0;
+
+    if (!cc1101_is_init() && cc1101_init() != ESP_OK) {
+        s_cc1101_stub_screen("Alarm Sensors - No CC1101", "Check DIP 1 ON.");
+        return;
+    }
+
+    create_function_page_base("Alarm Sensors");
+    apply_menu_bg();
+
+    // Frequency selector
+    lv_obj_t *freq_row = lv_obj_create(function_page);
+    lv_obj_set_size(freq_row, LCD_H_RES - 10, 28);
+    lv_obj_align(freq_row, LV_ALIGN_TOP_MID, 0, 34);
+    lv_obj_set_style_bg_opa(freq_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(freq_row, 0, 0);
+    lv_obj_set_style_pad_all(freq_row, 0, 0);
+    lv_obj_set_flex_flow(freq_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(freq_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(freq_row, 8, 0);
+    lv_obj_clear_flag(freq_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    static float alm_freqs[2] = {315.0f, 433.92f};
+    static const char *alm_flbls[2] = {"315 MHz", "433 MHz"};
+    for (int i = 0; i < 2; i++) {
+        s_alm_freq_btn[i] = lv_btn_create(freq_row);
+        lv_obj_set_size(s_alm_freq_btn[i], 88, 24);
+        bool sel = (alm_freqs[i] == s_alm_freq_mhz);
+        lv_obj_set_style_bg_color(s_alm_freq_btn[i],
+            sel ? lv_color_hex(0xB71C1C) : lv_color_make(50,50,50), LV_STATE_DEFAULT);
+        lv_obj_set_style_border_color(s_alm_freq_btn[i], lv_color_hex(0xB71C1C), 0);
+        lv_obj_set_style_border_width(s_alm_freq_btn[i], sel ? 0 : 1, 0);
+        lv_obj_set_style_radius(s_alm_freq_btn[i], 4, 0);
+        lv_obj_t *fl = lv_label_create(s_alm_freq_btn[i]);
+        lv_label_set_text(fl, alm_flbls[i]);
+        lv_obj_set_style_text_font(fl, &lv_font_montserrat_12, 0);
+        lv_obj_center(fl);
+        lv_obj_add_event_cb(s_alm_freq_btn[i], s_alm_freq_cb, LV_EVENT_CLICKED, &alm_freqs[i]);
+    }
+
+    s_alm_status = lv_label_create(function_page);
+    lv_label_set_text(s_alm_status, "Listening 433.92 MHz OOK (EV1527)...");
+    lv_obj_set_style_text_font(s_alm_status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_alm_status, lv_color_hex(0xEF9A9A), 0);
+    lv_obj_set_style_text_align(s_alm_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_alm_status, LV_ALIGN_TOP_MID, 0, 66);
+
+    s_alm_list = lv_obj_create(function_page);
+    lv_obj_set_size(s_alm_list, LCD_H_RES - 10, LCD_V_RES - 118);
+    lv_obj_align(s_alm_list, LV_ALIGN_TOP_MID, 0, 86);
+    lv_obj_set_style_bg_opa(s_alm_list, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_alm_list, 0, 0);
+    lv_obj_set_style_pad_all(s_alm_list, 4, 0);
+    lv_obj_set_style_pad_gap(s_alm_list, 4, 0);
+    lv_obj_set_flex_flow(s_alm_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_add_flag(s_alm_list, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *m = lv_label_create(s_alm_list);
+    lv_label_set_text(m, "Waiting for sensor transmission...");
+    lv_obj_set_style_text_font(m, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(m, ui_text_color(), 0);
+
+    rfhat_add_back_btn("CC1101", show_cc1101_screen);
+
+    xTaskCreate(s_alm_task_fn, "cc1101_alm", 4096, NULL, tskIDLE_PRIORITY + 2, &s_alm_task);
 }
 
 // ── RF Wardrive ───────────────────────────────────────────────────────────────
@@ -38218,16 +39801,400 @@ static void show_cc1101_wardrive_screen(void)
         "Coming in next version.");
 }
 
-// ── Signal Proximity Tracker ──────────────────────────────────────────────────
+// ── Fox Hunt (CC1101 RSSI-based signal tracker with haptic feedback) ──────────
 
-static void show_cc1101_proximity_screen(void)
+static void s_fox_timer_cb(lv_timer_t *tmr)
 {
-    s_cc1101_stub_screen(MY_SYMBOL_PERSON_WALKING "  Proximity Tracker",
-        "Track signal source by RSSI\nwith haptic proximity\nfeedback via vibrator\n\n"
-        "Coming in next version.");
+    (void)tmr;
+    if (!cc1101_is_init()) return;
+
+    // Deferred CC1101 setup: create_function_page_base() cancels any running scan
+    // task (band scope), but the task may still be mid-sweep for up to ~15 ms.
+    // By deferring apply_preset/rx to the first timer tick (50 ms later), we
+    // guarantee the task has exited and the CC1101 is ours to configure.
+    if (!s_fox_setup_done) {
+        cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);
+        cc1101_set_freq_mhz(cc1101_freq_cal(s_cc1101_freq_mhz));
+        cc1101_rx();
+        s_fox_setup_done = true;
+        return;  // skip RSSI read this tick; let AGC settle for the next tick
+    }
+
+    int8_t rssi = cc1101_get_rssi_dbm();
+
+    if (rssi > s_fox_peak_dbm) s_fox_peak_dbm = rssi;
+
+    char buf[40];
+    if (s_fox_rssi_lbl) {
+        snprintf(buf, sizeof(buf), "%d dBm", (int)rssi);
+        lv_label_set_text(s_fox_rssi_lbl, buf);
+    }
+    if (s_fox_peak_lbl) {
+        snprintf(buf, sizeof(buf), "Peak: %d dBm", (int)s_fox_peak_dbm);
+        lv_label_set_text(s_fox_peak_lbl, buf);
+    }
+    if (s_fox_rssi_bar) {
+        int pct = (int)rssi + 120;
+        if (pct < 0)  pct = 0;
+        if (pct > 90) pct = 90;
+        lv_bar_set_value(s_fox_rssi_bar, pct * 100 / 90, LV_ANIM_OFF);
+    }
+
+    // Colour-code status label by proximity
+    if (s_fox_status_lbl) {
+        int above = (int)rssi - (int)s_fox_squelch_dbm;
+        if (above <= 0) {
+            lv_label_set_text(s_fox_status_lbl, "-- SILENT");
+            lv_obj_set_style_text_color(s_fox_status_lbl, lv_color_hex(0x757575), 0);
+        } else if (above < 10) {
+            lv_label_set_text(s_fox_status_lbl, " > WEAK");
+            lv_obj_set_style_text_color(s_fox_status_lbl, lv_color_hex(0x4CAF50), 0);
+        } else if (above < 25) {
+            lv_label_set_text(s_fox_status_lbl, ">> MEDIUM");
+            lv_obj_set_style_text_color(s_fox_status_lbl, lv_color_hex(0xFFEB3B), 0);
+        } else {
+            lv_label_set_text(s_fox_status_lbl, ">>> STRONG - CLOSE!");
+            lv_obj_set_style_text_color(s_fox_status_lbl, lv_color_hex(0xF44336), 0);
+        }
+    }
+
+    // Bug-hunter haptic: pulse rate proportional to RSSI above squelch.
+    // Always fire at 100% strength so the motor actually spins up.
+    if (s_fox_haptic_on && (int)rssi > (int)s_fox_squelch_dbm) {
+        int above = (int)rssi - (int)s_fox_squelch_dbm;
+        // Period in 50ms ticks: 30=1.5s slow near squelch, 2=100ms fast when strong
+        int period = 30 - above;
+        if (period < 2) period = 2;
+        s_fox_haptic_ctr++;
+        if (s_fox_haptic_ctr >= period) {
+            s_fox_haptic_ctr = 0;
+            g_vibtest_strength_pct = 100;
+            vibrator_pulse(150);
+        }
+    } else {
+        s_fox_haptic_ctr = 0;
+    }
 }
 
+static void s_fox_squelch_adj_cb(lv_event_t *e)
+{
+    int delta = (int)(intptr_t)lv_event_get_user_data(e);
+    s_fox_squelch_dbm = (int8_t)((int)s_fox_squelch_dbm + delta);
+    if (s_fox_squelch_dbm < -120) s_fox_squelch_dbm = -120;
+    if (s_fox_squelch_dbm > -30)  s_fox_squelch_dbm = -30;
+    if (s_fox_squelch_lbl) {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "Squelch: %d dBm", (int)s_fox_squelch_dbm);
+        lv_label_set_text(s_fox_squelch_lbl, buf);
+    }
+    s_fox_haptic_ctr = 0;
+}
+
+static void s_fox_clear_peak_cb(lv_event_t *e)
+{
+    (void)e;
+    s_fox_peak_dbm = -120;
+}
+
+static void s_fox_haptic_toggle_cb(lv_event_t *e)
+{
+    (void)e;
+    s_fox_haptic_on = !s_fox_haptic_on;
+    if (!s_fox_haptic_on) { vibrator_off(); s_fox_haptic_ctr = 0; }
+    if (s_fox_haptic_btn) {
+        lv_obj_t *l = lv_obj_get_child(s_fox_haptic_btn, 0);
+        if (l) lv_label_set_text(l, s_fox_haptic_on
+            ? LV_SYMBOL_AUDIO " Haptic: ON"
+            : LV_SYMBOL_MUTE  " Haptic: OFF");
+        lv_obj_set_style_bg_color(s_fox_haptic_btn,
+            s_fox_haptic_on ? lv_color_hex(0x1565C0) : lv_color_hex(0x455A64),
+            LV_STATE_DEFAULT);
+    }
+}
+
+static void s_fox_freq_adj_cb(lv_event_t *e)
+{
+    float delta = *(float *)lv_event_get_user_data(e);
+    s_cc1101_freq_mhz += delta;
+    // Clamp to CC1101 valid bands
+    if (s_cc1101_freq_mhz < 300.0f) s_cc1101_freq_mhz = 300.0f;
+    if (s_cc1101_freq_mhz > 928.0f) s_cc1101_freq_mhz = 928.0f;
+    if (cc1101_is_init()) cc1101_set_freq_mhz(cc1101_freq_cal(s_cc1101_freq_mhz));
+    s_fox_peak_dbm = -120;
+    s_fox_haptic_ctr = 0;
+    if (s_fox_freq_lbl) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.3f MHz", (double)s_cc1101_freq_mhz);
+        lv_label_set_text(s_fox_freq_lbl, buf);
+    }
+}
+
+static void s_fox_preset_cb(lv_event_t *e)
+{
+    float mhz = *(float *)lv_event_get_user_data(e);
+    s_cc1101_freq_mhz = mhz;
+    if (cc1101_is_init()) cc1101_set_freq_mhz(cc1101_freq_cal(mhz));
+    s_fox_peak_dbm = -120;
+    s_fox_haptic_ctr = 0;
+    if (s_fox_freq_lbl) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.3f MHz", (double)mhz);
+        lv_label_set_text(s_fox_freq_lbl, buf);
+    }
+}
+
+static void show_cc1101_foxhunt_screen(void)
+{
+    if (s_fox_tmr) { lv_timer_del(s_fox_tmr); s_fox_tmr = NULL; }
+    s_fox_rssi_bar   = NULL; s_fox_rssi_lbl  = NULL;
+    s_fox_peak_lbl   = NULL; s_fox_freq_lbl  = NULL;
+    s_fox_squelch_lbl= NULL; s_fox_haptic_btn= NULL;
+    s_fox_status_lbl = NULL;
+    s_fox_peak_dbm   = -120;
+    s_fox_haptic_ctr = 0;
+
+    if (!cc1101_is_init() && cc1101_init() != ESP_OK) {
+        s_cc1101_stub_screen("Fox Hunt — No CC1101",
+                             "Check DIP 1 ON.\nRun HW Test first.");
+        return;
+    }
+
+    s_fox_setup_done    = false;  // CC1101 will be configured on the first timer tick
+    s_fox_saved_vib_pct = g_vibtest_strength_pct;
+
+    // create_function_page_base cancels any running band scope / scan task via
+    // reset_function_page_children. CC1101 setup is deferred to the first timer
+    // tick (50 ms later) so that task exits before we configure the radio.
+    create_function_page_base("CC1101 Fox Hunt");
+    apply_menu_bg();
+
+    int y = 32;
+
+    // ── Frequency display ──────────────────────────────────────────────────────
+    lv_obj_t *freq_row = lv_obj_create(function_page);
+    lv_obj_set_size(freq_row, LCD_H_RES - 10, 26);
+    lv_obj_align(freq_row, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_set_style_bg_opa(freq_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(freq_row, 0, 0);
+    lv_obj_set_style_pad_all(freq_row, 0, 0);
+    lv_obj_set_flex_flow(freq_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(freq_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(freq_row, 6, 0);
+    lv_obj_clear_flag(freq_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_fox_freq_lbl = lv_label_create(freq_row);
+    { char buf[32]; snprintf(buf, sizeof(buf), "%.3f MHz", (double)s_cc1101_freq_mhz);
+      lv_label_set_text(s_fox_freq_lbl, buf); }
+    lv_obj_set_style_text_font(s_fox_freq_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(s_fox_freq_lbl, lv_color_hex(0x26C6DA), 0);
+    y += 28;
+
+    // ── Frequency preset buttons: 315 / 433 / 868 / 915 ───────────────────────
+    lv_obj_t *preset_row = lv_obj_create(function_page);
+    lv_obj_set_size(preset_row, LCD_H_RES - 10, 26);
+    lv_obj_align(preset_row, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_set_style_bg_opa(preset_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(preset_row, 0, 0);
+    lv_obj_set_style_pad_all(preset_row, 0, 0);
+    lv_obj_set_flex_flow(preset_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(preset_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(preset_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    static float s_fox_preset_vals[4];
+    static const float fox_preset_mhz[4]  = {315.0f, 433.92f, 868.35f, 915.0f};
+    static const char *fox_preset_lbl[4]  = {"315", "433", "868", "915"};
+    for (int i = 0; i < 4; i++) {
+        s_fox_preset_vals[i] = fox_preset_mhz[i];
+        lv_obj_t *pb = lv_btn_create(preset_row);
+        lv_obj_set_size(pb, 50, 22);
+        lv_obj_set_style_bg_color(pb, lv_color_make(30,60,80), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(pb, lv_color_make(0,100,120), LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(pb, lv_color_hex(0x26C6DA), 0);
+        lv_obj_set_style_border_width(pb, 1, 0);
+        lv_obj_set_style_radius(pb, 4, 0);
+        lv_obj_t *pl = lv_label_create(pb);
+        lv_label_set_text(pl, fox_preset_lbl[i]);
+        lv_obj_set_style_text_font(pl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(pl, lv_color_white(), 0);
+        lv_obj_center(pl);
+        lv_obj_add_event_cb(pb, s_fox_preset_cb, LV_EVENT_CLICKED, &s_fox_preset_vals[i]);
+    }
+    y += 28;
+
+    // ── Fine-tune buttons: −1 / −0.1 / +0.1 / +1 MHz ─────────────────────────
+    lv_obj_t *tune_row = lv_obj_create(function_page);
+    lv_obj_set_size(tune_row, LCD_H_RES - 10, 26);
+    lv_obj_align(tune_row, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_set_style_bg_opa(tune_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(tune_row, 0, 0);
+    lv_obj_set_style_pad_all(tune_row, 0, 0);
+    lv_obj_set_flex_flow(tune_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(tune_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tune_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    static float s_fox_tune_vals[4];
+    static const float fox_tune_delta[4] = {-1.0f, -0.1f, 0.1f, 1.0f};
+    static const char *fox_tune_lbl[4]   = {"-1", "-.1", "+.1", "+1"};
+    for (int i = 0; i < 4; i++) {
+        s_fox_tune_vals[i] = fox_tune_delta[i];
+        lv_obj_t *tb = lv_btn_create(tune_row);
+        lv_obj_set_size(tb, 50, 22);
+        lv_obj_set_style_bg_color(tb, lv_color_make(40,50,70), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(tb, lv_color_make(60,80,110), LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(tb, lv_color_hex(0x546E7A), 0);
+        lv_obj_set_style_border_width(tb, 1, 0);
+        lv_obj_set_style_radius(tb, 4, 0);
+        lv_obj_t *tl = lv_label_create(tb);
+        lv_label_set_text(tl, fox_tune_lbl[i]);
+        lv_obj_set_style_text_font(tl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(tl, lv_color_white(), 0);
+        lv_obj_center(tl);
+        lv_obj_add_event_cb(tb, s_fox_freq_adj_cb, LV_EVENT_CLICKED, &s_fox_tune_vals[i]);
+    }
+    lv_obj_t *mhz_lbl = lv_label_create(function_page);
+    lv_label_set_text(mhz_lbl, "MHz");
+    lv_obj_set_style_text_font(mhz_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(mhz_lbl, lv_color_hex(0x78909C), 0);
+    lv_obj_align(mhz_lbl, LV_ALIGN_TOP_RIGHT, -6, y + 5);
+    y += 30;
+
+    // ── RSSI bar ───────────────────────────────────────────────────────────────
+    s_fox_rssi_bar = lv_bar_create(function_page);
+    lv_obj_set_size(s_fox_rssi_bar, LCD_H_RES - 16, 16);
+    lv_obj_align(s_fox_rssi_bar, LV_ALIGN_TOP_MID, 0, y);
+    lv_bar_set_range(s_fox_rssi_bar, 0, 100);
+    lv_bar_set_value(s_fox_rssi_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(s_fox_rssi_bar, lv_color_make(30,30,30), 0);
+    lv_obj_set_style_bg_color(s_fox_rssi_bar, lv_color_hex(0x00E676), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(s_fox_rssi_bar, 4, 0);
+    lv_obj_set_style_radius(s_fox_rssi_bar, 4, LV_PART_INDICATOR);
+    y += 18;
+
+    // ── RSSI number + peak ─────────────────────────────────────────────────────
+    lv_obj_t *rssi_row = lv_obj_create(function_page);
+    lv_obj_set_size(rssi_row, LCD_H_RES - 10, 18);
+    lv_obj_align(rssi_row, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_set_style_bg_opa(rssi_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(rssi_row, 0, 0);
+    lv_obj_set_style_pad_all(rssi_row, 0, 0);
+    lv_obj_set_flex_flow(rssi_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(rssi_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(rssi_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_fox_rssi_lbl = lv_label_create(rssi_row);
+    lv_label_set_text(s_fox_rssi_lbl, "--- dBm");
+    lv_obj_set_style_text_font(s_fox_rssi_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_fox_rssi_lbl, lv_color_hex(0x00E676), 0);
+
+    s_fox_peak_lbl = lv_label_create(rssi_row);
+    lv_label_set_text(s_fox_peak_lbl, "Peak: ---");
+    lv_obj_set_style_text_font(s_fox_peak_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_fox_peak_lbl, lv_color_hex(0xFFB300), 0);
+    y += 20;
+
+    // ── Squelch row ────────────────────────────────────────────────────────────
+    lv_obj_t *sq_row = lv_obj_create(function_page);
+    lv_obj_set_size(sq_row, LCD_H_RES - 10, 26);
+    lv_obj_align(sq_row, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_set_style_bg_opa(sq_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(sq_row, 0, 0);
+    lv_obj_set_style_pad_all(sq_row, 0, 0);
+    lv_obj_set_flex_flow(sq_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(sq_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(sq_row, 6, 0);
+    lv_obj_clear_flag(sq_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_fox_squelch_lbl = lv_label_create(sq_row);
+    { char buf[28]; snprintf(buf, sizeof(buf), "Squelch: %d dBm", (int)s_fox_squelch_dbm);
+      lv_label_set_text(s_fox_squelch_lbl, buf); }
+    lv_obj_set_style_text_font(s_fox_squelch_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_fox_squelch_lbl, ui_text_color(), 0);
+    lv_obj_set_flex_grow(s_fox_squelch_lbl, 1);
+
+    static int sq_deltas[2] = {-5, 5};
+    static const char *sq_lbls[2] = {"-5", "+5"};
+    for (int i = 0; i < 2; i++) {
+        lv_obj_t *sqb = lv_btn_create(sq_row);
+        lv_obj_set_size(sqb, 36, 22);
+        lv_obj_set_style_bg_color(sqb, lv_color_make(50,50,70), LV_STATE_DEFAULT);
+        lv_obj_set_style_border_width(sqb, 0, 0);
+        lv_obj_set_style_radius(sqb, 4, 0);
+        lv_obj_t *sql = lv_label_create(sqb);
+        lv_label_set_text(sql, sq_lbls[i]);
+        lv_obj_set_style_text_font(sql, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(sql, lv_color_white(), 0);
+        lv_obj_center(sql);
+        lv_obj_add_event_cb(sqb, s_fox_squelch_adj_cb, LV_EVENT_CLICKED, (void *)(intptr_t)sq_deltas[i]);
+    }
+    y += 28;
+
+    // ── Haptic toggle + Clear Peak ──────────────────────────────────────────────
+    lv_obj_t *ctrl_row = lv_obj_create(function_page);
+    lv_obj_set_size(ctrl_row, LCD_H_RES - 10, 28);
+    lv_obj_align(ctrl_row, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_set_style_bg_opa(ctrl_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ctrl_row, 0, 0);
+    lv_obj_set_style_pad_all(ctrl_row, 0, 0);
+    lv_obj_set_flex_flow(ctrl_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(ctrl_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(ctrl_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_fox_haptic_btn = lv_btn_create(ctrl_row);
+    lv_obj_set_size(s_fox_haptic_btn, 118, 24);
+    lv_obj_set_style_bg_color(s_fox_haptic_btn, lv_color_hex(0x1565C0), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(s_fox_haptic_btn, 0, 0);
+    lv_obj_set_style_radius(s_fox_haptic_btn, 6, 0);
+    lv_obj_t *hbl = lv_label_create(s_fox_haptic_btn);
+    lv_label_set_text(hbl, LV_SYMBOL_AUDIO " Haptic: ON");
+    lv_obj_set_style_text_font(hbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(hbl);
+    lv_obj_add_event_cb(s_fox_haptic_btn, s_fox_haptic_toggle_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *clr_btn = lv_btn_create(ctrl_row);
+    lv_obj_set_size(clr_btn, 100, 24);
+    lv_obj_set_style_bg_color(clr_btn, lv_color_hex(0x37474F), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(clr_btn, 0, 0);
+    lv_obj_set_style_radius(clr_btn, 6, 0);
+    lv_obj_t *cll = lv_label_create(clr_btn);
+    lv_label_set_text(cll, LV_SYMBOL_REFRESH " Clear Peak");
+    lv_obj_set_style_text_font(cll, &lv_font_montserrat_12, 0);
+    lv_obj_center(cll);
+    lv_obj_add_event_cb(clr_btn, s_fox_clear_peak_cb, LV_EVENT_CLICKED, NULL);
+    y += 30;
+
+    // ── Status label ───────────────────────────────────────────────────────────
+    s_fox_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_fox_status_lbl, "-- SILENT");
+    lv_obj_set_style_text_font(s_fox_status_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_fox_status_lbl, lv_color_hex(0x757575), 0);
+    lv_obj_set_style_text_align(s_fox_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_fox_status_lbl, LV_ALIGN_TOP_MID, 0, y);
+
+    s_fox_tmr = lv_timer_create(s_fox_timer_cb, 50, NULL);
+
+    // Save vibration strength; restore on exit via back button
+    rfhat_add_back_btn("CC1101", show_cc1101_screen);
+}
+
+// On exiting the fox hunt screen the back button calls show_cc1101_screen.
+// Restore vibration and clean up in that path via the existing rfhat_add_back_btn.
+// (The timer is cleaned up by reset_function_page_children / create_function_page_base.)
+
 // ── Jammer (Attack — FOR AUTHORIZED USE ONLY) ────────────────────────────────
+
+static void s_jam_band_cb(lv_event_t *e)
+{
+    jam_band_t new_band = *(jam_band_t *)lv_event_get_user_data(e);
+    if (new_band == s_jam_band) return;
+    s_jam_band = new_band;
+    for (int i = 0; i < 5; i++) {
+        if (!s_jam_band_btns[i] || !lv_obj_is_valid(s_jam_band_btns[i])) continue;
+        bool sel = ((jam_band_t)i == s_jam_band);
+        lv_obj_set_style_bg_color(s_jam_band_btns[i],
+            sel ? UI_ACCENT_RED : lv_color_make(50,50,50), LV_STATE_DEFAULT);
+        lv_obj_set_style_border_width(s_jam_band_btns[i], sel ? 0 : 1, 0);
+    }
+}
 
 static void s_cc1101_jam_stop(void)
 {
@@ -38238,13 +40205,34 @@ static void s_cc1101_jam_stop(void)
         lv_label_set_text(s_cc1101_jam_status, "Stopped");
         lv_obj_set_style_text_color(s_cc1101_jam_status, lv_color_hex(0xFFC107), 0);
     }
+    if (s_cc1101_jam_freq_lbl) {
+        lv_label_set_text(s_cc1101_jam_freq_lbl, "--");
+        lv_obj_set_style_text_color(s_cc1101_jam_freq_lbl, lv_color_hex(0x757575), 0);
+    }
+}
+
+// ── Jammer band sweep (state declared in CC1101 shared state above) ───────────
+
+static void s_jam_fill_and_tx(float freq_mhz)
+{
+    // In random-TX mode the CC1101 generates PRBS internally — no FIFO needed.
+    // SIDLE → change freq → STX; chip transmits continuously until next SIDLE.
+    cc1101_idle();
+    cc1101_set_freq_mhz(cc1101_freq_cal(freq_mhz));
+    cc1101_strobe(CC1101_STX);
 }
 
 static void s_cc1101_jam_timer_cb(lv_timer_t *tmr)
 {
     if (!s_cc1101_jamming || !cc1101_is_init()) { s_cc1101_jam_stop(); return; }
-    // Re-strobe TX to keep jammer running (CC1101 may return to IDLE on some configs)
-    cc1101_tx();
+    s_jam_freq_idx = (s_jam_freq_idx + 1) % JAM_STEPS;
+    float f = s_jam_table[s_jam_freq_idx];
+    s_jam_fill_and_tx(f);
+    if (s_cc1101_jam_freq_lbl) {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%.1f MHz", (double)f);
+        lv_label_set_text(s_cc1101_jam_freq_lbl, buf);
+    }
     (void)tmr;
 }
 
@@ -38253,16 +40241,40 @@ static void s_cc1101_jam_start_cb(lv_event_t *e)
     if (!cc1101_is_init()) {
         if (cc1101_init() != ESP_OK) return;
     }
-    cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);
+    // Apply band-appropriate preset
+    switch (s_jam_band) {
+        case JAM_BAND_315:  cc1101_apply_preset(CC1101_PRESET_OOK_4K8_315MHZ); s_jam_table = s_jam_315;  break;
+        case JAM_BAND_433N: cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ); s_jam_table = s_jam_433n; break;
+        case JAM_BAND_868:  cc1101_apply_preset(CC1101_PRESET_OOK_4K8_868MHZ); s_jam_table = s_jam_868;  break;
+        case JAM_BAND_915:  cc1101_apply_preset(CC1101_PRESET_OOK_4K8_915MHZ); s_jam_table = s_jam_915;  break;
+        default:            cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ); s_jam_table = s_jam_433;  break;
+    }
     cc1101_set_output_power_dbm(10);
+    // 2-FSK random PRBS — widest modulation the CC1101 can produce:
+    //   PKTCTRL0 = 0x0A → DATA_FORMAT=10 (random PRBS, no FIFO) + LENGTH=10 (infinite)
+    //   MDMCFG4  = 0x07 → channel filter BW=812 kHz, DR_E=7
+    //   MDMCFG3  = 0x3B → DR_M=59 → ≈250 kbps
+    //   MDMCFG2  = 0x00 → 2-FSK, no sync, no Manchester (overrides OOK preset)
+    //   DEVIATN  = 0x77 → max deviation ≈±381 kHz
+    //   FREND0   = 0x10 → single-level PA for FSK (not OOK 2-level PATABLE)
+    // Carson's rule BW: 2×(381+125) ≈ 1012 kHz per hop — the entire 433N
+    // narrow band (165 kHz) is buried under each individual hop.
+    cc1101_write_reg(CC1101_PKTCTRL0, 0x0A);  // random TX, infinite
+    cc1101_write_reg(CC1101_MDMCFG4,  0x07);  // BW=812 kHz, DR_E=7
+    cc1101_write_reg(CC1101_MDMCFG3,  0x3B);  // DR_M=59 → ≈250 kbps
+    cc1101_write_reg(CC1101_MDMCFG2,  0x00);  // 2-FSK, no sync, no Manchester
+    cc1101_write_reg(CC1101_DEVIATN,   0x77);  // max deviation ≈±381 kHz
+    cc1101_write_reg(CC1101_FREND0,    0x10);  // FSK single-level PA
     s_cc1101_jamming = true;
-    cc1101_tx();
+    s_jam_freq_idx = 0;
+    s_jam_fill_and_tx(s_jam_table[0]);
+
     if (s_cc1101_jam_status) {
-        lv_label_set_text(s_cc1101_jam_status, "JAMMING 433 MHz");
+        lv_label_set_text(s_cc1101_jam_status, "JAMMING");
         lv_obj_set_style_text_color(s_cc1101_jam_status, UI_ACCENT_RED, 0);
     }
     if (!s_cc1101_jam_tmr)
-        s_cc1101_jam_tmr = lv_timer_create(s_cc1101_jam_timer_cb, 500, NULL);
+        s_cc1101_jam_tmr = lv_timer_create(s_cc1101_jam_timer_cb, 31, NULL);
     (void)e;
 }
 
@@ -38359,20 +40371,63 @@ static void show_cc1101_jammer_screen(void)
     lv_obj_set_style_text_font(hdr, &g_font_icon14, 0);
     lv_obj_set_style_text_color(hdr, UI_ACCENT_RED, 0);
 
+    // ── Band selector (4 buttons) ──────────────────────────────────────────────
+    lv_obj_t *band_row = lv_obj_create(card);
+    lv_obj_set_size(band_row, lv_pct(100), 28);
+    lv_obj_set_style_bg_opa(band_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(band_row, 0, 0);
+    lv_obj_set_style_pad_all(band_row, 0, 0);
+    lv_obj_set_flex_flow(band_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(band_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(band_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    // 5 bands: 315 / 433W (wide) / 433N (narrow ±80 kHz) / 868 / 915
+    static const char *band_lbls[5] = {"315", "433W", "433N", "868", "915"};
+    static jam_band_t band_vals[5] = {JAM_BAND_315, JAM_BAND_433W, JAM_BAND_433N, JAM_BAND_868, JAM_BAND_915};
+    lv_obj_t *band_btns[5];
+    for (int i = 0; i < 5; i++) {
+        band_btns[i] = lv_btn_create(band_row);
+        lv_obj_set_size(band_btns[i], 38, 24);  // 5 × 38 + 4 × 4 gap = 206 ≤ 208 px ✓
+        bool sel = ((jam_band_t)i == s_jam_band);
+        lv_obj_set_style_bg_color(band_btns[i],
+            sel ? UI_ACCENT_RED : lv_color_make(50,50,50), LV_STATE_DEFAULT);
+        lv_obj_set_style_border_color(band_btns[i], UI_ACCENT_RED, 0);
+        lv_obj_set_style_border_width(band_btns[i], sel ? 0 : 1, 0);
+        lv_obj_set_style_radius(band_btns[i], 4, 0);
+        lv_obj_t *bl = lv_label_create(band_btns[i]);
+        lv_label_set_text(bl, band_lbls[i]);
+        lv_obj_set_style_text_font(bl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(bl, lv_color_white(), 0);
+        lv_obj_center(bl);
+        s_jam_band_btns[i] = band_btns[i];
+        lv_obj_add_event_cb(band_btns[i], s_jam_band_cb, LV_EVENT_CLICKED, &band_vals[i]);
+    }
+    // 433N tooltip label
+    lv_obj_t *n_hint = lv_label_create(card);
+    lv_label_set_text(n_hint, "433N = narrow +-80 kHz @ 433.920");
+    lv_obj_set_style_text_font(n_hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(n_hint, lv_color_hex(0x757575), 0);
+
+    // ── Status + live frequency ────────────────────────────────────────────────
     s_cc1101_jam_status = lv_label_create(card);
     lv_label_set_text(s_cc1101_jam_status, "Ready");
     lv_obj_set_style_text_font(s_cc1101_jam_status, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_cc1101_jam_status, lv_color_hex(0x66BB6A), 0);
 
+    s_cc1101_jam_freq_lbl = lv_label_create(card);
+    lv_label_set_text(s_cc1101_jam_freq_lbl, "--");
+    lv_obj_set_style_text_font(s_cc1101_jam_freq_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_cc1101_jam_freq_lbl, lv_color_hex(0x757575), 0);
+
     lv_obj_t *note = lv_label_create(card);
-    lv_label_set_text(note, "Jams 433 MHz OOK remotes\nby transmitting carrier");
+    lv_label_set_text(note, "12-step sweep -- 31 ms/step -- 372 ms cycle\n2-FSK +-381 kHz ~1 MHz noise per hop");
     lv_obj_set_style_text_font(note, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(note, lv_color_make(150,150,150), 0);
+    lv_obj_set_style_text_color(note, lv_color_make(120,120,120), 0);
     lv_obj_set_style_text_align(note, LV_TEXT_ALIGN_CENTER, 0);
 
-    // Start / Stop buttons
+    // ── Start / Stop buttons ───────────────────────────────────────────────────
     lv_obj_t *btn_row = lv_obj_create(card);
-    lv_obj_set_size(btn_row, LCD_H_RES - 36, 36);
+    lv_obj_set_size(btn_row, lv_pct(100), 36);
     lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(btn_row, 0, 0);
     lv_obj_set_style_pad_all(btn_row, 0, 0);
@@ -38509,6 +40564,22 @@ static void s_bs_ui_timer_cb(lv_timer_t *t)
         if (v > 255) v = 255;
         ctx->canv_buf[wf_start * CC1101_BS_W + x] = scope_heat_color((uint8_t)v);
     }
+    // SDR-style frequency marker: solid yellow vertical line in spectrum section ONLY.
+    // Drawing into the waterfall section would ghost: memmove scroll carries line
+    // pixels down with each frame, making ghost trails in the history.
+    if (ctx->marker_set && ctx->tap_freq_mhz > 0.0f) {
+        float freq_start = ctx->center - ctx->span / 2.0f;
+        int line_x = (int)((ctx->tap_freq_mhz - freq_start) / ctx->span * (float)CC1101_BS_W);
+        if (line_x >= 0 && line_x < CC1101_BS_W) {
+            lv_color_t yellow = lv_color_hex(0xFFEB3B);
+            for (int ly = 0; ly < CC1101_BS_SPEC_H; ly++) {
+                ctx->canv_buf[ly * CC1101_BS_W + line_x] = yellow;
+                if (line_x + 1 < CC1101_BS_W)
+                    ctx->canv_buf[ly * CC1101_BS_W + line_x + 1] = yellow;
+            }
+        }
+    }
+
     lv_obj_invalidate(ctx->canvas);
 
     if (ctx->status_lbl && esp_timer_get_time() >= ctx->tap_expire_us) {
@@ -38528,7 +40599,6 @@ static void s_bs_ui_timer_cb(lv_timer_t *t)
 
 static void s_bs_canvas_tap_cb(lv_event_t *e)
 {
-    (void)e;
     cc1101_bs_ctx_t *ctx = s_bs;
     if (!ctx || !ctx->status_lbl || !ctx->canvas) return;
     lv_indev_t *indev = lv_indev_get_act();
@@ -38539,18 +40609,31 @@ static void s_bs_canvas_tap_cb(lv_event_t *e)
     lv_obj_get_coords(ctx->canvas, &area);
     int x = pt.x - area.x1;
     if (x < 0 || x >= CC1101_BS_W) return;
-    // Snap to the nearest CC1101 measurement bin (not pixel-interpolated)
+
+    // Snap to the nearest CC1101 measurement bin
     float pppt = (float)CC1101_BS_W / (float)CC1101_BS_NPTS;
     int bin = (int)((float)x / pppt);
     if (bin >= CC1101_BS_NPTS) bin = CC1101_BS_NPTS - 1;
     float step = ctx->span / (float)CC1101_BS_NPTS;
     float freq = (ctx->center - ctx->span / 2.0f) + ((float)bin + 0.5f) * step;
     int rssi_dbm = (int)ctx->rssi[bin];
+
     char buf[36];
     snprintf(buf, sizeof(buf), "%.2f MHz  %d dBm", (double)freq, rssi_dbm);
     lv_label_set_text(ctx->status_lbl, buf);
     lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0xFFEB3B), 0);
+    ctx->tap_freq_mhz = freq;
+    ctx->marker_set   = true;
     ctx->tap_expire_us = esp_timer_get_time() + 2000000ULL;
+}
+
+static void s_bs_hunt_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    cc1101_bs_ctx_t *ctx = s_bs;
+    if (!ctx) return;
+    s_cc1101_freq_mhz = ctx->tap_freq_mhz;
+    show_cc1101_foxhunt_screen();
 }
 
 static void s_bs_preset_cb(lv_event_t *e)
@@ -38607,7 +40690,9 @@ static void show_cc1101_bandscope_screen(void)
     ctx->center = 433.92f;
     ctx->span   = 20.0f;
 
-    int canvas_h = CC1101_BS_SPEC_H + 1 + CC1101_BS_WF_H;  // 165 px
+    int canvas_h = CC1101_BS_SPEC_H + 1 + CC1101_BS_WF_H;
+    ctx->canvas_h  = canvas_h;
+    ctx->marker_set = false;
     ctx->canv_buf = heap_caps_calloc((size_t)(CC1101_BS_W * canvas_h),
                                       sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
     if (!ctx->canv_buf) { heap_caps_free(ctx); return; }
@@ -38623,7 +40708,9 @@ static void show_cc1101_bandscope_screen(void)
     lv_obj_set_pos(s_bs->canvas, 0, 28);
     lv_obj_set_size(s_bs->canvas, CC1101_BS_W, canvas_h);
     lv_obj_add_flag(s_bs->canvas, LV_OBJ_FLAG_CLICKABLE);
+    // CLICKED = place marker + show Hunt button; PRESSING = drag marker in real time
     lv_obj_add_event_cb(s_bs->canvas, s_bs_canvas_tap_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(s_bs->canvas, s_bs_canvas_tap_cb, LV_EVENT_PRESSING, NULL);
 
     int cy = 28 + canvas_h;  // y coordinate immediately below canvas (193)
 
@@ -38665,9 +40752,20 @@ static void show_cc1101_bandscope_screen(void)
     lv_obj_set_style_text_align(s_bs->status_lbl, LV_TEXT_ALIGN_CENTER, 0);
 
     // Start / Stop toggle button
-    s_bs->start_btn = lv_btn_create(function_page);
-    lv_obj_set_size(s_bs->start_btn, 110, 26);
-    lv_obj_set_pos(s_bs->start_btn, (LCD_H_RES - 110) / 2, cy + 57);
+    // Start/Stop and Hunt buttons in a shared row at cy+57
+    lv_obj_t *action_row = lv_obj_create(function_page);
+    lv_obj_set_size(action_row, LCD_H_RES - 10, 26);
+    lv_obj_set_pos(action_row, 5, cy + 57);
+    lv_obj_set_style_bg_opa(action_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(action_row, 0, 0);
+    lv_obj_set_style_pad_all(action_row, 0, 0);
+    lv_obj_set_flex_flow(action_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(action_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(action_row, 6, 0);
+    lv_obj_clear_flag(action_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_bs->start_btn = lv_btn_create(action_row);
+    lv_obj_set_size(s_bs->start_btn, 108, 26);
     lv_obj_set_style_bg_color(s_bs->start_btn, lv_color_hex(0x1B5E20), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(s_bs->start_btn, lv_color_hex(0x2E7D32), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(s_bs->start_btn, 0, 0);
@@ -38677,6 +40775,23 @@ static void show_cc1101_bandscope_screen(void)
     lv_obj_set_style_text_font(sl, &lv_font_montserrat_12, 0);
     lv_obj_center(sl);
     lv_obj_add_event_cb(s_bs->start_btn, s_bs_startstop_cb, LV_EVENT_CLICKED, NULL);
+
+    // Hunt button — always visible, right of Start/Stop; hunts current marker freq
+    s_bs->hunt_btn = lv_btn_create(action_row);
+    lv_obj_set_size(s_bs->hunt_btn, 108, 26);
+    lv_obj_set_style_bg_color(s_bs->hunt_btn, lv_color_hex(0xE65100), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(s_bs->hunt_btn, lv_color_hex(0xBF360C), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(s_bs->hunt_btn, 0, 0);
+    lv_obj_set_style_radius(s_bs->hunt_btn, 6, 0);
+    lv_obj_t *hl = lv_label_create(s_bs->hunt_btn);
+    lv_label_set_text(hl, "Hunt freq");
+    lv_obj_set_style_text_font(hl, &lv_font_montserrat_12, 0);
+    lv_obj_center(hl);
+    lv_obj_add_event_cb(s_bs->hunt_btn, s_bs_hunt_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    // Initialize marker at center frequency so line appears on open
+    s_bs->tap_freq_mhz = ctx->center;
+    s_bs->marker_set   = true;
 
     s_bs->tmr = lv_timer_create(s_bs_ui_timer_cb, 100, NULL);
 
@@ -39109,7 +41224,7 @@ static void s_n24_page_next_cb(lv_event_t *e)
 static lv_obj_t *s_n24_make_page(lv_obj_t *parent)
 {
     lv_obj_t *p = lv_obj_create(parent);
-    lv_obj_set_size(p, LCD_H_RES, 188);
+    lv_obj_set_size(p, LCD_H_RES, 238);  // 3 rows × 74 + 2×4 gap + 2×4 pad
     lv_obj_set_style_bg_opa(p, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(p, 0, 0);
     lv_obj_set_style_pad_all(p, 4, 0);
@@ -39132,6 +41247,7 @@ static void s_n24_tile_cb(lv_event_t *e)
     else if (strcmp(name, "Saved")   == 0) show_nrf24_saved_screen();
     else if (strcmp(name, "Jammer")  == 0) show_nrf24_jammer_screen();
     else if (strcmp(name, "Futaba")  == 0) show_nrf24_futaba_screen();
+    else if (strcmp(name, "FoxHunt") == 0) show_nrf24_foxhunt_screen();
     else if (strcmp(name, "MouseJack") == 0)
         s_n24_stub_screen(LV_SYMBOL_USB "  MouseJack",
             "Hijack/inject packets into\nunprotected 2.4GHz keyboards\nand mice.\n\n"
@@ -39163,6 +41279,12 @@ static void show_nrf24_screen(void)
     s_n24_jam_active = false;
     s_n24_jam_status = NULL;
     if (s_n24_jam_tmr) { lv_timer_del(s_n24_jam_tmr); s_n24_jam_tmr = NULL; }
+    // nRF24 Fox Hunt cleanup
+    if (s_n24fox_tmr) { lv_timer_del(s_n24fox_tmr); s_n24fox_tmr = NULL; }
+    vibrator_off();
+    g_vibtest_strength_pct = s_n24fox_saved_vib_pct;
+    s_n24fox_bar = NULL; s_n24fox_lbl = NULL; s_n24fox_ch_lbl = NULL;
+    s_n24fox_hbtn = NULL; s_n24fox_status = NULL;
 
     nrf24_hat_claim();
     s_n24_page = 0;
@@ -39172,7 +41294,7 @@ static void show_nrf24_screen(void)
 
     // Tile container
     lv_obj_t *tc = lv_obj_create(function_page);
-    lv_obj_set_size(tc, LCD_H_RES, 192);
+    lv_obj_set_size(tc, LCD_H_RES, 244);
     lv_obj_align(tc, LV_ALIGN_TOP_MID, 0, 30);
     lv_obj_set_style_bg_opa(tc, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tc, 0, 0);
@@ -39192,6 +41314,7 @@ static void show_nrf24_screen(void)
     create_tile(p1, LV_SYMBOL_SAVE,          "Saved\nFiles", lv_color_hex(0x4A148C), s_n24_tile_cb, "Saved");
     create_tile(p1, MY_SYMBOL_SKULL_CROSS,   "Jammer",       UI_ACCENT_RED,          s_n24_tile_cb, "Jammer");
     create_tile(p1, MY_SYMBOL_CAR,           "Futaba\nS-FHSS",lv_color_hex(0xE65100),s_n24_tile_cb, "Futaba");
+    create_tile(p1, MY_SYMBOL_PERSON_WALKING,"Fox\nHunt",    lv_color_hex(0xE65100),s_n24_tile_cb, "FoxHunt");
 
     // Page 2: Research stubs (with legal warnings where required)
     lv_obj_t *p2 = s_n24_pages[1];
@@ -39288,26 +41411,44 @@ static void show_nrf24_hw_test_screen(void)
     lv_obj_set_width(res, LCD_H_RES - 44);
     lv_obj_set_style_text_align(res, LV_TEXT_ALIGN_CENTER, 0);
 
-    char buf[192];
+    char buf[512];
     if (err == ESP_OK) {
-        uint8_t st  = nrf24_get_status();
-        uint8_t cfg = nrf24_read_reg(0x00);
-        uint8_t ch  = nrf24_read_reg(0x05);
-        uint8_t rfs = nrf24_read_reg(0x06);
+        uint8_t st   = nrf24_get_status();
+        uint8_t cfg  = nrf24_read_reg(0x00);  // CONFIG
+        uint8_t enaa = nrf24_read_reg(0x01);  // EN_AA
+        uint8_t aw   = nrf24_read_reg(0x03);  // SETUP_AW
+        uint8_t ch   = nrf24_read_reg(0x05);  // RF_CH
+        uint8_t rfs  = nrf24_read_reg(0x06);  // RF_SETUP
+        uint8_t obs  = nrf24_read_reg(0x08);  // OBSERVE_TX (lost/retr counts)
+        uint8_t rpd  = nrf24_read_reg(0x09);  // RPD (received power detector)
+        uint8_t fifo = nrf24_read_reg(0x17);  // FIFO_STATUS
+        uint8_t aw_bytes = (aw & 0x03) + 2;  // 01→3B 10→4B 11→5B
+        const char *dr = (rfs & 0x20) ? "250k" : (rfs & 0x08) ? "2M" : "1M";
+        static const char *pa_lut[4] = {"-18dBm","-12dBm","-6dBm","0dBm"};
+        const char *pa = pa_lut[(rfs >> 1) & 0x03];
+        ESP_LOGI("NRF24_HWT",
+                 "STATUS=0x%02X CONFIG=0x%02X EN_AA=0x%02X SETUP_AW=0x%02X "
+                 "RF_CH=%u RF_SETUP=0x%02X OBSERVE_TX=0x%02X RPD=0x%02X FIFO=0x%02X",
+                 st, cfg, enaa, aw, ch, rfs, obs, rpd, fifo);
         snprintf(buf, sizeof(buf),
-                 LV_SYMBOL_OK "  Detected\n\n"
+                 LV_SYMBOL_OK "  nRF24L01+ Detected\n\n"
                  "STATUS:   0x%02X\n"
-                 "CONFIG:   0x%02X\n"
+                 "CONFIG:   0x%02X  EN_AA: 0x%02X\n"
                  "RF_CH:    %u  (%.0f MHz)\n"
-                 "RF_SETUP: 0x%02X\n\n"
+                 "RF_SETUP: 0x%02X  Rate: %s\n"
+                 "nRF24 PA: %s -> AT2401C -> ~+20dBm\n"
+                 "SETUP_AW: 0x%02X  (%u-byte addr)\n"
+                 "FIFO:     0x%02X  RPD: %u\n"
+                 "OBSERVE_TX: 0x%02X\n\n"
                  "DIP 2: CE=GPIO8  CSN=GPIO9",
-                 st, cfg, ch, 2400.0f + ch, rfs);
+                 st, cfg, enaa, ch, 2400.0f + ch,
+                 rfs, dr, pa, aw, aw_bytes, fifo, rpd, obs);
         lv_label_set_text(res, buf);
         lv_obj_set_style_text_color(res, lv_color_hex(0x66BB6A), 0);
     } else {
         snprintf(buf, sizeof(buf),
                  LV_SYMBOL_WARNING "  Not detected\n\n"
-                 "Check DIP switch 2\nand module seating.\n\nErr: %s",
+                 "Check DIP switch 2 ON.\n\nErr: %s",
                  esp_err_to_name(err));
         lv_label_set_text(res, buf);
         lv_obj_set_style_text_color(res, UI_ACCENT_RED, 0);
@@ -39574,6 +41715,9 @@ static void s_nsniff_rx_cb(const nrf24_packet_t *pkt, void *ctx_v)
     nrf24_sniff_ctx_t *ctx = (nrf24_sniff_ctx_t *)ctx_v;
     if (!ctx) return;
     memcpy(&ctx->last_pkt, pkt, sizeof(*pkt));
+    int idx = ctx->pkt_count;
+    if (ctx->pkts && idx < NRF24_SNIFF_MAX_PKTS)
+        memcpy(&ctx->pkts[idx], pkt, sizeof(*pkt));
     ctx->pkt_count++;
 }
 
@@ -39595,28 +41739,26 @@ static void s_nsniff_task_fn(void *arg)
     const uint8_t bcast[3] = { 0xAA, 0xAA, 0xAA };
     memcpy(cap.addr, bcast, 3);
 
-    // Collect packets
+    // Allocate packet buffer and share with callback via ctx->pkts
     nrf24_packet_t *pkts = heap_caps_calloc(NRF24_SNIFF_MAX_PKTS,
                                              sizeof(nrf24_packet_t), MALLOC_CAP_SPIRAM);
-    cap.pkts = pkts;
+    ctx->pkts = pkts;
+    cap.pkts  = pkts;
 
     nrf24_sniff(ctx->channel, ctx->payload_len,
                 s_nsniff_rx_cb, ctx, 0, &ctx->cancel);
 
-    // Save whatever was captured
+    // Save all captured packets (up to NRF24_SNIFF_MAX_PKTS)
     if (pkts) {
         int n = ctx->pkt_count < NRF24_SNIFF_MAX_PKTS ? ctx->pkt_count : NRF24_SNIFF_MAX_PKTS;
-        memcpy(pkts, &ctx->last_pkt, sizeof(nrf24_packet_t));
-        cap.count = n > 0 ? 1 : 0;  // simplified: save last packet
-        if (cap.count > 0) nrf24_capture_save(&cap, ctx->save_path);
+        cap.count = n;
+        if (n > 0) nrf24_capture_save(&cap, ctx->save_path);
+        ctx->pkts = NULL;
         heap_caps_free(pkts);
     }
 
     ctx->active = false;
     ctx->task = NULL;
-    if (s_nsniff) { s_nsniff->tmr = NULL; }
-    heap_caps_free(ctx);
-    if (s_nsniff == ctx) s_nsniff = NULL;
     vTaskDelete(NULL);
 }
 
@@ -39710,14 +41852,16 @@ static void show_nrf24_sniffer_screen(void)
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *hdr = lv_label_create(card);
-    lv_label_set_text(hdr, LV_SYMBOL_EYE_OPEN "  nRF24 Protocol Sniffer");
+    lv_label_set_text(hdr, LV_SYMBOL_EYE_OPEN "  Packet Sniffer");
     lv_obj_set_style_text_font(hdr, &g_font_icon14, 0);
     lv_obj_set_style_text_color(hdr, lv_color_hex(0x66BB6A), 0);
 
     lv_obj_t *info = lv_label_create(card);
-    lv_label_set_text(info, "Ch 76 | nRF24 protocol only | Addr AA:AA:AA");
+    lv_label_set_text(info, "Ch 76 | No CRC | 32B | Addr AA:AA:AA");
     lv_obj_set_style_text_font(info, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(info, lv_color_make(150, 150, 150), 0);
+    lv_obj_set_width(info, LCD_H_RES - 36);
+    lv_label_set_long_mode(info, LV_LABEL_LONG_WRAP);
 
     ctx->status_lbl = lv_label_create(card);
     lv_label_set_text(ctx->status_lbl, "Ready");
@@ -39764,16 +41908,13 @@ typedef struct { char path[NRF24_SUB_PATH_LEN]; } nrf24_saved_path_t;
 EXT_RAM_BSS_ATTR static nrf24_saved_path_t *s_n24_saved_paths = NULL;
 EXT_RAM_BSS_ATTR static int                 s_n24_saved_count  = 0;
 
+static void show_nrf24_file_detail_screen(const char *path);  // forward decl
+
 static void s_n24_saved_play_cb(lv_event_t *e)
 {
     const char *path = (const char *)lv_event_get_user_data(e);
     if (!path) return;
-    // Load and replay (stub — show hex of first packet)
-    nrf24_capture_t cap = {0};
-    if (nrf24_capture_load(path, &cap) == ESP_OK) {
-        // Simple feedback: navigate to sniffer with info
-        nrf24_capture_free(&cap);
-    }
+    show_nrf24_file_detail_screen(path);
 }
 
 static void show_nrf24_saved_screen(void)
@@ -39867,6 +42008,98 @@ static void show_nrf24_saved_screen(void)
     rfhat_add_back_btn("nRF24", show_nrf24_screen);
 }
 
+// ── File Detail Viewer ────────────────────────────────────────────────────────
+
+static void show_nrf24_file_detail_screen(const char *path)
+{
+    nrf24_capture_t cap = {0};
+    esp_err_t load_err = nrf24_capture_load(path, &cap);
+
+    create_function_page_base("nRF24 File View");
+    apply_menu_bg();
+
+    lv_obj_t *card = lv_obj_create(function_page);
+    lv_obj_set_size(card, LCD_H_RES - 16, LCD_V_RES - 80);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x4A148C), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 8, 0);
+    lv_obj_set_style_pad_all(card, 8, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(card, 5, 0);
+
+    if (load_err != ESP_OK) {
+        lv_obj_t *el = lv_label_create(card);
+        lv_label_set_text(el, LV_SYMBOL_WARNING "  Failed to load file");
+        lv_obj_set_style_text_font(el, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(el, UI_ACCENT_RED, 0);
+        rfhat_add_back_btn("Saved", show_nrf24_saved_screen);
+        return;
+    }
+
+    // Filename header
+    const char *fn = strrchr(path, '/');
+    fn = fn ? fn + 1 : path;
+    lv_obj_t *fn_lbl = lv_label_create(card);
+    lv_label_set_text(fn_lbl, fn);
+    lv_obj_set_style_text_font(fn_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(fn_lbl, lv_color_hex(0x90CAF9), 0);
+    lv_label_set_long_mode(fn_lbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(fn_lbl, LCD_H_RES - 36);
+
+    // Metadata line
+    char meta[96];
+    snprintf(meta, sizeof(meta),
+             "Ch %u  %.0f MHz | %d pkts | Pld %uB\n"
+             "Addr: %02X:%02X:%02X",
+             cap.channel, 2400.0f + cap.channel, cap.count, cap.payload_len,
+             cap.addr[0], cap.addr[1], cap.addr[2]);
+    lv_obj_t *ml = lv_label_create(card);
+    lv_label_set_text(ml, meta);
+    lv_obj_set_style_text_font(ml, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ml, lv_color_hex(0xFFD54F), 0);
+    lv_label_set_long_mode(ml, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(ml, LCD_H_RES - 36);
+
+    // Separator
+    lv_obj_t *sep = lv_obj_create(card);
+    lv_obj_set_size(sep, LCD_H_RES - 36, 1);
+    lv_obj_set_style_bg_color(sep, lv_color_make(60, 60, 80), 0);
+    lv_obj_set_style_border_width(sep, 0, 0);
+
+    // Show first 5 packets in hex (up to 16 bytes each)
+    int show_n = cap.count < 5 ? cap.count : 5;
+    for (int p = 0; p < show_n; p++) {
+        char hex[96];
+        int off = snprintf(hex, sizeof(hex), "#%d: ", p + 1);
+        int nbytes = cap.pkts[p].len > 16 ? 16 : cap.pkts[p].len;
+        for (int b = 0; b < nbytes && off < (int)sizeof(hex) - 4; b++)
+            off += snprintf(hex + off, sizeof(hex) - off, "%02X ", cap.pkts[p].data[b]);
+        if (cap.pkts[p].len > 16 && off < (int)sizeof(hex) - 4)
+            snprintf(hex + off, sizeof(hex) - off, "...");
+        lv_obj_t *pl = lv_label_create(card);
+        lv_label_set_text(pl, hex);
+        lv_obj_set_style_text_font(pl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(pl, lv_color_hex(0x66BB6A), 0);
+        lv_label_set_long_mode(pl, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(pl, LCD_H_RES - 36);
+    }
+    if (cap.count > 5) {
+        char mbuf[32];
+        snprintf(mbuf, sizeof(mbuf), "... %d more packet%s",
+                 cap.count - 5, cap.count - 5 == 1 ? "" : "s");
+        lv_obj_t *more = lv_label_create(card);
+        lv_label_set_text(more, mbuf);
+        lv_obj_set_style_text_font(more, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(more, lv_color_make(150, 150, 150), 0);
+    }
+
+    nrf24_capture_free(&cap);
+    rfhat_add_back_btn("Saved", show_nrf24_saved_screen);
+}
+
 // ── Jammer ────────────────────────────────────────────────────────────────────
 
 static void s_n24_jam_task_fn(void *arg)
@@ -39897,7 +42130,7 @@ static void s_n24_jam_start_cb(lv_event_t *e)
     if (!nrf24_is_init()) return;
     s_n24_jam_active = true;
     if (!s_n24_jam_task)
-        xTaskCreate(s_n24_jam_task_fn, "nrf24_jam", 2048, NULL, 6, &s_n24_jam_task);
+        xTaskCreate(s_n24_jam_task_fn, "nrf24_jam", 3072, NULL, 2, &s_n24_jam_task);
 }
 
 static void s_n24_jam_stop_cb(lv_event_t *e)
@@ -40253,6 +42486,504 @@ static void rfid_tile_keytest_cb(lv_event_t *e)  { (void)e; show_rfid_key_test_s
 static void rfid_tile_saved_cb(lv_event_t *e)    { (void)e; show_rfid_saved_screen(); }
 static void rfid_tile_hwtest_cb(lv_event_t *e)   { (void)e; show_rfid_hw_test_screen(); }
 
+// ── nRF24 Fox Hunt (carrier-detect proximity tracker) ─────────────────────────
+
+static void s_n24fox_update_ch_label(void)
+{
+    if (!s_n24fox_ch_lbl) return;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "CH %u  [%u MHz]",
+             (unsigned)s_n24fox_channel, (unsigned)(2400 + s_n24fox_channel));
+    lv_label_set_text(s_n24fox_ch_lbl, buf);
+}
+
+static void s_n24fox_set_channel(uint8_t ch)
+{
+    s_n24fox_channel = ch;
+    if (ch > 125) s_n24fox_channel = 125;
+    nrf24_set_channel(s_n24fox_channel);
+    nrf24_rx_mode();
+    s_n24fox_hits = 0; s_n24fox_samples = 0;
+    s_n24fox_update_ch_label();
+}
+
+static void s_n24fox_timer_cb(lv_timer_t *tmr)
+{
+    (void)tmr;
+    // Sample carrier detect 3× with brief settle between reads
+    int det = 0;
+    for (int i = 0; i < 3; i++) {
+        esp_rom_delay_us(140);   // ≥130 µs for RPD latch
+        if (nrf24_carrier_detect()) det++;
+    }
+    s_n24fox_hits    = (s_n24fox_hits    * (N24FOX_WINDOW - 1) + det * 100 / 3) / N24FOX_WINDOW;
+    s_n24fox_samples = 1;  // just used for first-run guard
+
+    int pct = s_n24fox_hits;
+    if (pct > 100) pct = 100;
+    if (s_n24fox_bar) lv_bar_set_value(s_n24fox_bar, pct, LV_ANIM_OFF);
+    if (s_n24fox_lbl) {
+        char buf[24]; snprintf(buf, sizeof(buf), "Signal: %d%%", pct);
+        lv_label_set_text(s_n24fox_lbl, buf);
+    }
+    if (s_n24fox_status) {
+        if (pct == 0) {
+            lv_label_set_text(s_n24fox_status, "-- SILENT");
+            lv_obj_set_style_text_color(s_n24fox_status, lv_color_hex(0x757575), 0);
+        } else if (pct < 30) {
+            lv_label_set_text(s_n24fox_status, " > WEAK");
+            lv_obj_set_style_text_color(s_n24fox_status, lv_color_hex(0x4CAF50), 0);
+        } else if (pct < 70) {
+            lv_label_set_text(s_n24fox_status, ">> MEDIUM");
+            lv_obj_set_style_text_color(s_n24fox_status, lv_color_hex(0xFFEB3B), 0);
+        } else {
+            lv_label_set_text(s_n24fox_status, ">>> STRONG - CLOSE!");
+            lv_obj_set_style_text_color(s_n24fox_status, lv_color_hex(0xF44336), 0);
+        }
+    }
+    if (s_n24fox_haptic && det > 0) {
+        g_vibtest_strength_pct = 100;
+        vibrator_pulse(150);
+    }
+}
+
+static void s_n24fox_ch_adj_cb(lv_event_t *e)
+{
+    int delta = (int)(intptr_t)lv_event_get_user_data(e);
+    int ch = (int)s_n24fox_channel + delta;
+    if (ch < 0) ch = 0;
+    if (ch > 125) ch = 125;
+    s_n24fox_set_channel((uint8_t)ch);
+}
+
+static void s_n24fox_haptic_toggle_cb(lv_event_t *e)
+{
+    (void)e;
+    s_n24fox_haptic = !s_n24fox_haptic;
+    if (!s_n24fox_haptic) { vibrator_off(); }
+    if (s_n24fox_hbtn) {
+        lv_obj_t *l = lv_obj_get_child(s_n24fox_hbtn, 0);
+        if (l) lv_label_set_text(l, s_n24fox_haptic
+            ? LV_SYMBOL_AUDIO " Haptic: ON"
+            : LV_SYMBOL_MUTE  " Haptic: OFF");
+        lv_obj_set_style_bg_color(s_n24fox_hbtn,
+            s_n24fox_haptic ? lv_color_hex(0x1565C0) : lv_color_hex(0x455A64),
+            LV_STATE_DEFAULT);
+    }
+}
+
+static void show_nrf24_foxhunt_screen(void)
+{
+    if (s_n24fox_tmr) { lv_timer_del(s_n24fox_tmr); s_n24fox_tmr = NULL; }
+    s_n24fox_bar = NULL; s_n24fox_lbl = NULL;
+    s_n24fox_ch_lbl = NULL; s_n24fox_hbtn = NULL; s_n24fox_status = NULL;
+    s_n24fox_hits = 0; s_n24fox_samples = 0;
+
+    if (!nrf24_chip_present()) {
+        s_cc1101_stub_screen(MY_SYMBOL_PERSON_WALKING "  nRF24 Fox Hunt — No nRF24",
+                             "Check DIP 2 ON.\nRun HW Test first.");
+        return;
+    }
+    nrf24_set_channel(s_n24fox_channel);
+    nrf24_set_data_rate(NRF24_DR_1M);
+    nrf24_rx_mode();
+
+    s_n24fox_saved_vib_pct = g_vibtest_strength_pct;
+
+    create_function_page_base("nRF24 Fox Hunt");
+    apply_menu_bg();
+    int y = 34;
+
+    // Channel display
+    s_n24fox_ch_lbl = lv_label_create(function_page);
+    s_n24fox_update_ch_label();
+    lv_obj_set_style_text_font(s_n24fox_ch_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(s_n24fox_ch_lbl, lv_color_hex(0x26C6DA), 0);
+    lv_obj_align(s_n24fox_ch_lbl, LV_ALIGN_TOP_MID, 0, y);
+    y += 24;
+
+    // Channel up/down buttons
+    lv_obj_t *ch_row = lv_obj_create(function_page);
+    lv_obj_set_size(ch_row, LCD_H_RES - 10, 28);
+    lv_obj_align(ch_row, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_set_style_bg_opa(ch_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ch_row, 0, 0);
+    lv_obj_set_style_pad_all(ch_row, 0, 0);
+    lv_obj_set_flex_flow(ch_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(ch_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(ch_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    static int n24fox_deltas[4] = {-10, -1, 1, 10};
+    static const char *n24fox_dlbls[4] = {"-10", "-1", "+1", "+10"};
+    // Common freqs: 0=2400 BT adv, 39=2439 WiFi ch7, 76=2476 ISM, 100=2500
+    static int n24fox_presets[3] = {0, 76, 100};
+    static const char *n24fox_plbls[3] = {"2.4G", "2476", "2.5G"};
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t *cb = lv_btn_create(ch_row);
+        lv_obj_set_size(cb, 46, 22);
+        lv_obj_set_style_bg_color(cb, lv_color_make(30,60,80), LV_STATE_DEFAULT);
+        lv_obj_set_style_border_color(cb, lv_color_hex(0x26C6DA), 0);
+        lv_obj_set_style_border_width(cb, 1, 0);
+        lv_obj_set_style_radius(cb, 4, 0);
+        lv_obj_t *cl = lv_label_create(cb);
+        lv_label_set_text(cl, n24fox_dlbls[i]);
+        lv_obj_set_style_text_font(cl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(cl, lv_color_white(), 0);
+        lv_obj_center(cl);
+        lv_obj_add_event_cb(cb, s_n24fox_ch_adj_cb, LV_EVENT_CLICKED, (void *)(intptr_t)n24fox_deltas[i]);
+    }
+    y += 30;
+
+    // Preset row: common channels
+    lv_obj_t *pr_row = lv_obj_create(function_page);
+    lv_obj_set_size(pr_row, LCD_H_RES - 10, 26);
+    lv_obj_align(pr_row, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_set_style_bg_opa(pr_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(pr_row, 0, 0);
+    lv_obj_set_style_pad_all(pr_row, 0, 0);
+    lv_obj_set_flex_flow(pr_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(pr_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(pr_row, LV_OBJ_FLAG_SCROLLABLE);
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *pb = lv_btn_create(pr_row);
+        lv_obj_set_size(pb, 62, 22);
+        lv_obj_set_style_bg_color(pb, lv_color_make(50,40,80), LV_STATE_DEFAULT);
+        lv_obj_set_style_border_color(pb, lv_color_hex(0xAB47BC), 0);
+        lv_obj_set_style_border_width(pb, 1, 0);
+        lv_obj_set_style_radius(pb, 4, 0);
+        lv_obj_t *pl = lv_label_create(pb);
+        lv_label_set_text(pl, n24fox_plbls[i]);
+        lv_obj_set_style_text_font(pl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(pl, lv_color_white(), 0);
+        lv_obj_center(pl);
+        lv_obj_add_event_cb(pb, s_n24fox_ch_adj_cb, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)(n24fox_presets[i] - (int)s_n24fox_channel));
+    }
+    y += 30;
+
+    // Signal bar
+    s_n24fox_bar = lv_bar_create(function_page);
+    lv_obj_set_size(s_n24fox_bar, LCD_H_RES - 16, 16);
+    lv_obj_align(s_n24fox_bar, LV_ALIGN_TOP_MID, 0, y);
+    lv_bar_set_range(s_n24fox_bar, 0, 100);
+    lv_bar_set_value(s_n24fox_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(s_n24fox_bar, lv_color_make(30,30,30), 0);
+    lv_obj_set_style_bg_color(s_n24fox_bar, lv_color_hex(0xAB47BC), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(s_n24fox_bar, 4, 0);
+    lv_obj_set_style_radius(s_n24fox_bar, 4, LV_PART_INDICATOR);
+    y += 20;
+
+    s_n24fox_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_n24fox_lbl, "Signal: 0%");
+    lv_obj_set_style_text_font(s_n24fox_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_n24fox_lbl, lv_color_hex(0xAB47BC), 0);
+    lv_obj_align(s_n24fox_lbl, LV_ALIGN_TOP_MID, 0, y);
+    y += 22;
+
+    // Haptic toggle
+    s_n24fox_hbtn = lv_btn_create(function_page);
+    lv_obj_set_size(s_n24fox_hbtn, 160, 26);
+    lv_obj_align(s_n24fox_hbtn, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_set_style_bg_color(s_n24fox_hbtn, lv_color_hex(0x1565C0), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(s_n24fox_hbtn, 0, 0);
+    lv_obj_set_style_radius(s_n24fox_hbtn, 6, 0);
+    lv_obj_t *hbl2 = lv_label_create(s_n24fox_hbtn);
+    lv_label_set_text(hbl2, LV_SYMBOL_AUDIO " Haptic: ON");
+    lv_obj_set_style_text_font(hbl2, &lv_font_montserrat_12, 0);
+    lv_obj_center(hbl2);
+    lv_obj_add_event_cb(s_n24fox_hbtn, s_n24fox_haptic_toggle_cb, LV_EVENT_CLICKED, NULL);
+    y += 30;
+
+    s_n24fox_status = lv_label_create(function_page);
+    lv_label_set_text(s_n24fox_status, "-- SILENT");
+    lv_obj_set_style_text_font(s_n24fox_status, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_n24fox_status, lv_color_hex(0x757575), 0);
+    lv_obj_set_style_text_align(s_n24fox_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_n24fox_status, LV_ALIGN_TOP_MID, 0, y);
+
+    s_n24fox_tmr = lv_timer_create(s_n24fox_timer_cb, 100, NULL);
+
+    rfhat_add_back_btn("nRF24", show_nrf24_screen);
+}
+
+// ── RF433 Fox Hunt (activity-level proximity tracker, fixed 433.92 MHz) ───────
+// Note: R4A_433 receiver demodulates OOK to GPIO9. No RSSI available;
+// edge count per second is used as a signal-activity proxy.
+
+IRAM_ATTR static void s_rf433_fox_isr(void *arg)
+{
+    (void)arg;
+    s_rf433_fox_edges++;
+}
+
+static void s_rf433_fox_timer_cb(lv_timer_t *tmr)
+{
+    (void)tmr;
+    // Read and reset edge count (100ms window)
+    int edges = s_rf433_fox_edges;
+    s_rf433_fox_edges = 0;
+    int rate = edges * 10;  // edges/s (100ms window * 10)
+    // Exponential smooth: 70% old + 30% new
+    s_rf433_fox_rate = (s_rf433_fox_rate * 7 + rate * 3) / 10;
+
+    // Map 0..2000 edges/s to 0..100%
+    int pct = s_rf433_fox_rate * 100 / 2000;
+    if (pct > 100) pct = 100;
+
+    if (s_rf433_fox_bar) lv_bar_set_value(s_rf433_fox_bar, pct, LV_ANIM_OFF);
+    if (s_rf433_fox_lbl) {
+        char buf[32]; snprintf(buf, sizeof(buf), "%d edges/s", s_rf433_fox_rate);
+        lv_label_set_text(s_rf433_fox_lbl, buf);
+    }
+    if (s_rf433_fox_status) {
+        if (pct == 0) {
+            lv_label_set_text(s_rf433_fox_status, "-- SILENT");
+            lv_obj_set_style_text_color(s_rf433_fox_status, lv_color_hex(0x757575), 0);
+        } else if (pct < 25) {
+            lv_label_set_text(s_rf433_fox_status, " > WEAK");
+            lv_obj_set_style_text_color(s_rf433_fox_status, lv_color_hex(0x4CAF50), 0);
+        } else if (pct < 60) {
+            lv_label_set_text(s_rf433_fox_status, ">> MEDIUM");
+            lv_obj_set_style_text_color(s_rf433_fox_status, lv_color_hex(0xFFEB3B), 0);
+        } else {
+            lv_label_set_text(s_rf433_fox_status, ">>> STRONG - CLOSE!");
+            lv_obj_set_style_text_color(s_rf433_fox_status, lv_color_hex(0xF44336), 0);
+        }
+    }
+    // Bug-hunter haptic: 100ms ticks, rate scales with signal level.
+    // Always 100% strength so the motor spins up reliably.
+    if (s_rf433_fox_haptic && pct > 5) {
+        // period: 15 ticks=1.5s near threshold, 2 ticks=200ms at full
+        int period = 15 - pct * 13 / 100;
+        if (period < 2) period = 2;
+        s_rf433_fox_hap_ctr++;
+        if (s_rf433_fox_hap_ctr >= period) {
+            s_rf433_fox_hap_ctr = 0;
+            g_vibtest_strength_pct = 100;
+            vibrator_pulse(150);
+        }
+    } else {
+        s_rf433_fox_hap_ctr = 0;
+    }
+}
+
+static void s_rf433_fox_haptic_toggle_cb(lv_event_t *e)
+{
+    (void)e;
+    s_rf433_fox_haptic = !s_rf433_fox_haptic;
+    if (!s_rf433_fox_haptic) vibrator_off();
+    if (s_rf433_fox_hbtn) {
+        lv_obj_t *l = lv_obj_get_child(s_rf433_fox_hbtn, 0);
+        if (l) lv_label_set_text(l, s_rf433_fox_haptic
+            ? LV_SYMBOL_AUDIO " Haptic: ON"
+            : LV_SYMBOL_MUTE  " Haptic: OFF");
+        lv_obj_set_style_bg_color(s_rf433_fox_hbtn,
+            s_rf433_fox_haptic ? lv_color_hex(0x1565C0) : lv_color_hex(0x455A64),
+            LV_STATE_DEFAULT);
+    }
+}
+
+static void show_rf433_foxhunt_screen(void)
+{
+    if (s_rf433_fox_tmr) { lv_timer_del(s_rf433_fox_tmr); s_rf433_fox_tmr = NULL; }
+    if (s_rf433_fox_isr_installed) {
+        gpio_isr_handler_remove(RF_HAT_RF433_RX_GPIO);
+        s_rf433_fox_isr_installed = false;
+    }
+    s_rf433_fox_bar = NULL; s_rf433_fox_lbl = NULL;
+    s_rf433_fox_hbtn = NULL; s_rf433_fox_status = NULL;
+    s_rf433_fox_edges = 0; s_rf433_fox_rate = 0;
+
+    // Configure GPIO9 (RF433 RX) as input
+    gpio_config_t io_cfg = {
+        .pin_bit_mask  = (1ULL << RF_HAT_RF433_RX_GPIO),
+        .mode          = GPIO_MODE_INPUT,
+        .pull_up_en    = GPIO_PULLUP_DISABLE,
+        .pull_down_en  = GPIO_PULLDOWN_DISABLE,
+        .intr_type     = GPIO_INTR_ANYEDGE,
+    };
+    gpio_config(&io_cfg);
+    esp_err_t isr_err = gpio_install_isr_service(0);
+    if (isr_err == ESP_OK || isr_err == ESP_ERR_INVALID_STATE) {
+        gpio_isr_handler_add(RF_HAT_RF433_RX_GPIO, s_rf433_fox_isr, NULL);
+        s_rf433_fox_isr_installed = true;
+    }
+
+    s_rf433_fox_saved_vib_pct = g_vibtest_strength_pct;
+
+    create_function_page_base("RF433 Fox Hunt");
+    apply_menu_bg();
+    int y = 34;
+
+    // Fixed-freq header
+    lv_obj_t *freq_lbl = lv_label_create(function_page);
+    lv_label_set_text(freq_lbl, "Fixed: 433.92 MHz OOK");
+    lv_obj_set_style_text_font(freq_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(freq_lbl, lv_color_hex(0xFF8F00), 0);
+    lv_obj_align(freq_lbl, LV_ALIGN_TOP_MID, 0, y);
+    y += 26;
+
+    lv_obj_t *note = lv_label_create(function_page);
+    lv_label_set_text(note, "Activity level only — no true RSSI");
+    lv_obj_set_style_text_font(note, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(note, lv_color_hex(0x78909C), 0);
+    lv_obj_align(note, LV_ALIGN_TOP_MID, 0, y);
+    y += 22;
+
+    // Activity bar
+    s_rf433_fox_bar = lv_bar_create(function_page);
+    lv_obj_set_size(s_rf433_fox_bar, LCD_H_RES - 16, 16);
+    lv_obj_align(s_rf433_fox_bar, LV_ALIGN_TOP_MID, 0, y);
+    lv_bar_set_range(s_rf433_fox_bar, 0, 100);
+    lv_bar_set_value(s_rf433_fox_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(s_rf433_fox_bar, lv_color_make(30,30,30), 0);
+    lv_obj_set_style_bg_color(s_rf433_fox_bar, lv_color_hex(0xFF8F00), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(s_rf433_fox_bar, 4, 0);
+    lv_obj_set_style_radius(s_rf433_fox_bar, 4, LV_PART_INDICATOR);
+    y += 20;
+
+    s_rf433_fox_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_rf433_fox_lbl, "0 edges/s");
+    lv_obj_set_style_text_font(s_rf433_fox_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_rf433_fox_lbl, lv_color_hex(0xFF8F00), 0);
+    lv_obj_align(s_rf433_fox_lbl, LV_ALIGN_TOP_MID, 0, y);
+    y += 22;
+
+    s_rf433_fox_hbtn = lv_btn_create(function_page);
+    lv_obj_set_size(s_rf433_fox_hbtn, 160, 26);
+    lv_obj_align(s_rf433_fox_hbtn, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_set_style_bg_color(s_rf433_fox_hbtn, lv_color_hex(0x1565C0), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(s_rf433_fox_hbtn, 0, 0);
+    lv_obj_set_style_radius(s_rf433_fox_hbtn, 6, 0);
+    lv_obj_t *hbl3 = lv_label_create(s_rf433_fox_hbtn);
+    lv_label_set_text(hbl3, LV_SYMBOL_AUDIO " Haptic: ON");
+    lv_obj_set_style_text_font(hbl3, &lv_font_montserrat_12, 0);
+    lv_obj_center(hbl3);
+    lv_obj_add_event_cb(s_rf433_fox_hbtn, s_rf433_fox_haptic_toggle_cb, LV_EVENT_CLICKED, NULL);
+    y += 30;
+
+    s_rf433_fox_status = lv_label_create(function_page);
+    lv_label_set_text(s_rf433_fox_status, "-- SILENT");
+    lv_obj_set_style_text_font(s_rf433_fox_status, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_rf433_fox_status, lv_color_hex(0x757575), 0);
+    lv_obj_set_style_text_align(s_rf433_fox_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_rf433_fox_status, LV_ALIGN_TOP_MID, 0, y);
+
+    s_rf433_fox_hap_ctr = 0;
+    s_rf433_fox_tmr = lv_timer_create(s_rf433_fox_timer_cb, 100, NULL);
+
+    rfhat_add_back_btn("RF433", show_rf433_menu_screen);
+}
+
+// ── RF433 OOK Scan — EV1527 alarm sensor decoder via R4A_433 ─────────────────
+// The R4A_433 superheterodyne receiver is more sensitive than CC1101 at 433.92 MHz
+// for short OOK bursts from alarm sensors. No RSSI available (hardware limit).
+
+static void s_rf433_scan_lvgl_cb(void *arg)
+{
+    free(arg);
+    if (!s_rf433_scan_list) return;
+    lv_obj_clean(s_rf433_scan_list);
+    for (int i = 0; i < s_ook_alarm_count; i++) {
+        ook_alarm_entry_t *e = &s_ook_alarms[i];
+        lv_obj_t *row = lv_obj_create(s_rf433_scan_list);
+        lv_obj_set_size(row, LCD_H_RES - 18, 46);
+        lv_obj_set_style_bg_color(row, ui_panel_color(), 0);
+        lv_obj_set_style_border_color(row, lv_color_hex(0xFF8F00), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_radius(row, 6, 0);
+        lv_obj_set_style_pad_all(row, 5, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        char line1[48], line2[40], age[12];
+        ook_age_str(e->last_us, age, sizeof(age));
+        snprintf(line1, sizeof(line1), "Addr: 0x%06lX   Ch: %X",
+                 (unsigned long)e->addr, e->data & 0xF);
+        snprintf(line2, sizeof(line2), "x%u   %s ago   (no RSSI)", e->count, age);
+        lv_obj_t *l1 = lv_label_create(row);
+        lv_label_set_text(l1, line1);
+        lv_obj_set_style_text_font(l1, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(l1, lv_color_hex(0xFFCC80), 0);
+        lv_obj_align(l1, LV_ALIGN_TOP_LEFT, 0, 0);
+        lv_obj_t *l2 = lv_label_create(row);
+        lv_label_set_text(l2, line2);
+        lv_obj_set_style_text_font(l2, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l2, ui_text_color(), 0);
+        lv_obj_align(l2, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    }
+    if (s_ook_alarm_count == 0) {
+        lv_obj_t *m = lv_label_create(s_rf433_scan_list);
+        lv_label_set_text(m, "Waiting for sensor burst...\nTrigger a door/PIR/smoke sensor.");
+        lv_obj_set_style_text_font(m, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(m, ui_text_color(), 0);
+    }
+}
+
+static void s_rf433_scan_task_fn(void *arg)
+{
+    (void)arg;
+    static int32_t buf[2048];
+    while (!s_rf433_scan_stop) {
+        int count = 0;
+        rf433_ook_capture(buf, &count, 700);
+        if (count > 10 && !s_rf433_scan_stop) {
+            uint32_t addr; uint8_t data;
+            for (int start = 0; start < count - 56; start++) {
+                if (ook_decode_ev1527(buf + start, count - start, &addr, &data)) {
+                    ook_alarm_update(addr, data, -127);  // -127 = no RSSI
+                    wx_update_t *u = malloc(sizeof(wx_update_t));
+                    if (u) { u->changed = true; lv_async_call(s_rf433_scan_lvgl_cb, u); }
+                    start += 56;
+                }
+            }
+        }
+        if (!s_rf433_scan_stop) vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    s_rf433_scan_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void show_rf433_ook_scan_screen(void)
+{
+    if (s_rf433_scan_task) { s_rf433_scan_stop = true; vTaskDelay(pdMS_TO_TICKS(100)); }
+    s_rf433_scan_stop = false;
+    s_rf433_scan_status = NULL;
+    s_rf433_scan_list   = NULL;
+    s_ook_alarm_count   = 0;
+
+    create_function_page_base("RF433 OOK Scan");
+    apply_menu_bg();
+
+    s_rf433_scan_status = lv_label_create(function_page);
+    lv_label_set_text(s_rf433_scan_status,
+        "R4A_433 receiver - 433.92 MHz fixed\n"
+        "Decoding EV1527 alarm sensors");
+    lv_obj_set_style_text_font(s_rf433_scan_status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_rf433_scan_status, lv_color_hex(0xFF8F00), 0);
+    lv_obj_set_style_text_align(s_rf433_scan_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_rf433_scan_status, LV_ALIGN_TOP_MID, 0, 34);
+
+    s_rf433_scan_list = lv_obj_create(function_page);
+    lv_obj_set_size(s_rf433_scan_list, LCD_H_RES - 10, LCD_V_RES - 108);
+    lv_obj_align(s_rf433_scan_list, LV_ALIGN_TOP_MID, 0, 78);
+    lv_obj_set_style_bg_opa(s_rf433_scan_list, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_rf433_scan_list, 0, 0);
+    lv_obj_set_style_pad_all(s_rf433_scan_list, 4, 0);
+    lv_obj_set_style_pad_gap(s_rf433_scan_list, 4, 0);
+    lv_obj_set_flex_flow(s_rf433_scan_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_add_flag(s_rf433_scan_list, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *m = lv_label_create(s_rf433_scan_list);
+    lv_label_set_text(m, "Waiting for sensor burst...");
+    lv_obj_set_style_text_font(m, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(m, ui_text_color(), 0);
+
+    rfhat_add_back_btn("RF433", show_rf433_menu_screen);
+
+    xTaskCreate(s_rf433_scan_task_fn, "rf433_scan", 6144, NULL,
+                tskIDLE_PRIORITY + 2, &s_rf433_scan_task);
+}
+
 // ── RFID Main Menu ─────────────────────────────────────────────────────────────
 
 static void show_rfid_menu_screen(void)
@@ -40278,7 +43009,7 @@ static void show_rfid_menu_screen(void)
     lv_obj_set_style_bg_opa(grid, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(grid, 0, 0);
     lv_obj_set_style_pad_all(grid, 4, 0);
-    lv_obj_set_style_pad_gap(grid, 5, 0);
+    lv_obj_set_style_pad_gap(grid, 4, 0);
     lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
@@ -40300,8 +43031,61 @@ static lv_obj_t *s_rfid_scan_type_lbl   = NULL;
 static lv_obj_t *s_rfid_scan_atqa_lbl   = NULL;
 static lv_obj_t *s_rfid_scan_status_lbl = NULL;
 static lv_obj_t *s_rfid_scan_save_btn   = NULL;
+static lv_obj_t *s_rfid_scan_read_btn   = NULL;
 static bool       s_rfid_has_card        = false;
 static lv_timer_t *s_rfid_init_retry_tmr = NULL;
+
+// ── Read All helpers ──────────────────────────────────────────────────────────
+static void s_rfid_poll_cb(rfid_err_t result, const rfid_card_t *card, void *ctx);  // forward
+typedef struct { rfid_err_t r; uint16_t page_count; } rfid_read_done_t;
+
+static void s_rfid_read_done_lvgl_cb(void *arg)
+{
+    rfid_read_done_t *d = (rfid_read_done_t *)arg;
+    if (s_rfid_scan_status_lbl) {
+        if (d->r == RFID_OK) {
+            char buf[40];
+            snprintf(buf, sizeof(buf), "Read: %u pages OK", (unsigned)d->page_count);
+            lv_label_set_text(s_rfid_scan_status_lbl, buf);
+        } else {
+            lv_label_set_text(s_rfid_scan_status_lbl, "Read failed — hold card closer");
+        }
+    }
+    if (s_rfid_scan_read_btn) lv_obj_clear_state(s_rfid_scan_read_btn, LV_STATE_DISABLED);
+    free(d);
+    rfid_manager_start_poll(s_rfid_poll_cb, NULL, 500);
+}
+
+static void s_rfid_read_all_task(void *arg)
+{
+    rfid_card_t *card = (rfid_card_t *)arg;
+    // rfid_card_t is ~5.7 KB — allocate from PSRAM instead of stack to avoid overflow.
+    rfid_card_t *tmp = heap_caps_malloc(sizeof(rfid_card_t), MALLOC_CAP_SPIRAM);
+    rfid_err_t r = RFID_ERR_HW;
+    if (tmp) {
+        r = rfid_manager_scan_card(tmp, 2000);
+        if (r == RFID_OK) {
+            card->protocol = tmp->protocol;
+            if (!card->page_count) card->page_count = tmp->page_count;
+            r = rfid_manager_read_card_data(card);
+        }
+        free(tmp);
+    }
+    rfid_read_done_t *d = malloc(sizeof(rfid_read_done_t));
+    if (d) { d->r = r; d->page_count = card->page_count; lv_async_call(s_rfid_read_done_lvgl_cb, d); }
+    vTaskDelete(NULL);
+}
+
+static void s_rfid_read_all_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!s_rfid_has_card || !s_rfid_last_card) return;
+    rfid_manager_stop_poll();
+    if (s_rfid_scan_status_lbl) lv_label_set_text(s_rfid_scan_status_lbl, "Hold card — reading...");
+    if (s_rfid_scan_read_btn)   lv_obj_add_state(s_rfid_scan_read_btn, LV_STATE_DISABLED);
+    xTaskCreate(s_rfid_read_all_task, "rfid_read", 6144, s_rfid_last_card,
+                tskIDLE_PRIORITY + 2, NULL);
+}
 
 // Stop poll and null scan-screen labels before navigating away — prevents
 // in-flight lv_async_call callbacks from firing against deleted LVGL objects
@@ -40319,6 +43103,7 @@ static void rfid_back_to_menu(void)
     s_rfid_scan_atqa_lbl   = NULL;
     s_rfid_scan_status_lbl = NULL;
     s_rfid_scan_save_btn   = NULL;
+    s_rfid_scan_read_btn   = NULL;
     // s_rfid_has_card intentionally NOT cleared — last scanned card persists
     // while navigating within the RFID sub-menus so Card Emulate can use it.
     show_rfid_menu_screen();
@@ -40353,9 +43138,11 @@ static void s_rfid_scan_lvgl_cb(void *arg)
             lv_label_set_text(s_rfid_scan_atqa_lbl, info);
         }
         if (s_rfid_scan_status_lbl)
-            lv_label_set_text(s_rfid_scan_status_lbl, "Card detected");
+            lv_label_set_text(s_rfid_scan_status_lbl, "Card detected — tap Read All for pages");
         if (s_rfid_scan_save_btn)
             lv_obj_clear_state(s_rfid_scan_save_btn, LV_STATE_DISABLED);
+        if (s_rfid_scan_read_btn)
+            lv_obj_clear_state(s_rfid_scan_read_btn, LV_STATE_DISABLED);
     } else {
         if (s_rfid_scan_status_lbl)
             lv_label_set_text(s_rfid_scan_status_lbl, "Waiting for card...");
@@ -40604,7 +43391,7 @@ static void show_rfid_scan_screen(void)
 
     // Save JSON button
     s_rfid_scan_save_btn = lv_btn_create(row);
-    lv_obj_set_size(s_rfid_scan_save_btn, 96, 36);
+    lv_obj_set_size(s_rfid_scan_save_btn, 76, 36);
     lv_obj_set_style_bg_color(s_rfid_scan_save_btn, lv_color_hex(0x00695C), LV_STATE_DEFAULT);
     lv_obj_set_style_radius(s_rfid_scan_save_btn, 6, 0);
     lv_obj_set_style_border_width(s_rfid_scan_save_btn, 0, 0);
@@ -40617,7 +43404,7 @@ static void show_rfid_scan_screen(void)
 
     // Export .nfc button
     lv_obj_t *exp_btn = lv_btn_create(row);
-    lv_obj_set_size(exp_btn, 100, 36);
+    lv_obj_set_size(exp_btn, 76, 36);
     lv_obj_set_style_bg_color(exp_btn, lv_color_hex(0x1565C0), LV_STATE_DEFAULT);
     lv_obj_set_style_radius(exp_btn, 6, 0);
     lv_obj_set_style_border_width(exp_btn, 0, 0);
@@ -40626,6 +43413,19 @@ static void show_rfid_scan_screen(void)
     lv_obj_set_style_text_font(el, &lv_font_montserrat_12, 0);
     lv_obj_center(el);
     lv_obj_add_event_cb(exp_btn, s_rfid_export_nfc_cb, LV_EVENT_CLICKED, NULL);
+
+    // Read All button — reads full page/block dump from card into memory
+    s_rfid_scan_read_btn = lv_btn_create(row);
+    lv_obj_set_size(s_rfid_scan_read_btn, 80, 36);
+    lv_obj_set_style_bg_color(s_rfid_scan_read_btn, lv_color_hex(0x4E342E), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(s_rfid_scan_read_btn, 6, 0);
+    lv_obj_set_style_border_width(s_rfid_scan_read_btn, 0, 0);
+    lv_obj_add_state(s_rfid_scan_read_btn, LV_STATE_DISABLED);
+    lv_obj_t *rl = lv_label_create(s_rfid_scan_read_btn);
+    lv_label_set_text(rl, LV_SYMBOL_REFRESH " Read");
+    lv_obj_set_style_text_font(rl, &lv_font_montserrat_12, 0);
+    lv_obj_center(rl);
+    lv_obj_add_event_cb(s_rfid_scan_read_btn, s_rfid_read_all_cb, LV_EVENT_CLICKED, NULL);
 
     rfhat_add_back_btn("RFID Menu", rfid_back_to_menu);
 
@@ -41026,27 +43826,236 @@ static void show_rfid_key_test_screen(void)
     rfhat_add_back_btn("RFID Menu", rfid_back_to_menu);
 }
 
-// ── Clone / Write (placeholder) ───────────────────────────────────────────────
+// ── Clone / Write ─────────────────────────────────────────────────────────────
+
+static lv_obj_t *s_rfid_clone_status = NULL;
+static lv_obj_t *s_rfid_clone_btn    = NULL;
+
+typedef struct { rfid_err_t r; uint16_t pages_written; } rfid_clone_done_t;
+
+static void s_rfid_clone_done_lvgl_cb(void *arg)
+{
+    rfid_clone_done_t *d = (rfid_clone_done_t *)arg;
+    if (s_rfid_clone_status) {
+        char buf[64];
+        if (d->r == RFID_OK)
+            snprintf(buf, sizeof(buf), "Cloned! %u pages written", (unsigned)d->pages_written);
+        else
+            snprintf(buf, sizeof(buf), "Error: %s", rfid_err_str(d->r));
+        lv_label_set_text(s_rfid_clone_status, buf);
+    }
+    if (s_rfid_clone_btn) lv_obj_clear_state(s_rfid_clone_btn, LV_STATE_DISABLED);
+    free(d);
+}
+
+typedef struct { rfid_card_t *src; uint8_t skip_below; } rfid_clone_ctx_t;
+
+static void s_rfid_clone_task(void *arg)
+{
+    rfid_clone_ctx_t *ctx = (rfid_clone_ctx_t *)arg;
+    rfid_err_t r = rfid_manager_clone_ntag(ctx->src, ctx->skip_below);
+    rfid_clone_done_t *d = malloc(sizeof(rfid_clone_done_t));
+    if (d) {
+        d->r = r;
+        d->pages_written = (r == RFID_OK) ? ctx->src->page_count : 0;
+        lv_async_call(s_rfid_clone_done_lvgl_cb, d);
+    }
+    free(ctx);
+    vTaskDelete(NULL);
+}
+
+static void s_rfid_clone_start_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!s_rfid_last_card || !s_rfid_has_card) return;
+    bool has_pages = false;
+    for (uint16_t i = 0; i < s_rfid_last_card->page_count && i < RFID_MAX_BLOCKS; i++)
+        if (s_rfid_last_card->blocks[i].valid) { has_pages = true; break; }
+    if (!has_pages) {
+        if (s_rfid_clone_status)
+            lv_label_set_text(s_rfid_clone_status, "No page data — Scan & Read All first");
+        return;
+    }
+    if (s_rfid_clone_status)
+        lv_label_set_text(s_rfid_clone_status, "Present blank NTAG card (5 s)...");
+    if (s_rfid_clone_btn) lv_obj_add_state(s_rfid_clone_btn, LV_STATE_DISABLED);
+    rfid_clone_ctx_t *ctx = malloc(sizeof(rfid_clone_ctx_t));
+    if (!ctx) return;
+    ctx->src = s_rfid_last_card;
+    ctx->skip_below = 4;  // skip OTP pages 0-3 on genuine NTAG; use 0 for Magic/CUID
+    xTaskCreate(s_rfid_clone_task, "rfid_clone", 6144, ctx, tskIDLE_PRIORITY + 2, NULL);
+}
+
+static void s_rfid_clone_select_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_rfid_entry_count) return;
+    if (!s_rfid_last_card)
+        s_rfid_last_card = heap_caps_calloc(1, sizeof(rfid_card_t), MALLOC_CAP_SPIRAM);
+    if (!s_rfid_last_card) return;
+    rfid_err_t r = rfid_storage_load(s_rfid_entries[idx].path, s_rfid_last_card);
+    if (r == RFID_OK) {
+        s_rfid_has_card = true;
+        show_rfid_clone_screen();
+    }
+}
 
 static void show_rfid_clone_screen(void)
 {
     rfid_manager_stop_poll();
+
+    s_rfid_clone_status = NULL;
+    s_rfid_clone_btn    = NULL;
+
     create_function_page_base("Clone / Write Card");
     apply_menu_bg();
 
-    lv_obj_t *info = lv_label_create(function_page);
-    lv_label_set_text(info,
-        "Clone & Write\n"
-        "Coming soon.\n\n"
-        "Requires a writable\n"
-        "blank card (Magic/CUID)\n"
-        "in the RF field.");
-    lv_obj_set_style_text_font(info, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(info, ui_text_color(), 0);
-    lv_obj_set_style_text_align(info, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_long_mode(info, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(info, LCD_H_RES - 20);
-    lv_obj_align(info, LV_ALIGN_CENTER, 0, -10);
+    s_rfid_entry_count = rfid_storage_list(RFID_BAND_HF, s_rfid_entries, RFID_MAX_LIST_DISPLAY);
+
+    int cur_y = 38;
+
+    if (s_rfid_has_card && s_rfid_last_card) {
+        // Source card info panel
+        lv_obj_t *panel = lv_obj_create(function_page);
+        lv_obj_set_size(panel, LCD_H_RES - 16, 68);
+        lv_obj_align(panel, LV_ALIGN_TOP_MID, 0, cur_y);
+        lv_obj_set_style_bg_color(panel, ui_panel_color(), 0);
+        lv_obj_set_style_border_color(panel, lv_color_hex(0x1565C0), 0);
+        lv_obj_set_style_border_width(panel, 1, 0);
+        lv_obj_set_style_radius(panel, 8, 0);
+        lv_obj_set_style_pad_all(panel, 6, 0);
+        lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_gap(panel, 2, 0);
+        lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+
+        char uid_str[32], line[80];
+        rfid_format_uid(s_rfid_last_card->uid, s_rfid_last_card->uid_len,
+                        uid_str, sizeof(uid_str));
+        snprintf(line, sizeof(line), "UID: %s", uid_str);
+        lv_obj_t *l1 = lv_label_create(panel);
+        lv_label_set_text(l1, line);
+        lv_obj_set_style_text_font(l1, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l1, ui_text_color(), 0);
+
+        int valid_pages = 0;
+        for (uint16_t i = 0; i < s_rfid_last_card->page_count && i < RFID_MAX_BLOCKS; i++)
+            if (s_rfid_last_card->blocks[i].valid) valid_pages++;
+
+        const char *lbl = s_rfid_last_card->name[0] ? s_rfid_last_card->name
+                                                      : s_rfid_last_card->protocol_str;
+        snprintf(line, sizeof(line), "%s  Pages: %d/%u",
+                 lbl, valid_pages, (unsigned)s_rfid_last_card->page_count);
+        lv_obj_t *l2 = lv_label_create(panel);
+        lv_label_set_text(l2, line);
+        lv_obj_set_style_text_font(l2, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l2, valid_pages > 0 ? lv_color_hex(0x80CBC4)
+                                                         : lv_color_hex(0xFFB300), 0);
+        lv_label_set_long_mode(l2, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(l2, LCD_H_RES - 28);
+
+        snprintf(line, sizeof(line), "Type: %s", s_rfid_last_card->protocol_str);
+        lv_obj_t *l3 = lv_label_create(panel);
+        lv_label_set_text(l3, line);
+        lv_obj_set_style_text_font(l3, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l3, ui_text_color(), 0);
+
+        cur_y += 72;
+
+        s_rfid_clone_status = lv_label_create(function_page);
+        lv_label_set_text(s_rfid_clone_status, valid_pages > 0
+            ? "Ready — present blank NTAG, tap Clone"
+            : "No pages read — use Scan & Read All first");
+        lv_obj_set_style_text_font(s_rfid_clone_status, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(s_rfid_clone_status,
+            valid_pages > 0 ? lv_color_hex(0xB39DDB) : lv_color_hex(0xFFB300), 0);
+        lv_obj_set_style_text_align(s_rfid_clone_status, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(s_rfid_clone_status, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(s_rfid_clone_status, LCD_H_RES - 20);
+        lv_obj_align(s_rfid_clone_status, LV_ALIGN_TOP_MID, 0, cur_y);
+        cur_y += 30;
+
+        s_rfid_clone_btn = lv_btn_create(function_page);
+        lv_obj_set_size(s_rfid_clone_btn, 168, 36);
+        lv_obj_align(s_rfid_clone_btn, LV_ALIGN_TOP_MID, 0, cur_y);
+        lv_obj_set_style_bg_color(s_rfid_clone_btn, lv_color_hex(0x1565C0), LV_STATE_DEFAULT);
+        lv_obj_set_style_radius(s_rfid_clone_btn, 6, 0);
+        lv_obj_set_style_border_width(s_rfid_clone_btn, 0, 0);
+        if (valid_pages == 0) lv_obj_add_state(s_rfid_clone_btn, LV_STATE_DISABLED);
+        lv_obj_t *cl = lv_label_create(s_rfid_clone_btn);
+        lv_label_set_text(cl, LV_SYMBOL_COPY " Clone to Blank Card");
+        lv_obj_set_style_text_font(cl, &lv_font_montserrat_12, 0);
+        lv_obj_center(cl);
+        lv_obj_add_event_cb(s_rfid_clone_btn, s_rfid_clone_start_cb, LV_EVENT_CLICKED, NULL);
+        cur_y += 44;
+    } else {
+        lv_obj_t *hint = lv_label_create(function_page);
+        lv_label_set_text(hint, "Select a saved card below\nor use Scan & Read All first");
+        lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(hint, lv_color_hex(0x9E9E9E), 0);
+        lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, cur_y + 4);
+        cur_y += 36;
+    }
+
+    // Saved cards header
+    lv_obj_t *sec_hdr = lv_label_create(function_page);
+    lv_label_set_text(sec_hdr, "Saved Cards (tap to select source)");
+    lv_obj_set_style_text_font(sec_hdr, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sec_hdr, lv_color_hex(0x4DB6AC), 0);
+    lv_obj_align(sec_hdr, LV_ALIGN_TOP_LEFT, 10, cur_y);
+    cur_y += 18;
+
+    // Scrollable list
+    lv_obj_t *list = lv_obj_create(function_page);
+    lv_obj_set_size(list, LCD_H_RES - 10, LCD_V_RES - cur_y - 46);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, cur_y);
+    lv_obj_set_style_bg_color(list, ui_panel_color(), 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    lv_obj_set_style_radius(list, 0, 0);
+    lv_obj_set_style_pad_all(list, 4, 0);
+    lv_obj_set_style_pad_gap(list, 4, 0);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                           LV_FLEX_ALIGN_CENTER);
+    lv_obj_add_flag(list, LV_OBJ_FLAG_SCROLLABLE);
+
+    if (s_rfid_entry_count == 0) {
+        lv_obj_t *empty = lv_label_create(list);
+        lv_label_set_text(empty, "No saved cards.");
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(empty, ui_text_color(), 0);
+    } else {
+        char buf[64];
+        for (int i = 0; i < s_rfid_entry_count; i++) {
+            lv_obj_t *row = lv_obj_create(list);
+            lv_obj_set_size(row, LCD_H_RES - 18, 46);
+            lv_obj_set_style_bg_color(row, ui_panel_color(), 0);
+            lv_obj_set_style_border_color(row, lv_color_hex(0x1565C0), 0);
+            lv_obj_set_style_border_width(row, 1, 0);
+            lv_obj_set_style_radius(row, 6, 0);
+            lv_obj_set_style_pad_all(row, 6, 0);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+
+            lv_obj_t *name_lbl = lv_label_create(row);
+            snprintf(buf, sizeof(buf), "%s", s_rfid_entries[i].display_name);
+            lv_label_set_text(name_lbl, buf);
+            lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(name_lbl, lv_color_hex(0x4DB6AC), 0);
+            lv_obj_align(name_lbl, LV_ALIGN_TOP_LEFT, 0, 0);
+
+            lv_obj_t *info_lbl = lv_label_create(row);
+            snprintf(buf, sizeof(buf), "%s  %s",
+                     s_rfid_entries[i].uid_str, s_rfid_entries[i].protocol_str);
+            lv_label_set_text(info_lbl, buf);
+            lv_obj_set_style_text_font(info_lbl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(info_lbl, ui_text_color(), 0);
+            lv_obj_align(info_lbl, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+            lv_obj_add_event_cb(row, s_rfid_clone_select_cb, LV_EVENT_CLICKED,
+                                (void *)(intptr_t)i);
+        }
+    }
 
     rfhat_add_back_btn("RFID Menu", rfid_back_to_menu);
 }

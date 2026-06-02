@@ -9,6 +9,7 @@ idf_component_register(
         "src/hf/pn532_reader.c"
         "src/hf/pn532_target.c"
         "src/hf/mifare_classic.c"
+        "src/hf/ntag.c"
         "src/lf/lf_stub.c"
     INCLUDE_DIRS "include"
     REQUIRES

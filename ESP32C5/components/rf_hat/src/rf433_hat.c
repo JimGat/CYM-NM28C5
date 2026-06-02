@@ -24,6 +24,19 @@ static volatile uint32_t s_pulse_count  = 0;
 static volatile int64_t  s_last_edge_us = 0;
 static bool              s_jamming      = false;
 
+// ── Jammer modulation timer ───────────────────────────────────────────────────
+// T2-433M is OOK: GPIO8 HIGH=TX, LOW=idle. Toggling at ~2 kHz produces OOK
+// sidebands that look like modulated noise on a spectrum scope and more
+// effectively disrupt sensors than a pure CW carrier.
+static esp_timer_handle_t s_jam_tmr = NULL;
+static volatile bool      s_jam_gpio_state = false;
+
+static void s_jam_timer_cb(void *arg)
+{
+    s_jam_gpio_state = !s_jam_gpio_state;
+    gpio_set_level(RF_HAT_RF433_TX_GPIO, s_jam_gpio_state ? 1 : 0);
+}
+
 // ISR double-buffer in DRAM — capped at 256, enough for all standard OOK frames.
 #define RF433_ISR_BUF_MAX 256
 static uint32_t s_isr_buf[RF433_ISR_BUF_MAX];
@@ -471,14 +484,23 @@ void rf433_hat_jam_start(void)
     if (s_jamming) return;
     s_setup_tx();
     rf433_hat_capture_cancel();
+
+    if (!s_jam_tmr) {
+        esp_timer_create_args_t a = { .callback = s_jam_timer_cb, .name = "rf433_jam" };
+        esp_timer_create(&a, &s_jam_tmr);
+    }
+    // 500 µs half-period = 1 kHz toggle = 2 kHz OOK sidebands around 433.92 MHz
+    s_jam_gpio_state = true;
     gpio_set_level(RF_HAT_RF433_TX_GPIO, 1);
+    esp_timer_start_periodic(s_jam_tmr, 500);
     s_jamming = true;
-    ESP_LOGI(TAG, "RF433 jam start");
+    ESP_LOGI(TAG, "RF433 jam start (modulated, 1 kHz toggle)");
 }
 
 void rf433_hat_jam_stop(void)
 {
     if (!s_jamming) return;
+    if (s_jam_tmr) esp_timer_stop(s_jam_tmr);
     gpio_set_level(RF_HAT_RF433_TX_GPIO, 0);
     s_jamming = false;
     ESP_LOGI(TAG, "RF433 jam stop");

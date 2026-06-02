@@ -251,10 +251,14 @@ void cc1101_set_output_power_dbm(int8_t dbm)
     else if (dbm >= -15) pa = 0x1D;
     else if (dbm >= -20) pa = 0x0D;
     else                 pa = 0x03;
-    // Write PATABLE via burst write
-    uint8_t tx_data[2] = { CC1101_PATABLE | CC1101_BURST | CC1101_WRITE, pa };
+    // Write PATABLE[0] AND PATABLE[1] via burst write (3 bytes total).
+    // OOK presets set FREND0=0x11, routing OOK '1' bits through PATABLE[1].
+    // Without writing PATABLE[1], OOK TX has no power (PATABLE[1] = 0 after SRES).
+    // FSK presets use FREND0[2:0]=0 (PATABLE[0]), so PATABLE[1] is unused there —
+    // writing it here is harmless.  Max CC1101 output at 433 MHz: 0xC0 ≈ +10 dBm.
+    uint8_t tx_data[3] = { CC1101_PATABLE | CC1101_BURST | CC1101_WRITE, pa, pa };
     spi_transaction_t t = {
-        .length    = 16,
+        .length    = 24,   // 3 bytes × 8
         .tx_buffer = tx_data,
     };
     if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
@@ -325,7 +329,7 @@ void cc1101_apply_preset(cc1101_preset_t preset)
     cc1101_write_reg(CC1101_FSCTRL1,  0x06);
     cc1101_write_reg(CC1101_FSCTRL0,  0x00);
     cc1101_write_reg(CC1101_MCSM2,    0x07);
-    cc1101_write_reg(CC1101_MCSM1,    0x30);   // Stay in RX after RX; go to RX after TX
+    cc1101_write_reg(CC1101_MCSM1,    0x30);   // RXOFF=IDLE, TXOFF=IDLE (async presets use this; packet presets override to 0x3C)
     cc1101_write_reg(CC1101_MCSM0,    0x18);   // Calibrate when going from IDLE to RX/TX
     cc1101_write_reg(CC1101_FOCCFG,   0x16);
     cc1101_write_reg(CC1101_BSCFG,    0x6C);
@@ -397,10 +401,118 @@ void cc1101_apply_preset(cc1101_preset_t preset)
             cc1101_write_reg(CC1101_DEVIATN,  0x35);
             cc1101_write_reg(CC1101_AGCCTRL2, 0x43);
             break;
+
+        // TPMS packet-mode presets — override async-serial base config for FIFO packet RX
+        case CC1101_PRESET_OOK_10K_315MHZ:
+        case CC1101_PRESET_OOK_10K_433MHZ:
+            cc1101_set_freq_mhz(preset == CC1101_PRESET_OOK_10K_315MHZ ? 315.0f : 433.92f);
+            cc1101_write_reg(CC1101_MDMCFG4, 0x88);   // BW=203 kHz, DRATE_E=8
+            cc1101_write_reg(CC1101_MDMCFG3, 0x92);   // ~9.97 kbps
+            cc1101_write_reg(CC1101_MDMCFG2, 0x32);   // OOK, 16/16 sync, no Manchester
+            cc1101_write_reg(CC1101_MDMCFG1, 0x22);   // 4 preamble bytes
+            cc1101_write_reg(CC1101_SYNC1,   0xD3);   // Sync D391 (Schrader)
+            cc1101_write_reg(CC1101_SYNC0,   0x91);
+            cc1101_write_reg(CC1101_PKTLEN,   0x08);   // fixed 8-byte packet
+            cc1101_write_reg(CC1101_PKTCTRL0, 0x00);   // fixed length, no CRC, no whitening
+            cc1101_write_reg(CC1101_PKTCTRL1, 0x00);   // no addr check, no status append
+            cc1101_write_reg(CC1101_IOCFG0,   CC1101_GDO0_PKT_SYNC);
+            cc1101_write_reg(CC1101_FIFOTHR,  0x0F);   // RX FIFO threshold 16 bytes
+            cc1101_write_reg(CC1101_DEVIATN,  0x00);
+            cc1101_write_reg(CC1101_FREND0,   0x11);   // OOK: 2-entry PATABLE
+            cc1101_write_reg(CC1101_MCSM1,    0x3C);   // RXOFF=RX: stay in RX after each packet
+            cc1101_write_reg(CC1101_AGCCTRL2, 0x07);   // max LNA gain
+            cc1101_write_reg(CC1101_AGCCTRL1, 0x40);
+            cc1101_write_reg(CC1101_AGCCTRL0, 0x91);
+            break;
+
+        // FSK TPMS — same packet structure/sync, 2-FSK ±25 kHz (Continental, Hella, TRW variants)
+        case CC1101_PRESET_FSK_10K_315MHZ:
+        case CC1101_PRESET_FSK_10K_433MHZ:
+            cc1101_set_freq_mhz(preset == CC1101_PRESET_FSK_10K_315MHZ ? 315.0f : 433.92f);
+            cc1101_write_reg(CC1101_MDMCFG4, 0x88);   // BW=203 kHz, DRATE_E=8
+            cc1101_write_reg(CC1101_MDMCFG3, 0x92);   // ~9.97 kbps
+            cc1101_write_reg(CC1101_MDMCFG2, 0x12);   // GFSK, 16/16 sync, no Manchester
+            cc1101_write_reg(CC1101_MDMCFG1, 0x22);   // 4 preamble bytes
+            cc1101_write_reg(CC1101_SYNC1,   0xD3);
+            cc1101_write_reg(CC1101_SYNC0,   0x91);
+            cc1101_write_reg(CC1101_PKTLEN,   0x08);
+            cc1101_write_reg(CC1101_PKTCTRL0, 0x00);
+            cc1101_write_reg(CC1101_PKTCTRL1, 0x00);
+            cc1101_write_reg(CC1101_IOCFG0,   CC1101_GDO0_PKT_SYNC);
+            cc1101_write_reg(CC1101_FIFOTHR,  0x0F);
+            cc1101_write_reg(CC1101_DEVIATN,  0x35);   // ±25 kHz deviation
+            cc1101_write_reg(CC1101_MCSM1,    0x3C);   // RXOFF=RX: stay in RX after each packet
+            cc1101_write_reg(CC1101_AGCCTRL2, 0x43);
+            cc1101_write_reg(CC1101_AGCCTRL1, 0x40);
+            cc1101_write_reg(CC1101_AGCCTRL0, 0x91);
+            break;
     }
 
     // Set max TX power
     cc1101_set_output_power_dbm(10);
+}
+
+// ── Packet receive ────────────────────────────────────────────────────────────
+
+int cc1101_rx_packet(uint8_t *buf, uint8_t pktlen, int8_t *rssi_out,
+                     uint32_t timeout_ms, volatile bool *cancel)
+{
+    if (!s_init || !buf || pktlen == 0 || pktlen > 64) return -1;
+
+    int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+
+    while (!(cancel && *cancel)) {
+        if (esp_timer_get_time() >= deadline) break;
+
+        uint8_t marc = cc1101_get_marc_state();
+        // Recover from RX FIFO overflow (MARCSTATE == 0x11)
+        if (marc == 0x11) {
+            cc1101_strobe(CC1101_SIDLE);
+            cc1101_strobe(CC1101_SFRX);
+            cc1101_strobe(CC1101_SRX);
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        // Re-arm if preset forgot MCSM1 stay-in-RX or something else drove us IDLE
+        if (marc == 0x01) {
+            cc1101_strobe(CC1101_SRX);
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
+        uint8_t rxbytes = cc1101_read_status(CC1101_RXBYTES);
+        if (rxbytes & 0x80) {
+            // Overflow flag in RXBYTES
+            cc1101_strobe(CC1101_SIDLE);
+            cc1101_strobe(CC1101_SFRX);
+            cc1101_strobe(CC1101_SRX);
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
+        if (rxbytes >= pktlen) {
+            // Burst-read pktlen bytes from RX FIFO
+            // Address = RXFIFO | READ | BURST = 0x3F | 0x80 | 0x40 = 0xFF
+            uint8_t tx_buf[65];
+            uint8_t rx_buf[65];
+            memset(tx_buf, 0, pktlen + 1);
+            tx_buf[0] = CC1101_RXFIFO | CC1101_READ | CC1101_BURST;
+            spi_transaction_t t = {
+                .length    = (pktlen + 1) * 8,
+                .tx_buffer = tx_buf,
+                .rx_buffer = rx_buf,
+            };
+            if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
+            spi_device_polling_transmit(s_spi, &t);
+            if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+            memcpy(buf, rx_buf + 1, pktlen);
+            if (rssi_out) *rssi_out = cc1101_get_rssi_dbm();
+            return pktlen;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return -1;
 }
 
 // ── RAW Capture ───────────────────────────────────────────────────────────────

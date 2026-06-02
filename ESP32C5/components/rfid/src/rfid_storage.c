@@ -113,16 +113,22 @@ rfid_err_t rfid_storage_save(const rfid_card_t *card,
     jw_str(f, "name",       card->name,                           true);
     jw_str(f, "source",     card->source[0] ? card->source : "scan", true);
     jw_str(f, "timestamp",  card->timestamp,                      true);
+    jw_int(f, "page_count", card->page_count,                     true);
 
-    // Blocks sub-object
+    // Blocks sub-object — iterate whichever is larger (MIFARE uses block_count, NTAG uses page_count)
+    uint16_t dump_count = card->page_count > card->block_count
+                          ? card->page_count : card->block_count;
     fprintf(f, "\"blocks\":{");
     bool first_blk = true;
     char key[8], hex[33];
-    for (int b = 0; b < card->block_count && b < RFID_MAX_BLOCKS; b++) {
+    // For NTAG/UL, pages are 4 bytes wide; for MIFARE Classic, 16 bytes.
+    int bytes_per_entry = (card->page_count > 0 && card->page_count > card->block_count)
+                          ? 4 : RFID_BLOCK_LEN;
+    for (int b = 0; b < dump_count && b < RFID_MAX_BLOCKS; b++) {
         if (!card->blocks[b].valid) continue;
-        for (int j = 0; j < RFID_BLOCK_LEN; j++)
+        for (int j = 0; j < bytes_per_entry; j++)
             snprintf(hex + j*2, 3, "%02X", card->blocks[b].data[j]);
-        hex[32] = '\0';
+        hex[bytes_per_entry * 2] = '\0';
         snprintf(key, sizeof(key), "%d", b);
         if (!first_blk) fprintf(f, ",");
         fprintf(f, "\"%s\":\"%s\"", key, hex);
@@ -190,8 +196,20 @@ rfid_err_t rfid_storage_load(const char *path, rfid_card_t *card_out)
         }
         if (jp_str(line, "name", val, sizeof(val)))
             strncpy(card_out->name, val, sizeof(card_out->name) - 1);
-        if (jp_str(line, "protocol", val, sizeof(val)))
+        if (jp_str(line, "page_count", val, sizeof(val)))
+            card_out->page_count = (uint16_t)atoi(val);
+        if (jp_str(line, "protocol", val, sizeof(val))) {
             strncpy(card_out->protocol_str, val, sizeof(card_out->protocol_str) - 1);
+            // Derive protocol enum so emulation and rfid_manager_read_card_data() route correctly
+            if (strstr(val, "MIFARE Classic 4K"))   card_out->protocol = RFID_PROTO_MIFARE_CLASSIC_4K;
+            else if (strstr(val, "MIFARE Classic"))  card_out->protocol = RFID_PROTO_MIFARE_CLASSIC_1K;
+            else if (strstr(val, "NTAG216"))         card_out->protocol = RFID_PROTO_NTAG216;
+            else if (strstr(val, "NTAG215"))         card_out->protocol = RFID_PROTO_NTAG215;
+            else if (strstr(val, "NTAG213"))         card_out->protocol = RFID_PROTO_NTAG213;
+            else if (strstr(val, "Ultralight"))      card_out->protocol = RFID_PROTO_MIFARE_ULTRALIGHT;
+            else if (strstr(val, "DESFire"))         card_out->protocol = RFID_PROTO_DESFIRE;
+            else if (strstr(val, "ISO14443-4"))      card_out->protocol = RFID_PROTO_ISO14443_4;
+        }
         if (jp_str(line, "source", val, sizeof(val)))
             strncpy(card_out->source, val, sizeof(card_out->source) - 1);
         if (jp_str(line, "timestamp", val, sizeof(val)))
@@ -231,10 +249,16 @@ rfid_err_t rfid_storage_load(const char *path, rfid_card_t *card_out)
                             if (sscanf(vstart + j, "%2x", &byte) == 1)
                                 card_out->blocks[blk].data[j/2] = (uint8_t)byte;
                         }
-                        if (vl >= RFID_BLOCK_LEN * 2) {
+                        // Valid if at least 4 bytes (NTAG page) or 16 bytes (MIFARE block)
+                        if (vl >= 8) {
                             card_out->blocks[blk].valid = true;
-                            if ((uint16_t)(blk + 1) > card_out->block_count)
-                                card_out->block_count = (uint16_t)(blk + 1);
+                            // Update block_count (MIFARE) or page_count (NTAG) tracking
+                            if (card_out->page_count > 0) {
+                                // NTAG: page_count already set from JSON field; don't clobber it
+                            } else {
+                                if ((uint16_t)(blk + 1) > card_out->block_count)
+                                    card_out->block_count = (uint16_t)(blk + 1);
+                            }
                         }
                     }
                 }
@@ -265,6 +289,18 @@ rfid_err_t rfid_storage_load(const char *path, rfid_card_t *card_out)
         }
     }
     fclose(f);
+
+    // Legacy JSON fixup: files saved before page_count field was added have
+    // block_count set from page indices and page_count = 0.
+    if (card_out->page_count == 0 && card_out->block_count > 0 &&
+        (card_out->protocol == RFID_PROTO_NTAG213 ||
+         card_out->protocol == RFID_PROTO_NTAG215 ||
+         card_out->protocol == RFID_PROTO_NTAG216 ||
+         card_out->protocol == RFID_PROTO_MIFARE_ULTRALIGHT)) {
+        card_out->page_count  = card_out->block_count;
+        card_out->block_count = 0;
+    }
+
     return (card_out->uid_len > 0) ? RFID_OK : RFID_ERR_IO;
 }
 
