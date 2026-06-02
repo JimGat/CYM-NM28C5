@@ -277,7 +277,8 @@
               <div id="devWarning" class="dev-warn" style="display:none;"><strong>Development build</strong> &mdash; binaries fetched live from the <code>Jimgat_Dev</code> branch. May be unstable.</div>
               <div class="actions">
                 <button id="connectBtn">Connect</button>
-                <button id="flashBtn" class="ghost" disabled>Flash</button>
+                <button id="flashBtn" class="ghost" disabled>Flash All</button>
+                <button id="quickFlashBtn" class="ghost" disabled title="Flash only CYM-NM28C5.bin @ 0x10000 (skips bootloader + partition table)">Quick Flash</button>
                 <label class="check"><input id="eraseAll" type="checkbox">Erase</label>
                 <select id="baudSelect" aria-label="Baud rate">
                   <option value="115200">115200 baud (reliable)</option>
@@ -372,6 +373,7 @@
         progress: document.getElementById("progressBar"),
         connectBtn: document.getElementById("connectBtn"),
         flashBtn: document.getElementById("flashBtn"),
+        quickFlashBtn: document.getElementById("quickFlashBtn"),
         eraseAll: document.getElementById("eraseAll"),
         baud: document.getElementById("baudSelect"),
         repoLink: document.getElementById("repoLink"),
@@ -387,7 +389,7 @@
       };
 
       const state = { manifest:null, channel:"stable", port:null, onDisconnect:null, esploader:null, chip:null, connected:false, flashing:false, monitorPort:null, monitorReader:null, monitorWriter:null, monitorPipe:null, monitorDisconnect:null, monitorConnected:false };
-      const PAGE_VERSION = "2.6.0";  // fix stub URL (development branch) + port lock cleanup
+      const PAGE_VERSION = "2.7.0";  // hardResetToFirmware + Quick Flash app-only button
       const RAW_BASE = "https://raw.githubusercontent.com/JimGat/CYM-NM28C5/Jimgat_Dev/ESP32C5";
       const DEV_MANIFEST_URL = `${RAW_BASE}/docs/manifest.json`;
       const RAW_BIN = `${RAW_BASE}/binaries-esp32c5`;
@@ -562,6 +564,8 @@
           ui.connectBtn.textContent = "Disconnect";
           ui.flashBtn.disabled = false;
           ui.flashBtn.classList.add("flash-armed");
+          ui.quickFlashBtn.disabled = false;
+          ui.quickFlashBtn.classList.add("flash-armed");
           setStatus(`Connected to ${state.chip}. Ready to flash.`);
           log(`Connected: ${state.chip}`);
         } catch (err) {
@@ -588,15 +592,22 @@
         return files;
       };
 
-      const flash = async () => {
+      // appOnly=true: flash only the main app binary (CYM-NM28C5.bin @ 0x10000)
+      const flash = async (appOnly = false) => {
         ensureSupport();
         if (!state.esploader) await connect();
         ui.flashBtn.disabled = true;
+        ui.quickFlashBtn.disabled = true;
         ui.connectBtn.disabled = true;
         state.flashing = true;
         ui.progress.style.width = "0%";
         try {
-          const files = await fetchFiles();
+          let files = await fetchFiles();
+          if (appOnly) {
+            files = files.filter(f => f.address === 0x10000);
+            if (!files.length) throw new Error("No app binary found at 0x10000 in manifest");
+            log("Quick Flash: app binary only @ 0x10000");
+          }
           log("Preparing flash writes");
 
           // Erase — stop pulsing while working
@@ -652,9 +663,11 @@
             }
           }
 
-          await state.esploader.after();
+          // Reset chip after flashing — tasmota uses hardResetToFirmware() not after()
+          try { await state.esploader.hardResetToFirmware(); }
+          catch { try { await state.esploader.hardReset(); } catch {} }
           ui.progress.style.width = "100%";
-          setStatus("Flash complete. Press RESET if the board does not reboot.");
+          setStatus("Flash complete - board rebooting!");
           log("Flash complete.");
         } catch (err) {
           setStatus(err.message || "Flash failed", "error");
@@ -662,6 +675,7 @@
         } finally {
           state.flashing = false;
           ui.flashBtn.disabled = !state.connected;
+          ui.quickFlashBtn.disabled = !state.connected;
           ui.connectBtn.disabled = false;
         }
       };
@@ -684,6 +698,8 @@
         ui.chip.style.display = "none";
         ui.flashBtn.disabled = true;
         ui.flashBtn.classList.remove("flash-armed");
+        ui.quickFlashBtn.disabled = true;
+        ui.quickFlashBtn.classList.remove("flash-armed");
         ui.connectBtn.textContent = "Connect";
         setStatus("Disconnected.");
       };
@@ -754,7 +770,8 @@
       };
 
       ui.connectBtn.addEventListener("click", () => connect().catch(() => {}));
-      ui.flashBtn.addEventListener("click", () => flash().catch(() => {}));
+      ui.flashBtn.addEventListener("click", () => flash(false).catch(() => {}));
+      ui.quickFlashBtn.addEventListener("click", () => flash(true).catch(() => {}));
       ui.monitorBtn.addEventListener("click", () => connectMonitor().catch(() => {}));
       ui.clearMonitorBtn.addEventListener("click", () => { ui.monitorLog.textContent = ""; });
       ui.monitorSendBtn.addEventListener("click", () => sendMonitor().catch((err) => { setMonitorStatus(err.message || "Send failed.", "error"); monitorLine(`Error: ${err?.message || err}`); }));
