@@ -22,6 +22,12 @@
 </p>
 
 <p align="center">
+  <a href="https://jimgat.github.io/CYM-NM28C5/" target="_blank">
+    <img src="https://img.shields.io/badge/⚡%20Web%20Flasher-Flash%20in%20Browser-39ff14?style=for-the-badge&logo=googlechrome&logoColor=black" alt="Web Flasher"/>
+  </a>
+</p>
+
+<p align="center">
   <img src="docs/screenshots/Cheep%20Yellow%20Monster.jpg" alt="Cheap Yellow Monster" width="50%"/>
 </p>
 
@@ -2400,17 +2406,15 @@ idf.py build
 
 After each build the compiled binaries are automatically copied to `ESP32C5/binaries-esp32c5/`.
 
-### Flash — Web Browser (No Install Required)
+### Flash — Web Flasher (Easiest — No Install Required)
 
-Use **[ESPConnect](https://thelastoutpostworkshop.github.io/ESPConnect/)** to flash directly from Chrome or Edge via WebSerial. Flash each file at the address shown below.
+**[https://jimgat.github.io/CYM-NM28C5/](https://jimgat.github.io/CYM-NM28C5/)**
 
-| File | Address |
-|------|---------|
-| `bootloader.bin` | `0x2000` |
-| `partition-table.bin` | `0x8000` |
-| `CYM-NM28C5.bin` | `0x10000` |
+One-click flashing from Chrome or Edge via WebSerial. Select **Stable** for the current release or **Dev** for the latest development build, connect your board in ROM mode, and hit Flash. No drivers, no terminal, no manual file selection.
 
-> **[ESPTerminator](https://espterminator.com/)** is a newer web flash/terminal tool but does not yet identify the NM-CYD-C5 correctly and fails to flash the board reliably. Check back for future support.
+**ROM mode:** hold the BOOT button, plug in USB-C, release BOOT. Then click Connect in the flasher.
+
+> The flasher also includes a built-in **serial monitor** — connect after flashing to read the boot log without leaving the browser.
 
 ### Flash — Command Line
 
