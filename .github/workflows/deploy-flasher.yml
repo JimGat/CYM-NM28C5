@@ -57,6 +57,11 @@ jobs:
 
           cp ESP32C5/binaries-esp32c5/*.bin _site/binaries-esp32c5/
 
+          # Copy artwork / static assets from docs/
+          for f in ESP32C5/docs/*.png ESP32C5/docs/*.jpg ESP32C5/docs/*.gif ESP32C5/docs/*.svg; do
+            [ -f "$f" ] && cp "$f" _site/
+          done
+
           echo "--- site contents ---"
           find _site -type f | sort
 
