@@ -2430,11 +2430,45 @@ After each build the compiled binaries are automatically copied to `ESP32C5/bina
 
 **[https://jimgat.github.io/CYM-NM28C5/](https://jimgat.github.io/CYM-NM28C5/)**
 
-One-click flashing from Chrome or Edge via WebSerial. Select **Stable** for the current release or **Dev** for the latest development build, connect your board in ROM mode, and hit Flash. No drivers, no terminal, no manual file selection.
+A custom-built browser flasher using Chrome or Edge WebSerial. No drivers, no terminal, no file selection — everything is fetched automatically. Click the LAB5 logo on the page to visit the store.
 
-**ROM mode:** hold the BOOT button, plug in USB-C, release BOOT. Then click Connect in the flasher.
+#### Channels
 
-> The flasher also includes a built-in **serial monitor** — connect after flashing to read the boot log without leaving the browser.
+| Button | Source | When to use |
+|--------|--------|-------------|
+| **Stable** | `main` branch — GitHub Pages CDN | Production releases |
+| **Dev** | `Jimgat_Dev` branch — raw GitHub | Latest dev builds |
+
+#### Connection flow
+
+1. Put the board in ROM mode: **hold BOOT → plug USB-C → release BOOT**
+2. Click **Connect** — the flasher will:
+   - Detect the ESP32 Native USB bridge
+   - Sync with the ROM bootloader
+   - Identify the chip (ESP32-C5 revision 1.0)
+   - Upload the tasmota flash stub (required for the OPI PSRAM used on this board — standard esptool-js cannot communicate with flash while PSRAM is initialized)
+3. The **Flash** button glows bright red when the board is connected and armed
+
+#### Flash buttons
+
+| Button | What it flashes | Time |
+|--------|----------------|------|
+| **Flash All** | bootloader (0x2000) + partition table (0x8000) + app (0x10000) | ~17 s |
+| **Quick Flash** | app binary only (0x10000) | ~16 s |
+
+**Quick Flash** is for routine dev-cycle updates when the bootloader and partition table have not changed. It connects, uploads the stub, and writes only `CYM-NM28C5.bin`. Use **Flash All** after any partition layout change or for a fresh board.
+
+The **Erase** checkbox performs a full flash erase before writing — use only when recovering from bad partitions, bootloops, or stale NVS config. Normal updates do not need it.
+
+After flashing the board auto-reboots. The flash progress bar sweeps 0-100% during the write.
+
+#### Serial monitor
+
+The flasher includes a built-in UART monitor. After the board reboots, click **Monitor** and select the same serial port — no separate terminal app needed. Useful for reading the boot log, GPS output, or any serial debug immediately after flashing.
+
+#### Baud rate
+
+Default is **115200 baud** which is reliable for all conditions. Higher rates (460800, 921600) are available but may fail on some USB hubs or cables.
 
 ### Flash — Command Line
 
