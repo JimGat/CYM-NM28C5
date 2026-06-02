@@ -548,16 +548,21 @@ static char     g_saved_wifi_pass[65] = ""; // Home network password
 #define NVS_KEY_GPS_ALT      "gps_alt_i"
 #define NVS_KEY_RF_HAT       "rf_hat"
 #define NVS_KEY_BTSC_CTR     "btsc_ctr"
-#define NVS_KEY_CC1101_OFF   "cc1101_off"  // int32 Hz, ±20000 crystal calibration offset
+#define NVS_KEY_CC1101_PPM   "cc1101_ppm"  // int32 milli-PPM (ppm × 1000), ±300000 = ±300 ppm
 
 // ── CC1101 crystal calibration — declared here so NVS load can access them ────
-// Consumer 26 MHz crystals vary ±20-40 ppm; at 433 MHz that is ±8.7-17 kHz.
-// Positive offset = chip measures HIGHER than programmed.
-// Correction: enter negative (chip high) or positive (chip low) kHz value.
-static int32_t g_cc1101_freq_offset_hz = 0;
+// CC1101 uses a 26 MHz crystal whose error multiplies with the PLL.
+// A given PPM error produces MORE Hz deviation at higher frequencies:
+//   433 MHz × 138 ppm = 60 kHz offset
+//   915 MHz × 138 ppm = 126 kHz offset  ← same crystal, 2× the Hz error
+// Correction MUST be stored in PPM, not Hz, so it scales correctly to all bands.
+// millippm = measured_deviation_kHz × 1,000,000 / 433.920 (when calibrating at 433 MHz)
+// Applied: f_programmed = f_desired × (1 + millippm / 1e9)
+// Range: ±300 ppm covers even poorly-spec'd modules (≈±130 kHz at 433, ±275 kHz at 915)
+static int32_t g_cc1101_freq_offset_millippm = 0;  // ppm × 1000, signed
 
 static inline float cc1101_freq_cal(float mhz) {
-    return mhz + (float)g_cc1101_freq_offset_hz / 1000000.0f;
+    return mhz * (1.0f + (float)g_cc1101_freq_offset_millippm / 1000000000.0f);
 }
 
 static void nvs_save_cc1101_offset(void);   // forward — implemented near HW test screen
@@ -3284,10 +3289,10 @@ static void nvs_settings_load(void)
         if (nvs_get_u8(h, NVS_KEY_RF_HAT, &rfhat) == ESP_OK) g_rf_hat_enabled = (rfhat != 0);
         uint32_t btsc_ctr = 0;
         if (nvs_get_u32(h, NVS_KEY_BTSC_CTR, &btsc_ctr) == ESP_OK) g_btsc_counter = btsc_ctr;
-        int32_t cc1101_off = 0;
-        if (nvs_get_i32(h, NVS_KEY_CC1101_OFF, &cc1101_off) == ESP_OK) {
-            if (cc1101_off >= -20000 && cc1101_off <= 20000)
-                g_cc1101_freq_offset_hz = cc1101_off;
+        int32_t cc1101_ppm = 0;
+        if (nvs_get_i32(h, NVS_KEY_CC1101_PPM, &cc1101_ppm) == ESP_OK) {
+            if (cc1101_ppm >= -300000 && cc1101_ppm <= 300000)
+                g_cc1101_freq_offset_millippm = cc1101_ppm;
         }
         uint8_t bt_scan_dur = 10;
         if (nvs_get_u8(h, NVS_KEY_BT_SCAN_DUR, &bt_scan_dur) == ESP_OK)
@@ -37841,7 +37846,7 @@ static void nvs_save_cc1101_offset(void)
 {
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_i32(h, NVS_KEY_CC1101_OFF, g_cc1101_freq_offset_hz);
+        nvs_set_i32(h, NVS_KEY_CC1101_PPM, g_cc1101_freq_offset_millippm);
         nvs_commit(h);
         nvs_close(h);
     }
@@ -37902,18 +37907,25 @@ static void s_offset_confirm_cb(lv_event_t *e)
         const char *txt = lv_textarea_get_text(s_offset_ta);
         float khz = 0.0f;
         if (sscanf(txt, "%f", &khz) == 1) {
-            int32_t hz = (int32_t)(khz * 1000.0f);
-            if (hz < -20000) hz = -20000;
-            if (hz >  20000) hz =  20000;
-            g_cc1101_freq_offset_hz = hz;
+            // Convert kHz measured at 433.920 MHz calibration frequency to millippm.
+            // millippm = khz × 1000 Hz / 433920000 Hz × 1e9 = khz × 1e6 / 433.920
+            int32_t mppm = (int32_t)(khz * 1000000.0f / 433.920f);
+            if (mppm < -300000) mppm = -300000;  // -300 ppm (≈-130 kHz @ 433)
+            if (mppm >  300000) mppm =  300000;  // +300 ppm (≈+130 kHz @ 433)
+            g_cc1101_freq_offset_millippm = mppm;
             nvs_save_cc1101_offset();
             if (s_cc1101_ht_offset_lbl) {
-                char buf[48];
-                snprintf(buf, sizeof(buf), "Offset: %+.3f kHz (%+ld Hz)",
-                         (double)(hz / 1000.0f), (long)hz);
+                char buf[64];
+                if (mppm == 0) {
+                    snprintf(buf, sizeof(buf), "Offset: 0.0 ppm (uncalibrated)");
+                } else {
+                    float ppm = mppm / 1000.0f;
+                    snprintf(buf, sizeof(buf), "Offset: %+.1f ppm (%+.1f kHz @ 433 MHz)",
+                             (double)ppm, (double)khz);
+                }
                 lv_label_set_text(s_cc1101_ht_offset_lbl, buf);
                 lv_obj_set_style_text_color(s_cc1101_ht_offset_lbl,
-                    hz == 0 ? lv_color_hex(0x9E9E9E) : lv_color_hex(0xFFB300), 0);
+                    mppm == 0 ? lv_color_hex(0x9E9E9E) : lv_color_hex(0xFFB300), 0);
             }
         }
     }
@@ -37969,9 +37981,10 @@ static void s_offset_entry_cb(lv_event_t *e)
 
     lv_obj_t *hint = lv_label_create(card);
     lv_label_set_text(hint,
-        "Chip measures HIGH by X kHz -> enter -X\n"
-        "Chip measures LOW by X kHz  -> enter +X\n"
-        "Range: +-20.000 kHz  (e.g. -15.3)");
+        "Enter kHz deviation at CAL TX (433.920 MHz)\n"
+        "Chip LOW by X kHz  -> enter +X (e.g. +60.0)\n"
+        "Chip HIGH by X kHz -> enter -X\n"
+        "Range: +-130 kHz = +-300 ppm (scales to all bands)");
     lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(hint, lv_color_hex(0xB0BEC5), 0);
 
@@ -37980,9 +37993,11 @@ static void s_offset_entry_cb(lv_event_t *e)
     lv_obj_set_height(s_offset_ta, 36);
     lv_textarea_set_max_length(s_offset_ta, 10);
     lv_textarea_set_one_line(s_offset_ta, true);
-    char cur[16]; snprintf(cur, sizeof(cur), "%.3f", (double)(g_cc1101_freq_offset_hz / 1000.0f));
+    // Pre-fill with current offset converted back to kHz at 433.920 MHz
+    float cur_khz = (float)g_cc1101_freq_offset_millippm * 433.920f / 1000000.0f;
+    char cur[16]; snprintf(cur, sizeof(cur), "%.1f", (double)cur_khz);
     lv_textarea_set_text(s_offset_ta, cur);
-    lv_textarea_set_placeholder_text(s_offset_ta, "0.000");
+    lv_textarea_set_placeholder_text(s_offset_ta, "0.0");
     lv_obj_set_style_text_font(s_offset_ta, &lv_font_montserrat_12, 0);
     lv_obj_set_style_bg_color(s_offset_ta, ui_bg_color(), 0);
     lv_obj_set_style_text_color(s_offset_ta, ui_text_color(), 0);
@@ -38097,15 +38112,20 @@ static void show_cc1101_hw_test_screen(void)
 
     s_cc1101_ht_offset_lbl = lv_label_create(card);
     {
-        char buf[48];
-        snprintf(buf, sizeof(buf), "Offset: %+.3f kHz (%+ld Hz)",
-                 (double)(g_cc1101_freq_offset_hz / 1000.0f),
-                 (long)g_cc1101_freq_offset_hz);
+        char buf[64];
+        if (g_cc1101_freq_offset_millippm == 0) {
+            snprintf(buf, sizeof(buf), "Offset: 0.0 ppm (uncalibrated)");
+        } else {
+            float ppm  = g_cc1101_freq_offset_millippm / 1000.0f;
+            float khz  = ppm * 433.920f / 1000.0f;
+            snprintf(buf, sizeof(buf), "Offset: %+.1f ppm (%+.1f kHz @ 433 MHz)",
+                     (double)ppm, (double)khz);
+        }
         lv_label_set_text(s_cc1101_ht_offset_lbl, buf);
     }
     lv_obj_set_style_text_font(s_cc1101_ht_offset_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_cc1101_ht_offset_lbl,
-        g_cc1101_freq_offset_hz == 0 ? lv_color_hex(0x9E9E9E) : lv_color_hex(0xFFB300), 0);
+        g_cc1101_freq_offset_millippm == 0 ? lv_color_hex(0x9E9E9E) : lv_color_hex(0xFFB300), 0);
 
     // Button row: [Set Offset] [CAL TX 433]
     // Button row: width = card inner (LCD_H_RES-16 card - 2×8 pad = 208 px)
@@ -39605,10 +39625,17 @@ static void s_cc1101_jam_stop(void)
     }
 }
 
+// Sweep table for jammer: covers 433 MHz ISM band (433.05-434.79 MHz EU / 902-928 MHz US)
+// stepping 200 kHz per tick to hit all common OOK fixed-channel devices in range.
+static const float s_jam_freqs[] = { 433.1f, 433.3f, 433.5f, 433.7f, 433.9f, 434.1f };
+static int s_jam_freq_idx = 0;
+
 static void s_cc1101_jam_timer_cb(lv_timer_t *tmr)
 {
     if (!s_cc1101_jamming || !cc1101_is_init()) { s_cc1101_jam_stop(); return; }
-    // Re-strobe TX to keep jammer running (CC1101 may return to IDLE on some configs)
+    // Step to next sweep frequency and re-strobe TX
+    s_jam_freq_idx = (s_jam_freq_idx + 1) % (int)(sizeof(s_jam_freqs) / sizeof(s_jam_freqs[0]));
+    cc1101_set_freq_mhz(cc1101_freq_cal(s_jam_freqs[s_jam_freq_idx]));
     cc1101_tx();
     (void)tmr;
 }
@@ -39626,8 +39653,10 @@ static void s_cc1101_jam_start_cb(lv_event_t *e)
         lv_label_set_text(s_cc1101_jam_status, "JAMMING 433 MHz");
         lv_obj_set_style_text_color(s_cc1101_jam_status, UI_ACCENT_RED, 0);
     }
-    if (!s_cc1101_jam_tmr)
-        s_cc1101_jam_tmr = lv_timer_create(s_cc1101_jam_timer_cb, 500, NULL);
+    if (!s_cc1101_jam_tmr) {
+        s_jam_freq_idx = 0;
+        s_cc1101_jam_tmr = lv_timer_create(s_cc1101_jam_timer_cb, 100, NULL);
+    }
     (void)e;
 }
 
