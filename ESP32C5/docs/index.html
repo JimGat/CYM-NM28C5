@@ -349,7 +349,8 @@
       // tasmota-webserial-esptool v9.2.23 — Tasmota fork of esptool-js that fixes the
       // ESP32-C5 OPI PSRAM / Flash ID: 0 issue (esptool-js mainline issue #217, still open).
       // ESPConnect uses this same library. Uses flashData() API instead of writeFlash().
-      import { ESPLoader, Transport } from "https://cdn.jsdelivr.net/npm/tasmota-webserial-esptool@9.2.23/dist/index.js";
+      // esm.sh used as CDN — automatically resolves bare module specifiers for browser use.
+      import { ESPLoader, Transport } from "https://esm.sh/tasmota-webserial-esptool@9.2.23";
 
       const ui = {
         status: document.getElementById("statusText"),
