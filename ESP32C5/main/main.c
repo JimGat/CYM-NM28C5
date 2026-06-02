@@ -39663,11 +39663,10 @@ static void s_cc1101_jam_stop(void)
 
 static void s_jam_fill_and_tx(float freq_mhz)
 {
+    // In random-TX mode the CC1101 generates PRBS internally — no FIFO needed.
+    // SIDLE → change freq → STX; chip transmits continuously until next SIDLE.
     cc1101_idle();
     cc1101_set_freq_mhz(cc1101_freq_cal(freq_mhz));
-    cc1101_flush_tx();
-    // Fill FIFO with 0xFF = OOK carrier ON; 32 bytes × 8 bits / 4800 baud ≈ 53 ms
-    for (int i = 0; i < 32; i++) cc1101_write_reg(CC1101_TXFIFO, 0xFF);
     cc1101_strobe(CC1101_STX);
 }
 
@@ -39677,14 +39676,9 @@ static void s_cc1101_jam_timer_cb(lv_timer_t *tmr)
     s_jam_freq_idx = (s_jam_freq_idx + 1) % 6;
     float f = s_jam_table[s_jam_freq_idx];
     s_jam_fill_and_tx(f);
-    // Read back actual programmed frequency from CC1101 FREQ registers to verify
-    float actual = cc1101_get_freq_mhz();
-    ESP_LOGI("JAM", "idx=%d target=%.3f programmed=%.3f MHz (MARC=%u)",
-             s_jam_freq_idx, (double)cc1101_freq_cal(f), (double)actual,
-             (unsigned)cc1101_get_marc_state());
     if (s_cc1101_jam_freq_lbl) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%.3f MHz (reg: %.3f)", (double)f, (double)actual);
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%.1f MHz", (double)f);
         lv_label_set_text(s_cc1101_jam_freq_lbl, buf);
     }
     (void)tmr;
@@ -39703,7 +39697,14 @@ static void s_cc1101_jam_start_cb(lv_event_t *e)
         default:           cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ); s_jam_table = s_jam_433; break;
     }
     cc1101_set_output_power_dbm(10);
-    cc1101_write_reg(CC1101_PKTCTRL0, 0x02);  // infinite packet = continuous carrier per hop
+    // Wideband noise via CC1101 random-TX mode:
+    //   PKTCTRL0 = 0x0A → DATA_FORMAT=10 (random PRBS, no FIFO) + LENGTH=10 (infinite)
+    //   MDMCFG4  = 0x07 → channel filter BW=812 kHz, DR_E=7
+    //   MDMCFG3  = 0x3B → DR_M=59 → data rate ≈250 kbps
+    // OOK at 250 kbps random: ±125 kHz sidebands ≈ 250 kHz visible noise per hop.
+    cc1101_write_reg(CC1101_PKTCTRL0, 0x0A);  // random TX, infinite
+    cc1101_write_reg(CC1101_MDMCFG4,  0x07);  // BW=812 kHz, DR_E=7
+    cc1101_write_reg(CC1101_MDMCFG3,  0x3B);  // DR_M=59 → ≈250 kbps
     s_cc1101_jamming = true;
     s_jam_freq_idx = 0;
     s_jam_fill_and_tx(s_jam_table[0]);
@@ -39713,7 +39714,7 @@ static void s_cc1101_jam_start_cb(lv_event_t *e)
         lv_obj_set_style_text_color(s_cc1101_jam_status, UI_ACCENT_RED, 0);
     }
     if (!s_cc1101_jam_tmr)
-        s_cc1101_jam_tmr = lv_timer_create(s_cc1101_jam_timer_cb, 500, NULL);
+        s_cc1101_jam_tmr = lv_timer_create(s_cc1101_jam_timer_cb, 125, NULL);
     (void)e;
 }
 
@@ -39853,7 +39854,7 @@ static void show_cc1101_jammer_screen(void)
     lv_obj_set_style_text_color(s_cc1101_jam_freq_lbl, lv_color_hex(0x757575), 0);
 
     lv_obj_t *note = lv_label_create(card);
-    lv_label_set_text(note, "6-step sweep, 200 kHz steps\n500 ms dwell — 3 s full cycle");
+    lv_label_set_text(note, "6-step sweep, 200 kHz steps\n125 ms dwell -- 750 ms cycle\n~250 kHz noise/hop");
     lv_obj_set_style_text_font(note, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(note, lv_color_make(120,120,120), 0);
     lv_obj_set_style_text_align(note, LV_TEXT_ALIGN_CENTER, 0);
