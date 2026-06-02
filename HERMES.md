@@ -2,7 +2,7 @@
 
 **Purpose of this file:** Complete context document for AI agents (Claude, ChatGPT, Hermes, or any LLM) working on this project. Read this before touching any code. It covers every major decision made, the reasoning behind it, known hazards, and how everything fits together.
 
-**Last updated:** 2026-06-01, v2.4.28
+**Last updated:** 2026-06-02, v2.4.44
 
 ---
 
@@ -375,7 +375,13 @@ Key features added since the previous HERMES version:
 | v2.4.27 | **Fox Hunt** — CC1101 (tunable 300-928 MHz, RSSI+squelch, bug-hunter haptic, preset+fine-tune buttons); nRF24 (carrier-detect rate, channel ±1/±10); RF433 (GPIO9 edge count, ISR-based); Band Scope SDR freq marker (yellow line at center freq, drag to move, Hunt button in row with Start/Stop); CC1101/nRF24/RF433 menus updated with Fox Hunt tile |
 | v2.4.28 | Fix: Unicode status chars (●▲★) → ASCII (--/>>/>>>); Band Scope line restricted to spectrum section only (no waterfall ghosting); hunt_btn always visible in action row; marker initialized at center freq on open |
 | v2.4.29 | Fix: CC1101 Fox Hunt stuck at -98 dBm after Band Scope→Hunt (band scope task race with apply_preset); deferred CC1101 setup to first timer tick; Hunt button block char → plain text |
-| v2.4.30 | **CC1101 Crystal Calibration**: g_cc1101_freq_offset_hz (int32 Hz, ±20000, NVS key "cc1101_off"); cc1101_freq_cal() wrapper applied to all cc1101_set_freq_mhz() calls in main.c; HW Test screen Crystal Calibration panel with [Set Offset] numeric kHz popup + [CAL TX 433] continuous OOK carrier (PKTCTRL0=0x02 infinite, FIFO filled with 0xFF, 50ms refill timer) |
+| v2.4.30 | **CC1101 Crystal Calibration**: HW Test Crystal Calibration panel — [Set Offset] numeric kHz popup, [CAL TX 433] continuous OOK carrier. Initial implementation used fixed Hz offset. |
+| v2.4.37 | **PPM-based crystal calibration**: Changed from additive Hz to multiplicative PPM. `g_cc1101_freq_offset_millippm` (int32, ppm×1000). `cc1101_freq_cal(f) = f × (1 + millippm/1e9)` — scales correctly to 315/433/868/915 MHz. NVS key changed `"cc1101_off"` (Hz) → `"cc1101_ppm"` (millippm). Input range ±130 kHz at 433 = ±300 ppm. Display shows both ppm and kHz@433. Jammer frequencies also calibrated. |
+| v2.4.37 | **CC1101 Jammer frequency sweep**: 6-step sweep across 433.1-434.1 MHz using continuous OOK carrier (PKTCTRL0=0x02 infinite, FIFO 0xFF fill). Band selector buttons added (315/433/868/915). |
+| v2.4.41 | **Jammer modulation**: switched to CC1101 internal random PRBS TX mode (`PKTCTRL0=0x0A`, DATA_FORMAT=10). 250 kbps data rate → ~250 kHz OOK noise bandwidth per hop. |
+| v2.4.42 | **Jammer 433N narrow sweep**: 5th band (433N) covers 433.840-434.005 MHz in 12 steps at 15 kHz. All sweep tables expanded to 12 steps. Timer 62ms/step. Default: 433N. |
+| v2.4.43 | Jammer: 31ms/step (2× faster). |
+| v2.4.44 | **Jammer 2-FSK**: MDMCFG2=0x00 (2-FSK), DEVIATN=0x77 (±381 kHz), FREND0=0x10 (FSK PA). Carson BW ≈1 MHz per hop — entire 433N range covered by one hop. Default: 433N + 2-FSK. |
 
 **Architecture notes for new features:**
 - **Fox Hunt timers** are static file-scope (`s_fox_tmr`, `s_n24fox_tmr`, `s_rf433_fox_tmr`). They are cleaned up at the TOP of `show_cc1101_screen()`, `show_nrf24_screen()`, and `show_rf433_menu_screen()` respectively — not in `reset_function_page_children()`.
