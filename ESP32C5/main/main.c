@@ -37861,18 +37861,14 @@ static void s_cal_tx_stop(void)
     }
 }
 
-static void s_cal_tx_refill_cb(lv_timer_t *t)
+// Timer callback: re-strobe TX every 100 ms (same pattern as jammer, faster rate).
+// OOK in async mode produces a brief RF burst on each STX strobe — visible on
+// spectrum scope or service monitor with peak hold at the calibrated frequency.
+static void s_cal_tx_restrobe_cb(lv_timer_t *t)
 {
     (void)t;
     if (!s_cc1101_cal_tx_active || !cc1101_is_init()) return;
-    uint8_t tx_used = cc1101_read_status(0x3A) & 0x7F;  // TXBYTES status register
-    int space = 64 - (int)tx_used;
-    if (space > 0) {
-        int fill = (space > 32) ? 32 : space;
-        for (int i = 0; i < fill; i++) cc1101_write_reg(CC1101_TXFIFO, 0xFF);
-    }
-    uint8_t marc = cc1101_get_marc_state();
-    if (marc != 19 && marc != 18) cc1101_strobe(CC1101_STX);
+    cc1101_tx();  // flush TX FIFO + re-strobe STX (identical to jammer approach)
 }
 
 static void s_cal_tx_toggle_cb(lv_event_t *e)
@@ -37880,13 +37876,18 @@ static void s_cal_tx_toggle_cb(lv_event_t *e)
     (void)e;
     if (s_cc1101_cal_tx_active) { s_cal_tx_stop(); return; }
     if (!cc1101_is_init() && cc1101_init() != ESP_OK) return;
+
     cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);
     cc1101_set_freq_mhz(cc1101_freq_cal(433.920f));
-    cc1101_write_reg(CC1101_PKTCTRL0, 0x02);  // infinite packet, no CRC
-    for (int i = 0; i < 64; i++) cc1101_write_reg(CC1101_TXFIFO, 0xFF);
-    cc1101_strobe(CC1101_STX);
+    // CRITICAL: set PA table for OOK output power.
+    // After cc1101_init() sends SRES, PATABLE resets to [0xC0, 0x00, ...].
+    // OOK mode routes '1' bits through PATABLE[1] (FREND0=0x11). Without this
+    // call PATABLE[1]=0x00 → no RF output despite TX being active.
+    cc1101_set_output_power_dbm(10);
+    cc1101_tx();  // flush TX FIFO + STX (same as jammer)
+
     s_cc1101_cal_tx_active = true;
-    s_cc1101_cal_tx_tmr = lv_timer_create(s_cal_tx_refill_cb, 50, NULL);
+    s_cc1101_cal_tx_tmr = lv_timer_create(s_cal_tx_restrobe_cb, 100, NULL);
     if (s_cc1101_ht_cal_btn) {
         lv_obj_t *l = lv_obj_get_child(s_cc1101_ht_cal_btn, 0);
         if (l) lv_label_set_text(l, LV_SYMBOL_STOP " TX ACTIVE");
