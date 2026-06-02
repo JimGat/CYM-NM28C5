@@ -56,6 +56,17 @@
       }
       .deedee:hover { transform:scale(1.04) rotate(-2deg); }
 
+      /* Nuclear launch button — glows red when ready to flash */
+      @keyframes nuclear-pulse {
+        0%,100% { box-shadow: 0 0 12px 2px rgba(255,30,30,0.7), 0 0 30px 6px rgba(255,0,0,0.4); }
+        50%      { box-shadow: 0 0 24px 6px rgba(255,60,60,1.0), 0 0 60px 16px rgba(255,0,0,0.6); }
+      }
+      .flash-armed {
+        background: linear-gradient(135deg, #cc0000, #ff2222) !important;
+        animation: nuclear-pulse 1.4s ease-in-out infinite !important;
+        color: #fff !important;
+      }
+
       .container { max-width:1160px; margin:0 auto; display:grid; gap:16px; position:relative; z-index:1; }
 
       a { color:inherit; }
@@ -478,13 +489,12 @@
           setStatus("Syncing with chip — hold BOOT + tap RESET if needed");
           log("Connecting via tasmota connectWithPort...");
 
-          // tasmota API: connectWithPort(port, terminal) handles all handshaking internally
-          const terminal = { clean() {}, writeLine: log, write: log };
+          // tasmota logger interface: needs .log() not .writeLine()/.write()
+          const terminal = { clean() {}, writeLine: log, write: log, log, error: log };
           const timeout = new Promise((_, rej) =>
             setTimeout(() => rej(new Error(`Connect timeout after ${CONNECT_TIMEOUT_MS/1000}s — hold BOOT and tap RESET`)), CONNECT_TIMEOUT_MS));
           state.esploader = await Promise.race([connectWithPort(state.port, terminal), timeout]);
 
-          // chip name is a property on the loader, not the return value of main()
           state.chip = state.esploader?.chip_name || state.esploader?.chip || "ESP32-C5";
 
           state.connected = true;
@@ -492,6 +502,7 @@
           ui.chip.textContent = `Chip ${state.chip}`;
           ui.connectBtn.textContent = "Disconnect";
           ui.flashBtn.disabled = false;
+          ui.flashBtn.classList.add("flash-armed");
           setStatus(`Connected to ${state.chip}. Ready to flash.`);
           log(`Connected: ${state.chip}`);
         } catch (err) {
@@ -529,12 +540,17 @@
           const files = await fetchFiles();
           log("Preparing flash writes");
 
-          // Erase full flash first if requested
+          // Erase — stop pulsing while working
+          ui.flashBtn.classList.remove("flash-armed");
           if (ui.eraseAll.checked) {
             setStatus("Erasing flash (may take 20-30 s)...");
             log("Erasing flash...");
-            try { await state.esploader.eraseFlash(); log("Flash erased."); }
-            catch (e) { log(`Erase warning: ${e?.message || e}`); }
+            const eraseFn = state.esploader.eraseFlash || state.esploader.erase_flash
+                         || state.esploader.eraseChip || state.esploader.flashErase;
+            if (typeof eraseFn === "function") {
+              try { await eraseFn.call(state.esploader); log("Flash erased."); }
+              catch (e) { log(`Erase warning: ${e?.message || e}`); }
+            } else { log("Erase skipped (not supported by this library version)."); }
           }
 
           // tasmota-webserial-esptool uses flashData() per file (ArrayBuffer, not Uint8Array)
@@ -577,6 +593,7 @@
         state.port = null; state.onDisconnect = null; state.esploader = null; state.chip = null; state.connected = false;
         ui.chip.style.display = "none";
         ui.flashBtn.disabled = true;
+        ui.flashBtn.classList.remove("flash-armed");
         ui.connectBtn.textContent = "Connect";
         setStatus("Disconnected.");
       };
