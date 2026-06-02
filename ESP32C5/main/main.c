@@ -37459,7 +37459,7 @@ static bool      s_cc1101_jamming      = false;
 // Jammer band selection and sweep tables (12 steps each)
 typedef enum { JAM_BAND_315=0, JAM_BAND_433W, JAM_BAND_433N, JAM_BAND_868, JAM_BAND_915 } jam_band_t;
 #define JAM_STEPS  12
-static jam_band_t s_jam_band = JAM_BAND_433W;
+static jam_band_t s_jam_band = JAM_BAND_433N;
 
 // 315 MHz  — 12 steps, 50 kHz spacing (314.65–315.20 MHz)
 static const float s_jam_315[JAM_STEPS] = {
@@ -39738,7 +39738,7 @@ static void s_cc1101_jam_start_cb(lv_event_t *e)
         lv_obj_set_style_text_color(s_cc1101_jam_status, UI_ACCENT_RED, 0);
     }
     if (!s_cc1101_jam_tmr)
-        s_cc1101_jam_tmr = lv_timer_create(s_cc1101_jam_timer_cb, 62, NULL);
+        s_cc1101_jam_tmr = lv_timer_create(s_cc1101_jam_timer_cb, 31, NULL);
     (void)e;
 }
 
