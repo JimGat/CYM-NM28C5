@@ -43067,6 +43067,9 @@ static lv_obj_t *s_rfid_scan_save_btn   = NULL;
 static lv_obj_t *s_rfid_scan_read_btn   = NULL;
 static bool       s_rfid_has_card        = false;
 static lv_timer_t *s_rfid_init_retry_tmr = NULL;
+// Auto-read timer: fires 1 s after first card detection to trigger Read All
+// automatically, so the user only needs to hold the card still.
+static lv_timer_t *s_rfid_autoread_tmr  = NULL;
 
 // ── Minimal NDEF TLV decoder ──────────────────────────────────────────────────
 // Scans card pages 4..page_count for NDEF Message TLV (0x03).
@@ -43236,12 +43239,28 @@ static void s_rfid_read_all_task(void *arg)
 static void s_rfid_read_all_cb(lv_event_t *e)
 {
     (void)e;
+    // Cancel auto-read timer if it's still pending (manual tap takes priority)
+    if (s_rfid_autoread_tmr) { lv_timer_del(s_rfid_autoread_tmr); s_rfid_autoread_tmr = NULL; }
     if (!s_rfid_has_card || !s_rfid_last_card) return;
     rfid_manager_stop_poll();
     if (s_rfid_scan_status_lbl) lv_label_set_text(s_rfid_scan_status_lbl, "Hold card - reading...");
     if (s_rfid_scan_read_btn)   lv_obj_add_state(s_rfid_scan_read_btn, LV_STATE_DISABLED);
     xTaskCreate(s_rfid_read_all_task, "rfid_read", 6144, s_rfid_last_card,
                 tskIDLE_PRIORITY + 2, NULL);
+}
+
+static void s_rfid_autoread_tmr_cb(lv_timer_t *t)
+{
+    // Auto-read fires 1 s after first stable card detection.
+    // Only triggers if card is still present (s_rfid_has_card) and
+    // no read is already in progress (Read button still enabled).
+    lv_timer_del(t);
+    s_rfid_autoread_tmr = NULL;
+    if (!s_rfid_has_card || !s_rfid_last_card) return;
+    if (s_rfid_scan_read_btn &&
+        lv_obj_has_state(s_rfid_scan_read_btn, LV_STATE_DISABLED)) return;
+    ESP_LOGI("rfid_scan", "auto-read triggered after stable detection");
+    s_rfid_read_all_cb(NULL);
 }
 
 // Stop poll and null scan-screen labels before navigating away — prevents
@@ -43254,6 +43273,10 @@ static void rfid_back_to_menu(void)
     if (s_rfid_init_retry_tmr) {
         lv_timer_del(s_rfid_init_retry_tmr);
         s_rfid_init_retry_tmr = NULL;
+    }
+    if (s_rfid_autoread_tmr) {
+        lv_timer_del(s_rfid_autoread_tmr);
+        s_rfid_autoread_tmr = NULL;
     }
     s_rfid_scan_uid_lbl    = NULL;
     s_rfid_scan_type_lbl   = NULL;
@@ -43276,7 +43299,6 @@ static void s_rfid_scan_lvgl_cb(void *arg)
 
     if (ev->result == RFID_OK) {
         if (s_rfid_last_card) *s_rfid_last_card = ev->card;
-        s_rfid_has_card = true;
 
         char uid_str[32];
         rfid_format_uid(ev->card.uid, ev->card.uid_len, uid_str, sizeof(uid_str));
@@ -43311,7 +43333,22 @@ static void s_rfid_scan_lvgl_cb(void *arg)
             lv_obj_clear_state(s_rfid_scan_save_btn, LV_STATE_DISABLED);
         if (s_rfid_scan_read_btn)
             lv_obj_clear_state(s_rfid_scan_read_btn, LV_STATE_DISABLED);
+
+        // Start auto-read timer on FIRST detection (not on subsequent polls
+        // while card stays present, and not if already reading).
+        bool was_already_detected = s_rfid_has_card;
+        s_rfid_has_card = true;
+        if (!was_already_detected && !s_rfid_autoread_tmr) {
+            // Card just appeared — auto-read in 1 second if still present
+            s_rfid_autoread_tmr = lv_timer_create(s_rfid_autoread_tmr_cb, 1000, NULL);
+            lv_timer_set_repeat_count(s_rfid_autoread_tmr, 1);
+        }
     } else {
+        // Card removed — cancel pending auto-read
+        if (s_rfid_autoread_tmr) {
+            lv_timer_del(s_rfid_autoread_tmr);
+            s_rfid_autoread_tmr = NULL;
+        }
         if (s_rfid_scan_status_lbl) {
             lv_label_set_text(s_rfid_scan_status_lbl, "Waiting for card...");
             lv_obj_set_style_text_color(s_rfid_scan_status_lbl,
