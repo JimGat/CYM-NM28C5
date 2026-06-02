@@ -388,7 +388,7 @@
       };
 
       const state = { manifest:null, channel:"stable", port:null, onDisconnect:null, esploader:null, chip:null, connected:false, flashing:false, monitorPort:null, monitorReader:null, monitorWriter:null, monitorPipe:null, monitorDisconnect:null, monitorConnected:false };
-      const PAGE_VERSION = "1.8.0";  // writeFlash() with transport init fallback
+      const PAGE_VERSION = "1.9.0";  // debug: log ESPLoader methods
       const RAW_BASE = "https://raw.githubusercontent.com/JimGat/CYM-NM28C5/Jimgat_Dev/ESP32C5";
       const DEV_MANIFEST_URL = `${RAW_BASE}/docs/manifest.json`;
       const RAW_BIN = `${RAW_BASE}/binaries-esp32c5`;
@@ -552,6 +552,11 @@
               catch (e) { log(`Erase warning: ${e?.message || e}`); }
             } else { log("Erase skipped (not supported by this library version)."); }
           }
+
+          // Debug: show all ESPLoader methods so we know what API is available
+          const loaderMethods = Object.getOwnPropertyNames(Object.getPrototypeOf(state.esploader))
+            .filter(m => m !== "constructor" && typeof state.esploader[m] === "function");
+          log(`ESPLoader methods: ${loaderMethods.join(", ")}`);
 
           // Try writeFlash() first (handles transport init properly); fall back to flashData()
           const totalBytes = files.reduce((s, f) => s + f.data.length, 0);
