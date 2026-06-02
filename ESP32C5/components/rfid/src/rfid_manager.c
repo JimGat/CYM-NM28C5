@@ -85,16 +85,10 @@ rfid_err_t rfid_manager_init(void)
         return RFID_ERR_HW;
     }
 
-    // Small settle delay after SAM configure before issuing RFConfiguration.
-    // The PN532 activates its RF field on SAM configure; a brief gap prevents
-    // the I2C response frame from being misread (observed TFI=0x7F without it).
-    vTaskDelay(pdMS_TO_TICKS(50));
-
-    // Apply sensitivity tuning: raise RxGain to 48 dB max, lower RxThreshold.
-    // Non-fatal if this fails — basic operation still works at default sensitivity.
-    rfid_err_t sr = pn532_rf_configure_sensitivity();
-    if (sr != RFID_OK)
-        ESP_LOGW(TAG, "sensitivity config failed (non-fatal): %s", rfid_err_str(sr));
+    // NOTE: pn532_rf_configure_sensitivity() (RFConfiguration 0x0A) is intentionally
+    // NOT called here. PN532 firmware v1.6 returns ERROR FRAME 7F 81 for config item 0x0A
+    // (analog settings not supported by this firmware version). The default 38 dB RxGain
+    // is sufficient; calling it just generates a spurious warning on every init.
 
     s_mgr_init = true;
     ESP_LOGI(TAG, "init OK");
