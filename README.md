@@ -5,7 +5,7 @@
 <h1 align="center">Cheap Yellow Monster</h1>
 
 <p align="center">
-  <b>v2.4.44</b>
+  <b>v2.6.46</b>
 </p>
 
 <p align="center">
@@ -123,8 +123,9 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **Credentials** | Captive portal credential capture, WPA-SEC upload |
 | **TX Power Mode** | Selectable Normal / Max Power for WiFi and BLE — persisted across reboots |
 | **Data Transfer** | Self-hosted AP file server (TheLab) and WiFi client file server — browse, upload, create directories, and recursively delete folders from any browser; client IP logged to serial; IP shown on screen |
-| **NM-RF-HAT** | Hardware addon board for RF expansion -- IR capture/replay/Universal Remote/TV-B-Gone (Flipper .ir); RF433 OOK capture/replay/Fox Hunt (Flipper .sub); CC1101 Sub-GHz: Band Scope (SDR freq marker + Hunt), Fox Hunt (RSSI bug-hunter haptic, 300-928 MHz tunable), RAW Capture+Replay, Z-Wave Scout, TPMS 315+433 MHz (Flipper .sub); nRF24L01+ 2.4 GHz: Ch Scan/Sniffer/Jammer/Futaba S-FHSS/Fox Hunt (Flipper .nrf24); PN532 NFC/RFID: scan+Read All, NTAG213/215/216 full page dump, Clone/Write to blank NTAG, MIFARE Classic key-dict test, save/emulate/.nfc import+export (Flipper .nfc); DIP switch per module |
-| **Fox Hunt** | Ham radio-style RF proximity tracker on all three sub-GHz radios. CC1101: tunable 300-928 MHz, RSSI bar + peak hold, adjustable squelch, bug-hunter haptic (pulse rate proportional to RSSI above squelch — from 2 s/pulse at threshold to continuous at 38 dB above). nRF24: carrier-detect rate bar across 2400-2525 MHz in 1 MHz steps. RF433: GPIO edge-count activity bar at 433.92 MHz. All three use the vibrator for proximity feedback. Band Scope → Fox Hunt tap-through with SDR-style draggable yellow frequency marker. |
+| **NM-RF-HAT** | Hardware addon board for RF expansion -- IR capture/replay/Universal Remote/TV-B-Gone (Flipper .ir); RF433 OOK capture/replay/OOK Scan/Fox Hunt/Jammer (Flipper .sub); CC1101 Sub-GHz: Band Scope (SDR freq marker + Hunt), Fox Hunt (RSSI bug-hunter haptic, 300-928 MHz tunable), RAW Capture+Replay, Z-Wave Scout, TPMS 315+433 MHz, **Alarm Sensor decoder (EV1527)**, **Weather Station decoder (Fine Offset)** (Flipper .sub); nRF24L01+ 2.4 GHz: Ch Scan/Sniffer/Jammer/Futaba S-FHSS/Fox Hunt (Flipper .nrf24); PN532 NFC/RFID: scan+Read All, NTAG213/215/216 full page dump, Clone/Write to blank NTAG, MIFARE Classic key-dict test, save/emulate/.nfc import+export (Flipper .nfc); DIP switch per module |
+| **Fox Hunt** | Ham radio-style RF proximity tracker on all three sub-GHz radios. CC1101: tunable 300-928 MHz, RSSI bar + peak hold, adjustable squelch, bug-hunter haptic (pulse rate scales from 1 pulse/1.5 s at threshold to continuous at strong signal — always 100% motor strength for reliable feel). nRF24: carrier-detect rate bar across 2400-2525 MHz in 1 MHz steps. RF433: GPIO edge-count activity bar at 433.92 MHz. All three use the vibrator for proximity feedback. Band Scope → Fox Hunt tap-through with SDR-style draggable yellow frequency marker. |
+| **OOK Protocol Decoding** | CC1101 Alarm Sensor: decodes **EV1527** 315/433 MHz OOK alarm sensors (door contacts, PIR, smoke, flood) — 24-bit address + 4-bit channel, RSSI, trigger count, scrollable live list. CC1101 Weather Station: decodes **Fine Offset** 433.92 MHz weather sensors (WH65/WH57/WS80/WH31 and similar) — temperature (°C), humidity, battery, RSSI, scrollable list. RF433 OOK Scan: same EV1527 decoder using the R4A_433 superheterodyne receiver for higher sensitivity at exactly 433.92 MHz. |
 | **SD Card Remount** | Settings → SD Card → Remount SD Card: unmounts and re-mounts at 20/10/5 MHz fallback without physical eject — useful after a crash or RF-HAT FPC contact issue. |
 | **CC1101 Crystal Cal** | CC1101 HW Test → Crystal Calibration. Consumer 26 MHz crystals drift ±8.7-17 kHz at 433 MHz (±20-40 ppm). Error is proportional — the same ppm causes 2× more Hz deviation at 915 MHz vs 433 MHz. CAL TX 433 button transmits a continuous carrier for measurement. Set Offset popup accepts ±130 kHz (= ±300 ppm). Stored as PPM so it scales correctly to all bands automatically. Persists to NVS ("cc1101_ppm" key). |
 | **UI** | Material dark theme, touch gestures, screen dimming, screenshots — all screens portrait 240×320 |
@@ -211,10 +212,10 @@ Home
 │   │   │   ├── Saved Files
 │   │   │   ├── Z-Wave Scout
 │   │   │   ├── TPMS Monitor (315 / 433 MHz, 20 sensors)
-│   │   │   └── Weather Station [stub]
+│   │   │   └── Weather Station (Fine Offset decoder — temp/humidity/battery)
 │   │   └── Page 2
 │   │       ├── POCSAG Pager [stub]
-│   │       ├── Alarm Sensor [stub]
+│   │       ├── Alarm Sensor (EV1527 decoder — 315/433 MHz, 24-bit addr)
 │   │       ├── RF Wardrive [stub]
 │   │       ├── Decode Proto [stub]
 │   │       ├── Jammer  (band: 315/433W/433N/868/915; 2-FSK ±381 kHz; 12-step sweep)
@@ -236,9 +237,10 @@ Home
 │   └── RF433 OOK/ASK [DIP 5]
 │       ├── Capture
 │       ├── Replay
-│       ├── Jammer
+│       ├── Jammer  (1 kHz OOK modulation, T2-433M transmitter)
 │       ├── LBK Test (loopback)
-│       └── Fox Hunt (433.92 MHz fixed, edge-count activity)
+│       ├── Fox Hunt (433.92 MHz fixed, edge-count activity, haptic)
+│       └── OOK Scan (EV1527 decoder via R4A_433 superheterodyne RX)
 └── RFID/NFC [RF-HAT DIP 3]
     ├── Scan & Read  →  Read All (full page dump)  →  Save / Export .nfc
     ├── Clone/Write  →  Select source  →  Clone to blank NTAG
@@ -1930,9 +1932,10 @@ Copy any `.ir` file directly into `/sdcard/lab/infrared/` — no conversion need
 **Features:**
 - **Capture:** records OOK signal transitions via GPIO9 (R4A_433 RX output); saves as Flipper `.sub`.
 - **Replay:** plays back `.sub` files via the T2-433M OOK transmitter.
-- **Jammer:** continuous OOK transmission to saturate the 433 MHz band.
+- **Jammer:** T2-433M OOK transmitter toggled at 1 kHz via esp_timer (500 µs half-period), creating OOK AM sidebands around 433.92 MHz — visible modulation on a spectrum analyzer, more effective at disrupting OOK demodulators than a pure CW carrier.
 - **LBK Test:** loopback self-test verifying GPIO8 TX and GPIO9 RX path.
-- **Fox Hunt:** proximity tracker at fixed 433.92 MHz. The R4A_433 module demodulates incoming OOK signals to a digital output — edge transitions per second are counted as a signal-activity proxy. Higher activity = stronger 433 MHz signal nearby. Haptic feedback: vibrator pulses scale with activity. Note: no true RSSI — this is activity-based only.
+- **Fox Hunt:** proximity tracker at fixed 433.92 MHz. The R4A_433 module demodulates incoming OOK signals to a digital output — edge transitions per second are counted as a signal-activity proxy. Higher activity = stronger 433 MHz signal nearby. Haptic feedback: vibrator fires at 100% strength for reliable motor spin-up; pulse rate scales from ~1 pulse/1.5 s at low activity to 5 pulses/s at peak. Note: no true RSSI — this is activity-based only.
+- **OOK Scan:** passive EV1527 protocol decoder using the R4A_433 superheterodyne receiver. Decodes 315/433 MHz OOK alarm sensors: 24-bit address, 4-bit channel/data, trigger count, last-seen time. Auto-aggregates repeat transmissions from the same sensor. Useful when CC1101 sensitivity isn't sufficient for distant sensors.
 
 **SD card path:** `/sdcard/lab/rf433/`
 
@@ -1989,6 +1992,8 @@ Sub-1 GHz (300-928 MHz) OOK/ASK capture, replay, spectrum scan, and jamming. Use
 - **Fox Hunt:** ham radio-style proximity tracker tunable across 300-928 MHz. Four preset buttons (315 / 433 / 868 / 915 MHz) plus ±0.1/±1 MHz fine-tune buttons. RSSI bar with peak hold (tap Clear Peak to reset). Adjustable squelch (±5 dBm per tap). Haptic feedback in bug-hunter style: slow pulses (1 every 2 s) just above squelch, racing pulses (10/s) at strong signals — vibration intensity also scales with RSSI. Status label: `-- SILENT / > WEAK / >> MEDIUM / >>> STRONG - CLOSE!`
 - **Z-Wave Scout:** passive wardrive on the Z-Wave frequency (908.42 MHz US / 868.42 MHz EU). Configures CC1101 for GFSK 9.6 kbps, sync word `0xAA01`. Logs frame metadata (node IDs, command class, RSSI, GPS coordinates) to `/sdcard/lab/zwave/` as a timestamped CSV. GPS-tagged entries are compatible with WiGLE for mapping Z-Wave device density.
 - **TPMS Monitor:** receives Tire Pressure Monitoring System transmissions at 315 MHz (US) or 433.92 MHz (EU). Decodes Schrader-family OOK packets — identifies each sensor by its unique 32-bit ID, displays pressure in PSI and kPa, temperature in °C, battery-low and alarm flags, and RSSI. Tracks up to **20 unique sensors** in a scrollable grid. Logs all valid packets to `/sdcard/lab/tpms/` as a timestamped CSV.
+- **Weather Station:** decodes **Fine Offset** protocol weather sensors (WH65, WH57, WS80, WH31, Froggit, Ecowitt, and compatible) at 433.92 MHz OOK. Extracts temperature (°C), humidity (%), battery status, and device ID. Displays a live scrollable list of up to 6 sensors with RSSI and last-seen age. Most Fine Offset sensors transmit every 30–60 seconds; just open the screen and wait.
+- **Alarm Sensor:** decodes **EV1527** OOK alarm sensors at 315 MHz or 433.92 MHz (toggle buttons). EV1527 is the protocol used by ~90% of cheap wireless alarm products — door/window contacts, PIR motion detectors, smoke detectors, and flood sensors. Displays 24-bit unique address, 4-bit channel/button code, RSSI, trigger count, and last-seen age. Trigger a sensor (open a door, break a beam) to see its address appear instantly.
 
 ##### CC1101 Crystal Frequency Calibration
 

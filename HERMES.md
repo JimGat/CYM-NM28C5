@@ -2,7 +2,7 @@
 
 **Purpose of this file:** Complete context document for AI agents (Claude, ChatGPT, Hermes, or any LLM) working on this project. Read this before touching any code. It covers every major decision made, the reasoning behind it, known hazards, and how everything fits together.
 
-**Last updated:** 2026-06-02, v2.4.44
+**Last updated:** 2026-06-02, v2.6.46
 
 ---
 
@@ -273,7 +273,7 @@ GPIO 26 → SC8002B class-D amp → 1N5819 Schottky (series rectifier) → motor
 - Driver: `LEDC_TIMER_2 / LEDC_CHANNEL_4 / LEDC_TIMER_8_BIT`, 333 Hz fixed
 - Duty formula: `strength_pct × 128 / 100` (100% → 128/255 → 50% duty)
 - API: `vibrator_on()`, `vibrator_off()`, `vibrator_pulse(ms)`, `vibrator_burst(count, on_ms, gap_ms)`
-- Haptic events: BT Lookout hit = `vibrator_burst(3, 1000, 500)`, Deauth launch = `vibrator_pulse(3000)`, BT Locator = continuous scaled by RSSI, Fox Hunt = 50 ms pulses at variable rate (2 s at squelch → 100 ms at 38 dB above)
+- Haptic events: BT Lookout hit = `vibrator_burst(3, 1000, 500)`, Deauth launch = `vibrator_pulse(3000)`, BT Locator = continuous scaled by RSSI, Fox Hunt = **150 ms pulses at 100% strength** at variable rate (1 pulse/1.5 s near squelch → 5/s at strong signal). Fixed at 100% strength so ERM motor reliably reaches felt speed within the pulse.
 
 **JST connector:** 1.25mm pitch (not 1.0mm — ordered wrong once, 1.0mm is too small and won't fit).
 
@@ -382,13 +382,18 @@ Key features added since the previous HERMES version:
 | v2.4.42 | **Jammer 433N narrow sweep**: 5th band (433N) covers 433.840-434.005 MHz in 12 steps at 15 kHz. All sweep tables expanded to 12 steps. Timer 62ms/step. Default: 433N. |
 | v2.4.43 | Jammer: 31ms/step (2× faster). |
 | v2.4.44 | **Jammer 2-FSK**: MDMCFG2=0x00 (2-FSK), DEVIATN=0x77 (±381 kHz), FREND0=0x10 (FSK PA). Carson BW ≈1 MHz per hop — entire 433N range covered by one hop. Default: 433N + 2-FSK. |
+| v2.4.45 | **OOK Protocol Decoders**: (1) **CC1101 Alarm Sensor** — EV1527 decoder at 315/433 MHz OOK. `ook_decode_ev1527()` extracts 24-bit address + 4-bit channel from preamble+sync+28 data bits (T≈350 µs). Background task runs `cc1101_raw_capture()` 600 ms windows; scrollable live sensor list with RSSI, count, age. (2) **CC1101 Weather Station** — Fine Offset decoder at 433.92 MHz OOK. `ook_decode_fineoffset()` / `ook_crc8_fo()` decode 40-bit PWM (500 µs preamble, 2 ms sync gap), CRC-8/POLY=0x31. Extracts temp/humidity/battery/ID. 800 ms capture windows. (3) **RF433 OOK Scan** — same EV1527 decoder using R4A_433 superheterodyne GPIO9 ISR capture (`s_rf433_ook_cap_isr` IRAM_ATTR, 2048-sample ring buffer). New 6th tile in RF433 menu. All shared alarm state (`s_ook_alarms[]`, `s_ook_alarm_count`) is declared early to avoid forward-reference in cleanup code. |
+| v2.4.46 | **Fox Hunt haptic fix (all 3 radios)**: Root cause — 40 ms pulse duration is below ERM motor spin-up time (~80 ms minimum to reach felt speed); haptic strength was also scaled down to 10% at weak signals (motor inert at 10% duty). Fix: all three fox hunts now always fire at **100% strength** + **150 ms pulse**. Rate still scales with signal (CC1101: counter-based 50 ms timer, period 30→2 ticks; RF433: same pattern on 100 ms timer, 15→2 ticks; nRF24: fires every 100 ms tick). **Vibrator save/restore**: nRF24 and RF433 fox hunts had `(void)saved_vib` — captured `g_vibtest_strength_pct` but never restored. Fixed with `s_n24fox_saved_vib_pct` and `s_rf433_fox_saved_vib_pct` static vars, restored in cleanup. **RF433 Jammer modulation**: was `gpio_set_level HIGH` = pure CW carrier (single frequency). Now esp_timer periodic at 500 µs toggles GPIO8 → 1 kHz OOK modulation sidebands around 433.92 MHz. **RF433 OOK Scan**: replaced em-dash (U+2014) in status label with ASCII hyphen (U+2014 not in lv_font_montserrat_12 → block char). |
 
 **Architecture notes for new features:**
 - **Fox Hunt timers** are static file-scope (`s_fox_tmr`, `s_n24fox_tmr`, `s_rf433_fox_tmr`). They are cleaned up at the TOP of `show_cc1101_screen()`, `show_nrf24_screen()`, and `show_rf433_menu_screen()` respectively — not in `reset_function_page_children()`.
 - **RF433 ISR** (`s_rf433_fox_isr`) uses `IRAM_ATTR` and `gpio_isr_handler_add(RF_HAT_RF433_RX_GPIO)`. Removed in `show_rf433_menu_screen()` cleanup and also in the fox hunt screen open guard.
 - **Band Scope marker**: `cc1101_bs_ctx_t` now has `tap_freq_mhz`, `canvas_h`, `marker_set`, `hunt_btn` fields. Line drawn only in `y=0..CC1101_BS_SPEC_H-1` to prevent waterfall ghosting.
 - **ntag.c / ntag.h**: new component under `ESP32C5/components/rfid/src/hf/`. Follow mifare_classic.c style.
-- **LVGL status strings**: NEVER use Unicode (●▲★ etc.) — only LV_SYMBOL_* or plain ASCII. Montserrat bitmap fonts only cover basic Latin.
+- **LVGL status strings**: NEVER use Unicode (●▲★ etc.) — only LV_SYMBOL_* or plain ASCII. Montserrat bitmap fonts only cover basic Latin. Also avoid em-dash (U+2014) in any label — use ASCII hyphen instead.
+- **OOK decoder shared state**: `s_ook_alarms[]` (max 20 entries, `ook_alarm_entry_t`), `s_ook_alarm_count`, and `ook_age_str()` are shared by CC1101 Alarm Sensor and RF433 OOK Scan. Declare early (before `show_cc1101_screen()` cleanup code references them). Timer callbacks use `lv_async_call` to update LVGL from task context.
+- **Fox hunt haptic pattern**: All three fox hunts must use `g_vibtest_strength_pct = 100; vibrator_pulse(150)` — never scale strength down. Scale only pulse rate (counter-based timer ticks). Save/restore `g_vibtest_strength_pct` on open/exit using a static `s_Xfox_saved_vib_pct` variable (not a local — local is freed before the exit cleanup runs).
+- **RF433 jammer modulation**: `rf433_hat_jam_start()` in `rf_hat/src/rf433_hat.c` creates a `s_jam_tmr` esp_timer periodic at 500 µs; `s_jam_timer_cb` toggles GPIO8. Stop calls `esp_timer_stop(s_jam_tmr)` then `gpio_set_level LOW`. Timer is created once and reused (create-once pattern).
 
 ---
 
