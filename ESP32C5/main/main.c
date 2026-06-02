@@ -37451,8 +37451,20 @@ static lv_obj_t *s_cc1101_ht_rssi  = NULL;
 static lv_obj_t *s_cc1101_ht_freq  = NULL;
 
 // Jammer screen state
-static lv_obj_t *s_cc1101_jam_status = NULL;
-static bool      s_cc1101_jamming    = false;
+static lv_obj_t *s_cc1101_jam_status   = NULL;
+static lv_obj_t *s_cc1101_jam_freq_lbl = NULL;
+static lv_obj_t *s_jam_band_btns[4]    = {NULL, NULL, NULL, NULL};
+static bool      s_cc1101_jamming      = false;
+
+// Jammer band selection and sweep tables (declared early for s_jam_band_cb)
+typedef enum { JAM_BAND_315=0, JAM_BAND_433, JAM_BAND_868, JAM_BAND_915 } jam_band_t;
+static jam_band_t s_jam_band = JAM_BAND_433;
+static const float s_jam_315[6] = { 314.7f, 314.9f, 315.0f, 315.1f, 315.3f, 315.5f };
+static const float s_jam_433[6] = { 433.1f, 433.3f, 433.5f, 433.7f, 433.9f, 434.1f };
+static const float s_jam_868[6] = { 867.6f, 867.8f, 868.0f, 868.2f, 868.4f, 868.6f };
+static const float s_jam_915[6] = { 914.7f, 914.9f, 915.0f, 915.1f, 915.3f, 915.5f };
+static const float *s_jam_table = s_jam_433;
+static int s_jam_freq_idx = 0;
 static lv_timer_t *s_cc1101_jam_tmr = NULL;
 
 // Freq scan header label (kept across redraws; updated by freq button)
@@ -37664,6 +37676,8 @@ static void show_cc1101_screen(void)
     s_cc1101_freq_hdr        = NULL;
     s_cc1101_cap_freq_lbl    = NULL;
     s_cc1101_jam_status      = NULL;
+    s_cc1101_jam_freq_lbl    = NULL;
+    for (int i = 0; i < 4; i++) s_jam_band_btns[i] = NULL;
     s_cc1101_ht_status       = NULL;
     s_cc1101_jamming         = false;
     s_cc1101_cap_status_lbl  = NULL;
@@ -38003,6 +38017,8 @@ static void s_offset_entry_cb(lv_event_t *e)
     lv_obj_set_style_text_color(s_offset_ta, ui_text_color(), 0);
     lv_obj_set_style_border_color(s_offset_ta, lv_color_hex(0x827717), 0);
     lv_keyboard_set_textarea(kb, s_offset_ta);
+    // Keyboard created before card so card was drawn on top — move keyboard to front
+    lv_obj_move_foreground(kb);
 
     lv_obj_t *btn_row = lv_obj_create(card);
     lv_obj_set_size(btn_row, LCD_H_RES - 32, 32);
@@ -39614,6 +39630,20 @@ static void show_cc1101_foxhunt_screen(void)
 
 // ── Jammer (Attack — FOR AUTHORIZED USE ONLY) ────────────────────────────────
 
+static void s_jam_band_cb(lv_event_t *e)
+{
+    jam_band_t new_band = *(jam_band_t *)lv_event_get_user_data(e);
+    if (new_band == s_jam_band) return;
+    s_jam_band = new_band;
+    for (int i = 0; i < 4; i++) {
+        if (!s_jam_band_btns[i] || !lv_obj_is_valid(s_jam_band_btns[i])) continue;
+        bool sel = ((jam_band_t)i == s_jam_band);
+        lv_obj_set_style_bg_color(s_jam_band_btns[i],
+            sel ? UI_ACCENT_RED : lv_color_make(50,50,50), LV_STATE_DEFAULT);
+        lv_obj_set_style_border_width(s_jam_band_btns[i], sel ? 0 : 1, 0);
+    }
+}
+
 static void s_cc1101_jam_stop(void)
 {
     s_cc1101_jamming = false;
@@ -39623,20 +39653,34 @@ static void s_cc1101_jam_stop(void)
         lv_label_set_text(s_cc1101_jam_status, "Stopped");
         lv_obj_set_style_text_color(s_cc1101_jam_status, lv_color_hex(0xFFC107), 0);
     }
+    if (s_cc1101_jam_freq_lbl) {
+        lv_label_set_text(s_cc1101_jam_freq_lbl, "--");
+        lv_obj_set_style_text_color(s_cc1101_jam_freq_lbl, lv_color_hex(0x757575), 0);
+    }
 }
 
-// Sweep table for jammer: covers 433 MHz ISM band (433.05-434.79 MHz EU / 902-928 MHz US)
-// stepping 200 kHz per tick to hit all common OOK fixed-channel devices in range.
-static const float s_jam_freqs[] = { 433.1f, 433.3f, 433.5f, 433.7f, 433.9f, 434.1f };
-static int s_jam_freq_idx = 0;
+// ── Jammer band sweep (state declared in CC1101 shared state above) ───────────
+
+static void s_jam_fill_and_tx(float freq_mhz)
+{
+    cc1101_idle();
+    cc1101_set_freq_mhz(cc1101_freq_cal(freq_mhz));
+    cc1101_flush_tx();
+    // Fill FIFO with 0xFF = OOK carrier ON; 32 bytes × 8 bits / 4800 baud ≈ 53 ms
+    for (int i = 0; i < 32; i++) cc1101_write_reg(CC1101_TXFIFO, 0xFF);
+    cc1101_strobe(CC1101_STX);
+}
 
 static void s_cc1101_jam_timer_cb(lv_timer_t *tmr)
 {
     if (!s_cc1101_jamming || !cc1101_is_init()) { s_cc1101_jam_stop(); return; }
-    // Step to next sweep frequency and re-strobe TX
-    s_jam_freq_idx = (s_jam_freq_idx + 1) % (int)(sizeof(s_jam_freqs) / sizeof(s_jam_freqs[0]));
-    cc1101_set_freq_mhz(cc1101_freq_cal(s_jam_freqs[s_jam_freq_idx]));
-    cc1101_tx();
+    s_jam_freq_idx = (s_jam_freq_idx + 1) % 6;
+    float f = s_jam_table[s_jam_freq_idx];
+    s_jam_fill_and_tx(f);
+    if (s_cc1101_jam_freq_lbl) {
+        char buf[24]; snprintf(buf, sizeof(buf), "%.1f MHz", (double)f);
+        lv_label_set_text(s_cc1101_jam_freq_lbl, buf);
+    }
     (void)tmr;
 }
 
@@ -39645,18 +39689,25 @@ static void s_cc1101_jam_start_cb(lv_event_t *e)
     if (!cc1101_is_init()) {
         if (cc1101_init() != ESP_OK) return;
     }
-    cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ);
+    // Apply band-appropriate preset
+    switch (s_jam_band) {
+        case JAM_BAND_315: cc1101_apply_preset(CC1101_PRESET_OOK_4K8_315MHZ); s_jam_table = s_jam_315; break;
+        case JAM_BAND_868: cc1101_apply_preset(CC1101_PRESET_OOK_4K8_868MHZ); s_jam_table = s_jam_868; break;
+        case JAM_BAND_915: cc1101_apply_preset(CC1101_PRESET_OOK_4K8_915MHZ); s_jam_table = s_jam_915; break;
+        default:           cc1101_apply_preset(CC1101_PRESET_OOK_4K8_433MHZ); s_jam_table = s_jam_433; break;
+    }
     cc1101_set_output_power_dbm(10);
+    cc1101_write_reg(CC1101_PKTCTRL0, 0x02);  // infinite packet = continuous carrier per hop
     s_cc1101_jamming = true;
-    cc1101_tx();
+    s_jam_freq_idx = 0;
+    s_jam_fill_and_tx(s_jam_table[0]);
+
     if (s_cc1101_jam_status) {
-        lv_label_set_text(s_cc1101_jam_status, "JAMMING 433 MHz");
+        lv_label_set_text(s_cc1101_jam_status, "JAMMING");
         lv_obj_set_style_text_color(s_cc1101_jam_status, UI_ACCENT_RED, 0);
     }
-    if (!s_cc1101_jam_tmr) {
-        s_jam_freq_idx = 0;
+    if (!s_cc1101_jam_tmr)
         s_cc1101_jam_tmr = lv_timer_create(s_cc1101_jam_timer_cb, 100, NULL);
-    }
     (void)e;
 }
 
@@ -39753,20 +39804,57 @@ static void show_cc1101_jammer_screen(void)
     lv_obj_set_style_text_font(hdr, &g_font_icon14, 0);
     lv_obj_set_style_text_color(hdr, UI_ACCENT_RED, 0);
 
+    // ── Band selector (4 buttons) ──────────────────────────────────────────────
+    lv_obj_t *band_row = lv_obj_create(card);
+    lv_obj_set_size(band_row, lv_pct(100), 28);
+    lv_obj_set_style_bg_opa(band_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(band_row, 0, 0);
+    lv_obj_set_style_pad_all(band_row, 0, 0);
+    lv_obj_set_flex_flow(band_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(band_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(band_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    static const char *band_lbls[4] = {"315", "433", "868", "915"};
+    static jam_band_t band_vals[4] = {JAM_BAND_315, JAM_BAND_433, JAM_BAND_868, JAM_BAND_915};
+    lv_obj_t *band_btns[4];
+    for (int i = 0; i < 4; i++) {
+        band_btns[i] = lv_btn_create(band_row);
+        lv_obj_set_size(band_btns[i], 46, 24);
+        bool sel = ((jam_band_t)i == s_jam_band);
+        lv_obj_set_style_bg_color(band_btns[i],
+            sel ? UI_ACCENT_RED : lv_color_make(50,50,50), LV_STATE_DEFAULT);
+        lv_obj_set_style_border_color(band_btns[i], UI_ACCENT_RED, 0);
+        lv_obj_set_style_border_width(band_btns[i], sel ? 0 : 1, 0);
+        lv_obj_set_style_radius(band_btns[i], 4, 0);
+        lv_obj_t *bl = lv_label_create(band_btns[i]);
+        lv_label_set_text(bl, band_lbls[i]);
+        lv_obj_set_style_text_font(bl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(bl, lv_color_white(), 0);
+        lv_obj_center(bl);
+        s_jam_band_btns[i] = band_btns[i];
+        lv_obj_add_event_cb(band_btns[i], s_jam_band_cb, LV_EVENT_CLICKED, &band_vals[i]);
+    }
+
+    // ── Status + live frequency ────────────────────────────────────────────────
     s_cc1101_jam_status = lv_label_create(card);
     lv_label_set_text(s_cc1101_jam_status, "Ready");
     lv_obj_set_style_text_font(s_cc1101_jam_status, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_cc1101_jam_status, lv_color_hex(0x66BB6A), 0);
 
+    s_cc1101_jam_freq_lbl = lv_label_create(card);
+    lv_label_set_text(s_cc1101_jam_freq_lbl, "--");
+    lv_obj_set_style_text_font(s_cc1101_jam_freq_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_cc1101_jam_freq_lbl, lv_color_hex(0x757575), 0);
+
     lv_obj_t *note = lv_label_create(card);
-    lv_label_set_text(note, "Jams 433 MHz OOK remotes\nby transmitting carrier");
+    lv_label_set_text(note, "6-step sweep, 200 kHz steps\n100 ms dwell per step");
     lv_obj_set_style_text_font(note, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(note, lv_color_make(150,150,150), 0);
+    lv_obj_set_style_text_color(note, lv_color_make(120,120,120), 0);
     lv_obj_set_style_text_align(note, LV_TEXT_ALIGN_CENTER, 0);
 
-    // Start / Stop buttons
+    // ── Start / Stop buttons ───────────────────────────────────────────────────
     lv_obj_t *btn_row = lv_obj_create(card);
-    lv_obj_set_size(btn_row, LCD_H_RES - 36, 36);
+    lv_obj_set_size(btn_row, lv_pct(100), 36);
     lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(btn_row, 0, 0);
     lv_obj_set_style_pad_all(btn_row, 0, 0);
