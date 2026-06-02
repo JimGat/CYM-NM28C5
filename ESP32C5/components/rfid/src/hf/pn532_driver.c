@@ -212,7 +212,13 @@ rfid_err_t pn532_read_response(uint8_t expected_cmd, uint8_t *buf, uint8_t *buf_
     }
     uint8_t len = raw[4];
     if (raw[6] != PN532_TFI_PN532) {
-        ESP_LOGW(TAG, "TFI mismatch: 0x%02X", raw[6]);
+        // Log full raw frame to help diagnose the mismatch root cause.
+        // raw[0]=RDY, raw[1..3]=preamble, raw[4]=LEN, raw[5]=LCS, raw[6]=TFI
+        ESP_LOGW(TAG, "TFI mismatch: got 0x%02X want 0xD5 — "
+                 "raw[0..9]: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                 raw[6],
+                 raw[0], raw[1], raw[2], raw[3], raw[4],
+                 raw[5], raw[6], raw[7], raw[8], raw[9]);
         return RFID_ERR_HW;
     }
     if (raw[7] != (uint8_t)(expected_cmd + 1)) {
@@ -299,7 +305,7 @@ rfid_err_t pn532_rf_configure_sensitivity(void)
         return r;
     }
     uint8_t resp[1]; uint8_t rlen = 0;
-    r = pn532_read_response(PN532_CMD_RF_CONFIGURATION, resp, &rlen, sizeof(resp), 100);
+    r = pn532_read_response(PN532_CMD_RF_CONFIGURATION, resp, &rlen, sizeof(resp), 500);
     if (r == RFID_OK)
         ESP_LOGI(TAG, "RF sensitivity configured: RxGain=48dB RxThreshold=0x6A");
     else

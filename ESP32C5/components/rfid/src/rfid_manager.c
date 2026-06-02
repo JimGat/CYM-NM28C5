@@ -85,6 +85,11 @@ rfid_err_t rfid_manager_init(void)
         return RFID_ERR_HW;
     }
 
+    // Small settle delay after SAM configure before issuing RFConfiguration.
+    // The PN532 activates its RF field on SAM configure; a brief gap prevents
+    // the I2C response frame from being misread (observed TFI=0x7F without it).
+    vTaskDelay(pdMS_TO_TICKS(50));
+
     // Apply sensitivity tuning: raise RxGain to 48 dB max, lower RxThreshold.
     // Non-fatal if this fails — basic operation still works at default sensitivity.
     rfid_err_t sr = pn532_rf_configure_sensitivity();

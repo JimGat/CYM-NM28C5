@@ -15,13 +15,34 @@ static const char *TAG = "pn532_reader";
 // InListPassiveTarget BrTy (baud rate / tag type) for ISO14443A at 106 kbps
 #define BAUD_ISO14443A  0x00
 
+// Normalise ATQA to a canonical little-endian uint16 regardless of how the
+// PN532 byte-orders it.  The PN532 user manual says ATQA is two bytes
+// "MSB first" in the InListPassiveTarget response, but observed behaviour on
+// this NM-RF-HAT build returns the bytes in reverse order (LSB first).
+// Accept both orderings by also checking the byte-swapped value so that
+// NTAG213/215/216 (standard ATQA 0x0044) is recognised regardless of which
+// byte comes back in resp[2] vs resp[3].
+static inline uint16_t s_atqa_normalise(uint16_t raw_atqa)
+{
+    // Standard form: 0x0044 for NTAG/Ultralight, 0x0004 for MIFARE Classic 1K, etc.
+    // If the value looks byte-swapped (high byte = known ATQA low byte), swap it.
+    // Heuristic: if the low byte is 0x00 and high byte is non-zero, swap.
+    if ((raw_atqa & 0x00FF) == 0x00 && (raw_atqa >> 8) != 0x00)
+        return (raw_atqa >> 8) | ((raw_atqa & 0xFF) << 8);
+    return raw_atqa;
+}
+
 rfid_protocol_t pn532_identify_protocol(uint16_t atqa, uint8_t sak, uint8_t uid_len)
 {
+    // Normalise ATQA byte ordering (PN532 returns bytes in a different order
+    // than the ISO 14443A standard on this hardware).
+    uint16_t a = s_atqa_normalise(atqa);
+    ESP_LOGI("pn532_id", "ATQA raw=0x%04X norm=0x%04X SAK=0x%02X uid_len=%u",
+             atqa, a, sak, uid_len);
+
     // SAK bit 5 (0x20) set = ISO14443-4 compliant (smart card layer)
     if (sak & 0x20) {
-        // Check for DESFire: SAK=0x20, ATQA=0x0344 or specific combos
-        if ((sak & 0x20) && (atqa == 0x0344 || atqa == 0x03C4))
-            return RFID_PROTO_DESFIRE;
+        if (a == 0x0344 || a == 0x03C4) return RFID_PROTO_DESFIRE;
         return RFID_PROTO_ISO14443_4;
     }
     // SAK bit 3 (0x08) set = MIFARE Classic
@@ -31,13 +52,18 @@ rfid_protocol_t pn532_identify_protocol(uint16_t atqa, uint8_t sak, uint8_t uid_
         if (sak == 0x09) return RFID_PROTO_MIFARE_CLASSIC_1K;  // Mini
         return RFID_PROTO_MIFARE_CLASSIC_1K;
     }
-    // SAK=0x00 = MIFARE Ultralight / NTAG
+    // SAK=0x00 = MIFARE Ultralight / NTAG family
     if (sak == 0x00) {
-        if (atqa == 0x0044) {
-            // Differentiate NTAG by UID length (7-byte for NTAG, 4 for some UL)
-            if (uid_len == 7) return RFID_PROTO_NTAG213;  // refined later by GET_VERSION
+        // NTAG213/215/216 and MIFARE Ultralight both have ATQA=0x0044, SAK=0x00.
+        // 7-byte UID → NTAG213 (refined to 215/216 by GET_VERSION later).
+        // 4-byte UID → Ultralight.
+        // Accept both the standard form (0x0044) and our observed byte-swapped
+        // form (0x4400) to be robust against PN532 ATQA byte ordering.
+        if (a == 0x0044 || a == 0x4400) {
+            if (uid_len == 7) return RFID_PROTO_NTAG213;
             return RFID_PROTO_MIFARE_ULTRALIGHT;
         }
+        // Other SAK=0x00 cards (e.g. some ISO15693 or proprietary)
         return RFID_PROTO_MIFARE_ULTRALIGHT;
     }
     // SAK=0x10 or 0x11 = MIFARE Plus
