@@ -10995,45 +10995,12 @@ static void wardrive_promisc_task(void *pvParameters) {
     // the user came from a BLE screen that left current_radio_mode as RADIO_MODE_BLE.
     current_radio_mode = RADIO_MODE_WIFI;
 
-    // Start BLE coex scan — NimBLE is already initialized above, WiFi promisc follows.
-    // With BLE claiming DMA first, BLE_ERR_MEM_CAPACITY should no longer occur.
-    if (wdp_ble_devices && ble_scan_feasible) {
-#if MYNEWT_VAL(BLE_EXT_ADV)
-        struct ble_gap_ext_disc_params bpe = { .itvl = 0x0200, .window = 0x0040, .passive = 0 };
-        if (ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 0, 0, 0,
-                             BLE_HCI_SCAN_FILT_NO_WL, 0,
-                             &bpe, &bpe, wdp_ble_gap_cb, NULL) == 0) {
-            ble_continuous = true; wd_used_coex_ble = true;
-            ESP_LOGI(TAG, "[WDP] BLE coex ext_disc running (12.5%% duty, 40ms/320ms)");
-        } else {
-            // ext_disc fails with BLE_ERR_MEM_CAPACITY when WiFi promiscuous exhausts DMA.
-            // Fall back to legacy scan — uses less BLE controller memory.
-            ESP_LOGW(TAG, "[WDP] BLE ext_disc failed (mem), falling back to legacy scan");
-            struct ble_gap_disc_params bp_fb = { .itvl = 0x0200, .window = 0x0040,
-                .filter_policy = BLE_HCI_SCAN_FILT_NO_WL, .passive = 0, .filter_duplicates = 0 };
-            if (ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &bp_fb,
-                             wdp_ble_gap_cb, NULL) == 0) {
-                ble_continuous = true; wd_used_coex_ble = true;
-                ESP_LOGI(TAG, "[WDP] BLE coex legacy_disc running (12.5%% duty)");
-            } else {
-                // Both ext and legacy failed — BLE scanning not feasible in this config.
-                // Mark infeasible so the 5GHz dwell loop and periodic burst stop retrying,
-                // which was draining DMA to <200 bytes and causing SD write failures.
-                ble_scan_feasible = false;
-                ESP_LOGW(TAG, "[WDP] BLE scanning not feasible (DMA exhausted by WiFi promisc) — disabled for this session");
-            }
-        }
-#else
-        struct ble_gap_disc_params bp = { .itvl = 0x0200, .window = 0x0040,
-            .filter_policy = BLE_HCI_SCAN_FILT_NO_WL, .passive = 0, .filter_duplicates = 0 };
-        if (ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &bp, wdp_ble_gap_cb, NULL) == 0) {
-            ble_continuous = true; wd_used_coex_ble = true;
-            ESP_LOGI(TAG, "[WDP] BLE coex disc running (12.5%% duty, 40ms/320ms)");
-        }
-#endif
-        if (!ble_continuous)
-            ESP_LOGW(TAG, "[WDP] BLE coex scan start failed");
-    }
+    // v2.6.61: Band-based BLE switching — avoid DMA exhaustion
+    // BLE runs ONLY during 5 GHz dwells (2.4 GHz radio idle).
+    // During 2.4 GHz dwells, WiFi promiscuous runs alone.
+    // This eliminates the DMA collision that was causing allocate_dma_buf errors.
+    // Do NOT start continuous BLE coex scan — BLE is started per-dwell below.
+    ESP_LOGI(TAG, "[WDP] Band-based BLE mode: 2.4GHz=WiFi only, 5GHz=BLE only (no coex)");
 
     int64_t last_stats_us = esp_timer_get_time();
     int64_t last_ble_us   = esp_timer_get_time();
@@ -11049,23 +11016,31 @@ static void wardrive_promisc_task(void *pvParameters) {
         wd_ui_update_flag = true;
         wdp_dwell_new_networks = 0;
 
-        // 5 GHz dwell: the 2.4 GHz radio is completely idle → run BLE at 100% duty.
-        // Only attempt if BLE scanning was feasible at wardrive start (not mem-exhausted).
-        bool is_5g = (channel >= 36) && wdp_ble_devices && nimble_initialized && ble_scan_feasible;
+        // v2.6.61: Band-based BLE switching
+        // 5 GHz dwell: 2.4 GHz radio is idle → use BLE-only at 100% duty (WiFi off)
+        // 2.4 GHz dwell: Use WiFi promiscuous only (BLE off)
+        bool is_5g = (channel >= 36);
         bool ble_5g_started = false;
-        if (is_5g) {
-            ble_gap_disc_cancel();            // pause any running coex/burst scan
-            vTaskDelay(pdMS_TO_TICKS(5));     // settle
+
+        if (is_5g && wdp_ble_devices && nimble_initialized && ble_scan_feasible) {
+            // Stop WiFi promiscuous during 5 GHz to avoid DMA collision
+            esp_wifi_set_promiscuous(false);
+            vTaskDelay(pdMS_TO_TICKS(5));  // settle radio state
+
+            // Run BLE at 100% duty (10ms/10ms = full bandwidth)
             struct ble_gap_disc_params bp5 = {
-                .itvl = 0x10, .window = 0x10,  // 100% duty: 10ms/10ms
+                .itvl = 0x10, .window = 0x10,  // 100% duty
                 .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
                 .limited = 0, .passive = 0, .filter_duplicates = 0,
             };
             if (ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER,
                              &bp5, wdp_ble_gap_cb, NULL) == 0) {
                 ble_5g_started = true;
+            } else {
+                ESP_LOGW(TAG, "[WDP] 5GHz BLE scan failed");
             }
         }
+
         vTaskDelay(pdMS_TO_TICKS(dwell_ms));
 
         // ========== DMA TRACKING: Per-dwell check ==========
@@ -11078,18 +11053,11 @@ static void wardrive_promisc_task(void *pvParameters) {
         // ====================================================
 
         if (ble_5g_started) {
+            // Stop 5 GHz BLE scan and resume WiFi promiscuous for 2.4 GHz
             ble_gap_disc_cancel();
-            vTaskDelay(pdMS_TO_TICKS(5));
-            // Restart coex scan for 2.4 GHz dwells if it was running before
-            if (ble_continuous) {
-                struct ble_gap_disc_params bp_cx = {
-                    .itvl = 0x0200, .window = 0x0040,
-                    .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
-                    .limited = 0, .passive = 0, .filter_duplicates = 0,
-                };
-                ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER,
-                             &bp_cx, wdp_ble_gap_cb, NULL);
-            }
+            vTaskDelay(pdMS_TO_TICKS(5));  // settle
+            esp_wifi_set_promiscuous(true);  // resume WiFi for next dwell
+            wd_used_coex_ble = true;  // mark that BLE was used during wardrive
         }
 
         int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(50));
@@ -11130,86 +11098,9 @@ static void wardrive_promisc_task(void *pvParameters) {
         wdp_ducb_update(ch_idx, reward);
         wd_ui_update_flag = true;
 
-        // ── BLE burst fallback (only when coex continuous scan unavailable) ─
-        if (!ble_continuous && ble_scan_feasible && g_wd_ble && wdp_ble_devices &&
-            (esp_timer_get_time() - last_ble_us) >= (int64_t)WDP_BLE_INTERVAL_S * 1000000LL) {
-            last_ble_us = esp_timer_get_time();
-
-            // With CONFIG_ESP_COEX_SW_COEXIST_ENABLE, attempt BLE while keeping
-            // WiFi promiscuous running. Coex manager arbitrates the shared RF
-            // front-end. WiFi RX/TX buffers (RX=4, TX=3) + BLE ~31KB < 48KB DMA.
-            // bt_nimble_init() is idempotent if NimBLE is already initialized.
-            bool ble_scan_ok = false;
-            bool via_coex    = false;
-            if (current_radio_mode == RADIO_MODE_WIFI && bt_nimble_init() == ESP_OK) {
-                via_coex = true;
-                wd_used_coex_ble = true;
-                ble_scan_ok = true;
-            } else {
-                // Fall back: pause WiFi and do a full radio switch.
-                esp_wifi_set_promiscuous(false);
-                ble_scan_ok = ensure_ble_mode();
-            }
-
-            if (ble_scan_ok) {
-                wdp_current_channel = -1;  // signal UI: BLE pass in progress
-                wd_ui_update_flag = true;
-
-#if MYNEWT_VAL(BLE_EXT_ADV)
-                struct ble_gap_ext_disc_params bpe = {
-                    .itvl = 0x60, .window = 0x60, .passive = 0,
-                };
-                if (ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 0, 0, 0,
-                                     BLE_HCI_SCAN_FILT_NO_WL, 0,
-                                     &bpe, &bpe,
-                                     wdp_ble_gap_cb, NULL) == 0) {
-                    vTaskDelay(pdMS_TO_TICKS(WDP_BLE_DWELL_MS));
-                    ble_gap_disc_cancel();
-                } else {
-                    // Fallback: ext_disc fails under memory pressure — use legacy scan
-                    struct ble_gap_disc_params bp_fb = {
-                        .itvl = 0x60, .window = 0x60,
-                        .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
-                        .limited = 0, .passive = 0, .filter_duplicates = 0,
-                    };
-                    if (ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &bp_fb,
-                                     wdp_ble_gap_cb, NULL) == 0) {
-                        vTaskDelay(pdMS_TO_TICKS(WDP_BLE_DWELL_MS));
-                        ble_gap_disc_cancel();
-                    }
-                }
-#else
-                struct ble_gap_disc_params bp = {
-                    .itvl = 0x60, .window = 0x60,
-                    .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
-                    .limited = 0, .passive = 0, .filter_duplicates = 0,
-                };
-                if (ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &bp,
-                                 wdp_ble_gap_cb, NULL) == 0) {
-                    vTaskDelay(pdMS_TO_TICKS(WDP_BLE_DWELL_MS));
-                    ble_gap_disc_cancel();
-                }
-#endif
-            }
-
-            if (!wardrive_active) break;
-
-            if (!via_coex) {
-                // Radio-switch path: restore WiFi (it was stopped for BLE).
-                ensure_wifi_mode();
-                wifi_country_t wifi_country = {
-                    .cc = "PH", .schan = 1, .nchan = 14,
-                    .policy = WIFI_COUNTRY_POLICY_AUTO,
-                };
-                esp_wifi_set_country(&wifi_country);
-                apply_wifi_power_settings();
-                wdp_ducb_init();  // rebuild channel list after reinit
-                esp_wifi_set_promiscuous_filter(&filt);
-                esp_wifi_set_promiscuous_rx_cb(wdp_promiscuous_cb);
-                esp_wifi_set_promiscuous(true);
-            }
-            // Coex path: WiFi promiscuous kept running — continue as-is.
-        }
+        // v2.6.61: BLE burst fallback DISABLED
+        // With band-based BLE switching, BLE is now handled per-dwell on 5 GHz.
+        // No need for periodic bursts during 2.4 GHz dwells (would reduce WiFi capture).
         // ─────────────────────────────────────────────────────────
 
         if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
