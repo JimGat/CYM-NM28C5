@@ -11012,7 +11012,39 @@ static void wardrive_promisc_task(void *pvParameters) {
         wdp_current_channel = channel;
         wd_ui_update_flag = true;
         wdp_dwell_new_networks = 0;
+
+        // 5 GHz dwell: the 2.4 GHz radio is completely idle → run BLE at 100% duty.
+        // No coexistence needed, no DMA memory pressure from shared RF front-end.
+        bool is_5g = (channel >= 36) && wdp_ble_devices && nimble_initialized;
+        bool ble_5g_started = false;
+        if (is_5g) {
+            ble_gap_disc_cancel();            // pause any running coex/burst scan
+            vTaskDelay(pdMS_TO_TICKS(5));     // settle
+            struct ble_gap_disc_params bp5 = {
+                .itvl = 0x10, .window = 0x10,  // 100% duty: 10ms/10ms
+                .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
+                .limited = 0, .passive = 0, .filter_duplicates = 0,
+            };
+            if (ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER,
+                             &bp5, wdp_ble_gap_cb, NULL) == 0) {
+                ble_5g_started = true;
+            }
+        }
         vTaskDelay(pdMS_TO_TICKS(dwell_ms));
+        if (ble_5g_started) {
+            ble_gap_disc_cancel();
+            vTaskDelay(pdMS_TO_TICKS(5));
+            // Restart coex scan for 2.4 GHz dwells if it was running before
+            if (ble_continuous) {
+                struct ble_gap_disc_params bp_cx = {
+                    .itvl = 0x0200, .window = 0x0040,
+                    .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
+                    .limited = 0, .passive = 0, .filter_duplicates = 0,
+                };
+                ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER,
+                             &bp_cx, wdp_ble_gap_cb, NULL);
+            }
+        }
 
         int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(50));
         if (len > 0) {
