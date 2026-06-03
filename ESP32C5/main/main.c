@@ -10871,8 +10871,9 @@ static void wardrive_promisc_task(void *pvParameters) {
     (void)pvParameters;
     ESP_LOGI(TAG, "Wardrive promisc task started");
     log_heap_stats("wardrive-start");
-    bool wd_used_coex_ble = false;  // true if BLE was init'd while WiFi stayed up
-    bool ble_continuous   = false;  // true if BLE coex scan is running throughout wardrive
+    bool wd_used_coex_ble  = false;  // true if BLE was init'd while WiFi stayed up
+    bool ble_continuous    = false;  // true if BLE coex scan is running throughout wardrive
+    bool ble_scan_feasible = true;   // set false after BLE_ERR_MEM_CAPACITY — stops retry loop
 
     wardrive_file_counter = (int)(esp_timer_get_time() / 1000000);
     snprintf(wd_marks_fname, sizeof(wd_marks_fname),
@@ -10985,6 +10986,12 @@ static void wardrive_promisc_task(void *pvParameters) {
                              wdp_ble_gap_cb, NULL) == 0) {
                 ble_continuous = true; wd_used_coex_ble = true;
                 ESP_LOGI(TAG, "[WDP] BLE coex legacy_disc running (12.5%% duty)");
+            } else {
+                // Both ext and legacy failed — BLE scanning not feasible in this config.
+                // Mark infeasible so the 5GHz dwell loop and periodic burst stop retrying,
+                // which was draining DMA to <200 bytes and causing SD write failures.
+                ble_scan_feasible = false;
+                ESP_LOGW(TAG, "[WDP] BLE scanning not feasible (DMA exhausted by WiFi promisc) — disabled for this session");
             }
         }
 #else
@@ -11014,8 +11021,8 @@ static void wardrive_promisc_task(void *pvParameters) {
         wdp_dwell_new_networks = 0;
 
         // 5 GHz dwell: the 2.4 GHz radio is completely idle → run BLE at 100% duty.
-        // No coexistence needed, no DMA memory pressure from shared RF front-end.
-        bool is_5g = (channel >= 36) && wdp_ble_devices && nimble_initialized;
+        // Only attempt if BLE scanning was feasible at wardrive start (not mem-exhausted).
+        bool is_5g = (channel >= 36) && wdp_ble_devices && nimble_initialized && ble_scan_feasible;
         bool ble_5g_started = false;
         if (is_5g) {
             ble_gap_disc_cancel();            // pause any running coex/burst scan
@@ -11085,7 +11092,7 @@ static void wardrive_promisc_task(void *pvParameters) {
         wd_ui_update_flag = true;
 
         // ── BLE burst fallback (only when coex continuous scan unavailable) ─
-        if (!ble_continuous && g_wd_ble && wdp_ble_devices &&
+        if (!ble_continuous && ble_scan_feasible && g_wd_ble && wdp_ble_devices &&
             (esp_timer_get_time() - last_ble_us) >= (int64_t)WDP_BLE_INTERVAL_S * 1000000LL) {
             last_ble_us = esp_timer_get_time();
 
