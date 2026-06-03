@@ -453,10 +453,12 @@ esp_err_t nrf24_scan_channels(uint8_t start_ch, uint8_t stop_ch,
         if ((cancel && *cancel) || s_drv->cancel) break;
         nrf24_write_reg(REG_RF_CH, ch);
         ce_high();
-        esp_rom_delay_us(200);   // slightly longer than Tstby2a
+        esp_rom_delay_us(140);   // ≥130 µs for RPD latch (nRF24L01+ datasheet)
         bool carrier = nrf24_carrier_detect();
         ce_low();
         if (cb) cb(ch, carrier, ctx);
+        // Yield every 8 channels — 126×200µs was starving the LVGL main loop
+        if ((ch & 0x07) == 0x07) vTaskDelay(1);
     }
     return ESP_OK;
 }
