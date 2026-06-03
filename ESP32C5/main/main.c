@@ -5230,15 +5230,10 @@ void app_main(void)
 		ESP_LOGE(TAG, "GPS UART init failed");
 	}
     
-    // Initialize WiFi CLI system (WiFi, LED, all components)
-    esp_err_t ret = wifi_cli_init();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "WiFi CLI init FAILED: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "WiFi CLI system initialized OK");
-        current_radio_mode = RADIO_MODE_WIFI;
-        wifi_initialized = true;
-    }
+    // WiFi is initialized on-demand by ensure_wifi_mode() when first needed (Wardrive, WiFi Scan, etc).
+    // Initializing here wastes 42 KB of DMA for the entire session when using BLE-only features.
+    // current_radio_mode starts at RADIO_MODE_NONE; wifi_initialized starts as false.
+    ESP_LOGI(TAG, "[INIT] WiFi deferred to on-demand initialization (Wardrive/Scan/Deauth)");
 
     // Load screen settings (timeout, brightness) from NVS
     nvs_settings_load();
