@@ -10975,10 +10975,21 @@ static void wardrive_promisc_task(void *pvParameters) {
         }
     }
 
+    // ========== DMA TRACKING: Before promisc ==========
+    size_t dma_before = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    ESP_LOGI(TAG, "[DMA_TRACK] Before promisc start — DMA: %u bytes", (unsigned)dma_before);
+    // ================================================
+
     wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
     esp_wifi_set_promiscuous_filter(&filt);
     esp_wifi_set_promiscuous_rx_cb(wdp_promiscuous_cb);
     esp_wifi_set_promiscuous(true);
+
+    // ========== DMA TRACKING: After promisc ==========
+    size_t dma_after_promisc = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    ESP_LOGI(TAG, "[DMA_TRACK] After promisc start — DMA: %u bytes (lost: %u)",
+             (unsigned)dma_after_promisc, (unsigned)(dma_before - dma_after_promisc));
+    // =================================================
 
     // Set radio mode to WIFI so the periodic BLE burst's coex path works even if
     // the user came from a BLE screen that left current_radio_mode as RADIO_MODE_BLE.
@@ -11056,6 +11067,16 @@ static void wardrive_promisc_task(void *pvParameters) {
             }
         }
         vTaskDelay(pdMS_TO_TICKS(dwell_ms));
+
+        // ========== DMA TRACKING: Per-dwell check ==========
+        static int dwell_count = 0;
+        if (++dwell_count % 10 == 0) {  // Log every 10 dwells to avoid spam
+            size_t dma_now = heap_caps_get_free_size(MALLOC_CAP_DMA);
+            ESP_LOGI(TAG, "[DMA_TRACK] Dwell #%d (CH %d) — DMA: %u bytes",
+                     dwell_count, channel, (unsigned)dma_now);
+        }
+        // ====================================================
+
         if (ble_5g_started) {
             ble_gap_disc_cancel();
             vTaskDelay(pdMS_TO_TICKS(5));
@@ -11275,6 +11296,12 @@ static void wardrive_promisc_task(void *pvParameters) {
 
     wardrive_active = false;
     wardrive_task_handle = NULL;
+
+    // ========== DMA TRACKING: After wardrive stops ==========
+    size_t dma_after_stop = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    ESP_LOGI(TAG, "[DMA_TRACK] After promisc stop — DMA: %u bytes", (unsigned)dma_after_stop);
+    // ========================================================
+
     ESP_LOGI(TAG, "Wardrive promisc stopped. Total networks: %d. File: wd%d.csv",
              wdp_seen_count, wardrive_file_counter);
     log_heap_stats("wardrive-stop");
@@ -13033,12 +13060,31 @@ static void radio_reset_to_idle(void)
         ensure_wifi_mode();
     } else {
         // WiFi driver is alive — just cycle stop/start to clear AP, promisc, etc.
+
+        // ========== DMA TRACKING: Before WiFi stop ==========
+        size_t dma_before_wifi_stop = heap_caps_get_free_size(MALLOC_CAP_DMA);
+        ESP_LOGI(TAG, "[DMA_TRACK] radio_reset: before WiFi stop — DMA: %u bytes", (unsigned)dma_before_wifi_stop);
+        // ===================================================
+
         esp_wifi_set_promiscuous(false);
         esp_wifi_set_promiscuous_rx_cb(NULL);
         wifi_scanner_abort();   /* clear any stuck scan state before stop */
         esp_wifi_stop();
+
+        // ========== DMA TRACKING: After WiFi stop ==========
+        size_t dma_after_wifi_stop = heap_caps_get_free_size(MALLOC_CAP_DMA);
+        ESP_LOGI(TAG, "[DMA_TRACK] radio_reset: after WiFi stop — DMA: %u bytes (released: %u)",
+                 (unsigned)dma_after_wifi_stop, (unsigned)(dma_after_wifi_stop - dma_before_wifi_stop));
+        // ==================================================
+
         esp_wifi_set_mode(WIFI_MODE_STA);
         esp_wifi_start();
+
+        // ========== DMA TRACKING: After WiFi restart ==========
+        size_t dma_after_wifi_restart = heap_caps_get_free_size(MALLOC_CAP_DMA);
+        ESP_LOGI(TAG, "[DMA_TRACK] radio_reset: after WiFi restart — DMA: %u bytes", (unsigned)dma_after_wifi_restart);
+        // ====================================================
+
         vTaskDelay(pdMS_TO_TICKS(300));  // let STA task finish starting before scan is allowed
         { wifi_country_t _wc = { .cc="01",.schan=1,.nchan=13,.policy=WIFI_COUNTRY_POLICY_MANUAL }; esp_wifi_set_country(&_wc); }   /* MANUAL — prevent regdomain update from AP on next STA connect */
         apply_wifi_power_settings();
@@ -21806,6 +21852,12 @@ static void show_sd_free_space_screen(void)
 
     bool ok = false;
     uint64_t total_b = 0, free_b = 0, used_b = 0;
+
+    // ========== DMA TRACKING: Before SD get_free_space ==========
+    size_t dma_before_getfree = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    ESP_LOGI(TAG, "[DMA_TRACK] Before f_getfree — DMA: %u bytes", (unsigned)dma_before_getfree);
+    // ==========================================================
+
     if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
         FATFS *fs_p;
         DWORD fre_clust;

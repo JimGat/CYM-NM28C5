@@ -109,6 +109,11 @@ static esp_err_t init_wifi(void) {
                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
 
+    // ========== DMA TRACKING: WiFi init complete ==========
+    size_t dma_free = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    ESP_LOGI(TAG, "[DMA_TRACK] WiFi init COMPLETE — DMA available: %u bytes", (unsigned)dma_free);
+    // =====================================================
+
     return ESP_OK;
 }
 
