@@ -42623,8 +42623,8 @@ static void show_nrf24_foxhunt_screen(void)
     s_n24fox_hits = 0; s_n24fox_samples = 0;
 
     if (!nrf24_chip_present()) {
-        s_cc1101_stub_screen(MY_SYMBOL_PERSON_WALKING "  nRF24 Fox Hunt — No nRF24",
-                             "Check DIP 2 ON.\nRun HW Test first.");
+        s_n24_stub_screen(MY_SYMBOL_PERSON_WALKING "  nRF24 Fox Hunt - No nRF24",
+                          "Check DIP 2 ON.\nRun HW Test first.");
         return;
     }
     nrf24_set_channel(s_n24fox_channel);
