@@ -11367,6 +11367,9 @@ static void wardrive_start_btn_cb(lv_event_t *e)
 {
     (void)e;
 
+    // Ensure WiFi is initialized before wardrive starts (required for esp_wifi_set_promiscuous)
+    ensure_wifi_mode();
+
     scan_done_ui_flag = false;
 
     create_function_page_base("Wardrive");
