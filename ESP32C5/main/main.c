@@ -10951,6 +10951,23 @@ static void wardrive_promisc_task(void *pvParameters) {
     }
     wdp_ble_count = 0;
 
+    // ── Init NimBLE BEFORE WiFi promiscuous ────────────────────────────────────
+    // Root cause of BLE_ERR_MEM_CAPACITY: bt_nimble_init() was called after
+    // esp_wifi_set_promiscuous(true). WiFi promisc claimed DMA first, leaving the
+    // BLE controller insufficient internal SRAM for its scan parameter buffers.
+    // Solution: NimBLE claims its DMA share first, WiFi promisc takes what's left.
+    // BLE controller hardware buffers MUST be in internal DMA SRAM (not PSRAM) —
+    // this is a hardware constraint. Application buffers (wdp_ble_devices) use PSRAM.
+    if (g_wd_ble && wdp_ble_devices) {
+        if (bt_nimble_init() != ESP_OK) {
+            ESP_LOGW(TAG, "[WDP] NimBLE init failed — BLE disabled for this session");
+            ble_scan_feasible = false;
+        } else {
+            ble_gap_disc_cancel();  // clear any leftover scan from prior BLE feature use
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+
     wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
     esp_wifi_set_promiscuous_filter(&filt);
     esp_wifi_set_promiscuous_rx_cb(wdp_promiscuous_cb);
@@ -10960,15 +10977,9 @@ static void wardrive_promisc_task(void *pvParameters) {
     // the user came from a BLE screen that left current_radio_mode as RADIO_MODE_BLE.
     current_radio_mode = RADIO_MODE_WIFI;
 
-    // Start BLE scan immediately via coex — coex stack shares the radio automatically.
-    // Scan window = 40ms / interval = 320ms → 12.5% BLE duty, 87.5% RF time for WiFi.
-    // 0x0040 = 64 units × 0.625ms = 40ms; 0x0200 = 512 units × 0.625ms = 320ms.
-    if (wdp_ble_devices && bt_nimble_init() == ESP_OK) {
-        // Cancel any leftover scan from BT Observer/Scan/Lookout before starting coex scan.
-        // ble_gap_ext_disc() returns BLE_HS_EALREADY if a scan is already running, which
-        // silently sets ble_continuous=false and the entire session logs 0 BLE devices.
-        ble_gap_disc_cancel();
-        vTaskDelay(pdMS_TO_TICKS(20));
+    // Start BLE coex scan — NimBLE is already initialized above, WiFi promisc follows.
+    // With BLE claiming DMA first, BLE_ERR_MEM_CAPACITY should no longer occur.
+    if (wdp_ble_devices && ble_scan_feasible) {
 #if MYNEWT_VAL(BLE_EXT_ADV)
         struct ble_gap_ext_disc_params bpe = { .itvl = 0x0200, .window = 0x0040, .passive = 0 };
         if (ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 0, 0, 0,
