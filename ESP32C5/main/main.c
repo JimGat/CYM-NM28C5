@@ -10955,10 +10955,19 @@ static void wardrive_promisc_task(void *pvParameters) {
     esp_wifi_set_promiscuous_rx_cb(wdp_promiscuous_cb);
     esp_wifi_set_promiscuous(true);
 
+    // Set radio mode to WIFI so the periodic BLE burst's coex path works even if
+    // the user came from a BLE screen that left current_radio_mode as RADIO_MODE_BLE.
+    current_radio_mode = RADIO_MODE_WIFI;
+
     // Start BLE scan immediately via coex — coex stack shares the radio automatically.
     // Scan window = 40ms / interval = 320ms → 12.5% BLE duty, 87.5% RF time for WiFi.
     // 0x0040 = 64 units × 0.625ms = 40ms; 0x0200 = 512 units × 0.625ms = 320ms.
     if (wdp_ble_devices && bt_nimble_init() == ESP_OK) {
+        // Cancel any leftover scan from BT Observer/Scan/Lookout before starting coex scan.
+        // ble_gap_ext_disc() returns BLE_HS_EALREADY if a scan is already running, which
+        // silently sets ble_continuous=false and the entire session logs 0 BLE devices.
+        ble_gap_disc_cancel();
+        vTaskDelay(pdMS_TO_TICKS(20));
 #if MYNEWT_VAL(BLE_EXT_ADV)
         struct ble_gap_ext_disc_params bpe = { .itvl = 0x0200, .window = 0x0040, .passive = 0 };
         if (ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 0, 0, 0,
@@ -10966,6 +10975,8 @@ static void wardrive_promisc_task(void *pvParameters) {
                              &bpe, &bpe, wdp_ble_gap_cb, NULL) == 0) {
             ble_continuous = true; wd_used_coex_ble = true;
             ESP_LOGI(TAG, "[WDP] BLE coex ext_disc running (12.5%% duty, 40ms/320ms)");
+        } else {
+            ESP_LOGW(TAG, "[WDP] BLE coex ext_disc failed — will use periodic burst mode");
         }
 #else
         struct ble_gap_disc_params bp = { .itvl = 0x0200, .window = 0x0040,
@@ -22651,6 +22662,7 @@ static void gps_show_edit_overlay(lv_event_t *e)
 
     // ── Keyboard (child of overlay, always renders above card and its contents) ──
     lv_obj_t *kb = lv_keyboard_create(gps_edit_overlay);
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);  // numeric — coords are "-0123456789."
     lv_obj_set_size(kb, LCD_H_RES, 130);
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
