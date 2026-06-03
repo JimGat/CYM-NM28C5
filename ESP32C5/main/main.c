@@ -5230,6 +5230,19 @@ void app_main(void)
 		ESP_LOGE(TAG, "GPS UART init failed");
 	}
     
+    // Initialize NVS (required for settings, touch calibration, etc)
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_ret);
+
+    // Initialize LED (WS2812 on GPIO27 - no WiFi dependency)
+    if (init_led() != ESP_OK) {
+        ESP_LOGW(TAG, "LED initialization failed");
+    }
+
     // WiFi is initialized on-demand by ensure_wifi_mode() when first needed (Wardrive, WiFi Scan, etc).
     // Initializing here wastes 42 KB of DMA for the entire session when using BLE-only features.
     // current_radio_mode starts at RADIO_MODE_NONE; wifi_initialized starts as false.

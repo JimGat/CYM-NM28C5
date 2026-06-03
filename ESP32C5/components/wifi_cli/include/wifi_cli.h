@@ -18,6 +18,12 @@ extern "C" {
 esp_err_t wifi_cli_init(void);
 
 /**
+ * @brief Initialize LED strip (WS2812 on GPIO27)
+ * Safe to call multiple times (has init guard)
+ */
+esp_err_t init_led(void);
+
+/**
  * @brief Register all CLI commands
  */
 void wifi_cli_register_commands(void);
