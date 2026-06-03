@@ -5251,9 +5251,8 @@ void app_main(void)
     // Load screen settings (timeout, brightness) from NVS
     nvs_settings_load();
 
-    // Init scanner and register event handler
-    wifi_scanner_init();
-    esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE, &wifi_scan_done_cb, NULL);
+    // WiFi event handler and scanner will be registered when WiFi is first initialized
+    // (in ensure_wifi_mode) to avoid registering handlers before WiFi is ready
 
     // Allocate sniffer handshake + wardrive promisc arrays in PSRAM
     hs_ap_targets = (hs_ap_target_t *)heap_caps_calloc(HS_MAX_APS, sizeof(hs_ap_target_t), MALLOC_CAP_SPIRAM);
@@ -31864,6 +31863,15 @@ static bool ensure_wifi_mode(void)
             };
             esp_wifi_set_country(&wifi_country);
             apply_wifi_power_settings();
+
+            // Register WiFi scan event handler NOW that WiFi is fully initialized
+            // (moved from app_main to ensure the event loop is ready)
+            static bool s_wifi_event_handler_registered = false;
+            if (!s_wifi_event_handler_registered) {
+                esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE, &wifi_scan_done_cb, NULL);
+                s_wifi_event_handler_registered = true;
+                ESP_LOGI(TAG, "WiFi scan event handler registered");
+            }
 
             current_radio_mode = RADIO_MODE_WIFI;
             wifi_initialized = true;
