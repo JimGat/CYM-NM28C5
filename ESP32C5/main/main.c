@@ -23111,6 +23111,8 @@ static void lookout_back_btn_cb(lv_event_t *e)
     if (!bt_lookout_is_active() && current_radio_mode == RADIO_MODE_BLE) {
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
+        // Reinit WiFi to reclaim DMA for other features
+        wifi_cli_init();
     }
     show_bluetooth_screen();
 }
@@ -27393,6 +27395,7 @@ static void gw_deferred_start_cb(lv_timer_t *t)
 
 static void gw_back_btn_cb(lv_event_t *e)
 {
+    (void)e;
     gw_screen_active = false;
     gw_status_lbl    = NULL;
     gw_svc_lbl       = NULL;
@@ -27400,6 +27403,10 @@ static void gw_back_btn_cb(lv_event_t *e)
     gw_result_lbl    = NULL;
     gw_cancel_btn    = NULL;
     gw_back_btn      = NULL;
+
+    // Reinit WiFi to reclaim DMA for other features
+    wifi_cli_init();
+
     show_bt_attack_tiles_screen();
 }
 
@@ -27932,6 +27939,9 @@ static void show_gatt_walker_screen(void)
 {
     if (function_page) { lv_obj_del(function_page); function_page = NULL; }
     reset_function_page_children();
+
+    // Switch to BLE mode (deinits WiFi if running, frees 42KB DMA for BLE)
+    ensure_ble_mode();
 
     /* Stop any active scan — we'll need the radio for connecting */
     ble_gap_disc_cancel();
