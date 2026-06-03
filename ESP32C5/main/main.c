@@ -795,7 +795,6 @@ void sd_cache_add_portal_entry(const char *entry);
 void sd_cache_add_handshake_name(const char *name);
 
 static lv_obj_t *scan_status_label = NULL;
-static lv_timer_t *wifi_scan_progress_timer = NULL;
 static lv_obj_t *scan_list = NULL;
 // WiFi scan pagination
 static int        wifi_sas_page      = 0;
@@ -6287,12 +6286,6 @@ void app_main(void)
                 } else {
                 scan_done_ui_flag = false;
                 wifi_sas_page = 0;
-
-                // Delete WiFi scan progress timer
-                if (wifi_scan_progress_timer) {
-                    lv_timer_del(wifi_scan_progress_timer);
-                    wifi_scan_progress_timer = NULL;
-                }
 
                 if (function_page) { lv_obj_del(function_page); function_page = NULL; }
                 reset_function_page_children();
@@ -13610,17 +13603,6 @@ static void wifi_scan_next_btn_cb(lv_event_t *e)
     show_attack_tiles_screen();
 }
 
-// WiFi scan progress timer callback - updates found network count
-static void wifi_scan_progress_timer_cb(lv_timer_t *timer)
-{
-    (void)timer;
-    if (scan_status_label && lv_obj_is_valid(scan_status_label)) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "Scanning... (%d found)", g_shared_scan_count);
-        lv_label_set_text(scan_status_label, buf);
-    }
-}
-
 // WiFi Scan & Attack screen - scan and show network list with checkboxes
 static void show_wifi_scan_attack_screen(void)
 {
@@ -13646,9 +13628,9 @@ static void show_wifi_scan_attack_screen(void)
     lv_obj_t *scan_spinner = lv_spinner_create(scan_container, 1000, 60);
     lv_obj_set_size(scan_spinner, 50, 50);
 
-    // Scanning text with network count
+    // Scanning text
     scan_status_label = lv_label_create(scan_container);
-    lv_label_set_text(scan_status_label, "Scanning... (0 found)");
+    lv_label_set_text(scan_status_label, "Scanning...");
     lv_obj_set_style_text_color(scan_status_label, ui_text_color(), 0);
     lv_obj_set_style_text_font(scan_status_label, &lv_font_montserrat_20, 0);
 
@@ -13658,12 +13640,6 @@ static void show_wifi_scan_attack_screen(void)
 
     // Start scan
     wifi_scanner_start_scan();
-
-    // Create timer to update network count every 500ms
-    if (wifi_scan_progress_timer) {
-        lv_timer_del(wifi_scan_progress_timer);
-    }
-    wifi_scan_progress_timer = lv_timer_create(wifi_scan_progress_timer_cb, 500, NULL);
 }
 
 // ============================================================================
