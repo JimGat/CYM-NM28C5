@@ -16,8 +16,19 @@ Apply the same scoped workflow automatically:
 - **Sonnet (current)** → writing code, reasoning about architecture, commit messages
 - Do NOT use Sonnet to do what a Haiku grep agent can do in seconds.
 
+## Version bump — MANDATORY before every build
+
+Before every `idf.py build` that produces a changed binary:
+1. Increment the PATCH digit in `ESP32C5/CMakeLists.txt` → `set(PROJECT_VER "vX.Y.Z+1")`
+2. Update `ESP32C5/docs/manifest.json` → `"version"` and `"build"` to match
+3. After build, verify: `strings binaries-esp32c5/CYM-NM28C5.bin | grep vX.Y.Z+1`
+
+**No two different binaries may share a version number.**
+Never skip this step. It is the only way to track which binary is on the device.
+
 ## Session hygiene
 
 - Commit and push after every working change. Never accumulate uncommitted work.
+- Do NOT merge to main unless user explicitly says "merge to main" or "next release".
 - If a session has been running > 90 minutes, suggest a clean break: commit what works, note what's next in memory, close.
 - HERMES.md and memory files should be trimmed when stale entries outnumber active ones.
