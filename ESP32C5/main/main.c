@@ -10976,7 +10976,16 @@ static void wardrive_promisc_task(void *pvParameters) {
             ble_continuous = true; wd_used_coex_ble = true;
             ESP_LOGI(TAG, "[WDP] BLE coex ext_disc running (12.5%% duty, 40ms/320ms)");
         } else {
-            ESP_LOGW(TAG, "[WDP] BLE coex ext_disc failed — will use periodic burst mode");
+            // ext_disc fails with BLE_ERR_MEM_CAPACITY when WiFi promiscuous exhausts DMA.
+            // Fall back to legacy scan — uses less BLE controller memory.
+            ESP_LOGW(TAG, "[WDP] BLE ext_disc failed (mem), falling back to legacy scan");
+            struct ble_gap_disc_params bp_fb = { .itvl = 0x0200, .window = 0x0040,
+                .filter_policy = BLE_HCI_SCAN_FILT_NO_WL, .passive = 0, .filter_duplicates = 0 };
+            if (ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &bp_fb,
+                             wdp_ble_gap_cb, NULL) == 0) {
+                ble_continuous = true; wd_used_coex_ble = true;
+                ESP_LOGI(TAG, "[WDP] BLE coex legacy_disc running (12.5%% duty)");
+            }
         }
 #else
         struct ble_gap_disc_params bp = { .itvl = 0x0200, .window = 0x0040,
@@ -11078,6 +11087,18 @@ static void wardrive_promisc_task(void *pvParameters) {
                                      wdp_ble_gap_cb, NULL) == 0) {
                     vTaskDelay(pdMS_TO_TICKS(WDP_BLE_DWELL_MS));
                     ble_gap_disc_cancel();
+                } else {
+                    // Fallback: ext_disc fails under memory pressure — use legacy scan
+                    struct ble_gap_disc_params bp_fb = {
+                        .itvl = 0x60, .window = 0x60,
+                        .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
+                        .limited = 0, .passive = 0, .filter_duplicates = 0,
+                    };
+                    if (ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &bp_fb,
+                                     wdp_ble_gap_cb, NULL) == 0) {
+                        vTaskDelay(pdMS_TO_TICKS(WDP_BLE_DWELL_MS));
+                        ble_gap_disc_cancel();
+                    }
                 }
 #else
                 struct ble_gap_disc_params bp = {
