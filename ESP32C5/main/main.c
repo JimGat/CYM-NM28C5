@@ -543,6 +543,7 @@ static char     g_saved_wifi_pass[65] = ""; // Home network password
 #define NVS_KEY_WD_BAND      "wd_band"
 #define NVS_KEY_WD_PCAP      "wd_pcap"
 #define NVS_KEY_WD_BLE       "wd_ble"
+#define NVS_KEY_WD_RADIO     "wd_radio"
 #define NVS_KEY_GPS_LAT      "gps_lat_i"
 #define NVS_KEY_GPS_LON      "gps_lon_i"
 #define NVS_KEY_GPS_ALT      "gps_alt_i"
@@ -576,6 +577,9 @@ static void nvs_save_cc1101_offset(void);   // forward — implemented near HW t
 
 // Wardrive band selection
 typedef enum { WD_BAND_BOTH = 0, WD_BAND_24G, WD_BAND_5G } wd_band_t;
+
+// Wardrive radio mode (which radios to use)
+typedef enum { WD_RADIO_WIFI_BOTH = 0, WD_RADIO_BLE_ONLY } wd_radio_mode_t;
 
 // Wardrive upload log path
 #define WDUP_LOG_PATH "/sdcard/lab/wardrives/upload_log.csv"
@@ -1106,6 +1110,8 @@ static volatile bool wardrive_ui_active = false;
 static lv_obj_t *wd_ui_gps_label = NULL;
 static lv_obj_t *wd_ui_counter_label = NULL;
 static lv_obj_t *wd_ui_ble_label = NULL;
+static lv_obj_t *wd_ui_counter_box = NULL;  // WiFi counter box
+static lv_obj_t *wd_ui_ble_box = NULL;      // BLE counter box
 static lv_obj_t *wd_ui_header = NULL;
 static lv_obj_t *wd_ui_table = NULL;
 static lv_obj_t *wd_ui_channel_label = NULL;
@@ -1277,6 +1283,7 @@ static lv_obj_t         *wdup_back_btn_obj     = NULL;
 typedef struct { char text[128]; lv_color_t color; } wdup_ui_msg_t;
 static wd_band_t         g_wd_band         = WD_BAND_BOTH;
 static bool              g_wd_pcap         = false;
+static wd_radio_mode_t   g_wd_radio_mode   = WD_RADIO_WIFI_BOTH;
 static void            (*wdup_back_fn)(void) = NULL;
 static bool              wdup_use_explicit  = false;
 static int               wdup_explicit_indices[64];
@@ -2241,6 +2248,8 @@ static void reset_function_page_children(void) {
     wd_ui_gps_label = NULL;
     wd_ui_counter_label = NULL;
     wd_ui_ble_label = NULL;
+    wd_ui_counter_box = NULL;
+    wd_ui_ble_box = NULL;
     wd_ui_channel_label = NULL;
     wd_ui_header = NULL;
     wd_ui_table = NULL;
@@ -3300,6 +3309,8 @@ static void nvs_settings_load(void)
         if (nvs_get_u8(h, NVS_KEY_WD_BAND, &wb) == ESP_OK) g_wd_band = (wd_band_t)wb;
         uint8_t wp = 0;
         if (nvs_get_u8(h, NVS_KEY_WD_PCAP, &wp) == ESP_OK) g_wd_pcap = (wp != 0);
+        uint8_t wr = 0;
+        if (nvs_get_u8(h, NVS_KEY_WD_RADIO, &wr) == ESP_OK) g_wd_radio_mode = (wd_radio_mode_t)wr;
         uint8_t wble = 0;
         // g_wd_ble is always true — no longer user-configurable
         uint8_t rfhat = 0;
@@ -10973,21 +10984,26 @@ static void wardrive_promisc_task(void *pvParameters) {
     // ================================================
 
     wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
-    esp_wifi_set_promiscuous_filter(&filt);
-    esp_wifi_set_promiscuous_rx_cb(wdp_promiscuous_cb);
-    esp_wifi_set_promiscuous(true);
+    // Start WiFi promiscuous only if not BLE-only mode
+    if (g_wd_radio_mode != WD_RADIO_BLE_ONLY) {
+        esp_wifi_set_promiscuous_filter(&filt);
+        esp_wifi_set_promiscuous_rx_cb(wdp_promiscuous_cb);
+        esp_wifi_set_promiscuous(true);
 
-    // ========== DMA TRACKING: After promisc ==========
-    size_t dma_after_promisc = heap_caps_get_free_size(MALLOC_CAP_DMA);
-    ESP_LOGI(TAG, "[DMA_TRACK] After promisc start — DMA: %u bytes (lost: %u)",
-             (unsigned)dma_after_promisc, (unsigned)(dma_before - dma_after_promisc));
-    // =================================================
+        // ========== DMA TRACKING: After promisc ==========
+        size_t dma_after_promisc = heap_caps_get_free_size(MALLOC_CAP_DMA);
+        ESP_LOGI(TAG, "[DMA_TRACK] After promisc start — DMA: %u bytes (lost: %u)",
+                 (unsigned)dma_after_promisc, (unsigned)(dma_before - dma_after_promisc));
+        // =================================================
+    } else {
+        ESP_LOGI(TAG, "Wardrive BLE-only mode: WiFi promiscuous disabled");
+    }
 
     // Start BLE scan immediately via coex — coex stack shares the radio automatically.
     // Reduced BLE duty (3.1%) to avoid DMA fragmentation during SD writes.
     // Scan window = 40ms / interval = 1280ms → 3.1% BLE duty, 96.9% RF time for WiFi.
     // 0x0040 = 64 units × 0.625ms = 40ms; 0x0800 = 2048 units × 0.625ms = 1280ms.
-    if (wdp_ble_devices && bt_nimble_init() == ESP_OK) {
+    if (g_wd_radio_mode == WD_RADIO_WIFI_BOTH && wdp_ble_devices && bt_nimble_init() == ESP_OK) {
 #if MYNEWT_VAL(BLE_EXT_ADV)
         struct ble_gap_ext_disc_params bpe = { .itvl = 0x0800, .window = 0x0040, .passive = 0 };
         if (ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 0, 0, 0,
@@ -11396,46 +11412,48 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_align(wd_ui_channel_label, LV_ALIGN_BOTTOM_MID, 0, -2);
 
     // ─── WiFi network counter ─────────────────────────────────────
-    lv_obj_t *cnt_box = lv_obj_create(function_page);
-    lv_obj_set_size(cnt_box, 74, 42);
-    lv_obj_align(cnt_box, LV_ALIGN_TOP_LEFT, 84, 55);
-    lv_obj_set_style_bg_color(cnt_box, lv_color_make(30, 30, 45), 0);
-    lv_obj_set_style_border_color(cnt_box, lv_color_make(0, 188, 212), 0);
-    lv_obj_set_style_border_width(cnt_box, 2, 0);
-    lv_obj_set_style_radius(cnt_box, 10, 0);
-    lv_obj_set_style_pad_all(cnt_box, 0, 0);
-    lv_obj_clear_flag(cnt_box, LV_OBJ_FLAG_SCROLLABLE);
+    wd_ui_counter_box = lv_obj_create(function_page);
+    lv_obj_set_size(wd_ui_counter_box, 74, 42);
+    lv_obj_align(wd_ui_counter_box, LV_ALIGN_TOP_LEFT, 84, 55);
+    lv_obj_set_style_bg_color(wd_ui_counter_box, lv_color_make(30, 30, 45), 0);
+    lv_obj_set_style_border_color(wd_ui_counter_box, lv_color_make(0, 188, 212), 0);
+    lv_obj_set_style_border_width(wd_ui_counter_box, 2, 0);
+    lv_obj_set_style_radius(wd_ui_counter_box, 10, 0);
+    lv_obj_set_style_pad_all(wd_ui_counter_box, 0, 0);
+    lv_obj_clear_flag(wd_ui_counter_box, LV_OBJ_FLAG_SCROLLABLE);
+    if (g_wd_radio_mode == WD_RADIO_BLE_ONLY) lv_obj_add_flag(wd_ui_counter_box, LV_OBJ_FLAG_HIDDEN);
 
-    lv_obj_t *cnt_title = lv_label_create(cnt_box);
+    lv_obj_t *cnt_title = lv_label_create(wd_ui_counter_box);
     lv_label_set_text(cnt_title, "WiFi");
     lv_obj_set_style_text_color(cnt_title, lv_color_make(0, 188, 212), 0);
     lv_obj_set_style_text_font(cnt_title, &lv_font_montserrat_12, 0);
     lv_obj_align(cnt_title, LV_ALIGN_TOP_MID, 0, 2);
 
-    wd_ui_counter_label = lv_label_create(cnt_box);
+    wd_ui_counter_label = lv_label_create(wd_ui_counter_box);
     lv_label_set_text(wd_ui_counter_label, "0");
     lv_obj_set_style_text_color(wd_ui_counter_label, ui_text_color(), 0);
     lv_obj_set_style_text_font(wd_ui_counter_label, &lv_font_montserrat_20, 0);
     lv_obj_align(wd_ui_counter_label, LV_ALIGN_BOTTOM_MID, 0, -2);
 
     // ─── BLE device counter ───────────────────────────────────────
-    lv_obj_t *ble_box = lv_obj_create(function_page);
-    lv_obj_set_size(ble_box, 70, 42);
-    lv_obj_align(ble_box, LV_ALIGN_TOP_LEFT, 166, 55);
-    lv_obj_set_style_bg_color(ble_box, lv_color_make(30, 30, 45), 0);
-    lv_obj_set_style_border_color(ble_box, lv_color_make(171, 71, 188), 0);
-    lv_obj_set_style_border_width(ble_box, 2, 0);
-    lv_obj_set_style_radius(ble_box, 10, 0);
-    lv_obj_set_style_pad_all(ble_box, 0, 0);
-    lv_obj_clear_flag(ble_box, LV_OBJ_FLAG_SCROLLABLE);
+    wd_ui_ble_box = lv_obj_create(function_page);
+    lv_obj_set_size(wd_ui_ble_box, 70, 42);
+    lv_obj_align(wd_ui_ble_box, LV_ALIGN_TOP_LEFT, 166, 55);
+    lv_obj_set_style_bg_color(wd_ui_ble_box, lv_color_make(30, 30, 45), 0);
+    lv_obj_set_style_border_color(wd_ui_ble_box, lv_color_make(171, 71, 188), 0);
+    lv_obj_set_style_border_width(wd_ui_ble_box, 2, 0);
+    lv_obj_set_style_radius(wd_ui_ble_box, 10, 0);
+    lv_obj_set_style_pad_all(wd_ui_ble_box, 0, 0);
+    lv_obj_clear_flag(wd_ui_ble_box, LV_OBJ_FLAG_SCROLLABLE);
+    if (g_wd_radio_mode == WD_RADIO_WIFI_BOTH) lv_obj_add_flag(wd_ui_ble_box, LV_OBJ_FLAG_HIDDEN);
 
-    lv_obj_t *ble_title = lv_label_create(ble_box);
+    lv_obj_t *ble_title = lv_label_create(wd_ui_ble_box);
     lv_label_set_text(ble_title, "BLE");
     lv_obj_set_style_text_color(ble_title, lv_color_make(171, 71, 188), 0);
     lv_obj_set_style_text_font(ble_title, &lv_font_montserrat_12, 0);
     lv_obj_align(ble_title, LV_ALIGN_TOP_MID, 0, 2);
 
-    wd_ui_ble_label = lv_label_create(ble_box);
+    wd_ui_ble_label = lv_label_create(wd_ui_ble_box);
     lv_label_set_text(wd_ui_ble_label, "0");
     lv_obj_set_style_text_color(wd_ui_ble_label, ui_text_color(), 0);
     lv_obj_set_style_text_font(wd_ui_ble_label, &lv_font_montserrat_20, 0);
@@ -11622,6 +11640,8 @@ static void wardrive_stop_btn_cb(lv_event_t *e)
     wd_ui_gps_label = NULL;
     wd_ui_counter_label = NULL;
     wd_ui_ble_label = NULL;
+    wd_ui_counter_box = NULL;
+    wd_ui_ble_box = NULL;
     wd_ui_channel_label = NULL;
     wd_ui_header = NULL;
     wd_ui_table = NULL;
@@ -18461,27 +18481,29 @@ static void show_wardrive_menu_screen(void)
 
 // --- Wardrive Options screen ---
 
-static lv_obj_t *wd_opts_band_dd = NULL;
-static lv_obj_t *wd_opts_pcap_sw = NULL;
-static lv_obj_t *wd_opts_ble_sw  = NULL;
+static lv_obj_t *wd_opts_band_dd  = NULL;
+static lv_obj_t *wd_opts_pcap_sw  = NULL;
+static lv_obj_t *wd_opts_ble_sw   = NULL;
+static lv_obj_t *wd_opts_radio_dd = NULL;
 
 static void wd_opts_save_cb(lv_event_t *e)
 {
     (void)e;
     if (wd_opts_band_dd) g_wd_band = (wd_band_t)lv_dropdown_get_selected(wd_opts_band_dd);
     if (wd_opts_pcap_sw) g_wd_pcap = lv_obj_has_state(wd_opts_pcap_sw, LV_STATE_CHECKED);
-    // g_wd_ble always true — BLE toggle removed
+    if (wd_opts_radio_dd) g_wd_radio_mode = (wd_radio_mode_t)lv_dropdown_get_selected(wd_opts_radio_dd);
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_u8(h, NVS_KEY_WD_BAND, (uint8_t)g_wd_band);
         nvs_set_u8(h, NVS_KEY_WD_PCAP, g_wd_pcap ? 1 : 0);
-        // NVS_KEY_WD_BLE no longer saved — BLE is always on
+        nvs_set_u8(h, NVS_KEY_WD_RADIO, (uint8_t)g_wd_radio_mode);
         nvs_commit(h);
         nvs_close(h);
     }
     wd_opts_band_dd = NULL;
     wd_opts_pcap_sw = NULL;
-    wd_opts_ble_sw  = NULL;  // always NULL now — BLE toggle removed
+    wd_opts_ble_sw  = NULL;
+    wd_opts_radio_dd = NULL;
     show_wardrive_menu_screen();
 }
 
@@ -18490,7 +18512,8 @@ static void wd_opts_back_cb(lv_event_t *e)
     (void)e;
     wd_opts_band_dd = NULL;
     wd_opts_pcap_sw = NULL;
-    wd_opts_ble_sw  = NULL;  // always NULL now — BLE toggle removed
+    wd_opts_ble_sw  = NULL;
+    wd_opts_radio_dd = NULL;
     show_wardrive_menu_screen();
 }
 
@@ -18544,7 +18567,22 @@ static void show_wardrive_options_screen(void)
     lv_obj_align(wd_opts_pcap_sw, LV_ALIGN_RIGHT_MID, 0, 0);
     if (g_wd_pcap) lv_obj_add_state(wd_opts_pcap_sw, LV_STATE_CHECKED);
 
-    // BLE is always on via coex — no toggle needed
+    // Radio mode label
+    lv_obj_t *radio_lbl = lv_label_create(content);
+    lv_label_set_text(radio_lbl, "Radio Mode");
+    lv_obj_set_style_text_color(radio_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(radio_lbl, &lv_font_montserrat_14, 0);
+
+    // Radio mode dropdown
+    wd_opts_radio_dd = lv_dropdown_create(content);
+    lv_dropdown_set_options(wd_opts_radio_dd, "WiFi (2.4 + 5 GHz)\nBLE only");
+    lv_dropdown_set_selected(wd_opts_radio_dd, (uint16_t)g_wd_radio_mode);
+    lv_obj_set_width(wd_opts_radio_dd, LCD_H_RES - 32);
+    lv_obj_set_style_text_font(wd_opts_radio_dd, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wd_opts_radio_dd, ui_text_color(), 0);
+    lv_obj_set_style_bg_color(wd_opts_radio_dd, ui_card_color(), 0);
+    lv_obj_set_style_border_color(wd_opts_radio_dd, UI_ACCENT_GREEN, 0);
+    lv_obj_set_style_border_width(wd_opts_radio_dd, 1, 0);
 
     // Save button
     lv_obj_t *save_btn = lv_btn_create(function_page);
