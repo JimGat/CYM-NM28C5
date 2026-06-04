@@ -1,4 +1,5 @@
 #include "wifi_wardrive.h"
+#include "wardrive_buffer.h"
 #include "wifi_scanner.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
@@ -35,6 +36,10 @@ typedef struct {
 static gps_state_t gps_data = {0};
 static volatile bool wardrive_active = false;
 static TaskHandle_t wardrive_task_handle = NULL;
+static TaskHandle_t wardrive_flush_task_handle = NULL;
+static esp_timer_handle_t wardrive_flush_timer = NULL;
+static uint32_t wardrive_flush_interval_ms = 10000;  // 10 seconds default
+static FILE *wardrive_csv_file = NULL;
 static bool sd_card_mounted = false;
 
 // SD Card state
@@ -428,20 +433,198 @@ esp_err_t wifi_wardrive_format_sd(void) {
 
 static void wardrive_scan_task(void *pvParameters) {
     ESP_LOGI(TAG, "Wardrive task started");
-    
-    // Open CSV file
-    FILE *f = NULL;
+
+    int scan_count = 0;
+
+    while (wardrive_active && !g_operation_stop_requested) {
+        // Start WiFi scan
+        esp_err_t ret = wifi_scanner_start_scan();
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Scan failed");
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+
+        // Wait for scan to complete
+        while (wifi_scanner_is_scanning()) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+
+        scan_count++;
+
+        // Get results
+        wifi_ap_record_t results[MAX_SCAN_RESULTS];
+        int count = wifi_scanner_get_results(results, MAX_SCAN_RESULTS);
+
+        ESP_LOGI(TAG, "Scan #%d: Found %d networks", scan_count, count);
+
+        // Buffer detections (non-blocking, no mutex needed)
+        for (int i = 0; i < count; i++) {
+            wifi_ap_record_t *ap = &results[i];
+
+            wardrive_detection_t detection = {0};
+            memcpy(detection.bssid, ap->bssid, 6);
+            strncpy(detection.ssid, (const char *)ap->ssid, sizeof(detection.ssid) - 1);
+            detection.channel = ap->primary;
+            detection.authmode = ap->authmode;
+            detection.rssi = ap->rssi;
+            detection.latitude = gps_data.latitude;
+            detection.longitude = gps_data.longitude;
+            detection.altitude = gps_data.altitude;
+            detection.satellites = gps_data.satellites;
+
+            wardrive_buffer_add(&detection);
+        }
+
+        // Print status
+        if (gps_data.fix_valid) {
+            ESP_LOGI(TAG, "GPS: %.6f, %.6f (sats: %d)",
+                    gps_data.latitude, gps_data.longitude, gps_data.satellites);
+        } else {
+            ESP_LOGW(TAG, "GPS: No fix");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(2000)); // Wait 2 seconds between scans
+    }
+
+    ESP_LOGI(TAG, "Wardrive stopped after %d scans", scan_count);
+    wardrive_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void wardrive_flush_task(void *pvParameters) {
+    (void)pvParameters;
+    wardrive_detection_t batch[256];  // Batch size: 256 detections per flush
+
+    ESP_LOGI(TAG, "Wardrive flush task started");
+
+    while (wardrive_active && !g_operation_stop_requested) {
+        // Wait for signal from timer or timeout
+        uint32_t notified = ulTaskNotifyTake(pdFALSE, pdMS_TO_TICKS(wardrive_flush_interval_ms));
+
+        if (!wardrive_active) break;
+
+        // Get pending detections from buffer
+        int count = wardrive_buffer_get_pending(batch, 256);
+
+        if (count > 0 && wardrive_csv_file && sd_spi_mutex) {
+            // Acquire mutex ONCE for entire batch write
+            if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+                for (int i = 0; i < count; i++) {
+                    wardrive_detection_t *det = &batch[i];
+
+                    fprintf(wardrive_csv_file, "%02X:%02X:%02X:%02X:%02X:%02X,",
+                            det->bssid[0], det->bssid[1], det->bssid[2],
+                            det->bssid[3], det->bssid[4], det->bssid[5]);
+
+                    char ssid_escaped[128];
+                    escape_csv_field(det->ssid, ssid_escaped, sizeof(ssid_escaped));
+                    fprintf(wardrive_csv_file, "%s,", ssid_escaped);
+
+                    fprintf(wardrive_csv_file, "%s,%d,%d,",
+                            authmode_to_string(det->authmode),
+                            det->channel,
+                            det->rssi);
+
+                    fprintf(wardrive_csv_file, "%.6f,%.6f,%.1f,%d\n",
+                            det->latitude, det->longitude,
+                            det->altitude, det->satellites);
+                }
+                fflush(wardrive_csv_file);
+                xSemaphoreGive(sd_spi_mutex);
+
+                // Mark detections as flushed
+                wardrive_buffer_mark_flushed(count);
+
+                ESP_LOGI(TAG, "Flushed %d detections", count);
+            } else {
+                ESP_LOGW(TAG, "Failed to acquire mutex for flush, retrying later");
+            }
+        }
+
+        // Check overflow condition
+        int fill = wardrive_buffer_get_fill_percent();
+        if (fill > 80) {
+            ESP_LOGW(TAG, "Buffer %d%% full, consider increasing flush frequency", fill);
+        }
+    }
+
+    // FINAL FLUSH on shutdown
+    int count = wardrive_buffer_get_pending(batch, 256);
+    while (count > 0) {
+        if (wardrive_csv_file && sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+            for (int i = 0; i < count; i++) {
+                wardrive_detection_t *det = &batch[i];
+                fprintf(wardrive_csv_file, "%02X:%02X:%02X:%02X:%02X:%02X,",
+                        det->bssid[0], det->bssid[1], det->bssid[2],
+                        det->bssid[3], det->bssid[4], det->bssid[5]);
+
+                char ssid_escaped[128];
+                escape_csv_field(det->ssid, ssid_escaped, sizeof(ssid_escaped));
+                fprintf(wardrive_csv_file, "%s,", ssid_escaped);
+
+                fprintf(wardrive_csv_file, "%s,%d,%d,",
+                        authmode_to_string(det->authmode),
+                        det->channel,
+                        det->rssi);
+
+                fprintf(wardrive_csv_file, "%.6f,%.6f,%.1f,%d\n",
+                        det->latitude, det->longitude,
+                        det->altitude, det->satellites);
+            }
+            fflush(wardrive_csv_file);
+            xSemaphoreGive(sd_spi_mutex);
+            wardrive_buffer_mark_flushed(count);
+        }
+        count = wardrive_buffer_get_pending(batch, 256);
+    }
+
+    ESP_LOGI(TAG, "Flush task stopped");
+    wardrive_flush_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void wardrive_flush_timer_callback(void *arg) {
+    (void)arg;
+    if (wardrive_flush_task_handle) {
+        xTaskNotifyGive(wardrive_flush_task_handle);
+    }
+}
+
+esp_err_t wifi_wardrive_start(void) {
+    if (wardrive_active) {
+        ESP_LOGW(TAG, "Wardrive already running");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG, "Starting wardrive...");
+
+    // Initialize GPS if not already done
+    static bool gps_initialized = false;
+    if (!gps_initialized) {
+        wifi_wardrive_init_gps();
+        gps_initialized = true;
+    }
+
+    // Initialize SD card if not already done
+    if (!sd_card_mounted) {
+        esp_err_t ret = wifi_wardrive_init_sd();
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "SD card not available, logging disabled");
+        }
+    }
+
+    // Open CSV file for logging
     if (sd_card_mounted && sd_spi_mutex) {
         char filename[64];
-        snprintf(filename, sizeof(filename), "/sdcard/wardrive_%lu.csv", 
-                (unsigned long)(esp_timer_get_time() / 1000000));
-        
-        // ✅ Protect SD file operations with mutex (SPI shared with display)
+        snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/wd%lu.csv",
+                 (unsigned long)(esp_timer_get_time() / 1000000));
+
         if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
-            f = fopen(filename, "w");
-            if (f) {
-                fprintf(f, "BSSID,SSID,AuthMode,Channel,RSSI,Latitude,Longitude,Altitude,Satellites\n");
-                fflush(f);
+            wardrive_csv_file = fopen(filename, "w");
+            if (wardrive_csv_file) {
+                fprintf(wardrive_csv_file, "BSSID,SSID,AuthMode,Channel,RSSI,Latitude,Longitude,Altitude,Satellites\n");
+                fflush(wardrive_csv_file);
                 ESP_LOGI(TAG, "Logging to: %s", filename);
             } else {
                 ESP_LOGE(TAG, "Failed to open log file");
@@ -451,125 +634,41 @@ static void wardrive_scan_task(void *pvParameters) {
             ESP_LOGE(TAG, "Failed to acquire SD mutex for file open");
         }
     }
-    
-    int scan_count = 0;
-    
-    while (wardrive_active && !g_operation_stop_requested) {
-        // Start WiFi scan
-        esp_err_t ret = wifi_scanner_start_scan();
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "Scan failed");
-            vTaskDelay(pdMS_TO_TICKS(5000));
-            continue;
-        }
-        
-        // Wait for scan to complete
-        while (wifi_scanner_is_scanning()) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        
-        scan_count++;
-        
-        // Get results
-        wifi_ap_record_t results[MAX_SCAN_RESULTS];
-        int count = wifi_scanner_get_results(results, MAX_SCAN_RESULTS);
-        
-        ESP_LOGI(TAG, "Scan #%d: Found %d networks", scan_count, count);
-        
-        // Log to SD card
-        if (f && sd_spi_mutex) {
-            // ✅ Protect SD write operations with mutex
-            if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-                for (int i = 0; i < count; i++) {
-                    wifi_ap_record_t *ap = &results[i];
-                    
-                    fprintf(f, "%02X:%02X:%02X:%02X:%02X:%02X,",
-                           ap->bssid[0], ap->bssid[1], ap->bssid[2],
-                           ap->bssid[3], ap->bssid[4], ap->bssid[5]);
-                    
-                    char ssid_escaped[128];
-                    escape_csv_field((const char *)ap->ssid, ssid_escaped, sizeof(ssid_escaped));
-                    fprintf(f, "%s,", ssid_escaped);
-                    
-                    fprintf(f, "%s,%d,%d,",
-                           authmode_to_string(ap->authmode),
-                           ap->primary,
-                           ap->rssi);
-                    
-                    if (gps_data.fix_valid) {
-                        fprintf(f, "%.6f,%.6f,%.1f,%d\n",
-                               gps_data.latitude,
-                               gps_data.longitude,
-                               gps_data.altitude,
-                               gps_data.satellites);
-                    } else {
-                        fprintf(f, ",,,,\n");
-                    }
-                }
-                
-                fflush(f);
-                xSemaphoreGive(sd_spi_mutex);
-            }
-        }
-        
-        // Print status
-        if (gps_data.fix_valid) {
-            ESP_LOGI(TAG, "GPS: %.6f, %.6f (sats: %d)",
-                    gps_data.latitude, gps_data.longitude, gps_data.satellites);
-        } else {
-            ESP_LOGW(TAG, "GPS: No fix");
-        }
-        
-        vTaskDelay(pdMS_TO_TICKS(2000)); // Wait 2 seconds between scans
-    }
-    
-    if (f && sd_spi_mutex) {
-        // ✅ Protect SD close operation with mutex
-        if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
-            fclose(f);
-            xSemaphoreGive(sd_spi_mutex);
-            ESP_LOGI(TAG, "Log file closed");
-        }
-    }
-    
-    ESP_LOGI(TAG, "Wardrive stopped after %d scans", scan_count);
-    wardrive_active = false;
-    wardrive_task_handle = NULL;
-    vTaskDelete(NULL);
-}
 
-esp_err_t wifi_wardrive_start(void) {
-    if (wardrive_active) {
-        ESP_LOGW(TAG, "Wardrive already running");
-        return ESP_ERR_INVALID_STATE;
-    }
-    
-    ESP_LOGI(TAG, "Starting wardrive...");
-    
-    // Initialize GPS if not already done
-    static bool gps_initialized = false;
-    if (!gps_initialized) {
-        wifi_wardrive_init_gps();
-        gps_initialized = true;
-    }
-    
-    // Initialize SD card if not already done
-    if (!sd_card_mounted) {
-        esp_err_t ret = wifi_wardrive_init_sd();
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "SD card not available, logging disabled");
-        }
-    }
-    
     wardrive_active = true;
-    
+
+    // Initialize detection buffer (1000 detections = ~64 KB PSRAM)
+    esp_err_t ret = wardrive_buffer_init(1000);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize detection buffer");
+        wardrive_active = false;
+        return ret;
+    }
+
+    // Start flush task
+    xTaskCreate(wardrive_flush_task, "wardrive_flush", 4096, NULL, 4, &wardrive_flush_task_handle);
+
+    // Start flush timer (fires every wardrive_flush_interval_ms)
+    esp_timer_create_args_t timer_args = {
+        .callback = wardrive_flush_timer_callback,
+        .arg = NULL,
+        .name = "wardrive_flush",
+        .dispatch_method = ESP_TIMER_TASK,
+    };
+    ret = esp_timer_create(&timer_args, &wardrive_flush_timer);
+    if (ret == ESP_OK) {
+        esp_timer_start_periodic(wardrive_flush_timer, wardrive_flush_interval_ms * 1000);
+    } else {
+        ESP_LOGE(TAG, "Failed to create flush timer");
+    }
+
     // Start GPS task
     xTaskCreate(gps_task, "gps_task", 4096, NULL, 5, NULL);
-    
-    // Start wardrive scan task
+
+    // Start wardrive scan task (priority 5 for continuous scanning)
     xTaskCreate(wardrive_scan_task, "wardrive_scan", 8192, NULL, 5, &wardrive_task_handle);
-    
-    ESP_LOGI(TAG, "Wardrive started");
+
+    ESP_LOGI(TAG, "Wardrive started with write-ahead buffering (flush every %u ms)", wardrive_flush_interval_ms);
     return ESP_OK;
 }
 
@@ -578,18 +677,43 @@ esp_err_t wifi_wardrive_stop(void) {
         ESP_LOGW(TAG, "Wardrive not running");
         return ESP_ERR_INVALID_STATE;
     }
-    
+
     ESP_LOGI(TAG, "Stopping wardrive...");
-    
+
     wardrive_active = false;
-    
-    // Wait for tasks to finish
+
+    // Stop and delete flush timer
+    if (wardrive_flush_timer) {
+        esp_timer_stop(wardrive_flush_timer);
+        esp_timer_delete(wardrive_flush_timer);
+        wardrive_flush_timer = NULL;
+    }
+
+    // Signal flush task to do final flush and exit
+    if (wardrive_flush_task_handle) {
+        xTaskNotifyGive(wardrive_flush_task_handle);
+    }
+
+    // Wait for all tasks to finish
     int wait_count = 0;
-    while (wardrive_task_handle != NULL && wait_count < 100) {
+    while ((wardrive_task_handle != NULL || wardrive_flush_task_handle != NULL) && wait_count < 100) {
         vTaskDelay(pdMS_TO_TICKS(100));
         wait_count++;
     }
-    
+
+    // Close CSV file
+    if (wardrive_csv_file && sd_spi_mutex) {
+        if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+            fclose(wardrive_csv_file);
+            wardrive_csv_file = NULL;
+            xSemaphoreGive(sd_spi_mutex);
+            ESP_LOGI(TAG, "Log file closed");
+        }
+    }
+
+    // Clean up detection buffer
+    wardrive_buffer_free();
+
     ESP_LOGI(TAG, "Wardrive stopped");
     return ESP_OK;
 }

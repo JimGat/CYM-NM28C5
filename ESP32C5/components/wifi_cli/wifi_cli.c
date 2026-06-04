@@ -109,10 +109,15 @@ static esp_err_t init_wifi(void) {
                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
 
+    // ========== DMA TRACKING: WiFi init complete ==========
+    size_t dma_free = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    ESP_LOGI(TAG, "[DMA_TRACK] WiFi init COMPLETE — DMA available: %u bytes", (unsigned)dma_free);
+    // =====================================================
+
     return ESP_OK;
 }
 
-static esp_err_t init_led(void) {
+esp_err_t init_led(void) {
     if (g_led_strip != NULL) return ESP_OK;  // already initialised (e.g. after BLE→WiFi switch)
     led_strip_config_t strip_cfg = {
         .strip_gpio_num = NEOPIXEL_GPIO,

@@ -1,6 +1,44 @@
 # CYM-NM28C5 Pre-built Firmware Binaries
 
-**Firmware version: v1.8.85**
+**Firmware version: v2.7.0**
+
+---
+
+## Release Notes — v2.7.0
+
+### Wardrive GPS & Radio Mode Stability
+
+Stabilized wardrive workflow with three major improvements:
+
+1. **BLE-only mode with PSRAM buffering** — BLE devices collected during scan are buffered in PSRAM and flushed to CSV after scan completes, avoiding DMA exhaustion from concurrent SD writes
+2. **WiFi-only mode** (default) no longer attempts BLE scanning, eliminating radio state thrashing and DMA pressure
+3. **GPS lock prompt** blocks wardrive startup with proper state reset — "Use Cached" proceeds immediately, "Wait for Fresh Lock" monitors satellites and auto-launches wardrive when lock acquired (≥1 sat); canceling properly resets state so next wardrive click re-checks GPS
+
+**Dual-band WiFi 6** (2.4 + 5 GHz) wardrive with optional BLE; configurable via dropdown menu. WiGLE CSV format output compatible with direct uploads.
+
+---
+
+## Release Notes — v2.6.84
+
+### Wardrive GPS Lock Logic Fix
+
+GPS check now always runs when the Wardrive tile is clicked (unless already in a GPS wait/choice state). State is properly reset when wardrive stops, ensuring users are re-prompted if GPS is still stale on the next wardrive launch — even after canceling a previous "Wait for Lock" prompt.
+
+**Previous behavior:** Once GPS was checked and the user chose an action, subsequent wardrive clicks would skip the GPS check entirely for the rest of the session.
+
+**New behavior:** Every wardrive click checks GPS freshness. If stale (0 satellites), the modal re-appears allowing "Use Cached" or "Wait for Lock". State resets on wardrive stop.
+
+---
+
+## Release Notes — v2.6.79–v2.6.83
+
+### Wardrive DMA Exhaustion & BLE Improvements
+
+- **BLE-only wardrive mode** with PSRAM buffering: BLE devices collected during scan are buffered in PSRAM and flushed to CSV after scan completes, avoiding DMA exhaustion from concurrent SD writes
+- **WiFi-only mode** no longer attempts BLE scanning, eliminating radio state thrashing
+- **GPS lock prompt** blocks wardrive startup until user chooses: "Use Cached GPS" (immediate) or "Wait for Fresh Lock" (satellites > 0, shown in modal with satellite count)
+- **WiGLE CSV format** wardrive output compatible with direct uploads
+- Dual-band WiFi 6 (2.4 + 5 GHz) wardrive with optional BLE, configurable via dropdown menu
 
 ---
 

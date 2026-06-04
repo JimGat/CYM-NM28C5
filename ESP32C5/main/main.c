@@ -543,6 +543,7 @@ static char     g_saved_wifi_pass[65] = ""; // Home network password
 #define NVS_KEY_WD_BAND      "wd_band"
 #define NVS_KEY_WD_PCAP      "wd_pcap"
 #define NVS_KEY_WD_BLE       "wd_ble"
+#define NVS_KEY_WD_RADIO     "wd_radio"
 #define NVS_KEY_GPS_LAT      "gps_lat_i"
 #define NVS_KEY_GPS_LON      "gps_lon_i"
 #define NVS_KEY_GPS_ALT      "gps_alt_i"
@@ -576,6 +577,9 @@ static void nvs_save_cc1101_offset(void);   // forward — implemented near HW t
 
 // Wardrive band selection
 typedef enum { WD_BAND_BOTH = 0, WD_BAND_24G, WD_BAND_5G } wd_band_t;
+
+// Wardrive radio mode (which radios to use)
+typedef enum { WD_RADIO_WIFI_ONLY = 0, WD_RADIO_BLE_ONLY } wd_radio_mode_t;
 
 // Wardrive upload log path
 #define WDUP_LOG_PATH "/sdcard/lab/wardrives/upload_log.csv"
@@ -1106,12 +1110,17 @@ static volatile bool wardrive_ui_active = false;
 static lv_obj_t *wd_ui_gps_label = NULL;
 static lv_obj_t *wd_ui_counter_label = NULL;
 static lv_obj_t *wd_ui_ble_label = NULL;
+static lv_obj_t *wd_ui_counter_box = NULL;  // WiFi counter box
+static lv_obj_t *wd_ui_ble_box = NULL;      // BLE counter box
 static lv_obj_t *wd_ui_header = NULL;
 static lv_obj_t *wd_ui_table = NULL;
 static lv_obj_t *wd_ui_channel_label = NULL;
 static lv_timer_t *wd_ui_timer = NULL;
 static volatile bool wd_ui_update_flag = false;
 static volatile int wdp_current_channel = 0;
+
+// Wardrive GPS lock prompt state machine
+static volatile int wd_gps_prompt_state = 0;  // 0=none, 1=prompt shown, 2=use cached, 3=waiting for lock
 
 // Wardrive GPS marks (waypoints)
 static FILE       *wd_marks_file      = NULL;
@@ -1277,6 +1286,7 @@ static lv_obj_t         *wdup_back_btn_obj     = NULL;
 typedef struct { char text[128]; lv_color_t color; } wdup_ui_msg_t;
 static wd_band_t         g_wd_band         = WD_BAND_BOTH;
 static bool              g_wd_pcap         = false;
+static wd_radio_mode_t   g_wd_radio_mode   = WD_RADIO_WIFI_ONLY;  // default: WiFi only (recommended for SD writes)
 static void            (*wdup_back_fn)(void) = NULL;
 static bool              wdup_use_explicit  = false;
 static int               wdup_explicit_indices[64];
@@ -2241,6 +2251,8 @@ static void reset_function_page_children(void) {
     wd_ui_gps_label = NULL;
     wd_ui_counter_label = NULL;
     wd_ui_ble_label = NULL;
+    wd_ui_counter_box = NULL;
+    wd_ui_ble_box = NULL;
     wd_ui_channel_label = NULL;
     wd_ui_header = NULL;
     wd_ui_table = NULL;
@@ -3300,6 +3312,9 @@ static void nvs_settings_load(void)
         if (nvs_get_u8(h, NVS_KEY_WD_BAND, &wb) == ESP_OK) g_wd_band = (wd_band_t)wb;
         uint8_t wp = 0;
         if (nvs_get_u8(h, NVS_KEY_WD_PCAP, &wp) == ESP_OK) g_wd_pcap = (wp != 0);
+        uint8_t wr = 0;
+        // Don't load wardrive radio mode from NVS — always use default (WiFi) on boot
+        // if (nvs_get_u8(h, NVS_KEY_WD_RADIO, &wr) == ESP_OK) g_wd_radio_mode = (wd_radio_mode_t)wr;
         uint8_t wble = 0;
         // g_wd_ble is always true — no longer user-configurable
         uint8_t rfhat = 0;
@@ -5230,22 +5245,38 @@ void app_main(void)
 		ESP_LOGE(TAG, "GPS UART init failed");
 	}
     
-    // Initialize WiFi CLI system (WiFi, LED, all components)
-    esp_err_t ret = wifi_cli_init();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "WiFi CLI init FAILED: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "WiFi CLI system initialized OK");
+    // Initialize NVS (required for settings, touch calibration, etc)
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_ret);
+
+    // Initialize LED (WS2812 on GPIO27 - no WiFi dependency)
+    if (init_led() != ESP_OK) {
+        ESP_LOGW(TAG, "LED initialization failed");
+    }
+
+    // Initialize WiFi at boot (v2.0.1 behavior, restored for shared wardrive capture).
+    // Keeping WiFi up from boot avoids DMA fragmentation from repeated deinit/init cycles.
+    // The 42 KB DMA footprint is unavoidable on ESP32-C5, so keep it allocated once at boot
+    // rather than fragmenting it across BLE screen transitions. This allows bt_nimble_init()
+    // to succeed during wardrive by initializing BLE into a clean, stable WiFi+coex stack.
+    esp_err_t wifi_init_ret = wifi_cli_init();
+    if (wifi_init_ret == ESP_OK) {
         current_radio_mode = RADIO_MODE_WIFI;
         wifi_initialized = true;
+        ESP_LOGI(TAG, "[INIT] WiFi initialized at boot (shared wardrive capture enabled)");
+    } else {
+        ESP_LOGE(TAG, "[INIT] WiFi init failed at boot: 0x%x", wifi_init_ret);
     }
 
     // Load screen settings (timeout, brightness) from NVS
     nvs_settings_load();
 
-    // Init scanner and register event handler
-    wifi_scanner_init();
-    esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE, &wifi_scan_done_cb, NULL);
+    // WiFi event handler and scanner will be registered when WiFi is first initialized
+    // (in ensure_wifi_mode) to avoid registering handlers before WiFi is ready
 
     // Allocate sniffer handshake + wardrive promisc arrays in PSRAM
     hs_ap_targets = (hs_ap_target_t *)heap_caps_calloc(HS_MAX_APS, sizeof(hs_ap_target_t), MALLOC_CAP_SPIRAM);
@@ -9846,6 +9877,11 @@ static int wdp_ble_gap_cb(struct ble_gap_event *event, void *arg)
     }
 
     wdp_ble_count = cnt + 1;
+    if (g_wd_radio_mode == WD_RADIO_BLE_ONLY) {
+        ESP_LOGD(TAG, "[WDP] BLE-only: detected device #%d: %02X:%02X:%02X:%02X:%02X:%02X RSSI=%d",
+                 cnt + 1, dev->mac[5], dev->mac[4], dev->mac[3],
+                 dev->mac[2], dev->mac[1], dev->mac[0], dev->rssi);
+    }
     return 0;
 }
 
@@ -10871,8 +10907,9 @@ static void wardrive_promisc_task(void *pvParameters) {
     (void)pvParameters;
     ESP_LOGI(TAG, "Wardrive promisc task started");
     log_heap_stats("wardrive-start");
-    bool wd_used_coex_ble = false;  // true if BLE was init'd while WiFi stayed up
-    bool ble_continuous   = false;  // true if BLE coex scan is running throughout wardrive
+    bool wd_used_coex_ble  = false;  // true if BLE was init'd while WiFi stayed up
+    bool ble_continuous    = false;  // true if BLE coex scan is running throughout wardrive
+    bool ble_scan_feasible = true;   // set false after BLE_ERR_MEM_CAPACITY — stops retry loop
 
     wardrive_file_counter = (int)(esp_timer_get_time() / 1000000);
     snprintf(wd_marks_fname, sizeof(wd_marks_fname),
@@ -10901,6 +10938,13 @@ static void wardrive_promisc_task(void *pvParameters) {
                 vTaskDelay(pdMS_TO_TICKS(500));
             }
             if (!wardrive_active) {
+                // Restore WiFi if we stopped it for BLE-only mode
+                if (g_wd_radio_mode == WD_RADIO_BLE_ONLY && !wifi_initialized) {
+                    ESP_LOGI(TAG, "Wardrive BLE-only done: restarting WiFi");
+                    esp_wifi_start();
+                    wifi_initialized = true;
+                    current_radio_mode = RADIO_MODE_WIFI;
+                }
                 wardrive_task_handle = NULL;
                 vTaskDelete(NULL);
                 return;
@@ -10930,6 +10974,13 @@ static void wardrive_promisc_task(void *pvParameters) {
     if (!file) {
         ESP_LOGI(TAG, "Failed to create %s - aborting", filename);
         if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+        // Restore WiFi if we stopped it for BLE-only mode
+        if (g_wd_radio_mode == WD_RADIO_BLE_ONLY && !wifi_initialized) {
+            ESP_LOGI(TAG, "Wardrive BLE-only done: restarting WiFi");
+            esp_wifi_start();
+            wifi_initialized = true;
+            current_radio_mode = RADIO_MODE_WIFI;
+        }
         wardrive_active = false;
         wardrive_task_handle = NULL;
         vTaskDelete(NULL);
@@ -10941,6 +10992,13 @@ static void wardrive_promisc_task(void *pvParameters) {
     fflush(file);
     if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
 
+    // For BLE-only mode, unload WiFi to free up DMA
+    if (g_wd_radio_mode == WD_RADIO_BLE_ONLY && wifi_initialized) {
+        ESP_LOGI(TAG, "Wardrive BLE-only: stopping WiFi to free DMA");
+        esp_wifi_stop();
+        wifi_initialized = false;
+    }
+
     wdp_ducb_init();
 
     // Allocate BLE device table in PSRAM (used only if g_wd_ble enabled)
@@ -10950,33 +11008,70 @@ static void wardrive_promisc_task(void *pvParameters) {
     }
     wdp_ble_count = 0;
 
-    wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
-    esp_wifi_set_promiscuous_filter(&filt);
-    esp_wifi_set_promiscuous_rx_cb(wdp_promiscuous_cb);
-    esp_wifi_set_promiscuous(true);
+    // ========== DMA TRACKING: Before promisc ==========
+    size_t dma_before = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    ESP_LOGI(TAG, "[DMA_TRACK] Before promisc start — DMA: %u bytes", (unsigned)dma_before);
+    // ================================================
 
-    // Start BLE scan immediately via coex — coex stack shares the radio automatically.
-    // Scan window = 40ms / interval = 320ms → 12.5% BLE duty, 87.5% RF time for WiFi.
-    // 0x0040 = 64 units × 0.625ms = 40ms; 0x0200 = 512 units × 0.625ms = 320ms.
-    if (wdp_ble_devices && bt_nimble_init() == ESP_OK) {
+    wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
+    // Start WiFi promiscuous only if not BLE-only mode
+    if (g_wd_radio_mode != WD_RADIO_BLE_ONLY) {
+        esp_wifi_set_promiscuous_filter(&filt);
+        esp_wifi_set_promiscuous_rx_cb(wdp_promiscuous_cb);
+        esp_wifi_set_promiscuous(true);
+
+        // ========== DMA TRACKING: After promisc ==========
+        size_t dma_after_promisc = heap_caps_get_free_size(MALLOC_CAP_DMA);
+        ESP_LOGI(TAG, "[DMA_TRACK] After promisc start — DMA: %u bytes (lost: %u)",
+                 (unsigned)dma_after_promisc, (unsigned)(dma_before - dma_after_promisc));
+        // =================================================
+    } else {
+        ESP_LOGI(TAG, "Wardrive BLE-only mode: WiFi promiscuous disabled");
+    }
+
+    // Start BLE scan only if BLE-only mode (WiFi-only doesn't use BLE).
+    // BLE-only uses 100% duty cycle (no WiFi to share radio time with).
+    // 0x0040 = 64 units × 0.625ms = 40ms (window = interval = 100% duty).
+    if (g_wd_radio_mode == WD_RADIO_BLE_ONLY && wdp_ble_devices) {
+        size_t dma_before_nimble = heap_caps_get_free_size(MALLOC_CAP_DMA);
+        ESP_LOGI(TAG, "[BLE_INSTRUMENTATION] Before bt_nimble_init: DMA=%u bytes", (unsigned)dma_before_nimble);
+
+        if (bt_nimble_init() == ESP_OK) {
+            size_t dma_after_nimble = heap_caps_get_free_size(MALLOC_CAP_DMA);
+            ESP_LOGI(TAG, "[BLE_INSTRUMENTATION] After bt_nimble_init: DMA=%u bytes (consumed: %u bytes)",
+                     (unsigned)dma_after_nimble, (unsigned)(dma_before_nimble - dma_after_nimble));
+
 #if MYNEWT_VAL(BLE_EXT_ADV)
-        struct ble_gap_ext_disc_params bpe = { .itvl = 0x0200, .window = 0x0040, .passive = 0 };
-        if (ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 0, 0, 0,
-                             BLE_HCI_SCAN_FILT_NO_WL, 0,
-                             &bpe, &bpe, wdp_ble_gap_cb, NULL) == 0) {
-            ble_continuous = true; wd_used_coex_ble = true;
-            ESP_LOGI(TAG, "[WDP] BLE coex ext_disc running (12.5%% duty, 40ms/320ms)");
-        }
+            struct ble_gap_ext_disc_params bpe = { .itvl = 0x0040, .window = 0x0040, .passive = 1 };
+            size_t dma_before_scan = heap_caps_get_free_size(MALLOC_CAP_DMA);
+            if (ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 0, 0, 0,
+                                 BLE_HCI_SCAN_FILT_NO_WL, 0,
+                                 &bpe, &bpe, wdp_ble_gap_cb, NULL) == 0) {
+                size_t dma_after_scan = heap_caps_get_free_size(MALLOC_CAP_DMA);
+                ble_continuous = true;
+                wd_used_coex_ble = true;
+                ESP_LOGI(TAG, "[BLE_INSTRUMENTATION] After ble_gap_ext_disc: DMA=%u bytes (consumed: %u bytes)",
+                         (unsigned)dma_after_scan, (unsigned)(dma_before_scan - dma_after_scan));
+                ESP_LOGI(TAG, "[WDP] BLE scan running (100%% duty, continuous)");
+            }
 #else
-        struct ble_gap_disc_params bp = { .itvl = 0x0200, .window = 0x0040,
-            .filter_policy = BLE_HCI_SCAN_FILT_NO_WL, .passive = 0, .filter_duplicates = 0 };
-        if (ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &bp, wdp_ble_gap_cb, NULL) == 0) {
-            ble_continuous = true; wd_used_coex_ble = true;
-            ESP_LOGI(TAG, "[WDP] BLE coex disc running (12.5%% duty, 40ms/320ms)");
-        }
+            struct ble_gap_disc_params bp = { .itvl = 0x0040, .window = 0x0040,
+                .filter_policy = BLE_HCI_SCAN_FILT_NO_WL, .passive = 1, .filter_duplicates = 0 };
+            size_t dma_before_scan = heap_caps_get_free_size(MALLOC_CAP_DMA);
+            if (ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &bp, wdp_ble_gap_cb, NULL) == 0) {
+                size_t dma_after_scan = heap_caps_get_free_size(MALLOC_CAP_DMA);
+                ble_continuous = true;
+                wd_used_coex_ble = true;
+                ESP_LOGI(TAG, "[BLE_INSTRUMENTATION] After ble_gap_disc: DMA=%u bytes (consumed: %u bytes)",
+                         (unsigned)dma_after_scan, (unsigned)(dma_before_scan - dma_after_scan));
+                ESP_LOGI(TAG, "[WDP] BLE scan running (100%% duty, continuous)");
+            }
 #endif
-        if (!ble_continuous)
-            ESP_LOGW(TAG, "[WDP] BLE coex scan start failed");
+            if (!ble_continuous)
+                ESP_LOGW(TAG, "[WDP] BLE coex scan start failed");
+        } else {
+            ESP_LOGE(TAG, "[BLE_INSTRUMENTATION] bt_nimble_init() FAILED");
+        }
     }
 
     int64_t last_stats_us = esp_timer_get_time();
@@ -10988,59 +11083,31 @@ static void wardrive_promisc_task(void *pvParameters) {
         int channel = wdp_ducb_channels[ch_idx].channel;
         int dwell_ms = wdp_get_dwell_ms(wdp_ducb_channels[ch_idx].tier);
 
-        esp_wifi_set_channel((uint8_t)channel, WIFI_SECOND_CHAN_NONE);
+        // Only set WiFi channel in WiFi mode; in BLE-only mode, WiFi is not running
+        if (g_wd_radio_mode != WD_RADIO_BLE_ONLY) {
+            esp_wifi_set_channel((uint8_t)channel, WIFI_SECOND_CHAN_NONE);
+        }
         wdp_current_channel = channel;
         wd_ui_update_flag = true;
         wdp_dwell_new_networks = 0;
         vTaskDelay(pdMS_TO_TICKS(dwell_ms));
 
-        int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(50));
-        if (len > 0) {
-            wardrive_gps_buffer[len] = '\0';
-            char *line = strtok(wardrive_gps_buffer, "\r\n");
-            while (line != NULL) { parse_gps_nmea(line); line = strtok(NULL, "\r\n"); }
+        // ========== DMA TRACKING: Per-dwell check ==========
+        static int dwell_count = 0;
+        if (++dwell_count % 10 == 0) {  // Log every 10 dwells to avoid spam
+            size_t dma_now = heap_caps_get_free_size(MALLOC_CAP_DMA);
+            ESP_LOGI(TAG, "[DMA_TRACK] Dwell #%d (CH %d) — DMA: %u bytes",
+                     dwell_count, channel, (unsigned)dma_now);
         }
+        // ====================================================
 
-        if (!current_gps.valid) {
-            if (g_gps_last_known.valid) {
-                // Hold last-known position — continue scanning without pausing
-                ESP_LOGD(TAG, "[WDP] GPS fix lost; holding last-known (%.6f, %.6f, acc %.0fm)",
-                         (double)g_gps_last_known.latitude, (double)g_gps_last_known.longitude,
-                         (double)GPS_STALE_ACCURACY_M);
-            } else {
-                // No fallback at all — must pause until re-acquired
-                ESP_LOGI(TAG, "[WDP] GPS fix lost (no last-known), pausing promisc...");
-                esp_wifi_set_promiscuous(false);
-                while (wardrive_active && !current_gps.valid) {
-                    len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(200));
-                    if (len > 0) {
-                        wardrive_gps_buffer[len] = '\0';
-                        char *l = strtok(wardrive_gps_buffer, "\r\n");
-                        while (l) { parse_gps_nmea(l); l = strtok(NULL, "\r\n"); }
-                    }
-                    vTaskDelay(pdMS_TO_TICKS(500));
-                }
-                if (!wardrive_active) break;
-                ESP_LOGI(TAG, "[WDP] GPS fix re-acquired, resuming promisc.");
-                esp_wifi_set_promiscuous(true);
-            }
-        }
-
-        if (wdp_needs_grow) wdp_grow_network_buffer();
-
-        double reward = (double)wdp_dwell_new_networks;
-        wdp_ducb_update(ch_idx, reward);
-        wd_ui_update_flag = true;
-
-        // ── BLE burst fallback (only when coex continuous scan unavailable) ─
-        if (!ble_continuous && g_wd_ble && wdp_ble_devices &&
+        // BLE burst fallback (only in BLE-only mode; WiFi-only mode skips BLE entirely)
+        if (g_wd_radio_mode == WD_RADIO_BLE_ONLY && !ble_continuous && g_wd_ble && wdp_ble_devices &&
             (esp_timer_get_time() - last_ble_us) >= (int64_t)WDP_BLE_INTERVAL_S * 1000000LL) {
             last_ble_us = esp_timer_get_time();
 
-            // With CONFIG_ESP_COEX_SW_COEXIST_ENABLE, attempt BLE while keeping
-            // WiFi promiscuous running. Coex manager arbitrates the shared RF
-            // front-end. WiFi RX/TX buffers (RX=4, TX=3) + BLE ~31KB < 48KB DMA.
-            // bt_nimble_init() is idempotent if NimBLE is already initialized.
+            // With reduced WiFi buffers, attempt BLE while keeping WiFi promiscuous running.
+            // Coex manager arbitrates the shared RF front-end. bt_nimble_init() is idempotent.
             bool ble_scan_ok = false;
             bool via_coex    = false;
             if (current_radio_mode == RADIO_MODE_WIFI && bt_nimble_init() == ESP_OK) {
@@ -11100,6 +11167,48 @@ static void wardrive_promisc_task(void *pvParameters) {
             }
             // Coex path: WiFi promiscuous kept running — continue as-is.
         }
+
+        int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(50));
+        if (len > 0) {
+            wardrive_gps_buffer[len] = '\0';
+            char *line = strtok(wardrive_gps_buffer, "\r\n");
+            while (line != NULL) { parse_gps_nmea(line); line = strtok(NULL, "\r\n"); }
+        }
+
+        if (!current_gps.valid) {
+            if (g_gps_last_known.valid) {
+                // Hold last-known position — continue scanning without pausing
+                ESP_LOGD(TAG, "[WDP] GPS fix lost; holding last-known (%.6f, %.6f, acc %.0fm)",
+                         (double)g_gps_last_known.latitude, (double)g_gps_last_known.longitude,
+                         (double)GPS_STALE_ACCURACY_M);
+            } else {
+                // No fallback at all — must pause until re-acquired
+                ESP_LOGI(TAG, "[WDP] GPS fix lost (no last-known), pausing promisc...");
+                esp_wifi_set_promiscuous(false);
+                while (wardrive_active && !current_gps.valid) {
+                    len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(200));
+                    if (len > 0) {
+                        wardrive_gps_buffer[len] = '\0';
+                        char *l = strtok(wardrive_gps_buffer, "\r\n");
+                        while (l) { parse_gps_nmea(l); l = strtok(NULL, "\r\n"); }
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                }
+                if (!wardrive_active) break;
+                ESP_LOGI(TAG, "[WDP] GPS fix re-acquired, resuming promisc.");
+                esp_wifi_set_promiscuous(true);
+            }
+        }
+
+        if (wdp_needs_grow) wdp_grow_network_buffer();
+
+        double reward = (double)wdp_dwell_new_networks;
+        wdp_ducb_update(ch_idx, reward);
+        wd_ui_update_flag = true;
+
+        // v2.6.61: BLE burst fallback DISABLED
+        // With band-based BLE switching, BLE is now handled per-dwell on 5 GHz.
+        // No need for periodic bursts during 2.4 GHz dwells (would reduce WiFi capture).
         // ─────────────────────────────────────────────────────────
 
         if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
@@ -11126,9 +11235,12 @@ static void wardrive_promisc_task(void *pvParameters) {
             net->written_to_file = true;
             networks_since_flush++;
         }
-        // Write any newly discovered BLE devices
-        if (g_wd_ble && wdp_ble_devices) {
+        // In WiFi-only mode, write BLE devices during scan (if any detected via coex)
+        // In BLE-only mode, skip writing during scan to avoid SD DMA exhaustion
+        // BLE devices will be flushed to CSV after wardrive stops
+        if (g_wd_ble && wdp_ble_devices && g_wd_radio_mode != WD_RADIO_BLE_ONLY) {
             int ble_cnt = wdp_ble_count;
+            int ble_written = 0;
             for (int i = 0; i < ble_cnt; i++) {
                 if (wdp_ble_devices[i].written) continue;
                 wdp_ble_device_t *bd = &wdp_ble_devices[i];
@@ -11143,12 +11255,35 @@ static void wardrive_promisc_task(void *pvParameters) {
                         bd->rssi, bd->latitude, bd->longitude);
                 bd->written = true;
                 networks_since_flush++;
+                ble_written++;
+            }
+            if (ble_written > 0) {
+                ESP_LOGI(TAG, "[WDP] Wrote %d BLE device(s) to CSV (total BLE: %d)", ble_written, ble_cnt);
             }
         }
 
         if (networks_since_flush >= WDP_FILE_FLUSH_INTERVAL) {
+            // Pause BLE briefly to allow DMA defragmentation during SD flush
+            // (DMA allocation for SD write can fail if pool is fragmented by WiFi+BLE)
+            if (ble_continuous) {
+                ble_gap_disc_cancel();
+                vTaskDelay(pdMS_TO_TICKS(5));  // let DMA settle
+            }
+
             fflush(file);
             networks_since_flush = 0;
+
+            // Resume BLE if it was running
+            if (ble_continuous) {
+                vTaskDelay(pdMS_TO_TICKS(5));
+                struct ble_gap_disc_params bp = { .itvl = 0x0800, .window = 0x0040,
+                    .filter_policy = BLE_HCI_SCAN_FILT_NO_WL, .passive = 0, .filter_duplicates = 0 };
+                if (ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &bp, wdp_ble_gap_cb, NULL) == 0) {
+                    // BLE resumed
+                } else {
+                    ESP_LOGW(TAG, "[WDP] BLE resume after SD flush failed");
+                }
+            }
         }
         if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
 
@@ -11170,6 +11305,33 @@ static void wardrive_promisc_task(void *pvParameters) {
     esp_wifi_set_promiscuous(false);
 
     if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
+
+    // In BLE-only mode, flush all buffered BLE devices to CSV after scan stops
+    if (file && g_wd_radio_mode == WD_RADIO_BLE_ONLY && wdp_ble_devices) {
+        char timestamp[32];
+        get_timestamp_string(timestamp, sizeof(timestamp));
+        int ble_cnt = wdp_ble_count;
+        int ble_flushed = 0;
+        for (int i = 0; i < ble_cnt; i++) {
+            if (wdp_ble_devices[i].written) continue;
+            wdp_ble_device_t *bd = &wdp_ble_devices[i];
+            char ble_mac[18];
+            snprintf(ble_mac, sizeof(ble_mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     bd->mac[5], bd->mac[4], bd->mac[3],
+                     bd->mac[2], bd->mac[1], bd->mac[0]);
+            char ble_name[64];
+            escape_csv_field(bd->name[0] ? bd->name : "[BLE]", ble_name, sizeof(ble_name));
+            fprintf(file, "%s,%s,[BLE],%s,37,2402,%d,%.7f,%.7f,0.00,0.00,,,BLE\n",
+                    ble_mac, ble_name, timestamp,
+                    bd->rssi, bd->latitude, bd->longitude);
+            bd->written = true;
+            ble_flushed++;
+        }
+        if (ble_flushed > 0) {
+            ESP_LOGI(TAG, "[WDP] BLE-only: flushed %d device(s) to CSV after scan", ble_flushed);
+        }
+    }
+
     if (file) { fflush(file); fclose(file); }
     if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
 
@@ -11186,9 +11348,24 @@ static void wardrive_promisc_task(void *pvParameters) {
 
     wardrive_active = false;
     wardrive_task_handle = NULL;
+
+    // ========== DMA TRACKING: After wardrive stops ==========
+    size_t dma_after_stop = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    ESP_LOGI(TAG, "[DMA_TRACK] After promisc stop — DMA: %u bytes", (unsigned)dma_after_stop);
+    // ========================================================
+
     ESP_LOGI(TAG, "Wardrive promisc stopped. Total networks: %d. File: wd%d.csv",
              wdp_seen_count, wardrive_file_counter);
     log_heap_stats("wardrive-stop");
+
+    // Restore WiFi if we stopped it for BLE-only mode
+    if (g_wd_radio_mode == WD_RADIO_BLE_ONLY && !wifi_initialized) {
+        ESP_LOGI(TAG, "Wardrive BLE-only done: restarting WiFi");
+        esp_wifi_start();
+        wifi_initialized = true;
+        current_radio_mode = RADIO_MODE_WIFI;
+    }
+
     vTaskDelete(NULL);
 }
 
@@ -11234,49 +11411,356 @@ static void wd_ui_timer_cb(lv_timer_t *timer) {
         lv_label_set_text(wd_ui_ble_label, ble_buf);
     }
 
-    // Update table with last 50 networks
+    // Update table with last 50 networks/devices (WiFi or BLE depending on mode)
     if (wd_ui_table) {
-        int total = wdp_seen_count;
-        int show = (total > 50) ? 50 : total;
-        int start = total - show;
-        lv_table_set_row_cnt(wd_ui_table, show > 0 ? show : 1);
+        int total, show, start;
         lv_table_set_col_cnt(wd_ui_table, 5);
 
-        for (int i = 0; i < show; i++) {
-            wdp_network_t *net = &wdp_seen_networks[start + show - 1 - i];
-            char ssid_trunc[20];
-            strncpy(ssid_trunc, net->ssid[0] ? net->ssid : "[hidden]", 19);
-            ssid_trunc[19] = '\0';
-            lv_table_set_cell_value(wd_ui_table, i, 0, ssid_trunc);
+        if (g_wd_radio_mode == WD_RADIO_BLE_ONLY) {
+            // Show BLE devices
+            total = wdp_ble_count;
+            show = (total > 50) ? 50 : total;
+            start = total - show;
+            lv_table_set_row_cnt(wd_ui_table, show > 0 ? show : 1);
 
-            char ch_str[4];
-            snprintf(ch_str, sizeof(ch_str), "%d", net->channel);
-            lv_table_set_cell_value(wd_ui_table, i, 1, ch_str);
+            for (int i = 0; i < show; i++) {
+                wdp_ble_device_t *dev = &wdp_ble_devices[start + show - 1 - i];
+                char addr_str[18];
+                snprintf(addr_str, sizeof(addr_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                         dev->mac[0], dev->mac[1], dev->mac[2], dev->mac[3], dev->mac[4], dev->mac[5]);
+                lv_table_set_cell_value(wd_ui_table, i, 0, addr_str);
 
-            char rssi_str[8];
-            snprintf(rssi_str, sizeof(rssi_str), "%d", net->rssi);
-            lv_table_set_cell_value(wd_ui_table, i, 2, rssi_str);
+                char rssi_str[8];
+                snprintf(rssi_str, sizeof(rssi_str), "%d", dev->rssi);
+                lv_table_set_cell_value(wd_ui_table, i, 1, rssi_str);
 
-            const char *auth = get_auth_mode_wiggle(net->authmode);
-            char auth_short[8];
-            strncpy(auth_short, auth, 7);
-            auth_short[7] = '\0';
-            lv_table_set_cell_value(wd_ui_table, i, 3, auth_short);
-
-            char coord_str[24];
-            if (net->latitude != 0.0f || net->longitude != 0.0f) {
-                snprintf(coord_str, sizeof(coord_str), "%.2f", (double)net->latitude);
-            } else {
-                snprintf(coord_str, sizeof(coord_str), "--");
+                lv_table_set_cell_value(wd_ui_table, i, 2, "BLE");
+                lv_table_set_cell_value(wd_ui_table, i, 3, "");
+                lv_table_set_cell_value(wd_ui_table, i, 4, "");
             }
-            lv_table_set_cell_value(wd_ui_table, i, 4, coord_str);
+        } else {
+            // Show WiFi networks
+            total = wdp_seen_count;
+            show = (total > 50) ? 50 : total;
+            start = total - show;
+            lv_table_set_row_cnt(wd_ui_table, show > 0 ? show : 1);
+
+            for (int i = 0; i < show; i++) {
+                wdp_network_t *net = &wdp_seen_networks[start + show - 1 - i];
+                char ssid_trunc[20];
+                strncpy(ssid_trunc, net->ssid[0] ? net->ssid : "[hidden]", 19);
+                ssid_trunc[19] = '\0';
+                lv_table_set_cell_value(wd_ui_table, i, 0, ssid_trunc);
+
+                char ch_str[4];
+                snprintf(ch_str, sizeof(ch_str), "%d", net->channel);
+                lv_table_set_cell_value(wd_ui_table, i, 1, ch_str);
+
+                char rssi_str[8];
+                snprintf(rssi_str, sizeof(rssi_str), "%d", net->rssi);
+                lv_table_set_cell_value(wd_ui_table, i, 2, rssi_str);
+
+                const char *auth = get_auth_mode_wiggle(net->authmode);
+                char auth_short[8];
+                strncpy(auth_short, auth, 7);
+                auth_short[7] = '\0';
+                lv_table_set_cell_value(wd_ui_table, i, 3, auth_short);
+
+                char coord_str[24];
+                if (net->latitude != 0.0f || net->longitude != 0.0f) {
+                    snprintf(coord_str, sizeof(coord_str), "%.2f", (double)net->latitude);
+                } else {
+                    snprintf(coord_str, sizeof(coord_str), "--");
+                }
+                lv_table_set_cell_value(wd_ui_table, i, 4, coord_str);
+            }
         }
     }
+}
+
+// Timer callback: monitor GPS prompt state and start wardrive when ready
+static lv_timer_t *wd_gps_wait_timer = NULL;
+static lv_obj_t *wd_gps_wait_modal = NULL;  // Reference to waiting modal (not just text overlay)
+static lv_obj_t *wd_gps_wait_msg = NULL;   // Reference to waiting message for updates
+static int wd_gps_wait_sats_logged = 0;     // track if we logged GPS status
+
+// Cancel button callback - user clicked Cancel while waiting for GPS
+static void wd_gps_cancel_wait_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "[GPS WAIT] User cancelled GPS wait");
+
+    // Clean up timer and modal
+    if (wd_gps_wait_timer) {
+        lv_timer_del(wd_gps_wait_timer);
+        wd_gps_wait_timer = NULL;
+    }
+    if (wd_gps_wait_modal && lv_obj_is_valid(wd_gps_wait_modal)) {
+        lv_obj_del(wd_gps_wait_modal);
+    }
+    wd_gps_wait_modal = NULL;
+    wd_gps_wait_msg = NULL;
+    wd_gps_prompt_state = 0;
+
+    // Return to wardrive menu
+    show_wardrive_menu_screen();
+}
+
+static void wd_gps_wait_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+
+    // Check if user made a choice
+    if (wd_gps_prompt_state == 0 || wd_gps_prompt_state == 1) return;  // no choice yet or prompt showing
+
+    // State 2: user chose "use cached" → proceed immediately
+    // State 3: user chose "wait" → only proceed if GPS now has a FRESH lock (satellites > 0)
+    if (wd_gps_prompt_state == 3) {
+        // Check for fresh GPS lock: satellites > 0 (not just cached data with Sats:0)
+        if (current_gps.satellites <= 0) {
+            // Still waiting for fresh lock; update modal with satellite count
+            if (wd_gps_wait_msg && lv_obj_is_valid(wd_gps_wait_msg)) {
+                char wait_text[96];
+                snprintf(wait_text, sizeof(wait_text), "Waiting for GPS lock...\nSats: %d",
+                         current_gps.satellites);
+                lv_label_set_text(wd_gps_wait_msg, wait_text);
+            }
+            // Log GPS status periodically so user sees activity in logs
+            if (++wd_gps_wait_sats_logged % 10 == 0) {  // log every 1 sec (10 * 100ms)
+                ESP_LOGI(TAG, "[GPS WAIT] Still waiting for fresh lock... Sats: %d",
+                         current_gps.satellites);
+            }
+            return;  // Keep waiting
+        }
+        // GPS just acquired fresh lock (satellites > 0)!
+        ESP_LOGI(TAG, "[GPS WAIT] FRESH GPS lock acquired! Starting wardrive");
+        ESP_LOGI(TAG, "[GPS WAIT] Lat:%.6f Lon:%.6f Sats:%d Accuracy:%.0fm",
+                 (double)current_gps.latitude, (double)current_gps.longitude,
+                 current_gps.satellites, (double)current_gps.accuracy);
+        wd_gps_wait_sats_logged = 0;
+        // Close waiting modal
+        if (wd_gps_wait_modal && lv_obj_is_valid(wd_gps_wait_modal)) {
+            lv_obj_del(wd_gps_wait_modal);
+        }
+        wd_gps_wait_modal = NULL;
+        wd_gps_wait_msg = NULL;
+    }
+
+    // Conditions met; create wardrive UI and start wardrive
+    ESP_LOGI(TAG, "GPS prompt resolved; creating wardrive UI");
+
+    // Now create the full wardrive UI (same as wardrive_start_btn_cb would do)
+    // This is a simplified inline version; in production you'd extract to a function
+    scan_done_ui_flag = false;
+    create_function_page_base("Wardrive");
+    wardrive_ui_active = true;
+
+    // Create GPS label with appropriate status
+    wd_ui_gps_label = lv_label_create(lv_layer_top());
+    if (wd_gps_prompt_state == 3) {
+        lv_label_set_text(wd_ui_gps_label, "GPS locked - scanning...  Sats: 0");
+        lv_obj_set_style_text_color(wd_ui_gps_label, lv_color_make(76, 175, 80), 0);
+    } else {
+        lv_label_set_text(wd_ui_gps_label, "Using cached location...  Sats: 0");
+        lv_obj_set_style_text_color(wd_ui_gps_label, COLOR_MATERIAL_ORANGE, 0);
+    }
+    lv_obj_set_style_text_font(wd_ui_gps_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_align(wd_ui_gps_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_bg_opa(wd_ui_gps_label, LV_OPA_TRANSP, 0);
+    lv_obj_set_width(wd_ui_gps_label, LCD_H_RES);
+    lv_obj_align(wd_ui_gps_label, LV_ALIGN_TOP_MID, 0, 35);
+
+    // Instead of duplicating all UI creation code here, we'll create a minimal UI
+    // and start the wardrive task. The full UI creation happens in wardrive_start_btn_cb
+    // For now, just start the task with the GPS label we created above.
+    wardrive_enable_log_capture();
+
+    if (!wardrive_active && wardrive_task_handle == NULL) {
+        ESP_LOGI(TAG, "Starting Wardrive (promisc+D-UCB)...");
+        wardrive_active = true;
+
+        wardrive_task_stack = (StackType_t *)heap_caps_malloc(8192 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+        if (wardrive_task_stack != NULL) {
+            wardrive_task_handle = xTaskCreateStatic(wardrive_task, "wardrive_task", 8192, NULL,
+                5, wardrive_task_stack, &wardrive_task_buffer);
+        }
+    }
+
+    show_touch_dot = false;
+    if (touch_dot) lv_obj_add_flag(touch_dot, LV_OBJ_FLAG_HIDDEN);
+
+    // Stop waiting timer
+    lv_timer_del(wd_gps_wait_timer);
+    wd_gps_wait_timer = NULL;
+    wd_gps_prompt_state = 4;  // done
+}
+
+// GPS prompt modal callbacks
+static void wd_gps_use_now_cb(lv_event_t *e)
+{
+    lv_obj_t *modal = (lv_obj_t *)lv_event_get_user_data(e);
+    if (modal) lv_obj_del(modal);
+    ESP_LOGI(TAG, "[GPS PROMPT] User chose 'Use Now' - starting wardrive with cached GPS");
+    wd_gps_prompt_state = 2;  // use cached
+    // Continue wardrive setup immediately (skip GPS check since we've already decided)
+    wardrive_start_btn_cb(NULL);
+}
+
+static void wd_gps_wait_lock_cb(lv_event_t *e)
+{
+    lv_obj_t *modal = (lv_obj_t *)lv_event_get_user_data(e);
+    if (modal) lv_obj_del(modal);
+
+    // Create persistent modal with Cancel button
+    wd_gps_wait_modal = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(wd_gps_wait_modal, 220, 160);
+    lv_obj_align(wd_gps_wait_modal, LV_ALIGN_CENTER, 0, -20);
+    lv_obj_set_style_bg_color(wd_gps_wait_modal, lv_color_make(25, 25, 40), 0);
+    lv_obj_set_style_border_color(wd_gps_wait_modal, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_border_width(wd_gps_wait_modal, 2, 0);
+    lv_obj_set_style_radius(wd_gps_wait_modal, 8, 0);
+    lv_obj_set_style_pad_all(wd_gps_wait_modal, 8, 0);
+
+    // Title
+    lv_obj_t *title = lv_label_create(wd_gps_wait_modal);
+    lv_label_set_text(title, "Acquiring GPS Lock");
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    // Message with satellite count
+    wd_gps_wait_msg = lv_label_create(wd_gps_wait_modal);
+    lv_label_set_text(wd_gps_wait_msg, "Searching for satellites...\nSats: 0");
+    lv_obj_set_style_text_color(wd_gps_wait_msg, lv_color_make(200, 200, 200), 0);
+    lv_obj_set_style_text_font(wd_gps_wait_msg, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_align(wd_gps_wait_msg, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(wd_gps_wait_msg, 200);
+    lv_label_set_long_mode(wd_gps_wait_msg, LV_LABEL_LONG_WRAP);
+    lv_obj_align(wd_gps_wait_msg, LV_ALIGN_TOP_MID, 0, 22);
+
+    // Cancel button
+    lv_obj_t *cancel_btn = lv_btn_create(wd_gps_wait_modal);
+    lv_obj_set_size(cancel_btn, 190, 30);
+    lv_obj_align(cancel_btn, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_make(244, 67, 54), 0);
+    lv_obj_set_style_radius(cancel_btn, 6, 0);
+    lv_obj_add_event_cb(cancel_btn, wd_gps_cancel_wait_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, "Cancel");
+    lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(cancel_lbl);
+
+    ESP_LOGI(TAG, "[GPS WAIT] User chose to wait for GPS lock - modal shown");
+    wd_gps_prompt_state = 3;  // waiting for lock
+    wd_gps_wait_sats_logged = 0;
+    // Start timer to check when GPS locks (100ms for smooth updates)
+    if (wd_gps_wait_timer) lv_timer_del(wd_gps_wait_timer);
+    wd_gps_wait_timer = lv_timer_create(wd_gps_wait_timer_cb, 100, NULL);
+}
+
+// Show GPS lock prompt modal when wardrive starts with stale GPS
+static void wd_gps_show_prompt_modal(void)
+{
+    const gps_data_t *cached = gps_best();
+
+    lv_obj_t *modal = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(modal, 200, 180);
+    lv_obj_align(modal, LV_ALIGN_CENTER, 0, -30);
+    lv_obj_set_style_bg_color(modal, lv_color_make(25, 25, 40), 0);
+    lv_obj_set_style_border_color(modal, UI_ACCENT_CYAN, 0);
+    lv_obj_set_style_border_width(modal, 2, 0);
+    lv_obj_set_style_radius(modal, 8, 0);
+    lv_obj_set_style_pad_all(modal, 8, 0);
+
+    // Title
+    lv_obj_t *title = lv_label_create(modal);
+    lv_label_set_text(title, "Cached GPS Data");
+    lv_obj_set_style_text_color(title, UI_ACCENT_CYAN, 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    // Coordinates
+    lv_obj_t *coord_lbl = lv_label_create(modal);
+    char coord_text[96];
+    if (cached && cached->latitude != 0.0f) {
+        snprintf(coord_text, sizeof(coord_text), "%.5f\n%.5f",
+                 (double)cached->latitude, fabs((double)cached->longitude));
+    } else {
+        snprintf(coord_text, sizeof(coord_text), "No cached\ndata");
+    }
+    lv_label_set_text(coord_lbl, coord_text);
+    lv_obj_set_style_text_color(coord_lbl, lv_color_make(200, 200, 200), 0);
+    lv_obj_set_style_text_font(coord_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_align(coord_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(coord_lbl, 180);
+    lv_label_set_long_mode(coord_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_align(coord_lbl, LV_ALIGN_TOP_MID, 0, 22);
+
+    // Question
+    lv_obj_t *q_lbl = lv_label_create(modal);
+    lv_label_set_text(q_lbl, "Use this data?");
+    lv_obj_set_style_text_color(q_lbl, lv_color_make(200, 200, 200), 0);
+    lv_obj_set_style_text_font(q_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_align(q_lbl, LV_ALIGN_TOP_MID, 0, 65);
+
+    // "Use Now" button (LVGL 8 uses lv_btn_create)
+    lv_obj_t *use_btn = lv_btn_create(modal);
+    lv_obj_set_size(use_btn, 88, 30);
+    lv_obj_align(use_btn, LV_ALIGN_BOTTOM_LEFT, 2, -2);
+    lv_obj_set_style_bg_color(use_btn, lv_color_make(76, 175, 80), 0);
+    lv_obj_set_style_radius(use_btn, 6, 0);
+    lv_obj_add_event_cb(use_btn, wd_gps_use_now_cb, LV_EVENT_CLICKED, (void *)modal);
+    lv_obj_t *use_lbl = lv_label_create(use_btn);
+    lv_label_set_text(use_lbl, "Use Now");
+    lv_obj_set_style_text_font(use_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(use_lbl);
+
+    // "Wait for Lock" button
+    lv_obj_t *wait_btn = lv_btn_create(modal);
+    lv_obj_set_size(wait_btn, 88, 30);
+    lv_obj_align(wait_btn, LV_ALIGN_BOTTOM_RIGHT, -2, -2);
+    lv_obj_set_style_bg_color(wait_btn, lv_color_make(33, 150, 243), 0);
+    lv_obj_set_style_radius(wait_btn, 6, 0);
+    lv_obj_add_event_cb(wait_btn, wd_gps_wait_lock_cb, LV_EVENT_CLICKED, (void *)modal);
+    lv_obj_t *wait_lbl = lv_label_create(wait_btn);
+    lv_label_set_text(wait_lbl, "Wait");
+    lv_obj_set_style_text_font(wait_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(wait_lbl);
+
+    wd_gps_prompt_state = 1;  // prompt shown
 }
 
 static void wardrive_start_btn_cb(lv_event_t *e)
 {
     (void)e;
+
+    // Only check GPS if we're not already in a GPS choice/wait state
+    // (wd_gps_prompt_state > 0 means user is interacting with GPS modal)
+    if (wd_gps_prompt_state == 0) {
+        // Check GPS lock status before showing wardrive
+        if (!current_gps.valid) {
+            // GPS is stale; check if we have cached data
+            const gps_data_t *cached = gps_best();
+            if (cached && cached->latitude != 0.0f) {
+                // Have cached data; show prompt and wait for user choice
+                wd_gps_show_prompt_modal();
+                // Don't proceed yet; wait for user to choose via callback
+                return;
+            } else {
+                // No GPS data at all
+                lv_obj_t *mbox = lv_msgbox_create(NULL, "Error", "No GPS data available\nPlease wait for fix or move\nnear window",
+                                                  (const char *[]){"OK", ""}, true);
+                lv_obj_center(mbox);
+                return;
+            }
+        }
+    }
+
+    // GPS is fresh or user has made choice; proceed with wardrive setup
+    // WiFi is already initialized at boot (v2.0.1 restored behavior).
+    // No need to call ensure_wifi_mode() — this avoids DMA fragmentation from
+    // deinit/reinit cycles. BLE will initialize during wardrive into a clean,
+    // stable WiFi+coex stack.
 
     scan_done_ui_flag = false;
 
@@ -11324,46 +11808,54 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_align(wd_ui_channel_label, LV_ALIGN_BOTTOM_MID, 0, -2);
 
     // ─── WiFi network counter ─────────────────────────────────────
-    lv_obj_t *cnt_box = lv_obj_create(function_page);
-    lv_obj_set_size(cnt_box, 74, 42);
-    lv_obj_align(cnt_box, LV_ALIGN_TOP_LEFT, 84, 55);
-    lv_obj_set_style_bg_color(cnt_box, lv_color_make(30, 30, 45), 0);
-    lv_obj_set_style_border_color(cnt_box, lv_color_make(0, 188, 212), 0);
-    lv_obj_set_style_border_width(cnt_box, 2, 0);
-    lv_obj_set_style_radius(cnt_box, 10, 0);
-    lv_obj_set_style_pad_all(cnt_box, 0, 0);
-    lv_obj_clear_flag(cnt_box, LV_OBJ_FLAG_SCROLLABLE);
+    wd_ui_counter_box = lv_obj_create(function_page);
+    lv_obj_set_size(wd_ui_counter_box, 74, 42);
+    lv_obj_align(wd_ui_counter_box, LV_ALIGN_TOP_LEFT, 84, 55);
+    lv_obj_set_style_bg_color(wd_ui_counter_box, lv_color_make(30, 30, 45), 0);
+    lv_obj_set_style_border_color(wd_ui_counter_box, lv_color_make(0, 188, 212), 0);
+    lv_obj_set_style_border_width(wd_ui_counter_box, 2, 0);
+    lv_obj_set_style_radius(wd_ui_counter_box, 10, 0);
+    lv_obj_set_style_pad_all(wd_ui_counter_box, 0, 0);
+    lv_obj_clear_flag(wd_ui_counter_box, LV_OBJ_FLAG_SCROLLABLE);
+    // Hide WiFi counter in BLE-only mode
+    if (g_wd_radio_mode == WD_RADIO_BLE_ONLY) {
+        lv_obj_add_flag(wd_ui_counter_box, LV_OBJ_FLAG_HIDDEN);
+    }
 
-    lv_obj_t *cnt_title = lv_label_create(cnt_box);
+    lv_obj_t *cnt_title = lv_label_create(wd_ui_counter_box);
     lv_label_set_text(cnt_title, "WiFi");
     lv_obj_set_style_text_color(cnt_title, lv_color_make(0, 188, 212), 0);
     lv_obj_set_style_text_font(cnt_title, &lv_font_montserrat_12, 0);
     lv_obj_align(cnt_title, LV_ALIGN_TOP_MID, 0, 2);
 
-    wd_ui_counter_label = lv_label_create(cnt_box);
+    wd_ui_counter_label = lv_label_create(wd_ui_counter_box);
     lv_label_set_text(wd_ui_counter_label, "0");
     lv_obj_set_style_text_color(wd_ui_counter_label, ui_text_color(), 0);
     lv_obj_set_style_text_font(wd_ui_counter_label, &lv_font_montserrat_20, 0);
     lv_obj_align(wd_ui_counter_label, LV_ALIGN_BOTTOM_MID, 0, -2);
 
     // ─── BLE device counter ───────────────────────────────────────
-    lv_obj_t *ble_box = lv_obj_create(function_page);
-    lv_obj_set_size(ble_box, 70, 42);
-    lv_obj_align(ble_box, LV_ALIGN_TOP_LEFT, 166, 55);
-    lv_obj_set_style_bg_color(ble_box, lv_color_make(30, 30, 45), 0);
-    lv_obj_set_style_border_color(ble_box, lv_color_make(171, 71, 188), 0);
-    lv_obj_set_style_border_width(ble_box, 2, 0);
-    lv_obj_set_style_radius(ble_box, 10, 0);
-    lv_obj_set_style_pad_all(ble_box, 0, 0);
-    lv_obj_clear_flag(ble_box, LV_OBJ_FLAG_SCROLLABLE);
+    wd_ui_ble_box = lv_obj_create(function_page);
+    lv_obj_set_size(wd_ui_ble_box, 70, 42);
+    lv_obj_align(wd_ui_ble_box, LV_ALIGN_TOP_LEFT, 166, 55);
+    lv_obj_set_style_bg_color(wd_ui_ble_box, lv_color_make(30, 30, 45), 0);
+    lv_obj_set_style_border_color(wd_ui_ble_box, lv_color_make(171, 71, 188), 0);
+    lv_obj_set_style_border_width(wd_ui_ble_box, 2, 0);
+    lv_obj_set_style_radius(wd_ui_ble_box, 10, 0);
+    lv_obj_set_style_pad_all(wd_ui_ble_box, 0, 0);
+    lv_obj_clear_flag(wd_ui_ble_box, LV_OBJ_FLAG_SCROLLABLE);
+    // Hide BLE counter in WiFi-only mode
+    if (g_wd_radio_mode == WD_RADIO_WIFI_ONLY) {
+        lv_obj_add_flag(wd_ui_ble_box, LV_OBJ_FLAG_HIDDEN);
+    }
 
-    lv_obj_t *ble_title = lv_label_create(ble_box);
+    lv_obj_t *ble_title = lv_label_create(wd_ui_ble_box);
     lv_label_set_text(ble_title, "BLE");
     lv_obj_set_style_text_color(ble_title, lv_color_make(171, 71, 188), 0);
     lv_obj_set_style_text_font(ble_title, &lv_font_montserrat_12, 0);
     lv_obj_align(ble_title, LV_ALIGN_TOP_MID, 0, 2);
 
-    wd_ui_ble_label = lv_label_create(ble_box);
+    wd_ui_ble_label = lv_label_create(wd_ui_ble_box);
     lv_label_set_text(wd_ui_ble_label, "0");
     lv_obj_set_style_text_color(wd_ui_ble_label, ui_text_color(), 0);
     lv_obj_set_style_text_font(wd_ui_ble_label, &lv_font_montserrat_20, 0);
@@ -11537,7 +12029,15 @@ static void wardrive_stop_btn_cb(lv_event_t *e)
         
         ESP_LOGI(TAG, "Wardrive stopped");
     }
-    
+
+    // Restore WiFi if we stopped it for BLE-only mode
+    if (g_wd_radio_mode == WD_RADIO_BLE_ONLY && !wifi_initialized) {
+        ESP_LOGI(TAG, "Wardrive BLE-only done: restarting WiFi");
+        esp_wifi_start();
+        wifi_initialized = true;
+        current_radio_mode = RADIO_MODE_WIFI;
+    }
+
     esp_wifi_set_promiscuous(false);
     wardrive_disable_log_capture();
     wardrive_log_ta = NULL;
@@ -11545,11 +12045,20 @@ static void wardrive_stop_btn_cb(lv_event_t *e)
     wardrive_ui_active = false;
     scan_done_ui_flag = false;
 
+    // Reset GPS prompt state so next wardrive click will re-check GPS
+    wd_gps_prompt_state = 0;
+    if (wd_gps_wait_timer) { lv_timer_del(wd_gps_wait_timer); wd_gps_wait_timer = NULL; }
+    if (wd_gps_wait_modal && lv_obj_is_valid(wd_gps_wait_modal)) { lv_obj_del(wd_gps_wait_modal); }
+    wd_gps_wait_modal = NULL;
+    wd_gps_wait_msg = NULL;
+
     if (wd_ui_timer) { lv_timer_del(wd_ui_timer); wd_ui_timer = NULL; }
     if (wd_ui_gps_label && lv_obj_is_valid(wd_ui_gps_label)) lv_obj_del(wd_ui_gps_label);
     wd_ui_gps_label = NULL;
     wd_ui_counter_label = NULL;
     wd_ui_ble_label = NULL;
+    wd_ui_counter_box = NULL;
+    wd_ui_ble_box = NULL;
     wd_ui_channel_label = NULL;
     wd_ui_header = NULL;
     wd_ui_table = NULL;
@@ -11572,7 +12081,8 @@ static void wardrive_stop_btn_cb(lv_event_t *e)
         wd_marks_file = NULL;
     }
 
-    nav_to_menu_flag = true;
+    // Return to wardrive menu, not main menu
+    show_wardrive_menu_screen();
 }
 
 // Back To Observer callback from Karma screen
@@ -12941,12 +13451,31 @@ static void radio_reset_to_idle(void)
         ensure_wifi_mode();
     } else {
         // WiFi driver is alive — just cycle stop/start to clear AP, promisc, etc.
+
+        // ========== DMA TRACKING: Before WiFi stop ==========
+        size_t dma_before_wifi_stop = heap_caps_get_free_size(MALLOC_CAP_DMA);
+        ESP_LOGI(TAG, "[DMA_TRACK] radio_reset: before WiFi stop — DMA: %u bytes", (unsigned)dma_before_wifi_stop);
+        // ===================================================
+
         esp_wifi_set_promiscuous(false);
         esp_wifi_set_promiscuous_rx_cb(NULL);
         wifi_scanner_abort();   /* clear any stuck scan state before stop */
         esp_wifi_stop();
+
+        // ========== DMA TRACKING: After WiFi stop ==========
+        size_t dma_after_wifi_stop = heap_caps_get_free_size(MALLOC_CAP_DMA);
+        ESP_LOGI(TAG, "[DMA_TRACK] radio_reset: after WiFi stop — DMA: %u bytes (released: %u)",
+                 (unsigned)dma_after_wifi_stop, (unsigned)(dma_after_wifi_stop - dma_before_wifi_stop));
+        // ==================================================
+
         esp_wifi_set_mode(WIFI_MODE_STA);
         esp_wifi_start();
+
+        // ========== DMA TRACKING: After WiFi restart ==========
+        size_t dma_after_wifi_restart = heap_caps_get_free_size(MALLOC_CAP_DMA);
+        ESP_LOGI(TAG, "[DMA_TRACK] radio_reset: after WiFi restart — DMA: %u bytes", (unsigned)dma_after_wifi_restart);
+        // ====================================================
+
         vTaskDelay(pdMS_TO_TICKS(300));  // let STA task finish starting before scan is allowed
         { wifi_country_t _wc = { .cc="01",.schan=1,.nchan=13,.policy=WIFI_COUNTRY_POLICY_MANUAL }; esp_wifi_set_country(&_wc); }   /* MANUAL — prevent regdomain update from AP on next STA connect */
         apply_wifi_power_settings();
@@ -13535,22 +14064,20 @@ static void show_wifi_scan_attack_screen(void)
     lv_obj_set_flex_align(scan_container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_gap(scan_container, 10, 0);
     
-    // WiFi scanning icon
-    lv_obj_t *scan_icon = lv_label_create(scan_container);
-    lv_label_set_text(scan_icon, LV_SYMBOL_WIFI);
-    lv_obj_set_style_text_font(scan_icon, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(scan_icon, ui_text_color(), 0);
-    
+    // WiFi scanning spinner (animated indicator)
+    lv_obj_t *scan_spinner = lv_spinner_create(scan_container, 1000, 60);
+    lv_obj_set_size(scan_spinner, 50, 50);
+
     // Scanning text
     scan_status_label = lv_label_create(scan_container);
     lv_label_set_text(scan_status_label, "Scanning...");
     lv_obj_set_style_text_color(scan_status_label, ui_text_color(), 0);
     lv_obj_set_style_text_font(scan_status_label, &lv_font_montserrat_20, 0);
-    
+
     // Clear previous selections when user manually starts scan
     wifi_scanner_clear_selections();
     wifi_scanner_clear_targets();
-    
+
     // Start scan
     wifi_scanner_start_scan();
 }
@@ -18371,27 +18898,29 @@ static void show_wardrive_menu_screen(void)
 
 // --- Wardrive Options screen ---
 
-static lv_obj_t *wd_opts_band_dd = NULL;
-static lv_obj_t *wd_opts_pcap_sw = NULL;
-static lv_obj_t *wd_opts_ble_sw  = NULL;
+static lv_obj_t *wd_opts_band_dd  = NULL;
+static lv_obj_t *wd_opts_pcap_sw  = NULL;
+static lv_obj_t *wd_opts_ble_sw   = NULL;
+static lv_obj_t *wd_opts_radio_dd = NULL;
 
 static void wd_opts_save_cb(lv_event_t *e)
 {
     (void)e;
     if (wd_opts_band_dd) g_wd_band = (wd_band_t)lv_dropdown_get_selected(wd_opts_band_dd);
     if (wd_opts_pcap_sw) g_wd_pcap = lv_obj_has_state(wd_opts_pcap_sw, LV_STATE_CHECKED);
-    // g_wd_ble always true — BLE toggle removed
+    if (wd_opts_radio_dd) g_wd_radio_mode = (wd_radio_mode_t)lv_dropdown_get_selected(wd_opts_radio_dd);
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_u8(h, NVS_KEY_WD_BAND, (uint8_t)g_wd_band);
         nvs_set_u8(h, NVS_KEY_WD_PCAP, g_wd_pcap ? 1 : 0);
-        // NVS_KEY_WD_BLE no longer saved — BLE is always on
+        nvs_set_u8(h, NVS_KEY_WD_RADIO, (uint8_t)g_wd_radio_mode);
         nvs_commit(h);
         nvs_close(h);
     }
     wd_opts_band_dd = NULL;
     wd_opts_pcap_sw = NULL;
-    wd_opts_ble_sw  = NULL;  // always NULL now — BLE toggle removed
+    wd_opts_ble_sw  = NULL;
+    wd_opts_radio_dd = NULL;
     show_wardrive_menu_screen();
 }
 
@@ -18400,7 +18929,8 @@ static void wd_opts_back_cb(lv_event_t *e)
     (void)e;
     wd_opts_band_dd = NULL;
     wd_opts_pcap_sw = NULL;
-    wd_opts_ble_sw  = NULL;  // always NULL now — BLE toggle removed
+    wd_opts_ble_sw  = NULL;
+    wd_opts_radio_dd = NULL;
     show_wardrive_menu_screen();
 }
 
@@ -18454,7 +18984,22 @@ static void show_wardrive_options_screen(void)
     lv_obj_align(wd_opts_pcap_sw, LV_ALIGN_RIGHT_MID, 0, 0);
     if (g_wd_pcap) lv_obj_add_state(wd_opts_pcap_sw, LV_STATE_CHECKED);
 
-    // BLE is always on via coex — no toggle needed
+    // Radio mode label
+    lv_obj_t *radio_lbl = lv_label_create(content);
+    lv_label_set_text(radio_lbl, "Radio Mode");
+    lv_obj_set_style_text_color(radio_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(radio_lbl, &lv_font_montserrat_14, 0);
+
+    // Radio mode dropdown
+    wd_opts_radio_dd = lv_dropdown_create(content);
+    lv_dropdown_set_options(wd_opts_radio_dd, "WiFi (2.4+5) only\nBLE only");
+    lv_dropdown_set_selected(wd_opts_radio_dd, (uint16_t)g_wd_radio_mode);
+    lv_obj_set_width(wd_opts_radio_dd, LCD_H_RES - 32);
+    lv_obj_set_style_text_font(wd_opts_radio_dd, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wd_opts_radio_dd, ui_text_color(), 0);
+    lv_obj_set_style_bg_color(wd_opts_radio_dd, ui_card_color(), 0);
+    lv_obj_set_style_border_color(wd_opts_radio_dd, UI_ACCENT_GREEN, 0);
+    lv_obj_set_style_border_width(wd_opts_radio_dd, 1, 0);
 
     // Save button
     lv_obj_t *save_btn = lv_btn_create(function_page);
@@ -21716,6 +22261,12 @@ static void show_sd_free_space_screen(void)
 
     bool ok = false;
     uint64_t total_b = 0, free_b = 0, used_b = 0;
+
+    // ========== DMA TRACKING: Before SD get_free_space ==========
+    size_t dma_before_getfree = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    ESP_LOGI(TAG, "[DMA_TRACK] Before f_getfree — DMA: %u bytes", (unsigned)dma_before_getfree);
+    // ==========================================================
+
     if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
         FATFS *fs_p;
         DWORD fre_clust;
@@ -22651,6 +23202,7 @@ static void gps_show_edit_overlay(lv_event_t *e)
 
     // ── Keyboard (child of overlay, always renders above card and its contents) ──
     lv_obj_t *kb = lv_keyboard_create(gps_edit_overlay);
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);  // numeric — coords are "-0123456789."
     lv_obj_set_size(kb, LCD_H_RES, 130);
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
@@ -23023,6 +23575,8 @@ static void lookout_back_btn_cb(lv_event_t *e)
     if (!bt_lookout_is_active() && current_radio_mode == RADIO_MODE_BLE) {
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
+        // Reinit WiFi to reclaim DMA for other features
+        wifi_cli_init();
     }
     show_bluetooth_screen();
 }
@@ -27305,6 +27859,7 @@ static void gw_deferred_start_cb(lv_timer_t *t)
 
 static void gw_back_btn_cb(lv_event_t *e)
 {
+    (void)e;
     gw_screen_active = false;
     gw_status_lbl    = NULL;
     gw_svc_lbl       = NULL;
@@ -27312,6 +27867,10 @@ static void gw_back_btn_cb(lv_event_t *e)
     gw_result_lbl    = NULL;
     gw_cancel_btn    = NULL;
     gw_back_btn      = NULL;
+
+    // Reinit WiFi to reclaim DMA for other features
+    wifi_cli_init();
+
     show_bt_attack_tiles_screen();
 }
 
@@ -27844,6 +28403,9 @@ static void show_gatt_walker_screen(void)
 {
     if (function_page) { lv_obj_del(function_page); function_page = NULL; }
     reset_function_page_children();
+
+    // Switch to BLE mode (deinits WiFi if running, frees 42KB DMA for BLE)
+    ensure_ble_mode();
 
     /* Stop any active scan — we'll need the radio for connecting */
     ble_gap_disc_cancel();
@@ -31773,6 +32335,15 @@ static bool ensure_wifi_mode(void)
             };
             esp_wifi_set_country(&wifi_country);
             apply_wifi_power_settings();
+
+            // Register WiFi scan event handler NOW that WiFi is fully initialized
+            // (moved from app_main to ensure the event loop is ready)
+            static bool s_wifi_event_handler_registered = false;
+            if (!s_wifi_event_handler_registered) {
+                esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE, &wifi_scan_done_cb, NULL);
+                s_wifi_event_handler_registered = true;
+                ESP_LOGI(TAG, "WiFi scan event handler registered");
+            }
 
             current_radio_mode = RADIO_MODE_WIFI;
             wifi_initialized = true;
@@ -42611,8 +43182,8 @@ static void show_nrf24_foxhunt_screen(void)
     s_n24fox_hits = 0; s_n24fox_samples = 0;
 
     if (!nrf24_chip_present()) {
-        s_cc1101_stub_screen(MY_SYMBOL_PERSON_WALKING "  nRF24 Fox Hunt — No nRF24",
-                             "Check DIP 2 ON.\nRun HW Test first.");
+        s_n24_stub_screen(MY_SYMBOL_PERSON_WALKING "  nRF24 Fox Hunt - No nRF24",
+                          "Check DIP 2 ON.\nRun HW Test first.");
         return;
     }
     nrf24_set_channel(s_n24fox_channel);
