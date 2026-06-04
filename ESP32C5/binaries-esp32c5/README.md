@@ -1,6 +1,20 @@
 # CYM-NM28C5 Pre-built Firmware Binaries
 
-**Firmware version: v2.6.84**
+**Firmware version: v2.7.0**
+
+---
+
+## Release Notes — v2.7.0
+
+### Wardrive GPS & Radio Mode Stability
+
+Stabilized wardrive workflow with three major improvements:
+
+1. **BLE-only mode with PSRAM buffering** — BLE devices collected during scan are buffered in PSRAM and flushed to CSV after scan completes, avoiding DMA exhaustion from concurrent SD writes
+2. **WiFi-only mode** (default) no longer attempts BLE scanning, eliminating radio state thrashing and DMA pressure
+3. **GPS lock prompt** blocks wardrive startup with proper state reset — "Use Cached" proceeds immediately, "Wait for Fresh Lock" monitors satellites and auto-launches wardrive when lock acquired (≥1 sat); canceling properly resets state so next wardrive click re-checks GPS
+
+**Dual-band WiFi 6** (2.4 + 5 GHz) wardrive with optional BLE; configurable via dropdown menu. WiGLE CSV format output compatible with direct uploads.
 
 ---
 
