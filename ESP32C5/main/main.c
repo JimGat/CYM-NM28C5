@@ -11490,10 +11490,11 @@ static void wd_gps_wait_timer_cb(lv_timer_t *timer)
     if (wd_gps_prompt_state == 0 || wd_gps_prompt_state == 1) return;  // no choice yet or prompt showing
 
     // State 2: user chose "use cached" → proceed immediately
-    // State 3: user chose "wait" → only proceed if GPS now locked
+    // State 3: user chose "wait" → only proceed if GPS now has a FRESH lock (satellites > 0)
     if (wd_gps_prompt_state == 3) {
-        if (!current_gps.valid) {
-            // Still waiting; update UI with satellite count
+        // Check for fresh GPS lock: satellites > 0 (not just cached data with Sats:0)
+        if (current_gps.satellites <= 0) {
+            // Still waiting for fresh lock; update UI with satellite count
             if (wd_gps_wait_msg && lv_obj_is_valid(wd_gps_wait_msg)) {
                 char wait_text[96];
                 snprintf(wait_text, sizeof(wait_text), "Waiting for GPS lock...\nSats: %d",
@@ -11502,12 +11503,13 @@ static void wd_gps_wait_timer_cb(lv_timer_t *timer)
             }
             // Log GPS status periodically so user sees activity in logs
             if (++wd_gps_wait_sats_logged % 10 == 0) {  // log every 1 sec (10 * 100ms)
-                ESP_LOGI(TAG, "[GPS WAIT] Still waiting... Sats: %d", current_gps.satellites);
+                ESP_LOGI(TAG, "[GPS WAIT] Still waiting for fresh lock... Sats: %d, Acc: %.0fm",
+                         current_gps.satellites, (double)current_gps.accuracy);
             }
             return;  // Keep waiting
         }
-        // GPS just locked!
-        ESP_LOGI(TAG, "[GPS WAIT] GPS lock acquired! Starting wardrive with fresh fix");
+        // GPS just acquired fresh lock (satellites > 0)!
+        ESP_LOGI(TAG, "[GPS WAIT] FRESH GPS lock acquired! Starting wardrive");
         ESP_LOGI(TAG, "[GPS WAIT] Lat:%.6f Lon:%.6f Sats:%d Accuracy:%.0fm",
                  (double)current_gps.latitude, (double)current_gps.longitude,
                  current_gps.satellites, (double)current_gps.accuracy);
