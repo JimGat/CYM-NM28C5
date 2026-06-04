@@ -11480,6 +11480,8 @@ static void wd_ui_timer_cb(lv_timer_t *timer) {
 
 // Timer callback: monitor GPS prompt state and start wardrive when ready
 static lv_timer_t *wd_gps_wait_timer = NULL;
+static lv_obj_t *wd_gps_wait_msg = NULL;  // Reference to waiting message for updates
+static int wd_gps_wait_sats_logged = 0;  // track if we logged GPS status
 static void wd_gps_wait_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
@@ -11489,7 +11491,33 @@ static void wd_gps_wait_timer_cb(lv_timer_t *timer)
 
     // State 2: user chose "use cached" → proceed immediately
     // State 3: user chose "wait" → only proceed if GPS now locked
-    if (wd_gps_prompt_state == 3 && !current_gps.valid) return;  // still waiting for GPS lock
+    if (wd_gps_prompt_state == 3) {
+        if (!current_gps.valid) {
+            // Still waiting; update UI with satellite count
+            if (wd_gps_wait_msg && lv_obj_is_valid(wd_gps_wait_msg)) {
+                char wait_text[96];
+                snprintf(wait_text, sizeof(wait_text), "Waiting for GPS lock...\nSats: %d",
+                         current_gps.satellites);
+                lv_label_set_text(wd_gps_wait_msg, wait_text);
+            }
+            // Log GPS status periodically so user sees activity in logs
+            if (++wd_gps_wait_sats_logged % 10 == 0) {  // log every 1 sec (10 * 100ms)
+                ESP_LOGI(TAG, "[GPS WAIT] Still waiting... Sats: %d", current_gps.satellites);
+            }
+            return;  // Keep waiting
+        }
+        // GPS just locked!
+        ESP_LOGI(TAG, "[GPS WAIT] GPS lock acquired! Starting wardrive with fresh fix");
+        ESP_LOGI(TAG, "[GPS WAIT] Lat:%.6f Lon:%.6f Sats:%d Accuracy:%.0fm",
+                 (double)current_gps.latitude, (double)current_gps.longitude,
+                 current_gps.satellites, (double)current_gps.accuracy);
+        wd_gps_wait_sats_logged = 0;
+        // Clear waiting message before creating wardrive UI
+        if (wd_gps_wait_msg && lv_obj_is_valid(wd_gps_wait_msg)) {
+            lv_obj_del(wd_gps_wait_msg);
+        }
+        wd_gps_wait_msg = NULL;
+    }
 
     // Conditions met; create wardrive UI and start wardrive
     ESP_LOGI(TAG, "GPS prompt resolved; creating wardrive UI");
@@ -11557,17 +11585,19 @@ static void wd_gps_wait_lock_cb(lv_event_t *e)
     if (modal) lv_obj_del(modal);
 
     // Show "waiting for GPS lock" message
-    lv_obj_t *wait_msg = lv_label_create(lv_scr_act());
-    lv_label_set_text(wait_msg, "Waiting for GPS lock...\nPlease wait");
-    lv_obj_set_style_text_color(wait_msg, COLOR_MATERIAL_ORANGE, 0);
-    lv_obj_set_style_text_font(wait_msg, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_align(wait_msg, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_center(wait_msg);
+    wd_gps_wait_msg = lv_label_create(lv_scr_act());
+    lv_label_set_text(wd_gps_wait_msg, "Waiting for GPS lock...\nMove to open sky\nSats: --");
+    lv_obj_set_style_text_color(wd_gps_wait_msg, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_text_font(wd_gps_wait_msg, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_align(wd_gps_wait_msg, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_center(wd_gps_wait_msg);
 
+    ESP_LOGI(TAG, "[GPS WAIT] User chose to wait for GPS lock");
     wd_gps_prompt_state = 3;  // waiting for lock
-    // Start timer to check when GPS locks
+    wd_gps_wait_sats_logged = 0;
+    // Start timer to check when GPS locks (100ms for smooth updates)
     if (wd_gps_wait_timer) lv_timer_del(wd_gps_wait_timer);
-    wd_gps_wait_timer = lv_timer_create(wd_gps_wait_timer_cb, 500, NULL);
+    wd_gps_wait_timer = lv_timer_create(wd_gps_wait_timer_cb, 100, NULL);
 }
 
 // Show GPS lock prompt modal when wardrive starts with stale GPS
