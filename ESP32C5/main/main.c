@@ -11003,22 +11003,23 @@ static void wardrive_promisc_task(void *pvParameters) {
         wd_ui_update_flag = true;
         wdp_dwell_new_networks = 0;
 
-        // v2.6.61: Band-based BLE switching — init BLE ONLY during 5 GHz dwells
+        // Revert to v2.6.46 exclusive radio switching: pause WiFi, fully deinit it,
+        // then init BLE for the dwell. This avoids DMA collision (WiFi ~42KB + BLE ~18KB > 48KB pool).
         bool is_5g = (channel >= 36);
-        bool ble_5g_initialized = false;
-        bool ble_5g_started = false;
+        bool ble_5g_switched = false;
 
         if (is_5g && wdp_ble_devices && ble_scan_feasible) {
-            // Stop WiFi promiscuous during 5 GHz to free DMA for BLE
+            // Stop WiFi promiscuous and fully deinit to free ~42KB DMA
             esp_wifi_set_promiscuous(false);
             vTaskDelay(pdMS_TO_TICKS(5));
 
-            // Initialize BLE only when needed (5 GHz dwell)
-            if (bt_nimble_init() == ESP_OK) {
-                ble_5g_initialized = true;
+            // Fully deinit WiFi (not just stop) to release entire DMA footprint
+            // ensure_ble_mode() handles this transition automatically
+            if (ensure_ble_mode()) {
+                ble_5g_switched = true;
                 vTaskDelay(pdMS_TO_TICKS(10));
 
-                // Run BLE at 100% duty (10ms/10ms = full bandwidth)
+                // Run BLE at 100% duty during the dwell
                 struct ble_gap_disc_params bp5 = {
                     .itvl = 0x10, .window = 0x10,  // 100% duty
                     .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
@@ -11026,14 +11027,13 @@ static void wardrive_promisc_task(void *pvParameters) {
                 };
                 if (ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER,
                                  &bp5, wdp_ble_gap_cb, NULL) == 0) {
-                    ble_5g_started = true;
                     wd_used_coex_ble = true;
                 } else {
                     ESP_LOGW(TAG, "[WDP] 5GHz BLE scan failed");
-                    ble_scan_feasible = false;  // mark as infeasible for future dwells
+                    ble_scan_feasible = false;
                 }
             } else {
-                ESP_LOGW(TAG, "[WDP] 5GHz BLE init failed");
+                ESP_LOGW(TAG, "[WDP] 5GHz BLE mode switch failed");
                 ble_scan_feasible = false;
             }
         }
@@ -11049,22 +11049,15 @@ static void wardrive_promisc_task(void *pvParameters) {
         }
         // ====================================================
 
-        if (ble_5g_started) {
-            // Stop BLE scan after dwell
+        // If BLE was switched to, stop scan and switch back to WiFi
+        if (ble_5g_switched) {
             ble_gap_disc_cancel();
             vTaskDelay(pdMS_TO_TICKS(5));
-        }
-
-        if (ble_5g_initialized) {
-            // Deinitialize BLE to release DMA before resuming WiFi promiscuous
-            ble_gap_disc_cancel();  // ensure scan is stopped
-            // Note: nimble_initialized flag persists; BLE can be re-initialized next 5GHz dwell
-            vTaskDelay(pdMS_TO_TICKS(5));
-        }
-
-        // Resume WiFi promiscuous for 2.4 GHz dwells
-        if (is_5g) {
+            // Fully deinit BLE and reinit WiFi via ensure_wifi_mode()
+            ensure_wifi_mode();
+            // Restart WiFi promiscuous for next 2.4 GHz dwells
             esp_wifi_set_promiscuous(true);
+            vTaskDelay(pdMS_TO_TICKS(5));
         }
 
         int len = uart_read_bytes(GPS_UART_NUM, (uint8_t*)wardrive_gps_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(50));
