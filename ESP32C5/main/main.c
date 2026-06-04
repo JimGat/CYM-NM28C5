@@ -1120,8 +1120,7 @@ static volatile bool wd_ui_update_flag = false;
 static volatile int wdp_current_channel = 0;
 
 // Wardrive GPS lock prompt state machine
-static volatile int wd_gps_prompt_state = 0;  // 0=none, 1=prompt shown, 2=use cached, 3=waiting for lock, 4=ready
-static volatile bool wd_gps_check_needed = true;  // skip GPS check on subsequent wardrive_start_btn_cb calls
+static volatile int wd_gps_prompt_state = 0;  // 0=none, 1=prompt shown, 2=use cached, 3=waiting for lock
 
 // Wardrive GPS marks (waypoints)
 static FILE       *wd_marks_file      = NULL;
@@ -11502,7 +11501,6 @@ static void wd_gps_cancel_wait_cb(lv_event_t *e)
     wd_gps_wait_modal = NULL;
     wd_gps_wait_msg = NULL;
     wd_gps_prompt_state = 0;
-    wd_gps_check_needed = true;  // Allow next wardrive click to re-check GPS
 
     // Return to wardrive menu
     show_wardrive_menu_screen();
@@ -11736,24 +11734,20 @@ static void wardrive_start_btn_cb(lv_event_t *e)
 {
     (void)e;
 
-    // Check GPS lock status ONLY on first call (when button clicked)
-    // Skip on subsequent calls from timer callback (wd_gps_check_needed = false)
-    if (wd_gps_check_needed) {
-        wd_gps_check_needed = false;  // mark as checked
-
+    // Only check GPS if we're not already in a GPS choice/wait state
+    // (wd_gps_prompt_state > 0 means user is interacting with GPS modal)
+    if (wd_gps_prompt_state == 0) {
         // Check GPS lock status before showing wardrive
         if (!current_gps.valid) {
             // GPS is stale; check if we have cached data
             const gps_data_t *cached = gps_best();
             if (cached && cached->latitude != 0.0f) {
                 // Have cached data; show prompt and wait for user choice
-                wd_gps_prompt_state = 0;
                 wd_gps_show_prompt_modal();
                 // Don't proceed yet; wait for user to choose via callback
                 return;
             } else {
                 // No GPS data at all
-                wd_gps_check_needed = true;  // reset for next attempt
                 lv_obj_t *mbox = lv_msgbox_create(NULL, "Error", "No GPS data available\nPlease wait for fix or move\nnear window",
                                                   (const char *[]){"OK", ""}, true);
                 lv_obj_center(mbox);
@@ -12050,6 +12044,13 @@ static void wardrive_stop_btn_cb(lv_event_t *e)
     wardrive_stop_btn = NULL;
     wardrive_ui_active = false;
     scan_done_ui_flag = false;
+
+    // Reset GPS prompt state so next wardrive click will re-check GPS
+    wd_gps_prompt_state = 0;
+    if (wd_gps_wait_timer) { lv_timer_del(wd_gps_wait_timer); wd_gps_wait_timer = NULL; }
+    if (wd_gps_wait_modal && lv_obj_is_valid(wd_gps_wait_modal)) { lv_obj_del(wd_gps_wait_modal); }
+    wd_gps_wait_modal = NULL;
+    wd_gps_wait_msg = NULL;
 
     if (wd_ui_timer) { lv_timer_del(wd_ui_timer); wd_ui_timer = NULL; }
     if (wd_ui_gps_label && lv_obj_is_valid(wd_ui_gps_label)) lv_obj_del(wd_ui_gps_label);
