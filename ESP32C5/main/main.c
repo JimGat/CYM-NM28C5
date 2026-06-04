@@ -11346,42 +11346,69 @@ static void wd_ui_timer_cb(lv_timer_t *timer) {
         lv_label_set_text(wd_ui_ble_label, ble_buf);
     }
 
-    // Update table with last 50 networks
+    // Update table with last 50 networks/devices (WiFi or BLE depending on mode)
     if (wd_ui_table) {
-        int total = wdp_seen_count;
-        int show = (total > 50) ? 50 : total;
-        int start = total - show;
-        lv_table_set_row_cnt(wd_ui_table, show > 0 ? show : 1);
+        int total, show, start;
         lv_table_set_col_cnt(wd_ui_table, 5);
 
-        for (int i = 0; i < show; i++) {
-            wdp_network_t *net = &wdp_seen_networks[start + show - 1 - i];
-            char ssid_trunc[20];
-            strncpy(ssid_trunc, net->ssid[0] ? net->ssid : "[hidden]", 19);
-            ssid_trunc[19] = '\0';
-            lv_table_set_cell_value(wd_ui_table, i, 0, ssid_trunc);
+        if (g_wd_radio_mode == WD_RADIO_BLE_ONLY) {
+            // Show BLE devices
+            total = wdp_ble_count;
+            show = (total > 50) ? 50 : total;
+            start = total - show;
+            lv_table_set_row_cnt(wd_ui_table, show > 0 ? show : 1);
 
-            char ch_str[4];
-            snprintf(ch_str, sizeof(ch_str), "%d", net->channel);
-            lv_table_set_cell_value(wd_ui_table, i, 1, ch_str);
+            for (int i = 0; i < show; i++) {
+                wdp_ble_device_t *dev = &wdp_ble_devices[start + show - 1 - i];
+                char addr_str[18];
+                snprintf(addr_str, sizeof(addr_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                         dev->mac[0], dev->mac[1], dev->mac[2], dev->mac[3], dev->mac[4], dev->mac[5]);
+                lv_table_set_cell_value(wd_ui_table, i, 0, addr_str);
 
-            char rssi_str[8];
-            snprintf(rssi_str, sizeof(rssi_str), "%d", net->rssi);
-            lv_table_set_cell_value(wd_ui_table, i, 2, rssi_str);
+                char rssi_str[8];
+                snprintf(rssi_str, sizeof(rssi_str), "%d", dev->rssi);
+                lv_table_set_cell_value(wd_ui_table, i, 1, rssi_str);
 
-            const char *auth = get_auth_mode_wiggle(net->authmode);
-            char auth_short[8];
-            strncpy(auth_short, auth, 7);
-            auth_short[7] = '\0';
-            lv_table_set_cell_value(wd_ui_table, i, 3, auth_short);
-
-            char coord_str[24];
-            if (net->latitude != 0.0f || net->longitude != 0.0f) {
-                snprintf(coord_str, sizeof(coord_str), "%.2f", (double)net->latitude);
-            } else {
-                snprintf(coord_str, sizeof(coord_str), "--");
+                lv_table_set_cell_value(wd_ui_table, i, 2, "BLE");
+                lv_table_set_cell_value(wd_ui_table, i, 3, "");
+                lv_table_set_cell_value(wd_ui_table, i, 4, "");
             }
-            lv_table_set_cell_value(wd_ui_table, i, 4, coord_str);
+        } else {
+            // Show WiFi networks
+            total = wdp_seen_count;
+            show = (total > 50) ? 50 : total;
+            start = total - show;
+            lv_table_set_row_cnt(wd_ui_table, show > 0 ? show : 1);
+
+            for (int i = 0; i < show; i++) {
+                wdp_network_t *net = &wdp_seen_networks[start + show - 1 - i];
+                char ssid_trunc[20];
+                strncpy(ssid_trunc, net->ssid[0] ? net->ssid : "[hidden]", 19);
+                ssid_trunc[19] = '\0';
+                lv_table_set_cell_value(wd_ui_table, i, 0, ssid_trunc);
+
+                char ch_str[4];
+                snprintf(ch_str, sizeof(ch_str), "%d", net->channel);
+                lv_table_set_cell_value(wd_ui_table, i, 1, ch_str);
+
+                char rssi_str[8];
+                snprintf(rssi_str, sizeof(rssi_str), "%d", net->rssi);
+                lv_table_set_cell_value(wd_ui_table, i, 2, rssi_str);
+
+                const char *auth = get_auth_mode_wiggle(net->authmode);
+                char auth_short[8];
+                strncpy(auth_short, auth, 7);
+                auth_short[7] = '\0';
+                lv_table_set_cell_value(wd_ui_table, i, 3, auth_short);
+
+                char coord_str[24];
+                if (net->latitude != 0.0f || net->longitude != 0.0f) {
+                    snprintf(coord_str, sizeof(coord_str), "%.2f", (double)net->latitude);
+                } else {
+                    snprintf(coord_str, sizeof(coord_str), "--");
+                }
+                lv_table_set_cell_value(wd_ui_table, i, 4, coord_str);
+            }
         }
     }
 }
