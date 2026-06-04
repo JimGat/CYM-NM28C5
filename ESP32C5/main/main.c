@@ -1283,7 +1283,7 @@ static lv_obj_t         *wdup_back_btn_obj     = NULL;
 typedef struct { char text[128]; lv_color_t color; } wdup_ui_msg_t;
 static wd_band_t         g_wd_band         = WD_BAND_BOTH;
 static bool              g_wd_pcap         = false;
-static wd_radio_mode_t   g_wd_radio_mode   = WD_RADIO_WIFI_ONLY;  // default: WiFi only
+static wd_radio_mode_t   g_wd_radio_mode   = WD_RADIO_WIFI_ONLY;  // default: WiFi only (recommended for SD writes)
 static void            (*wdup_back_fn)(void) = NULL;
 static bool              wdup_use_explicit  = false;
 static int               wdup_explicit_indices[64];
@@ -9873,6 +9873,11 @@ static int wdp_ble_gap_cb(struct ble_gap_event *event, void *arg)
     }
 
     wdp_ble_count = cnt + 1;
+    if (g_wd_radio_mode == WD_RADIO_BLE_ONLY) {
+        ESP_LOGD(TAG, "[WDP] BLE-only: detected device #%d: %02X:%02X:%02X:%02X:%02X:%02X RSSI=%d",
+                 cnt + 1, dev->mac[5], dev->mac[4], dev->mac[3],
+                 dev->mac[2], dev->mac[1], dev->mac[0], dev->rssi);
+    }
     return 0;
 }
 
@@ -11074,7 +11079,10 @@ static void wardrive_promisc_task(void *pvParameters) {
         int channel = wdp_ducb_channels[ch_idx].channel;
         int dwell_ms = wdp_get_dwell_ms(wdp_ducb_channels[ch_idx].tier);
 
-        esp_wifi_set_channel((uint8_t)channel, WIFI_SECOND_CHAN_NONE);
+        // Only set WiFi channel in WiFi mode; in BLE-only mode, WiFi is not running
+        if (g_wd_radio_mode != WD_RADIO_BLE_ONLY) {
+            esp_wifi_set_channel((uint8_t)channel, WIFI_SECOND_CHAN_NONE);
+        }
         wdp_current_channel = channel;
         wd_ui_update_flag = true;
         wdp_dwell_new_networks = 0;
@@ -11223,9 +11231,10 @@ static void wardrive_promisc_task(void *pvParameters) {
             net->written_to_file = true;
             networks_since_flush++;
         }
-        // Write any newly discovered BLE devices
+        // Write any newly discovered BLE devices (in WiGLE-compatible format)
         if (g_wd_ble && wdp_ble_devices) {
             int ble_cnt = wdp_ble_count;
+            int ble_written = 0;
             for (int i = 0; i < ble_cnt; i++) {
                 if (wdp_ble_devices[i].written) continue;
                 wdp_ble_device_t *bd = &wdp_ble_devices[i];
@@ -11240,6 +11249,10 @@ static void wardrive_promisc_task(void *pvParameters) {
                         bd->rssi, bd->latitude, bd->longitude);
                 bd->written = true;
                 networks_since_flush++;
+                ble_written++;
+            }
+            if (ble_written > 0) {
+                ESP_LOGI(TAG, "[WDP] Wrote %d BLE device(s) to CSV (total BLE: %d)", ble_written, ble_cnt);
             }
         }
 
