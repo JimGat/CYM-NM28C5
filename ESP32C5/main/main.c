@@ -11025,7 +11025,7 @@ static void wardrive_promisc_task(void *pvParameters) {
     // 0x0040 = 64 units × 0.625ms = 40ms (window = interval = 100% duty).
     if (g_wd_radio_mode == WD_RADIO_BLE_ONLY && wdp_ble_devices && bt_nimble_init() == ESP_OK) {
 #if MYNEWT_VAL(BLE_EXT_ADV)
-        struct ble_gap_ext_disc_params bpe = { .itvl = 0x0040, .window = 0x0040, .passive = 0 };
+        struct ble_gap_ext_disc_params bpe = { .itvl = 0x0040, .window = 0x0040, .passive = 1 };
         if (ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 0, 0, 0,
                              BLE_HCI_SCAN_FILT_NO_WL, 0,
                              &bpe, &bpe, wdp_ble_gap_cb, NULL) == 0) {
@@ -11035,7 +11035,7 @@ static void wardrive_promisc_task(void *pvParameters) {
         }
 #else
         struct ble_gap_disc_params bp = { .itvl = 0x0040, .window = 0x0040,
-            .filter_policy = BLE_HCI_SCAN_FILT_NO_WL, .passive = 0, .filter_duplicates = 0 };
+            .filter_policy = BLE_HCI_SCAN_FILT_NO_WL, .passive = 1, .filter_duplicates = 0 };
         if (ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &bp, wdp_ble_gap_cb, NULL) == 0) {
             ble_continuous = true;
             wd_used_coex_ble = true;
