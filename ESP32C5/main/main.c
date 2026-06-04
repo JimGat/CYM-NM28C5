@@ -1121,6 +1121,7 @@ static volatile int wdp_current_channel = 0;
 
 // Wardrive GPS lock prompt state machine
 static volatile int wd_gps_prompt_state = 0;  // 0=none, 1=prompt shown, 2=use cached, 3=waiting for lock, 4=ready
+static volatile bool wd_gps_check_needed = true;  // skip GPS check on subsequent wardrive_start_btn_cb calls
 
 // Wardrive GPS marks (waypoints)
 static FILE       *wd_marks_file      = NULL;
@@ -11480,8 +11481,32 @@ static void wd_ui_timer_cb(lv_timer_t *timer) {
 
 // Timer callback: monitor GPS prompt state and start wardrive when ready
 static lv_timer_t *wd_gps_wait_timer = NULL;
-static lv_obj_t *wd_gps_wait_msg = NULL;  // Reference to waiting message for updates
-static int wd_gps_wait_sats_logged = 0;  // track if we logged GPS status
+static lv_obj_t *wd_gps_wait_modal = NULL;  // Reference to waiting modal (not just text overlay)
+static lv_obj_t *wd_gps_wait_msg = NULL;   // Reference to waiting message for updates
+static int wd_gps_wait_sats_logged = 0;     // track if we logged GPS status
+
+// Cancel button callback - user clicked Cancel while waiting for GPS
+static void wd_gps_cancel_wait_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "[GPS WAIT] User cancelled GPS wait");
+
+    // Clean up timer and modal
+    if (wd_gps_wait_timer) {
+        lv_timer_del(wd_gps_wait_timer);
+        wd_gps_wait_timer = NULL;
+    }
+    if (wd_gps_wait_modal && lv_obj_is_valid(wd_gps_wait_modal)) {
+        lv_obj_del(wd_gps_wait_modal);
+    }
+    wd_gps_wait_modal = NULL;
+    wd_gps_wait_msg = NULL;
+    wd_gps_prompt_state = 0;
+
+    // Return to wardrive menu
+    show_wardrive_menu_screen();
+}
+
 static void wd_gps_wait_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
@@ -11494,7 +11519,7 @@ static void wd_gps_wait_timer_cb(lv_timer_t *timer)
     if (wd_gps_prompt_state == 3) {
         // Check for fresh GPS lock: satellites > 0 (not just cached data with Sats:0)
         if (current_gps.satellites <= 0) {
-            // Still waiting for fresh lock; update UI with satellite count
+            // Still waiting for fresh lock; update modal with satellite count
             if (wd_gps_wait_msg && lv_obj_is_valid(wd_gps_wait_msg)) {
                 char wait_text[96];
                 snprintf(wait_text, sizeof(wait_text), "Waiting for GPS lock...\nSats: %d",
@@ -11503,8 +11528,8 @@ static void wd_gps_wait_timer_cb(lv_timer_t *timer)
             }
             // Log GPS status periodically so user sees activity in logs
             if (++wd_gps_wait_sats_logged % 10 == 0) {  // log every 1 sec (10 * 100ms)
-                ESP_LOGI(TAG, "[GPS WAIT] Still waiting for fresh lock... Sats: %d, Acc: %.0fm",
-                         current_gps.satellites, (double)current_gps.accuracy);
+                ESP_LOGI(TAG, "[GPS WAIT] Still waiting for fresh lock... Sats: %d",
+                         current_gps.satellites);
             }
             return;  // Keep waiting
         }
@@ -11514,10 +11539,11 @@ static void wd_gps_wait_timer_cb(lv_timer_t *timer)
                  (double)current_gps.latitude, (double)current_gps.longitude,
                  current_gps.satellites, (double)current_gps.accuracy);
         wd_gps_wait_sats_logged = 0;
-        // Clear waiting message before creating wardrive UI
-        if (wd_gps_wait_msg && lv_obj_is_valid(wd_gps_wait_msg)) {
-            lv_obj_del(wd_gps_wait_msg);
+        // Close waiting modal
+        if (wd_gps_wait_modal && lv_obj_is_valid(wd_gps_wait_modal)) {
+            lv_obj_del(wd_gps_wait_modal);
         }
+        wd_gps_wait_modal = NULL;
         wd_gps_wait_msg = NULL;
     }
 
@@ -11575,10 +11601,10 @@ static void wd_gps_use_now_cb(lv_event_t *e)
 {
     lv_obj_t *modal = (lv_obj_t *)lv_event_get_user_data(e);
     if (modal) lv_obj_del(modal);
+    ESP_LOGI(TAG, "[GPS PROMPT] User chose 'Use Now' - starting wardrive with cached GPS");
     wd_gps_prompt_state = 2;  // use cached
-    // Start timer to proceed with wardrive
-    if (wd_gps_wait_timer) lv_timer_del(wd_gps_wait_timer);
-    wd_gps_wait_timer = lv_timer_create(wd_gps_wait_timer_cb, 100, NULL);
+    // Continue wardrive setup immediately (skip GPS check since we've already decided)
+    wardrive_start_btn_cb(NULL);
 }
 
 static void wd_gps_wait_lock_cb(lv_event_t *e)
@@ -11586,15 +11612,46 @@ static void wd_gps_wait_lock_cb(lv_event_t *e)
     lv_obj_t *modal = (lv_obj_t *)lv_event_get_user_data(e);
     if (modal) lv_obj_del(modal);
 
-    // Show "waiting for GPS lock" message
-    wd_gps_wait_msg = lv_label_create(lv_scr_act());
-    lv_label_set_text(wd_gps_wait_msg, "Waiting for GPS lock...\nMove to open sky\nSats: --");
-    lv_obj_set_style_text_color(wd_gps_wait_msg, COLOR_MATERIAL_ORANGE, 0);
-    lv_obj_set_style_text_font(wd_gps_wait_msg, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_align(wd_gps_wait_msg, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_center(wd_gps_wait_msg);
+    // Create persistent modal with Cancel button
+    wd_gps_wait_modal = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(wd_gps_wait_modal, 220, 160);
+    lv_obj_align(wd_gps_wait_modal, LV_ALIGN_CENTER, 0, -20);
+    lv_obj_set_style_bg_color(wd_gps_wait_modal, lv_color_make(25, 25, 40), 0);
+    lv_obj_set_style_border_color(wd_gps_wait_modal, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_border_width(wd_gps_wait_modal, 2, 0);
+    lv_obj_set_style_radius(wd_gps_wait_modal, 8, 0);
+    lv_obj_set_style_pad_all(wd_gps_wait_modal, 8, 0);
 
-    ESP_LOGI(TAG, "[GPS WAIT] User chose to wait for GPS lock");
+    // Title
+    lv_obj_t *title = lv_label_create(wd_gps_wait_modal);
+    lv_label_set_text(title, "Acquiring GPS Lock");
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    // Message with satellite count
+    wd_gps_wait_msg = lv_label_create(wd_gps_wait_modal);
+    lv_label_set_text(wd_gps_wait_msg, "Searching for satellites...\nSats: 0");
+    lv_obj_set_style_text_color(wd_gps_wait_msg, lv_color_make(200, 200, 200), 0);
+    lv_obj_set_style_text_font(wd_gps_wait_msg, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_align(wd_gps_wait_msg, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(wd_gps_wait_msg, 200);
+    lv_label_set_long_mode(wd_gps_wait_msg, LV_LABEL_LONG_WRAP);
+    lv_obj_align(wd_gps_wait_msg, LV_ALIGN_TOP_MID, 0, 22);
+
+    // Cancel button
+    lv_obj_t *cancel_btn = lv_btn_create(wd_gps_wait_modal);
+    lv_obj_set_size(cancel_btn, 190, 30);
+    lv_obj_align(cancel_btn, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_make(244, 67, 54), 0);
+    lv_obj_set_style_radius(cancel_btn, 6, 0);
+    lv_obj_add_event_cb(cancel_btn, wd_gps_cancel_wait_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, "Cancel");
+    lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(cancel_lbl);
+
+    ESP_LOGI(TAG, "[GPS WAIT] User chose to wait for GPS lock - modal shown");
     wd_gps_prompt_state = 3;  // waiting for lock
     wd_gps_wait_sats_logged = 0;
     // Start timer to check when GPS locks (100ms for smooth updates)
@@ -11678,27 +11735,33 @@ static void wardrive_start_btn_cb(lv_event_t *e)
 {
     (void)e;
 
-    // Check GPS lock status before showing wardrive
-    // If GPS is fresh, skip the prompt and proceed immediately
-    if (!current_gps.valid) {
-        // GPS is stale; check if we have cached data
-        const gps_data_t *cached = gps_best();
-        if (cached && cached->latitude != 0.0f) {
-            // Have cached data; show prompt and wait for user choice
-            wd_gps_prompt_state = 0;
-            wd_gps_show_prompt_modal();
-            // Don't proceed yet; wait for user to choose via callback
-            return;
-        } else {
-            // No GPS data at all
-            lv_obj_t *mbox = lv_msgbox_create(NULL, "Error", "No GPS data available\nPlease wait for fix or move\nnear window",
-                                              (const char *[]){"OK", ""}, true);
-            lv_obj_center(mbox);
-            return;
+    // Check GPS lock status ONLY on first call (when button clicked)
+    // Skip on subsequent calls from timer callback (wd_gps_check_needed = false)
+    if (wd_gps_check_needed) {
+        wd_gps_check_needed = false;  // mark as checked
+
+        // Check GPS lock status before showing wardrive
+        if (!current_gps.valid) {
+            // GPS is stale; check if we have cached data
+            const gps_data_t *cached = gps_best();
+            if (cached && cached->latitude != 0.0f) {
+                // Have cached data; show prompt and wait for user choice
+                wd_gps_prompt_state = 0;
+                wd_gps_show_prompt_modal();
+                // Don't proceed yet; wait for user to choose via callback
+                return;
+            } else {
+                // No GPS data at all
+                wd_gps_check_needed = true;  // reset for next attempt
+                lv_obj_t *mbox = lv_msgbox_create(NULL, "Error", "No GPS data available\nPlease wait for fix or move\nnear window",
+                                                  (const char *[]){"OK", ""}, true);
+                lv_obj_center(mbox);
+                return;
+            }
         }
     }
 
-    // GPS is fresh; proceed immediately
+    // GPS is fresh or user has made choice; proceed with wardrive setup
     // WiFi is already initialized at boot (v2.0.1 restored behavior).
     // No need to call ensure_wifi_mode() — this avoids DMA fragmentation from
     // deinit/reinit cycles. BLE will initialize during wardrive into a clean,
