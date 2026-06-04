@@ -10984,12 +10984,12 @@ static void wardrive_promisc_task(void *pvParameters) {
     // =================================================
 
     // Start BLE scan immediately via coex — coex stack shares the radio automatically.
-    // With reduced WiFi buffers (RX=8, TX=8), DMA budget allows 12.5% BLE duty.
-    // Scan window = 40ms / interval = 320ms → 12.5% BLE duty, 87.5% RF time for WiFi.
-    // 0x0040 = 64 units × 0.625ms = 40ms; 0x0200 = 512 units × 0.625ms = 320ms.
+    // Reduced BLE duty (3.1%) to avoid DMA fragmentation during SD writes.
+    // Scan window = 40ms / interval = 1280ms → 3.1% BLE duty, 96.9% RF time for WiFi.
+    // 0x0040 = 64 units × 0.625ms = 40ms; 0x0800 = 2048 units × 0.625ms = 1280ms.
     if (wdp_ble_devices && bt_nimble_init() == ESP_OK) {
 #if MYNEWT_VAL(BLE_EXT_ADV)
-        struct ble_gap_ext_disc_params bpe = { .itvl = 0x0200, .window = 0x0040, .passive = 0 };
+        struct ble_gap_ext_disc_params bpe = { .itvl = 0x0800, .window = 0x0040, .passive = 0 };
         if (ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 0, 0, 0,
                              BLE_HCI_SCAN_FILT_NO_WL, 0,
                              &bpe, &bpe, wdp_ble_gap_cb, NULL) == 0) {
@@ -10998,7 +10998,7 @@ static void wardrive_promisc_task(void *pvParameters) {
             ESP_LOGI(TAG, "[WDP] BLE coex ext_disc running (12.5%% duty, 40ms/320ms)");
         }
 #else
-        struct ble_gap_disc_params bp = { .itvl = 0x0200, .window = 0x0040,
+        struct ble_gap_disc_params bp = { .itvl = 0x0800, .window = 0x0040,
             .filter_policy = BLE_HCI_SCAN_FILT_NO_WL, .passive = 0, .filter_duplicates = 0 };
         if (ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &bp, wdp_ble_gap_cb, NULL) == 0) {
             ble_continuous = true;
@@ -11202,7 +11202,7 @@ static void wardrive_promisc_task(void *pvParameters) {
             // Resume BLE if it was running
             if (ble_continuous) {
                 vTaskDelay(pdMS_TO_TICKS(5));
-                struct ble_gap_disc_params bp = { .itvl = 0x0200, .window = 0x0040,
+                struct ble_gap_disc_params bp = { .itvl = 0x0800, .window = 0x0040,
                     .filter_policy = BLE_HCI_SCAN_FILT_NO_WL, .passive = 0, .filter_duplicates = 0 };
                 if (ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &bp, wdp_ble_gap_cb, NULL) == 0) {
                     // BLE resumed
