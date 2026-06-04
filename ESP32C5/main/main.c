@@ -11023,27 +11023,46 @@ static void wardrive_promisc_task(void *pvParameters) {
     // Start BLE scan only if BLE-only mode (WiFi-only doesn't use BLE).
     // BLE-only uses 100% duty cycle (no WiFi to share radio time with).
     // 0x0040 = 64 units × 0.625ms = 40ms (window = interval = 100% duty).
-    if (g_wd_radio_mode == WD_RADIO_BLE_ONLY && wdp_ble_devices && bt_nimble_init() == ESP_OK) {
+    if (g_wd_radio_mode == WD_RADIO_BLE_ONLY && wdp_ble_devices) {
+        size_t dma_before_nimble = heap_caps_get_free_size(MALLOC_CAP_DMA);
+        ESP_LOGI(TAG, "[BLE_INSTRUMENTATION] Before bt_nimble_init: DMA=%u bytes", (unsigned)dma_before_nimble);
+
+        if (bt_nimble_init() == ESP_OK) {
+            size_t dma_after_nimble = heap_caps_get_free_size(MALLOC_CAP_DMA);
+            ESP_LOGI(TAG, "[BLE_INSTRUMENTATION] After bt_nimble_init: DMA=%u bytes (consumed: %u bytes)",
+                     (unsigned)dma_after_nimble, (unsigned)(dma_before_nimble - dma_after_nimble));
+
 #if MYNEWT_VAL(BLE_EXT_ADV)
-        struct ble_gap_ext_disc_params bpe = { .itvl = 0x0040, .window = 0x0040, .passive = 1 };
-        if (ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 0, 0, 0,
-                             BLE_HCI_SCAN_FILT_NO_WL, 0,
-                             &bpe, &bpe, wdp_ble_gap_cb, NULL) == 0) {
-            ble_continuous = true;
-            wd_used_coex_ble = true;
-            ESP_LOGI(TAG, "[WDP] BLE scan running (100%% duty, continuous)");
-        }
+            struct ble_gap_ext_disc_params bpe = { .itvl = 0x0040, .window = 0x0040, .passive = 1 };
+            size_t dma_before_scan = heap_caps_get_free_size(MALLOC_CAP_DMA);
+            if (ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 0, 0, 0,
+                                 BLE_HCI_SCAN_FILT_NO_WL, 0,
+                                 &bpe, &bpe, wdp_ble_gap_cb, NULL) == 0) {
+                size_t dma_after_scan = heap_caps_get_free_size(MALLOC_CAP_DMA);
+                ble_continuous = true;
+                wd_used_coex_ble = true;
+                ESP_LOGI(TAG, "[BLE_INSTRUMENTATION] After ble_gap_ext_disc: DMA=%u bytes (consumed: %u bytes)",
+                         (unsigned)dma_after_scan, (unsigned)(dma_before_scan - dma_after_scan));
+                ESP_LOGI(TAG, "[WDP] BLE scan running (100%% duty, continuous)");
+            }
 #else
-        struct ble_gap_disc_params bp = { .itvl = 0x0040, .window = 0x0040,
-            .filter_policy = BLE_HCI_SCAN_FILT_NO_WL, .passive = 1, .filter_duplicates = 0 };
-        if (ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &bp, wdp_ble_gap_cb, NULL) == 0) {
-            ble_continuous = true;
-            wd_used_coex_ble = true;
-            ESP_LOGI(TAG, "[WDP] BLE scan running (100%% duty, continuous)");
-        }
+            struct ble_gap_disc_params bp = { .itvl = 0x0040, .window = 0x0040,
+                .filter_policy = BLE_HCI_SCAN_FILT_NO_WL, .passive = 1, .filter_duplicates = 0 };
+            size_t dma_before_scan = heap_caps_get_free_size(MALLOC_CAP_DMA);
+            if (ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &bp, wdp_ble_gap_cb, NULL) == 0) {
+                size_t dma_after_scan = heap_caps_get_free_size(MALLOC_CAP_DMA);
+                ble_continuous = true;
+                wd_used_coex_ble = true;
+                ESP_LOGI(TAG, "[BLE_INSTRUMENTATION] After ble_gap_disc: DMA=%u bytes (consumed: %u bytes)",
+                         (unsigned)dma_after_scan, (unsigned)(dma_before_scan - dma_after_scan));
+                ESP_LOGI(TAG, "[WDP] BLE scan running (100%% duty, continuous)");
+            }
 #endif
-        if (!ble_continuous)
-            ESP_LOGW(TAG, "[WDP] BLE coex scan start failed");
+            if (!ble_continuous)
+                ESP_LOGW(TAG, "[WDP] BLE coex scan start failed");
+        } else {
+            ESP_LOGE(TAG, "[BLE_INSTRUMENTATION] bt_nimble_init() FAILED");
+        }
     }
 
     int64_t last_stats_us = esp_timer_get_time();
