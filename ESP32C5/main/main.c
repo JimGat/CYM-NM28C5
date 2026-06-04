@@ -11232,8 +11232,10 @@ static void wardrive_promisc_task(void *pvParameters) {
             net->written_to_file = true;
             networks_since_flush++;
         }
-        // Write any newly discovered BLE devices (in WiGLE-compatible format)
-        if (g_wd_ble && wdp_ble_devices) {
+        // In WiFi-only mode, write BLE devices during scan (if any detected via coex)
+        // In BLE-only mode, skip writing during scan to avoid SD DMA exhaustion
+        // BLE devices will be flushed to CSV after wardrive stops
+        if (g_wd_ble && wdp_ble_devices && g_wd_radio_mode != WD_RADIO_BLE_ONLY) {
             int ble_cnt = wdp_ble_count;
             int ble_written = 0;
             for (int i = 0; i < ble_cnt; i++) {
@@ -11300,6 +11302,33 @@ static void wardrive_promisc_task(void *pvParameters) {
     esp_wifi_set_promiscuous(false);
 
     if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
+
+    // In BLE-only mode, flush all buffered BLE devices to CSV after scan stops
+    if (file && g_wd_radio_mode == WD_RADIO_BLE_ONLY && wdp_ble_devices) {
+        char timestamp[32];
+        get_timestamp_string(timestamp, sizeof(timestamp));
+        int ble_cnt = wdp_ble_count;
+        int ble_flushed = 0;
+        for (int i = 0; i < ble_cnt; i++) {
+            if (wdp_ble_devices[i].written) continue;
+            wdp_ble_device_t *bd = &wdp_ble_devices[i];
+            char ble_mac[18];
+            snprintf(ble_mac, sizeof(ble_mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     bd->mac[5], bd->mac[4], bd->mac[3],
+                     bd->mac[2], bd->mac[1], bd->mac[0]);
+            char ble_name[64];
+            escape_csv_field(bd->name[0] ? bd->name : "[BLE]", ble_name, sizeof(ble_name));
+            fprintf(file, "%s,%s,[BLE],%s,37,2402,%d,%.7f,%.7f,0.00,0.00,,,BLE\n",
+                    ble_mac, ble_name, timestamp,
+                    bd->rssi, bd->latitude, bd->longitude);
+            bd->written = true;
+            ble_flushed++;
+        }
+        if (ble_flushed > 0) {
+            ESP_LOGI(TAG, "[WDP] BLE-only: flushed %d device(s) to CSV after scan", ble_flushed);
+        }
+    }
+
     if (file) { fflush(file); fclose(file); }
     if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
 
