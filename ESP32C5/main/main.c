@@ -11582,7 +11582,8 @@ static void wardrive_stop_btn_cb(lv_event_t *e)
         wd_marks_file = NULL;
     }
 
-    nav_to_menu_flag = true;
+    // Return to wardrive menu, not main menu
+    show_wardrive_menu_screen();
 }
 
 // Back To Observer callback from Karma screen
