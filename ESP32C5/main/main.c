@@ -3310,7 +3310,8 @@ static void nvs_settings_load(void)
         uint8_t wp = 0;
         if (nvs_get_u8(h, NVS_KEY_WD_PCAP, &wp) == ESP_OK) g_wd_pcap = (wp != 0);
         uint8_t wr = 0;
-        if (nvs_get_u8(h, NVS_KEY_WD_RADIO, &wr) == ESP_OK) g_wd_radio_mode = (wd_radio_mode_t)wr;
+        // Don't load wardrive radio mode from NVS — always use default (WiFi) on boot
+        // if (nvs_get_u8(h, NVS_KEY_WD_RADIO, &wr) == ESP_OK) g_wd_radio_mode = (wd_radio_mode_t)wr;
         uint8_t wble = 0;
         // g_wd_ble is always true — no longer user-configurable
         uint8_t rfhat = 0;
