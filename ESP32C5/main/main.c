@@ -579,7 +579,7 @@ static void nvs_save_cc1101_offset(void);   // forward — implemented near HW t
 typedef enum { WD_BAND_BOTH = 0, WD_BAND_24G, WD_BAND_5G } wd_band_t;
 
 // Wardrive radio mode (which radios to use)
-typedef enum { WD_RADIO_WIFI_BOTH = 0, WD_RADIO_BLE_ONLY } wd_radio_mode_t;
+typedef enum { WD_RADIO_WIFI_BOTH = 0, WD_RADIO_WIFI_ONLY, WD_RADIO_BLE_ONLY } wd_radio_mode_t;
 
 // Wardrive upload log path
 #define WDUP_LOG_PATH "/sdcard/lab/wardrives/upload_log.csv"
@@ -10999,11 +10999,11 @@ static void wardrive_promisc_task(void *pvParameters) {
         ESP_LOGI(TAG, "Wardrive BLE-only mode: WiFi promiscuous disabled");
     }
 
-    // Start BLE scan immediately via coex — coex stack shares the radio automatically.
+    // Start BLE scan only if not WiFi-only mode.
     // Reduced BLE duty (3.1%) to avoid DMA fragmentation during SD writes.
     // Scan window = 40ms / interval = 1280ms → 3.1% BLE duty, 96.9% RF time for WiFi.
     // 0x0040 = 64 units × 0.625ms = 40ms; 0x0800 = 2048 units × 0.625ms = 1280ms.
-    if (g_wd_radio_mode == WD_RADIO_WIFI_BOTH && wdp_ble_devices && bt_nimble_init() == ESP_OK) {
+    if (g_wd_radio_mode != WD_RADIO_WIFI_ONLY && wdp_ble_devices && bt_nimble_init() == ESP_OK) {
 #if MYNEWT_VAL(BLE_EXT_ADV)
         struct ble_gap_ext_disc_params bpe = { .itvl = 0x0800, .window = 0x0040, .passive = 0 };
         if (ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 0, 0, 0,
@@ -11011,7 +11011,7 @@ static void wardrive_promisc_task(void *pvParameters) {
                              &bpe, &bpe, wdp_ble_gap_cb, NULL) == 0) {
             ble_continuous = true;
             wd_used_coex_ble = true;
-            ESP_LOGI(TAG, "[WDP] BLE coex ext_disc running (12.5%% duty, 40ms/320ms)");
+            ESP_LOGI(TAG, "[WDP] BLE coex ext_disc running (3.1%% duty, 40ms/1280ms)");
         }
 #else
         struct ble_gap_disc_params bp = { .itvl = 0x0800, .window = 0x0040,
@@ -11019,7 +11019,7 @@ static void wardrive_promisc_task(void *pvParameters) {
         if (ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &bp, wdp_ble_gap_cb, NULL) == 0) {
             ble_continuous = true;
             wd_used_coex_ble = true;
-            ESP_LOGI(TAG, "[WDP] BLE coex disc running (12.5%% duty, 40ms/320ms)");
+            ESP_LOGI(TAG, "[WDP] BLE coex disc running (3.1%% duty, 40ms/1280ms)");
         }
 #endif
         if (!ble_continuous)
@@ -11445,7 +11445,7 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_set_style_radius(wd_ui_ble_box, 10, 0);
     lv_obj_set_style_pad_all(wd_ui_ble_box, 0, 0);
     lv_obj_clear_flag(wd_ui_ble_box, LV_OBJ_FLAG_SCROLLABLE);
-    if (g_wd_radio_mode == WD_RADIO_WIFI_BOTH) lv_obj_add_flag(wd_ui_ble_box, LV_OBJ_FLAG_HIDDEN);
+    if (g_wd_radio_mode != WD_RADIO_WIFI_BOTH) lv_obj_add_flag(wd_ui_ble_box, LV_OBJ_FLAG_HIDDEN);
 
     lv_obj_t *ble_title = lv_label_create(wd_ui_ble_box);
     lv_label_set_text(ble_title, "BLE");
@@ -18575,7 +18575,7 @@ static void show_wardrive_options_screen(void)
 
     // Radio mode dropdown
     wd_opts_radio_dd = lv_dropdown_create(content);
-    lv_dropdown_set_options(wd_opts_radio_dd, "WiFi (2.4 + 5 GHz)\nBLE only");
+    lv_dropdown_set_options(wd_opts_radio_dd, "WiFi (2.4+5) + BLE\nWiFi (2.4+5) only\nBLE only");
     lv_dropdown_set_selected(wd_opts_radio_dd, (uint16_t)g_wd_radio_mode);
     lv_obj_set_width(wd_opts_radio_dd, LCD_H_RES - 32);
     lv_obj_set_style_text_font(wd_opts_radio_dd, &lv_font_montserrat_12, 0);
