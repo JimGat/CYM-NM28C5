@@ -11502,6 +11502,7 @@ static void wd_gps_cancel_wait_cb(lv_event_t *e)
     wd_gps_wait_modal = NULL;
     wd_gps_wait_msg = NULL;
     wd_gps_prompt_state = 0;
+    wd_gps_check_needed = true;  // Allow next wardrive click to re-check GPS
 
     // Return to wardrive menu
     show_wardrive_menu_screen();
