@@ -11189,8 +11189,27 @@ static void wardrive_promisc_task(void *pvParameters) {
         }
 
         if (networks_since_flush >= WDP_FILE_FLUSH_INTERVAL) {
+            // Pause BLE briefly to allow DMA defragmentation during SD flush
+            // (DMA allocation for SD write can fail if pool is fragmented by WiFi+BLE)
+            if (ble_continuous) {
+                ble_gap_disc_cancel();
+                vTaskDelay(pdMS_TO_TICKS(5));  // let DMA settle
+            }
+
             fflush(file);
             networks_since_flush = 0;
+
+            // Resume BLE if it was running
+            if (ble_continuous) {
+                vTaskDelay(pdMS_TO_TICKS(5));
+                struct ble_gap_disc_params bp = { .itvl = 0x0200, .window = 0x0040,
+                    .filter_policy = BLE_HCI_SCAN_FILT_NO_WL, .passive = 0, .filter_duplicates = 0 };
+                if (ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &bp, wdp_ble_gap_cb, NULL) == 0) {
+                    // BLE resumed
+                } else {
+                    ESP_LOGW(TAG, "[WDP] BLE resume after SD flush failed");
+                }
+            }
         }
         if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
 
