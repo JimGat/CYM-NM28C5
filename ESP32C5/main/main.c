@@ -11098,8 +11098,8 @@ static void wardrive_promisc_task(void *pvParameters) {
         }
         // ====================================================
 
-        // BLE burst fallback (only when coex continuous scan unavailable)
-        if (!ble_continuous && g_wd_ble && wdp_ble_devices &&
+        // BLE burst fallback (only in BLE-only mode; WiFi-only mode skips BLE entirely)
+        if (g_wd_radio_mode == WD_RADIO_BLE_ONLY && !ble_continuous && g_wd_ble && wdp_ble_devices &&
             (esp_timer_get_time() - last_ble_us) >= (int64_t)WDP_BLE_INTERVAL_S * 1000000LL) {
             last_ble_us = esp_timer_get_time();
 
