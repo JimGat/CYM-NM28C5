@@ -10929,6 +10929,13 @@ static void wardrive_promisc_task(void *pvParameters) {
                 vTaskDelay(pdMS_TO_TICKS(500));
             }
             if (!wardrive_active) {
+                // Restore WiFi if we stopped it for BLE-only mode
+                if (g_wd_radio_mode == WD_RADIO_BLE_ONLY && !wifi_initialized) {
+                    ESP_LOGI(TAG, "Wardrive BLE-only done: restarting WiFi");
+                    esp_wifi_start();
+                    wifi_initialized = true;
+                    current_radio_mode = RADIO_MODE_WIFI;
+                }
                 wardrive_task_handle = NULL;
                 vTaskDelete(NULL);
                 return;
@@ -10958,6 +10965,13 @@ static void wardrive_promisc_task(void *pvParameters) {
     if (!file) {
         ESP_LOGI(TAG, "Failed to create %s - aborting", filename);
         if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+        // Restore WiFi if we stopped it for BLE-only mode
+        if (g_wd_radio_mode == WD_RADIO_BLE_ONLY && !wifi_initialized) {
+            ESP_LOGI(TAG, "Wardrive BLE-only done: restarting WiFi");
+            esp_wifi_start();
+            wifi_initialized = true;
+            current_radio_mode = RADIO_MODE_WIFI;
+        }
         wardrive_active = false;
         wardrive_task_handle = NULL;
         vTaskDelete(NULL);
@@ -10968,6 +10982,13 @@ static void wardrive_promisc_task(void *pvParameters) {
     fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type\n");
     fflush(file);
     if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+
+    // For BLE-only mode, unload WiFi to free up DMA
+    if (g_wd_radio_mode == WD_RADIO_BLE_ONLY && wifi_initialized) {
+        ESP_LOGI(TAG, "Wardrive BLE-only: stopping WiFi to free DMA");
+        esp_wifi_stop();
+        wifi_initialized = false;
+    }
 
     wdp_ducb_init();
 
@@ -11272,6 +11293,15 @@ static void wardrive_promisc_task(void *pvParameters) {
     ESP_LOGI(TAG, "Wardrive promisc stopped. Total networks: %d. File: wd%d.csv",
              wdp_seen_count, wardrive_file_counter);
     log_heap_stats("wardrive-stop");
+
+    // Restore WiFi if we stopped it for BLE-only mode
+    if (g_wd_radio_mode == WD_RADIO_BLE_ONLY && !wifi_initialized) {
+        ESP_LOGI(TAG, "Wardrive BLE-only done: restarting WiFi");
+        esp_wifi_start();
+        wifi_initialized = true;
+        current_radio_mode = RADIO_MODE_WIFI;
+    }
+
     vTaskDelete(NULL);
 }
 
@@ -11627,7 +11657,15 @@ static void wardrive_stop_btn_cb(lv_event_t *e)
         
         ESP_LOGI(TAG, "Wardrive stopped");
     }
-    
+
+    // Restore WiFi if we stopped it for BLE-only mode
+    if (g_wd_radio_mode == WD_RADIO_BLE_ONLY && !wifi_initialized) {
+        ESP_LOGI(TAG, "Wardrive BLE-only done: restarting WiFi");
+        esp_wifi_start();
+        wifi_initialized = true;
+        current_radio_mode = RADIO_MODE_WIFI;
+    }
+
     esp_wifi_set_promiscuous(false);
     wardrive_disable_log_capture();
     wardrive_log_ta = NULL;
