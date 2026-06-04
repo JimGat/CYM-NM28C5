@@ -5243,10 +5243,19 @@ void app_main(void)
         ESP_LOGW(TAG, "LED initialization failed");
     }
 
-    // WiFi is initialized on-demand by ensure_wifi_mode() when first needed (Wardrive, WiFi Scan, etc).
-    // Initializing here wastes 42 KB of DMA for the entire session when using BLE-only features.
-    // current_radio_mode starts at RADIO_MODE_NONE; wifi_initialized starts as false.
-    ESP_LOGI(TAG, "[INIT] WiFi deferred to on-demand initialization (Wardrive/Scan/Deauth)");
+    // Initialize WiFi at boot (v2.0.1 behavior, restored for shared wardrive capture).
+    // Keeping WiFi up from boot avoids DMA fragmentation from repeated deinit/init cycles.
+    // The 42 KB DMA footprint is unavoidable on ESP32-C5, so keep it allocated once at boot
+    // rather than fragmenting it across BLE screen transitions. This allows bt_nimble_init()
+    // to succeed during wardrive by initializing BLE into a clean, stable WiFi+coex stack.
+    esp_err_t wifi_init_ret = wifi_cli_init();
+    if (wifi_init_ret == ESP_OK) {
+        current_radio_mode = RADIO_MODE_WIFI;
+        wifi_initialized = true;
+        ESP_LOGI(TAG, "[INIT] WiFi initialized at boot (shared wardrive capture enabled)");
+    } else {
+        ESP_LOGE(TAG, "[INIT] WiFi init failed at boot: 0x%x", wifi_init_ret);
+    }
 
     // Load screen settings (timeout, brightness) from NVS
     nvs_settings_load();
@@ -11317,8 +11326,10 @@ static void wardrive_start_btn_cb(lv_event_t *e)
 {
     (void)e;
 
-    // Ensure WiFi is initialized before wardrive starts (required for esp_wifi_set_promiscuous)
-    ensure_wifi_mode();
+    // WiFi is already initialized at boot (v2.0.1 restored behavior).
+    // No need to call ensure_wifi_mode() — this avoids DMA fragmentation from
+    // deinit/reinit cycles. BLE will initialize during wardrive into a clean,
+    // stable WiFi+coex stack.
 
     scan_done_ui_flag = false;
 
