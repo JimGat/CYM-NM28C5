@@ -1092,14 +1092,21 @@ typedef struct {
     float    accuracy;  // GPS accuracy at time of discovery (m); GPS_STALE_ACCURACY_M if held
 } wdp_network_t;
 
+#define WDP_DEDUP_BUFFER_SIZE  50
+#define WDP_SCREEN_FIFO_SIZE   20
+#define WDP_GPS_MOVE_THRESHOLD_M 30.48  // 100 yards in meters
+
 static wdp_ducb_channel_t wdp_ducb_channels[WDP_TOTAL_CHANNELS];
 static int wdp_ducb_channel_count = 0;
 static double wdp_ducb_discounted_total = 0.0;
-static wdp_network_t *wdp_seen_networks = NULL;
-static volatile int wdp_seen_count = 0;
-static volatile int wdp_seen_capacity = 0;
+static wdp_network_t wdp_seen_networks[WDP_DEDUP_BUFFER_SIZE];  // Fixed 50-entry FIFO dedup buffer
+static int wdp_fifo_head = 0;  // FIFO head pointer
+static volatile int wdp_seen_count = 0;  // Current count in FIFO (0-50)
+static volatile int wdp_total_networks = 0;  // Cumulative counter (never resets during wardrive)
 static volatile int wdp_dwell_new_networks = 0;
-static volatile bool wdp_needs_grow = false;
+static float wdp_last_gps_lat = 0.0f;  // Track GPS for 100-yard buffer clear
+static float wdp_last_gps_lon = 0.0f;
+static wdp_network_t wdp_screen_fifo[WDP_SCREEN_FIFO_SIZE];  // 20-network screen display FIFO
 
 // Wardrive UI state
 static lv_obj_t *wardrive_log_ta = NULL;
@@ -5284,9 +5291,8 @@ void app_main(void)
     hs_ap_targets = (hs_ap_target_t *)heap_caps_calloc(HS_MAX_APS, sizeof(hs_ap_target_t), MALLOC_CAP_SPIRAM);
     hs_clients = (hs_client_entry_t *)heap_caps_calloc(HS_MAX_CLIENTS, sizeof(hs_client_entry_t), MALLOC_CAP_SPIRAM);
     ducb_channels = (ducb_channel_t *)heap_caps_calloc(dual_band_channels_count, sizeof(ducb_channel_t), MALLOC_CAP_SPIRAM);
-    wdp_seen_networks = (wdp_network_t *)heap_caps_calloc(WDP_INITIAL_CAPACITY, sizeof(wdp_network_t), MALLOC_CAP_SPIRAM);
-    wdp_seen_capacity = WDP_INITIAL_CAPACITY;
-    if (!hs_ap_targets || !hs_clients || !ducb_channels || !wdp_seen_networks) {
+    // wdp_seen_networks is now a fixed 50-entry array (no dynamic allocation needed)
+    if (!hs_ap_targets || !hs_clients || !ducb_channels) {
         ESP_LOGE(TAG, "PSRAM alloc FAILED!");
     }
 
@@ -7004,7 +7010,7 @@ void app_main(void)
 
                 if (wd_ui_counter_label && lv_obj_is_valid(wd_ui_counter_label)) {
                     char cnt_buf[32];
-                    snprintf(cnt_buf, sizeof(cnt_buf), "%d", wdp_seen_count);
+                    snprintf(cnt_buf, sizeof(cnt_buf), "%d", wdp_total_networks);  // Show cumulative counter
                     lv_label_set_text(wd_ui_counter_label, cnt_buf);
                 }
 
@@ -7015,13 +7021,11 @@ void app_main(void)
                 }
 
                 if (wd_ui_table && lv_obj_is_valid(wd_ui_table)) {
-                    int total = wdp_seen_count;
-                    int show = (total > 50) ? 50 : total;
-                    int start = total - show;
-                    lv_table_set_row_cnt(wd_ui_table, show > 0 ? show : 1);
+                    // Display screen FIFO (20 most recent networks)
+                    lv_table_set_row_cnt(wd_ui_table, WDP_SCREEN_FIFO_SIZE);
                     lv_table_set_col_cnt(wd_ui_table, 5);
-                    for (int i = 0; i < show; i++) {
-                        wdp_network_t *net = &wdp_seen_networks[start + show - 1 - i];
+                    for (int i = 0; i < WDP_SCREEN_FIFO_SIZE; i++) {
+                        wdp_network_t *net = &wdp_screen_fifo[i];
                         char ssid_trunc[20];
                         strncpy(ssid_trunc, net->ssid[0] ? net->ssid : "[hidden]", 19);
                         ssid_trunc[19] = '\0';
@@ -9577,6 +9581,34 @@ static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t typ
 // Wardrive Promisc: Promiscuous Callback and Buffer Growth
 // ============================================================================
 
+static float wdp_gps_distance_m(float lat1, float lon1, float lat2, float lon2) {
+    // Haversine formula for distance between two GPS coordinates in meters
+    float dlat = (lat2 - lat1) * 0.0174533f;  // convert to radians
+    float dlon = (lon2 - lon1) * 0.0174533f;
+    float a = sin(dlat / 2) * sin(dlat / 2) + cos(lat1 * 0.0174533f) * cos(lat2 * 0.0174533f) * sin(dlon / 2) * sin(dlon / 2);
+    float c = 2 * atan2(sqrt(a), sqrt(1 - a));
+    return 6371000 * c;  // Earth radius in meters
+}
+
+static void wdp_clear_dedup_buffer(void) {
+    wdp_fifo_head = 0;
+    wdp_seen_count = 0;
+    memset(wdp_seen_networks, 0, sizeof(wdp_seen_networks));
+    memset(wdp_screen_fifo, 0, sizeof(wdp_screen_fifo));
+    const gps_data_t *g = gps_best();
+    wdp_last_gps_lat = g->valid ? g->latitude : 0.0f;
+    wdp_last_gps_lon = g->valid ? g->longitude : 0.0f;
+    ESP_LOGI(TAG, "[WDP] Dedup buffer cleared (GPS moved 100+ yards)");
+}
+
+static void wdp_push_to_screen_fifo(const wdp_network_t *net) {
+    // Shift screen FIFO: move all entries left, drop oldest, add new at end
+    for (int i = 0; i < WDP_SCREEN_FIFO_SIZE - 1; i++) {
+        memcpy(&wdp_screen_fifo[i], &wdp_screen_fifo[i + 1], sizeof(wdp_network_t));
+    }
+    memcpy(&wdp_screen_fifo[WDP_SCREEN_FIFO_SIZE - 1], net, sizeof(wdp_network_t));
+}
+
 static int wdp_find_bssid(const uint8_t *bssid) {
     for (int i = 0; i < wdp_seen_count; i++) {
         if (memcmp(wdp_seen_networks[i].bssid, bssid, 6) == 0) return i;
@@ -9941,6 +9973,15 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
         offset += 2 + tag_len;
     }
 
+    // Check if GPS moved 100+ yards; if so, clear dedup buffer to allow re-discovery
+    const gps_data_t *g = gps_best();
+    if (g->valid && (wdp_last_gps_lat != 0.0f || wdp_last_gps_lon != 0.0f)) {
+        float dist = wdp_gps_distance_m(wdp_last_gps_lat, wdp_last_gps_lon, g->latitude, g->longitude);
+        if (dist >= WDP_GPS_MOVE_THRESHOLD_M) {
+            wdp_clear_dedup_buffer();
+        }
+    }
+
     int existing = wdp_find_bssid(ap_bssid);
     if (existing >= 0) {
         if (pkt->rx_ctrl.rssi > wdp_seen_networks[existing].rssi) {
@@ -9949,12 +9990,14 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
         return;
     }
 
-    if (wdp_seen_count >= wdp_seen_capacity) {
-        wdp_needs_grow = true;
-        return;
+    // FIFO is full (50 entries), drop oldest and wrap
+    if (wdp_seen_count >= WDP_DEDUP_BUFFER_SIZE) {
+        wdp_fifo_head = (wdp_fifo_head + 1) % WDP_DEDUP_BUFFER_SIZE;
+    } else {
+        wdp_seen_count++;
     }
 
-    int idx = wdp_seen_count;
+    int idx = (wdp_fifo_head + wdp_seen_count - 1) % WDP_DEDUP_BUFFER_SIZE;
     memcpy(wdp_seen_networks[idx].bssid, ap_bssid, 6);
     strncpy(wdp_seen_networks[idx].ssid, ssid, 32);
     wdp_seen_networks[idx].ssid[32] = '\0';
@@ -9962,39 +10005,16 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     wdp_seen_networks[idx].rssi = (int8_t)pkt->rx_ctrl.rssi;
     wdp_seen_networks[idx].authmode = authmode;
     wdp_seen_networks[idx].written_to_file = false;
-    {
-        const gps_data_t *g = gps_best();
-        wdp_seen_networks[idx].latitude  = g->valid ? g->latitude  : 0.0f;
-        wdp_seen_networks[idx].longitude = g->valid ? g->longitude : 0.0f;
-        wdp_seen_networks[idx].accuracy  = g->valid ? gps_best_accuracy() : 0.0f;
-    }
-    wdp_seen_count++;
+    wdp_seen_networks[idx].latitude  = g->valid ? g->latitude  : 0.0f;
+    wdp_seen_networks[idx].longitude = g->valid ? g->longitude : 0.0f;
+    wdp_seen_networks[idx].accuracy  = g->valid ? gps_best_accuracy() : 0.0f;
+
+    wdp_total_networks++;  // Cumulative counter (never reset)
+    wdp_push_to_screen_fifo(&wdp_seen_networks[idx]);  // Add to screen FIFO
     wdp_dwell_new_networks++;
 }
 
-static bool wdp_grow_network_buffer(void) {
-    int new_capacity = wdp_seen_capacity * 2;
-    size_t new_size = (size_t)new_capacity * sizeof(wdp_network_t);
-    size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-
-    if (free_psram < new_size + WDP_PSRAM_RESERVE_BYTES) {
-        ESP_LOGI(TAG, "Cannot grow wardrive buffer: only %u bytes free PSRAM", (unsigned)free_psram);
-        return false;
-    }
-
-    wdp_network_t *new_buf = (wdp_network_t *)heap_caps_realloc(wdp_seen_networks, new_size, MALLOC_CAP_SPIRAM);
-    if (!new_buf) {
-        ESP_LOGI(TAG, "Failed to realloc wardrive buffer to %d entries", new_capacity);
-        return false;
-    }
-
-    memset(&new_buf[wdp_seen_capacity], 0, (size_t)(new_capacity - wdp_seen_capacity) * sizeof(wdp_network_t));
-    wdp_seen_networks = new_buf;
-    wdp_seen_capacity = new_capacity;
-    wdp_needs_grow = false;
-    ESP_LOGI(TAG, "Wardrive buffer grown to %d entries", new_capacity);
-    return true;
-}
+// wdp_grow_network_buffer removed: wardrive now uses fixed 50-entry FIFO buffer
 
 static void handshake_cleanup(void) {
     ESP_LOGI(TAG, "Cleaning up handshake attack...");
@@ -10930,10 +10950,16 @@ static void wardrive_promisc_task(void *pvParameters) {
     snprintf(wd_marks_fname, sizeof(wd_marks_fname),
              "/sdcard/lab/wardrives/wd%d_marks.gpx", wardrive_file_counter);
 
+    // Initialize wardrive buffers
+    wdp_fifo_head = 0;
     wdp_seen_count = 0;
+    wdp_total_networks = 0;  // Reset cumulative counter at wardrive start
     wdp_dwell_new_networks = 0;
-    wdp_needs_grow = false;
-    if (wdp_seen_networks) memset(wdp_seen_networks, 0, (size_t)wdp_seen_capacity * sizeof(wdp_network_t));
+    memset(wdp_seen_networks, 0, sizeof(wdp_seen_networks));
+    memset(wdp_screen_fifo, 0, sizeof(wdp_screen_fifo));
+    const gps_data_t *g = gps_best();
+    wdp_last_gps_lat = g->valid ? g->latitude : 0.0f;
+    wdp_last_gps_lon = g->valid ? g->longitude : 0.0f;
 
     if (!current_gps.valid) {
         if (g_gps_last_known.valid) {
@@ -11215,8 +11241,6 @@ static void wardrive_promisc_task(void *pvParameters) {
                 esp_wifi_set_promiscuous(true);
             }
         }
-
-        if (wdp_needs_grow) wdp_grow_network_buffer();
 
         double reward = (double)wdp_dwell_new_networks;
         wdp_ducb_update(ch_idx, reward);
