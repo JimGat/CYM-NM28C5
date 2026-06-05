@@ -1092,21 +1092,20 @@ typedef struct {
     float    accuracy;  // GPS accuracy at time of discovery (m); GPS_STALE_ACCURACY_M if held
 } wdp_network_t;
 
-#define WDP_DEDUP_BUFFER_SIZE  50
+#define WDP_DEDUP_BUFFER_SIZE  100
 #define WDP_SCREEN_FIFO_SIZE   20
-#define WDP_GPS_MOVE_THRESHOLD_M 30.48  // 100 yards in meters
+#define WDP_GPS_MOVE_THRESHOLD_M 45.72  // 150 feet in meters
 
 static wdp_ducb_channel_t wdp_ducb_channels[WDP_TOTAL_CHANNELS];
 static int wdp_ducb_channel_count = 0;
 static double wdp_ducb_discounted_total = 0.0;
-static wdp_network_t wdp_seen_networks[WDP_DEDUP_BUFFER_SIZE];  // Fixed 50-entry FIFO dedup buffer
-static int wdp_fifo_head = 0;  // FIFO head pointer
-static volatile int wdp_seen_count = 0;  // Current count in FIFO (0-50)
-static volatile int wdp_total_networks = 0;  // Cumulative counter (never resets during wardrive)
+static wdp_network_t wdp_seen_networks[WDP_DEDUP_BUFFER_SIZE];  // Persistent 100-entry dedup buffer (no cycling)
+static volatile int wdp_seen_count = 0;  // Current count in dedup buffer (0-100)
+static volatile int wdp_total_networks = 0;  // Cumulative counter (increments on new CSV write, never resets during wardrive)
 static volatile int wdp_dwell_new_networks = 0;
-static float wdp_last_gps_lat = 0.0f;  // Track GPS for 100-yard buffer clear
+static float wdp_last_gps_lat = 0.0f;  // Track GPS location for 150-foot buffer clear trigger
 static float wdp_last_gps_lon = 0.0f;
-static wdp_network_t wdp_screen_fifo[WDP_SCREEN_FIFO_SIZE];  // 20-network screen display FIFO
+static wdp_network_t wdp_screen_fifo[WDP_SCREEN_FIFO_SIZE];  // 20-network screen FIFO (populated on CSV writes)
 
 // Wardrive UI state
 static lv_obj_t *wardrive_log_ta = NULL;
@@ -9591,22 +9590,25 @@ static float wdp_gps_distance_m(float lat1, float lon1, float lat2, float lon2) 
 }
 
 static void wdp_clear_dedup_buffer(void) {
-    wdp_fifo_head = 0;
     wdp_seen_count = 0;
     memset(wdp_seen_networks, 0, sizeof(wdp_seen_networks));
-    memset(wdp_screen_fifo, 0, sizeof(wdp_screen_fifo));
     const gps_data_t *g = gps_best();
     wdp_last_gps_lat = g->valid ? g->latitude : 0.0f;
     wdp_last_gps_lon = g->valid ? g->longitude : 0.0f;
-    ESP_LOGI(TAG, "[WDP] Dedup buffer cleared (GPS moved 100+ yards)");
+    ESP_LOGI(TAG, "[WDP] Dedup buffer cleared (GPS moved 150+ feet)");
 }
 
 static void wdp_push_to_screen_fifo(const wdp_network_t *net) {
-    // Shift screen FIFO: move all entries left, drop oldest, add new at end
-    for (int i = 0; i < WDP_SCREEN_FIFO_SIZE - 1; i++) {
-        memcpy(&wdp_screen_fifo[i], &wdp_screen_fifo[i + 1], sizeof(wdp_network_t));
+    if (wdp_dwell_new_networks >= WDP_SCREEN_FIFO_SIZE) {
+        // Shift: move all entries left, drop oldest, add new at end
+        for (int i = 0; i < WDP_SCREEN_FIFO_SIZE - 1; i++) {
+            memcpy(&wdp_screen_fifo[i], &wdp_screen_fifo[i + 1], sizeof(wdp_network_t));
+        }
+        memcpy(&wdp_screen_fifo[WDP_SCREEN_FIFO_SIZE - 1], net, sizeof(wdp_network_t));
+    } else {
+        memcpy(&wdp_screen_fifo[wdp_dwell_new_networks], net, sizeof(wdp_network_t));
     }
-    memcpy(&wdp_screen_fifo[WDP_SCREEN_FIFO_SIZE - 1], net, sizeof(wdp_network_t));
+    wdp_dwell_new_networks++;
 }
 
 static int wdp_find_bssid(const uint8_t *bssid) {
@@ -9973,7 +9975,7 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
         offset += 2 + tag_len;
     }
 
-    // Check if GPS moved 100+ yards; if so, clear dedup buffer to allow re-discovery
+    // Check if GPS moved 150+ feet; if so, clear dedup buffer to allow re-discovery
     const gps_data_t *g = gps_best();
     if (g->valid && (wdp_last_gps_lat != 0.0f || wdp_last_gps_lon != 0.0f)) {
         float dist = wdp_gps_distance_m(wdp_last_gps_lat, wdp_last_gps_lon, g->latitude, g->longitude);
@@ -9987,17 +9989,15 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
         if (pkt->rx_ctrl.rssi > wdp_seen_networks[existing].rssi) {
             wdp_seen_networks[existing].rssi = (int8_t)pkt->rx_ctrl.rssi;
         }
-        return;
+        return;  // Already in dedup buffer, skip
     }
 
-    // FIFO is full (50 entries), drop oldest and wrap
+    // New network found — add to persistent dedup buffer (max 100 entries)
     if (wdp_seen_count >= WDP_DEDUP_BUFFER_SIZE) {
-        wdp_fifo_head = (wdp_fifo_head + 1) % WDP_DEDUP_BUFFER_SIZE;
-    } else {
-        wdp_seen_count++;
+        return;  // Buffer full, skip further discoveries this dwell
     }
 
-    int idx = (wdp_fifo_head + wdp_seen_count - 1) % WDP_DEDUP_BUFFER_SIZE;
+    int idx = wdp_seen_count;
     memcpy(wdp_seen_networks[idx].bssid, ap_bssid, 6);
     strncpy(wdp_seen_networks[idx].ssid, ssid, 32);
     wdp_seen_networks[idx].ssid[32] = '\0';
@@ -10009,12 +10009,9 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     wdp_seen_networks[idx].longitude = g->valid ? g->longitude : 0.0f;
     wdp_seen_networks[idx].accuracy  = g->valid ? gps_best_accuracy() : 0.0f;
 
-    wdp_total_networks++;  // Cumulative counter (never reset)
-    wdp_push_to_screen_fifo(&wdp_seen_networks[idx]);  // Add to screen FIFO
-    wdp_dwell_new_networks++;
+    wdp_seen_count++;  // Increment dedup buffer count
+    wdp_total_networks++;  // Cumulative counter (never resets during wardrive)
 }
-
-// wdp_grow_network_buffer removed: wardrive now uses fixed 50-entry FIFO buffer
 
 static void handshake_cleanup(void) {
     ESP_LOGI(TAG, "Cleaning up handshake attack...");
@@ -10951,9 +10948,8 @@ static void wardrive_promisc_task(void *pvParameters) {
              "/sdcard/lab/wardrives/wd%d_marks.gpx", wardrive_file_counter);
 
     // Initialize wardrive buffers
-    wdp_fifo_head = 0;
     wdp_seen_count = 0;
-    wdp_total_networks = 0;  // Reset cumulative counter at wardrive start
+    wdp_total_networks = 0;  // Cumulative counter (increments on each new network discovery)
     wdp_dwell_new_networks = 0;
     memset(wdp_seen_networks, 0, sizeof(wdp_seen_networks));
     memset(wdp_screen_fifo, 0, sizeof(wdp_screen_fifo));
@@ -11278,6 +11274,7 @@ static void wardrive_promisc_task(void *pvParameters) {
             } else {
                 net->written_to_file = true;
                 networks_since_flush++;
+                wdp_push_to_screen_fifo(net);  // Add to screen FIFO only on successful CSV write
             }
         }
         // In WiFi-only mode, write BLE devices during scan (if any detected via coex)
