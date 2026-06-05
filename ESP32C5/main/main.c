@@ -11451,7 +11451,7 @@ static void wd_ui_timer_cb(lv_timer_t *timer) {
     // Total networks counter
     if (wd_ui_counter_label) {
         char cnt_buf[32];
-        snprintf(cnt_buf, sizeof(cnt_buf), "%d", wdp_seen_count);
+        snprintf(cnt_buf, sizeof(cnt_buf), "%d", wdp_total_networks);
         lv_label_set_text(wd_ui_counter_label, cnt_buf);
     }
 
