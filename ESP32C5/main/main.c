@@ -22499,6 +22499,7 @@ static void sd_tree_populate(const char *path)
     }
 
     DIR *dir = opendir(path);
+    ESP_LOGI(TAG, "[SD_TREE_DEBUG] opendir('%s') => handle=%p", path, (void*)dir);
     if (!dir) {
         xSemaphoreGive(sd_spi_mutex);
         lv_obj_t *e = lv_label_create(s_sd_tree_list);
@@ -22515,7 +22516,12 @@ static void sd_tree_populate(const char *path)
     for (int pass = 0; pass < 2; pass++) {
         rewinddir(dir);
         struct dirent *entry;
+        int entry_num = 0;
         while ((entry = readdir(dir)) != NULL) {
+            ESP_LOGI(TAG, "[SD_TREE_DEBUG] readdir[%d] returned: name='%s' type=%d",
+                     entry_num, entry->d_name, entry->d_type);
+            entry_num++;
+
             if (entry->d_name[0] == '.') continue;
 
             char child[300];
