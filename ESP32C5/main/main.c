@@ -22416,13 +22416,26 @@ static void sd_tree_populate(const char *path);
 static void sd_dir_btn_cb(lv_event_t *e)
 {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
-    ESP_LOGI(TAG, "[SD_TREE_DEBUG] sd_dir_btn_cb: idx=%d, s_sd_dir_count=%d", idx, s_sd_dir_count);
+    ESP_LOGI(TAG, "[SD_TREE_DEBUG] ===== BUTTON CLICK =====");
+    ESP_LOGI(TAG, "[SD_TREE_DEBUG] Current state: cwd='%s', dir_count=%d", s_sd_tree_cwd, s_sd_dir_count);
+    ESP_LOGI(TAG, "[SD_TREE_DEBUG] Button idx=%d (count=%d)", idx, s_sd_dir_count);
+
+    // Dump all stored paths
+    for (int i = 0; i < s_sd_dir_count && i < 10; i++) {
+        ESP_LOGI(TAG, "[SD_TREE_DEBUG]   paths[%d]='%s' (len=%zu)", i, s_sd_dir_paths[i], strlen(s_sd_dir_paths[i]));
+    }
+    if (s_sd_dir_count > 10) {
+        ESP_LOGI(TAG, "[SD_TREE_DEBUG]   ... and %d more paths", s_sd_dir_count - 10);
+    }
+
     if (idx >= 0 && idx < s_sd_dir_count) {
-        ESP_LOGI(TAG, "[SD_TREE_DEBUG] Navigating to s_sd_dir_paths[%d]='%s'", idx, s_sd_dir_paths[idx]);
+        ESP_LOGI(TAG, "[SD_TREE_DEBUG] NAVIGATE: paths[%d]='%s' (len=%zu, addr=%p)",
+                 idx, s_sd_dir_paths[idx], strlen(s_sd_dir_paths[idx]), (void*)&s_sd_dir_paths[idx]);
         sd_tree_populate(s_sd_dir_paths[idx]);
     } else {
         ESP_LOGW(TAG, "[SD_TREE_DEBUG] INVALID INDEX: idx=%d out of range [0,%d)", idx, s_sd_dir_count);
     }
+    ESP_LOGI(TAG, "[SD_TREE_DEBUG] ===== END BUTTON CLICK =====");
 }
 
 static void sd_tree_up_cb(lv_event_t *e)
@@ -22454,10 +22467,23 @@ static void sd_tree_populate(const char *path)
     /* Update path label — strip /sdcard prefix for display */
     if (s_sd_path_lbl) {
         const char *disp = s_sd_tree_cwd;
-        if (strncmp(disp, SD_TREE_ROOT, strlen(SD_TREE_ROOT)) == 0)
+        ESP_LOGI(TAG, "[SD_TREE_DEBUG] Label prep: s_sd_tree_cwd='%s' (len=%zu)", s_sd_tree_cwd, strlen(s_sd_tree_cwd));
+        if (strncmp(disp, SD_TREE_ROOT, strlen(SD_TREE_ROOT)) == 0) {
+            ESP_LOGI(TAG, "[SD_TREE_DEBUG] Stripping /sdcard (len=%zu) from disp", strlen(SD_TREE_ROOT));
             disp += strlen(SD_TREE_ROOT);
-        ESP_LOGI(TAG, "[SD_TREE_DEBUG] Label display text='%s'", disp[0] ? disp : "/");
-        lv_label_set_text(s_sd_path_lbl, disp[0] ? disp : "/");
+        }
+        const char *label_text = disp[0] ? disp : "/";
+        ESP_LOGI(TAG, "[SD_TREE_DEBUG] SETTING LABEL TEXT: '%s' (len=%zu, ptr=%p)", label_text, strlen(label_text), (void*)label_text);
+
+        // Extra check: verify label object is valid
+        if (lv_obj_is_valid(s_sd_path_lbl)) {
+            lv_label_set_text(s_sd_path_lbl, label_text);
+            ESP_LOGI(TAG, "[SD_TREE_DEBUG] Label set successfully");
+        } else {
+            ESP_LOGW(TAG, "[SD_TREE_DEBUG] WARNING: label object is INVALID!");
+        }
+    } else {
+        ESP_LOGW(TAG, "[SD_TREE_DEBUG] WARNING: s_sd_path_lbl is NULL!");
     }
 
     if (!s_sd_tree_list) return;
