@@ -1062,7 +1062,8 @@ static const uint8_t wdp_ch_5_dfs[]        = {52, 56, 60, 64, 100, 104, 108, 112
 #define WDP_INITIAL_CAPACITY      256
 #define WDP_PSRAM_RESERVE_BYTES   (64 * 1024)
 #define WDP_STATS_INTERVAL_US     (30 * 1000000LL)
-#define WDP_FILE_FLUSH_INTERVAL   50
+#define WDP_FILE_FLUSH_INTERVAL   20
+#define WDP_FLUSH_TIMEOUT_US      (30 * 1000000LL)
 
 typedef enum {
     WDP_TIER_24_PRIMARY,
@@ -11090,6 +11091,7 @@ static void wardrive_promisc_task(void *pvParameters) {
 
     int64_t last_stats_us = esp_timer_get_time();
     int64_t last_ble_us   = esp_timer_get_time();
+    int64_t last_flush_us = esp_timer_get_time();
     int networks_since_flush = 0;
 
     while (wardrive_active) {
@@ -11285,7 +11287,9 @@ static void wardrive_promisc_task(void *pvParameters) {
             }
         }
 
-        if (networks_since_flush >= WDP_FILE_FLUSH_INTERVAL) {
+        int64_t now_us = esp_timer_get_time();
+        if (networks_since_flush >= WDP_FILE_FLUSH_INTERVAL ||
+            (now_us - last_flush_us) >= WDP_FLUSH_TIMEOUT_US) {
             // Pause BLE briefly to allow DMA defragmentation during SD flush
             // (DMA allocation for SD write can fail if pool is fragmented by WiFi+BLE)
             if (ble_continuous) {
@@ -11297,6 +11301,7 @@ static void wardrive_promisc_task(void *pvParameters) {
                 sd_error_report("Wardrive CSV", "fflush", "buffer flush failed");
             }
             networks_since_flush = 0;
+            last_flush_us = now_us;
 
             // Resume BLE if it was running
             if (ble_continuous) {
