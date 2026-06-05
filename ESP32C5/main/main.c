@@ -22296,7 +22296,9 @@ static void show_sd_free_space_screen(void)
     if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
         FATFS *fs_p;
         DWORD fre_clust;
+        esp_task_wdt_reset();  // Reset watchdog before blocking f_getfree()
         FRESULT res = f_getfree("0:", &fre_clust, &fs_p);
+        esp_task_wdt_reset();  // Reset watchdog after f_getfree() completes
         if (res == FR_OK) {
             uint64_t clust_sz = (uint64_t)fs_p->csize * 512ULL;
             uint64_t total_clust = (uint64_t)(fs_p->n_fatent - 2);
