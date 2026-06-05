@@ -22416,8 +22416,13 @@ static void sd_tree_populate(const char *path);
 static void sd_dir_btn_cb(lv_event_t *e)
 {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
-    if (idx >= 0 && idx < s_sd_dir_count)
+    ESP_LOGI(TAG, "[SD_TREE_DEBUG] sd_dir_btn_cb: idx=%d, s_sd_dir_count=%d", idx, s_sd_dir_count);
+    if (idx >= 0 && idx < s_sd_dir_count) {
+        ESP_LOGI(TAG, "[SD_TREE_DEBUG] Navigating to s_sd_dir_paths[%d]='%s'", idx, s_sd_dir_paths[idx]);
         sd_tree_populate(s_sd_dir_paths[idx]);
+    } else {
+        ESP_LOGW(TAG, "[SD_TREE_DEBUG] INVALID INDEX: idx=%d out of range [0,%d)", idx, s_sd_dir_count);
+    }
 }
 
 static void sd_tree_up_cb(lv_event_t *e)
@@ -22440,15 +22445,18 @@ static void sd_tree_up_cb(lv_event_t *e)
 
 static void sd_tree_populate(const char *path)
 {
+    ESP_LOGI(TAG, "[SD_TREE_DEBUG] sd_tree_populate() called with path='%s'", path ? path : "NULL");
     strncpy(s_sd_tree_cwd, path, sizeof(s_sd_tree_cwd) - 1);
     s_sd_tree_cwd[sizeof(s_sd_tree_cwd) - 1] = '\0';
     s_sd_dir_count = 0;
+    ESP_LOGI(TAG, "[SD_TREE_DEBUG] After copy to cwd: cwd='%s' (len=%zu)", s_sd_tree_cwd, strlen(s_sd_tree_cwd));
 
     /* Update path label — strip /sdcard prefix for display */
     if (s_sd_path_lbl) {
         const char *disp = s_sd_tree_cwd;
         if (strncmp(disp, SD_TREE_ROOT, strlen(SD_TREE_ROOT)) == 0)
             disp += strlen(SD_TREE_ROOT);
+        ESP_LOGI(TAG, "[SD_TREE_DEBUG] Label display text='%s'", disp[0] ? disp : "/");
         lv_label_set_text(s_sd_path_lbl, disp[0] ? disp : "/");
     }
 
@@ -22486,6 +22494,10 @@ static void sd_tree_populate(const char *path)
 
             char child[300];
             snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+            if (strcmp(entry->d_name, "pcap") == 0 || strcmp(entry->d_name, "lab") == 0) {
+                ESP_LOGI(TAG, "[SD_TREE_DEBUG] Entry: name='%s' path='%s' => child='%s'",
+                         entry->d_name, path, child);
+            }
 
             /* Classify using d_type; fall back to stat only if unknown */
             bool is_dir;
@@ -22526,9 +22538,12 @@ static void sd_tree_populate(const char *path)
                 lv_label_set_text(lbl, text);
                 lv_obj_set_style_text_color(lbl, lv_color_make(255, 210, 0), 0);
                 if (s_sd_dir_count < SD_TREE_MAX_DIRS) {
+                    ESP_LOGI(TAG, "[SD_TREE_DEBUG] Adding dir[%d]: child='%s' (from path='%s' + name='%s')",
+                             s_sd_dir_count, child, path, entry->d_name);
                     strncpy(s_sd_dir_paths[s_sd_dir_count], child,
                             sizeof(s_sd_dir_paths[0]) - 1);
                     s_sd_dir_paths[s_sd_dir_count][sizeof(s_sd_dir_paths[0]) - 1] = '\0';
+                    ESP_LOGI(TAG, "[SD_TREE_DEBUG] Stored in paths[%d]: '%s'", s_sd_dir_count, s_sd_dir_paths[s_sd_dir_count]);
                     lv_obj_add_event_cb(row, sd_dir_btn_cb, LV_EVENT_CLICKED,
                                         (void *)(intptr_t)s_sd_dir_count);
                     s_sd_dir_count++;
@@ -22561,11 +22576,13 @@ static void sd_tree_populate(const char *path)
 static void show_sd_tree_screen(void)
 {
     // Reset globals to prevent stale data from previous visits
+    ESP_LOGI(TAG, "[SD_TREE_DEBUG] show_sd_tree_screen() called, resetting globals");
     memset(s_sd_tree_cwd, 0, sizeof(s_sd_tree_cwd));
     s_sd_tree_list = NULL;
     s_sd_path_lbl = NULL;
     s_sd_dir_count = 0;
     memset(s_sd_dir_paths, 0, sizeof(s_sd_dir_paths));
+    ESP_LOGI(TAG, "[SD_TREE_DEBUG] After reset: cwd='%s' dir_count=%d", s_sd_tree_cwd, s_sd_dir_count);
 
     create_function_page_base("SD File Tree");
 
