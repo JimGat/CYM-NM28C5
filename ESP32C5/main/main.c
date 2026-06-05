@@ -7019,8 +7019,8 @@ void app_main(void)
                     lv_label_set_text(wd_ui_ble_label, ble_buf);
                 }
 
-                if (wd_ui_table && lv_obj_is_valid(wd_ui_table)) {
-                    // Display screen FIFO (20 most recent networks)
+                if (wd_ui_table && lv_obj_is_valid(wd_ui_table) && wdp_dwell_new_networks > 0) {
+                    // Only redraw table if new networks were written to CSV this dwell
                     lv_table_set_row_cnt(wd_ui_table, WDP_SCREEN_FIFO_SIZE);
                     lv_table_set_col_cnt(wd_ui_table, 5);
                     for (int i = 0; i < WDP_SCREEN_FIFO_SIZE; i++) {
