@@ -3,6 +3,7 @@
 #include "ff.h"
 #include "dexter_img.h"
 #include "lvgl.h"
+#include "sd_error_handler.h"
 
 LV_FONT_DECLARE(lv_extra_symbols);
 /* Mutable Montserrat copies with lv_extra_symbols chained as .fallback.
@@ -7043,7 +7044,10 @@ void app_main(void)
             }
 
             sleep_ms = lv_timer_handler();
-            
+
+            // Check for SD write errors and show modal if needed
+            sd_error_modal_update();
+
             // Reset watchdog INSIDE mutex to catch long rendering operations
             esp_task_wdt_reset();
             
@@ -9594,11 +9598,17 @@ static void wd_save_mark(const char *note)
         if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
             wd_marks_file = fopen(wd_marks_fname, "w");
             if (wd_marks_file) {
-                fprintf(wd_marks_file,
+                int wr_hdr = fprintf(wd_marks_file,
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
                     "<gpx version=\"1.1\" creator=\"JANOS NM-CYD-C5 %s\">\n",
                     FW_VERSION);
-                fflush(wd_marks_file);
+                if (wr_hdr < 0) {
+                    sd_error_report("Wardrive GPX", "fprintf", "header write failed");
+                    fclose(wd_marks_file);
+                    wd_marks_file = NULL;
+                } else if (fflush(wd_marks_file) != 0) {
+                    sd_error_report("Wardrive GPX", "fflush", "header flush failed");
+                }
             }
             xSemaphoreGive(sd_spi_mutex);
         }
@@ -9631,7 +9641,7 @@ static void wd_save_mark(const char *note)
     }
 
     if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
-        fprintf(wd_marks_file,
+        int wr_wp = fprintf(wd_marks_file,
             "<wpt lat=\"%.7f\" lon=\"%.7f\">\n"
             "  <ele>%.1f</ele>\n"
             "  <time>%s</time>\n"
@@ -9645,7 +9655,11 @@ static void wd_save_mark(const char *note)
             wd_mark_count,
             safe_note,
             current_gps.valid ? "" : " [stale pos]");
-        fflush(wd_marks_file);
+        if (wr_wp < 0) {
+            sd_error_report("Wardrive GPX", "fprintf", "waypoint write failed");
+        } else if (fflush(wd_marks_file) != 0) {
+            sd_error_report("Wardrive GPX", "fflush", "waypoint flush failed");
+        }
         xSemaphoreGive(sd_spi_mutex);
     }
 
@@ -11228,12 +11242,17 @@ static void wardrive_promisc_task(void *pvParameters) {
                        2412 + (net->channel - 1) * 5 :
                        (net->channel == 14) ? 2484 :
                        (net->channel >= 36)  ? 5000 + 5 * net->channel : 0;
-            fprintf(file, "%s,%s,[%s],%s,%d,%d,%d,%.7f,%.7f,0.00,%.2f,,,WIFI\n",
+            int wr = fprintf(file, "%s,%s,[%s],%s,%d,%d,%d,%.7f,%.7f,0.00,%.2f,,,WIFI\n",
                     mac_str, escaped_ssid, auth, timestamp,
                     net->channel, freq, net->rssi, net->latitude, net->longitude,
                     (double)net->accuracy);
-            net->written_to_file = true;
-            networks_since_flush++;
+            if (wr < 0) {
+                sd_error_report("Wardrive CSV", "fprintf", "WiFi line write failed");
+                net->written_to_file = true; // Mark as written to avoid re-attempts
+            } else {
+                net->written_to_file = true;
+                networks_since_flush++;
+            }
         }
         // In WiFi-only mode, write BLE devices during scan (if any detected via coex)
         // In BLE-only mode, skip writing during scan to avoid SD DMA exhaustion
@@ -11250,11 +11269,15 @@ static void wardrive_promisc_task(void *pvParameters) {
                          bd->mac[2], bd->mac[1], bd->mac[0]);
                 char ble_name[64];
                 escape_csv_field(bd->name[0] ? bd->name : "[BLE]", ble_name, sizeof(ble_name));
-                fprintf(file, "%s,%s,[BLE],%s,37,2402,%d,%.7f,%.7f,0.00,0.00,,,BLE\n",
+                int wr_ble = fprintf(file, "%s,%s,[BLE],%s,37,2402,%d,%.7f,%.7f,0.00,0.00,,,BLE\n",
                         ble_mac, ble_name, timestamp,
                         bd->rssi, bd->latitude, bd->longitude);
+                if (wr_ble < 0) {
+                    sd_error_report("Wardrive CSV", "fprintf", "BLE line write failed");
+                } else {
+                    networks_since_flush++;
+                }
                 bd->written = true;
-                networks_since_flush++;
                 ble_written++;
             }
             if (ble_written > 0) {
@@ -11270,7 +11293,9 @@ static void wardrive_promisc_task(void *pvParameters) {
                 vTaskDelay(pdMS_TO_TICKS(5));  // let DMA settle
             }
 
-            fflush(file);
+            if (fflush(file) != 0) {
+                sd_error_report("Wardrive CSV", "fflush", "buffer flush failed");
+            }
             networks_since_flush = 0;
 
             // Resume BLE if it was running
@@ -15236,15 +15261,20 @@ static void mitm_pcap_writer_task(void *pvParameters)
                 .incl_len = frame->len,
                 .orig_len = frame->len
             };
-            fwrite(&rec, 1, sizeof(rec), mitm_pcap_file);
-            fwrite(frame->data, 1, frame->len, mitm_pcap_file);
+            size_t wr_rec = fwrite(&rec, 1, sizeof(rec), mitm_pcap_file);
+            size_t wr_data = fwrite(frame->data, 1, frame->len, mitm_pcap_file);
+            if (wr_rec != sizeof(rec) || wr_data != (size_t)frame->len) {
+                sd_error_report("PCAP capture", "fwrite", "packet write incomplete");
+            }
             heap_caps_free(frame);
             mitm_frame_count++;
             flush_counter++;
         } while (xQueueReceive(mitm_packet_queue, &frame, 0) == pdTRUE);
 
         if (flush_counter >= 50) {
-            fflush(mitm_pcap_file);
+            if (fflush(mitm_pcap_file) != 0) {
+                sd_error_report("PCAP capture", "fflush", "buffer flush failed");
+            }
             flush_counter = 0;
         }
 
@@ -15260,13 +15290,18 @@ static void mitm_pcap_writer_task(void *pvParameters)
                 .incl_len = frame->len,
                 .orig_len = frame->len
             };
-            fwrite(&rec, 1, sizeof(rec), mitm_pcap_file);
-            fwrite(frame->data, 1, frame->len, mitm_pcap_file);
+            size_t wr_rec = fwrite(&rec, 1, sizeof(rec), mitm_pcap_file);
+            size_t wr_data = fwrite(frame->data, 1, frame->len, mitm_pcap_file);
+            if (wr_rec != sizeof(rec) || wr_data != (size_t)frame->len) {
+                sd_error_report("PCAP capture", "fwrite", "final packet write incomplete");
+            }
             heap_caps_free(frame);
             mitm_frame_count++;
         }
         if (mitm_pcap_file) {
-            fflush(mitm_pcap_file);
+            if (fflush(mitm_pcap_file) != 0) {
+                sd_error_report("PCAP capture", "fflush", "final flush failed");
+            }
             fclose(mitm_pcap_file);
             mitm_pcap_file = NULL;
             sd_sync();
