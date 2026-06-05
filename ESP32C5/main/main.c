@@ -22508,6 +22508,60 @@ static void sd_tree_populate(const char *path)
         return;
     }
 
+    /* WORKAROUND: FatFS can return stale directory handle entries after navigation.
+     * Detect if readdir() is returning entries from a subdirectory by checking:
+     * - If first entry exists as a directory AND
+     * - If subsequent entries appear to be children of the first entry (heuristic)
+     * If detected, close and re-open the directory handle to reset FatFS state. */
+    bool entries_look_nested = false;
+    {
+        struct dirent *test_entry;
+        int test_count = 0;
+        char first_dir[300] = "";
+        while ((test_entry = readdir(dir)) != NULL && test_count < 5) {
+            if (test_entry->d_name[0] == '.') continue;
+            test_count++;
+
+            if (test_count == 1) {
+                // Remember first entry name
+                strncpy(first_dir, test_entry->d_name, sizeof(first_dir) - 1);
+                first_dir[sizeof(first_dir) - 1] = '\0';
+            } else if (test_count == 2) {
+                // Check if second entry looks like it's inside first entry
+                // (simple heuristic: if we see entries that typically appear in subdirs together)
+                // For /sdcard/lab, we expect to see 20+ entries at once (handshakes, screenshots, etc)
+                // If we see (handshakes, screenshots, cellular...) but also entries from /lab/handshakes,
+                // then we're getting nested entries
+                // For now, just note if we see common /lab/handshakes children
+                if (strcmp(test_entry->d_name, "pcap") == 0 ||
+                    strcmp(test_entry->d_name, "cellular") == 0) {
+                    // These are typical /lab children, not /lab/handshakes children
+                    entries_look_nested = false;
+                } else if (strcmp(test_entry->d_name, "screenshots") == 0 &&
+                           strcmp(first_dir, "handshakes") == 0) {
+                    // handshakes followed by screenshots = nested! (should be siblings)
+                    entries_look_nested = true;
+                    ESP_LOGW(TAG, "[SD_TREE_DEBUG] DETECTED NESTED ENTRIES: '%s' then '%s'",
+                             first_dir, test_entry->d_name);
+                }
+            }
+        }
+
+        if (entries_look_nested) {
+            ESP_LOGW(TAG, "[SD_TREE_DEBUG] FATFS HANDLE CORRUPTION DETECTED — closing and re-opening directory");
+            closedir(dir);
+            dir = opendir(path);
+            if (!dir) {
+                ESP_LOGE(TAG, "[SD_TREE_DEBUG] Failed to re-open directory after corruption");
+                xSemaphoreGive(sd_spi_mutex);
+                lv_obj_t *e = lv_label_create(s_sd_tree_list);
+                lv_label_set_text(e, "Directory read error");
+                lv_obj_set_style_text_color(e, COLOR_MATERIAL_RED, 0);
+                return;
+            }
+        }
+    }
+
     /* Two passes: directories first, then files.
      * Use d_type for dir/file classification — stat() on FAT can return
      * wrong st_mode on the first readdir cycle, causing dirs to appear as files
@@ -22526,6 +22580,25 @@ static void sd_tree_populate(const char *path)
 
             char child[300];
             snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+
+            /* DEFENSIVE: Validate that constructed path makes sense.
+             * If child path looks like it skips directory levels, skip this entry.
+             * Example: path="/sdcard/lab", entry->d_name="lab" would give "/sdcard/lab/lab" (wrong) */
+            size_t path_len = strlen(path);
+            if (path_len > 0 && path[path_len - 1] != '/') {
+                // path is like "/sdcard/lab"
+                const char *path_basename = strrchr(path, '/');
+                if (path_basename) {
+                    path_basename++;  // skip the /
+                    // If entry name matches the last component of path, it's recursive — skip
+                    if (strcmp(entry->d_name, path_basename) == 0) {
+                        ESP_LOGW(TAG, "[SD_TREE_DEBUG] SKIP: Recursive entry '%s' would create '%s'",
+                                 entry->d_name, child);
+                        continue;
+                    }
+                }
+            }
+
             if (strcmp(entry->d_name, "pcap") == 0 || strcmp(entry->d_name, "lab") == 0) {
                 ESP_LOGI(TAG, "[SD_TREE_DEBUG] Entry: name='%s' path='%s' => child='%s'",
                          entry->d_name, path, child);
