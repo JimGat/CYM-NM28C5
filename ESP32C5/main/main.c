@@ -11599,50 +11599,15 @@ static void wd_gps_wait_timer_cb(lv_timer_t *timer)
 
     // Conditions met; create wardrive UI and start wardrive
     ESP_LOGI(TAG, "GPS prompt resolved; creating wardrive UI");
+    wd_gps_prompt_state = 2;  // Mark as resolved (use fresh lock)
 
-    // Now create the full wardrive UI (same as wardrive_start_btn_cb would do)
-    // This is a simplified inline version; in production you'd extract to a function
-    scan_done_ui_flag = false;
-    create_function_page_base("Wardrive");
-    wardrive_ui_active = true;
-
-    // Create GPS label with appropriate status
-    wd_ui_gps_label = lv_label_create(lv_layer_top());
-    if (wd_gps_prompt_state == 3) {
-        lv_label_set_text(wd_ui_gps_label, "GPS locked - scanning...  Sats: 0");
-        lv_obj_set_style_text_color(wd_ui_gps_label, lv_color_make(76, 175, 80), 0);
-    } else {
-        lv_label_set_text(wd_ui_gps_label, "Using cached location...  Sats: 0");
-        lv_obj_set_style_text_color(wd_ui_gps_label, COLOR_MATERIAL_ORANGE, 0);
-    }
-    lv_obj_set_style_text_font(wd_ui_gps_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_align(wd_ui_gps_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_bg_opa(wd_ui_gps_label, LV_OPA_TRANSP, 0);
-    lv_obj_set_width(wd_ui_gps_label, LCD_H_RES);
-    lv_obj_align(wd_ui_gps_label, LV_ALIGN_TOP_MID, 0, 35);
-
-    // Instead of duplicating all UI creation code here, we'll create a minimal UI
-    // and start the wardrive task. The full UI creation happens in wardrive_start_btn_cb
-    // For now, just start the task with the GPS label we created above.
-    wardrive_enable_log_capture();
-
-    if (!wardrive_active && wardrive_task_handle == NULL) {
-        ESP_LOGI(TAG, "Starting Wardrive (promisc+D-UCB)...");
-        wardrive_active = true;
-
-        wardrive_task_stack = (StackType_t *)heap_caps_malloc(8192 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
-        if (wardrive_task_stack != NULL) {
-            wardrive_task_handle = xTaskCreateStatic(wardrive_task, "wardrive_task", 8192, NULL,
-                5, wardrive_task_stack, &wardrive_task_buffer);
-        }
-    }
-
-    show_touch_dot = false;
-    if (touch_dot) lv_obj_add_flag(touch_dot, LV_OBJ_FLAG_HIDDEN);
-
-    // Stop waiting timer
+    // Stop waiting timer before delegating to wardrive_start_btn_cb
     lv_timer_del(wd_gps_wait_timer);
     wd_gps_wait_timer = NULL;
+
+    // Call the standard wardrive start callback to create full UI and start task
+    wardrive_start_btn_cb(NULL);
+
     wd_gps_prompt_state = 4;  // done
 }
 
