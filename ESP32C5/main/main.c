@@ -22560,6 +22560,13 @@ static void sd_tree_populate(const char *path)
 
 static void show_sd_tree_screen(void)
 {
+    // Reset globals to prevent stale data from previous visits
+    memset(s_sd_tree_cwd, 0, sizeof(s_sd_tree_cwd));
+    s_sd_tree_list = NULL;
+    s_sd_path_lbl = NULL;
+    s_sd_dir_count = 0;
+    memset(s_sd_dir_paths, 0, sizeof(s_sd_dir_paths));
+
     create_function_page_base("SD File Tree");
 
     /* ── Path bar ─────────────────────────────────────────────── */
