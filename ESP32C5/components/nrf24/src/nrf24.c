@@ -458,7 +458,7 @@ esp_err_t nrf24_scan_channels(uint8_t start_ch, uint8_t stop_ch,
         ce_low();
         if (cb) cb(ch, carrier, ctx);
         // Yield every 8 channels — 126×200µs was starving the LVGL main loop
-        if ((ch & 0x07) == 0x07) vTaskDelay(1);
+        if ((ch & 0x07) == 0x07) vTaskDelay(pdMS_TO_TICKS(10));
     }
     return ESP_OK;
 }
