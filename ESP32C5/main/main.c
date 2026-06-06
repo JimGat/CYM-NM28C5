@@ -5702,10 +5702,9 @@ void app_main(void)
         ESP_LOGW(TAG, "Battery ADC init failed - voltage monitor disabled");
     }
 
-    // Main task watchdog subscription removed: provision task owns watchdog for long SD operations.
-    // Main task has no blocking operations that can hang indefinitely (LVGL, touch, LED have timeouts).
-    // esp_task_wdt_add(NULL);
-    // ESP_LOGI(TAG, "Main task subscribed to watchdog");
+    // Subscribe main task to watchdog
+    esp_task_wdt_add(NULL);
+    ESP_LOGI(TAG, "Main task subscribed to watchdog");
 
     ESP_LOGI(TAG, "Main event loop started");
 
@@ -22034,9 +22033,10 @@ static void sd_provision_task(void *pvParams)
     bool after_format = (bool)(uintptr_t)pvParams;
     int  created = 0, ok_count = 0;
 
-    // Register this task with the watchdog so esp_task_wdt_reset() works
-    esp_task_wdt_add(NULL);
-    ESP_LOGI(TAG, "[SD_PROV] Task registered with watchdog");
+    // Watchdog handled by main task. Provision task yields 30ms between items
+    // to let the main loop reset watchdog. Task yields are sufficient.
+    // esp_task_wdt_add(NULL);
+    // ESP_LOGI(TAG, "[SD_PROV] Task registered with watchdog");
 
     // Format must hold the mutex for its entire duration (many SPI transactions)
     if (after_format) {
@@ -22084,13 +22084,11 @@ static void sd_provision_task(void *pvParams)
             goto done;
         }
 
-        esp_task_wdt_reset();  // Reset watchdog before potentially slow operation
+        // Watchdog reset handled by main task; provision task yields between items
         ESP_LOGI(TAG, "[SD_PROV] Item %d: calling stat(%s)", i, item->path);
 
         struct stat st;
         bool exists = (stat(item->path, &st) == 0);
-
-        esp_task_wdt_reset();  // Reset after stat
         ESP_LOGI(TAG, "[SD_PROV] Item %d: stat returned exists=%d", i, exists);
 
         if (item->type == SD_ITEM_DIR) {
@@ -22113,15 +22111,12 @@ static void sd_provision_task(void *pvParams)
             } else {
                 ESP_LOGI(TAG, "[SD_PROV] Item %d: calling fopen(%s) for write", i, item->path);
                 FILE *f = fopen(item->path, "w");
-                esp_task_wdt_reset();
                 if (f) {
                     if (item->content && item->content[0]) {
                         ESP_LOGI(TAG, "[SD_PROV] Item %d: calling fwrite, content_len=%zu", i, strlen(item->content));
                         fwrite(item->content, 1, strlen(item->content), f);
-                        esp_task_wdt_reset();
                     }
                     fclose(f);
-                    esp_task_wdt_reset();
                     PROV_POST("  ++  %s", item->path + 8);
                     created++;
                 } else {
@@ -22130,7 +22125,6 @@ static void sd_provision_task(void *pvParams)
             }
         }
 
-        esp_task_wdt_reset();  // Reset before releasing mutex
         xSemaphoreGive(sd_spi_mutex);
         vTaskDelay(pdMS_TO_TICKS(30));  // yield — lets LVGL flush the new log line
     }
@@ -22149,7 +22143,7 @@ done: ;
     char *summary = malloc(64);
     if (summary) snprintf(summary, 64, "Done - %d created, %d OK", created, ok_count);
     lv_async_call(sd_prov_done_cb, summary);
-    esp_task_wdt_delete(NULL);  // Unregister from watchdog right before exit
+    // esp_task_wdt_delete(NULL);  // Main task owns watchdog
     vTaskDelete(NULL);
 }
 
