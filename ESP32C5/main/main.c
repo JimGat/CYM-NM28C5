@@ -7056,7 +7056,15 @@ void app_main(void)
                 }
             }
 
+            // Monitor LVGL handler execution to detect hangs
+            uint64_t lvgl_call_us = esp_timer_get_time();
+            ESP_LOGD(TAG, "[MAIN_LOOP] Entering first lv_timer_handler() at %llu us", lvgl_call_us);
             sleep_ms = lv_timer_handler();
+            uint64_t lvgl_return_us = esp_timer_get_time();
+            uint64_t lvgl_elapsed_us = lvgl_return_us - lvgl_call_us;
+            if (lvgl_elapsed_us > 100000) {  // Log if handler took > 100ms
+                ESP_LOGW(TAG, "[MAIN_LOOP] LONG lv_timer_handler() took %llu us (%.1f ms)", lvgl_elapsed_us, (float)lvgl_elapsed_us / 1000.0f);
+            }
 
             // Deferred provision startup: create dialog outside event callback
             // This prevents blocking display rendering when the dialog is created
@@ -7069,8 +7077,13 @@ void app_main(void)
                 ESP_LOGI(TAG, "[DIAG] Dialog created in %lld us", t_dialog_created - t_dialog_start);
                 // Force immediate render of the new dialog before yielding
                 uint64_t t_render_start = esp_timer_get_time();
+                ESP_LOGD(TAG, "[MAIN_LOOP] Entering second lv_timer_handler() for dialog render at %llu us", t_render_start);
                 sleep_ms = lv_timer_handler();
                 uint64_t t_render_done = esp_timer_get_time();
+                uint64_t dialog_handler_us = t_render_done - t_render_start;
+                if (dialog_handler_us > 100000) {
+                    ESP_LOGW(TAG, "[MAIN_LOOP] LONG dialog lv_timer_handler() took %llu us (%.1f ms)", dialog_handler_us, (float)dialog_handler_us / 1000.0f);
+                }
                 ESP_LOGI(TAG, "[DIAG] First render took %lld us", t_render_done - t_render_start);
             }
 
@@ -7078,23 +7091,31 @@ void app_main(void)
             sd_error_modal_update();
 
             // Reset watchdog INSIDE mutex to catch long rendering operations
+            uint64_t wdt_inside_us = esp_timer_get_time();
             esp_task_wdt_reset();
-            
+            ESP_LOGD(TAG, "[MAIN_LOOP] Watchdog reset inside mutex at %llu us", wdt_inside_us);
+
             xSemaphoreGive(lvgl_mutex);
         }
 
         // Reset watchdog again after releasing mutex
+        uint64_t wdt_after_us = esp_timer_get_time();
         esp_task_wdt_reset();
-        
+        ESP_LOGD(TAG, "[MAIN_LOOP] Watchdog reset after mutex release at %llu us", wdt_after_us);
+
         // Free the provision task's static PSRAM stack from main-task context.
         // No stack cleanup in main loop. The 4KB PSRAM stack is reclaimed by
         // show_sd_provision_running_screen() if the user provisions again, so there's
         // no cumulative leak. This approach avoids any main-loop blocking.
 
         // Process pending karma saves (with SPI mutex to avoid display conflicts)
+        uint64_t sd_spi_try_us = esp_timer_get_time();
         if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            ESP_LOGD(TAG, "[MAIN_LOOP] Acquired sd_spi_mutex at %llu us", sd_spi_try_us);
             wifi_attacks_process_pending_saves();
             xSemaphoreGive(sd_spi_mutex);
+        } else {
+            ESP_LOGD(TAG, "[MAIN_LOOP] sd_spi_mutex timeout (10ms) at %llu us", sd_spi_try_us);
         }
 
         // Flush GPS position to NVS from main-task context (throttled inside the function).
@@ -22033,12 +22054,14 @@ static void sd_prov_line_cb(void *arg)
         return;
     }
 
-    ESP_LOGD(TAG, "[PROV_LINE_CB] Adding to textarea: %s", upd->line);
+    uint64_t cb_start_us = esp_timer_get_time();
+    ESP_LOGI(TAG, "[PROV_LINE_CB] Executing at %llu us, adding: %s", cb_start_us, upd->line);
 
     if (sd_provision_log_ta) {
         lv_textarea_add_text(sd_provision_log_ta, upd->line);
         lv_textarea_add_text(sd_provision_log_ta, "\n");
-        ESP_LOGD(TAG, "[PROV_LINE_CB] Text added successfully");
+        uint64_t cb_end_us = esp_timer_get_time();
+        ESP_LOGD(TAG, "[PROV_LINE_CB] Text added in %llu us", cb_end_us - cb_start_us);
     } else {
         ESP_LOGW(TAG, "[PROV_LINE_CB] Textarea is NULL!");
     }
@@ -22303,7 +22326,7 @@ static void sd_provision_task(void *pvParams)
         // Feed watchdog and yield to main loop
         esp_task_wdt_reset();
         ESP_LOGD(TAG, "[PROV_ITEM] %d: Yielding...", i);
-        vTaskDelay(pdMS_TO_TICKS(30));  // Let LVGL render + idle task run
+        vTaskDelay(pdMS_TO_TICKS(500));  // Let LVGL drain async queue and render each item
     }
 
     uint64_t items_ms = (esp_timer_get_time() - items_start) / 1000;
