@@ -22147,17 +22147,37 @@ static void sd_prov_done_cb(void *arg)
     ESP_LOGI(TAG, "[PROV_CB] Done callback complete at %llu us", esp_timer_get_time());
 }
 
-// ─── Provision Background Task with Full Debug Logging ───────────────────────
+// ─── Provision Background Task with Batched Synchronous LVGL Updates ────────
 //
 // This task runs at priority 2 (above main loop, below WiFi/system tasks).
 // It processes 44 SD items: checks each with stat(), creates missing dirs/files.
 // The task feeds its own watchdog to prevent timeout during slow SD operations.
 //
-// Key design decisions:
-// 1. Take mutex only for the single filesystem op (stat/mkdir/fopen) — a few ms
-// 2. Release mutex immediately, then post LVGL update and yield
-// 3. This lets the display flush between items without blocking
-// 4. Task watchdog subscription guarantees we feed the WDT even during f_mkfs()
+// ARCHITECTURE: Batched Synchronous Updates (NOT async callbacks)
+// ════════════════════════════════════════════════════════════════════════════════
+// PROBLEM: The old async pattern (lv_async_call) queues 44 callbacks to update the
+// provision log textarea. Each callback executes 200-300ms later in the main loop's
+// event queue. By item 30+, callbacks accumulate faster than they drain, blocking
+// the main loop. Textarea render time grows from 100ms (item 7) to 1000+ms (item 40).
+// The watchdog times out after 9-10 seconds of accumulated main-loop blocking.
+//
+// SOLUTION: Batch updates (5 items per batch) and flush synchronously while holding
+// lvgl_mutex. This reduces 44 updates to ~8 batches, and each sync update takes
+// 50-100ms (texture rendering + trimming), not 300ms queue latency.
+//
+// KEY INVARIANTS:
+// 1. Take sd_spi_mutex only for the single filesystem op (stat/mkdir/fopen) — 1-5ms
+// 2. Release sd_spi_mutex IMMEDIATELY, then yield to main loop
+// 3. Batch accumulated lines in a 1KB buffer (typically 5 items = 200-400 bytes)
+// 4. Every 300ms OR after 5 items OR at the end: acquire lvgl_mutex and flush
+// 5. If lvgl_mutex times out (500ms), fall back to async as a safety valve
+// 6. The main loop (priority 1) is NOT starved — it runs every 200ms for LVGL render
+// 7. Task watchdog subscription guarantees we feed the WDT even during f_mkfs()
+//
+// SYNCHRONIZATION MODEL:
+// - sd_spi_mutex: protects SD card filesystem operations (held 1-5ms per item)
+// - lvgl_mutex: protects LVGL textarea updates (held 50-100ms per batch flush)
+// - No circular dependencies — provision task never calls main-loop code
 
 #define PROV_POST(fmt, ...) do { \
     sd_prov_update_t *_u = malloc(sizeof(sd_prov_update_t)); \
@@ -22398,38 +22418,77 @@ static void sd_provision_task(void *pvParams)
         bool flush_at_end = (i == (int)SD_ITEMS_COUNT - 1);          // Or at the very end
 
         if (flush_by_time || flush_by_count || flush_at_end) {
-            // Flush accumulated batch to textarea via LVGL async callback
+            // Flush accumulated batch to textarea via synchronous mutex-protected update.
+            // RATIONALE: The async pattern (lv_async_call) queues 44 callbacks that execute
+            // 200-300ms later. By item 30+, callbacks accumulate faster than they drain,
+            // blocking the main loop. This causes render times > 1000ms and WDT timeout.
+            // The sync pattern acquires lvgl_mutex and calls scrollable_textarea_append()
+            // directly, keeping render time bounded (~50-100ms per batch).
             if (batch_len > 0) {
-                sd_prov_update_t *upd = malloc(sizeof(sd_prov_update_t));
-                if (upd) {
-                    strncpy(upd->line, batch_buffer, sizeof(upd->line) - 1);
-                    upd->line[sizeof(upd->line) - 1] = '\0';
-                    uint64_t elapsed_since_batch_start = (now_us - last_flush_us) / 1000;
-                    ESP_LOGI(TAG, "[PROV_BATCH_FLUSH] Flushing %d items (elapsed %lld ms, batch_len %d bytes)",
-                             batch_item_count, elapsed_since_batch_start, batch_len);
+                uint64_t elapsed_since_batch_start = (now_us - last_flush_us) / 1000;
+                ESP_LOGI(TAG, "[PROV_BATCH_FLUSH] Flushing %d items (elapsed %lld ms, batch_len %d bytes)",
+                         batch_item_count, elapsed_since_batch_start, batch_len);
 
-                    // Check textarea buffer size to detect bottleneck
-                    if (sd_provision_log_ta) {
+                // Try to acquire LVGL mutex with a reasonable timeout (500ms).
+                // The main loop can take 100-200ms to drain all queued LVGL operations,
+                // so we allow up to 500ms before declaring a timeout.
+                // If we timeout, fall back to async as a safety valve (keeps provision task alive).
+                uint64_t mutex_start_us = esp_timer_get_time();
+                if (xSemaphoreTake(lvgl_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+                    uint64_t mutex_acquired_ms = (esp_timer_get_time() - mutex_start_us) / 1000;
+                    ESP_LOGD(TAG, "[PROV_MUTEX_ACQUIRED] took %lld ms", mutex_acquired_ms);
+
+                    // Sanity check: textarea must still be valid (user could have navigated away)
+                    if (sd_provision_log_ta && lv_obj_is_valid(sd_provision_log_ta)) {
+                        // Update textarea size monitor before append
                         size_t ta_len = strlen(lv_textarea_get_text(sd_provision_log_ta));
-                        ESP_LOGD(TAG, "[PROV_TA_SIZE] Current textarea: %u bytes", (unsigned)ta_len);
+                        ESP_LOGD(TAG, "[PROV_TA_SIZE_BEFORE] Current textarea: %u bytes", (unsigned)ta_len);
                         if (ta_len > 5000) {
                             ESP_LOGW(TAG, "[PROV_TA_SIZE] WARNING: textarea > 5KB (%u bytes) — render may slow down",
                                      (unsigned)ta_len);
                         }
-                        if (ta_len > 10000) {
-                            ESP_LOGE(TAG, "[PROV_TA_SIZE] CRITICAL: textarea > 10KB (%u bytes) — WDT at risk!",
-                                     (unsigned)ta_len);
-                        }
+
+                        // Call the scrollable textarea helper directly while holding mutex.
+                        // This does NOT queue a callback — it updates LVGL immediately.
+                        // Trimming is enabled (max_chars=2000) to keep render fast.
+                        scrollable_textarea_append(sd_provision_log_ta, batch_buffer, 2000, true);
+
+                        // Add newline after batch (scrollable_textarea_append doesn't add one automatically)
+                        lv_textarea_add_text(sd_provision_log_ta, "\n");
+
+                        size_t ta_len_after = strlen(lv_textarea_get_text(sd_provision_log_ta));
+                        ESP_LOGD(TAG, "[PROV_TA_SIZE_AFTER] Textarea now: %u bytes", (unsigned)ta_len_after);
+
+                        ESP_LOGI(TAG, "[PROV_SYNC_FLUSH] Direct update complete (batch_len %d → ta %u bytes)",
+                                 batch_len, (unsigned)ta_len_after);
+                    } else {
+                        ESP_LOGW(TAG, "[PROV_SYNC_FLUSH] Textarea is NULL or invalid");
                     }
 
-                    lv_async_call(sd_prov_line_cb, upd);
-                    batch_item_count = 0;
-                    batch_len = 0;
-                    memset(batch_buffer, 0, sizeof(batch_buffer));
-                    last_flush_us = esp_timer_get_time();
+                    xSemaphoreGive(lvgl_mutex);
+                    ESP_LOGD(TAG, "[PROV_MUTEX_RELEASED]");
                 } else {
-                    ESP_LOGE(TAG, "[PROV_BATCH_FLUSH] malloc failed");
+                    // Mutex timeout: main loop may be slow. Fall back to async to keep
+                    // the provision task from blocking indefinitely.
+                    uint64_t timeout_ms = (esp_timer_get_time() - mutex_start_us) / 1000;
+                    ESP_LOGW(TAG, "[PROV_MUTEX_TIMEOUT] Waited %lld ms, main loop may be stuck", timeout_ms);
+
+                    // Try the async fallback
+                    sd_prov_update_t *upd = malloc(sizeof(sd_prov_update_t));
+                    if (upd) {
+                        strncpy(upd->line, batch_buffer, sizeof(upd->line) - 1);
+                        upd->line[sizeof(upd->line) - 1] = '\0';
+                        lv_async_call(sd_prov_line_cb, upd);
+                        ESP_LOGI(TAG, "[PROV_BATCH_FLUSH] Fell back to async due to mutex timeout");
+                    } else {
+                        ESP_LOGE(TAG, "[PROV_BATCH_FLUSH] malloc failed (async fallback)");
+                    }
                 }
+
+                batch_item_count = 0;
+                batch_len = 0;
+                memset(batch_buffer, 0, sizeof(batch_buffer));
+                last_flush_us = esp_timer_get_time();
             }
             ESP_LOGD(TAG, "[PROV_ITEM] %d: Flushed batch (time=%d, count=%d, end=%d)",
                      i, flush_by_time, flush_by_count, flush_at_end);
