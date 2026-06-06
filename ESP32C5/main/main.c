@@ -1328,6 +1328,11 @@ static volatile bool sd_provision_active      = false;
 static StackType_t *sd_provision_task_stack   = NULL;
 static StaticTask_t sd_provision_task_buf;
 
+// Deferred provision startup: event callbacks set these flags instead of creating
+// the dialog directly, so the main loop can create it outside lv_timer_handler()
+static volatile bool sd_prov_pending_start = false;
+static volatile bool sd_prov_pending_after_format = false;
+
 typedef struct {
     char text[192];
     lv_color_t color;
@@ -7048,6 +7053,15 @@ void app_main(void)
             }
 
             sleep_ms = lv_timer_handler();
+
+            // Deferred provision startup: create dialog outside event callback
+            // This prevents blocking display rendering when the dialog is created
+            if (sd_prov_pending_start) {
+                sd_prov_pending_start = false;
+                show_sd_provision_running_screen(sd_prov_pending_after_format);
+                // Force immediate render of the new dialog before yielding
+                sleep_ms = lv_timer_handler();
+            }
 
             // Check for SD write errors and show modal if needed
             sd_error_modal_update();
@@ -22132,7 +22146,7 @@ static void sd_provision_task(void *pvParams)
         int64_t t_mutex_release = esp_timer_get_time() / 1000;
         ESP_LOGI(TAG, "[SD_PROV] Item %d: mutex released @ +%lld ms", i, t_mutex_release - t_start);
 
-        vTaskDelay(pdMS_TO_TICKS(5));  // Brief yield between items (main task runs during this)
+        vTaskDelay(pdMS_TO_TICKS(20));  // Yield 20ms between items (main task renders during this)
         int64_t t_end = esp_timer_get_time() / 1000;
         ESP_LOGI(TAG, "[SD_PROV] Item %d DONE: total iteration took %lld ms", i, t_end - t_start);
     }
@@ -22236,8 +22250,10 @@ static void show_sd_provision_running_screen(bool after_format)
 
 static void sd_prov_confirm_yes_cb(lv_event_t *e)
 {
-    bool after_fmt = (bool)(uintptr_t)lv_event_get_user_data(e);
-    show_sd_provision_running_screen(after_fmt);
+    // Set flags for main loop to create dialog outside lv_timer_handler()
+    // (creating it inside the event handler blocks display rendering)
+    sd_prov_pending_after_format = (bool)(uintptr_t)lv_event_get_user_data(e);
+    sd_prov_pending_start = true;
 }
 
 static void sd_prov_confirm_no_cb(lv_event_t *e)
