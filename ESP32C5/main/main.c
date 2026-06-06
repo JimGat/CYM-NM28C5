@@ -22498,8 +22498,8 @@ static void sd_tree_populate(const char *path)
         return;
     }
 
-    DIR *dir = opendir(path);
-    ESP_LOGI(TAG, "[SD_TREE_DEBUG] opendir('%s') => handle=%p", path, (void*)dir);
+    DIR *dir = opendir(s_sd_tree_cwd);
+    ESP_LOGI(TAG, "[SD_TREE_DEBUG] opendir('%s') => handle=%p", s_sd_tree_cwd, (void*)dir);
     if (!dir) {
         xSemaphoreGive(sd_spi_mutex);
         lv_obj_t *e = lv_label_create(s_sd_tree_list);
@@ -22524,21 +22524,40 @@ static void sd_tree_populate(const char *path)
 
             if (entry->d_name[0] == '.') continue;
 
-            char child[300];
-            snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+            char child[600];  // 300 path + 1 sep + 255 name + nullterm
+            size_t cwd_len = strlen(s_sd_tree_cwd);
+            size_t name_len = strlen(entry->d_name);
+            if (cwd_len + 1 + name_len >= sizeof(child)) continue;
+            snprintf(child, sizeof(child), "%s/%s", s_sd_tree_cwd, entry->d_name);
 
-            /* DEFENSIVE: Validate that constructed path makes sense.
-             * If child path looks like it skips directory levels, skip this entry.
-             * Example: path="/sdcard/lab", entry->d_name="lab" would give "/sdcard/lab/lab" (wrong) */
-            size_t path_len = strlen(path);
-            if (path_len > 0 && path[path_len - 1] != '/') {
-                // path is like "/sdcard/lab"
-                const char *path_basename = strrchr(path, '/');
-                if (path_basename) {
-                    path_basename++;  // skip the /
-                    // If entry name matches the last component of path, it's recursive — skip
-                    if (strcmp(entry->d_name, path_basename) == 0) {
-                        ESP_LOGW(TAG, "[SD_TREE_DEBUG] SKIP: Recursive entry '%s' would create '%s'",
+            /* CRITICAL VALIDATION: FatFS readdir() can return entries from multiple directory
+             * levels (e.g., when reading /sdcard/lab, returns entries from both /sdcard/lab
+             * AND /sdcard/lab/handshakes mixed together). Detect and skip nested entries.
+             * Count slashes: if child has more than one extra slash from cwd, skip it. */
+            size_t cwd_slash_count = 0;
+            {
+                const char *p = s_sd_tree_cwd;
+                while ((p = strchr(p, '/')) != NULL) { cwd_slash_count++; p++; }
+            }
+            size_t child_slash_count = 0;
+            {
+                const char *p = child;
+                while ((p = strchr(p, '/')) != NULL) { child_slash_count++; p++; }
+            }
+            if (child_slash_count != cwd_slash_count + 1) {
+                ESP_LOGW(TAG, "[SD_TREE_DEBUG] SKIP NESTED: '%s' has %zu slashes, expected %zu. child='%s'",
+                         entry->d_name, child_slash_count, cwd_slash_count + 1, child);
+                continue;
+            }
+
+            /* DEFENSIVE: Validate recursive entries (e.g., "/sdcard/lab" + "lab" = "/sdcard/lab/lab") */
+            size_t cwd_path_len = strlen(s_sd_tree_cwd);
+            if (cwd_path_len > 0 && s_sd_tree_cwd[cwd_path_len - 1] != '/') {
+                const char *cwd_basename = strrchr(s_sd_tree_cwd, '/');
+                if (cwd_basename) {
+                    cwd_basename++;
+                    if (strcmp(entry->d_name, cwd_basename) == 0) {
+                        ESP_LOGW(TAG, "[SD_TREE_DEBUG] SKIP: Recursive '%s' => '%s'",
                                  entry->d_name, child);
                         continue;
                     }
@@ -22547,7 +22566,7 @@ static void sd_tree_populate(const char *path)
 
             if (strcmp(entry->d_name, "pcap") == 0 || strcmp(entry->d_name, "lab") == 0) {
                 ESP_LOGI(TAG, "[SD_TREE_DEBUG] Entry: name='%s' path='%s' => child='%s'",
-                         entry->d_name, path, child);
+                         entry->d_name, s_sd_tree_cwd, child);
             }
 
             /* Classify using d_type; fall back to stat only if unknown */
