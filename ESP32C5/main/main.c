@@ -22033,6 +22033,10 @@ static void sd_provision_task(void *pvParams)
     bool after_format = (bool)(uintptr_t)pvParams;
     int  created = 0, ok_count = 0;
 
+    // Register this task with the watchdog so esp_task_wdt_reset() works
+    esp_task_wdt_add(NULL);
+    ESP_LOGI(TAG, "[SD_PROV] Task registered with watchdog");
+
     // Format must hold the mutex for its entire duration (many SPI transactions)
     if (after_format) {
         /* Warn the user BEFORE grabbing the mutex so the screen can update.
@@ -22141,6 +22145,7 @@ static void sd_provision_task(void *pvParams)
     }
 
 done: ;
+    esp_task_wdt_delete(NULL);  // Unregister from watchdog before exit
     char *summary = malloc(64);
     if (summary) snprintf(summary, 64, "Done - %d created, %d OK", created, ok_count);
     lv_async_call(sd_prov_done_cb, summary);
