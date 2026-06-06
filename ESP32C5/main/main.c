@@ -22145,10 +22145,10 @@ static void sd_provision_task(void *pvParams)
     }
 
 done: ;
-    esp_task_wdt_delete(NULL);  // Unregister from watchdog before exit
     char *summary = malloc(64);
     if (summary) snprintf(summary, 64, "Done - %d created, %d OK", created, ok_count);
     lv_async_call(sd_prov_done_cb, summary);
+    esp_task_wdt_delete(NULL);  // Unregister from watchdog right before exit
     vTaskDelete(NULL);
 }
 
