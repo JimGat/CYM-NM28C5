@@ -7057,10 +7057,17 @@ void app_main(void)
             // Deferred provision startup: create dialog outside event callback
             // This prevents blocking display rendering when the dialog is created
             if (sd_prov_pending_start) {
+                ESP_LOGI(TAG, "[DIAG] Deferred provision start detected, creating dialog...");
+                uint64_t t_dialog_start = esp_timer_get_time();
                 sd_prov_pending_start = false;
                 show_sd_provision_running_screen(sd_prov_pending_after_format);
+                uint64_t t_dialog_created = esp_timer_get_time();
+                ESP_LOGI(TAG, "[DIAG] Dialog created in %lld us", t_dialog_created - t_dialog_start);
                 // Force immediate render of the new dialog before yielding
+                uint64_t t_render_start = esp_timer_get_time();
                 sleep_ms = lv_timer_handler();
+                uint64_t t_render_done = esp_timer_get_time();
+                ESP_LOGI(TAG, "[DIAG] First render took %lld us", t_render_done - t_render_start);
             }
 
             // Check for SD write errors and show modal if needed
@@ -7117,13 +7124,19 @@ void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_
 {
     lvgl_flush_counter++;
     flush_call_count++;
-    
-    // Log co 100 flushów aby nie zaśmiecić logu
-    /*if (flush_call_count % 100 == 0) {
-        ESP_LOGI(TAG, "[FLUSH] Call #%u, area: (%d,%d)-(%d,%d)", 
-                 flush_call_count, area->x1, area->y1, area->x2, area->y2);
-    }*/
-    
+
+    // Log large flushes during provision (textarea updates)
+    if (sd_provision_active && (area->y2 - area->y1) > 50) {
+        static uint32_t last_prov_flush_log = 0;
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        if (now_ms - last_prov_flush_log > 500) {  // Log max once per 500ms to avoid spam
+            ESP_LOGI(TAG, "[FLUSH-PROV] Call #%u, area: (%d,%d)-(%d,%d), height=%d",
+                     flush_call_count, area->x1, area->y1, area->x2, area->y2,
+                     area->y2 - area->y1);
+            last_prov_flush_log = now_ms;
+        }
+    }
+
     esp_lcd_panel_handle_t panel = (esp_lcd_panel_handle_t)drv->user_data;
     int32_t width = area->x2 - area->x1 + 1;
     int32_t height = area->y2 - area->y1 + 1;
@@ -7145,23 +7158,27 @@ void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_
         if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             uint64_t mutex_acquired = esp_timer_get_time();
             xSemaphoreTake(flush_done_sem, 0); // drain any stale count from init DMAs
+            uint64_t draw_start = esp_timer_get_time();
             esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
+            uint64_t draw_done = esp_timer_get_time();
             // Hold mutex until DMA completes. Releasing before the semaphore
             // creates a window where another task can start an SPI transaction
             // on the shared bus while display DMA is still running — causing
             // the ST7789 column-counter to desync and produce a vertical tear.
+            uint64_t sem_start = esp_timer_get_time();
             xSemaphoreTake(flush_done_sem, pdMS_TO_TICKS(1000));
+            uint64_t sem_done = esp_timer_get_time();
             xSemaphoreGive(sd_spi_mutex);
             uint64_t flush_done = esp_timer_get_time();
-            if (area->y2 - area->y1 > 100) { // Only log for large flushes (e.g., textarea updates)
-                ESP_LOGD(TAG, "[FLUSH] drew rect (%d,%d)-(%d,%d) in %lld us (mutex held %lld us)",
-                         area->x1, area->y1, area->x2, area->y2,
-                         flush_done - flush_start, mutex_acquired - flush_start);
+
+            if (sd_provision_active && (area->y2 - area->y1) > 50) {
+                ESP_LOGI(TAG, "[FLUSH-PROV-SUCCESS] draw=%lld us, sem_wait=%lld us, total=%lld us",
+                         draw_done - draw_start, sem_done - sem_start, flush_done - flush_start);
             }
         } else {
             flush_mutex_wait_count++;
-            if (flush_mutex_wait_count % 100 == 0) {
-                ESP_LOGW(TAG, "[FLUSH] Skipped %d times (mutex unavailable)", flush_mutex_wait_count);
+            if (sd_provision_active && flush_mutex_wait_count % 10 == 0) {
+                ESP_LOGW(TAG, "[FLUSH-PROV-SKIP] Skipped %d times (mutex unavailable)", flush_mutex_wait_count);
             }
         }
     } else {
@@ -22105,11 +22122,15 @@ static void sd_provision_task(void *pvParams)
 
     // Process each item using a state machine: each state performs ONE SPI operation
     // then releases the mutex and yields. This keeps the main task responsive.
+    uint64_t task_start = esp_timer_get_time();
+    ESP_LOGI(TAG, "[SD_PROV] Task started, will process %d items", SD_ITEMS_COUNT);
+
     prov_item_ctx_t *items = malloc(sizeof(prov_item_ctx_t) * SD_ITEMS_COUNT);
     if (!items) {
         PROV_POST("ERR: malloc failed for item contexts");
         goto done;
     }
+    ESP_LOGI(TAG, "[SD_PROV] Allocated item contexts, starting FSM");
 
     // Initialize all item contexts
     for (int i = 0; i < (int)SD_ITEMS_COUNT; i++) {
@@ -22252,20 +22273,34 @@ static void sd_provision_task(void *pvParams)
 
     free(items);
 
+    uint64_t task_items_done = esp_timer_get_time();
+    ESP_LOGI(TAG, "[SD_PROV] All %d items processed in %lld ms", SD_ITEMS_COUNT, (task_items_done - task_start) / 1000);
+
     // Append run summary to provision.log
+    ESP_LOGI(TAG, "[SD_PROV] Starting log file append...");
+    uint64_t log_start = esp_timer_get_time();
     if (PROV_TAKE_MUTEX()) {
+        ESP_LOGI(TAG, "[SD_PROV] Mutex acquired for log, opening file...");
         FILE *log = fopen("/sdcard/lab/config/provision.log", "a");
         if (log) {
+            ESP_LOGI(TAG, "[SD_PROV] Writing to log file...");
             fprintf(log, "Created: %d  OK: %d\n", created, ok_count);
             fclose(log);
+            ESP_LOGI(TAG, "[SD_PROV] Log file closed");
+        } else {
+            ESP_LOGW(TAG, "[SD_PROV] Failed to open log file");
         }
         xSemaphoreGive(sd_spi_mutex);
     }
+    uint64_t log_done = esp_timer_get_time();
+    ESP_LOGI(TAG, "[SD_PROV] Log file append took %lld ms", (log_done - log_start) / 1000);
 
 done: ;
+    ESP_LOGI(TAG, "[SD_PROV] Calling done callback...");
     char *summary = malloc(64);
     if (summary) snprintf(summary, 64, "Done - %d created, %d OK", created, ok_count);
     lv_async_call(sd_prov_done_cb, summary);
+    ESP_LOGI(TAG, "[SD_PROV] Task exiting (will delete self)");
     // esp_task_wdt_delete(NULL);  // Main task owns watchdog
     vTaskDelete(NULL);
 }
