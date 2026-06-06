@@ -22135,7 +22135,7 @@ static void sd_provision_task(void *pvParams)
         int64_t t_mutex_release = esp_timer_get_time() / 1000;
         ESP_LOGI(TAG, "[SD_PROV] Item %d: mutex released @ +%lld ms", i, t_mutex_release - t_start);
 
-        vTaskDelay(pdMS_TO_TICKS(30));  // yield — lets LVGL flush the new log line
+        vTaskDelay(pdMS_TO_TICKS(100));  // long yield to give main task time to reset watchdog
         int64_t t_end = esp_timer_get_time() / 1000;
         ESP_LOGI(TAG, "[SD_PROV] Item %d DONE: total iteration took %lld ms", i, t_end - t_start);
     }
