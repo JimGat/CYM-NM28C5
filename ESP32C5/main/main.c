@@ -22540,11 +22540,15 @@ done: ;
         ESP_LOGE(TAG, "[SD_PROV] Failed to allocate summary string");
     }
 
+    // Signal main loop to stop draining the queue (MUST be before queue delete!)
+    sd_provision_active = false;
+    ESP_LOGI(TAG, "[SD_PROV] Set sd_provision_active = false");
+
     // Clean up provision queue. Main loop will stop draining after task exits.
     if (sd_prov_queue != NULL) {
         vQueueDelete(sd_prov_queue);
         sd_prov_queue = NULL;
-        ESP_LOGI(TAG, "[SD_PROV] Queue deleted");
+        ESP_LOGI(TAG, "[SD_PROV] Queue deleted and set to NULL");
     }
 
     // Unsubscribe from watchdog before exit
