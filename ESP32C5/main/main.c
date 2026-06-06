@@ -7123,41 +7123,29 @@ void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_
     
     // CRITICAL: Take SD/SPI mutex before drawing to display
     // Display and SD card share the same SPI bus (SPI2_HOST)
+    // IMPORTANT: Do NOT spin-wait for this mutex. If another task holds it (e.g., SD provision),
+    // just skip the flush. LVGL will mark the area dirty and re-render it next cycle.
+    // Spin-waiting blocks the main task and prevents watchdog resets.
     if (sd_spi_mutex) {
-        TickType_t start = xTaskGetTickCount();
-        int wait_attempt = 0;
-
-        while (true) {
-            if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                xSemaphoreTake(flush_done_sem, 0); // drain any stale count from init DMAs
-                esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
-                // Hold mutex until DMA completes. Releasing before the semaphore
-                // creates a window where another task can start an SPI transaction
-                // on the shared bus while display DMA is still running — causing
-                // the ST7789 column-counter to desync and produce a vertical tear.
-                xSemaphoreTake(flush_done_sem, pdMS_TO_TICKS(1000));
-                xSemaphoreGive(sd_spi_mutex);
-                lv_disp_flush_ready(drv);
-                return;
-            }
-
-            wait_attempt++;
-            TickType_t elapsed = xTaskGetTickCount() - start;
-            if (elapsed > pdMS_TO_TICKS(5000)) {
-                ESP_LOGW(TAG, "[FLUSH] SPI mutex stuck >5s (attempt %d), skipping flush",
-                         wait_attempt);
-                lv_disp_flush_ready(drv);
-                return;
-            }
-
-            esp_task_wdt_reset();
+        if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+            xSemaphoreTake(flush_done_sem, 0); // drain any stale count from init DMAs
+            esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
+            // Hold mutex until DMA completes. Releasing before the semaphore
+            // creates a window where another task can start an SPI transaction
+            // on the shared bus while display DMA is still running — causing
+            // the ST7789 column-counter to desync and produce a vertical tear.
+            xSemaphoreTake(flush_done_sem, pdMS_TO_TICKS(1000));
+            xSemaphoreGive(sd_spi_mutex);
+        } else {
+            // Mutex held by another task (SD provision, etc.) — skip this flush
+            // LVGL will re-render the dirty area in the next timer cycle
             flush_mutex_wait_count++;
         }
     } else {
         esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
         xSemaphoreTake(flush_done_sem, pdMS_TO_TICKS(1000));
-        lv_disp_flush_ready(drv);
     }
+    lv_disp_flush_ready(drv);
 }
 
 void lvgl_touch_read_cb(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
