@@ -6172,23 +6172,49 @@ void app_main(void)
             // Process SD Provision Queue — Main loop drains provision batches.
             // The provision task queues batches (5 items per batch), and the main loop
             // processes them here while holding lvgl_mutex, calling scrollable_textarea_append().
-            // This keeps render time bounded and main loop responsive to watchdog resets.
+            // Limit drain to 2 items per iteration to avoid blocking watchdog.
             if (sd_provision_log_ta && sd_prov_queue && sd_provision_active) {
+                uint64_t drain_start_us = esp_timer_get_time();
                 sd_prov_update_t msg;
-                while (xQueueReceive(sd_prov_queue, &msg, 0) == pdTRUE) {
+                int drain_count = 0;
+                const int max_drain_per_iter = 2;  // Process 2 items max per loop iteration
+
+                while (xQueueReceive(sd_prov_queue, &msg, 0) == pdTRUE && drain_count < max_drain_per_iter) {
                     size_t line_len = strlen(msg.line);
                     if (line_len == 0) continue;
 
                     // Append batch to textarea with trimming enabled (max 2000 chars).
                     // Trimming keeps render time O(1) regardless of item count.
+                    uint64_t append_start = esp_timer_get_time();
                     scrollable_textarea_append(sd_provision_log_ta, msg.line, 2000, true);
+                    uint64_t append_ms = (esp_timer_get_time() - append_start) / 1000;
 
                     // Add newline if the message doesn't already end with one
                     if (msg.line[line_len - 1] != '\n') {
                         lv_textarea_add_text(sd_provision_log_ta, "\n");
                     }
 
-                    ESP_LOGD(TAG, "[PROV_MAIN_LOOP] Drained batch from queue: %u bytes", (unsigned)line_len);
+                    drain_count++;
+                    if (append_ms > 100) {
+                        ESP_LOGW(TAG, "[PROV_MAIN_LOOP] SLOW append: %llu ms, line=%u bytes", append_ms, (unsigned)line_len);
+                    }
+                }
+
+                uint64_t drain_total_ms = (esp_timer_get_time() - drain_start_us) / 1000;
+                if (drain_count > 0) {
+                    ESP_LOGI(TAG, "[PROV_MAIN_LOOP] Drained %d items in %llu ms total", drain_count, drain_total_ms);
+                }
+            } else if (sd_prov_queue && !sd_provision_active && sd_provision_log_ta) {
+                // Provision has finished but queue may still have items.
+                // Log how many are pending (don't drain them, just count).
+                int pending = 0;
+                sd_prov_update_t msg;
+                while (xQueuePeek(sd_prov_queue, &msg, 0) == pdTRUE) {
+                    pending++;
+                    xQueueReceive(sd_prov_queue, &msg, 0);  // Remove from queue without draining
+                }
+                if (pending > 0) {
+                    ESP_LOGI(TAG, "[PROV_MAIN_LOOP] Provision done, %d items still queued but not displayed (flag=false)", pending);
                 }
             }
 
