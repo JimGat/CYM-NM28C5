@@ -22027,6 +22027,9 @@ static void sd_prov_line_cb(void *arg)
 
 static void sd_prov_done_cb(void *arg)
 {
+    // CRITICAL: This runs in LVGL context (inside lv_timer_handler).
+    // DO NOT do heavy work here — just update UI labels.
+    // Task cleanup happens BEFORE this callback is posted.
     char *summary = (char *)arg;
     if (sd_provision_status_label) {
         lv_label_set_text(sd_provision_status_label, summary ? summary : "Done");
@@ -22038,10 +22041,7 @@ static void sd_prov_done_cb(void *arg)
     }
     free(summary);
     sd_provision_active = false;
-    if (sd_provision_task_stack) {
-        heap_caps_free(sd_provision_task_stack);
-        sd_provision_task_stack = NULL;
-    }
+    // Task stack cleanup is done by the task itself, NOT here
 }
 
 // ─── Provision State Machine Types ──────────────────────────────────────────
@@ -22296,10 +22296,21 @@ static void sd_provision_task(void *pvParams)
     ESP_LOGI(TAG, "[SD_PROV] Log file append took %lld ms", (log_done - log_start) / 1000);
 
 done: ;
+    // Clean up task stack BEFORE posting callback to LVGL
+    // This prevents blocking the main task's watchdog reset
+    ESP_LOGI(TAG, "[SD_PROV] Freeing task stack before callback...");
+    if (sd_provision_task_stack) {
+        heap_caps_free(sd_provision_task_stack);
+        sd_provision_task_stack = NULL;
+        ESP_LOGI(TAG, "[SD_PROV] Task stack freed");
+    }
+
+    // Now post UI update callback (this is just LVGL label updates, very fast)
     ESP_LOGI(TAG, "[SD_PROV] Calling done callback...");
     char *summary = malloc(64);
     if (summary) snprintf(summary, 64, "Done - %d created, %d OK", created, ok_count);
     lv_async_call(sd_prov_done_cb, summary);
+
     ESP_LOGI(TAG, "[SD_PROV] Task exiting (will delete self)");
     // esp_task_wdt_delete(NULL);  // Main task owns watchdog
     vTaskDelete(NULL);
