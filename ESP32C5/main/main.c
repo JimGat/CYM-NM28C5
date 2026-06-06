@@ -1327,6 +1327,10 @@ static lv_obj_t    *sd_prov_back_btn          = NULL;
 static volatile bool sd_provision_active      = false;
 static StackType_t *sd_provision_task_stack   = NULL;
 static StaticTask_t sd_provision_task_buf;
+// Set true by the provision task just before vTaskDelete(NULL). The main loop
+// polls this and frees the static PSRAM stack from main-task context — a task
+// can never free its own stack (the SP lives inside it → instant overflow).
+static volatile bool sd_provision_stack_free_pending = false;
 
 // Deferred provision startup: event callbacks set these flags instead of creating
 // the dialog directly, so the main loop can create it outside lv_timer_handler()
@@ -7082,6 +7086,24 @@ void app_main(void)
         // Reset watchdog again after releasing mutex
         esp_task_wdt_reset();
         
+        // Free the provision task's static PSRAM stack from main-task context.
+        // The task set this flag right before vTaskDelete(NULL); it cannot free its
+        // own stack. By the time we observe the flag the task is gone, so the memory
+        // is safe to release here.
+        if (sd_provision_stack_free_pending) {
+            // Wait until FreeRTOS has fully reaped the deleted task before freeing
+            // its stack. eTaskGetState() returns eDeleted (or eInvalid) once the idle
+            // task has finished tearing the TCB down; only then is the stack idle.
+            TaskHandle_t prov_h = xTaskGetHandle("sd_prov");
+            if (prov_h == NULL) {
+                sd_provision_stack_free_pending = false;
+                if (sd_provision_task_stack) {
+                    heap_caps_free(sd_provision_task_stack);
+                    sd_provision_task_stack = NULL;
+                }
+            }
+        }
+
         // Process pending karma saves (with SPI mutex to avoid display conflicts)
         if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             wifi_attacks_process_pending_saves();
@@ -22041,27 +22063,8 @@ static void sd_prov_done_cb(void *arg)
     }
     free(summary);
     sd_provision_active = false;
-    // Task stack cleanup is done by the task itself, NOT here
+    // Stack is freed by the main loop (sd_provision_stack_free_pending), never here.
 }
-
-// ─── Provision State Machine Types ──────────────────────────────────────────
-
-typedef enum {
-    PROV_ITEM_IDLE,              // Initial state
-    PROV_ITEM_STAT_PENDING,      // About to call stat()
-    PROV_ITEM_STAT_COMPLETE,     // stat() complete, result known
-    PROV_ITEM_CREATE_PENDING,    // About to mkdir() or fopen()
-    PROV_ITEM_CREATE_COMPLETE,   // mkdir() or fwrite() complete
-    PROV_ITEM_DONE,              // Ready for next item
-} prov_item_state_t;
-
-typedef struct {
-    const sd_provision_item_t *item;  // Points to SD_ITEMS[i]
-    prov_item_state_t state;          // Current FSM state
-    bool exists;                      // Result of stat()
-    int errno_val;                    // Captured errno from last operation
-    int64_t t_start;                  // Microseconds at item start
-} prov_item_ctx_t;
 
 // ─── Provision background task ───────────────────────────────────────────────
 
@@ -22071,47 +22074,107 @@ typedef struct {
                lv_async_call(sd_prov_line_cb, _u); } \
 } while (0)
 
-// Helper: take sd_spi_mutex with 10s timeout; returns false and posts error on failure
+// Take sd_spi_mutex (10 s timeout). Returns false on timeout.
 #define PROV_TAKE_MUTEX() \
     (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(10000)) == pdTRUE)
+
+// One SD item: take the mutex, do the single filesystem op, release. The mutex is
+// held only for the duration of one stat/mkdir/fopen — never across a yield — so
+// the display flush (which also wants sd_spi_mutex) is blocked for at most a few ms.
+//
+// WHY THIS IS SAFE (and the old per-op FSM was not necessary):
+// Every other screen in this firmware calls mkdir()/fopen() on /sdcard directly.
+// A single dir/file op is a handful of short SPI transactions (a few ms), well
+// under the 5 s task-WDT window. The previous version's elaborate 6-state machine
+// added no safety — it just multiplied mutex take/release churn and the number of
+// vTaskDelay points, while still holding the mutex during each real op exactly as
+// here. We keep the work in a background task (priority 2) so the main LVGL loop
+// keeps rendering, and we subscribe THIS task to the task-WDT and reset it after
+// every item so a slow card can never trip the watchdog.
+static void sd_prov_do_item(const sd_provision_item_t *item, int idx,
+                            int *created, int *ok_count)
+{
+    if (!PROV_TAKE_MUTEX()) {
+        PROV_POST("ERR: mutex timeout at item %d", idx);
+        return;
+    }
+
+    struct stat st;
+    bool exists = (stat(item->path, &st) == 0);
+
+    if (exists) {
+        xSemaphoreGive(sd_spi_mutex);
+        PROV_POST("  OK  %s%s", item->path + 8, item->type == SD_ITEM_DIR ? "/" : "");
+        (*ok_count)++;
+        return;
+    }
+
+    int err = 0;
+    if (item->type == SD_ITEM_DIR) {
+        if (mkdir(item->path, 0755) != 0) err = errno;
+    } else {
+        FILE *f = fopen(item->path, "w");
+        if (f) {
+            if (item->content && item->content[0])
+                fwrite(item->content, 1, strlen(item->content), f);
+            fclose(f);
+        } else {
+            err = errno;
+        }
+    }
+    xSemaphoreGive(sd_spi_mutex);  // release BEFORE posting to LVGL / yielding
+
+    if (err == 0) {
+        PROV_POST("  ++  %s%s", item->path + 8, item->type == SD_ITEM_DIR ? "/" : "");
+        (*created)++;
+    } else {
+        PROV_POST("  !!  %s%s (errno %d)", item->path + 8,
+                  item->type == SD_ITEM_DIR ? "/" : "", err);
+    }
+}
 
 static void sd_provision_task(void *pvParams)
 {
     bool after_format = (bool)(uintptr_t)pvParams;
     int  created = 0, ok_count = 0;
 
-    // Watchdog handled by main task. Provision task yields 30ms between items
-    // to let the main loop reset watchdog. Task yields are sufficient.
-    // esp_task_wdt_add(NULL);
-    // ESP_LOGI(TAG, "[SD_PROV] Task registered with watchdog");
+    // Subscribe THIS task to the task-WDT. The format path makes a single long,
+    // un-yielding f_mkfs() call; subscribing + resetting around it (and after every
+    // item) guarantees the watchdog is fed from the task that is actually doing the
+    // work, not relied upon from the main loop which may be starved while we run.
+    esp_task_wdt_add(NULL);
+    esp_task_wdt_reset();
 
-    // Format must hold the mutex for its entire duration (many SPI transactions)
+    // ── Optional format pass ────────────────────────────────────────────────
     if (after_format) {
-        /* Warn the user BEFORE grabbing the mutex so the screen can update.
-           Once we hold sd_spi_mutex, the display flush is blocked — no UI updates
-           are possible until f_mkfs completes (30-90 s on a large card). */
+        // Warn BEFORE grabbing the mutex: once we hold sd_spi_mutex the display
+        // flush is blocked, so no UI update is possible until f_mkfs completes.
         PROV_POST("Formatting SD card...\n\nScreen will freeze\nuntil complete.\nPlease wait...");
-        vTaskDelay(pdMS_TO_TICKS(500)); /* let the message render before SPI lock */
+        vTaskDelay(pdMS_TO_TICKS(500));  // let the message render before SPI lock
 
         if (!PROV_TAKE_MUTEX()) {
             PROV_POST("ERR: mutex timeout during format");
             goto done;
         }
-        esp_err_t fr = wifi_wardrive_format_sd();
+        esp_task_wdt_reset();
+        esp_err_t fr = wifi_wardrive_format_sd();  // long blocking call (30-90 s)
+        esp_task_wdt_reset();
         xSemaphoreGive(sd_spi_mutex);
-        vTaskDelay(pdMS_TO_TICKS(500)); /* card settle time after unmount */
+        vTaskDelay(pdMS_TO_TICKS(500));  // card settle after unmount
         if (fr != ESP_OK) {
             PROV_POST("Format FAILED.\nCard unmounted cleanly.\nRemove and reinsert\ncard, then retry.");
             goto done;
         }
         PROV_POST("Format OK!\nRemounting...");
         vTaskDelay(pdMS_TO_TICKS(300));
-        // Format unmounted the card — remount before provisioning files
+
         if (!PROV_TAKE_MUTEX()) {
             PROV_POST("ERR: mutex timeout before remount");
             goto done;
         }
+        esp_task_wdt_reset();
         esp_err_t mr = wifi_wardrive_init_sd();
+        esp_task_wdt_reset();
         xSemaphoreGive(sd_spi_mutex);
         if (mr != ESP_OK) {
             PROV_POST("Remount FAILED: %s", esp_err_to_name(mr));
@@ -22120,195 +22183,42 @@ static void sd_provision_task(void *pvParams)
         PROV_POST("Remount OK!\nRebuilding structure...");
     }
 
-    // Process each item using a state machine: each state performs ONE SPI operation
-    // then releases the mutex and yields. This keeps the main task responsive.
+    // ── Validate / create every item ────────────────────────────────────────
     uint64_t task_start = esp_timer_get_time();
-    ESP_LOGI(TAG, "[SD_PROV] Task started, will process %d items", SD_ITEMS_COUNT);
+    ESP_LOGI(TAG, "[SD_PROV] Processing %d items", (int)SD_ITEMS_COUNT);
 
-    prov_item_ctx_t *items = malloc(sizeof(prov_item_ctx_t) * SD_ITEMS_COUNT);
-    if (!items) {
-        PROV_POST("ERR: malloc failed for item contexts");
-        goto done;
-    }
-    ESP_LOGI(TAG, "[SD_PROV] Allocated item contexts, starting FSM");
-
-    // Initialize all item contexts
     for (int i = 0; i < (int)SD_ITEMS_COUNT; i++) {
-        items[i].item = &SD_ITEMS[i];
-        items[i].state = PROV_ITEM_IDLE;
-        items[i].exists = false;
-        items[i].errno_val = 0;
-        items[i].t_start = esp_timer_get_time();
+        sd_prov_do_item(&SD_ITEMS[i], i, &created, &ok_count);
+        esp_task_wdt_reset();          // fed by the working task itself
+        vTaskDelay(pdMS_TO_TICKS(10)); // yield: lets main loop render + idle run
     }
 
-    // Run FSM for each item
-    for (int i = 0; i < (int)SD_ITEMS_COUNT; i++) {
-        prov_item_ctx_t *ctx = &items[i];
-        const sd_provision_item_t *item = ctx->item;
-
-        while (ctx->state != PROV_ITEM_DONE) {
-            switch (ctx->state) {
-                case PROV_ITEM_IDLE:
-                    // Start item processing
-                    ESP_LOGI(TAG, "[SD_PROV] Item %d/%d: %s", i, (int)SD_ITEMS_COUNT, item->path);
-                    ctx->state = PROV_ITEM_STAT_PENDING;
-                    break;
-
-                case PROV_ITEM_STAT_PENDING: {
-                    // SYNC BLOCK: Take mutex, stat(), release
-                    if (!PROV_TAKE_MUTEX()) {
-                        PROV_POST("ERR: mutex timeout at item %d", i);
-                        ctx->state = PROV_ITEM_DONE;
-                        break;
-                    }
-                    int64_t t0 = esp_timer_get_time() / 1000;
-                    struct stat st;
-                    ctx->exists = (stat(item->path, &st) == 0);
-                    int64_t t1 = esp_timer_get_time() / 1000;
-                    xSemaphoreGive(sd_spi_mutex);
-
-                    ESP_LOGI(TAG, "[SD_PROV] Item %d: stat() took %lld ms, exists=%d", i, t1 - t0, ctx->exists);
-                    ctx->state = PROV_ITEM_STAT_COMPLETE;
-                    break;
-                }
-
-                case PROV_ITEM_STAT_COMPLETE: {
-                    // Decision point: does item exist?
-                    if (ctx->exists) {
-                        // Item exists — just log
-                        if (item->type == SD_ITEM_DIR) {
-                            PROV_POST("  OK  %s/", item->path + 8);
-                        } else {
-                            PROV_POST("  OK  %s", item->path + 8);
-                        }
-                        ok_count++;
-                        ctx->state = PROV_ITEM_DONE;
-                    } else {
-                        // Item doesn't exist — need to create
-                        PROV_POST("  → creating: %s%s", item->path + 8, item->type == SD_ITEM_DIR ? "/" : "");
-                        ctx->state = PROV_ITEM_CREATE_PENDING;
-                    }
-                    vTaskDelay(pdMS_TO_TICKS(10));  // Yield to let main task render
-                    break;
-                }
-
-                case PROV_ITEM_CREATE_PENDING: {
-                    // SYNC BLOCK: Take mutex, mkdir() or fopen(), release
-                    if (!PROV_TAKE_MUTEX()) {
-                        PROV_POST("ERR: mutex timeout creating item %d", i);
-                        ctx->state = PROV_ITEM_DONE;
-                        break;
-                    }
-                    int64_t t0 = esp_timer_get_time() / 1000;
-
-                    if (item->type == SD_ITEM_DIR) {
-                        // Create directory
-                        if (mkdir(item->path, 0755) == 0) {
-                            ctx->errno_val = 0;
-                        } else {
-                            ctx->errno_val = errno;
-                        }
-                        ESP_LOGI(TAG, "[SD_PROV] Item %d: mkdir() errno=%d", i, ctx->errno_val);
-                    } else {
-                        // Create file
-                        FILE *f = fopen(item->path, "w");
-                        if (f) {
-                            if (item->content && item->content[0]) {
-                                fwrite(item->content, 1, strlen(item->content), f);
-                            }
-                            fclose(f);
-                            ctx->errno_val = 0;
-                        } else {
-                            ctx->errno_val = errno;
-                        }
-                        ESP_LOGI(TAG, "[SD_PROV] Item %d: fopen/fwrite errno=%d", i, ctx->errno_val);
-                    }
-
-                    int64_t t1 = esp_timer_get_time() / 1000;
-                    xSemaphoreGive(sd_spi_mutex);
-                    ESP_LOGI(TAG, "[SD_PROV] Item %d: create took %lld ms", i, t1 - t0);
-                    ctx->state = PROV_ITEM_CREATE_COMPLETE;
-                    break;
-                }
-
-                case PROV_ITEM_CREATE_COMPLETE: {
-                    // Report result of creation
-                    if (ctx->errno_val == 0) {
-                        if (item->type == SD_ITEM_DIR) {
-                            PROV_POST("  ++  %s/", item->path + 8);
-                        } else {
-                            PROV_POST("  ++  %s", item->path + 8);
-                        }
-                        created++;
-                    } else {
-                        if (item->type == SD_ITEM_DIR) {
-                            PROV_POST("  !!  %s/ (errno %d)", item->path + 8, ctx->errno_val);
-                        } else {
-                            PROV_POST("  !!  %s (errno %d)", item->path + 8, ctx->errno_val);
-                        }
-                    }
-                    vTaskDelay(pdMS_TO_TICKS(10));  // Yield to let main task render
-                    ctx->state = PROV_ITEM_DONE;
-                    break;
-                }
-
-                case PROV_ITEM_DONE:
-                    // Already logged; will exit while loop
-                    break;
-
-                default:
-                    ESP_LOGW(TAG, "[SD_PROV] Item %d: unknown state %d", i, ctx->state);
-                    ctx->state = PROV_ITEM_DONE;
-                    break;
-            }
-        }
-
-        // Log total time for this item
-        int64_t t_total = (esp_timer_get_time() - ctx->t_start) / 1000;
-        ESP_LOGI(TAG, "[SD_PROV] Item %d DONE: %lld ms total", i, t_total);
-
-        // Yield between items to ensure main task gets time
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
-
-    free(items);
-
-    uint64_t task_items_done = esp_timer_get_time();
-    ESP_LOGI(TAG, "[SD_PROV] All %d items processed in %lld ms", SD_ITEMS_COUNT, (task_items_done - task_start) / 1000);
+    ESP_LOGI(TAG, "[SD_PROV] %d items in %lld ms (created=%d ok=%d)",
+             (int)SD_ITEMS_COUNT, (esp_timer_get_time() - task_start) / 1000,
+             created, ok_count);
 
     // Append run summary to provision.log
-    ESP_LOGI(TAG, "[SD_PROV] Starting log file append...");
-    uint64_t log_start = esp_timer_get_time();
     if (PROV_TAKE_MUTEX()) {
-        ESP_LOGI(TAG, "[SD_PROV] Mutex acquired for log, opening file...");
         FILE *log = fopen("/sdcard/lab/config/provision.log", "a");
         if (log) {
-            ESP_LOGI(TAG, "[SD_PROV] Writing to log file...");
             fprintf(log, "Created: %d  OK: %d\n", created, ok_count);
             fclose(log);
-            ESP_LOGI(TAG, "[SD_PROV] Log file closed");
-        } else {
-            ESP_LOGW(TAG, "[SD_PROV] Failed to open log file");
         }
         xSemaphoreGive(sd_spi_mutex);
     }
-    uint64_t log_done = esp_timer_get_time();
-    ESP_LOGI(TAG, "[SD_PROV] Log file append took %lld ms", (log_done - log_start) / 1000);
+    esp_task_wdt_reset();
 
 done: ;
-    // CRITICAL: Cannot free the task's own stack from within the task.
-    // The stack pointer (SP) is inside this memory. Freeing it causes immediate stack overflow.
-    // Solution: Let the stack persist (only 4KB, provision runs once per session/lifetime).
-    // The stack will be reused on next provision or leaked if device doesn't provision again.
-
-    // Post UI update callback (this is just LVGL label updates, very fast)
-    ESP_LOGI(TAG, "[SD_PROV] Calling done callback...");
+    // Post the UI-completion callback (LVGL label updates only — runs in LVGL ctx).
     char *summary = malloc(64);
     if (summary) snprintf(summary, 64, "Done - %d created, %d OK", created, ok_count);
     lv_async_call(sd_prov_done_cb, summary);
 
-    ESP_LOGI(TAG, "[SD_PROV] Task exiting (stack persists, ~4KB)");
-    // esp_task_wdt_delete(NULL);  // Main task owns watchdog
+    // Hand the static PSRAM stack back to the main loop to free — a task must never
+    // free its own stack (SP lives inside it). Unsubscribe from the WDT first.
+    esp_task_wdt_delete(NULL);
+    ESP_LOGI(TAG, "[SD_PROV] Task exiting; main loop will free stack");
+    sd_provision_stack_free_pending = true;
     vTaskDelete(NULL);
 }
 
@@ -22376,10 +22286,19 @@ static void show_sd_provision_running_screen(bool after_format)
     lv_obj_center(back_lbl);
 
     // Launch background task in PSRAM stack
+    // Reclaim any stack left over from a previous provision run before allocating
+    // a new one (avoids leaking if the main loop hadn't freed it yet).
+    sd_provision_stack_free_pending = false;
+    if (sd_provision_task_stack) {
+        heap_caps_free(sd_provision_task_stack);
+        sd_provision_task_stack = NULL;
+    }
     sd_provision_task_stack = heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
     if (sd_provision_task_stack) {
+        // Priority 2 (RF-hat scan-task convention): above the priority-1 main loop so
+        // provision makes progress, below WiFi/system tasks. Subscribed to the WDT.
         xTaskCreateStatic(sd_provision_task, "sd_prov", 4096,
-                          (void *)(uintptr_t)after_format, 3,
+                          (void *)(uintptr_t)after_format, 2,
                           sd_provision_task_stack, &sd_provision_task_buf);
     } else {
         lv_label_set_text(sd_provision_status_label, "ERR: no PSRAM for task");
