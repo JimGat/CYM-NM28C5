@@ -22498,31 +22498,12 @@ static void sd_tree_populate(const char *path)
         return;
     }
 
-    /* WORKAROUND: FatFS can return wrong directory handles if it has a cached
-     * working directory. Force it to set the working directory explicitly with
-     * chdir(), then use opendir(".") to ensure proper handle initialization. */
-    char saved_cwd[300];
-    if (getcwd(saved_cwd, sizeof(saved_cwd)) == NULL) {
-        strcpy(saved_cwd, "/");  // fallback
-    }
-    ESP_LOGI(TAG, "[SD_TREE_DEBUG] Saved cwd: '%s'", saved_cwd);
-
-    if (chdir(path) != 0) {
-        ESP_LOGW(TAG, "[SD_TREE_DEBUG] chdir('%s') failed", path);
-        xSemaphoreGive(sd_spi_mutex);
-        lv_obj_t *e = lv_label_create(s_sd_tree_list);
-        lv_label_set_text(e, "Cannot access directory");
-        lv_obj_set_style_text_color(e, COLOR_MATERIAL_RED, 0);
-        return;
-    }
-
-    DIR *dir = opendir(".");
-    ESP_LOGI(TAG, "[SD_TREE_DEBUG] opendir('.') after chdir('%s') => handle=%p", path, (void*)dir);
+    DIR *dir = opendir(path);
+    ESP_LOGI(TAG, "[SD_TREE_DEBUG] opendir('%s') => handle=%p", path, (void*)dir);
     if (!dir) {
-        chdir(saved_cwd);  // restore
         xSemaphoreGive(sd_spi_mutex);
         lv_obj_t *e = lv_label_create(s_sd_tree_list);
-        lv_label_set_text(e, "Cannot read directory");
+        lv_label_set_text(e, "Cannot open directory");
         lv_obj_set_style_text_color(e, COLOR_MATERIAL_RED, 0);
         return;
     }
@@ -22640,25 +22621,31 @@ static void sd_tree_populate(const char *path)
         }
     }
     closedir(dir);
-    chdir(saved_cwd);  // restore original working directory
-    ESP_LOGI(TAG, "[SD_TREE_DEBUG] Restored cwd to: '%s'", saved_cwd);
     xSemaphoreGive(sd_spi_mutex);
 }
 
 static void show_sd_tree_screen(void)
 {
-    // Reset globals to prevent stale data from previous visits
-    ESP_LOGI(TAG, "[SD_TREE_DEBUG] show_sd_tree_screen() called, resetting globals");
-    memset(s_sd_tree_cwd, 0, sizeof(s_sd_tree_cwd));
-    s_sd_tree_list = NULL;
-    s_sd_path_lbl = NULL;
-    s_sd_dir_count = 0;
-    memset(s_sd_dir_paths, 0, sizeof(s_sd_dir_paths));
-    ESP_LOGI(TAG, "[SD_TREE_DEBUG] After reset: cwd='%s' dir_count=%d", s_sd_tree_cwd, s_sd_dir_count);
-
     create_function_page_base("SD File Tree");
 
-    /* ── Path bar ─────────────────────────────────────────────── */
+    lv_obj_t *msg = lv_label_create(function_page);
+    lv_label_set_text(msg,
+        "SD File Tree — NOT AVAILABLE\n\n"
+        "FatFS mount point detection needed.\n\n"
+        "Use Settings → SD Card → Free Space\n"
+        "or access files via WiFi mode.");
+    lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(msg, &lv_font_montserrat_14, 0);
+    lv_obj_align(msg, LV_ALIGN_CENTER, 0, 0);
+    return;
+}
+
+#if 0
+static void show_sd_tree_screen_disabled_old_code(void)
+{
+    create_function_page_base("SD File Tree");
+
+    /* Path bar */
     lv_obj_t *path_bar = lv_obj_create(function_page);
     lv_obj_set_size(path_bar, lv_pct(100), 22);
     lv_obj_align(path_bar, LV_ALIGN_TOP_MID, 0, 32);
@@ -22714,6 +22701,7 @@ static void show_sd_tree_screen(void)
     /* Start at SD root */
     sd_tree_populate(SD_TREE_ROOT);
 }
+#endif
 
 // ─── Format — two-stage confirmation ─────────────────────────────────────────
 
