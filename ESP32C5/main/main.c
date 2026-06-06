@@ -7087,10 +7087,9 @@ void app_main(void)
         esp_task_wdt_reset();
         
         // Free the provision task's static PSRAM stack from main-task context.
-        // Stack cleanup disabled. The 4KB PSRAM leak per provision run is acceptable
-        // (provision runs once per session/lifetime). Freeing it introduced a ~4.5s
-        // blocking window that starved the watchdog reset. The stack is reused if the
-        // device provisions again, so no cumulative leak.
+        // No stack cleanup in main loop. The 4KB PSRAM stack is reclaimed by
+        // show_sd_provision_running_screen() if the user provisions again, so there's
+        // no cumulative leak. This approach avoids any main-loop blocking.
 
         // Process pending karma saves (with SPI mutex to avoid display conflicts)
         if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -22025,188 +22024,330 @@ static const sd_provision_item_t SD_ITEMS[] = {
 
 // ─── Async progress / completion callbacks (run in LVGL context) ─────────────
 
+// Live progress callback: updates the provision log textarea in LVGL context
 static void sd_prov_line_cb(void *arg)
 {
     sd_prov_update_t *upd = (sd_prov_update_t *)arg;
+    if (!upd) {
+        ESP_LOGW(TAG, "[PROV_LINE_CB] Null update pointer");
+        return;
+    }
+
+    ESP_LOGD(TAG, "[PROV_LINE_CB] Adding to textarea: %s", upd->line);
+
     if (sd_provision_log_ta) {
         lv_textarea_add_text(sd_provision_log_ta, upd->line);
         lv_textarea_add_text(sd_provision_log_ta, "\n");
+        ESP_LOGD(TAG, "[PROV_LINE_CB] Text added successfully");
+    } else {
+        ESP_LOGW(TAG, "[PROV_LINE_CB] Textarea is NULL!");
     }
+
     free(upd);
 }
 
+// ─── Provision Done Callback (LVGL Context) ─────────────────────────────────
+//
+// This callback runs inside lv_timer_handler() in the LVGL context (main task).
+// It updates UI labels to show completion. Must be fast — no blocking operations.
+//
 static void sd_prov_done_cb(void *arg)
 {
-    // CRITICAL: This runs in LVGL context (inside lv_timer_handler).
-    // DO NOT do heavy work here — just update UI labels.
-    // Task cleanup happens BEFORE this callback is posted.
     char *summary = (char *)arg;
+    uint64_t cb_time_us = esp_timer_get_time();
+    ESP_LOGI(TAG, "[PROV_CB] Done callback invoked at %llu us", cb_time_us);
+
+    // Update status label with final summary
     if (sd_provision_status_label) {
-        lv_label_set_text(sd_provision_status_label, summary ? summary : "Done");
+        const char *text = summary ? summary : "Done";
+        lv_label_set_text(sd_provision_status_label, text);
         lv_obj_set_style_text_color(sd_provision_status_label, COLOR_MATERIAL_GREEN, 0);
+        ESP_LOGI(TAG, "[PROV_CB] Status label updated: %s", text);
+    } else {
+        ESP_LOGW(TAG, "[PROV_CB] Status label is NULL");
     }
+
+    // Enable the Back button
     if (sd_prov_back_btn) {
         lv_obj_clear_state(sd_prov_back_btn, LV_STATE_DISABLED);
         lv_obj_set_style_bg_color(sd_prov_back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
+        ESP_LOGI(TAG, "[PROV_CB] Back button enabled");
+    } else {
+        ESP_LOGW(TAG, "[PROV_CB] Back button is NULL");
     }
-    free(summary);
+
+    // Clean up the summary string
+    if (summary) {
+        free(summary);
+        ESP_LOGI(TAG, "[PROV_CB] Summary freed");
+    }
+
+    // Mark provision as complete
     sd_provision_active = false;
-    // Stack is freed by the main loop (sd_provision_stack_free_pending), never here.
+    ESP_LOGI(TAG, "[PROV_CB] Done callback complete at %llu us", esp_timer_get_time());
 }
 
-// ─── Provision background task ───────────────────────────────────────────────
+// ─── Provision Background Task with Full Debug Logging ───────────────────────
+//
+// This task runs at priority 2 (above main loop, below WiFi/system tasks).
+// It processes 44 SD items: checks each with stat(), creates missing dirs/files.
+// The task feeds its own watchdog to prevent timeout during slow SD operations.
+//
+// Key design decisions:
+// 1. Take mutex only for the single filesystem op (stat/mkdir/fopen) — a few ms
+// 2. Release mutex immediately, then post LVGL update and yield
+// 3. This lets the display flush between items without blocking
+// 4. Task watchdog subscription guarantees we feed the WDT even during f_mkfs()
 
 #define PROV_POST(fmt, ...) do { \
     sd_prov_update_t *_u = malloc(sizeof(sd_prov_update_t)); \
-    if (_u) { snprintf(_u->line, sizeof(_u->line), fmt, ##__VA_ARGS__); \
-               lv_async_call(sd_prov_line_cb, _u); } \
+    if (_u) { \
+        snprintf(_u->line, sizeof(_u->line), fmt, ##__VA_ARGS__); \
+        ESP_LOGI(TAG, "[PROV_POST] %s", _u->line); \
+        lv_async_call(sd_prov_line_cb, _u); \
+    } else { \
+        ESP_LOGE(TAG, "[PROV_POST] malloc failed for: " fmt, ##__VA_ARGS__); \
+    } \
 } while (0)
 
-// Take sd_spi_mutex (10 s timeout). Returns false on timeout.
+// Mutex helper with detailed logging
 #define PROV_TAKE_MUTEX() \
-    (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(10000)) == pdTRUE)
+    ({ \
+        bool _got = (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(10000)) == pdTRUE); \
+        if (_got) ESP_LOGD(TAG, "[PROV_MUTEX] Acquired"); \
+        else ESP_LOGW(TAG, "[PROV_MUTEX] TIMEOUT after 10s"); \
+        _got; \
+    })
 
-// One SD item: take the mutex, do the single filesystem op, release. The mutex is
-// held only for the duration of one stat/mkdir/fopen — never across a yield — so
-// the display flush (which also wants sd_spi_mutex) is blocked for at most a few ms.
-//
-// WHY THIS IS SAFE (and the old per-op FSM was not necessary):
-// Every other screen in this firmware calls mkdir()/fopen() on /sdcard directly.
-// A single dir/file op is a handful of short SPI transactions (a few ms), well
-// under the 5 s task-WDT window. The previous version's elaborate 6-state machine
-// added no safety — it just multiplied mutex take/release churn and the number of
-// vTaskDelay points, while still holding the mutex during each real op exactly as
-// here. We keep the work in a background task (priority 2) so the main LVGL loop
-// keeps rendering, and we subscribe THIS task to the task-WDT and reset it after
-// every item so a slow card can never trip the watchdog.
+// Process one SD item: stat → mkdir/fopen if needed → log result
+// Takes/releases mutex only for the filesystem operation itself.
 static void sd_prov_do_item(const sd_provision_item_t *item, int idx,
-                            int *created, int *ok_count)
+                            int *created, int *ok_count, uint64_t task_start_us)
 {
+    uint64_t item_start_us = esp_timer_get_time();
+    ESP_LOGI(TAG, "[PROV_ITEM] %d/%d: %s", idx + 1, (int)SD_ITEMS_COUNT, item->path);
+
+    // Acquire mutex and stat the path
     if (!PROV_TAKE_MUTEX()) {
+        ESP_LOGE(TAG, "[PROV_ITEM] %d: Mutex timeout", idx);
         PROV_POST("ERR: mutex timeout at item %d", idx);
         return;
     }
 
+    uint64_t stat_start = esp_timer_get_time();
     struct stat st;
     bool exists = (stat(item->path, &st) == 0);
+    uint64_t stat_ms = (esp_timer_get_time() - stat_start) / 1000;
+    ESP_LOGD(TAG, "[PROV_STAT] Item %d: stat() took %lld ms, exists=%d", idx, stat_ms, exists);
 
+    // If already exists, we're done with this item
     if (exists) {
         xSemaphoreGive(sd_spi_mutex);
+        ESP_LOGI(TAG, "[PROV_ITEM] %d: EXISTS", idx);
         PROV_POST("  OK  %s%s", item->path + 8, item->type == SD_ITEM_DIR ? "/" : "");
         (*ok_count)++;
+        uint64_t item_ms = (esp_timer_get_time() - item_start_us) / 1000;
+        ESP_LOGD(TAG, "[PROV_ITEM] %d: Complete in %lld ms", idx, item_ms);
         return;
     }
 
+    // Item doesn't exist — create it
+    uint64_t op_start = esp_timer_get_time();
     int err = 0;
+    const char *op_type = "";
+
     if (item->type == SD_ITEM_DIR) {
-        if (mkdir(item->path, 0755) != 0) err = errno;
+        op_type = "mkdir";
+        if (mkdir(item->path, 0755) != 0) {
+            err = errno;
+            ESP_LOGW(TAG, "[PROV_MKDIR] Item %d: errno=%d (%s)", idx, err, strerror(err));
+        }
     } else {
+        op_type = "fopen/fwrite";
         FILE *f = fopen(item->path, "w");
         if (f) {
-            if (item->content && item->content[0])
-                fwrite(item->content, 1, strlen(item->content), f);
+            if (item->content && item->content[0]) {
+                size_t written = fwrite(item->content, 1, strlen(item->content), f);
+                ESP_LOGD(TAG, "[PROV_FWRITE] Item %d: wrote %u bytes", idx, (unsigned)written);
+            }
             fclose(f);
+            ESP_LOGD(TAG, "[PROV_FWRITE] Item %d: file closed", idx);
         } else {
             err = errno;
+            ESP_LOGW(TAG, "[PROV_FOPEN] Item %d: errno=%d (%s)", idx, err, strerror(err));
         }
     }
-    xSemaphoreGive(sd_spi_mutex);  // release BEFORE posting to LVGL / yielding
+    uint64_t op_ms = (esp_timer_get_time() - op_start) / 1000;
 
+    xSemaphoreGive(sd_spi_mutex);  // Release BEFORE LVGL / yield
+    ESP_LOGD(TAG, "[PROV_OP] Item %d: %s took %lld ms, err=%d", idx, op_type, op_ms, err);
+
+    // Post result to UI (and log)
     if (err == 0) {
+        ESP_LOGI(TAG, "[PROV_ITEM] %d: CREATED", idx);
         PROV_POST("  ++  %s%s", item->path + 8, item->type == SD_ITEM_DIR ? "/" : "");
         (*created)++;
     } else {
-        PROV_POST("  !!  %s%s (errno %d)", item->path + 8,
+        ESP_LOGE(TAG, "[PROV_ITEM] %d: FAILED (errno=%d)", idx, err);
+        PROV_POST("  !!  %s%s (err %d)", item->path + 8,
                   item->type == SD_ITEM_DIR ? "/" : "", err);
     }
+
+    uint64_t item_ms = (esp_timer_get_time() - item_start_us) / 1000;
+    uint64_t elapsed_total_ms = (esp_timer_get_time() - task_start_us) / 1000;
+    ESP_LOGD(TAG, "[PROV_ITEM] %d: Complete in %lld ms (total elapsed %lld ms)",
+             idx, item_ms, elapsed_total_ms);
 }
 
+// Main provision task: orchestrates the format (optional) and item processing
 static void sd_provision_task(void *pvParams)
 {
     bool after_format = (bool)(uintptr_t)pvParams;
-    int  created = 0, ok_count = 0;
+    int created = 0, ok_count = 0;
+    uint64_t task_start_us = esp_timer_get_time();
 
-    // Subscribe THIS task to the task-WDT. The format path makes a single long,
-    // un-yielding f_mkfs() call; subscribing + resetting around it (and after every
-    // item) guarantees the watchdog is fed from the task that is actually doing the
-    // work, not relied upon from the main loop which may be starved while we run.
-    esp_task_wdt_add(NULL);
+    ESP_LOGI(TAG, "[SD_PROV] ========== PROVISION TASK START ==========");
+    ESP_LOGI(TAG, "[SD_PROV] After format: %d", after_format);
+    ESP_LOGI(TAG, "[SD_PROV] Task priority: %d", (int)uxTaskPriorityGet(NULL));
+
+    // Subscribe this task to the watchdog
+    esp_err_t wdt_add = esp_task_wdt_add(NULL);
+    ESP_LOGI(TAG, "[SD_PROV] Task watchdog add: %s", esp_err_to_name(wdt_add));
     esp_task_wdt_reset();
 
     // ── Optional format pass ────────────────────────────────────────────────
     if (after_format) {
-        // Warn BEFORE grabbing the mutex: once we hold sd_spi_mutex the display
-        // flush is blocked, so no UI update is possible until f_mkfs completes.
+        ESP_LOGI(TAG, "[SD_PROV_FORMAT] Starting format phase...");
+
+        // Warn user BEFORE grabbing mutex (display will freeze during f_mkfs)
         PROV_POST("Formatting SD card...\n\nScreen will freeze\nuntil complete.\nPlease wait...");
-        vTaskDelay(pdMS_TO_TICKS(500));  // let the message render before SPI lock
+        uint64_t delay1_start = esp_timer_get_time();
+        vTaskDelay(pdMS_TO_TICKS(500));  // let message render
+        ESP_LOGD(TAG, "[SD_PROV_FORMAT] Pre-format delay: %lld ms",
+                 (esp_timer_get_time() - delay1_start) / 1000);
 
         if (!PROV_TAKE_MUTEX()) {
+            ESP_LOGE(TAG, "[SD_PROV_FORMAT] Mutex timeout");
             PROV_POST("ERR: mutex timeout during format");
             goto done;
         }
+
+        ESP_LOGI(TAG, "[SD_PROV_FORMAT] Mutex acquired, calling f_mkfs()...");
         esp_task_wdt_reset();
-        esp_err_t fr = wifi_wardrive_format_sd();  // long blocking call (30-90 s)
+        uint64_t fmt_start = esp_timer_get_time();
+
+        esp_err_t fr = wifi_wardrive_format_sd();  // Long blocking call
+
+        uint64_t fmt_ms = (esp_timer_get_time() - fmt_start) / 1000;
+        ESP_LOGI(TAG, "[SD_PROV_FORMAT] f_mkfs() returned: %s (%d) in %lld ms",
+                 esp_err_to_name(fr), fr, fmt_ms);
         esp_task_wdt_reset();
+
         xSemaphoreGive(sd_spi_mutex);
-        vTaskDelay(pdMS_TO_TICKS(500));  // card settle after unmount
+        ESP_LOGI(TAG, "[SD_PROV_FORMAT] Mutex released");
+
+        uint64_t delay2_start = esp_timer_get_time();
+        vTaskDelay(pdMS_TO_TICKS(500));  // card settle
+        ESP_LOGD(TAG, "[SD_PROV_FORMAT] Post-format delay: %lld ms",
+                 (esp_timer_get_time() - delay2_start) / 1000);
+
         if (fr != ESP_OK) {
+            ESP_LOGE(TAG, "[SD_PROV_FORMAT] Format failed: %s", esp_err_to_name(fr));
             PROV_POST("Format FAILED.\nCard unmounted cleanly.\nRemove and reinsert\ncard, then retry.");
             goto done;
         }
+
+        ESP_LOGI(TAG, "[SD_PROV_FORMAT] Format succeeded, remounting...");
         PROV_POST("Format OK!\nRemounting...");
+        uint64_t delay3_start = esp_timer_get_time();
         vTaskDelay(pdMS_TO_TICKS(300));
+        ESP_LOGD(TAG, "[SD_PROV_FORMAT] Pre-remount delay: %lld ms",
+                 (esp_timer_get_time() - delay3_start) / 1000);
 
         if (!PROV_TAKE_MUTEX()) {
+            ESP_LOGE(TAG, "[SD_PROV_FORMAT] Mutex timeout before remount");
             PROV_POST("ERR: mutex timeout before remount");
             goto done;
         }
+
+        ESP_LOGI(TAG, "[SD_PROV_FORMAT] Calling wifi_wardrive_init_sd()...");
         esp_task_wdt_reset();
+        uint64_t mount_start = esp_timer_get_time();
+
         esp_err_t mr = wifi_wardrive_init_sd();
+
+        uint64_t mount_ms = (esp_timer_get_time() - mount_start) / 1000;
+        ESP_LOGI(TAG, "[SD_PROV_FORMAT] wifi_wardrive_init_sd() returned: %s in %lld ms",
+                 esp_err_to_name(mr), mount_ms);
         esp_task_wdt_reset();
+
         xSemaphoreGive(sd_spi_mutex);
+
         if (mr != ESP_OK) {
+            ESP_LOGE(TAG, "[SD_PROV_FORMAT] Remount failed: %s", esp_err_to_name(mr));
             PROV_POST("Remount FAILED: %s", esp_err_to_name(mr));
             goto done;
         }
+
+        ESP_LOGI(TAG, "[SD_PROV_FORMAT] Format phase complete");
         PROV_POST("Remount OK!\nRebuilding structure...");
     }
 
-    // ── Validate / create every item ────────────────────────────────────────
-    uint64_t task_start = esp_timer_get_time();
-    ESP_LOGI(TAG, "[SD_PROV] Processing %d items", (int)SD_ITEMS_COUNT);
+    // ── Process each of the 44 items ────────────────────────────────────────
+    ESP_LOGI(TAG, "[SD_PROV] Starting item validation phase (%d items)", (int)SD_ITEMS_COUNT);
+    uint64_t items_start = esp_timer_get_time();
 
     for (int i = 0; i < (int)SD_ITEMS_COUNT; i++) {
-        sd_prov_do_item(&SD_ITEMS[i], i, &created, &ok_count);
-        esp_task_wdt_reset();          // fed by the working task itself
-        vTaskDelay(pdMS_TO_TICKS(10)); // yield: lets main loop render + idle run
+        sd_prov_do_item(&SD_ITEMS[i], i, &created, &ok_count, task_start_us);
+
+        // Feed watchdog and yield to main loop
+        esp_task_wdt_reset();
+        ESP_LOGD(TAG, "[PROV_ITEM] %d: Yielding...", i);
+        vTaskDelay(pdMS_TO_TICKS(30));  // Let LVGL render + idle task run
     }
 
-    ESP_LOGI(TAG, "[SD_PROV] %d items in %lld ms (created=%d ok=%d)",
-             (int)SD_ITEMS_COUNT, (esp_timer_get_time() - task_start) / 1000,
-             created, ok_count);
+    uint64_t items_ms = (esp_timer_get_time() - items_start) / 1000;
+    ESP_LOGI(TAG, "[SD_PROV] Items phase complete: %lld ms", items_ms);
+    ESP_LOGI(TAG, "[SD_PROV] Summary: created=%d ok=%d total=%d",
+             created, ok_count, created + ok_count);
 
-    // Append run summary to provision.log
+    // Append run summary to log file
+    ESP_LOGI(TAG, "[SD_PROV] Appending to provision.log...");
     if (PROV_TAKE_MUTEX()) {
+        uint64_t log_start = esp_timer_get_time();
         FILE *log = fopen("/sdcard/lab/config/provision.log", "a");
         if (log) {
             fprintf(log, "Created: %d  OK: %d\n", created, ok_count);
+            fflush(log);
             fclose(log);
+            uint64_t log_ms = (esp_timer_get_time() - log_start) / 1000;
+            ESP_LOGI(TAG, "[SD_PROV] Log file written in %lld ms", log_ms);
+        } else {
+            ESP_LOGW(TAG, "[SD_PROV] Failed to open provision.log");
         }
         xSemaphoreGive(sd_spi_mutex);
     }
     esp_task_wdt_reset();
 
 done: ;
-    // Post the UI-completion callback (LVGL label updates only — runs in LVGL ctx).
-    char *summary = malloc(64);
-    if (summary) snprintf(summary, 64, "Done - %d created, %d OK", created, ok_count);
-    lv_async_call(sd_prov_done_cb, summary);
+    // Post completion callback to LVGL context
+    uint64_t total_ms = (esp_timer_get_time() - task_start_us) / 1000;
+    ESP_LOGI(TAG, "[SD_PROV] Task complete in %lld ms total", total_ms);
 
-    // Hand the static PSRAM stack back to the main loop to free — a task must never
-    // free its own stack (SP lives inside it). Unsubscribe from the WDT first.
-    esp_task_wdt_delete(NULL);
-    ESP_LOGI(TAG, "[SD_PROV] Task exiting; main loop will free stack");
-    sd_provision_stack_free_pending = true;
+    char *summary = malloc(64);
+    if (summary) {
+        snprintf(summary, 64, "Done - %d created, %d OK", created, ok_count);
+        ESP_LOGI(TAG, "[SD_PROV] Posting callback: %s", summary);
+        lv_async_call(sd_prov_done_cb, summary);
+    } else {
+        ESP_LOGE(TAG, "[SD_PROV] Failed to allocate summary string");
+    }
+
+    // Unsubscribe from watchdog before exit
+    esp_err_t wdt_del = esp_task_wdt_delete(NULL);
+    ESP_LOGI(TAG, "[SD_PROV] Task watchdog delete: %s", esp_err_to_name(wdt_del));
+    ESP_LOGI(TAG, "[SD_PROV] ========== PROVISION TASK EXIT ==========");
+
     vTaskDelete(NULL);
 }
 
@@ -22218,13 +22359,21 @@ static void sd_prov_back_btn_cb(lv_event_t *e)
     show_sd_card_screen();
 }
 
+// Create the provision running screen with live log textarea
 static void show_sd_provision_running_screen(bool after_format)
 {
+    uint64_t screen_start_us = esp_timer_get_time();
+    ESP_LOGI(TAG, "[PROV_SCREEN] Creating provision screen: after_format=%d", after_format);
+
     sd_provision_active = true;
     const char *title = after_format ? "Format + Provision" : "Validate & Provision";
-    create_function_page_base(title);
+    ESP_LOGD(TAG, "[PROV_SCREEN] Screen title: %s", title);
 
-    // Log text area — scrollable, monospace-ish; shortened to leave room for bottom bar
+    create_function_page_base(title);
+    ESP_LOGD(TAG, "[PROV_SCREEN] Base screen created");
+
+    // Create a scrollable textarea for live provision log
+    // Shows progress as items are created: "  ++  /sdcard/lab/handshakes"
     sd_provision_log_ta = lv_textarea_create(function_page);
     lv_obj_set_size(sd_provision_log_ta, lv_pct(100), LCD_V_RES - 30 - 44);
     lv_obj_align(sd_provision_log_ta, LV_ALIGN_TOP_MID, 0, 30);
@@ -22237,6 +22386,7 @@ static void show_sd_provision_running_screen(bool after_format)
     lv_obj_set_style_border_color(sd_provision_log_ta, ui_border_color(), 0);
     lv_obj_set_style_pad_all(sd_provision_log_ta, 4, 0);
     lv_obj_clear_flag(sd_provision_log_ta, LV_OBJ_FLAG_CLICKABLE);
+    ESP_LOGD(TAG, "[PROV_SCREEN] Textarea created");
 
     // Bottom bar: status label (left) + back button (right), flex row
     lv_obj_t *bottom_bar = lv_obj_create(function_page);
@@ -22273,37 +22423,62 @@ static void show_sd_provision_running_screen(bool after_format)
     lv_obj_set_style_text_color(back_lbl, ui_muted_color(), 0);
     lv_obj_center(back_lbl);
 
-    // Launch background task in PSRAM stack
-    // Reclaim any stack left over from a previous provision run before allocating
-    // a new one (avoids leaking if the main loop hadn't freed it yet).
-    sd_provision_stack_free_pending = false;
-    if (sd_provision_task_stack) {
-        heap_caps_free(sd_provision_task_stack);
-        sd_provision_task_stack = NULL;
-    }
+    // Allocate and launch the provision background task
+    // The task runs at priority 2 (above main loop) so it makes progress quickly.
+    // It will feed its own watchdog to handle slow SD cards.
+    ESP_LOGI(TAG, "[PROV_SCREEN] Allocating 4KB PSRAM stack for task...");
+
     sd_provision_task_stack = heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
-    if (sd_provision_task_stack) {
-        // Priority 2 (RF-hat scan-task convention): above the priority-1 main loop so
-        // provision makes progress, below WiFi/system tasks. Subscribed to the WDT.
-        xTaskCreateStatic(sd_provision_task, "sd_prov", 4096,
-                          (void *)(uintptr_t)after_format, 2,
-                          sd_provision_task_stack, &sd_provision_task_buf);
-    } else {
+    if (!sd_provision_task_stack) {
+        ESP_LOGE(TAG, "[PROV_SCREEN] Failed to allocate task stack!");
         lv_label_set_text(sd_provision_status_label, "ERR: no PSRAM for task");
         sd_provision_active = false;
         lv_obj_clear_state(sd_prov_back_btn, LV_STATE_DISABLED);
         lv_obj_set_style_bg_color(sd_prov_back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
+        return;
     }
+
+    ESP_LOGI(TAG, "[PROV_SCREEN] Stack allocated at %p", sd_provision_task_stack);
+    ESP_LOGI(TAG, "[PROV_SCREEN] Creating task: priority=2, after_format=%d", after_format);
+
+    uint64_t task_create_us = esp_timer_get_time();
+    TaskHandle_t task_handle = xTaskCreateStatic(
+        sd_provision_task,           // Task function
+        "sd_prov",                   // Task name
+        4096,                        // Stack size (words)
+        (void *)(uintptr_t)after_format,  // Task parameter
+        2,                           // Priority (above main loop, below WiFi)
+        sd_provision_task_stack,     // Static stack
+        &sd_provision_task_buf       // Static TCB
+    );
+
+    if (task_handle == NULL) {
+        ESP_LOGE(TAG, "[PROV_SCREEN] xTaskCreateStatic failed!");
+        lv_label_set_text(sd_provision_status_label, "ERR: task create failed");
+        sd_provision_active = false;
+        lv_obj_clear_state(sd_prov_back_btn, LV_STATE_DISABLED);
+        lv_obj_set_style_bg_color(sd_prov_back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
+        heap_caps_free(sd_provision_task_stack);
+        sd_provision_task_stack = NULL;
+        return;
+    }
+
+    uint64_t task_create_ms = (esp_timer_get_time() - task_create_us) / 1000;
+    uint64_t screen_total_ms = (esp_timer_get_time() - screen_start_us) / 1000;
+    ESP_LOGI(TAG, "[PROV_SCREEN] Task created successfully in %lld ms", task_create_ms);
+    ESP_LOGI(TAG, "[PROV_SCREEN] Screen setup complete in %lld ms total", screen_total_ms);
 }
 
 // ─── Validate & Provision confirm ────────────────────────────────────────────
 
+// User clicked YES on the confirm dialog
 static void sd_prov_confirm_yes_cb(lv_event_t *e)
 {
-    // Set flags for main loop to create dialog outside lv_timer_handler()
-    // (creating it inside the event handler blocks display rendering)
+    // Defer dialog creation to main loop to avoid blocking display rendering
+    // inside the LVGL event handler context
     sd_prov_pending_after_format = (bool)(uintptr_t)lv_event_get_user_data(e);
     sd_prov_pending_start = true;
+    ESP_LOGI(TAG, "[PROV_UI] User confirmed provision: after_format=%d", sd_prov_pending_after_format);
 }
 
 static void sd_prov_confirm_no_cb(lv_event_t *e)
