@@ -22540,16 +22540,16 @@ done: ;
         ESP_LOGE(TAG, "[SD_PROV] Failed to allocate summary string");
     }
 
-    // Signal main loop to stop draining the queue (MUST be before queue delete!)
+    // Signal main loop to stop draining the queue
     sd_provision_active = false;
     ESP_LOGI(TAG, "[SD_PROV] Set sd_provision_active = false");
 
-    // Clean up provision queue. Main loop will stop draining after task exits.
-    if (sd_prov_queue != NULL) {
-        vQueueDelete(sd_prov_queue);
-        sd_prov_queue = NULL;
-        ESP_LOGI(TAG, "[SD_PROV] Queue deleted and set to NULL");
-    }
+    // DO NOT delete the queue from this task. The main loop may still be inside
+    // an xQueueReceive call with the queue handle. Deleting the queue while another
+    // task is dereferencing it causes use-after-free (assertion in queue.c).
+    // Instead, just set the flag to false. The main loop will naturally stop draining
+    // when it sees the flag is false. On the next provision cycle, xQueueCreate will
+    // be called again, which implicitly replaces the old queue handle.
 
     // Unsubscribe from watchdog before exit
     esp_err_t wdt_del = esp_task_wdt_delete(NULL);
