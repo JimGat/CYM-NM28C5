@@ -22072,19 +22072,28 @@ static void sd_provision_task(void *pvParams)
     for (int i = 0; i < (int)SD_ITEMS_COUNT; i++) {
         const sd_provision_item_t *item = &SD_ITEMS[i];
 
+        ESP_LOGI(TAG, "[SD_PROV] Processing item %d/%d: %s", i, (int)SD_ITEMS_COUNT, item->path);
+
         if (!PROV_TAKE_MUTEX()) {
             PROV_POST("ERR: mutex timeout at item %d", i);
             goto done;
         }
 
+        esp_task_wdt_reset();  // Reset watchdog before potentially slow operation
+        ESP_LOGI(TAG, "[SD_PROV] Item %d: calling stat(%s)", i, item->path);
+
         struct stat st;
         bool exists = (stat(item->path, &st) == 0);
+
+        esp_task_wdt_reset();  // Reset after stat
+        ESP_LOGI(TAG, "[SD_PROV] Item %d: stat returned exists=%d", i, exists);
 
         if (item->type == SD_ITEM_DIR) {
             if (exists) {
                 PROV_POST("  OK  %s/", item->path + 8);
                 ok_count++;
             } else {
+                ESP_LOGI(TAG, "[SD_PROV] Item %d: calling mkdir(%s)", i, item->path);
                 if (mkdir(item->path, 0755) == 0) {
                     PROV_POST("  ++  %s/", item->path + 8);
                     created++;
@@ -22097,11 +22106,17 @@ static void sd_provision_task(void *pvParams)
                 PROV_POST("  OK  %s", item->path + 8);
                 ok_count++;
             } else {
+                ESP_LOGI(TAG, "[SD_PROV] Item %d: calling fopen(%s) for write", i, item->path);
                 FILE *f = fopen(item->path, "w");
+                esp_task_wdt_reset();
                 if (f) {
-                    if (item->content && item->content[0])
+                    if (item->content && item->content[0]) {
+                        ESP_LOGI(TAG, "[SD_PROV] Item %d: calling fwrite, content_len=%zu", i, strlen(item->content));
                         fwrite(item->content, 1, strlen(item->content), f);
+                        esp_task_wdt_reset();
+                    }
                     fclose(f);
+                    esp_task_wdt_reset();
                     PROV_POST("  ++  %s", item->path + 8);
                     created++;
                 } else {
@@ -22110,6 +22125,7 @@ static void sd_provision_task(void *pvParams)
             }
         }
 
+        esp_task_wdt_reset();  // Reset before releasing mutex
         xSemaphoreGive(sd_spi_mutex);
         vTaskDelay(pdMS_TO_TICKS(30));  // yield — lets LVGL flush the new log line
     }
