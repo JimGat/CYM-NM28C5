@@ -22027,6 +22027,25 @@ static void sd_prov_done_cb(void *arg)
     }
 }
 
+// ─── Provision State Machine Types ──────────────────────────────────────────
+
+typedef enum {
+    PROV_ITEM_IDLE,              // Initial state
+    PROV_ITEM_STAT_PENDING,      // About to call stat()
+    PROV_ITEM_STAT_COMPLETE,     // stat() complete, result known
+    PROV_ITEM_CREATE_PENDING,    // About to mkdir() or fopen()
+    PROV_ITEM_CREATE_COMPLETE,   // mkdir() or fwrite() complete
+    PROV_ITEM_DONE,              // Ready for next item
+} prov_item_state_t;
+
+typedef struct {
+    const sd_provision_item_t *item;  // Points to SD_ITEMS[i]
+    prov_item_state_t state;          // Current FSM state
+    bool exists;                      // Result of stat()
+    int errno_val;                    // Captured errno from last operation
+    int64_t t_start;                  // Microseconds at item start
+} prov_item_ctx_t;
+
 // ─── Provision background task ───────────────────────────────────────────────
 
 #define PROV_POST(fmt, ...) do { \
@@ -22084,72 +22103,154 @@ static void sd_provision_task(void *pvParams)
         PROV_POST("Remount OK!\nRebuilding structure...");
     }
 
-    // Process each item with per-item mutex acquire/release so display stays live
-    for (int i = 0; i < (int)SD_ITEMS_COUNT; i++) {
-        const sd_provision_item_t *item = &SD_ITEMS[i];
-        int64_t t_start = esp_timer_get_time() / 1000;  // milliseconds
-
-        ESP_LOGI(TAG, "[SD_PROV] Item %d/%d START: %s @ %lld ms", i, (int)SD_ITEMS_COUNT, item->path, t_start);
-
-        if (!PROV_TAKE_MUTEX()) {
-            PROV_POST("ERR: mutex timeout at item %d", i);
-            goto done;
-        }
-        int64_t t_mutex = esp_timer_get_time() / 1000;
-        ESP_LOGI(TAG, "[SD_PROV] Item %d: mutex acquired (+%lld ms)", i, t_mutex - t_start);
-
-        struct stat st;
-        int64_t t_stat_start = esp_timer_get_time() / 1000;
-        bool exists = (stat(item->path, &st) == 0);
-        int64_t t_stat_end = esp_timer_get_time() / 1000;
-        ESP_LOGI(TAG, "[SD_PROV] Item %d: stat() took %lld ms, exists=%d", i, t_stat_end - t_stat_start, exists);
-
-        vTaskDelay(pdMS_TO_TICKS(10));  // Brief yield AFTER operation so main task updates display
-        int64_t t_yield = esp_timer_get_time() / 1000;
-        ESP_LOGI(TAG, "[SD_PROV] Item %d: after 10ms yield, now at +%lld ms total", i, t_yield - t_start);
-
-        if (item->type == SD_ITEM_DIR) {
-            if (exists) {
-                PROV_POST("  OK  %s/", item->path + 8);
-                ok_count++;
-            } else {
-                ESP_LOGI(TAG, "[SD_PROV] Item %d: calling mkdir(%s)", i, item->path);
-                if (mkdir(item->path, 0755) == 0) {
-                    PROV_POST("  ++  %s/", item->path + 8);
-                    created++;
-                } else {
-                    PROV_POST("  !!  %s/ (err %d)", item->path + 8, errno);
-                }
-            }
-        } else {
-            if (exists) {
-                PROV_POST("  OK  %s", item->path + 8);
-                ok_count++;
-            } else {
-                ESP_LOGI(TAG, "[SD_PROV] Item %d: calling fopen(%s) for write", i, item->path);
-                FILE *f = fopen(item->path, "w");
-                if (f) {
-                    if (item->content && item->content[0]) {
-                        ESP_LOGI(TAG, "[SD_PROV] Item %d: calling fwrite, content_len=%zu", i, strlen(item->content));
-                        fwrite(item->content, 1, strlen(item->content), f);
-                    }
-                    fclose(f);
-                    PROV_POST("  ++  %s", item->path + 8);
-                    created++;
-                } else {
-                    PROV_POST("  !!  %s (errno %d)", item->path + 8, errno);
-                }
-            }
-        }
-
-        xSemaphoreGive(sd_spi_mutex);
-        int64_t t_mutex_release = esp_timer_get_time() / 1000;
-        ESP_LOGI(TAG, "[SD_PROV] Item %d: mutex released @ +%lld ms", i, t_mutex_release - t_start);
-
-        vTaskDelay(pdMS_TO_TICKS(20));  // Yield 20ms between items (main task renders during this)
-        int64_t t_end = esp_timer_get_time() / 1000;
-        ESP_LOGI(TAG, "[SD_PROV] Item %d DONE: total iteration took %lld ms", i, t_end - t_start);
+    // Process each item using a state machine: each state performs ONE SPI operation
+    // then releases the mutex and yields. This keeps the main task responsive.
+    prov_item_ctx_t *items = malloc(sizeof(prov_item_ctx_t) * SD_ITEMS_COUNT);
+    if (!items) {
+        PROV_POST("ERR: malloc failed for item contexts");
+        goto done;
     }
+
+    // Initialize all item contexts
+    for (int i = 0; i < (int)SD_ITEMS_COUNT; i++) {
+        items[i].item = &SD_ITEMS[i];
+        items[i].state = PROV_ITEM_IDLE;
+        items[i].exists = false;
+        items[i].errno_val = 0;
+        items[i].t_start = esp_timer_get_time();
+    }
+
+    // Run FSM for each item
+    for (int i = 0; i < (int)SD_ITEMS_COUNT; i++) {
+        prov_item_ctx_t *ctx = &items[i];
+        const sd_provision_item_t *item = ctx->item;
+
+        while (ctx->state != PROV_ITEM_DONE) {
+            switch (ctx->state) {
+                case PROV_ITEM_IDLE:
+                    // Start item processing
+                    ESP_LOGI(TAG, "[SD_PROV] Item %d/%d: %s", i, (int)SD_ITEMS_COUNT, item->path);
+                    ctx->state = PROV_ITEM_STAT_PENDING;
+                    break;
+
+                case PROV_ITEM_STAT_PENDING: {
+                    // SYNC BLOCK: Take mutex, stat(), release
+                    if (!PROV_TAKE_MUTEX()) {
+                        PROV_POST("ERR: mutex timeout at item %d", i);
+                        ctx->state = PROV_ITEM_DONE;
+                        break;
+                    }
+                    int64_t t0 = esp_timer_get_time() / 1000;
+                    struct stat st;
+                    ctx->exists = (stat(item->path, &st) == 0);
+                    int64_t t1 = esp_timer_get_time() / 1000;
+                    xSemaphoreGive(sd_spi_mutex);
+
+                    ESP_LOGI(TAG, "[SD_PROV] Item %d: stat() took %lld ms, exists=%d", i, t1 - t0, ctx->exists);
+                    ctx->state = PROV_ITEM_STAT_COMPLETE;
+                    break;
+                }
+
+                case PROV_ITEM_STAT_COMPLETE: {
+                    // Decision point: does item exist?
+                    if (ctx->exists) {
+                        // Item exists — just log
+                        if (item->type == SD_ITEM_DIR) {
+                            PROV_POST("  OK  %s/", item->path + 8);
+                        } else {
+                            PROV_POST("  OK  %s", item->path + 8);
+                        }
+                        ok_count++;
+                        ctx->state = PROV_ITEM_DONE;
+                    } else {
+                        // Item doesn't exist — need to create
+                        PROV_POST("  → creating: %s%s", item->path + 8, item->type == SD_ITEM_DIR ? "/" : "");
+                        ctx->state = PROV_ITEM_CREATE_PENDING;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(10));  // Yield to let main task render
+                    break;
+                }
+
+                case PROV_ITEM_CREATE_PENDING: {
+                    // SYNC BLOCK: Take mutex, mkdir() or fopen(), release
+                    if (!PROV_TAKE_MUTEX()) {
+                        PROV_POST("ERR: mutex timeout creating item %d", i);
+                        ctx->state = PROV_ITEM_DONE;
+                        break;
+                    }
+                    int64_t t0 = esp_timer_get_time() / 1000;
+
+                    if (item->type == SD_ITEM_DIR) {
+                        // Create directory
+                        if (mkdir(item->path, 0755) == 0) {
+                            ctx->errno_val = 0;
+                        } else {
+                            ctx->errno_val = errno;
+                        }
+                        ESP_LOGI(TAG, "[SD_PROV] Item %d: mkdir() errno=%d", i, ctx->errno_val);
+                    } else {
+                        // Create file
+                        FILE *f = fopen(item->path, "w");
+                        if (f) {
+                            if (item->content && item->content[0]) {
+                                fwrite(item->content, 1, strlen(item->content), f);
+                            }
+                            fclose(f);
+                            ctx->errno_val = 0;
+                        } else {
+                            ctx->errno_val = errno;
+                        }
+                        ESP_LOGI(TAG, "[SD_PROV] Item %d: fopen/fwrite errno=%d", i, ctx->errno_val);
+                    }
+
+                    int64_t t1 = esp_timer_get_time() / 1000;
+                    xSemaphoreGive(sd_spi_mutex);
+                    ESP_LOGI(TAG, "[SD_PROV] Item %d: create took %lld ms", i, t1 - t0);
+                    ctx->state = PROV_ITEM_CREATE_COMPLETE;
+                    break;
+                }
+
+                case PROV_ITEM_CREATE_COMPLETE: {
+                    // Report result of creation
+                    if (ctx->errno_val == 0) {
+                        if (item->type == SD_ITEM_DIR) {
+                            PROV_POST("  ++  %s/", item->path + 8);
+                        } else {
+                            PROV_POST("  ++  %s", item->path + 8);
+                        }
+                        created++;
+                    } else {
+                        if (item->type == SD_ITEM_DIR) {
+                            PROV_POST("  !!  %s/ (errno %d)", item->path + 8, ctx->errno_val);
+                        } else {
+                            PROV_POST("  !!  %s (errno %d)", item->path + 8, ctx->errno_val);
+                        }
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(10));  // Yield to let main task render
+                    ctx->state = PROV_ITEM_DONE;
+                    break;
+                }
+
+                case PROV_ITEM_DONE:
+                    // Already logged; will exit while loop
+                    break;
+
+                default:
+                    ESP_LOGW(TAG, "[SD_PROV] Item %d: unknown state %d", i, ctx->state);
+                    ctx->state = PROV_ITEM_DONE;
+                    break;
+            }
+        }
+
+        // Log total time for this item
+        int64_t t_total = (esp_timer_get_time() - ctx->t_start) / 1000;
+        ESP_LOGI(TAG, "[SD_PROV] Item %d DONE: %lld ms total", i, t_total);
+
+        // Yield between items to ensure main task gets time
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    free(items);
 
     // Append run summary to provision.log
     if (PROV_TAKE_MUTEX()) {
