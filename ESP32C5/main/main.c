@@ -7087,21 +7087,14 @@ void app_main(void)
         esp_task_wdt_reset();
         
         // Free the provision task's static PSRAM stack from main-task context.
-        // The task set this flag right before vTaskDelete(NULL); it cannot free its
-        // own stack. By the time we observe the flag the task is gone, so the memory
-        // is safe to release here.
+        // Stack cleanup: We do NOT free the stack here. A 4KB PSRAM leak per provision
+        // run is acceptable (provision runs once per session/lifetime). Freeing it
+        // introduces a blocking window that starves the watchdog reset (~4.5s observed).
+        // The previous attempt to wait for task reap was still blocking. Solution: leak it.
+        // If device provisions multiple times in a session, reuse the same allocation.
         if (sd_provision_stack_free_pending) {
-            // Wait until FreeRTOS has fully reaped the deleted task before freeing
-            // its stack. eTaskGetState() returns eDeleted (or eInvalid) once the idle
-            // task has finished tearing the TCB down; only then is the stack idle.
-            TaskHandle_t prov_h = xTaskGetHandle("sd_prov");
-            if (prov_h == NULL) {
-                sd_provision_stack_free_pending = false;
-                if (sd_provision_task_stack) {
-                    heap_caps_free(sd_provision_task_stack);
-                    sd_provision_task_stack = NULL;
-                }
-            }
+            sd_provision_stack_free_pending = false;
+            // Stack remains allocated but unused. No blocking, no watchdog starvation.
         }
 
         // Process pending karma saves (with SPI mutex to avoid display conflicts)
