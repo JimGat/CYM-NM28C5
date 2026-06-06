@@ -22402,7 +22402,7 @@ static void show_sd_free_space_screen(void)
 
 // ─── Interactive SD file browser ─────────────────────────────────────────────
 
-#define SD_TREE_ROOT     "/"
+#define SD_TREE_ROOT     "/sdcard"
 #define SD_TREE_MAX_DIRS 64
 
 static char      s_sd_tree_cwd[300];
