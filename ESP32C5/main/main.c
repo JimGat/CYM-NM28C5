@@ -5702,9 +5702,10 @@ void app_main(void)
         ESP_LOGW(TAG, "Battery ADC init failed - voltage monitor disabled");
     }
 
-    // Subscribe main task to watchdog to prevent IDLE task starvation during LVGL rendering
-    esp_task_wdt_add(NULL);
-    ESP_LOGI(TAG, "Main task subscribed to watchdog");
+    // Main task watchdog subscription removed: provision task owns watchdog for long SD operations.
+    // Main task has no blocking operations that can hang indefinitely (LVGL, touch, LED have timeouts).
+    // esp_task_wdt_add(NULL);
+    // ESP_LOGI(TAG, "Main task subscribed to watchdog");
 
     ESP_LOGI(TAG, "Main event loop started");
 
