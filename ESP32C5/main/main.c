@@ -22402,7 +22402,7 @@ static void show_sd_free_space_screen(void)
 
 // ─── Interactive SD file browser ─────────────────────────────────────────────
 
-#define SD_TREE_ROOT     "/sdcard"
+#define SD_TREE_ROOT     "/"
 #define SD_TREE_MAX_DIRS 64
 
 static char      s_sd_tree_cwd[300];
@@ -22626,23 +22626,15 @@ static void sd_tree_populate(const char *path)
 
 static void show_sd_tree_screen(void)
 {
-    create_function_page_base("SD File Tree");
+    // Reset globals to prevent stale data from previous visits
+    ESP_LOGI(TAG, "[SD_TREE_DEBUG] show_sd_tree_screen() called, resetting globals");
+    memset(s_sd_tree_cwd, 0, sizeof(s_sd_tree_cwd));
+    s_sd_tree_list = NULL;
+    s_sd_path_lbl = NULL;
+    s_sd_dir_count = 0;
+    memset(s_sd_dir_paths, 0, sizeof(s_sd_dir_paths));
+    ESP_LOGI(TAG, "[SD_TREE_DEBUG] After reset: cwd='%s' dir_count=%d", s_sd_tree_cwd, s_sd_dir_count);
 
-    lv_obj_t *msg = lv_label_create(function_page);
-    lv_label_set_text(msg,
-        "SD File Tree — NOT AVAILABLE\n\n"
-        "FatFS mount point detection needed.\n\n"
-        "Use Settings → SD Card → Free Space\n"
-        "or access files via WiFi mode.");
-    lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(msg, &lv_font_montserrat_14, 0);
-    lv_obj_align(msg, LV_ALIGN_CENTER, 0, 0);
-    return;
-}
-
-#if 0
-static void show_sd_tree_screen_disabled_old_code(void)
-{
     create_function_page_base("SD File Tree");
 
     /* Path bar */
@@ -22701,7 +22693,6 @@ static void show_sd_tree_screen_disabled_old_code(void)
     /* Start at SD root */
     sd_tree_populate(SD_TREE_ROOT);
 }
-#endif
 
 // ─── Format — two-stage confirmation ─────────────────────────────────────────
 
