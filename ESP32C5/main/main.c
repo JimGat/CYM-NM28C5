@@ -7087,15 +7087,10 @@ void app_main(void)
         esp_task_wdt_reset();
         
         // Free the provision task's static PSRAM stack from main-task context.
-        // Stack cleanup: We do NOT free the stack here. A 4KB PSRAM leak per provision
-        // run is acceptable (provision runs once per session/lifetime). Freeing it
-        // introduces a blocking window that starves the watchdog reset (~4.5s observed).
-        // The previous attempt to wait for task reap was still blocking. Solution: leak it.
-        // If device provisions multiple times in a session, reuse the same allocation.
-        if (sd_provision_stack_free_pending) {
-            sd_provision_stack_free_pending = false;
-            // Stack remains allocated but unused. No blocking, no watchdog starvation.
-        }
+        // Stack cleanup disabled. The 4KB PSRAM leak per provision run is acceptable
+        // (provision runs once per session/lifetime). Freeing it introduced a ~4.5s
+        // blocking window that starved the watchdog reset. The stack is reused if the
+        // device provisions again, so no cumulative leak.
 
         // Process pending karma saves (with SPI mutex to avoid display conflicts)
         if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
