@@ -22084,13 +22084,13 @@ static void sd_provision_task(void *pvParams)
             goto done;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(5));  // Brief yield to let main task run
-        // Watchdog reset handled by main task; provision task yields between items
         ESP_LOGI(TAG, "[SD_PROV] Item %d: calling stat(%s)", i, item->path);
 
         struct stat st;
         bool exists = (stat(item->path, &st) == 0);
         ESP_LOGI(TAG, "[SD_PROV] Item %d: stat returned exists=%d", i, exists);
+
+        vTaskDelay(pdMS_TO_TICKS(10));  // Brief yield AFTER operation so main task updates display
 
         if (item->type == SD_ITEM_DIR) {
             if (exists) {
