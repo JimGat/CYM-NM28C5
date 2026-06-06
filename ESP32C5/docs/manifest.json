@@ -1,7 +1,7 @@
 {
   "name": "Cheap Yellow Monster — CYM-NM28C5",
-  "version": "v2.7.24",
-  "build": "v2.7.24",
+  "version": "v2.7.25",
+  "build": "v2.7.25",
   "chipFamily": "ESP32-C5",
   "parts": [
     { "path": "../binaries-esp32c5/bootloader.bin",      "offset": 8192   },

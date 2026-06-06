@@ -22084,6 +22084,7 @@ static void sd_provision_task(void *pvParams)
             goto done;
         }
 
+        vTaskDelay(pdMS_TO_TICKS(5));  // Brief yield to let main task run
         // Watchdog reset handled by main task; provision task yields between items
         ESP_LOGI(TAG, "[SD_PROV] Item %d: calling stat(%s)", i, item->path);
 
