@@ -123,6 +123,22 @@
         background:rgba(57,255,20,0.04);
       }
       .pill strong { color:var(--text); }
+      .hero-cta { margin-top:16px; }
+      .hero-cta a {
+        display:inline-flex;
+        align-items:center;
+        gap:10px;
+        min-height:48px;
+        padding:12px 18px;
+        border-radius:14px;
+        text-decoration:none;
+        font-weight:700;
+        color:#050e05;
+        background:linear-gradient(135deg, var(--accent2), var(--accent));
+        box-shadow:0 10px 28px rgba(255,230,0,0.28), 0 0 22px rgba(57,255,20,0.18);
+      }
+      .hero-cta a:hover { transform:translateY(-1px); box-shadow:0 14px 34px rgba(255,230,0,0.38), 0 0 30px rgba(57,255,20,0.28); }
+      .hero-cta span { font-size:12px; font-weight:600; opacity:.82; text-transform:uppercase; letter-spacing:.05em; }
 
       /* ── Layout ── */
       .split { display:grid; grid-template-columns:1.3fr 1fr; gap:14px; }
@@ -262,6 +278,7 @@
           <span class="pill"><strong>Offsets</strong> 0x2000 / 0x8000 / 0x10000</span>
           <span class="pill" id="versionPill"><strong>Version</strong> loading</span>
         </div>
+        <div class="hero-cta"><a href="https://github.com/JimGat/CYM-NM28C5#readme" target="_blank" rel="noopener noreferrer">📘 Project instructions / README <span>opens new window</span></a></div>
       </header>
 
       <div class="split">
