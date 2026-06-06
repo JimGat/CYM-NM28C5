@@ -7127,7 +7127,9 @@ void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_
     // just skip the flush. LVGL will mark the area dirty and re-render it next cycle.
     // Spin-waiting blocks the main task and prevents watchdog resets.
     if (sd_spi_mutex) {
+        uint64_t flush_start = esp_timer_get_time();
         if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+            uint64_t mutex_acquired = esp_timer_get_time();
             xSemaphoreTake(flush_done_sem, 0); // drain any stale count from init DMAs
             esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
             // Hold mutex until DMA completes. Releasing before the semaphore
@@ -7136,10 +7138,17 @@ void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_
             // the ST7789 column-counter to desync and produce a vertical tear.
             xSemaphoreTake(flush_done_sem, pdMS_TO_TICKS(1000));
             xSemaphoreGive(sd_spi_mutex);
+            uint64_t flush_done = esp_timer_get_time();
+            if (area->y2 - area->y1 > 100) { // Only log for large flushes (e.g., textarea updates)
+                ESP_LOGD(TAG, "[FLUSH] drew rect (%d,%d)-(%d,%d) in %lld us (mutex held %lld us)",
+                         area->x1, area->y1, area->x2, area->y2,
+                         flush_done - flush_start, mutex_acquired - flush_start);
+            }
         } else {
-            // Mutex held by another task (SD provision, etc.) — skip this flush
-            // LVGL will re-render the dirty area in the next timer cycle
             flush_mutex_wait_count++;
+            if (flush_mutex_wait_count % 100 == 0) {
+                ESP_LOGW(TAG, "[FLUSH] Skipped %d times (mutex unavailable)", flush_mutex_wait_count);
+            }
         }
     } else {
         esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
@@ -22123,7 +22132,7 @@ static void sd_provision_task(void *pvParams)
         int64_t t_mutex_release = esp_timer_get_time() / 1000;
         ESP_LOGI(TAG, "[SD_PROV] Item %d: mutex released @ +%lld ms", i, t_mutex_release - t_start);
 
-        vTaskDelay(pdMS_TO_TICKS(100));  // long yield to give main task time to reset watchdog
+        vTaskDelay(pdMS_TO_TICKS(5));  // Brief yield between items (main task runs during this)
         int64_t t_end = esp_timer_get_time() / 1000;
         ESP_LOGI(TAG, "[SD_PROV] Item %d DONE: total iteration took %lld ms", i, t_end - t_start);
     }
