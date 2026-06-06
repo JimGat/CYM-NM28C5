@@ -22439,6 +22439,18 @@ static void show_sd_provision_running_screen(bool after_format)
     }
 
     ESP_LOGI(TAG, "[PROV_SCREEN] Stack allocated at %p", sd_provision_task_stack);
+
+    // CRITICAL: Force LVGL to flush the newly created screen to the panel BEFORE
+    // creating the provision task. The task runs at priority 2 (above main loop priority 1),
+    // so it will immediately preempt. If we don't flush first, the main loop never gets
+    // a chance to render the screen before the task floods LVGL with async updates.
+    // Result: screen is still blank, only the old dialog shows, crash after 3.4s.
+    ESP_LOGI(TAG, "[PROV_SCREEN] Forcing LVGL refresh before task creation...");
+    uint64_t flush_start_us = esp_timer_get_time();
+    lv_refr_now(NULL);  // Synchronously render all dirty areas to the panel
+    uint64_t flush_ms = (esp_timer_get_time() - flush_start_us) / 1000;
+    ESP_LOGI(TAG, "[PROV_SCREEN] LVGL flush complete in %lld ms", flush_ms);
+
     ESP_LOGI(TAG, "[PROV_SCREEN] Creating task: priority=2, after_format=%d", after_format);
 
     uint64_t task_create_us = esp_timer_get_time();
