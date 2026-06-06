@@ -7023,6 +7023,11 @@ void app_main(void)
             uint64_t lvgl_elapsed_us = lvgl_return_us - lvgl_call_us;
             if (lvgl_elapsed_us > 100000) {  // Log if handler took > 100ms
                 ESP_LOGW(TAG, "[MAIN_LOOP] LONG lv_timer_handler() took %llu us (%.1f ms)", lvgl_elapsed_us, (float)lvgl_elapsed_us / 1000.0f);
+                // Additional risk detection: if render time exceeds 500ms, we're approaching WDT danger zone
+                if (lvgl_elapsed_us > 500000) {
+                    ESP_LOGE(TAG, "[MAIN_LOOP] CRITICAL: render took %.1f ms — WDT timeout at 10s risk! Check LVGL buffer size.",
+                             (float)lvgl_elapsed_us / 1000.0f);
+                }
             }
 
             // Deferred provision startup: create dialog outside event callback
@@ -22174,10 +22179,13 @@ static void sd_prov_done_cb(void *arg)
         _got; \
     })
 
-// Process one SD item: stat → mkdir/fopen if needed → log result
+// Process one SD item: stat → mkdir/fopen if needed → queue result for batching
 // Takes/releases mutex only for the filesystem operation itself.
+// Instead of PROV_POST (which posts immediately), appends to batch_buffer for deferred flush.
+// Returns the status line to add to batch (caller must append to batch_buffer and manage batching).
 static void sd_prov_do_item(const sd_provision_item_t *item, int idx,
-                            int *created, int *ok_count, uint64_t task_start_us)
+                            int *created, int *ok_count, uint64_t task_start_us,
+                            char *batch_buffer, size_t batch_size, int *batch_len)
 {
     uint64_t item_start_us = esp_timer_get_time();
     ESP_LOGI(TAG, "[PROV_ITEM] %d/%d: %s", idx + 1, (int)SD_ITEMS_COUNT, item->path);
@@ -22199,7 +22207,12 @@ static void sd_prov_do_item(const sd_provision_item_t *item, int idx,
     if (exists) {
         xSemaphoreGive(sd_spi_mutex);
         ESP_LOGI(TAG, "[PROV_ITEM] %d: EXISTS", idx);
-        PROV_POST("  OK  %s%s", item->path + 8, item->type == SD_ITEM_DIR ? "/" : "");
+        // Queue to batch instead of posting immediately
+        int len = snprintf(batch_buffer + *batch_len, batch_size - *batch_len,
+                          "  OK  %s%s\n", item->path + 8, item->type == SD_ITEM_DIR ? "/" : "");
+        if (len > 0 && *batch_len + len < (int)batch_size) {
+            *batch_len += len;
+        }
         (*ok_count)++;
         uint64_t item_ms = (esp_timer_get_time() - item_start_us) / 1000;
         ESP_LOGD(TAG, "[PROV_ITEM] %d: Complete in %lld ms", idx, item_ms);
@@ -22237,15 +22250,23 @@ static void sd_prov_do_item(const sd_provision_item_t *item, int idx,
     xSemaphoreGive(sd_spi_mutex);  // Release BEFORE LVGL / yield
     ESP_LOGD(TAG, "[PROV_OP] Item %d: %s took %lld ms, err=%d", idx, op_type, op_ms, err);
 
-    // Post result to UI (and log)
+    // Queue result to batch instead of posting immediately
     if (err == 0) {
         ESP_LOGI(TAG, "[PROV_ITEM] %d: CREATED", idx);
-        PROV_POST("  ++  %s%s", item->path + 8, item->type == SD_ITEM_DIR ? "/" : "");
+        int len = snprintf(batch_buffer + *batch_len, batch_size - *batch_len,
+                          "  ++  %s%s\n", item->path + 8, item->type == SD_ITEM_DIR ? "/" : "");
+        if (len > 0 && *batch_len + len < (int)batch_size) {
+            *batch_len += len;
+        }
         (*created)++;
     } else {
         ESP_LOGE(TAG, "[PROV_ITEM] %d: FAILED (errno=%d)", idx, err);
-        PROV_POST("  !!  %s%s (err %d)", item->path + 8,
-                  item->type == SD_ITEM_DIR ? "/" : "", err);
+        int len = snprintf(batch_buffer + *batch_len, batch_size - *batch_len,
+                          "  !!  %s%s (err %d)\n", item->path + 8,
+                          item->type == SD_ITEM_DIR ? "/" : "", err);
+        if (len > 0 && *batch_len + len < (int)batch_size) {
+            *batch_len += len;
+        }
     }
 
     uint64_t item_ms = (esp_timer_get_time() - item_start_us) / 1000;
@@ -22348,17 +22369,77 @@ static void sd_provision_task(void *pvParams)
         PROV_POST("Remount OK!\nRebuilding structure...");
     }
 
-    // ── Process each of the 44 items ────────────────────────────────────────
+    // ── Process each of the 44 items with batching ────────────────────────────
+    // Batch updates to textarea to prevent LVGL render timeout.
+    // Collect ~5 items per batch, flush every 300ms or at end.
+    // This reduces 44 textarea updates to ~8, keeping render time <200ms.
+
     ESP_LOGI(TAG, "[SD_PROV] Starting item validation phase (%d items)", (int)SD_ITEMS_COUNT);
     uint64_t items_start = esp_timer_get_time();
+    uint64_t last_flush_us = items_start;
+    char batch_buffer[1024] = {0};  // Accumulate lines here (increased to 1KB for safety)
+    int batch_len = 0;              // Current length of accumulated text
+    int batch_item_count = 0;       // How many items in current batch
 
     for (int i = 0; i < (int)SD_ITEMS_COUNT; i++) {
-        sd_prov_do_item(&SD_ITEMS[i], i, &created, &ok_count, task_start_us);
+        // Call sd_prov_do_item with batch buffer — it will append to batch instead of posting immediately
+        sd_prov_do_item(&SD_ITEMS[i], i, &created, &ok_count, task_start_us,
+                       batch_buffer, sizeof(batch_buffer), &batch_len);
 
-        // Feed watchdog and yield to main loop
+        // Feed watchdog
         esp_task_wdt_reset();
-        ESP_LOGD(TAG, "[PROV_ITEM] %d: Yielding...", i);
-        vTaskDelay(pdMS_TO_TICKS(500));  // Let LVGL drain async queue and render each item
+
+        batch_item_count++;
+
+        uint64_t now_us = esp_timer_get_time();
+        uint64_t elapsed_since_last_flush_ms = (now_us - last_flush_us) / 1000;
+        bool flush_by_time = (elapsed_since_last_flush_ms >= 300);  // Flush every 300ms
+        bool flush_by_count = (batch_item_count >= 5);               // Or every 5 items
+        bool flush_at_end = (i == (int)SD_ITEMS_COUNT - 1);          // Or at the very end
+
+        if (flush_by_time || flush_by_count || flush_at_end) {
+            // Flush accumulated batch to textarea via LVGL async callback
+            if (batch_len > 0) {
+                sd_prov_update_t *upd = malloc(sizeof(sd_prov_update_t));
+                if (upd) {
+                    strncpy(upd->line, batch_buffer, sizeof(upd->line) - 1);
+                    upd->line[sizeof(upd->line) - 1] = '\0';
+                    uint64_t elapsed_since_batch_start = (now_us - last_flush_us) / 1000;
+                    ESP_LOGI(TAG, "[PROV_BATCH_FLUSH] Flushing %d items (elapsed %lld ms, batch_len %d bytes)",
+                             batch_item_count, elapsed_since_batch_start, batch_len);
+
+                    // Check textarea buffer size to detect bottleneck
+                    if (sd_provision_log_ta) {
+                        size_t ta_len = strlen(lv_textarea_get_text(sd_provision_log_ta));
+                        ESP_LOGD(TAG, "[PROV_TA_SIZE] Current textarea: %u bytes", (unsigned)ta_len);
+                        if (ta_len > 5000) {
+                            ESP_LOGW(TAG, "[PROV_TA_SIZE] WARNING: textarea > 5KB (%u bytes) — render may slow down",
+                                     (unsigned)ta_len);
+                        }
+                        if (ta_len > 10000) {
+                            ESP_LOGE(TAG, "[PROV_TA_SIZE] CRITICAL: textarea > 10KB (%u bytes) — WDT at risk!",
+                                     (unsigned)ta_len);
+                        }
+                    }
+
+                    lv_async_call(sd_prov_line_cb, upd);
+                    batch_item_count = 0;
+                    batch_len = 0;
+                    memset(batch_buffer, 0, sizeof(batch_buffer));
+                    last_flush_us = esp_timer_get_time();
+                } else {
+                    ESP_LOGE(TAG, "[PROV_BATCH_FLUSH] malloc failed");
+                }
+            }
+            ESP_LOGD(TAG, "[PROV_ITEM] %d: Flushed batch (time=%d, count=%d, end=%d)",
+                     i, flush_by_time, flush_by_count, flush_at_end);
+        }
+
+        // Yield to main loop after each item, but less frequently now that we batch updates
+        if (i % 5 == 0 || flush_by_time || flush_by_count || flush_at_end) {
+            ESP_LOGD(TAG, "[PROV_ITEM] %d: Yielding...", i);
+            vTaskDelay(pdMS_TO_TICKS(200));  // Reduced from 500ms since we're batching updates
+        }
     }
 
     uint64_t items_ms = (esp_timer_get_time() - items_start) / 1000;
