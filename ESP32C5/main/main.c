@@ -22076,21 +22076,26 @@ static void sd_provision_task(void *pvParams)
     // Process each item with per-item mutex acquire/release so display stays live
     for (int i = 0; i < (int)SD_ITEMS_COUNT; i++) {
         const sd_provision_item_t *item = &SD_ITEMS[i];
+        int64_t t_start = esp_timer_get_time() / 1000;  // milliseconds
 
-        ESP_LOGI(TAG, "[SD_PROV] Processing item %d/%d: %s", i, (int)SD_ITEMS_COUNT, item->path);
+        ESP_LOGI(TAG, "[SD_PROV] Item %d/%d START: %s @ %lld ms", i, (int)SD_ITEMS_COUNT, item->path, t_start);
 
         if (!PROV_TAKE_MUTEX()) {
             PROV_POST("ERR: mutex timeout at item %d", i);
             goto done;
         }
-
-        ESP_LOGI(TAG, "[SD_PROV] Item %d: calling stat(%s)", i, item->path);
+        int64_t t_mutex = esp_timer_get_time() / 1000;
+        ESP_LOGI(TAG, "[SD_PROV] Item %d: mutex acquired (+%lld ms)", i, t_mutex - t_start);
 
         struct stat st;
+        int64_t t_stat_start = esp_timer_get_time() / 1000;
         bool exists = (stat(item->path, &st) == 0);
-        ESP_LOGI(TAG, "[SD_PROV] Item %d: stat returned exists=%d", i, exists);
+        int64_t t_stat_end = esp_timer_get_time() / 1000;
+        ESP_LOGI(TAG, "[SD_PROV] Item %d: stat() took %lld ms, exists=%d", i, t_stat_end - t_stat_start, exists);
 
         vTaskDelay(pdMS_TO_TICKS(10));  // Brief yield AFTER operation so main task updates display
+        int64_t t_yield = esp_timer_get_time() / 1000;
+        ESP_LOGI(TAG, "[SD_PROV] Item %d: after 10ms yield, now at +%lld ms total", i, t_yield - t_start);
 
         if (item->type == SD_ITEM_DIR) {
             if (exists) {
@@ -22127,7 +22132,12 @@ static void sd_provision_task(void *pvParams)
         }
 
         xSemaphoreGive(sd_spi_mutex);
+        int64_t t_mutex_release = esp_timer_get_time() / 1000;
+        ESP_LOGI(TAG, "[SD_PROV] Item %d: mutex released @ +%lld ms", i, t_mutex_release - t_start);
+
         vTaskDelay(pdMS_TO_TICKS(30));  // yield — lets LVGL flush the new log line
+        int64_t t_end = esp_timer_get_time() / 1000;
+        ESP_LOGI(TAG, "[SD_PROV] Item %d DONE: total iteration took %lld ms", i, t_end - t_start);
     }
 
     // Append run summary to provision.log
