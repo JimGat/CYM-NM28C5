@@ -22296,22 +22296,18 @@ static void sd_provision_task(void *pvParams)
     ESP_LOGI(TAG, "[SD_PROV] Log file append took %lld ms", (log_done - log_start) / 1000);
 
 done: ;
-    // Clean up task stack BEFORE posting callback to LVGL
-    // This prevents blocking the main task's watchdog reset
-    ESP_LOGI(TAG, "[SD_PROV] Freeing task stack before callback...");
-    if (sd_provision_task_stack) {
-        heap_caps_free(sd_provision_task_stack);
-        sd_provision_task_stack = NULL;
-        ESP_LOGI(TAG, "[SD_PROV] Task stack freed");
-    }
+    // CRITICAL: Cannot free the task's own stack from within the task.
+    // The stack pointer (SP) is inside this memory. Freeing it causes immediate stack overflow.
+    // Solution: Let the stack persist (only 4KB, provision runs once per session/lifetime).
+    // The stack will be reused on next provision or leaked if device doesn't provision again.
 
-    // Now post UI update callback (this is just LVGL label updates, very fast)
+    // Post UI update callback (this is just LVGL label updates, very fast)
     ESP_LOGI(TAG, "[SD_PROV] Calling done callback...");
     char *summary = malloc(64);
     if (summary) snprintf(summary, 64, "Done - %d created, %d OK", created, ok_count);
     lv_async_call(sd_prov_done_cb, summary);
 
-    ESP_LOGI(TAG, "[SD_PROV] Task exiting (will delete self)");
+    ESP_LOGI(TAG, "[SD_PROV] Task exiting (stack persists, ~4KB)");
     // esp_task_wdt_delete(NULL);  // Main task owns watchdog
     vTaskDelete(NULL);
 }
