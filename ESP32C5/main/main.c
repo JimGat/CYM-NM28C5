@@ -14146,10 +14146,12 @@ static void wifi_scan_next_btn_cb(lv_event_t *e)
 static void show_wifi_scan_attack_screen(void)
 {
     // Ensure WiFi mode is active
+    ESP_LOGI(TAG, "[WIFI_SCAN_DEBUG] show_wifi_scan_attack_screen: calling ensure_wifi_mode()");
     if (!ensure_wifi_mode()) {
         ESP_LOGE(TAG, "Failed to switch to WiFi mode for scan");
         return;
     }
+    ESP_LOGI(TAG, "[WIFI_SCAN_DEBUG] show_wifi_scan_attack_screen: ensure_wifi_mode() returned true");
     
     create_function_page_base("WiFi Scan & Attack");
     
@@ -32981,10 +32983,18 @@ static bool ensure_wifi_mode(void)
             // Register WiFi scan event handler NOW that WiFi is fully initialized
             // (moved from app_main to ensure the event loop is ready)
             static bool s_wifi_event_handler_registered = false;
+            ESP_LOGI(TAG, "[WIFI_SCAN_DEBUG] Checking handler registration: s_wifi_event_handler_registered=%d", (int)s_wifi_event_handler_registered);
             if (!s_wifi_event_handler_registered) {
-                esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE, &wifi_scan_done_cb, NULL);
-                s_wifi_event_handler_registered = true;
-                ESP_LOGI(TAG, "WiFi scan event handler registered");
+                ESP_LOGI(TAG, "[WIFI_SCAN_DEBUG] Registering WiFi scan event handler NOW");
+                esp_err_t reg_err = esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE, &wifi_scan_done_cb, NULL);
+                if (reg_err == ESP_OK) {
+                    s_wifi_event_handler_registered = true;
+                    ESP_LOGI(TAG, "[WIFI_SCAN_DEBUG] WiFi scan event handler registered successfully");
+                } else {
+                    ESP_LOGE(TAG, "[WIFI_SCAN_DEBUG] FAILED to register handler: err=%d", (int)reg_err);
+                }
+            } else {
+                ESP_LOGI(TAG, "[WIFI_SCAN_DEBUG] Handler already registered, skipping");
             }
 
             current_radio_mode = RADIO_MODE_WIFI;
