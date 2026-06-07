@@ -2705,15 +2705,12 @@ static void sniffer_ui_async_cb(void *arg) {
 
 static void wifi_scan_done_cb(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
-    ESP_LOGI(TAG, "[WIFI_SCAN_DEBUG] Callback FIRED: event_base=%d, event_id=%d, deauth_rescan_active=%d", event_base, event_id, (int)deauth_rescan_active);
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE) {
         // Use separate flag for deauth rescan to avoid conflicts
         if (deauth_rescan_active) {
             deauth_rescan_done_flag = true;
-            ESP_LOGI(TAG, "[WIFI_SCAN_DEBUG] Callback: deauth rescan mode, flag NOT set for UI");
         } else {
             scan_done_ui_flag = true;
-            ESP_LOGI(TAG, "[WIFI_SCAN_DEBUG] Callback: scan_done_ui_flag SET TO TRUE");
         }
     }
     // Ensure button UI matches actual sniffer state (in case we auto-started)
@@ -6334,13 +6331,8 @@ void app_main(void)
             }
             // If scan finished, build results UI (but not during blackout/snifferdog/sae_overflow/handshake/wardrive/karma attack/deauth_monitor/portal or when handshaker is waiting for scan, or when the WCS client scan owns it)
             else if (scan_done_ui_flag) {
-                ESP_LOGI(TAG, "[WIFI_SCAN_DEBUG] Main loop: scan_done_ui_flag IS TRUE");
                 if (g_wcs_scan_active || blackout_ui_active || snifferdog_ui_active || sae_overflow_ui_active || handshake_ui_active || wardrive_ui_active || karma_ui_active || deauth_monitor_ui_active || portal_ui_active || handshake_waiting_for_scan || g_handshaker_global_mode || wana_active) {
                     // WCS client scan or an active attack/visualizer owns this — clear flag, leave screen alone
-                    ESP_LOGW(TAG, "[WIFI_SCAN_DEBUG] BLOCKING: wcs=%d blk=%d snif=%d sae=%d hs=%d wd=%d karma=%d deauth=%d port=%d hswait=%d hsgm=%d wana=%d",
-                             (int)g_wcs_scan_active, (int)blackout_ui_active, (int)snifferdog_ui_active, (int)sae_overflow_ui_active,
-                             (int)handshake_ui_active, (int)wardrive_ui_active, (int)karma_ui_active, (int)deauth_monitor_ui_active,
-                             (int)portal_ui_active, (int)handshake_waiting_for_scan, (int)g_handshaker_global_mode, (int)wana_active);
                     scan_done_ui_flag = false;
                 } else {
                 scan_done_ui_flag = false;
@@ -14146,15 +14138,26 @@ static void wifi_scan_next_btn_cb(lv_event_t *e)
 static void show_wifi_scan_attack_screen(void)
 {
     // Ensure WiFi mode is active
-    ESP_LOGI(TAG, "[WIFI_SCAN_DEBUG] show_wifi_scan_attack_screen: calling ensure_wifi_mode()");
     if (!ensure_wifi_mode()) {
         ESP_LOGE(TAG, "Failed to switch to WiFi mode for scan");
         return;
     }
-    ESP_LOGI(TAG, "[WIFI_SCAN_DEBUG] show_wifi_scan_attack_screen: ensure_wifi_mode() returned true");
-    
+
+    // SAFETY: Ensure the UI callback is registered before starting scan
+    // (Guards against boot-time registration failures in ensure_wifi_mode)
+    static bool s_ui_callback_registered = false;
+    if (!s_ui_callback_registered) {
+        esp_err_t err = esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE, &wifi_scan_done_cb, NULL);
+        if (err == ESP_OK) {
+            s_ui_callback_registered = true;
+            ESP_LOGI(TAG, "[WIFI_SCAN] UI callback registered for scan results");
+        } else {
+            ESP_LOGE(TAG, "[WIFI_SCAN] FAILED to register UI callback: err=%d", (int)err);
+        }
+    }
+
     create_function_page_base("WiFi Scan & Attack");
-    
+
     // Create centered scanning container with icon and text
     lv_obj_t *scan_container = lv_obj_create(function_page);
     lv_obj_set_size(scan_container, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
@@ -14164,7 +14167,7 @@ static void show_wifi_scan_attack_screen(void)
     lv_obj_set_flex_flow(scan_container, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(scan_container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_gap(scan_container, 10, 0);
-    
+
     // WiFi scanning spinner (animated indicator)
     lv_obj_t *scan_spinner = lv_spinner_create(scan_container, 1000, 60);
     lv_obj_set_size(scan_spinner, 50, 50);
@@ -32983,18 +32986,10 @@ static bool ensure_wifi_mode(void)
             // Register WiFi scan event handler NOW that WiFi is fully initialized
             // (moved from app_main to ensure the event loop is ready)
             static bool s_wifi_event_handler_registered = false;
-            ESP_LOGI(TAG, "[WIFI_SCAN_DEBUG] Checking handler registration: s_wifi_event_handler_registered=%d", (int)s_wifi_event_handler_registered);
             if (!s_wifi_event_handler_registered) {
-                ESP_LOGI(TAG, "[WIFI_SCAN_DEBUG] Registering WiFi scan event handler NOW");
-                esp_err_t reg_err = esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE, &wifi_scan_done_cb, NULL);
-                if (reg_err == ESP_OK) {
-                    s_wifi_event_handler_registered = true;
-                    ESP_LOGI(TAG, "[WIFI_SCAN_DEBUG] WiFi scan event handler registered successfully");
-                } else {
-                    ESP_LOGE(TAG, "[WIFI_SCAN_DEBUG] FAILED to register handler: err=%d", (int)reg_err);
-                }
-            } else {
-                ESP_LOGI(TAG, "[WIFI_SCAN_DEBUG] Handler already registered, skipping");
+                esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE, &wifi_scan_done_cb, NULL);
+                s_wifi_event_handler_registered = true;
+                ESP_LOGI(TAG, "WiFi scan event handler registered");
             }
 
             current_radio_mode = RADIO_MODE_WIFI;
