@@ -2711,6 +2711,7 @@ static void wifi_scan_done_cb(void *arg, esp_event_base_t event_base, int32_t ev
             deauth_rescan_done_flag = true;
         } else {
             scan_done_ui_flag = true;
+            ESP_LOGI(TAG, "[WIFI_SCAN_DEBUG] Callback: scan_done_ui_flag SET TO TRUE");
         }
     }
     // Ensure button UI matches actual sniffer state (in case we auto-started)
@@ -6331,8 +6332,13 @@ void app_main(void)
             }
             // If scan finished, build results UI (but not during blackout/snifferdog/sae_overflow/handshake/wardrive/karma attack/deauth_monitor/portal or when handshaker is waiting for scan, or when the WCS client scan owns it)
             else if (scan_done_ui_flag) {
+                ESP_LOGI(TAG, "[WIFI_SCAN_DEBUG] Main loop: scan_done_ui_flag IS TRUE");
                 if (g_wcs_scan_active || blackout_ui_active || snifferdog_ui_active || sae_overflow_ui_active || handshake_ui_active || wardrive_ui_active || karma_ui_active || deauth_monitor_ui_active || portal_ui_active || handshake_waiting_for_scan || g_handshaker_global_mode || wana_active) {
                     // WCS client scan or an active attack/visualizer owns this — clear flag, leave screen alone
+                    ESP_LOGW(TAG, "[WIFI_SCAN_DEBUG] BLOCKING: wcs=%d blk=%d snif=%d sae=%d hs=%d wd=%d karma=%d deauth=%d port=%d hswait=%d hsgm=%d wana=%d",
+                             (int)g_wcs_scan_active, (int)blackout_ui_active, (int)snifferdog_ui_active, (int)sae_overflow_ui_active,
+                             (int)handshake_ui_active, (int)wardrive_ui_active, (int)karma_ui_active, (int)deauth_monitor_ui_active,
+                             (int)portal_ui_active, (int)handshake_waiting_for_scan, (int)g_handshaker_global_mode, (int)wana_active);
                     scan_done_ui_flag = false;
                 } else {
                 scan_done_ui_flag = false;
@@ -6404,6 +6410,7 @@ void app_main(void)
                 lv_obj_add_event_cb(wifi_sas_nav_next, wifi_scan_next_page_cb, LV_EVENT_CLICKED, NULL);
                 lv_obj_add_event_cb(wifi_sas_nav_next, wifi_scan_next_page_cb, LV_EVENT_LONG_PRESSED_REPEAT, NULL);
 
+                ESP_LOGI(TAG, "[WIFI_SCAN_DEBUG] Calling wifi_scan_rebuild_page() - scan_count=%d", (int)wifi_scanner_get_count());
                 wifi_scan_rebuild_page();
 
                 // "Next" button — goes to attack selection
