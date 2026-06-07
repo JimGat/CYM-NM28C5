@@ -2705,10 +2705,12 @@ static void sniffer_ui_async_cb(void *arg) {
 
 static void wifi_scan_done_cb(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
+    ESP_LOGI(TAG, "[WIFI_SCAN_DEBUG] Callback FIRED: event_base=%d, event_id=%d, deauth_rescan_active=%d", event_base, event_id, (int)deauth_rescan_active);
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE) {
         // Use separate flag for deauth rescan to avoid conflicts
         if (deauth_rescan_active) {
             deauth_rescan_done_flag = true;
+            ESP_LOGI(TAG, "[WIFI_SCAN_DEBUG] Callback: deauth rescan mode, flag NOT set for UI");
         } else {
             scan_done_ui_flag = true;
             ESP_LOGI(TAG, "[WIFI_SCAN_DEBUG] Callback: scan_done_ui_flag SET TO TRUE");
