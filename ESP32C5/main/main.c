@@ -39632,6 +39632,9 @@ static void s_cc1101_cap_task_fn(void *arg)
         int uptime_s = (int)(esp_timer_get_time() / 1000000);
         snprintf(s_cc1101_cap_path, 64,
                  "/sdcard/lab/radio/%.0fMHz_%d.sub", (double)raw.freq_mhz, uptime_s);
+        // Ensure directory exists before autosave (defensive against incomplete provisioning)
+        mkdir("/sdcard/lab", 0755);
+        mkdir("/sdcard/lab/radio", 0755);
         cc1101_sub_save(&s_cc1101_cap_raw, s_cc1101_cap_path);
         s_cc1101_cap_state = CC1101_CAP_DONE;
     } else {
