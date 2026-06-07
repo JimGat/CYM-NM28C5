@@ -43926,6 +43926,17 @@ static void show_nrf24_foxhunt_screen(void)
     lv_obj_align(s_n24fox_lbl, LV_ALIGN_TOP_MID, 0, y);
     y += 22;
 
+    // Hint label explaining carrier detect
+    lv_obj_t *hint = lv_label_create(function_page);
+    lv_label_set_text(hint, "Detects any 2.4 GHz carrier\n(WiFi, BT, microwave, etc.)\nUse Channel Scan to find active.");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint, ui_muted_color(), 0);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(hint, 220);
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, y);
+    y += 56;
+
     // Haptic toggle
     s_n24fox_hbtn = lv_btn_create(function_page);
     lv_obj_set_size(s_n24fox_hbtn, 160, 26);
