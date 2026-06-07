@@ -2613,6 +2613,18 @@ This is not a uniquely American position. Every jurisdiction with a radio commun
 
 ---
 
+## Support This Project
+
+If you find Cheap Yellow Monster useful and would like to support its continued development, consider buying me a coffee! Your support helps fund hardware, research, and development time.
+
+<p align="center">
+  <a href="https://buymeacoffee.com/wjvasxixlg" target="_blank">
+    <img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-☕-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black" alt="Buy Me a Coffee"/>
+  </a>
+</p>
+
+---
+
 ## Disclaimer
 
 This project is intended for **educational and authorized security research purposes only**. Unauthorized access to computer networks is illegal. Always obtain proper authorization before testing on any network you do not own. The author assumes no liability for misuse of this software.
