@@ -32983,14 +32983,8 @@ static bool ensure_wifi_mode(void)
             esp_wifi_set_country(&wifi_country);
             apply_wifi_power_settings();
 
-            // Register WiFi scan event handler NOW that WiFi is fully initialized
-            // (moved from app_main to ensure the event loop is ready)
-            static bool s_wifi_event_handler_registered = false;
-            if (!s_wifi_event_handler_registered) {
-                esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE, &wifi_scan_done_cb, NULL);
-                s_wifi_event_handler_registered = true;
-                ESP_LOGI(TAG, "WiFi scan event handler registered");
-            }
+            // Note: WiFi scan event handler is registered on-demand in show_wifi_scan_attack_screen()
+            // to conserve memory for users who don't use WiFi Scan feature
 
             current_radio_mode = RADIO_MODE_WIFI;
             wifi_initialized = true;
