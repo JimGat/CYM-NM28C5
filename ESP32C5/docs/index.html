@@ -188,13 +188,15 @@
       /* ── Form controls ── */
       .check, select, .text-input {
         border:1px solid rgba(57,255,20,0.2);
-        background:rgba(57,255,20,0.04);
+        background:#061406;
         color:var(--text);
         border-radius:12px;
       }
       .check { display:inline-flex; align-items:center; gap:10px; padding:10px 12px; font-size:13px; font-weight:600; user-select:none; cursor:pointer; }
       .check input { width:16px; height:16px; accent-color:var(--accent); }
       select, .text-input { padding:10px 12px; font-size:13px; }
+      select option { background:#f4fff4; color:#061406; }
+      select option:checked { background:#39ff14; color:#061406; }
       .text-input { flex:1; min-width:220px; }
       select:focus, .text-input:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 2px rgba(57,255,20,0.2); }
 
