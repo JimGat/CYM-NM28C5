@@ -21993,7 +21993,7 @@ static const char SEED_RICKROLL_DUCK[] =
     "\n"
     "REM Open default browser (Win+B)\n"
     "GUI b\n"
-    "DELAY 2500\n"
+    "DELAY 4000\n"
     "\n"
     "REM Focus address bar\n"
     "CTRL l\n"
