@@ -29576,7 +29576,16 @@ static void ble_spam_start_btn_cb(lv_event_t *e)
         }
         ble_spam_count = 0;
         ble_spam_active = true;
-        memset(&g_ble_spam_state, 0, sizeof(g_ble_spam_state));  // reset state
+        // Reset payload indices only; keep configured/started to avoid reconfigure on persisted instance
+        g_ble_spam_state.apple_idx = 0;
+        g_ble_spam_state.samsung_idx = 0;
+        g_ble_spam_state.google_idx = 0;
+        g_ble_spam_state.windows_idx = 0;
+        g_ble_spam_state.airtag_idx = 0;
+        g_ble_spam_state.smarttag_idx = 0;
+        g_ble_spam_state.sour_apple_idx = 0;
+        g_ble_spam_state.mode_round = 0;
+        // configured/started persist across start/stop cycles for the BLE session
         g_ble_spam_state.timer = lv_timer_create(ble_spam_timer_cb, 100, NULL);  // 100ms interval
         lv_label_set_text(lv_obj_get_child(ble_spam_start_btn, 0), "STOP");
         lv_obj_set_style_bg_color(ble_spam_start_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
@@ -29823,7 +29832,7 @@ static void ble_spoof_start_cb(lv_event_t *e)
             return;
         }
         ble_spoof_active = true;
-        memset(&g_ble_spoof_state, 0, sizeof(g_ble_spoof_state));
+        // Keep configured/started to avoid reconfigure on persisted instance
         g_ble_spoof_state.timer = lv_timer_create(ble_spoof_timer_cb, 200, NULL);  // 200ms interval
         lv_label_set_text(lv_obj_get_child(ble_spoof_start_btn, 0), "STOP");
         lv_obj_set_style_bg_color(ble_spoof_start_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
