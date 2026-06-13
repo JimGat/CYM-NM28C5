@@ -29435,10 +29435,12 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
     ble_addr_t rnd_addr;
     if (ble_hs_id_gen_rnd(1, &rnd_addr) == 0) {
         int addr_rc = ble_gap_ext_adv_set_addr(BLE_SPAM_ADV_INSTANCE, &rnd_addr);
-        if (addr_rc != 0) {
-            ESP_LOGW(TAG, "[SPAM] pkt%d set_addr failed: %d (MAC: %02x:%02x:%02x:%02x:%02x:%02x)",
-                     ble_spam_count, addr_rc, rnd_addr.val[0], rnd_addr.val[1], rnd_addr.val[2],
+        if (addr_rc == 0) {
+            ESP_LOGI(TAG, "[SPAM] pkt%d MAC set OK: %02x:%02x:%02x:%02x:%02x:%02x",
+                     ble_spam_count, rnd_addr.val[0], rnd_addr.val[1], rnd_addr.val[2],
                      rnd_addr.val[3], rnd_addr.val[4], rnd_addr.val[5]);
+        } else {
+            ESP_LOGW(TAG, "[SPAM] pkt%d set_addr FAILED: rc=%d", ble_spam_count, addr_rc);
         }
     }
 
