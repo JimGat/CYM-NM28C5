@@ -29376,6 +29376,7 @@ struct ble_spam_state_t {
     bool configured;
     bool started;
     lv_timer_t *timer;
+    struct os_mbuf *adv_mbuf;  // Pre-allocated, reused each cycle to prevent pool exhaustion
 } g_ble_spam_state = {0};
 
 // ── BLE Spam timer callback (called by LVGL every 100ms) ────────────────────────
@@ -29386,7 +29387,7 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
 
     struct ble_spam_state_t *st = &g_ble_spam_state;
 
-    // Configure on first callback
+    // Configure and pre-allocate mbuf on first callback
     if (!st->configured) {
         struct ble_gap_ext_adv_params ext_adv_params;
         memset(&ext_adv_params, 0, sizeof(ext_adv_params));
@@ -29411,7 +29412,15 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
             ble_spam_active = false;
             return;
         }
-        ESP_LOGI(TAG, "[SPAM] configure SUCCESS — instance %d configured", BLE_SPAM_ADV_INSTANCE);
+
+        // Pre-allocate reusable mbuf to prevent pool exhaustion
+        st->adv_mbuf = os_msys_get_pkthdr(BLE_HS_ADV_MAX_SZ, 0);
+        if (!st->adv_mbuf) {
+            ESP_LOGE(TAG, "[SPAM] mbuf pre-alloc FAILED — no memory");
+            ble_spam_active = false;
+            return;
+        }
+        ESP_LOGI(TAG, "[SPAM] configure SUCCESS — instance %d configured, mbuf pre-allocated", BLE_SPAM_ADV_INSTANCE);
         st->configured = true;
     }
 
@@ -29539,24 +29548,27 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
         fields.svc_data_uuid16_len = svc_data_len;
     }
 
-    // Now safe to set data (advertising is started)
-    struct os_mbuf *om = os_msys_get_pkthdr(BLE_HS_ADV_MAX_SZ, 0);
+    // Reuse pre-allocated mbuf (prevents pool exhaustion)
+    struct os_mbuf *om = st->adv_mbuf;
     if (!om) {
-        ESP_LOGW(TAG, "[SPAM] mbuf alloc failed");
+        ESP_LOGW(TAG, "[SPAM] pre-allocated mbuf missing");
         return;
     }
+
+    // Reset mbuf: trim any old data, prepare for new fields
+    om->om_len = 0;
+    om->om_pkthdr_len = 0;
+    om->om_data = om->om_databuf;  // Reset data pointer to start
 
     int rc = ble_hs_adv_set_fields_mbuf(&fields, om);
     if (rc != 0) {
         ESP_LOGW(TAG, "[SPAM] set_fields failed: %d", rc);
-        os_mbuf_free_chain(om);
         return;
     }
 
     rc = ble_gap_ext_adv_set_data(BLE_SPAM_ADV_INSTANCE, om);
     if (rc != 0) {
         ESP_LOGW(TAG, "[SPAM] set_data failed: %d", rc);
-        os_mbuf_free_chain(om);
         return;
     }
 
@@ -29621,6 +29633,10 @@ static void ble_spam_back_cb(lv_event_t *e)
     if (current_radio_mode == RADIO_MODE_BLE) {
         ESP_LOGI(TAG, "[SPAM] cleanup: stopping instance %d", BLE_SPAM_ADV_INSTANCE);
         ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
+        if (g_ble_spam_state.adv_mbuf) {
+            os_mbuf_free_chain(g_ble_spam_state.adv_mbuf);
+            g_ble_spam_state.adv_mbuf = NULL;
+        }
         memset(&g_ble_spam_state, 0, sizeof(g_ble_spam_state));
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
@@ -29719,6 +29735,7 @@ struct ble_spoof_state_t {
     bool configured;
     bool started;
     lv_timer_t *timer;
+    struct os_mbuf *adv_mbuf;  // Pre-allocated, reused each cycle
 } g_ble_spoof_state = {0};
 
 // ── BLE Spoof timer callback (called by LVGL every 200ms) ────────────────────────
@@ -29761,7 +29778,15 @@ static void ble_spoof_timer_cb(lv_timer_t *timer)
         int addr_rc = ble_gap_ext_adv_set_addr(BLE_SPOOF_ADV_INSTANCE, &target_addr);
         ESP_LOGI(TAG, "[SPOOF] set_addr() returned %d", addr_rc);
 
-        ESP_LOGI(TAG, "[SPOOF] configure SUCCESS — instance %d configured", BLE_SPOOF_ADV_INSTANCE);
+        // Pre-allocate reusable mbuf to prevent pool exhaustion
+        st->adv_mbuf = os_msys_get_pkthdr(BLE_HS_ADV_MAX_SZ, 0);
+        if (!st->adv_mbuf) {
+            ESP_LOGE(TAG, "[SPOOF] mbuf pre-alloc FAILED — no memory");
+            ble_spoof_active = false;
+            return;
+        }
+
+        ESP_LOGI(TAG, "[SPOOF] configure SUCCESS — instance %d configured, mbuf pre-allocated", BLE_SPOOF_ADV_INSTANCE);
         st->configured = true;
     }
 
@@ -29798,24 +29823,27 @@ static void ble_spoof_timer_cb(lv_timer_t *timer)
         fields.name_is_complete = 1;
     }
 
-    // Now safe to set data (advertising is started)
-    struct os_mbuf *om = os_msys_get_pkthdr(BLE_HS_ADV_MAX_SZ, 0);
+    // Reuse pre-allocated mbuf (prevents pool exhaustion)
+    struct os_mbuf *om = st->adv_mbuf;
     if (!om) {
-        ESP_LOGW(TAG, "[SPOOF] mbuf alloc failed");
+        ESP_LOGW(TAG, "[SPOOF] pre-allocated mbuf missing");
         return;
     }
+
+    // Reset mbuf: trim any old data, prepare for new fields
+    om->om_len = 0;
+    om->om_pkthdr_len = 0;
+    om->om_data = om->om_databuf;  // Reset data pointer to start
 
     int rc = ble_hs_adv_set_fields_mbuf(&fields, om);
     if (rc != 0) {
         ESP_LOGW(TAG, "[SPOOF] set_fields failed: %d", rc);
-        os_mbuf_free_chain(om);
         return;
     }
 
     rc = ble_gap_ext_adv_set_data(BLE_SPOOF_ADV_INSTANCE, om);
     if (rc != 0) {
         ESP_LOGW(TAG, "[SPOOF] set_data failed: %d", rc);
-        os_mbuf_free_chain(om);
         return;
     }
 
@@ -29877,6 +29905,10 @@ static void ble_spoof_back_cb(lv_event_t *e)
     if (current_radio_mode == RADIO_MODE_BLE) {
         ESP_LOGI(TAG, "[SPOOF] cleanup: stopping instance %d", BLE_SPOOF_ADV_INSTANCE);
         ble_gap_ext_adv_stop(BLE_SPOOF_ADV_INSTANCE);
+        if (g_ble_spoof_state.adv_mbuf) {
+            os_mbuf_free_chain(g_ble_spoof_state.adv_mbuf);
+            g_ble_spoof_state.adv_mbuf = NULL;
+        }
         memset(&g_ble_spoof_state, 0, sizeof(g_ble_spoof_state));
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
