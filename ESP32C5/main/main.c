@@ -29373,7 +29373,8 @@ struct ble_spam_state_t {
     int apple_idx, samsung_idx, google_idx, windows_idx;
     int airtag_idx, smarttag_idx, sour_apple_idx;
     int mode_round;
-    bool initialized;
+    bool configured;
+    bool started;
     lv_timer_t *timer;
 } g_ble_spam_state = {0};
 
@@ -29385,8 +29386,8 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
 
     struct ble_spam_state_t *st = &g_ble_spam_state;
 
-    // Initialize extended advertising on first callback
-    if (!st->initialized) {
+    // Configure on first callback
+    if (!st->configured) {
         struct ble_gap_ext_adv_params ext_adv_params;
         memset(&ext_adv_params, 0, sizeof(ext_adv_params));
         ext_adv_params.connectable = 0;
@@ -29401,11 +29402,24 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
 
         int rc = ble_gap_ext_adv_configure(BLE_SPAM_ADV_INSTANCE, &ext_adv_params, NULL, NULL, NULL);
         if (rc != 0) {
-            ESP_LOGE(TAG, "BLE Spam: ext_adv_configure failed: %d", rc);
+            ESP_LOGE(TAG, "[SPAM] configure failed: %d", rc);
             ble_spam_active = false;
             return;
         }
-        st->initialized = true;
+        ESP_LOGI(TAG, "[SPAM] configured, now starting");
+        st->configured = true;
+    }
+
+    // Start immediately after config (once)
+    if (!st->started) {
+        int rc = ble_gap_ext_adv_start(BLE_SPAM_ADV_INSTANCE, 0, 0);
+        if (rc != 0 && rc != BLE_HS_EALREADY) {
+            ESP_LOGE(TAG, "[SPAM] start failed: %d", rc);
+            ble_spam_active = false;
+            return;
+        }
+        ESP_LOGI(TAG, "[SPAM] started");
+        st->started = true;
     }
 
     // Rotate random address
@@ -29506,36 +29520,28 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
         fields.svc_data_uuid16_len = svc_data_len;
     }
 
-    // Allocate mbuf for advertisement data
+    // Now safe to set data (advertising is started)
     struct os_mbuf *om = os_msys_get_pkthdr(BLE_HS_ADV_MAX_SZ, 0);
     if (!om) {
-        ESP_LOGW(TAG, "BLE Spam: mbuf allocation failed");
+        ESP_LOGW(TAG, "[SPAM] mbuf alloc failed");
         return;
     }
 
     int rc = ble_hs_adv_set_fields_mbuf(&fields, om);
     if (rc != 0) {
-        ESP_LOGW(TAG, "BLE Spam: adv_set_fields_mbuf failed: %d", rc);
+        ESP_LOGW(TAG, "[SPAM] set_fields failed: %d", rc);
         os_mbuf_free_chain(om);
         return;
     }
 
     rc = ble_gap_ext_adv_set_data(BLE_SPAM_ADV_INSTANCE, om);
     if (rc != 0) {
-        ESP_LOGW(TAG, "BLE Spam: ext_adv_set_data failed: %d", rc);
+        ESP_LOGW(TAG, "[SPAM] set_data failed: %d", rc);
         os_mbuf_free_chain(om);
         return;
     }
 
-    // Start on first cycle only
-    if (!st->initialized) {
-        rc = ble_gap_ext_adv_start(BLE_SPAM_ADV_INSTANCE, 0, 0);
-        if (rc != 0 && rc != BLE_HS_EALREADY) {
-            ESP_LOGW(TAG, "BLE Spam: ext_adv_start failed: %d", rc);
-            return;
-        }
-    }
-
+    ESP_LOGI(TAG, "[SPAM] packet %d sent", ble_spam_count + 1);
     ble_spam_count++;
     ble_spam_needs_ui_update = true;
 }
@@ -29678,7 +29684,8 @@ static void show_ble_spam_screen(void)
 // ── BLE Device Spoof screen + task ───────────────────────────────────────────
 // ── BLE Spoof state (for LVGL timer) ──────────────────────────────────────────
 struct ble_spoof_state_t {
-    bool initialized;
+    bool configured;
+    bool started;
     lv_timer_t *timer;
 } g_ble_spoof_state = {0};
 
@@ -29690,8 +29697,8 @@ static void ble_spoof_timer_cb(lv_timer_t *timer)
 
     struct ble_spoof_state_t *st = &g_ble_spoof_state;
 
-    // Initialize extended advertising on first callback
-    if (!st->initialized) {
+    // Configure on first callback
+    if (!st->configured) {
         struct ble_gap_ext_adv_params ext_adv_params;
         memset(&ext_adv_params, 0, sizeof(ext_adv_params));
         ext_adv_params.connectable = 0;
@@ -29706,7 +29713,7 @@ static void ble_spoof_timer_cb(lv_timer_t *timer)
 
         int rc = ble_gap_ext_adv_configure(BLE_SPOOF_ADV_INSTANCE, &ext_adv_params, NULL, NULL, NULL);
         if (rc != 0) {
-            ESP_LOGE(TAG, "BLE Spoof: ext_adv_configure failed: %d", rc);
+            ESP_LOGE(TAG, "[SPOOF] configure failed: %d", rc);
             ble_spoof_active = false;
             return;
         }
@@ -29717,7 +29724,20 @@ static void ble_spoof_timer_cb(lv_timer_t *timer)
         memcpy(target_addr.val, ble_spoof_target_mac, 6);
         ble_gap_ext_adv_set_addr(BLE_SPOOF_ADV_INSTANCE, &target_addr);
 
-        st->initialized = true;
+        ESP_LOGI(TAG, "[SPOOF] configured, now starting");
+        st->configured = true;
+    }
+
+    // Start immediately after config (once)
+    if (!st->started) {
+        int rc = ble_gap_ext_adv_start(BLE_SPOOF_ADV_INSTANCE, 0, 0);
+        if (rc != 0 && rc != BLE_HS_EALREADY) {
+            ESP_LOGE(TAG, "[SPOOF] start failed: %d", rc);
+            ble_spoof_active = false;
+            return;
+        }
+        ESP_LOGI(TAG, "[SPOOF] started");
+        st->started = true;
     }
 
     // Build advertisement fields
@@ -29738,36 +29758,28 @@ static void ble_spoof_timer_cb(lv_timer_t *timer)
         fields.name_is_complete = 1;
     }
 
-    // Allocate mbuf for advertisement data
+    // Now safe to set data (advertising is started)
     struct os_mbuf *om = os_msys_get_pkthdr(BLE_HS_ADV_MAX_SZ, 0);
     if (!om) {
-        ESP_LOGW(TAG, "BLE Spoof: mbuf allocation failed");
+        ESP_LOGW(TAG, "[SPOOF] mbuf alloc failed");
         return;
     }
 
     int rc = ble_hs_adv_set_fields_mbuf(&fields, om);
     if (rc != 0) {
-        ESP_LOGW(TAG, "BLE Spoof: adv_set_fields_mbuf failed: %d", rc);
+        ESP_LOGW(TAG, "[SPOOF] set_fields failed: %d", rc);
         os_mbuf_free_chain(om);
         return;
     }
 
     rc = ble_gap_ext_adv_set_data(BLE_SPOOF_ADV_INSTANCE, om);
     if (rc != 0) {
-        ESP_LOGW(TAG, "BLE Spoof: ext_adv_set_data failed: %d", rc);
+        ESP_LOGW(TAG, "[SPOOF] set_data failed: %d", rc);
         os_mbuf_free_chain(om);
         return;
     }
 
-    // Start on first cycle only
-    if (st->initialized && !ble_spoof_needs_ui_update) {  // first time only
-        rc = ble_gap_ext_adv_start(BLE_SPOOF_ADV_INSTANCE, 0, 0);
-        if (rc != 0 && rc != BLE_HS_EALREADY) {
-            ESP_LOGW(TAG, "BLE Spoof: ext_adv_start failed: %d", rc);
-            return;
-        }
-    }
-
+    ESP_LOGI(TAG, "[SPOOF] data updated");
     ble_spoof_needs_ui_update = true;
 }
 
