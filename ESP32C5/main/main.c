@@ -29399,9 +29399,10 @@ static void ble_spam_task(void *pvParameters)
 
     while (ble_spam_active) {
         // Stop any active advertisement before updating data
-        // Extended advertising needs proper settle time to clean up mbuf resources
+        // Extended advertising needs significant settle time to clean up mbuf resources
+        // and allow NimBLE controller firmware to fully process stop event
         ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(250));
 
         // Rotate random address each cycle
         ble_addr_t rnd_addr;
@@ -29527,7 +29528,7 @@ static void ble_spam_task(void *pvParameters)
             ESP_LOGW(TAG, "BLE Spam: mbuf allocation failed");
         }
 
-        vTaskDelay(pdMS_TO_TICKS(80));
+        vTaskDelay(pdMS_TO_TICKS(20));  // total cycle: 250ms settle + 20ms work = 270ms
     }
 
     ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
