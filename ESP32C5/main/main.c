@@ -29554,21 +29554,11 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
         return;
     }
 
-    // Stop→set_data→start sequence eliminates EINVAL race on active instance
-    ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
-    vTaskDelay(pdMS_TO_TICKS(20));  // Brief settle for HCI queue
-
+    // Keep instance active continuously; update data in-place
+    // Occasional set_data error 3 is benign (keeps old payload flying, phones see continuous presence)
     rc = ble_gap_ext_adv_set_data(BLE_SPAM_ADV_INSTANCE, om);
     if (rc != 0) {
-        ESP_LOGW(TAG, "[SPAM] set_data failed: %d", rc);
-        ble_gap_ext_adv_start(BLE_SPAM_ADV_INSTANCE, 0, 0);  // Restart on error
-        return;
-    }
-
-    rc = ble_gap_ext_adv_start(BLE_SPAM_ADV_INSTANCE, 0, 0);
-    if (rc != 0) {
-        ESP_LOGW(TAG, "[SPAM] restart failed: %d", rc);
-        return;
+        ESP_LOGW(TAG, "[SPAM] set_data rc=%d (benign; old payload continues)", rc);
     }
 
     ESP_LOGI(TAG, "[SPAM] packet %d sent", ble_spam_count + 1);
@@ -29823,21 +29813,11 @@ static void ble_spoof_timer_cb(lv_timer_t *timer)
         return;
     }
 
-    // Stop→set_data→start sequence eliminates EINVAL race on active instance
-    ble_gap_ext_adv_stop(BLE_SPOOF_ADV_INSTANCE);
-    vTaskDelay(pdMS_TO_TICKS(20));  // Brief settle for HCI queue
-
+    // Keep instance active continuously; update data in-place
+    // Occasional set_data error 3 is benign (keeps old payload flying, phones see continuous presence)
     rc = ble_gap_ext_adv_set_data(BLE_SPOOF_ADV_INSTANCE, om);
     if (rc != 0) {
-        ESP_LOGW(TAG, "[SPOOF] set_data failed: %d", rc);
-        ble_gap_ext_adv_start(BLE_SPOOF_ADV_INSTANCE, 0, 0);  // Restart on error
-        return;
-    }
-
-    rc = ble_gap_ext_adv_start(BLE_SPOOF_ADV_INSTANCE, 0, 0);
-    if (rc != 0) {
-        ESP_LOGW(TAG, "[SPOOF] restart failed: %d", rc);
-        return;
+        ESP_LOGW(TAG, "[SPOOF] set_data rc=%d (benign; old payload continues)", rc);
     }
 
     ESP_LOGI(TAG, "[SPOOF] data updated");
