@@ -29399,8 +29399,9 @@ static void ble_spam_task(void *pvParameters)
 
     while (ble_spam_active) {
         // Stop any active advertisement before updating data
+        // Extended advertising needs proper settle time to clean up mbuf resources
         ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(pdMS_TO_TICKS(100));
 
         // Rotate random address each cycle
         ble_addr_t rnd_addr;
@@ -29507,18 +29508,26 @@ static void ble_spam_task(void *pvParameters)
             if (rc == 0) {
                 rc = ble_gap_ext_adv_set_data(BLE_SPAM_ADV_INSTANCE, om);
                 if (rc == 0) {
-                    ble_gap_ext_adv_start(BLE_SPAM_ADV_INSTANCE, 0, 0);
+                    rc = ble_gap_ext_adv_start(BLE_SPAM_ADV_INSTANCE, 0, 0);
+                    if (rc == 0 || rc == BLE_HS_EALREADY) {
+                        ble_spam_count++;
+                        ble_spam_needs_ui_update = true;
+                    } else {
+                        ESP_LOGW(TAG, "BLE Spam: ext_adv_start failed: %d", rc);
+                    }
                 } else {
+                    ESP_LOGW(TAG, "BLE Spam: ext_adv_set_data failed: %d", rc);
                     os_mbuf_free_chain(om);
                 }
             } else {
+                ESP_LOGW(TAG, "BLE Spam: adv_set_fields_mbuf failed: %d", rc);
                 os_mbuf_free_chain(om);
             }
+        } else {
+            ESP_LOGW(TAG, "BLE Spam: mbuf allocation failed");
         }
 
-        vTaskDelay(pdMS_TO_TICKS(175));
-        ble_spam_count++;
-        ble_spam_needs_ui_update = true;
+        vTaskDelay(pdMS_TO_TICKS(80));
     }
 
     ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
