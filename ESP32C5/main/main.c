@@ -29405,32 +29405,46 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
                  ext_adv_params.legacy_pdu, ext_adv_params.own_addr_type);
 
         int rc = ble_gap_ext_adv_configure(BLE_SPAM_ADV_INSTANCE, &ext_adv_params, NULL, NULL, NULL);
+        ESP_LOGI(TAG, "[SPAM] configure() returned %d", rc);
         if (rc != 0) {
-            ESP_LOGE(TAG, "[SPAM] configure failed: %d (state may need delete+reset)", rc);
+            ESP_LOGE(TAG, "[SPAM] configure FAILED: %d — instance state invalid", rc);
             ble_spam_active = false;
             return;
         }
-        ESP_LOGI(TAG, "[SPAM] configured OK, now starting");
+        ESP_LOGI(TAG, "[SPAM] configure SUCCESS — instance %d configured", BLE_SPAM_ADV_INSTANCE);
         st->configured = true;
+    }
+
+    // Set a random address BEFORE starting (critical for some stacks)
+    if (!st->started) {
+        ble_addr_t rnd_addr;
+        if (ble_hs_id_gen_rnd(1, &rnd_addr) == 0) {
+            int addr_rc = ble_gap_ext_adv_set_addr(BLE_SPAM_ADV_INSTANCE, &rnd_addr);
+            ESP_LOGI(TAG, "[SPAM] set_addr(random) returned %d", addr_rc);
+        }
     }
 
     // Start immediately after config (once)
     if (!st->started) {
-        ESP_LOGI(TAG, "[SPAM] timer: starting instance %d", BLE_SPAM_ADV_INSTANCE);
+        ESP_LOGI(TAG, "[SPAM] timer: attempting start on instance %d", BLE_SPAM_ADV_INSTANCE);
         int rc = ble_gap_ext_adv_start(BLE_SPAM_ADV_INSTANCE, 0, 0);
+        ESP_LOGI(TAG, "[SPAM] start() returned %d", rc);
         if (rc != 0 && rc != BLE_HS_EALREADY) {
-            ESP_LOGE(TAG, "[SPAM] start failed: %d (check if delete was called before reconfigure)", rc);
+            ESP_LOGE(TAG, "[SPAM] START FAILED: %d — stack: instance=%d configured=%d started=%d",
+                     rc, BLE_SPAM_ADV_INSTANCE, st->configured, st->started);
             ble_spam_active = false;
             return;
         }
-        ESP_LOGI(TAG, "[SPAM] started OK, beginning packet cycle");
+        ESP_LOGI(TAG, "[SPAM] START SUCCESS — advertising now active");
         st->started = true;
     }
 
-    // Rotate random address
-    ble_addr_t rnd_addr;
-    if (ble_hs_id_gen_rnd(1, &rnd_addr) == 0) {
-        ble_gap_ext_adv_set_addr(BLE_SPAM_ADV_INSTANCE, &rnd_addr);
+    // Rotate random address on each packet (if not in first-start mode)
+    if (st->started) {
+        ble_addr_t rnd_addr;
+        if (ble_hs_id_gen_rnd(1, &rnd_addr) == 0) {
+            ble_gap_ext_adv_set_addr(BLE_SPAM_ADV_INSTANCE, &rnd_addr);
+        }
     }
 
     struct ble_hs_adv_fields fields;
@@ -29733,32 +29747,36 @@ static void ble_spoof_timer_cb(lv_timer_t *timer)
                  BLE_SPOOF_ADV_INSTANCE, ext_adv_params.connectable, ext_adv_params.scannable, ext_adv_params.legacy_pdu);
 
         int rc = ble_gap_ext_adv_configure(BLE_SPOOF_ADV_INSTANCE, &ext_adv_params, NULL, NULL, NULL);
+        ESP_LOGI(TAG, "[SPOOF] configure() returned %d", rc);
         if (rc != 0) {
-            ESP_LOGE(TAG, "[SPOOF] configure failed: %d (state may need delete+reset)", rc);
+            ESP_LOGE(TAG, "[SPOOF] configure FAILED: %d — instance state invalid", rc);
             ble_spoof_active = false;
             return;
         }
 
-        // Set target address
+        // Set target address (before start)
         ble_addr_t target_addr;
         target_addr.type = BLE_ADDR_RANDOM;
         memcpy(target_addr.val, ble_spoof_target_mac, 6);
-        ble_gap_ext_adv_set_addr(BLE_SPOOF_ADV_INSTANCE, &target_addr);
+        int addr_rc = ble_gap_ext_adv_set_addr(BLE_SPOOF_ADV_INSTANCE, &target_addr);
+        ESP_LOGI(TAG, "[SPOOF] set_addr() returned %d", addr_rc);
 
-        ESP_LOGI(TAG, "[SPOOF] configured OK, now starting");
+        ESP_LOGI(TAG, "[SPOOF] configure SUCCESS — instance %d configured", BLE_SPOOF_ADV_INSTANCE);
         st->configured = true;
     }
 
     // Start immediately after config (once)
     if (!st->started) {
-        ESP_LOGI(TAG, "[SPOOF] timer: starting instance %d", BLE_SPOOF_ADV_INSTANCE);
+        ESP_LOGI(TAG, "[SPOOF] timer: attempting start on instance %d", BLE_SPOOF_ADV_INSTANCE);
         int rc = ble_gap_ext_adv_start(BLE_SPOOF_ADV_INSTANCE, 0, 0);
+        ESP_LOGI(TAG, "[SPOOF] start() returned %d", rc);
         if (rc != 0 && rc != BLE_HS_EALREADY) {
-            ESP_LOGE(TAG, "[SPOOF] start failed: %d (check if delete was called before reconfigure)", rc);
+            ESP_LOGE(TAG, "[SPOOF] START FAILED: %d — stack: instance=%d configured=%d started=%d",
+                     rc, BLE_SPOOF_ADV_INSTANCE, st->configured, st->started);
             ble_spoof_active = false;
             return;
         }
-        ESP_LOGI(TAG, "[SPOOF] started OK, beginning packet cycle");
+        ESP_LOGI(TAG, "[SPOOF] START SUCCESS — advertising now active");
         st->started = true;
     }
 
