@@ -29423,17 +29423,22 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
 
     // Bruce/GhostESP pattern: stop → set_addr → set_data → start per packet
     // Each packet with fresh MAC appears as a new device to phones (defeats per-MAC dedup)
+
     // Stop instance (if running) before updating address and data
     if (st->started) {
         ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
+        // NimBLE stop is async; brief yield to allow controller to process
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
 
-    // Generate random address while stopped (controller accepts set_addr only when stopped/configured)
+    // Generate random address (controller accepts set_addr only when stopped/configured)
     ble_addr_t rnd_addr;
     if (ble_hs_id_gen_rnd(1, &rnd_addr) == 0) {
         int addr_rc = ble_gap_ext_adv_set_addr(BLE_SPAM_ADV_INSTANCE, &rnd_addr);
         if (addr_rc != 0) {
-            ESP_LOGW(TAG, "[SPAM] set_addr failed: %d", addr_rc);
+            ESP_LOGW(TAG, "[SPAM] pkt%d set_addr failed: %d (MAC: %02x:%02x:%02x:%02x:%02x:%02x)",
+                     ble_spam_count, addr_rc, rnd_addr.val[0], rnd_addr.val[1], rnd_addr.val[2],
+                     rnd_addr.val[3], rnd_addr.val[4], rnd_addr.val[5]);
         }
     }
 
@@ -29498,6 +29503,9 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
             fields.mfg_data_len = 15;
         }
         st->apple_packet_cycle = (st->apple_packet_cycle + 1) % 2;
+        ESP_LOGI(TAG, "[SPAM] Apple pkt%d cycle=%d action_idx=%d → mfg[0]=%02x mfg[2]=%02x",
+                 ble_spam_count, st->apple_packet_cycle, st->apple_nearby_action_idx,
+                 fields.mfg_data[0], fields.mfg_data[2]);
         break;
     }
     case BLE_SPAM_MODE_SAMSUNG: {
