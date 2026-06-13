@@ -29373,7 +29373,7 @@ struct ble_spam_state_t {
     int apple_idx, samsung_idx, google_idx, windows_idx;
     int airtag_idx, smarttag_idx, sour_apple_idx;
     int mode_round;
-    bool configured;
+    bool initialized;
     lv_timer_t *timer;
 } g_ble_spam_state = {0};
 
@@ -29385,8 +29385,8 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
 
     struct ble_spam_state_t *st = &g_ble_spam_state;
 
-    // Configure extended advertising once on first callback
-    if (!st->configured) {
+    // Initialize extended advertising on first callback
+    if (!st->initialized) {
         struct ble_gap_ext_adv_params ext_adv_params;
         memset(&ext_adv_params, 0, sizeof(ext_adv_params));
         ext_adv_params.connectable = 0;
@@ -29405,11 +29405,8 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
             ble_spam_active = false;
             return;
         }
-        st->configured = true;
+        st->initialized = true;
     }
-
-    // Stop previous advertisement
-    ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
 
     // Rotate random address
     ble_addr_t rnd_addr;
@@ -29509,31 +29506,38 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
         fields.svc_data_uuid16_len = svc_data_len;
     }
 
-    // Allocate fresh mbuf (NimBLE takes ownership)
+    // Allocate mbuf for advertisement data
     struct os_mbuf *om = os_msys_get_pkthdr(BLE_HS_ADV_MAX_SZ, 0);
-    if (om) {
-        int rc = ble_hs_adv_set_fields_mbuf(&fields, om);
-        if (rc == 0) {
-            rc = ble_gap_ext_adv_set_data(BLE_SPAM_ADV_INSTANCE, om);
-            if (rc == 0) {
-                rc = ble_gap_ext_adv_start(BLE_SPAM_ADV_INSTANCE, 0, 0);
-                if (rc == 0 || rc == BLE_HS_EALREADY) {
-                    ble_spam_count++;
-                    ble_spam_needs_ui_update = true;
-                } else {
-                    ESP_LOGW(TAG, "BLE Spam: ext_adv_start failed: %d", rc);
-                }
-            } else {
-                ESP_LOGW(TAG, "BLE Spam: ext_adv_set_data failed: %d", rc);
-                os_mbuf_free_chain(om);
-            }
-        } else {
-            ESP_LOGW(TAG, "BLE Spam: adv_set_fields_mbuf failed: %d", rc);
-            os_mbuf_free_chain(om);
-        }
-    } else {
+    if (!om) {
         ESP_LOGW(TAG, "BLE Spam: mbuf allocation failed");
+        return;
     }
+
+    int rc = ble_hs_adv_set_fields_mbuf(&fields, om);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "BLE Spam: adv_set_fields_mbuf failed: %d", rc);
+        os_mbuf_free_chain(om);
+        return;
+    }
+
+    rc = ble_gap_ext_adv_set_data(BLE_SPAM_ADV_INSTANCE, om);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "BLE Spam: ext_adv_set_data failed: %d", rc);
+        os_mbuf_free_chain(om);
+        return;
+    }
+
+    // Start on first cycle only
+    if (!st->initialized) {
+        rc = ble_gap_ext_adv_start(BLE_SPAM_ADV_INSTANCE, 0, 0);
+        if (rc != 0 && rc != BLE_HS_EALREADY) {
+            ESP_LOGW(TAG, "BLE Spam: ext_adv_start failed: %d", rc);
+            return;
+        }
+    }
+
+    ble_spam_count++;
+    ble_spam_needs_ui_update = true;
 }
 
 // ── BLE Spam screen helpers ───────────────────────────────────────────────────
@@ -29672,88 +29676,99 @@ static void show_ble_spam_screen(void)
 }
 
 // ── BLE Device Spoof screen + task ───────────────────────────────────────────
-static void ble_spoof_task(void *pvParameters)
+// ── BLE Spoof state (for LVGL timer) ──────────────────────────────────────────
+struct ble_spoof_state_t {
+    bool initialized;
+    lv_timer_t *timer;
+} g_ble_spoof_state = {0};
+
+// ── BLE Spoof timer callback (called by LVGL every 200ms) ────────────────────────
+static void ble_spoof_timer_cb(lv_timer_t *timer)
 {
-    (void)pvParameters;
-    bool mac_valid = false;
-    for (int i = 0; i < 6; i++) if (ble_spoof_target_mac[i]) { mac_valid = true; break; }
-    if (!mac_valid) {
-        ble_spoof_active = false;
-        ble_spoof_task_handle = NULL;
-        vTaskDelete(NULL);
-        return;
+    (void)timer;
+    if (!ble_spoof_active) return;
+
+    struct ble_spoof_state_t *st = &g_ble_spoof_state;
+
+    // Initialize extended advertising on first callback
+    if (!st->initialized) {
+        struct ble_gap_ext_adv_params ext_adv_params;
+        memset(&ext_adv_params, 0, sizeof(ext_adv_params));
+        ext_adv_params.connectable = 0;
+        ext_adv_params.scannable = 1;
+        ext_adv_params.legacy_pdu = 1;
+        ext_adv_params.own_addr_type = BLE_OWN_ADDR_RANDOM;
+        ext_adv_params.primary_phy = BLE_HCI_LE_PHY_1M;
+        ext_adv_params.secondary_phy = BLE_HCI_LE_PHY_1M;
+        ext_adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(200);
+        ext_adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(350);
+        ext_adv_params.sid = BLE_SPOOF_ADV_INSTANCE;
+
+        int rc = ble_gap_ext_adv_configure(BLE_SPOOF_ADV_INSTANCE, &ext_adv_params, NULL, NULL, NULL);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "BLE Spoof: ext_adv_configure failed: %d", rc);
+            ble_spoof_active = false;
+            return;
+        }
+
+        // Set target address
+        ble_addr_t target_addr;
+        target_addr.type = BLE_ADDR_RANDOM;
+        memcpy(target_addr.val, ble_spoof_target_mac, 6);
+        ble_gap_ext_adv_set_addr(BLE_SPOOF_ADV_INSTANCE, &target_addr);
+
+        st->initialized = true;
     }
 
-    char mac_log[18]; bt_format_addr(ble_spoof_target_mac, mac_log);
-    ESP_LOGI(TAG, "BLE Spoof: cloning %s (%s)", ble_spoof_target_name_str, mac_log);
-
-    // Configure extended advertising once at task start
-    struct ble_gap_ext_adv_params ext_adv_params;
-    memset(&ext_adv_params, 0, sizeof(ext_adv_params));
-    ext_adv_params.connectable = 0;
-    ext_adv_params.scannable = 1;
-    ext_adv_params.legacy_pdu = 1;
-    ext_adv_params.own_addr_type = BLE_OWN_ADDR_RANDOM;
-    ext_adv_params.primary_phy = BLE_HCI_LE_PHY_1M;
-    ext_adv_params.secondary_phy = BLE_HCI_LE_PHY_1M;
-    ext_adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(200);
-    ext_adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(350);
-    ext_adv_params.sid = BLE_SPOOF_ADV_INSTANCE;
-
-    int rc = ble_gap_ext_adv_configure(BLE_SPOOF_ADV_INSTANCE, &ext_adv_params, NULL, NULL, NULL);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "BLE Spoof: ext_adv_configure failed: %d", rc);
-        ble_spoof_task_handle = NULL;
-        vTaskDelete(NULL);
-        return;
-    }
-
-    // Set target address for spoofed device
-    ble_addr_t target_addr;
-    target_addr.type = BLE_ADDR_RANDOM;
-    memcpy(target_addr.val, ble_spoof_target_mac, 6);
-    ble_gap_ext_adv_set_addr(BLE_SPOOF_ADV_INSTANCE, &target_addr);
+    // Build advertisement fields
+    struct ble_hs_adv_fields fields;
+    memset(&fields, 0, sizeof(fields));
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
 
     uint8_t spoof_mfg[8];
     spoof_mfg[0] = ble_spoof_target_company_id & 0xFF;
     spoof_mfg[1] = (ble_spoof_target_company_id >> 8) & 0xFF;
     memcpy(spoof_mfg + 2, ble_spoof_target_mac, 6);
+    fields.mfg_data = spoof_mfg;
+    fields.mfg_data_len = sizeof(spoof_mfg);
 
-    while (ble_spoof_active) {
-        struct ble_hs_adv_fields fields;
-        memset(&fields, 0, sizeof(fields));
-        fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-        fields.mfg_data = spoof_mfg;
-        fields.mfg_data_len = sizeof(spoof_mfg);
-        if (ble_spoof_target_name_str[0]) {
-            fields.name = (const uint8_t *)ble_spoof_target_name_str;
-            fields.name_len = strlen(ble_spoof_target_name_str);
-            fields.name_is_complete = 1;
-        }
-
-        // Set advertisement data using extended API
-        struct os_mbuf *om = os_msys_get_pkthdr(BLE_HS_ADV_MAX_SZ, 0);
-        if (om) {
-            rc = ble_hs_adv_set_fields_mbuf(&fields, om);
-            if (rc == 0) {
-                rc = ble_gap_ext_adv_set_data(BLE_SPOOF_ADV_INSTANCE, om);
-                if (rc == 0) {
-                    ble_gap_ext_adv_start(BLE_SPOOF_ADV_INSTANCE, 0, 0);
-                } else {
-                    os_mbuf_free_chain(om);
-                }
-            } else {
-                os_mbuf_free_chain(om);
-            }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(200));
-        ble_spoof_needs_ui_update = true;
+    if (ble_spoof_target_name_str[0]) {
+        fields.name = (const uint8_t *)ble_spoof_target_name_str;
+        fields.name_len = strlen(ble_spoof_target_name_str);
+        fields.name_is_complete = 1;
     }
 
-    ble_gap_ext_adv_stop(BLE_SPOOF_ADV_INSTANCE);
-    ble_spoof_task_handle = NULL;
-    vTaskDelete(NULL);
+    // Allocate mbuf for advertisement data
+    struct os_mbuf *om = os_msys_get_pkthdr(BLE_HS_ADV_MAX_SZ, 0);
+    if (!om) {
+        ESP_LOGW(TAG, "BLE Spoof: mbuf allocation failed");
+        return;
+    }
+
+    int rc = ble_hs_adv_set_fields_mbuf(&fields, om);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "BLE Spoof: adv_set_fields_mbuf failed: %d", rc);
+        os_mbuf_free_chain(om);
+        return;
+    }
+
+    rc = ble_gap_ext_adv_set_data(BLE_SPOOF_ADV_INSTANCE, om);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "BLE Spoof: ext_adv_set_data failed: %d", rc);
+        os_mbuf_free_chain(om);
+        return;
+    }
+
+    // Start on first cycle only
+    if (st->initialized && !ble_spoof_needs_ui_update) {  // first time only
+        rc = ble_gap_ext_adv_start(BLE_SPOOF_ADV_INSTANCE, 0, 0);
+        if (rc != 0 && rc != BLE_HS_EALREADY) {
+            ESP_LOGW(TAG, "BLE Spoof: ext_adv_start failed: %d", rc);
+            return;
+        }
+    }
+
+    ble_spoof_needs_ui_update = true;
 }
 
 static void ble_spoof_start_cb(lv_event_t *e)
@@ -29761,6 +29776,11 @@ static void ble_spoof_start_cb(lv_event_t *e)
     (void)e;
     if (ble_spoof_active) {
         ble_spoof_active = false;
+        if (g_ble_spoof_state.timer) {
+            lv_timer_del(g_ble_spoof_state.timer);
+            g_ble_spoof_state.timer = NULL;
+        }
+        ble_gap_ext_adv_stop(BLE_SPOOF_ADV_INSTANCE);
         lv_label_set_text(lv_obj_get_child(ble_spoof_start_btn, 0), "START SPOOF");
         lv_obj_set_style_bg_color(ble_spoof_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
         if (ble_spoof_status_label) lv_label_set_text(ble_spoof_status_label, "Stopped.");
@@ -29776,12 +29796,13 @@ static void ble_spoof_start_cb(lv_event_t *e)
             return;
         }
         ble_spoof_active = true;
+        memset(&g_ble_spoof_state, 0, sizeof(g_ble_spoof_state));
+        g_ble_spoof_state.timer = lv_timer_create(ble_spoof_timer_cb, 200, NULL);  // 200ms interval
         lv_label_set_text(lv_obj_get_child(ble_spoof_start_btn, 0), "STOP");
         lv_obj_set_style_bg_color(ble_spoof_start_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
         char mac_s[18]; bt_format_addr(ble_spoof_target_mac, mac_s);
         char sbuf[64]; snprintf(sbuf, sizeof(sbuf), "Spoofing: %s", mac_s);
         if (ble_spoof_status_label) lv_label_set_text(ble_spoof_status_label, sbuf);
-        xTaskCreate(ble_spoof_task, "ble_spoof", 4096, NULL, 5, &ble_spoof_task_handle);
     }
 }
 
@@ -29789,8 +29810,10 @@ static void ble_spoof_back_cb(lv_event_t *e)
 {
     (void)e;
     ble_spoof_active = false;
-    for (int i = 0; i < 20 && ble_spoof_task_handle != NULL; i++)
-        vTaskDelay(pdMS_TO_TICKS(50));
+    if (g_ble_spoof_state.timer) {
+        lv_timer_del(g_ble_spoof_state.timer);
+        g_ble_spoof_state.timer = NULL;
+    }
     ble_spoof_ui_active = false;
     ble_spoof_status_label = NULL;
     ble_spoof_start_btn = NULL;
