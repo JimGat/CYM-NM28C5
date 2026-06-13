@@ -296,6 +296,7 @@ static lv_obj_t   *bd_speed_dd    = NULL;
 static lv_timer_t *bd_ui_timer    = NULL;
 
 // BLE Device Spoof state
+#define BLE_SPOOF_ADV_INSTANCE    2
 static volatile bool ble_spoof_active = false;
 static TaskHandle_t ble_spoof_task_handle = NULL;
 static lv_obj_t *ble_spoof_status_label = NULL;
@@ -29556,7 +29557,7 @@ static void ble_spam_back_cb(lv_event_t *e)
     ble_spam_counter_label = NULL;
     ble_spam_start_btn = NULL;
     if (current_radio_mode == RADIO_MODE_BLE) {
-        ble_gap_adv_stop();
+        ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
     }
@@ -29652,7 +29653,6 @@ static void show_ble_spam_screen(void)
 static void ble_spoof_task(void *pvParameters)
 {
     (void)pvParameters;
-    // Use the authoritative MAC array — valid for both list-selected and SAS-directed entry
     bool mac_valid = false;
     for (int i = 0; i < 6; i++) if (ble_spoof_target_mac[i]) { mac_valid = true; break; }
     if (!mac_valid) {
@@ -29665,14 +29665,39 @@ static void ble_spoof_task(void *pvParameters)
     char mac_log[18]; bt_format_addr(ble_spoof_target_mac, mac_log);
     ESP_LOGI(TAG, "BLE Spoof: cloning %s (%s)", ble_spoof_target_name_str, mac_log);
 
+    // Configure extended advertising once at task start
+    struct ble_gap_ext_adv_params ext_adv_params;
+    memset(&ext_adv_params, 0, sizeof(ext_adv_params));
+    ext_adv_params.connectable = 0;
+    ext_adv_params.scannable = 1;
+    ext_adv_params.legacy_pdu = 1;
+    ext_adv_params.own_addr_type = BLE_OWN_ADDR_RANDOM;
+    ext_adv_params.primary_phy = BLE_HCI_LE_PHY_1M;
+    ext_adv_params.secondary_phy = BLE_HCI_LE_PHY_1M;
+    ext_adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(200);
+    ext_adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(350);
+    ext_adv_params.sid = BLE_SPOOF_ADV_INSTANCE;
+
+    int rc = ble_gap_ext_adv_configure(BLE_SPOOF_ADV_INSTANCE, &ext_adv_params, NULL, NULL, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "BLE Spoof: ext_adv_configure failed: %d", rc);
+        ble_spoof_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Set target address for spoofed device
+    ble_addr_t target_addr;
+    target_addr.type = BLE_ADDR_RANDOM;
+    memcpy(target_addr.val, ble_spoof_target_mac, 6);
+    ble_gap_ext_adv_set_addr(BLE_SPOOF_ADV_INSTANCE, &target_addr);
+
     uint8_t spoof_mfg[8];
     spoof_mfg[0] = ble_spoof_target_company_id & 0xFF;
     spoof_mfg[1] = (ble_spoof_target_company_id >> 8) & 0xFF;
     memcpy(spoof_mfg + 2, ble_spoof_target_mac, 6);
 
     while (ble_spoof_active) {
-        ble_gap_adv_stop();
-
         struct ble_hs_adv_fields fields;
         memset(&fields, 0, sizeof(fields));
         fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
@@ -29684,21 +29709,27 @@ static void ble_spoof_task(void *pvParameters)
             fields.name_is_complete = 1;
         }
 
-        if (ble_gap_adv_set_fields(&fields) == 0) {
-            struct ble_gap_adv_params adv_params;
-            memset(&adv_params, 0, sizeof(adv_params));
-            adv_params.conn_mode = BLE_GAP_CONN_MODE_NON;
-            adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
-            adv_params.itvl_min = BLE_GAP_ADV_FAST_INTERVAL1_MIN;
-            adv_params.itvl_max = BLE_GAP_ADV_FAST_INTERVAL1_MAX;
-            ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER,
-                              &adv_params, NULL, NULL);
+        // Set advertisement data using extended API
+        struct os_mbuf *om = os_msys_get_pkthdr(BLE_HS_ADV_MAX_SZ, 0);
+        if (om) {
+            rc = ble_hs_adv_set_fields_mbuf(&fields, om);
+            if (rc == 0) {
+                rc = ble_gap_ext_adv_set_data(BLE_SPOOF_ADV_INSTANCE, om);
+                if (rc == 0) {
+                    ble_gap_ext_adv_start(BLE_SPOOF_ADV_INSTANCE, 0, 0);
+                } else {
+                    os_mbuf_free_chain(om);
+                }
+            } else {
+                os_mbuf_free_chain(om);
+            }
         }
+
         vTaskDelay(pdMS_TO_TICKS(200));
         ble_spoof_needs_ui_update = true;
     }
 
-    ble_gap_adv_stop();
+    ble_gap_ext_adv_stop(BLE_SPOOF_ADV_INSTANCE);
     ble_spoof_task_handle = NULL;
     vTaskDelete(NULL);
 }
@@ -29745,7 +29776,7 @@ static void ble_spoof_back_cb(lv_event_t *e)
     memset(ble_spoof_target_mac, 0, 6);
     memset(ble_spoof_target_name_str, 0, sizeof(ble_spoof_target_name_str));
     if (current_radio_mode == RADIO_MODE_BLE) {
-        ble_gap_adv_stop();
+        ble_gap_ext_adv_stop(BLE_SPOOF_ADV_INSTANCE);
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
     }
