@@ -16330,7 +16330,7 @@ static int wpasec_upload_file(const char *filepath, const char *filename)
         wpasec_api_key, boundary, body_total_len);
 
     esp_tls_cfg_t tls_cfg = {
-        .crt_bundle_attach = esp_crt_bundle_attach,
+        .crt_bundle_attach = NULL,
         .timeout_ms = 15000,
     };
 
