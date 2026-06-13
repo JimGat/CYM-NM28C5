@@ -29398,6 +29398,10 @@ static void ble_spam_task(void *pvParameters)
     }
 
     while (ble_spam_active) {
+        // Stop any active advertisement before updating data
+        ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
+        vTaskDelay(pdMS_TO_TICKS(5));
+
         // Rotate random address each cycle
         ble_addr_t rnd_addr;
         if (ble_hs_id_gen_rnd(1, &rnd_addr) == 0) {
@@ -29512,7 +29516,7 @@ static void ble_spam_task(void *pvParameters)
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(180));
+        vTaskDelay(pdMS_TO_TICKS(175));
         ble_spam_count++;
         ble_spam_needs_ui_update = true;
     }
