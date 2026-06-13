@@ -29554,9 +29554,20 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
         return;
     }
 
+    // Stop→set_data→start sequence eliminates EINVAL race on active instance
+    ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
+    vTaskDelay(pdMS_TO_TICKS(20));  // Brief settle for HCI queue
+
     rc = ble_gap_ext_adv_set_data(BLE_SPAM_ADV_INSTANCE, om);
     if (rc != 0) {
         ESP_LOGW(TAG, "[SPAM] set_data failed: %d", rc);
+        ble_gap_ext_adv_start(BLE_SPAM_ADV_INSTANCE, 0, 0);  // Restart on error
+        return;
+    }
+
+    rc = ble_gap_ext_adv_start(BLE_SPAM_ADV_INSTANCE, 0, 0);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "[SPAM] restart failed: %d", rc);
         return;
     }
 
@@ -29812,9 +29823,20 @@ static void ble_spoof_timer_cb(lv_timer_t *timer)
         return;
     }
 
+    // Stop→set_data→start sequence eliminates EINVAL race on active instance
+    ble_gap_ext_adv_stop(BLE_SPOOF_ADV_INSTANCE);
+    vTaskDelay(pdMS_TO_TICKS(20));  // Brief settle for HCI queue
+
     rc = ble_gap_ext_adv_set_data(BLE_SPOOF_ADV_INSTANCE, om);
     if (rc != 0) {
         ESP_LOGW(TAG, "[SPOOF] set_data failed: %d", rc);
+        ble_gap_ext_adv_start(BLE_SPOOF_ADV_INSTANCE, 0, 0);  // Restart on error
+        return;
+    }
+
+    rc = ble_gap_ext_adv_start(BLE_SPOOF_ADV_INSTANCE, 0, 0);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "[SPOOF] restart failed: %d", rc);
         return;
     }
 
