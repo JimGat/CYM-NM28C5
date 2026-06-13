@@ -29397,12 +29397,17 @@ static void ble_spam_task(void *pvParameters)
         return;
     }
 
+    // Start extended advertising once; keep running, just update data each cycle
+    rc = ble_gap_ext_adv_start(BLE_SPAM_ADV_INSTANCE, 0, 0);
+    if (rc != 0 && rc != BLE_HS_EALREADY) {
+        ESP_LOGE(TAG, "BLE Spam: ext_adv_start (initial) failed: %d", rc);
+        ble_spam_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
     while (ble_spam_active) {
-        // Stop any active advertisement before updating data
-        // Extended advertising needs significant settle time to clean up mbuf resources
-        // and allow NimBLE controller firmware to fully process stop event
-        ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
-        vTaskDelay(pdMS_TO_TICKS(250));
+        // Keep advertising running; just update address and data each cycle
 
         // Rotate random address each cycle
         ble_addr_t rnd_addr;
@@ -29502,20 +29507,15 @@ static void ble_spam_task(void *pvParameters)
             fields.svc_data_uuid16_len = svc_data_len;
         }
 
-        // Set advertisement data using extended API
+        // Set advertisement data using extended API (while advertising keeps running)
         struct os_mbuf *om = os_msys_get_pkthdr(BLE_HS_ADV_MAX_SZ, 0);
         if (om) {
             rc = ble_hs_adv_set_fields_mbuf(&fields, om);
             if (rc == 0) {
                 rc = ble_gap_ext_adv_set_data(BLE_SPAM_ADV_INSTANCE, om);
                 if (rc == 0) {
-                    rc = ble_gap_ext_adv_start(BLE_SPAM_ADV_INSTANCE, 0, 0);
-                    if (rc == 0 || rc == BLE_HS_EALREADY) {
-                        ble_spam_count++;
-                        ble_spam_needs_ui_update = true;
-                    } else {
-                        ESP_LOGW(TAG, "BLE Spam: ext_adv_start failed: %d", rc);
-                    }
+                    ble_spam_count++;
+                    ble_spam_needs_ui_update = true;
                 } else {
                     ESP_LOGW(TAG, "BLE Spam: ext_adv_set_data failed: %d", rc);
                     os_mbuf_free_chain(om);
@@ -29528,7 +29528,7 @@ static void ble_spam_task(void *pvParameters)
             ESP_LOGW(TAG, "BLE Spam: mbuf allocation failed");
         }
 
-        vTaskDelay(pdMS_TO_TICKS(20));  // total cycle: 250ms settle + 20ms work = 270ms
+        vTaskDelay(pdMS_TO_TICKS(100));  // update payload every 100ms (no stop/start cycle)
     }
 
     ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
