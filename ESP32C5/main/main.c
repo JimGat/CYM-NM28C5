@@ -29400,25 +29400,30 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
         ext_adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(150);
         ext_adv_params.sid = BLE_SPAM_ADV_INSTANCE;
 
+        ESP_LOGI(TAG, "[SPAM] timer: configuring instance %d (connectable=%d, scannable=%d, legacy_pdu=%d, own_addr_type=%d)",
+                 BLE_SPAM_ADV_INSTANCE, ext_adv_params.connectable, ext_adv_params.scannable,
+                 ext_adv_params.legacy_pdu, ext_adv_params.own_addr_type);
+
         int rc = ble_gap_ext_adv_configure(BLE_SPAM_ADV_INSTANCE, &ext_adv_params, NULL, NULL, NULL);
         if (rc != 0) {
-            ESP_LOGE(TAG, "[SPAM] configure failed: %d", rc);
+            ESP_LOGE(TAG, "[SPAM] configure failed: %d (state may need delete+reset)", rc);
             ble_spam_active = false;
             return;
         }
-        ESP_LOGI(TAG, "[SPAM] configured, now starting");
+        ESP_LOGI(TAG, "[SPAM] configured OK, now starting");
         st->configured = true;
     }
 
     // Start immediately after config (once)
     if (!st->started) {
+        ESP_LOGI(TAG, "[SPAM] timer: starting instance %d", BLE_SPAM_ADV_INSTANCE);
         int rc = ble_gap_ext_adv_start(BLE_SPAM_ADV_INSTANCE, 0, 0);
         if (rc != 0 && rc != BLE_HS_EALREADY) {
-            ESP_LOGE(TAG, "[SPAM] start failed: %d", rc);
+            ESP_LOGE(TAG, "[SPAM] start failed: %d (check if delete was called before reconfigure)", rc);
             ble_spam_active = false;
             return;
         }
-        ESP_LOGI(TAG, "[SPAM] started");
+        ESP_LOGI(TAG, "[SPAM] started OK, beginning packet cycle");
         st->started = true;
     }
 
@@ -29551,13 +29556,15 @@ static void ble_spam_start_btn_cb(lv_event_t *e)
 {
     (void)e;
     if (ble_spam_active) {
-        // Stop
+        // Stop (but keep configured for restart)
         ble_spam_active = false;
         if (g_ble_spam_state.timer) {
             lv_timer_del(g_ble_spam_state.timer);
             g_ble_spam_state.timer = NULL;
         }
+        ESP_LOGI(TAG, "[SPAM] stopping instance %d (keeping config)", BLE_SPAM_ADV_INSTANCE);
         ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
+        g_ble_spam_state.started = false;
         lv_label_set_text(lv_obj_get_child(ble_spam_start_btn, 0), "START");
         lv_obj_set_style_bg_color(ble_spam_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
     } else {
@@ -29589,7 +29596,9 @@ static void ble_spam_back_cb(lv_event_t *e)
     ble_spam_counter_label = NULL;
     ble_spam_start_btn = NULL;
     if (current_radio_mode == RADIO_MODE_BLE) {
+        ESP_LOGI(TAG, "[SPAM] cleanup: stopping instance %d", BLE_SPAM_ADV_INSTANCE);
         ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
+        memset(&g_ble_spam_state, 0, sizeof(g_ble_spam_state));
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
     }
@@ -29711,9 +29720,12 @@ static void ble_spoof_timer_cb(lv_timer_t *timer)
         ext_adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(350);
         ext_adv_params.sid = BLE_SPOOF_ADV_INSTANCE;
 
+        ESP_LOGI(TAG, "[SPOOF] timer: configuring instance %d (connectable=%d, scannable=%d, legacy_pdu=%d)",
+                 BLE_SPOOF_ADV_INSTANCE, ext_adv_params.connectable, ext_adv_params.scannable, ext_adv_params.legacy_pdu);
+
         int rc = ble_gap_ext_adv_configure(BLE_SPOOF_ADV_INSTANCE, &ext_adv_params, NULL, NULL, NULL);
         if (rc != 0) {
-            ESP_LOGE(TAG, "[SPOOF] configure failed: %d", rc);
+            ESP_LOGE(TAG, "[SPOOF] configure failed: %d (state may need delete+reset)", rc);
             ble_spoof_active = false;
             return;
         }
@@ -29724,19 +29736,20 @@ static void ble_spoof_timer_cb(lv_timer_t *timer)
         memcpy(target_addr.val, ble_spoof_target_mac, 6);
         ble_gap_ext_adv_set_addr(BLE_SPOOF_ADV_INSTANCE, &target_addr);
 
-        ESP_LOGI(TAG, "[SPOOF] configured, now starting");
+        ESP_LOGI(TAG, "[SPOOF] configured OK, now starting");
         st->configured = true;
     }
 
     // Start immediately after config (once)
     if (!st->started) {
+        ESP_LOGI(TAG, "[SPOOF] timer: starting instance %d", BLE_SPOOF_ADV_INSTANCE);
         int rc = ble_gap_ext_adv_start(BLE_SPOOF_ADV_INSTANCE, 0, 0);
         if (rc != 0 && rc != BLE_HS_EALREADY) {
-            ESP_LOGE(TAG, "[SPOOF] start failed: %d", rc);
+            ESP_LOGE(TAG, "[SPOOF] start failed: %d (check if delete was called before reconfigure)", rc);
             ble_spoof_active = false;
             return;
         }
-        ESP_LOGI(TAG, "[SPOOF] started");
+        ESP_LOGI(TAG, "[SPOOF] started OK, beginning packet cycle");
         st->started = true;
     }
 
@@ -29792,7 +29805,9 @@ static void ble_spoof_start_cb(lv_event_t *e)
             lv_timer_del(g_ble_spoof_state.timer);
             g_ble_spoof_state.timer = NULL;
         }
+        ESP_LOGI(TAG, "[SPOOF] stopping instance %d (keeping config)", BLE_SPOOF_ADV_INSTANCE);
         ble_gap_ext_adv_stop(BLE_SPOOF_ADV_INSTANCE);
+        g_ble_spoof_state.started = false;
         lv_label_set_text(lv_obj_get_child(ble_spoof_start_btn, 0), "START SPOOF");
         lv_obj_set_style_bg_color(ble_spoof_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
         if (ble_spoof_status_label) lv_label_set_text(ble_spoof_status_label, "Stopped.");
@@ -29833,7 +29848,9 @@ static void ble_spoof_back_cb(lv_event_t *e)
     memset(ble_spoof_target_mac, 0, 6);
     memset(ble_spoof_target_name_str, 0, sizeof(ble_spoof_target_name_str));
     if (current_radio_mode == RADIO_MODE_BLE) {
+        ESP_LOGI(TAG, "[SPOOF] cleanup: stopping instance %d", BLE_SPOOF_ADV_INSTANCE);
         ble_gap_ext_adv_stop(BLE_SPOOF_ADV_INSTANCE);
+        memset(&g_ble_spoof_state, 0, sizeof(g_ble_spoof_state));
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
     }
