@@ -742,13 +742,16 @@ static volatile bool scan_done_ui_flag = false;
 static volatile bool g_wcs_scan_active  = false;  /* WCS client scan owns SCAN_DONE — suppress attack flow */
 #define SCAN_RESULTS_MAX_DISPLAY 32
 
-// Whitelist for BSSID protection
+// Whitelist for BSSID and SSID protection
 #define MAX_WHITELISTED_BSSIDS 150
+#define MAX_WHITELISTED_SSIDS 50
 typedef struct {
     uint8_t bssid[6];
 } whitelisted_bssid_t;
 whitelisted_bssid_t whiteListedBssids[MAX_WHITELISTED_BSSIDS];
 int whitelistedBssidsCount = 0;
+EXT_RAM_BSS_ATTR static char whitelistedSsids[MAX_WHITELISTED_SSIDS][33];
+static int whitelistedSsidCount = 0;
 
 // ============================================================================
 // SD Card Cache in PSRAM
@@ -1002,6 +1005,7 @@ typedef struct {
     bool complete;
     bool beacon_captured;
     bool has_existing_file;
+    bool save_deferred;
     int64_t last_deauth_us;
     int64_t last_seen_us;
     int target_index;
@@ -4424,10 +4428,11 @@ static void sd_init_task(void *param)
 
 // Load whitelist from SD card
 void load_whitelist_from_sd(void) {
-    whitelistedBssidsCount = 0; // Reset count
-    
+    whitelistedBssidsCount = 0;
+    whitelistedSsidCount = 0;
+
     ESP_LOGI(TAG, "Loading whitelist from /sdcard/lab/white.txt...");
-    
+
     // Try to open the file - if SD not mounted, this will fail gracefully
     // Don't try to mount SD here - let it be mounted elsewhere
     FILE *file = fopen("/sdcard/lab/white.txt", "r");
@@ -4435,61 +4440,72 @@ void load_whitelist_from_sd(void) {
         ESP_LOGI(TAG, "white.txt not found or SD not accessible - whitelist will be empty");
         return;
     }
-    
-    ESP_LOGI(TAG, "Found white.txt, loading whitelisted BSSIDs...");
-    
+
+    ESP_LOGI(TAG, "Found white.txt, loading whitelisted BSSIDs and SSIDs...");
+
     char line[128];
     int line_number = 0;
-    int loaded_count = 0;
-    
-    while (fgets(line, sizeof(line), file) != NULL && whitelistedBssidsCount < MAX_WHITELISTED_BSSIDS) {
+    int bssid_count = 0, ssid_count = 0;
+
+    while (fgets(line, sizeof(line), file) != NULL) {
         line_number++;
-        
+
         // Remove trailing newline/whitespace
         line[strcspn(line, "\r\n")] = '\0';
-        
-        // Skip empty lines
-        if (strlen(line) == 0) {
+
+        // Skip leading whitespace
+        char *start = line;
+        while (*start == ' ' || *start == '\t') start++;
+
+        // Skip empty lines and comments
+        if (strlen(start) == 0 || *start == '#') {
             continue;
         }
-        
+
         // Parse BSSID in format: XX:XX:XX:XX:XX:XX or XX-XX-XX-XX-XX-XX
         uint8_t bssid[6];
         int matches = 0;
-        
+
         // Try with colon separator
-        matches = sscanf(line, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+        matches = sscanf(start, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
                         &bssid[0], &bssid[1], &bssid[2],
                         &bssid[3], &bssid[4], &bssid[5]);
-        
+
         // If that didn't work, try with dash separator
         if (matches != 6) {
-            matches = sscanf(line, "%hhx-%hhx-%hhx-%hhx-%hhx-%hhx",
+            matches = sscanf(start, "%hhx-%hhx-%hhx-%hhx-%hhx-%hhx",
                             &bssid[0], &bssid[1], &bssid[2],
                             &bssid[3], &bssid[4], &bssid[5]);
         }
-        
-        if (matches == 6) {
-            // Valid BSSID found, add to whitelist
+
+        if (matches == 6 && whitelistedBssidsCount < MAX_WHITELISTED_BSSIDS) {
+            // Valid BSSID found, add to BSSID whitelist
             memcpy(whiteListedBssids[whitelistedBssidsCount].bssid, bssid, 6);
             whitelistedBssidsCount++;
-            loaded_count++;
-            
-            ESP_LOGI(TAG, "  [%d] Loaded: %02X:%02X:%02X:%02X:%02X:%02X",
-                     loaded_count,
+            bssid_count++;
+
+            ESP_LOGI(TAG, "  [BSSID %d] Loaded: %02X:%02X:%02X:%02X:%02X:%02X",
+                     bssid_count,
                      bssid[0], bssid[1], bssid[2],
                      bssid[3], bssid[4], bssid[5]);
-        } else {
-            ESP_LOGI(TAG, "  Line %d: Invalid BSSID format, ignoring: %s", line_number, line);
+        } else if (matches != 6 && whitelistedSsidCount < MAX_WHITELISTED_SSIDS) {
+            // Not a valid BSSID, treat as SSID
+            strncpy(whitelistedSsids[whitelistedSsidCount], start, 32);
+            whitelistedSsids[whitelistedSsidCount][32] = '\0';
+            whitelistedSsidCount++;
+            ssid_count++;
+
+            ESP_LOGI(TAG, "  [SSID %d] Loaded: '%s'", ssid_count, start);
         }
     }
-    
+
     fclose(file);
-    
-    if (whitelistedBssidsCount > 0) {
-        ESP_LOGI(TAG, "Successfully loaded %d whitelisted BSSID(s)", whitelistedBssidsCount);
+
+    if (whitelistedBssidsCount > 0 || whitelistedSsidCount > 0) {
+        ESP_LOGI(TAG, "Successfully loaded %d BSSID(s) and %d SSID(s)",
+                 whitelistedBssidsCount, whitelistedSsidCount);
     } else {
-        ESP_LOGI(TAG, "No valid BSSIDs found in white.txt");
+        ESP_LOGI(TAG, "No valid entries found in white.txt");
     }
 }
 
@@ -4498,13 +4514,28 @@ bool is_bssid_whitelisted(const uint8_t *bssid) {
     if (bssid == NULL || whitelistedBssidsCount == 0) {
         return false;
     }
-    
+
     for (int i = 0; i < whitelistedBssidsCount; i++) {
         if (memcmp(bssid, whiteListedBssids[i].bssid, 6) == 0) {
             return true;
         }
     }
-    
+
+    return false;
+}
+
+// Check if an SSID is in the whitelist
+static bool is_ssid_whitelisted(const char *ssid) {
+    if (ssid == NULL || whitelistedSsidCount == 0) {
+        return false;
+    }
+
+    for (int i = 0; i < whitelistedSsidCount; i++) {
+        if (strcmp(ssid, whitelistedSsids[i]) == 0) {
+            return true;
+        }
+    }
+
     return false;
 }
 
@@ -9590,6 +9621,10 @@ static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t typ
                 offset += 2 + tag_len;
             }
             if (authmode != WIFI_AUTH_OPEN) {
+                // Skip whitelisted APs (by BSSID or SSID)
+                if (is_bssid_whitelisted(ap_bssid) || is_ssid_whitelisted(ssid)) {
+                    return;
+                }
                 int ap_idx = hs_add_or_update_ap(ap_bssid, ssid, beacon_channel, authmode, pkt->rx_ctrl.rssi);
                 if (ap_idx >= 0 && !hs_ap_targets[ap_idx].beacon_captured &&
                     !hs_ap_targets[ap_idx].has_existing_file && !hs_ap_targets[ap_idx].complete) {
@@ -10348,7 +10383,7 @@ static void handshake_attack_task_selected(void) {
                 }
             }
 
-            if (ap_idx >= 0 && hs_ap_targets[ap_idx].complete) {
+            if (ap_idx >= 0 && hs_ap_targets[ap_idx].complete && !hs_ap_targets[ap_idx].save_deferred) {
                 ESP_LOGI(TAG, "Saving handshake for '%s'...", target_ap->ssid);
                 if (hs_save_handshake_to_sd(ap_idx)) {
                     hs_ap_targets[ap_idx].has_existing_file = true;
@@ -10358,6 +10393,9 @@ static void handshake_attack_task_selected(void) {
                     ESP_LOGI(TAG, "Handshake #%d captured and saved!", hs_total_handshakes_captured);
                     pcap_serializer_init();
                     hs_ui_update_flag = true;
+                } else {
+                    hs_ap_targets[ap_idx].save_deferred = true;
+                    ESP_LOGW(TAG, "[HS] Save deferred for '%s' — will retry after attack stops", target_ap->ssid);
                 }
             }
         }
@@ -10371,6 +10409,21 @@ static void handshake_attack_task_selected(void) {
     }
 
     esp_wifi_set_promiscuous(false);
+
+    // Final save pass: switch to STA mode to free APSTA DMA, then save deferred handshakes
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    for (int a = 0; a < hs_ap_count; a++) {
+        hs_ap_target_t *ap = &hs_ap_targets[a];
+        if (!ap->complete || ap->has_existing_file) continue;
+        if (hs_save_handshake_to_sd(a)) {
+            ap->has_existing_file = true;
+            hs_total_handshakes_captured++;
+            ESP_LOGI(TAG, "[HS-FINAL] Saved deferred handshake for '%s'", ap->ssid);
+        }
+    }
+
     pcap_serializer_deinit();
 }
 
@@ -10529,7 +10582,7 @@ static void handshake_attack_task_sniffer(void) {
 
         for (int a = 0; a < hs_ap_count; a++) {
             hs_ap_target_t *ap = &hs_ap_targets[a];
-            if (!ap->complete || ap->has_existing_file) continue;
+            if (!ap->complete || ap->has_existing_file || ap->save_deferred) continue;
 
             ESP_LOGI(TAG, "Saving complete handshake for '%s'...", ap->ssid);
             if (hs_save_handshake_to_sd(a)) {
@@ -10544,6 +10597,9 @@ static void handshake_attack_task_sniffer(void) {
                         hs_ap_targets[j].beacon_captured = false;
                     }
                 }
+            } else {
+                ap->save_deferred = true;
+                ESP_LOGW(TAG, "[HS] Save deferred for '%s' — will retry after sniffer stops", ap->ssid);
             }
         }
 
@@ -10561,6 +10617,21 @@ static void handshake_attack_task_sniffer(void) {
     }
 
     esp_wifi_set_promiscuous(false);
+
+    // Final save pass: switch to STA mode to free APSTA DMA, then save deferred handshakes
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    for (int a = 0; a < hs_ap_count; a++) {
+        hs_ap_target_t *ap = &hs_ap_targets[a];
+        if (!ap->complete || ap->has_existing_file) continue;
+        if (hs_save_handshake_to_sd(a)) {
+            ap->has_existing_file = true;
+            hs_total_handshakes_captured++;
+            ESP_LOGI(TAG, "[HS-FINAL] Saved deferred handshake for '%s'", ap->ssid);
+        }
+    }
+
     pcap_serializer_deinit();
 }
 
