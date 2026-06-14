@@ -5042,12 +5042,12 @@ static esp_err_t sd_cache_load_all(void) {
         ESP_LOGI(TAG, "  Handshakes: 0 (directory not found)");
     }
     
-    // 6. Load WPA-SEC API key from wpa-sec.txt
+    // 6. Load WPA-SEC API key from wpa-sec.txt (skip comment lines starting with #)
     sd_cache->wpasec_key[0] = '\0';
     file = fopen(WPASEC_KEY_PATH, "r");
     if (file != NULL) {
         char buf[WPASEC_KEY_MAX_LEN + 8];
-        if (fgets(buf, sizeof(buf), file) != NULL) {
+        while (fgets(buf, sizeof(buf), file) != NULL) {
             size_t len = strlen(buf);
             while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r' ||
                    buf[len - 1] == ' ' || buf[len - 1] == '\t')) {
@@ -5055,13 +5055,22 @@ static esp_err_t sd_cache_load_all(void) {
             }
             char *start = buf;
             while (*start == ' ' || *start == '\t') start++;
+            // Skip comment lines and empty lines
+            if (*start == '#' || strlen(start) == 0) {
+                continue;
+            }
             if (strlen(start) > 0 && strlen(start) < WPASEC_KEY_MAX_LEN) {
                 strncpy(sd_cache->wpasec_key, start, WPASEC_KEY_MAX_LEN - 1);
                 sd_cache->wpasec_key[WPASEC_KEY_MAX_LEN - 1] = '\0';
+                break;
             }
         }
         fclose(file);
-        ESP_LOGI(TAG, "  WPA-SEC key: %.4s****", sd_cache->wpasec_key);
+        if (sd_cache->wpasec_key[0] != '\0') {
+            ESP_LOGI(TAG, "  WPA-SEC key: %.4s****", sd_cache->wpasec_key);
+        } else {
+            ESP_LOGI(TAG, "  WPA-SEC key: not found");
+        }
     } else {
         ESP_LOGI(TAG, "  WPA-SEC key: not found");
     }
@@ -9597,6 +9606,13 @@ static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t typ
             int ap_idx = hs_find_ap(ap_mac);
             if (ap_idx >= 0 && !hs_ap_targets[ap_idx].has_existing_file && !hs_ap_targets[ap_idx].complete) {
                 hs_add_or_update_client(client_mac, ap_idx, pkt->rx_ctrl.rssi);
+                pcap_serializer_append_frame(frame, len, pkt->rx_ctrl.timestamp);
+            }
+        } else if (frame_type == 0x10) {
+            uint8_t *ap_mac = addr2;
+            int ap_idx = hs_find_ap(ap_mac);
+            if (ap_idx >= 0 && !hs_ap_targets[ap_idx].has_existing_file && !hs_ap_targets[ap_idx].complete) {
+                pcap_serializer_append_frame(frame, len, pkt->rx_ctrl.timestamp);
             }
         }
         return;
@@ -16372,11 +16388,17 @@ static int wpasec_upload_file(const char *filepath, const char *filename)
         return -1;
     }
 
-    // Read response
-    char resp_buf[512] = {0};
+    // Read response into larger PSRAM buffer (2 KB)
+    char *resp_buf = (char *)heap_caps_malloc(2048, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!resp_buf) {
+        ESP_LOGW(TAG, "WPA-SEC: Failed to allocate response buffer");
+        esp_tls_conn_destroy(tls);
+        return -1;
+    }
+
     int total_read = 0;
-    while (total_read < (int)sizeof(resp_buf) - 1) {
-        ret = esp_tls_conn_read(tls, resp_buf + total_read, sizeof(resp_buf) - 1 - total_read);
+    while (total_read < 2047) {
+        ret = esp_tls_conn_read(tls, (uint8_t *)resp_buf + total_read, 2047 - total_read);
         if (ret <= 0) break;
         total_read += ret;
     }
@@ -16391,15 +16413,36 @@ static int wpasec_upload_file(const char *filepath, const char *filename)
         if (sp) status = atoi(sp + 1);
     }
 
+    // Find HTTP body after \r\n\r\n
+    const char *body_ptr = strstr(resp_buf, "\r\n\r\n");
+    if (body_ptr) {
+        body_ptr += 4;
+    } else {
+        body_ptr = "";
+    }
+
+    // Skip chunked encoding size line if present (starts with hex digits then \r\n)
+    if (body_ptr && strstr(resp_buf, "chunked")) {
+        const char *nl = strchr(body_ptr, '\n');
+        if (nl) body_ptr = nl + 1;
+    }
+
+    int result = -1;
     if (status == 200) {
-        if (strstr(resp_buf, "already submitted") != NULL) {
-            return 1; // duplicate
+        if (strstr(body_ptr, "already submitted") != NULL) {
+            result = 1; // duplicate
+        } else if (strstr(body_ptr, "Bad capture") != NULL || strstr(body_ptr, "invalid") != NULL) {
+            result = -1; // bad capture
+        } else {
+            result = 0; // success
         }
-        return 0; // success
     } else {
         ESP_LOGW(TAG, "WPA-SEC: HTTP error %d", status);
-        return -1;
+        result = -1;
     }
+
+    heap_caps_free(resp_buf);
+    return result;
 }
 
 /**
