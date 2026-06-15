@@ -29518,8 +29518,8 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
         ext_adv_params.own_addr_type = BLE_OWN_ADDR_RANDOM;
         ext_adv_params.primary_phy = BLE_HCI_LE_PHY_1M;
         ext_adv_params.secondary_phy = BLE_HCI_LE_PHY_1M;
-        ext_adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(40);
-        ext_adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(60);
+        ext_adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(80);
+        ext_adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(100);
         ext_adv_params.tx_power = 20;  // +20 dBm max TX power
         ext_adv_params.sid = BLE_SPAM_ADV_INSTANCE;
 
@@ -29596,7 +29596,7 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
     // disable to propagate before set_addr/set_data to avoid EINVAL host validation
     uint64_t stop_time_us = esp_timer_get_time();
     ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(30));
     uint64_t after_delay_us = esp_timer_get_time();
     st->started = false;
     ESP_LOGD(TAG, "[SPAM] pkt%d stopped adv, delayed %.1f ms", ble_spam_count, (after_delay_us - stop_time_us) / 1000.0);
