@@ -29581,12 +29581,14 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
     // Each packet with fresh MAC appears as a new device to phones (defeats per-MAC dedup)
     // EXCEPTION: Samsung in "All" mode uses burst MAC to give Samsung time to accumulate detections
 
-    // Stop instance (if running) before updating address and data
-    if (st->started) {
-        ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
-        // NimBLE stop is async; brief yield to allow controller to process
+    // Stop instance before updating address/data. ble_gap_ext_adv_active() reflects
+    // the controller's real state (not our stale st->started flag); spin until the
+    // async stop actually lands so set_addr/start don't race it and return EALREADY(3).
+    ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
+    for (int i = 0; i < 20 && ble_gap_ext_adv_active(BLE_SPAM_ADV_INSTANCE); i++) {
         vTaskDelay(pdMS_TO_TICKS(2));
     }
+    st->started = false;
 
     // Generate random address (controller accepts set_addr only when stopped/configured)
     ble_addr_t rnd_addr;
