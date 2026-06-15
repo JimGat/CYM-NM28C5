@@ -29518,8 +29518,8 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
         ext_adv_params.own_addr_type = BLE_OWN_ADDR_RANDOM;
         ext_adv_params.primary_phy = BLE_HCI_LE_PHY_1M;
         ext_adv_params.secondary_phy = BLE_HCI_LE_PHY_1M;
-        ext_adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(20);
-        ext_adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(30);
+        ext_adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(40);
+        ext_adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(60);
         ext_adv_params.tx_power = 20;  // +20 dBm max TX power
         ext_adv_params.sid = BLE_SPAM_ADV_INSTANCE;
 
