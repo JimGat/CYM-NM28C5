@@ -30,10 +30,16 @@ static const char *TAG = "pcap_serializer";
 
 /**
  * @brief Constanst according to reference
- * 
- * @see Ref: http://www.tcpdump.org/linktypes.html (LINKTYPE_IEEE802_11)
+ *
+ * @see Ref: http://www.tcpdump.org/linktypes.html (LINKTYPE_IEEE802_11_RADIO)
  */
-#define LINKTYPE_IEEE802_11 105
+#define LINKTYPE_IEEE802_11_RADIO 127
+
+static const uint8_t s_radiotap_min[8] = {
+    0x00, 0x00,              // revision, pad
+    0x08, 0x00,              // header length = 8 LE
+    0x00, 0x00, 0x00, 0x00   // present bitmask = none
+};
 
 static unsigned pcap_size = 0;
 static uint8_t *pcap_buffer = NULL;
@@ -53,7 +59,7 @@ uint8_t *pcap_serializer_init(){
         .thiszone = 0,
         .sigfigs = 0,
         .snaplen = SNAPLEN,
-        .network = LINKTYPE_IEEE802_11
+        .network = LINKTYPE_IEEE802_11_RADIO
     };
     
     // Allocate in PSRAM for large buffers
@@ -74,30 +80,38 @@ void pcap_serializer_append_frame(const uint8_t *buffer, unsigned size, unsigned
         ESP_LOGD(TAG, "Frame size is 0. Not appending anything.");
         return;
     }
+
+    unsigned radiotap_len = sizeof(s_radiotap_min);
+    unsigned total_frame_size = radiotap_len + size;
+
     // Ref: https://gitlab.com/wireshark/wireshark/-/wikis/Development/LibpcapFileFormat#record-packet-header
     pcap_record_header_t pcap_record_header = {
         .ts_sec = ts_usec / 1000000,
         .ts_usec = ts_usec % 1000000,
-        .incl_len = size,
-        .orig_len = size,
+        .incl_len = total_frame_size,
+        .orig_len = total_frame_size,
     };
     // Ref: https://gitlab.com/wireshark/wireshark/-/wikis/Development/LibpcapFileFormat#record-packet-header
     // Stored packet/frame cannot be larger than SNAPLEN
-    if(size > SNAPLEN){
-        size = SNAPLEN;
+    if(total_frame_size > SNAPLEN){
+        total_frame_size = SNAPLEN;
         pcap_record_header.incl_len = SNAPLEN;
     }
 
     // Use PSRAM-aware realloc
-    uint8_t *reallocated_pcap_buffer = heap_caps_realloc(pcap_buffer, pcap_size + sizeof(pcap_record_header_t) + size, MALLOC_CAP_SPIRAM);
+    uint8_t *reallocated_pcap_buffer = heap_caps_realloc(pcap_buffer, pcap_size + sizeof(pcap_record_header_t) + total_frame_size, MALLOC_CAP_SPIRAM);
     if(reallocated_pcap_buffer == NULL){
         ESP_LOGE(TAG, "Error reallocating PCAP buffer in PSRAM! PCAP buffer may not be complete.");
         return;
     }
     memcpy(&reallocated_pcap_buffer[pcap_size], &pcap_record_header, sizeof(pcap_record_header_t));
-    memcpy(&reallocated_pcap_buffer[pcap_size + sizeof(pcap_record_header_t)], buffer, size);
+
+    uint8_t *frame_ptr = &reallocated_pcap_buffer[pcap_size + sizeof(pcap_record_header_t)];
+    memcpy(frame_ptr, s_radiotap_min, radiotap_len);
+    memcpy(frame_ptr + radiotap_len, buffer, total_frame_size - radiotap_len);
+
     pcap_buffer = reallocated_pcap_buffer;
-    pcap_size += sizeof(pcap_record_header_t) + size;
+    pcap_size += sizeof(pcap_record_header_t) + total_frame_size;
 }
 
 void pcap_serializer_deinit(){

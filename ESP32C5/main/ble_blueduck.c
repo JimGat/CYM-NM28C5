@@ -617,7 +617,7 @@ static void bd_payload_task(void *arg)
     }
 
     /* Post-pair settle: allow Android's keyboard setup dialog to dismiss */
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    vTaskDelay(pdMS_TO_TICKS(4000));
 
     s_payloads++;
 
