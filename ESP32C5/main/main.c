@@ -29549,24 +29549,30 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
     int cur_mode = ble_spam_mode;
     if (cur_mode == BLE_SPAM_MODE_ALL) {
         cur_mode = all_modes[st->mode_round % 7];
+    }
 
-        // Samsung burst: send 4 packets with same MAC so Samsung detects a stable device
-        if (cur_mode == BLE_SPAM_MODE_SAMSUNG || cur_mode == BLE_SPAM_MODE_SMARTTAG) {
-            if (st->samsung_burst_count == 0) {
-                // Start new burst: generate MAC once, reuse for 4 packets
-                if (ble_hs_id_gen_rnd(1, &st->samsung_burst_mac) != 0) {
-                    ESP_LOGW(TAG, "[SPAM] failed to generate burst MAC for Samsung/SmartTag");
-                }
+    // Determine if this mode uses burst MAC (same MAC for 4 packets to allow Samsung detection)
+    bool burst_mode = (cur_mode == BLE_SPAM_MODE_SAMSUNG || cur_mode == BLE_SPAM_MODE_SMARTTAG);
+
+    if (burst_mode) {
+        if (st->samsung_burst_count == 0) {
+            // First packet of burst: mint one MAC to reuse for next 3 packets
+            if (ble_hs_id_gen_rnd(1, &st->samsung_burst_mac) != 0) {
+                ESP_LOGW(TAG, "[SPAM] failed to generate burst MAC");
             }
-            st->samsung_burst_count++;
-            if (st->samsung_burst_count >= 4) {
-                // Burst complete: move to next mode on next call
-                st->samsung_burst_count = 0;
+        }
+        st->samsung_burst_count++;
+        if (st->samsung_burst_count >= 4) {
+            // Burst complete: reset counter, advance mode only if in All mode
+            st->samsung_burst_count = 0;
+            if (ble_spam_mode == BLE_SPAM_MODE_ALL) {
                 st->mode_round++;
             }
-        } else {
-            // Non-Samsung/SmartTag mode: advance normally
-            st->samsung_burst_count = 0;
+        }
+    } else {
+        // Non-burst mode: reset counter and advance mode (if in All mode)
+        st->samsung_burst_count = 0;
+        if (ble_spam_mode == BLE_SPAM_MODE_ALL) {
             st->mode_round++;
         }
     }
@@ -29584,8 +29590,9 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
 
     // Generate random address (controller accepts set_addr only when stopped/configured)
     ble_addr_t rnd_addr;
-    if (ble_spam_mode == BLE_SPAM_MODE_ALL && (cur_mode == BLE_SPAM_MODE_SAMSUNG || cur_mode == BLE_SPAM_MODE_SMARTTAG)) {
-        // Samsung/SmartTag burst in "All Platforms" mode: reuse MAC for 4 packets
+    if (burst_mode) {
+        // Burst modes (Samsung/SmartTag) reuse same MAC for 4 packets
+        // (minted on packet 1, reused on packets 2-4)
         memcpy(rnd_addr.val, st->samsung_burst_mac.val, 6);
     } else {
         // Normal per-packet randomization for all other modes
@@ -29797,6 +29804,7 @@ static void ble_spam_start_btn_cb(lv_event_t *e)
         g_ble_spam_state.smarttag_idx = 0;
         g_ble_spam_state.sour_apple_idx = 0;
         g_ble_spam_state.mode_round = 0;
+        g_ble_spam_state.samsung_burst_count = 0;  // Reset burst counter for clean start
         // configured/started persist across start/stop cycles for the BLE session
         g_ble_spam_state.timer = lv_timer_create(ble_spam_timer_cb, 100, NULL);  // 100ms interval
         lv_label_set_text(lv_obj_get_child(ble_spam_start_btn, 0), "STOP");
