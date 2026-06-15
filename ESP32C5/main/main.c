@@ -29596,7 +29596,7 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
     // disable to propagate before set_addr/set_data to avoid EINVAL host validation
     uint64_t stop_time_us = esp_timer_get_time();
     ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
-    vTaskDelay(pdMS_TO_TICKS(30));
+    vTaskDelay(pdMS_TO_TICKS(50));
     uint64_t after_delay_us = esp_timer_get_time();
     st->started = false;
     ESP_LOGD(TAG, "[SPAM] pkt%d stopped adv, delayed %.1f ms", ble_spam_count, (after_delay_us - stop_time_us) / 1000.0);
