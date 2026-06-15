@@ -29584,9 +29584,8 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
 
     // Generate random address (controller accepts set_addr only when stopped/configured)
     ble_addr_t rnd_addr;
-    if (cur_mode == BLE_SPAM_MODE_SAMSUNG || cur_mode == BLE_SPAM_MODE_SMARTTAG) {
-        // Samsung burst: reuse the same MAC for 4 packets so device appears stable
-        // Works in both "All Platforms" mode and Samsung/SmartTag-only modes
+    if (ble_spam_mode == BLE_SPAM_MODE_ALL && (cur_mode == BLE_SPAM_MODE_SAMSUNG || cur_mode == BLE_SPAM_MODE_SMARTTAG)) {
+        // Samsung/SmartTag burst in "All Platforms" mode: reuse MAC for 4 packets
         memcpy(rnd_addr.val, st->samsung_burst_mac.val, 6);
     } else {
         // Normal per-packet randomization for all other modes
