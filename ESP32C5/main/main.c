@@ -29559,15 +29559,23 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
             // First packet of burst: mint one MAC to reuse for next 3 packets
             // Use static-random (nrpa=0) not NRPA (nrpa=1) — ble_gap_ext_adv_set_addr requires top bits 11
             if (ble_hs_id_gen_rnd(0, &st->samsung_burst_mac) != 0) {
-                ESP_LOGW(TAG, "[SPAM] failed to generate burst MAC");
+                ESP_LOGW(TAG, "[SPAM] [BURST] failed to generate burst MAC");
+            } else {
+                uint8_t top_bits = st->samsung_burst_mac.val[5] & 0xC0;
+                ESP_LOGI(TAG, "[SPAM] [BURST] new burst MAC: %02x:%02x:%02x:%02x:%02x:%02x (type_bits=%02x, expect 0xc0)",
+                         st->samsung_burst_mac.val[0], st->samsung_burst_mac.val[1], st->samsung_burst_mac.val[2],
+                         st->samsung_burst_mac.val[3], st->samsung_burst_mac.val[4], st->samsung_burst_mac.val[5],
+                         top_bits);
             }
         }
         st->samsung_burst_count++;
+        ESP_LOGI(TAG, "[SPAM] [BURST] Samsung burst pkt %d/4 (mode_round=%d)", st->samsung_burst_count, st->mode_round);
         if (st->samsung_burst_count >= 4) {
             // Burst complete: reset counter, advance mode only if in All mode
             st->samsung_burst_count = 0;
             if (ble_spam_mode == BLE_SPAM_MODE_ALL) {
                 st->mode_round++;
+                ESP_LOGI(TAG, "[SPAM] [BURST] burst complete → mode_round=%d", st->mode_round);
             }
         }
     } else {
@@ -29585,9 +29593,12 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
     // Stop instance before updating address/data. The stop is blocking at the
     // HCI level but the controller's physical state lags; yield 10ms for the
     // disable to propagate before set_addr/set_data to avoid EINVAL host validation
+    uint64_t stop_time_us = esp_timer_get_time();
     ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
     vTaskDelay(pdMS_TO_TICKS(10));
+    uint64_t after_delay_us = esp_timer_get_time();
     st->started = false;
+    ESP_LOGD(TAG, "[SPAM] pkt%d stopped adv, delayed %.1f ms", ble_spam_count, (after_delay_us - stop_time_us) / 1000.0);
 
     // Generate random address (controller accepts set_addr only when stopped/configured)
     ble_addr_t rnd_addr;
@@ -29595,6 +29606,7 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
         // Burst modes (Samsung/SmartTag) reuse same MAC for 4 packets
         // (minted on packet 1, reused on packets 2-4)
         memcpy(rnd_addr.val, st->samsung_burst_mac.val, 6);
+        ESP_LOGD(TAG, "[SPAM] pkt%d using burst MAC (count=%d)", ble_spam_count, st->samsung_burst_count);
     } else {
         // Normal per-packet randomization for all other modes
         // Use static-random (nrpa=0) not NRPA (nrpa=1) — ble_gap_ext_adv_set_addr requires top bits 11
@@ -29602,15 +29614,21 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
             ESP_LOGW(TAG, "[SPAM] pkt%d MAC generation failed", ble_spam_count);
             return;
         }
+        uint8_t top_bits = rnd_addr.val[5] & 0xC0;
+        ESP_LOGD(TAG, "[SPAM] pkt%d generated random MAC (type_bits=%02x, expect 0xc0)", ble_spam_count, top_bits);
     }
 
+    ESP_LOGD(TAG, "[SPAM] pkt%d calling set_addr with MAC: %02x:%02x:%02x:%02x:%02x:%02x",
+             ble_spam_count, rnd_addr.val[0], rnd_addr.val[1], rnd_addr.val[2],
+             rnd_addr.val[3], rnd_addr.val[4], rnd_addr.val[5]);
     int addr_rc = ble_gap_ext_adv_set_addr(BLE_SPAM_ADV_INSTANCE, &rnd_addr);
     if (addr_rc == 0) {
         ESP_LOGI(TAG, "[SPAM] pkt%d MAC set OK: %02x:%02x:%02x:%02x:%02x:%02x",
                  ble_spam_count, rnd_addr.val[0], rnd_addr.val[1], rnd_addr.val[2],
                  rnd_addr.val[3], rnd_addr.val[4], rnd_addr.val[5]);
     } else {
-        ESP_LOGW(TAG, "[SPAM] pkt%d set_addr FAILED: rc=%d", ble_spam_count, addr_rc);
+        ESP_LOGW(TAG, "[SPAM] pkt%d set_addr FAILED: rc=%d (addr_type=%02x, top_bits=%02x)",
+                 ble_spam_count, addr_rc, rnd_addr.type, rnd_addr.val[5] & 0xC0);
     }
 
     struct ble_hs_adv_fields fields;
@@ -29751,18 +29769,27 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
     }
 
     // Set payload (now that instance is stopped and address is fresh)
+    ESP_LOGD(TAG, "[SPAM] pkt%d calling set_data (payload_len=%d)", ble_spam_count, os_mbuf_len(om));
     rc = ble_gap_ext_adv_set_data(BLE_SPAM_ADV_INSTANCE, om);
     if (rc != 0) {
-        ESP_LOGW(TAG, "[SPAM] set_data rc=%d; mbuf invalid or buffer full", rc);
+        ESP_LOGW(TAG, "[SPAM] pkt%d set_data FAILED: rc=%d", ble_spam_count, rc);
         os_mbuf_free_chain(om);
+    } else {
+        ESP_LOGD(TAG, "[SPAM] pkt%d set_data OK", ble_spam_count);
     }
 
     // Start advertising with fresh payload and random MAC (seen as new device by phones)
+    ESP_LOGD(TAG, "[SPAM] pkt%d calling start (instance=%d)", ble_spam_count, BLE_SPAM_ADV_INSTANCE);
     rc = ble_gap_ext_adv_start(BLE_SPAM_ADV_INSTANCE, 0, 0);
     if (rc != 0 && rc != BLE_HS_EALREADY) {
-        ESP_LOGW(TAG, "[SPAM] start rc=%d", rc);
+        ESP_LOGW(TAG, "[SPAM] pkt%d start FAILED: rc=%d", ble_spam_count, rc);
     } else {
         st->started = true;
+        if (rc == BLE_HS_EALREADY) {
+            ESP_LOGD(TAG, "[SPAM] pkt%d start returned EALREADY (already running)", ble_spam_count);
+        } else {
+            ESP_LOGD(TAG, "[SPAM] pkt%d start OK", ble_spam_count);
+        }
     }
 
     ESP_LOGI(TAG, "[SPAM] packet %d sent", ble_spam_count + 1);
