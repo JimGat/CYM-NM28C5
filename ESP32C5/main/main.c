@@ -29605,7 +29605,7 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
     if (burst_mode) {
         // Burst modes (Samsung/SmartTag) reuse same MAC for 4 packets
         // (minted on packet 1, reused on packets 2-4)
-        memcpy(rnd_addr.val, st->samsung_burst_mac.val, 6);
+        rnd_addr = st->samsung_burst_mac;  // Copy entire struct (val + type)
         ESP_LOGD(TAG, "[SPAM] pkt%d using burst MAC (count=%d)", ble_spam_count, st->samsung_burst_count);
     } else {
         // Normal per-packet randomization for all other modes
