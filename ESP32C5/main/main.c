@@ -29557,7 +29557,8 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
     if (burst_mode) {
         if (st->samsung_burst_count == 0) {
             // First packet of burst: mint one MAC to reuse for next 3 packets
-            if (ble_hs_id_gen_rnd(1, &st->samsung_burst_mac) != 0) {
+            // Use static-random (nrpa=0) not NRPA (nrpa=1) — ble_gap_ext_adv_set_addr requires top bits 11
+            if (ble_hs_id_gen_rnd(0, &st->samsung_burst_mac) != 0) {
                 ESP_LOGW(TAG, "[SPAM] failed to generate burst MAC");
             }
         }
@@ -29581,13 +29582,11 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
     // Each packet with fresh MAC appears as a new device to phones (defeats per-MAC dedup)
     // EXCEPTION: Samsung in "All" mode uses burst MAC to give Samsung time to accumulate detections
 
-    // Stop instance before updating address/data. ble_gap_ext_adv_active() reflects
-    // the controller's real state (not our stale st->started flag); spin until the
-    // async stop actually lands so set_addr/start don't race it and return EALREADY(3).
+    // Stop instance before updating address/data. The stop is blocking at the
+    // HCI level but the controller's physical state lags; yield 10ms for the
+    // disable to propagate before set_addr/set_data to avoid EINVAL host validation
     ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
-    for (int i = 0; i < 20 && ble_gap_ext_adv_active(BLE_SPAM_ADV_INSTANCE); i++) {
-        vTaskDelay(pdMS_TO_TICKS(2));
-    }
+    vTaskDelay(pdMS_TO_TICKS(10));
     st->started = false;
 
     // Generate random address (controller accepts set_addr only when stopped/configured)
@@ -29598,7 +29597,8 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
         memcpy(rnd_addr.val, st->samsung_burst_mac.val, 6);
     } else {
         // Normal per-packet randomization for all other modes
-        if (ble_hs_id_gen_rnd(1, &rnd_addr) != 0) {
+        // Use static-random (nrpa=0) not NRPA (nrpa=1) — ble_gap_ext_adv_set_addr requires top bits 11
+        if (ble_hs_id_gen_rnd(0, &rnd_addr) != 0) {
             ESP_LOGW(TAG, "[SPAM] pkt%d MAC generation failed", ble_spam_count);
             return;
         }
