@@ -16396,7 +16396,7 @@ static int wpasec_upload_file(const char *filepath, const char *filename)
     char body_start[256];
     int start_len = snprintf(body_start, sizeof(body_start),
         "--%s\r\n"
-        "Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
+        "Content-Disposition: form-data; name=\"webfile\"; filename=\"%s\"\r\n"
         "Content-Type: application/octet-stream\r\n\r\n",
         boundary, filename);
 
@@ -16408,7 +16408,7 @@ static int wpasec_upload_file(const char *filepath, const char *filename)
     // Build HTTP request headers
     char http_headers[512];
     int hdr_len = snprintf(http_headers, sizeof(http_headers),
-        "POST / HTTP/1.1\r\n"
+        "POST /?submit HTTP/1.1\r\n"
         "Host: wpa-sec.stanev.org\r\n"
         "Cookie: key=%s\r\n"
         "Content-Type: multipart/form-data; boundary=%s\r\n"
