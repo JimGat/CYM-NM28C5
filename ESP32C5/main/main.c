@@ -29508,7 +29508,17 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
 
     struct ble_spam_state_t *st = &g_ble_spam_state;
 
-    // Configure on first callback
+    // Periodic restart every 200 packets to clear NimBLE mbuf pool
+    static int packets_since_restart = 0;
+    if (st->configured && packets_since_restart >= 200) {
+        ESP_LOGI(TAG, "[SPAM] Periodic restart at pkt%d to clear mbuf pool", ble_spam_count);
+        ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
+        vTaskDelay(pdMS_TO_TICKS(100));  // Give controller time to clean up
+        st->configured = false;  // Force reconfiguration on next iteration
+        packets_since_restart = 0;
+    }
+
+    // Configure on first callback or after restart
     if (!st->configured) {
         struct ble_gap_ext_adv_params ext_adv_params;
         memset(&ext_adv_params, 0, sizeof(ext_adv_params));
@@ -29822,6 +29832,7 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
 
     ESP_LOGI(TAG, "[SPAM] packet %d sent", ble_spam_count + 1);
     ble_spam_count++;
+    packets_since_restart++;  // Track for periodic mbuf pool restart
     ble_spam_needs_ui_update = true;
 }
 
