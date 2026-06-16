@@ -2646,9 +2646,9 @@ This project wouldn't be where it is without the brilliant minds and generous ti
 - **ᛕ ᛊ ߇ ᛙ ᚢ (Kevin)** — For deep technical testing and helping diagnose the toughest issues
 - **sithwrld999** — For thorough testing and finding edge cases we missed
 - **bkbroiler** — For hands-on testing and constructive feedback
-- **HeavyButter** — For testing across multiple hardware variants
-- **eCowboy** — For code review and helping refine implementations
-- **OrdoOuroborus** — For testing, review, and contributions to the codebase
+- **HeavyButter** — For testing and just being Paranoid Butter
+- **eCowboy** — For Hardware testing and design suggestons
+- **OrdoOuroborus** — For testing, review, and contributions for feature ideas
 
 Your help made this toolkit more robust, more reliable, and better for everyone. 💙
 
