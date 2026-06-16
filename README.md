@@ -2634,6 +2634,26 @@ This project is intended for **educational and authorized security research purp
 ---
 
 <p align="center">
+
+---
+
+## 🙏 Thank You
+
+This project wouldn't be where it is without the brilliant minds and generous time of the following people. They've tested the firmware under brutal conditions, caught bugs before they reached users, reviewed code with a critical eye, and submitted fixes that made everything better.
+
+**Heartfelt thanks to:**
+- **@Birolt29** — For relentless testing and valuable code review feedback
+- **ᛕ ᛊ ߇ ᛙ ᚢ (Kevin)** — For deep technical testing and helping diagnose the toughest issues
+- **sithwrld999** — For thorough testing and finding edge cases we missed
+- **bkbroiler** — For hands-on testing and constructive feedback
+- **HeavyButter** — For testing and just being Paranoid Butter
+- **eCowboy** — For Hardware testing and design suggestons
+- **OrdoOuroborus** — For testing, review, and contributions for feature ideas
+
+Your help made this toolkit more robust, more reliable, and better for everyone. 💙
+
+---
+
   <b>Made with ☕ and ESP-IDF</b>
 </p>
 
