@@ -3286,7 +3286,7 @@ static void init_display(void)
     ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(lcd_io_handle, &panel_config, &panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
-    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, false));
 }
 
 // ============================================================================
@@ -5422,20 +5422,20 @@ void app_main(void)
     }
 
     // 15 lines per buffer — works for both 16-bit (7200 B) and 32-bit (14400 B) color depth.
-    // Single internal DMA buffer (buf2=NULL): PSRAM buffers forced SPI master to allocate
-    // 1208 B bounce buffer per frame from the 4 KB DMA pool, exhausting it during wardrive.
-    // flush_done_sem serializes render/flush, so secondary buffer is redundant.
+    // MALLOC_CAP_SPIRAM: ESP32-C5 GDMA is cache-transparent so PSRAM buffers work for SPI DMA,
+    // and the 32KB internal DMA pool is exhausted by WiFi static RX/TX buffers before we get here.
     const size_t buf_size = LCD_H_RES * 15 * sizeof(lv_color_t);
-    buf1 = spi_bus_dma_memory_alloc(LCD_HOST, buf_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    buf2 = NULL;
-    if (buf1 == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate draw buffer! free internal DMA=%zu",
+    buf1 = spi_bus_dma_memory_alloc(LCD_HOST, buf_size, MALLOC_CAP_SPIRAM);
+    buf2 = spi_bus_dma_memory_alloc(LCD_HOST, buf_size, MALLOC_CAP_SPIRAM);
+    if (buf1 == NULL || buf2 == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate draw buffers! free SPIRAM=%zu internal=%zu",
+                 heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                  heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
         return;
     }
-    ESP_LOGI(TAG, "Display buffer allocated: buf1=%p (size: %zu bytes)", buf1, buf_size);
+    ESP_LOGI(TAG, "Display buffers allocated: buf1=%p, buf2=%p (size: %zu bytes each)", buf1, buf2, buf_size);
 
-    lv_disp_draw_buf_init(&draw_buf, buf1, NULL, LCD_H_RES * 15);
+    lv_disp_draw_buf_init(&draw_buf, buf1, buf2, LCD_H_RES * 15);
     static lv_disp_drv_t disp_drv;
     lv_disp_drv_init(&disp_drv);
     disp_drv.hor_res = LCD_H_RES;
