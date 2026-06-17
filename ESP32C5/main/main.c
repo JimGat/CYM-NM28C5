@@ -1302,6 +1302,9 @@ static wd_band_t         g_wd_band         = WD_BAND_BOTH;
 static bool              g_wd_pcap         = false;
 static wd_radio_mode_t   g_wd_radio_mode   = WD_RADIO_WIFI_ONLY;  // default: WiFi only (recommended for SD writes)
 static void            (*wdup_back_fn)(void) = NULL;
+// Wardrive upload task stack (allocated from PSRAM to avoid internal heap exhaustion during TLS)
+static StackType_t     *wdup_task_stack        = NULL;
+static StaticTask_t     wdup_task_buf;
 static bool              wdup_use_explicit  = false;
 static int               wdup_explicit_indices[64];
 static int               wdup_explicit_count  = 0;
@@ -5106,20 +5109,23 @@ static esp_err_t sd_cache_load_all(void) {
         ESP_LOGI(TAG, "  WPA-SEC key: not found");
     }
     
-    // 7. Load WiGLE API key from wigle.txt
+    // 7. Load WiGLE API key from wigle.txt (skip # comment lines and blank lines)
     sd_cache->wigle_key[0] = '\0';
     file = fopen(WIGLE_KEY_PATH, "r");
     if (file != NULL) {
         char buf[WIGLE_KEY_MAX_LEN + 8];
-        if (fgets(buf, sizeof(buf), file) != NULL) {
+        while (fgets(buf, sizeof(buf), file) != NULL) {
             size_t len = strlen(buf);
             while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r' ||
                    buf[len-1] == ' '  || buf[len-1] == '\t')) buf[--len] = '\0';
             char *start = buf;
             while (*start == ' ' || *start == '\t') start++;
+            // Skip comment lines (starting with #) and blank lines
+            if (start[0] == '#' || strlen(start) == 0) continue;
             if (strlen(start) > 0 && strlen(start) < WIGLE_KEY_MAX_LEN) {
                 strncpy(sd_cache->wigle_key, start, WIGLE_KEY_MAX_LEN - 1);
                 sd_cache->wigle_key[WIGLE_KEY_MAX_LEN - 1] = '\0';
+                break;
             }
         }
         fclose(file);
@@ -5128,20 +5134,23 @@ static esp_err_t sd_cache_load_all(void) {
         ESP_LOGI(TAG, "  WiGLE key: not found");
     }
 
-    // 8. Load WDG Wars API key from wdgwars.txt
+    // 8. Load WDG Wars API key from wdgwars.txt (skip # comment lines and blank lines)
     sd_cache->wdgwars_key[0] = '\0';
     file = fopen(WDGWARS_KEY_PATH, "r");
     if (file != NULL) {
         char buf[WDGWARS_KEY_MAX_LEN + 8];
-        if (fgets(buf, sizeof(buf), file) != NULL) {
+        while (fgets(buf, sizeof(buf), file) != NULL) {
             size_t len = strlen(buf);
             while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r' ||
                    buf[len-1] == ' '  || buf[len-1] == '\t')) buf[--len] = '\0';
             char *start = buf;
             while (*start == ' ' || *start == '\t') start++;
+            // Skip comment lines (starting with #) and blank lines
+            if (start[0] == '#' || strlen(start) == 0) continue;
             if (strlen(start) > 0 && strlen(start) < WDGWARS_KEY_MAX_LEN) {
                 strncpy(sd_cache->wdgwars_key, start, WDGWARS_KEY_MAX_LEN - 1);
                 sd_cache->wdgwars_key[WDGWARS_KEY_MAX_LEN - 1] = '\0';
+                break;
             }
         }
         fclose(file);
@@ -11417,6 +11426,13 @@ static void wardrive_promisc_task(void *pvParameters) {
         for (int i = 0; i < wdp_seen_count; i++) {
             if (wdp_seen_networks[i].written_to_file) continue;
             wdp_network_t *net = &wdp_seen_networks[i];
+
+            // Skip whitelisted networks (privacy filter: don't upload operator's own networks to WiGLE/WDG)
+            if (is_bssid_whitelisted(net->bssid) || is_ssid_whitelisted(net->ssid)) {
+                net->written_to_file = true;  // Mark as written to skip on future iterations
+                continue;
+            }
+
             char mac_str[18];
             snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
                      net->bssid[0], net->bssid[1], net->bssid[2],
@@ -11450,6 +11466,16 @@ static void wardrive_promisc_task(void *pvParameters) {
             for (int i = 0; i < ble_cnt; i++) {
                 if (wdp_ble_devices[i].written) continue;
                 wdp_ble_device_t *bd = &wdp_ble_devices[i];
+
+                // Skip whitelisted BLE MAC addresses (privacy filter)
+                // Note: bd->mac is stored in reverse order (mac[0..5] = low..high bytes)
+                // Construct normal byte order for whitelist check
+                uint8_t mac_normal[6] = {bd->mac[5], bd->mac[4], bd->mac[3], bd->mac[2], bd->mac[1], bd->mac[0]};
+                if (is_bssid_whitelisted(mac_normal)) {
+                    bd->written = true;
+                    continue;
+                }
+
                 char ble_mac[18];
                 snprintf(ble_mac, sizeof(ble_mac), "%02X:%02X:%02X:%02X:%02X:%02X",
                          bd->mac[5], bd->mac[4], bd->mac[3],
@@ -11530,6 +11556,16 @@ static void wardrive_promisc_task(void *pvParameters) {
         for (int i = 0; i < ble_cnt; i++) {
             if (wdp_ble_devices[i].written) continue;
             wdp_ble_device_t *bd = &wdp_ble_devices[i];
+
+            // Skip whitelisted BLE MAC addresses (privacy filter)
+            // Note: bd->mac is stored in reverse order (mac[0..5] = low..high bytes)
+            // Construct normal byte order for whitelist check
+            uint8_t mac_normal[6] = {bd->mac[5], bd->mac[4], bd->mac[3], bd->mac[2], bd->mac[1], bd->mac[0]};
+            if (is_bssid_whitelisted(mac_normal)) {
+                bd->written = true;
+                continue;
+            }
+
             char ble_mac[18];
             snprintf(ble_mac, sizeof(ble_mac), "%02X:%02X:%02X:%02X:%02X:%02X",
                      bd->mac[5], bd->mac[4], bd->mac[3],
@@ -16499,7 +16535,7 @@ static int wpasec_upload_file(const char *filepath, const char *filename)
     }
 
     int result = -1;
-    if (status == 200) {
+    if (status >= 200 && status < 300) {
         if (strstr(body_ptr, "already submitted") != NULL) {
             result = 1; // duplicate
         } else if (strstr(body_ptr, "Bad capture") != NULL || strstr(body_ptr, "invalid") != NULL) {
@@ -18685,7 +18721,7 @@ static int wdup_upload_one(const char *filepath, const char *filename,
     ESP_LOGI(TAG, "WDUP [%s] %s -> HTTP %d",
              use_wigle ? "WiGLE" : "WDG", filename, status);
 
-    if (status == 200) {
+    if (status >= 200 && status < 300) {
         // Check for already-submitted (WiGLE) or duplicate (WDG)
         if (strstr(resp, "already") || strstr(resp, "duplicate") || strstr(resp, "DUPE"))
             return 1;
@@ -18762,6 +18798,13 @@ static void wdup_task(void *pvParameters)
         goto task_done;
     }
     wdup_push_msg("WiFi connected.", green);
+
+    // Force 2.4 GHz connection before TLS handshake. A 5 GHz 11ax/VHT80 association's
+    // large RX buffers collapse the DMA pool during cert bursts. 2.4 GHz BW20 is lightweight
+    // and upload is API-bound (not WiFi-bound). Restore AUTO after uploads complete.
+    wdup_push_msg("Forcing 2.4 GHz for upload...", amber);
+    esp_wifi_set_band_mode(WIFI_BAND_MODE_2G_ONLY);
+    vTaskDelay(pdMS_TO_TICKS(500));
 
     // Check at least one key is configured
     bool do_wigle = (wdup_target == WDUP_WIGLE || wdup_target == WDUP_BOTH) && wigle_api_key[0];
@@ -18950,6 +18993,9 @@ static void wdup_task(void *pvParameters)
     wdup_push_msg(msg, (fail_count > 0) ? red : green);
 
 task_done:
+    // Restore AUTO band mode (5 GHz + 2.4 GHz)
+    esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO);
+
     wdup_done   = true;
     wdup_active = false;
     wdup_task_handle = NULL;
@@ -19064,10 +19110,29 @@ static void wdup_start_cb(lv_event_t *e)
     else
         xQueueReset(wdup_ui_queue);
 
-    wdup_done   = false;
-    wdup_active = true;
+    wdup_done = false;
 
-    xTaskCreate(wdup_task, "wdup", 8192, NULL, 4, &wdup_task_handle);
+    // Allocate task stack from PSRAM (avoids internal heap exhaustion during TLS cert parsing)
+    if (!wdup_task_stack) {
+        wdup_task_stack = (StackType_t *)heap_caps_malloc(8192 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    }
+    if (!wdup_task_stack) {
+        ESP_LOGE(TAG, "Wardrive Upload: Failed to allocate task stack");
+        wdup_done = true;
+        return;
+    }
+
+    wdup_task_handle = xTaskCreateStatic(
+        wdup_task, "wdup", 8192, NULL, 4,
+        wdup_task_stack, &wdup_task_buf);
+    if (!wdup_task_handle) {
+        ESP_LOGE(TAG, "Wardrive Upload: Failed to create task");
+        wdup_done = true;
+        return;
+    }
+
+    // Set active flag only after task created successfully
+    wdup_active = true;
 
     if (wdup_timer) { lv_timer_del(wdup_timer); wdup_timer = NULL; }
     wdup_timer = lv_timer_create(wdup_timer_cb, 200, NULL);
@@ -29810,8 +29875,10 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
     ESP_LOGD(TAG, "[SPAM] pkt%d calling set_data (payload_len=%d)", ble_spam_count, os_mbuf_len(om));
     rc = ble_gap_ext_adv_set_data(BLE_SPAM_ADV_INSTANCE, om);
     if (rc != 0) {
-        ESP_LOGW(TAG, "[SPAM] pkt%d set_data FAILED: rc=%d", ble_spam_count, rc);
-        os_mbuf_free_chain(om);
+        // NimBLE always frees om internally on any path (success or failure). Do NOT double-free.
+        // Skip ext_adv_start on failure; instance remains stopped until next timer cycle.
+        ESP_LOGW(TAG, "[SPAM] pkt%d set_data FAILED: rc=%d (instance remains stopped)", ble_spam_count, rc);
+        return;
     } else {
         ESP_LOGD(TAG, "[SPAM] pkt%d set_data OK", ble_spam_count);
     }
