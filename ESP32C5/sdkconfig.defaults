@@ -69,6 +69,11 @@ CONFIG_ESP_PANIC_HANDLER_IRAM=y
 # dump and backtrace so we can see which task/line caused the hang.
 CONFIG_ESP_TASK_WDT_PANIC=y
 
+# Compiler optimization: size (matches webflasher build configuration)
+# Build is optimized for size (-Os) instead of debug (-O0 with debug symbols)
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_DISABLE=y
+
 # mbedTLS memory — use system allocator so PSRAM (via SPIRAM_USE_MALLOC) is
 # available for TLS context structures instead of a fixed internal-RAM pool.
 # DYNAMIC_BUFFER defers the 16 KB SSL I/O buffer allocation until a connection
