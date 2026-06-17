@@ -16371,6 +16371,11 @@ static int wpasec_tls_write_all(esp_tls_t *tls, const char *buf, int len)
  * @param filename  Just the filename (for the Content-Disposition header)
  * @return 0 on success, 1 on duplicate ("already submitted"), -1 on error
  */
+/* GTS Root R4 (embedded via EMBED_TXTFILES) — explicit trust anchor for WPA-SEC
+ * and WDG, whose cross-signed Google Trust Services chain ESP-IDF 6.0's
+ * esp_crt_bundle cannot verify ("No matching trusted root certificate found"). */
+extern const uint8_t gts_root_r4_pem_start[] asm("_binary_gts_root_r4_pem_start");
+extern const uint8_t gts_root_r4_pem_end[]   asm("_binary_gts_root_r4_pem_end");
 static int wpasec_upload_file(const char *filepath, const char *filename)
 {
     // Read file into memory (acquire SD mutex)
@@ -16455,7 +16460,10 @@ static int wpasec_upload_file(const char *filepath, const char *filename)
         wpasec_api_key, boundary, body_total_len);
 
     esp_tls_cfg_t tls_cfg = {
-        .crt_bundle_attach = esp_crt_bundle_attach,
+        // IDF 6.0 crt_bundle can't verify wpa-sec.stanev.org's cross-signed GTS
+        // chain; trust GTS Root R4 explicitly instead of the bundle.
+        .cacert_buf = gts_root_r4_pem_start,
+        .cacert_bytes = (unsigned int)(gts_root_r4_pem_end - gts_root_r4_pem_start),
         .timeout_ms = 15000,
     };
 
@@ -18682,7 +18690,16 @@ static int wdup_upload_one(const char *filepath, const char *filename,
             path, host, key, boundary, body_total);
     }
 
-    esp_tls_cfg_t cfg = { .crt_bundle_attach = esp_crt_bundle_attach, .timeout_ms = 20000 };
+    // WiGLE (Let's Encrypt / ISRG Root X1) verifies via the bundle. WDG (wdgwars.pl)
+    // uses the cross-signed GTS chain the IDF 6.0 bundle can't match, so trust GTS
+    // Root R4 explicitly for it.
+    esp_tls_cfg_t cfg = { .timeout_ms = 20000 };
+    if (use_wigle) {
+        cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    } else {
+        cfg.cacert_buf   = gts_root_r4_pem_start;
+        cfg.cacert_bytes = (unsigned int)(gts_root_r4_pem_end - gts_root_r4_pem_start);
+    }
     esp_tls_t *tls = esp_tls_init();
     if (!tls) { free(fbuf); return -1; }
 
