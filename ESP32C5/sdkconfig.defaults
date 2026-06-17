@@ -21,11 +21,12 @@ CONFIG_BT_NIMBLE_EXT_ADV=y
 # get corrupted by ROM pointer tagging → Load access fault. EXTERNAL mode is
 # incompatible with ESP32-C5 BLE ROM. Use INTERNAL to force DRAM allocation.
 CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_INTERNAL=y
-# Reduce NimBLE host buffer counts to fit in ~5 KB of general internal heap.
-# MSYS1(6×128=768) + MSYS2(5×320=1600) + ACL(5×255=1275) + HCI_HI(8×70=560) +
-# HCI_LO(4×70=280) = 4483 bytes — fits with ~700 B margin.
+# NimBLE host buffer counts. MSYS2 increased from 5→12 to prevent rc=3
+# (BLE_ERR_MEM_CAPACITY) during BLE Spam extended advertising cycles.
+# MSYS1(6×128=768) + MSYS2(12×320=3840) + ACL(5×255=1275) + HCI_HI(8×70=560) +
+# HCI_LO(4×70=280) = 6723 bytes total internal DRAM.
 CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=6
-CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=5
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=12
 CONFIG_BT_NIMBLE_MSYS1_BLOCK_COUNT=6
 CONFIG_BT_NIMBLE_ACL_BUF_COUNT=5
 CONFIG_BT_NIMBLE_HCI_EVT_HI_BUF_COUNT=8
@@ -35,13 +36,12 @@ CONFIG_BT_NIMBLE_HCI_EVT_LO_BUF_COUNT=4
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
-# DMA reserve pool: 48 KB. WiFi static RX (4×1700=6.8KB) + TX (3×~1700=5.1KB)
-# + BLE LL controller (~18KB) + SD (~1.3KB) ≈ 31KB used; 48KB gives ~17KB margin.
-# BLE controller init was confirmed successful with this pool size in v1.6.27.
-CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=49152
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
+# DMA reserve pool: 60 KB. WiFi static RX (4×1700=6.8KB) + TX (3×~1700=5.1KB)
+# + BLE LL (~18KB) + LCD draw buffers (PSRAM via GDMA cache-transparent) ≈ 30KB used.
+# 60KB gives ~30KB free at wardrive+promisc start, enough for SD SPI and mbuf headroom.
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=61440
 # WiFi RX: 4 static buffers. TX: 3 static buffers (minimum tested to work).
-# Both BLE LL env and HCI UART transport allocate from the DMA pool regardless
-# of NIMBLE_MEM_ALLOC_MODE. WiFi + BLE together need ~31KB; 48KB pool gives ~17KB margin.
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
 CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=3
 
@@ -68,14 +68,23 @@ CONFIG_ESP_PANIC_HANDLER_IRAM=y
 # Task WDT panic — converts silent watchdog reboot into a full panic with register
 # dump and backtrace so we can see which task/line caused the hang.
 CONFIG_ESP_TASK_WDT_PANIC=y
+# WDT timeout: 30 s. Default (5 s) is too short for software P-384 ECC during
+# WiGLE TLS handshake (ISRG Root X2 chain). Software ECC + AES can stall for >5 s.
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
 
-# mbedTLS memory — use system allocator so PSRAM (via SPIRAM_USE_MALLOC) is
-# available for TLS context structures instead of a fixed internal-RAM pool.
-# DYNAMIC_BUFFER defers the 16 KB SSL I/O buffer allocation until a connection
-# is actually in progress and frees it immediately after, preventing the internal
-# heap from being exhausted before the TLS handshake can start.
-CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC=y
+# mbedTLS memory — FORCE all mbedTLS allocations to PSRAM (EXTERNAL).
+# DEFAULT_MEM_ALLOC does NOT reliably use PSRAM — sub-16KB allocations land in
+# internal DRAM due to SPIRAM_MALLOC_ALWAYSINTERNAL=16384, exhausting the DMA pool
+# during WiGLE/WPA-SEC TLS handshake. EXTERNAL_MEM_ALLOC sends every mbedTLS block
+# to PSRAM. Hardware AES/ECC disabled so TLS buffers never need DMA.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+# Hardware AES needs DMA-capable internal RAM. With LCD + WiFi consuming the DMA pool
+# there isn't enough headroom. Software AES uses PSRAM via SPIRAM_USE_MALLOC.
+CONFIG_MBEDTLS_HARDWARE_AES=n
+# Hardware ECC on ESP32-C5 only supports P-192/P-256. Let's Encrypt E-series CAs
+# use P-384 (ISRG Root X2) — hardware ECC returns error on P-384. Use software.
+CONFIG_MBEDTLS_HARDWARE_ECC=n
 
 # Smaller CA bundle — "common" set covers every major commercial CA
 # (Amazon, DigiCert, Let's Encrypt, Comodo, GeoTrust, etc.) used by
@@ -88,3 +97,11 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
 # scarce internal DRAM/RTCRAM, preventing heap corruption under WiFi/BLE pressure.
 CONFIG_LV_MEM_CUSTOM=y
 CONFIG_LV_MEM_CUSTOM_INCLUDE="lvgl_memory.h"
+
+# ST7789 byte-order fix — CRITICAL. The ST7789 expects RGB565 pixels big-endian
+# (high byte first). Without this LVGL sends them little-endian, swapping every
+# pixel's bytes and producing full-screen color corruption.
+# THIS MUST STAY IN sdkconfig.defaults — it is NOT set by any IDF chip default.
+# Every idf.py fullclean + set-target will silently drop it otherwise.
+# Verified fix in v2.10.13. See CLAUDE.md "ST7789 color byte-order fix" section.
+CONFIG_LV_COLOR_16_SWAP=y

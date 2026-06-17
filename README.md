@@ -5,7 +5,7 @@
 <h1 align="center">Cheap Yellow Monster</h1>
 
 <p align="center">
-  <b>v2.6.46</b>
+  <b>v2.10.15</b>
 </p>
 
 <p align="center">
@@ -2642,7 +2642,7 @@ This project is intended for **educational and authorized security research purp
 This project wouldn't be where it is without the brilliant minds and generous time of the following people. They've tested the firmware under brutal conditions, caught bugs before they reached users, reviewed code with a critical eye, and submitted fixes that made everything better.
 
 **Heartfelt thanks to:**
-- **@Birolt29** — For relentless testing and valuable code review feedback
+- **@Birolt29** — For relentless hardware testing, deep ESP32-C5 DMA analysis, and contributing the v2.10.15 hardware optimization patch (upload stability, mbedTLS PSRAM routing, BLE Spam memory hardening, and more)
 - **ᛕ ᛊ ߇ ᛙ ᚢ (Kevin)** — For deep technical testing and helping diagnose the toughest issues
 - **sithwrld999** — For thorough testing and finding edge cases we missed
 - **bkbroiler** — For hands-on testing and constructive feedback
