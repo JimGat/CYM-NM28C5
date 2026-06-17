@@ -21,12 +21,9 @@ CONFIG_BT_NIMBLE_EXT_ADV=y
 # get corrupted by ROM pointer tagging → Load access fault. EXTERNAL mode is
 # incompatible with ESP32-C5 BLE ROM. Use INTERNAL to force DRAM allocation.
 CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_INTERNAL=y
-# NimBLE host buffer counts. MSYS2 increased from 5→12 to prevent rc=3
-# (BLE_ERR_MEM_CAPACITY) during BLE Spam extended advertising cycles.
-# MSYS1(6×128=768) + MSYS2(12×320=3840) + ACL(5×255=1275) + HCI_HI(8×70=560) +
-# HCI_LO(4×70=280) = 6723 bytes.
+# NimBLE host buffer counts
 CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=6
-CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=12
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=5
 CONFIG_BT_NIMBLE_MSYS1_BLOCK_COUNT=6
 CONFIG_BT_NIMBLE_ACL_BUF_COUNT=5
 CONFIG_BT_NIMBLE_HCI_EVT_HI_BUF_COUNT=8
@@ -37,12 +34,7 @@ CONFIG_SPIRAM=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
-# DMA reserve pool: 60 KB. WiFi static RX (4×1700=6.8KB) + TX (3×~1700=5.1KB)
-# + BLE LL (~18KB) + LCD draw buffers (2×2400=4.8KB, MALLOC_CAP_DMA|INTERNAL) ≈ 53KB.
-# LCD buffers moved to internal DMA heap so SPI master uses them directly without
-# allocating a 1208-byte per-frame priv TX bounce buffer (which exhausted DMA during wardrive).
-# 60KB gives ~8KB free at wardrive+promisc start, enough for SD SPI (needs ≥512B/sector).
-CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=61440
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=49152
 # WiFi RX: 4 static buffers. TX: 3 static buffers (minimum tested to work).
 # Both BLE LL env and HCI UART transport allocate from the DMA pool regardless
 # of NIMBLE_MEM_ALLOC_MODE. WiFi + BLE together need ~31KB; 48KB pool gives ~17KB margin.
