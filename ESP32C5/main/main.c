@@ -5109,23 +5109,20 @@ static esp_err_t sd_cache_load_all(void) {
         ESP_LOGI(TAG, "  WPA-SEC key: not found");
     }
     
-    // 7. Load WiGLE API key from wigle.txt (skip # comment lines and blank lines)
+    // 7. Load WiGLE API key from wigle.txt
     sd_cache->wigle_key[0] = '\0';
     file = fopen(WIGLE_KEY_PATH, "r");
     if (file != NULL) {
         char buf[WIGLE_KEY_MAX_LEN + 8];
-        while (fgets(buf, sizeof(buf), file) != NULL) {
+        if (fgets(buf, sizeof(buf), file) != NULL) {
             size_t len = strlen(buf);
             while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r' ||
                    buf[len-1] == ' '  || buf[len-1] == '\t')) buf[--len] = '\0';
             char *start = buf;
             while (*start == ' ' || *start == '\t') start++;
-            // Skip comment lines (starting with #) and blank lines
-            if (start[0] == '#' || strlen(start) == 0) continue;
             if (strlen(start) > 0 && strlen(start) < WIGLE_KEY_MAX_LEN) {
                 strncpy(sd_cache->wigle_key, start, WIGLE_KEY_MAX_LEN - 1);
                 sd_cache->wigle_key[WIGLE_KEY_MAX_LEN - 1] = '\0';
-                break;
             }
         }
         fclose(file);
@@ -5134,23 +5131,20 @@ static esp_err_t sd_cache_load_all(void) {
         ESP_LOGI(TAG, "  WiGLE key: not found");
     }
 
-    // 8. Load WDG Wars API key from wdgwars.txt (skip # comment lines and blank lines)
+    // 8. Load WDG Wars API key from wdgwars.txt
     sd_cache->wdgwars_key[0] = '\0';
     file = fopen(WDGWARS_KEY_PATH, "r");
     if (file != NULL) {
         char buf[WDGWARS_KEY_MAX_LEN + 8];
-        while (fgets(buf, sizeof(buf), file) != NULL) {
+        if (fgets(buf, sizeof(buf), file) != NULL) {
             size_t len = strlen(buf);
             while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r' ||
                    buf[len-1] == ' '  || buf[len-1] == '\t')) buf[--len] = '\0';
             char *start = buf;
             while (*start == ' ' || *start == '\t') start++;
-            // Skip comment lines (starting with #) and blank lines
-            if (start[0] == '#' || strlen(start) == 0) continue;
             if (strlen(start) > 0 && strlen(start) < WDGWARS_KEY_MAX_LEN) {
                 strncpy(sd_cache->wdgwars_key, start, WDGWARS_KEY_MAX_LEN - 1);
                 sd_cache->wdgwars_key[WDGWARS_KEY_MAX_LEN - 1] = '\0';
-                break;
             }
         }
         fclose(file);
