@@ -308,6 +308,55 @@ static char ble_spoof_target_name_str[33];        // authoritative target name f
 static uint16_t ble_spoof_target_company_id = 0; // authoritative company ID for task
 static volatile bool ble_spoof_needs_ui_update = false;
 
+// ── ESP-NOW Scout state ────────────────────────────────────────────────────
+// Passive ESP-NOW frame detector using WiFi promiscuous + channel hopper.
+// Identifies ESP-NOW action frames by exact 5-field fingerprint so that no
+// other 802.11 protocol triggers a false positive:
+//   [0]  FC lo-byte = 0xD0   → Management / Action subtype
+//   [24] Category  = 0x7F   → Vendor Specific
+//   [25..27] OUI   = 18:FE:34 → Espressif vendor OUI
+//   [28] Type      = 0x04   → ESP-NOW
+//
+// Stage 1: passive detect + channel hop (1-13, 200 ms dwell)
+// Stage 2: label known devices from /sdcard/lab/espnow/profiles.json
+#define ESPNOW_MAX_DEVICES   32
+#define ESPNOW_MAX_PROFILES  16
+#define ESPNOW_DWELL_MS      200
+#define ESPNOW_EXPORT_DIR    "/sdcard/lab/espnow"
+#define ESPNOW_PROFILES_PATH "/sdcard/lab/espnow/profiles.json"
+
+typedef struct {
+    uint8_t  src_mac[6];
+    uint8_t  dst_mac[6];
+    uint8_t  channel;
+    int8_t   rssi;
+    int64_t  first_seen_us;
+    int64_t  last_seen_us;
+    uint32_t pkt_count;
+    char     label[33];   // matched from profiles.json; empty if unknown
+    bool     encrypted;   // unicast dst = peer-to-peer (likely encrypted)
+} espnow_device_t;
+
+typedef struct {
+    uint8_t mac[6];
+    char    label[33];
+    uint8_t lmk[16];   // Stage 2: known peer LMK; zero = not loaded
+} espnow_profile_t;
+
+static espnow_device_t  espnow_devices[ESPNOW_MAX_DEVICES];
+static int              espnow_device_count   = 0;
+static espnow_profile_t espnow_profiles[ESPNOW_MAX_PROFILES];
+static int              espnow_profile_count  = 0;
+static volatile bool    espnow_scout_active   = false;
+static TaskHandle_t     espnow_hopper_handle  = NULL;
+static uint8_t          espnow_current_ch     = 1;
+static portMUX_TYPE     espnow_mux            = portMUX_INITIALIZER_UNLOCKED;
+/* UI handles */
+static lv_obj_t        *espnow_list           = NULL;
+static lv_obj_t        *espnow_status_lbl     = NULL;
+static lv_timer_t      *espnow_refresh_timer  = NULL;
+static volatile bool    espnow_ui_needs_update = false;
+
 // BLE Spoof general list (spooflist.txt)
 #define SPOOF_LIST_MAX  64
 #define SPOOF_LIST_PATH "/sdcard/lab/bluetooth/spooflist.csv"
@@ -2685,6 +2734,9 @@ static void drone_row_tap_cb(lv_event_t *e);
 static void show_wifi_analyzer_screen(void);
 static void show_wscope_screen(void);
 static void wscope_task(void *p);
+static void show_espnow_scout_screen(void);
+static void espnow_scout_stop(void);
+static void espnow_rebuild_list(void);
 
 // HoneyPair
 static void show_honeypair_screen(void);
@@ -13922,6 +13974,8 @@ static void main_tile_event_cb(lv_event_t *e)
         show_wifi_analyzer_screen();
     } else if (strcmp(tile_name, "WiFi Scope") == 0) {
         show_wscope_screen();
+    } else if (strcmp(tile_name, "ESP-NOW Scout") == 0) {
+        show_espnow_scout_screen();
     } else if (strcmp(tile_name, "Bluetooth") == 0) {
         show_bluetooth_screen();
     } else if (strcmp(tile_name, "Wardrive") == 0) {
@@ -17029,6 +17083,8 @@ static void show_wifi_menu_screen(void)
     (void)wana_tile;
     lv_obj_t *wscope_tile = create_tile(tiles, MY_SYMBOL_WAVE,     "WiFi\nScope",      lv_color_hex(0x006064), main_tile_event_cb, "WiFi Scope");
     (void)wscope_tile;
+    lv_obj_t *espnow_tile = create_tile(tiles, MY_SYMBOL_SATELLITE_DISH, "ESP-NOW\nScout", lv_color_hex(0x004D40), main_tile_event_cb, "ESP-NOW Scout");
+    (void)espnow_tile;
 }
 
 // WiFi Sniff & Karma screen
@@ -48001,4 +48057,484 @@ static void show_zgwd_flood(int pan_idx)
 
     fld->tmr = lv_timer_create(s_zgwd_flood_ui_timer_cb, 300, NULL);
     xTaskCreate(s_zgwd_flood_task_fn, "zgwdfld", 3072, fld, 2, &fld->task);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ESP-NOW Scout — passive ESP-NOW frame detector + channel hopper
+// ═══════════════════════════════════════════════════════════════════════════
+
+/* ── 802.11 action-frame ESP-NOW fingerprint check ──────────────────────────
+ * Returns true only when the raw frame is a confirmed ESP-NOW data frame.
+ *
+ * 802.11 Management / Action layout (no FCS in promiscuous payload):
+ *   [0-1]  Frame Control
+ *   [2-3]  Duration
+ *   [4-9]  DA  (destination MAC)
+ *   [10-15] SA  (source MAC)
+ *   [16-21] BSSID
+ *   [22-23] Sequence Control
+ *   [24]   Category = 0x7F (Vendor Specific)
+ *   [25-27] OUI      = 18:FE:34 (Espressif)
+ *   [28]   Type     = 0x04 (ESP-NOW)
+ */
+static bool espnow_is_espnow_frame(const uint8_t *buf, uint16_t len)
+{
+    if (len < 29) return false;
+    /* FC lo-byte: type=00 (mgmt), subtype=1101 (action) → 0xD0 */
+    if (buf[0] != 0xD0) return false;
+    if (buf[24] != 0x7F) return false;                           /* Category: Vendor Specific */
+    if (buf[25] != 0x18 || buf[26] != 0xFE || buf[27] != 0x34) return false; /* Espressif OUI */
+    if (buf[28] != 0x04) return false;                           /* ESP-NOW type */
+    return true;
+}
+
+/* ── Find or create a device entry (call inside portMUX) ──────────────────── */
+static int espnow_find_or_add(const uint8_t *src_mac, const uint8_t *dst_mac,
+                               uint8_t ch, int8_t rssi)
+{
+    /* search for existing entry */
+    for (int i = 0; i < espnow_device_count; i++) {
+        if (memcmp(espnow_devices[i].src_mac, src_mac, 6) == 0) {
+            /* update live fields */
+            espnow_devices[i].last_seen_us = esp_timer_get_time();
+            espnow_devices[i].pkt_count++;
+            espnow_devices[i].rssi    = rssi;
+            espnow_devices[i].channel = ch;
+            return i;
+        }
+    }
+    /* add new entry if room */
+    if (espnow_device_count >= ESPNOW_MAX_DEVICES) return -1;
+    int idx = espnow_device_count++;
+    espnow_device_t *d = &espnow_devices[idx];
+    memset(d, 0, sizeof(*d));
+    memcpy(d->src_mac, src_mac, 6);
+    memcpy(d->dst_mac, dst_mac, 6);
+    d->channel       = ch;
+    d->rssi          = rssi;
+    d->first_seen_us = esp_timer_get_time();
+    d->last_seen_us  = d->first_seen_us;
+    d->pkt_count     = 1;
+    /* ff:ff:ff:ff:ff:ff destination = broadcast (unencrypted) */
+    uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    d->encrypted = (memcmp(dst_mac, bcast, 6) != 0);
+    /* Stage 2: match label from loaded profiles */
+    for (int p = 0; p < espnow_profile_count; p++) {
+        if (memcmp(espnow_profiles[p].mac, src_mac, 6) == 0) {
+            strncpy(d->label, espnow_profiles[p].label, sizeof(d->label) - 1);
+            break;
+        }
+    }
+    return idx;
+}
+
+/* ── Promiscuous callback (runs in WiFi task context — not LVGL safe) ──────── */
+static void espnow_scout_promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    if (!espnow_scout_active) return;
+    if (type != WIFI_PKT_MGMT) return;
+
+    const wifi_promiscuous_pkt_t *ppkt = (const wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *payload = ppkt->payload;
+    uint16_t       len     = ppkt->rx_ctrl.sig_len;
+
+    if (!espnow_is_espnow_frame(payload, len)) return;
+
+    const uint8_t *dst_mac = payload + 4;   /* DA  */
+    const uint8_t *src_mac = payload + 10;  /* SA  */
+    int8_t  rssi = (int8_t)ppkt->rx_ctrl.rssi;
+    uint8_t ch   = (uint8_t)ppkt->rx_ctrl.channel;
+
+    portENTER_CRITICAL_ISR(&espnow_mux);
+    espnow_find_or_add(src_mac, dst_mac, ch, rssi);
+    portEXIT_CRITICAL_ISR(&espnow_mux);
+
+    espnow_ui_needs_update = true;
+}
+
+/* ── Channel hopper task ────────────────────────────────────────────────────── */
+static void espnow_hopper_task(void *pv)
+{
+    (void)pv;
+    uint8_t ch = 1;
+    while (espnow_scout_active) {
+        esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+        espnow_current_ch = ch;
+        espnow_ui_needs_update = true;
+        vTaskDelay(pdMS_TO_TICKS(ESPNOW_DWELL_MS));
+        ch = (ch % 13) + 1;   /* cycle 1→13→1 */
+    }
+    espnow_hopper_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+/* ── Minimal JSON string-value extractor (no cJSON dependency) ──────────────
+ * Scans `obj` for "key" : "value" and copies value into out[0..out_sz-1].
+ * Returns true on success.  obj must be a null-terminated object fragment.
+ */
+static bool espnow_json_get_str(const char *obj, const char *key,
+                                 char *out, size_t out_sz)
+{
+    char search[48];
+    snprintf(search, sizeof(search), "\"%s\"", key);
+    const char *p = strstr(obj, search);
+    if (!p) return false;
+    p += strlen(search);
+    while (*p && (*p == ' ' || *p == '\t' || *p == ':')) p++;
+    if (*p != '"') return false;
+    p++;
+    size_t i = 0;
+    while (*p && *p != '"' && i < out_sz - 1) out[i++] = *p++;
+    out[i] = '\0';
+    return (i > 0);
+}
+
+/* ── Load Stage-2 profiles from SD ─────────────────────────────────────────── */
+static void espnow_load_profiles(void)
+{
+    espnow_profile_count = 0;
+    ensure_sd_mounted();
+    FILE *f = fopen(ESPNOW_PROFILES_PATH, "r");
+    if (!f) return;   /* profiles.json is optional */
+
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > 8192) { fclose(f); return; }
+
+    char *raw = heap_caps_malloc(sz + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!raw) { fclose(f); return; }
+    fread(raw, 1, sz, f);
+    fclose(f);
+    raw[sz] = '\0';
+
+    /* Walk the JSON array: find each '{' … '}' object and extract fields */
+    char *cur = raw;
+    while (espnow_profile_count < ESPNOW_MAX_PROFILES) {
+        char *obj_start = strchr(cur, '{');
+        if (!obj_start) break;
+        char *obj_end = strchr(obj_start, '}');
+        if (!obj_end) break;
+        char saved = *obj_end;
+        *obj_end = '\0';   /* temporarily terminate object */
+
+        char mac_str[24] = "";
+        if (espnow_json_get_str(obj_start, "mac", mac_str, sizeof(mac_str))) {
+            espnow_profile_t *prof = &espnow_profiles[espnow_profile_count];
+            memset(prof, 0, sizeof(*prof));
+            unsigned int b[6];
+            if (sscanf(mac_str, "%x:%x:%x:%x:%x:%x",
+                       &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6) {
+                for (int k = 0; k < 6; k++) prof->mac[k] = (uint8_t)b[k];
+                espnow_json_get_str(obj_start, "label",
+                                    prof->label, sizeof(prof->label));
+                char lmk_str[33] = "";
+                if (espnow_json_get_str(obj_start, "lmk", lmk_str, sizeof(lmk_str))) {
+                    for (int k = 0; k < 16 && lmk_str[k*2] && lmk_str[k*2+1]; k++) {
+                        unsigned int bv = 0;
+                        char hex[3] = { lmk_str[k*2], lmk_str[k*2+1], '\0' };
+                        if (sscanf(hex, "%x", &bv) == 1) prof->lmk[k] = (uint8_t)bv;
+                    }
+                }
+                espnow_profile_count++;
+            }
+        }
+
+        *obj_end = saved;
+        cur = obj_end + 1;
+    }
+    heap_caps_free(raw);
+    ESP_LOGI(TAG, "ESP-NOW Scout: loaded %d profile(s)", espnow_profile_count);
+}
+
+/* ── Export device table to JSON ────────────────────────────────────────────── */
+static void espnow_export_json(void)
+{
+    ensure_sd_mounted();
+
+    /* ensure output dir exists */
+    struct stat st;
+    if (stat(ESPNOW_EXPORT_DIR, &st) != 0) mkdir(ESPNOW_EXPORT_DIR, 0775);
+
+    /* timestamped filename using RTC or monotonic counter */
+    char path[80];
+    time_t now_t = 0;
+    time(&now_t);
+    struct tm *tm_info = localtime(&now_t);
+    if (tm_info && now_t > 1000000) {
+        snprintf(path, sizeof(path), ESPNOW_EXPORT_DIR "/scout_%04d%02d%02d_%02d%02d%02d.json",
+                 tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
+                 tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
+    } else {
+        snprintf(path, sizeof(path), ESPNOW_EXPORT_DIR "/scout_%lld.json",
+                 (long long)esp_timer_get_time() / 1000000LL);
+    }
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        ESP_LOGW(TAG, "ESP-NOW Scout: cannot open %s for export", path);
+        return;
+    }
+
+    portENTER_CRITICAL(&espnow_mux);
+    int count = espnow_device_count;
+    /* safe copy so we release the mux quickly */
+    espnow_device_t *snap = heap_caps_malloc(count * sizeof(espnow_device_t),
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (snap) memcpy(snap, espnow_devices, count * sizeof(espnow_device_t));
+    portEXIT_CRITICAL(&espnow_mux);
+
+    if (!snap) { fclose(f); return; }
+
+    fprintf(f, "[\n");
+    for (int i = 0; i < count; i++) {
+        espnow_device_t *d = &snap[i];
+        char first_ts[32], last_ts[32];
+        /* convert microseconds to seconds since boot */
+        snprintf(first_ts, sizeof(first_ts), "%.3f", (double)d->first_seen_us / 1e6);
+        snprintf(last_ts,  sizeof(last_ts),  "%.3f", (double)d->last_seen_us  / 1e6);
+        fprintf(f,
+            "  {\n"
+            "    \"src_mac\": \"%02X:%02X:%02X:%02X:%02X:%02X\",\n"
+            "    \"dst_mac\": \"%02X:%02X:%02X:%02X:%02X:%02X\",\n"
+            "    \"channel\": %d,\n"
+            "    \"rssi\": %d,\n"
+            "    \"first_seen_s\": %s,\n"
+            "    \"last_seen_s\": %s,\n"
+            "    \"pkt_count\": %lu,\n"
+            "    \"encrypted\": %s,\n"
+            "    \"label\": \"%s\"\n"
+            "  }%s\n",
+            d->src_mac[0], d->src_mac[1], d->src_mac[2],
+            d->src_mac[3], d->src_mac[4], d->src_mac[5],
+            d->dst_mac[0], d->dst_mac[1], d->dst_mac[2],
+            d->dst_mac[3], d->dst_mac[4], d->dst_mac[5],
+            d->channel, d->rssi,
+            first_ts, last_ts,
+            (unsigned long)d->pkt_count,
+            d->encrypted ? "true" : "false",
+            d->label,
+            (i < count - 1) ? "," : "");
+    }
+    fprintf(f, "]\n");
+    fclose(f);
+    heap_caps_free(snap);
+    ESP_LOGI(TAG, "ESP-NOW Scout: exported %d device(s) → %s", count, path);
+}
+
+/* ── Stop scanning + clean up radio ────────────────────────────────────────── */
+static void espnow_scout_stop(void)
+{
+    espnow_scout_active = false;
+    /* hopper task self-deletes; wait up to 600 ms */
+    for (int i = 0; i < 30 && espnow_hopper_handle != NULL; i++)
+        vTaskDelay(pdMS_TO_TICKS(20));
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(NULL);
+}
+
+/* ── Rebuild the scrollable device list (LVGL task context) ─────────────────── */
+static void espnow_rebuild_list(void)
+{
+    if (!espnow_list || !lv_obj_is_valid(espnow_list)) return;
+    lv_obj_clean(espnow_list);
+
+    portENTER_CRITICAL(&espnow_mux);
+    int count = espnow_device_count;
+    portEXIT_CRITICAL(&espnow_mux);
+
+    for (int i = 0; i < count; i++) {
+        portENTER_CRITICAL(&espnow_mux);
+        espnow_device_t d = espnow_devices[i];   /* local copy */
+        portEXIT_CRITICAL(&espnow_mux);
+
+        lv_obj_t *card = lv_obj_create(espnow_list);
+        lv_obj_set_size(card, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_pad_all(card, 4, 0);
+        lv_obj_set_style_pad_gap(card, 2, 0);
+        lv_obj_set_style_radius(card, 6, 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_border_color(card,
+            d.encrypted ? lv_color_hex(0xFFA726) : lv_color_hex(0x26C6DA), 0);
+        lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+
+        /* Row 1: src MAC + RSSI */
+        char r1[56];
+        snprintf(r1, sizeof(r1), "%02X:%02X:%02X:%02X:%02X:%02X  %ddBm  ch%d",
+                 d.src_mac[0], d.src_mac[1], d.src_mac[2],
+                 d.src_mac[3], d.src_mac[4], d.src_mac[5],
+                 d.rssi, d.channel);
+        lv_obj_t *l1 = lv_label_create(card);
+        lv_label_set_text(l1, r1);
+        lv_obj_set_style_text_font(l1, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l1, ui_text_color(), 0);
+        lv_label_set_long_mode(l1, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(l1, lv_pct(100));
+
+        /* Row 2: label (if known) or dst MAC */
+        char r2[56];
+        if (d.label[0]) {
+            snprintf(r2, sizeof(r2), "\xEF\x80\xAB %s", d.label);   /* fa-tag */
+        } else {
+            snprintf(r2, sizeof(r2), "dst %02X:%02X:%02X:%02X:%02X:%02X",
+                     d.dst_mac[0], d.dst_mac[1], d.dst_mac[2],
+                     d.dst_mac[3], d.dst_mac[4], d.dst_mac[5]);
+        }
+        lv_obj_t *l2 = lv_label_create(card);
+        lv_label_set_text(l2, r2);
+        lv_obj_set_style_text_font(l2, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l2, d.label[0] ? UI_ACCENT_CYAN : ui_muted_color(), 0);
+        lv_label_set_long_mode(l2, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(l2, lv_pct(100));
+
+        /* Row 3: packet count + enc/bcast indicator */
+        char r3[48];
+        snprintf(r3, sizeof(r3), "%lu pkt  %s",
+                 (unsigned long)d.pkt_count,
+                 d.encrypted ? "unicast (enc)" : "broadcast");
+        lv_obj_t *l3 = lv_label_create(card);
+        lv_label_set_text(l3, r3);
+        lv_obj_set_style_text_font(l3, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l3, d.encrypted ? lv_color_hex(0xFFA726) : lv_color_hex(0x26C6DA), 0);
+        lv_label_set_long_mode(l3, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(l3, lv_pct(100));
+    }
+}
+
+/* ── LVGL refresh timer (500 ms) ────────────────────────────────────────────── */
+static void espnow_refresh_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!espnow_ui_needs_update) return;
+    espnow_ui_needs_update = false;
+
+    if (espnow_status_lbl && lv_obj_is_valid(espnow_status_lbl)) {
+        portENTER_CRITICAL(&espnow_mux);
+        int cnt = espnow_device_count;
+        portEXIT_CRITICAL(&espnow_mux);
+        char buf[48];
+        if (espnow_scout_active)
+            snprintf(buf, sizeof(buf), "Hopping ch%d  —  %d device(s)", espnow_current_ch, cnt);
+        else
+            snprintf(buf, sizeof(buf), "Stopped  —  %d device(s)", cnt);
+        lv_label_set_text(espnow_status_lbl, buf);
+    }
+    espnow_rebuild_list();
+}
+
+/* ── Button callbacks ────────────────────────────────────────────────────────── */
+static void espnow_stop_cb(lv_event_t *e)
+{
+    (void)e;
+    espnow_scout_stop();
+    if (espnow_refresh_timer) { lv_timer_del(espnow_refresh_timer); espnow_refresh_timer = NULL; }
+    espnow_list        = NULL;
+    espnow_status_lbl  = NULL;
+    show_wifi_menu_screen();
+}
+
+static void espnow_export_cb(lv_event_t *e)
+{
+    (void)e;
+    portENTER_CRITICAL(&espnow_mux);
+    int cnt = espnow_device_count;
+    portEXIT_CRITICAL(&espnow_mux);
+    if (cnt == 0) {
+        if (espnow_status_lbl && lv_obj_is_valid(espnow_status_lbl))
+            lv_label_set_text(espnow_status_lbl, "Nothing to export yet");
+        return;
+    }
+    espnow_export_json();
+    if (espnow_status_lbl && lv_obj_is_valid(espnow_status_lbl))
+        lv_label_set_text(espnow_status_lbl, "Exported to /sdcard/lab/espnow/");
+}
+
+/* ── Screen entry point ─────────────────────────────────────────────────────── */
+static void show_espnow_scout_screen(void)
+{
+    if (!ensure_wifi_mode()) return;
+
+    /* load Stage-2 profiles before clearing screen so it is non-blocking */
+    espnow_load_profiles();
+
+    create_function_page_base("ESP-NOW Scout");
+
+    /* Status label */
+    espnow_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(espnow_status_lbl, "Starting channel hopper...");
+    lv_obj_set_style_text_color(espnow_status_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(espnow_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_align(espnow_status_lbl, LV_ALIGN_TOP_LEFT, 5, 35);
+
+    /* Scrollable device list — follows BT Observer pattern */
+    espnow_list = lv_obj_create(function_page);
+    lv_obj_set_size(espnow_list, lv_pct(100), LCD_V_RES - 30 - 18 - 76);
+    lv_obj_align(espnow_list, LV_ALIGN_TOP_MID, 0, 52);
+    lv_obj_set_style_bg_color(espnow_list, ui_bg_color(), 0);
+    lv_obj_set_style_border_color(espnow_list, lv_color_hex(0x004D40), 0);
+    lv_obj_set_style_border_width(espnow_list, 1, 0);
+    lv_obj_set_flex_flow(espnow_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(espnow_list, 3, 0);
+    lv_obj_set_style_pad_gap(espnow_list, 3, 0);
+    lv_obj_set_scrollbar_mode(espnow_list, LV_SCROLLBAR_MODE_AUTO);
+
+    /* Export button */
+    lv_obj_t *exp_btn = lv_btn_create(function_page);
+    lv_obj_set_size(exp_btn, 110, 32);
+    lv_obj_align(exp_btn, LV_ALIGN_BOTTOM_LEFT, 6, -6);
+    lv_obj_set_style_bg_color(exp_btn, lv_color_hex(0x004D40), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(exp_btn, lv_color_hex(0x00695C), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(exp_btn, 0, 0);
+    lv_obj_set_style_radius(exp_btn, 8, 0);
+    lv_obj_t *exp_lbl = lv_label_create(exp_btn);
+    lv_label_set_text(exp_lbl, LV_SYMBOL_SAVE "  Export JSON");
+    lv_obj_set_style_text_font(exp_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(exp_lbl, lv_color_white(), 0);
+    lv_obj_center(exp_lbl);
+    lv_obj_add_event_cb(exp_btn, espnow_export_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Stop / Exit button */
+    lv_obj_t *stop_btn = lv_btn_create(function_page);
+    lv_obj_set_size(stop_btn, 110, 32);
+    lv_obj_align(stop_btn, LV_ALIGN_BOTTOM_RIGHT, -6, -6);
+    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 40), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(stop_btn, 0, 0);
+    lv_obj_set_style_radius(stop_btn, 8, 0);
+    lv_obj_t *stop_lbl = lv_label_create(stop_btn);
+    lv_label_set_text(stop_lbl, LV_SYMBOL_CLOSE "  Stop / Exit");
+    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(stop_lbl, lv_color_white(), 0);
+    lv_obj_center(stop_lbl);
+    lv_obj_add_event_cb(stop_btn, espnow_stop_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Reset device table for a fresh scan */
+    portENTER_CRITICAL(&espnow_mux);
+    espnow_device_count = 0;
+    memset(espnow_devices, 0, sizeof(espnow_devices));
+    portEXIT_CRITICAL(&espnow_mux);
+    espnow_current_ch       = 1;
+    espnow_ui_needs_update  = true;
+    espnow_scout_active     = true;
+
+    /* Enable promiscuous on management frames only */
+    wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
+    esp_wifi_set_promiscuous_filter(&filt);
+    esp_wifi_set_promiscuous_rx_cb(espnow_scout_promisc_cb);
+    esp_wifi_set_promiscuous(true);
+
+    /* Launch channel hopper task */
+    BaseType_t ret = xTaskCreate(espnow_hopper_task, "enow_hop", 2048, NULL, 2, &espnow_hopper_handle);
+    if (ret != pdPASS) {
+        espnow_scout_active = false;
+        esp_wifi_set_promiscuous(false);
+        esp_wifi_set_promiscuous_rx_cb(NULL);
+        lv_label_set_text(espnow_status_lbl, "Task start failed!");
+        return;
+    }
+
+    /* 500 ms LVGL refresh timer */
+    espnow_refresh_timer = lv_timer_create(espnow_refresh_cb, 500, NULL);
 }
