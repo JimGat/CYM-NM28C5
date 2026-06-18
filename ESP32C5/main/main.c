@@ -14257,20 +14257,44 @@ static void wifi_scan_rebuild_page(void)
             if (!ssid_lbl) break;
             char name_buf[128];
             const char *band = (records[i].primary <= 14) ? "2.4GHz" : "5GHz";
+
+            /* Auth mode label + MFP color indicator.
+             * Red   = WPA3/OWE  — MFP required, deauth attacks will be ignored.
+             * Amber = WPA2      — MFP optional; cannot determine from scan record.
+             * Green = Open/WEP/WPA — no MFP, deauth attacks work. */
+            const char *auth_str;
+            lv_color_t  mfp_color;
+            switch (records[i].authmode) {
+                case WIFI_AUTH_WPA3_PSK:
+                case WIFI_AUTH_WPA2_WPA3_PSK:        auth_str = "WPA3";    mfp_color = COLOR_MATERIAL_RED;   break;
+                case WIFI_AUTH_OWE:                  auth_str = "OWE";     mfp_color = COLOR_MATERIAL_RED;   break;
+                case WIFI_AUTH_WPA3_ENT_192:
+                case WIFI_AUTH_WPA3_ENTERPRISE:      auth_str = "WPA3-E";  mfp_color = COLOR_MATERIAL_RED;   break;
+                case WIFI_AUTH_WPA2_WPA3_ENTERPRISE: auth_str = "WPA2/3E"; mfp_color = COLOR_MATERIAL_RED;   break;
+                case WIFI_AUTH_WPA2_PSK:             auth_str = "WPA2";    mfp_color = UI_ACCENT_AMBER;      break;
+                case WIFI_AUTH_WPA2_ENTERPRISE:      auth_str = "WPA2-E";  mfp_color = UI_ACCENT_AMBER;      break;
+                case WIFI_AUTH_WPA_WPA2_PSK:         auth_str = "WPA/2";   mfp_color = COLOR_MATERIAL_GREEN; break;
+                case WIFI_AUTH_WPA_PSK:              auth_str = "WPA";     mfp_color = COLOR_MATERIAL_GREEN; break;
+                case WIFI_AUTH_WEP:                  auth_str = "WEP";     mfp_color = COLOR_MATERIAL_GREEN; break;
+                case WIFI_AUTH_OPEN:                 auth_str = "Open";    mfp_color = COLOR_MATERIAL_GREEN; break;
+                default:                             auth_str = "?";       mfp_color = ui_text_color();      break;
+            }
+
             if (records[i].ssid[0] != 0) {
-                snprintf(name_buf, sizeof(name_buf), "%s (%s, %02X:%02X:%02X:%02X:%02X:%02X)",
-                         (const char *)records[i].ssid, band,
+                snprintf(name_buf, sizeof(name_buf), "%s (%s, %s, %02X:%02X:%02X:%02X:%02X:%02X)",
+                         (const char *)records[i].ssid, auth_str, band,
                          records[i].bssid[0], records[i].bssid[1], records[i].bssid[2],
                          records[i].bssid[3], records[i].bssid[4], records[i].bssid[5]);
             } else {
-                snprintf(name_buf, sizeof(name_buf), "%02X:%02X:%02X:%02X:%02X:%02X (%s)",
+                snprintf(name_buf, sizeof(name_buf), "%02X:%02X:%02X:%02X:%02X:%02X (%s, %s)",
                          records[i].bssid[0], records[i].bssid[1], records[i].bssid[2],
-                         records[i].bssid[3], records[i].bssid[4], records[i].bssid[5], band);
+                         records[i].bssid[3], records[i].bssid[4], records[i].bssid[5],
+                         auth_str, band);
             }
             lv_label_set_text(ssid_lbl, name_buf);
             lv_label_set_long_mode(ssid_lbl, LV_LABEL_LONG_DOT);
             lv_obj_set_style_text_font(ssid_lbl, &lv_font_montserrat_14, 0);
-            lv_obj_set_style_text_color(ssid_lbl, ui_text_color(), 0);
+            lv_obj_set_style_text_color(ssid_lbl, mfp_color, 0);
             lv_obj_align(ssid_lbl, LV_ALIGN_LEFT_MID, 0, 5);
             lv_obj_set_width(ssid_lbl, lv_pct(85));
         }
