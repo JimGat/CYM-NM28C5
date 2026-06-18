@@ -11123,6 +11123,7 @@ static void handshake_stop_btn_cb(lv_event_t *e)
     handshake_stop_btn = NULL;
     handshake_status_list = NULL;
     handshake_ui_active = false;
+    handshake_waiting_for_scan = false;
     scan_done_ui_flag = false;
 
     if (hs_ui_timer) { lv_timer_del(hs_ui_timer); hs_ui_timer = NULL; }
@@ -13473,6 +13474,7 @@ static void create_function_page_base(const char *name)
     handshake_stop_btn = NULL;
     handshake_status_list = NULL;
     handshake_ui_active = false;
+    handshake_waiting_for_scan = false;
     handshake_attack_active = false;
     handshake_attack_task_handle = NULL;
 
@@ -14360,6 +14362,11 @@ static void show_wifi_scan_attack_screen(void)
     // Clear previous selections when user manually starts scan
     wifi_scanner_clear_selections();
     wifi_scanner_clear_targets();
+
+    // If a prior Handshaker session set this flag and never cleared it, the
+    // scan-done handler treats this screen as still owned by an active attack
+    // and skips building the results list, leaving the spinner spinning forever.
+    handshake_waiting_for_scan = false;
 
     // Start scan
     wifi_scanner_start_scan();
