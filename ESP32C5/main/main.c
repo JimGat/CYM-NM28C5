@@ -20367,7 +20367,13 @@ static void delbr_confirm_del_cb(lv_event_t *e)
         xSemaphoreGive(sd_spi_mutex);
     }
     s_delbr_del_target[0] = '\0';
-    if (ok) delbr_populate(s_delbr_cwd);  /* refresh on success */
+    if (ok) {
+        delbr_populate(s_delbr_cwd);  /* refresh on success */
+    } else if (s_delbr_path_lbl) {
+        /* Visible feedback on failure (previously failed silently) */
+        lv_label_set_text(s_delbr_path_lbl, LV_SYMBOL_WARNING " Delete failed");
+        lv_obj_set_style_text_color(s_delbr_path_lbl, COLOR_MATERIAL_AMBER, 0);
+    }
 }
 
 static void delbr_trash_btn_cb(lv_event_t *e)
@@ -20472,7 +20478,7 @@ static void delbr_populate(const char *path)
         lv_obj_set_style_text_color(err, COLOR_MATERIAL_RED, 0);
         return;
     }
-    DIR *dir = opendir(path);
+    DIR *dir = opendir(s_delbr_cwd);
     if (!dir) {
         xSemaphoreGive(sd_spi_mutex);
         lv_obj_t *err = lv_label_create(s_delbr_list);
@@ -20487,7 +20493,7 @@ static void delbr_populate(const char *path)
         while ((entry = readdir(dir)) != NULL) {
             if (entry->d_name[0] == '.') continue;
             char child[300];
-            snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+            snprintf(child, sizeof(child), "%s/%s", s_delbr_cwd, entry->d_name);
             struct stat st;
             bool have_stat = (stat(child, &st) == 0);
             bool is_dir    = have_stat && S_ISDIR(st.st_mode);
