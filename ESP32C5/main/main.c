@@ -9562,6 +9562,13 @@ static void hs_sanitize_ssid(char *out, const char *in, size_t out_size) {
 
 static bool hs_save_handshake_to_sd(int ap_idx) {
     hs_ap_target_t *ap = &hs_ap_targets[ap_idx];
+    // Privacy (white.txt): never write a handshake for a whitelisted network. This is the
+    // single chokepoint every capture path uses to persist a pcap, so it protects the active
+    // Handshaker as well as the passive sniffer — the operator's own networks are never saved.
+    if (is_bssid_whitelisted(ap->bssid) || is_ssid_whitelisted(ap->ssid)) {
+        ESP_LOGW(TAG, "[HS-SAVE] Skipping whitelisted network '%s' (privacy)", ap->ssid);
+        return false;
+    }
     hccapx_t *hccapx = (hccapx_t *)hccapx_serializer_get();
     unsigned pcap_size = pcap_serializer_get_size();
     uint8_t *pcap_buf = pcap_serializer_get_buffer();
@@ -16733,6 +16740,28 @@ static void wpasec_upload_task(void *pvParameters)
         // Filter: skip dirs and non-.pcap files
         size_t nlen = strlen(d_name);
         if (nlen <= 5 || strcasecmp(d_name + nlen - 5, ".pcap") != 0) continue;
+
+        // Privacy (white.txt): skip any leftover pcap whose name matches a whitelisted SSID.
+        // Filename format is "<ssid>_<bssid_suffix>_<ts>.pcap", so a whitelisted SSID followed
+        // by '_' is a match. Defense-in-depth for files captured before the save-time guard.
+        {
+            bool wl_skip = false;
+            for (int wi = 0; wi < whitelistedSsidCount; wi++) {
+                size_t sl = strlen(whitelistedSsids[wi]);
+                // Match "<ssid>_..." (real capture format) and "<ssid>.pcap" — the char right
+                // after the SSID must be a separator ('_' or '.') so we don't match a longer
+                // SSID that merely starts with a whitelisted one (e.g. "HOMENET2_...").
+                if (sl > 0 && nlen > sl && (d_name[sl] == '_' || d_name[sl] == '.') &&
+                    strncmp(d_name, whitelistedSsids[wi], sl) == 0) {
+                    wl_skip = true;
+                    break;
+                }
+            }
+            if (wl_skip) {
+                ESP_LOGW(TAG, "[WPA-SEC] Skipping whitelisted pcap '%s' (privacy)", d_name);
+                continue;
+            }
+        }
 
         current++;
         char filepath[280];
