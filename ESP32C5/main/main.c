@@ -18887,8 +18887,19 @@ static bool wdup_ensure_wifi(void)
     // Already associated — wait for DHCP before returning (guards the race where
     // the caller gets back true but DNS still fails because no IP is assigned yet).
     if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
-        WDUP_WAIT_IP_MS(3000);
-        return true; // associated; proceed even if IP poll timed out
+        // If the existing link is on 2.4 GHz (channel <= 14) — or we have no saved creds to
+        // reconnect with — keep it. But if it is on a 5 GHz channel (ch > 14), the caller's
+        // 2G-only band restriction does NOT move an already-associated link: it stays on
+        // 5 GHz VHT80, whose large RX buffers collapse the DMA pool during the TLS cert
+        // bursts and break DNS (getaddrinfo() returns 202). Force a reconnect so the link
+        // comes up on 2.4 GHz BW20.
+        if (ap.primary <= 14 || g_saved_wifi_ssid[0] == '\0') {
+            WDUP_WAIT_IP_MS(3000);
+            return true; // associated on 2.4 GHz (or nothing to reconnect with); proceed
+        }
+        esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(500));
+        // fall through to reconnect on the now 2G-only band
     }
 
     // No saved credentials — caller should direct user to WiFi Client screen.
@@ -18921,7 +18932,17 @@ static void wdup_task(void *pvParameters)
     wdup_wigle_ok_cnt = wdup_wigle_dup_cnt = wdup_wigle_fail_cnt = 0;
     wdup_wdg_ok_cnt   = wdup_wdg_dup_cnt   = wdup_wdg_fail_cnt   = 0;
 
-    // Ensure WiFi STA connection
+    // Force 2.4 GHz BEFORE associating. A 5 GHz 11ax/VHT80 association's large RX buffers
+    // collapse the DMA pool during TLS cert bursts (DNS getaddrinfo() then returns 202).
+    // 2.4 GHz BW20 is lightweight and upload is API-bound (not WiFi-bound). Setting the band
+    // mode must happen before the link is established — restricting the band on an already
+    // associated 5 GHz link does not move it; wdup_ensure_wifi() reconnects on 2.4 GHz if a
+    // prior link was on 5 GHz. Restore AUTO after uploads complete (task_done).
+    wdup_push_msg("Forcing 2.4 GHz for upload...", amber);
+    esp_wifi_set_band_mode(WIFI_BAND_MODE_2G_ONLY);
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    // Ensure WiFi STA connection (now on the 2.4 GHz-only band)
     wdup_push_msg("Connecting to WiFi...", cyan);
     if (!wdup_ensure_wifi()) {
         if (g_saved_wifi_ssid[0] == '\0')
@@ -18931,13 +18952,6 @@ static void wdup_task(void *pvParameters)
         goto task_done;
     }
     wdup_push_msg("WiFi connected.", green);
-
-    // Force 2.4 GHz connection before TLS handshake. A 5 GHz 11ax/VHT80 association's
-    // large RX buffers collapse the DMA pool during cert bursts. 2.4 GHz BW20 is lightweight
-    // and upload is API-bound (not WiFi-bound). Restore AUTO after uploads complete.
-    wdup_push_msg("Forcing 2.4 GHz for upload...", amber);
-    esp_wifi_set_band_mode(WIFI_BAND_MODE_2G_ONLY);
-    vTaskDelay(pdMS_TO_TICKS(500));
 
     // Check at least one key is configured
     bool do_wigle = (wdup_target == WDUP_WIGLE || wdup_target == WDUP_BOTH) && wigle_api_key[0];
