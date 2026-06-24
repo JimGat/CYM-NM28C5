@@ -308,6 +308,55 @@ static char ble_spoof_target_name_str[33];        // authoritative target name f
 static uint16_t ble_spoof_target_company_id = 0; // authoritative company ID for task
 static volatile bool ble_spoof_needs_ui_update = false;
 
+// ── ESP-NOW Scout state ────────────────────────────────────────────────────
+// Passive ESP-NOW frame detector using WiFi promiscuous + channel hopper.
+// Identifies ESP-NOW action frames by exact 5-field fingerprint so that no
+// other 802.11 protocol triggers a false positive:
+//   [0]  FC lo-byte = 0xD0   → Management / Action subtype
+//   [24] Category  = 0x7F   → Vendor Specific
+//   [25..27] OUI   = 18:FE:34 → Espressif vendor OUI
+//   [28] Type      = 0x04   → ESP-NOW
+//
+// Stage 1: passive detect + channel hop (1-13, 200 ms dwell)
+// Stage 2: label known devices from /sdcard/lab/espnow/profiles.json
+#define ESPNOW_MAX_DEVICES   32
+#define ESPNOW_MAX_PROFILES  16
+#define ESPNOW_DWELL_MS      200
+#define ESPNOW_EXPORT_DIR    "/sdcard/lab/espnow"
+#define ESPNOW_PROFILES_PATH "/sdcard/lab/espnow/profiles.json"
+
+typedef struct {
+    uint8_t  src_mac[6];
+    uint8_t  dst_mac[6];
+    uint8_t  channel;
+    int8_t   rssi;
+    int64_t  first_seen_us;
+    int64_t  last_seen_us;
+    uint32_t pkt_count;
+    char     label[33];   // matched from profiles.json; empty if unknown
+    bool     encrypted;   // unicast dst = peer-to-peer (likely encrypted)
+} espnow_device_t;
+
+typedef struct {
+    uint8_t mac[6];
+    char    label[33];
+    uint8_t lmk[16];   // Stage 2: known peer LMK; zero = not loaded
+} espnow_profile_t;
+
+static espnow_device_t  espnow_devices[ESPNOW_MAX_DEVICES];
+static int              espnow_device_count   = 0;
+static espnow_profile_t espnow_profiles[ESPNOW_MAX_PROFILES];
+static int              espnow_profile_count  = 0;
+static volatile bool    espnow_scout_active   = false;
+static TaskHandle_t     espnow_hopper_handle  = NULL;
+static uint8_t          espnow_current_ch     = 1;
+static portMUX_TYPE     espnow_mux            = portMUX_INITIALIZER_UNLOCKED;
+/* UI handles */
+static lv_obj_t        *espnow_list           = NULL;
+static lv_obj_t        *espnow_status_lbl     = NULL;
+static lv_timer_t      *espnow_refresh_timer  = NULL;
+static volatile bool    espnow_ui_needs_update = false;
+
 // BLE Spoof general list (spooflist.txt)
 #define SPOOF_LIST_MAX  64
 #define SPOOF_LIST_PATH "/sdcard/lab/bluetooth/spooflist.csv"
@@ -2685,6 +2734,9 @@ static void drone_row_tap_cb(lv_event_t *e);
 static void show_wifi_analyzer_screen(void);
 static void show_wscope_screen(void);
 static void wscope_task(void *p);
+static void show_espnow_scout_screen(void);
+static void espnow_scout_stop(void);
+static void espnow_rebuild_list(void);
 
 // HoneyPair
 static void show_honeypair_screen(void);
@@ -9510,6 +9562,13 @@ static void hs_sanitize_ssid(char *out, const char *in, size_t out_size) {
 
 static bool hs_save_handshake_to_sd(int ap_idx) {
     hs_ap_target_t *ap = &hs_ap_targets[ap_idx];
+    // Privacy (white.txt): never write a handshake for a whitelisted network. This is the
+    // single chokepoint every capture path uses to persist a pcap, so it protects the active
+    // Handshaker as well as the passive sniffer — the operator's own networks are never saved.
+    if (is_bssid_whitelisted(ap->bssid) || is_ssid_whitelisted(ap->ssid)) {
+        ESP_LOGW(TAG, "[HS-SAVE] Skipping whitelisted network '%s' (privacy)", ap->ssid);
+        return false;
+    }
     hccapx_t *hccapx = (hccapx_t *)hccapx_serializer_get();
     unsigned pcap_size = pcap_serializer_get_size();
     uint8_t *pcap_buf = pcap_serializer_get_buffer();
@@ -11071,6 +11130,7 @@ static void handshake_stop_btn_cb(lv_event_t *e)
     handshake_stop_btn = NULL;
     handshake_status_list = NULL;
     handshake_ui_active = false;
+    handshake_waiting_for_scan = false;
     scan_done_ui_flag = false;
 
     if (hs_ui_timer) { lv_timer_del(hs_ui_timer); hs_ui_timer = NULL; }
@@ -13421,6 +13481,7 @@ static void create_function_page_base(const char *name)
     handshake_stop_btn = NULL;
     handshake_status_list = NULL;
     handshake_ui_active = false;
+    handshake_waiting_for_scan = false;
     handshake_attack_active = false;
     handshake_attack_task_handle = NULL;
 
@@ -13922,6 +13983,8 @@ static void main_tile_event_cb(lv_event_t *e)
         show_wifi_analyzer_screen();
     } else if (strcmp(tile_name, "WiFi Scope") == 0) {
         show_wscope_screen();
+    } else if (strcmp(tile_name, "ESP-NOW Scout") == 0) {
+        show_espnow_scout_screen();
     } else if (strcmp(tile_name, "Bluetooth") == 0) {
         show_bluetooth_screen();
     } else if (strcmp(tile_name, "Wardrive") == 0) {
@@ -14201,20 +14264,44 @@ static void wifi_scan_rebuild_page(void)
             if (!ssid_lbl) break;
             char name_buf[128];
             const char *band = (records[i].primary <= 14) ? "2.4GHz" : "5GHz";
+
+            /* Auth mode label + MFP color indicator.
+             * Red   = WPA3/OWE  — MFP required, deauth attacks will be ignored.
+             * Amber = WPA2      — MFP optional; cannot determine from scan record.
+             * Green = Open/WEP/WPA — no MFP, deauth attacks work. */
+            const char *auth_str;
+            lv_color_t  mfp_color;
+            switch (records[i].authmode) {
+                case WIFI_AUTH_WPA3_PSK:
+                case WIFI_AUTH_WPA2_WPA3_PSK:        auth_str = "WPA3";    mfp_color = COLOR_MATERIAL_RED;   break;
+                case WIFI_AUTH_OWE:                  auth_str = "OWE";     mfp_color = COLOR_MATERIAL_RED;   break;
+                case WIFI_AUTH_WPA3_ENT_192:
+                case WIFI_AUTH_WPA3_ENTERPRISE:      auth_str = "WPA3-E";  mfp_color = COLOR_MATERIAL_RED;   break;
+                case WIFI_AUTH_WPA2_WPA3_ENTERPRISE: auth_str = "WPA2/3E"; mfp_color = COLOR_MATERIAL_RED;   break;
+                case WIFI_AUTH_WPA2_PSK:             auth_str = "WPA2";    mfp_color = UI_ACCENT_AMBER;      break;
+                case WIFI_AUTH_WPA2_ENTERPRISE:      auth_str = "WPA2-E";  mfp_color = UI_ACCENT_AMBER;      break;
+                case WIFI_AUTH_WPA_WPA2_PSK:         auth_str = "WPA/2";   mfp_color = COLOR_MATERIAL_GREEN; break;
+                case WIFI_AUTH_WPA_PSK:              auth_str = "WPA";     mfp_color = COLOR_MATERIAL_GREEN; break;
+                case WIFI_AUTH_WEP:                  auth_str = "WEP";     mfp_color = COLOR_MATERIAL_GREEN; break;
+                case WIFI_AUTH_OPEN:                 auth_str = "Open";    mfp_color = COLOR_MATERIAL_GREEN; break;
+                default:                             auth_str = "?";       mfp_color = ui_text_color();      break;
+            }
+
             if (records[i].ssid[0] != 0) {
-                snprintf(name_buf, sizeof(name_buf), "%s (%s, %02X:%02X:%02X:%02X:%02X:%02X)",
-                         (const char *)records[i].ssid, band,
+                snprintf(name_buf, sizeof(name_buf), "%s (%s, %s, %02X:%02X:%02X:%02X:%02X:%02X)",
+                         (const char *)records[i].ssid, auth_str, band,
                          records[i].bssid[0], records[i].bssid[1], records[i].bssid[2],
                          records[i].bssid[3], records[i].bssid[4], records[i].bssid[5]);
             } else {
-                snprintf(name_buf, sizeof(name_buf), "%02X:%02X:%02X:%02X:%02X:%02X (%s)",
+                snprintf(name_buf, sizeof(name_buf), "%02X:%02X:%02X:%02X:%02X:%02X (%s, %s)",
                          records[i].bssid[0], records[i].bssid[1], records[i].bssid[2],
-                         records[i].bssid[3], records[i].bssid[4], records[i].bssid[5], band);
+                         records[i].bssid[3], records[i].bssid[4], records[i].bssid[5],
+                         auth_str, band);
             }
             lv_label_set_text(ssid_lbl, name_buf);
             lv_label_set_long_mode(ssid_lbl, LV_LABEL_LONG_DOT);
             lv_obj_set_style_text_font(ssid_lbl, &lv_font_montserrat_14, 0);
-            lv_obj_set_style_text_color(ssid_lbl, ui_text_color(), 0);
+            lv_obj_set_style_text_color(ssid_lbl, mfp_color, 0);
             lv_obj_align(ssid_lbl, LV_ALIGN_LEFT_MID, 0, 5);
             lv_obj_set_width(ssid_lbl, lv_pct(85));
         }
@@ -14306,6 +14393,11 @@ static void show_wifi_scan_attack_screen(void)
     // Clear previous selections when user manually starts scan
     wifi_scanner_clear_selections();
     wifi_scanner_clear_targets();
+
+    // If a prior Handshaker session set this flag and never cleared it, the
+    // scan-done handler treats this screen as still owned by an active attack
+    // and skips building the results list, leaving the spinner spinning forever.
+    handshake_waiting_for_scan = false;
 
     // Start scan
     wifi_scanner_start_scan();
@@ -16649,6 +16741,28 @@ static void wpasec_upload_task(void *pvParameters)
         size_t nlen = strlen(d_name);
         if (nlen <= 5 || strcasecmp(d_name + nlen - 5, ".pcap") != 0) continue;
 
+        // Privacy (white.txt): skip any leftover pcap whose name matches a whitelisted SSID.
+        // Filename format is "<ssid>_<bssid_suffix>_<ts>.pcap", so a whitelisted SSID followed
+        // by '_' is a match. Defense-in-depth for files captured before the save-time guard.
+        {
+            bool wl_skip = false;
+            for (int wi = 0; wi < whitelistedSsidCount; wi++) {
+                size_t sl = strlen(whitelistedSsids[wi]);
+                // Match "<ssid>_..." (real capture format) and "<ssid>.pcap" — the char right
+                // after the SSID must be a separator ('_' or '.') so we don't match a longer
+                // SSID that merely starts with a whitelisted one (e.g. "HOMENET2_...").
+                if (sl > 0 && nlen > sl && (d_name[sl] == '_' || d_name[sl] == '.') &&
+                    strncmp(d_name, whitelistedSsids[wi], sl) == 0) {
+                    wl_skip = true;
+                    break;
+                }
+            }
+            if (wl_skip) {
+                ESP_LOGW(TAG, "[WPA-SEC] Skipping whitelisted pcap '%s' (privacy)", d_name);
+                continue;
+            }
+        }
+
         current++;
         char filepath[280];
         snprintf(filepath, sizeof(filepath), "/sdcard/lab/handshakes/%s", d_name);
@@ -17029,6 +17143,8 @@ static void show_wifi_menu_screen(void)
     (void)wana_tile;
     lv_obj_t *wscope_tile = create_tile(tiles, MY_SYMBOL_WAVE,     "WiFi\nScope",      lv_color_hex(0x006064), main_tile_event_cb, "WiFi Scope");
     (void)wscope_tile;
+    lv_obj_t *espnow_tile = create_tile(tiles, MY_SYMBOL_SATELLITE_DISH, "ESP-NOW\nScout", lv_color_hex(0x004D40), main_tile_event_cb, "ESP-NOW Scout");
+    (void)espnow_tile;
 }
 
 // WiFi Sniff & Karma screen
@@ -18771,8 +18887,19 @@ static bool wdup_ensure_wifi(void)
     // Already associated — wait for DHCP before returning (guards the race where
     // the caller gets back true but DNS still fails because no IP is assigned yet).
     if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
-        WDUP_WAIT_IP_MS(3000);
-        return true; // associated; proceed even if IP poll timed out
+        // If the existing link is on 2.4 GHz (channel <= 14) — or we have no saved creds to
+        // reconnect with — keep it. But if it is on a 5 GHz channel (ch > 14), the caller's
+        // 2G-only band restriction does NOT move an already-associated link: it stays on
+        // 5 GHz VHT80, whose large RX buffers collapse the DMA pool during the TLS cert
+        // bursts and break DNS (getaddrinfo() returns 202). Force a reconnect so the link
+        // comes up on 2.4 GHz BW20.
+        if (ap.primary <= 14 || g_saved_wifi_ssid[0] == '\0') {
+            WDUP_WAIT_IP_MS(3000);
+            return true; // associated on 2.4 GHz (or nothing to reconnect with); proceed
+        }
+        esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(500));
+        // fall through to reconnect on the now 2G-only band
     }
 
     // No saved credentials — caller should direct user to WiFi Client screen.
@@ -18805,7 +18932,17 @@ static void wdup_task(void *pvParameters)
     wdup_wigle_ok_cnt = wdup_wigle_dup_cnt = wdup_wigle_fail_cnt = 0;
     wdup_wdg_ok_cnt   = wdup_wdg_dup_cnt   = wdup_wdg_fail_cnt   = 0;
 
-    // Ensure WiFi STA connection
+    // Force 2.4 GHz BEFORE associating. A 5 GHz 11ax/VHT80 association's large RX buffers
+    // collapse the DMA pool during TLS cert bursts (DNS getaddrinfo() then returns 202).
+    // 2.4 GHz BW20 is lightweight and upload is API-bound (not WiFi-bound). Setting the band
+    // mode must happen before the link is established — restricting the band on an already
+    // associated 5 GHz link does not move it; wdup_ensure_wifi() reconnects on 2.4 GHz if a
+    // prior link was on 5 GHz. Restore AUTO after uploads complete (task_done).
+    wdup_push_msg("Forcing 2.4 GHz for upload...", amber);
+    esp_wifi_set_band_mode(WIFI_BAND_MODE_2G_ONLY);
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    // Ensure WiFi STA connection (now on the 2.4 GHz-only band)
     wdup_push_msg("Connecting to WiFi...", cyan);
     if (!wdup_ensure_wifi()) {
         if (g_saved_wifi_ssid[0] == '\0')
@@ -18815,13 +18952,6 @@ static void wdup_task(void *pvParameters)
         goto task_done;
     }
     wdup_push_msg("WiFi connected.", green);
-
-    // Force 2.4 GHz connection before TLS handshake. A 5 GHz 11ax/VHT80 association's
-    // large RX buffers collapse the DMA pool during cert bursts. 2.4 GHz BW20 is lightweight
-    // and upload is API-bound (not WiFi-bound). Restore AUTO after uploads complete.
-    wdup_push_msg("Forcing 2.4 GHz for upload...", amber);
-    esp_wifi_set_band_mode(WIFI_BAND_MODE_2G_ONLY);
-    vTaskDelay(pdMS_TO_TICKS(500));
 
     // Check at least one key is configured
     bool do_wigle = (wdup_target == WDUP_WIGLE || wdup_target == WDUP_BOTH) && wigle_api_key[0];
@@ -20251,7 +20381,13 @@ static void delbr_confirm_del_cb(lv_event_t *e)
         xSemaphoreGive(sd_spi_mutex);
     }
     s_delbr_del_target[0] = '\0';
-    if (ok) delbr_populate(s_delbr_cwd);  /* refresh on success */
+    if (ok) {
+        delbr_populate(s_delbr_cwd);  /* refresh on success */
+    } else if (s_delbr_path_lbl) {
+        /* Visible feedback on failure (previously failed silently) */
+        lv_label_set_text(s_delbr_path_lbl, LV_SYMBOL_WARNING " Delete failed");
+        lv_obj_set_style_text_color(s_delbr_path_lbl, COLOR_MATERIAL_AMBER, 0);
+    }
 }
 
 static void delbr_trash_btn_cb(lv_event_t *e)
@@ -20356,7 +20492,7 @@ static void delbr_populate(const char *path)
         lv_obj_set_style_text_color(err, COLOR_MATERIAL_RED, 0);
         return;
     }
-    DIR *dir = opendir(path);
+    DIR *dir = opendir(s_delbr_cwd);
     if (!dir) {
         xSemaphoreGive(sd_spi_mutex);
         lv_obj_t *err = lv_label_create(s_delbr_list);
@@ -20371,7 +20507,7 @@ static void delbr_populate(const char *path)
         while ((entry = readdir(dir)) != NULL) {
             if (entry->d_name[0] == '.') continue;
             char child[300];
-            snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+            snprintf(child, sizeof(child), "%s/%s", s_delbr_cwd, entry->d_name);
             struct stat st;
             bool have_stat = (stat(child, &st) == 0);
             bool is_dir    = have_stat && S_ISDIR(st.st_mode);
@@ -48001,4 +48137,484 @@ static void show_zgwd_flood(int pan_idx)
 
     fld->tmr = lv_timer_create(s_zgwd_flood_ui_timer_cb, 300, NULL);
     xTaskCreate(s_zgwd_flood_task_fn, "zgwdfld", 3072, fld, 2, &fld->task);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ESP-NOW Scout — passive ESP-NOW frame detector + channel hopper
+// ═══════════════════════════════════════════════════════════════════════════
+
+/* ── 802.11 action-frame ESP-NOW fingerprint check ──────────────────────────
+ * Returns true only when the raw frame is a confirmed ESP-NOW data frame.
+ *
+ * 802.11 Management / Action layout (no FCS in promiscuous payload):
+ *   [0-1]  Frame Control
+ *   [2-3]  Duration
+ *   [4-9]  DA  (destination MAC)
+ *   [10-15] SA  (source MAC)
+ *   [16-21] BSSID
+ *   [22-23] Sequence Control
+ *   [24]   Category = 0x7F (Vendor Specific)
+ *   [25-27] OUI      = 18:FE:34 (Espressif)
+ *   [28]   Type     = 0x04 (ESP-NOW)
+ */
+static bool espnow_is_espnow_frame(const uint8_t *buf, uint16_t len)
+{
+    if (len < 29) return false;
+    /* FC lo-byte: type=00 (mgmt), subtype=1101 (action) → 0xD0 */
+    if (buf[0] != 0xD0) return false;
+    if (buf[24] != 0x7F) return false;                           /* Category: Vendor Specific */
+    if (buf[25] != 0x18 || buf[26] != 0xFE || buf[27] != 0x34) return false; /* Espressif OUI */
+    if (buf[28] != 0x04) return false;                           /* ESP-NOW type */
+    return true;
+}
+
+/* ── Find or create a device entry (call inside portMUX) ──────────────────── */
+static int espnow_find_or_add(const uint8_t *src_mac, const uint8_t *dst_mac,
+                               uint8_t ch, int8_t rssi)
+{
+    /* search for existing entry */
+    for (int i = 0; i < espnow_device_count; i++) {
+        if (memcmp(espnow_devices[i].src_mac, src_mac, 6) == 0) {
+            /* update live fields */
+            espnow_devices[i].last_seen_us = esp_timer_get_time();
+            espnow_devices[i].pkt_count++;
+            espnow_devices[i].rssi    = rssi;
+            espnow_devices[i].channel = ch;
+            return i;
+        }
+    }
+    /* add new entry if room */
+    if (espnow_device_count >= ESPNOW_MAX_DEVICES) return -1;
+    int idx = espnow_device_count++;
+    espnow_device_t *d = &espnow_devices[idx];
+    memset(d, 0, sizeof(*d));
+    memcpy(d->src_mac, src_mac, 6);
+    memcpy(d->dst_mac, dst_mac, 6);
+    d->channel       = ch;
+    d->rssi          = rssi;
+    d->first_seen_us = esp_timer_get_time();
+    d->last_seen_us  = d->first_seen_us;
+    d->pkt_count     = 1;
+    /* ff:ff:ff:ff:ff:ff destination = broadcast (unencrypted) */
+    uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    d->encrypted = (memcmp(dst_mac, bcast, 6) != 0);
+    /* Stage 2: match label from loaded profiles */
+    for (int p = 0; p < espnow_profile_count; p++) {
+        if (memcmp(espnow_profiles[p].mac, src_mac, 6) == 0) {
+            strncpy(d->label, espnow_profiles[p].label, sizeof(d->label) - 1);
+            break;
+        }
+    }
+    return idx;
+}
+
+/* ── Promiscuous callback (runs in WiFi task context — not LVGL safe) ──────── */
+static void espnow_scout_promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    if (!espnow_scout_active) return;
+    if (type != WIFI_PKT_MGMT) return;
+
+    const wifi_promiscuous_pkt_t *ppkt = (const wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *payload = ppkt->payload;
+    uint16_t       len     = ppkt->rx_ctrl.sig_len;
+
+    if (!espnow_is_espnow_frame(payload, len)) return;
+
+    const uint8_t *dst_mac = payload + 4;   /* DA  */
+    const uint8_t *src_mac = payload + 10;  /* SA  */
+    int8_t  rssi = (int8_t)ppkt->rx_ctrl.rssi;
+    uint8_t ch   = (uint8_t)ppkt->rx_ctrl.channel;
+
+    portENTER_CRITICAL_ISR(&espnow_mux);
+    espnow_find_or_add(src_mac, dst_mac, ch, rssi);
+    portEXIT_CRITICAL_ISR(&espnow_mux);
+
+    espnow_ui_needs_update = true;
+}
+
+/* ── Channel hopper task ────────────────────────────────────────────────────── */
+static void espnow_hopper_task(void *pv)
+{
+    (void)pv;
+    uint8_t ch = 1;
+    while (espnow_scout_active) {
+        esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+        espnow_current_ch = ch;
+        espnow_ui_needs_update = true;
+        vTaskDelay(pdMS_TO_TICKS(ESPNOW_DWELL_MS));
+        ch = (ch % 13) + 1;   /* cycle 1→13→1 */
+    }
+    espnow_hopper_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+/* ── Minimal JSON string-value extractor (no cJSON dependency) ──────────────
+ * Scans `obj` for "key" : "value" and copies value into out[0..out_sz-1].
+ * Returns true on success.  obj must be a null-terminated object fragment.
+ */
+static bool espnow_json_get_str(const char *obj, const char *key,
+                                 char *out, size_t out_sz)
+{
+    char search[48];
+    snprintf(search, sizeof(search), "\"%s\"", key);
+    const char *p = strstr(obj, search);
+    if (!p) return false;
+    p += strlen(search);
+    while (*p && (*p == ' ' || *p == '\t' || *p == ':')) p++;
+    if (*p != '"') return false;
+    p++;
+    size_t i = 0;
+    while (*p && *p != '"' && i < out_sz - 1) out[i++] = *p++;
+    out[i] = '\0';
+    return (i > 0);
+}
+
+/* ── Load Stage-2 profiles from SD ─────────────────────────────────────────── */
+static void espnow_load_profiles(void)
+{
+    espnow_profile_count = 0;
+    ensure_sd_mounted();
+    FILE *f = fopen(ESPNOW_PROFILES_PATH, "r");
+    if (!f) return;   /* profiles.json is optional */
+
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > 8192) { fclose(f); return; }
+
+    char *raw = heap_caps_malloc(sz + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!raw) { fclose(f); return; }
+    fread(raw, 1, sz, f);
+    fclose(f);
+    raw[sz] = '\0';
+
+    /* Walk the JSON array: find each '{' … '}' object and extract fields */
+    char *cur = raw;
+    while (espnow_profile_count < ESPNOW_MAX_PROFILES) {
+        char *obj_start = strchr(cur, '{');
+        if (!obj_start) break;
+        char *obj_end = strchr(obj_start, '}');
+        if (!obj_end) break;
+        char saved = *obj_end;
+        *obj_end = '\0';   /* temporarily terminate object */
+
+        char mac_str[24] = "";
+        if (espnow_json_get_str(obj_start, "mac", mac_str, sizeof(mac_str))) {
+            espnow_profile_t *prof = &espnow_profiles[espnow_profile_count];
+            memset(prof, 0, sizeof(*prof));
+            unsigned int b[6];
+            if (sscanf(mac_str, "%x:%x:%x:%x:%x:%x",
+                       &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6) {
+                for (int k = 0; k < 6; k++) prof->mac[k] = (uint8_t)b[k];
+                espnow_json_get_str(obj_start, "label",
+                                    prof->label, sizeof(prof->label));
+                char lmk_str[33] = "";
+                if (espnow_json_get_str(obj_start, "lmk", lmk_str, sizeof(lmk_str))) {
+                    for (int k = 0; k < 16 && lmk_str[k*2] && lmk_str[k*2+1]; k++) {
+                        unsigned int bv = 0;
+                        char hex[3] = { lmk_str[k*2], lmk_str[k*2+1], '\0' };
+                        if (sscanf(hex, "%x", &bv) == 1) prof->lmk[k] = (uint8_t)bv;
+                    }
+                }
+                espnow_profile_count++;
+            }
+        }
+
+        *obj_end = saved;
+        cur = obj_end + 1;
+    }
+    heap_caps_free(raw);
+    ESP_LOGI(TAG, "ESP-NOW Scout: loaded %d profile(s)", espnow_profile_count);
+}
+
+/* ── Export device table to JSON ────────────────────────────────────────────── */
+static void espnow_export_json(void)
+{
+    ensure_sd_mounted();
+
+    /* ensure output dir exists */
+    struct stat st;
+    if (stat(ESPNOW_EXPORT_DIR, &st) != 0) mkdir(ESPNOW_EXPORT_DIR, 0775);
+
+    /* timestamped filename using RTC or monotonic counter */
+    char path[80];
+    time_t now_t = 0;
+    time(&now_t);
+    struct tm *tm_info = localtime(&now_t);
+    if (tm_info && now_t > 1000000) {
+        snprintf(path, sizeof(path), ESPNOW_EXPORT_DIR "/scout_%04d%02d%02d_%02d%02d%02d.json",
+                 tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
+                 tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
+    } else {
+        snprintf(path, sizeof(path), ESPNOW_EXPORT_DIR "/scout_%lld.json",
+                 (long long)esp_timer_get_time() / 1000000LL);
+    }
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        ESP_LOGW(TAG, "ESP-NOW Scout: cannot open %s for export", path);
+        return;
+    }
+
+    portENTER_CRITICAL(&espnow_mux);
+    int count = espnow_device_count;
+    /* safe copy so we release the mux quickly */
+    espnow_device_t *snap = heap_caps_malloc(count * sizeof(espnow_device_t),
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (snap) memcpy(snap, espnow_devices, count * sizeof(espnow_device_t));
+    portEXIT_CRITICAL(&espnow_mux);
+
+    if (!snap) { fclose(f); return; }
+
+    fprintf(f, "[\n");
+    for (int i = 0; i < count; i++) {
+        espnow_device_t *d = &snap[i];
+        char first_ts[32], last_ts[32];
+        /* convert microseconds to seconds since boot */
+        snprintf(first_ts, sizeof(first_ts), "%.3f", (double)d->first_seen_us / 1e6);
+        snprintf(last_ts,  sizeof(last_ts),  "%.3f", (double)d->last_seen_us  / 1e6);
+        fprintf(f,
+            "  {\n"
+            "    \"src_mac\": \"%02X:%02X:%02X:%02X:%02X:%02X\",\n"
+            "    \"dst_mac\": \"%02X:%02X:%02X:%02X:%02X:%02X\",\n"
+            "    \"channel\": %d,\n"
+            "    \"rssi\": %d,\n"
+            "    \"first_seen_s\": %s,\n"
+            "    \"last_seen_s\": %s,\n"
+            "    \"pkt_count\": %lu,\n"
+            "    \"encrypted\": %s,\n"
+            "    \"label\": \"%s\"\n"
+            "  }%s\n",
+            d->src_mac[0], d->src_mac[1], d->src_mac[2],
+            d->src_mac[3], d->src_mac[4], d->src_mac[5],
+            d->dst_mac[0], d->dst_mac[1], d->dst_mac[2],
+            d->dst_mac[3], d->dst_mac[4], d->dst_mac[5],
+            d->channel, d->rssi,
+            first_ts, last_ts,
+            (unsigned long)d->pkt_count,
+            d->encrypted ? "true" : "false",
+            d->label,
+            (i < count - 1) ? "," : "");
+    }
+    fprintf(f, "]\n");
+    fclose(f);
+    heap_caps_free(snap);
+    ESP_LOGI(TAG, "ESP-NOW Scout: exported %d device(s) → %s", count, path);
+}
+
+/* ── Stop scanning + clean up radio ────────────────────────────────────────── */
+static void espnow_scout_stop(void)
+{
+    espnow_scout_active = false;
+    /* hopper task self-deletes; wait up to 600 ms */
+    for (int i = 0; i < 30 && espnow_hopper_handle != NULL; i++)
+        vTaskDelay(pdMS_TO_TICKS(20));
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(NULL);
+}
+
+/* ── Rebuild the scrollable device list (LVGL task context) ─────────────────── */
+static void espnow_rebuild_list(void)
+{
+    if (!espnow_list || !lv_obj_is_valid(espnow_list)) return;
+    lv_obj_clean(espnow_list);
+
+    portENTER_CRITICAL(&espnow_mux);
+    int count = espnow_device_count;
+    portEXIT_CRITICAL(&espnow_mux);
+
+    for (int i = 0; i < count; i++) {
+        portENTER_CRITICAL(&espnow_mux);
+        espnow_device_t d = espnow_devices[i];   /* local copy */
+        portEXIT_CRITICAL(&espnow_mux);
+
+        lv_obj_t *card = lv_obj_create(espnow_list);
+        lv_obj_set_size(card, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_pad_all(card, 4, 0);
+        lv_obj_set_style_pad_gap(card, 2, 0);
+        lv_obj_set_style_radius(card, 6, 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_border_color(card,
+            d.encrypted ? lv_color_hex(0xFFA726) : lv_color_hex(0x26C6DA), 0);
+        lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+
+        /* Row 1: src MAC + RSSI */
+        char r1[56];
+        snprintf(r1, sizeof(r1), "%02X:%02X:%02X:%02X:%02X:%02X  %ddBm  ch%d",
+                 d.src_mac[0], d.src_mac[1], d.src_mac[2],
+                 d.src_mac[3], d.src_mac[4], d.src_mac[5],
+                 d.rssi, d.channel);
+        lv_obj_t *l1 = lv_label_create(card);
+        lv_label_set_text(l1, r1);
+        lv_obj_set_style_text_font(l1, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l1, ui_text_color(), 0);
+        lv_label_set_long_mode(l1, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(l1, lv_pct(100));
+
+        /* Row 2: label (if known) or dst MAC */
+        char r2[56];
+        if (d.label[0]) {
+            snprintf(r2, sizeof(r2), "\xEF\x80\xAB %s", d.label);   /* fa-tag */
+        } else {
+            snprintf(r2, sizeof(r2), "dst %02X:%02X:%02X:%02X:%02X:%02X",
+                     d.dst_mac[0], d.dst_mac[1], d.dst_mac[2],
+                     d.dst_mac[3], d.dst_mac[4], d.dst_mac[5]);
+        }
+        lv_obj_t *l2 = lv_label_create(card);
+        lv_label_set_text(l2, r2);
+        lv_obj_set_style_text_font(l2, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l2, d.label[0] ? UI_ACCENT_CYAN : ui_muted_color(), 0);
+        lv_label_set_long_mode(l2, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(l2, lv_pct(100));
+
+        /* Row 3: packet count + enc/bcast indicator */
+        char r3[48];
+        snprintf(r3, sizeof(r3), "%lu pkt  %s",
+                 (unsigned long)d.pkt_count,
+                 d.encrypted ? "unicast (enc)" : "broadcast");
+        lv_obj_t *l3 = lv_label_create(card);
+        lv_label_set_text(l3, r3);
+        lv_obj_set_style_text_font(l3, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l3, d.encrypted ? lv_color_hex(0xFFA726) : lv_color_hex(0x26C6DA), 0);
+        lv_label_set_long_mode(l3, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(l3, lv_pct(100));
+    }
+}
+
+/* ── LVGL refresh timer (500 ms) ────────────────────────────────────────────── */
+static void espnow_refresh_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!espnow_ui_needs_update) return;
+    espnow_ui_needs_update = false;
+
+    if (espnow_status_lbl && lv_obj_is_valid(espnow_status_lbl)) {
+        portENTER_CRITICAL(&espnow_mux);
+        int cnt = espnow_device_count;
+        portEXIT_CRITICAL(&espnow_mux);
+        char buf[48];
+        if (espnow_scout_active)
+            snprintf(buf, sizeof(buf), "Hopping ch%d  —  %d device(s)", espnow_current_ch, cnt);
+        else
+            snprintf(buf, sizeof(buf), "Stopped  —  %d device(s)", cnt);
+        lv_label_set_text(espnow_status_lbl, buf);
+    }
+    espnow_rebuild_list();
+}
+
+/* ── Button callbacks ────────────────────────────────────────────────────────── */
+static void espnow_stop_cb(lv_event_t *e)
+{
+    (void)e;
+    espnow_scout_stop();
+    if (espnow_refresh_timer) { lv_timer_del(espnow_refresh_timer); espnow_refresh_timer = NULL; }
+    espnow_list        = NULL;
+    espnow_status_lbl  = NULL;
+    show_wifi_menu_screen();
+}
+
+static void espnow_export_cb(lv_event_t *e)
+{
+    (void)e;
+    portENTER_CRITICAL(&espnow_mux);
+    int cnt = espnow_device_count;
+    portEXIT_CRITICAL(&espnow_mux);
+    if (cnt == 0) {
+        if (espnow_status_lbl && lv_obj_is_valid(espnow_status_lbl))
+            lv_label_set_text(espnow_status_lbl, "Nothing to export yet");
+        return;
+    }
+    espnow_export_json();
+    if (espnow_status_lbl && lv_obj_is_valid(espnow_status_lbl))
+        lv_label_set_text(espnow_status_lbl, "Exported to /sdcard/lab/espnow/");
+}
+
+/* ── Screen entry point ─────────────────────────────────────────────────────── */
+static void show_espnow_scout_screen(void)
+{
+    if (!ensure_wifi_mode()) return;
+
+    /* load Stage-2 profiles before clearing screen so it is non-blocking */
+    espnow_load_profiles();
+
+    create_function_page_base("ESP-NOW Scout");
+
+    /* Status label */
+    espnow_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(espnow_status_lbl, "Starting channel hopper...");
+    lv_obj_set_style_text_color(espnow_status_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(espnow_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_align(espnow_status_lbl, LV_ALIGN_TOP_LEFT, 5, 35);
+
+    /* Scrollable device list — follows BT Observer pattern */
+    espnow_list = lv_obj_create(function_page);
+    lv_obj_set_size(espnow_list, lv_pct(100), LCD_V_RES - 30 - 18 - 76);
+    lv_obj_align(espnow_list, LV_ALIGN_TOP_MID, 0, 52);
+    lv_obj_set_style_bg_color(espnow_list, ui_bg_color(), 0);
+    lv_obj_set_style_border_color(espnow_list, lv_color_hex(0x004D40), 0);
+    lv_obj_set_style_border_width(espnow_list, 1, 0);
+    lv_obj_set_flex_flow(espnow_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(espnow_list, 3, 0);
+    lv_obj_set_style_pad_gap(espnow_list, 3, 0);
+    lv_obj_set_scrollbar_mode(espnow_list, LV_SCROLLBAR_MODE_AUTO);
+
+    /* Export button */
+    lv_obj_t *exp_btn = lv_btn_create(function_page);
+    lv_obj_set_size(exp_btn, 110, 32);
+    lv_obj_align(exp_btn, LV_ALIGN_BOTTOM_LEFT, 6, -6);
+    lv_obj_set_style_bg_color(exp_btn, lv_color_hex(0x004D40), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(exp_btn, lv_color_hex(0x00695C), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(exp_btn, 0, 0);
+    lv_obj_set_style_radius(exp_btn, 8, 0);
+    lv_obj_t *exp_lbl = lv_label_create(exp_btn);
+    lv_label_set_text(exp_lbl, LV_SYMBOL_SAVE "  Export JSON");
+    lv_obj_set_style_text_font(exp_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(exp_lbl, lv_color_white(), 0);
+    lv_obj_center(exp_lbl);
+    lv_obj_add_event_cb(exp_btn, espnow_export_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Stop / Exit button */
+    lv_obj_t *stop_btn = lv_btn_create(function_page);
+    lv_obj_set_size(stop_btn, 110, 32);
+    lv_obj_align(stop_btn, LV_ALIGN_BOTTOM_RIGHT, -6, -6);
+    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 40), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(stop_btn, 0, 0);
+    lv_obj_set_style_radius(stop_btn, 8, 0);
+    lv_obj_t *stop_lbl = lv_label_create(stop_btn);
+    lv_label_set_text(stop_lbl, LV_SYMBOL_CLOSE "  Stop / Exit");
+    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(stop_lbl, lv_color_white(), 0);
+    lv_obj_center(stop_lbl);
+    lv_obj_add_event_cb(stop_btn, espnow_stop_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Reset device table for a fresh scan */
+    portENTER_CRITICAL(&espnow_mux);
+    espnow_device_count = 0;
+    memset(espnow_devices, 0, sizeof(espnow_devices));
+    portEXIT_CRITICAL(&espnow_mux);
+    espnow_current_ch       = 1;
+    espnow_ui_needs_update  = true;
+    espnow_scout_active     = true;
+
+    /* Enable promiscuous on management frames only */
+    wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
+    esp_wifi_set_promiscuous_filter(&filt);
+    esp_wifi_set_promiscuous_rx_cb(espnow_scout_promisc_cb);
+    esp_wifi_set_promiscuous(true);
+
+    /* Launch channel hopper task */
+    BaseType_t ret = xTaskCreate(espnow_hopper_task, "enow_hop", 2048, NULL, 2, &espnow_hopper_handle);
+    if (ret != pdPASS) {
+        espnow_scout_active = false;
+        esp_wifi_set_promiscuous(false);
+        esp_wifi_set_promiscuous_rx_cb(NULL);
+        lv_label_set_text(espnow_status_lbl, "Task start failed!");
+        return;
+    }
+
+    /* 500 ms LVGL refresh timer */
+    espnow_refresh_timer = lv_timer_create(espnow_refresh_cb, 500, NULL);
 }

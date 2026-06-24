@@ -17,6 +17,22 @@ When Jim asks for a change that he will test from GitHub, do the complete test-b
 8. Push to `origin Jimgat_Dev`.
 9. Never run `idf.py flash`, `esptool write-flash`, or `git push --force` unless Jim explicitly overrides.
 
+## Release to main — MANDATORY binary attachment
+
+When merging to main and creating a GitHub release, ALL files in `ESP32C5/binaries-esp32c5/` MUST be attached to the release as assets:
+
+```bash
+gh release create vX.Y.Z \
+  --target main \
+  --title "..." \
+  --notes "..." \
+  ESP32C5/binaries-esp32c5/CYM-NM28C5.bin \
+  ESP32C5/binaries-esp32c5/bootloader.bin \
+  ESP32C5/binaries-esp32c5/partition-table.bin
+```
+
+This allows users to manually flash with esptool without needing the web flasher, and gives the release a self-contained set of artifacts. Never create a release without these files attached.
+
 Runtime crash discipline:
 - Build success is not enough for LVGL/task/lifecycle changes.
 - For sniffer/capture/UI teardown work, specifically review task ownership, timers, global pointers, cancellation, and use-after-free risks before publishing a binary.
