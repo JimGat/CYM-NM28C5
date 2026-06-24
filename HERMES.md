@@ -446,9 +446,62 @@ Three community enclosures for the full NM-CYD-C5 + NM-RF-HAT stack:
 
 **DIP switch relocation:** For cases with internal DIP switches, solder extension wires to switch pads and mount a panel-mount DIP switch on the case exterior.
 
+**Immediate hardware TODO:** Jim needs to start printing a CYM case. Prefer the Thingiverse community-favorite enclosure first if exterior DIP access matters; otherwise evaluate the magnetic-lid Printables case or MakerWorld GPS/18650 case depending on battery/GPS plans. Before committing to a print, verify NM-CYD-C5 + NM-RF-HAT stack height, touch/display opening alignment, USB-C access, SD access, antenna clearance, and whether external DIP access or relocated DIP wiring is required.
+
 ---
 
-## 12. Development Workflow Summary
+## 12. Next Feature Idea — ESP-NOW Listener / Debugger
+
+Jim wants to add an **ESP-NOW debugger/listener/controller** under the WiFi feature set so CYM can detect ESP-NOW traffic and collect useful intelligence. Treat this as a defensive/research/debug feature, not an injection/replay feature.
+
+### Concept
+
+ESP-NOW uses 802.11 vendor-specific action frames. CYM should provide a passive listener mode that can identify likely ESP-NOW frames, maintain a device/session table, and export observations for later analysis.
+
+Useful metadata even without keys:
+- source MAC and destination/broadcast MAC
+- RSSI, channel, timestamp, packet count, packet rate
+- frame length/range and sequence behavior
+- Espressif/vendor OUI hints
+- plaintext-vs-encrypted/opaque payload guess
+- broadcast discovery vs unicast peer traffic indicators
+
+### Proposed UI modes
+
+- **Channel Hopper:** scan channels 1-13 with configurable dwell time; best for discovery.
+- **Fixed Channel:** lock to one channel for deeper capture; best once ESP-NOW activity is found.
+- **Device Table:** MAC, label, channel, RSSI, first seen, last seen, packet count, frame lengths.
+- **Live Packet Log:** timestamp, channel, RSSI, src/dst, length, short hex preview when visible.
+- **Export:** save CSV/JSON captures under `/sdcard/lab/espnow/` and add that directory to `SD_ITEMS` when implemented.
+- **Known Device Labels:** allow user labels for MACs via NVS or SD-side config.
+
+### Known-key decode feasibility
+
+ESP-NOW does **not** negotiate a new ephemeral key per connection like TLS. It uses configured keys:
+- PMK: Primary Master Key set via `esp_now_set_pmk()`
+- LMK: per-peer Local Master Key in `esp_now_peer_info_t.lmk`
+- encrypted unicast traffic uses the LMK
+- broadcast ESP-NOW is not encrypted
+
+If Jim knows the relevant per-peer LMK, CYM can plausibly decode traffic for that known peer relationship. PMK alone is probably not enough for passive decode; the LMK is the traffic key.
+
+Recommended staged implementation:
+1. **Passive Detect:** promiscuous/channel-hop identification and metadata only.
+2. **Known-Key Profiles:** store peer MAC, LMK, optional PMK, label, expected protocol magic.
+3. **Native ESP-NOW Receive/Decode:** when CYM is on the right channel and registered as a peer, let ESP-IDF decrypt frames addressed to CYM or broadcast/plaintext frames.
+4. **Advanced Passive Decrypt:** later, parse raw 802.11/CCMP fields and attempt passive decrypt with known LMK. This is more complex because firmware must handle frame parsing, nonce/AAD/MIC, replay counters, and failure reporting itself.
+
+### Radio architecture caveat
+
+The ESP32-C5 has one shared WiFi radio. If CYM is connected to an AP, the radio is effectively pinned to that AP channel. For real cross-channel ESP-NOW discovery, use a dedicated listener mode that suspends/disconnects normal WiFi features while hopping channels. If WiFi stays connected, only expect to observe ESP-NOW on the current AP channel.
+
+### Safety / scope
+
+Start with passive detection and known-key decode for Jim's own devices. Do not implement injection, replay, or unauthorized traffic manipulation unless Jim explicitly scopes and authorizes that work later.
+
+---
+
+## 13. Development Workflow Summary
 
 ```bash
 # 1. Bump version FIRST
@@ -477,13 +530,13 @@ git checkout Jimgat_Dev
 
 ---
 
-## 13. Secret
+## 14. Secret
 
 There is one undocumented easter egg. Do not mention it in commits, README, release notes, or any user-facing text. It is intentionally hidden. If you encounter `vibrator_pulse(55)` on a beat in a disco or party animation context — that is it. Leave it alone and keep it out of all documentation.
 
 ---
 
-## 14. Contact / Attribution
+## 15. Contact / Attribution
 
 **Developer:** Jim Gatwood (jim.gatwood@gmail.com)  
 **Project:** https://github.com/JimGat/CYM-NM28C5  
