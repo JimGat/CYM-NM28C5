@@ -133,6 +133,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **GPS** | NMEA RMC auto-syncs system clock (FAT timestamps); last-known position persisted to NVS (5-minute throttle); manual fallback editor in Settings → GPS Info; all data-collection features (wardrive, GATT Walker, marks) use best available GPS transparently |
 | **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk, Bluetooth Lookout, BLE Spam (8 modes incl. Sour Apple), Device Spoof (general + directed), BLE Disconnect (directed), BLE PCAP (Kismet PCAPNG raw capture; BLE 5.0 extended advertisement support), **BlueDuck** (BLE HID DuckyScript keyboard injector), **HoneyPair** (BLE persona honeypot), **WhisperPair** (CVE-2025-36911 Google Fast Pair KBP bypass — auto-scan, sequential run-all FP targets, AES-128-ECB exploit); BT Scan & Select supports **Save List** (GPS-tagged JSON snapshot of every device found); **Matter [M] detection** passive tagging of Thread/BLE Matter devices by GATT service `0xFFF6` |
 | **Zigbee Scout** | IEEE 802.15.4 passive wardrive using the ESP32-C5's built-in PHY; logs PAN IDs, channel, RSSI, device addresses, and NWK/APS frame metadata to WiGLE-compatible CSV + PCAP; RSSI locator locks onto a specific PAN; logs to `/sdcard/lab/zigbee/` |
+| **ESP-NOW Scout** | Passive ESP-NOW device discovery and packet analysis. Hops channels 1–13 (200 ms/ch) sniffing vendor-specific 802.11 Action frames (OUI `18:FE:34`, type `0x04`). Tracks up to 32 unique senders with src/dst MAC, channel, RSSI, packet count, first/last seen timestamp, and broadcast vs. unicast (encrypted) status. **Tap any discovered device** to lock the radio to its channel and open a session sub-screen. Session modes: *This Dev Pkt Log* (filtered to selected src MAC) and *All Ch Pkt Log* (every ESP-NOW frame on that channel). Packet log shows last 20 frames in a terminal-style dark view — hex dump, timestamp, RSSI, and ASCII interpretation for broadcast (plaintext) frames. Encrypted unicast frames show an AES-128-ECB probe result if an LMK is loaded from `profiles.json`. Export full 200-frame ring buffer to timestamped `.txt` on SD. Known-device labels and LMK keys loaded from `/sdcard/lab/espnow/profiles.json`. Discovery device table exported to timestamped JSON. Logs to `/sdcard/lab/espnow/`. |
 | **BlueDuck** | BLE HID keyboard injector — pairs as any of 9 device personas; executes DuckyScript payloads from SD card (preloaded into PSRAM at boot, immune to SD DMA OOM during BLE); HUMAN_MODE variable-speed typing; Android (Win+H/B/N), Windows (Win+R/L, Ctrl+Shift+Esc), and iOS (Cmd+H/Space) keyboard shortcut support; session JSONL log to SD card; 13-script library included |
 | **HoneyPair** | Continuous BLE persona honeypot — cycles 9 consumer device personas every 5 min, logs all pairing attempts to JSONL; GATT/HID enumeration on any pairing device; persona MACs randomised and deduplicated |
 | **Deauth Monitor** | Passive detection of nearby deauth attacks |
@@ -165,7 +166,11 @@ Home
 │   ├── WiFi Observer (Sniffer / Karma)
 │   ├── Drone Detect
 │   ├── Chanalizer
-│   └── WiFi Scope
+│   ├── WiFi Scope
+│   └── ESP-NOW Scout
+│       └── (tap device) → Session
+│           ├── This Dev Pkt Log
+│           └── All Ch Pkt Log
 ├── Bluetooth
 │   ├── BT Scan & Select
 │   ├── BT Observer
@@ -642,6 +647,48 @@ Passive network intelligence and rogue AP capabilities.
 | 5 GHz | 25 channels (36–165) | ~1.5 s |
 
 The spectrum bar chart (top) shows current peak RSSI per channel as a heat-color bar. The waterfall (bottom) scrolls down one row per completed sweep, building a time history of band activity. Tap **Band: 2.4GHz / Band: 5 GHz** to toggle — the axis label, peak arrays, and waterfall all reset cleanly on each switch.
+
+#### ESP-NOW Scout
+
+**Passive ESP-NOW device discovery and packet capture** using the WiFi promiscuous radio. ESP-NOW is Espressif's low-latency peer-to-peer 802.11 protocol used in smart home devices, RC controllers, sensor meshes, and custom embedded projects. CYM identifies ESP-NOW frames by their exact 5-field fingerprint — `FC=0xD0` (Action), `Category=0x7F` (Vendor Specific), `OUI=18:FE:34` (Espressif), `Type=0x04` — with no false positives from other 802.11 traffic.
+
+**Discovery phase** — hops channels 1–13 at 200 ms/channel. Each unique sender appears as a card showing:
+
+- Source MAC, destination MAC, channel, RSSI, packet count
+- First / last seen timestamps
+- **Orange border** = unicast (peer-to-peer, likely encrypted) — **Cyan border** = broadcast (plaintext)
+- Device label in cyan if matched from `profiles.json`
+
+**Session phase** — tap any device card to lock the radio to that channel and open the session sub-screen. The session shows the device's full info, LMK status, and two action tiles:
+
+| Tile | Description |
+|------|-------------|
+| **This Dev Pkt Log** | Captures only frames from the selected source MAC |
+| **All Ch Pkt Log** | Captures all ESP-NOW frames on the locked channel |
+
+**Packet log screen** — terminal-style dark view showing the last 20 captured frames, scrolled to newest. Each frame shows:
+
+- Timestamp (seconds since boot), RSSI, channel, `[PLAIN]` / `[ENC]` badge
+- Full source → destination MACs
+- Hex dump (first 14 bytes inline, byte count if more)
+- **Broadcast frames:** green ASCII interpretation — the raw application payload is immediately readable in plaintext
+- **Unicast + LMK loaded:** AES-128-ECB probe — if the decrypted block contains recognisable ASCII, reports `DEC✓` + hex; otherwise `DEC✗` with a note
+- **Unicast, no LMK:** prompt to add key to `profiles.json`
+
+Buttons: **Export TXT** saves the full 200-frame ring buffer to `/sdcard/lab/espnow/pktlog_YYYYMMDD_HHMMSS.txt` (hex + ASCII per frame). **Clear** resets the ring buffer.
+
+**Known-device profiles** — place a JSON file at `/sdcard/lab/espnow/profiles.json`:
+
+```json
+[
+  { "mac": "AA:BB:CC:DD:EE:FF", "label": "Hat Controller", "lmk": "0102030405060708090a0b0c0d0e0f10" },
+  { "mac": "11:22:33:44:55:66", "label": "Hat Hat-1" }
+]
+```
+
+`lmk` is optional (32 hex chars = 16 bytes). Devices without an LMK entry are still discovered and logged; the decrypt probe is skipped.
+
+All output logs to `/sdcard/lab/espnow/`.
 
 ### 2. Bluetooth
 
