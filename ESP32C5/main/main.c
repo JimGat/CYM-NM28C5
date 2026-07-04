@@ -900,6 +900,18 @@ static lv_obj_t *targeted_deauth_status_label = NULL;
 static lv_timer_t *targeted_deauth_timer = NULL;
 static uint32_t targeted_deauth_count = 0;
 
+// Deauth Client — passive client discovery before targeted deauth
+#define DC_MAX_CLIENTS 24
+typedef struct { uint8_t mac[6]; int8_t rssi; } dc_client_t;
+static dc_client_t s_dc_clients[DC_MAX_CLIENTS];
+static int s_dc_client_count = 0;
+static volatile bool s_dc_scanning = false;
+static uint8_t s_dc_ap_bssid[6];
+static int s_dc_seconds_left = 0;
+static lv_obj_t *s_dc_status_lbl = NULL;
+static lv_obj_t *s_dc_list_cont = NULL;
+static lv_timer_t *s_dc_timer = NULL;
+
 static lv_obj_t *evil_twin_network_dd = NULL;
 static lv_obj_t *evil_twin_html_dd = NULL;
 static lv_obj_t *evil_twin_start_btn = NULL;
@@ -2542,8 +2554,14 @@ static void sniffer_refresh_ap_list(void);
 static void sniffer_client_click_cb(lv_event_t *e);
 static bool wifi_is_matter_oui(const uint8_t *bssid);
 static void show_targeted_deauth_screen(void);
+static void targeted_deauth_screen_stop(void);
 static void targeted_deauth_timer_cb(lv_timer_t *timer);
 static void targeted_deauth_stop_cb(lv_event_t *e);
+static void deauth_client_promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type);
+static void deauth_client_tap_cb(lv_event_t *e);
+static void deauth_client_timer_cb(lv_timer_t *timer);
+static void deauth_client_scan_stop(void);
+static void show_deauth_client_scan_screen(void);
 static void sniffer_refresh_observe_view(void);
 static void sniffer_new_client_notify(void);
 static void sae_overflow_yes_btn_cb(lv_event_t *e);
@@ -8643,9 +8661,20 @@ static void targeted_deauth_stop_cb(lv_event_t *e) {
     }
 }
 
+// Stop hook — fires on Back/Home navigation while targeted deauth is running
+static void targeted_deauth_screen_stop(void) {
+    targeted_deauth_active = false;
+    if (targeted_deauth_timer) {
+        lv_timer_del(targeted_deauth_timer);
+        targeted_deauth_timer = NULL;
+    }
+    targeted_deauth_status_label = NULL;
+}
+
 // Show targeted deauth screen
 static void show_targeted_deauth_screen(void) {
     create_function_page_base("Deauth Station");
+    g_screen_stop_fn = targeted_deauth_screen_stop;
     
     // Content area
     lv_obj_t *content = lv_obj_create(function_page);
@@ -14145,6 +14174,63 @@ static void attack_tile_event_cb(lv_event_t *e)
             }
             show_wifi_connect_screen();
         }
+    } else if (strcmp(attack_name, "Deauth Client") == 0) {
+        // Requires exactly one selected network — passive-sniff clients then target one
+        int selected_indices[SCAN_RESULTS_MAX_DISPLAY];
+        int selected_count = wifi_scanner_get_selected(selected_indices, SCAN_RESULTS_MAX_DISPLAY);
+
+        if (selected_count != 1) {
+            lv_obj_t *overlay = lv_obj_create(lv_scr_act());
+            lv_obj_set_size(overlay, LCD_H_RES, LCD_V_RES);
+            lv_obj_set_pos(overlay, 0, 0);
+            lv_obj_set_style_bg_color(overlay, ui_bg_color(), 0);
+            lv_obj_set_style_bg_opa(overlay, LV_OPA_70, 0);
+            lv_obj_set_style_border_width(overlay, 0, 0);
+            lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
+
+            lv_obj_t *dialog = lv_obj_create(overlay);
+            lv_obj_set_size(dialog, 280, 120);
+            lv_obj_center(dialog);
+            lv_obj_set_style_bg_color(dialog, ui_panel_color(), 0);
+            lv_obj_set_style_border_color(dialog, COLOR_MATERIAL_ORANGE, 0);
+            lv_obj_set_style_border_width(dialog, 2, 0);
+            lv_obj_set_style_radius(dialog, 10, 0);
+            lv_obj_clear_flag(dialog, LV_OBJ_FLAG_SCROLLABLE);
+
+            lv_obj_t *msg = lv_label_create(dialog);
+            lv_label_set_text(msg, "Select only one network");
+            lv_obj_set_style_text_color(msg, ui_text_color(), 0);
+            lv_obj_set_style_text_font(msg, &lv_font_montserrat_16, 0);
+            lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_align(msg, LV_ALIGN_TOP_MID, 0, 15);
+
+            lv_obj_t *ok_btn = lv_btn_create(dialog);
+            lv_obj_set_size(ok_btn, 80, 30);
+            lv_obj_align(ok_btn, LV_ALIGN_BOTTOM_MID, 0, -5);
+            lv_obj_set_style_bg_color(ok_btn, COLOR_MATERIAL_ORANGE, LV_STATE_DEFAULT);
+            lv_obj_set_style_border_width(ok_btn, 0, 0);
+            lv_obj_set_style_radius(ok_btn, 8, 0);
+            lv_obj_t *ok_lbl = lv_label_create(ok_btn);
+            lv_label_set_text(ok_lbl, "OK");
+            lv_obj_set_style_text_color(ok_lbl, ui_text_color(), 0);
+            lv_obj_center(ok_lbl);
+            lv_obj_add_event_cb(ok_btn, close_popup_overlay_cb, LV_EVENT_CLICKED, NULL);
+        } else {
+            // Populate targeted_deauth AP globals from scan results
+            const wifi_ap_record_t *records = wifi_scanner_get_results_ptr();
+            const uint16_t *count_ptr = wifi_scanner_get_count_ptr();
+            int ap_idx = selected_indices[0];
+            if (records && count_ptr && ap_idx < (int)*count_ptr) {
+                const wifi_ap_record_t *ap = &records[ap_idx];
+                memcpy(targeted_deauth_ap_bssid, ap->bssid, 6);
+                strncpy(targeted_deauth_ssid, (const char *)ap->ssid, sizeof(targeted_deauth_ssid) - 1);
+                targeted_deauth_ssid[sizeof(targeted_deauth_ssid) - 1] = '\0';
+                targeted_deauth_channel = (uint8_t)ap->primary;
+                targeted_deauth_ap_index = -1;  // Not returning to Network Observer
+                show_deauth_client_scan_screen();
+            }
+        }
     }
 }
 
@@ -16991,6 +17077,213 @@ static void show_wpa_sec_upload_page(void)
     }
 }
 
+// ─── Deauth Client — passive client discovery + targeted deauth ──────────────
+
+// Promiscuous callback: collect unique client MACs on the target AP's channel
+static void deauth_client_promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+    if (!s_dc_scanning) return;
+    if (type != WIFI_PKT_DATA && type != WIFI_PKT_MGMT) return;
+
+    const wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *frame = pkt->payload;
+    if (pkt->rx_ctrl.sig_len < 24) return;
+
+    uint8_t fc0 = frame[0];
+    uint8_t fc1 = frame[1];
+    uint8_t frame_type = fc0 & 0xFC;
+    bool to_ds   = (fc1 & 0x01) != 0;
+    bool from_ds = (fc1 & 0x02) != 0;
+    const uint8_t *addr1 = &frame[4];
+    const uint8_t *addr2 = &frame[10];
+
+    const uint8_t *ap_mac  = NULL;
+    const uint8_t *sta_mac = NULL;
+
+    if (type == WIFI_PKT_DATA) {
+        if (to_ds && !from_ds) {
+            ap_mac = addr1; sta_mac = addr2;          // STA→AP
+        } else if (!to_ds && from_ds) {
+            ap_mac = addr2; sta_mac = addr1;          // AP→STA
+        } else {
+            return;
+        }
+    } else {
+        // Management frames: association/auth tell us the STA
+        switch (frame_type) {
+            case 0x00: case 0x20: case 0xB0:          // AssocReq / ReassocReq / Auth
+                ap_mac = addr1; sta_mac = addr2; break;
+            case 0x10: case 0x30:                     // AssocResp / ReassocResp
+                ap_mac = addr2; sta_mac = addr1; break;
+            default: return;
+        }
+    }
+
+    if (!ap_mac || !sta_mac) return;
+    if (memcmp(ap_mac, s_dc_ap_bssid, 6) != 0) return;  // Wrong AP
+    if (is_broadcast_bssid(sta_mac) || is_multicast_mac(sta_mac) || is_own_device_mac(sta_mac)) return;
+
+    // Deduplicate — update RSSI if already seen
+    for (int i = 0; i < s_dc_client_count; i++) {
+        if (memcmp(s_dc_clients[i].mac, sta_mac, 6) == 0) {
+            s_dc_clients[i].rssi = pkt->rx_ctrl.rssi;
+            return;
+        }
+    }
+    if (s_dc_client_count >= DC_MAX_CLIENTS) return;
+    memcpy(s_dc_clients[s_dc_client_count].mac, sta_mac, 6);
+    s_dc_clients[s_dc_client_count].rssi = pkt->rx_ctrl.rssi;
+    s_dc_client_count++;
+}
+
+// Tap on a discovered client row — launch targeted deauth
+static void deauth_client_tap_cb(lv_event_t *e) {
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_dc_client_count) return;
+    // AP globals already set; fill in the station MAC
+    memcpy(targeted_deauth_station_mac, s_dc_clients[idx].mac, 6);
+    targeted_deauth_ap_index = -1;  // Return to menu on stop, not to sniffer view
+    show_targeted_deauth_screen();
+}
+
+// Stop hook — fires on Back/Home while the scan screen is open
+static void deauth_client_scan_stop(void) {
+    s_dc_scanning = false;
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(NULL);
+    if (s_dc_timer) {
+        lv_timer_del(s_dc_timer);
+        s_dc_timer = NULL;
+    }
+    s_dc_status_lbl = NULL;
+    s_dc_list_cont  = NULL;
+}
+
+// 1-second countdown timer: update status and populate list when done
+static void deauth_client_timer_cb(lv_timer_t *timer) {
+    (void)timer;
+    if (s_dc_seconds_left > 0) s_dc_seconds_left--;
+
+    if (s_dc_seconds_left > 0) {
+        if (s_dc_status_lbl) {
+            char buf[56];
+            snprintf(buf, sizeof(buf), "Scanning... %ds | %d found", s_dc_seconds_left, s_dc_client_count);
+            lv_label_set_text(s_dc_status_lbl, buf);
+        }
+        return;
+    }
+
+    // Scan complete — stop promiscuous and render results
+    s_dc_scanning = false;
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(NULL);
+
+    lv_timer_del(s_dc_timer);
+    s_dc_timer = NULL;
+
+    if (s_dc_status_lbl) {
+        char buf[64];
+        if (s_dc_client_count > 0) {
+            snprintf(buf, sizeof(buf), "%d client(s) found — tap to target", s_dc_client_count);
+            lv_obj_set_style_text_color(s_dc_status_lbl, lv_color_make(0, 200, 0), 0);
+        } else {
+            snprintf(buf, sizeof(buf), "No clients detected — press \342\200\271 Back");
+            lv_obj_set_style_text_color(s_dc_status_lbl, COLOR_MATERIAL_ORANGE, 0);
+        }
+        lv_label_set_text(s_dc_status_lbl, buf);
+    }
+
+    if (!s_dc_list_cont) return;
+    lv_obj_clean(s_dc_list_cont);
+
+    if (s_dc_client_count == 0) {
+        lv_obj_t *none_lbl = lv_label_create(s_dc_list_cont);
+        lv_label_set_text(none_lbl, "No clients — move closer or wait for traffic");
+        lv_obj_set_style_text_color(none_lbl, lv_color_make(130, 130, 130), 0);
+        lv_obj_set_style_text_font(none_lbl, &lv_font_montserrat_12, 0);
+        return;
+    }
+
+    for (int i = 0; i < s_dc_client_count; i++) {
+        lv_obj_t *row = lv_btn_create(s_dc_list_cont);
+        lv_obj_set_size(row, lv_pct(100), 34);
+        lv_obj_set_style_bg_color(row, ui_panel_color(), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(row, lv_color_make(80, 0, 0), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_radius(row, 6, 0);
+        lv_obj_set_style_pad_all(row, 4, 0);
+        lv_obj_add_event_cb(row, deauth_client_tap_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+        lv_obj_t *mac_lbl = lv_label_create(row);
+        char mac_str[48];
+        snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X  [%d dBm]",
+                 s_dc_clients[i].mac[0], s_dc_clients[i].mac[1], s_dc_clients[i].mac[2],
+                 s_dc_clients[i].mac[3], s_dc_clients[i].mac[4], s_dc_clients[i].mac[5],
+                 (int)s_dc_clients[i].rssi);
+        lv_label_set_text(mac_lbl, mac_str);
+        lv_obj_set_style_text_color(mac_lbl, lv_color_make(255, 140, 0), 0);
+        lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_align(mac_lbl, LV_ALIGN_LEFT_MID, 4, 0);
+    }
+}
+
+// Passive client discovery screen: lock to AP channel, sniff 5 s, show client list
+static void show_deauth_client_scan_screen(void) {
+    create_function_page_base("Deauth Client");
+    g_screen_stop_fn = deauth_client_scan_stop;
+
+    // AP header: SSID + channel
+    lv_obj_t *ap_lbl = lv_label_create(function_page);
+    char ap_text[80];
+    snprintf(ap_text, sizeof(ap_text), "AP: %s  CH%d",
+             targeted_deauth_ssid[0] ? targeted_deauth_ssid : "[Hidden]",
+             (int)targeted_deauth_channel);
+    lv_label_set_text(ap_lbl, ap_text);
+    lv_obj_set_style_text_color(ap_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(ap_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_align(ap_lbl, LV_ALIGN_TOP_LEFT, 10, 36);
+
+    // Live status: countdown and found count
+    s_dc_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_dc_status_lbl, "Scanning... 5s | 0 found");
+    lv_obj_set_style_text_color(s_dc_status_lbl, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_text_font(s_dc_status_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_align(s_dc_status_lbl, LV_ALIGN_TOP_LEFT, 10, 56);
+
+    // Scrollable client list (fills remainder of screen)
+    s_dc_list_cont = lv_obj_create(function_page);
+    lv_obj_set_size(s_dc_list_cont, lv_pct(100), LCD_V_RES - 82);
+    lv_obj_align(s_dc_list_cont, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(s_dc_list_cont, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(s_dc_list_cont, 0, 0);
+    lv_obj_set_style_pad_all(s_dc_list_cont, 6, 0);
+    lv_obj_set_flex_flow(s_dc_list_cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_gap(s_dc_list_cont, 4, 0);
+    lv_obj_add_flag(s_dc_list_cont, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *ph = lv_label_create(s_dc_list_cont);
+    lv_label_set_text(ph, "Listening for client traffic...");
+    lv_obj_set_style_text_color(ph, lv_color_make(100, 100, 100), 0);
+    lv_obj_set_style_text_font(ph, &lv_font_montserrat_12, 0);
+
+    // Initialise scan state and enable promiscuous on AP channel
+    s_dc_client_count = 0;
+    s_dc_scanning     = true;
+    s_dc_seconds_left = 5;
+    memcpy(s_dc_ap_bssid, targeted_deauth_ap_bssid, 6);
+
+    esp_wifi_set_channel(targeted_deauth_channel, WIFI_SECOND_CHAN_NONE);
+    wifi_promiscuous_filter_t filt = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_DATA | WIFI_PROMIS_FILTER_MASK_MGMT
+    };
+    esp_wifi_set_promiscuous_filter(&filt);
+    esp_wifi_set_promiscuous_rx_cb(deauth_client_promisc_cb);
+    esp_wifi_set_promiscuous(true);
+
+    s_dc_timer = lv_timer_create(deauth_client_timer_cb, 1000, NULL);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 // Attack tiles screen - shown after selecting networks
 static void show_attack_tiles_screen(void)
 {
@@ -17008,11 +17301,12 @@ static void show_attack_tiles_screen(void)
     lv_obj_set_flex_align(attack_tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(attack_tiles, LV_OBJ_FLAG_SCROLLABLE);
     
-    // Row 1: Deauth, Evil Twin, SAE, Handshake
+    // Row 1: Deauth, Evil Twin, SAE, Handshake, Deauth Client
     create_small_tile(attack_tiles, LV_SYMBOL_CHARGE, "Deauth", COLOR_MATERIAL_RED, attack_tile_event_cb, "Deauth");
     create_small_tile(attack_tiles, LV_SYMBOL_WARNING, "Evil Twin", COLOR_MATERIAL_ORANGE, attack_tile_event_cb, "Evil Twin");
     create_small_tile(attack_tiles, LV_SYMBOL_POWER, "SAE", COLOR_MATERIAL_PINK, attack_tile_event_cb, "SAE Overflow");
     create_small_tile(attack_tiles, LV_SYMBOL_DOWNLOAD, "Handshake", COLOR_MATERIAL_AMBER, attack_tile_event_cb, "Handshaker");
+    create_small_tile(attack_tiles, LV_SYMBOL_LIST, "Deauth Client", lv_color_make(183, 28, 28), attack_tile_event_cb, "Deauth Client");
     // Row 2: ARP Poison, MITM, Rogue AP, WPA-SEC Upload, Observer
     create_small_tile(attack_tiles, LV_SYMBOL_SHUFFLE, "ARP Poison", COLOR_MATERIAL_TEAL, attack_tile_event_cb, "ARP Poison");
     create_small_tile(attack_tiles, LV_SYMBOL_LOOP, "MITM", lv_color_make(121, 85, 72), attack_tile_event_cb, "MITM");
