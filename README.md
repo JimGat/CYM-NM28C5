@@ -33,13 +33,23 @@
 
 ---
 
-## Introduction
+## Cheap Yellow Monster — CYM-NM28C5
 
-**Cheap Yellow Monster** is a portable, touchscreen-driven WiFi security toolkit running on the **NM-CYD-C5 ESP32-C5-WIFI6-KIT**. Originally inspired by Pancake, it combines a rich set of offensive and defensive WiFi tools with BLE scanning, GPS wardriving, and a beautiful Material-style dark UI — all packed into a handheld form factor with a 2.8" resistive touch display.
+**Cheap Yellow Monster** is a portable, touchscreen-driven ESP32-C5 wireless security, BLE, GPS wardriving, and RF experimentation toolkit built specifically for the **NM-CYD-C5 / MonsterC5-style ESP32-C5-WIFI6-KIT** hardware family.
 
-Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, the firmware leverages the ESP32-C5's RISC-V core and WiFi 6 capabilities for modern wireless security research and education.
+CYM brings together many of the workflows people normally jump between separate ESP32 firmwares to get: WiFi scanning, WiFi analysis, deauth monitoring, Evil Portal-style testing, handshake capture, BLE scanning, BLE capture workflows, GPS wardriving, RF expansion support, and touchscreen-driven field use. It is designed to be a compact handheld platform for wireless research, education, defensive testing, and hardware hacking.
 
-> **Note:** While Pancake provided the original inspiration, this project has diverged substantially in target hardware (ESP32-C5 / NM-CYD-C5), build system (ESP-IDF vs Arduino), UI framework (LVGL 8), feature set, and architecture. It is a standalone project, not a fork.
+Where CYM really separates itself is in the field workflow. It includes GPS-aware wardriving with stability handling for GPS loss, including last-known-position behavior so brief GPS dropouts do not destroy a capture session. It also includes BLE capture-list management so you can compare sessions, identify devices that are unique to a location, and find devices that are common across multiple captures.
+
+CYM also includes a **GATT Walker** for deeper BLE analysis. Instead of only listing nearby BLE devices, the GATT Walker performs extended discovery of BLE GATT services, characteristics, descriptors, and exposed features, then logs the results to SD card in structured JSON. This makes the data useful for deeper offline analytics, fingerprinting, comparison between devices, and long-term BLE research.
+
+Built entirely on **ESP-IDF 6.0** with **LVGL 8.x** for the UI, CYM leverages the ESP32-C5's RISC-V core, WiFi 6 support, BLE capabilities, and modern embedded architecture. The interface uses a Material-style dark UI designed for practical handheld use on the 2.8" resistive touch display.
+
+CYM also supports the **NM-RF-HAT** ecosystem, including NFC/RFID, CC1101 Sub-GHz experiments, nRF24, RF433, and infrared features where supported by the hardware. CC1101 workflows include frequency correction support, allowing PPM adjustment based on observed frequency shift to help compensate for module crystal tolerance and improve Sub-GHz accuracy in the field.
+
+The project was originally inspired by **Pancake**, but has diverged substantially in target hardware, build system, UI framework, feature set, and architecture. CYM targets the ESP32-C5 / NM-CYD-C5 hardware family, uses ESP-IDF instead of Arduino, uses LVGL 8 for the UI, and has grown into a standalone firmware platform rather than a fork.
+
+CYM also comes from the broader **MonsterC5 / JanOS** ecosystem. It was branched with Janek / JanOS, and the **Cheap Yellow Monster** name was approved by **OyczE**, the designer of the MonsterC5. I beta test for the LAB5 Team and have great respect for everyone involved. CYM is my contribution back to that community.
 
 The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/nm-cyd-c5/). Additional purchase sources and full hardware documentation are available on the [official board repository](https://github.com/RockBase-iot/NM-CYD-C5).
 
@@ -2219,6 +2229,7 @@ The nRF24 always prepends a 1-byte preamble before the address field. The preamb
 | **LVGL Material Dark Theme** | Modern, touch-friendly dark UI |
 | **Portrait 240×320 Layout** | All screens designed and reflowed for the NM-CYD-C5's 240×320 portrait display |
 | **5-Tile Main Menu** | WiFi, Bluetooth, Wardrive, Settings, Go Dark — WiFi expands to sub-menu |
+| **Unified Navigation** | Single top-bar `‹ Back` on every screen steps up one menu level and fully stops the current feature (WiFi radio, BLE, RF task, RFID poll). Both Back and Home cleanly stop all running services before rebuilding the parent screen — no more orphaned background tasks or crashes when navigating away mid-capture |
 | **Screenshot Capture** | Tap the **title bar** on any screen to save a BMP to `/sdcard/screenshots/` — works on every screen including all menus, feature pages, and live data views |
 | **WPA-SEC Upload** | Upload captured handshakes to wpa-sec.stanev.org via HTTPS |
 | **NeoPixel Status LED** | Mode-based color indicator via WS2812 LED (GPIO 27) |

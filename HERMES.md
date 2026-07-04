@@ -2,7 +2,7 @@
 
 **Purpose of this file:** Complete context document for AI agents (Claude, ChatGPT, Hermes, or any LLM) working on this project. Read this before touching any code. It covers every major decision made, the reasoning behind it, known hazards, and how everything fits together.
 
-**Last updated:** 2026-06-02, v2.6.46
+**Last updated:** 2026-07-04, v2.10.25
 
 ---
 
@@ -186,6 +186,8 @@ Components in `ESP32C5/components/`:
 
 **CRITICAL invariant — always assign `s_X = ctx` AFTER `create_function_page_base()` returns, never before.** Pre-assignment causes immediate free of the new context → NULL deref crash (manifests as Store access fault with MTVAL = offset of first field, e.g. 0x3c = offset of `canvas`). This bit us in v1.8.95 across 4 screens. Fixed in v1.8.96.
 
+**Navigation model (v2.10.23+ — @birolt29):** A runtime navigation stack drives a single top-bar `‹ Back` button on every screen. Pressing Back steps up one menu level; pressing Home goes to the main tiles. Both paths fire the registered `g_screen_stop_fn` stop hook BEFORE rebuilding the parent screen. `rfhat_add_back_btn()` is now a no-op stub. Every new screen that starts an LVGL timer, a task, or an `lv_async_call` source MUST register a stop hook via `g_screen_stop_fn = my_stop_fn;` immediately after `create_function_page_base()`. Omitting this causes use-after-free crashes on Back/Home while a capture or scan is active. See `.claude/rules/cym-screen-stop-hooks.md` for the full pattern and list of retrofitted screens.
+
 **Brightness:** Software black overlay (`brightness_overlay`) on `lv_layer_top()` — not PWM. Backlight GPIO 25 is driven HIGH at boot and left on.
 
 **Touch calibration:** 4-corner sequence, stores to NVS namespace `touch_cal`, magic `0xCA15`. Triggered on first boot, from `calibrate.txt` on SD, or Settings → Screen → Recalibrate Touch.
@@ -295,6 +297,29 @@ GPIO 26 → SC8002B class-D amp → 1N5819 Schottky (series rectifier) → motor
 ### LVGL Label Strings
 
 **Never use Unicode characters** in LVGL label strings. The Montserrat bitmap fonts cover only basic Latin. Em dashes, curly quotes, ellipsis etc. render as solid block glyphs. Use plain ASCII substitutes. Only `LV_SYMBOL_*` macros are safe (they use the private-use area of the icon font).
+
+### Screen Stop Hooks (v2.10.23+)
+
+**Every screen that starts a timer, task, or async callback MUST register a stop hook.**
+
+```c
+static void my_screen_stop(void)
+{
+    if (s_my_tmr) { lv_timer_del(s_my_tmr); s_my_tmr = NULL; }
+    my_task_cancel();
+    s_my_status_lbl = NULL;   // NULL every lv_obj_t* reachable by async callbacks
+}
+
+static void show_my_screen(void)
+{
+    create_function_page_base("My Screen");
+    g_screen_stop_fn = my_screen_stop;   // MANDATORY — immediately after create_function_page_base
+    apply_menu_bg();
+    // ... build UI ...
+}
+```
+
+`rfhat_add_back_btn()` is now a no-op stub (v2.10.23+). All lv_async_call callbacks must NULL-guard every LVGL pointer. The stop fn must not navigate — the nav stack does that. All existing screens retrofitted in v2.10.24–v2.10.25.
 
 ### RF Hat Task Priorities
 
