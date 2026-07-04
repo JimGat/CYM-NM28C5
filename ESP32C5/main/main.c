@@ -42904,6 +42904,19 @@ static void s_ncs_startstop_cb(lv_event_t *e)
     }
 }
 
+// Stop hook for nRF24 Channel Scan screen — same timer-dangling risk as CC1101 Capture.
+static void nrf24_chscan_screen_stop(void)
+{
+    if (!s_ncs) return;
+    s_ncs->active = false;
+    s_ncs->cancel = true;
+    if (s_ncs->tmr) { lv_timer_del(s_ncs->tmr); s_ncs->tmr = NULL; }
+    s_ncs->canvas     = NULL;
+    s_ncs->status_lbl = NULL;
+    s_ncs->start_btn  = NULL;
+    // ctx and canv_buf freed by reset_function_page_children once the task exits.
+}
+
 static void show_nrf24_ch_scan_screen(void)
 {
     ESP_LOGI("NCS", "enter: s_ncs=%p nrf24_is_init=%d", s_ncs, (int)nrf24_is_init());
@@ -42936,6 +42949,7 @@ static void show_nrf24_ch_scan_screen(void)
 
     create_function_page_base("nRF24 Ch Scan");
     s_ncs = ctx; // assign AFTER reset_function_page_children has run inside create_function_page_base
+    g_screen_stop_fn = nrf24_chscan_screen_stop;
     apply_menu_bg();
 
     ctx->canvas = lv_canvas_create(function_page);
@@ -44907,6 +44921,25 @@ static void s_rfid_export_nfc_cb(lv_event_t *e)
     }
 }
 
+// Stop hook: cancel poll, delete both timers, NULL all scan-screen LVGL
+// pointers before LVGL tears the screen down. Equivalent to rfid_back_to_menu()
+// without the navigation call — fired on BOTH top-bar Back AND Home.
+static void rfid_scan_screen_stop(void)
+{
+    rfid_manager_stop_poll();
+    rfid_manager_stop_emulate();
+    if (s_rfid_init_retry_tmr) { lv_timer_del(s_rfid_init_retry_tmr); s_rfid_init_retry_tmr = NULL; }
+    if (s_rfid_autoread_tmr)   { lv_timer_del(s_rfid_autoread_tmr);   s_rfid_autoread_tmr   = NULL; }
+    s_rfid_scan_uid_lbl    = NULL;
+    s_rfid_scan_type_lbl   = NULL;
+    s_rfid_scan_atqa_lbl   = NULL;
+    s_rfid_scan_status_lbl = NULL;
+    s_rfid_scan_ndef_lbl   = NULL;
+    s_rfid_scan_panel      = NULL;
+    s_rfid_scan_save_btn   = NULL;
+    s_rfid_scan_read_btn   = NULL;
+}
+
 static void show_rfid_scan_screen(void)
 {
     rfid_manager_stop_poll();
@@ -44921,6 +44954,7 @@ static void show_rfid_scan_screen(void)
     s_rfid_has_card        = false;
 
     create_function_page_base("Scan & Read Card");
+    g_screen_stop_fn = rfid_scan_screen_stop;
     apply_menu_bg();
 
     // Card info panel — taller to accommodate NDEF URL label
@@ -45363,6 +45397,15 @@ static void s_rfid_kt_scan_and_start_cb(lv_event_t *e)
     xTaskCreate(s_rfid_kt_task, "rfid_kt", 4096, NULL, tskIDLE_PRIORITY + 2, NULL);
 }
 
+// Stop hook: stop poll and NULL key-test LVGL pointers. The task's async
+// callbacks already NULL-guard, so in-flight lv_async_call is safe after this.
+static void rfid_key_test_screen_stop(void)
+{
+    rfid_manager_stop_poll();
+    s_rfid_kt_status = NULL;
+    s_rfid_kt_bar    = NULL;
+}
+
 static void show_rfid_key_test_screen(void)
 {
     // FOR AUTHORIZED SECURITY TESTING ON OWN CARDS ONLY.
@@ -45372,6 +45415,7 @@ static void show_rfid_key_test_screen(void)
     s_rfid_kt_bar    = NULL;
 
     create_function_page_base("MIFARE Key Test");
+    g_screen_stop_fn = rfid_key_test_screen_stop;
     apply_menu_bg();
 
     lv_obj_t *warn = lv_label_create(function_page);
@@ -45509,6 +45553,14 @@ static void s_rfid_clone_select_cb(lv_event_t *e)
     }
 }
 
+// Stop hook: stop poll and NULL clone LVGL pointers on any exit.
+static void rfid_clone_screen_stop(void)
+{
+    rfid_manager_stop_poll();
+    s_rfid_clone_status = NULL;
+    s_rfid_clone_btn    = NULL;
+}
+
 static void show_rfid_clone_screen(void)
 {
     rfid_manager_stop_poll();
@@ -45517,6 +45569,7 @@ static void show_rfid_clone_screen(void)
     s_rfid_clone_btn    = NULL;
 
     create_function_page_base("Clone / Write Card");
+    g_screen_stop_fn = rfid_clone_screen_stop;
     apply_menu_bg();
 
     s_rfid_entry_count = rfid_storage_list(RFID_BAND_HF, s_rfid_entries, RFID_MAX_LIST_DISPLAY);
@@ -45745,6 +45798,16 @@ static void s_rfid_emu_select_cb(lv_event_t *e)
     }
 }
 
+// Stop hook: stop emulation task and NULL emulate LVGL pointers on any exit.
+static void rfid_emulate_screen_stop(void)
+{
+    rfid_manager_stop_poll();
+    rfid_manager_stop_emulate();
+    s_rfid_emu_status_lbl = NULL;
+    s_rfid_emu_btn        = NULL;
+    s_rfid_emu_stop_btn   = NULL;
+}
+
 static void show_rfid_emulate_screen(void)
 {
     rfid_manager_stop_poll();
@@ -45755,6 +45818,7 @@ static void show_rfid_emulate_screen(void)
     s_rfid_emu_stop_btn   = NULL;
 
     create_function_page_base("Card Emulate");
+    g_screen_stop_fn = rfid_emulate_screen_stop;
     apply_menu_bg();
 
     s_rfid_entry_count = rfid_storage_list(RFID_BAND_HF, s_rfid_entries, RFID_MAX_LIST_DISPLAY);
