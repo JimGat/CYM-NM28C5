@@ -112,7 +112,7 @@ jobs:
           cp "ESP32C5/.github/scripts/flash_board.py" "${out_dir}/flash_board.py"
           cp "${out_dir}/bootloader.bin" "${out_dir}/bootloader-esp32c5.bin"
           cp "${out_dir}/partition-table.bin" "${out_dir}/partition-table-esp32c5.bin"
-          cp "$app_src" "${out_dir}/${FW_BASENAME}.bin"
+          # app_src is already ${out_dir}/${FW_BASENAME}.bin — skip self-copy, just make versioned copy
           cp "$app_src" "${out_dir}/${FW_BASENAME}-${version}.bin"
 
           echo "version=${version}" >> "$GITHUB_OUTPUT"
@@ -145,7 +145,6 @@ jobs:
             bootloader-esp32c5.bin \
             partition-table.bin \
             partition-table-esp32c5.bin \
-            CYM-NM28C5.bin \
             "${FW_BASENAME}.bin" \
             "${FW_BASENAME}-${{ steps.prepare.outputs.version }}.bin" \
             "${FW_BASENAME}-full.bin" \
