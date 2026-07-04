@@ -134,3 +134,37 @@ bool gw_probe_start(uint32_t dwell_ms);
 
 /* Free probe task stack after GW_EVENT_PROBE_DONE fires. */
 void gw_probe_free_stack(void);
+
+/* ── Interactive / keep-connected API ───────────────────────────── */
+
+/* Keep the BLE connection alive after gw_walk() completes so the result
+ * screen can perform interactive reads, writes, and subscriptions.
+ * Must be called BEFORE gw_walk(). Default: false (disconnect on complete). */
+void gw_set_keep_connected(bool keep);
+
+/* Return the active NimBLE connection handle, or BLE_HS_CONN_HANDLE_NONE
+ * if no connection is open. */
+uint16_t gw_get_conn_handle(void);
+
+/* Return true if a BLE connection is currently open. */
+bool gw_is_connected(void);
+
+/* Disconnect the current connection (idempotent). */
+void gw_disconnect(void);
+
+/* Initiate bonding / encryption on the current connection.
+ * Asynchronous — fires BLE_GAP_EVENT_ENC_CHANGE on completion.
+ * Returns 0 on success, NimBLE error code on failure. */
+int gw_bond(void);
+
+/* Notification callback type for interactive subscriptions.
+ * Called from the NimBLE task context — NO LVGL calls here.
+ * val_handle: characteristic value handle that fired.
+ * data/len: notification payload. arg: user-supplied pointer. */
+typedef void (*gw_int_notify_cb_t)(uint16_t val_handle,
+                                    const uint8_t *data, uint16_t len,
+                                    void *arg);
+
+/* Register/clear a notification handler for interactive subscriptions.
+ * Set cb=NULL to stop receiving notifications in main.c. */
+void gw_set_int_notify_cb(gw_int_notify_cb_t cb, void *arg);

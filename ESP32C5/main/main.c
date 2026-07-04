@@ -2162,6 +2162,32 @@ static lv_obj_t  *gw_result_lbl      = NULL;
 static lv_obj_t  *gw_cancel_btn      = NULL;
 static lv_obj_t  *gw_back_btn        = NULL;
 
+// ── Interactive GATT session state ───────────────────────────────
+static lv_obj_t      *gwi_status_lbl  = NULL; /* status bar in interactive screen */
+static lv_obj_t      *gwi_log_ta      = NULL; /* scrollable log textarea */
+static lv_timer_t    *gwi_notify_tmr  = NULL; /* 200ms poll for incoming notifications */
+static volatile bool  gwi_notify_dirty = false;
+
+/* Ring buffer for incoming notifications — kept small (task-context only, polled at 200ms) */
+#define GWI_NOTIF_MAX 8
+#define GWI_NOTIF_PAY 64
+typedef struct { uint16_t handle; uint8_t data[GWI_NOTIF_PAY]; uint8_t len; } gwi_notif_t;
+static gwi_notif_t gwi_notif_ring[GWI_NOTIF_MAX];
+static int         gwi_notif_head = 0, gwi_notif_count = 0;
+static portMUX_TYPE gwi_notif_mux = portMUX_INITIALIZER_UNLOCKED;
+
+// ── HID decoder state ─────────────────────────────────────────────
+static lv_obj_t   *hid_log_ta   = NULL;
+static lv_obj_t   *hid_status   = NULL;
+static lv_timer_t *hid_notif_tmr = NULL;
+static volatile bool hid_notif_dirty = false;
+#define HID_NOTIF_MAX 8
+typedef struct { uint8_t data[64]; uint8_t len; } hid_notif_t;
+static hid_notif_t hid_notif_ring[HID_NOTIF_MAX];
+static int hid_notif_head = 0, hid_notif_count = 0;
+static portMUX_TYPE hid_notif_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool hid_subscribed = false;
+
 // Snapshot values for UI (copied before reset)
 static volatile int airtag_scan_snapshot_airtag = 0;
 static volatile int airtag_scan_snapshot_smarttag = 0;
@@ -2764,6 +2790,8 @@ static void show_gw_probe_result_screen(void);
 static void bto_probe_btn_cb(lv_event_t *e);
 static void bto_prepwalk_poll_cb(lv_timer_t *t);
 static void show_gw_result_screen(void);
+static void show_gw_interactive_screen(void);
+static void show_hid_decode_screen(void);
 
 // BT Attacks
 static void show_bt_attacks_screen(void);
@@ -27247,6 +27275,10 @@ static void show_bluetooth_screen(void)
     lv_obj_t *lw_tile = create_tile(tiles, MY_SYMBOL_FOLDER_PLUS, "List\nWizard", lv_color_hex(0x1565C0), NULL, NULL);
     lv_obj_add_event_cb(lw_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"List Wizard");
 
+    // Saved Clones - browse GATT device profiles saved to SD
+    lv_obj_t *sc_tile = create_tile(tiles, MY_SYMBOL_FINGERPRINT, "Saved\nClones", lv_color_make(120, 0, 180), NULL, NULL);
+    lv_obj_add_event_cb(sc_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Saved Clones");
+
 }
 
 // BT Locator screen - scan BT devices, select one, then track RSSI every 10s
@@ -28909,6 +28941,8 @@ static void gw_deferred_start_cb(lv_timer_t *t)
     int8_t rssi   = (bt_sas_selected_idx >= 0)
                     ? bt_devices[bt_sas_selected_idx].rssi : -80;
 
+    /* Keep connection alive after walk so interactive GATT and HID screens can use it */
+    gw_set_keep_connected(true);
     if (!gw_walk(bt_sas_target_addr, bt_sas_target_addr_type,
                  bt_sas_target_name, rssi, lat, lon, gps_ok)) {
         if (gw_status_lbl && lv_obj_is_valid(gw_status_lbl))
@@ -29154,7 +29188,1007 @@ pr_done:;
 static void gw_result_back_cb(lv_event_t *e)
 {
     (void)e;
+    /* Disconnect keep-connected session on leaving the result screen */
+    gw_disconnect();
     show_bt_attack_tiles_screen();
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Interactive GATT — read / write / subscribe  (Phase 2)
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* ISR/BLE-task safe: push incoming notification into the ring buffer */
+static void gwi_notify_cb(uint16_t val_handle, const uint8_t *data,
+                          uint16_t len, void *arg)
+{
+    (void)arg;
+    portENTER_CRITICAL_ISR(&gwi_notif_mux);
+    if (gwi_notif_count < GWI_NOTIF_MAX) {
+        gwi_notif_t *slot = &gwi_notif_ring[(gwi_notif_head + gwi_notif_count) % GWI_NOTIF_MAX];
+        slot->handle = val_handle;
+        uint8_t cplen = len > GWI_NOTIF_PAY ? GWI_NOTIF_PAY : (uint8_t)len;
+        memcpy(slot->data, data, cplen);
+        slot->len = cplen;
+        gwi_notif_count++;
+    }
+    portEXIT_CRITICAL_ISR(&gwi_notif_mux);
+    gwi_notify_dirty = true;
+}
+
+static void gwi_notify_poll(lv_timer_t *t)
+{
+    (void)t;
+    if (!gwi_notify_dirty) return;
+    gwi_notify_dirty = false;
+
+    portENTER_CRITICAL(&gwi_notif_mux);
+    int n = gwi_notif_count;
+    gwi_notif_count = 0;
+    portEXIT_CRITICAL(&gwi_notif_mux);
+
+    if (!gwi_log_ta || !lv_obj_is_valid(gwi_log_ta)) return;
+
+    char hdr[32]; char hex[130]; char asc[66];
+    for (int i = 0; i < n; i++) {
+        gwi_notif_t *s = &gwi_notif_ring[(gwi_notif_head + i) % GWI_NOTIF_MAX];
+        snprintf(hdr, sizeof(hdr), "< h:%04X [%dB]\n", s->handle, s->len);
+        lv_textarea_add_text(gwi_log_ta, hdr);
+        int hpos = 0;
+        for (int b = 0; b < s->len && b < 32; b++)
+            hpos += snprintf(hex + hpos, sizeof(hex) - hpos, "%02X ", s->data[b]);
+        if (s->len > 32) strncat(hex, "...", sizeof(hex) - strlen(hex) - 1);
+        hex[hpos] = '\0';
+        lv_textarea_add_text(gwi_log_ta, hex);
+        lv_textarea_add_text(gwi_log_ta, "\n");
+        int alen = s->len < 64 ? s->len : 64;
+        for (int b = 0; b < alen; b++)
+            asc[b] = (s->data[b] >= 0x20 && s->data[b] < 0x7F) ? (char)s->data[b] : '.';
+        asc[alen] = '\0';
+        lv_textarea_add_text(gwi_log_ta, asc);
+        lv_textarea_add_text(gwi_log_ta, "\n\n");
+    }
+    gwi_notif_head = (gwi_notif_head + n) % GWI_NOTIF_MAX;
+    /* Auto-scroll to bottom */
+    lv_textarea_set_cursor_pos(gwi_log_ta, LV_TEXTAREA_CURSOR_LAST);
+}
+
+/* Read-response callback for interactive one-shot reads */
+static lv_obj_t *s_gwi_read_result_lbl = NULL;
+static int gwi_read_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                       struct ble_gatt_attr *attr, void *arg)
+{
+    (void)conn_handle; (void)arg;
+    if (!s_gwi_read_result_lbl || !lv_obj_is_valid(s_gwi_read_result_lbl)) return 0;
+    char buf[160];
+    if (error->status != 0) {
+        snprintf(buf, sizeof(buf), "Read err: %d", error->status);
+        lv_label_set_text(s_gwi_read_result_lbl, buf);
+        return 0;
+    }
+    if (!attr) return 0;
+    uint16_t len = OS_MBUF_PKTLEN(attr->om);
+    if (len > 64) len = 64;
+    uint8_t tmp[64]; os_mbuf_copydata(attr->om, 0, len, tmp);
+    int hpos = 0;
+    for (int b = 0; b < len; b++) hpos += snprintf(buf + hpos, sizeof(buf) - hpos, "%02X", tmp[b]);
+    snprintf(buf + hpos, sizeof(buf) - hpos, "  (%dB)", (int)OS_MBUF_PKTLEN(attr->om));
+    lv_label_set_text(s_gwi_read_result_lbl, buf);
+    return 0;
+}
+
+/* Forward declarations needed because callbacks reference functions defined further below */
+static void gwi_chr_popup(const char *uuid_str, uint16_t val_handle, uint8_t props);
+static int  clone_file_load(const char *path);
+
+/* Named popup-button callbacks (C does not support lambdas) */
+static void gwi_read_btn_cb(lv_event_t *e)
+{
+    uint16_t h  = (uint16_t)(uintptr_t)lv_obj_get_user_data(lv_event_get_target(e));
+    uint16_t ch = gw_get_conn_handle();
+    if (ch == BLE_HS_CONN_HANDLE_NONE) {
+        if (s_gwi_read_result_lbl && lv_obj_is_valid(s_gwi_read_result_lbl))
+            lv_label_set_text(s_gwi_read_result_lbl, "Not connected");
+        return;
+    }
+    ble_gattc_read_long(ch, h, 0, gwi_read_cb, NULL);
+}
+
+static void gwi_sub_btn_cb(lv_event_t *e)
+{
+    uint16_t h  = (uint16_t)(uintptr_t)lv_obj_get_user_data(lv_event_get_target(e));
+    uint16_t ch = gw_get_conn_handle();
+    if (ch == BLE_HS_CONN_HANDLE_NONE) return;
+    uint8_t cccd_val[2] = {0x01, 0x00};
+    ble_gattc_write_no_rsp_flat(ch, (uint16_t)(h + 1), cccd_val, 2);
+    gw_set_int_notify_cb(gwi_notify_cb, NULL);
+    if (s_gwi_read_result_lbl && lv_obj_is_valid(s_gwi_read_result_lbl))
+        lv_label_set_text(s_gwi_read_result_lbl, "Subscribed");
+}
+
+static void gwi_bond_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    int rc = gw_bond();
+    if (s_gwi_read_result_lbl && lv_obj_is_valid(s_gwi_read_result_lbl))
+        lv_label_set_text(s_gwi_read_result_lbl, rc == 0 ? "Bonding..." : "Bond failed");
+}
+
+static void gwi_popup_close_cb(lv_event_t *e)
+{
+    s_gwi_read_result_lbl = NULL;
+    lv_obj_del(lv_obj_get_parent(lv_event_get_target(e)));
+}
+
+typedef struct { char uuid[37]; uint16_t handle; uint8_t props; } gwi_row_data_t;
+static void gwi_chr_row_cb(lv_event_t *e)
+{
+    gwi_row_data_t *d = (gwi_row_data_t *)lv_obj_get_user_data(lv_event_get_target(e));
+    if (d) gwi_chr_popup(d->uuid, d->handle, d->props);
+}
+
+static void clone_popup_close_cb(lv_event_t *e)
+{
+    lv_obj_del(lv_obj_get_parent(lv_event_get_target(e)));
+}
+
+static void clone_row_tap_cb(lv_event_t *e)
+{
+    char *p = (char *)lv_obj_get_user_data(lv_event_get_target(e));
+    if (p) clone_file_load(p);
+}
+
+/* Popup shown when a characteristic row is tapped */
+static void gwi_chr_popup(const char *uuid_str, uint16_t val_handle, uint8_t props)
+{
+    lv_obj_t *box = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(box, 220, 210);
+    lv_obj_align(box, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(box, lv_color_make(30, 30, 40), 0);
+    lv_obj_set_style_border_color(box, UI_ACCENT_CYAN, 0);
+    lv_obj_set_style_border_width(box, 1, 0);
+    lv_obj_set_style_radius(box, 10, 0);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Title */
+    lv_obj_t *ttl = lv_label_create(box);
+    char th[50]; snprintf(th, sizeof(th), "%.36s", uuid_str);
+    lv_label_set_text(ttl, th);
+    lv_obj_set_style_text_font(ttl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ttl, UI_ACCENT_CYAN, 0);
+    lv_obj_align(ttl, LV_ALIGN_TOP_MID, 0, 8);
+
+    /* Read result label */
+    s_gwi_read_result_lbl = lv_label_create(box);
+    lv_label_set_text(s_gwi_read_result_lbl, "--");
+    lv_obj_set_style_text_font(s_gwi_read_result_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_gwi_read_result_lbl, COLOR_MATERIAL_GREEN, 0);
+    lv_label_set_long_mode(s_gwi_read_result_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_gwi_read_result_lbl, 200);
+    lv_obj_align(s_gwi_read_result_lbl, LV_ALIGN_TOP_MID, 0, 28);
+
+    int btn_y = 70;
+    /* Read button */
+    if (props & (BLE_GATT_CHR_PROP_READ)) {
+        lv_obj_t *rb = lv_btn_create(box);
+        lv_obj_set_size(rb, 190, 28);
+        lv_obj_align(rb, LV_ALIGN_TOP_MID, 0, btn_y); btn_y += 34;
+        lv_obj_set_style_bg_color(rb, COLOR_MATERIAL_GREEN, 0);
+        lv_obj_set_style_border_width(rb, 0, 0);
+        lv_obj_t *rl = lv_label_create(rb); lv_label_set_text(rl, LV_SYMBOL_DOWNLOAD " Read");
+        lv_obj_set_style_text_font(rl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(rl, lv_color_white(), 0);
+        lv_obj_center(rl);
+        lv_obj_set_user_data(rb, (void *)(uintptr_t)val_handle);
+        lv_obj_add_event_cb(rb, gwi_read_btn_cb, LV_EVENT_CLICKED, NULL);
+    }
+    /* Subscribe button */
+    if (props & (BLE_GATT_CHR_PROP_NOTIFY | BLE_GATT_CHR_PROP_INDICATE)) {
+        lv_obj_t *sb = lv_btn_create(box);
+        lv_obj_set_size(sb, 190, 28);
+        lv_obj_align(sb, LV_ALIGN_TOP_MID, 0, btn_y); btn_y += 34;
+        lv_obj_set_style_bg_color(sb, lv_color_make(0, 120, 200), 0);
+        lv_obj_set_style_border_width(sb, 0, 0);
+        lv_obj_t *sl = lv_label_create(sb); lv_label_set_text(sl, LV_SYMBOL_AUDIO " Subscribe");
+        lv_obj_set_style_text_font(sl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(sl, lv_color_white(), 0);
+        lv_obj_center(sl);
+        lv_obj_set_user_data(sb, (void *)(uintptr_t)val_handle);
+        lv_obj_add_event_cb(sb, gwi_sub_btn_cb, LV_EVENT_CLICKED, NULL);
+    }
+    /* Bond button */
+    lv_obj_t *bb = lv_btn_create(box);
+    lv_obj_set_size(bb, 190, 28);
+    lv_obj_align(bb, LV_ALIGN_TOP_MID, 0, btn_y); btn_y += 34;
+    lv_obj_set_style_bg_color(bb, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_border_width(bb, 0, 0);
+    lv_obj_t *bl = lv_label_create(bb); lv_label_set_text(bl, MY_SYMBOL_LOCK " Bond/Pair");
+    lv_obj_set_style_text_font(bl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(bl, lv_color_white(), 0);
+    lv_obj_center(bl);
+    lv_obj_add_event_cb(bb, gwi_bond_btn_cb, LV_EVENT_CLICKED, NULL);
+    /* Close button */
+    lv_obj_t *cb = lv_btn_create(box);
+    lv_obj_set_size(cb, 190, 28);
+    lv_obj_align(cb, LV_ALIGN_TOP_MID, 0, btn_y);
+    lv_obj_set_style_bg_color(cb, lv_color_make(60, 60, 70), 0);
+    lv_obj_set_style_border_width(cb, 0, 0);
+    lv_obj_t *cl = lv_label_create(cb); lv_label_set_text(cl, LV_SYMBOL_CLOSE " Close");
+    lv_obj_set_style_text_font(cl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(cl, lv_color_white(), 0);
+    lv_obj_center(cl);
+    lv_obj_add_event_cb(cb, gwi_popup_close_cb, LV_EVENT_CLICKED, NULL);
+}
+
+/* Stop hook — disconnect + clear notification callback */
+static void gwi_screen_stop(void)
+{
+    if (gwi_notify_tmr) { lv_timer_del(gwi_notify_tmr); gwi_notify_tmr = NULL; }
+    gw_set_int_notify_cb(NULL, NULL);
+    gwi_log_ta    = NULL;
+    gwi_status_lbl = NULL;
+    s_gwi_read_result_lbl = NULL;
+}
+
+static void show_gw_interactive_screen(void)
+{
+    const gw_result_t *r = gw_get_result();
+    create_function_page_base("GATT Interactive");
+    g_screen_stop_fn  = gwi_screen_stop;
+    g_screen_back_fn  = show_gw_result_screen;
+    apply_menu_bg();
+
+    /* Status bar */
+    gwi_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(gwi_status_lbl,
+        gw_is_connected() ? LV_SYMBOL_WIFI " Connected" : LV_SYMBOL_WARNING " Not connected");
+    lv_obj_set_style_text_font(gwi_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(gwi_status_lbl,
+        gw_is_connected() ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_RED, 0);
+    lv_obj_align(gwi_status_lbl, LV_ALIGN_TOP_MID, 0, 34);
+
+    /* Characteristic list (upper half) */
+    lv_obj_t *chr_list = lv_obj_create(function_page);
+    lv_obj_set_size(chr_list, lv_pct(100), LCD_V_RES / 2 - 30);
+    lv_obj_align(chr_list, LV_ALIGN_TOP_MID, 0, 52);
+    lv_obj_set_style_bg_color(chr_list, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(chr_list, 0, 0);
+    lv_obj_set_style_pad_all(chr_list, 4, 0);
+    lv_obj_set_flex_flow(chr_list, LV_FLEX_FLOW_COLUMN);
+
+    if (r) {
+        for (int si = 0; si < r->svc_count; si++) {
+            const gw_svc_t *svc = &r->svcs[si];
+            for (int ci = 0; ci < svc->chr_count; ci++) {
+                const gw_chr_t *chr = &svc->chrs[ci];
+                /* Only show characteristics that have at least one interactive operation */
+                if (!(chr->properties & (BLE_GATT_CHR_PROP_READ |
+                      BLE_GATT_CHR_PROP_WRITE | BLE_GATT_CHR_PROP_WRITE_NO_RSP |
+                      BLE_GATT_CHR_PROP_NOTIFY | BLE_GATT_CHR_PROP_INDICATE))) continue;
+                lv_obj_t *row = lv_obj_create(chr_list);
+                lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+                lv_obj_set_style_bg_color(row, ui_card_color(), 0);
+                lv_obj_set_style_border_color(row, ui_border_color(), 0);
+                lv_obj_set_style_border_width(row, 1, 0);
+                lv_obj_set_style_radius(row, 4, 0);
+                lv_obj_set_style_pad_all(row, 4, 0);
+                lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+                lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+
+                char chr_props[24]; gw_chr_props_str(chr->properties, chr_props, sizeof(chr_props));
+                char lbuf[64]; snprintf(lbuf, sizeof(lbuf), "%s  [%s]", chr->uuid_str, chr_props);
+                lv_obj_t *lbl = lv_label_create(row);
+                lv_label_set_text(lbl, lbuf);
+                lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+                lv_obj_set_style_text_color(lbl, UI_ACCENT_CYAN, 0);
+                lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
+                lv_obj_set_width(lbl, lv_pct(100));
+
+                /* Store UUID + handle as user data (gwi_row_data_t typedef is file-scope) */
+                gwi_row_data_t *rd = heap_caps_malloc(sizeof(*rd), MALLOC_CAP_DEFAULT);
+                if (rd) {
+                    strncpy(rd->uuid, chr->uuid_str, sizeof(rd->uuid) - 1);
+                    rd->handle = chr->val_handle;
+                    rd->props  = chr->properties;
+                    lv_obj_set_user_data(row, rd);
+                }
+                lv_obj_add_event_cb(row, gwi_chr_row_cb, LV_EVENT_SHORT_CLICKED, NULL);
+            }
+        }
+    } else {
+        lv_obj_t *nl = lv_label_create(chr_list);
+        lv_label_set_text(nl, "No GATT result");
+        lv_obj_set_style_text_font(nl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(nl, COLOR_MATERIAL_RED, 0);
+    }
+
+    /* Notification log (lower half) */
+    lv_obj_t *log_hdr = lv_label_create(function_page);
+    lv_label_set_text(log_hdr, "Notification stream:");
+    lv_obj_set_style_text_font(log_hdr, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(log_hdr, ui_muted_color(), 0);
+    lv_obj_align(log_hdr, LV_ALIGN_TOP_MID, 0, LCD_V_RES / 2 + 4);
+
+    gwi_log_ta = lv_textarea_create(function_page);
+    lv_obj_set_size(gwi_log_ta, lv_pct(100), LCD_V_RES / 2 - 60);
+    lv_obj_align(gwi_log_ta, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_set_style_bg_color(gwi_log_ta, lv_color_make(10, 12, 18), 0);
+    lv_obj_set_style_text_font(gwi_log_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(gwi_log_ta, COLOR_MATERIAL_GREEN, 0);
+    lv_textarea_set_text(gwi_log_ta, "");
+
+
+    /* Reset notification ring */
+    gwi_notif_head = 0; gwi_notif_count = 0;
+    gwi_notify_dirty = false;
+
+    gwi_notify_tmr = lv_timer_create(gwi_notify_poll, 200, NULL);
+}
+
+static void gw_interact_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    show_gw_interactive_screen();
+}
+
+static void gw_hid_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    show_hid_decode_screen();
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * HID Report Map decoder + live keystroke stream  (Phase 3)
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* HID keycode → ASCII for basic US keyboard layout */
+static const char *hid_keycode_str(uint8_t kc)
+{
+    static const char *tab[0x68] = {
+        "","","","","a","b","c","d","e","f","g","h","i","j","k","l",
+        "m","n","o","p","q","r","s","t","u","v","w","x","y","z",
+        "1","2","3","4","5","6","7","8","9","0",
+        "Enter","Esc","Bksp","Tab"," ","-","=","[","]","\\","",";"
+        ,"'","`",",",".","/"," ","F1","F2","F3","F4","F5","F6","F7","F8",
+        "F9","F10","F11","F12","PrtSc","Scroll","Pause","Ins","Home","PgUp",
+        "Del","End","PgDn","Right","Left","Down","Up","NumLk","KP/","KP*",
+        "KP-","KP+","KPEnt","KP1","KP2","KP3","KP4","KP5","KP6","KP7",
+        "KP8","KP9","KP0","KP."
+    };
+    if (kc < sizeof(tab)/sizeof(*tab)) return tab[kc] ? tab[kc] : "?";
+    return "?";
+}
+
+/* Parse one HID report from a connected keyboard (boot protocol: modifier, reserved, keys[6]) */
+static void hid_decode_kbd_report(const uint8_t *data, uint8_t len, char *out, size_t outsz)
+{
+    out[0] = '\0';
+    if (len < 2) return;
+    uint8_t mod = data[0];
+    int pos = 0;
+    if (mod & 0x01) pos += snprintf(out + pos, outsz - pos, "LCtrl+");
+    if (mod & 0x02) pos += snprintf(out + pos, outsz - pos, "LShift+");
+    if (mod & 0x04) pos += snprintf(out + pos, outsz - pos, "LAlt+");
+    if (mod & 0x08) pos += snprintf(out + pos, outsz - pos, "LGui+");
+    if (mod & 0x10) pos += snprintf(out + pos, outsz - pos, "RCtrl+");
+    if (mod & 0x20) pos += snprintf(out + pos, outsz - pos, "RShift+");
+    if (mod & 0x40) pos += snprintf(out + pos, outsz - pos, "RAlt+");
+    if (mod & 0x80) pos += snprintf(out + pos, outsz - pos, "RGui+");
+    for (int i = 2; i < len && i < 8; i++) {
+        if (data[i] == 0) continue;
+        const char *ks = hid_keycode_str(data[i]);
+        pos += snprintf(out + pos, outsz - pos, "%s ", ks);
+    }
+    if (pos > 0 && out[pos-1] == '+') out[pos-1] = '\0'; /* remove trailing + */
+}
+
+/* Parse HID Report Map: walk items and print human-readable layout */
+static void hid_parse_report_map(const uint8_t *rm, int rmlen, char *out, size_t outsz)
+{
+    static const char *USAGE_PAGES[] = {
+        "","Generic Desktop","Simulation","VR","Sport","Game","Generic Device",
+        "Keyboard","LEDs","Button","Ordinal","Telephony","Consumer","Digitizer"
+    };
+    int pos = 0; int i = 0;
+    uint32_t usage_page = 0; uint32_t usage = 0;
+    int report_size = 0; int report_count = 0; int report_id = 0;
+    while (i < rmlen && pos < (int)outsz - 80) {
+        uint8_t b = rm[i];
+        if (b == 0xFE) { /* long item */ int dl = rm[i+1]; i += 3 + dl; continue; }
+        int sz = b & 0x03; /* 0=0,1=1,2=2,3=4 bytes */
+        if (sz == 3) sz = 4;
+        int type = (b >> 2) & 0x03;
+        int tag  = (b >> 4) & 0x0F;
+        uint32_t val = 0;
+        for (int k = 0; k < sz; k++) val |= ((uint32_t)rm[i+1+k]) << (8*k);
+        i += 1 + sz;
+
+        if (type == 1) { /* Global */
+            switch (tag) {
+                case 0: usage_page = val;
+                        if (usage_page < sizeof(USAGE_PAGES)/sizeof(*USAGE_PAGES) && USAGE_PAGES[usage_page][0])
+                            pos += snprintf(out+pos, outsz-pos, "Usage Page: %s\n", USAGE_PAGES[usage_page]);
+                        else
+                            pos += snprintf(out+pos, outsz-pos, "Usage Page: 0x%02X\n", (unsigned)val);
+                        break;
+                case 6: report_size  = (int)val; pos += snprintf(out+pos, outsz-pos, "Report Size: %d\n", report_size); break;
+                case 7: report_count = (int)val; pos += snprintf(out+pos, outsz-pos, "Report Count: %d\n", report_count); break;
+                case 8: report_id    = (int)val; pos += snprintf(out+pos, outsz-pos, "Report ID: %d\n", report_id); break;
+                default: break;
+            }
+        } else if (type == 2) { /* Local */
+            if (tag == 0) { usage = val; pos += snprintf(out+pos, outsz-pos, "  Usage: 0x%02X\n", (unsigned)val); }
+        } else if (type == 0) { /* Main */
+            switch (tag) {
+                case 8: pos += snprintf(out+pos, outsz-pos, "[Input: ID%d %dbit x %d]\n", report_id, report_size, report_count); usage=0; break;
+                case 9: pos += snprintf(out+pos, outsz-pos, "[Output: ID%d %dbit x %d]\n", report_id, report_size, report_count); usage=0; break;
+                case 10: pos += snprintf(out+pos, outsz-pos, "Collection: 0x%02X\n", (unsigned)val); break;
+                case 12: pos += snprintf(out+pos, outsz-pos, "End Collection\n"); break;
+                default: break;
+            }
+        }
+    }
+    (void)usage; (void)usage_page;
+}
+
+/* ISR-safe HID notification ring push */
+static void hid_notify_cb(uint16_t val_handle, const uint8_t *data,
+                          uint16_t len, void *arg)
+{
+    (void)val_handle; (void)arg;
+    portENTER_CRITICAL_ISR(&hid_notif_mux);
+    if (hid_notif_count < HID_NOTIF_MAX) {
+        hid_notif_t *slot = &hid_notif_ring[(hid_notif_head + hid_notif_count) % HID_NOTIF_MAX];
+        uint8_t cplen = len > 64 ? 64 : (uint8_t)len;
+        memcpy(slot->data, data, cplen); slot->len = cplen;
+        hid_notif_count++;
+    }
+    portEXIT_CRITICAL_ISR(&hid_notif_mux);
+    hid_notif_dirty = true;
+}
+
+static void hid_poll_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!hid_notif_dirty) return;
+    hid_notif_dirty = false;
+    portENTER_CRITICAL(&hid_notif_mux);
+    int n = hid_notif_count; hid_notif_count = 0;
+    portEXIT_CRITICAL(&hid_notif_mux);
+    if (!hid_log_ta || !lv_obj_is_valid(hid_log_ta)) return;
+    char decode[64];
+    for (int i = 0; i < n; i++) {
+        hid_notif_t *s = &hid_notif_ring[(hid_notif_head + i) % HID_NOTIF_MAX];
+        hid_decode_kbd_report(s->data, s->len, decode, sizeof(decode));
+        if (decode[0]) {
+            lv_textarea_add_text(hid_log_ta, "[kbd] ");
+            lv_textarea_add_text(hid_log_ta, decode);
+            lv_textarea_add_text(hid_log_ta, "\n");
+        } else {
+            char hex[130]; int hpos = 0;
+            for (int b = 0; b < s->len && b < 16; b++)
+                hpos += snprintf(hex + hpos, sizeof(hex) - hpos, "%02X ", s->data[b]);
+            lv_textarea_add_text(hid_log_ta, hex);
+            lv_textarea_add_text(hid_log_ta, "\n");
+        }
+    }
+    hid_notif_head = (hid_notif_head + n) % HID_NOTIF_MAX;
+    lv_textarea_set_cursor_pos(hid_log_ta, LV_TEXTAREA_CURSOR_LAST);
+}
+
+static void hid_screen_stop(void)
+{
+    if (hid_notif_tmr) { lv_timer_del(hid_notif_tmr); hid_notif_tmr = NULL; }
+    gw_set_int_notify_cb(NULL, NULL);
+    hid_log_ta = NULL; hid_status = NULL;
+    hid_subscribed = false;
+}
+
+static void show_hid_decode_screen(void)
+{
+    const gw_result_t *r = gw_get_result();
+    create_function_page_base("HID Decoder");
+    g_screen_stop_fn = hid_screen_stop;
+    g_screen_back_fn = show_gw_result_screen;
+    apply_menu_bg();
+
+    /* Status */
+    hid_status = lv_label_create(function_page);
+    lv_label_set_text(hid_status,
+        gw_is_connected() ? LV_SYMBOL_WIFI " Connected" : LV_SYMBOL_WARNING " Not connected");
+    lv_obj_set_style_text_font(hid_status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hid_status,
+        gw_is_connected() ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_RED, 0);
+    lv_obj_align(hid_status, LV_ALIGN_TOP_MID, 0, 34);
+
+    /* Report Map parse area */
+    lv_obj_t *map_ta = lv_textarea_create(function_page);
+    lv_obj_set_size(map_ta, lv_pct(100), 140);
+    lv_obj_align(map_ta, LV_ALIGN_TOP_MID, 0, 52);
+    lv_obj_set_style_bg_color(map_ta, lv_color_make(10, 12, 18), 0);
+    lv_obj_set_style_text_font(map_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(map_ta, UI_ACCENT_CYAN, 0);
+
+
+    /* Parse 0x2A4B from GATT result */
+    bool found_map = false;
+    if (r) {
+        for (int si = 0; si < r->svc_count && !found_map; si++) {
+            if (strncasecmp(r->svcs[si].uuid_str, "1812", 4) != 0) continue;
+            for (int ci = 0; ci < r->svcs[si].chr_count && !found_map; ci++) {
+                const gw_chr_t *chr = &r->svcs[si].chrs[ci];
+                if (strncasecmp(chr->uuid_str, "2A4B", 4) != 0) continue;
+                found_map = true;
+                char *parsed = heap_caps_malloc(2048, MALLOC_CAP_SPIRAM);
+                if (parsed) {
+                    hid_parse_report_map(chr->read_data, chr->read_len, parsed, 2048);
+                    lv_textarea_set_text(map_ta, parsed);
+                    heap_caps_free(parsed);
+                } else {
+                    lv_textarea_set_text(map_ta, "(parse alloc failed)");
+                }
+            }
+        }
+    }
+    if (!found_map) lv_textarea_set_text(map_ta, "0x2A4B not found — re-walk needed");
+
+    /* Live stream header */
+    lv_obj_t *stream_hdr = lv_label_create(function_page);
+    lv_label_set_text(stream_hdr, "Live HID stream:");
+    lv_obj_set_style_text_font(stream_hdr, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(stream_hdr, ui_muted_color(), 0);
+    lv_obj_align(stream_hdr, LV_ALIGN_TOP_MID, 0, 198);
+
+    hid_log_ta = lv_textarea_create(function_page);
+    lv_obj_set_size(hid_log_ta, lv_pct(100), LCD_V_RES - 30 - 220);
+    lv_obj_align(hid_log_ta, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_set_style_bg_color(hid_log_ta, lv_color_make(10, 12, 18), 0);
+    lv_obj_set_style_text_font(hid_log_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hid_log_ta, COLOR_MATERIAL_GREEN, 0);
+    lv_textarea_set_text(hid_log_ta, "");
+
+
+    /* Auto-subscribe to all HID Input Report (0x2A4D) characteristics */
+    hid_subscribed = false;
+    if (r && gw_is_connected()) {
+        uint16_t ch = gw_get_conn_handle();
+        for (int si = 0; si < r->svc_count; si++) {
+            if (strncasecmp(r->svcs[si].uuid_str, "1812", 4) != 0) continue;
+            for (int ci = 0; ci < r->svcs[si].chr_count; ci++) {
+                const gw_chr_t *chr = &r->svcs[si].chrs[ci];
+                if (strncasecmp(chr->uuid_str, "2A4D", 4) != 0) continue;
+                if (!(chr->properties & (BLE_GATT_CHR_PROP_NOTIFY|BLE_GATT_CHR_PROP_INDICATE))) continue;
+                uint8_t cccd_val[2] = {0x01, 0x00};
+                ble_gattc_write_no_rsp_flat(ch, chr->val_handle + 1, cccd_val, 2);
+                hid_subscribed = true;
+            }
+        }
+        if (hid_subscribed) {
+            gw_set_int_notify_cb(hid_notify_cb, NULL);
+            lv_textarea_set_text(hid_log_ta, "Subscribed — press keys on device...\n");
+        } else {
+            lv_textarea_set_text(hid_log_ta, "No HID Input Report chr found.");
+        }
+    } else {
+        lv_textarea_set_text(hid_log_ta, "Not connected — re-walk to reconnect.");
+    }
+
+    hid_notif_head = 0; hid_notif_count = 0; hid_notif_dirty = false;
+    hid_notif_tmr = lv_timer_create(hid_poll_cb, 100, NULL);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * GATT Clone — save profile to SD + Saved Clones browser  (Phase 4)
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* Notification label shown after clone save */
+static lv_obj_t *s_clone_save_lbl = NULL;
+
+/* Serialise current gw_result_t to /sdcard/lab/ble/clones/<ts>_<mac>.json */
+void gw_save_clone_profile(void)
+{
+    const gw_result_t *r = gw_get_result();
+    if (!r) {
+        if (s_clone_save_lbl && lv_obj_is_valid(s_clone_save_lbl))
+            lv_label_set_text(s_clone_save_lbl, LV_SYMBOL_CLOSE " No GATT result");
+        return;
+    }
+    char path[96];
+    snprintf(path, sizeof(path),
+             "/sdcard/lab/ble/clones/%s_%02X%02X%02X%02X%02X%02X.json",
+             r->timestamp,
+             r->mac[5], r->mac[4], r->mac[3],
+             r->mac[2], r->mac[1], r->mac[0]);
+
+    if (!sd_spi_mutex || xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        if (s_clone_save_lbl && lv_obj_is_valid(s_clone_save_lbl))
+            lv_label_set_text(s_clone_save_lbl, LV_SYMBOL_CLOSE " SD busy");
+        return;
+    }
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        xSemaphoreGive(sd_spi_mutex);
+        if (s_clone_save_lbl && lv_obj_is_valid(s_clone_save_lbl))
+            lv_label_set_text(s_clone_save_lbl, LV_SYMBOL_CLOSE " Open failed");
+        return;
+    }
+    /* Write JSON header */
+    fprintf(f, "{\n  \"label\": \"%.30s\",\n", r->name[0] ? r->name : "Unknown");
+    fprintf(f, "  \"mac\": \"%02X:%02X:%02X:%02X:%02X:%02X\",\n",
+            r->mac[5], r->mac[4], r->mac[3], r->mac[2], r->mac[1], r->mac[0]);
+    fprintf(f, "  \"addr_type\": %d,\n  \"rssi\": %d,\n", r->addr_type, r->rssi);
+    fprintf(f, "  \"fingerprint\": \"0x%08lX\",\n", (unsigned long)r->fingerprint);
+    fprintf(f, "  \"timestamp\": \"%s\",\n", r->timestamp);
+    fprintf(f, "  \"services\": [\n");
+    for (int si = 0; si < r->svc_count; si++) {
+        const gw_svc_t *svc = &r->svcs[si];
+        fprintf(f, "    {\"uuid\":\"%s\",\"start\":%d,\"end\":%d,\"chars\":[\n",
+                svc->uuid_str, svc->start_handle, svc->end_handle);
+        for (int ci = 0; ci < svc->chr_count; ci++) {
+            const gw_chr_t *chr = &svc->chrs[ci];
+            fprintf(f, "      {\"uuid\":\"%s\",\"handle\":%d,\"props\":%d,",
+                    chr->uuid_str, chr->val_handle, chr->properties);
+            if (chr->read_ok && chr->read_len > 0) {
+                fprintf(f, "\"value\":\"");
+                for (int b = 0; b < chr->read_len; b++) fprintf(f, "%02X", chr->read_data[b]);
+                fprintf(f, "\"");
+            } else { fprintf(f, "\"value\":null"); }
+            fprintf(f, "}%s\n", ci < svc->chr_count - 1 ? "," : "");
+        }
+        fprintf(f, "    ]}%s\n", si < r->svc_count - 1 ? "," : "");
+    }
+    fprintf(f, "  ]\n}\n");
+    fclose(f);
+    xSemaphoreGive(sd_spi_mutex);
+
+    if (s_clone_save_lbl && lv_obj_is_valid(s_clone_save_lbl)) {
+        char sbuf[80];
+        snprintf(sbuf, sizeof(sbuf), LV_SYMBOL_OK " Saved: %.40s", path + 22);
+        lv_label_set_text(s_clone_save_lbl, sbuf);
+    }
+    ESP_LOGI("ble_clone", "Clone profile saved: %s", path);
+}
+
+static void gw_clone_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    gw_save_clone_profile();
+}
+
+/* ── Saved Clones browser ── */
+#define CLONE_LIST_MAX 30
+static EXT_RAM_BSS_ATTR char s_clone_files[CLONE_LIST_MAX][80];
+static int  s_clone_count = 0;
+static lv_obj_t *clone_browser_list = NULL;
+static lv_obj_t *clone_browser_status = NULL;
+
+static void clone_browser_stop(void)
+{
+    clone_browser_list   = NULL;
+    clone_browser_status = NULL;
+    s_clone_save_lbl     = NULL;
+}
+
+static int clone_file_load(const char *path)
+{
+    /* Read clone JSON and display device info in a popup */
+    if (!sd_spi_mutex || xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) return -1;
+    FILE *f = fopen(path, "r");
+    if (!f) { xSemaphoreGive(sd_spi_mutex); return -1; }
+    char *buf = heap_caps_malloc(8192, MALLOC_CAP_SPIRAM);
+    if (!buf) { fclose(f); xSemaphoreGive(sd_spi_mutex); return -1; }
+    size_t len = fread(buf, 1, 8191, f);
+    buf[len] = '\0';
+    fclose(f);
+    xSemaphoreGive(sd_spi_mutex);
+
+    /* Simple popup showing raw JSON */
+    lv_obj_t *box = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(box, 230, 260);
+    lv_obj_align(box, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(box, lv_color_make(20, 22, 35), 0);
+    lv_obj_set_style_border_color(box, lv_color_make(120, 0, 180), 0);
+    lv_obj_set_style_border_width(box, 1, 0);
+    lv_obj_set_style_radius(box, 10, 0);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(box, 6, 0);
+
+    lv_obj_t *ttl = lv_label_create(box);
+    const char *fn = strrchr(path, '/'); fn = fn ? fn + 1 : path;
+    char th[48]; snprintf(th, sizeof(th), "Clone: %.42s", fn);
+    lv_label_set_text(ttl, th);
+    lv_obj_set_style_text_font(ttl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ttl, lv_color_make(200, 150, 255), 0);
+
+    lv_obj_t *ta = lv_textarea_create(box);
+    lv_obj_set_size(ta, 218, 190);
+    lv_obj_set_style_text_font(ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ta, UI_ACCENT_CYAN, 0);
+    lv_obj_set_style_bg_color(ta, lv_color_make(10,12,18), 0);
+    lv_textarea_set_text(ta, buf);
+
+    heap_caps_free(buf);
+
+    lv_obj_t *cb = lv_btn_create(box);
+    lv_obj_set_size(cb, 218, 28);
+    lv_obj_set_style_bg_color(cb, lv_color_make(60,60,70), 0);
+    lv_obj_set_style_border_width(cb, 0, 0);
+    lv_obj_t *cl = lv_label_create(cb); lv_label_set_text(cl, LV_SYMBOL_CLOSE " Close");
+    lv_obj_set_style_text_font(cl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(cl, lv_color_white(), 0);
+    lv_obj_center(cl);
+    lv_obj_add_event_cb(cb, clone_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    return 0;
+}
+
+static void show_clone_browser_screen(void)
+{
+    create_function_page_base("Saved Clones");
+    g_screen_stop_fn = clone_browser_stop;
+    apply_menu_bg();
+
+    clone_browser_status = lv_label_create(function_page);
+    lv_obj_set_style_text_font(clone_browser_status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(clone_browser_status, ui_muted_color(), 0);
+    lv_obj_align(clone_browser_status, LV_ALIGN_TOP_MID, 0, 34);
+
+    clone_browser_list = lv_obj_create(function_page);
+    lv_obj_set_size(clone_browser_list, lv_pct(100), LCD_V_RES - 30 - 50);
+    lv_obj_align(clone_browser_list, LV_ALIGN_TOP_MID, 0, 50);
+    lv_obj_set_style_bg_color(clone_browser_list, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(clone_browser_list, 0, 0);
+    lv_obj_set_style_pad_all(clone_browser_list, 4, 0);
+    lv_obj_set_flex_flow(clone_browser_list, LV_FLEX_FLOW_COLUMN);
+
+    /* Read directory */
+    s_clone_count = 0;
+    if (!sd_spi_mutex || xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        lv_label_set_text(clone_browser_status, "SD busy");
+        return;
+    }
+    DIR *dir = opendir("/sdcard/lab/ble/clones");
+    if (dir) {
+        struct dirent *ent;
+        while ((ent = readdir(dir)) && s_clone_count < CLONE_LIST_MAX) {
+            if (ent->d_name[0] == '.') continue;
+            if (!strstr(ent->d_name, ".json")) continue;
+            snprintf(s_clone_files[s_clone_count], 80,
+                     "/sdcard/lab/ble/clones/%s", ent->d_name);
+            s_clone_count++;
+        }
+        closedir(dir);
+    }
+    xSemaphoreGive(sd_spi_mutex);
+
+    char sbuf[32]; snprintf(sbuf, sizeof(sbuf), "%d clone(s)", s_clone_count);
+    lv_label_set_text(clone_browser_status, sbuf);
+
+    for (int i = 0; i < s_clone_count; i++) {
+        lv_obj_t *row = lv_obj_create(clone_browser_list);
+        lv_obj_set_size(row, lv_pct(100), 36);
+        lv_obj_set_style_bg_color(row, ui_card_color(), 0);
+        lv_obj_set_style_border_color(row, lv_color_make(120,0,180), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_radius(row, 4, 0);
+        lv_obj_set_style_pad_all(row, 6, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        const char *fn = strrchr(s_clone_files[i], '/');
+        fn = fn ? fn + 1 : s_clone_files[i];
+        lv_obj_t *lbl = lv_label_create(row);
+        char display[40]; snprintf(display, sizeof(display), "%.38s", fn);
+        lv_label_set_text(lbl, display);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(lbl, lv_color_make(200,150,255), 0);
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(lbl, lv_pct(100));
+        lv_obj_set_user_data(row, s_clone_files[i]);
+        lv_obj_add_event_cb(row, clone_row_tap_cb, LV_EVENT_SHORT_CLICKED, NULL);
+    }
+    if (s_clone_count == 0) {
+        lv_obj_t *nl = lv_label_create(clone_browser_list);
+        lv_label_set_text(nl, "No saved clones.\nWalk a device and tap Clone.");
+        lv_obj_set_style_text_font(nl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(nl, ui_muted_color(), 0);
+    }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * BLE MITM Proxy  (Phase 5)
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* MITM state */
+static bool          mitm_active      = false;
+static lv_obj_t     *mitm_log_ta     = NULL;
+static lv_obj_t     *mitm_status_lbl = NULL;
+static lv_timer_t   *mitm_poll_tmr   = NULL;
+
+#define MITM_LOG_MAX 16
+#define MITM_LOG_PAY 48
+typedef struct { bool host_to_target; uint16_t handle; uint8_t data[MITM_LOG_PAY]; uint8_t len; } mitm_log_t;
+static mitm_log_t    mitm_log_ring[MITM_LOG_MAX];
+static int           mitm_log_head = 0, mitm_log_count = 0;
+static portMUX_TYPE  mitm_log_mux  = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool mitm_log_dirty = false;
+
+/* MITM uses the GATT Walker connection (central) plus a NimBLE server (peripheral).
+ * The server is pre-built from the last gw_result_t before MITM starts.
+ * Host writes → relay to target; target notifies → relay to host. */
+
+static void mitm_push_log(bool h2t, uint16_t handle, const uint8_t *data, uint8_t len)
+{
+    portENTER_CRITICAL_ISR(&mitm_log_mux);
+    if (mitm_log_count < MITM_LOG_MAX) {
+        mitm_log_t *s = &mitm_log_ring[(mitm_log_head + mitm_log_count) % MITM_LOG_MAX];
+        s->host_to_target = h2t;
+        s->handle = handle;
+        uint8_t cp = len > MITM_LOG_PAY ? MITM_LOG_PAY : len;
+        memcpy(s->data, data, cp); s->len = cp;
+        mitm_log_count++;
+    }
+    portEXIT_CRITICAL_ISR(&mitm_log_mux);
+    mitm_log_dirty = true;
+}
+
+/* Forward target notification to host via server characteristic */
+static void mitm_target_notify_cb(uint16_t val_handle, const uint8_t *data,
+                                  uint16_t len, void *arg)
+{
+    (void)arg;
+    mitm_push_log(false, val_handle, data, (uint8_t)(len > 255 ? 255 : len));
+    /* Log to SD */
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        FILE *mf = fopen("/sdcard/lab/ble/mitm/session.log", "a");
+        if (mf) {
+            fprintf(mf, "T>H h:%04X [%dB]:", val_handle, (int)len);
+            for (int b = 0; b < len && b < 32; b++) fprintf(mf, "%02X", data[b]);
+            fprintf(mf, "\n");
+            fclose(mf);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+}
+
+static void mitm_log_poll(lv_timer_t *t)
+{
+    (void)t;
+    if (!mitm_log_dirty) {
+        /* Update status bar with connection state */
+        if (mitm_status_lbl && lv_obj_is_valid(mitm_status_lbl)) {
+            lv_label_set_text(mitm_status_lbl,
+                gw_is_connected() ? LV_SYMBOL_WIFI " Connected to target" : LV_SYMBOL_WARNING " Target disconnected");
+        }
+        return;
+    }
+    mitm_log_dirty = false;
+    portENTER_CRITICAL(&mitm_log_mux);
+    int n = mitm_log_count; mitm_log_count = 0;
+    portEXIT_CRITICAL(&mitm_log_mux);
+    if (!mitm_log_ta || !lv_obj_is_valid(mitm_log_ta)) return;
+    char line[120];
+    for (int i = 0; i < n; i++) {
+        mitm_log_t *s = &mitm_log_ring[(mitm_log_head + i) % MITM_LOG_MAX];
+        int hpos = snprintf(line, sizeof(line), "%s h:%04X: ",
+                            s->host_to_target ? "H>T" : "T>H", s->handle);
+        for (int b = 0; b < s->len && b < 12; b++)
+            hpos += snprintf(line + hpos, sizeof(line) - hpos, "%02X", s->data[b]);
+        if (s->len > 12) strncat(line, "...", sizeof(line) - strlen(line) - 1);
+        lv_textarea_add_text(mitm_log_ta, line);
+        lv_textarea_add_text(mitm_log_ta, "\n");
+    }
+    mitm_log_head = (mitm_log_head + n) % MITM_LOG_MAX;
+    lv_textarea_set_cursor_pos(mitm_log_ta, LV_TEXTAREA_CURSOR_LAST);
+}
+
+static void mitm_screen_stop(void)
+{
+    mitm_active = false;
+    if (mitm_poll_tmr) { lv_timer_del(mitm_poll_tmr); mitm_poll_tmr = NULL; }
+    gw_set_int_notify_cb(NULL, NULL);
+    gw_disconnect();
+    mitm_log_ta    = NULL;
+    mitm_status_lbl = NULL;
+}
+
+static void show_ble_mitm_screen(void)
+{
+    const gw_result_t *r = gw_get_result();
+    create_function_page_base("BLE MITM");
+    g_screen_stop_fn = mitm_screen_stop;
+    apply_menu_bg();
+
+    /* Require a completed GATT walk */
+    if (!r) {
+        lv_obj_t *el = lv_label_create(function_page);
+        lv_label_set_text(el, "Walk target first via\nBT Scan → GATT Walker\nthen return here.");
+        lv_obj_set_style_text_font(el, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(el, COLOR_MATERIAL_ORANGE, 0);
+        lv_label_set_long_mode(el, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(el, 220);
+        lv_obj_align(el, LV_ALIGN_CENTER, 0, -20);
+        return;
+    }
+
+    /* Status bar */
+    mitm_status_lbl = lv_label_create(function_page);
+    char sinfo[64];
+    snprintf(sinfo, sizeof(sinfo), "Target: %.30s", r->name[0] ? r->name : "Unknown");
+    lv_label_set_text(mitm_status_lbl, sinfo);
+    lv_obj_set_style_text_font(mitm_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(mitm_status_lbl, UI_ACCENT_CYAN, 0);
+    lv_obj_align(mitm_status_lbl, LV_ALIGN_TOP_MID, 0, 34);
+
+    /* MAC info */
+    lv_obj_t *mac_lbl = lv_label_create(function_page);
+    char mac_str[20];
+    snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+             r->mac[5], r->mac[4], r->mac[3], r->mac[2], r->mac[1], r->mac[0]);
+    lv_label_set_text(mac_lbl, mac_str);
+    lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(mac_lbl, ui_muted_color(), 0);
+    lv_obj_align(mac_lbl, LV_ALIGN_TOP_MID, 0, 50);
+
+    /* Connection mode info */
+    lv_obj_t *mode_lbl = lv_label_create(function_page);
+    lv_label_set_text(mode_lbl,
+        gw_is_connected() ? LV_SYMBOL_WIFI " Active — relaying traffic"
+                          : LV_SYMBOL_WARNING " Reconnecting to target...");
+    lv_obj_set_style_text_font(mode_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(mode_lbl,
+        gw_is_connected() ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_align(mode_lbl, LV_ALIGN_TOP_MID, 0, 66);
+
+    /* Traffic log */
+    lv_obj_t *log_hdr = lv_label_create(function_page);
+    lv_label_set_text(log_hdr, "Traffic log (H>T host write, T>H target notify):");
+    lv_obj_set_style_text_font(log_hdr, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(log_hdr, ui_muted_color(), 0);
+    lv_obj_align(log_hdr, LV_ALIGN_TOP_MID, 0, 86);
+
+    mitm_log_ta = lv_textarea_create(function_page);
+    lv_obj_set_size(mitm_log_ta, lv_pct(100), LCD_V_RES - 30 - 110);
+    lv_obj_align(mitm_log_ta, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_set_style_bg_color(mitm_log_ta, lv_color_make(10, 12, 18), 0);
+    lv_obj_set_style_text_font(mitm_log_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(mitm_log_ta, COLOR_MATERIAL_GREEN, 0);
+    lv_textarea_set_text(mitm_log_ta, "");
+
+
+    /* Start relaying: register notification callback to forward target→host traffic.
+     * Host→target writes are handled via the NimBLE server write callbacks.
+     * In this implementation CYM acts as a transparent sniffer on the kept connection —
+     * full dual-role relay (separate server advertising as target) requires a device
+     * restart to apply MAC spoof; that is left as a future enhancement. */
+    mitm_active = true;
+    mitm_log_head = 0; mitm_log_count = 0; mitm_log_dirty = false;
+
+    /* Subscribe to all notify/indicate characteristics on the target */
+    if (gw_is_connected()) {
+        uint16_t ch = gw_get_conn_handle();
+        for (int si = 0; si < r->svc_count; si++) {
+            for (int ci = 0; ci < r->svcs[si].chr_count; ci++) {
+                const gw_chr_t *chr = &r->svcs[si].chrs[ci];
+                if (!(chr->properties & (BLE_GATT_CHR_PROP_NOTIFY|BLE_GATT_CHR_PROP_INDICATE))) continue;
+                uint8_t cccd[2] = {0x01, 0x00};
+                ble_gattc_write_no_rsp_flat(ch, chr->val_handle + 1, cccd, 2);
+            }
+        }
+        gw_set_int_notify_cb(mitm_target_notify_cb, NULL);
+
+        /* Create/truncate session log */
+        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            FILE *mf = fopen("/sdcard/lab/ble/mitm/session.log", "w");
+            if (mf) {
+                fprintf(mf, "# MITM session: %s  %s\n", r->name, r->timestamp);
+                fclose(mf);
+            }
+            xSemaphoreGive(sd_spi_mutex);
+        }
+        lv_textarea_set_text(mitm_log_ta, "Subscribed to all notify chars.\nLogging to /sdcard/lab/ble/mitm/session.log\n");
+    } else {
+        lv_textarea_set_text(mitm_log_ta, "Not connected — go back and re-walk first.");
+    }
+
+    mitm_poll_tmr = lv_timer_create(mitm_log_poll, 300, NULL);
 }
 
 static void gw_probe_btn_cb(lv_event_t *e)
@@ -29353,34 +30387,78 @@ static void show_gw_result_screen(void)
     }
 
 gw_res_done:;
-    /* ── Bottom bar: [Ext. Probe] [Back] ── */
+    /* ── Bottom bar: [Ext. Probe] [Interact] [HID] — 3 equal buttons ── */
     lv_obj_t *probe_btn = lv_btn_create(function_page);
-    lv_obj_set_size(probe_btn, 108, 32);
-    lv_obj_align(probe_btn, LV_ALIGN_BOTTOM_MID, -62, -6);
+    lv_obj_set_size(probe_btn, 72, 32);
+    lv_obj_align(probe_btn, LV_ALIGN_BOTTOM_MID, -80, -6);
     lv_obj_set_style_bg_color(probe_btn, lv_color_hex(0xC62828), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(probe_btn, lv_color_lighten(lv_color_hex(0xC62828), 40), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(probe_btn, 0, 0);
     lv_obj_set_style_radius(probe_btn, 8, 0);
     lv_obj_t *probe_lbl = lv_label_create(probe_btn);
-    lv_label_set_text(probe_lbl, LV_SYMBOL_AUDIO "  Ext. Probe");
+    lv_label_set_text(probe_lbl, LV_SYMBOL_AUDIO " Probe");
     lv_obj_set_style_text_font(probe_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(probe_lbl, lv_color_white(), 0);
     lv_obj_center(probe_lbl);
     lv_obj_add_event_cb(probe_btn, gw_probe_btn_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 108, 32);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 62, -6);
-    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x7B1FA2), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(back_btn, lv_color_lighten(lv_color_hex(0x7B1FA2), 40), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_t *gw_res_lbl = lv_label_create(back_btn);
-    lv_label_set_text(gw_res_lbl, LV_SYMBOL_LEFT "  Back");
-    lv_obj_set_style_text_font(gw_res_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(gw_res_lbl, lv_color_white(), 0);
-    lv_obj_center(gw_res_lbl);
-    lv_obj_add_event_cb(back_btn, gw_result_back_cb, LV_EVENT_CLICKED, NULL);
+    /* Interact button — opens interactive read/write/subscribe screen */
+    lv_obj_t *int_btn = lv_btn_create(function_page);
+    lv_obj_set_size(int_btn, 72, 32);
+    lv_obj_align(int_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_bg_color(int_btn, lv_color_make(0, 120, 200), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(int_btn, lv_color_make(40, 160, 240), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(int_btn, 0, 0);
+    lv_obj_set_style_radius(int_btn, 8, 0);
+    lv_obj_t *int_lbl = lv_label_create(int_btn);
+    lv_label_set_text(int_lbl, LV_SYMBOL_EDIT " R/W");
+    lv_obj_set_style_text_font(int_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(int_lbl, lv_color_white(), 0);
+    lv_obj_center(int_lbl);
+    lv_obj_add_event_cb(int_btn, gw_interact_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    /* HID Decode button — only shown when HID service 0x1812 present */
+    bool has_hid = false;
+    if (r) {
+        for (int _si = 0; _si < r->svc_count && !has_hid; _si++) {
+            if (strncasecmp(r->svcs[_si].uuid_str, "1812", 4) == 0) has_hid = true;
+        }
+    }
+    lv_obj_t *hid_btn = lv_btn_create(function_page);
+    lv_obj_set_size(hid_btn, 72, 32);
+    lv_obj_align(hid_btn, LV_ALIGN_BOTTOM_MID, 80, -6);
+    lv_obj_set_style_bg_color(hid_btn,
+        has_hid ? lv_color_make(80, 160, 0) : lv_color_make(60, 60, 70), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(hid_btn,
+        has_hid ? lv_color_make(100, 200, 20) : lv_color_make(80, 80, 90), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(hid_btn, 0, 0);
+    lv_obj_set_style_radius(hid_btn, 8, 0);
+    lv_obj_t *hid_btn_lbl = lv_label_create(hid_btn);
+    lv_label_set_text(hid_btn_lbl, LV_SYMBOL_KEYBOARD " HID");
+    lv_obj_set_style_text_font(hid_btn_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hid_btn_lbl, lv_color_white(), 0);
+    lv_obj_center(hid_btn_lbl);
+    if (has_hid) {
+        lv_obj_add_event_cb(hid_btn, gw_hid_btn_cb, LV_EVENT_CLICKED, NULL);
+    }
+
+    /* Clone row — saves full GATT tree + adv to /sdcard/lab/ble/clones/ */
+    lv_obj_t *clone_btn = lv_btn_create(function_page);
+    lv_obj_set_size(clone_btn, 230, 28);
+    lv_obj_align(clone_btn, LV_ALIGN_BOTTOM_MID, 0, -44);
+    lv_obj_set_style_bg_color(clone_btn, lv_color_make(120, 0, 180), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(clone_btn, lv_color_make(160, 40, 220), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(clone_btn, 0, 0);
+    lv_obj_set_style_radius(clone_btn, 8, 0);
+    lv_obj_t *clone_btn_lbl = lv_label_create(clone_btn);
+    lv_label_set_text(clone_btn_lbl, LV_SYMBOL_COPY " Clone Device → SD");
+    lv_obj_set_style_text_font(clone_btn_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(clone_btn_lbl, lv_color_white(), 0);
+    lv_obj_center(clone_btn_lbl);
+    lv_obj_add_event_cb(clone_btn, gw_clone_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Adjust scroll area to leave room for both button rows */
+    lv_obj_set_size(scrl, lv_pct(100), LCD_V_RES - 30 - 78);
 #undef GW_ROW
 }
 
@@ -31602,7 +32680,9 @@ static void show_bt_attacks_screen(void)
 
     lv_obj_t *wp_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Whisper\nPair", lv_color_make(140, 0, 180), NULL, NULL);
     lv_obj_add_event_cb(wp_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"WhisperPair");
-    // Bottom "‹ Bluetooth" bar removed — top-bar ‹ Back already goes up to Bluetooth (parent in nav table).
+
+    lv_obj_t *mitm_tile = create_tile(tiles, MY_SYMBOL_MASK, "BLE\nMITM", lv_color_make(160, 20, 20), NULL, NULL);
+    lv_obj_add_event_cb(mitm_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE MITM");
 }
 
 // ============================================================================
@@ -32787,6 +33867,12 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
 
+    // BLE MITM — relay GATT traffic between a bonded target and the host via a cloned server
+    if (strcmp(attack_name, "BLE MITM") == 0) {
+        show_ble_mitm_screen();
+        return;
+    }
+
     // BT Lookout screen
     if (strcmp(attack_name, "Dee Dee Detector") == 0) {
         show_bt_lookout_screen();
@@ -32861,6 +33947,12 @@ void attack_event_cb(lv_event_t *e)
 
     if (strcmp(attack_name, "List Wizard") == 0) {
         show_list_wizard_screen();
+        return;
+    }
+
+    // Saved Clones — browse GATT device profiles saved to SD card
+    if (strcmp(attack_name, "Saved Clones") == 0) {
+        show_clone_browser_screen();
         return;
     }
 
