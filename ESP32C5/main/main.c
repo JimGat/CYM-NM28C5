@@ -240,6 +240,13 @@ typedef struct {
     bool is_possible_airtag;  /* Apple 0x05 Nearby Action — AirTag in owner-proximity/paused mode */
     bool is_fast_pair;         /* Google Fast Pair — service UUID 0xFE2C; potentially CVE-2025-36911 vulnerable */
     bool is_matter;            /* Matter commissioning beacon — service UUID 0xFFF6 in advertisement */
+    /* ── Advanced fingerprinting fields (populated in bt_gap_event_callback) ── */
+    uint8_t  apple_sub_type;   /* Apple Continuity message type byte; 0x00 if not Apple/unknown */
+    uint16_t fp_svc_uuid;      /* First notable SIG service UUID (0x1812 HID, 0x180D HR, etc.) */
+    bool     is_eddystone;     /* Eddystone beacon (svc UUID 0xFEAA) */
+    bool     is_bthome;        /* BTHome sensor protocol (svc UUID 0xFCD2) */
+    bool     is_tile;          /* Tile tracker (svc UUID 0xFEED) */
+    bool     is_exposure;      /* COVID-19 Exposure Notification (svc UUID 0xFD6F) */
 } bt_device_info_t;
 
 static bt_device_info_t bt_devices[BT_MAX_DEVICES];
@@ -2090,6 +2097,7 @@ typedef struct {
     int              chr_count;
     uint32_t         fingerprint;
     char             filepath[80];   /* JSON path on SD — populated after walk */
+    char             fp_hint[48];    /* Human-readable device-type guess from advertising data */
 } bto_device_t;
 
 typedef enum {
@@ -22541,6 +22549,11 @@ static const sd_provision_item_t SD_ITEMS[] = {
     { SD_ITEM_DIR,  "/sdcard/lab/ble/blueduck",              NULL },  /* BlueDuck session logs */
     { SD_ITEM_DIR,  "/sdcard/lab/ble/blueduck/scripts",      NULL },  /* DuckyScript payloads */
     { SD_ITEM_DIR,  "/sdcard/lab/ble/whisperpair",           NULL },  /* WhisperPair logs */
+    { SD_ITEM_DIR,  "/sdcard/lab/ble/obs",                  NULL },  /* BT Observer enriched scan JSON */
+    { SD_ITEM_DIR,  "/sdcard/lab/ble/clones",               NULL },  /* GATT clone profiles */
+    { SD_ITEM_DIR,  "/sdcard/lab/ble/hid",                  NULL },  /* HID Report Map dumps + keystroke logs */
+    { SD_ITEM_DIR,  "/sdcard/lab/ble/mitm",                 NULL },  /* BLE MITM session traffic logs */
+    { SD_ITEM_DIR,  "/sdcard/lab/ble/gatt",                 NULL },  /* Interactive GATT session write/read logs */
     { SD_ITEM_DIR,  "/sdcard/lab/infrared",                  NULL },  /* IR HAT remotes (Flipper .ir format) */
     { SD_ITEM_DIR,  "/sdcard/lab/rf433",                     NULL },  /* RF433 HAT captures (Flipper .sub format) */
     { SD_ITEM_DIR,  "/sdcard/lab/radio",                     NULL },  /* CC1101 captures (Flipper .sub) */
@@ -28388,6 +28401,67 @@ static void bto_stop(void)
     bto_state = BTO_STATE_IDLE;
 }
 
+/* Derive a short human-readable device-type hint from raw advertising fields.
+ * Returns nothing if no strong signal is present. */
+static void ble_adv_fp_hint(const bt_device_info_t *d, char *out, size_t outsz)
+{
+    out[0] = '\0';
+    /* Apple — use Continuity sub-type for precise identification */
+    if (d->company_id == 0x004C) {
+        const char *sub;
+        if      (d->is_airtag)           sub = "Apple AirTag";
+        else if (d->is_possible_airtag)  sub = "Apple AirTag (passive)";
+        else switch (d->apple_sub_type) {
+            case 0x02: sub = "Apple iBeacon";           break;
+            case 0x05: sub = "Apple AirDrop";           break;
+            case 0x07: sub = "Apple AirPods";           break;
+            case 0x09: sub = "Apple AirPlay Source";    break;
+            case 0x0A: sub = "Apple AirPlay Target";    break;
+            case 0x0B: sub = "Apple Watch Pairing";     break;
+            case 0x0C: sub = "Apple Handoff";           break;
+            case 0x0D: sub = "Apple Tethering Target";  break;
+            case 0x0E: sub = "Apple Tethering Source";  break;
+            case 0x0F: sub = "Apple Nearby Action";     break;
+            case 0x10: sub = "Apple Nearby";            break;
+            case 0x12: sub = "Apple FindMy";            break;
+            default:   sub = "Apple device";            break;
+        }
+        snprintf(out, outsz, "%s", sub);
+        return;
+    }
+    /* Samsung */
+    if (d->company_id == 0x0075) {
+        snprintf(out, outsz, d->is_smarttag ? "Samsung SmartTag" : "Samsung device");
+        return;
+    }
+    /* Xiaomi MiBeacon */
+    if (d->company_id == 0x0157) { snprintf(out, outsz, "Xiaomi MiBeacon"); return; }
+    /* Microsoft */
+    if (d->company_id == 0x0006) { snprintf(out, outsz, "Microsoft device"); return; }
+    /* Google Fast Pair */
+    if (d->is_fast_pair)  { snprintf(out, outsz, "Google Fast Pair"); return; }
+    /* Matter commissioning */
+    if (d->is_matter)     { snprintf(out, outsz, "Matter device"); return; }
+    /* Protocol-specific by service UUID */
+    if (d->is_eddystone)  { snprintf(out, outsz, "Eddystone beacon"); return; }
+    if (d->is_bthome)     { snprintf(out, outsz, "BTHome sensor"); return; }
+    if (d->is_tile)       { snprintf(out, outsz, "Tile tracker"); return; }
+    if (d->is_exposure)   { snprintf(out, outsz, "Exposure Notification"); return; }
+    /* SIG device-class service UUID */
+    switch (d->fp_svc_uuid) {
+        case 0x1812: snprintf(out, outsz, "BLE HID device");        return;
+        case 0x180D: snprintf(out, outsz, "Heart Rate monitor");     return;
+        case 0x1816: snprintf(out, outsz, "Cycling speed sensor");   return;
+        case 0x1818: snprintf(out, outsz, "Cycling power meter");    return;
+        case 0x1826: snprintf(out, outsz, "Fitness machine");        return;
+        case 0x1809: snprintf(out, outsz, "Thermometer");            return;
+        case 0x180F: snprintf(out, outsz, "Battery service");        return;
+        case 0x181A: snprintf(out, outsz, "Environmental sensor");   return;
+        default: break;
+    }
+    /* No strong signal — leave empty */
+}
+
 static void bto_rebuild_list(void)
 {
     if (!bto_list || !lv_obj_is_valid(bto_list)) return;
@@ -28436,6 +28510,16 @@ static void bto_rebuild_list(void)
             lv_obj_set_style_text_color(l2, UI_ACCENT_CYAN, 0);
             lv_label_set_long_mode(l2, LV_LABEL_LONG_CLIP);
             lv_obj_set_width(l2, lv_pct(100));
+        }
+
+        // Row 2.5: advertising fingerprint hint (amber — shown even before walk)
+        if (d->fp_hint[0]) {
+            lv_obj_t *lfp = lv_label_create(card);
+            lv_label_set_text(lfp, d->fp_hint);
+            lv_obj_set_style_text_font(lfp, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(lfp, lv_color_make(255, 180, 40), 0);
+            lv_label_set_long_mode(lfp, LV_LABEL_LONG_CLIP);
+            lv_obj_set_width(lfp, lv_pct(100));
         }
 
         // Row 3: walk status
@@ -28620,6 +28704,8 @@ static void bt_observer_task(void *pvParameters)
         strncpy(bto_devices[i].name, bt_devices[i].name, sizeof(bto_devices[i].name) - 1);
         bto_devices[i].rssi   = bt_devices[i].rssi;
         bto_devices[i].status = BTO_DEV_QUEUED;
+        /* Derive advertising fingerprint hint from scan metadata */
+        ble_adv_fp_hint(&bt_devices[i], bto_devices[i].fp_hint, sizeof(bto_devices[i].fp_hint));
     }
     bto_device_count = n;
     /* Sort by RSSI descending — strongest signal first */
@@ -33997,6 +34083,35 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
         /* Matter detection: service UUID 0xFFF6 (Matter commissioning beacon) */
         if (bt_is_matter_adv(&fields)) {
             dev->is_matter = true;
+        }
+
+        /* ── Advanced fingerprinting: Apple Continuity sub-type ── */
+        dev->apple_sub_type = 0;
+        if (dev->company_id == 0x004C && fields.mfg_data_len >= 3) {
+            /* mfg_data[0..1] = company ID (lo/hi); [2] = Continuity message type */
+            dev->apple_sub_type = fields.mfg_data[2];
+        }
+
+        /* ── Advanced fingerprinting: service UUID-based detection ── */
+        dev->fp_svc_uuid  = 0;
+        dev->is_eddystone = false;
+        dev->is_bthome    = false;
+        dev->is_tile      = false;
+        dev->is_exposure  = false;
+        if (fields.uuids16 && fields.num_uuids16 > 0) {
+            for (uint8_t _ui = 0; _ui < fields.num_uuids16; _ui++) {
+                uint16_t _u = fields.uuids16[_ui].value;
+                if      (_u == 0xFEAA) dev->is_eddystone = true;
+                else if (_u == 0xFCD2) dev->is_bthome    = true;
+                else if (_u == 0xFEED) dev->is_tile       = true;
+                else if (_u == 0xFD6F) dev->is_exposure   = true;
+                /* Record first notable SIG device-class service UUID */
+                if (!dev->fp_svc_uuid &&
+                    (_u == 0x1812 || _u == 0x180D || _u == 0x1816 || _u == 0x1818 ||
+                     _u == 0x1826 || _u == 0x1809 || _u == 0x180F || _u == 0x181A)) {
+                    dev->fp_svc_uuid = _u;
+                }
+            }
         }
 
         bt_device_count++;
