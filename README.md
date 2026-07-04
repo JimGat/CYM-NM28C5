@@ -2219,6 +2219,7 @@ The nRF24 always prepends a 1-byte preamble before the address field. The preamb
 | **LVGL Material Dark Theme** | Modern, touch-friendly dark UI |
 | **Portrait 240×320 Layout** | All screens designed and reflowed for the NM-CYD-C5's 240×320 portrait display |
 | **5-Tile Main Menu** | WiFi, Bluetooth, Wardrive, Settings, Go Dark — WiFi expands to sub-menu |
+| **Unified Navigation** | Single top-bar `‹ Back` on every screen steps up one menu level and fully stops the current feature (WiFi radio, BLE, RF task, RFID poll). Both Back and Home cleanly stop all running services before rebuilding the parent screen — no more orphaned background tasks or crashes when navigating away mid-capture |
 | **Screenshot Capture** | Tap the **title bar** on any screen to save a BMP to `/sdcard/screenshots/` — works on every screen including all menus, feature pages, and live data views |
 | **WPA-SEC Upload** | Upload captured handshakes to wpa-sec.stanev.org via HTTPS |
 | **NeoPixel Status LED** | Mode-based color indicator via WS2812 LED (GPIO 27) |
