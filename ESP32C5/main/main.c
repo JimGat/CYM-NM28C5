@@ -17330,15 +17330,15 @@ static void show_attack_tiles_screen(void)
     
     // Create small tiles container (4+5 layout) with compact spacing
     lv_obj_t *attack_tiles = lv_obj_create(function_page);
-    lv_obj_set_size(attack_tiles, lv_pct(100), 170);
-    lv_obj_align(attack_tiles, LV_ALIGN_TOP_MID, 0, 35);
+    lv_obj_set_size(attack_tiles, lv_pct(100), 218);
+    lv_obj_align(attack_tiles, LV_ALIGN_TOP_MID, 0, 32);
     lv_obj_set_style_bg_color(attack_tiles, ui_bg_color(), 0);
     lv_obj_set_style_border_width(attack_tiles, 0, 0);
     lv_obj_set_style_pad_all(attack_tiles, 5, 0);
     lv_obj_set_style_pad_gap(attack_tiles, 5, 0);
     lv_obj_set_flex_flow(attack_tiles, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(attack_tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(attack_tiles, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_align(attack_tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
+    lv_obj_add_flag(attack_tiles, LV_OBJ_FLAG_SCROLLABLE);
     
     // Row 1: Deauth, Evil Twin, SAE, Handshake, Deauth Client
     create_small_tile(attack_tiles, LV_SYMBOL_CHARGE, "Deauth", COLOR_MATERIAL_RED, attack_tile_event_cb, "Deauth");
@@ -17356,7 +17356,7 @@ static void show_attack_tiles_screen(void)
     // Horizontal separator line above Selected Networks
     lv_obj_t *separator = lv_obj_create(function_page);
     lv_obj_set_size(separator, lv_pct(90), 2);
-    lv_obj_align(separator, LV_ALIGN_TOP_MID, 0, 213);
+    lv_obj_align(separator, LV_ALIGN_TOP_MID, 0, 254);
     lv_obj_set_style_bg_color(separator, ui_accent_color(), 0);
     lv_obj_set_style_bg_opa(separator, LV_OPA_50, 0);
     lv_obj_set_style_border_width(separator, 0, 0);
@@ -17367,11 +17367,11 @@ static void show_attack_tiles_screen(void)
     lv_label_set_text(header_label, "Selected Networks:");
     lv_obj_set_style_text_font(header_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(header_label, ui_text_color(), 0);
-    lv_obj_align(header_label, LV_ALIGN_TOP_LEFT, 10, 220);
+    lv_obj_align(header_label, LV_ALIGN_TOP_LEFT, 10, 259);
     
     // Selected networks list
     lv_obj_t *network_list = lv_obj_create(function_page);
-    lv_obj_set_size(network_list, lv_pct(100), LCD_V_RES - 240);  // Bottom 80px
+    lv_obj_set_size(network_list, lv_pct(100), LCD_V_RES - 283);  // Bottom ~37px (tiles grew for 10th tile)
     lv_obj_align(network_list, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(network_list, ui_bg_color(), 0);
     lv_obj_set_style_border_width(network_list, 0, 0);
