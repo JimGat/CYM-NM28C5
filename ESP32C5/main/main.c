@@ -39648,6 +39648,19 @@ static void s_cc1101_cap_start_cb(lv_event_t *e)
     (void)e;
 }
 
+// Stop hook for CC1101 Capture screen — runs via g_screen_stop_fn on Back or Home.
+// Deletes the polling timer before the screen is torn down so its callback never
+// fires against freed LVGL objects. Task self-exits after cc1101_capture_cancel().
+static void cc1101_cap_screen_stop(void)
+{
+    if (s_cc1101_cap_tmr) { lv_timer_del(s_cc1101_cap_tmr); s_cc1101_cap_tmr = NULL; }
+    if (s_cc1101_cap_task) cc1101_capture_cancel();
+    s_cc1101_cap_freq_lbl   = NULL;
+    s_cc1101_cap_status_lbl = NULL;
+    s_cc1101_cap_count_lbl  = NULL;
+    s_cc1101_cap_btn        = NULL;
+}
+
 static void show_cc1101_capture_screen(void)
 {
     if (s_cc1101_cap_task) cc1101_capture_cancel();
@@ -39666,6 +39679,7 @@ static void show_cc1101_capture_screen(void)
     cc1101_set_freq_mhz(cc1101_freq_cal(s_cc1101_freq_mhz));
 
     create_function_page_base("CC1101 Capture");
+    g_screen_stop_fn = cc1101_cap_screen_stop;
     apply_menu_bg();
 
     lv_obj_t *card = lv_obj_create(function_page);
@@ -39801,6 +39815,14 @@ static void s_cc1101_rep_btn_cb(lv_event_t *e)
                 (void*)(intptr_t)repeats, 2, &s_cc1101_rep_task);
 }
 
+// Stop hook for CC1101 Replay screen — same timer-dangling risk as Capture.
+static void cc1101_rep_screen_stop(void)
+{
+    if (s_cc1101_rep_tmr) { lv_timer_del(s_cc1101_rep_tmr); s_cc1101_rep_tmr = NULL; }
+    if (s_cc1101_rep_task) cc1101_replay_cancel();
+    s_cc1101_rep_status = NULL;
+}
+
 static void show_cc1101_replay_screen(void)
 {
     if (s_cc1101_rep_tmr) { lv_timer_del(s_cc1101_rep_tmr); s_cc1101_rep_tmr = NULL; }
@@ -39808,6 +39830,7 @@ static void show_cc1101_replay_screen(void)
     s_cc1101_rep_state  = CC1101_REP_IDLE;
 
     create_function_page_base("CC1101 Replay");
+    g_screen_stop_fn = cc1101_rep_screen_stop;
     apply_menu_bg();
 
     lv_obj_t *card = lv_obj_create(function_page);
@@ -41500,6 +41523,16 @@ static void s_cc1101_jammer_dismiss_cb(lv_event_t *e)
     (void)e;
 }
 
+// Stop hook for CC1101 Jammer screen — stops transmit, deletes timer, NULLs LVGL pointers.
+static void cc1101_jam_screen_stop(void)
+{
+    s_cc1101_jamming = false;
+    if (cc1101_is_init()) cc1101_idle();
+    if (s_cc1101_jam_tmr) { lv_timer_del(s_cc1101_jam_tmr); s_cc1101_jam_tmr = NULL; }
+    s_cc1101_jam_status   = NULL;
+    s_cc1101_jam_freq_lbl = NULL;
+}
+
 static void show_cc1101_jammer_screen(void)
 {
     if (!cc1101_is_init()) {
@@ -41520,6 +41553,7 @@ static void show_cc1101_jammer_screen(void)
         s_jam_band = JAM_BAND_868;
 
     create_function_page_base("CC1101 Jammer");
+    g_screen_stop_fn = cc1101_jam_screen_stop;
     apply_menu_bg();
 
     // Legal disclaimer popup overlay
@@ -41889,6 +41923,20 @@ static void s_bs_startstop_cb(lv_event_t *e)
     }
 }
 
+// Stop hook for CC1101 Band Scope — NULLs ctx UI pointers and deletes its timer
+// so the scan-update callback never fires against freed LVGL objects after Home.
+static void cc1101_bs_screen_stop(void)
+{
+    if (!s_bs) return;
+    s_bs->active    = false;
+    s_bs->cancel    = true;
+    if (s_bs->tmr) { lv_timer_del(s_bs->tmr); s_bs->tmr = NULL; }
+    s_bs->canvas     = NULL;
+    s_bs->status_lbl = NULL;
+    s_bs->start_btn  = NULL;
+    // ctx and canv_buf freed by reset_function_page_children once the task exits.
+}
+
 static void show_cc1101_bandscope_screen(void)
 {
     if (!cc1101_is_init()) {
@@ -41921,6 +41969,7 @@ static void show_cc1101_bandscope_screen(void)
 
     create_function_page_base("CC1101 Band Scope");
     s_bs = ctx; // assign AFTER reset_function_page_children has run inside create_function_page_base
+    g_screen_stop_fn = cc1101_bs_screen_stop;
     apply_menu_bg();
 
     // Canvas — fills full width, starts just below the page title bar
@@ -42265,6 +42314,21 @@ static void s_zw_back_cb(lv_event_t *e)
     show_cc1101_screen();
 }
 
+// Stop hook for CC1101 Z-Wave Scout — mirrors the re-entry guard in show_cc1101_zwave_screen.
+static void cc1101_zwave_screen_stop(void)
+{
+    if (!s_zwave) return;
+    s_zwave->cancel    = true;
+    s_zwave->active    = false;
+    if (s_zwave->tmr) { lv_timer_del(s_zwave->tmr); s_zwave->tmr = NULL; }
+    s_zwave->status_lbl = NULL;
+    s_zwave->frame_lbl  = NULL;
+    s_zwave->net_lbl    = NULL;
+    s_zwave->gps_lbl    = NULL;
+    s_zwave->start_btn  = NULL;
+    // ctx freed by reset_function_page_children once the task exits.
+}
+
 static void show_cc1101_zwave_screen(void)
 {
     if (!cc1101_is_init()) {
@@ -42289,6 +42353,7 @@ static void show_cc1101_zwave_screen(void)
 
     create_function_page_base("CC1101 Z-Wave Scout");
     s_zwave = ctx_zw; // assign AFTER reset_function_page_children has run inside create_function_page_base
+    g_screen_stop_fn = cc1101_zwave_screen_stop;
     apply_menu_bg();
 
     // Info card
@@ -43026,6 +43091,19 @@ static void s_nsniff_start_cb(lv_event_t *e)
     }
 }
 
+// Stop hook for nRF24 Sniffer screen — mirrors the ctx cancel logic in show_nrf24_screen().
+static void nrf24_sniffer_screen_stop(void)
+{
+    if (!s_nsniff) return;
+    s_nsniff->active = false;
+    s_nsniff->cancel = true;
+    if (s_nsniff->tmr) { lv_timer_del(s_nsniff->tmr); s_nsniff->tmr = NULL; }
+    s_nsniff->status_lbl = NULL;
+    s_nsniff->hex_lbl    = NULL;
+    s_nsniff->count_lbl  = NULL;
+    s_nsniff->start_btn  = NULL;
+}
+
 static void show_nrf24_sniffer_screen(void)
 {
     if (s_nsniff) { s_nsniff->active = false; s_nsniff->cancel = true; }
@@ -43044,6 +43122,7 @@ static void show_nrf24_sniffer_screen(void)
     ctx->payload_len = 32;
     create_function_page_base("nRF24 Sniffer");
     s_nsniff = ctx; // assign AFTER reset_function_page_children has run inside create_function_page_base
+    g_screen_stop_fn = nrf24_sniffer_screen_stop;
     apply_menu_bg();
 
     lv_obj_t *card = lv_obj_create(function_page);
@@ -43354,6 +43433,14 @@ static void s_n24_jam_dismiss_cb(lv_event_t *e)
     if (overlay) lv_obj_del(overlay);
 }
 
+// Stop hook for nRF24 Jammer screen.
+static void nrf24_jam_screen_stop(void)
+{
+    s_n24_jam_active = false;  // signals the jam task to exit via nrf24_jam_sweep()
+    if (s_n24_jam_tmr) { lv_timer_del(s_n24_jam_tmr); s_n24_jam_tmr = NULL; }
+    s_n24_jam_status = NULL;
+}
+
 static void show_nrf24_jammer_screen(void)
 {
     if (!nrf24_is_init()) {
@@ -43366,6 +43453,7 @@ static void show_nrf24_jammer_screen(void)
     s_n24_jam_active = false;
 
     create_function_page_base("nRF24 Jammer");
+    g_screen_stop_fn = nrf24_jam_screen_stop;
     apply_menu_bg();
 
     // Legal disclaimer overlay
@@ -43570,6 +43658,18 @@ static void s_nfut_start_cb(lv_event_t *e)
     xTaskCreate(s_nfut_task_fn, "nrf24_fut", 4096, ctx, 2, &ctx->task);
 }
 
+// Stop hook for nRF24 Futaba S-FHSS screen.
+static void nrf24_futaba_screen_stop(void)
+{
+    if (!s_nfut) return;
+    s_nfut->active = false;
+    s_nfut->cancel = true;
+    if (s_nfut->tmr) { lv_timer_del(s_nfut->tmr); s_nfut->tmr = NULL; }
+    s_nfut->status_lbl = NULL;
+    s_nfut->result_lbl = NULL;
+    s_nfut->start_btn  = NULL;
+}
+
 static void show_nrf24_futaba_screen(void)
 {
     if (s_nfut) { s_nfut->active = false; s_nfut->cancel = true; }
@@ -43587,6 +43687,7 @@ static void show_nrf24_futaba_screen(void)
     if (!ctx) { s_n24_stub_screen("nRF24 Error", "Out of memory"); return; }
     create_function_page_base("Futaba S-FHSS");
     s_nfut = ctx; // assign AFTER reset_function_page_children has run inside create_function_page_base
+    g_screen_stop_fn = nrf24_futaba_screen_stop;
     apply_menu_bg();
 
     lv_obj_t *card = lv_obj_create(function_page);
@@ -43780,6 +43881,16 @@ static void s_n24fox_haptic_toggle_cb(lv_event_t *e)
     }
 }
 
+// Stop hook for nRF24 Fox Hunt screen.
+static void nrf24_foxhunt_screen_stop(void)
+{
+    if (s_n24fox_tmr) { lv_timer_del(s_n24fox_tmr); s_n24fox_tmr = NULL; }
+    vibrator_off();
+    g_vibtest_strength_pct = s_n24fox_saved_vib_pct;
+    s_n24fox_bar = NULL; s_n24fox_lbl = NULL;
+    s_n24fox_ch_lbl = NULL; s_n24fox_hbtn = NULL; s_n24fox_status = NULL;
+}
+
 static void show_nrf24_foxhunt_screen(void)
 {
     if (s_n24fox_tmr) { lv_timer_del(s_n24fox_tmr); s_n24fox_tmr = NULL; }
@@ -43799,6 +43910,7 @@ static void show_nrf24_foxhunt_screen(void)
     s_n24fox_saved_vib_pct = g_vibtest_strength_pct;
 
     create_function_page_base("nRF24 Fox Hunt");
+    g_screen_stop_fn = nrf24_foxhunt_screen_stop;
     apply_menu_bg();
     int y = 34;
 
@@ -44002,6 +44114,20 @@ static void s_rf433_fox_haptic_toggle_cb(lv_event_t *e)
     }
 }
 
+// Stop hook for RF433 Fox Hunt screen — also removes the GPIO ISR.
+static void rf433_foxhunt_screen_stop(void)
+{
+    if (s_rf433_fox_tmr) { lv_timer_del(s_rf433_fox_tmr); s_rf433_fox_tmr = NULL; }
+    if (s_rf433_fox_isr_installed) {
+        gpio_isr_handler_remove(RF_HAT_RF433_RX_GPIO);
+        s_rf433_fox_isr_installed = false;
+    }
+    vibrator_off();
+    g_vibtest_strength_pct = s_rf433_fox_saved_vib_pct;
+    s_rf433_fox_bar = NULL; s_rf433_fox_lbl = NULL;
+    s_rf433_fox_hbtn = NULL; s_rf433_fox_status = NULL;
+}
+
 static void show_rf433_foxhunt_screen(void)
 {
     if (s_rf433_fox_tmr) { lv_timer_del(s_rf433_fox_tmr); s_rf433_fox_tmr = NULL; }
@@ -44031,6 +44157,7 @@ static void show_rf433_foxhunt_screen(void)
     s_rf433_fox_saved_vib_pct = g_vibtest_strength_pct;
 
     create_function_page_base("RF433 Fox Hunt");
+    g_screen_stop_fn = rf433_foxhunt_screen_stop;
     apply_menu_bg();
     int y = 34;
 
