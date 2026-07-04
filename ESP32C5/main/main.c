@@ -147,6 +147,7 @@ LV_IMG_DECLARE(deedee_img);
 // TLS (WPA-SEC upload)
 #include "esp_tls.h"
 #include "esp_crt_bundle.h"
+#include "aes/esp_aes.h"
 
 // NimBLE (BLE scanner)
 #include "nimble/nimble_port.h"
@@ -351,11 +352,40 @@ static volatile bool    espnow_scout_active   = false;
 static TaskHandle_t     espnow_hopper_handle  = NULL;
 static uint8_t          espnow_current_ch     = 1;
 static portMUX_TYPE     espnow_mux            = portMUX_INITIALIZER_UNLOCKED;
-/* UI handles */
+/* UI handles (discovery screen) */
 static lv_obj_t        *espnow_list           = NULL;
 static lv_obj_t        *espnow_status_lbl     = NULL;
 static lv_timer_t      *espnow_refresh_timer  = NULL;
 static volatile bool    espnow_ui_needs_update = false;
+
+/* ── ESP-NOW packet log + session state ─────────────────────────────────── */
+#define ESPNOW_PKT_LOG_MAX  200    // ring-buffer slots (PSRAM)
+#define ESPNOW_PKT_CAP       96    // max payload bytes captured per frame
+// Raw captured frame (bytes from offset [29] of the Action frame = ESP-NOW body)
+typedef struct {
+    int64_t  ts_us;
+    int8_t   rssi;
+    uint8_t  channel;
+    uint8_t  src_mac[6];
+    uint8_t  dst_mac[6];
+    uint8_t  payload_len;   // bytes captured (≤ ESPNOW_PKT_CAP)
+    bool     encrypted;     // unicast dst → likely encrypted
+    uint8_t  payload[ESPNOW_PKT_CAP];
+} espnow_pkt_t;
+
+// Session: user tapped a discovered device → lock channel
+static int            espnow_session_idx   = -1;    // index in espnow_devices[]; -1 = no session
+static bool           espnow_session_allch = false;  // false = filter src_mac; true = all ESP-NOW on ch
+// Packet log ring buffer (lazy-allocated from PSRAM on first session)
+static espnow_pkt_t  *espnow_pktlog       = NULL;
+static int            espnow_pkt_head     = 0;      // next write slot
+static int            espnow_pkt_count    = 0;      // entries present (≤ ESPNOW_PKT_LOG_MAX)
+static portMUX_TYPE   espnow_pkt_mux      = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool  espnow_pkt_dirty    = false;
+/* UI handles (packet log screen) */
+static lv_obj_t      *espnow_pl_list      = NULL;
+static lv_obj_t      *espnow_pl_status    = NULL;
+static lv_timer_t    *espnow_pl_timer     = NULL;
 
 // BLE Spoof general list (spooflist.txt)
 #define SPOOF_LIST_MAX  64
@@ -899,6 +929,18 @@ static volatile bool targeted_deauth_active = false;
 static lv_obj_t *targeted_deauth_status_label = NULL;
 static lv_timer_t *targeted_deauth_timer = NULL;
 static uint32_t targeted_deauth_count = 0;
+
+// Deauth Client — passive client discovery before targeted deauth
+#define DC_MAX_CLIENTS 24
+typedef struct { uint8_t mac[6]; int8_t rssi; } dc_client_t;
+static dc_client_t s_dc_clients[DC_MAX_CLIENTS];
+static int s_dc_client_count = 0;
+static volatile bool s_dc_scanning = false;
+static uint8_t s_dc_ap_bssid[6];
+static int s_dc_seconds_left = 0;
+static lv_obj_t *s_dc_status_lbl = NULL;
+static lv_obj_t *s_dc_list_cont = NULL;
+static lv_timer_t *s_dc_timer = NULL;
 
 static lv_obj_t *evil_twin_network_dd = NULL;
 static lv_obj_t *evil_twin_html_dd = NULL;
@@ -2542,8 +2584,14 @@ static void sniffer_refresh_ap_list(void);
 static void sniffer_client_click_cb(lv_event_t *e);
 static bool wifi_is_matter_oui(const uint8_t *bssid);
 static void show_targeted_deauth_screen(void);
+static void targeted_deauth_screen_stop(void);
 static void targeted_deauth_timer_cb(lv_timer_t *timer);
 static void targeted_deauth_stop_cb(lv_event_t *e);
+static void deauth_client_promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type);
+static void deauth_client_tap_cb(lv_event_t *e);
+static void deauth_client_timer_cb(lv_timer_t *timer);
+static void deauth_client_scan_stop(void);
+static void show_deauth_client_scan_screen(void);
 static void sniffer_refresh_observe_view(void);
 static void sniffer_new_client_notify(void);
 static void sae_overflow_yes_btn_cb(lv_event_t *e);
@@ -2765,6 +2813,15 @@ static void wscope_task(void *p);
 static void show_espnow_scout_screen(void);
 static void espnow_scout_stop(void);
 static void espnow_rebuild_list(void);
+static void espnow_device_tap_cb(lv_event_t *e);
+static void espnow_session_tile_cb(lv_event_t *e);
+static void espnow_session_stop(void);
+static void show_espnow_session_screen(int dev_idx);
+static void espnow_pktlog_stop(void);
+static void espnow_pktlog_clear_cb(lv_event_t *ev);
+static void show_espnow_pktlog_screen(void);
+static bool espnow_try_decrypt(const uint8_t *payload, int plen,
+                                const uint8_t *lmk, uint8_t *out, int *out_len);
 
 // HoneyPair
 static void show_honeypair_screen(void);
@@ -8643,9 +8700,20 @@ static void targeted_deauth_stop_cb(lv_event_t *e) {
     }
 }
 
+// Stop hook — fires on Back/Home navigation while targeted deauth is running
+static void targeted_deauth_screen_stop(void) {
+    targeted_deauth_active = false;
+    if (targeted_deauth_timer) {
+        lv_timer_del(targeted_deauth_timer);
+        targeted_deauth_timer = NULL;
+    }
+    targeted_deauth_status_label = NULL;
+}
+
 // Show targeted deauth screen
 static void show_targeted_deauth_screen(void) {
     create_function_page_base("Deauth Station");
+    g_screen_stop_fn = targeted_deauth_screen_stop;
     
     // Content area
     lv_obj_t *content = lv_obj_create(function_page);
@@ -14145,6 +14213,63 @@ static void attack_tile_event_cb(lv_event_t *e)
             }
             show_wifi_connect_screen();
         }
+    } else if (strcmp(attack_name, "Deauth Client") == 0) {
+        // Requires exactly one selected network — passive-sniff clients then target one
+        int selected_indices[SCAN_RESULTS_MAX_DISPLAY];
+        int selected_count = wifi_scanner_get_selected(selected_indices, SCAN_RESULTS_MAX_DISPLAY);
+
+        if (selected_count != 1) {
+            lv_obj_t *overlay = lv_obj_create(lv_scr_act());
+            lv_obj_set_size(overlay, LCD_H_RES, LCD_V_RES);
+            lv_obj_set_pos(overlay, 0, 0);
+            lv_obj_set_style_bg_color(overlay, ui_bg_color(), 0);
+            lv_obj_set_style_bg_opa(overlay, LV_OPA_70, 0);
+            lv_obj_set_style_border_width(overlay, 0, 0);
+            lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
+
+            lv_obj_t *dialog = lv_obj_create(overlay);
+            lv_obj_set_size(dialog, 280, 120);
+            lv_obj_center(dialog);
+            lv_obj_set_style_bg_color(dialog, ui_panel_color(), 0);
+            lv_obj_set_style_border_color(dialog, COLOR_MATERIAL_ORANGE, 0);
+            lv_obj_set_style_border_width(dialog, 2, 0);
+            lv_obj_set_style_radius(dialog, 10, 0);
+            lv_obj_clear_flag(dialog, LV_OBJ_FLAG_SCROLLABLE);
+
+            lv_obj_t *msg = lv_label_create(dialog);
+            lv_label_set_text(msg, "Select only one network");
+            lv_obj_set_style_text_color(msg, ui_text_color(), 0);
+            lv_obj_set_style_text_font(msg, &lv_font_montserrat_16, 0);
+            lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_align(msg, LV_ALIGN_TOP_MID, 0, 15);
+
+            lv_obj_t *ok_btn = lv_btn_create(dialog);
+            lv_obj_set_size(ok_btn, 80, 30);
+            lv_obj_align(ok_btn, LV_ALIGN_BOTTOM_MID, 0, -5);
+            lv_obj_set_style_bg_color(ok_btn, COLOR_MATERIAL_ORANGE, LV_STATE_DEFAULT);
+            lv_obj_set_style_border_width(ok_btn, 0, 0);
+            lv_obj_set_style_radius(ok_btn, 8, 0);
+            lv_obj_t *ok_lbl = lv_label_create(ok_btn);
+            lv_label_set_text(ok_lbl, "OK");
+            lv_obj_set_style_text_color(ok_lbl, ui_text_color(), 0);
+            lv_obj_center(ok_lbl);
+            lv_obj_add_event_cb(ok_btn, close_popup_overlay_cb, LV_EVENT_CLICKED, NULL);
+        } else {
+            // Populate targeted_deauth AP globals from scan results
+            const wifi_ap_record_t *records = wifi_scanner_get_results_ptr();
+            const uint16_t *count_ptr = wifi_scanner_get_count_ptr();
+            int ap_idx = selected_indices[0];
+            if (records && count_ptr && ap_idx < (int)*count_ptr) {
+                const wifi_ap_record_t *ap = &records[ap_idx];
+                memcpy(targeted_deauth_ap_bssid, ap->bssid, 6);
+                strncpy(targeted_deauth_ssid, (const char *)ap->ssid, sizeof(targeted_deauth_ssid) - 1);
+                targeted_deauth_ssid[sizeof(targeted_deauth_ssid) - 1] = '\0';
+                targeted_deauth_channel = (uint8_t)ap->primary;
+                targeted_deauth_ap_index = -1;  // Not returning to Network Observer
+                show_deauth_client_scan_screen();
+            }
+        }
     }
 }
 
@@ -16991,6 +17116,213 @@ static void show_wpa_sec_upload_page(void)
     }
 }
 
+// ─── Deauth Client — passive client discovery + targeted deauth ──────────────
+
+// Promiscuous callback: collect unique client MACs on the target AP's channel
+static void deauth_client_promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+    if (!s_dc_scanning) return;
+    if (type != WIFI_PKT_DATA && type != WIFI_PKT_MGMT) return;
+
+    const wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *frame = pkt->payload;
+    if (pkt->rx_ctrl.sig_len < 24) return;
+
+    uint8_t fc0 = frame[0];
+    uint8_t fc1 = frame[1];
+    uint8_t frame_type = fc0 & 0xFC;
+    bool to_ds   = (fc1 & 0x01) != 0;
+    bool from_ds = (fc1 & 0x02) != 0;
+    const uint8_t *addr1 = &frame[4];
+    const uint8_t *addr2 = &frame[10];
+
+    const uint8_t *ap_mac  = NULL;
+    const uint8_t *sta_mac = NULL;
+
+    if (type == WIFI_PKT_DATA) {
+        if (to_ds && !from_ds) {
+            ap_mac = addr1; sta_mac = addr2;          // STA→AP
+        } else if (!to_ds && from_ds) {
+            ap_mac = addr2; sta_mac = addr1;          // AP→STA
+        } else {
+            return;
+        }
+    } else {
+        // Management frames: association/auth tell us the STA
+        switch (frame_type) {
+            case 0x00: case 0x20: case 0xB0:          // AssocReq / ReassocReq / Auth
+                ap_mac = addr1; sta_mac = addr2; break;
+            case 0x10: case 0x30:                     // AssocResp / ReassocResp
+                ap_mac = addr2; sta_mac = addr1; break;
+            default: return;
+        }
+    }
+
+    if (!ap_mac || !sta_mac) return;
+    if (memcmp(ap_mac, s_dc_ap_bssid, 6) != 0) return;  // Wrong AP
+    if (is_broadcast_bssid(sta_mac) || is_multicast_mac(sta_mac) || is_own_device_mac(sta_mac)) return;
+
+    // Deduplicate — update RSSI if already seen
+    for (int i = 0; i < s_dc_client_count; i++) {
+        if (memcmp(s_dc_clients[i].mac, sta_mac, 6) == 0) {
+            s_dc_clients[i].rssi = pkt->rx_ctrl.rssi;
+            return;
+        }
+    }
+    if (s_dc_client_count >= DC_MAX_CLIENTS) return;
+    memcpy(s_dc_clients[s_dc_client_count].mac, sta_mac, 6);
+    s_dc_clients[s_dc_client_count].rssi = pkt->rx_ctrl.rssi;
+    s_dc_client_count++;
+}
+
+// Tap on a discovered client row — launch targeted deauth
+static void deauth_client_tap_cb(lv_event_t *e) {
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_dc_client_count) return;
+    // AP globals already set; fill in the station MAC
+    memcpy(targeted_deauth_station_mac, s_dc_clients[idx].mac, 6);
+    targeted_deauth_ap_index = -1;  // Return to menu on stop, not to sniffer view
+    show_targeted_deauth_screen();
+}
+
+// Stop hook — fires on Back/Home while the scan screen is open
+static void deauth_client_scan_stop(void) {
+    s_dc_scanning = false;
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(NULL);
+    if (s_dc_timer) {
+        lv_timer_del(s_dc_timer);
+        s_dc_timer = NULL;
+    }
+    s_dc_status_lbl = NULL;
+    s_dc_list_cont  = NULL;
+}
+
+// 1-second countdown timer: update status and populate list when done
+static void deauth_client_timer_cb(lv_timer_t *timer) {
+    (void)timer;
+    if (s_dc_seconds_left > 0) s_dc_seconds_left--;
+
+    if (s_dc_seconds_left > 0) {
+        if (s_dc_status_lbl) {
+            char buf[56];
+            snprintf(buf, sizeof(buf), "Scanning... %ds | %d found", s_dc_seconds_left, s_dc_client_count);
+            lv_label_set_text(s_dc_status_lbl, buf);
+        }
+        return;
+    }
+
+    // Scan complete — stop promiscuous and render results
+    s_dc_scanning = false;
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(NULL);
+
+    lv_timer_del(s_dc_timer);
+    s_dc_timer = NULL;
+
+    if (s_dc_status_lbl) {
+        char buf[64];
+        if (s_dc_client_count > 0) {
+            snprintf(buf, sizeof(buf), "%d client(s) found — tap to target", s_dc_client_count);
+            lv_obj_set_style_text_color(s_dc_status_lbl, lv_color_make(0, 200, 0), 0);
+        } else {
+            snprintf(buf, sizeof(buf), "No clients detected — press \342\200\271 Back");
+            lv_obj_set_style_text_color(s_dc_status_lbl, COLOR_MATERIAL_ORANGE, 0);
+        }
+        lv_label_set_text(s_dc_status_lbl, buf);
+    }
+
+    if (!s_dc_list_cont) return;
+    lv_obj_clean(s_dc_list_cont);
+
+    if (s_dc_client_count == 0) {
+        lv_obj_t *none_lbl = lv_label_create(s_dc_list_cont);
+        lv_label_set_text(none_lbl, "No clients — move closer or wait for traffic");
+        lv_obj_set_style_text_color(none_lbl, lv_color_make(130, 130, 130), 0);
+        lv_obj_set_style_text_font(none_lbl, &lv_font_montserrat_12, 0);
+        return;
+    }
+
+    for (int i = 0; i < s_dc_client_count; i++) {
+        lv_obj_t *row = lv_btn_create(s_dc_list_cont);
+        lv_obj_set_size(row, lv_pct(100), 34);
+        lv_obj_set_style_bg_color(row, ui_panel_color(), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(row, lv_color_make(80, 0, 0), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_radius(row, 6, 0);
+        lv_obj_set_style_pad_all(row, 4, 0);
+        lv_obj_add_event_cb(row, deauth_client_tap_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+        lv_obj_t *mac_lbl = lv_label_create(row);
+        char mac_str[48];
+        snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X  [%d dBm]",
+                 s_dc_clients[i].mac[0], s_dc_clients[i].mac[1], s_dc_clients[i].mac[2],
+                 s_dc_clients[i].mac[3], s_dc_clients[i].mac[4], s_dc_clients[i].mac[5],
+                 (int)s_dc_clients[i].rssi);
+        lv_label_set_text(mac_lbl, mac_str);
+        lv_obj_set_style_text_color(mac_lbl, lv_color_make(255, 140, 0), 0);
+        lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_align(mac_lbl, LV_ALIGN_LEFT_MID, 4, 0);
+    }
+}
+
+// Passive client discovery screen: lock to AP channel, sniff 5 s, show client list
+static void show_deauth_client_scan_screen(void) {
+    create_function_page_base("Deauth Client");
+    g_screen_stop_fn = deauth_client_scan_stop;
+
+    // AP header: SSID + channel
+    lv_obj_t *ap_lbl = lv_label_create(function_page);
+    char ap_text[80];
+    snprintf(ap_text, sizeof(ap_text), "AP: %s  CH%d",
+             targeted_deauth_ssid[0] ? targeted_deauth_ssid : "[Hidden]",
+             (int)targeted_deauth_channel);
+    lv_label_set_text(ap_lbl, ap_text);
+    lv_obj_set_style_text_color(ap_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(ap_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_align(ap_lbl, LV_ALIGN_TOP_LEFT, 10, 36);
+
+    // Live status: countdown and found count
+    s_dc_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_dc_status_lbl, "Scanning... 5s | 0 found");
+    lv_obj_set_style_text_color(s_dc_status_lbl, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_text_font(s_dc_status_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_align(s_dc_status_lbl, LV_ALIGN_TOP_LEFT, 10, 56);
+
+    // Scrollable client list (fills remainder of screen)
+    s_dc_list_cont = lv_obj_create(function_page);
+    lv_obj_set_size(s_dc_list_cont, lv_pct(100), LCD_V_RES - 82);
+    lv_obj_align(s_dc_list_cont, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(s_dc_list_cont, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(s_dc_list_cont, 0, 0);
+    lv_obj_set_style_pad_all(s_dc_list_cont, 6, 0);
+    lv_obj_set_flex_flow(s_dc_list_cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_gap(s_dc_list_cont, 4, 0);
+    lv_obj_add_flag(s_dc_list_cont, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *ph = lv_label_create(s_dc_list_cont);
+    lv_label_set_text(ph, "Listening for client traffic...");
+    lv_obj_set_style_text_color(ph, lv_color_make(100, 100, 100), 0);
+    lv_obj_set_style_text_font(ph, &lv_font_montserrat_12, 0);
+
+    // Initialise scan state and enable promiscuous on AP channel
+    s_dc_client_count = 0;
+    s_dc_scanning     = true;
+    s_dc_seconds_left = 5;
+    memcpy(s_dc_ap_bssid, targeted_deauth_ap_bssid, 6);
+
+    esp_wifi_set_channel(targeted_deauth_channel, WIFI_SECOND_CHAN_NONE);
+    wifi_promiscuous_filter_t filt = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_DATA | WIFI_PROMIS_FILTER_MASK_MGMT
+    };
+    esp_wifi_set_promiscuous_filter(&filt);
+    esp_wifi_set_promiscuous_rx_cb(deauth_client_promisc_cb);
+    esp_wifi_set_promiscuous(true);
+
+    s_dc_timer = lv_timer_create(deauth_client_timer_cb, 1000, NULL);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 // Attack tiles screen - shown after selecting networks
 static void show_attack_tiles_screen(void)
 {
@@ -16998,21 +17330,22 @@ static void show_attack_tiles_screen(void)
     
     // Create small tiles container (4+5 layout) with compact spacing
     lv_obj_t *attack_tiles = lv_obj_create(function_page);
-    lv_obj_set_size(attack_tiles, lv_pct(100), 170);
-    lv_obj_align(attack_tiles, LV_ALIGN_TOP_MID, 0, 35);
+    lv_obj_set_size(attack_tiles, lv_pct(100), 218);
+    lv_obj_align(attack_tiles, LV_ALIGN_TOP_MID, 0, 32);
     lv_obj_set_style_bg_color(attack_tiles, ui_bg_color(), 0);
     lv_obj_set_style_border_width(attack_tiles, 0, 0);
     lv_obj_set_style_pad_all(attack_tiles, 5, 0);
     lv_obj_set_style_pad_gap(attack_tiles, 5, 0);
     lv_obj_set_flex_flow(attack_tiles, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(attack_tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(attack_tiles, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_align(attack_tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
+    lv_obj_add_flag(attack_tiles, LV_OBJ_FLAG_SCROLLABLE);
     
-    // Row 1: Deauth, Evil Twin, SAE, Handshake
+    // Row 1: Deauth, Evil Twin, SAE, Handshake, Deauth Client
     create_small_tile(attack_tiles, LV_SYMBOL_CHARGE, "Deauth", COLOR_MATERIAL_RED, attack_tile_event_cb, "Deauth");
     create_small_tile(attack_tiles, LV_SYMBOL_WARNING, "Evil Twin", COLOR_MATERIAL_ORANGE, attack_tile_event_cb, "Evil Twin");
     create_small_tile(attack_tiles, LV_SYMBOL_POWER, "SAE", COLOR_MATERIAL_PINK, attack_tile_event_cb, "SAE Overflow");
     create_small_tile(attack_tiles, LV_SYMBOL_DOWNLOAD, "Handshake", COLOR_MATERIAL_AMBER, attack_tile_event_cb, "Handshaker");
+    create_small_tile(attack_tiles, LV_SYMBOL_LIST, "Deauth Client", lv_color_make(183, 28, 28), attack_tile_event_cb, "Deauth Client");
     // Row 2: ARP Poison, MITM, Rogue AP, WPA-SEC Upload, Observer
     create_small_tile(attack_tiles, LV_SYMBOL_SHUFFLE, "ARP Poison", COLOR_MATERIAL_TEAL, attack_tile_event_cb, "ARP Poison");
     create_small_tile(attack_tiles, LV_SYMBOL_LOOP, "MITM", lv_color_make(121, 85, 72), attack_tile_event_cb, "MITM");
@@ -17023,7 +17356,7 @@ static void show_attack_tiles_screen(void)
     // Horizontal separator line above Selected Networks
     lv_obj_t *separator = lv_obj_create(function_page);
     lv_obj_set_size(separator, lv_pct(90), 2);
-    lv_obj_align(separator, LV_ALIGN_TOP_MID, 0, 213);
+    lv_obj_align(separator, LV_ALIGN_TOP_MID, 0, 254);
     lv_obj_set_style_bg_color(separator, ui_accent_color(), 0);
     lv_obj_set_style_bg_opa(separator, LV_OPA_50, 0);
     lv_obj_set_style_border_width(separator, 0, 0);
@@ -17034,11 +17367,11 @@ static void show_attack_tiles_screen(void)
     lv_label_set_text(header_label, "Selected Networks:");
     lv_obj_set_style_text_font(header_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(header_label, ui_text_color(), 0);
-    lv_obj_align(header_label, LV_ALIGN_TOP_LEFT, 10, 220);
+    lv_obj_align(header_label, LV_ALIGN_TOP_LEFT, 10, 259);
     
     // Selected networks list
     lv_obj_t *network_list = lv_obj_create(function_page);
-    lv_obj_set_size(network_list, lv_pct(100), LCD_V_RES - 240);  // Bottom 80px
+    lv_obj_set_size(network_list, lv_pct(100), LCD_V_RES - 283);  // Bottom ~37px (tiles grew for 10th tile)
     lv_obj_align(network_list, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(network_list, ui_bg_color(), 0);
     lv_obj_set_style_border_width(network_list, 0, 0);
@@ -47698,25 +48031,56 @@ static int espnow_find_or_add(const uint8_t *src_mac, const uint8_t *dst_mac,
 /* ── Promiscuous callback (runs in WiFi task context — not LVGL safe) ──────── */
 static void espnow_scout_promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type)
 {
-    if (!espnow_scout_active) return;
+    // Active in discovery mode (hopping) OR when locked into a session
+    if (!espnow_scout_active && espnow_session_idx < 0) return;
     if (type != WIFI_PKT_MGMT) return;
 
     const wifi_promiscuous_pkt_t *ppkt = (const wifi_promiscuous_pkt_t *)buf;
-    const uint8_t *payload = ppkt->payload;
-    uint16_t       len     = ppkt->rx_ctrl.sig_len;
+    const uint8_t *frame = ppkt->payload;
+    uint16_t       len   = ppkt->rx_ctrl.sig_len;
 
-    if (!espnow_is_espnow_frame(payload, len)) return;
+    if (!espnow_is_espnow_frame(frame, len)) return;
 
-    const uint8_t *dst_mac = payload + 4;   /* DA  */
-    const uint8_t *src_mac = payload + 10;  /* SA  */
+    const uint8_t *dst_mac = frame + 4;    /* DA  */
+    const uint8_t *src_mac = frame + 10;   /* SA  */
     int8_t  rssi = (int8_t)ppkt->rx_ctrl.rssi;
     uint8_t ch   = (uint8_t)ppkt->rx_ctrl.channel;
 
+    // Update the device discovery table
     portENTER_CRITICAL_ISR(&espnow_mux);
     espnow_find_or_add(src_mac, dst_mac, ch, rssi);
     portEXIT_CRITICAL_ISR(&espnow_mux);
-
     espnow_ui_needs_update = true;
+
+    // Capture raw payload to packet log when a session is active
+    if (espnow_session_idx >= 0 && espnow_pktlog) {
+        // Filter: either all ESP-NOW on this channel, or only the selected device's src MAC
+        bool capture = espnow_session_allch ||
+                       (memcmp(src_mac, espnow_devices[espnow_session_idx].src_mac, 6) == 0);
+        if (capture) {
+            // ESP-NOW body starts at byte [29]: after FC(2)+Dur(2)+DA(6)+SA(6)+BSSID(6)+Seq(2)+Cat(1)+OUI(3)+Type(1)
+            int body_off  = 29;
+            int body_len  = (int)len - body_off;
+            if (body_len < 0) body_len = 0;
+            if (body_len > ESPNOW_PKT_CAP) body_len = ESPNOW_PKT_CAP;
+
+            portENTER_CRITICAL_ISR(&espnow_pkt_mux);
+            espnow_pkt_t *slot = &espnow_pktlog[espnow_pkt_head];
+            slot->ts_us      = esp_timer_get_time();
+            slot->rssi       = rssi;
+            slot->channel    = ch;
+            memcpy(slot->src_mac, src_mac, 6);
+            memcpy(slot->dst_mac, dst_mac, 6);
+            slot->encrypted  = (dst_mac[0] != 0xFF);  // non-broadcast = likely encrypted
+            slot->payload_len = (uint8_t)body_len;
+            if (body_len > 0) memcpy(slot->payload, frame + body_off, body_len);
+            espnow_pkt_head  = (espnow_pkt_head + 1) % ESPNOW_PKT_LOG_MAX;
+            if (espnow_pkt_count < ESPNOW_PKT_LOG_MAX) espnow_pkt_count++;
+            portEXIT_CRITICAL_ISR(&espnow_pkt_mux);
+
+            espnow_pkt_dirty = true;
+        }
+    }
 }
 
 /* ── Channel hopper task ────────────────────────────────────────────────────── */
@@ -47924,8 +48288,12 @@ static void espnow_rebuild_list(void)
         lv_obj_set_style_border_color(card,
             d.encrypted ? lv_color_hex(0xFFA726) : lv_color_hex(0x26C6DA), 0);
         lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+        lv_obj_set_style_bg_color(card, lv_color_hex(0x1a2e1a), LV_STATE_PRESSED);
         lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+        // Tap → lock channel and open session sub-screen
+        lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(card, espnow_device_tap_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
 
         /* Row 1: src MAC + RSSI */
         char r1[56];
@@ -48091,4 +48459,485 @@ static void show_espnow_scout_screen(void)
 
     /* 500 ms LVGL refresh timer */
     espnow_refresh_timer = lv_timer_create(espnow_refresh_cb, 500, NULL);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+ * ESP-NOW Session: tap-to-lock, packet log, payload decode
+ * ══════════════════════════════════════════════════════════════════════════════ */
+
+/* ── Card tap in discovery list → stop hopper, open session sub-screen ──── */
+static void espnow_device_tap_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= espnow_device_count) return;
+    espnow_scout_active = false;   // hopper task will self-exit within one ESPNOW_DWELL_MS cycle
+    show_espnow_session_screen(idx);
+}
+
+/* ── Best-effort AES-128-ECB probe for unicast ESP-NOW payloads ─────────────
+ * ESP-NOW unicast encryption format is not publicly documented.
+ * This probes whether the first 16-byte block decrypts to printable/structured
+ * content using AES-ECB with the known LMK as the key.  Works if the device
+ * uses AES-ECB (common in simple embedded implementations). For AES-CCM/CTR/CBC
+ * the bytes will look random — in that case the raw hex is still exported.
+ * Returns true if at least 4 of the 16 output bytes are printable ASCII,
+ * which is a useful heuristic for "this looks like plaintext."
+ */
+static bool espnow_try_decrypt(const uint8_t *payload, int plen,
+                                const uint8_t *lmk, uint8_t *out, int *out_len)
+{
+    if (!payload || plen < 16 || !lmk) return false;
+
+    esp_aes_context aes;
+    esp_aes_init(&aes);
+    if (esp_aes_setkey(&aes, lmk, 128) != 0) {
+        esp_aes_free(&aes);
+        return false;
+    }
+    // Decrypt first block only (16 bytes) using ECB
+    esp_aes_crypt_ecb(&aes, ESP_AES_DECRYPT, payload, out);
+    esp_aes_free(&aes);
+    *out_len = 16;
+
+    // Heuristic: ≥4 printable ASCII bytes → likely plaintext
+    int printable = 0;
+    for (int i = 0; i < 16; i++)
+        if (out[i] >= 0x20 && out[i] < 0x7F) printable++;
+    return (printable >= 4);
+}
+
+/* ── Stop hook for session screen ───────────────────────────────────────── */
+static void espnow_session_stop(void)
+{
+    espnow_session_idx   = -1;
+    espnow_session_allch = false;
+    espnow_scout_stop();   // stops promiscuous + waits for hopper (already dead)
+}
+
+/* ── Session screen tile callback ───────────────────────────────────────── */
+static void espnow_session_tile_cb(lv_event_t *e)
+{
+    const char *action = (const char *)lv_event_get_user_data(e);
+    if (!action) return;
+    if (strcmp(action, "pktlog_dev") == 0) {
+        espnow_session_allch = false;
+        show_espnow_pktlog_screen();
+    } else if (strcmp(action, "pktlog_all") == 0) {
+        espnow_session_allch = true;
+        show_espnow_pktlog_screen();
+    } else if (strcmp(action, "export") == 0) {
+        espnow_export_cb(NULL);   // reuses existing discovery-screen export
+    }
+}
+
+/* ── Session sub-screen: device info + action tiles ────────────────────── */
+static void show_espnow_session_screen(int dev_idx)
+{
+    create_function_page_base("ESP-NOW Session");
+    g_screen_stop_fn = espnow_session_stop;
+
+    espnow_session_idx = dev_idx;
+    espnow_device_t *d = &espnow_devices[dev_idx];
+
+    // Lock radio to this device's channel
+    esp_wifi_set_channel(d->channel, WIFI_SECOND_CHAN_NONE);
+
+    // Allocate packet log buffer from PSRAM (once; reuse across sessions)
+    if (!espnow_pktlog) {
+        espnow_pktlog = heap_caps_malloc(
+            ESPNOW_PKT_LOG_MAX * sizeof(espnow_pkt_t),
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    // Clear log for fresh session
+    portENTER_CRITICAL(&espnow_pkt_mux);
+    espnow_pkt_head  = 0;
+    espnow_pkt_count = 0;
+    portEXIT_CRITICAL(&espnow_pkt_mux);
+    espnow_pkt_dirty = false;
+
+    // ── Header: src MAC, RSSI, channel ──────────────────────────────────
+    lv_obj_t *src_lbl = lv_label_create(function_page);
+    char info[72];
+    snprintf(info, sizeof(info), "%02X:%02X:%02X:%02X:%02X:%02X  ch%d  %ddBm  %lu pkts",
+             d->src_mac[0], d->src_mac[1], d->src_mac[2],
+             d->src_mac[3], d->src_mac[4], d->src_mac[5],
+             d->channel, d->rssi, (unsigned long)d->pkt_count);
+    lv_label_set_text(src_lbl, info);
+    lv_obj_set_style_text_color(src_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(src_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_align(src_lbl, LV_ALIGN_TOP_LEFT, 5, 36);
+
+    // Label row (if matched from profiles.json)
+    int y_off = 50;
+    if (d->label[0]) {
+        lv_obj_t *lbl_row = lv_label_create(function_page);
+        char lb[56];
+        snprintf(lb, sizeof(lb), "\xEF\x80\xAB  %s", d->label);   /* fa-tag glyph */
+        lv_label_set_text(lbl_row, lb);
+        lv_obj_set_style_text_color(lbl_row, UI_ACCENT_CYAN, 0);
+        lv_obj_set_style_text_font(lbl_row, &lv_font_montserrat_12, 0);
+        lv_obj_align(lbl_row, LV_ALIGN_TOP_LEFT, 5, y_off);
+        y_off += 14;
+    }
+
+    // Encryption + LMK status hint
+    bool has_lmk = false;
+    for (int p = 0; p < espnow_profile_count && !has_lmk; p++) {
+        if (memcmp(espnow_profiles[p].mac, d->src_mac, 6) == 0) {
+            for (int k = 0; k < 16; k++) if (espnow_profiles[p].lmk[k]) { has_lmk = true; break; }
+        }
+    }
+    lv_obj_t *enc_lbl = lv_label_create(function_page);
+    char enc_buf[64];
+    snprintf(enc_buf, sizeof(enc_buf), "%s  |  LMK: %s",
+             d->encrypted ? "unicast (enc)" : "broadcast (plain)",
+             has_lmk ? "loaded \xE2\x9C\x93" : "none");
+    lv_label_set_text(enc_lbl, enc_buf);
+    lv_obj_set_style_text_color(enc_lbl,
+        has_lmk ? lv_color_make(0, 200, 0) : lv_color_make(150, 150, 150), 0);
+    lv_obj_set_style_text_font(enc_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_align(enc_lbl, LV_ALIGN_TOP_LEFT, 5, y_off);
+
+    // ── Action tiles ────────────────────────────────────────────────────
+    lv_obj_t *tiles = lv_obj_create(function_page);
+    lv_obj_set_size(tiles, lv_pct(100), 145);
+    lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(tiles, 0, 0);
+    lv_obj_set_style_pad_all(tiles, 5, 0);
+    lv_obj_set_style_pad_gap(tiles, 5, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Pkt Log — this device only
+    create_small_tile(tiles, LV_SYMBOL_LIST, "This Dev\nPkt Log",
+                      lv_color_hex(0x004D40), espnow_session_tile_cb, "pktlog_dev");
+    // Pkt Log — all ESP-NOW on this channel
+    create_small_tile(tiles, LV_SYMBOL_EYE_OPEN, "All Ch\nPkt Log",
+                      lv_color_hex(0x4A148C), espnow_session_tile_cb, "pktlog_all");
+    // Export discovery JSON (reuses existing export)
+    create_small_tile(tiles, LV_SYMBOL_SAVE, "Export\nDiscovery",
+                      lv_color_hex(0x1A237E), espnow_session_tile_cb, "export");
+}
+
+/* ── Packet log screen stop hook ────────────────────────────────────────── */
+static void espnow_pktlog_stop(void)
+{
+    if (espnow_pl_timer) { lv_timer_del(espnow_pl_timer); espnow_pl_timer = NULL; }
+    espnow_pl_list   = NULL;
+    espnow_pl_status = NULL;
+}
+
+/* ── Export raw packet log to SD ────────────────────────────────────────── */
+static void espnow_pktlog_export_cb(lv_event_t *ev)
+{
+    (void)ev;
+    ensure_sd_mounted();
+    struct stat st;
+    if (stat(ESPNOW_EXPORT_DIR, &st) != 0) mkdir(ESPNOW_EXPORT_DIR, 0775);
+
+    char path[80];
+    time_t now_t = 0; time(&now_t);
+    struct tm *tm_info = localtime(&now_t);
+    if (tm_info && now_t > 1000000)
+        snprintf(path, sizeof(path), ESPNOW_EXPORT_DIR "/pktlog_%04d%02d%02d_%02d%02d%02d.txt",
+                 tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
+                 tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
+    else
+        snprintf(path, sizeof(path), ESPNOW_EXPORT_DIR "/pktlog_%lld.txt",
+                 (long long)esp_timer_get_time() / 1000000LL);
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        if (espnow_pl_status && lv_obj_is_valid(espnow_pl_status))
+            lv_label_set_text(espnow_pl_status, "Export failed — check SD");
+        return;
+    }
+
+    portENTER_CRITICAL(&espnow_pkt_mux);
+    int count = espnow_pkt_count;
+    // Snapshot (ring oldest→newest)
+    espnow_pkt_t *snap = heap_caps_malloc(count * sizeof(espnow_pkt_t),
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (snap) {
+        int start = (espnow_pkt_count == ESPNOW_PKT_LOG_MAX)
+                    ? espnow_pkt_head : 0;
+        for (int i = 0; i < count; i++)
+            snap[i] = espnow_pktlog[(start + i) % ESPNOW_PKT_LOG_MAX];
+    }
+    portEXIT_CRITICAL(&espnow_pkt_mux);
+
+    if (!snap) { fclose(f); return; }
+
+    fprintf(f, "# ESP-NOW Packet Log — CYM-NM28C5\n");
+    fprintf(f, "# Format: timestamp_s | ch | rssi | src | dst | type | payload_hex | ascii\n\n");
+
+    for (int i = 0; i < count; i++) {
+        espnow_pkt_t *p = &snap[i];
+        fprintf(f, "+%.3fs  ch%d  %ddBm  %02X:%02X:%02X:%02X:%02X:%02X → %02X:%02X:%02X:%02X:%02X:%02X  [%s]\n",
+                (double)p->ts_us / 1e6,
+                p->channel, p->rssi,
+                p->src_mac[0], p->src_mac[1], p->src_mac[2],
+                p->src_mac[3], p->src_mac[4], p->src_mac[5],
+                p->dst_mac[0], p->dst_mac[1], p->dst_mac[2],
+                p->dst_mac[3], p->dst_mac[4], p->dst_mac[5],
+                p->encrypted ? "UNICAST/ENC" : "BROADCAST");
+        // Hex
+        fprintf(f, "  HEX:");
+        for (int b = 0; b < p->payload_len; b++) fprintf(f, " %02X", p->payload[b]);
+        fprintf(f, "\n");
+        // ASCII (printable only)
+        fprintf(f, "  ASC: ");
+        for (int b = 0; b < p->payload_len; b++)
+            fputc((p->payload[b] >= 0x20 && p->payload[b] < 0x7F) ? p->payload[b] : '.', f);
+        fprintf(f, "\n\n");
+    }
+    fclose(f);
+    heap_caps_free(snap);
+    ESP_LOGI(TAG, "ESP-NOW pkt log: exported %d packets → %s", count, path);
+
+    if (espnow_pl_status && lv_obj_is_valid(espnow_pl_status)) {
+        char msg[48];
+        snprintf(msg, sizeof(msg), "Saved %d pkts → /sdcard/lab/espnow/", count);
+        lv_label_set_text(espnow_pl_status, msg);
+    }
+}
+
+/* ── Find LMK for a src MAC from loaded profiles ──────────────────────── */
+static const uint8_t *espnow_find_lmk(const uint8_t *src_mac)
+{
+    for (int p = 0; p < espnow_profile_count; p++) {
+        if (memcmp(espnow_profiles[p].mac, src_mac, 6) == 0) {
+            bool has = false;
+            for (int k = 0; k < 16; k++) if (espnow_profiles[p].lmk[k]) { has = true; break; }
+            return has ? espnow_profiles[p].lmk : NULL;
+        }
+    }
+    return NULL;
+}
+
+/* ── Rebuild the last N visible entries in the packet log UI ───────────── */
+#define ESPNOW_PL_VISIBLE  20     // max cards shown at once
+
+static void espnow_pktlog_rebuild(void)
+{
+    if (!espnow_pl_list || !lv_obj_is_valid(espnow_pl_list)) return;
+    lv_obj_clean(espnow_pl_list);
+
+    portENTER_CRITICAL(&espnow_pkt_mux);
+    int count = espnow_pkt_count;
+    int head  = espnow_pkt_head;
+    portEXIT_CRITICAL(&espnow_pkt_mux);
+
+    if (count == 0) {
+        lv_obj_t *ph = lv_label_create(espnow_pl_list);
+        lv_label_set_text(ph, "No packets yet — waiting...");
+        lv_obj_set_style_text_color(ph, lv_color_make(100, 100, 100), 0);
+        lv_obj_set_style_text_font(ph, &lv_font_montserrat_12, 0);
+        return;
+    }
+
+    // Show last ESPNOW_PL_VISIBLE entries (oldest of the visible set first)
+    int show  = (count < ESPNOW_PL_VISIBLE) ? count : ESPNOW_PL_VISIBLE;
+    int start = (head - show + ESPNOW_PKT_LOG_MAX) % ESPNOW_PKT_LOG_MAX;
+
+    for (int i = 0; i < show; i++) {
+        portENTER_CRITICAL(&espnow_pkt_mux);
+        espnow_pkt_t pkt = espnow_pktlog[(start + i) % ESPNOW_PKT_LOG_MAX];
+        portEXIT_CRITICAL(&espnow_pkt_mux);
+
+        // Card container
+        lv_obj_t *card = lv_obj_create(espnow_pl_list);
+        lv_obj_set_size(card, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(card, lv_color_hex(0x0d1a12), 0);
+        lv_obj_set_style_border_color(card,
+            pkt.encrypted ? lv_color_hex(0xFFA726) : lv_color_hex(0x26C6DA), 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_radius(card, 4, 0);
+        lv_obj_set_style_pad_all(card, 3, 0);
+        lv_obj_set_style_pad_gap(card, 2, 0);
+        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+        // Row 1: timestamp + RSSI + channel + type badge
+        char r1[64];
+        snprintf(r1, sizeof(r1), "+%.3fs  ch%d  %ddBm  [%s]",
+                 (double)pkt.ts_us / 1e6,
+                 pkt.channel, pkt.rssi,
+                 pkt.encrypted ? "ENC" : "PLAIN");
+        lv_obj_t *l1 = lv_label_create(card);
+        lv_label_set_text(l1, r1);
+        lv_obj_set_style_text_font(l1, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l1, pkt.encrypted ? lv_color_hex(0xFFA726) : lv_color_hex(0x26C6DA), 0);
+        lv_label_set_long_mode(l1, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(l1, lv_pct(100));
+
+        // Row 2: src → dst (last 3 octets each to save space)
+        char r2[56];
+        snprintf(r2, sizeof(r2), "  %02X:%02X:%02X:%02X:%02X:%02X\342\206\222%02X:%02X:%02X:%02X:%02X:%02X",
+                 pkt.src_mac[0], pkt.src_mac[1], pkt.src_mac[2],
+                 pkt.src_mac[3], pkt.src_mac[4], pkt.src_mac[5],
+                 pkt.dst_mac[0], pkt.dst_mac[1], pkt.dst_mac[2],
+                 pkt.dst_mac[3], pkt.dst_mac[4], pkt.dst_mac[5]);
+        lv_obj_t *l2 = lv_label_create(card);
+        lv_label_set_text(l2, r2);
+        lv_obj_set_style_text_font(l2, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l2, ui_muted_color(), 0);
+        lv_label_set_long_mode(l2, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(l2, lv_pct(100));
+
+        if (pkt.payload_len == 0) continue;
+
+        // Row 3: hex bytes (first 14, ellipsis if more)
+        char hex_buf[80];
+        int hpos = 0;
+        hpos += snprintf(hex_buf + hpos, sizeof(hex_buf) - hpos, "  ");
+        int show_bytes = (pkt.payload_len <= 14) ? pkt.payload_len : 14;
+        for (int b = 0; b < show_bytes && hpos < (int)sizeof(hex_buf) - 4; b++)
+            hpos += snprintf(hex_buf + hpos, sizeof(hex_buf) - hpos, "%02X ", pkt.payload[b]);
+        if (pkt.payload_len > 14)
+            snprintf(hex_buf + hpos, sizeof(hex_buf) - hpos, "...[%dB]", pkt.payload_len);
+        lv_obj_t *l3 = lv_label_create(card);
+        lv_label_set_text(l3, hex_buf);
+        lv_obj_set_style_text_font(l3, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l3, lv_color_hex(0x80CBC4), 0);  // teal
+        lv_label_set_long_mode(l3, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(l3, lv_pct(100));
+
+        // Row 4: ASCII printable interpretation (for broadcast / plaintext)
+        if (!pkt.encrypted) {
+            char asc_buf[80];
+            int apos = 2;
+            asc_buf[0] = ' '; asc_buf[1] = ' ';
+            for (int b = 0; b < pkt.payload_len && apos < (int)sizeof(asc_buf) - 1; b++)
+                asc_buf[apos++] = (pkt.payload[b] >= 0x20 && pkt.payload[b] < 0x7F)
+                                  ? (char)pkt.payload[b] : '.';
+            asc_buf[apos] = '\0';
+            lv_obj_t *l4 = lv_label_create(card);
+            lv_label_set_text(l4, asc_buf);
+            lv_obj_set_style_text_font(l4, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(l4, lv_color_hex(0xA5D6A7), 0);  // green
+            lv_label_set_long_mode(l4, LV_LABEL_LONG_CLIP);
+            lv_obj_set_width(l4, lv_pct(100));
+        } else {
+            // Try decrypt with known LMK if available
+            const uint8_t *lmk = espnow_find_lmk(pkt.src_mac);
+            char dec_buf[96];
+            if (lmk) {
+                uint8_t plain[ESPNOW_PKT_CAP];
+                int plain_len = 0;
+                if (espnow_try_decrypt(pkt.payload, pkt.payload_len, lmk, plain, &plain_len)) {
+                    int dpos = snprintf(dec_buf, sizeof(dec_buf), "  DEC\342\234\223 ");
+                    for (int b = 0; b < plain_len && dpos < (int)sizeof(dec_buf) - 3; b++)
+                        dpos += snprintf(dec_buf + dpos, sizeof(dec_buf) - dpos, "%02X ", plain[b]);
+                } else {
+                    snprintf(dec_buf, sizeof(dec_buf), "  DEC\342\234\227 MIC mismatch (nonce unknown)");
+                }
+            } else {
+                snprintf(dec_buf, sizeof(dec_buf), "  ENC: add LMK to profiles.json to attempt decrypt");
+            }
+            lv_obj_t *l4 = lv_label_create(card);
+            lv_label_set_text(l4, dec_buf);
+            lv_obj_set_style_text_font(l4, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(l4,
+                (lmk && strstr(dec_buf, "\342\234\223")) ? lv_color_hex(0x69F0AE) : lv_color_hex(0xFF7043), 0);
+            lv_label_set_long_mode(l4, LV_LABEL_LONG_WRAP);
+            lv_obj_set_width(l4, lv_pct(100));
+        }
+    }
+
+    // Scroll to newest (bottom)
+    lv_obj_scroll_to_y(espnow_pl_list, LV_COORD_MAX, LV_ANIM_OFF);
+}
+
+/* ── Clear packet log ────────────────────────────────────────────────────── */
+static void espnow_pktlog_clear_cb(lv_event_t *ev)
+{
+    (void)ev;
+    portENTER_CRITICAL(&espnow_pkt_mux);
+    espnow_pkt_head  = 0;
+    espnow_pkt_count = 0;
+    portEXIT_CRITICAL(&espnow_pkt_mux);
+    espnow_pkt_dirty = true;
+}
+
+/* ── 500 ms LVGL refresh for packet log ─────────────────────────────────── */
+static void espnow_pl_refresh_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!espnow_pkt_dirty) return;
+    espnow_pkt_dirty = false;
+
+    if (espnow_pl_status && lv_obj_is_valid(espnow_pl_status)) {
+        portENTER_CRITICAL(&espnow_pkt_mux);
+        int cnt = espnow_pkt_count;
+        portEXIT_CRITICAL(&espnow_pkt_mux);
+        char buf[56];
+        snprintf(buf, sizeof(buf), "%s ch%d  |  %d/%d pkts",
+                 espnow_session_allch ? "All" : "Dev",
+                 espnow_session_idx >= 0 ? espnow_devices[espnow_session_idx].channel : 0,
+                 cnt, ESPNOW_PKT_LOG_MAX);
+        lv_label_set_text(espnow_pl_status, buf);
+    }
+    espnow_pktlog_rebuild();
+}
+
+/* ── Packet log screen ───────────────────────────────────────────────────── */
+static void show_espnow_pktlog_screen(void)
+{
+    create_function_page_base("ESP-NOW Pkt Log");
+    g_screen_stop_fn = espnow_pktlog_stop;
+
+    // Status bar
+    espnow_pl_status = lv_label_create(function_page);
+    lv_label_set_text(espnow_pl_status, "Waiting for packets...");
+    lv_obj_set_style_text_color(espnow_pl_status, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_text_font(espnow_pl_status, &lv_font_montserrat_12, 0);
+    lv_obj_align(espnow_pl_status, LV_ALIGN_TOP_LEFT, 5, 36);
+
+    // Export button (bottom-left)
+    lv_obj_t *exp_btn = lv_btn_create(function_page);
+    lv_obj_set_size(exp_btn, 110, 30);
+    lv_obj_align(exp_btn, LV_ALIGN_BOTTOM_LEFT, 5, -5);
+    lv_obj_set_style_bg_color(exp_btn, lv_color_hex(0x004D40), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(exp_btn, lv_color_hex(0x00695C), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(exp_btn, 0, 0);
+    lv_obj_set_style_radius(exp_btn, 8, 0);
+    lv_obj_t *exp_lbl = lv_label_create(exp_btn);
+    lv_label_set_text(exp_lbl, LV_SYMBOL_SAVE "  Export TXT");
+    lv_obj_set_style_text_font(exp_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(exp_lbl, lv_color_white(), 0);
+    lv_obj_center(exp_lbl);
+    lv_obj_add_event_cb(exp_btn, espnow_pktlog_export_cb, LV_EVENT_CLICKED, NULL);
+
+    // Clear button (bottom-right)
+    lv_obj_t *clr_btn = lv_btn_create(function_page);
+    lv_obj_set_size(clr_btn, 90, 30);
+    lv_obj_align(clr_btn, LV_ALIGN_BOTTOM_RIGHT, -5, -5);
+    lv_obj_set_style_bg_color(clr_btn, lv_color_hex(0x6D1313), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(clr_btn, lv_color_hex(0x8B1A1A), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(clr_btn, 0, 0);
+    lv_obj_set_style_radius(clr_btn, 8, 0);
+    lv_obj_t *clr_lbl = lv_label_create(clr_btn);
+    lv_label_set_text(clr_lbl, LV_SYMBOL_TRASH "  Clear");
+    lv_obj_set_style_text_font(clr_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(clr_lbl, lv_color_white(), 0);
+    lv_obj_center(clr_lbl);
+    lv_obj_add_event_cb(clr_btn, espnow_pktlog_clear_cb, LV_EVENT_CLICKED, NULL);
+
+    // Scrollable packet list (fills screen between status bar and buttons)
+    espnow_pl_list = lv_obj_create(function_page);
+    lv_obj_set_size(espnow_pl_list, lv_pct(100), LCD_V_RES - 36 - 16 - 40);
+    lv_obj_align(espnow_pl_list, LV_ALIGN_TOP_MID, 0, 52);
+    lv_obj_set_style_bg_color(espnow_pl_list, lv_color_hex(0x050e08), 0);
+    lv_obj_set_style_border_color(espnow_pl_list, lv_color_hex(0x004D40), 0);
+    lv_obj_set_style_border_width(espnow_pl_list, 1, 0);
+    lv_obj_set_flex_flow(espnow_pl_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(espnow_pl_list, 3, 0);
+    lv_obj_set_style_pad_gap(espnow_pl_list, 3, 0);
+    lv_obj_set_scrollbar_mode(espnow_pl_list, LV_SCROLLBAR_MODE_AUTO);
+
+    espnow_pktlog_rebuild();
+    espnow_pl_timer = lv_timer_create(espnow_pl_refresh_cb, 500, NULL);
 }
