@@ -556,6 +556,13 @@ static volatile uint16_t touch_y_flag = 0;
 static volatile bool show_touch_dot = true;
 static volatile bool ui_locked = false;
 static volatile bool nav_to_menu_flag = false;
+// Deferred top-bar ‹ Back target: nav_back_cb records the parent show-fn here and
+// the main loop runs it OUTSIDE the LVGL event dispatch — symmetric with the Home
+// path (nav_to_menu_flag). This keeps any screen stop-hook (run via
+// reset_function_page_children) off the lv_timer_handler stack; some stop hooks
+// block (e.g. Handshaker waits up to 5s for its attack task), which crashes if run
+// inline inside the ‹ Back button's own event.
+static void (* volatile nav_deferred_show_fn)(void) = NULL;
 static volatile int64_t last_input_ms = 0;
 static volatile bool screen_dimmed = false;
 static volatile bool ignore_touch_until_release = false;
@@ -2261,7 +2268,7 @@ static void show_gps_info_screen(void);
 static void show_found_tags_screen(void);
 static void show_tag_tracker_screen(int dev_idx);
 static void airtag_view_tags_btn_cb(lv_event_t *e);
-static void found_tags_back_btn_cb(lv_event_t *e);
+static void found_tags_go_back(void);
 static void show_sd_provision_confirm(bool after_format);
 static void show_sd_provision_running_screen(bool after_format);
 static void home_btn_event_cb(lv_event_t *e);
@@ -2273,14 +2280,35 @@ static void bt_sas_scroll_up_cb(lv_event_t *e);
 static void bt_sas_scroll_down_cb(lv_event_t *e);
 static void lw_scroll_up_cb(lv_event_t *e);
 static void lw_scroll_down_cb(lv_event_t *e);
-static void deauth_quit_event_cb(lv_event_t *e);
+static void deauth_stop(void);
 static void deauth_rescan_timer_stop(void);
 static void set_screenshot_buttons_disabled(bool disabled);
 static void screenshot_finish_ui_cb(void *user_data);
 static void screenshot_save_task(void *arg);
 
 // Reset all child pointers when function_page is deleted
+// Optional per-screen teardown, invoked right before LEAVING the current screen
+// (top ‹ Back, Home, or any forward navigation — all funnel through
+// reset_function_page_children). Operation screens that need teardown beyond the
+// generic cleanup below (e.g. radio deinit, DMA reclaim) register it via
+// g_screen_stop_fn; run_screen_stop_fn() clears-then-calls so it runs exactly once.
+static void (*g_screen_stop_fn)(void) = NULL;
+static void run_screen_stop_fn(void) {
+    void (*fn)(void) = g_screen_stop_fn;
+    g_screen_stop_fn = NULL;
+    if (fn) fn();
+}
+
+// Optional per-screen Back-override. Screens whose parent has a DYNAMIC title
+// (device name, "BT: <target>") can't be resolved via NAV_SHOW_TABLE, so the
+// top-bar ‹ Back would otherwise fall through to Home. They register the correct
+// go-up target here (right after create_function_page_base); nav_back_cb prefers
+// it. Cleared on every screen transition so it never leaks to an unrelated page.
+static void (*g_screen_back_fn)(void) = NULL;
+
 static void reset_function_page_children(void) {
+    run_screen_stop_fn();   // stop the OUTGOING screen's operation before tearing down its UI
+    g_screen_back_fn = NULL;
     scan_status_label = NULL;
     scan_list = NULL;
     wifi_sas_page = 0;
@@ -2496,11 +2524,11 @@ static esp_err_t evil_twin_enable_log_capture(void);
 static void evil_twin_ui_event_callback(evil_twin_event_data_t *data);
 static void evil_twin_disable_log_capture(void);
 static void blackout_yes_btn_cb(lv_event_t *e);
-static void blackout_stop_btn_cb(lv_event_t *e);
+static void blackout_stop(void);
 static esp_err_t blackout_enable_log_capture(void);
 static void blackout_disable_log_capture(void);
 static void snifferdog_yes_btn_cb(lv_event_t *e);
-static void snifferdog_stop_btn_cb(lv_event_t *e);
+static void snifferdog_stop(void);
 static esp_err_t snifferdog_enable_log_capture(void);
 static void snifferdog_disable_log_capture(void);
 static void sniffer_yes_btn_cb(lv_event_t *e);
@@ -2519,11 +2547,11 @@ static void targeted_deauth_stop_cb(lv_event_t *e);
 static void sniffer_refresh_observe_view(void);
 static void sniffer_new_client_notify(void);
 static void sae_overflow_yes_btn_cb(lv_event_t *e);
-static void sae_overflow_stop_btn_cb(lv_event_t *e);
+static void sae_overflow_stop(void);
 static esp_err_t sae_overflow_enable_log_capture(void);
 static void sae_overflow_disable_log_capture(void);
 static void handshake_yes_btn_cb(lv_event_t *e);
-static void handshake_stop_btn_cb(lv_event_t *e);
+static void handshake_stop(void);
 static esp_err_t handshake_enable_log_capture(void);
 static void handshake_disable_log_capture(void);
 static void handshake_attack_task(void *pvParameters);
@@ -2556,7 +2584,7 @@ static void sniffer_dog_channel_hop(void);
 static void sniffer_dog_task(void *pvParameters);
 static void sniffer_dog_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type);
 static void wardrive_start_btn_cb(lv_event_t *e);
-static void wardrive_stop_btn_cb(lv_event_t *e);
+static void wardrive_screen_stop(void);
 static esp_err_t wardrive_enable_log_capture(void);
 static void wardrive_disable_log_capture(void);
 static void wardrive_task(void *pvParameters);
@@ -2569,7 +2597,7 @@ static void show_portal_page(void);
 static void portal_ssid_ta_event_cb(lv_event_t *e);
 static void portal_keyboard_event_cb(lv_event_t *e);
 static void portal_start_btn_cb(lv_event_t *e);
-static void portal_stop_btn_cb(lv_event_t *e);
+static void portal_stop(void);
 static esp_err_t portal_enable_log_capture(void);
 static void portal_disable_log_capture(void);
 static void portal_ui_event_callback(evil_twin_event_data_t *data);
@@ -2658,7 +2686,7 @@ static void show_bt_observer_screen(void);
 static void bt_observer_task(void *pvParameters);
 static void show_bto_device_detail(int dev_idx);
 static void bto_restore_screen(void);
-static void bto_stop_cb(lv_event_t *e);
+static void bto_stop(void);
 static void bto_rebuild_list(void);
 
 // Data Transfer screens
@@ -2715,7 +2743,7 @@ static void blacklist_edit_btn_cb(lv_event_t *e);
 
 // Deauth Monitor functions
 static void show_deauth_monitor_screen(void);
-static void deauth_monitor_exit_cb(lv_event_t *e);
+static void deauth_monitor_stop(void);
 static void deauth_monitor_start_monitoring(void);
 static void deauth_monitor_task(void *pvParameters);
 static void deauth_monitor_channel_hop(void);
@@ -2724,7 +2752,7 @@ static const char* deauth_monitor_find_ssid_by_bssid(const uint8_t *bssid);
 
 // AirTag Scanner functions
 static void show_airtag_scan_screen(void);
-static void airtag_scan_exit_cb(lv_event_t *e);
+static void airtag_scan_stop(void);
 static void airtag_scan_task(void *pvParameters);
 static void show_drone_detector_screen(void);
 static void drone_exit_cb(lv_event_t *e);
@@ -2755,7 +2783,7 @@ static void show_blueduck_screen(void);
 // BT Locator functions
 static void show_bt_locator_screen(void);
 static void bt_locator_device_selected_cb(lv_event_t *e);
-static void bt_locator_exit_cb(lv_event_t *e);
+static void bt_locator_stop(void);
 static void bt_locator_tracking_task(void *pvParameters);
 static void bt_locator_update_list(void);
 
@@ -2776,6 +2804,28 @@ static void wifi_scan_done_cb(void *arg, esp_event_base_t event_base, int32_t ev
     }
     // Ensure button UI matches actual sniffer state (in case we auto-started)
     lv_async_call(sniffer_ui_async_cb, NULL);
+}
+
+// Register the UI-side SCAN_DONE callback (the one that sets scan_done_ui_flag)
+// exactly once. Shared by every screen that starts a scan and then waits on
+// scan_done_ui_flag (WiFi Scan & Attack, Deauth Monitor, ...). Registering the
+// same handler more than once double-invokes it and leaks internal heap (see
+// wifi_scanner.c), so guard with a single file-scope flag across all callers.
+// Previously this was registered only inside show_wifi_scan_attack_screen(),
+// so entering Deauth Monitor without first visiting WiFi Scan left the flag
+// unregistered and the monitor stuck forever on "Scanning / Waiting for scan".
+static void ensure_wifi_scan_ui_cb(void)
+{
+    static bool s_ui_callback_registered = false;
+    if (!s_ui_callback_registered) {
+        esp_err_t err = esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE, &wifi_scan_done_cb, NULL);
+        if (err == ESP_OK) {
+            s_ui_callback_registered = true;
+            ESP_LOGI(TAG, "[WIFI_SCAN] UI callback registered for scan results");
+        } else {
+            ESP_LOGE(TAG, "[WIFI_SCAN] FAILED to register UI callback: err=%d", (int)err);
+        }
+    }
 }
 
 static void scan_checkbox_event_cb(lv_event_t *e)
@@ -5014,12 +5064,6 @@ static bool show_sd_format_confirm(void)
     return (s_sd_err_choice == SD_ERR_RETRY); /* SD_ERR_RETRY(1) = confirmed */
 }
 
-static void show_sd_fatal_error_and_halt(void)
-{
-    /* Kept for compatibility — now interactive rather than a true halt. */
-    show_sd_error_screen(false);
-}
-
 // ============================================================================
 // SD Cache Load All Data
 // ============================================================================
@@ -5911,6 +5955,20 @@ void app_main(void)
                 show_menu();
             }
 
+            // Handle deferred top-bar ‹ Back navigation (parent show-fn) safely —
+            // runs OUTSIDE the LVGL event dispatch. Critically, run the outgoing
+            // screen's stop-hook FIRST, while its UI is still intact — symmetric
+            // with show_menu() (the Home path). Otherwise the hook would run mid-
+            // way through the parent's create_function_page_base (via
+            // reset_function_page_children), and a heavy teardown there
+            // (e.g. Handshaker's radio_reset_to_idle WiFi restart) freezes/crashes.
+            if (nav_deferred_show_fn) {
+                void (*fn)(void) = nav_deferred_show_fn;
+                nav_deferred_show_fn = NULL;
+                run_screen_stop_fn();   // stop op before parent rebuild (screen intact)
+                fn();
+            }
+
             // Process Evil Twin UI events
             if (evil_twin_event_queue && evil_twin_status_list) {
                 evil_twin_event_data_t evt;
@@ -6443,7 +6501,7 @@ void app_main(void)
 
                 if (function_page) { lv_obj_del(function_page); function_page = NULL; }
                 reset_function_page_children();
-                show_function_page("Scan Results");
+                show_function_page("WiFi Scan & Attack");
                 show_touch_dot = true;
 
                 // scan_list: leave room for 28px nav bar + 45px Next button
@@ -7743,17 +7801,22 @@ static void deauth_rescan_timer_stop(void)
     deauth_rescan_done_flag = false;
 }
 
-static void deauth_quit_event_cb(lv_event_t *e)
+// Screen-exit teardown for Deauther / Evil Twin — runs via g_screen_stop_fn on ANY
+// exit (top ‹ Back, Home). Navigation itself is handled by the nav stack.
+static void deauth_stop(void)
 {
-    (void)e;
     // Stop rescan timer
     deauth_rescan_timer_stop();
     // Stop all attacks (deauth, evil twin, etc.)
     wifi_attacks_stop_all();
     deauth_stop_flag = true;
     deauth_paused = false;
-    // Navigate back to menu
-    nav_to_menu_flag = true;
+    // Full radio reset to STA-idle — same teardown as the Home path. Without this
+    // ‹ Back left WiFi in APSTA (residual AP still broadcasting) + injection state;
+    // deauth/evil-twin leave the driver dirty, so match Home exactly (Birol: service
+    // seemed to keep running after ‹ Back). Safe: run_screen_stop_fn runs it while the
+    // outgoing screen's UI is intact (deferred handler), like handshake_stop.
+    radio_reset_to_idle();
 }
 
 static void blackout_yes_btn_cb(lv_event_t *e)
@@ -7762,7 +7825,8 @@ static void blackout_yes_btn_cb(lv_event_t *e)
     
     // Recreate base page to keep title bar
     create_function_page_base("Blackout");
-    
+    g_screen_stop_fn = blackout_stop;  // stop attack on ANY exit (top ‹ Back / Home / forward nav)
+
     // Set blackout UI active flag
     blackout_ui_active = true;
     scan_done_ui_flag = false;  // Clear any pending scan done flag
@@ -7790,40 +7854,15 @@ static void blackout_yes_btn_cb(lv_event_t *e)
     lv_obj_set_style_text_font(blackout_status_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(blackout_status_label, COLOR_MATERIAL_RED, 0);
     lv_obj_set_style_text_align(blackout_status_label, LV_TEXT_ALIGN_CENTER, 0);
-    
-    // Stop & Exit button (handshaker style)
-    blackout_stop_btn = lv_btn_create(function_page);
-    lv_obj_set_size(blackout_stop_btn, 120, 55);
-    lv_obj_align(blackout_stop_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(blackout_stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(blackout_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(blackout_stop_btn, 0, 0);
-    lv_obj_set_style_radius(blackout_stop_btn, 10, 0);
-    lv_obj_set_style_shadow_width(blackout_stop_btn, 6, 0);
-    lv_obj_set_style_shadow_color(blackout_stop_btn, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_shadow_opa(blackout_stop_btn, LV_OPA_40, 0);
-    lv_obj_set_flex_flow(blackout_stop_btn, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(blackout_stop_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    
-    lv_obj_t *x_icon = lv_label_create(blackout_stop_btn);
-    lv_label_set_text(x_icon, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_font(x_icon, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(x_icon, ui_text_color(), 0);
-    
-    lv_obj_t *stop_text = lv_label_create(blackout_stop_btn);
-    lv_label_set_text(stop_text, "Exit");
-    lv_obj_set_style_text_font(stop_text, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(stop_text, ui_text_color(), 0);
-    
-    lv_obj_add_event_cb(blackout_stop_btn, blackout_stop_btn_cb, LV_EVENT_CLICKED, NULL);
-    
+
     // Start blackout attack
     wifi_attacks_start_blackout();
 }
 
-static void blackout_stop_btn_cb(lv_event_t *e)
+// Screen-exit teardown for Blackout — runs via g_screen_stop_fn on ANY exit
+// (top ‹ Back, Home, forward nav). Navigation itself is handled by the nav stack.
+static void blackout_stop(void)
 {
-    (void)e;
     // Stop blackout attack
     wifi_attacks_stop_all();
     blackout_disable_log_capture();
@@ -7832,8 +7871,6 @@ static void blackout_stop_btn_cb(lv_event_t *e)
     blackout_stop_btn = NULL;
     blackout_ui_active = false;  // Clear blackout UI active flag
     scan_done_ui_flag = false;  // Clear any pending scan done flag
-    // Navigate back to menu
-    nav_to_menu_flag = true;
 }
 
 static void snifferdog_yes_btn_cb(lv_event_t *e)
@@ -7842,7 +7879,8 @@ static void snifferdog_yes_btn_cb(lv_event_t *e)
     
     // Recreate base page to keep title bar
     create_function_page_base("Snifferdog");
-    
+    g_screen_stop_fn = snifferdog_stop;  // stop attack on ANY exit (top ‹ Back / Home / forward nav)
+
     // Set snifferdog UI active flag
     snifferdog_ui_active = true;
     scan_done_ui_flag = false;  // Clear any pending scan done flag
@@ -7882,35 +7920,8 @@ static void snifferdog_yes_btn_cb(lv_event_t *e)
     lv_obj_set_width(snifferdog_recent_label, lv_pct(95));
     lv_label_set_long_mode(snifferdog_recent_label, LV_LABEL_LONG_WRAP);
 
-    // Exit button (compact row)
-    snifferdog_stop_btn = lv_btn_create(function_page);
-    lv_obj_set_size(snifferdog_stop_btn, 110, 28);
-    lv_obj_align(snifferdog_stop_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(snifferdog_stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(snifferdog_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(snifferdog_stop_btn, 0, 0);
-    lv_obj_set_style_radius(snifferdog_stop_btn, 8, 0);
-    lv_obj_set_style_shadow_width(snifferdog_stop_btn, 4, 0);
-    lv_obj_set_style_shadow_color(snifferdog_stop_btn, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_shadow_opa(snifferdog_stop_btn, LV_OPA_40, 0);
-    lv_obj_set_style_pad_ver(snifferdog_stop_btn, 4, 0);
-    lv_obj_set_style_pad_hor(snifferdog_stop_btn, 8, 0);
-    lv_obj_set_style_pad_column(snifferdog_stop_btn, 4, 0);
-    lv_obj_set_flex_flow(snifferdog_stop_btn, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(snifferdog_stop_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    // Exit via top ‹ Back / Home (stop handled by g_screen_stop_fn = snifferdog_stop)
 
-    lv_obj_t *x_icon = lv_label_create(snifferdog_stop_btn);
-    lv_label_set_text(x_icon, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_font(x_icon, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(x_icon, ui_text_color(), 0);
-
-    lv_obj_t *stop_text = lv_label_create(snifferdog_stop_btn);
-    lv_label_set_text(stop_text, "Exit");
-    lv_obj_set_style_text_font(stop_text, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(stop_text, ui_text_color(), 0);
-
-    lv_obj_add_event_cb(snifferdog_stop_btn, snifferdog_stop_btn_cb, LV_EVENT_CLICKED, NULL);
-    
     // Start snifferdog attack (custom implementation)
     if (sniffer_dog_active) {
         ESP_LOGI(TAG, "Snifferdog already active");
@@ -7952,10 +7963,10 @@ static void snifferdog_yes_btn_cb(lv_event_t *e)
     ESP_LOGI(TAG, "Snifferdog started - hunting for AP-STA pairs...");
 }
 
-static void snifferdog_stop_btn_cb(lv_event_t *e)
+// Screen-exit teardown for Snifferdog — runs via g_screen_stop_fn on ANY exit
+// (top ‹ Back, Home, forward nav). Navigation itself is handled by the nav stack.
+static void snifferdog_stop(void)
 {
-    (void)e;
-    
     // Stop snifferdog attack
     if (sniffer_dog_active || sniffer_dog_task_handle != NULL) {
         ESP_LOGI(TAG, "Stopping Snifferdog...");
@@ -7992,8 +8003,6 @@ static void snifferdog_stop_btn_cb(lv_event_t *e)
     portEXIT_CRITICAL(&snifferdog_stats_spin);
     snifferdog_ui_active = false;  // Clear snifferdog UI active flag
     scan_done_ui_flag = false;  // Clear any pending scan done flag
-    // Navigate back to menu
-    nav_to_menu_flag = true;
 }
 
 // Forward declaration already exists at line 376 for attack_event_cb
@@ -8124,10 +8133,11 @@ static void sniffer_nav_karma_cb(lv_event_t *e)
     attack_event_cb(&synthetic_event);
 }
 
-static void sniffer_quit_cb(lv_event_t *e)
+// Screen-exit teardown for Network Observer — runs via g_screen_stop_fn on ANY exit
+// (top ‹ Back / Home / forward nav to Karma). Stops the sniffer task but KEEPS the
+// captured data in PSRAM so downstream Karma/probe views still have it.
+static void sniffer_screen_stop(void)
 {
-    (void)e;
-    
     // Stop sniffer task but KEEP data in PSRAM
     if (sniffer_task_active || sniffer_task_handle != NULL) {
         ESP_LOGI(TAG, "Stopping WiFi Sniffer (keeping data)...");
@@ -8160,10 +8170,7 @@ static void sniffer_quit_cb(lv_event_t *e)
     sniffer_return_pending = false;
     scan_done_ui_flag = false;
     
-    ESP_LOGI(TAG, "Sniffer quit - data preserved in PSRAM");
-    
-    // Navigate back to menu
-    nav_to_menu_flag = true;
+    ESP_LOGI(TAG, "Sniffer stopped - data preserved in PSRAM");
 }
 
 // Rescan callback - clears all data and restarts fresh scan
@@ -8854,58 +8861,23 @@ static void sniffer_yes_btn_cb(lv_event_t *e)
 {
     (void)e;
     
-    // Recreate base page with channel indicator
-    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
-    reset_function_page_children();
-    
-    // Hide main screen tiles and title bar (needed when called directly from main menu)
-    if (tiles_container) {
-        lv_obj_add_flag(tiles_container, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (title_bar) {
-        lv_obj_add_flag(title_bar, LV_OBJ_FLAG_HIDDEN);
-    }
-    
-    function_page = lv_obj_create(lv_scr_act());
-    lv_obj_set_size(function_page, LCD_H_RES, LCD_V_RES);
-    lv_obj_set_style_bg_color(function_page, ui_bg_color(), 0);
-    lv_obj_set_style_border_width(function_page, 0, 0);
-    lv_obj_set_style_radius(function_page, 0, 0);
-    lv_obj_set_style_pad_all(function_page, 0, 0);
-    lv_obj_clear_flag(function_page, LV_OBJ_FLAG_SCROLLABLE);
-    
-    // Title bar with channel indicator
-    lv_obj_t *title_bar = lv_obj_create(function_page);
-    lv_obj_set_size(title_bar, lv_pct(100), 30);
-    lv_obj_align(title_bar, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_bg_color(title_bar, ui_panel_color(), 0);
-    lv_obj_set_style_border_width(title_bar, 0, 0);
-    lv_obj_set_style_radius(title_bar, 0, 0);
-    lv_obj_set_style_pad_all(title_bar, 0, 0);
-    lv_obj_clear_flag(title_bar, LV_OBJ_FLAG_SCROLLABLE);
-    
-    lv_obj_t *title_label = lv_label_create(title_bar);
-    lv_label_set_text(title_label, "Network Observer");
-    lv_obj_set_style_text_color(title_label, ui_text_color(), 0);
-    lv_obj_align(title_label, LV_ALIGN_LEFT_MID, 10, 0);
-    lv_obj_add_flag(title_label, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(title_label, screenshot_btn_event_cb, LV_EVENT_CLICKED, NULL);
-    
-    // Channel indicator (shifted left to make room for voltage)
-    sniffer_channel_label = lv_label_create(title_bar);
+    // Standard top bar (Home / ‹ Back / Go Dark + battery) + nav-stack push so top
+    // ‹ Back returns to the real parent (WiFi Observer or Select Attack). Replaces the
+    // old hand-rolled title bar that had no Home/Back and never pushed the nav stack.
+    create_function_page_base("Network Observer");
+    // Stop the sniffer (keeping PSRAM data) on ANY exit — top ‹ Back / Home / forward
+    // nav to Karma. Karma's own handler already stops first, so a double-stop is a no-op.
+    g_screen_stop_fn = sniffer_screen_stop;
+
+    // Live channel readout. The 240px-wide standard bar is full, so it sits on its own
+    // thin line just below the bar, right-aligned (tap = screenshot, as before).
+    sniffer_channel_label = lv_label_create(function_page);
     lv_label_set_text(sniffer_channel_label, "Ch: --");
     lv_obj_set_style_text_color(sniffer_channel_label, COLOR_MATERIAL_GREEN, 0);
-    lv_obj_align(sniffer_channel_label, LV_ALIGN_RIGHT_MID, -70, 0);
+    lv_obj_set_style_text_font(sniffer_channel_label, &lv_font_montserrat_12, 0);
+    lv_obj_align(sniffer_channel_label, LV_ALIGN_TOP_RIGHT, -6, 32);
     lv_obj_add_flag(sniffer_channel_label, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(sniffer_channel_label, screenshot_btn_event_cb, LV_EVENT_CLICKED, NULL);
-    
-    // Battery voltage label - far right of title bar
-    battery_label = lv_label_create(title_bar);
-    lv_label_set_text(battery_label, last_voltage_str);
-    lv_obj_set_style_text_color(battery_label, ui_muted_color(), 0);
-    lv_obj_set_style_text_font(battery_label, &lv_font_montserrat_12, 0);
-    lv_obj_align(battery_label, LV_ALIGN_RIGHT_MID, -8, 0);
-    if (last_voltage_str[0] == '\0') lv_obj_add_flag(battery_label, LV_OBJ_FLAG_HIDDEN);
 
     // Set sniffer UI active flag
     sniffer_ui_active = true;
@@ -8916,8 +8888,8 @@ static void sniffer_yes_btn_cb(lv_event_t *e)
     
     // Scrollable list for networks with clients
     sniffer_ap_list = lv_list_create(function_page);
-    lv_obj_set_size(sniffer_ap_list, lv_pct(100), LCD_V_RES - 30 - 50);  // Leave space for title and buttons
-    lv_obj_align(sniffer_ap_list, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_size(sniffer_ap_list, lv_pct(100), LCD_V_RES - 50 - 50);  // top bar + channel line above, control row below
+    lv_obj_align(sniffer_ap_list, LV_ALIGN_TOP_MID, 0, 50);
     lv_obj_set_style_bg_color(sniffer_ap_list, ui_bg_color(), 0);
     lv_obj_set_style_bg_opa(sniffer_ap_list, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(sniffer_ap_list, 0, 0);
@@ -8984,19 +8956,10 @@ static void sniffer_yes_btn_cb(lv_event_t *e)
     lv_obj_center(karma_lbl);
     lv_obj_add_event_cb(karma_btn, sniffer_karma_btn_cb, LV_EVENT_CLICKED, NULL);
     
-    // Quit button (teal)
-    lv_obj_t *quit_btn = lv_btn_create(control_row);
-    lv_obj_set_size(quit_btn, 80, 35);
-    lv_obj_set_style_bg_color(quit_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(quit_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(quit_btn, 0, 0);
-    lv_obj_set_style_radius(quit_btn, 8, 0);
-    lv_obj_t *quit_lbl = lv_label_create(quit_btn);
-    lv_label_set_text(quit_lbl, "Quit");
-    lv_obj_set_style_text_color(quit_lbl, ui_text_color(), 0);
-    lv_obj_center(quit_lbl);
-    lv_obj_add_event_cb(quit_btn, sniffer_quit_cb, LV_EVENT_CLICKED, NULL);
-    
+    // Quit button removed — top-bar ‹ Back / Home now exit this screen and the sniffer
+    // is stopped (PSRAM data kept) via g_screen_stop_fn = sniffer_screen_stop.
+    // Start/Stop, Rescan, Karma remain.
+
     // Enable log capture
     sniffer_enable_log_capture();
     
@@ -9093,20 +9056,7 @@ static void sae_overflow_yes_btn_cb(lv_event_t *e)
         lv_obj_set_style_text_font(error_label, &lv_font_montserrat_16, 0);
         lv_obj_align(error_label, LV_ALIGN_TOP_MID, 0, 40);
         
-        // Back button
-        lv_obj_t *back_btn = lv_btn_create(function_page);
-        lv_obj_set_size(back_btn, 100, 35);
-        lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
-        lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_color(back_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
-        lv_obj_set_style_border_width(back_btn, 0, 0);
-        lv_obj_set_style_radius(back_btn, 8, 0);
-        lv_obj_t *back_lbl = lv_label_create(back_btn);
-        lv_label_set_text(back_lbl, "BACK");
-        lv_obj_set_style_text_color(back_lbl, ui_text_color(), 0);
-        lv_obj_center(back_lbl);
-        lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
-        
+        // Redundant bottom BACK removed; use top ‹ Back
         return;
     }
     
@@ -9146,31 +9096,9 @@ static void sae_overflow_yes_btn_cb(lv_event_t *e)
     lv_obj_align(network_info, LV_ALIGN_TOP_MID, 0, 40);
     lv_obj_set_style_text_align(network_info, LV_TEXT_ALIGN_CENTER, 0);
     
-    // Stop & Exit tile at bottom (red with X icon) - same as Deauth
-    sae_overflow_stop_btn = lv_btn_create(function_page);
-    lv_obj_set_size(sae_overflow_stop_btn, 120, 55);
-    lv_obj_align(sae_overflow_stop_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(sae_overflow_stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(sae_overflow_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(sae_overflow_stop_btn, 0, 0);
-    lv_obj_set_style_radius(sae_overflow_stop_btn, 10, 0);
-    lv_obj_set_style_shadow_width(sae_overflow_stop_btn, 6, 0);
-    lv_obj_set_style_shadow_color(sae_overflow_stop_btn, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_shadow_opa(sae_overflow_stop_btn, LV_OPA_40, 0);
-    lv_obj_set_flex_flow(sae_overflow_stop_btn, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(sae_overflow_stop_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    
-    lv_obj_t *x_icon = lv_label_create(sae_overflow_stop_btn);
-    lv_label_set_text(x_icon, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_font(x_icon, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(x_icon, ui_text_color(), 0);
-    
-    lv_obj_t *stop_text = lv_label_create(sae_overflow_stop_btn);
-    lv_label_set_text(stop_text, "Stop & Exit");
-    lv_obj_set_style_text_font(stop_text, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(stop_text, ui_text_color(), 0);
-    
-    lv_obj_add_event_cb(sae_overflow_stop_btn, sae_overflow_stop_btn_cb, LV_EVENT_CLICKED, NULL);
+    // Top ‹ Back / Home stop the attack via the screen stop-hook
+    // (run_screen_stop_fn → sae_overflow_stop). Redundant bottom "Stop & Exit" removed.
+    g_screen_stop_fn = sae_overflow_stop;
     
     // Save selected network as target
     wifi_scanner_save_target_bssids();
@@ -9198,9 +9126,10 @@ static void sae_overflow_yes_btn_cb(lv_event_t *e)
     }
 }
 
-static void sae_overflow_stop_btn_cb(lv_event_t *e)
+// Screen-exit teardown for SAE Overflow — runs via g_screen_stop_fn on ANY exit
+// (top ‹ Back, Home). Navigation itself is handled by the nav stack.
+static void sae_overflow_stop(void)
 {
-    (void)e;
     // Stop SAE overflow attack
     wifi_attacks_stop_all();
     sae_overflow_disable_log_capture();
@@ -9208,8 +9137,6 @@ static void sae_overflow_stop_btn_cb(lv_event_t *e)
     sae_overflow_stop_btn = NULL;
     sae_overflow_ui_active = false;
     scan_done_ui_flag = false;
-    // Navigate back to menu
-    nav_to_menu_flag = true;
 }
 
 static bool check_handshake_file_exists(const char *ssid) {
@@ -10915,6 +10842,7 @@ static void handshake_yes_btn_cb(lv_event_t *e)
     }
 
     create_function_page_base("Handshaker");
+    g_screen_stop_fn = handshake_stop;  // stop attack on ANY exit (top ‹ Back / Home / forward nav)
     handshake_ui_active = true;
 
     // ─── D-UCB Channel indicator (top left) ────────────────────────
@@ -11029,35 +10957,6 @@ static void handshake_yes_btn_cb(lv_event_t *e)
     lv_label_set_long_mode(hs_ui_stats_label, LV_LABEL_LONG_WRAP);
     lv_obj_align(hs_ui_stats_label, LV_ALIGN_TOP_MID, 0, 160);
 
-    // ─── Stop & Exit button (compact row) ─────────────────────────
-    handshake_stop_btn = lv_btn_create(function_page);
-    lv_obj_set_size(handshake_stop_btn, 110, 28);
-    lv_obj_align(handshake_stop_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(handshake_stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(handshake_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(handshake_stop_btn, 0, 0);
-    lv_obj_set_style_radius(handshake_stop_btn, 8, 0);
-    lv_obj_set_style_shadow_width(handshake_stop_btn, 4, 0);
-    lv_obj_set_style_shadow_color(handshake_stop_btn, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_shadow_opa(handshake_stop_btn, LV_OPA_40, 0);
-    lv_obj_set_style_pad_ver(handshake_stop_btn, 4, 0);
-    lv_obj_set_style_pad_hor(handshake_stop_btn, 8, 0);
-    lv_obj_set_style_pad_column(handshake_stop_btn, 4, 0);
-    lv_obj_set_flex_flow(handshake_stop_btn, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(handshake_stop_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-    lv_obj_t *x_icon = lv_label_create(handshake_stop_btn);
-    lv_label_set_text(x_icon, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_font(x_icon, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(x_icon, ui_text_color(), 0);
-
-    lv_obj_t *stop_text = lv_label_create(handshake_stop_btn);
-    lv_label_set_text(stop_text, "Stop & Exit");
-    lv_obj_set_style_text_font(stop_text, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(stop_text, ui_text_color(), 0);
-
-    lv_obj_add_event_cb(handshake_stop_btn, handshake_stop_btn_cb, LV_EVENT_CLICKED, NULL);
-
     // ─── Start the timer for UI updates ───────────────────────────
     hs_ui_timer = lv_timer_create(hs_ui_timer_cb, 500, NULL);
 
@@ -11088,10 +10987,12 @@ static void handshake_yes_btn_cb(lv_event_t *e)
     if (touch_dot) lv_obj_add_flag(touch_dot, LV_OBJ_FLAG_HIDDEN);
 }
 
-static void handshake_stop_btn_cb(lv_event_t *e)
+// Screen-exit teardown for Handshaker — runs via g_screen_stop_fn on ANY exit
+// (top ‹ Back, Home, forward nav). Navigation itself is handled by the nav stack.
+// Previously only the bottom "Stop & Exit" button ran this; top ‹ Back left the
+// attack task running → crash/reset. Now both paths stop it cleanly.
+static void handshake_stop(void)
 {
-    (void)e;
-    
     g_operation_stop_requested = true;
     handshake_attack_active = false;
     attack_handshake_stop();
@@ -11144,8 +11045,15 @@ static void handshake_stop_btn_cb(lv_event_t *e)
     hs_ui_stats_label = NULL;
     hs_ui_status_label = NULL;
 
+    // Full radio reset — same teardown the Home path runs (show_menu →
+    // radio_reset_to_idle). The handshake attack leaves the WiFi driver in a
+    // promiscuous/injection state that wifi_attacks_stop_all() alone does NOT
+    // clear; only radio_reset_to_idle()'s esp_wifi restart does. Exiting via top
+    // ‹ Back (which never called radio_reset_to_idle) left that state live → a
+    // WiFi callback faulted ~3s later → crash/reset. This makes ‹ Back == Home.
+    radio_reset_to_idle();
+
     ESP_LOGI(TAG, "All operations stopped.");
-    nav_to_menu_flag = true;
 }
 
 // Heap diagnostic — logs internal free/min/largest-block and DMA free.
@@ -12040,7 +11948,11 @@ static void wardrive_start_btn_cb(lv_event_t *e)
 
     scan_done_ui_flag = false;
 
-    create_function_page_base("Wardrive");
+    // Unique page name (NOT "Wardrive" — same as the parent menu) so nav_stack_enter
+    // pushes this as a child level; otherwise the top ‹ Back truncates to the menu's
+    // level and jumps straight Home instead of back to the Wardrive menu.
+    create_function_page_base("Wardriving");
+    g_screen_stop_fn = wardrive_screen_stop;
     wardrive_ui_active = true;
 
     // ─── GPS status bar (top) ─────────────────────────────────────
@@ -12205,27 +12117,7 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     wd_marks_file = NULL;
     wd_marks_fname[0] = '\0';  // task will fill this in once counter is set
 
-    wardrive_stop_btn = lv_btn_create(function_page);
-    lv_obj_set_size(wardrive_stop_btn, 108, 30);
-    lv_obj_align(wardrive_stop_btn, LV_ALIGN_BOTTOM_MID, -60, -5);
-    lv_obj_set_style_bg_color(wardrive_stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(wardrive_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(wardrive_stop_btn, 0, 0);
-    lv_obj_set_style_radius(wardrive_stop_btn, 8, 0);
-    lv_obj_set_style_shadow_width(wardrive_stop_btn, 4, 0);
-    lv_obj_set_style_shadow_color(wardrive_stop_btn, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_flex_flow(wardrive_stop_btn, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(wardrive_stop_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(wardrive_stop_btn, 6, 0);
-    lv_obj_t *x_icon2 = lv_label_create(wardrive_stop_btn);
-    lv_label_set_text(x_icon2, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_font(x_icon2, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(x_icon2, ui_text_color(), 0);
-    lv_obj_t *stop_lbl = lv_label_create(wardrive_stop_btn);
-    lv_label_set_text(stop_lbl, "Stop");
-    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(stop_lbl, ui_text_color(), 0);
-    lv_obj_add_event_cb(wardrive_stop_btn, wardrive_stop_btn_cb, LV_EVENT_CLICKED, NULL);
+    // Bottom-left "X Stop" removed — top-bar ‹ Back stops wardrive (g_screen_stop_fn = wardrive_screen_stop).
 
     // Mark button — double-tap for quick mark, single tap opens note dialog
     lv_obj_t *mark_btn = lv_btn_create(function_page);
@@ -12280,10 +12172,9 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     if (touch_dot) lv_obj_add_flag(touch_dot, LV_OBJ_FLAG_HIDDEN);
 }
 
-static void wardrive_stop_btn_cb(lv_event_t *e)
+// Teardown-only stop hook (top-bar ‹ Back / Home invoke it via g_screen_stop_fn).
+static void wardrive_screen_stop(void)
 {
-    (void)e;
-    
     // Stop wardrive
     if (wardrive_active || wardrive_task_handle != NULL) {
         ESP_LOGI(TAG, "Stopping Wardrive...");
@@ -12357,15 +12248,15 @@ static void wardrive_stop_btn_cb(lv_event_t *e)
         wd_marks_file = NULL;
     }
 
-    // Return to wardrive menu, not main menu
-    show_wardrive_menu_screen();
 }
 
 // Back To Observer callback from Karma screen
-static void karma_back_to_observer_cb(lv_event_t *e)
+// Return from Karma to the Network Observer screen (stopping Karma's portal first if
+// running). Shared by the bottom "Back To Observer" button AND the top-bar ‹ Back
+// (via g_screen_back_fn) — the Observer parent title isn't in NAV_SHOW_TABLE, so
+// without this the top ‹ Back would fall through to Home.
+static void karma_go_back_to_observer(void)
 {
-    (void)e;
-    
     // Stop Karma if it's running
     if (karma_ui_active) {
         ESP_LOGI(TAG, "Stopping Karma before returning to Observer...");
@@ -12378,14 +12269,23 @@ static void karma_back_to_observer_cb(lv_event_t *e)
         karma_info_filename_label = NULL;
         karma_ui_active = false;
     }
-    
+
     // Go back to Network Observer and restart sniffing
     sniffer_yes_btn_cb(NULL);
+}
+
+static void karma_back_to_observer_cb(lv_event_t *e)
+{
+    (void)e;
+    karma_go_back_to_observer();
 }
 
 static void show_karma_page(void)
 {
     create_function_page_base("Karma");
+    // Top ‹ Back → Network Observer (parent title not in NAV_SHOW_TABLE → would
+    // otherwise fall through to Home). Mirrors the bottom "Back To Observer" button.
+    g_screen_back_fn = karma_go_back_to_observer;
     wifi_attacks_refresh_sd_html_list();
 
     karma_content = lv_obj_create(function_page);
@@ -12683,6 +12583,9 @@ static void karma_start_btn_cb(lv_event_t *e)
 
     // Create Karma Running page (Portal-style UI)
     create_function_page_base("Karma");
+    // Top ‹ Back → Network Observer (stops the Karma portal first); parent not in
+    // NAV_SHOW_TABLE so it would otherwise fall through to Home.
+    g_screen_back_fn = karma_go_back_to_observer;
 
     // Content container below title bar (leave space for button at bottom)
     lv_obj_t *content = lv_obj_create(function_page);
@@ -12849,8 +12752,11 @@ static void show_portal_page(void)
     lv_obj_align(portal_content, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_opa(portal_content, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(portal_content, 0, 0);
-    lv_obj_set_style_pad_all(portal_content, 10, 0);
-    lv_obj_set_style_pad_gap(portal_content, 10, 0);
+    // Tighter padding/gap so the SSID field, HTML dropdown and Start Portal button
+    // all fit ABOVE the on-screen keyboard (40% = 128px, top at y=192). Keyboard
+    // itself is left untouched.
+    lv_obj_set_style_pad_all(portal_content, 6, 0);
+    lv_obj_set_style_pad_gap(portal_content, 4, 0);
     lv_obj_set_flex_flow(portal_content, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(portal_content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 
@@ -12862,6 +12768,7 @@ static void show_portal_page(void)
 
     portal_ssid_ta = lv_textarea_create(portal_content);
     lv_obj_set_width(portal_ssid_ta, lv_pct(100));
+    lv_obj_set_height(portal_ssid_ta, 28);
     lv_textarea_set_one_line(portal_ssid_ta, true);
     lv_textarea_set_text(portal_ssid_ta, portal_ssid_buffer);
     lv_obj_set_style_bg_color(portal_ssid_ta, ui_bg_color(), 0);
@@ -12906,6 +12813,7 @@ static void show_portal_page(void)
 
     portal_html_dd = lv_dropdown_create(portal_content);
     lv_obj_set_width(portal_html_dd, lv_pct(100));
+    lv_obj_set_height(portal_html_dd, 28);
     lv_dropdown_set_dir(portal_html_dd, LV_DIR_BOTTOM);
     // Retro terminal styling for dropdown
     lv_obj_set_style_bg_color(portal_html_dd, ui_bg_color(), LV_PART_MAIN);
@@ -12970,7 +12878,7 @@ static void show_portal_page(void)
 
     // Start Portal button
     portal_start_btn = lv_btn_create(portal_content);
-    lv_obj_set_size(portal_start_btn, 140, 35);
+    lv_obj_set_size(portal_start_btn, 140, 34);
     lv_obj_set_style_bg_color(portal_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(portal_start_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(portal_start_btn, 0, 0);
@@ -13097,30 +13005,12 @@ static void portal_start_btn_cb(lv_event_t *e)
     lv_obj_set_style_border_width(portal_log_ta, 1, 0);
     lv_obj_set_style_text_font(portal_log_ta, &lv_font_montserrat_12, 0);
 
-    // Red Stop button at the bottom (styled like BT Locator)
-    portal_stop_btn = lv_btn_create(function_page);
-    lv_obj_set_size(portal_stop_btn, 120, 55);
-    lv_obj_align(portal_stop_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(portal_stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(portal_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(portal_stop_btn, 0, 0);
-    lv_obj_set_style_radius(portal_stop_btn, 10, 0);
-    lv_obj_set_style_shadow_width(portal_stop_btn, 6, 0);
-    lv_obj_set_style_shadow_color(portal_stop_btn, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_shadow_opa(portal_stop_btn, LV_OPA_40, 0);
-    lv_obj_set_flex_flow(portal_stop_btn, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(portal_stop_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_add_event_cb(portal_stop_btn, portal_stop_btn_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *stop_icon = lv_label_create(portal_stop_btn);
-    lv_label_set_text(stop_icon, LV_SYMBOL_STOP);
-    lv_obj_set_style_text_font(stop_icon, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(stop_icon, ui_text_color(), 0);
-
-    lv_obj_t *stop_label = lv_label_create(portal_stop_btn);
-    lv_label_set_text(stop_label, "Stop");
-    lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(stop_label, ui_text_color(), 0);
+    // Top ‹ Back / Home stop the portal via the screen stop-hook
+    // (run_screen_stop_fn → portal_stop). Redundant bottom "Stop" removed.
+    g_screen_stop_fn = portal_stop;
+    // Top ‹ Back → "Global WiFi Attacks" (running + config screens share the name
+    // "Portal", so make the go-up target explicit rather than relying on nav-stack).
+    g_screen_back_fn = show_global_attacks_screen;
 
     // Set UI active flag
     portal_ui_active = true;
@@ -13152,30 +13042,34 @@ static void portal_start_btn_cb(lv_event_t *e)
     ESP_LOGI(TAG, "Portal started successfully");
 }
 
-static void portal_stop_btn_cb(lv_event_t *e)
+// Screen-exit teardown for Captive Portal — runs via g_screen_stop_fn on ANY exit
+// (top ‹ Back, Home). Navigation itself is handled by the nav stack.
+static void portal_stop(void)
 {
-    (void)e;
-    
     ESP_LOGI(TAG, "Stopping Portal...");
-    
+
     // Stop the portal
     wifi_attacks_stop_portal();
-    
+
     // Unregister event callback
     wifi_attacks_set_evil_twin_event_cb(NULL);
-    
+
     // Disable log capture
     portal_disable_log_capture();
-    
+
     // Reset UI state
     portal_log_ta = NULL;
     portal_stop_btn = NULL;
     portal_info_ssid_label = NULL;
     portal_info_filename_label = NULL;
     portal_ui_active = false;
-    
-    // Navigate back to menu
-    nav_to_menu_flag = true;
+
+    // Full radio reset to STA-idle (matches Home). wifi_attacks_stop_portal leaves
+    // the driver in APSTA with the "Free WiFi" AP config still set, so it keeps
+    // broadcasting after ‹ Back; radio_reset_to_idle switches to STA-only so the
+    // portal AP is truly down (Birol: portal didn't close on ‹ Back, only on Home).
+    // Safe: the Portal running screen is terminal (Portal Data is a separate tile).
+    radio_reset_to_idle();
 }
 
 // ── Go Dark confirmation dialog ───────────────────────────────────────────────
@@ -13433,8 +13327,105 @@ static void show_disco_mode(void)
     lv_timer_create(disco_pre_pause_end, 5000, NULL);
 }
 
+// ============================================================================
+// Top-bar back navigation: a lightweight stack that records the menu path so the
+// title-bar "‹" button can step UP one level (to the parent menu) instead of
+// jumping straight Home. The stack is keyed by the page NAME (the string passed
+// to create_function_page_base); re-entering a name already on the stack truncates
+// back to it, so existing direct show_*() back paths stay consistent automatically.
+// To re-display a parent we only need a show-fn for screens that ARE parents
+// (menus); leaves never get looked up. An unknown parent gracefully falls back to
+// Home (the previous behaviour) — no regression.
+// ============================================================================
+#define NAV_STACK_MAX 12
+static const char *nav_stack[NAV_STACK_MAX];
+static int          nav_stack_depth = 0;
+
+typedef struct { const char *name; void (*show)(void); } nav_show_entry_t;
+
+// name -> function that re-displays that menu screen. Only PARENT (menu/intermediate)
+// screens need an entry. All listed functions are forward-declared above.
+static const nav_show_entry_t NAV_SHOW_TABLE[] = {
+    { "WiFi",                 show_wifi_menu_screen        },
+    { "WiFi Scan & Attack",   show_wifi_scan_attack_screen },
+    { "Global WiFi Attacks",  show_global_attacks_screen   },
+    { "Select Attack",        show_attack_tiles_screen     },
+    { "WiFi Observer",        show_sniff_karma_screen      },
+    { "Compromised Data",     show_wifi_monitor_screen     },
+    { "Bluetooth",            show_bluetooth_screen        },
+    { "BT Scan & Select",     show_bt_scan_select_screen   },
+    { "BT Attacks",           show_bt_attacks_screen       },
+    { "Bluetooth Lookout",    show_bt_lookout_screen       },
+    { "OUI Groups",           show_oui_groups_screen       },
+    { "Wardrive",             show_wardrive_menu_screen    },
+    { "WD Options",           show_wardrive_options_screen },
+    { "Manage Data",          show_wardrive_manage_screen  },
+    { "Settings",             show_settings_screen         },
+    { "SD Card",              show_sd_card_screen          },
+    { "Hardware Options",     show_hardware_options_screen },
+    { "NM-RF-HAT",            show_nmrfhat_settings_screen },
+    { "Data Transfer",        show_data_transfer_screen    },
+    { "Zigbee Scout",         show_zigbee_wardrive_screen  },
+    { "Infrared",             show_ir_menu_screen          },
+    { "Radio",                show_radio_menu_screen       },
+    { "RFID / NFC",           show_rfid_menu_screen        },
+    { "CC1101 Sub-GHz",       show_cc1101_screen           },
+    { "nRF24L01 2.4GHz",      show_nrf24_screen            },
+    { "RF433 OOK",            show_rf433_menu_screen       },
+};
+
+static void (*nav_show_lookup(const char *name))(void)
+{
+    if (!name) return NULL;
+    for (size_t i = 0; i < sizeof(NAV_SHOW_TABLE) / sizeof(NAV_SHOW_TABLE[0]); i++) {
+        if (strcmp(NAV_SHOW_TABLE[i].name, name) == 0) return NAV_SHOW_TABLE[i].show;
+    }
+    return NULL;
+}
+
+// Reset the path stack — called from show_main_tiles() (the home screen).
+static void nav_stack_reset(void) { nav_stack_depth = 0; }
+
+// Record entering screen `name`. If already on the stack, truncate back to it
+// (we navigated up/back); otherwise push it as a new level.
+static void nav_stack_enter(const char *name)
+{
+    if (!name) return;
+    for (int i = 0; i < nav_stack_depth; i++) {
+        if (nav_stack[i] && strcmp(nav_stack[i], name) == 0) {
+            nav_stack_depth = i + 1;
+            return;
+        }
+    }
+    if (nav_stack_depth < NAV_STACK_MAX) nav_stack[nav_stack_depth++] = name;
+}
+
+// Title-bar "‹" handler: go up one level to the parent menu, or Home if none.
+static void nav_back_cb(lv_event_t *e)
+{
+    (void)e;
+    // Resolve the go-up target, then DEFER it to the main loop (see
+    // nav_deferred_show_fn) so any stop-hook runs off the LVGL event stack.
+    void (*fn)(void) = NULL;
+    // A screen with a dynamic-titled parent registered its own go-up target.
+    if (g_screen_back_fn) {
+        fn = g_screen_back_fn;
+        g_screen_back_fn = NULL;
+    } else if (nav_stack_depth >= 2) {
+        fn = nav_show_lookup(nav_stack[nav_stack_depth - 2]);
+    }
+    if (fn) {
+        nav_deferred_show_fn = fn;   // run from main loop, not inside this event
+    } else {
+        nav_to_menu_flag = true;     // no parent → Home (also deferred)
+    }
+}
+
 static void create_function_page_base(const char *name)
 {
+    // Record this screen on the back-navigation path stack (keyed by name).
+    nav_stack_enter(name);
+
     // Print memory stats when opening new page
     print_memory_stats();
     
@@ -13574,6 +13565,9 @@ static void create_function_page_base(const char *name)
     lv_obj_set_style_bg_color(page_title_bar, ui_panel_color(), 0);
     lv_obj_set_style_border_width(page_title_bar, 0, 0);
     lv_obj_set_style_radius(page_title_bar, 0, 0);
+    // No inner padding: lets the Home/Back cluster sit flush against the left edge
+    // (removes the gap between the screen edge and the Home icon).
+    lv_obj_set_style_pad_all(page_title_bar, 0, 0);
     lv_obj_clear_flag(page_title_bar, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *home_btn = lv_btn_create(page_title_bar);
@@ -13591,27 +13585,48 @@ static void create_function_page_base(const char *name)
     lv_obj_set_style_text_color(home_label, ui_text_color(), 0);
     lv_obj_center(home_label);
 
-    // Mini Go Dark button — power off screen without leaving the current op
+    // Back button — step UP one menu level (parent screen), not straight Home.
+    // Parent is resolved at click time from the runtime nav stack (see nav_back_cb).
+    lv_obj_t *back_btn = lv_btn_create(page_title_bar);
+    lv_obj_set_size(back_btn, 30, 30);
+    lv_obj_align(back_btn, LV_ALIGN_LEFT_MID, 34, 0);
+    lv_obj_set_style_bg_color(back_btn, ui_accent_color(), 0);
+    lv_obj_set_style_bg_color(back_btn, lv_color_lighten(ui_accent_color(), 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(back_btn, 5, 0);
+    lv_obj_set_style_shadow_width(back_btn, 0, 0);
+    lv_obj_add_event_cb(back_btn, nav_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *back_label = lv_label_create(back_btn);
+    lv_label_set_text(back_label, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(back_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(back_label, ui_text_color(), 0);
+    lv_obj_center(back_label);
+
+    // Go Dark button — power off screen without leaving the current op. Far RIGHT now,
+    // styled identically to Home/Back (same accent button, same 30x30 size, same montserrat_16
+    // symbol family) for a consistent top-bar look.
     lv_obj_t *dark_btn = lv_btn_create(page_title_bar);
-    lv_obj_set_size(dark_btn, 24, 24);
-    lv_obj_align(dark_btn, LV_ALIGN_LEFT_MID, 34, 0);
-    lv_obj_set_style_bg_color(dark_btn, lv_color_hex(0x0D1117), 0);
-    lv_obj_set_style_bg_color(dark_btn, lv_color_hex(0x1A2332), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(dark_btn, 4, 0);
+    lv_obj_set_size(dark_btn, 30, 30);
+    lv_obj_align(dark_btn, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_set_style_bg_color(dark_btn, lv_color_hex(0x8A8FA8), 0);  // match home-screen Go Dark tile
+    lv_obj_set_style_bg_color(dark_btn, lv_color_lighten(lv_color_hex(0x8A8FA8), 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(dark_btn, 5, 0);
     lv_obj_set_style_shadow_width(dark_btn, 0, 0);
     lv_obj_add_event_cb(dark_btn, go_dark_mini_btn_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *dark_lbl = lv_label_create(dark_btn);
     lv_label_set_text(dark_lbl, LV_SYMBOL_POWER);
-    lv_obj_set_style_text_font(dark_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(dark_lbl, lv_color_hex(0x4A90D9), 0);
+    lv_obj_set_style_text_font(dark_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(dark_lbl, ui_text_color(), 0);
     lv_obj_center(dark_lbl);
 
     lv_obj_t *page_title_label = lv_label_create(page_title_bar);
     lv_label_set_text(page_title_label, name ? name : "");
     lv_obj_set_style_text_color(page_title_label, ui_text_color(), 0);
-    // Constrain to space right of both left buttons (home 30px + dark btn 24px + gaps = 62px)
-    lv_obj_set_width(page_title_label, 170);
-    lv_obj_align(page_title_label, LV_ALIGN_LEFT_MID, 62, 0);
+    // One step smaller than the default title font so longer names don't run into the icons.
+    lv_obj_set_style_text_font(page_title_label, &lv_font_montserrat_12, 0);
+    // Two icons each side (home+back left, battery+go-dark right) → center the title on the
+    // bar. Width is held clear of the back button (left edge ~x=64) and the battery (right).
+    lv_obj_set_width(page_title_label, 108);
+    lv_obj_align(page_title_label, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_text_align(page_title_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(page_title_label, LV_LABEL_LONG_DOT);
 
@@ -13622,7 +13637,8 @@ static void create_function_page_base(const char *name)
     lv_label_set_text(battery_label, last_voltage_str);
     lv_obj_set_style_text_color(battery_label, ui_muted_color(), 0);
     lv_obj_set_style_text_font(battery_label, &lv_font_montserrat_12, 0);
-    lv_obj_align(battery_label, LV_ALIGN_RIGHT_MID, -8, 0);
+    // Sits just left of the Go Dark button (now flush far-right, x=0 w=30).
+    lv_obj_align(battery_label, LV_ALIGN_RIGHT_MID, -32, 0);
     if (last_voltage_str[0] == '\0') lv_obj_add_flag(battery_label, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -13772,6 +13788,14 @@ static void radio_reset_to_idle(void)
 
 void show_menu(void)
 {
+    // Run the current screen's own teardown FIRST, while its radio mode is still
+    // intact — symmetric with the top-bar ‹ Back path (nav_back_cb → parent →
+    // reset_function_page_children → run_screen_stop_fn). radio_reset_to_idle()
+    // below flips current_radio_mode, which would otherwise defeat mode-guarded
+    // stop hooks (e.g. BLE Spam). Cleared after running, so the later
+    // reset_function_page_children call is a harmless no-op.
+    run_screen_stop_fn();
+
     radio_reset_to_idle();
 
     evil_twin_log_capture_enabled = false;
@@ -14040,18 +14064,8 @@ static void attack_tile_event_cb(lv_event_t *e)
         lv_obj_set_style_pad_all(btn_bar, 4, 0);
         lv_obj_set_style_pad_gap(btn_bar, 4, 0);
         
-        lv_obj_t *back_btn = lv_btn_create(btn_bar);
-        lv_obj_set_size(back_btn, 90, 32);
-        lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_color(back_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
-        lv_obj_set_style_border_width(back_btn, 0, 0);
-        lv_obj_set_style_radius(back_btn, 8, 0);
-        lv_obj_t *back_lbl = lv_label_create(back_btn);
-        lv_label_set_text(back_lbl, "BACK");
-        lv_obj_set_style_text_color(back_lbl, ui_text_color(), 0);
-        lv_obj_center(back_lbl);
-        lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
-        
+        // YES button (centered — redundant bottom BACK removed; use top ‹ Back)
+        lv_obj_set_flex_align(btn_bar, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_t *yes_btn = lv_btn_create(btn_bar);
         lv_obj_set_size(yes_btn, 90, 32);
         lv_obj_set_style_bg_color(yes_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
@@ -14160,6 +14174,9 @@ static void apply_menu_bg(void)
 // Show main tiles screen (6 tiles)
 static void show_main_tiles(void)
 {
+    // Home screen = root of the menu path; clear the back-navigation stack.
+    nav_stack_reset();
+
     // Delete existing tiles container if present
     if (tiles_container) {
         lv_obj_del(tiles_container);
@@ -14357,16 +14374,7 @@ static void show_wifi_scan_attack_screen(void)
 
     // SAFETY: Ensure the UI callback is registered before starting scan
     // (Guards against boot-time registration failures in ensure_wifi_mode)
-    static bool s_ui_callback_registered = false;
-    if (!s_ui_callback_registered) {
-        esp_err_t err = esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE, &wifi_scan_done_cb, NULL);
-        if (err == ESP_OK) {
-            s_ui_callback_registered = true;
-            ESP_LOGI(TAG, "[WIFI_SCAN] UI callback registered for scan results");
-        } else {
-            ESP_LOGE(TAG, "[WIFI_SCAN] FAILED to register UI callback: err=%d", (int)err);
-        }
-    }
+    ensure_wifi_scan_ui_cb();
 
     create_function_page_base("WiFi Scan & Attack");
 
@@ -15098,22 +15106,6 @@ static void arp_scan_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
-static void arp_poison_exit_cb(lv_event_t *e)
-{
-    (void)e;
-    stop_arp_ban();
-    if (arp_poison_overlay) {
-        lv_obj_del(arp_poison_overlay);
-        arp_poison_overlay = NULL;
-    }
-    arp_poison_status_label = NULL;
-    if (arp_scan_check_timer) {
-        lv_timer_del(arp_scan_check_timer);
-        arp_scan_check_timer = NULL;
-    }
-    nav_to_menu_flag = true;
-}
-
 static void arp_poison_popup_stop_cb(lv_event_t *e)
 {
     (void)e;
@@ -15262,10 +15254,25 @@ static void arp_host_click_cb(lv_event_t *e)
     lv_obj_add_event_cb(stop_btn, arp_poison_popup_stop_cb, LV_EVENT_CLICKED, NULL);
 }
 
+// Screen-exit teardown for the ARP host-table — runs via g_screen_stop_fn on ANY
+// exit (top ‹ Back, Home). radio_reset_to_idle() stops the ban (stop_arp_ban is
+// inside it) AND drops the STA connection so we don't stay associated to the AP
+// after ‹ Back (matches Home; same LESSON as WPA-SEC). Safe: this is the TERMINAL
+// ARP screen — poisoning happens in the arp_poison_overlay modal, not a new page,
+// so this hook never fires on a forward nav (unlike the scanning screen).
+static void arp_stop(void)
+{
+    radio_reset_to_idle();
+}
+
 static void arp_poison_show_host_table(void)
 {
     create_function_page_base("ARP Poison");
-    
+    // Top ‹ Back → "Select Attack" tiles (parent "Connect to WiFi" isn't in
+    // NAV_SHOW_TABLE) + fully stop the attack via the stop-hook.
+    g_screen_back_fn = show_attack_tiles_screen;
+    g_screen_stop_fn = arp_stop;
+
     lv_obj_t *content = lv_obj_create(function_page);
     lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30);
     lv_obj_align(content, LV_ALIGN_BOTTOM_MID, 0, 0);
@@ -15330,21 +15337,8 @@ static void arp_poison_show_host_table(void)
             lv_obj_add_event_cb(row, arp_host_click_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
         }
     }
-    
-    // Back button (returns to menu without starting attack)
-    lv_obj_t *exit_btn = lv_btn_create(content);
-    lv_obj_set_size(exit_btn, 120, 36);
-    lv_obj_set_style_bg_color(exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(exit_btn, LV_OPA_COVER, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
-    lv_obj_set_style_text_color(exit_btn, ui_text_color(), 0);
-    lv_obj_set_style_border_width(exit_btn, 0, 0);
-    lv_obj_set_style_radius(exit_btn, 8, 0);
-    lv_obj_t *exit_lbl = lv_label_create(exit_btn);
-    lv_label_set_text(exit_lbl, "Back");
-    lv_obj_set_style_text_font(exit_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_center(exit_lbl);
-    lv_obj_add_event_cb(exit_btn, arp_poison_exit_cb, LV_EVENT_CLICKED, NULL);
+    // Bottom "Back" removed — top-bar ‹ Back → Select Attack + stops the attack
+    // (g_screen_back_fn = show_attack_tiles_screen, g_screen_stop_fn = arp_stop).
 }
 
 static void arp_scan_check_timer_cb(lv_timer_t *timer)
@@ -15363,7 +15357,12 @@ static void arp_scan_check_timer_cb(lv_timer_t *timer)
 static void show_arp_poison_page(void)
 {
     create_function_page_base("ARP Poison");
-    
+    // Top ‹ Back → "Select Attack" tiles (parent "Connect to WiFi" isn't in
+    // NAV_SHOW_TABLE). No stop-hook here: this scanning screen forward-navigates to
+    // arp_poison_show_host_table (needs the STA connection), so a radio_reset stop
+    // would fire on that forward nav; the host-table (terminal) carries arp_stop.
+    g_screen_back_fn = show_attack_tiles_screen;
+
     // Show scanning overlay
     lv_obj_t *content = lv_obj_create(function_page);
     lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30);
@@ -16227,13 +16226,17 @@ static void show_mitm_page(void)
     mitm_scan_check_timer = lv_timer_create(mitm_scan_check_timer_cb, 200, NULL);
 }
 
-static void rogue_ap_exit_cb(lv_event_t *e)
+// Screen-exit teardown for Rogue AP — runs via g_screen_stop_fn on ANY exit
+// (top ‹ Back, Home). Navigation itself is handled by the nav stack.
+static void rogue_ap_stop(void)
 {
-    (void)e;
     wifi_attacks_stop_portal();
     wifi_attacks_set_evil_twin_event_cb(NULL);
     rogue_ap_status_list = NULL;
-    nav_to_menu_flag = true;
+    // Full radio reset to STA-idle (matches Home). wifi_attacks_stop_portal leaves
+    // the driver in APSTA (a residual AP keeps broadcasting); radio_reset_to_idle
+    // switches to STA-only so the service is truly down after ‹ Back.
+    radio_reset_to_idle();
 }
 
 static void rogue_ap_start_btn_cb(lv_event_t *e)
@@ -16282,20 +16285,12 @@ static void rogue_ap_start_btn_cb(lv_event_t *e)
     lv_obj_set_style_radius(rogue_ap_status_list, 8, 0);
     lv_obj_set_style_pad_all(rogue_ap_status_list, 4, 0);
     
-    // Exit button
-    lv_obj_t *exit_btn = lv_btn_create(content);
-    lv_obj_set_size(exit_btn, 120, 36);
-    lv_obj_set_style_bg_color(exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(exit_btn, LV_OPA_COVER, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
-    lv_obj_set_style_text_color(exit_btn, ui_text_color(), 0);
-    lv_obj_set_style_border_width(exit_btn, 0, 0);
-    lv_obj_set_style_radius(exit_btn, 8, 0);
-    lv_obj_t *exit_lbl = lv_label_create(exit_btn);
-    lv_label_set_text(exit_lbl, "Stop & Exit");
-    lv_obj_set_style_text_font(exit_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_center(exit_lbl);
-    lv_obj_add_event_cb(exit_btn, rogue_ap_exit_cb, LV_EVENT_CLICKED, NULL);
+    // Top ‹ Back / Home stop the portal via the screen stop-hook
+    // (run_screen_stop_fn → rogue_ap_stop). Redundant bottom "Stop & Exit" removed.
+    g_screen_stop_fn = rogue_ap_stop;
+    // Top ‹ Back → "Select Attack" tiles (parent "Connect to WiFi" isn't in
+    // NAV_SHOW_TABLE, so without this override ‹ Back would resolve to Home).
+    g_screen_back_fn = show_attack_tiles_screen;
     
     // Set up event queue
     if (!rogue_ap_event_queue) {
@@ -16861,6 +16856,15 @@ static void wpasec_upload_timer_cb(lv_timer_t *timer)
     }
 }
 
+// Screen-exit teardown for WPA-SEC Upload — runs via g_screen_stop_fn on ANY exit
+// (top ‹ Back, Home). radio_reset_to_idle() stops the upload (wpasec_upload_active
+// =false) AND drops the STA connection (esp_wifi_stop → STA restart), so the device
+// isn't left associated to the target AP after ‹ Back (Birol: service kept running).
+static void wpasec_stop(void)
+{
+    radio_reset_to_idle();
+}
+
 /**
  * @brief Show the WPA-SEC Upload page.
  * Reads API key from SD, checks handshake count, starts background upload task.
@@ -16868,6 +16872,11 @@ static void wpasec_upload_timer_cb(lv_timer_t *timer)
 static void show_wpa_sec_upload_page(void)
 {
     create_function_page_base("WPA-SEC Upload");
+    // Top ‹ Back → "Select Attack" tiles (parent "Connect to WiFi" isn't in
+    // NAV_SHOW_TABLE, so without this override ‹ Back would resolve to Home).
+    g_screen_back_fn = show_attack_tiles_screen;
+    // Stop upload + drop STA connection on ANY exit (top ‹ Back / Home).
+    g_screen_stop_fn = wpasec_stop;
 
     // 1. Read API key from SD card
     if (!wpasec_read_key_from_sd()) {
@@ -17408,12 +17417,6 @@ static void download_mode_confirm_cb(lv_event_t *e)
     esp_timer_start_once(timer, 1500000);  // 1.5 seconds in microseconds
 }
 
-// Download Mode cancel callback
-static void download_mode_cancel_cb(lv_event_t *e)
-{
-    show_settings_screen();
-}
-
 // Download Mode screen - show confirmation and execute restart
 static void show_download_mode_screen(void)
 {
@@ -17436,18 +17439,8 @@ static void show_download_mode_screen(void)
     lv_obj_set_style_pad_all(btn_bar, 4, 0);
     lv_obj_set_style_pad_gap(btn_bar, 4, 0);
     
-    lv_obj_t *cancel_btn = lv_btn_create(btn_bar);
-    lv_obj_set_size(cancel_btn, 90, 32);
-    lv_obj_set_style_bg_color(cancel_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(cancel_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(cancel_btn, 0, 0);
-    lv_obj_set_style_radius(cancel_btn, 8, 0);
-    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
-    lv_label_set_text(cancel_lbl, "BACK");
-    lv_obj_set_style_text_color(cancel_lbl, ui_text_color(), 0);
-    lv_obj_center(cancel_lbl);
-    lv_obj_add_event_cb(cancel_btn, download_mode_cancel_cb, LV_EVENT_CLICKED, NULL);
-    
+    // RESTART centered — redundant bottom BACK removed; use top ‹ Back
+    lv_obj_set_flex_align(btn_bar, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_t *confirm_btn = lv_btn_create(btn_bar);
     lv_obj_set_size(confirm_btn, 90, 32);
     lv_obj_set_style_bg_color(confirm_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
@@ -17606,7 +17599,7 @@ static lv_obj_t      *s_fileserv_ip_lbl = NULL;
 static lv_obj_t      *s_fileserv_status_lbl = NULL;
 static lv_timer_t    *s_fileserv_poll_timer = NULL;
 static uint32_t       s_fileserv_connect_ms = 0;
-/* Declared here so s_fileserv_stop_cb (below) can reference them. */
+/* Declared here so fileserv_stop (below) can reference them. */
 static lv_obj_t      *s_wcs_scan_popup = NULL;
 static lv_timer_t    *s_wcs_scan_timer = NULL;
 static lv_obj_t      *s_wcs_ssid_ta    = NULL;
@@ -18165,9 +18158,13 @@ static void s_fileserv_poll_ip_cb(lv_timer_t *t)
 }
 
 /* Shared stop callback — stops HTTP server and optionally rejoins WiFi scan mode. */
-static void s_fileserv_stop_cb(lv_event_t *e)
+/* Teardown-only stop (no navigation) — wired as g_screen_stop_fn on both the AP
+   File Server and WiFi Client screens, so top ‹ Back AND Home both fully stop the
+   HTTP server + WiFi. Navigation is handled by the nav mechanism: Data Transfer
+   parent resolves via the nav stack; the wdup "WiFi for Upload" case sets
+   g_screen_back_fn = show_wardrive_upload_screen at build time. */
+static void fileserv_stop(void)
 {
-    (void)e;
     if (s_fileserv_poll_timer) { lv_timer_del(s_fileserv_poll_timer); s_fileserv_poll_timer = NULL; }
     if (s_wcs_scan_timer)     { lv_timer_del(s_wcs_scan_timer);     s_wcs_scan_timer = NULL; }
     if (s_wcs_scan_popup)     { lv_obj_del(s_wcs_scan_popup);       s_wcs_scan_popup = NULL; }
@@ -18183,12 +18180,18 @@ static void s_fileserv_stop_cb(lv_event_t *e)
     if (s_wcs_connected) esp_wifi_disconnect();  /* ensure clean disconnect on Back */
     s_wcs_connected = false;
     s_fileserv_httpd_stop();
-    if (s_wdup_pending_after_wifi) {
-        s_wdup_pending_after_wifi = false;
-        show_wardrive_upload_screen();
-        return;
-    }
-    show_settings_screen();
+    s_wdup_pending_after_wifi = false;  /* consumed on any exit */
+}
+
+/* AP File Server variant: also bring the soft-AP fully down. fileserv_stop() alone
+   only stops the HTTP server — the driver stays in APSTA so "TheLab" keeps
+   broadcasting; only radio_reset_to_idle() (what Home does) returns to STA-idle.
+   NOT used for the WiFi Client screen: the wdup success path relies on the STA
+   connection surviving, which radio_reset_to_idle() would tear down. */
+static void ap_fileserv_stop(void)
+{
+    fileserv_stop();
+    radio_reset_to_idle();
 }
 
 // ── AP File Server screen ────────────────────────────────────────────────────
@@ -18197,6 +18200,7 @@ static void show_ap_file_server_screen(void)
 {
     create_function_page_base("AP File Server");
     apply_menu_bg();
+    g_screen_stop_fn = ap_fileserv_stop;  /* top ‹ Back / Home stops the AP + HTTP server */
 
     // Info card
     lv_obj_t *card = lv_obj_create(function_page);
@@ -18243,19 +18247,6 @@ static void show_ap_file_server_screen(void)
     lv_obj_set_style_text_font(s_fileserv_status_lbl, &lv_font_montserrat_12, 0);
     lv_obj_align(s_fileserv_status_lbl, LV_ALIGN_TOP_MID, 0, 175);
 
-    lv_obj_t *stop_btn = lv_btn_create(function_page);
-    lv_obj_set_size(stop_btn, 110, 34);
-    lv_obj_align(stop_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
-    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, 0);
-    lv_obj_set_style_bg_color(stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(stop_btn, 8, 0);
-    lv_obj_t *stop_lbl = lv_label_create(stop_btn);
-    lv_label_set_text(stop_lbl, LV_SYMBOL_CLOSE "  Stop");
-    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(stop_lbl, lv_color_white(), 0);
-    lv_obj_center(stop_lbl);
-    lv_obj_add_event_cb(stop_btn, s_fileserv_stop_cb, LV_EVENT_CLICKED, NULL);
-
     /* Start the AP and HTTP server */
     ensure_wifi_mode();
 
@@ -18293,7 +18284,7 @@ static void show_ap_file_server_screen(void)
 // ── WiFi Client File Server screen ───────────────────────────────────────────
 
 /* s_wcs_ssid_ta, s_wcs_pass_ta, s_wcs_keyboard, s_wcs_active_ta, s_wcs_scan_popup,
-   s_wcs_scan_timer all declared earlier (before s_fileserv_stop_cb). */
+   s_wcs_scan_timer all declared earlier (before fileserv_stop). */
 
 static void s_wcs_eye_cb(lv_event_t *e)
 {
@@ -18546,6 +18537,10 @@ static void show_wifi_client_server_screen(void)
     log_heap_stats("fileserv-screen-open");
     create_function_page_base(s_wdup_pending_after_wifi ? "WiFi for Upload" : "WiFi File Server");
     apply_menu_bg();
+    g_screen_stop_fn = fileserv_stop;  /* top ‹ Back / Home stops the client + HTTP server */
+    /* wdup "WiFi for Upload" comes from Wardrive Upload (not in NAV_SHOW_TABLE) — route
+       ‹ Back back to it; the normal "WiFi File Server" resolves Data Transfer via nav stack. */
+    if (s_wdup_pending_after_wifi) g_screen_back_fn = show_wardrive_upload_screen;
 
     lv_obj_t *content = lv_obj_create(function_page);
     lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 50);
@@ -18647,19 +18642,10 @@ static void show_wifi_client_server_screen(void)
     lv_obj_set_style_pad_ver(btn_row, 0, 0);
     lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    lv_obj_t *stop_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(stop_btn, 100, 32);
-    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, 0);
-    lv_obj_set_style_bg_color(stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(stop_btn, 8, 0);
-    lv_obj_t *stop_lbl = lv_label_create(stop_btn);
-    lv_label_set_text(stop_lbl, LV_SYMBOL_CLOSE " Back");
-    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(stop_lbl, lv_color_white(), 0);
-    lv_obj_center(stop_lbl);
-    lv_obj_add_event_cb(stop_btn, s_fileserv_stop_cb, LV_EVENT_CLICKED, NULL);
+    /* Bottom red "Back" removed — top ‹ Back (g_screen_stop_fn=fileserv_stop) stops the
+       client and navigates up. Only Connect remains, centered. */
 
     s_wcs_conn_btn = lv_btn_create(btn_row);
     lv_obj_set_size(s_wcs_conn_btn, 110, 32);
@@ -19289,11 +19275,6 @@ static void wdup_start_cb(lv_event_t *e)
 
 // --- Wardrive Menu screen ---
 
-static void wd_menu_back_cb(lv_event_t *e)
-{
-    (void)e;
-    show_main_tiles();
-}
 
 static void wd_menu_tile_cb(lv_event_t *e)
 {
@@ -19324,18 +19305,6 @@ static void show_wardrive_menu_screen(void)
     create_tile(tiles, LV_SYMBOL_SETTINGS, "Options",         UI_ACCENT_GREEN,       wd_menu_tile_cb, "Options");
     create_tile(tiles, LV_SYMBOL_LIST,     "Manage\nData",    UI_ACCENT_CYAN,        wd_menu_tile_cb, "Manage");
 
-    lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 110, 30);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), 0);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_t *back_lbl = lv_label_create(back_btn);
-    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT "  Home");
-    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(back_lbl, ui_text_color(), 0);
-    lv_obj_center(back_lbl);
-    lv_obj_add_event_cb(back_btn, wd_menu_back_cb, LV_EVENT_CLICKED, NULL);
 }
 
 // --- Wardrive Options screen ---
@@ -19359,16 +19328,6 @@ static void wd_opts_save_cb(lv_event_t *e)
         nvs_commit(h);
         nvs_close(h);
     }
-    wd_opts_band_dd = NULL;
-    wd_opts_pcap_sw = NULL;
-    wd_opts_ble_sw  = NULL;
-    wd_opts_radio_dd = NULL;
-    show_wardrive_menu_screen();
-}
-
-static void wd_opts_back_cb(lv_event_t *e)
-{
-    (void)e;
     wd_opts_band_dd = NULL;
     wd_opts_pcap_sw = NULL;
     wd_opts_ble_sw  = NULL;
@@ -19446,7 +19405,7 @@ static void show_wardrive_options_screen(void)
     // Save button
     lv_obj_t *save_btn = lv_btn_create(function_page);
     lv_obj_set_size(save_btn, 110, 30);
-    lv_obj_align(save_btn, LV_ALIGN_BOTTOM_MID, 62, -8);
+    lv_obj_align(save_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
     lv_obj_set_style_bg_color(save_btn, UI_ACCENT_GREEN, 0);
     lv_obj_set_style_bg_color(save_btn, lv_color_make(50, 140, 50), LV_STATE_PRESSED);
     lv_obj_set_style_radius(save_btn, 8, 0);
@@ -19455,20 +19414,6 @@ static void show_wardrive_options_screen(void)
     lv_obj_set_style_text_font(save_lbl, &lv_font_montserrat_12, 0);
     lv_obj_center(save_lbl);
     lv_obj_add_event_cb(save_btn, wd_opts_save_cb, LV_EVENT_CLICKED, NULL);
-
-    // Back button
-    lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 110, 30);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, -62, -8);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), 0);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_t *back_lbl = lv_label_create(back_btn);
-    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT "  Back");
-    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(back_lbl, ui_text_color(), 0);
-    lv_obj_center(back_lbl);
-    lv_obj_add_event_cb(back_btn, wd_opts_back_cb, LV_EVENT_CLICKED, NULL);
 }
 
 // --- Wardrive Manage Data screen ---
@@ -19698,15 +19643,6 @@ static void wdm_upload_selected_cb(lv_event_t *e)
     show_wardrive_upload_screen();
 }
 
-static void wdm_back_cb(lv_event_t *e)
-{
-    (void)e;
-    void (*fn)(void) = wdm_back_fn;
-    wdm_back_fn = NULL;
-    if (fn) fn();
-    else show_wardrive_menu_screen();
-}
-
 static void show_wardrive_manage_screen(void)
 {
     create_function_page_base("Manage Data");
@@ -19921,23 +19857,10 @@ static void show_wardrive_manage_screen(void)
     lv_obj_center(none_lbl);
     lv_obj_add_event_cb(none_btn, wdm_sel_none_cb, LV_EVENT_CLICKED, NULL);
 
-    // Row 2: Back / Delete / Upload  (y from bottom = -10)
-    lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 68, 30);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_LEFT, 4, -10);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), 0);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_t *back_lbl = lv_label_create(back_btn);
-    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " Back");
-    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(back_lbl, ui_text_color(), 0);
-    lv_obj_center(back_lbl);
-    lv_obj_add_event_cb(back_btn, wdm_back_cb, LV_EVENT_CLICKED, NULL);
-
+    // Row 2: Delete / Upload  (y from bottom = -10)
     wdm_del_btn_bottom = lv_btn_create(function_page);
     lv_obj_set_size(wdm_del_btn_bottom, 76, 30);
-    lv_obj_align(wdm_del_btn_bottom, LV_ALIGN_BOTTOM_LEFT, 78, -10);
+    lv_obj_align(wdm_del_btn_bottom, LV_ALIGN_BOTTOM_MID, -42, -10);
     lv_obj_set_style_bg_color(wdm_del_btn_bottom, COLOR_MATERIAL_RED, 0);
     lv_obj_set_style_bg_color(wdm_del_btn_bottom, lv_color_make(180, 30, 30), LV_STATE_PRESSED);
     lv_obj_set_style_radius(wdm_del_btn_bottom, 8, 0);
@@ -19951,7 +19874,7 @@ static void show_wardrive_manage_screen(void)
 
     wdm_up_btn_bottom = lv_btn_create(function_page);
     lv_obj_set_size(wdm_up_btn_bottom, 76, 30);
-    lv_obj_align(wdm_up_btn_bottom, LV_ALIGN_BOTTOM_RIGHT, -4, -10);
+    lv_obj_align(wdm_up_btn_bottom, LV_ALIGN_BOTTOM_MID, 42, -10);
     lv_obj_set_style_bg_color(wdm_up_btn_bottom, lv_color_hex(0xE91E63), 0);
     lv_obj_set_style_bg_color(wdm_up_btn_bottom, lv_color_hex(0xAD1457), LV_STATE_PRESSED);
     lv_obj_set_style_radius(wdm_up_btn_bottom, 8, 0);
@@ -19995,22 +19918,6 @@ static void wdup_ta_focus_cb(lv_event_t *e)
         if (wdup_upload_btn)   lv_obj_add_flag(wdup_upload_btn,   LV_OBJ_FLAG_HIDDEN);
         if (wdup_back_btn_obj) lv_obj_add_flag(wdup_back_btn_obj, LV_OBJ_FLAG_HIDDEN);
     }
-}
-
-static void wdup_back_cb(lv_event_t *e)
-{
-    (void)e;
-    wdup_active       = false;
-    wdup_wigle_key_ta = NULL;
-    wdup_wdg_key_ta   = NULL;
-    wdup_status_list  = NULL;
-    wdup_upload_btn   = NULL;
-    wdup_back_btn_obj = NULL;
-    if (wdup_timer) { lv_timer_del(wdup_timer); wdup_timer = NULL; }
-    void (*back_fn)(void) = wdup_back_fn;
-    wdup_back_fn = NULL;
-    if (back_fn) back_fn();
-    else show_data_transfer_screen();
 }
 
 static void show_wardrive_upload_screen(void)
@@ -20152,10 +20059,10 @@ static void show_wardrive_upload_screen(void)
         if (hint) lv_obj_set_style_text_color(hint, lv_color_make(255, 193, 7), 0);
     }
 
-    // ── Bottom button bar: [Upload] [Back] — created before keyboard for Z-order ──
+    // ── Bottom button bar: [Upload] — created before keyboard for Z-order ──
     wdup_upload_btn = lv_btn_create(function_page);
     lv_obj_set_size(wdup_upload_btn, 110, 32);
-    lv_obj_align(wdup_upload_btn, LV_ALIGN_BOTTOM_MID, -62, -6);
+    lv_obj_align(wdup_upload_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
     lv_obj_set_style_bg_color(wdup_upload_btn, lv_color_make(233, 30, 99), LV_STATE_DEFAULT);
     lv_obj_set_style_radius(wdup_upload_btn, 8, 0);
     lv_obj_set_style_border_width(wdup_upload_btn, 0, 0);
@@ -20164,18 +20071,6 @@ static void show_wardrive_upload_screen(void)
     lv_obj_set_style_text_font(upload_lbl, &lv_font_montserrat_12, 0);
     lv_obj_center(upload_lbl);
     lv_obj_add_event_cb(wdup_upload_btn, wdup_start_cb, LV_EVENT_CLICKED, NULL);
-
-    wdup_back_btn_obj = lv_btn_create(function_page);
-    lv_obj_set_size(wdup_back_btn_obj, 110, 32);
-    lv_obj_align(wdup_back_btn_obj, LV_ALIGN_BOTTOM_MID, 62, -6);
-    lv_obj_set_style_bg_color(wdup_back_btn_obj, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
-    lv_obj_set_style_radius(wdup_back_btn_obj, 8, 0);
-    lv_obj_set_style_border_width(wdup_back_btn_obj, 0, 0);
-    lv_obj_t *back_lbl = lv_label_create(wdup_back_btn_obj);
-    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT "  Back");
-    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_center(back_lbl);
-    lv_obj_add_event_cb(wdup_back_btn_obj, wdup_back_cb, LV_EVENT_CLICKED, NULL);
 
     // ── On-screen keyboard (hidden until a text area is tapped; above buttons in Z-order) ──
     lv_obj_t *kb = lv_keyboard_create(function_page);
@@ -20352,12 +20247,12 @@ static void delbr_up_cb(lv_event_t *e)
     parent[sizeof(parent) - 1] = '\0';
     char *slash = strrchr(parent, '/');
     if (!slash || slash == parent || strlen(parent) <= strlen("/sdcard")) {
-        show_data_transfer_screen();
+        nav_back_cb(NULL);  // at root: up to the actual parent menu (SD Card or Data Transfer) via nav stack
         return;
     }
     *slash = '\0';
     if (strlen(parent) < strlen("/sdcard/lab"))
-        show_data_transfer_screen();
+        nav_back_cb(NULL);  // at root: up to the actual parent menu via nav stack
     else
         delbr_populate(parent);
 }
@@ -20659,11 +20554,6 @@ static void data_transfer_tile_cb(lv_event_t *e)
     }
 }
 
-static void data_transfer_back_cb(lv_event_t *e)
-{
-    (void)e;
-    show_settings_screen();
-}
 
 static void show_data_transfer_screen(void)
 {
@@ -20685,18 +20575,6 @@ static void show_data_transfer_screen(void)
     create_tile(tiles, MY_SYMBOL_LAPTOP, "WiFi\nClient",      COLOR_MATERIAL_GREEN,     data_transfer_tile_cb, "WiFi Client");
     create_tile(tiles, MY_SYMBOL_CLOUD_UP,"Wardrive\nUpload",  lv_color_hex(0xE91E63),  data_transfer_tile_cb, "Wardrive Upload");
 
-    lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 110, 30);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), 0);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_t *back_lbl = lv_label_create(back_btn);
-    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " Settings");
-    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(back_lbl, ui_text_color(), 0);
-    lv_obj_center(back_lbl);
-    lv_obj_add_event_cb(back_btn, data_transfer_back_cb, LV_EVENT_CLICKED, NULL);
 }
 
 // ============================================================================
@@ -21897,11 +21775,6 @@ static void show_power_mode_popup(void)
 
 // ─── Hardware Options sub-screen ─────────────────────────────────────────────
 
-static void hw_opts_back_cb(lv_event_t *e)
-{
-    (void)e;
-    show_settings_screen();
-}
 
 // ── NM-RF-HAT settings screen ─────────────────────────────────────────────────
 
@@ -21975,7 +21848,6 @@ static void rfhat_toggle_cb(lv_event_t *e)
     }
 }
 
-static void rfhat_back_cb(lv_event_t *e) { (void)e; show_hardware_options_screen(); }
 
 static void show_nmrfhat_settings_screen(void)
 {
@@ -22065,23 +21937,6 @@ static void show_nmrfhat_settings_screen(void)
     lv_obj_center(dis_lbl);
     lv_obj_add_event_cb(s_rfhat_dis_btn, rfhat_toggle_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)false);
 
-    // Back button
-    lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 120, 30);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(60,60,60), LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(back_btn, 4, 0);
-    lv_obj_t *bi = lv_label_create(back_btn); lv_label_set_text(bi, LV_SYMBOL_LEFT);
-    lv_obj_set_style_text_font(bi, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(bi, lv_color_white(), 0);
-    lv_obj_t *bl = lv_label_create(back_btn); lv_label_set_text(bl, "Hw Options");
-    lv_obj_set_style_text_font(bl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(bl, lv_color_white(), 0);
-    lv_obj_add_event_cb(back_btn, rfhat_back_cb, LV_EVENT_CLICKED, NULL);
 }
 
 // ── DIP switch reminder popup ─────────────────────────────────────────────────
@@ -22196,25 +22051,6 @@ static void show_hardware_options_screen(void)
     create_tile(tiles, LV_SYMBOL_CHARGE,    "Power\nMode",  COLOR_MATERIAL_RED,     hw_options_tile_event_cb, "Power Mode");
     create_tile(tiles, MY_SYMBOL_TOWER,     "NM-RF-HAT",   lv_color_hex(0x607D8B), hw_options_tile_event_cb, "NM-RF-HAT");
 
-    lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 120, 30);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(back_btn, 4, 0);
-    lv_obj_t *bi = lv_label_create(back_btn);
-    lv_label_set_text(bi, LV_SYMBOL_LEFT);
-    lv_obj_set_style_text_font(bi, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(bi, lv_color_white(), 0);
-    lv_obj_t *bl = lv_label_create(back_btn);
-    lv_label_set_text(bl, "Settings");
-    lv_obj_set_style_text_font(bl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(bl, lv_color_white(), 0);
-    lv_obj_add_event_cb(back_btn, hw_opts_back_cb, LV_EVENT_CLICKED, NULL);
 }
 
 // Settings sub-menu tile event callback
@@ -23243,18 +23079,7 @@ static void show_sd_free_space_screen(void)
         lv_obj_clear_flag(bar_fill, LV_OBJ_FLAG_SCROLLABLE);
     }
 
-    lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 90, 34);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(back_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_add_event_cb(back_btn, sd_back_to_menu_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *back_lbl = lv_label_create(back_btn);
-    lv_label_set_text(back_lbl, "Back");
-    lv_obj_set_style_text_color(back_lbl, ui_text_color(), 0);
-    lv_obj_center(back_lbl);
+    // Bottom "Back" removed — top-bar ‹ Back returns to the SD Card menu.
 }
 
 // ─── File Tree screen ────────────────────────────────────────────────────────
@@ -23797,17 +23622,9 @@ static void show_sd_remount_screen(void)
     lv_obj_center(bl);
     lv_obj_add_event_cb(s_sd_remount_btn, s_sd_remount_trigger_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 90, 34);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_add_event_cb(back_btn, sd_back_to_menu_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *bbl = lv_label_create(back_btn);
-    lv_label_set_text(bbl, "Back");
-    lv_obj_set_style_text_color(bbl, ui_text_color(), 0);
-    lv_obj_center(bbl);
+    // Bottom "Back" removed — top-bar ‹ Back already returns to the SD Card menu
+    // ("SD Card" is in NAV_SHOW_TABLE). No service to stop (remount is a one-shot task).
+    // sd_back_to_menu_cb kept — still used by the Format-confirm dialogs.
 }
 
 // ─── SD Card sub-menu ────────────────────────────────────────────────────────
@@ -23937,9 +23754,10 @@ static void gps_info_refresh_cb(lv_timer_t *t)
     lv_obj_set_style_text_color(gps_info_acc_lbl, pos_color, 0);
 }
 
-static void gps_back_to_settings_cb(lv_event_t *e)
+// Teardown for the GPS Info screen — runs on any exit (top ‹ Back, Home, forward
+// nav, bottom Back) via the g_screen_stop_fn hook.
+static void gps_info_stop(void)
 {
-    (void)e;
     if (gps_info_refresh_timer) {
         lv_timer_del(gps_info_refresh_timer);
         gps_info_refresh_timer = NULL;
@@ -23947,7 +23765,6 @@ static void gps_back_to_settings_cb(lv_event_t *e)
     gps_info_fix_lbl = gps_info_time_lbl = gps_info_sat_lbl = NULL;
     gps_info_lat_lbl = gps_info_lon_lbl  = gps_info_alt_lbl = NULL;
     gps_info_acc_lbl = NULL;
-    show_settings_screen();
 }
 
 // ── Manual GPS position edit overlay ─────────────────────────────────────────
@@ -24197,6 +24014,7 @@ static void gps_show_edit_overlay(lv_event_t *e)
 static void show_gps_info_screen(void)
 {
     create_function_page_base("GPS Info");
+    g_screen_stop_fn = gps_info_stop;
 
     lv_obj_t *card = lv_obj_create(function_page);
     lv_obj_set_size(card, 220, 252);
@@ -24274,7 +24092,7 @@ static void show_gps_info_screen(void)
     // Set Position button (amber)
     lv_obj_t *setpos_btn = lv_btn_create(function_page);
     lv_obj_set_size(setpos_btn, 120, 32);
-    lv_obj_align(setpos_btn, LV_ALIGN_BOTTOM_MID, -44, -10);
+    lv_obj_align(setpos_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
     lv_obj_set_style_bg_color(setpos_btn, COLOR_MATERIAL_AMBER, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(setpos_btn, lv_color_lighten(COLOR_MATERIAL_AMBER, 30), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(setpos_btn, 0, 0);
@@ -24285,21 +24103,6 @@ static void show_gps_info_screen(void)
     lv_obj_set_style_text_font(setpos_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(setpos_lbl, lv_color_black(), 0);
     lv_obj_center(setpos_lbl);
-
-    // Back button (teal)
-    lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 80, 32);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 64, -10);
-    lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(back_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_add_event_cb(back_btn, gps_back_to_settings_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *back_lbl2 = lv_label_create(back_btn);
-    lv_label_set_text(back_lbl2, LV_SYMBOL_LEFT "  Back");
-    lv_obj_set_style_text_font(back_lbl2, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(back_lbl2, ui_text_color(), 0);
-    lv_obj_center(back_lbl2);
 }
 
 // ============================================================================
@@ -24556,8 +24359,12 @@ static void lookout_back_btn_cb(lv_event_t *e)
     if (!bt_lookout_is_active() && current_radio_mode == RADIO_MODE_BLE) {
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
-        // Reinit WiFi to reclaim DMA for other features
+        // Reinit WiFi to reclaim DMA for other features. Mark the mode as WIFI so a
+        // later ensure_ble_mode() knows WiFi owns the DMA and fully deinits it before
+        // re-initialising BLE. Without this the mode stayed NONE while WiFi held the
+        // DMA pool, so BLE re-init ran out of DMA and failed on re-entry.
         wifi_cli_init();
+        current_radio_mode = RADIO_MODE_WIFI;
     }
     show_bluetooth_screen();
 }
@@ -25357,11 +25164,6 @@ static void oui_group_add_cb(lv_event_t *e)
         lv_label_set_text(lbl, ok ? "Added!" : "Failed!");
 }
 
-static void oui_groups_back_cb(lv_event_t *e)
-{
-    (void)e;
-    show_bt_lookout_screen();
-}
 
 static void show_oui_groups_screen(void)
 {
@@ -25446,26 +25248,6 @@ static void show_oui_groups_screen(void)
         lv_obj_add_event_cb(add_btn, oui_group_add_cb, LV_EVENT_CLICKED, (void *)(intptr_t)g);
     }
 
-    /* Back button */
-    lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 110, 30);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(back_btn, 4, 0);
-    lv_obj_t *b_icon = lv_label_create(back_btn);
-    lv_label_set_text(b_icon, LV_SYMBOL_LEFT);
-    lv_obj_set_style_text_font(b_icon, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(b_icon, ui_text_color(), 0);
-    lv_obj_t *b_lbl = lv_label_create(back_btn);
-    lv_label_set_text(b_lbl, "Back");
-    lv_obj_set_style_text_font(b_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(b_lbl, ui_text_color(), 0);
-    lv_obj_add_event_cb(back_btn, oui_groups_back_cb, LV_EVENT_CLICKED, NULL);
 }
 
 // ─── BLE PCAP capture (Kismet/PCAPNG format) ─────────────────────────────
@@ -25660,13 +25442,12 @@ static void ble_pcap_timer_cb(lv_timer_t *t)
     }
 }
 
-static void ble_pcap_stop_cb(lv_event_t *e)
+// Teardown-only stop hook (top-bar ‹ Back / Home both invoke it via g_screen_stop_fn).
+static void ble_pcap_screen_stop(void)
 {
-    (void)e;
     ble_pcap_stop();
     ble_pcap_save_sw = NULL;
     ble_pcap_fn_lbl  = NULL;
-    show_bluetooth_screen();
 }
 
 static void show_ble_pcap_screen(void)
@@ -25712,6 +25493,7 @@ static void show_ble_pcap_screen(void)
     ble_pcap_active    = true;
 
     create_function_page_base("BLE PCAP");
+    g_screen_stop_fn = ble_pcap_screen_stop;
 
     // Filename label
     lv_obj_t *fn_lbl = lv_label_create(function_page);
@@ -25749,18 +25531,7 @@ static void show_ble_pcap_screen(void)
     lv_obj_set_width(fmt_lbl, LCD_H_RES - 16);
     lv_obj_align(fmt_lbl, LV_ALIGN_CENTER, 0, 60);
 
-    // Stop button
-    lv_obj_t *stop_btn = lv_btn_create(function_page);
-    lv_obj_set_size(stop_btn, 110, 30);
-    lv_obj_align(stop_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
-    lv_obj_set_style_bg_color(stop_btn, lv_color_make(200, 50, 50), 0);
-    lv_obj_set_style_bg_color(stop_btn, lv_color_make(160, 30, 30), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(stop_btn, 8, 0);
-    lv_obj_t *stop_lbl = lv_label_create(stop_btn);
-    lv_label_set_text(stop_lbl, LV_SYMBOL_STOP "  Stop");
-    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_center(stop_lbl);
-    lv_obj_add_event_cb(stop_btn, ble_pcap_stop_cb, LV_EVENT_CLICKED, NULL);
+    // Bottom "Stop" removed — top-bar ‹ Back stops capture (g_screen_stop_fn).
 
 #if MYNEWT_VAL(BLE_EXT_ADV)
     struct ble_gap_ext_disc_params ep = {
@@ -26175,8 +25946,9 @@ static void lw_create_list_cb(lv_event_t *e) {
     lv_obj_add_event_cb(save_btn, lw_save_result_confirm_cb, LV_EVENT_CLICKED, NULL);
 }
 
-static void lw_back_cb(lv_event_t *e) {
-    (void)e;
+// Teardown for the List Wizard screen — runs on any exit (top ‹ Back, Home, forward
+// nav, bottom Back) via the g_screen_stop_fn hook.
+static void lw_stop(void) {
     lw_ui_active = false;
     if (lw_files) { heap_caps_free(lw_files); lw_files = NULL; }
     if (lw_result_buf) { heap_caps_free(lw_result_buf); lw_result_buf = NULL; }
@@ -26193,7 +25965,6 @@ static void lw_back_cb(lv_event_t *e) {
     lw_del_idx = -1;
     lw_list_scroll_top = 0;
     lw_list_box = NULL; lw_status_lbl = NULL;
-    show_bluetooth_screen();
 }
 
 static void lw_result_close_cb(lv_event_t *e) {
@@ -26952,6 +26723,7 @@ static void show_list_wizard_screen(void) {
     if (function_page) { lv_obj_del(function_page); function_page = NULL; }
     reset_function_page_children();
     create_function_page_base("List Wizard");
+    g_screen_stop_fn = lw_stop;
     lw_ui_active = true;
     lw_select_count = 0;
     lw_list_scroll_top = 0;
@@ -26983,7 +26755,7 @@ static void show_list_wizard_screen(void) {
     lv_obj_set_scrollbar_mode(lw_list_box, LV_SCROLLBAR_MODE_OFF);
     lv_obj_clear_flag(lw_list_box, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Bottom buttons: [Back] [Unique] [Common]
+    // Bottom buttons: [Unique] [Common] (top-bar ‹ Back handles exit; lw_stop teardown)
     lv_obj_t *btn_row = lv_obj_create(function_page);
     lv_obj_set_size(btn_row, lv_pct(100), 38);
     lv_obj_align(btn_row, LV_ALIGN_BOTTOM_MID, 0, -6);
@@ -26994,17 +26766,6 @@ static void show_list_wizard_screen(void) {
     lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *back_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(back_btn, 68, 30);
-    lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_RED, 0);
-    lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_t *back_lbl = lv_label_create(back_btn);
-    lv_label_set_text(back_lbl, LV_SYMBOL_CLOSE "  Back");
-    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
-    lv_obj_center(back_lbl);
-    lv_obj_add_event_cb(back_btn, lw_back_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *uniq_btn = lv_btn_create(btn_row);
     lv_obj_set_size(uniq_btn, 78, 30);
@@ -27145,6 +26906,7 @@ static void show_bt_locator_screen(void)
     
     // Create base page with title "Bluetooth Locator"
     create_function_page_base("Bluetooth Locator");
+    g_screen_stop_fn = bt_locator_stop;
     bt_locator_ui_active = true;
     bt_locator_tracking_active = false;
     bt_tracking_mode = false;
@@ -27203,34 +26965,7 @@ static void show_bt_locator_screen(void)
     lv_obj_align(bt_locator_mac_label, LV_ALIGN_CENTER, 0, 20);
     lv_obj_add_flag(bt_locator_mac_label, LV_OBJ_FLAG_HIDDEN);
     
-    // Back button at bottom (compact row)
-    bt_locator_exit_btn = lv_btn_create(function_page);
-    lv_obj_set_size(bt_locator_exit_btn, 110, 28);
-    lv_obj_align(bt_locator_exit_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(bt_locator_exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(bt_locator_exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(bt_locator_exit_btn, 0, 0);
-    lv_obj_set_style_radius(bt_locator_exit_btn, 8, 0);
-    lv_obj_set_style_shadow_width(bt_locator_exit_btn, 4, 0);
-    lv_obj_set_style_shadow_color(bt_locator_exit_btn, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_shadow_opa(bt_locator_exit_btn, LV_OPA_40, 0);
-    lv_obj_set_style_pad_ver(bt_locator_exit_btn, 4, 0);
-    lv_obj_set_style_pad_hor(bt_locator_exit_btn, 8, 0);
-    lv_obj_set_style_pad_column(bt_locator_exit_btn, 4, 0);
-    lv_obj_set_flex_flow(bt_locator_exit_btn, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(bt_locator_exit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-    lv_obj_t *exit_icon = lv_label_create(bt_locator_exit_btn);
-    lv_label_set_text(exit_icon, LV_SYMBOL_LEFT);
-    lv_obj_set_style_text_font(exit_icon, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(exit_icon, ui_text_color(), 0);
-
-    lv_obj_t *exit_lbl = lv_label_create(bt_locator_exit_btn);
-    lv_label_set_text(exit_lbl, "Back");
-    lv_obj_set_style_text_font(exit_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(exit_lbl, ui_text_color(), 0);
-
-    lv_obj_add_event_cb(bt_locator_exit_btn, bt_locator_exit_cb, LV_EVENT_CLICKED, NULL);
+    // Bottom "< Back" removed — top-bar ‹ Back stops tracking (g_screen_stop_fn = bt_locator_stop).
 
     // Switch to BLE mode
     if (!ensure_ble_mode()) {
@@ -27265,9 +27000,9 @@ static void show_bt_locator_screen(void)
 // BT SCAN & SELECT
 // ============================================================================
 
-static void bt_sas_exit_cb(lv_event_t *e)
+// Teardown-only stop hook (top-bar ‹ Back / Home both invoke it via g_screen_stop_fn).
+static void bt_sas_stop(void)
 {
-    (void)e;
     if (bt_scan_active) {
         bt_scan_active = false;
         bt_stop_scan();
@@ -27279,7 +27014,6 @@ static void bt_sas_exit_cb(lv_event_t *e)
     bt_sas_save_ta = NULL;
     bt_sas_ui_active = false;
     bt_sas_selected_idx = -1;
-    show_bluetooth_screen();
 }
 
 static void bt_sas_rescan_cb(lv_event_t *e)
@@ -27822,6 +27556,7 @@ static void show_bt_scan_select_screen(void)
     }
 
     create_function_page_base("BT Scan & Select");
+    g_screen_stop_fn = bt_sas_stop;
     bt_sas_ui_active = true;
     bt_sas_selected_idx = -1;
     bt_sas_scroll_top = 0;
@@ -27847,7 +27582,8 @@ static void show_bt_scan_select_screen(void)
     lv_obj_set_scrollbar_mode(bt_sas_list, LV_SCROLLBAR_MODE_OFF);
     lv_obj_clear_flag(bt_sas_list, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Bottom button row: [Exit] [Save List] [Rescan] [Actions →]
+    // Bottom button row: [Save List] [Rescan] [Actions →]
+    // (Exit removed — top-bar ‹ Back stops the scan via g_screen_stop_fn = bt_sas_stop)
     lv_obj_t *btn_row = lv_obj_create(function_page);
     lv_obj_set_size(btn_row, lv_pct(100), 38);
     lv_obj_align(btn_row, LV_ALIGN_BOTTOM_MID, 0, -6);
@@ -27858,19 +27594,6 @@ static void show_bt_scan_select_screen(void)
     lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *exit_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(exit_btn, 56, 30);
-    lv_obj_set_style_bg_color(exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 40), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(exit_btn, 0, 0);
-    lv_obj_set_style_radius(exit_btn, 8, 0);
-    lv_obj_t *exit_lbl = lv_label_create(exit_btn);
-    lv_label_set_text(exit_lbl, LV_SYMBOL_CLOSE " Exit");
-    lv_obj_set_style_text_font(exit_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(exit_lbl, lv_color_white(), 0);
-    lv_obj_center(exit_lbl);
-    lv_obj_add_event_cb(exit_btn, bt_sas_exit_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *save_list_btn = lv_btn_create(btn_row);
     lv_obj_set_size(save_list_btn, 76, 30);
@@ -28008,12 +27731,6 @@ static void s_chr_props_desc(uint8_t p, char *buf, size_t bufsz)
 
 /* ── BT Observer device detail screen ───────────────────────────── */
 
-static void bto_detail_back_cb(lv_event_t *e)
-{
-    (void)e;
-    bto_restore_screen();
-}
-
 /* Polls walk completion when a pre-walk is needed before probing a BTO device */
 static void bto_prepwalk_poll_cb(lv_timer_t *t)
 {
@@ -28077,6 +27794,7 @@ static void show_bto_device_detail(int dev_idx)
     char title[40];
     snprintf(title, sizeof(title), "%.38s", d->name[0] ? d->name : "GATT Detail");
     create_function_page_base(title);
+    g_screen_back_fn = bto_restore_screen;  // top ‹ Back → device list (parent title is dynamic)
 
     /* Scrollable container */
     lv_obj_t *scrl = lv_obj_create(function_page);
@@ -28235,7 +27953,7 @@ done:;
         /* Ext. Probe button (red if available, grey if not) */
         lv_obj_t *det_probe_btn = lv_btn_create(function_page);
         lv_obj_set_size(det_probe_btn, 108, 32);
-        lv_obj_align(det_probe_btn, LV_ALIGN_BOTTOM_MID, -62, -6);
+        lv_obj_align(det_probe_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
         lv_obj_set_style_bg_color(det_probe_btn,
             can_probe ? lv_color_hex(0xC62828) : lv_color_make(70, 70, 70),
             LV_STATE_DEFAULT);
@@ -28253,20 +27971,7 @@ done:;
             lv_obj_add_event_cb(det_probe_btn, bto_probe_btn_cb, LV_EVENT_CLICKED,
                                 (void *)(intptr_t)dev_idx);
 
-        /* Back button */
-        lv_obj_t *back_btn = lv_btn_create(function_page);
-        lv_obj_set_size(back_btn, 108, 32);
-        lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 62, -6);
-        lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x7B1FA2), LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_color(back_btn, lv_color_lighten(lv_color_hex(0x7B1FA2), 40), LV_STATE_PRESSED);
-        lv_obj_set_style_border_width(back_btn, 0, 0);
-        lv_obj_set_style_radius(back_btn, 8, 0);
-        lv_obj_t *back_lbl = lv_label_create(back_btn);
-        lv_label_set_text(back_lbl, LV_SYMBOL_LEFT "  Back");
-        lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
-        lv_obj_center(back_lbl);
-        lv_obj_add_event_cb(back_btn, bto_detail_back_cb, LV_EVENT_CLICKED, NULL);
+        /* Bottom "< Back" removed — top-bar ‹ Back → device list (g_screen_back_fn = bto_restore_screen). */
     }
 }
 #undef DET_ROW
@@ -28278,6 +27983,7 @@ static void bto_restore_screen(void)
     reset_function_page_children();
 
     create_function_page_base("BT Observer");
+    g_screen_stop_fn = bto_stop;
 
     bto_status_lbl = lv_label_create(function_page);
     char sbuf[64];
@@ -28302,19 +28008,7 @@ static void bto_restore_screen(void)
     lv_obj_set_style_pad_gap(bto_list, 3, 0);
     lv_obj_set_scrollbar_mode(bto_list, LV_SCROLLBAR_MODE_AUTO);
 
-    lv_obj_t *exit_btn = lv_btn_create(function_page);
-    lv_obj_set_size(exit_btn, 110, 32);
-    lv_obj_align(exit_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
-    lv_obj_set_style_bg_color(exit_btn, lv_color_hex(0x7B1FA2), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(exit_btn, lv_color_lighten(lv_color_hex(0x7B1FA2), 40), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(exit_btn, 0, 0);
-    lv_obj_set_style_radius(exit_btn, 8, 0);
-    lv_obj_t *exit_lbl = lv_label_create(exit_btn);
-    lv_label_set_text(exit_lbl, LV_SYMBOL_LEFT "  Back");
-    lv_obj_set_style_text_font(exit_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(exit_lbl, lv_color_white(), 0);
-    lv_obj_center(exit_lbl);
-    lv_obj_add_event_cb(exit_btn, bto_stop_cb, LV_EVENT_CLICKED, NULL);
+    // Bottom "< Back" removed — top-bar ‹ Back → Bluetooth (g_screen_stop_fn = bto_stop).
 
     bto_rebuild_list();
 }
@@ -28338,9 +28032,10 @@ static void bto_card_tap_cb(lv_event_t *e)
     show_bto_device_detail(idx);
 }
 
-static void bto_stop_cb(lv_event_t *e)
+// Teardown-only stop hook (top-bar ‹ Back / Home invoke it via g_screen_stop_fn
+// on the main observer screen). No navigation here.
+static void bto_stop(void)
 {
-    (void)e;
     bto_active = false;
     if (bto_refresh_timer) { lv_timer_del(bto_refresh_timer); bto_refresh_timer = NULL; }
     bto_spinner_destroy();
@@ -28352,7 +28047,6 @@ static void bto_stop_cb(lv_event_t *e)
         gw_get_state() != GW_STATE_FAILED && gw_get_state() != GW_STATE_CANCELLED)
         gw_cancel();
     bto_state = BTO_STATE_IDLE;
-    show_bluetooth_screen();
 }
 
 static void bto_rebuild_list(void)
@@ -28489,6 +28183,7 @@ static void show_bt_observer_screen(void)
     }
 
     create_function_page_base("BT Observer");
+    g_screen_stop_fn = bto_stop;
 
     // Status label
     bto_status_lbl = lv_label_create(function_page);
@@ -28509,20 +28204,8 @@ static void show_bt_observer_screen(void)
     lv_obj_set_style_pad_gap(bto_list, 3, 0);
     lv_obj_set_scrollbar_mode(bto_list, LV_SCROLLBAR_MODE_AUTO);
 
-    // Stop / Exit button
-    lv_obj_t *stop_btn = lv_btn_create(function_page);
-    lv_obj_set_size(stop_btn, 110, 32);
-    lv_obj_align(stop_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
-    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 40), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(stop_btn, 0, 0);
-    lv_obj_set_style_radius(stop_btn, 8, 0);
-    lv_obj_t *stop_lbl = lv_label_create(stop_btn);
-    lv_label_set_text(stop_lbl, LV_SYMBOL_CLOSE "  Stop / Exit");
-    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(stop_lbl, lv_color_white(), 0);
-    lv_obj_center(stop_lbl);
-    lv_obj_add_event_cb(stop_btn, bto_stop_cb, LV_EVENT_CLICKED, NULL);
+    // Bottom "Stop / Exit" removed — top-bar ‹ Back stops the scan/walk
+    // (g_screen_stop_fn = bto_stop). Restore (device-list) screen keeps its "< Back".
 
     // Reset state
     bto_device_count = 0;
@@ -28707,6 +28390,7 @@ static void show_bt_locator_direct_track(void)
     char title[48];
     snprintf(title, sizeof(title), "Locating: %.22s", bt_sas_target_name[0] ? bt_sas_target_name : "Unknown");
     create_function_page_base(title);
+    g_screen_stop_fn = bt_locator_stop;
 
     bt_locator_ui_active = true;
     bt_locator_tracking_active = false;
@@ -28753,34 +28437,7 @@ static void show_bt_locator_direct_track(void)
     lv_obj_set_style_text_font(bt_locator_mac_label, &lv_font_montserrat_14, 0);
     lv_obj_align(bt_locator_mac_label, LV_ALIGN_CENTER, 0, 10);
 
-    // Back button
-    bt_locator_exit_btn = lv_btn_create(function_page);
-    lv_obj_set_size(bt_locator_exit_btn, 110, 28);
-    lv_obj_align(bt_locator_exit_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(bt_locator_exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(bt_locator_exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(bt_locator_exit_btn, 0, 0);
-    lv_obj_set_style_radius(bt_locator_exit_btn, 8, 0);
-    lv_obj_set_style_shadow_width(bt_locator_exit_btn, 4, 0);
-    lv_obj_set_style_shadow_color(bt_locator_exit_btn, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_shadow_opa(bt_locator_exit_btn, LV_OPA_40, 0);
-    lv_obj_set_style_pad_ver(bt_locator_exit_btn, 4, 0);
-    lv_obj_set_style_pad_hor(bt_locator_exit_btn, 8, 0);
-    lv_obj_set_style_pad_column(bt_locator_exit_btn, 4, 0);
-    lv_obj_set_flex_flow(bt_locator_exit_btn, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(bt_locator_exit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-    lv_obj_t *exit_icon = lv_label_create(bt_locator_exit_btn);
-    lv_label_set_text(exit_icon, LV_SYMBOL_LEFT);
-    lv_obj_set_style_text_font(exit_icon, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(exit_icon, ui_text_color(), 0);
-
-    lv_obj_t *exit_lbl = lv_label_create(bt_locator_exit_btn);
-    lv_label_set_text(exit_lbl, "Back");
-    lv_obj_set_style_text_font(exit_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(exit_lbl, ui_text_color(), 0);
-
-    lv_obj_add_event_cb(bt_locator_exit_btn, bt_locator_exit_cb, LV_EVENT_CLICKED, NULL);
+    // Bottom "< Back" removed — top-bar ‹ Back stops tracking (g_screen_stop_fn = bt_locator_stop).
 
     // Switch to BLE mode
     if (!ensure_ble_mode()) {
@@ -29101,6 +28758,7 @@ static void show_gw_result_screen(void)
     char title[40];
     snprintf(title, sizeof(title), "%.38s", (r && r->name[0]) ? r->name : "GATT Result");
     create_function_page_base(title);
+    g_screen_back_fn = show_bt_attack_tiles_screen;  // top ‹ Back → "BT: <target>" tiles (matches bottom Back; parent title is dynamic)
     apply_menu_bg();
 
     lv_obj_t *scrl = lv_obj_create(function_page);
@@ -29479,11 +29137,6 @@ static void show_gatt_walker_screen(void)
 }
 
 // Attack tile screen after device selection
-static void bt_attack_tiles_back_cb(lv_event_t *e)
-{
-    (void)e;
-    show_bt_scan_select_screen();
-}
 
 static void show_bt_attack_tiles_screen(void)
 {
@@ -29521,26 +29174,6 @@ static void show_bt_attack_tiles_screen(void)
     lv_obj_t *attacks_tile = create_tile(tiles, MY_SYMBOL_SKULL_CROSS, "BT\nAttacks", COLOR_MATERIAL_AMBER, NULL, NULL);
     lv_obj_add_event_cb(attacks_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Directed BT Attacks");
 
-    /* Back button — return to BT Scan & Select */
-    lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 110, 30);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(back_btn, 4, 0);
-    lv_obj_t *back_icon = lv_label_create(back_btn);
-    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
-    lv_obj_set_style_text_font(back_icon, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(back_icon, lv_color_white(), 0);
-    lv_obj_t *back_lbl = lv_label_create(back_btn);
-    lv_label_set_text(back_lbl, "BT Scan");
-    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
-    lv_obj_add_event_cb(back_btn, bt_attack_tiles_back_cb, LV_EVENT_CLICKED, NULL);
 }
 
 static void stub_back_btn_cb(lv_event_t *e)
@@ -30100,9 +29733,10 @@ static void ble_spam_start_btn_cb(lv_event_t *e)
     }
 }
 
-static void ble_spam_back_cb(lv_event_t *e)
+// Screen-exit teardown for BLE Spam — runs via g_screen_stop_fn on ANY exit
+// (top ‹ Back, Home, forward nav). Navigation itself is handled by the nav stack.
+static void ble_spam_stop(void)
 {
-    (void)e;
     ble_spam_active = false;
     if (g_ble_spam_state.timer) {
         lv_timer_del(g_ble_spam_state.timer);
@@ -30115,11 +29749,15 @@ static void ble_spam_back_cb(lv_event_t *e)
     if (current_radio_mode == RADIO_MODE_BLE) {
         ESP_LOGI(TAG, "[SPAM] cleanup: stopping instance %d", BLE_SPAM_ADV_INSTANCE);
         ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
-        memset(&g_ble_spam_state, 0, sizeof(g_ble_spam_state));
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
     }
-    show_bt_attacks_screen();
+    // Always reset spam state (configured/started/indices) so a later START
+    // reconfigures the adv instance cleanly — even on the Home path, where
+    // radio_reset_to_idle already deinit'd NimBLE and flipped the mode before
+    // this hook runs (so the guard above is skipped). Without this, 'configured'
+    // stays stale-true and the timer skips ble_gap_ext_adv_configure → no packets.
+    memset(&g_ble_spam_state, 0, sizeof(g_ble_spam_state));
 }
 
 static void ble_spam_mode_dd_cb(lv_event_t *e)
@@ -30131,6 +29769,7 @@ static void ble_spam_mode_dd_cb(lv_event_t *e)
 static void show_ble_spam_screen(void)
 {
     create_function_page_base("BLE Spam");
+    g_screen_stop_fn = ble_spam_stop;  // stop spam + free BLE on any exit (top ‹ Back / Home / forward nav)
     ble_spam_ui_active = true;
     ble_spam_count = 0;
 
@@ -30184,27 +29823,8 @@ static void show_ble_spam_screen(void)
     lv_obj_set_style_text_color(start_lbl, lv_color_white(), 0);
     lv_obj_center(start_lbl);
     lv_obj_add_event_cb(ble_spam_start_btn, ble_spam_start_btn_cb, LV_EVENT_CLICKED, NULL);
-
-    // Back button
-    lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 110, 28);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(back_btn, 4, 0);
-    lv_obj_t *back_icon = lv_label_create(back_btn);
-    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
-    lv_obj_set_style_text_font(back_icon, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(back_icon, lv_color_white(), 0);
-    lv_obj_t *back_lbl = lv_label_create(back_btn);
-    lv_label_set_text(back_lbl, "BT Attacks");
-    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
-    lv_obj_add_event_cb(back_btn, ble_spam_back_cb, LV_EVENT_CLICKED, NULL);
+    // Bottom "‹ BT Attacks" bar removed — top-bar ‹ Back goes up to BT Attacks
+    // and ble_spam_stop() runs on exit via g_screen_stop_fn.
 }
 
 // ── BLE Device Spoof screen + task ───────────────────────────────────────────
@@ -31151,11 +30771,13 @@ static void spoof_gen_row_cb(lv_event_t *e) {
     }
 }
 
-static void spoof_gen_back_cb(lv_event_t *e) {
-    (void)e;
+// Screen-exit teardown for Device Spoof list — runs via g_screen_stop_fn on ANY exit
+// (top ‹ Back, Home, forward nav). No BLE op runs on this list screen; just drop the
+// stale scroll pointer + selection so re-entry starts clean. Parent (BT Attacks) is the
+// nav-stack parent, so the bottom Back button is no longer needed.
+static void spoof_gen_stop(void) {
     s_spoof_list_scroll = NULL;
     s_spoof_list_selected = -1;
-    show_bt_attacks_screen();
 }
 
 static void ble_spoof_general_proceed(void) {
@@ -31368,6 +30990,7 @@ static void show_ble_spoof_general_screen(void) {
     spoof_list_load();
 
     create_function_page_base("Device Spoof");
+    g_screen_stop_fn = spoof_gen_stop;
     apply_menu_bg();
 
     lv_obj_t *sub = lv_label_create(function_page);
@@ -31466,7 +31089,7 @@ static void show_ble_spoof_general_screen(void) {
                             (void *)(intptr_t)i);
     }
 
-    // Bottom buttons: [Back] [+ Add] [Save] [START]
+    // Bottom buttons: [+ Add] [Save] [START]  (top ‹ Back replaces the old bottom Back)
     lv_obj_t *btn_row = lv_obj_create(function_page);
     lv_obj_set_size(btn_row, 228, 36);
     lv_obj_align(btn_row, LV_ALIGN_BOTTOM_MID, 0, -8);
@@ -31479,21 +31102,8 @@ static void show_ble_spoof_general_screen(void) {
                            LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *back_btn2 = lv_btn_create(btn_row);
-    lv_obj_set_size(back_btn2, 52, 32);
-    lv_obj_set_style_bg_color(back_btn2, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(back_btn2, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(back_btn2, 0, 0);
-    lv_obj_set_style_radius(back_btn2, 8, 0);
-    lv_obj_t *bk2_lbl = lv_label_create(back_btn2);
-    lv_label_set_text(bk2_lbl, LV_SYMBOL_LEFT " Back");
-    lv_obj_set_style_text_font(bk2_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(bk2_lbl, ui_text_color(), 0);
-    lv_obj_center(bk2_lbl);
-    lv_obj_add_event_cb(back_btn2, spoof_gen_back_cb, LV_EVENT_CLICKED, NULL);
-
     lv_obj_t *add_btn2 = lv_btn_create(btn_row);
-    lv_obj_set_size(add_btn2, 62, 32);
+    lv_obj_set_size(add_btn2, 74, 32);
     lv_obj_set_style_bg_color(add_btn2, lv_color_make(30, 80, 160), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(add_btn2, lv_color_make(50, 110, 200), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(add_btn2, 0, 0);
@@ -31506,7 +31116,7 @@ static void show_ble_spoof_general_screen(void) {
     lv_obj_add_event_cb(add_btn2, spoof_gen_add_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *save_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(save_btn, 58, 32);
+    lv_obj_set_size(save_btn, 72, 32);
     lv_obj_set_style_bg_color(save_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(save_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(save_btn, 0, 0);
@@ -31519,7 +31129,7 @@ static void show_ble_spoof_general_screen(void) {
     lv_obj_add_event_cb(save_btn, spoof_gen_save_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *start_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(start_btn, 56, 32);
+    lv_obj_set_size(start_btn, 72, 32);
     lv_obj_set_style_bg_color(start_btn, COLOR_MATERIAL_ORANGE, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(start_btn, lv_color_lighten(COLOR_MATERIAL_ORANGE, 30),
                                LV_STATE_PRESSED);
@@ -31567,28 +31177,7 @@ static void show_bt_attacks_screen(void)
 
     lv_obj_t *wp_tile = create_tile(tiles, MY_SYMBOL_BLUETOOTH_B, "Whisper\nPair", lv_color_make(140, 0, 180), NULL, NULL);
     lv_obj_add_event_cb(wp_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"WhisperPair");
-
-    /* Back button */
-    lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 110, 28);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(back_btn, 4, 0);
-    lv_obj_t *back_icon = lv_label_create(back_btn);
-    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
-    lv_obj_set_style_text_font(back_icon, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(back_icon, lv_color_white(), 0);
-    lv_obj_t *back_lbl = lv_label_create(back_btn);
-    lv_label_set_text(back_lbl, "Bluetooth");
-    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
-    lv_obj_set_user_data(back_btn, (void *)show_bluetooth_screen);
-    lv_obj_add_event_cb(back_btn, stub_back_btn_cb, LV_EVENT_CLICKED, NULL);
+    // Bottom "‹ Bluetooth" bar removed — top-bar ‹ Back already goes up to Bluetooth (parent in nav table).
 }
 
 // ============================================================================
@@ -32120,28 +31709,10 @@ static void deauther_proceed(void)
             lv_mem_free(records);
         }
     }
-    lv_obj_t *stop_tile = lv_btn_create(function_page);
-    lv_obj_set_size(stop_tile, 120, 55);
-    lv_obj_align(stop_tile, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(stop_tile, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(stop_tile, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(stop_tile, 0, 0);
-    lv_obj_set_style_radius(stop_tile, 10, 0);
-    lv_obj_set_style_shadow_width(stop_tile, 6, 0);
-    lv_obj_set_style_shadow_color(stop_tile, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_shadow_opa(stop_tile, LV_OPA_40, 0);
-    lv_obj_set_flex_flow(stop_tile, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(stop_tile, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_t *x_icon = lv_label_create(stop_tile);
-    lv_label_set_text(x_icon, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_font(x_icon, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(x_icon, ui_text_color(), 0);
-    lv_obj_t *stop_text = lv_label_create(stop_tile);
-    lv_label_set_text(stop_text, "Stop & Exit");
-    lv_obj_set_style_text_font(stop_text, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(stop_text, ui_text_color(), 0);
-    lv_obj_add_event_cb(stop_tile, deauth_quit_event_cb, LV_EVENT_CLICKED, NULL);
-    deauth_quit_btn = stop_tile;
+    // Top ‹ Back / Home stop the attack via the screen stop-hook
+    // (run_screen_stop_fn → deauth_stop). Redundant bottom "Stop & Exit" removed.
+    g_screen_stop_fn = deauth_stop;
+    deauth_quit_btn = NULL;
     deauth_pause_btn = NULL;
     deauth_paused = false;
 }
@@ -32240,20 +31811,8 @@ void attack_event_cb(lv_event_t *e)
         lv_obj_set_style_pad_all(btn_bar, 4, 0);  // 4px padding
         lv_obj_set_style_pad_gap(btn_bar, 4, 0);  // 4px gap between buttons
         
-        // BACK button
-        lv_obj_t *back_btn = lv_btn_create(btn_bar);
-        lv_obj_set_size(back_btn, 90, 32);
-        lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_color(back_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
-        lv_obj_set_style_border_width(back_btn, 0, 0);
-        lv_obj_set_style_radius(back_btn, 8, 0);
-        lv_obj_t *back_lbl = lv_label_create(back_btn);
-        lv_label_set_text(back_lbl, "BACK");
-        lv_obj_set_style_text_color(back_lbl, ui_text_color(), 0);
-        lv_obj_center(back_lbl);
-        lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
-        
-        // YES button
+        // YES button (centered — redundant bottom BACK removed; use top ‹ Back)
+        lv_obj_set_flex_align(btn_bar, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_t *yes_btn = lv_btn_create(btn_bar);
         lv_obj_set_size(yes_btn, 90, 32);
         lv_obj_set_style_bg_color(yes_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
@@ -32293,20 +31852,8 @@ void attack_event_cb(lv_event_t *e)
         lv_obj_set_style_pad_all(btn_bar, 4, 0);  // 4px padding
         lv_obj_set_style_pad_gap(btn_bar, 4, 0);  // 4px gap between buttons
         
-        // BACK button
-        lv_obj_t *back_btn = lv_btn_create(btn_bar);
-        lv_obj_set_size(back_btn, 90, 32);
-        lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_color(back_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
-        lv_obj_set_style_border_width(back_btn, 0, 0);
-        lv_obj_set_style_radius(back_btn, 8, 0);
-        lv_obj_t *back_lbl = lv_label_create(back_btn);
-        lv_label_set_text(back_lbl, "BACK");
-        lv_obj_set_style_text_color(back_lbl, ui_text_color(), 0);
-        lv_obj_center(back_lbl);
-        lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
-        
-        // YES button
+        // YES button (centered — redundant bottom BACK removed; use top ‹ Back)
+        lv_obj_set_flex_align(btn_bar, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_t *yes_btn = lv_btn_create(btn_bar);
         lv_obj_set_size(yes_btn, 90, 32);
         lv_obj_set_style_bg_color(yes_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
@@ -32352,20 +31899,8 @@ void attack_event_cb(lv_event_t *e)
         lv_obj_set_style_pad_all(btn_bar, 4, 0);  // 4px padding
         lv_obj_set_style_pad_gap(btn_bar, 4, 0);  // 4px gap between buttons
         
-        // BACK button
-        lv_obj_t *back_btn = lv_btn_create(btn_bar);
-        lv_obj_set_size(back_btn, 90, 32);
-        lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_TEAL, LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_color(back_btn, lv_color_lighten(COLOR_MATERIAL_TEAL, 30), LV_STATE_PRESSED);
-        lv_obj_set_style_border_width(back_btn, 0, 0);
-        lv_obj_set_style_radius(back_btn, 8, 0);
-        lv_obj_t *back_lbl = lv_label_create(back_btn);
-        lv_label_set_text(back_lbl, "BACK");
-        lv_obj_set_style_text_color(back_lbl, ui_text_color(), 0);
-        lv_obj_center(back_lbl);
-        lv_obj_add_event_cb(back_btn, back_to_menu_cb, LV_EVENT_CLICKED, NULL);
-        
-        // YES button
+        // YES button (centered — redundant bottom BACK removed; use top ‹ Back)
+        lv_obj_set_flex_align(btn_bar, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_t *yes_btn = lv_btn_create(btn_bar);
         lv_obj_set_size(yes_btn, 90, 32);
         lv_obj_set_style_bg_color(yes_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
@@ -33510,20 +33045,12 @@ static void evil_twin_start_btn_cb(lv_event_t *e)
     lv_obj_set_style_border_width(evil_twin_status_list, 1, 0);
     lv_obj_set_style_pad_all(evil_twin_status_list, 4, 0);
 
-    // Exit button at the bottom
-    lv_obj_t *exit_btn = lv_btn_create(function_page);
-    lv_obj_set_size(exit_btn, 100, 35);
-    lv_obj_align(exit_btn, LV_ALIGN_BOTTOM_MID, 0, -5);
-    lv_obj_set_style_bg_color(exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(exit_btn, 0, 0);
-    lv_obj_set_style_radius(exit_btn, 8, 0);
-    lv_obj_add_event_cb(exit_btn, deauth_quit_event_cb, LV_EVENT_CLICKED, NULL);
-    
-    lv_obj_t *exit_label = lv_label_create(exit_btn);
-    lv_label_set_text(exit_label, "Exit");
-    lv_obj_set_style_text_color(exit_label, ui_text_color(), 0);
-    lv_obj_center(exit_label);
+    // Top ‹ Back / Home stop the attack via the screen stop-hook
+    // (run_screen_stop_fn → deauth_stop). Redundant bottom "Exit" removed.
+    g_screen_stop_fn = deauth_stop;
+    // Top ‹ Back → "Select Attack" tiles (parent "Evil Twin" config page isn't
+    // in NAV_SHOW_TABLE, so without this override ‹ Back would resolve to Home).
+    g_screen_back_fn = show_attack_tiles_screen;
 
     // Create event queue for Evil Twin UI events
     if (!evil_twin_event_queue) {
@@ -34463,10 +33990,10 @@ static void bt_locator_tracking_task(void *pvParameters)
 /**
  * BT Locator exit callback - cleanup and return to menu
  */
-static void bt_locator_exit_cb(lv_event_t *e)
+// Teardown-only stop hook (top-bar ‹ Back / Home invoke it via g_screen_stop_fn
+// on all three BT Locator screens). No navigation here.
+static void bt_locator_stop(void)
 {
-    (void)e;
-    
     // Stop tracking if running
     bt_locator_tracking_active = false;
     bt_tracking_mode = false;
@@ -34497,9 +34024,6 @@ static void bt_locator_exit_cb(lv_event_t *e)
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
     }
-    
-    // Return to Bluetooth screen
-    show_bluetooth_screen();
 }
 
 /**
@@ -34878,9 +34402,9 @@ static void deauth_monitor_task(void *pvParameters)
 }
 
 // Exit callback for deauth monitor
-static void deauth_monitor_exit_cb(lv_event_t *e)
+// Teardown-only stop hook (top-bar ‹ Back / Home invoke it via g_screen_stop_fn).
+static void deauth_monitor_stop(void)
 {
-    (void)e;
     
     ESP_LOGI(TAG, "Stopping deauth monitor...");
 
@@ -34936,9 +34460,6 @@ static void deauth_monitor_exit_cb(lv_event_t *e)
     deauth_monitor_attack_count = 0;
     deauth_monitor_channel_index = 0;
     deauth_monitor_current_channel = 1;
-
-    // Navigate to menu
-    nav_to_menu_flag = true;
 }
 
 // Helper to start deauth monitoring after scan completes
@@ -34949,6 +34470,10 @@ static void deauth_monitor_start_monitoring(void)
         lv_label_set_text(deauth_monitor_status_label, "MONITORING");
         lv_obj_set_style_text_font(deauth_monitor_status_label, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(deauth_monitor_status_label, COLOR_MATERIAL_RED, 0);
+        // Lift "MONITORING" clear of the 3-line "N networks known / No attacks..."
+        // block below it (that block is centered at -4 and its top line reaches
+        // up to ~-30, which used to overlap the header at -30).
+        lv_obj_align(deauth_monitor_status_label, LV_ALIGN_CENTER, 0, -60);
     }
     if (deauth_monitor_known_label && lv_obj_is_valid(deauth_monitor_known_label)) {
         uint16_t scan_count = wifi_scanner_get_count();
@@ -35046,6 +34571,7 @@ static void show_deauth_monitor_screen(void)
     }
     
     create_function_page_base("Deauth Monitor");
+    g_screen_stop_fn = deauth_monitor_stop;
     
     // Reset attack data
     portENTER_CRITICAL(&deauth_monitor_spin);
@@ -35084,33 +34610,7 @@ static void show_deauth_monitor_screen(void)
     lv_obj_set_style_text_font(list_title, &lv_font_montserrat_14, 0);
     
     // Red Exit button at bottom — compact single-row size leaves room for a second button
-    lv_obj_t *exit_btn = lv_btn_create(function_page);
-    lv_obj_set_size(exit_btn, 110, 28);
-    lv_obj_align(exit_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(exit_btn, 0, 0);
-    lv_obj_set_style_radius(exit_btn, 8, 0);
-    lv_obj_set_style_shadow_width(exit_btn, 4, 0);
-    lv_obj_set_style_shadow_color(exit_btn, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_shadow_opa(exit_btn, LV_OPA_40, 0);
-    lv_obj_set_style_pad_ver(exit_btn, 4, 0);
-    lv_obj_set_style_pad_hor(exit_btn, 8, 0);
-    lv_obj_set_style_pad_column(exit_btn, 4, 0);
-    lv_obj_set_flex_flow(exit_btn, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(exit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-    lv_obj_t *exit_icon = lv_label_create(exit_btn);
-    lv_label_set_text(exit_icon, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_font(exit_icon, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(exit_icon, ui_text_color(), 0);
-
-    lv_obj_t *exit_text = lv_label_create(exit_btn);
-    lv_label_set_text(exit_text, "Exit");
-    lv_obj_set_style_text_font(exit_text, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(exit_text, ui_text_color(), 0);
-
-    lv_obj_add_event_cb(exit_btn, deauth_monitor_exit_cb, LV_EVENT_CLICKED, NULL);
+    // Bottom "Exit" removed — top-bar ‹ Back stops monitoring (g_screen_stop_fn = deauth_monitor_stop).
 
     // Recording status label — updated once monitoring starts
     deauth_monitor_rec_label = lv_label_create(function_page);
@@ -35126,6 +34626,11 @@ static void show_deauth_monitor_screen(void)
     deauth_monitor_active = false;  // Will be set true after scan
     deauth_monitor_scan_pending = true;
     
+    // Register the UI SCAN_DONE callback before starting the scan — otherwise
+    // scan_done_ui_flag is never set and the monitor hangs on "Scanning..."
+    // (only registered on-demand, and not necessarily by a prior screen).
+    ensure_wifi_scan_ui_cb();
+
     // Start WiFi scan to gather network SSIDs
     ESP_LOGI(TAG, "Starting WiFi scan for deauth monitor...");
     wifi_scanner_start_scan();
@@ -36592,17 +36097,6 @@ static void wscope_band_toggle_cb(lv_event_t *e) {
         memset(wscope_buf, 0, WSCOPE_W * WSCOPE_CANVAS_H * sizeof(lv_color_t));
 }
 
-static void wscope_exit_cb(lv_event_t *e) {
-    (void)e;
-    wscope_active = false;  // task self-exits when this clears
-    if (wscope_ui_timer) { lv_timer_del(wscope_ui_timer); wscope_ui_timer = NULL; }
-    if (wscope_buf)      { heap_caps_free(wscope_buf);     wscope_buf = NULL; }
-    wscope_canvas = NULL;
-    wscope_status_lbl = NULL;
-    wscope_ax_lbl = NULL;
-    show_wifi_menu_screen();
-}
-
 static void show_wscope_screen(void) {
     if (!ensure_wifi_mode()) return;
     wifi_scanner_abort();   // stop any in-progress scan
@@ -36644,27 +36138,18 @@ static void show_wscope_screen(void) {
     lv_obj_set_style_text_font(wscope_ax_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(wscope_ax_lbl, lv_color_hex(0x666666), 0);
 
-    // Band toggle + Exit (y=266)
+    // Band toggle (centered — redundant bottom ‹ Exit removed; use top ‹ Back / Home,
+    // which stop the sweep via reset_function_page_children generic teardown).
     int brow_y = cy + 33;
     lv_obj_t *band_btn = lv_btn_create(function_page);
     lv_obj_set_size(band_btn, 110, 26);
-    lv_obj_set_pos(band_btn, 4, brow_y);
+    lv_obj_set_pos(band_btn, 65, brow_y);
     lv_obj_set_style_bg_color(band_btn, lv_color_hex(0x1565C0), 0);
     lv_obj_t *band_lbl = lv_label_create(band_btn);
     lv_label_set_text(band_lbl, "Band: 2.4GHz");
     lv_obj_center(band_lbl);
     lv_obj_set_style_text_font(band_lbl, &lv_font_montserrat_12, 0);
     lv_obj_add_event_cb(band_btn, wscope_band_toggle_cb, LV_EVENT_CLICKED, band_lbl);
-
-    lv_obj_t *exit_btn = lv_btn_create(function_page);
-    lv_obj_set_size(exit_btn, 108, 26);
-    lv_obj_set_pos(exit_btn, 128, brow_y);
-    lv_obj_set_style_bg_color(exit_btn, lv_color_hex(0x333333), 0);
-    lv_obj_add_event_cb(exit_btn, wscope_exit_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *el = lv_label_create(exit_btn);
-    lv_label_set_text(el, LV_SYMBOL_LEFT " Exit");
-    lv_obj_center(el);
-    lv_obj_set_style_text_font(el, &lv_font_montserrat_12, 0);
 
     xTaskCreate(wscope_task, "wscope", 3072, NULL, 5, &wscope_task_handle);
     wscope_ui_timer = lv_timer_create(wscope_ui_timer_cb, 100, NULL);
@@ -36724,10 +36209,9 @@ static void airtag_scan_task(void *pvParameters)
 }
 
 // Exit callback for AirTag scanner
-static void airtag_scan_exit_cb(lv_event_t *e)
+// Teardown-only stop hook (top-bar ‹ Back / Home both invoke it via g_screen_stop_fn).
+static void airtag_scan_stop(void)
 {
-    (void)e;
-
     ESP_LOGI(TAG, "Stopping AirTag scanner...");
 
     airtag_scan_active   = false;
@@ -36751,8 +36235,6 @@ static void airtag_scan_exit_cb(lv_event_t *e)
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
     }
-
-    show_bluetooth_screen();
 }
 
 /**
@@ -36765,19 +36247,16 @@ static void airtag_view_tags_btn_cb(lv_event_t *e)
 }
 
 /**
- * Button callback: return from Found Tags list back to AirTag scan screen.
- * The scan task is still running — just rebuild the UI, do NOT restart the task.
+ * Go up from Found Tags list back to the AirTag scan screen. Wired as the top-bar
+ * ‹ Back target (g_screen_back_fn) — the parent title "Airtag Scanner" is not in
+ * NAV_SHOW_TABLE, so without this override ‹ Back would resolve to Home. Deletes
+ * the Found Tags page first (create_function_page_base does NOT); show_airtag_scan_screen
+ * rebuilds the UI only when the scan task is still running, or restarts it otherwise.
  */
-static void found_tags_back_btn_cb(lv_event_t *e)
+static void found_tags_go_back(void)
 {
-    (void)e;
-    if (airtag_scan_active) {
-        /* Scan already running — rebuild UI only, no new task/stack */
-        if (function_page) { lv_obj_del(function_page); function_page = NULL; }
-        reset_function_page_children();
-        /* Re-enter show_airtag_scan_screen() which now detects active scan
-         * and skips task creation */
-    }
+    if (function_page) { lv_obj_del(function_page); function_page = NULL; }
+    reset_function_page_children();
     show_airtag_scan_screen();
 }
 
@@ -36803,6 +36282,9 @@ static void show_found_tags_screen(void)
     reset_function_page_children();
 
     create_function_page_base("Found Tags");
+    // Top ‹ Back → AirTag scan screen (parent title "Airtag Scanner" is not a menu,
+    // so the nav-stack lookup returns NULL → Home without this override).
+    g_screen_back_fn = found_tags_go_back;
 
     // Scrollable list container
     lv_obj_t *list = lv_obj_create(function_page);
@@ -36900,31 +36382,8 @@ static void show_found_tags_screen(void)
         lv_obj_center(empty);
     }
 
-    // Back button (compact row)
-    lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 110, 28);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(back_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_set_style_shadow_width(back_btn, 4, 0);
-    lv_obj_set_style_shadow_color(back_btn, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_shadow_opa(back_btn, LV_OPA_40, 0);
-    lv_obj_set_style_pad_ver(back_btn, 4, 0);
-    lv_obj_set_style_pad_hor(back_btn, 8, 0);
-    lv_obj_set_style_pad_column(back_btn, 4, 0);
-    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_t *back_icon = lv_label_create(back_btn);
-    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
-    lv_obj_set_style_text_font(back_icon, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(back_icon, lv_color_white(), 0);
-    lv_obj_t *back_lbl = lv_label_create(back_btn);
-    lv_label_set_text(back_lbl, "Back");
-    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
-    lv_obj_add_event_cb(back_btn, found_tags_back_btn_cb, LV_EVENT_CLICKED, NULL);
+    // Bottom "‹ Back" removed — top-bar ‹ Back returns to the AirTag scan screen
+    // via g_screen_back_fn = found_tags_go_back.
 }
 
 /**
@@ -36960,6 +36419,13 @@ static void show_tag_tracker_screen(int dev_idx)
     snprintf(title_buf, sizeof(title_buf), "%s Tracker",
              dev->is_airtag ? "AirTag" : "SmartTag");
     create_function_page_base(title_buf);
+    g_screen_stop_fn = bt_locator_stop;
+    // Top ‹ Back → Found Tags list (parent title "Found Tags" is not a menu, so
+    // the nav-stack lookup returns NULL → Home without this override). The only
+    // entry into this tracker is found_tag_track_btn_cb, so this target is always
+    // correct. show_found_tags_screen reads only static bt_devices[] (no BLE), so
+    // it is safe after bt_locator_stop deinits NimBLE on ‹ Back.
+    g_screen_back_fn = show_found_tags_screen;
 
     bt_locator_ui_active = true;
     bt_locator_tracking_active = false;
@@ -37008,31 +36474,17 @@ static void show_tag_tracker_screen(int dev_idx)
     lv_obj_set_style_text_font(bt_locator_status_label, &lv_font_montserrat_14, 0);
     lv_obj_align(bt_locator_status_label, LV_ALIGN_CENTER, 0, -60);
 
-    // Exit button (compact row)
-    bt_locator_exit_btn = lv_btn_create(function_page);
-    lv_obj_set_size(bt_locator_exit_btn, 110, 28);
-    lv_obj_align(bt_locator_exit_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(bt_locator_exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(bt_locator_exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(bt_locator_exit_btn, 0, 0);
-    lv_obj_set_style_radius(bt_locator_exit_btn, 8, 0);
-    lv_obj_set_style_shadow_width(bt_locator_exit_btn, 4, 0);
-    lv_obj_set_style_shadow_color(bt_locator_exit_btn, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_shadow_opa(bt_locator_exit_btn, LV_OPA_40, 0);
-    lv_obj_set_style_pad_ver(bt_locator_exit_btn, 4, 0);
-    lv_obj_set_style_pad_hor(bt_locator_exit_btn, 8, 0);
-    lv_obj_set_style_pad_column(bt_locator_exit_btn, 4, 0);
-    lv_obj_set_flex_flow(bt_locator_exit_btn, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(bt_locator_exit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_t *exit_icon2 = lv_label_create(bt_locator_exit_btn);
-    lv_label_set_text(exit_icon2, LV_SYMBOL_LEFT);
-    lv_obj_set_style_text_font(exit_icon2, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(exit_icon2, lv_color_white(), 0);
-    lv_obj_t *exit_text2 = lv_label_create(bt_locator_exit_btn);
-    lv_label_set_text(exit_text2, "Back");
-    lv_obj_set_style_text_font(exit_text2, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(exit_text2, lv_color_white(), 0);
-    lv_obj_add_event_cb(bt_locator_exit_btn, bt_locator_exit_cb, LV_EVENT_CLICKED, NULL);
+    // Bottom "< Back" removed — top-bar ‹ Back stops tracking (g_screen_stop_fn = bt_locator_stop).
+
+    // Ensure BLE is up before tracking. Reaching here from Found Tags tore down
+    // NimBLE via the AirTag scan screen's stop-hook (airtag_scan_stop → bt_nimble_deinit),
+    // so — unlike the other tracker entry points — re-init BLE here or the tracking
+    // task starts with NimBLE deinit'd and crashes/resets the device.
+    if (!ensure_ble_mode()) {
+        if (bt_locator_status_label)
+            lv_label_set_text(bt_locator_status_label, "BLE init failed!");
+        return;
+    }
 
     // Start tracking task
     bt_locator_saved_strength_pct = g_vibtest_strength_pct;
@@ -37067,7 +36519,8 @@ static void show_airtag_scan_screen(void)
     }
     
     create_function_page_base("Airtag Scanner");
-    
+    g_screen_stop_fn = airtag_scan_stop;
+
     // Status label - "Scan in progress..." (centered, visible while scanning)
     airtag_scan_status_label = lv_label_create(function_page);
     lv_label_set_text(airtag_scan_status_label, LV_SYMBOL_BLUETOOTH "  Scan in progress...");
@@ -37122,35 +36575,8 @@ static void show_airtag_scan_screen(void)
     lv_obj_add_event_cb(airtag_view_tags_btn, airtag_view_tags_btn_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_flag(airtag_view_tags_btn, LV_OBJ_FLAG_HIDDEN);
 
-    // Exit button (compact row)
-    lv_obj_t *exit_btn = lv_btn_create(function_page);
-    lv_obj_set_size(exit_btn, 110, 28);
-    lv_obj_align(exit_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(exit_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(exit_btn, lv_color_lighten(COLOR_MATERIAL_RED, 50), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(exit_btn, 0, 0);
-    lv_obj_set_style_radius(exit_btn, 8, 0);
-    lv_obj_set_style_shadow_width(exit_btn, 4, 0);
-    lv_obj_set_style_shadow_color(exit_btn, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_shadow_opa(exit_btn, LV_OPA_40, 0);
-    lv_obj_set_style_pad_ver(exit_btn, 4, 0);
-    lv_obj_set_style_pad_hor(exit_btn, 8, 0);
-    lv_obj_set_style_pad_column(exit_btn, 4, 0);
-    lv_obj_set_flex_flow(exit_btn, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(exit_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    // Bottom "Exit" removed — top-bar ‹ Back stops the scan via g_screen_stop_fn = airtag_scan_stop.
 
-    lv_obj_t *exit_icon = lv_label_create(exit_btn);
-    lv_label_set_text(exit_icon, LV_SYMBOL_CLOSE);
-    lv_obj_set_style_text_font(exit_icon, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(exit_icon, ui_text_color(), 0);
-
-    lv_obj_t *exit_text = lv_label_create(exit_btn);
-    lv_label_set_text(exit_text, "Exit");
-    lv_obj_set_style_text_font(exit_text, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(exit_text, ui_text_color(), 0);
-
-    lv_obj_add_event_cb(exit_btn, airtag_scan_exit_cb, LV_EVENT_CLICKED, NULL);
-    
     airtag_scan_ui_active = true;
 
     if (!airtag_scan_active) {
@@ -37247,9 +36673,9 @@ static void hp_dd_cb(lv_event_t *e)
         honeypair_set_persona(idx);
 }
 
-static void hp_back_cb(lv_event_t *e)
+// Teardown-only stop hook (top-bar ‹ Back / Home both invoke it via g_screen_stop_fn).
+static void hp_stop(void)
 {
-    (void)e;
     if (hp_ui_timer) { lv_timer_del(hp_ui_timer); hp_ui_timer = NULL; }
     hp_status_lbl = NULL; hp_stats_lbl = NULL; hp_start_btn = NULL; hp_dd = NULL;
     if (honeypair_is_active()) {
@@ -37257,12 +36683,12 @@ static void hp_back_cb(lv_event_t *e)
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
     }
-    show_bluetooth_screen();
 }
 
 static void show_honeypair_screen(void)
 {
     create_function_page_base("HoneyPair");
+    g_screen_stop_fn = hp_stop;
 
     /* Persona dropdown ──────────────────────────────────────────────────── */
     lv_obj_t *dd_lbl = lv_label_create(function_page);
@@ -37335,26 +36761,7 @@ static void show_honeypair_screen(void)
     lv_obj_set_width(log_lbl, lv_pct(96));
     lv_obj_align(log_lbl, LV_ALIGN_TOP_MID, 0, 228);
 
-    /* Back button ───────────────────────────────────────────────────────── */
-    lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 120, 30);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(back_btn, 4, 0);
-    lv_obj_t *bi = lv_label_create(back_btn);
-    lv_label_set_text(bi, LV_SYMBOL_LEFT);
-    lv_obj_set_style_text_font(bi, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(bi, lv_color_white(), 0);
-    lv_obj_t *bl = lv_label_create(back_btn);
-    lv_label_set_text(bl, "Bluetooth");
-    lv_obj_set_style_text_font(bl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(bl, lv_color_white(), 0);
-    lv_obj_add_event_cb(back_btn, hp_back_cb, LV_EVENT_CLICKED, NULL);
+    /* Bottom "< Bluetooth" removed — top-bar ‹ Back stops the bait (g_screen_stop_fn = hp_stop). */
 
     /* Refresh UI state immediately, then every 1s */
     hp_ui_refresh(NULL);
@@ -37464,9 +36871,11 @@ static void bd_human_sw_cb(lv_event_t *e)
      * This switch sets a session default communicated via a synthetic command. */
 }
 
-static void bd_back_cb(lv_event_t *e)
+// Screen-exit teardown for BlueDuck — runs via g_screen_stop_fn on ANY exit (top ‹ Back,
+// Home, forward nav). Stops advertising + frees BLE so re-entry starts clean. Top ‹ Back
+// already routes to BT Attacks (nav-stack parent), so the bottom Back button is gone.
+static void bd_stop(void)
 {
-    (void)e;
     if (bd_ui_timer) { lv_timer_del(bd_ui_timer); bd_ui_timer = NULL; }
     bd_status_lbl = NULL; bd_stats_lbl = NULL; bd_start_btn = NULL;
     bd_persona_dd = NULL; bd_script_dd = NULL; bd_human_sw = NULL; bd_speed_dd = NULL;
@@ -37476,7 +36885,6 @@ static void bd_back_cb(lv_event_t *e)
         s_ble_for_blueduck = false;
         current_radio_mode = RADIO_MODE_NONE;
     }
-    show_bt_attacks_screen();
 }
 
 static void show_blueduck_screen(void)
@@ -37485,6 +36893,7 @@ static void show_blueduck_screen(void)
     int nscripts = blueduck_scan_scripts();
 
     create_function_page_base("BlueDuck");
+    g_screen_stop_fn = bd_stop;
 
     /* ── Consent banner — fixed 34px height so wrap never bleeds down ── */
     lv_obj_t *warn_lbl = lv_label_create(function_page);
@@ -37586,27 +36995,6 @@ static void show_blueduck_screen(void)
     lv_obj_set_style_text_color(log_lbl, lv_color_make(120, 120, 120), 0);
     lv_obj_align(log_lbl, LV_ALIGN_TOP_MID, 0, 252);
 
-    /* ── Back button ────────────────────────────────────────────── */
-    lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 110, 28);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(back_btn, 4, 0);
-    lv_obj_t *bi = lv_label_create(back_btn);
-    lv_label_set_text(bi, LV_SYMBOL_LEFT);
-    lv_obj_set_style_text_font(bi, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(bi, lv_color_white(), 0);
-    lv_obj_t *bl2 = lv_label_create(back_btn);
-    lv_label_set_text(bl2, "BT Attacks");
-    lv_obj_set_style_text_font(bl2, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(bl2, lv_color_white(), 0);
-    lv_obj_add_event_cb(back_btn, bd_back_cb, LV_EVENT_CLICKED, NULL);
-
     bd_ui_refresh(NULL);
     bd_ui_timer = lv_timer_create(bd_ui_refresh, 1000, NULL);
 }
@@ -37646,9 +37034,11 @@ static void wp_rebuild_fp_list(void)
     }
 }
 
-static void wp_back_cb(lv_event_t *e)
+// Screen-exit teardown for WhisperPair — runs via g_screen_stop_fn on ANY exit (top ‹ Back,
+// Home, forward nav). Cancels any running probe/exploit + stops the auto-scan. Top ‹ Back
+// already routes to BT Attacks (nav-stack parent), so the bottom Back button is gone.
+static void wp_stop(void)
 {
-    (void)e;
     if (wp_ui_timer) { lv_timer_del(wp_ui_timer); wp_ui_timer = NULL; }
     if (wp_is_active()) wp_cancel();
     /* Stop auto-scan if it's still running */
@@ -37658,7 +37048,6 @@ static void wp_back_cb(lv_event_t *e)
     wp_probe_btn    = NULL;
     wp_exploit_btn  = NULL;
     wp_fp_queue_idx = -1;
-    show_bt_attacks_screen();
 }
 
 static void wp_result_cb(wp_result_t result, const char *detail,
@@ -37769,6 +37158,7 @@ static void wp_exploit_btn_cb(lv_event_t *e) { (void)e; wp_run_all(WP_MODE_EXPLO
 static void show_whisperpair_screen(void)
 {
     create_function_page_base("WhisperPair");
+    g_screen_stop_fn = wp_stop;
     wp_fp_queue_count = 0;
     wp_fp_queue_idx   = -1;
     wp_fp_list        = NULL;
@@ -37863,27 +37253,6 @@ static void show_whisperpair_screen(void)
     lv_obj_set_width(log_note, lv_pct(96));
     lv_obj_align(log_note, LV_ALIGN_TOP_MID, 0, 254);
 
-    /* ── Back button ──────────────────────────────────────── bottom ── */
-    lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, 110, 28);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -6);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(60, 60, 60), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(90, 90, 90), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(back_btn, 4, 0);
-    lv_obj_t *bi = lv_label_create(back_btn);
-    lv_label_set_text_static(bi, LV_SYMBOL_LEFT);
-    lv_obj_set_style_text_font(bi, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(bi, lv_color_white(), 0);
-    lv_obj_t *bl = lv_label_create(back_btn);
-    lv_label_set_text_static(bl, "BT Attacks");
-    lv_obj_set_style_text_font(bl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(bl, lv_color_white(), 0);
-    lv_obj_add_event_cb(back_btn, wp_back_cb, LV_EVENT_CLICKED, NULL);
-
     /* ── Auto-start BLE scan ────────────────────────────────────────── */
     wp_ui_timer = lv_timer_create(wp_ui_refresh, 500, NULL);
 
@@ -37977,39 +37346,18 @@ static void show_radio_menu_screen_from_rf433(void)
     show_radio_menu_screen();
 }
 
-static void show_radio_menu_screen_from_cc1101(void)
-{
-    if (cc1101_is_init()) cc1101_deinit();
-    show_radio_menu_screen();
-}
-
 // ── Shared back-button helper ─────────────────────────────────────────────────
-
-static void rfhat_menu_back_cb(lv_event_t *e)
-{
-    void (*parent_fn)(void) = (void(*)(void))lv_event_get_user_data(e);
-    if (parent_fn) parent_fn();
-}
+// (show_radio_menu_screen_from_cc1101/_nrf24 + rfhat_menu_back_cb removed with the
+//  redundant "‹ Radio" bottom buttons — Stage 5B T2a. Radio deinit is handled by
+//  the shared-GPIO claim model on the next peripheral entry.)
 
 static lv_obj_t *rfhat_add_back_btn(const char *label, void (*parent_fn)(void))
 {
-    lv_obj_t *btn = lv_btn_create(function_page);
-    lv_obj_set_size(btn, 120, 30);
-    lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, -8);
-    lv_obj_set_style_bg_color(btn, lv_color_make(60,60,60), LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(btn, 0, 0);
-    lv_obj_set_style_radius(btn, 8, 0);
-    lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(btn, 4, 0);
-    lv_obj_t *icon = lv_label_create(btn); lv_label_set_text(icon, LV_SYMBOL_LEFT);
-    lv_obj_set_style_text_font(icon, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(icon, lv_color_white(), 0);
-    lv_obj_t *lbl = lv_label_create(btn); lv_label_set_text(lbl, label);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
-    lv_obj_add_event_cb(btn, rfhat_menu_back_cb, LV_EVENT_CLICKED, (void*)parent_fn);
-    return btn;
+    // Stage 2: redundant bottom back bars removed — the top-bar ‹ Back button now
+    // handles "up one menu level" on every page. Kept as a no-op so all ~45 RF-HAT
+    // sub-screen callers compile unchanged (return value was never used anyway).
+    (void)label; (void)parent_fn;
+    return NULL;
 }
 
 // ── IR Menu ───────────────────────────────────────────────────────────────────
@@ -39443,7 +38791,10 @@ EXT_RAM_BSS_ATTR static zwave_ctx_t *s_zwave = NULL;
 
 static void s_cc1101_stub_screen(const char *title_text, const char *detail)
 {
-    create_function_page_base("CC1101 Sub-GHz");
+    // Use the (unique) title as the nav-stack page name, NOT "CC1101 Sub-GHz":
+    // reusing the parent-menu name made nav_stack_enter truncate this level, so the
+    // top-bar ‹ Back skipped the CC1101 menu and jumped to Radio (no-HW stub path).
+    create_function_page_base(title_text);
     apply_menu_bg();
 
     lv_obj_t *card = lv_obj_create(function_page);
@@ -39653,19 +39004,9 @@ static void show_cc1101_screen(void)
     lv_obj_set_style_pad_column(nav, 6, 0);
     lv_obj_clear_flag(nav, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Back button
-    lv_obj_t *back_btn = lv_btn_create(nav);
-    lv_obj_set_size(back_btn, 70, 28);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(60,60,60), LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_set_style_radius(back_btn, 6, 0);
-    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_t *back_lbl = lv_label_create(back_btn);
-    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " Radio");
-    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
-    lv_obj_add_event_cb(back_btn, rfhat_menu_back_cb, LV_EVENT_CLICKED, (void*)show_radio_menu_screen_from_cc1101);
+    // Redundant "‹ Radio" back button removed (Stage 5B T2a) — the top-bar ‹ Back
+    // goes up to the Radio menu, and the shared-GPIO8/9 claim model deinits CC1101
+    // on the next peripheral's *_claim(), so no eager deinit-on-exit is needed here.
 
     // Prev page button
     lv_obj_t *prev_btn = lv_btn_create(nav);
@@ -43042,12 +42383,6 @@ static void nrf24_hat_claim(void)
     if (cc1101_is_init())       cc1101_deinit();   // frees GPIO8 + GPIO9
 }
 
-static void show_radio_menu_screen_from_nrf24(void)
-{
-    if (nrf24_is_init()) nrf24_deinit();
-    show_radio_menu_screen();
-}
-
 // ── Stub helper ───────────────────────────────────────────────────────────────
 
 static void s_n24_stub_screen(const char *title_text, const char *detail)
@@ -43218,18 +42553,8 @@ static void show_nrf24_screen(void)
     lv_obj_set_style_pad_column(nav, 6, 0);
     lv_obj_clear_flag(nav, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *back_btn = lv_btn_create(nav);
-    lv_obj_set_size(back_btn, 70, 28);
-    lv_obj_set_style_bg_color(back_btn, lv_color_make(60,60,60), LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_set_style_radius(back_btn, 6, 0);
-    lv_obj_set_flex_flow(back_btn, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(back_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_t *back_lbl = lv_label_create(back_btn);
-    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " Radio");
-    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(back_lbl, lv_color_white(), 0);
-    lv_obj_add_event_cb(back_btn, rfhat_menu_back_cb, LV_EVENT_CLICKED, (void*)show_radio_menu_screen_from_nrf24);
+    // Redundant "‹ Radio" back button removed (Stage 5B T2a) — the top-bar ‹ Back
+    // goes up to the Radio menu; nRF24 is deinit'd by the next peripheral's *_claim().
 
     lv_obj_t *prev_btn = lv_btn_create(nav);
     lv_obj_set_size(prev_btn, 32, 28);
@@ -47529,22 +46854,6 @@ static void s_zgwd_active_cb(lv_event_t *e)
 }
 
 // ── Back callback ─────────────────────────────────────────────────────────────
-static void s_zgwd_back_cb(lv_event_t *e)
-{
-    (void)e;
-    zgwd_ctx_t *ctx = s_zgwd;
-    if (ctx) {
-        ctx->cancel      = true;
-        ctx->scanning    = false;
-        ctx->status_lbl  = NULL;
-        ctx->pan_list    = NULL;
-        ctx->passive_btn = NULL;
-        ctx->active_btn  = NULL;
-        if (ctx->tmr) { lv_timer_del(ctx->tmr); ctx->tmr = NULL; }
-    }
-    show_main_tiles();
-}
-
 // ── Main Zigbee Scout screen ──────────────────────────────────────────────────
 static void show_zigbee_wardrive_screen(void)
 {
@@ -47602,21 +46911,8 @@ static void show_zigbee_wardrive_screen(void)
         LV_ALIGN_BOTTOM_RIGHT, -8, -38, (LCD_H_RES/2) - 12, 32);
     lv_obj_add_event_cb(ctx->active_btn, s_zgwd_active_cb, LV_EVENT_CLICKED, NULL);
 
-    // Back button
-    lv_obj_t *back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(back_btn, LCD_H_RES - 16, 30);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -4);
-    lv_obj_set_style_bg_color(back_btn, ui_panel_color(), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(back_btn, ui_card_pressed_color(), LV_STATE_PRESSED);
-    lv_obj_set_style_border_color(back_btn, ui_border_color(), 0);
-    lv_obj_set_style_border_width(back_btn, 1, 0);
-    lv_obj_set_style_radius(back_btn, 6, 0);
-    lv_obj_t *back_lbl = lv_label_create(back_btn);
-    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT "  Home");
-    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(back_lbl, ui_text_color(), 0);
-    lv_obj_center(back_lbl);
-    lv_obj_add_event_cb(back_btn, s_zgwd_back_cb, LV_EVENT_CLICKED, NULL);
+    // Bottom "< Home" removed — top-bar ‹ Back exits; generic teardown
+    // (reset_function_page_children) cancels the s_zgwd scan on any exit.
 
     ctx->tmr = lv_timer_create(s_zgwd_ui_timer_cb, 500, NULL);
 }
@@ -48505,14 +47801,13 @@ static void espnow_refresh_cb(lv_timer_t *t)
 }
 
 /* ── Button callbacks ────────────────────────────────────────────────────────── */
-static void espnow_stop_cb(lv_event_t *e)
+// Teardown-only stop hook (top-bar ‹ Back / Home invoke it via g_screen_stop_fn).
+static void espnow_stop(void)
 {
-    (void)e;
     espnow_scout_stop();
     if (espnow_refresh_timer) { lv_timer_del(espnow_refresh_timer); espnow_refresh_timer = NULL; }
     espnow_list        = NULL;
     espnow_status_lbl  = NULL;
-    show_wifi_menu_screen();
 }
 
 static void espnow_export_cb(lv_event_t *e)
@@ -48540,6 +47835,7 @@ static void show_espnow_scout_screen(void)
     espnow_load_profiles();
 
     create_function_page_base("ESP-NOW Scout");
+    g_screen_stop_fn = espnow_stop;
 
     /* Status label */
     espnow_status_lbl = lv_label_create(function_page);
@@ -48575,20 +47871,7 @@ static void show_espnow_scout_screen(void)
     lv_obj_center(exp_lbl);
     lv_obj_add_event_cb(exp_btn, espnow_export_cb, LV_EVENT_CLICKED, NULL);
 
-    /* Stop / Exit button */
-    lv_obj_t *stop_btn = lv_btn_create(function_page);
-    lv_obj_set_size(stop_btn, 110, 32);
-    lv_obj_align(stop_btn, LV_ALIGN_BOTTOM_RIGHT, -6, -6);
-    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 40), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(stop_btn, 0, 0);
-    lv_obj_set_style_radius(stop_btn, 8, 0);
-    lv_obj_t *stop_lbl = lv_label_create(stop_btn);
-    lv_label_set_text(stop_lbl, LV_SYMBOL_CLOSE "  Stop / Exit");
-    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(stop_lbl, lv_color_white(), 0);
-    lv_obj_center(stop_lbl);
-    lv_obj_add_event_cb(stop_btn, espnow_stop_cb, LV_EVENT_CLICKED, NULL);
+    // Bottom "Stop / Exit" removed — top-bar ‹ Back stops scout (g_screen_stop_fn = espnow_stop).
 
     /* Reset device table for a fresh scan */
     portENTER_CRITICAL(&espnow_mux);
