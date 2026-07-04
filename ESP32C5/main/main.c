@@ -8714,7 +8714,13 @@ static void targeted_deauth_screen_stop(void) {
 static void show_targeted_deauth_screen(void) {
     create_function_page_base("Deauth Station");
     g_screen_stop_fn = targeted_deauth_screen_stop;
-    
+    // ‹ Back target: from Deauth Client (ap_index < 0) return to its client list.
+    // The "Deauth Station" title isn't in NAV_SHOW_TABLE, so without this the top
+    // ‹ Back falls through to Home. (Sniffer path keeps its own return behaviour.)
+    if (targeted_deauth_ap_index < 0) {
+        g_screen_back_fn = show_deauth_client_scan_screen;
+    }
+
     // Content area
     lv_obj_t *content = lv_obj_create(function_page);
     lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30 - 70);
@@ -48535,6 +48541,9 @@ static void show_espnow_session_screen(int dev_idx)
 {
     create_function_page_base("ESP-NOW Session");
     g_screen_stop_fn = espnow_session_stop;
+    // Top ‹ Back → ESP-NOW Scout (parent title not in NAV_SHOW_TABLE → would
+    // otherwise fall through to Home).
+    g_screen_back_fn = show_espnow_scout_screen;
 
     espnow_session_idx = dev_idx;
     espnow_device_t *d = &espnow_devices[dev_idx];
@@ -48884,10 +48893,18 @@ static void espnow_pl_refresh_cb(lv_timer_t *t)
 }
 
 /* ── Packet log screen ───────────────────────────────────────────────────── */
+// ‹ Back from the packet log steps up to the locked session (its parent title
+// isn't in NAV_SHOW_TABLE → resolve it explicitly via g_screen_back_fn).
+static void espnow_back_to_session(void)
+{
+    show_espnow_session_screen(espnow_session_idx);
+}
+
 static void show_espnow_pktlog_screen(void)
 {
     create_function_page_base("ESP-NOW Pkt Log");
     g_screen_stop_fn = espnow_pktlog_stop;
+    g_screen_back_fn = espnow_back_to_session;
 
     // Status bar
     espnow_pl_status = lv_label_create(function_page);
