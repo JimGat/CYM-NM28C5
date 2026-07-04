@@ -49,7 +49,7 @@ CYM also supports the **NM-RF-HAT** ecosystem, including NFC/RFID, CC1101 Sub-GH
 
 The project was originally inspired by **Pancake**, but has diverged substantially in target hardware, build system, UI framework, feature set, and architecture. CYM targets the ESP32-C5 / NM-CYD-C5 hardware family, uses ESP-IDF instead of Arduino, uses LVGL 8 for the UI, and has grown into a standalone firmware platform rather than a fork.
 
-CYM also comes from the broader **MonsterC5 / JanOS** ecosystem. It was branched with Janek / JanOS, and the **Cheap Yellow Monster** name was approved by **OyczE**, the designer of the MonsterC5. I beta test for the LAB5 Team and respect all of my team members greatly. The CYM is my contribution back into that community.
+CYM also comes from the broader **MonsterC5 / JanOS** ecosystem. It was branched with Janek / JanOS, and the **Cheap Yellow Monster** name was approved by **OyczE**, the designer of the MonsterC5. I beta test for the LAB5 Team and have great respect for everyone involved. CYM is my contribution back to that community.
 
 The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/nm-cyd-c5/). Additional purchase sources and full hardware documentation are available on the [official board repository](https://github.com/RockBase-iot/NM-CYD-C5).
 
