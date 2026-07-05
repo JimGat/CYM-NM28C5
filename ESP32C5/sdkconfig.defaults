@@ -105,3 +105,9 @@ CONFIG_LV_MEM_CUSTOM_INCLUDE="lvgl_memory.h"
 # Every idf.py fullclean + set-target will silently drop it otherwise.
 # Verified fix in v2.10.13. See CLAUDE.md "ST7789 color byte-order fix" section.
 CONFIG_LV_COLOR_16_SWAP=y
+
+# Reduce NimBLE prepared-write pool — 64 entries reserve a large host buffer;
+# 4 is sufficient for the GATT interactive use case and frees ~8 KB internal RAM.
+# Restores BLE scan adv-report buffer headroom after v2.10.30/31 static-BSS growth.
+# Measured fix: DMA-free +22 KB, BLE scan ~1 → 33 devices (@birolt29 v2.10.32).
+CONFIG_BT_NIMBLE_ATT_MAX_PREP_ENTRIES=4

@@ -249,7 +249,7 @@ typedef struct {
     bool     is_exposure;      /* COVID-19 Exposure Notification (svc UUID 0xFD6F) */
 } bt_device_info_t;
 
-static bt_device_info_t bt_devices[BT_MAX_DEVICES];
+EXT_RAM_BSS_ATTR static bt_device_info_t bt_devices[BT_MAX_DEVICES];
 static int bt_device_count = 0;
 
 // BLE Spam attack state
@@ -351,7 +351,7 @@ typedef struct {
     uint8_t lmk[16];   // Stage 2: known peer LMK; zero = not loaded
 } espnow_profile_t;
 
-static espnow_device_t  espnow_devices[ESPNOW_MAX_DEVICES];
+EXT_RAM_BSS_ATTR static espnow_device_t  espnow_devices[ESPNOW_MAX_DEVICES];
 static int              espnow_device_count   = 0;
 static espnow_profile_t espnow_profiles[ESPNOW_MAX_PROFILES];
 static int              espnow_profile_count  = 0;
@@ -398,7 +398,7 @@ static lv_timer_t    *espnow_pl_timer     = NULL;
 #define SPOOF_LIST_MAX  64
 #define SPOOF_LIST_PATH "/sdcard/lab/bluetooth/spooflist.csv"
 typedef struct { uint8_t mac[6]; char name[33]; } spoof_list_entry_t;
-static spoof_list_entry_t s_spoof_list[SPOOF_LIST_MAX];
+EXT_RAM_BSS_ATTR static spoof_list_entry_t s_spoof_list[SPOOF_LIST_MAX];
 static int  s_spoof_list_count    = 0;
 static int  s_spoof_list_selected = -1;
 static lv_obj_t *s_spoof_add_popup  = NULL;
@@ -1207,10 +1207,10 @@ typedef struct {
 #define WDP_SCREEN_FIFO_SIZE   20
 #define WDP_GPS_MOVE_THRESHOLD_M 45.72  // 150 feet in meters
 
-static wdp_ducb_channel_t wdp_ducb_channels[WDP_TOTAL_CHANNELS];
+EXT_RAM_BSS_ATTR static wdp_ducb_channel_t wdp_ducb_channels[WDP_TOTAL_CHANNELS];
 static int wdp_ducb_channel_count = 0;
 static double wdp_ducb_discounted_total = 0.0;
-static wdp_network_t wdp_seen_networks[WDP_DEDUP_BUFFER_SIZE];  // Persistent 100-entry dedup buffer (no cycling)
+EXT_RAM_BSS_ATTR static wdp_network_t wdp_seen_networks[WDP_DEDUP_BUFFER_SIZE];  // Persistent 100-entry dedup buffer (no cycling)
 static volatile int wdp_seen_count = 0;  // Current count in dedup buffer (0-100)
 static volatile int wdp_total_networks = 0;  // Cumulative counter (increments on new CSV write, never resets during wardrive)
 static volatile int wdp_dwell_new_networks = 0;
@@ -1570,7 +1570,7 @@ static int deauth_monitor_current_channel = 1;
 static int deauth_monitor_channel_index = 0;
 static int64_t deauth_monitor_last_channel_hop = 0;
 
-static deauth_monitor_attack_t deauth_monitor_attacks[DEAUTH_MONITOR_MAX_ATTACKS];
+EXT_RAM_BSS_ATTR static deauth_monitor_attack_t deauth_monitor_attacks[DEAUTH_MONITOR_MAX_ATTACKS];
 static volatile int deauth_monitor_attack_count = 0;
 static portMUX_TYPE deauth_monitor_spin = portMUX_INITIALIZER_UNLOCKED;
 
@@ -46703,7 +46703,7 @@ static void show_rfid_hw_test_screen(void)
 #define RFID_MAX_LIST_DISPLAY  20
 #define RFID_MAX_IMPORT_FILES  10
 
-static rfid_card_entry_t s_rfid_entries[RFID_MAX_LIST_DISPLAY];
+EXT_RAM_BSS_ATTR static rfid_card_entry_t s_rfid_entries[RFID_MAX_LIST_DISPLAY];
 static int               s_rfid_entry_count = 0;
 static char s_nfc_import_paths[RFID_MAX_IMPORT_FILES][RFID_FILENAME_LEN];
 static int  s_nfc_import_count = 0;
