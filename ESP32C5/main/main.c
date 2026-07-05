@@ -36319,39 +36319,96 @@ static void drone_drain_pcap(void)
     xSemaphoreGive(sd_spi_mutex);
 }
 
-// BLE GAP callback: filter company ID 0x0E00 (OpenDroneID) advertisements.
+// BLE GAP callback: detect drones via (1) OpenDroneID mfg company 0x0E00 and
+// (2) DJI presence (advertiser OUI 48:1C:B9 or DJI service UUID 0xFFF0).
+// Handles BOTH legacy DISC and BLE5 extended (EXT_DISC) advertising: DJI
+// broadcasts as extended advertising, which the old legacy-only scan never
+// received — that was why the Drone Detector missed the DJI Mini 4 Pro.
 static int drone_ble_gap_cb(struct ble_gap_event *event, void *arg)
 {
     (void)arg;
     if (!drone_scan_active) return 0;
-    if (event->type != BLE_GAP_EVENT_DISC) return 0;
-    struct ble_gap_disc_desc *desc = &event->disc;
-    struct ble_hs_adv_fields fields;
-    if (ble_hs_adv_parse_fields(&fields, desc->data, desc->length_data) != 0) return 0;
-    if (!fields.mfg_data || fields.mfg_data_len < 5) return 0;
-    // Company ID 0x0E00 (LE: 0x00 0x0E), AD application code 0x0D
-    if (fields.mfg_data[0] != 0x00 || fields.mfg_data[1] != 0x0E) return 0;
-    if (fields.mfg_data[2] != 0x0D) return 0;
 
-    drone_rec_t *rec = drone_find_or_create(desc->addr.val);
+    const uint8_t *adv_data;
+    uint8_t        adv_len;
+    const uint8_t *addr_val;
+    uint8_t        addr_type;
+    int8_t         rssi;
+    uint8_t        evt_type;
+
+#if MYNEWT_VAL(BLE_EXT_ADV)
+    if (event->type == BLE_GAP_EVENT_EXT_DISC) {
+        struct ble_gap_ext_disc_desc *d = &event->ext_disc;
+        adv_data = d->data; adv_len = d->length_data;
+        addr_val = d->addr.val; addr_type = d->addr.type;
+        rssi = d->rssi; evt_type = (uint8_t)d->props;
+    } else
+#endif
+    if (event->type == BLE_GAP_EVENT_DISC) {
+        struct ble_gap_disc_desc *d = &event->disc;
+        adv_data = d->data; adv_len = d->length_data;
+        addr_val = d->addr.val; addr_type = d->addr.type;
+        rssi = d->rssi; evt_type = (uint8_t)d->event_type;
+    } else {
+        return 0;
+    }
+
+    struct ble_hs_adv_fields fields;
+    if (ble_hs_adv_parse_fields(&fields, adv_data, adv_len) != 0) return 0;
+
+    // (1a) Standard OpenDroneID via Service Data UUID 0xFFFA (ASTM Remote ID) +
+    //      AD application code 0x0D — the primary ASTM F3411 BLE form used by ALL
+    //      compliant drones (DJI, Autel, Parrot, Skydio, Holy Stone, …).
+    const uint8_t *odid_msg = NULL;
+    int            odid_len = 0;
+    if (fields.svc_data_uuid16 && fields.svc_data_uuid16_len >= 6 &&
+        fields.svc_data_uuid16[0] == 0xFA && fields.svc_data_uuid16[1] == 0xFF &&
+        fields.svc_data_uuid16[2] == 0x0D) {
+        odid_msg = fields.svc_data_uuid16 + 4;   // [uuid][0D][counter][msg…]
+        odid_len = fields.svc_data_uuid16_len - 4;
+    }
+    // (1b) Legacy/alternate OpenDroneID via manufacturer data company 0x0E00, code 0x0D
+    else if (fields.mfg_data && fields.mfg_data_len >= 5 &&
+             fields.mfg_data[0] == 0x00 && fields.mfg_data[1] == 0x0E &&
+             fields.mfg_data[2] == 0x0D) {
+        odid_msg = fields.mfg_data + 4;          // [company][0D][counter][msg…]
+        odid_len = fields.mfg_data_len - 4;
+    }
+    bool is_odid = (odid_msg != NULL);
+
+    // (2) DJI presence: advertiser OUI 48:1C:B9 (NimBLE LE byte order) or
+    //     the DJI proprietary service UUID 0xFFF0 in the advertisement.
+    bool is_dji = (addr_val[5] == 0x48 && addr_val[4] == 0x1C && addr_val[3] == 0xB9);
+    if (!is_dji && fields.uuids16) {
+        for (uint8_t i = 0; i < fields.num_uuids16; i++)
+            if (fields.uuids16[i].value == 0xFFF0) { is_dji = true; break; }
+    }
+
+    if (!is_odid && !is_dji) return 0;
+
+    drone_rec_t *rec = drone_find_or_create(addr_val);
     if (!rec) return 0;
-    rec->rssi      = desc->rssi;
+    rec->rssi      = rssi;
     rec->source    = RID_SRC_BLE;
     rec->last_seen = (uint32_t)(esp_timer_get_time() / 1000000);
     rec->pkt_count++;
-    // Byte 3 = counter, byte 4+ = 25-byte RID message
-    if (fields.mfg_data_len >= 5)
-        drone_parse_rid(rec, fields.mfg_data + 4, fields.mfg_data_len - 4);
+    if (is_odid) {
+        drone_parse_rid(rec, odid_msg, odid_len);
+    } else if (rec->uas_id[0] == '\0') {
+        // DJI seen but no ASTM Remote ID payload yet (e.g. on the ground) —
+        // label it so the list shows a meaningful presence entry.
+        strncpy(rec->uas_id, "DJI drone (BLE)", sizeof(rec->uas_id) - 1);
+    }
 
     // Queue raw advertisement for PCAP
     if (drone_pcap_queue) {
         ble_pcap_pkt_t pkt;
-        memcpy(pkt.addr, desc->addr.val, 6);
-        pkt.addr_type    = desc->addr.type;
-        pkt.event_type   = (uint8_t)desc->event_type;
-        pkt.rssi         = desc->rssi;
-        pkt.data_len     = desc->length_data < 31 ? desc->length_data : 31;
-        memcpy(pkt.data, desc->data, pkt.data_len);
+        memcpy(pkt.addr, addr_val, 6);
+        pkt.addr_type    = addr_type;
+        pkt.event_type   = evt_type;
+        pkt.rssi         = rssi;
+        pkt.data_len     = adv_len < 31 ? adv_len : 31;
+        memcpy(pkt.data, adv_data, pkt.data_len);
         pkt.timestamp_us = (uint64_t)esp_timer_get_time();
         xQueueSend(drone_pcap_queue, &pkt, 0);
     }
@@ -36471,12 +36528,22 @@ static void drone_task(void *pvParameters)
         drone_update_flag = true;
         if (!ensure_ble_mode()) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
 
+        // Extended (BLE5) scan on both 1M and Coded PHY — required to receive
+        // DJI/OpenDroneID extended advertising that legacy ble_gap_disc misses.
+#if MYNEWT_VAL(BLE_EXT_ADV)
+        struct ble_gap_ext_disc_params p1m    = { .itvl = 0x60, .window = 0x60, .passive = 0 };
+        struct ble_gap_ext_disc_params pcoded = { .itvl = 0x60, .window = 0x60, .passive = 0 };
+        int rc = ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 0, 0, 0,
+                                  BLE_HCI_SCAN_FILT_NO_WL, 0,
+                                  &p1m, &pcoded, drone_ble_gap_cb, NULL);
+#else
         struct ble_gap_disc_params bp = {
             .itvl = 0x60, .window = 0x60,
             .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
             .limited = 0, .passive = 0, .filter_duplicates = 0
         };
         int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &bp, drone_ble_gap_cb, NULL);
+#endif
 
         int64_t ble_end = esp_timer_get_time() / 1000 + DRONE_BLE_PHASE_MS;
         while (drone_scan_active && esp_timer_get_time() / 1000 < ble_end)
