@@ -692,6 +692,8 @@ typedef enum { WD_RADIO_WIFI_ONLY = 0, WD_RADIO_BLE_ONLY } wd_radio_mode_t;
 #define DRONE_DETECT_DIR     "/sdcard/lab/dronedetect"
 #define DRONE_MAX            20
 #define DRONE_WIFI_PHASE_MS  10000   // ms per WiFi promiscuous pass
+#define DRONE_WIFI_DWELL_MS     60   // ms dwell per channel — short revisit so every
+                                     // 5 GHz RID channel is sampled ~13x/phase (was 500)
 #define DRONE_BLE_PHASE_MS    5000   // ms per BLE scan pass
 #define RID_SRC_BLE          0
 #define RID_SRC_WIFI         1
@@ -36570,7 +36572,7 @@ static void drone_task(void *pvParameters)
             int ch = s_drone_wifi_channels[ch_idx % DRONE_WIFI_CH_COUNT];
             ch_idx++;
             esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
-            vTaskDelay(pdMS_TO_TICKS(500));
+            vTaskDelay(pdMS_TO_TICKS(DRONE_WIFI_DWELL_MS));
         }
         esp_wifi_set_promiscuous(false);
         esp_wifi_set_promiscuous_rx_cb(NULL);
