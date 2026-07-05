@@ -11,6 +11,14 @@ import re
 import os
 import datetime
 
+# Force UTF-8 on stdout so box-drawing characters don't crash on Windows when
+# the stream is redirected (CI logs, piped idf.py build, some IDE terminals).
+# cp1252 — the Windows console fallback codec — can't encode ─ or ←.
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+except Exception:
+    pass
+
 # ── Argument handling ───────────────────────────────────────────────────────
 if len(sys.argv) < 5:
     print("usage: update_memory_map.py <map> <docs_dir> <version> <bin_size_bytes>")
