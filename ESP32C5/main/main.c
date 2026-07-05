@@ -13462,6 +13462,7 @@ static const nav_show_entry_t NAV_SHOW_TABLE[] = {
     { "Select Attack",        show_attack_tiles_screen     },
     { "WiFi Observer",        show_sniff_karma_screen      },
     { "Compromised Data",     show_wifi_monitor_screen     },
+    { "Drone Detector",       show_drone_detector_screen   },
     { "Bluetooth",            show_bluetooth_screen        },
     { "BT Scan & Select",     show_bt_scan_select_screen   },
     { "BT Attacks",           show_bt_attacks_screen       },
@@ -36597,8 +36598,6 @@ static void drone_exit_cb(lv_event_t *e)
 }
 
 // Detail view — scrollable parsed fields for one drone record.
-static void drone_detail_back_cb(lv_event_t *e) { (void)e; show_drone_detector_screen(); }
-
 static void drone_row_tap_cb(lv_event_t *e)
 {
     drone_show_detail((int)(intptr_t)lv_event_get_user_data(e));
@@ -36656,19 +36655,8 @@ static void drone_show_detail(int idx)
     if (r.self_id[0]) DR("Desc: %s", r.self_id);
     if (r.op_id[0])   DR("OpID: %s", r.op_id);
     #undef DR
-
-    lv_obj_t *bb = lv_btn_create(function_page);
-    lv_obj_set_size(bb, 110, 28);
-    lv_obj_align(bb, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(bb, lv_color_make(60,60,60), LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(bb, 0, 0);
-    lv_obj_set_style_radius(bb, 8, 0);
-    lv_obj_t *bbl = lv_label_create(bb);
-    lv_label_set_text(bbl, LV_SYMBOL_LEFT " Back");
-    lv_obj_set_style_text_font(bbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(bbl, lv_color_white(), 0);
-    lv_obj_center(bbl);
-    lv_obj_add_event_cb(bb, drone_detail_back_cb, LV_EVENT_CLICKED, NULL);
+    // No bottom Back button — navigation uses the top-bar ‹ Back, which returns
+    // to the drone list via NAV_SHOW_TABLE ("Drone Detector"), not Home.
 }
 
 // Main screen builder. Safe to call both for fresh start and from detail-view back.
