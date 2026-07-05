@@ -36483,14 +36483,65 @@ static void drone_wifi_cb(void *buf, wifi_promiscuous_pkt_type_t type)
                 }
                 return;
             }
+            // DJI proprietary DroneID vendor IE (0xDD, OUI 26:37:12) — emitted by
+            // older / WiFi-based DJI drones (the Mini 4 Pro is BLE-only). Presence-
+            // detect always; extract the ASCII serial and (best-effort, sanity-
+            // guarded) drone GPS from the known telemetry/info subcommands.
+            else if (tag == 0xDD && tlen >= 4 &&
+                     ie[2] == 0x26 && ie[3] == 0x37 && ie[4] == 0x12) {
+                const uint8_t *p    = ie + 5;      // payload after 26:37:12 OUI
+                int            plen = tlen - 3;     // payload byte count
+                drone_rec_t *rec = drone_find_or_create(src_mac);
+                if (rec) {
+                    rec->rssi      = pkt->rx_ctrl.rssi;
+                    rec->source    = RID_SRC_WIFI;
+                    rec->last_seen = (uint32_t)(esp_timer_get_time() / 1000000);
+                    rec->pkt_count++;
+                    uint8_t subcmd = (plen > 3) ? p[3] : 0;
+                    // subcmd 0x10 = flight telemetry, 0x11 = user info; both carry a
+                    // 16-byte ASCII serial at payload offset 4.
+                    if ((subcmd == 0x10 || subcmd == 0x11) && plen >= 20) {
+                        char sn[17];
+                        memcpy(sn, p + 4, 16); sn[16] = '\0';
+                        for (int k = 15; k >= 0 && (sn[k] == '\0' || sn[k] == ' '); k--)
+                            sn[k] = '\0';
+                        if ((uint8_t)sn[0] >= 0x20 && (uint8_t)sn[0] < 0x7F) {
+                            strncpy(rec->uas_id, sn, sizeof(rec->uas_id) - 1);
+                            rec->id_type = 1;   // serial
+                        }
+                    }
+                    // Drone lat/lon for 0x10: DJI stores radians*1e7, so deg =
+                    // raw / 174533.0. Sanity-bounded so a wrong offset cannot ever
+                    // surface bogus coordinates. UNTESTED on hardware (no WiFi DJI here).
+                    if (subcmd == 0x10 && plen >= 31) {
+                        int32_t lo = (int32_t)((uint32_t)p[23]|(uint32_t)p[24]<<8|(uint32_t)p[25]<<16|(uint32_t)p[26]<<24);
+                        int32_t la = (int32_t)((uint32_t)p[27]|(uint32_t)p[28]<<8|(uint32_t)p[29]<<16|(uint32_t)p[30]<<24);
+                        double latd = la / 174533.0, lond = lo / 174533.0;
+                        if ((la != 0 || lo != 0) &&
+                            latd >= -90.0 && latd <= 90.0 && lond >= -180.0 && lond <= 180.0) {
+                            rec->lat = latd; rec->lon = lond; rec->has_loc = true;
+                        }
+                    }
+                    if (rec->uas_id[0] == '\0')
+                        strncpy(rec->uas_id, "DJI drone (WiFi)", sizeof(rec->uas_id) - 1);
+                    drone_update_flag = true;
+                }
+                return;
+            }
             ie += 2 + tlen;
             ie_rem -= 2 + tlen;
         }
     }
 }
 
-// Channel sequence for WiFi phase — extra weight on ch 6 (NAN)
-static const int s_drone_wifi_channels[] = {6, 6, 1, 6, 6, 11, 6, 6};
+// Channel sequence for WiFi phase — 2.4 GHz (extra weight on ch 6 = NAN) plus
+// 5 GHz (drone RID beacons and DJI DroneID appear on 5 GHz too; C5 is dual-band).
+// 5 GHz hops require band mode AUTO (set in drone_task's WiFi phase).
+static const int s_drone_wifi_channels[] = {
+    6, 1, 11, 6,                     // 2.4 GHz
+    36, 40, 44, 48,                  // 5 GHz UNII-1
+    149, 153, 157, 161, 165          // 5 GHz UNII-3
+};
 #define DRONE_WIFI_CH_COUNT (int)(sizeof(s_drone_wifi_channels)/sizeof(s_drone_wifi_channels[0]))
 
 // Main drone detector task: alternates WiFi promiscuous and BLE scan phases.
@@ -36510,6 +36561,9 @@ static void drone_task(void *pvParameters)
         esp_wifi_set_promiscuous_filter(&filt);
         esp_wifi_set_promiscuous_rx_cb(drone_wifi_cb);
         esp_wifi_set_promiscuous(true);
+        // Enable dual-band so the 5 GHz channels in s_drone_wifi_channels are
+        // reachable (2.4-only band mode silently rejects 5 GHz set_channel).
+        esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO);
 
         int64_t wifi_end = esp_timer_get_time() / 1000 + DRONE_WIFI_PHASE_MS;
         while (drone_scan_active && esp_timer_get_time() / 1000 < wifi_end) {
