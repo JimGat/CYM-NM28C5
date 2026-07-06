@@ -75,6 +75,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
     - [BLE PCAP — How It Works](#ble-pcap--how-it-works)
     - [BT Scan & Select — How It Works](#bt-scan--select--how-it-works)
     - [Multi-Session Counter-Surveillance Workflow](#multi-session-counter-surveillance-workflow)
+    - [Drone Detector — How It Works](#drone-detector--how-it-works)
     - [AirTag / SmartTag Locator — How It Works](#airtag--smarttag-locator--how-it-works)
     - [GATT Walker — How It Works](#gatt-walker--how-it-works)
     - [GATT Interactive — Live Read / Write / Subscribe](#gatt-interactive--live-read--write--subscribe)
@@ -133,7 +134,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **Karma AP** | Respond to probe requests, rogue access point |
 | **Chanalizer** | Wide 520 px WiFi channel map — auto-scrolling left/right with touch-drag pause; SSID color grouping, group legend, channel annotations; portrait 240 px viewport over 2.4 GHz + 5 GHz |
 | **WiFi Band Scope** | Promiscuous RSSI per-channel waterfall (2.4 GHz 13-ch or 5 GHz 25-ch); band toggle updates axis label and resets peaks; 60 ms dwell / 0.8 s full 2.4 sweep |
-| **Drone Detector** | Passive BLE scan for DJI/Remote ID drone advertisements |
+| **Drone Detector** | Dual-mode (BLE5 extended + WiFi 2.4/5 GHz) passive Remote ID scanner. Detects all ASTM F3411-compliant drones via BLE service UUID 0xFFFA and WiFi Remote ID beacons; DJI presence by OUI / service UUID 0xFFF0. Alternates BLE and WiFi scan phases; logs to SD. |
 | **Wardriving** | GPS + WiFi logging, dual-band filter (2.4 GHz / 5 GHz / Both), optional BLE time-sliced scanning, WiGLE CSV 1.6, upload log tracking, raw PCAP toggle, GPS mark waypoints (GPX output), WiGLE and WDG Wars upload; GPS last-known position hold with 150 m stale accuracy when signal is lost; live dashboard shows separate WiFi network count and BLE device count |
 | **GPS** | NMEA RMC auto-syncs system clock (FAT timestamps); last-known position persisted to NVS (5-minute throttle); manual fallback editor in Settings → GPS Info; all data-collection features (wardrive, GATT Walker, marks) use best available GPS transparently |
 | **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk (with **advanced advertising fingerprinting** — AD-type decode, Company ID lookup, URIs, flags), Bluetooth Lookout, BLE Spam (8 modes incl. Sour Apple), Device Spoof (general + directed), BLE Disconnect (directed), BLE PCAP (Kismet PCAPNG raw capture; BLE 5.0 extended advertisement support), **BlueDuck** (BLE HID DuckyScript keyboard injector), **HoneyPair** (BLE persona honeypot), **WhisperPair** (CVE-2025-36911 Google Fast Pair KBP bypass — auto-scan, sequential run-all FP targets, AES-128-ECB exploit); BT Scan & Select supports **Save List** (GPS-tagged JSON snapshot of every device found); **Matter [M] detection** passive tagging of Thread/BLE Matter devices by GATT service `0xFFF6`; **GATT Interactive** (live read/write/subscribe to individual characteristics after walk); **GATT HID Decoder** (parses HID Report Map, decodes live keyboard/mouse input); **Saved Clones** browser; **BLE MITM Proxy** |
@@ -760,7 +761,7 @@ Bluetooth
 | **Tag Locator** | Per-tag RSSI tracking launched from the AirTag Scan found-tags list |
 | **Bluetooth Lookout** | Continuous BLE monitor that alerts when a watchlisted device (by full MAC or OUI prefix) is detected nearby. Triggers 3 × 1-second vibrator pulses on each detection (requires vibrator hardware). |
 | **BLE Spam** | Broadcasts fake BLE advertisements — Apple Prox. Pair (13 device types), Samsung Fast Connect (6 models), Google Fast Pair (12 model IDs), Windows Swift Pair, Apple Find My (AirTag), Samsung SmartTag, **Sour Apple** (Apple Nearby Action 0x0F — cycles 11 action types to flood iOS with system popups), or All simultaneously |
-| **Drone Detector** | Passive BLE scan for DJI/Remote ID drone advertisements — detects drones broadcasting operator ID and location data |
+| **Drone Detector** | Dual-mode passive Remote ID scanner (BLE5 extended advertising + WiFi promiscuous 2.4 & 5 GHz). Detects all ASTM F3411-compliant drones (DJI, Autel, Parrot, Skydio, …) via ASTM service UUID 0xFFFA; DJI presence via OUI 48:1C:B9 or service 0xFFF0. WiFi side covers NAN channel 6, ODID management IE, and DJI proprietary DroneID vendor IE (OUI 26:37:12). Tap any detected drone to open a detail view with parsed operator ID, UAS serial, location, altitude, and speed. Logs PCAP + JSON to `/sdcard/lab/dronedetect/`. |
 | **Device Spoof (directed)** | Clones the MAC address and name of a device pre-selected in BT Scan & Select — no additional selection step required |
 | **Device Spoof (general)** | Loads `/sdcard/lab/bluetooth/spooflist.csv`; select an entry or add new devices via on-screen keyboard, then START to begin spoofing |
 | **BLE Disconnect (directed)** | Floods a BT Scan & Select pre-selected target with BLE TERMINATE_IND frames to force disconnection |
@@ -770,6 +771,44 @@ Bluetooth
 | **WhisperPair** | CVE-2025-36911 Google Fast Pair Key-Based Pairing (KBP) bypass scanner. Passively detects Fast Pair–capable devices during BLE scan (tagged `[FP]` in scan list). Three attack modes: **Detect** (passive advertisement fingerprinting), **Probe** (GATT connect + service enumeration, confirms 0xFE2C service presence), and **Exploit** (writes a crafted AES-128-ECB encrypted KBP packet to trigger unsolicited pairing on vulnerable devices). All results logged to `/sdcard/lab/ble/whisperpair/`. *For authorized security research only.* |
 
 > **Note:** WiFi and BLE share the same radio. The firmware automatically switches between `RADIO_MODE_WIFI` and `RADIO_MODE_BLE` as needed.
+
+#### Drone Detector — How It Works
+
+**Drone Detector** is a passive **Remote ID** scanner. It alternates between a WiFi promiscuous phase and a BLE scan phase, looking for the operator ID, UAS serial number, GPS location, altitude, and speed that regulations in most jurisdictions now require drones to broadcast in real time.
+
+**Two scan phases run in a continuous loop:**
+
+| Phase | Duration | What it captures |
+|-------|----------|-----------------|
+| WiFi promiscuous | 10 s | Beacon / management frames on 2.4 GHz ch 1/6/11 + 5 GHz UNII-1 (36/40/44/48) + UNII-3 (149/153/157/161/165) |
+| BLE extended scan | 5 s | BLE 5.0 extended advertising on 1M + Coded PHY (legacy 1M-only fallback when extended adv is unavailable) |
+
+**What gets detected:**
+
+| Signal | Standard / Source | Decodes |
+|--------|------------------|---------|
+| BLE service UUID `0xFFFA` service-data AD | ASTM F3411 (all compliant brands — DJI, Autel, Parrot, Skydio, Holy Stone, …) | Full Remote ID message: operator ID, UAS serial, location, altitude, speed, timestamp |
+| BLE manufacturer data, company `0x0E00`, code `0x0D` | Legacy OpenDroneID alternate form | Same as above |
+| BLE OUI `48:1C:B9` or service UUID `0xFFF0` | DJI presence beacon (extended advertising) | Labels "DJI drone (BLE)"; RID payload parsed if included |
+| WiFi beacon ODID management IE `0xFA 0x0B 0xBC` | ASTM F3411 over WiFi | Full Remote ID message |
+| WiFi NAN SDF frame, service `50:6F:9A` | NAN-based Remote ID | Full Remote ID message |
+| WiFi vendor IE `0xDD`, OUI `26:37:12` | DJI proprietary DroneID | Presence + 16-byte ASCII serial; lat/lon best-effort (GPS decode untested on hardware) |
+
+**Important caveat — airborne DJI detection:**
+The DJI Mini 4 Pro (and other recent DJI models using OcuSync 4) do **not** broadcast standard OpenDroneID in flight. Their Remote ID is embedded in the encrypted OcuSync 4 link, which is not decodable by the ESP32 or commodity SDR hardware. CYM will detect these drones on the ground via their BLE pairing/presence beacon. A drone with a standards-compliant Remote ID (required by ASTM F3411 / EU 2019/945) will be detected at range in both phases.
+
+**Detail view:**
+
+Tap any row in the drone list to open a detail screen showing all decoded fields for that drone:
+
+- UAS ID / operator ID / serial number
+- Location (lat, lon), altitude (m), speed (m/s), heading
+- ID type, category, classification
+- Source (BLE / WiFi), RSSI, packet count, last seen
+
+**Output logs** saved to `/sdcard/lab/dronedetect/`:
+- `drone_YYYYMMDD_HHMMSS.pcap` — raw BLE advertising packets (Kismet PCAPNG format)
+- `drone_YYYYMMDD_HHMMSS.json` — parsed Remote ID records for all detected drones
 
 #### BT Scan & Select — How It Works
 
