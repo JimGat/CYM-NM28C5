@@ -418,7 +418,7 @@
       };
 
       const state = { manifest:null, channel:"stable", port:null, onDisconnect:null, esploader:null, chip:null, connected:false, flashing:false, monitorPort:null, monitorReader:null, monitorWriter:null, monitorPipe:null, monitorDisconnect:null, monitorConnected:false, lastPort:null };
-      const PAGE_VERSION = "2.9.3";  // keep connected=true after flash so Disconnect routes correctly
+      const PAGE_VERSION = "2.9.4";  // keep port open after flash so disconnect() RTS reset actually fires
       const RAW_BASE = "https://raw.githubusercontent.com/JimGat/CYM-NM28C5/Jimgat_Dev/ESP32C5";
       const DEV_MANIFEST_URL = `${RAW_BASE}/docs/manifest.json`;
       const RAW_BIN = `${RAW_BASE}/binaries-esp32c5`;
@@ -699,10 +699,10 @@
           setStatus("Flash complete - board rebooting!");
           log("Flash complete.");
 
-          // Use the library's own disconnect() to release all internal stream locks before
-          // closing the port. Manually canceling transport.reader is insufficient — ESPLoader
-          // uses piped transform streams internally that only its own disconnect() fully tears down.
-          // Pattern from ESPConnect: Promise.race(loader.disconnect(), sleep(800)) then device.close().
+          // Tear down the ESPLoader transport (releases SLIP stream locks) but do NOT
+          // close the physical port. Keeping the port open lets disconnect() send an
+          // RTS firmware-reset pulse before closing — if we close here, state.port becomes
+          // null, the if(state.port) block in disconnect() is skipped, and no reset fires.
           if (state.esploader) {
             try { await Promise.race([state.esploader.disconnect(), sleep(800)]); } catch {}
           }
@@ -710,15 +710,13 @@
             try { state.port?.removeEventListener("disconnect", state.onDisconnect); } catch {}
             state.onDisconnect = null;
           }
-          try { await state.port?.close(); } catch {}
-          state.lastPort = state.port;   // keep SerialPort reference for monitor reuse
-          state.port = null; state.esploader = null; state.chip = null;
-          // Keep state.connected = true so the button still reads "Disconnect" and
-          // routes through disconnect() (which resets the board) before returning to
-          // the "Connect" idle state. Setting connected=false here causes the button
-          // to call connect() → requestPort() picker on the very next click, which is wrong.
+          // state.port stays open — disconnect() will send the RTS reset and close it.
+          state.lastPort = state.port;   // also save reference for Monitor reuse
+          state.esploader = null; state.chip = null;
+          // state.connected stays true → button reads "Disconnect" → routes to disconnect()
+          // not connect() → no serial picker on that click.
           ui.chip.style.display = "none";
-          log("→ Board running firmware. Click 'Disconnect' to release the port, or 'Monitor' for serial output.");
+          log("→ Board running firmware. Click 'Disconnect' to reset and release port, or 'Monitor' for serial output.");
         } catch (err) {
           setStatus(err.message || "Flash failed", "error");
           log(`Error: ${err.message || err}`);
