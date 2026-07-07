@@ -34,6 +34,11 @@ static volatile bool      s_cancel_req  = false;
 static int s_cur_svc = 0;
 static int s_cur_chr = 0;
 
+/* ── Interactive / keep-connected state ─────────────────────────── */
+static bool                 s_keep_connected = false;
+static gw_int_notify_cb_t   s_int_notify_cb  = NULL;
+static void                *s_int_notify_arg  = NULL;
+
 /* ── Probe phase state ───────────────────────────────────────────── */
 static SemaphoreHandle_t  s_probe_conn_sem  = NULL;
 static SemaphoreHandle_t  s_probe_write_sem = NULL;
@@ -442,16 +447,22 @@ static void s_finish(void)
     s_fire_event(GW_EVENT_READING); /* final reading-done event */
 
     bool saved = s_write_json();
-    s_disconnect();
+
+    /* Only disconnect if interactive mode is not requested — keep-connected
+     * leaves the link open so the result screen can read/write/subscribe. */
+    if (!s_keep_connected) {
+        s_disconnect();
+    }
 
     if (saved) {
         s_fire_event(GW_EVENT_SAVED);
-        s_notify_ui("Walk complete");
+        s_notify_ui(s_keep_connected ? "Walk complete — connected" : "Walk complete");
         s_set_state(GW_STATE_COMPLETE);
         s_fire_event(GW_EVENT_COMPLETE);
     } else {
         s_notify_ui("Save failed");
         s_set_state(GW_STATE_FAILED);
+        if (!s_keep_connected) s_disconnect();
         s_fire_event(GW_EVENT_FAILED);
     }
 }
@@ -735,7 +746,7 @@ static int s_gap_cb(struct ble_gap_event *event, void *arg)
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         return 0;
 
-    case BLE_GAP_EVENT_NOTIFY_RX:
+    case BLE_GAP_EVENT_NOTIFY_RX: {
         if (s_state == GW_STATE_PROBING && s_probe_cur_chr) {
             gw_chr_t *chr = (gw_chr_t *)s_probe_cur_chr;
             if (chr->probe_frame_count < 8) {
@@ -747,6 +758,21 @@ static int s_gap_cb(struct ble_gap_event *event, void *arg)
                 chr->probe_frame_count++;
             }
         }
+        /* Forward notifications to interactive callback when in keep-connected mode */
+        if (s_keep_connected && s_int_notify_cb) {
+            uint16_t nlen = OS_MBUF_PKTLEN(event->notify_rx.om);
+            if (nlen > 512) nlen = 512;
+            uint8_t nbuf[512];
+            os_mbuf_copydata(event->notify_rx.om, 0, nlen, nbuf);
+            s_int_notify_cb(event->notify_rx.attr_handle, nbuf, nlen, s_int_notify_arg);
+        }
+        return 0;
+    }
+
+    case BLE_GAP_EVENT_ENC_CHANGE:
+        ESP_LOGI(TAG, "Encryption change: status=%d encrypted=%d",
+                 event->enc_change.status,
+                 event->enc_change.status == 0 ? 1 : 0);
         return 0;
 
     default:
@@ -786,6 +812,42 @@ void gw_set_timeout(uint32_t ms) { s_connect_timeout_ms = (ms < 1000) ? 1000 : m
 gw_state_t gw_get_state(void) { return s_state; }
 
 const gw_result_t *gw_get_result(void) { return s_result; }
+
+/* ── Interactive / keep-connected API ───────────────────────────── */
+
+void gw_set_keep_connected(bool keep)
+{
+    s_keep_connected = keep;
+}
+
+uint16_t gw_get_conn_handle(void)
+{
+    return s_conn_handle;
+}
+
+bool gw_is_connected(void)
+{
+    return s_conn_handle != BLE_HS_CONN_HANDLE_NONE;
+}
+
+void gw_disconnect(void)
+{
+    s_keep_connected = false;   /* clear flag so teardown doesn't re-enter */
+    s_int_notify_cb  = NULL;
+    s_disconnect();
+}
+
+int gw_bond(void)
+{
+    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return BLE_HS_ENOTCONN;
+    return ble_gap_security_initiate(s_conn_handle);
+}
+
+void gw_set_int_notify_cb(gw_int_notify_cb_t cb, void *arg)
+{
+    s_int_notify_cb  = cb;
+    s_int_notify_arg = arg;
+}
 
 bool gw_walk(const uint8_t mac[6], uint8_t addr_type, const char *name,
              int8_t rssi, double lat, double lon, bool gps_valid)
@@ -836,10 +898,12 @@ bool gw_walk(const uint8_t mac[6], uint8_t addr_type, const char *name,
              s_result->timestamp,
              mac[5], mac[4], mac[3], mac[2], mac[1], mac[0]);
 
-    s_cancel_req  = false;
-    s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-    s_cur_svc     = 0;
-    s_cur_chr     = 0;
+    s_cancel_req     = false;
+    s_conn_handle    = BLE_HS_CONN_HANDLE_NONE;
+    s_cur_svc        = 0;
+    s_cur_chr        = 0;
+    s_int_notify_cb  = NULL;
+    s_int_notify_arg = NULL;
 
     gw_ui_svc_count = 0;
     gw_ui_chr_count = 0;

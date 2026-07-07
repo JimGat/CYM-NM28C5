@@ -7,7 +7,7 @@ set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-zmuldefs")
 # Update ONLY this line when bumping the version. It is automatically propagated
 # to both the IDF boot log (app_init: App version) and to the FW_VERSION macro
 # used throughout the firmware — no need to edit wifi_common.h separately.
-set(PROJECT_VER "v2.10.29")
+set(PROJECT_VER "v2.10.37")
 
 # Bootstrap ESP-IDF build system
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
@@ -51,3 +51,26 @@ add_custom_command(
             "${EXPORT_DIR}/partition-table.bin"
     COMMENT "Copying firmware to ${EXPORT_DIR}"
 )
+
+# ===== POST-BUILD: update memory-budget.md from the linker map =====
+# Parses build/CYM-NM28C5.map and rewrites the auto-update tables in
+# docs/memory-budget.md so the committed doc always matches the binary.
+# Requires Python 3 (available in the IDF virtual-env).
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if(Python3_FOUND)
+    # Get the binary size at configure time (we use file(SIZE …) at build time via generator expression)
+    # Pass the .bin path; the script stats it for the binary size.
+    add_custom_command(
+        TARGET "gen_${CMAKE_PROJECT_NAME}_binary" POST_BUILD
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/tools/update_memory_map.py"
+                "${CMAKE_BINARY_DIR}/${CMAKE_PROJECT_NAME}.map"
+                "${CMAKE_SOURCE_DIR}/docs"
+                "${PROJECT_VER}"
+                "${EXPORT_DIR}/${CMAKE_PROJECT_NAME}.bin"
+        COMMENT "Updating docs/memory-budget.md from linker map"
+        VERBATIM
+    )
+else()
+    message(STATUS "[memory_map] Python3 not found — skipping memory-budget.md update")
+endif()

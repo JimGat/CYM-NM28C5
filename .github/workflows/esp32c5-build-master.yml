@@ -176,7 +176,8 @@ jobs:
           set -euo pipefail
           TAG="${EVENT_TAG:-}"
           if [ -z "$TAG" ]; then TAG="${INPUT_TAG:-}"; fi
-          if [ -z "$TAG" ]; then TAG="v${FW_VERSION}"; fi
+          # FW_VERSION already contains the leading 'v' (e.g. "v2.10.25") — do not add another.
+          if [ -z "$TAG" ]; then TAG="${FW_VERSION}"; fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Using tag: $TAG"
 
@@ -238,7 +239,8 @@ jobs:
           set -euo pipefail
           TAG="${EVENT_TAG:-}"
           if [ -z "$TAG" ]; then TAG="${INPUT_TAG:-}"; fi
-          if [ -z "$TAG" ]; then TAG="v${FW_VERSION}"; fi
+          # FW_VERSION already contains the leading 'v' (e.g. "v2.10.25") — do not add another.
+          if [ -z "$TAG" ]; then TAG="${FW_VERSION}"; fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Using tag: $TAG"
 
@@ -335,7 +337,8 @@ jobs:
             exit 0
           fi
 
-          TAG="${RELEASE_TAG:-v${FW_VERSION}}"
+          # FW_VERSION already contains the leading 'v' — do not add another.
+          TAG="${RELEASE_TAG:-${FW_VERSION}}"
           BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
           RELEASE_PAGE="https://github.com/${REPO}/releases/tag/${TAG}"
           PAGE_LINK="${PAGES_URL:-https://${GITHUB_REPOSITORY%/*}.github.io/${GITHUB_REPOSITORY#*/}/}"

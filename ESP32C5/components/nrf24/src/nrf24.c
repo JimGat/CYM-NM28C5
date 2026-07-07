@@ -487,7 +487,9 @@ esp_err_t nrf24_sniff(uint8_t channel, uint8_t payload_len,
 
     while (!s_drv->cancel && !(cancel && *cancel)) {
         if (timeout_ms > 0 && esp_timer_get_time() >= deadline) break;
-        if (nrf24_data_ready()) {
+        // Drain the full 3-deep RX FIFO each poll cycle — a single `if` silently
+        // drops up to 2 packets that arrived since the last tick.
+        while (nrf24_data_ready()) {
             nrf24_packet_t pkt = { .channel = channel };
             pkt.len = nrf24_read_payload(pkt.data, 32);
             s_drv->cap_count++;
@@ -577,8 +579,16 @@ esp_err_t nrf24_sfhss_scan(nrf24_sfhss_t *out, uint32_t timeout_ms,
 esp_err_t nrf24_capture_save(const nrf24_capture_t *cap, const char *path)
 {
     if (!cap || !path) return ESP_ERR_INVALID_ARG;
+    // FAT/SD SPI transactions share SPI2_HOST with the display DMA.  Without
+    // sd_spi_mutex the display flush (inside lv_timer_handler) blocks on the
+    // SPI host's internal lock while holding sd_spi_mutex, freezing the main
+    // loop for the entire save duration (observed: 785 ms – 1530 ms stalls).
+    if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
     FILE *f = fopen(path, "w");
-    if (!f) return ESP_FAIL;
+    if (!f) {
+        if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+        return ESP_FAIL;
+    }
 
     fprintf(f, "Filetype: Flipper NRF24 RAW File\r\n");
     fprintf(f, "Version: 1\r\n");
@@ -596,6 +606,7 @@ esp_err_t nrf24_capture_save(const nrf24_capture_t *cap, const char *path)
         fprintf(f, "\r\n");
     }
     fclose(f);
+    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
     return ESP_OK;
 }
 
