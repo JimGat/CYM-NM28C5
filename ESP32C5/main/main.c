@@ -41133,6 +41133,17 @@ static void s_cc1101_freq_btn_cb(lv_event_t *e)
     }
 }
 
+// Stop hook — kills the 250 ms RSSI timer and NULLs every lv_obj_t* the
+// timer/button callbacks touch, so they can't fire against freed objects
+// after Home or top-bar Back tears down the screen.
+static void cc1101_freq_scan_stop(void)
+{
+    if (s_cc1101_tmr) { lv_timer_del(s_cc1101_tmr); s_cc1101_tmr = NULL; }
+    s_cc1101_rssi_lbl  = NULL;
+    s_cc1101_rssi_bar  = NULL;
+    s_cc1101_freq_hdr  = NULL;
+}
+
 static void show_cc1101_freq_scan_screen(void)
 {
     if (!cc1101_is_init()) {
@@ -41148,6 +41159,7 @@ static void show_cc1101_freq_scan_screen(void)
     cc1101_rx();
 
     create_function_page_base("CC1101 Freq Scan");
+    g_screen_stop_fn = cc1101_freq_scan_stop;
     apply_menu_bg();
 
     lv_obj_t *card = lv_obj_create(function_page);
