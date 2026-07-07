@@ -418,7 +418,7 @@
       };
 
       const state = { manifest:null, channel:"stable", port:null, onDisconnect:null, esploader:null, chip:null, connected:false, flashing:false, monitorPort:null, monitorReader:null, monitorWriter:null, monitorPipe:null, monitorDisconnect:null, monitorConnected:false, lastPort:null };
-      const PAGE_VERSION = "2.9.0";  // port reuse: use esploader.disconnect() to fully release stream locks
+      const PAGE_VERSION = "2.9.1";  // reset board to firmware via RTS/DTR when monitor opens
       const RAW_BASE = "https://raw.githubusercontent.com/JimGat/CYM-NM28C5/Jimgat_Dev/ESP32C5";
       const DEV_MANIFEST_URL = `${RAW_BASE}/docs/manifest.json`;
       const RAW_BIN = `${RAW_BASE}/binaries-esp32c5`;
@@ -788,6 +788,16 @@
             state.monitorPort.addEventListener("disconnect", state.monitorDisconnect);
             await state.monitorPort.open({ baudRate: parseInt(ui.monitorBaud.value, 10) || 115200 });
           }
+          // Reset board to firmware run mode (same pattern as ESPConnect startMonitorFlow):
+          // RTS → EN pin: assert (true) pulls EN low = chip in reset
+          // DTR → IO0 pin: keep false = IO0 HIGH = firmware boot, not download mode
+          // Release RTS → EN HIGH → chip boots into firmware, not ROM bootloader
+          try {
+            await state.monitorPort.setSignals({ dataTerminalReady: false, requestToSend: true });
+            await sleep(100);
+            await state.monitorPort.setSignals({ dataTerminalReady: false, requestToSend: false });
+            await sleep(400); // wait for ESP32-C5 to finish booting before reading
+          } catch {}
           const decoder = new TextDecoderStream();
           state.monitorPipe = state.monitorPort.readable.pipeTo(decoder.writable).catch(() => {});
           state.monitorReader = decoder.readable.getReader();
