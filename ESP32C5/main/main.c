@@ -37568,10 +37568,25 @@ static void wana_ui_timer_cb(lv_timer_t *t) {
     show_wana_select_screen();
 }
 
+static void wana_screen_stop(void)
+{
+    wana_active        = false;
+    wana_scanning      = false;
+    wana_scroll_paused = false;
+    if (wana_scroll_timer) { lv_timer_del(wana_scroll_timer); wana_scroll_timer = NULL; }
+    if (wana_ui_timer)     { lv_timer_del(wana_ui_timer);     wana_ui_timer     = NULL; }
+    wana_chart_obj  = NULL;
+    wana_status_lbl = NULL;
+    wana_panel      = NULL;
+    wana_clear_ssid_labels();
+    if (wana_buf) { heap_caps_free(wana_buf); wana_buf = NULL; }
+}
+
 static void show_wifi_analyzer_screen(void) {
     if (!ensure_wifi_mode()) return;
 
     create_function_page_base("Chanalizer");
+    g_screen_stop_fn = wana_screen_stop;
 
     wana_active       = true;
     wana_scanning     = true;
@@ -37754,11 +37769,24 @@ static void wscope_band_toggle_cb(lv_event_t *e) {
         memset(wscope_buf, 0, WSCOPE_W * WSCOPE_CANVAS_H * sizeof(lv_color_t));
 }
 
+static void wscope_screen_stop(void)
+{
+    wscope_active = false;   // wscope_task checks this flag and exits its while loop
+    if (wscope_ui_timer) { lv_timer_del(wscope_ui_timer); wscope_ui_timer = NULL; }
+    wscope_canvas     = NULL;
+    wscope_status_lbl = NULL;
+    wscope_ax_lbl     = NULL;
+    // wscope_buf is only written by the now-deleted UI timer, not by wscope_task itself,
+    // so it is safe to free immediately even if the task hasn't exited yet.
+    if (wscope_buf) { heap_caps_free(wscope_buf); wscope_buf = NULL; }
+}
+
 static void show_wscope_screen(void) {
     if (!ensure_wifi_mode()) return;
     wifi_scanner_abort();   // stop any in-progress scan
 
     create_function_page_base("WiFi Band Scope");
+    g_screen_stop_fn = wscope_screen_stop;
     wscope_active     = true;
     wscope_5g_mode    = false;
     wscope_sweep_done = false;
