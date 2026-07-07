@@ -44789,7 +44789,14 @@ static void nrf24_sniffer_screen_stop(void)
 
 static void show_nrf24_sniffer_screen(void)
 {
-    if (s_nsniff) { s_nsniff->active = false; s_nsniff->cancel = true; }
+    if (s_nsniff) {
+        s_nsniff->active = false;
+        s_nsniff->cancel = true;
+        // Wait for the old task to fully exit — it does SPI to the nRF24 and SD card
+        // after the sniff loop exits (flush_rx + capture_save).  Starting a new nRF24
+        // init while those SPI transactions are in flight corrupts the bus.
+        for (int i = 0; i < 150 && s_nsniff->task; i++) vTaskDelay(pdMS_TO_TICKS(10));
+    }
 
     if (!nrf24_is_init()) {
         nrf24_hat_claim();
