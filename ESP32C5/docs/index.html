@@ -417,8 +417,8 @@
         devWarning: document.getElementById("devWarning"),
       };
 
-      const state = { manifest:null, channel:"stable", port:null, onDisconnect:null, esploader:null, chip:null, connected:false, flashing:false, monitorPort:null, monitorReader:null, monitorWriter:null, monitorPipe:null, monitorDisconnect:null, monitorConnected:false };
-      const PAGE_VERSION = "2.7.0";  // hardResetToFirmware + Quick Flash app-only button
+      const state = { manifest:null, channel:"stable", port:null, onDisconnect:null, esploader:null, chip:null, connected:false, flashing:false, monitorPort:null, monitorReader:null, monitorWriter:null, monitorPipe:null, monitorDisconnect:null, monitorConnected:false, lastPort:null };
+      const PAGE_VERSION = "2.8.0";  // port reuse: monitor opens on same port after flash (ESPConnect-style)
       const RAW_BASE = "https://raw.githubusercontent.com/JimGat/CYM-NM28C5/Jimgat_Dev/ESP32C5";
       const DEV_MANIFEST_URL = `${RAW_BASE}/docs/manifest.json`;
       const RAW_BIN = `${RAW_BASE}/binaries-esp32c5`;
@@ -698,6 +698,21 @@
           ui.progress.style.width = "100%";
           setStatus("Flash complete - board rebooting!");
           log("Flash complete.");
+
+          // Release the transport's stream locks and close the port so Monitor can reopen
+          // the SAME physical port at 115200 without another requestPort() picker prompt.
+          try { await state.esploader?.transport?.reader?.cancel?.(); } catch {}
+          await sleep(100); // let the cancel propagate through the pipeline
+          try { state.esploader?.transport?.writer?.releaseLock?.(); } catch {}
+          if (state.onDisconnect) {
+            try { state.port?.removeEventListener("disconnect", state.onDisconnect); } catch {}
+            state.onDisconnect = null;
+          }
+          try { await state.port?.close(); } catch {}
+          state.lastPort = state.port;   // keep SerialPort reference for monitor reuse
+          state.port = null; state.esploader = null; state.chip = null; state.connected = false;
+          ui.chip.style.display = "none";
+          log("→ Click 'Monitor' to open serial console on the same port (no re-select needed).");
         } catch (err) {
           setStatus(err.message || "Flash failed", "error");
           log(`Error: ${err.message || err}`);
@@ -711,17 +726,15 @@
 
       const disconnect = async () => {
         if (state.port && state.onDisconnect) try { state.port.removeEventListener("disconnect", state.onDisconnect); } catch {}
-        // Release any reader/writer locks the tasmota library holds on the port
         if (state.port) {
-          try { const r = state.port.readable?.getReader(); r?.releaseLock(); } catch {}
-          try {
-            if (state.port.readable?.locked) {
-              // Can't get a reader if locked — cancel via the esploader if possible
-              await state.esploader?.transport?.reader?.cancel?.().catch(() => {});
-            }
-          } catch {}
-          try { const w = state.port.writable?.getWriter(); w?.releaseLock(); } catch {}
+          // Cancel the transport's own reader — the only safe way to release a locked ReadableStream.
+          // (Calling getReader() on a locked stream throws; the old catch-swallow approach was silent no-op.)
+          try { await state.esploader?.transport?.reader?.cancel?.(); } catch {}
+          await sleep(50);
+          // Release writer lock if transport holds one
+          try { state.esploader?.transport?.writer?.releaseLock?.(); } catch {}
           try { await state.port.close(); } catch {}
+          state.lastPort = state.port; // save physical port for monitor reuse without re-picker
         }
         state.port = null; state.onDisconnect = null; state.esploader = null; state.chip = null; state.connected = false;
         ui.chip.style.display = "none";
@@ -752,12 +765,28 @@
         if (state.flashing) throw new Error("Cannot start monitor while flashing is in progress.");
         if (state.connected) await disconnect();
         ui.monitorBtn.disabled = true;
-        setMonitorStatus("Requesting serial port...");
         try {
-          state.monitorPort = await navigator.serial.requestPort({});
+          // If we just flashed, reuse the same SerialPort — skip the requestPort() picker.
+          // state.lastPort is set by disconnect() and by the post-flash cleanup in flash().
+          if (state.lastPort) {
+            setMonitorStatus("Reopening port from flash session...");
+            state.monitorPort = state.lastPort;
+            state.lastPort = null;
+          } else {
+            setMonitorStatus("Requesting serial port...");
+            state.monitorPort = await navigator.serial.requestPort({});
+          }
           state.monitorDisconnect = () => { disconnectMonitor().catch(() => {}); setMonitorStatus("Monitor disconnected by device.", "error"); };
           try { state.monitorPort.addEventListener("disconnect", state.monitorDisconnect); } catch {}
-          await state.monitorPort.open({ baudRate: parseInt(ui.monitorBaud.value, 10) || 115200 });
+          try {
+            await state.monitorPort.open({ baudRate: parseInt(ui.monitorBaud.value, 10) || 115200 });
+          } catch (openErr) {
+            // Port may already be open if close() didn't fully complete — try a fresh picker
+            log(`Port reopen failed (${openErr?.message || openErr}), falling back to port picker.`);
+            state.monitorPort = await navigator.serial.requestPort({});
+            state.monitorPort.addEventListener("disconnect", state.monitorDisconnect);
+            await state.monitorPort.open({ baudRate: parseInt(ui.monitorBaud.value, 10) || 115200 });
+          }
           const decoder = new TextDecoderStream();
           state.monitorPipe = state.monitorPort.readable.pipeTo(decoder.writable).catch(() => {});
           state.monitorReader = decoder.readable.getReader();
