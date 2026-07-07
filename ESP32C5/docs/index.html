@@ -418,7 +418,7 @@
       };
 
       const state = { manifest:null, channel:"stable", port:null, onDisconnect:null, esploader:null, chip:null, connected:false, flashing:false, monitorPort:null, monitorReader:null, monitorWriter:null, monitorPipe:null, monitorDisconnect:null, monitorConnected:false, lastPort:null };
-      const PAGE_VERSION = "2.9.2";  // reset to firmware on disconnect(); RTS/DTR pulse on monitor open
+      const PAGE_VERSION = "2.9.3";  // keep connected=true after flash so Disconnect routes correctly
       const RAW_BASE = "https://raw.githubusercontent.com/JimGat/CYM-NM28C5/Jimgat_Dev/ESP32C5";
       const DEV_MANIFEST_URL = `${RAW_BASE}/docs/manifest.json`;
       const RAW_BIN = `${RAW_BASE}/binaries-esp32c5`;
@@ -712,16 +712,22 @@
           }
           try { await state.port?.close(); } catch {}
           state.lastPort = state.port;   // keep SerialPort reference for monitor reuse
-          state.port = null; state.esploader = null; state.chip = null; state.connected = false;
+          state.port = null; state.esploader = null; state.chip = null;
+          // Keep state.connected = true so the button still reads "Disconnect" and
+          // routes through disconnect() (which resets the board) before returning to
+          // the "Connect" idle state. Setting connected=false here causes the button
+          // to call connect() → requestPort() picker on the very next click, which is wrong.
           ui.chip.style.display = "none";
-          log("→ Click 'Monitor' to open serial console on the same port (no re-select needed).");
+          log("→ Board running firmware. Click 'Disconnect' to release the port, or 'Monitor' for serial output.");
         } catch (err) {
           setStatus(err.message || "Flash failed", "error");
           log(`Error: ${err.message || err}`);
         } finally {
           state.flashing = false;
-          ui.flashBtn.disabled = !state.connected;
-          ui.quickFlashBtn.disabled = !state.connected;
+          // After a successful flash state.connected stays true (Disconnect button still shown)
+          // but flash buttons must stay disabled — can't reflash without a fresh connect.
+          ui.flashBtn.disabled = true;
+          ui.quickFlashBtn.disabled = true;
           ui.connectBtn.disabled = false;
         }
       };
