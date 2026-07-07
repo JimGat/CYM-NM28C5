@@ -7090,7 +7090,7 @@ void app_main(void)
                 }
                 if (drone_status_lbl && lv_obj_is_valid(drone_status_lbl)) {
                     if (drone_phase_ble)
-                        lv_label_set_text(drone_status_lbl, MY_SYMBOL_BLUETOOTH_B "  BLE scanning...");
+                        lv_label_set_text(drone_status_lbl, LV_SYMBOL_BLUETOOTH "  BLE scanning...");
                     else
                         lv_label_set_text(drone_status_lbl, LV_SYMBOL_WIFI "  WiFi NAN (ch 1/6/11)...");
                 }
