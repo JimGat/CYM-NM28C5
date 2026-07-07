@@ -418,7 +418,7 @@
       };
 
       const state = { manifest:null, channel:"stable", port:null, onDisconnect:null, esploader:null, chip:null, connected:false, flashing:false, monitorPort:null, monitorReader:null, monitorWriter:null, monitorPipe:null, monitorDisconnect:null, monitorConnected:false, lastPort:null };
-      const PAGE_VERSION = "2.9.6";  // keep loader alive after flash so disconnect() uses reliable hardResetToFirmware()
+      const PAGE_VERSION = "2.9.7";  // revert disconnect() to setSignals(); keep loader alive after flash (2.9.6 fix)
       const RAW_BASE = "https://raw.githubusercontent.com/JimGat/CYM-NM28C5/Jimgat_Dev/ESP32C5";
       const DEV_MANIFEST_URL = `${RAW_BASE}/docs/manifest.json`;
       const RAW_BIN = `${RAW_BASE}/binaries-esp32c5`;
@@ -730,22 +730,17 @@
       const disconnect = async () => {
         if (state.port && state.onDisconnect) try { state.port.removeEventListener("disconnect", state.onDisconnect); } catch {}
         if (state.port) {
-          // Reset board to firmware run mode before tearing down the transport.
-          // Prefer the loader's own hardResetToFirmware() when the loader is alive — it uses
-          // the active transport and is reliable. Fall back to direct setSignals() only when
-          // the loader is unavailable (e.g. monitor-only session with no prior flash/connect).
-          if (state.esploader) {
-            log("Resetting board to firmware via loader...");
-            try { await state.esploader.hardResetToFirmware(); }
-            catch { try { await state.esploader.hardReset(); } catch {} }
-          } else {
-            log("Resetting board to firmware via RTS...");
-            try {
-              await state.port.setSignals({ dataTerminalReady: false, requestToSend: true });
-              await sleep(100);
-              await state.port.setSignals({ dataTerminalReady: false, requestToSend: false });
-            } catch {}
-          }
+          // Reset board to firmware via direct setSignals() — unconditional and reliable.
+          // Do NOT use esploader.hardResetToFirmware(): after runStub() the loader becomes
+          // a stub instance that may lack this method; both calls fail silently and no reset
+          // fires. Direct setSignals() works while the port is open regardless of loader state.
+          // This requires the port to be in a clean (undisturbed) state — which is guaranteed
+          // because the flash cleanup no longer calls esploader.disconnect() prematurely.
+          try {
+            await state.port.setSignals({ dataTerminalReady: false, requestToSend: true });
+            await sleep(100);
+            await state.port.setSignals({ dataTerminalReady: false, requestToSend: false });
+          } catch {}
           // Tear down loader transport to release stream locks, then close port
           if (state.esploader) {
             try { await Promise.race([state.esploader.disconnect(), sleep(800)]); } catch {}
