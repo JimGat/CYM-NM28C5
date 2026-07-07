@@ -418,7 +418,7 @@
       };
 
       const state = { manifest:null, channel:"stable", port:null, onDisconnect:null, esploader:null, chip:null, connected:false, flashing:false, monitorPort:null, monitorReader:null, monitorWriter:null, monitorPipe:null, monitorDisconnect:null, monitorConnected:false, lastPort:null };
-      const PAGE_VERSION = "2.9.5";  // unconditional setSignals() reset in disconnect() — optional-chain was silent no-op
+      const PAGE_VERSION = "2.9.6";  // keep loader alive after flash so disconnect() uses reliable hardResetToFirmware()
       const RAW_BASE = "https://raw.githubusercontent.com/JimGat/CYM-NM28C5/Jimgat_Dev/ESP32C5";
       const DEV_MANIFEST_URL = `${RAW_BASE}/docs/manifest.json`;
       const RAW_BIN = `${RAW_BASE}/binaries-esp32c5`;
@@ -699,22 +699,19 @@
           setStatus("Flash complete - board rebooting!");
           log("Flash complete.");
 
-          // Tear down the ESPLoader transport (releases SLIP stream locks) but do NOT
-          // close the physical port. Keeping the port open lets disconnect() send an
-          // RTS firmware-reset pulse before closing — if we close here, state.port becomes
-          // null, the if(state.port) block in disconnect() is skipped, and no reset fires.
-          if (state.esploader) {
-            try { await Promise.race([state.esploader.disconnect(), sleep(800)]); } catch {}
-          }
+          // Do NOT call esploader.disconnect() here — that disturbs the port's stream
+          // state and makes subsequent setSignals() calls fail silently. Leave the loader
+          // fully alive so disconnect() can use hardResetToFirmware() through the live
+          // transport (same reliable path as connect-then-disconnect without flash).
           if (state.onDisconnect) {
             try { state.port?.removeEventListener("disconnect", state.onDisconnect); } catch {}
             state.onDisconnect = null;
           }
-          // state.port stays open — disconnect() will send the RTS reset and close it.
-          state.lastPort = state.port;   // also save reference for Monitor reuse
-          state.esploader = null; state.chip = null;
-          // state.connected stays true → button reads "Disconnect" → routes to disconnect()
-          // not connect() → no serial picker on that click.
+          // state.port open, state.esploader alive → disconnect() will use the loader's
+          // own hardResetToFirmware() for a reliable reset, then tear down transport + close.
+          state.lastPort = state.port;   // save reference for Monitor reuse
+          state.chip = null;
+          // state.connected stays true → "Disconnect" button routes to disconnect(), not connect()
           ui.chip.style.display = "none";
           log("→ Board running firmware. Click 'Disconnect' to reset and release port, or 'Monitor' for serial output.");
         } catch (err) {
@@ -733,16 +730,23 @@
       const disconnect = async () => {
         if (state.port && state.onDisconnect) try { state.port.removeEventListener("disconnect", state.onDisconnect); } catch {}
         if (state.port) {
-          // Reset board to firmware run mode: pulse RTS (→EN/reset) while DTR stays low (→IO0 HIGH = firmware boot).
-          // Done unconditionally via setSignals() — not via esploader?.hardResetToFirmware?.() because after
-          // flash esploader is null, optional-chain returns undefined, await undefined resolves without throwing,
-          // and the catch fallback never fires. Direct setSignals() always works while the port is open.
-          try {
-            await state.port.setSignals({ dataTerminalReady: false, requestToSend: true });
-            await sleep(100);
-            await state.port.setSignals({ dataTerminalReady: false, requestToSend: false });
-          } catch {}
-          // Tear down loader transport if still alive (connect-then-disconnect without flash)
+          // Reset board to firmware run mode before tearing down the transport.
+          // Prefer the loader's own hardResetToFirmware() when the loader is alive — it uses
+          // the active transport and is reliable. Fall back to direct setSignals() only when
+          // the loader is unavailable (e.g. monitor-only session with no prior flash/connect).
+          if (state.esploader) {
+            log("Resetting board to firmware via loader...");
+            try { await state.esploader.hardResetToFirmware(); }
+            catch { try { await state.esploader.hardReset(); } catch {} }
+          } else {
+            log("Resetting board to firmware via RTS...");
+            try {
+              await state.port.setSignals({ dataTerminalReady: false, requestToSend: true });
+              await sleep(100);
+              await state.port.setSignals({ dataTerminalReady: false, requestToSend: false });
+            } catch {}
+          }
+          // Tear down loader transport to release stream locks, then close port
           if (state.esploader) {
             try { await Promise.race([state.esploader.disconnect(), sleep(800)]); } catch {}
           }
