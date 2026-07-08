@@ -781,6 +781,7 @@ static gps_data_t g_gps_last_known = {0};  // persists across GPS dropouts; load
 // main-task context to avoid nvs_commit() disabling flash cache in a background task.
 static volatile bool g_gps_save_pending = false;
 static volatile bool g_gps_force_save_pending = false; // set on lock loss; bypasses 5-min throttle
+static volatile bool g_gps_uart_data_seen = false;     // set on first UART byte; distinguishes "no module" from "no fix"
 
 // Returns the best available GPS reading: live if valid, last-known (stale) if not.
 // Callers that write location data should always use this instead of current_gps directly.
@@ -24075,8 +24076,9 @@ static void gps_info_refresh_cb(lv_timer_t *t)
     if (!gps_info_fix_lbl || !lv_obj_is_valid(gps_info_fix_lbl)) return;
 
     char buf[80];
-    bool live = current_gps.valid;
+    bool live  = current_gps.valid;
     bool stale = !live && g_gps_last_known.valid;
+    bool seen  = g_gps_uart_data_seen;   // at least one UART byte ever received
 
     if (live) {
         lv_label_set_text(gps_info_fix_lbl, LV_SYMBOL_GPS " Fix: YES");
@@ -24084,9 +24086,13 @@ static void gps_info_refresh_cb(lv_timer_t *t)
     } else if (stale) {
         lv_label_set_text(gps_info_fix_lbl, LV_SYMBOL_GPS " Fix: NO  (last known " MY_SYMBOL_ARROW_DOWN ")");
         lv_obj_set_style_text_color(gps_info_fix_lbl, COLOR_MATERIAL_AMBER, 0);
-    } else {
+    } else if (seen) {
         lv_label_set_text(gps_info_fix_lbl, LV_SYMBOL_GPS " Fix: NO");
         lv_obj_set_style_text_color(gps_info_fix_lbl, COLOR_MATERIAL_ORANGE, 0);
+    } else {
+        /* No UART bytes at all — module not detected */
+        lv_label_set_text(gps_info_fix_lbl, LV_SYMBOL_WARNING " No GPS module detected");
+        lv_obj_set_style_text_color(gps_info_fix_lbl, COLOR_MATERIAL_RED, 0);
     }
 
     if (current_gps.time_utc[0] != '\0')
@@ -34156,6 +34162,7 @@ static void gps_task(void *arg)
 	for (;;) {
 		int len = uart_read_bytes(GPS_UART_NUM, (uint8_t *)gps_rx_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(200));
 		if (len > 0) {
+			g_gps_uart_data_seen = true;   // at least one byte received — module is wired up
 			gps_rx_buffer[len] = '\0';
 			char *line = strtok(gps_rx_buffer, "\r\n");
 			while (line != NULL) {
