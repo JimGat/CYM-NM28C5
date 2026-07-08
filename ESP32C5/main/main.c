@@ -5004,9 +5004,10 @@ static void hide_sd_loading_popup(void) {
 
 static volatile int s_sd_err_choice = 0;
 
-static void s_sd_err_retry_cb(lv_event_t *e)   { (void)e; s_sd_err_choice = SD_ERR_RETRY;    }
+static void s_sd_err_retry_cb(lv_event_t *e)   { (void)e; esp_restart(); }  // restart lets boot re-run the full SD speed-fallback sequence
 static void s_sd_err_format_cb(lv_event_t *e)  { (void)e; s_sd_err_choice = SD_ERR_FORMAT;   }
-static void s_sd_err_cont_cb(lv_event_t *e)    { (void)e; s_sd_err_choice = SD_ERR_CONTINUE; }
+static void s_sd_fmt_yes_cb(lv_event_t *e)     { (void)e; s_sd_err_choice = SD_ERR_RETRY;    }  // "Yes, format" in confirm dialog
+static void s_sd_fmt_no_cb(lv_event_t *e)      { (void)e; s_sd_err_choice = SD_ERR_CONTINUE; }  // "Cancel" in confirm dialog
 
 static void s_poll_lvgl_until(volatile int *flag, int sentinel)
 {
@@ -5034,12 +5035,12 @@ static int show_sd_error_screen(bool offer_format)
             ? "SD Card Error\n\n"
               "Card found but\nunreadable.\n"
               "Wrong format?\n\n"
-              "Retry, Format to\nFAT32, or Continue\nwithout SD."
+              "Tap Retry to restart\nor Format to FAT32."
             : "SD Card Error\n\n"
               "Card not responding.\n"
               "Requires FAT32\n"
               "(<= 32 GB)\n\n"
-              "Reseat card then\ntap Retry, or\ncontinue without SD.";
+              "Reseat card then\ntap Retry to restart.";
 
         lv_obj_t *lbl = lv_label_create(scr);
         lv_label_set_text(lbl, msg);
@@ -5078,20 +5079,6 @@ static int show_sd_error_screen(bool offer_format)
             lv_obj_center(fl);
             lv_obj_add_event_cb(fmt_btn, s_sd_err_format_cb, LV_EVENT_CLICKED, NULL);
         }
-
-        /* Continue — always bottom-right */
-        lv_obj_t *cont_btn = lv_btn_create(scr);
-        lv_obj_set_size(cont_btn, 100, 32);
-        lv_obj_align(cont_btn, LV_ALIGN_BOTTOM_RIGHT, -14, -12);
-        lv_obj_set_style_bg_color(cont_btn, lv_color_make(80, 80, 80), 0);
-        lv_obj_set_style_border_width(cont_btn, 0, 0);
-        lv_obj_set_style_radius(cont_btn, 8, 0);
-        lv_obj_t *cl = lv_label_create(cont_btn);
-        lv_label_set_text(cl, "Continue");
-        lv_obj_set_style_text_font(cl, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(cl, lv_color_white(), 0);
-        lv_obj_center(cl);
-        lv_obj_add_event_cb(cont_btn, s_sd_err_cont_cb, LV_EVENT_CLICKED, NULL);
 
         lv_scr_load(scr);
         lv_refr_now(NULL);
@@ -5135,7 +5122,7 @@ static bool show_sd_format_confirm(void)
         lv_obj_set_style_text_font(nl, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(nl, lv_color_white(), 0);
         lv_obj_center(nl);
-        lv_obj_add_event_cb(no_btn, s_sd_err_cont_cb, LV_EVENT_CLICKED, NULL); /* reuse cont = 3 */
+        lv_obj_add_event_cb(no_btn, s_sd_fmt_no_cb, LV_EVENT_CLICKED, NULL);
 
         /* Yes, Format — bottom-right */
         lv_obj_t *yes_btn = lv_btn_create(scr);
@@ -5149,7 +5136,7 @@ static bool show_sd_format_confirm(void)
         lv_obj_set_style_text_font(yl, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(yl, lv_color_white(), 0);
         lv_obj_center(yl);
-        lv_obj_add_event_cb(yes_btn, s_sd_err_retry_cb, LV_EVENT_CLICKED, NULL); /* reuse retry = 1 */
+        lv_obj_add_event_cb(yes_btn, s_sd_fmt_yes_cb, LV_EVENT_CLICKED, NULL);
 
         lv_scr_load(scr);
         lv_refr_now(NULL);
@@ -5863,10 +5850,6 @@ void app_main(void)
                     vTaskDelay(pdMS_TO_TICKS(100));
                 }
 
-            } else { /* SD_ERR_CONTINUE */
-                keep_trying = false;
-                sd_mounted_lazy = false;
-                ESP_LOGI(TAG, "[SD] User chose to continue without SD card");
             }
         }
     }
