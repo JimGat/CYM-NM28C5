@@ -4,6 +4,8 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Cheap Yellow Monster Web Flasher</title>
+    <link rel="icon" type="image/x-icon" href="favicon.ico">
+    <link rel="apple-touch-icon" href="favicon-32.png">
     <meta name="description" content="Browser flasher and serial monitor for Cheap Yellow Monster firmware on the NM-CYD-C5 (ESP32-C5).">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -418,7 +420,7 @@
       };
 
       const state = { manifest:null, channel:"stable", port:null, onDisconnect:null, esploader:null, chip:null, connected:false, flashing:false, monitorPort:null, monitorReader:null, monitorWriter:null, monitorPipe:null, monitorDisconnect:null, monitorConnected:false, lastPort:null };
-      const PAGE_VERSION = "2.9.7";  // revert disconnect() to setSignals(); keep loader alive after flash (2.9.6 fix)
+      const PAGE_VERSION = "2.9.8";  // add favicon (Dexter's face from LAB5 logo)
       const RAW_BASE = "https://raw.githubusercontent.com/JimGat/CYM-NM28C5/Jimgat_Dev/ESP32C5";
       const DEV_MANIFEST_URL = `${RAW_BASE}/docs/manifest.json`;
       const RAW_BIN = `${RAW_BASE}/binaries-esp32c5`;
