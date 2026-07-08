@@ -440,6 +440,17 @@ In addition to the periodic throttled save, the firmware **force-saves immediate
 
 Cold start to first fix typically takes 30–60 seconds with a clear sky view.
 
+**GPS Info screen status indicator** shows one of four states to help with setup and troubleshooting:
+
+| Color | Status | Meaning |
+|-------|--------|---------|
+| 🟢 Green | Fix: YES | Live satellite fix — all position data current |
+| 🟡 Amber | Fix: NO (last known ↓) | Module responding, no current fix; last-known position shown with `*` |
+| 🟠 Orange | Fix: NO | Module responding and sending NMEA sentences, but no satellite lock yet |
+| 🔴 Red | No GPS module detected | Zero UART bytes received since boot — check wiring or module power |
+
+The red "No GPS module detected" state is specifically useful for initial setup: if you see it after wiring the ATGM336H, confirm that TX/RX are not swapped (GPS TX → GPIO 4, GPS RX → GPIO 5), the module is powered at 3.3 V, and the correct UART pins are connected.
+
 ---
 
 ### Vibrator Motor Circuit
@@ -571,7 +582,7 @@ Main Menu
 │   │   ├── Timeout       (inactivity timer)
 │   │   └── Brightness    (10–100% overlay)
 │   ├── SD Card
-│   ├── GPS Info            ← live status; amber display when using last-known
+│   ├── GPS Info            ← four-state indicator: fix / no-fix / last-known / no module
 │   └── Set Position    ← manual lat/lon/alt editor, saves to NVS
 ├── Power Mode
 │   └── Data Transfer
