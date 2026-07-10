@@ -39053,7 +39053,7 @@ typedef struct {
 /* 28-button (7×4) LED strip remote — NEC addr=0x00.
  * Row 1 confirmed from Submersable_LED.ir capture.
  * Rows 2-7 are unverified placeholders; capture each button and update cmd. */
-static const led_rmt_btn_def_t s_led_rmt_btns[28] = {
+static const led_rmt_btn_def_t s_led_rmt_btns_custom[28] = {
     /* Row 1 — Control [confirmed] */
     { LV_SYMBOL_UP   " Brt+", 0x09, 0x333333, false },
     { LV_SYMBOL_DOWN " Brt-", 0x1D, 0x333333, false },
@@ -39091,8 +39091,52 @@ static const led_rmt_btn_def_t s_led_rmt_btns[28] = {
     { "Smooth", 0x49, 0x1A1A6E, false },
 };
 
+/* Standard 44-key Amazon LED strip remote — NEC addr=0x00, pared to 28 buttons.
+ * All codes confirmed from published NEC decode tables for this remote family.
+ * Rows 2-6: 20 colour slots.  Row 7: most-useful 4 effects (Flash/Auto/Fade7/Jump7). */
+static const led_rmt_btn_def_t s_led_rmt_btns_44key[28] = {
+    /* Row 1 — Control */
+    { LV_SYMBOL_UP " Brt+",   0x3A, 0x333333, false },
+    { LV_SYMBOL_DOWN " Brt-", 0xBA, 0x333333, false },
+    { "Play",                  0x82, 0x334433, false },
+    { LV_SYMBOL_POWER,         0x02, 0x443333, false },
+    /* Row 2 — Colour set 1 */
+    { "Red 1",  0x1A, 0xCC0000, false },
+    { "Grn 1",  0x9A, 0x007700, false },
+    { "Blu 1",  0xA2, 0x0000CC, false },
+    { "Wht 1",  0x22, 0xE8E8E8, true  },
+    /* Row 3 — Colour set 2 */
+    { "Red 2",  0x2A, 0xBB1100, false },
+    { "Grn 2",  0xAA, 0x009900, false },
+    { "Blu 2",  0x92, 0x003399, false },
+    { "Wht 2",  0x12, 0xDDDDDD, true  },
+    /* Row 4 — Colour set 3 */
+    { "Red 3",  0x0A, 0xAA2200, false },
+    { "Grn 3",  0x8A, 0x00BB00, false },
+    { "Blu 3",  0xB2, 0x0055BB, false },
+    { "Wht 3",  0x32, 0xCCCCCC, true  },
+    /* Row 5 — Colour set 4 */
+    { "Red 4",  0x38, 0x993300, false },
+    { "Grn 4",  0xB8, 0x00CC00, false },
+    { "Blu 4",  0x78, 0x0066CC, false },
+    { "Wht 4",  0xF8, 0xBBBBBB, true  },
+    /* Row 6 — Colour set 5 */
+    { "Red 5",  0x18, 0x882200, false },
+    { "Grn 5",  0x98, 0x00AA00, false },
+    { "Blu 5",  0x58, 0x0077CC, false },
+    { "Wht 5",  0xD8, 0xAAAAAA, true  },
+    /* Row 7 — Effects */
+    { "Flash",  0xD0, 0x1A1A6E, false },
+    { "Auto",   0xF0, 0x1A1A6E, false },
+    { "Fade7",  0xE0, 0x1A1A6E, false },
+    { "Jump7",  0xA0, 0x1A1A6E, false },
+};
+
 static lv_obj_t   *s_led_status_lbl = NULL;
-static ir_signal_t s_led_nec_sig;           /* reused per button press, avoids 4 KB stack alloc */
+static lv_obj_t   *s_led_grid_cont  = NULL;  /* container for the 7×4 button grid; cleaned on lib switch */
+static lv_obj_t   *s_led_lib_lbl    = NULL;  /* label inside the library toggle button */
+static int         s_led_rmt_lib    = 0;     /* 0 = custom 28-key  1 = standard 44-key */
+static ir_signal_t s_led_nec_sig;            /* reused per button press, avoids 4 KB stack alloc */
 
 /* Encode one standard NEC frame: 9ms leader, 4.5ms gap, 32 data bits (LSB first),
  * stop bit.  addr and cmd are 8-bit; the protocol appends their bit-complements. */
@@ -39124,6 +39168,53 @@ static void s_led_rmt_btn_cb(lv_event_t *e)
     ir_hat_replay(&s_led_nec_sig);
     if (s_led_status_lbl)
         lv_label_set_text_fmt(s_led_status_lbl, "Sent: %s  (0x%02X)", def->label, def->cmd);
+}
+
+/* Rebuild the 7×4 button grid inside s_led_grid_cont for the active library. */
+static void s_led_rmt_rebuild_grid(void)
+{
+    if (!s_led_grid_cont) return;
+    lv_obj_clean(s_led_grid_cont);
+    const led_rmt_btn_def_t *btns =
+        (s_led_rmt_lib == 0) ? s_led_rmt_btns_custom : s_led_rmt_btns_44key;
+
+    static const int xs[4] = { 2, 61, 120, 179 };  /* column left edges inside container */
+    static const int ys[7] = { 0, 37,  74, 111, 148, 185, 222 };  /* row top edges */
+    const int bw = 57, bh = 34;
+
+    for (int idx = 0; idx < 28; idx++) {
+        const led_rmt_btn_def_t *def = &btns[idx];
+        lv_obj_t *btn = lv_btn_create(s_led_grid_cont);
+        lv_obj_set_size(btn, bw, bh);
+        lv_obj_set_pos(btn, xs[idx % 4], ys[idx / 4]);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(def->bg), 0);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(btn, 1, 0);
+        lv_obj_set_style_border_color(btn, lv_color_hex(0x444444), 0);
+        lv_obj_set_style_radius(btn, 4, 0);
+        lv_obj_set_style_pad_all(btn, 2, 0);
+        lv_obj_add_event_cb(btn, s_led_rmt_btn_cb, LV_EVENT_CLICKED, (void *)def);
+
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, def->label);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(lbl,
+            def->dark_txt ? lv_color_hex(0x111111) : lv_color_white(), 0);
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
+        lv_obj_center(lbl);
+    }
+}
+
+/* Toggle between custom 28-key and standard 44-key library and refresh the grid. */
+static void s_led_lib_toggle_cb(lv_event_t *e)
+{
+    (void)e;
+    s_led_rmt_lib = (s_led_rmt_lib + 1) % 2;
+    if (s_led_lib_lbl)
+        lv_label_set_text(s_led_lib_lbl, s_led_rmt_lib == 0 ? "Custom" : "44-Key");
+    if (s_led_status_lbl)
+        lv_label_set_text(s_led_status_lbl, "Tap a button to send IR");
+    s_led_rmt_rebuild_grid();
 }
 
 // ── IR Edit Files ─────────────────────────────────────────────────────────────
@@ -39489,6 +39580,8 @@ static void show_ir_edit_screen(void)
 static void led_rmt_screen_stop(void)
 {
     s_led_status_lbl = NULL;
+    s_led_grid_cont  = NULL;
+    s_led_lib_lbl    = NULL;
     if (ir_hat_is_init()) ir_hat_deinit();
 }
 
@@ -39499,45 +39592,41 @@ static void show_ir_led_rmt_screen(void)
     g_screen_stop_fn = led_rmt_screen_stop;
     apply_menu_bg();
 
-    /* Status line — updates with each button press */
+    /* Status label — left portion of the top strip, truncated to leave room for lib btn */
     s_led_status_lbl = lv_label_create(function_page);
     lv_label_set_text(s_led_status_lbl, "Tap a button to send IR");
     lv_obj_set_style_text_font(s_led_status_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_led_status_lbl, lv_color_hex(0xAAAAAA), 0);
-    lv_obj_set_style_text_align(s_led_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(s_led_status_lbl, 230);
+    lv_obj_set_width(s_led_status_lbl, 165);
     lv_label_set_long_mode(s_led_status_lbl, LV_LABEL_LONG_CLIP);
-    lv_obj_align(s_led_status_lbl, LV_ALIGN_TOP_MID, 0, 38);
+    lv_obj_align(s_led_status_lbl, LV_ALIGN_TOP_LEFT, 3, 39);
 
-    /* 7 rows × 4 columns — fills the area below the status label.
-     * bh=34 keeps row 7 bottom edge at y=279+34=313 (same margin as the old 6-row layout). */
-    static const int xs[4] = {  2,  61, 120, 179 };
-    static const int ys[7] = { 57,  94, 131, 168, 205, 242, 279 };
-    const int bw = 57, bh = 34;
+    /* Library toggle button — top-right corner, same row as status label.
+     * Tap to cycle: Custom 28-key ↔ Standard 44-key. */
+    lv_obj_t *lib_btn = lv_btn_create(function_page);
+    lv_obj_set_size(lib_btn, 64, 22);
+    lv_obj_align(lib_btn, LV_ALIGN_TOP_RIGHT, -2, 36);
+    lv_obj_set_style_bg_color(lib_btn, lv_color_hex(0x37474F), 0);
+    lv_obj_set_style_bg_opa(lib_btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(lib_btn, 4, 0);
+    lv_obj_set_style_pad_all(lib_btn, 2, 0);
+    lv_obj_add_event_cb(lib_btn, s_led_lib_toggle_cb, LV_EVENT_CLICKED, NULL);
+    s_led_lib_lbl = lv_label_create(lib_btn);
+    lv_label_set_text(s_led_lib_lbl, s_led_rmt_lib == 0 ? "Custom" : "44-Key");
+    lv_obj_set_style_text_font(s_led_lib_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(s_led_lib_lbl);
 
-    for (int idx = 0; idx < 28; idx++) {
-        const led_rmt_btn_def_t *def = &s_led_rmt_btns[idx];
-        int row = idx / 4, col = idx % 4;
+    /* Transparent container holds all 28 grid buttons.
+     * Positioned at y=57 so bh=34 rows end at y=313 — 7px from screen bottom. */
+    s_led_grid_cont = lv_obj_create(function_page);
+    lv_obj_set_size(s_led_grid_cont, 238, 256);
+    lv_obj_align(s_led_grid_cont, LV_ALIGN_TOP_LEFT, 0, 57);
+    lv_obj_set_style_bg_opa(s_led_grid_cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_led_grid_cont, 0, 0);
+    lv_obj_set_style_pad_all(s_led_grid_cont, 0, 0);
+    lv_obj_clear_flag(s_led_grid_cont, LV_OBJ_FLAG_SCROLLABLE);
 
-        lv_obj_t *btn = lv_btn_create(function_page);
-        lv_obj_set_size(btn, bw, bh);
-        lv_obj_set_pos(btn, xs[col], ys[row]);
-        lv_obj_set_style_bg_color(btn, lv_color_hex(def->bg), 0);
-        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(btn, 1, 0);
-        lv_obj_set_style_border_color(btn, lv_color_hex(0x444444), 0);
-        lv_obj_set_style_radius(btn, 4, 0);
-        lv_obj_set_style_pad_all(btn, 2, 0);
-        lv_obj_add_event_cb(btn, s_led_rmt_btn_cb, LV_EVENT_CLICKED, (void *)def);
-
-        lv_obj_t *lbl = lv_label_create(btn);
-        lv_label_set_text(lbl, def->label);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(lbl,
-            def->dark_txt ? lv_color_hex(0x111111) : lv_color_white(), 0);
-        lv_label_set_long_mode(lbl, LV_LABEL_LONG_CLIP);
-        lv_obj_center(lbl);
-    }
+    s_led_rmt_rebuild_grid();
 }
 
 // ── IR Menu ───────────────────────────────────────────────────────────────────
