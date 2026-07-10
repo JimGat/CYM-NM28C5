@@ -5,7 +5,7 @@
 <h1 align="center">Cheap Yellow Monster</h1>
 
 <p align="center">
-  <b>v2.10.32</b>
+  <b>v2.10.41</b>
 </p>
 
 <p align="center">
@@ -101,6 +101,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
   - [Zigbee Scout](#6-zigbee-scout)
   - [NM-RF-HAT](#7-nm-rf-hat)
     - [Infrared (DIP 4)](#infrared-dip-4)
+      - [LED RMT — RGB LED Strip Remote](#led-rmt--rgb-led-strip-remote)
       - [Universal Remote](#universal-remote)
       - [TV-B-Gone](#tv-b-gone)
     - [RF433 OOK/ASK (DIP 5)](#rf433-ookask-dip-5)
@@ -147,7 +148,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **Credentials** | Captive portal credential capture, WPA-SEC upload |
 | **TX Power Mode** | Selectable Normal / Max Power for WiFi and BLE — persisted across reboots |
 | **Data Transfer** | Self-hosted AP file server (TheLab) and WiFi client file server — browse, upload, create directories, and recursively delete folders from any browser; client IP logged to serial; IP shown on screen |
-| **NM-RF-HAT** | Hardware addon board for RF expansion -- IR capture/replay/Universal Remote/TV-B-Gone (Flipper .ir); RF433 OOK capture/replay/OOK Scan/Fox Hunt/Jammer (Flipper .sub); CC1101 Sub-GHz: Band Scope (SDR freq marker + Hunt), Fox Hunt (RSSI bug-hunter haptic, 300-928 MHz tunable), RAW Capture+Replay, Z-Wave Scout, TPMS 315+433 MHz, **Alarm Sensor decoder (EV1527)**, **Weather Station decoder (Fine Offset)** (Flipper .sub); nRF24L01+ 2.4 GHz: Ch Scan/Sniffer/Jammer/Futaba S-FHSS/Fox Hunt (Flipper .nrf24); PN532 NFC/RFID: scan+Read All, NTAG213/215/216 full page dump, Clone/Write to blank NTAG, MIFARE Classic key-dict test, save/emulate/.nfc import+export (Flipper .nfc); DIP switch per module |
+| **NM-RF-HAT** | Hardware addon board for RF expansion -- IR capture/replay/**LED RMT** (24-btn NEC RGB LED strip controller)/Universal Remote/TV-B-Gone (Flipper .ir); RF433 OOK capture/replay/OOK Scan/Fox Hunt/Jammer (Flipper .sub); CC1101 Sub-GHz: Band Scope (SDR freq marker + Hunt), Fox Hunt (RSSI bug-hunter haptic, 300-928 MHz tunable), RAW Capture+Replay, Z-Wave Scout, TPMS 315+433 MHz, **Alarm Sensor decoder (EV1527)**, **Weather Station decoder (Fine Offset)** (Flipper .sub); nRF24L01+ 2.4 GHz: Ch Scan/Sniffer/Jammer/Futaba S-FHSS/Fox Hunt (Flipper .nrf24); PN532 NFC/RFID: scan+Read All, NTAG213/215/216 full page dump, Clone/Write to blank NTAG, MIFARE Classic key-dict test, save/emulate/.nfc import+export (Flipper .nfc); DIP switch per module |
 | **Fox Hunt** | Ham radio-style RF proximity tracker on all three sub-GHz radios. CC1101: tunable 300-928 MHz, RSSI bar + peak hold, adjustable squelch, bug-hunter haptic (pulse rate scales from 1 pulse/1.5 s at threshold to continuous at strong signal — always 100% motor strength for reliable feel). nRF24: carrier-detect rate bar across 2400-2525 MHz in 1 MHz steps. RF433: GPIO edge-count activity bar at 433.92 MHz. All three use the vibrator for proximity feedback. Band Scope → Fox Hunt tap-through with SDR-style draggable yellow frequency marker. |
 | **OOK Protocol Decoding** | CC1101 Alarm Sensor: decodes **EV1527** 315/433 MHz OOK alarm sensors (door contacts, PIR, smoke, flood) — 24-bit address + 4-bit channel, RSSI, trigger count, scrollable live list. CC1101 Weather Station: decodes **Fine Offset** 433.92 MHz weather sensors (WH65/WH57/WS80/WH31 and similar) — temperature (°C), humidity, battery, RSSI, scrollable list. RF433 OOK Scan: same EV1527 decoder using the R4A_433 superheterodyne receiver for higher sensitivity at exactly 433.92 MHz. |
 | **SD Card Remount** | Settings → SD Card → Remount SD Card: unmounts and re-mounts at 20/10/5 MHz fallback without physical eject — useful after a crash or RF-HAT FPC contact issue. |
@@ -227,8 +228,9 @@ Home
 ├── Go Dark (display off)
 ├── Zigbee Scout
 ├── Infrared [RF-HAT DIP 4]
-│   ├── Capture
+│   ├── Capture       (keyboard naming: remote name → signal name → save)
 │   ├── Replay  →  <Remote>.ir  →  Signal list
+│   ├── LED RMT       (24-button NEC RGB LED strip remote)
 │   ├── Universal Remote
 │   ├── TV-B-Gone
 │   └── IR Jammer
@@ -2058,19 +2060,27 @@ IR capture and replay using the ESP32-C5's RMT peripheral. Files use the **Flipp
 
 ```
 NM-RF-HAT IR
-├── Capture       -- listen for any IR signal (5 s timeout), then save to a remote file
+├── Capture       -- listen for any IR signal (5 s timeout), keyboard-named save (remote → signal)
 ├── Replay        -- browse remote files -> signals -> transmit
 │   ├── <Remote>.ir
 │   │   ├── Signal 1
 │   │   ├── Signal 2
 │   │   └── ...
 │   └── ...
+├── LED RMT       -- 24-button NEC RGB LED strip remote (colour-coded grid)
 ├── Universal     -- multi-button remote: Power Search + Power/VOL/CH/Input/Mute buttons
 ├── TV-B-Gone     -- transmit built-in power-off sequence for 16 common TV brands (3x repeats)
 └── IR Jammer     -- continuous 38 kHz carrier via LEDC hardware PWM
 ```
 
 **SD card path:** `/sdcard/lab/infrared/`
+
+**Capture — keyboard-named saves:** When you tap **Save to…** after a capture, a picker shows your existing remote files plus a **New remote** entry (in yellow). Selecting either opens a full-screen keyboard:
+
+- **New remote** → type remote file name → keyboard again for signal name → saved
+- **Existing remote** → type signal name → saved immediately
+
+The signal name is pre-filled with an auto-counter (`signal_0001`, `signal_0002`, …) that you can clear and replace. Both names are saved into the `.ir` file verbatim — no restrictions beyond the 31-character limit on signal names and 63 characters on remote file names.
 
 ---
 
@@ -2096,6 +2106,33 @@ data: 9000 4500 560 560 560 1680 560 560 ...
 ```
 
 Signal values are alternating mark/space pulse durations in **microseconds**. `frequency` is the carrier in Hz (typically 38000). `duty_cycle` is typically 0.33 (ignored on raw TX — RMT uses fixed 33% duty).
+
+---
+
+##### LED RMT — RGB LED Strip Remote
+
+A one-tap 24-button IR remote built to control common Chinese RGB LED strip controllers — the type that ship with a small IR remote like this:
+
+<p align="center">
+  <img src="ESP32C5/docs/led_remote.png" alt="24-button RGB LED strip remote" width="260"/>
+</p>
+
+The screen mirrors the physical remote's layout exactly: a 6-row × 4-column colour-coded grid where each button's background matches the colour it sends to the strip.
+
+| Row | Buttons |
+|-----|---------|
+| 1 | ▲ Brt+ · ▼ Brt- · OFF · ON |
+| 2 | Red · Green · Blue · White |
+| 3 | OrgRed · Lime · SkyBlu · Pink |
+| 4 | Orange · Aqua · Purple · WarmW |
+| 5 | YelOrg · Teal · Violet · Yellow |
+| 6 | Flash · Strobe · Fade · Smooth |
+
+A status line at the top of the screen updates after every tap, showing the button name and the NEC command byte sent.
+
+**Protocol:** NEC, address `0x00`, 38 kHz carrier. These are best-guess codes for the most common variant of this controller — the controller/remote pair that ships from many Chinese suppliers. If the buttons don't respond, use **IR → Capture** to record the actual codes from your physical remote into a `.ir` file, then use **Replay** to transmit them.
+
+**DIP switch:** DIP 4 must be ON (same as all other infrared functions).
 
 ---
 
