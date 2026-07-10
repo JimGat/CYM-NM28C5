@@ -39051,44 +39051,43 @@ typedef struct {
 } led_rmt_btn_def_t;
 
 /* 28-button (7×4) LED strip remote — NEC addr=0x00.
- * Row 1 confirmed from Submersable_LED.ir capture.
- * Rows 2-7 are unverified placeholders; capture each button and update cmd. */
+ * All 28 codes confirmed by physical capture (Submersable_LED.ir). */
 static const led_rmt_btn_def_t s_led_rmt_btns_custom[28] = {
-    /* Row 1 — Control [confirmed] */
-    { LV_SYMBOL_UP   " Brt+", 0x09, 0x333333, false },
-    { LV_SYMBOL_DOWN " Brt-", 0x1D, 0x333333, false },
+    /* Row 1 — Control */
+    { LV_SYMBOL_UP   " Brt+", 0x1D, 0x333333, false },
+    { LV_SYMBOL_DOWN " Brt-", 0x09, 0x333333, false },
     { LV_SYMBOL_POWER " OFF", 0x1F, 0x661111, false },
     { LV_SYMBOL_POWER " ON",  0x0D, 0x116611, false },
-    /* Row 2 — Primary colours [unverified] */
-    { "Red",    0x58, 0xCC0000, false },
-    { "Green",  0x59, 0x007700, false },
-    { "Blue",   0x45, 0x0000CC, false },
-    { "White",  0x44, 0xE8E8E8, true  },
-    /* Row 3 [unverified] */
-    { "OrgRed", 0x54, 0xBB2200, false },
-    { "Lime",   0x55, 0x55DD00, true  },
-    { "SkyBlu", 0x46, 0x0088CC, false },
-    { "Pink",   0x40, 0xDD44AA, false },
-    /* Row 4 [unverified] */
-    { "Orange", 0x50, 0xFF7700, true  },
-    { "Aqua",   0x51, 0x00BBAA, true  },
-    { "Purple", 0x47, 0x880099, false },
-    { "WarmW",  0x41, 0xFFE0BB, true  },
-    /* Row 5 [unverified] */
-    { "YelOrg", 0x4C, 0xFFAA00, true  },
-    { "Teal",   0x4D, 0x006B6B, false },
-    { "Violet", 0x43, 0x5500AA, false },
-    { "Yellow", 0x48, 0xEEEE00, true  },
-    /* Row 6 [unverified] */
-    { "YelGrn", 0x5C, 0x99EE00, true  },
-    { "NavyBl", 0x5D, 0x002288, false },
-    { "Magent", 0x5F, 0xBB0099, false },
-    { "CoolW",  0x5B, 0xDDEEFF, true  },
-    /* Row 7 — Effects [unverified] */
-    { "Flash",  0x5E, 0x1A1A6E, false },
-    { "Strobe", 0x5A, 0x1A1A6E, false },
-    { "Fade",   0x42, 0x1A1A6E, false },
-    { "Smooth", 0x49, 0x1A1A6E, false },
+    /* Row 2 — Primary colours */
+    { "Red",    0x19, 0xCC0000, false },
+    { "Green",  0x1B, 0x007700, false },
+    { "Blue",   0x11, 0x0000CC, false },
+    { "White",  0x15, 0xE8E8E8, true  },
+    /* Row 3 */
+    { "OrgRed", 0x17, 0xCC2200, false },
+    { "Lime",   0x12, 0x77DD00, true  },
+    { "SkyBlu", 0x16, 0x0088BB, false },
+    { "Flash",  0x4D, 0x1A1A6E, false },
+    /* Row 4 */
+    { "Orange", 0x40, 0xFF7700, true  },
+    { "Grass",  0x4C, 0x226600, false },
+    { "Purple", 0x04, 0x880099, false },
+    { "Strobe", 0x00, 0x1A1A6E, false },
+    /* Row 5 */
+    { "Yellow", 0x0A, 0xEEEE00, true  },
+    { "Frog",   0x1E, 0x00AA00, false },
+    { "Aqua",   0x0E, 0x009988, false },
+    { "Fade",   0x1A, 0x1A1A6E, false },
+    /* Row 6 */
+    { "YelGrn", 0x1C, 0x88DD00, true  },
+    { "Cyan",   0x14, 0x00AACC, false },
+    { "Magent", 0x0F, 0xBB0088, false },
+    { "Smooth", 0x0C, 0x1A1A6E, false },
+    /* Row 7 — Timers */
+    { "2H",     0x02, 0x1A3A6E, false },
+    { "4H",     0x48, 0x1A3A6E, false },
+    { "6H",     0x54, 0x1A3A6E, false },
+    { "TimOff", 0x05, 0x6E1A1A, false },
 };
 
 /* Standard 44-key Amazon LED strip remote — NEC addr=0x00, pared to 28 buttons.
