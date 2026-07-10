@@ -39486,10 +39486,15 @@ static void show_ir_edit_screen(void)
     rfhat_add_back_btn("Infrared", show_ir_menu_screen);
 }
 
-static void led_rmt_screen_stop(void) { s_led_status_lbl = NULL; }
+static void led_rmt_screen_stop(void)
+{
+    s_led_status_lbl = NULL;
+    if (ir_hat_is_init()) ir_hat_deinit();
+}
 
 static void show_ir_led_rmt_screen(void)
 {
+    ir_hat_claim();   /* init RMT TX, release CC1101/RFID/RF433 GPIO */
     create_function_page_base("LED Remote");
     g_screen_stop_fn = led_rmt_screen_stop;
     apply_menu_bg();
