@@ -39055,8 +39055,8 @@ typedef struct {
  * Rows 2-7 are unverified placeholders; capture each button and update cmd. */
 static const led_rmt_btn_def_t s_led_rmt_btns[28] = {
     /* Row 1 — Control [confirmed] */
-    { LV_SYMBOL_UP   " Brt+", 0x1D, 0x333333, false },
-    { LV_SYMBOL_DOWN " Brt-", 0x09, 0x333333, false },
+    { LV_SYMBOL_UP   " Brt+", 0x09, 0x333333, false },
+    { LV_SYMBOL_DOWN " Brt-", 0x1D, 0x333333, false },
     { LV_SYMBOL_POWER " OFF", 0x1F, 0x661111, false },
     { LV_SYMBOL_POWER " ON",  0x0D, 0x116611, false },
     /* Row 2 — Primary colours [unverified] */
