@@ -39050,37 +39050,45 @@ typedef struct {
     bool        dark_txt;  /* true = dark text for light-coloured buttons */
 } led_rmt_btn_def_t;
 
-static const led_rmt_btn_def_t s_led_rmt_btns[24] = {
-    /* Row 1 — Control */
-    { LV_SYMBOL_UP   " Brt+", 0x1D, 0x333333, false },  /* confirmed: Submersable_LED.ir */
-    { LV_SYMBOL_DOWN " Brt-", 0x09, 0x333333, false },  /* confirmed: Submersable_LED.ir */
-    { LV_SYMBOL_POWER " OFF", 0x1F, 0x661111, false },  /* confirmed: Submersable_LED.ir */
-    { LV_SYMBOL_POWER " ON",  0x0D, 0x116611, false },  /* confirmed: Submersable_LED.ir */
-    /* Row 2 — Pure colours */
-    { "Red",    0x09, 0xCC0000, false },
-    { "Green",  0x0D, 0x007700, false },
-    { "Blue",   0x0E, 0x0000CC, false },
-    { "White",  0x0F, 0xE8E8E8, true  },
-    /* Row 3 */
-    { "OrgRed", 0x19, 0xBB2200, false },
-    { "Lime",   0x1D, 0x55DD00, true  },
-    { "SkyBlu", 0x1E, 0x0088CC, false },
-    { "Pink",   0x1F, 0xDD44AA, false },
-    /* Row 4 */
-    { "Orange", 0x29, 0xFF7700, true  },
-    { "Aqua",   0x2D, 0x00BBAA, true  },
-    { "Purple", 0x2E, 0x880099, false },
-    { "WarmW",  0x2F, 0xFFE0BB, true  },
-    /* Row 5 */
-    { "YelOrg", 0x39, 0xFFAA00, true  },
-    { "Teal",   0x49, 0x006B6B, false },
-    { "Violet", 0x4E, 0x5500AA, false },
-    { "Yellow", 0x59, 0xEEEE00, true  },
-    /* Row 6 — Effects */
-    { "Flash",  0x44, 0x1A1A6E, false },
-    { "Strobe", 0x40, 0x1A1A6E, false },
-    { "Fade",   0x43, 0x1A1A6E, false },
-    { "Smooth", 0x42, 0x1A1A6E, false },
+/* 28-button (7×4) LED strip remote — NEC addr=0x00.
+ * Row 1 confirmed from Submersable_LED.ir capture.
+ * Rows 2-7 are unverified placeholders; capture each button and update cmd. */
+static const led_rmt_btn_def_t s_led_rmt_btns[28] = {
+    /* Row 1 — Control [confirmed] */
+    { LV_SYMBOL_UP   " Brt+", 0x1D, 0x333333, false },
+    { LV_SYMBOL_DOWN " Brt-", 0x09, 0x333333, false },
+    { LV_SYMBOL_POWER " OFF", 0x1F, 0x661111, false },
+    { LV_SYMBOL_POWER " ON",  0x0D, 0x116611, false },
+    /* Row 2 — Primary colours [unverified] */
+    { "Red",    0x58, 0xCC0000, false },
+    { "Green",  0x59, 0x007700, false },
+    { "Blue",   0x45, 0x0000CC, false },
+    { "White",  0x44, 0xE8E8E8, true  },
+    /* Row 3 [unverified] */
+    { "OrgRed", 0x54, 0xBB2200, false },
+    { "Lime",   0x55, 0x55DD00, true  },
+    { "SkyBlu", 0x46, 0x0088CC, false },
+    { "Pink",   0x40, 0xDD44AA, false },
+    /* Row 4 [unverified] */
+    { "Orange", 0x50, 0xFF7700, true  },
+    { "Aqua",   0x51, 0x00BBAA, true  },
+    { "Purple", 0x47, 0x880099, false },
+    { "WarmW",  0x41, 0xFFE0BB, true  },
+    /* Row 5 [unverified] */
+    { "YelOrg", 0x4C, 0xFFAA00, true  },
+    { "Teal",   0x4D, 0x006B6B, false },
+    { "Violet", 0x43, 0x5500AA, false },
+    { "Yellow", 0x48, 0xEEEE00, true  },
+    /* Row 6 [unverified] */
+    { "YelGrn", 0x5C, 0x99EE00, true  },
+    { "NavyBl", 0x5D, 0x002288, false },
+    { "Magent", 0x5F, 0xBB0099, false },
+    { "CoolW",  0x5B, 0xDDEEFF, true  },
+    /* Row 7 — Effects [unverified] */
+    { "Flash",  0x5E, 0x1A1A6E, false },
+    { "Strobe", 0x5A, 0x1A1A6E, false },
+    { "Fade",   0x42, 0x1A1A6E, false },
+    { "Smooth", 0x49, 0x1A1A6E, false },
 };
 
 static lv_obj_t   *s_led_status_lbl = NULL;
@@ -39496,12 +39504,13 @@ static void show_ir_led_rmt_screen(void)
     lv_label_set_long_mode(s_led_status_lbl, LV_LABEL_LONG_CLIP);
     lv_obj_align(s_led_status_lbl, LV_ALIGN_TOP_MID, 0, 38);
 
-    /* 6 rows × 4 columns — fills the area below the status label */
+    /* 7 rows × 4 columns — fills the area below the status label.
+     * bh=34 keeps row 7 bottom edge at y=279+34=313 (same margin as the old 6-row layout). */
     static const int xs[4] = {  2,  61, 120, 179 };
-    static const int ys[6] = { 57, 100, 143, 186, 229, 272 };
-    const int bw = 57, bh = 41;
+    static const int ys[7] = { 57,  94, 131, 168, 205, 242, 279 };
+    const int bw = 57, bh = 34;
 
-    for (int idx = 0; idx < 24; idx++) {
+    for (int idx = 0; idx < 28; idx++) {
         const led_rmt_btn_def_t *def = &s_led_rmt_btns[idx];
         int row = idx / 4, col = idx % 4;
 
