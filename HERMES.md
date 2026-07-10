@@ -2,7 +2,7 @@
 
 **Purpose of this file:** Complete context document for AI agents (Claude, ChatGPT, Hermes, or any LLM) working on this project. Read this before touching any code. It covers every major decision made, the reasoning behind it, known hazards, and how everything fits together.
 
-**Last updated:** 2026-07-04, v2.10.25
+**Last updated:** 2026-07-10, v2.11.0
 
 ---
 

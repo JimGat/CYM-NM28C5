@@ -5,7 +5,7 @@
 <h1 align="center">Cheap Yellow Monster</h1>
 
 <p align="center">
-  <b>v2.10.41</b>
+  <b>v2.11.0</b>
 </p>
 
 <p align="center">
@@ -160,7 +160,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 
 ## Menu Map
 
-Complete navigation tree as of v2.10.32. Items marked `[stub]` are placeholders with "Coming in next version" screens. Items marked `[RF-HAT]` require the NM-RF-HAT expansion board enabled in Settings → Hardware Options.
+Complete navigation tree as of v2.11.0. Items marked `[stub]` are placeholders with "Coming in next version" screens. Items marked `[RF-HAT]` require the NM-RF-HAT expansion board enabled in Settings → Hardware Options.
 
 ```
 Home
@@ -230,7 +230,8 @@ Home
 ├── Infrared [RF-HAT DIP 4]
 │   ├── Capture       (keyboard naming: remote name → signal name → save)
 │   ├── Replay  →  <Remote>.ir  →  Signal list
-│   ├── LED RMT       (24-button NEC RGB LED strip remote)
+│   ├── LED RMT       (28-button NEC RGB LED strip remote; library selector: Custom/44-Key)
+│   ├── Edit Files    (rename or delete remotes and individual signals; teal-cursor keyboard)
 │   ├── Universal Remote
 │   ├── TV-B-Gone
 │   └── IR Jammer
@@ -2067,7 +2068,8 @@ NM-RF-HAT IR
 │   │   ├── Signal 2
 │   │   └── ...
 │   └── ...
-├── LED RMT       -- 24-button NEC RGB LED strip remote (colour-coded grid)
+├── LED RMT       -- 28-button NEC RGB LED strip remote (7×4 colour-coded grid; library selector)
+├── Edit Files    -- rename or delete remotes and signals in saved .ir files
 ├── Universal     -- multi-button remote: Power Search + Power/VOL/CH/Input/Mute buttons
 ├── TV-B-Gone     -- transmit built-in power-off sequence for 16 common TV brands (3x repeats)
 └── IR Jammer     -- continuous 38 kHz carrier via LEDC hardware PWM
@@ -2111,28 +2113,43 @@ Signal values are alternating mark/space pulse durations in **microseconds**. `f
 
 ##### LED RMT — RGB LED Strip Remote
 
-A one-tap 24-button IR remote built to control common Chinese RGB LED strip controllers — the type that ship with a small IR remote like this:
+A one-tap 28-button IR remote built to control NEC-protocol RGB LED strip controllers. The screen shows a 7-row × 4-column colour-coded grid where each button's background matches the colour or function it sends.
 
 <p align="center">
-  <img src="ESP32C5/docs/led_remote.png" alt="24-button RGB LED strip remote" width="260"/>
+  <img src="ESP32C5/docs/led_remote.png" alt="28-button RGB LED strip remote" width="260"/>
 </p>
 
-The screen mirrors the physical remote's layout exactly: a 6-row × 4-column colour-coded grid where each button's background matches the colour it sends to the strip.
+**Library selector** — a small toggle button in the top-right corner cycles between two button sets:
 
-| Row | Buttons |
-|-----|---------|
-| 1 | ▲ Brt+ · ▼ Brt- · OFF · ON |
-| 2 | Red · Green · Blue · White |
-| 3 | OrgRed · Lime · SkyBlu · Pink |
-| 4 | Orange · Aqua · Purple · WarmW |
-| 5 | YelOrg · Teal · Violet · Yellow |
-| 6 | Flash · Strobe · Fade · Smooth |
+- **Custom** — 28 verified codes captured from a physical Submersable-style LED strip remote (addr `0x00`)
+- **44-Key** — 28-button subset of the standard 44-key NEC RGB LED remote (addr `0x00`)
+
+| Row | Custom library buttons | NEC cmd |
+|-----|----------------------|---------|
+| 1 | ▲ Brt+ · ▼ Brt- · ⏻ OFF · ⏻ ON | `0x09` · `0x1D` · `0x1F` · `0x0D` |
+| 2 | Red · Green · Blue · White | `0x19` · `0x1B` · `0x11` · `0x15` |
+| 3 | OrgRed · Lime · SkyBlu · Flash | `0x17` · `0x12` · `0x16` · `0x4D` |
+| 4 | Orange · Grass · Purple · Strobe | `0x40` · `0x4C` · `0x04` · `0x00` |
+| 5 | Yellow · Frog · Aqua · Fade | `0x0A` · `0x1E` · `0x0E` · `0x1A` |
+| 6 | YelGrn · Cyan · Magent · Smooth | `0x1C` · `0x14` · `0x0F` · `0x0C` |
+| 7 | 2H · 4H · 6H · TimOff | `0x02` · `0x48` · `0x54` · `0x05` |
 
 A status line at the top of the screen updates after every tap, showing the button name and the NEC command byte sent.
 
-**Protocol:** NEC, address `0x00`, 38 kHz carrier. These are best-guess codes for the most common variant of this controller — the controller/remote pair that ships from many Chinese suppliers. If the buttons don't respond, use **IR → Capture** to record the actual codes from your physical remote into a `.ir` file, then use **Replay** to transmit them.
+**Protocol:** NEC, address `0x00`, 38 kHz carrier. The Custom library codes were captured directly from a physical remote and verified with checksum (`cmd ^ ~cmd == 0xFF`). If your strip controller doesn't respond to either library, use **IR → Capture** to record your own codes into a `.ir` file and play them back via **Replay**.
 
 **DIP switch:** DIP 4 must be ON (same as all other infrared functions).
+
+---
+
+##### Edit Files
+
+Browse, rename, and delete saved `.ir` remote files and the individual signals inside them.
+
+- **Remote list** — shows all `.ir` files on SD. Tap a remote name to open it; **Rename** to rename the file; **🗑** (red) to delete the entire file with a confirmation popup.
+- **Signals view** — lists every named signal in the remote. Header shows `← All` (back), the remote name, a **Rename** button (renames the file), and a **🗑** button (deletes the file). Each signal row has its own **Rename** and **🗑** buttons.
+- **Rename keyboard** — teal-bordered input with a blinking cursor; matches the project-wide keyboard style. Confirms with the keyboard ✓ key or cancels with ✕.
+- **Delete confirmation** — dark modal overlay with a red card, item name, "This cannot be undone." warning, and **Cancel** / **🗑 Delete** buttons. No destructive action fires until **Delete** is tapped.
 
 ---
 
