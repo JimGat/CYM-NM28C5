@@ -39052,10 +39052,10 @@ typedef struct {
 
 static const led_rmt_btn_def_t s_led_rmt_btns[24] = {
     /* Row 1 — Control */
-    { LV_SYMBOL_UP   " Brt+", 0x3C, 0x333333, false },
-    { LV_SYMBOL_DOWN " Brt-", 0x3D, 0x333333, false },
-    { LV_SYMBOL_POWER " OFF", 0x47, 0x661111, false },
-    { LV_SYMBOL_POWER " ON",  0x45, 0x116611, false },
+    { LV_SYMBOL_UP   " Brt+", 0x1D, 0x333333, false },  /* confirmed: Submersable_LED.ir */
+    { LV_SYMBOL_DOWN " Brt-", 0x09, 0x333333, false },  /* confirmed: Submersable_LED.ir */
+    { LV_SYMBOL_POWER " OFF", 0x1F, 0x661111, false },  /* confirmed: Submersable_LED.ir */
+    { LV_SYMBOL_POWER " ON",  0x0D, 0x116611, false },  /* confirmed: Submersable_LED.ir */
     /* Row 2 — Pure colours */
     { "Red",    0x09, 0xCC0000, false },
     { "Green",  0x0D, 0x007700, false },
@@ -39116,6 +39116,366 @@ static void s_led_rmt_btn_cb(lv_event_t *e)
     ir_hat_replay(&s_led_nec_sig);
     if (s_led_status_lbl)
         lv_label_set_text_fmt(s_led_status_lbl, "Sent: %s  (0x%02X)", def->label, def->cmd);
+}
+
+// ── IR Edit Files ─────────────────────────────────────────────────────────────
+// Two-level browser: remote list → signal list, with keyboard rename for each.
+
+static void s_ir_edit_show_remotes(void);
+static void s_ir_edit_show_signals(void);
+
+/* Persistent arrays keep callback user-data pointers valid after the list is built. */
+static char      s_ir_edit_remote_names[IR_HAT_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
+static char      s_ir_edit_sig_names[IR_HAT_MAX_SIGNALS][IR_HAT_NAME_LEN];
+
+static char      s_ir_edit_remote[IR_HAT_REMOTE_NAME_LEN];
+static int       s_ir_edit_sig_idx          = -1;
+static bool      s_ir_edit_is_remote_rename = false;
+static lv_obj_t *s_ir_edit_cont             = NULL;
+static lv_obj_t *s_ir_edit_overlay          = NULL;
+static lv_obj_t *s_ir_edit_ta               = NULL;
+
+/* Load all signals from remote, rename the target, rewrite the file. */
+static void s_ir_rename_signal_in_file(const char *remote, int idx, const char *new_name)
+{
+    ir_signal_t *sigs = heap_caps_malloc(
+        IR_HAT_MAX_SIGNALS * sizeof(ir_signal_t), MALLOC_CAP_SPIRAM);
+    if (!sigs) return;
+    int cnt = 0;
+    while (cnt < IR_HAT_MAX_SIGNALS &&
+           ir_hat_load_signal_by_index(remote, cnt, &sigs[cnt]) == IR_HAT_OK)
+        cnt++;
+    if (idx >= 0 && idx < cnt)
+        strlcpy(sigs[idx].name, new_name, IR_HAT_NAME_LEN);
+    char path[160];
+    snprintf(path, sizeof(path), RF_HAT_IR_SAVE_DIR "/%s" IR_HAT_SAVE_EXT, remote);
+    remove(path);
+    for (int i = 0; i < cnt; i++)
+        ir_hat_append_signal(remote, &sigs[i]);
+    heap_caps_free(sigs);
+}
+
+static void s_ir_edit_kbd_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_ir_edit_overlay && lv_obj_is_valid(s_ir_edit_overlay)) {
+        lv_obj_del(s_ir_edit_overlay);
+        s_ir_edit_overlay = NULL; s_ir_edit_ta = NULL;
+    }
+}
+
+static void s_ir_edit_kbd_confirm_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!s_ir_edit_ta) return;
+    const char *text = lv_textarea_get_text(s_ir_edit_ta);
+    if (!text || !text[0]) { s_ir_edit_kbd_cancel_cb(e); return; }
+
+    if (s_ir_edit_is_remote_rename) {
+        char old_path[160], new_path[160];
+        snprintf(old_path, sizeof(old_path), RF_HAT_IR_SAVE_DIR "/%s" IR_HAT_SAVE_EXT,
+                 s_ir_edit_remote);
+        snprintf(new_path, sizeof(new_path), RF_HAT_IR_SAVE_DIR "/%s" IR_HAT_SAVE_EXT, text);
+        rename(old_path, new_path);
+        strlcpy(s_ir_edit_remote, text, IR_HAT_REMOTE_NAME_LEN);
+    } else {
+        s_ir_rename_signal_in_file(s_ir_edit_remote, s_ir_edit_sig_idx, text);
+    }
+
+    if (s_ir_edit_overlay && lv_obj_is_valid(s_ir_edit_overlay)) {
+        lv_obj_del(s_ir_edit_overlay);
+        s_ir_edit_overlay = NULL; s_ir_edit_ta = NULL;
+    }
+    if (s_ir_edit_is_remote_rename)
+        s_ir_edit_show_remotes();
+    else
+        s_ir_edit_show_signals();
+}
+
+static void s_ir_edit_show_kbd(const char *title, const char *prefill)
+{
+    if (s_ir_edit_overlay && lv_obj_is_valid(s_ir_edit_overlay)) {
+        lv_obj_del(s_ir_edit_overlay);
+        s_ir_edit_overlay = NULL; s_ir_edit_ta = NULL;
+    }
+    s_ir_edit_overlay = lv_obj_create(function_page);
+    lv_obj_set_size(s_ir_edit_overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(s_ir_edit_overlay, 0, 0);
+    lv_obj_set_style_bg_color(s_ir_edit_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(s_ir_edit_overlay, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(s_ir_edit_overlay, 0, 0);
+    lv_obj_clear_flag(s_ir_edit_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *kb = lv_keyboard_create(s_ir_edit_overlay);
+    lv_obj_set_width(kb, LCD_H_RES);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_add_event_cb(kb, s_ir_edit_kbd_confirm_cb, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(kb, s_ir_edit_kbd_cancel_cb, LV_EVENT_CANCEL, NULL);
+
+    lv_obj_t *card = lv_obj_create(s_ir_edit_overlay);
+    lv_obj_set_width(card, LCD_H_RES - 16);
+    lv_obj_set_height(card, LV_SIZE_CONTENT);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_border_color(card, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_pad_all(card, 6, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START,
+                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(card, 4, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *tl = lv_label_create(card);
+    lv_label_set_text(tl, title);
+    lv_obj_set_style_text_color(tl, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_text_font(tl, &lv_font_montserrat_14, 0);
+
+    s_ir_edit_ta = lv_textarea_create(card);
+    lv_obj_set_width(s_ir_edit_ta, LCD_H_RES - 32);
+    lv_obj_set_height(s_ir_edit_ta, 38);
+    lv_textarea_set_max_length(s_ir_edit_ta, IR_HAT_REMOTE_NAME_LEN - 1);
+    lv_textarea_set_one_line(s_ir_edit_ta, true);
+    if (prefill && prefill[0]) lv_textarea_set_text(s_ir_edit_ta, prefill);
+    lv_obj_set_style_text_font(s_ir_edit_ta, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_bg_color(s_ir_edit_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(s_ir_edit_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(s_ir_edit_ta, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_bg_opa(s_ir_edit_ta, LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(s_ir_edit_ta, COLOR_MATERIAL_TEAL,
+                                  LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(s_ir_edit_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(s_ir_edit_ta, LV_BORDER_SIDE_LEFT,
+                                 LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_keyboard_set_textarea(kb, s_ir_edit_ta);
+}
+
+static void s_ir_edit_remote_tap_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    strlcpy(s_ir_edit_remote, s_ir_edit_remote_names[idx], IR_HAT_REMOTE_NAME_LEN);
+    s_ir_edit_show_signals();
+}
+
+static void s_ir_edit_remote_rename_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    strlcpy(s_ir_edit_remote, s_ir_edit_remote_names[idx], IR_HAT_REMOTE_NAME_LEN);
+    s_ir_edit_is_remote_rename = true;
+    s_ir_edit_sig_idx = -1;
+    char title[64];
+    snprintf(title, sizeof(title), LV_SYMBOL_DRIVE " Rename: %.28s", s_ir_edit_remote);
+    s_ir_edit_show_kbd(title, s_ir_edit_remote);
+}
+
+static void s_ir_edit_ren_file_from_signals_cb(lv_event_t *e)
+{
+    (void)e;
+    s_ir_edit_is_remote_rename = true;
+    s_ir_edit_sig_idx = -1;
+    char title[64];
+    snprintf(title, sizeof(title), LV_SYMBOL_DRIVE " Rename: %.28s", s_ir_edit_remote);
+    s_ir_edit_show_kbd(title, s_ir_edit_remote);
+}
+
+static void s_ir_edit_sig_rename_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    s_ir_edit_sig_idx = idx;
+    s_ir_edit_is_remote_rename = false;
+    char title[64];
+    snprintf(title, sizeof(title), LV_SYMBOL_FILE " Rename: %.28s", s_ir_edit_sig_names[idx]);
+    s_ir_edit_show_kbd(title, s_ir_edit_sig_names[idx]);
+}
+
+static void s_ir_edit_back_to_remotes_cb(lv_event_t *e)
+{
+    (void)e;
+    s_ir_edit_show_remotes();
+}
+
+static void s_ir_edit_show_remotes(void)
+{
+    if (s_ir_edit_cont && lv_obj_is_valid(s_ir_edit_cont)) {
+        lv_obj_del(s_ir_edit_cont); s_ir_edit_cont = NULL;
+    }
+    s_ir_edit_cont = lv_obj_create(function_page);
+    lv_obj_set_size(s_ir_edit_cont, lv_pct(100), LCD_V_RES - 60);
+    lv_obj_align(s_ir_edit_cont, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_set_style_bg_opa(s_ir_edit_cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_ir_edit_cont, 0, 0);
+    lv_obj_set_style_pad_all(s_ir_edit_cont, 4, 0);
+    lv_obj_set_style_pad_gap(s_ir_edit_cont, 3, 0);
+    lv_obj_set_flex_flow(s_ir_edit_cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_ir_edit_cont, LV_FLEX_ALIGN_START,
+                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    int count = ir_hat_list_remotes(s_ir_edit_remote_names, IR_HAT_MAX_REMOTES);
+    if (count == 0) {
+        lv_obj_t *lbl = lv_label_create(s_ir_edit_cont);
+        lv_label_set_text(lbl, "No .ir remotes on SD card");
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0x888888), 0);
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        lv_obj_t *row = lv_obj_create(s_ir_edit_cont);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, 36);
+        lv_obj_set_style_bg_color(row, lv_color_hex(0x1E1E1E), 0);
+        lv_obj_set_style_border_color(row, lv_color_hex(0x333333), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_radius(row, 4, 0);
+        lv_obj_set_style_pad_hor(row, 6, 0);
+        lv_obj_set_style_pad_ver(row, 0, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                               LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *name_lbl = lv_label_create(row);
+        lv_label_set_text(name_lbl, s_ir_edit_remote_names[i]);
+        lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(name_lbl, lv_color_hex(0xDDDDDD), 0);
+        lv_obj_set_flex_grow(name_lbl, 1);
+        lv_obj_add_flag(name_lbl, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(name_lbl, s_ir_edit_remote_tap_cb,
+                            LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+        lv_obj_t *btn = lv_btn_create(row);
+        lv_obj_set_size(btn, 70, 28);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x0D47A1), 0);
+        lv_obj_set_style_radius(btn, 4, 0);
+        lv_obj_set_style_pad_all(btn, 2, 0);
+        lv_obj_t *bl = lv_label_create(btn);
+        lv_label_set_text(bl, "Rename");
+        lv_obj_set_style_text_font(bl, &lv_font_montserrat_12, 0);
+        lv_obj_center(bl);
+        lv_obj_add_event_cb(btn, s_ir_edit_remote_rename_cb,
+                            LV_EVENT_CLICKED, (void *)(intptr_t)i);
+    }
+}
+
+static void s_ir_edit_show_signals(void)
+{
+    if (s_ir_edit_cont && lv_obj_is_valid(s_ir_edit_cont)) {
+        lv_obj_del(s_ir_edit_cont); s_ir_edit_cont = NULL;
+    }
+    s_ir_edit_cont = lv_obj_create(function_page);
+    lv_obj_set_size(s_ir_edit_cont, lv_pct(100), LCD_V_RES - 60);
+    lv_obj_align(s_ir_edit_cont, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_set_style_bg_opa(s_ir_edit_cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_ir_edit_cont, 0, 0);
+    lv_obj_set_style_pad_all(s_ir_edit_cont, 4, 0);
+    lv_obj_set_style_pad_gap(s_ir_edit_cont, 3, 0);
+    lv_obj_set_flex_flow(s_ir_edit_cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_ir_edit_cont, LV_FLEX_ALIGN_START,
+                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    /* Header: ← All | remote name | [Rename File] */
+    lv_obj_t *hdr = lv_obj_create(s_ir_edit_cont);
+    lv_obj_set_width(hdr, lv_pct(100));
+    lv_obj_set_height(hdr, 36);
+    lv_obj_set_style_bg_color(hdr, lv_color_hex(0x1A237E), 0);
+    lv_obj_set_style_bg_opa(hdr, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(hdr, 0, 0);
+    lv_obj_set_style_radius(hdr, 4, 0);
+    lv_obj_set_style_pad_hor(hdr, 4, 0);
+    lv_obj_set_style_pad_ver(hdr, 0, 0);
+    lv_obj_set_flex_flow(hdr, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(hdr, LV_FLEX_ALIGN_START,
+                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(hdr, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back_btn = lv_btn_create(hdr);
+    lv_obj_set_size(back_btn, 52, 28);
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x455A64), 0);
+    lv_obj_set_style_radius(back_btn, 4, 0);
+    lv_obj_set_style_pad_all(back_btn, 2, 0);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " All");
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(back_lbl);
+    lv_obj_add_event_cb(back_btn, s_ir_edit_back_to_remotes_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *rname_lbl = lv_label_create(hdr);
+    lv_label_set_text(rname_lbl, s_ir_edit_remote);
+    lv_obj_set_style_text_font(rname_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(rname_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_flex_grow(rname_lbl, 1);
+
+    lv_obj_t *ren_file_btn = lv_btn_create(hdr);
+    lv_obj_set_size(ren_file_btn, 72, 28);
+    lv_obj_set_style_bg_color(ren_file_btn, lv_color_hex(0xBF360C), 0);
+    lv_obj_set_style_radius(ren_file_btn, 4, 0);
+    lv_obj_set_style_pad_all(ren_file_btn, 2, 0);
+    lv_obj_t *ren_file_lbl = lv_label_create(ren_file_btn);
+    lv_label_set_text(ren_file_lbl, "Ren File");
+    lv_obj_set_style_text_font(ren_file_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(ren_file_lbl);
+    lv_obj_add_event_cb(ren_file_btn, s_ir_edit_ren_file_from_signals_cb, LV_EVENT_CLICKED, NULL);
+
+    /* Signal rows */
+    int count = ir_hat_list_signals(s_ir_edit_remote, s_ir_edit_sig_names, IR_HAT_MAX_SIGNALS);
+    if (count == 0) {
+        lv_obj_t *lbl = lv_label_create(s_ir_edit_cont);
+        lv_label_set_text(lbl, "No signals in this remote");
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0x888888), 0);
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        lv_obj_t *row = lv_obj_create(s_ir_edit_cont);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, 34);
+        lv_obj_set_style_bg_color(row, lv_color_hex(0x1E1E1E), 0);
+        lv_obj_set_style_border_color(row, lv_color_hex(0x333333), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_radius(row, 4, 0);
+        lv_obj_set_style_pad_hor(row, 6, 0);
+        lv_obj_set_style_pad_ver(row, 0, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                               LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *name_lbl = lv_label_create(row);
+        lv_label_set_text(name_lbl, s_ir_edit_sig_names[i]);
+        lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(name_lbl, lv_color_hex(0xCCCCCC), 0);
+        lv_obj_set_flex_grow(name_lbl, 1);
+
+        lv_obj_t *btn = lv_btn_create(row);
+        lv_obj_set_size(btn, 70, 26);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x0D47A1), 0);
+        lv_obj_set_style_radius(btn, 4, 0);
+        lv_obj_set_style_pad_all(btn, 2, 0);
+        lv_obj_t *bl = lv_label_create(btn);
+        lv_label_set_text(bl, "Rename");
+        lv_obj_set_style_text_font(bl, &lv_font_montserrat_12, 0);
+        lv_obj_center(bl);
+        lv_obj_add_event_cb(btn, s_ir_edit_sig_rename_cb,
+                            LV_EVENT_CLICKED, (void *)(intptr_t)i);
+    }
+}
+
+static void ir_edit_screen_stop(void)
+{
+    if (s_ir_edit_overlay && lv_obj_is_valid(s_ir_edit_overlay)) {
+        lv_obj_del(s_ir_edit_overlay);
+        s_ir_edit_overlay = NULL; s_ir_edit_ta = NULL;
+    }
+    s_ir_edit_cont = NULL;
+}
+
+static void show_ir_edit_screen(void)
+{
+    create_function_page_base("IR Edit Files");
+    g_screen_stop_fn = ir_edit_screen_stop;
+    apply_menu_bg();
+    s_ir_edit_overlay = NULL;
+    s_ir_edit_ta      = NULL;
+    s_ir_edit_cont    = NULL;
+    s_ir_edit_show_remotes();
+    rfhat_add_back_btn("Infrared", show_ir_menu_screen);
 }
 
 static void led_rmt_screen_stop(void) { s_led_status_lbl = NULL; }
@@ -39184,6 +39544,8 @@ static void ir_menu_tile_cb(lv_event_t *e)
         show_ir_universal_screen();
     else if (strcmp(name, "LED RMT") == 0)
         show_ir_led_rmt_screen();
+    else if (strcmp(name, "Edit Files") == 0)
+        show_ir_edit_screen();
 }
 
 static void show_ir_menu_screen(void)
@@ -39207,7 +39569,8 @@ static void show_ir_menu_screen(void)
     create_tile(tiles, LV_SYMBOL_POWER,        "TV-B-Gone", lv_color_hex(0x4A148C), ir_menu_tile_cb, "TV-B-Gone");
     create_tile(tiles, LV_SYMBOL_WARNING,      "Jammer",    lv_color_hex(0xB71C1C), ir_menu_tile_cb, "Jammer");
     create_tile(tiles, LV_SYMBOL_LOOP,         "Universal", lv_color_hex(0x00695C), ir_menu_tile_cb, "Universal");
-    create_tile(tiles, LV_SYMBOL_POWER,        "LED RMT",   lv_color_hex(0xAD1457), ir_menu_tile_cb, "LED RMT");
+    create_tile(tiles, LV_SYMBOL_POWER,        "LED RMT",    lv_color_hex(0xAD1457), ir_menu_tile_cb, "LED RMT");
+    create_tile(tiles, LV_SYMBOL_SETTINGS,    "Edit Files", lv_color_hex(0x37474F), ir_menu_tile_cb, "Edit Files");
 
     rfhat_add_back_btn("Home", show_main_tiles_from_ir);
 }
@@ -39389,6 +39752,10 @@ static void s_ir_show_name_kbd(bool is_remote, const char *prefill)
     lv_obj_set_style_bg_color(s_ir_kbd_ta, ui_bg_color(), 0);
     lv_obj_set_style_text_color(s_ir_kbd_ta, ui_text_color(), 0);
     lv_obj_set_style_border_color(s_ir_kbd_ta, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_bg_opa(s_ir_kbd_ta, LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(s_ir_kbd_ta, COLOR_MATERIAL_TEAL, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(s_ir_kbd_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(s_ir_kbd_ta, LV_BORDER_SIDE_LEFT, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_keyboard_set_textarea(kb, s_ir_kbd_ta);
 
     /* OK / Cancel buttons */
