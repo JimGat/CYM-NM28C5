@@ -6,14 +6,6 @@ on:
       release_tag:
         description: "Optional tag name to upload assets to a release (example 'v0.5.1')"
         required: false
-      build_pages:
-        description: "Build and deploy GitHub Pages"
-        required: false
-        type: choice
-        options:
-          - "false"
-          - "true"
-        default: "false"
   push:
     branches: [main, master]
     paths:
@@ -208,116 +200,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  pages:
-    name: Pages Download Hub
-    needs: [release, package]
-    if: ${{ needs.release.result == 'success' && (github.event_name != 'workflow_dispatch' || inputs.build_pages == 'true') }}
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    outputs:
-      page_url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Pages
-        uses: actions/configure-pages@v5
-
-      - name: Resolve release tag
-        id: meta
-        env:
-          EVENT_TAG: ${{ github.event.release.tag_name }}
-          INPUT_TAG: ${{ inputs.release_tag }}
-          FW_VERSION: ${{ needs.package.outputs.fw_version }}
-        run: |
-          set -euo pipefail
-          TAG="${EVENT_TAG:-}"
-          if [ -z "$TAG" ]; then TAG="${INPUT_TAG:-}"; fi
-          # FW_VERSION already contains the leading 'v' (e.g. "v2.10.25") — do not add another.
-          if [ -z "$TAG" ]; then TAG="${FW_VERSION}"; fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Using tag: $TAG"
-
-      - name: Download release assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          TAG="${{ steps.meta.outputs.tag }}"
-          rm -rf ESP32C5/docs/firmware ESP32C5/docs/manifest.json
-          mkdir -p ESP32C5/docs/firmware
-
-          gh release download "$TAG" -R "$GITHUB_REPOSITORY" --dir ESP32C5/docs/firmware \
-            --pattern "flash_board.py" \
-            --pattern "bootloader.bin" \
-            --pattern "partition-table.bin" \
-            --pattern "${FW_BASENAME}.bin" \
-            --pattern "${FW_BASENAME}-full.bin"
-
-          for f in flash_board.py bootloader.bin partition-table.bin "${FW_BASENAME}.bin" "${FW_BASENAME}-full.bin"; do
-            if [ ! -f "ESP32C5/docs/firmware/$f" ]; then
-              echo "Missing release asset: $f" >&2
-              exit 1
-            fi
-          done
-
-      - name: Build manifest.json
-        env:
-          FW_VERSION: ${{ needs.package.outputs.fw_version }}
-          BUILD_TAG: ${{ steps.meta.outputs.tag }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          fw_basename = os.environ.get("FW_BASENAME", "CYM-NM28C5")
-          manifest = {
-              "name": "CYM-NM28C5",
-              "version": os.environ["FW_VERSION"],
-              "build": os.environ["BUILD_TAG"],
-              "chipFamily": "ESP32-C5",
-              "parts": [
-                  {"path": "firmware/bootloader.bin",      "offset": 0x2000},
-                  {"path": "firmware/partition-table.bin", "offset": 0x8000},
-                  {"path": f"firmware/{fw_basename}.bin",  "offset": 0x10000},
-              ],
-              "builds": [
-                  {
-                      "chipFamily": "ESP32-C5",
-                      "parts": [
-                          {"path": "firmware/bootloader.bin",      "offset": 0x2000},
-                          {"path": "firmware/partition-table.bin", "offset": 0x8000},
-                          {"path": f"firmware/{fw_basename}.bin",  "offset": 0x10000},
-                      ],
-                  }
-              ],
-          }
-
-          Path("ESP32C5/docs/manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-          PY
-
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: ESP32C5/docs
-
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
-
   discord:
     name: Discord
-    needs: [release, package, pages]
+    needs: [release, package]
     # Temporary hard-disable. Re-enable by restoring the previous condition.
     if: ${{ false }}
     runs-on: ubuntu-24.04
