@@ -113,6 +113,50 @@ For organizations operating their own drone fleets, run the Drone Detector to co
 
 ---
 
+## BLE Honeypot — Connectable Device Impersonation
+
+<!-- screenshot: ble_honeypot.png -->
+
+Takes the advertisement profile captured by GATT Walker (device name, service UUIDs, manufacturer data, TX power) and re-broadcasts it from CYM as a connectable advertisement. Any device or app that connects is logged — MAC, address type, timestamp, and every GATT operation it performs (reads, writes, subscriptions).
+
+### Research use cases
+
+**Discovering hidden scanners and seekers**  
+Most BLE attack-surface analysis focuses on what a target device advertises. The Honeypot flips the question: *who is actively looking for this device type?* Place CYM near a target environment impersonating a known device (a medical monitor, an industrial sensor, a POS terminal peripheral) and watch what connects. Background apps, rogue scanners, and unauthorized companion apps reveal themselves without any active probing on your part.
+
+**Client-side trust assumption testing**  
+Many BLE companion apps connect to any device that matches a target name or service UUID without verifying the device identity beyond the advertisement. The Honeypot confirms this by accepting connections and logging whether the connecting app sends credentials, commands, or sensitive data before any authentication step. This is a high-value finding in mobile app BLE security assessments.
+
+**Post-assessment rogue device detection**  
+After a red team engagement, leave the Honeypot running impersonating your own implant's BLE profile. If the client's blue team has deployed BLE monitoring, their detection system should alert — this validates whether their defensive tooling actually catches connectable rogue BLE devices.
+
+**Mapping the attack surface of a target device type**  
+Clone a device you're researching (e.g., a smart lock or glucose monitor) and observe what the manufacturer's companion app sends on first connection, pairing request, and subsequent reconnect. The log gives you the full client-side command sequence without needing a second physical unit.
+
+---
+
+## GATT Clone — Full Profile Impersonation
+
+<!-- screenshot: ble_gatt_clone.png -->
+
+After GATT Walker maps a real device, CYM can serve that device's **complete GATT profile** to any connecting client — identical service UUIDs, characteristic UUIDs, properties, and captured values. Connecting apps see no difference from the original device.
+
+### Research use cases
+
+**Reproducing device behavior without physical hardware**  
+Once a GATT map is captured, you can leave the original device behind and continue assessment work with CYM standing in as the target. Useful when physical access to the device is limited (time-sensitive, locked enclosure, single unit in production use).
+
+**Client app security assessment**  
+Connect your target mobile app to a GATT Clone and observe its full interaction sequence: which characteristics it reads, which it writes, what values it sends, and whether it validates response data. Without a real device, the app behaves identically — but now every byte is under your control and everything is logged.
+
+**Authentication bypass research**  
+A GATT Clone that serves expected characteristic values can bypass basic "is this the right device" checks in companion apps that don't perform cryptographic pairing verification. If the app accepts the clone as a legitimate device, no pairing was cryptographically enforced.
+
+**Regression and compatibility testing**  
+For developers, clone a known-good device GATT profile and use it as a stable test fixture. Any client app change that breaks against the clone breaks against the real device too — without needing the hardware on the bench.
+
+---
+
 ## BLE Spam — Advertisement Flood Testing
 
 <!-- screenshot: ble_spam.png -->
