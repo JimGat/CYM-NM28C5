@@ -40,6 +40,11 @@ CYM-NM28C5 is a pocket-sized WiFi 6 + BLE security toolkit and RF research platf
 
 All captures save to `/sdcard/lab/<feature>/` on the microSD card.
 
+### Quick Reference
+| Page | What it covers |
+|------|---------------|
+| [Use Cases](Use-Cases) | Master list of all real-world field scenarios — one page, every feature |
+
 ### Hardware Add-ons
 | Page | What it covers |
 |------|---------------|

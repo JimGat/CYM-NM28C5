@@ -30,6 +30,10 @@ Devices using static BLE MACs (most IoT, many medical) appear in every scan at t
 **Connectable vs. non-connectable inventory**  
 Connectable advertisements (`ADV_IND`) mean the device will accept a GATT connection — a significant attack surface. Non-connectable beacons (`ADV_NONCONN_IND`) are information-only. CYM flags connectable devices so you can prioritise GATT Walker sessions.
 
+### Field scenario
+
+You arrive at a hospital for a medical device security assessment. Before touching a single device, you open BLE Observer and let it run for ten minutes in the waiting room. By the time you sit down with the IT team, you already have a list of 47 advertising devices — including three infusion pumps in a nearby ward, two glucometers, and a BLE-enabled nurse call system that nobody mentioned in the asset register. Two of the pumps are advertising as connectable. That becomes the first item on the day's agenda.
+
 ---
 
 ## GATT Walker — Interactive GATT Inspector
@@ -63,6 +67,10 @@ OTA DFU services (Nordic DFU `0x0001`, TI OAD, custom vendor UUIDs) appear in th
 **Device fingerprinting database**  
 The FNV-32 fingerprint of a GATT map is stable across devices of the same firmware version. Run GATT Walker across multiple units of the same device and compare fingerprints to confirm firmware consistency — or detect that a "same model" device has unexpected services enabled.
 
+### Field scenario
+
+You're doing an IoT assessment for a client whose warehouse uses BLE-enabled industrial temperature sensors. Nothing in the datasheet mentions remote configuration. You connect GATT Walker and let it run for two minutes. The JSON that lands on your SD card tells a different story: buried inside the vendor-specific service tree is a writable characteristic labelled `0xFF03` — not documented anywhere. You write a test value to it. The sensor immediately changes its reporting interval from 60 seconds to 1 second, flooding the backend. That one undocumented write characteristic could crash the entire telemetry pipeline or mask legitimate environmental readings. It goes straight into the report as a critical finding.
+
 ---
 
 ## BT Lookout — Persistent Device Monitor
@@ -92,6 +100,10 @@ In authorized insider-threat simulations, load the BLE MAC of a specific person'
 **Covert alerting during walk-throughs**  
 Because the alert is haptic-only, you get a clear "target detected" signal in your hand while maintaining a natural appearance — no screen to glance at, no audible ping. Walk a facility at a normal pace; the burst pattern is distinctive enough to feel through a jacket pocket.
 
+### Field scenario
+
+Red team exercise. You've been told the client's security team will try to identify you during the engagement. You load the OUI prefix for their brand of security laptops and their MDM-managed iPhone fleet into BT Lookout, hit Go Dark so the screen goes completely black, and drop CYM into your jacket pocket. You sit down in the lobby with a coffee and a newspaper. Eleven minutes later your jacket buzzes — one, pause, two, pause, three. Security just walked past you in the hallway behind you. You don't reach for your phone, don't look up, don't change your posture. You set your coffee down and turn to a new page. You knew they were coming before they rounded the corner.
+
 ---
 
 ## BT Locator — Proximity Tracking with Variable Haptic
@@ -116,6 +128,10 @@ Keep CYM in a pocket and navigate to a target device without looking at the scre
 **Beacon placement validation**  
 After deploying your own BLE beacons, walk the coverage area and use BT Locator to verify that RSSI falls off at the expected rate. Sharp drop-offs indicate RF obstructions; unusually long range indicates antenna misplacement or excessive TX power.
 
+### Field scenario
+
+Post-assessment sweep of a data center. The client wants to know if there are any unauthorized wireless devices. BLE Observer flagged an unknown MAC during the initial scan — unknown OUI, advertising every two seconds, slightly too regular to be a phone. You lock it into BT Locator and slip CYM into your bag. The motor is barely breathing. You walk the floor. Near the back of a row of racks the pulses start coming faster. Stronger. By the time you're standing in front of rack 14 it's running full strength every half second. You look underneath the cable management arm. Zip-tied to the back of the rack frame: a small ESP32 dev board on a USB battery pack, blinking its status LED once every two seconds. You found it without looking at a screen once.
+
 ---
 
 ## Drone Detector
@@ -137,6 +153,10 @@ Remote ID includes operator GPS coordinates. If the drone is within BLE range (~
 
 **Fleet validation**  
 For organizations operating their own drone fleets, run the Drone Detector to confirm every drone is broadcasting its correct ID and that no unauthorized drones are mixed into the formation.
+
+### Field scenario
+
+Outdoor event security assessment. Your client wants to know if unauthorized drones are operating over the venue. You set CYM on the production table and let Drone Detector run through the show. Within the first 20 minutes: three drones detected, all broadcasting Remote ID. Two match the authorized fleet — correct operator IDs, GPS positions inside the approved flight corridor. The third doesn't. Its Remote ID shows an operator location 200 metres outside the perimeter fence and a flight path arcing directly over the stage during the headliner's set. No app, no subscription, no network connection. CYM decoded it off a BLE advertisement. Security has a grid reference for the operator before the song ends.
 
 ---
 
@@ -160,6 +180,10 @@ After a red team engagement, leave the Honeypot running impersonating your own i
 **Mapping the attack surface of a target device type**  
 Clone a device you're researching (e.g., a smart lock or glucose monitor) and observe what the manufacturer's companion app sends on first connection, pairing request, and subsequent reconnect. The log gives you the full client-side command sequence without needing a second physical unit.
 
+### Field scenario
+
+Hospital BLE security assessment. You spend five minutes running GATT Walker on a bedside infusion pump to capture its full advertisement profile. CYM clones it — same device name, same service UUIDs, same manufacturer data — and starts broadcasting as a connectable device. You set it on a supply cart and walk away to interview the IT team. Four minutes later something connects to the Honeypot. Not a nurse's tablet. Not the companion app running on an authorized device. A background process on a laptop three rooms over that was silently scanning for connectable infusion pump profiles. It immediately tried to read the drug dosage characteristic without any pairing request, no authentication, no handshake. The hospital had no idea that laptop had a background process doing that. The Honeypot found it without you actively probing anything — it just waited, and the threat revealed itself.
+
 ---
 
 ## GATT Clone — Full Profile Impersonation
@@ -182,6 +206,51 @@ A GATT Clone that serves expected characteristic values can bypass basic "is thi
 **Regression and compatibility testing**  
 For developers, clone a known-good device GATT profile and use it as a stable test fixture. Any client app change that breaks against the clone breaks against the real device too — without needing the hardware on the bench.
 
+### Field scenario
+
+You're auditing the companion app for a smart lock. The lock is installed on the client's front door — you can't take it into the lab. You run GATT Walker on it for two minutes in the field, capturing the full service tree to a JSON file on the SD card. Back at your desk, CYM serves that exact GATT profile to any connecting app. You install the lock's companion app on a test device, connect it to CYM instead of the real lock, and watch every byte it sends. On first connection the app transmits the unlock PIN in plaintext to a writable characteristic. No crypto, no auth challenge, no certificate pinning. The real lock stayed on the door. The clone gave you everything you needed from a desk fifty miles away.
+
+---
+
+## BLE List Analytics — Cross-Location Device Correlation & Go Dark
+
+<!-- screenshot: ble_list_wizard.png -->
+
+Load up to **four saved BLE scan lists** and find devices that appear across multiple scans — the intersection of who was present at multiple locations. Results can be pushed directly to BT Lookout as a live watchlist in one tap. Combined with **Go Dark** (display off, device fully active), the entire workflow runs covertly with no visible screen.
+
+### Research use cases
+
+**Cross-location device correlation**  
+Scan BLE at each location where a subject or incident of interest was present. Devices that appear in all four lists were physically co-located with the subject every time. Modern phones rotate their MAC every 10–15 minutes and almost never survive a cross-scan intersection. Static-MAC devices — AirTags, Fitbits, Tile trackers, Garmin watches, Galaxy Buds, cheap BLE earbuds — appear identically every time. The intersection filter separates the signal from the noise automatically.
+
+**Rogue tracker detection**  
+Scan your own environment at multiple points during the day. Any device that persists across all four scans and resolves to a tracking device OUI is a candidate for an unwanted tracker attached to your vehicle, bag, or equipment.
+
+**Authorized personnel tracking**  
+In authorized insider-threat scenarios, four scans at four locations where a subject was present narrows hundreds of BLE devices down to the handful of personal devices that never leave the subject's possession.
+
+### Field scenario
+
+You're doing a counter-surveillance assessment for a client who suspects they're being followed. You don't have a face, a plate, or a name. What you have is a pattern — the same feeling of being watched at four completely unrelated locations over two weeks: a coffee shop downtown, a parking garage near their office, a hardware store across town, and a restaurant they visited once. You were there for the debrief at each one. At every location you ran a passive BLE scan for ten minutes and saved the list. Four lists. Hundreds of devices in each — phones, laptops, store beacons, other customers' earbuds. A sea of MACs.
+
+Here's the thing about modern phones: they rotate their BLE MAC address every ten to fifteen minutes for privacy. Across four independent scans days apart, a phone almost never appears in more than one list. But certain devices don't rotate. **AirTags. Tile trackers. Fitbits. Garmin watches. Galaxy Buds. Cheap BLE earbuds from Amazon.** Static factory MACs. They show up identically every single time.
+
+You load all four scan files into the List Wizard and run the intersection. Out of hundreds of devices per scan, the common set collapses to nine MACs. Two resolve to store fixture OUIs — the coffee shop's in-store beacons, coincidentally present at two locations. You discard them. One is your client's own Fitbit. Two more resolve to a known tracking device OUI. Four are unresolved consumer electronics.
+
+Those four unknown devices were in the same physical space as your client at four locations chosen at random over two weeks. That is not a coincidence.
+
+You tap **Push to Lookout**. All four MACs land directly in the BT Lookout watchlist in one shot. Then you hit **Go Dark**. The screen goes black — not sleep, Blackout. The display is completely off. No glow through a shirt pocket. No reflection in a window. No bright rectangle for anyone to clock. CYM is invisible in your hand. It is still scanning. Every advertisement packet in the air is still being checked against those four MACs in real time. Fully awake, fully silent — light, sound, nothing. Just a warm rectangle in your jacket.
+
+You sit down at a table near the entrance and order a coffee.
+
+Eleven minutes later your jacket buzzes. One second on, half a second off. One second on, half a second off. One second on. Three beats. The BT Lookout pattern. You don't reach for the device. You don't look down. You lift your coffee and scan the room with your eyes the way anyone would when they hear a door open.
+
+A man in a grey jacket just sat down at the bar. He's looking at his phone. One of those four MACs walked through the door with him.
+
+You set your coffee down and say, quietly, to your client across the table: "Don't turn around. We have a problem."
+
+That is the full loop. Four passive scans. A list intersection that no human eye could perform across hundreds of devices. A one-tap push to a real-time watchlist. A blacked-out screen that reveals nothing. And a haptic alert felt through fabric in a crowded room before you made a single visible move. The tail never knew the net was already closing. They just walked into a room with a $20 board that had been waiting for them for eleven minutes.
+
 ---
 
 ## BLE Spam — Advertisement Flood Testing
@@ -202,3 +271,7 @@ Some embedded BLE stacks (IoT sensors, medical devices, industrial controllers) 
 
 **Scanner performance under load**  
 Verify that your own BLE monitoring infrastructure (SIEM sensors, asset tracking gateways) handles high-density advertisement environments without dropping packets or crashing.
+
+### Field scenario
+
+You're validating an organization's MDM policy before a large conference. Policy says all managed iOS devices must suppress pairing prompts from unauthorized accessories. You start BLE Spam in the break room before the morning session. If any attendee's phone starts showing pairing popups, that device either isn't enrolled in MDM or the policy isn't enforced correctly. You find three devices popping. All three belong to contractors using personal phones. MDM gap confirmed, documented, and reported before lunch.

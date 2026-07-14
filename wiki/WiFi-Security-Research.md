@@ -46,6 +46,10 @@ Some devices (IoT sensors, industrial controllers, POS terminals) reconnect inse
 **Rogue AP detection baseline**  
 Send a deauth burst to your own AP and observe which clients reconnect immediately vs. clients that switch to a rogue AP with a stronger signal. This reveals which clients are susceptible to evil twin attacks.
 
+### Field scenario
+
+Client claims their enterprise WiFi is protected by 802.11w. You select their BSSID, launch deauth, and feel the 3-second haptic blast confirm the attack started — your hand buzzes while you're watching their client devices on the other side of the room. Three devices drop connection immediately. PMF is either off or misconfigured on those clients. Two devices stay connected. Those two have it correctly enforced. One tap, one haptic confirmation, and you have a definitive per-device PMF audit in under 30 seconds.
+
 ---
 
 ## Handshake Capture
@@ -68,6 +72,10 @@ Networks running WPA3-SAE + WPA2 in transition mode remain vulnerable to handsha
 **Evidence collection**  
 The `.pcap` format is readable by Wireshark for detailed frame-level inspection, timestamp verification, and chain-of-custody documentation during authorized assessments.
 
+### Field scenario
+
+Authorized password audit. The client wants to know if their WPA2 PSK meets policy. You select their AP, kick one client with a deauth burst, watch it reconnect over the next three seconds, and the handshake is captured. Fifteen seconds total. The `.hccapx` goes to hashcat before you've finished your coffee. The PSK is `CompanyName2023!`. It cracks in four minutes against a rule-based mutation of a common wordlist. The client's password policy said minimum 12 characters, uppercase, number, special character. Technically compliant. Practically broken. That nuance goes in the executive summary.
+
 ---
 
 ## Evil Twin / Captive Portal
@@ -86,6 +94,10 @@ Devices that automatically connect to any open network with a known SSID (a comm
 
 **Captive portal detection bypass research**  
 Some devices send captive portal probes to known endpoints (e.g., `connectivitycheck.gstatic.com`). Hosting the evil twin lets you observe exactly which probe URLs a device uses and whether it validates TLS certificates — a common vector for MITM on IoT devices.
+
+### Field scenario
+
+Red team engagement, day two. You set up an evil twin in the parking lot matching the client's guest SSID. Over the next 90 minutes, eleven devices connect automatically — mostly contractor laptops that joined the guest network on a previous visit and stored the credentials. Three employees enter their domain credentials into the captive portal login page thinking they're re-authenticating to the real network. The log on your SD card has their usernames and passwords in plaintext. The client's guest network had no client isolation, no certificate-based authentication, and no user training about portal verification. All three findings make the report.
 
 ---
 
@@ -117,6 +129,10 @@ ESP-NOW can operate on any 2.4 GHz or 5 GHz channel. Channel-hopping mode lets y
 **Broadcast vs. unicast identification**  
 Broadcast ESP-NOW frames (destination `FF:FF:FF:FF:FF:FF`) are unencrypted by spec. Unicast frames may carry an LMK-encrypted payload. The Scout distinguishes these and flags encrypted unicast sessions for follow-up.
 
+### Field scenario
+
+Warehouse audit. The client runs inventory sensors throughout the floor but can't account for all of them in their documentation. You open ESP-NOW Scout and start channel hopping. Within two minutes: 14 source MACs, all on ch 6, all from the same ESP32 OUI. Twelve match the documented sensors. Two don't — different MAC batch dates, not in the asset management system, never registered with IT. Both have been silently transmitting data in a protocol that doesn't appear in any WiFi scan for an unknown period of time. You found two ghost devices that standard network monitoring would never have seen.
+
 ---
 
 ## Chanalizer — Channel Utilisation Analyser
@@ -135,3 +151,7 @@ An unexpected AP on a normally clear channel, or a sudden spike in channel utili
 
 **5 GHz coverage gap identification**  
 5 GHz has significantly more non-overlapping channels. The Chanalizer reveals which 5 GHz channels are in use and which are idle — useful for identifying coverage gaps in a corporate wireless deployment.
+
+### Field scenario
+
+Pre-engagement WiFi survey for a penetration test. Two minutes with Chanalizer tells you that the client's corporate SSID lives on 2.4 GHz ch 6 — already saturated with three overlapping APs and a neighbour's network. Channel 11 is completely clear. You set your evil twin on ch 11 with a slightly stronger SSID broadcast and it becomes the cleanest signal in the building before you've opened a terminal window. Chanalizer didn't just show you the landscape — it handed you the best position in it.

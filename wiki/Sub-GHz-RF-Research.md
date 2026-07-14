@@ -32,6 +32,10 @@ Regulatory 433 MHz ISM is shared by dozens of device classes. A 5-minute Band Sc
 **Z-Wave band check**  
 Verify 908.42 MHz (US) activity before running Z-Wave Scout — confirms the CC1101 antenna is resonant at that frequency and that Z-Wave nodes are transmitting.
 
+### Field scenario
+
+You're doing a physical assessment of a distribution warehouse. The client uses 433 MHz wireless door sensors and a keypad-armed alarm system. You open Band Scope on 433 MHz and watch the waterfall. Every time a forklift passes a dock sensor you see a spike light up and trail downward — pinpointing the exact frequency in seconds. You lock in on it and switch to Capture before you've even introduced yourself to the site manager.
+
 ---
 
 ## Capture — Raw Signal Recording
@@ -57,6 +61,10 @@ For devices that don't match a known decoder, the raw `.sub` file can be importe
 **Fleet/audit logging**  
 Capture multiple sensors in sequence, naming each file by location. The SD card becomes a timestamped evidence trail of every wireless device found during a physical security assessment.
 
+### Field scenario
+
+Same warehouse. You hit Capture, walk past the dock door once, and wait ten seconds. The `.sub` file lands on the SD card. You name it `dock_door_open`. That's it. The entire capture — frequency, modulation, pulse timings, everything — is now saved in a Flipper-compatible file. The alarm system uses fixed-code OOK. One signal. Captured in one pass. No protocol knowledge required, no decoding, no reverse engineering. Just a recording of what the real remote does.
+
 ---
 
 ## Replay — Signal Retransmission
@@ -76,6 +84,10 @@ Replay a captured alarm sensor signal to verify whether the alarm panel accepts 
 **Range and power testing**  
 Transmit a known signal at varying distances from your target receiver and note at what distance reception fails. Gives you a realistic RF budget estimate for the attack path.
 
+### Field scenario
+
+Two hours after the capture. You walk back to the dock door — no remote, no keyfob, no social engineering required. You select `dock_door_open` from the file list, hit Replay, and the door opens. The alarm panel disarms. You just demonstrated that the entire perimeter security system runs on fixed-code OOK with zero replay protection, using a device that cost less than a cup of coffee. That finding goes in the report as critical.
+
 ---
 
 ## Frequency Scan — Channel Survey
@@ -91,6 +103,10 @@ When you have a target device but don't know its frequency, the scan will light 
 
 **Multi-band ISM audit**  
 A single pass across 315, 433, 868, and 915 MHz identifies which bands are in use in the target environment, helping focus deeper analysis.
+
+### Field scenario
+
+You have a target device but no datasheet and no markings beyond a regulatory ID. You know it's sub-GHz. You run Frequency Scan across 315, 433, 868, and 915 MHz presets while standing next to it and triggering it manually. On the third press the 915 MHz scan lights up a channel that wasn't there before. You now have the transmit frequency, and you can switch directly to Capture from here.
 
 ---
 
@@ -116,6 +132,10 @@ Verify that a Z-Wave device is actually transmitting on the correct channel and 
 **Frame timing analysis**  
 Z-Wave uses ACK-required unicast. Watching the scout log lets you observe request/ACK pairs and identify nodes that are slow to respond or not ACKing — useful for diagnosing mesh health on a network you manage.
 
+### Field scenario
+
+Corporate office building, physical security assessment. Nobody mentioned Z-Wave in the scope documentation. You open Z-Wave Scout and walk the building for ten minutes. The log comes back with seven unique Home IDs and dozens of Node IDs — thermostats, motorized blinds, smart lighting controllers, and a Z-Wave lock on the executive suite. The client's IT team has zero visibility into any of it. The building management contractor installed it three years ago and never told anyone. Z-Wave Scout found all of it passively, without joining any mesh, without sending a single command frame.
+
 ---
 
 ## Fox Hunt — Sub-GHz Signal Direction Finding
@@ -139,6 +159,10 @@ The non-audible haptic alert means you can search for a transmitter in an occupi
 
 **Verifying antenna directionality**  
 Point CYM in different directions while standing still. On a directional antenna, the RSSI and haptic response will peak when aimed at the transmitter — confirming both antenna directionality and rough bearing to the target.
+
+### Field scenario
+
+Post-assessment sweep of a data center. The client wants to know if there are any covert RF transmitters. You lock CYM onto 433.92 MHz in Fox Hunt mode, slip it in your jacket pocket, and walk the floor. Short buzzes. Far away. You walk toward the server rows. The pulses start coming faster. By the time you're halfway down row 14 it's nearly continuous in your hand. You stop. Look around. Behind a ventilation panel screwed to the back wall: a commercial GSM bug transmitting telemetry every 30 seconds. You found it by feel, in a room full of equipment, without ever looking at the screen.
 
 ---
 

@@ -31,6 +31,10 @@ Scan every access card and badge presented during a social engineering exercise.
 **NDEF data extraction**  
 Smart posters and tap-to-pay loyalty cards often store URIs pointing to backend systems. Read the NDEF payload to identify backend URLs, deep links, and app store targets — these sometimes point to staging environments or reveal the app bundle ID.
 
+### Field scenario
+
+Physical pen test, day one. The receptionist's desk has a stack of visitor badges in a tray — MIFARE Classic, ISO14443A. You ask to see one "to check if it works with your equipment" during a conversation about the security system. CYM reads the UID in under a second while you're holding it. Badge goes back in the tray. You've got the UID logged. The entire interaction looked like a hardware compatibility check. Nobody saw a scan.
+
 ---
 
 ## Clone / Write — Credential Duplication
@@ -49,6 +53,10 @@ Before writing test data to a production NFC tag, clone it. You have a bit-exact
 
 **Credential mobility testing**  
 Test whether your organization's NFC credentials are unique to the physical card (anti-clone measures, rolling codes, challenge-response) or are simply a static UID that any blank tag can impersonate.
+
+### Field scenario
+
+Thirty minutes after reading the visitor badge UID. You're in your car in the parking lot. You write the captured UID to a blank NTAG213 — a $0.10 sticker tag from a pack of 50. Walk back to the building. Tap your sticker tag to the server room access reader. The door opens. The access control system never looked at anything beyond the UID. MIFARE Classic, deployed correctly, uses sector-level crypto authentication. This deployment didn't. The clone took thirty minutes and cost ten cents.
 
 ---
 
@@ -76,6 +84,10 @@ During an authorized physical pen test, emulate a cloned credential and attempt 
 **Reader firmware behavior analysis**  
 Some readers send unusual APDU sequences after UID selection. Running emulation mode while monitoring the PN532 I2C logs (available in ESP-IDF serial output) reveals exactly what commands the reader sends — useful for reverse-engineering proprietary reader protocols.
 
+### Field scenario
+
+Same server room reader, but this time you want to know whether CYM itself can get through without the cloned sticker — just by emulating the captured UID directly from the device. You switch to Card Emulation, select the saved badge profile, and tap CYM to the reader. Door opens. You've now demonstrated the vulnerability three ways: scan, clone to blank tag, and live emulation. The client gets all three methods documented, each with a different threat actor profile — opportunistic attacker with a blank tag vs. a researcher with a purpose-built device.
+
 ---
 
 ## Key Test — Authentication Attempt
@@ -94,3 +106,7 @@ Before a full MIFARE Classic clone (which requires knowing the keys for every se
 
 **Credential system audit**  
 Card issuers who claim to use custom keys can be verified — if Key Test cracks any sector with a well-known key, the issuer's key management practices are deficient.
+
+### Field scenario
+
+The access control vendor insists their MIFARE Classic deployment uses custom sector keys per facility. Key Test runs through the common default list in under a minute. Sector 0 opens with `FF FF FF FF FF FF`. Sector 3 opens with `A0 A1 A2 A3 A4 A5`. The facility code and card number are sitting in sector 1 in plaintext. The vendor's "custom key" claim was true for two of the sixteen sectors. The other fourteen used factory defaults. That's in the report as a vendor misrepresentation finding, not just a configuration gap.
