@@ -118,7 +118,7 @@ jobs:
           out_dir="release_artifacts/firmware"
           python -m esptool --chip esp32c5 merge_bin \
             -o "${out_dir}/${FW_BASENAME}-full-${{ steps.prepare.outputs.version }}.bin" \
-            --flash_mode dio --flash_freq 80m --flash_size 8MB \
+            --flash_mode dio --flash_freq 80m --flash_size 16MB \
             0x2000 "${out_dir}/bootloader.bin" \
             0x8000 "${out_dir}/partition-table.bin" \
             0x10000 "${out_dir}/CYM-NM28C5.bin"
