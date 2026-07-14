@@ -39,3 +39,8 @@ CYM-NM28C5 is a pocket-sized WiFi 6 + BLE security toolkit and RF research platf
 | 433 MHz OOK | T2-433M TX + R4A_433 superheterodyne RX via DIP 5 |
 
 All captures save to `/sdcard/lab/<feature>/` on the microSD card.
+
+### Hardware Add-ons
+| Page | What it covers |
+|------|---------------|
+| [Haptic Feedback](Haptic-Feedback) | ERM vibrator motor build, wiring, which features use it and how |

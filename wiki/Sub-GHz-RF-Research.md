@@ -118,6 +118,30 @@ Z-Wave uses ACK-required unicast. Watching the scout log lets you observe reques
 
 ---
 
+## Fox Hunt — Sub-GHz Signal Direction Finding
+
+<!-- screenshot: cc1101_foxhunt.png -->
+
+Tunes to a configurable frequency (300–928 MHz) and continuously displays RSSI with an adjustable squelch threshold. A **Hunt button** locks the tuning and switches the display to a signal-strength bar optimised for direction finding. **Haptic feedback fires on every signal detection above squelch** — 150 ms vibration bursts at full motor strength, with the pulse rate scaling proportionally to signal level. Stronger signal = faster pulses.
+
+Fine-tune controls let you step ±1 kHz or ±10 kHz while hunting, and the frequency and squelch settings persist across screen navigations.
+
+### Research use cases
+
+**Locating an unknown sub-GHz transmitter**  
+After Band Scope identifies an active frequency, switch to Fox Hunt on that frequency and walk toward the signal. The haptic pulse rate guides you by feel — faster buzzing means you're moving toward the source. No need to watch the screen; keep the device in a pocket or bag.
+
+**Rogue transmitter hunt during facility assessment**  
+Sub-GHz wireless bugs, covert RF exfiltration implants, and unauthorized telemetry devices all transmit periodically. Fox Hunt on the known frequency of a suspected implant type (433.92 MHz for most consumer-grade bugs, 315 MHz for US market devices) will physically guide you to within a metre of the source.
+
+**Covert navigation by haptic alone**  
+The non-audible haptic alert means you can search for a transmitter in an occupied space — conference room, server room, lobby — without drawing attention. The pulse-rate gradient is strong enough to feel through clothing.
+
+**Verifying antenna directionality**  
+Point CYM in different directions while standing still. On a directional antenna, the RSSI and haptic response will peak when aimed at the transmitter — confirming both antenna directionality and rough bearing to the target.
+
+---
+
 ## CC1101 Saved .sub Files
 
 Browse and replay any `.sub` file saved on the SD card. Compatible with files captured directly on CYM or exported from a Flipper Zero.

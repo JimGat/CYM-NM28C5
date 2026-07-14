@@ -69,7 +69,7 @@ The FNV-32 fingerprint of a GATT map is stable across devices of the same firmwa
 
 <!-- screenshot: bt_lookout.png -->
 
-Continuous BLE scanner that compares every observed advertisement against a **watchlist** of target MACs and OUI prefixes. Triggers a haptic alert (`3 × 1 s vibration bursts`) and logs a timestamped entry to `/sdcard/lab/bt_lookout/watchlist.csv` on each match.
+Continuous BLE scanner that compares every observed advertisement against a **watchlist** of target MACs and OUI prefixes. On each match it logs a timestamped entry to `/sdcard/lab/bt_lookout/watchlist.csv` and fires a **haptic alert: 3 × 1-second vibration bursts with 500 ms gaps**. The alert is non-audible — felt in a pocket or on a surface without drawing attention in a quiet environment.
 
 ### Watchlist matching
 - **Full MAC** — exact 6-byte match (identifies a specific known device)
@@ -88,6 +88,33 @@ After a physical intrusion assessment, run BT Lookout against a list of known im
 
 **Personnel monitoring (authorized)**  
 In authorized insider-threat simulations, load the BLE MAC of a specific person's phone or wearable. The CSV log provides a timestamped movement record.
+
+**Covert alerting during walk-throughs**  
+Because the alert is haptic-only, you get a clear "target detected" signal in your hand while maintaining a natural appearance — no screen to glance at, no audible ping. Walk a facility at a normal pace; the burst pattern is distinctive enough to feel through a jacket pocket.
+
+---
+
+## BT Locator — Proximity Tracking with Variable Haptic
+
+<!-- screenshot: bt_locator.png -->
+
+Locks onto a selected BLE device's MAC and tracks its signal strength in real time. Unlike BT Lookout's binary match/no-match, BT Locator uses **variable-intensity haptic feedback** tied directly to RSSI — the motor spins faster and stronger as you get closer to the target.
+
+**Haptic scaling:** Pulses fire every 500 ms. Motor intensity is computed from RSSI: `strength = 10 + (RSSI + 69) × 90 / 29`, clamped to 10–100 %. Silent below −69 dBm (device out of useful range). At −40 dBm and above the motor runs at full strength. Both the pulse feel and cadence change with distance — experienced users can navigate by touch alone.
+
+### Research use cases
+
+**Physical locating of a known BLE device**  
+Once you have a target MAC (from a prior BLE Observer scan or GATT Walker session), BT Locator guides you to it by feel. Walk toward stronger feedback. Useful for locating:
+- Hidden BLE beacons or trackers in a facility
+- An asset tag attached to a specific piece of equipment
+- A rogue BLE device planted during a prior access
+
+**Covert search during physical assessment**  
+Keep CYM in a pocket and navigate to a target device without looking at the screen. The haptic intensity gradient gives you directional guidance through walls and furniture — you'll feel the peak as you pass through the strongest-signal zone.
+
+**Beacon placement validation**  
+After deploying your own BLE beacons, walk the coverage area and use BT Locator to verify that RSSI falls off at the expected rate. Sharp drop-offs indicate RF obstructions; unusually long range indicates antenna misplacement or excessive TX power.
 
 ---
 

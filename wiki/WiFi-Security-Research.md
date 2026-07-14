@@ -30,7 +30,7 @@ The BSSID list feeds directly into Deauth and Handshake Capture — select your 
 
 <!-- screenshot: deauth.png -->
 
-Sends 802.11 deauthentication frames to a selected BSSID/client pair, forcing clients off the network.
+Sends 802.11 deauthentication frames to a selected BSSID/client pair, forcing clients off the network. A **3-second haptic burst fires the moment the attack launches** — non-audible confirmation that the deauth stream started, useful when operating the device at arm's length or inside a bag.
 
 ### Research use cases
 
