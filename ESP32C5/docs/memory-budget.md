@@ -21,7 +21,7 @@
 | .dram0.data | 23,673 B (23.1 KB) |
 | .dram0.bss  (internal) | 133,808 B (130.7 KB) |
 | .ext_ram.bss  (PSRAM) | 131,528 B (128.4 KB) |
-| App binary size | 2,948,704 B (2879.6 KB) |
+| App binary size | 2,949,328 B (2880.2 KB) |
 <!-- MEMORY_METRICS_END -->
 
 ### Top internal BSS consumers  *(auto-updated)*
