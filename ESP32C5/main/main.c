@@ -43820,6 +43820,18 @@ static void s_fox_preset_cb(lv_event_t *e)
     }
 }
 
+static void cc1101_foxhunt_screen_stop(void)
+{
+    if (s_fox_tmr) { lv_timer_del(s_fox_tmr); s_fox_tmr = NULL; }
+    s_fox_rssi_bar    = NULL; s_fox_rssi_lbl   = NULL;
+    s_fox_peak_lbl    = NULL; s_fox_freq_lbl   = NULL;
+    s_fox_squelch_lbl = NULL; s_fox_haptic_btn = NULL;
+    s_fox_status_lbl  = NULL;
+    vibrator_off();
+    g_vibtest_strength_pct = s_fox_saved_vib_pct;
+    cc1101_idle();
+}
+
 static void show_cc1101_foxhunt_screen(void)
 {
     if (s_fox_tmr) { lv_timer_del(s_fox_tmr); s_fox_tmr = NULL; }
@@ -43843,6 +43855,7 @@ static void show_cc1101_foxhunt_screen(void)
     // reset_function_page_children. CC1101 setup is deferred to the first timer
     // tick (50 ms later) so that task exits before we configure the radio.
     create_function_page_base("CC1101 Fox Hunt");
+    g_screen_stop_fn = cc1101_foxhunt_screen_stop;
     apply_menu_bg();
 
     int y = 32;
@@ -44050,14 +44063,7 @@ static void show_cc1101_foxhunt_screen(void)
     lv_obj_align(s_fox_status_lbl, LV_ALIGN_TOP_MID, 0, y);
 
     s_fox_tmr = lv_timer_create(s_fox_timer_cb, 50, NULL);
-
-    // Save vibration strength; restore on exit via back button
-    rfhat_add_back_btn("CC1101", show_cc1101_screen);
 }
-
-// On exiting the fox hunt screen the back button calls show_cc1101_screen.
-// Restore vibration and clean up in that path via the existing rfhat_add_back_btn.
-// (The timer is cleaned up by reset_function_page_children / create_function_page_base.)
 
 // ── Jammer (Attack — FOR AUTHORIZED USE ONLY) ────────────────────────────────
 
