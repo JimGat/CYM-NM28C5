@@ -2747,6 +2747,7 @@ static bool bt_is_apple_airtag(const uint8_t *data, uint8_t len, bool has_name);
 static bool bt_is_samsung_smarttag(const uint8_t *data, uint8_t len);
 
 // BLE Scan UI
+static void ble_scan_screen_stop(void);
 static void ble_scan_back_btn_cb(lv_event_t *e);
 static void ble_scan_update_list(void);
 
@@ -16344,9 +16345,16 @@ static void mitm_scan_check_timer_cb(lv_timer_t *timer)
     }
 }
 
+static void mitm_scan_stop(void)
+{
+    if (mitm_scan_check_timer) { lv_timer_del(mitm_scan_check_timer); mitm_scan_check_timer = NULL; }
+    // wifi scan task has no stored handle; it exits naturally and writes no LVGL objects
+}
+
 static void show_mitm_page(void)
 {
     create_function_page_base("MITM");
+    g_screen_stop_fn = mitm_scan_stop;
 
     lv_obj_t *content = lv_obj_create(function_page);
     lv_obj_set_size(content, lv_pct(100), LCD_V_RES - 30);
@@ -29014,11 +29022,20 @@ static void gw_probe_poll_cb(lv_timer_t *t)
     }
 }
 
+static void gw_probe_running_stop(void)
+{
+    gw_probe_screen_active = false;
+    if (gw_probe_timer) { lv_timer_del(gw_probe_timer); gw_probe_timer = NULL; }
+    gw_probe_status_lbl = NULL;
+    // gatt_walker task continues in background; gw_probe_screen_active=false stops its callbacks
+}
+
 static void show_gw_probe_running_screen(void)
 {
     if (function_page) { lv_obj_del(function_page); function_page = NULL; }
     reset_function_page_children();
     create_function_page_base("CCCD Probe");
+    g_screen_stop_fn = gw_probe_running_stop;
     apply_menu_bg();
 
     gw_probe_screen_active = true;
@@ -33724,6 +33741,7 @@ void attack_event_cb(lv_event_t *e)
         
         // Create base page
         create_function_page_base("BLE Scan");
+        g_screen_stop_fn = ble_scan_screen_stop;
         ble_scan_ui_active = true;
         
         // Status label below title bar (30px from top)
@@ -35758,26 +35776,26 @@ static void bt_scan_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
+static void ble_scan_screen_stop(void)
+{
+    bt_scan_stop();
+    ble_scan_ui_active = false;
+    ble_scan_list = NULL;
+    ble_scan_status_label = NULL;
+    ble_scan_content = NULL;
+    if (current_radio_mode == RADIO_MODE_BLE) {
+        bt_nimble_deinit();
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+}
+
 /**
  * BLE Scan Back button callback
  */
 static void ble_scan_back_btn_cb(lv_event_t *e)
 {
-    // Stop scan if running (waits for task to finish)
-    bt_scan_stop();
-    
-    // Clean up UI
-    ble_scan_ui_active = false;
-    ble_scan_list = NULL;
-    ble_scan_status_label = NULL;
-    ble_scan_content = NULL;
-    
-    // Switch back to WiFi mode
-    if (current_radio_mode == RADIO_MODE_BLE) {
-        bt_nimble_deinit();
-        current_radio_mode = RADIO_MODE_NONE;
-    }
-    
+    ble_scan_screen_stop();
+
     // Return to menu
     nav_to_menu_flag = true;
 }
@@ -43452,6 +43470,14 @@ static void s_wx_task_fn(void *arg)
     vTaskDelete(NULL);
 }
 
+static void cc1101_weather_screen_stop(void)
+{
+    s_wx_stop = true;
+    s_wx_status = NULL;
+    s_wx_list   = NULL;
+    // task exits on s_wx_stop and sets s_wx_task=NULL; cc1101_idle() called inside task
+}
+
 static void show_cc1101_weather_screen(void)
 {
     if (s_wx_task) { s_wx_stop = true; vTaskDelay(pdMS_TO_TICKS(100)); }
@@ -43466,6 +43492,7 @@ static void show_cc1101_weather_screen(void)
     }
 
     create_function_page_base("Weather Station");
+    g_screen_stop_fn = cc1101_weather_screen_stop;
     apply_menu_bg();
 
     s_wx_status = lv_label_create(function_page);
@@ -43596,6 +43623,15 @@ static void s_alm_freq_cb(lv_event_t *e)
     xTaskCreate(s_alm_task_fn, "cc1101_alm", 4096, NULL, tskIDLE_PRIORITY + 2, &s_alm_task);
 }
 
+static void cc1101_alarm_screen_stop(void)
+{
+    s_alm_stop    = true;
+    s_alm_status  = NULL;
+    s_alm_list    = NULL;
+    s_alm_freq_btn[0] = NULL;
+    s_alm_freq_btn[1] = NULL;
+}
+
 static void show_cc1101_alarm_screen(void)
 {
     if (s_alm_task) { s_alm_stop = true; vTaskDelay(pdMS_TO_TICKS(100)); }
@@ -43610,6 +43646,7 @@ static void show_cc1101_alarm_screen(void)
     }
 
     create_function_page_base("Alarm Sensors");
+    g_screen_stop_fn = cc1101_alarm_screen_stop;
     apply_menu_bg();
 
     // Frequency selector
@@ -46963,6 +47000,13 @@ static void s_rf433_scan_task_fn(void *arg)
     vTaskDelete(NULL);
 }
 
+static void rf433_ook_scan_stop(void)
+{
+    s_rf433_scan_stop   = true;
+    s_rf433_scan_status = NULL;
+    s_rf433_scan_list   = NULL;
+}
+
 static void show_rf433_ook_scan_screen(void)
 {
     if (s_rf433_scan_task) { s_rf433_scan_stop = true; vTaskDelay(pdMS_TO_TICKS(100)); }
@@ -46972,6 +47016,7 @@ static void show_rf433_ook_scan_screen(void)
     s_ook_alarm_count   = 0;
 
     create_function_page_base("RF433 OOK Scan");
+    g_screen_stop_fn = rf433_ook_scan_stop;
     apply_menu_bg();
 
     s_rf433_scan_status = lv_label_create(function_page);
@@ -49704,7 +49749,17 @@ static void s_zgwd_active_cb(lv_event_t *e)
     lv_obj_add_event_cb(cancel_btn, s_zgwd_popup_dismiss_cb, LV_EVENT_CLICKED, popup);
 }
 
-// ── Back callback ─────────────────────────────────────────────────────────────
+static void zgwd_scout_stop(void)
+{
+    if (s_zgwd) {
+        s_zgwd->cancel = true; s_zgwd->scanning = false;
+        s_zgwd->status_lbl  = NULL; s_zgwd->pan_list   = NULL;
+        s_zgwd->passive_btn = NULL; s_zgwd->active_btn = NULL;
+        if (s_zgwd->tmr) { lv_timer_del(s_zgwd->tmr); s_zgwd->tmr = NULL; }
+        if (!s_zgwd->task) { heap_caps_free(s_zgwd); s_zgwd = NULL; }
+    }
+}
+
 // ── Main Zigbee Scout screen ──────────────────────────────────────────────────
 static void show_zigbee_wardrive_screen(void)
 {
@@ -49715,6 +49770,7 @@ static void show_zigbee_wardrive_screen(void)
     if (!ctx) { ESP_LOGE(TAG, "[ZGWD] OOM"); return; }
 
     create_function_page_base("Zigbee Scout");
+    g_screen_stop_fn = zgwd_scout_stop;
     s_zgwd = ctx;
     if (s_zgwd_saved_pan_count > 0) {
         ctx->pan_count   = s_zgwd_saved_pan_count;
@@ -49921,12 +49977,21 @@ static void s_zgwd_detail_addrow(lv_obj_t *parent, const char *text,
     lv_obj_align(l, LV_ALIGN_TOP_LEFT, 4, y);
 }
 
+static void zgwd_pan_detail_stop(void)
+{
+    // Timer handle is not stored; callback guards with lv_obj_is_valid().
+    // Nulling s_zgwd_da_lbl makes the guard fail, stopping all LVGL writes.
+    s_zgwd_da_lbl    = NULL;
+    s_zgwd_da_result = 0;
+}
+
 static void show_zgwd_pan_detail(int pan_idx)
 {
     (void)pan_idx;
     zgwd_pan_entry_t *pe = &s_zgwd_sel_pan;
 
     create_function_page_base("PAN Detail");
+    g_screen_stop_fn = zgwd_pan_detail_stop;
     apply_menu_bg();
 
     int y = 32;
@@ -50103,6 +50168,17 @@ static void s_zgwd_loc_back_cb(lv_event_t *e)
     show_zigbee_wardrive_screen();
 }
 
+static void zgwd_locator_stop(void)
+{
+    vibrator_off();
+    g_vibtest_strength_pct = 100;
+    if (s_zgwd_loc) {
+        s_zgwd_loc->running = false;
+        if (s_zgwd_loc->tmr) { lv_timer_del(s_zgwd_loc->tmr); s_zgwd_loc->tmr = NULL; }
+        s_zgwd_loc->rssi_bar = NULL; s_zgwd_loc->rssi_lbl = NULL; s_zgwd_loc->pan_lbl = NULL;
+    }
+}
+
 static void show_zgwd_locator(int pan_idx)
 {
     (void)pan_idx;
@@ -50114,6 +50190,7 @@ static void show_zgwd_locator(int pan_idx)
     loc->running = true;
 
     create_function_page_base("ZB Locator");
+    g_screen_stop_fn = zgwd_locator_stop;
     s_zgwd_loc = loc;
     apply_menu_bg();
 
@@ -50229,6 +50306,15 @@ static void s_zgwd_flood_back_cb(lv_event_t *e)
     show_main_tiles();
 }
 
+static void zgwd_flood_stop(void)
+{
+    if (s_zgwd_fld) {
+        s_zgwd_fld->cancel = true;
+        if (s_zgwd_fld->tmr) { lv_timer_del(s_zgwd_fld->tmr); s_zgwd_fld->tmr = NULL; }
+        if (!s_zgwd_fld->task) { heap_caps_free(s_zgwd_fld); s_zgwd_fld = NULL; }
+    }
+}
+
 static void show_zgwd_flood(int pan_idx)
 {
     (void)pan_idx;
@@ -50240,6 +50326,7 @@ static void show_zgwd_flood(int pan_idx)
     fld->channel = pe->channel;
 
     create_function_page_base("Assoc Flood");
+    g_screen_stop_fn = zgwd_flood_stop;
     s_zgwd_fld = fld;
     apply_menu_bg();
 
