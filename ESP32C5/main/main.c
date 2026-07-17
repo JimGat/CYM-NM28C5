@@ -36645,12 +36645,15 @@ static void drone_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
-// Exit callback — stops task, closes files, returns to WiFi menu.
-static void drone_exit_cb(lv_event_t *e)
+// Stop hook — registered with g_screen_stop_fn so top-bar Back and Home both
+// tear down the task cleanly before the nav stack rebuilds the parent screen.
+static void drone_detector_stop(void)
 {
-    (void)e;
     drone_scan_active = false;
     drone_ui_active   = false;
+    drone_list        = NULL;   // prevent async update from touching freed objects
+    drone_status_lbl  = NULL;
+    drone_count_lbl   = NULL;
     esp_wifi_set_promiscuous(false);
     esp_wifi_set_promiscuous_rx_cb(NULL);
     if (current_radio_mode == RADIO_MODE_BLE) ble_gap_disc_cancel();
@@ -36658,6 +36661,13 @@ static void drone_exit_cb(lv_event_t *e)
         vTaskDelay(pdMS_TO_TICKS(100));
     if (drone_task_stack) { heap_caps_free(drone_task_stack); drone_task_stack = NULL; }
     if (drone_pcap_queue) { vQueueDelete(drone_pcap_queue); drone_pcap_queue = NULL; }
+}
+
+// Exit callback — delegates cleanup to stop hook, then navigates back.
+static void drone_exit_cb(lv_event_t *e)
+{
+    (void)e;
+    drone_detector_stop();
     show_wifi_menu_screen();
 }
 
@@ -36736,6 +36746,7 @@ static void show_drone_detector_screen(void)
     }
 
     create_function_page_base("Drone Detector");
+    g_screen_stop_fn = drone_detector_stop;
     drone_ui_active = true;
 
     drone_status_lbl = lv_label_create(function_page);
