@@ -46,7 +46,9 @@ static void show_my_screen(void)
 - For RF-HAT context-struct screens: assign `s_X = ctx` AFTER `create_function_page_base()`,
   then register `g_screen_stop_fn`.
 
-## Screens retrofitted (v2.10.24–v2.10.25)
+## Screens with registered stop hooks
+
+### Original RF-HAT screens (v2.10.24–v2.10.25)
 
 | Screen | Stop fn | Key cleanup |
 |--------|---------|-------------|
@@ -65,3 +67,25 @@ static void show_my_screen(void)
 | RFID Key Test | `rfid_key_test_screen_stop` | `stop_poll()` |
 | RFID Clone | `rfid_clone_screen_stop` | `stop_poll()` |
 | RFID Card Emulate | `rfid_emulate_screen_stop` | `stop_poll()` + `stop_emulate()` |
+
+### Additional screens audited and fixed (v2.11.2)
+
+| Screen | Stop fn | Key cleanup |
+|--------|---------|-------------|
+| CC1101 Fox Hunt | `cc1101_foxhunt_screen_stop` | timer + `cc1101_idle()` + vibrator restore |
+| MITM | `mitm_scan_stop` | timer |
+| CCCD Probe | `gw_probe_running_stop` | probe active flag + timer + NULL status lbl |
+| BLE Scan | `ble_scan_screen_stop` | `bt_scan_stop()` + ui_active flag + NULL list/status |
+| CC1101 Weather Station | `cc1101_weather_screen_stop` | stop flag + NULL status/list |
+| CC1101 Alarm Sensors | `cc1101_alarm_screen_stop` | stop flag + NULL status/list/freq btns |
+| RF433 OOK Scan | `rf433_ook_scan_stop` | stop flag + NULL status/list |
+| Zigbee Scout | `zgwd_scout_stop` | cancel flag + timer + NULL UI ptrs |
+| ZB Pan Detail | `zgwd_pan_detail_stop` | NULL result label |
+| ZB Locator | `zgwd_locator_stop` | vibrator off + running flag + timer + NULL bars |
+| ZB Assoc Flood | `zgwd_flood_stop` | cancel flag + timer |
+
+### v2.11.3
+
+| Screen | Stop fn | Key cleanup |
+|--------|---------|-------------|
+| Drone Detector | `drone_detector_stop` | `drone_scan_active=false` + task poll (≤3.5s) + free stack + NULL UI ptrs |

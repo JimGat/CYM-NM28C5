@@ -111,3 +111,25 @@ CONFIG_LV_COLOR_16_SWAP=y
 # Restores BLE scan adv-report buffer headroom after v2.10.30/31 static-BSS growth.
 # Measured fix: DMA-free +22 KB, BLE scan ~1 → 33 devices (@birolt29 v2.10.32).
 CONFIG_BT_NIMBLE_ATT_MAX_PREP_ENTRIES=4
+
+# ── RENDER PERFORMANCE LEVERS — device-measured on NM-CYD-C5 (BT Observer, BLE-active) ─────────
+# Measured full-frame LVGL render (lv_timer_handler): 148 ms → 119 ms (-20%) with the 4 lines below.
+# DMA-capable free heap actually IMPROVED (18 → ~21 KB) because -O2 links LESS IRAM than -Og.
+# No crash, display visually clean. See jim-handoff/render-perf-analysis-v2.11.2.md for the full data.
+#
+# -O2 instead of the default -Og. Espressif/LVGL report up to ~30% faster execution; measured here
+# -8% full-frame render on its own AND it compiles to ~3.7 KB LESS .iram0.text than -Og → +4.6 KB
+# internal DMA heap. Faster AND more free internal SRAM. Assertions left ENABLED.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+# LVGL: libc memcpy/memset (SIMD) instead of LVGL byte loops.
+CONFIG_LV_MEMCPY_MEMSET_STD=y
+# LVGL: refresh period 30→15 ms (Espressif recommends 10 ms) — higher UI refresh ceiling.
+CONFIG_LV_DISP_DEF_REFR_PERIOD=15
+# PSRAM 40→80 MHz (Quad; flash is already 80 MHz so the prerequisite is met; 120 MHz is not a valid
+# C5 option). Measured extra -8% on per-flush us/Kpx via the buffer-access path (the SPI-DMA push
+# itself is unchanged — the LCD SPI clock is the render floor). Costs no internal SRAM. Stable +
+# display visually clean on this board.
+CONFIG_SPIRAM_SPEED_80M=y
+# NOTE: CONFIG_LV_ATTRIBUTE_FAST_MEM_USE_IRAM was TESTED and REJECTED — it grew .iram0.text +13.8 KB,
+# collapsing DMA-free heap 18→4 KB (BLE-active) = straight into the internal-SRAM starvation zone.
+# The extra render gain (~117 vs 135 ms) did not justify eating the scarcest resource. Do NOT enable.

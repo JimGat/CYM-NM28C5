@@ -3467,7 +3467,7 @@ static void init_display(void)
     esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num = LCD_DC,
         .cs_gpio_num = LCD_CS,
-        .pclk_hz = 40 * 1000 * 1000,
+        .pclk_hz = 80 * 1000 * 1000,   // 80MHz LCD SPI (was 40) — halves the per-flush SPI push time. REQUIRES the draw buffers in INTERNAL SRAM (see app_main): at 80MHz a PSRAM-sourced DMA underruns the SPI FIFO and the display tears. 40MHz is the max with PSRAM buffers.
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
         .spi_mode = 0,
@@ -5602,11 +5602,13 @@ void app_main(void)
     }
 
     // 15 lines per buffer — works for both 16-bit (7200 B) and 32-bit (14400 B) color depth.
-    // MALLOC_CAP_SPIRAM: ESP32-C5 GDMA is cache-transparent so PSRAM buffers work for SPI DMA,
-    // and the 32KB internal DMA pool is exhausted by WiFi static RX/TX buffers before we get here.
+    // INTERNAL DMA SRAM (not PSRAM): internal SRAM feeds the SPI FIFO fast enough to sustain the
+    // 80MHz pclk without underrun/tearing — PSRAM cannot. Cost: 2x7.2KB = 14.4KB of internal DMA heap.
+    // If a board is short on internal DMA, drop pclk back to 40MHz AND revert these two to
+    // MALLOC_CAP_SPIRAM together (they must change as a pair).
     const size_t buf_size = LCD_H_RES * 15 * sizeof(lv_color_t);
-    buf1 = spi_bus_dma_memory_alloc(LCD_HOST, buf_size, MALLOC_CAP_SPIRAM);
-    buf2 = spi_bus_dma_memory_alloc(LCD_HOST, buf_size, MALLOC_CAP_SPIRAM);
+    buf1 = spi_bus_dma_memory_alloc(LCD_HOST, buf_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    buf2 = spi_bus_dma_memory_alloc(LCD_HOST, buf_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     if (buf1 == NULL || buf2 == NULL) {
         ESP_LOGE(TAG, "Failed to allocate draw buffers! free SPIRAM=%zu internal=%zu",
                  heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
@@ -23919,7 +23921,15 @@ static void s_sd_remount_update_cb(void *arg)
 static void s_sd_remount_task(void *arg)
 {
     (void)arg;
-    wifi_wardrive_unmount_sd();
+    // SD and the LCD share SPI2_HOST. Every SD access MUST hold sd_spi_mutex so it
+    // cannot collide with the display flush, which also takes it (see lvgl_flush_cb).
+    // Without the lock the SD mount transaction races an in-flight LCD DMA and trips
+    // assert(spi_ll_get_running_cmd(hw)==0) in spi_hal_setup_trans -> immediate reset.
+    // This is the only SD path in the firmware that was missing the mutex.
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        wifi_wardrive_unmount_sd();
+        xSemaphoreGive(sd_spi_mutex);
+    }
     sd_mounted_lazy = false;
 
     static const uint32_t freqs[]       = {20000, 10000, 5000};
@@ -23931,7 +23941,11 @@ static void s_sd_remount_task(void *arg)
         char *msg = strdup(freq_labels[i]);
         if (msg) lv_async_call(s_sd_remount_update_cb, msg);
         vTaskDelay(pdMS_TO_TICKS(200));
-        esp_err_t r = wifi_wardrive_init_sd_ex(freqs[i], false);
+        esp_err_t r = ESP_FAIL;
+        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(10000)) == pdTRUE) {
+            r = wifi_wardrive_init_sd_ex(freqs[i], false);
+            xSemaphoreGive(sd_spi_mutex);
+        }
         if (r == ESP_OK) {
             ok      = true;
             ok_freq = freqs[i];
@@ -36645,12 +36659,15 @@ static void drone_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
-// Exit callback — stops task, closes files, returns to WiFi menu.
-static void drone_exit_cb(lv_event_t *e)
+// Stop hook — registered with g_screen_stop_fn so top-bar Back and Home both
+// tear down the task cleanly before the nav stack rebuilds the parent screen.
+static void drone_detector_stop(void)
 {
-    (void)e;
     drone_scan_active = false;
     drone_ui_active   = false;
+    drone_list        = NULL;   // prevent async update from touching freed objects
+    drone_status_lbl  = NULL;
+    drone_count_lbl   = NULL;
     esp_wifi_set_promiscuous(false);
     esp_wifi_set_promiscuous_rx_cb(NULL);
     if (current_radio_mode == RADIO_MODE_BLE) ble_gap_disc_cancel();
@@ -36658,6 +36675,13 @@ static void drone_exit_cb(lv_event_t *e)
         vTaskDelay(pdMS_TO_TICKS(100));
     if (drone_task_stack) { heap_caps_free(drone_task_stack); drone_task_stack = NULL; }
     if (drone_pcap_queue) { vQueueDelete(drone_pcap_queue); drone_pcap_queue = NULL; }
+}
+
+// Exit callback — delegates cleanup to stop hook, then navigates back.
+static void drone_exit_cb(lv_event_t *e)
+{
+    (void)e;
+    drone_detector_stop();
     show_wifi_menu_screen();
 }
 
@@ -36736,6 +36760,7 @@ static void show_drone_detector_screen(void)
     }
 
     create_function_page_base("Drone Detector");
+    g_screen_stop_fn = drone_detector_stop;
     drone_ui_active = true;
 
     drone_status_lbl = lv_label_create(function_page);
@@ -39241,8 +39266,8 @@ static void s_ir_edit_show_remotes(void);
 static void s_ir_edit_show_signals(void);
 
 /* Persistent arrays keep callback user-data pointers valid after the list is built. */
-static char      s_ir_edit_remote_names[IR_HAT_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
-static char      s_ir_edit_sig_names[IR_HAT_MAX_SIGNALS][IR_HAT_NAME_LEN];
+EXT_RAM_BSS_ATTR static char      s_ir_edit_remote_names[IR_HAT_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
+EXT_RAM_BSS_ATTR static char      s_ir_edit_sig_names[IR_HAT_MAX_SIGNALS][IR_HAT_NAME_LEN];
 
 static char      s_ir_edit_remote[IR_HAT_REMOTE_NAME_LEN];
 static int       s_ir_edit_sig_idx          = -1;
@@ -39910,7 +39935,7 @@ static lv_obj_t             *s_ir_save_popup      = NULL;
 static uint32_t              s_ir_cap_signal_idx  = 0;  // auto-name counter
 
 // Remote names for save picker
-static char s_ir_cap_remotes[IR_HAT_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
+EXT_RAM_BSS_ATTR static char s_ir_cap_remotes[IR_HAT_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
 static int  s_ir_cap_remote_count = 0;
 
 // Keyboard naming overlay state (multi-step: remote name → signal name → save)
@@ -40286,7 +40311,7 @@ static void show_ir_capture_screen(void)
 
 // ── IR Replay — Level 1: remote file browser ──────────────────────────────────
 
-static char s_ir_remote_names[IR_HAT_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
+EXT_RAM_BSS_ATTR static char s_ir_remote_names[IR_HAT_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
 static int  s_ir_remote_count = 0;
 static char s_ir_cur_remote[IR_HAT_REMOTE_NAME_LEN];
 
@@ -40334,7 +40359,7 @@ static void show_ir_replay_screen(void)
 
 // ── IR Replay — Level 2: signal list within a remote ─────────────────────────
 
-static char     s_ir_signal_names[IR_HAT_MAX_SIGNALS][IR_HAT_NAME_LEN];
+EXT_RAM_BSS_ATTR static char     s_ir_signal_names[IR_HAT_MAX_SIGNALS][IR_HAT_NAME_LEN];
 static int      s_ir_signal_count = 0;
 static int      s_ir_sel_signal   = -1;
 static lv_obj_t *s_ir_sig_status  = NULL;
@@ -40654,7 +40679,7 @@ static lv_obj_t *s_ur_brand_lbl    = NULL;
 static lv_obj_t *s_ur_status_lbl   = NULL;
 static lv_obj_t *s_ur_search_popup = NULL;
 
-static char  s_ur_search_remotes[IR_HAT_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
+EXT_RAM_BSS_ATTR static char  s_ur_search_remotes[IR_HAT_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
 static int   s_ur_search_count = 0;
 static int   s_ur_search_idx   = 0;
 static lv_obj_t *s_ur_search_info_lbl  = NULL;
@@ -48774,7 +48799,7 @@ static volatile rf433_hat_err_t     s_rf433_cap_result   = RF433_HAT_ERR_TIMEOUT
 static lv_obj_t                    *s_rf433_save_popup   = NULL;
 static uint32_t                     s_rf433_cap_sig_idx  = 0;  // auto-name counter
 
-static char s_rf433_cap_remotes[RF433_HAT_MAX_REMOTES][RF433_HAT_REMOTE_NAME_LEN];
+EXT_RAM_BSS_ATTR static char s_rf433_cap_remotes[RF433_HAT_MAX_REMOTES][RF433_HAT_REMOTE_NAME_LEN];
 static int  s_rf433_cap_remote_count = 0;
 
 static void s_rf433_ui_update(void *arg)
@@ -48990,7 +49015,7 @@ static void show_rf433_capture_screen(void)
 
 // ── RF433 Replay — Level 1: remote (directory) list ──────────────────────────
 
-static char s_rf433_remote_names[RF433_HAT_MAX_REMOTES][RF433_HAT_REMOTE_NAME_LEN];
+EXT_RAM_BSS_ATTR static char s_rf433_remote_names[RF433_HAT_MAX_REMOTES][RF433_HAT_REMOTE_NAME_LEN];
 static int  s_rf433_remote_count = 0;
 static char s_rf433_cur_remote[RF433_HAT_REMOTE_NAME_LEN];
 
@@ -49040,7 +49065,7 @@ static void show_rf433_replay_screen(void)
 
 // ── RF433 Replay — Level 2: signal list inside a remote ──────────────────────
 
-static char     s_rf433_signal_names[RF433_HAT_MAX_SIGNALS][RF433_HAT_NAME_LEN];
+EXT_RAM_BSS_ATTR static char     s_rf433_signal_names[RF433_HAT_MAX_SIGNALS][RF433_HAT_NAME_LEN];
 static int      s_rf433_signal_count = 0;
 static int      s_rf433_sel_signal   = -1;
 static lv_obj_t *s_rf433_sig_status  = NULL;
