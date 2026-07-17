@@ -30474,7 +30474,7 @@ gw_res_done:;
     lv_obj_set_style_border_width(clone_btn, 0, 0);
     lv_obj_set_style_radius(clone_btn, 8, 0);
     lv_obj_t *clone_btn_lbl = lv_label_create(clone_btn);
-    lv_label_set_text(clone_btn_lbl, LV_SYMBOL_COPY " Clone Device → SD");
+    lv_label_set_text(clone_btn_lbl, LV_SYMBOL_COPY " Clone Device " LV_SYMBOL_RIGHT " SD");
     lv_obj_set_style_text_font(clone_btn_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(clone_btn_lbl, lv_color_white(), 0);
     lv_obj_center(clone_btn_lbl);
