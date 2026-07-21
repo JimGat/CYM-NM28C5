@@ -43044,6 +43044,27 @@ static void s_tpms_freq_cb(lv_event_t *e)
             want_315 ? lv_color_hex(0x37474F) : lv_color_hex(0x1565C0), LV_STATE_DEFAULT);
 }
 
+static void cc1101_tpms_screen_stop(void)
+{
+    cc1101_tpms_ctx_t *ctx = s_tpms;
+    if (!ctx) return;
+    ctx->active = false;
+    ctx->cancel = true;
+    if (ctx->tmr) { lv_timer_del(ctx->tmr); ctx->tmr = NULL; }
+    // NULL every lv_obj_t* so the 500ms timer callback and s_tpms_update_label
+    // can't touch freed LVGL objects if they fire during teardown.
+    ctx->status_lbl   = NULL;
+    ctx->count_lbl    = NULL;
+    ctx->freq_315_btn = NULL;
+    ctx->freq_433_btn = NULL;
+    ctx->start_btn    = NULL;
+    ctx->scroll_cont  = NULL;
+    for (int i = 0; i < TPMS_MAX_SENSORS; i++) ctx->sensor_lbl[i] = NULL;
+    // Wait up to 3 s for the scan task to exit cleanly (closes log_fp, cc1101_idle).
+    for (int i = 0; i < 30 && ctx->task != NULL; i++) vTaskDelay(pdMS_TO_TICKS(100));
+    // ctx freed by reset_function_page_children when ctx->task == NULL.
+}
+
 static void show_cc1101_tpms_screen(void)
 {
     if (s_tpms) { s_tpms->active = false; s_tpms->cancel = true; }
@@ -43062,6 +43083,7 @@ static void show_cc1101_tpms_screen(void)
 
     create_function_page_base("TPMS Monitor");
     s_tpms = ctx;
+    g_screen_stop_fn = cc1101_tpms_screen_stop;
     apply_menu_bg();
 
     // ── Frequency toggle — 2-line buttons showing region + typical brands ─────
