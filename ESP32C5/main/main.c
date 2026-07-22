@@ -28968,21 +28968,28 @@ static void gw_deferred_start_cb(lv_timer_t *t)
     }
 }
 
-static void gw_back_btn_cb(lv_event_t *e)
+// Teardown-only stop hook — top-bar ‹ Back / Home invoke this via g_screen_stop_fn.
+// The old gw_back_btn_cb was removed: it called wifi_cli_init() directly, leaving
+// BLE up → DMA cramped (~10KB) → the next GATT entry's ensure_ble_mode() skipped
+// the WiFi→BLE switch → bottom-Back re-init hit esp_wifi_init twice (0x103) →
+// firmware's own "recover RAM" path called esp_restart(). Very repeatable (2nd cycle).
+// Like bto_stop this hook does NOT touch radio mode — BLE stays up and is reclaimed
+// lazily by ensure_wifi_mode() on the next WiFi feature. Must NOT call gw_cancel()
+// when GW_STATE_COMPLETE: the walk→result forward nav keeps the connection alive for
+// the Interact / HID / Probe screens.
+static void gw_screen_stop(void)
 {
-    (void)e;
     gw_screen_active = false;
+    gw_state_t st = gw_get_state();
+    if (st != GW_STATE_IDLE && st != GW_STATE_COMPLETE &&
+        st != GW_STATE_FAILED && st != GW_STATE_CANCELLED)
+        gw_cancel();
     gw_status_lbl    = NULL;
     gw_svc_lbl       = NULL;
     gw_chr_lbl       = NULL;
     gw_result_lbl    = NULL;
     gw_cancel_btn    = NULL;
     gw_back_btn      = NULL;
-
-    // Reinit WiFi to reclaim DMA for other features
-    wifi_cli_init();
-
-    show_bt_attack_tiles_screen();
 }
 
 static void gw_cancel_btn_cb(lv_event_t *e)
@@ -30578,6 +30585,8 @@ static void show_gatt_walker_screen(void)
     char title[48];
     snprintf(title, sizeof(title), "GATT: %.26s", bt_sas_target_name);
     create_function_page_base(title);
+    g_screen_stop_fn = gw_screen_stop;               // cancel walk + NULL ptrs on ANY exit (top ‹ Back / Home)
+    g_screen_back_fn = show_bt_attack_tiles_screen;  // top ‹ Back → "BT: <target>" tiles (parent title is dynamic)
     apply_menu_bg();
 
     /* Target MAC line */
@@ -30643,16 +30652,10 @@ static void show_gatt_walker_screen(void)
     lv_label_set_text(clbl, "Cancel Walk");
     lv_obj_center(clbl);
 
-    /* Back button (hidden until done) */
-    gw_back_btn = lv_btn_create(function_page);
-    lv_obj_set_size(gw_back_btn, 140, 36);
-    lv_obj_align(gw_back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(gw_back_btn, lv_color_make(50, 50, 60), 0);
-    lv_obj_add_event_cb(gw_back_btn, gw_back_btn_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *blbl = lv_label_create(gw_back_btn);
-    lv_label_set_text(blbl, "Back");
-    lv_obj_center(blbl);
-    lv_obj_add_flag(gw_back_btn, LV_OBJ_FLAG_HIDDEN);
+    /* Bottom "Back" button removed — top-bar ‹ Back (g_screen_back_fn = tiles,
+     * g_screen_stop_fn = gw_screen_stop) is the single exit path. The old bottom
+     * Back called wifi_cli_init() directly and caused the double-init reset.
+     * gw_back_btn stays NULL; the show/hide refs below are guarded and harmless. */
 
     /* Mark screen active — walk starts after a brief timer to let NimBLE
      * finish processing the disc_cancel before we call ble_gap_connect(). */
