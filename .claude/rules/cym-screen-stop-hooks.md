@@ -89,3 +89,15 @@ static void show_my_screen(void)
 | Screen | Stop fn | Key cleanup |
 |--------|---------|-------------|
 | Drone Detector | `drone_detector_stop` | `drone_scan_active=false` + task poll (≤3.5s) + free stack + NULL UI ptrs |
+
+### v2.11.6
+
+| Screen | Stop fn | Key cleanup |
+|--------|---------|-------------|
+| CC1101 TPMS Monitor | `cc1101_tpms_screen_stop` | `cancel=true` + timer del + NULL all lv_obj_t* in ctx (status/count/freq btns/scroll_cont/sensor_lbl[20]) + task poll (≤3s) |
+
+### v2.11.7
+
+| Screen | Stop fn | Key cleanup |
+|--------|---------|-------------|
+| GATT Walker | `gw_screen_stop` | `gw_cancel()` if walk in progress (skip on COMPLETE) + NULL 6 UI ptrs; does NOT touch radio (BLE reclaimed lazily); `g_screen_back_fn = show_bt_attack_tiles_screen` |

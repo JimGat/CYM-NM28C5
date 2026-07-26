@@ -33,6 +33,18 @@
 
 ---
 
+## 🎬 Featured Video
+
+<p align="center">
+  <a href="https://youtu.be/IDm4uz38IDE" target="_blank">
+    <img src="https://img.youtube.com/vi/IDm4uz38IDE/maxresdefault.jpg" alt="Cheap Yellow Monster — Video Review by Anubis" width="70%"/>
+  </a>
+  <br/>
+  <em>CYM in the wild — video by <strong>Anubis</strong> &nbsp;·&nbsp; <a href="https://youtu.be/IDm4uz38IDE">Watch on YouTube ▶</a></em>
+</p>
+
+---
+
 ## Cheap Yellow Monster — CYM-NM28C5
 
 **Cheap Yellow Monster** is a portable, touchscreen-driven ESP32-C5 wireless security, BLE, GPS wardriving, and RF experimentation toolkit built specifically for the **NM-CYD-C5 / MonsterC5-style ESP32-C5-WIFI6-KIT** hardware family.
@@ -57,6 +69,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 
 ## Table of Contents
 
+- [Featured Video](#-featured-video)
 - [Features Overview](#features-overview)
 - [Menu Map](#menu-map)
 - [Screenshots](#screenshots)
@@ -2906,7 +2919,11 @@ This project is intended for **educational and authorized security research purp
 This project wouldn't be where it is without the brilliant minds and generous time of the following people. They've tested the firmware under brutal conditions, caught bugs before they reached users, reviewed code with a critical eye, and submitted fixes that made everything better.
 
 **Heartfelt thanks to:**
-- **@Birolt29** — For relentless hardware testing, deep ESP32-C5 DMA analysis, and contributing the v2.10.15 hardware optimization patch (upload stability, mbedTLS PSRAM routing, BLE Spam memory hardening, and more)
+
+- **@Birolt29** — An extraordinary contributor who has gone far above and beyond at every stage of this project. Birol performed deep ESP32-C5 DMA and render pipeline analysis on real hardware, submitted multiple major patch sets, and caught critical bugs before they ever reached users. His contributions include: the v2.10.15 hardware optimization patch (upload stability, mbedTLS PSRAM routing, BLE Spam memory hardening); the v2.11.x render performance series (LCD SPI 40→80 MHz, internal DMA draw buffers, -O2 optimization, LVGL memcpy, 15 ms refresh period, PSRAM 80 MHz — bringing full-frame render from 148 ms to ~77 ms); the SD remount mutex fix that eliminated a hard reset race; moving 17.4 KB of IR/RF433 name tables to PSRAM BSS; the GATT Walker double-init reset fix; and serial-validated testing of every patch on real hardware. The firmware is faster, more stable, and more reliable because of Birol. 🙏
+
+- **Anubis** — For creating the first community video showcase of CYM in the wild. Taking the time to film, edit, and publish a video of this project means the world — it helps new users discover what CYM can do and gives the project a presence beyond GitHub. Thank you! 🎬
+
 - **ᛕ ᛊ ߇ ᛙ ᚢ (Kevin)** — For deep technical testing and helping diagnose the toughest issues
 - **sithwrld999** — For thorough testing and finding edge cases we missed
 - **bkbroiler** — For hands-on testing and constructive feedback
