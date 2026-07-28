@@ -47248,7 +47248,7 @@ static void show_pn532_standalone_info_popup(void)
     lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *card = lv_obj_create(overlay);
-    lv_obj_set_size(card, 218, 230);
+    lv_obj_set_size(card, 218, 295);
     lv_obj_center(card);
     lv_obj_set_style_bg_color(card, lv_color_hex(0x0D3B2E), 0);
     lv_obj_set_style_border_color(card, lv_color_hex(0x4DB6AC), 0);
