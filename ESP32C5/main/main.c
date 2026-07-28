@@ -47842,9 +47842,13 @@ static void s_cham_rebuild_content(cham_state_t st)
                      info->fw_version >> 8, info->fw_version & 0xFF);
             s_cham_info_row(card, buf, lv_color_hex(0xCE93D8));
 
-            /* Row 2: battery (keep pointer for live updates) */
-            snprintf(buf, sizeof(buf), "Battery: %d%%  (%d mV)",
-                     info->battery_pct, info->battery_mv);
+            /* Row 2: battery — show N/A when device reports 0 mV (USB-only, no battery) */
+            if (info->battery_mv == 0) {
+                strlcpy(buf, "Battery: N/A (USB powered)", sizeof(buf));
+            } else {
+                snprintf(buf, sizeof(buf), "Battery: %d%%  (%d mV)",
+                         info->battery_pct, info->battery_mv);
+            }
             s_cham_bat_lbl = s_cham_info_row(card, buf, lv_color_hex(0x81C784));
 
             /* Row 3: BLE address */
@@ -47870,14 +47874,16 @@ static void s_cham_rebuild_content(cham_state_t st)
 
         s_cham_stub_tile(tiles, LV_SYMBOL_WIFI,    "Read HF");
 
-        /* Read LF — live tile matching stub tile style, navigates to LF reader */
+        /* Read LF — live tile: green border distinguishes it from inactive stubs.
+         * col MUST have LV_OBJ_FLAG_CLICKABLE cleared; lv_obj_create() sets it
+         * by default in LVGL 8, which intercepts touches before btn gets them. */
         {
             lv_obj_t *btn = lv_btn_create(tiles);
             lv_obj_set_size(btn, 72, 54);
             lv_obj_set_style_bg_color(btn, lv_color_hex(0x2A2A3A), 0);
             lv_obj_set_style_radius(btn, 8, 0);
             lv_obj_set_style_border_width(btn, 1, 0);
-            lv_obj_set_style_border_color(btn, lv_color_hex(0x4A4A5A), 0);
+            lv_obj_set_style_border_color(btn, lv_color_hex(0x2E7D52), 0); /* green = live */
 
             lv_obj_t *col = lv_obj_create(btn);
             lv_obj_set_size(col, LV_PCT(100), LV_PCT(100));
@@ -47886,6 +47892,7 @@ static void s_cham_rebuild_content(cham_state_t st)
             lv_obj_set_style_pad_all(col, 2, 0);
             lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
             lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_clear_flag(col, LV_OBJ_FLAG_CLICKABLE); /* let touches reach btn */
 
             lv_obj_t *ico = lv_label_create(col);
             lv_label_set_text(ico, LV_SYMBOL_AUDIO);
@@ -47900,7 +47907,7 @@ static void s_cham_rebuild_content(cham_state_t st)
             lv_obj_t *sub2 = lv_label_create(col);
             lv_label_set_text(sub2, "EM410X");
             lv_obj_set_style_text_font(sub2, &lv_font_montserrat_12, 0);
-            lv_obj_set_style_text_color(sub2, lv_color_hex(0x546E7A), 0);
+            lv_obj_set_style_text_color(sub2, lv_color_hex(0x66BB6A), 0); /* green = live */
 
             lv_obj_add_event_cb(btn, s_cham_lf_tile_cb, LV_EVENT_CLICKED, NULL);
         }
@@ -47963,8 +47970,12 @@ static void s_cham_poll_timer(lv_timer_t *t)
         const cham_device_info_t *info = cham_get_device_info();
         if (info) {
             char buf[40];
-            snprintf(buf, sizeof(buf), "Battery: %d%%  (%d mV)",
-                     info->battery_pct, info->battery_mv);
+            if (info->battery_mv == 0) {
+                strlcpy(buf, "Battery: N/A (USB powered)", sizeof(buf));
+            } else {
+                snprintf(buf, sizeof(buf), "Battery: %d%%  (%d mV)",
+                         info->battery_pct, info->battery_mv);
+            }
             lv_label_set_text(s_cham_bat_lbl, buf);
         }
     }
