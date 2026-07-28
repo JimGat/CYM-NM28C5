@@ -239,12 +239,20 @@ static void s_cb_chip_id(bool ok, const uint8_t *data, uint16_t dlen)
     cham_send_cmd(1012, NULL, 0, s_cb_ble_addr); /* getDeviceBLEAddress */
 }
 
+static void s_cb_device_mode(bool ok, const uint8_t *data, uint16_t dlen)
+{
+    if (ok && dlen >= 1) {
+        s_dev_info.device_mode = data[0]; /* 0=emulator, 1=reader */
+    }
+    cham_send_cmd(1011, NULL, 0, s_cb_chip_id);  /* getDeviceChipID */
+}
+
 static void s_cb_device_type(bool ok, const uint8_t *data, uint16_t dlen)
 {
     if (ok && dlen >= 1) {
         s_dev_info.is_lite = (data[0] != 0);
     }
-    cham_send_cmd(1011, NULL, 0, s_cb_chip_id);  /* getDeviceChipID */
+    cham_send_cmd(1002, NULL, 0, s_cb_device_mode); /* getDeviceMode */
 }
 
 static void s_cb_fw_version(bool ok, const uint8_t *data, uint16_t dlen)
@@ -799,8 +807,8 @@ const cham_scan_result_t *cham_scan_result_get(int idx)
     return &s_scan_results[idx];
 }
 
-bool cham_send_cmd(uint16_t cmd, const uint8_t *data, uint16_t dlen,
-                   cham_cmd_result_cb_t cb)
+bool cham_send_cmd_ex(uint16_t cmd, const uint8_t *data, uint16_t dlen,
+                      cham_cmd_result_cb_t cb, int64_t timeout_us)
 {
     if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return false;
     if (s_rx_val_hdl == 0) return false;
@@ -813,7 +821,7 @@ bool cham_send_cmd(uint16_t cmd, const uint8_t *data, uint16_t dlen,
     s_pend_cmd      = cmd;
     s_pend_cb       = cb;
     s_pend_write_ok = false;
-    s_pend_deadline = esp_timer_get_time() + CHAM_CMD_TIMEOUT_US;
+    s_pend_deadline = esp_timer_get_time() + timeout_us;
 
     int rc = ble_gattc_write_flat(s_conn_handle, s_rx_val_hdl,
                                    frame, flen, s_write_cb, NULL);
@@ -825,6 +833,12 @@ bool cham_send_cmd(uint16_t cmd, const uint8_t *data, uint16_t dlen,
         return false;
     }
     return true;
+}
+
+bool cham_send_cmd(uint16_t cmd, const uint8_t *data, uint16_t dlen,
+                   cham_cmd_result_cb_t cb)
+{
+    return cham_send_cmd_ex(cmd, data, dlen, cb, CHAM_CMD_TIMEOUT_US);
 }
 
 bool cham_poll(void)

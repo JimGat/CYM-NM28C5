@@ -43,6 +43,7 @@ typedef struct {
     char     chip_id[17];      /* 16 hex chars + NUL */
     int      battery_pct;      /* 0-100 */
     int      battery_mv;       /* millivolts */
+    uint8_t  device_mode;      /* 0=emulator, 1=reader (from getDeviceMode 1002) */
 } cham_device_info_t;
 
 /* ── Async command result callback ───────────────────────────────────────── */
@@ -87,7 +88,13 @@ bool cham_poll(void);
  * Send a low-level command (async).
  * cb fires from within cham_poll() when the response arrives (or on timeout).
  * Returns false if not READY/HANDSHAKING, or if another command is in flight.
- * Phase 1 internal use only — higher-level wrappers will be added in later phases.
  */
 bool cham_send_cmd(uint16_t cmd, const uint8_t *data, uint16_t dlen,
                    cham_cmd_result_cb_t cb);
+
+/*
+ * Like cham_send_cmd() but with an explicit timeout in microseconds.
+ * Use for long-running scan commands (e.g. scanEM410Xtag needs ~8 s).
+ */
+bool cham_send_cmd_ex(uint16_t cmd, const uint8_t *data, uint16_t dlen,
+                      cham_cmd_result_cb_t cb, int64_t timeout_us);

@@ -47364,6 +47364,196 @@ static lv_obj_t   *s_cham_scan_list = NULL;  /* lv_list during scan */
 static cham_state_t s_cham_ui_st    = (cham_state_t)0xFF; /* last-rendered state */
 static int         s_cham_list_n    = 0;      /* # items currently in scan list */
 
+/* LF read sub-screen globals — NULLed by cham_lf_read_stop() */
+static lv_timer_t *s_lf_tmr         = NULL;
+static lv_obj_t   *s_lf_status_lbl  = NULL;
+static lv_obj_t   *s_lf_uid_lbl     = NULL;
+static lv_obj_t   *s_lf_save_btn    = NULL;
+static uint8_t     s_lf_uid[5]      = {0};
+static int         s_lf_uid_len     = 0;
+static volatile bool s_lf_result_ready = false;
+static volatile bool s_lf_result_ok    = false;
+static volatile bool s_lf_mode_ok      = false;
+
+/* Forward declaration */
+static void show_cham_lf_read_screen(void);
+
+/* ── LF read: tile button callback ── */
+static void s_cham_lf_tile_cb(lv_event_t *e) { (void)e; show_cham_lf_read_screen(); }
+
+/* ── LF read: save Flipper .rfid file ── */
+static void s_lf_save_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_lf_uid_len <= 0) return;
+
+    /* Build a timestamp-based filename */
+    int64_t now_us = esp_timer_get_time();
+    char path[64];
+    snprintf(path, sizeof(path), "/sdcard/lab/rfid/em410x_%lld.rfid", now_us / 1000000LL);
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        if (s_lf_status_lbl) lv_label_set_text(s_lf_status_lbl, "Save failed — SD error");
+        return;
+    }
+    fprintf(f, "Filetype: Flipper RFID key\nVersion: 1\n");
+    fprintf(f, "Key type: EM4100\n");
+    fprintf(f, "Data:");
+    for (int i = 0; i < s_lf_uid_len; i++) {
+        fprintf(f, " %02X", s_lf_uid[i]);
+    }
+    fprintf(f, "\n");
+    fclose(f);
+
+    if (s_lf_save_btn) lv_obj_add_flag(s_lf_save_btn, LV_OBJ_FLAG_HIDDEN);
+    if (s_lf_status_lbl) lv_label_set_text(s_lf_status_lbl, "Saved to /sdcard/lab/rfid/");
+}
+
+/* ── LF read: scan result callback (fires from cham_poll via cham_send_cmd_ex) ── */
+static void s_lf_on_scan_result(bool ok, const uint8_t *data, uint16_t dlen)
+{
+    s_lf_result_ok = ok;
+    if (ok && data && dlen >= 5) {
+        /* Standard EM410X: 5-byte UID */
+        int copy = (dlen < 5) ? (int)dlen : 5;
+        memcpy(s_lf_uid, data, copy);
+        s_lf_uid_len = copy;
+    } else {
+        s_lf_uid_len = 0;
+    }
+    s_lf_result_ready = true;
+}
+
+/* ── LF read: mode-set callback — on success, start the card scan ── */
+static void s_lf_on_mode_set(bool ok, const uint8_t *data, uint16_t dlen)
+{
+    (void)data; (void)dlen;
+    s_lf_mode_ok = ok;
+    if (!ok) {
+        s_lf_result_ok    = false;
+        s_lf_result_ready = true; /* let timer pick up the failure */
+        return;
+    }
+    /* 8 s timeout — EM410X scan blocks until card present or timeout */
+    cham_send_cmd_ex(3000, NULL, 0, s_lf_on_scan_result, 8000000LL);
+}
+
+/* ── LF read: 50 ms poll timer ── */
+static void s_lf_poll_timer(lv_timer_t *t)
+{
+    (void)t;
+    cham_poll();   /* keep BLE state machine alive */
+
+    if (!s_lf_result_ready) return;
+    s_lf_result_ready = false;
+
+    if (!s_lf_status_lbl) return; /* screen already torn down */
+
+    if (s_lf_result_ok && s_lf_uid_len > 0) {
+        /* Show UID */
+        char uid_str[20] = {0};
+        for (int i = 0; i < s_lf_uid_len; i++) {
+            char byte[4];
+            snprintf(byte, sizeof(byte), "%02X%s",
+                     s_lf_uid[i], (i < s_lf_uid_len - 1) ? " " : "");
+            strlcat(uid_str, byte, sizeof(uid_str));
+        }
+        if (s_lf_uid_lbl) {
+            char buf[48];
+            snprintf(buf, sizeof(buf), "EM410X\n%s", uid_str);
+            lv_label_set_text(s_lf_uid_lbl, buf);
+            lv_obj_clear_flag(s_lf_uid_lbl, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (s_lf_save_btn) lv_obj_clear_flag(s_lf_save_btn, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(s_lf_status_lbl, "Card read — tap Save to export");
+    } else if (!s_lf_mode_ok) {
+        lv_label_set_text(s_lf_status_lbl, "Mode switch failed — try again");
+    } else {
+        lv_label_set_text(s_lf_status_lbl, "No card detected — try again");
+    }
+}
+
+/* ── LF read: stop hook ── */
+static void cham_lf_read_stop(void)
+{
+    if (s_lf_tmr) { lv_timer_del(s_lf_tmr); s_lf_tmr = NULL; }
+    s_lf_status_lbl  = NULL;
+    s_lf_uid_lbl     = NULL;
+    s_lf_save_btn    = NULL;
+    s_lf_result_ready = false;
+    s_lf_result_ok    = false;
+    s_lf_mode_ok      = false;
+    s_lf_uid_len      = 0;
+    /* Leave BLE connection alive — user stays on Chameleon session */
+}
+
+/* ── LF read: main screen ── */
+static void show_cham_lf_read_screen(void)
+{
+    create_function_page_base("LF Card Reader");
+    g_screen_stop_fn = cham_lf_read_stop;
+    g_screen_back_fn = show_chameleon_screen;
+    apply_menu_bg();
+
+    /* Status label — updates on scan result */
+    s_lf_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_lf_status_lbl, "Hold 125 kHz card near Chameleon...");
+    lv_obj_set_style_text_font(s_lf_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_lf_status_lbl, lv_color_hex(0xB0BEC5), 0);
+    lv_obj_set_style_text_align(s_lf_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_lf_status_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_lf_status_lbl, 220);
+    lv_obj_align(s_lf_status_lbl, LV_ALIGN_TOP_MID, 0, 40);
+
+    /* Icon */
+    lv_obj_t *icon = lv_label_create(function_page);
+    lv_label_set_text(icon, LV_SYMBOL_AUDIO);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(icon, lv_color_hex(0x66BB6A), 0);
+    lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 100);
+
+    /* UID result label (hidden until card read) */
+    s_lf_uid_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_lf_uid_lbl, "");
+    lv_obj_set_style_text_font(s_lf_uid_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(s_lf_uid_lbl, lv_color_hex(0xFFD54F), 0);
+    lv_obj_set_style_text_align(s_lf_uid_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_lf_uid_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_lf_uid_lbl, 220);
+    lv_obj_align(s_lf_uid_lbl, LV_ALIGN_TOP_MID, 0, 140);
+    lv_obj_add_flag(s_lf_uid_lbl, LV_OBJ_FLAG_HIDDEN);
+
+    /* Save button (hidden until successful read) */
+    s_lf_save_btn = lv_btn_create(function_page);
+    lv_obj_set_size(s_lf_save_btn, 140, 36);
+    lv_obj_align(s_lf_save_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_bg_color(s_lf_save_btn, lv_color_hex(0x1B5E20), 0);
+    lv_obj_add_flag(s_lf_save_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_lf_save_btn, s_lf_save_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *sl = lv_label_create(s_lf_save_btn);
+    lv_label_set_text(sl, LV_SYMBOL_SAVE " Save .rfid");
+    lv_obj_set_style_text_font(sl, &lv_font_montserrat_12, 0);
+    lv_obj_center(sl);
+
+    /* Reset scan state */
+    s_lf_result_ready = false;
+    s_lf_result_ok    = false;
+    s_lf_mode_ok      = false;
+    s_lf_uid_len      = 0;
+
+    /* Start scan: switch Chameleon to reader mode (cmd 1001, data=[1]),
+     * then s_lf_on_mode_set fires scanEM410Xtag (cmd 3000) with 8 s timeout */
+    static const uint8_t reader_mode[] = {1};
+    bool sent = cham_send_cmd(1001, reader_mode, 1, s_lf_on_mode_set);
+    if (!sent) {
+        lv_label_set_text(s_lf_status_lbl, "Not connected — go back and reconnect");
+    }
+
+    /* 50 ms poll timer keeps cham_poll() alive and picks up scan result */
+    s_lf_tmr = lv_timer_create(s_lf_poll_timer, 50, NULL);
+}
+
 /* ── Scan list item tap: start connecting to that device ── */
 static void s_cham_list_item_cb(lv_event_t *e)
 {
@@ -47679,7 +47869,42 @@ static void s_cham_rebuild_content(cham_state_t st)
         lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
         s_cham_stub_tile(tiles, LV_SYMBOL_WIFI,    "Read HF");
-        s_cham_stub_tile(tiles, LV_SYMBOL_AUDIO,   "Read LF");
+
+        /* Read LF — live tile, navigates to LF card reader sub-screen */
+        {
+            lv_obj_t *btn = lv_btn_create(tiles);
+            lv_obj_set_size(btn, 72, 54);
+            lv_obj_set_style_bg_color(btn, lv_color_hex(0x1B3A2A), 0);
+            lv_obj_set_style_radius(btn, 8, 0);
+            lv_obj_set_style_border_width(btn, 1, 0);
+            lv_obj_set_style_border_color(btn, lv_color_hex(0x2E7D52), 0);
+
+            lv_obj_t *col = lv_obj_create(btn);
+            lv_obj_set_size(col, LV_PCT(100), LV_PCT(100));
+            lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(col, 0, 0);
+            lv_obj_set_style_pad_all(col, 2, 0);
+            lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+            lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+            lv_obj_t *ico = lv_label_create(col);
+            lv_label_set_text(ico, LV_SYMBOL_AUDIO);
+            lv_obj_set_style_text_font(ico, &g_font_icon16, 0);
+            lv_obj_set_style_text_color(ico, lv_color_hex(0x66BB6A), 0);
+
+            lv_obj_t *nm = lv_label_create(col);
+            lv_label_set_text(nm, "Read LF");
+            lv_obj_set_style_text_font(nm, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(nm, lv_color_hex(0xB0BEC5), 0);
+
+            lv_obj_t *sub2 = lv_label_create(col);
+            lv_label_set_text(sub2, "EM410X");
+            lv_obj_set_style_text_font(sub2, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(sub2, lv_color_hex(0x4CAF50), 0);
+
+            lv_obj_add_event_cb(btn, s_cham_lf_tile_cb, LV_EVENT_CLICKED, NULL);
+        }
+
         s_cham_stub_tile(tiles, LV_SYMBOL_LIST,    "Slots");
 
         /* Disconnect button */
@@ -47756,8 +47981,10 @@ static void chameleon_screen_stop(void)
     s_cham_scan_list = NULL;
     s_cham_ui_st     = (cham_state_t)0xFF;
     s_cham_list_n    = 0;
-    /* Do NOT call cham_disconnect() here — user may return to this screen.
-     * BLE connection persists across screen transitions within the same session. */
+    /* Disconnect BLE so the Chameleon can sleep and re-advertise.
+     * The main screen is the terminal point — navigating back or home
+     * means the user is done with this session. */
+    cham_disconnect();
 }
 
 /* ── Main screen entry point ── */
