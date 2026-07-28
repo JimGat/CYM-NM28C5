@@ -112,6 +112,10 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
     - [GATT Connect Timeout](#gatt-connect-timeout)
     - [Data Transfer](#data-transfer)
   - [Zigbee Scout](#6-zigbee-scout)
+  - [NFC / RFID Hub](#8-nfc--rfid-hub)
+    - [Chameleon Ultra](#chameleon-ultra)
+    - [PN532 NFC/RFID](#pn532-nfcrfid)
+      - [NTAG213/215/216 Full Dump](#ntag213215216-full-dump-workflow)
   - [NM-RF-HAT](#7-nm-rf-hat)
     - [Infrared (DIP 4)](#infrared-dip-4)
       - [LED RMT — RGB LED Strip Remote](#led-rmt--rgb-led-strip-remote)
@@ -149,6 +153,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **Chanalizer** | Wide 520 px WiFi channel map — auto-scrolling left/right with touch-drag pause; SSID color grouping, group legend, channel annotations; portrait 240 px viewport over 2.4 GHz + 5 GHz |
 | **WiFi Band Scope** | Promiscuous RSSI per-channel waterfall (2.4 GHz 13-ch or 5 GHz 25-ch); band toggle updates axis label and resets peaks; 60 ms dwell / 0.8 s full 2.4 sweep |
 | **Drone Detector** | Dual-mode (BLE5 extended + WiFi 2.4/5 GHz) passive Remote ID scanner. Detects all ASTM F3411-compliant drones via BLE service UUID 0xFFFA and WiFi Remote ID beacons; DJI presence by OUI / service UUID 0xFFF0. Alternates BLE and WiFi scan phases; logs to SD. |
+| **Drone Spoof** | Broadcasts a synthetic ASTM F3411 Remote ID beacon over BLE or WiFi. Configurable UAS ID, operator ID, GPS coordinates, altitude, speed, and heading. For RF research, drone regulation testing, and authorized counter-UAS research. |
 | **Wardriving** | GPS + WiFi logging, dual-band filter (2.4 GHz / 5 GHz / Both), optional BLE time-sliced scanning, WiGLE CSV 1.6, upload log tracking, raw PCAP toggle, GPS mark waypoints (GPX output), WiGLE and WDG Wars upload; GPS last-known position hold with 150 m stale accuracy when signal is lost; live dashboard shows separate WiFi network count and BLE device count |
 | **GPS** | NMEA RMC auto-syncs system clock (FAT timestamps); last-known position persisted to NVS (5-minute throttle); manual fallback editor in Settings → GPS Info; all data-collection features (wardrive, GATT Walker, marks) use best available GPS transparently |
 | **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk (with **advanced advertising fingerprinting** — AD-type decode, Company ID lookup, URIs, flags), Bluetooth Lookout, BLE Spam (8 modes incl. Sour Apple), Device Spoof (general + directed), BLE Disconnect (directed), BLE PCAP (Kismet PCAPNG raw capture; BLE 5.0 extended advertisement support), **BlueDuck** (BLE HID DuckyScript keyboard injector), **HoneyPair** (BLE persona honeypot), **WhisperPair** (CVE-2025-36911 Google Fast Pair KBP bypass — auto-scan, sequential run-all FP targets, AES-128-ECB exploit); BT Scan & Select supports **Save List** (GPS-tagged JSON snapshot of every device found); **Matter [M] detection** passive tagging of Thread/BLE Matter devices by GATT service `0xFFF6`; **GATT Interactive** (live read/write/subscribe to individual characteristics after walk); **GATT HID Decoder** (parses HID Report Map, decodes live keyboard/mouse input); **Saved Clones** browser; **BLE MITM Proxy** |
@@ -186,7 +191,9 @@ Home
 │   ├── Deauth Monitor
 │   ├── Deauth Client
 │   ├── WiFi Observer (Sniffer / Karma)
-│   ├── Drone Detect
+│   ├── Drone Stuff
+│   │   ├── Drone Detect
+│   │   └── Drone Spoof
 │   ├── Chanalizer
 │   ├── WiFi Scope
 │   └── ESP-NOW Scout
@@ -288,13 +295,15 @@ Home
 │       ├── LBK Test (loopback)
 │       ├── Fox Hunt (433.92 MHz fixed, edge-count activity, haptic)
 │       └── OOK Scan (EV1527 decoder via R4A_433 superheterodyne RX)
-└── RFID/NFC [RF-HAT DIP 3]
-    ├── Scan & Read  →  Read All (full page dump)  →  Save / Export .nfc
-    ├── Clone/Write  →  Select source  →  Clone to blank NTAG
-    ├── Card Emulate →  Select saved card  →  Emulate / Stop
-    ├── Key Test     →  MIFARE Classic dict attack
-    ├── Saved Cards  →  load / emulate / Flipper .nfc import
-    └── HW Test      →  PN532 I2C probe, I2C bus scan
+└── NFC / RFID Hub  [always visible]
+    ├── Chameleon Ultra  [BLE — coming soon]
+    └── PN532 NFC  [RF-HAT DIP 3 — or standalone on CN1]
+        ├── Scan & Read  →  Read All (full page dump)  →  Save / Export .nfc
+        ├── Clone/Write  →  Select source  →  Clone to blank NTAG
+        ├── Card Emulate →  Select saved card  →  Emulate / Stop
+        ├── Key Test     →  MIFARE Classic dict attack
+        ├── Saved Cards  →  load / emulate / Flipper .nfc import
+        └── HW Test      →  PN532 I2C probe, I2C bus scan
 ```
 
 ---
@@ -836,6 +845,27 @@ Tap any row in the drone list to open a detail screen showing all decoded fields
 **Output logs** saved to `/sdcard/lab/dronedetect/`:
 - `drone_YYYYMMDD_HHMMSS.pcap` — raw BLE advertising packets (Kismet PCAPNG format)
 - `drone_YYYYMMDD_HHMMSS.json` — parsed Remote ID records for all detected drones
+
+#### Drone Spoof — How It Works
+
+**Drone Spoof** broadcasts a synthetic **ASTM F3411 Remote ID** beacon, making a receiver see a drone that does not physically exist. Use cases: testing Remote ID receiver software, authorized counter-UAS research, drone regulation compliance validation, and RF lab research.
+
+**Configurable fields:**
+
+| Field | Description |
+|-------|-------------|
+| UAS ID | 20-byte drone serial / operator identifier |
+| Operator ID | 20-byte operator string |
+| Latitude / Longitude | GPS coordinates of the spoofed position |
+| Altitude | Barometric / GPS altitude in meters |
+| Speed / Heading | Ground speed (m/s) and horizontal heading (deg) |
+
+**Broadcast modes:**
+
+- **BLE** — Extended advertising on primary PHY 1M, secondary PHY 1M. Broadcasts ASTM F3411 service UUID `0xFFFA` with a valid Remote ID message in the service-data AD. Received by any compliant Remote ID receiver.
+- **WiFi** — Management frame beacon with ODID IE (type `0xFA 0x0B 0xBC`). Reaches receivers monitoring channel 6 or the configured channel.
+
+> For authorized research only. Broadcasting a false Remote ID identifying a drone you do not operate may be illegal under your local aviation regulations. Ensure you have explicit authorization before transmitting outside of a shielded lab environment.
 
 #### BT Scan & Select — How It Works
 
@@ -2037,6 +2067,41 @@ The PCAP file uses **DLT 195** (`LINKTYPE_IEEE802_15_4_WITHFCS`) and can be open
 The Scout rotates through all 16 channels (11–26) with an 800 ms dwell per channel, completing a full sweep in ~13 seconds. Each PAN seen on any channel is de-duplicated by PAN ID in the live list.
 
 > **Note:** Zigbee Scout uses the ESP32-C5's hardware 802.15.4 PHY (`esp_ieee802154_*` API). WiFi and BLE are disabled while Zigbee Scout is running. The radio switches back automatically when you exit the screen.
+
+---
+
+### 8. NFC / RFID Hub
+
+The **NFC / RFID Hub** tile is permanently visible on the main menu — no RF-HAT required to enter it. From the hub, choose:
+
+#### Chameleon Ultra
+
+**Coming soon.** The Chameleon Ultra is a Bluetooth RFID/NFC reader, writer, cloner, and emulator supporting:
+- **LF 125 kHz** — EM4100, HID Prox, and other low-frequency formats
+- **HF 13.56 MHz** — MIFARE Classic, NTAG, ISO14443A/B
+
+Concept credit: **@bkbroiler**. Protocol reference: [ChameleonUltraGUI by GameTec-live](https://github.com/GameTec-live/ChameleonUltraGUI).
+
+The BLE stack and protocol implementation will be added in a future release. The hub tile and stub screen are present in firmware from v2.11.12.
+
+#### PN532 NFC/RFID
+
+The PN532 tile routes to the full PN532 feature screen. Two hardware configurations are supported:
+
+**With NM-RF-HAT (DIP 3 ON):** The standard path — a DIP-switch reminder popup appears before entering the feature screen.
+
+**Standalone PN532 breakout on CN1 (no RF-HAT needed):** Wire a PN532 breakout board directly to the CN1 header:
+
+| PN532 pin | CN1 / ESP32-C5 |
+|-----------|----------------|
+| SCL | GPIO 8 |
+| SDA | GPIO 9 |
+| VCC | 3.3 V |
+| GND | GND |
+
+Set the PN532 to **I2C mode** using its onboard DIP switch or solder bridges (varies by breakout). When RF-HAT is not enabled in Settings, tapping the PN532 tile shows wiring instructions. Enable RF-HAT in Settings → Hardware Options to see the DIP 3 reminder instead.
+
+> All PN532 feature details (Scan & Read, Clone/Write, Card Emulate, Key Test, Saved Cards, HW Test) are documented in the [NM-RF-HAT](#7-nm-rf-hat) section below.
 
 ---
 
