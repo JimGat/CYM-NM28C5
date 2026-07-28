@@ -47298,14 +47298,16 @@ static void show_pn532_standalone_info_popup(void)
     lv_obj_add_event_cb(ok_btn, pn532_info_popup_dismiss_cb, LV_EVENT_CLICKED, overlay);
 }
 
-/* PN532 tile callback: DIP popup (RF-HAT) or wiring info (standalone). */
+/* PN532 tile callback.
+ * RF-HAT enabled: remind user to flip DIP 3 before opening RFID menu.
+ * RF-HAT disabled: go straight to RFID menu (standalone CN1 breakout). */
 static void nfc_hub_pn532_cb(lv_event_t *e)
 {
     (void)e;
     if (g_rf_hat_enabled)
         show_dip_switch_popup(3, "PN532 RFID/NFC", show_rfid_menu_screen);
     else
-        show_pn532_standalone_info_popup();
+        show_rfid_menu_screen();
 }
 
 /* Chameleon tile callback. */
