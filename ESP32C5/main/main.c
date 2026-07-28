@@ -47370,14 +47370,16 @@ static lv_timer_t *s_lf_tmr         = NULL;
 static lv_obj_t   *s_lf_status_lbl  = NULL;
 static lv_obj_t   *s_lf_uid_lbl     = NULL;
 static lv_obj_t   *s_lf_save_btn    = NULL;
+static lv_obj_t   *s_lf_scan_btn    = NULL; /* "Scan Again" — shown after any result */
 static uint8_t     s_lf_uid[5]      = {0};
 static int         s_lf_uid_len     = 0;
 static volatile bool s_lf_result_ready = false;
 static volatile bool s_lf_result_ok    = false;
 static volatile bool s_lf_mode_ok      = false;
 
-/* Forward declaration */
+/* Forward declarations */
 static void show_cham_lf_read_screen(void);
+static void s_lf_on_mode_set(bool ok, const uint8_t *data, uint16_t dlen);
 
 /* ── LF read: tile button callback ── */
 static void s_cham_lf_tile_cb(lv_event_t *e)
@@ -47417,6 +47419,30 @@ static void s_lf_save_cb(lv_event_t *e)
 }
 
 /* ── LF read: scan result callback (fires from cham_poll via cham_send_cmd_ex) ── */
+/* ── LF read: restart the mode-set + scan sequence ── */
+static void s_lf_restart_scan(void)
+{
+    s_lf_result_ready = false;
+    s_lf_result_ok    = false;
+    s_lf_mode_ok      = false;
+    s_lf_uid_len      = 0;
+    if (s_lf_uid_lbl)  lv_obj_add_flag(s_lf_uid_lbl,  LV_OBJ_FLAG_HIDDEN);
+    if (s_lf_save_btn) lv_obj_add_flag(s_lf_save_btn, LV_OBJ_FLAG_HIDDEN);
+    if (s_lf_scan_btn) lv_obj_add_flag(s_lf_scan_btn, LV_OBJ_FLAG_HIDDEN);
+    if (s_lf_status_lbl)
+        lv_label_set_text(s_lf_status_lbl, "Hold 125 kHz card near Chameleon...");
+    static const uint8_t reader_mode[] = {1};
+    bool sent = cham_send_cmd(1001, reader_mode, 1, s_lf_on_mode_set);
+    if (!sent && s_lf_status_lbl)
+        lv_label_set_text(s_lf_status_lbl, "Not connected - go back and reconnect");
+}
+
+static void s_lf_scan_again_cb(lv_event_t *e)
+{
+    (void)e;
+    s_lf_restart_scan();
+}
+
 static void s_lf_on_scan_result(bool ok, const uint8_t *data, uint16_t dlen)
 {
     s_lf_result_ok = ok;
@@ -47441,8 +47467,11 @@ static void s_lf_on_mode_set(bool ok, const uint8_t *data, uint16_t dlen)
         s_lf_result_ready = true; /* let timer pick up the failure */
         return;
     }
-    /* 8 s timeout — EM410X scan blocks until card present or timeout */
-    cham_send_cmd_ex(3000, NULL, 0, s_lf_on_scan_result, 8000000LL);
+    /* Send 3000 ms scan duration as 2-byte big-endian uint16 (required by protocol).
+     * Without this field the Chameleon uses a zero/default timeout and returns
+     * "no tag found" almost instantly even when a card is present. */
+    static const uint8_t scan_tm[2] = { 0x0B, 0xB8 }; /* 0x0BB8 = 3000 ms */
+    cham_send_cmd_ex(3000, scan_tm, 2, s_lf_on_scan_result, 8000000LL);
 }
 
 /* ── LF read: 50 ms poll timer ── */
@@ -47472,11 +47501,14 @@ static void s_lf_poll_timer(lv_timer_t *t)
             lv_obj_clear_flag(s_lf_uid_lbl, LV_OBJ_FLAG_HIDDEN);
         }
         if (s_lf_save_btn) lv_obj_clear_flag(s_lf_save_btn, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(s_lf_status_lbl, "Card read — tap Save to export");
+        if (s_lf_scan_btn) lv_obj_clear_flag(s_lf_scan_btn, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(s_lf_status_lbl, "Card read - tap Save to export");
     } else if (!s_lf_mode_ok) {
-        lv_label_set_text(s_lf_status_lbl, "Mode switch failed — try again");
+        lv_label_set_text(s_lf_status_lbl, "Mode switch failed - tap Scan Again");
+        if (s_lf_scan_btn) lv_obj_clear_flag(s_lf_scan_btn, LV_OBJ_FLAG_HIDDEN);
     } else {
-        lv_label_set_text(s_lf_status_lbl, "No card detected — try again");
+        lv_label_set_text(s_lf_status_lbl, "No card detected - tap Scan Again");
+        if (s_lf_scan_btn) lv_obj_clear_flag(s_lf_scan_btn, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -47487,6 +47519,7 @@ static void cham_lf_read_stop(void)
     s_lf_status_lbl  = NULL;
     s_lf_uid_lbl     = NULL;
     s_lf_save_btn    = NULL;
+    s_lf_scan_btn    = NULL;
     s_lf_result_ready = false;
     s_lf_result_ok    = false;
     s_lf_mode_ok      = false;
@@ -47530,6 +47563,18 @@ static void show_cham_lf_read_screen(void)
     lv_obj_align(s_lf_uid_lbl, LV_ALIGN_TOP_MID, 0, 140);
     lv_obj_add_flag(s_lf_uid_lbl, LV_OBJ_FLAG_HIDDEN);
 
+    /* Scan Again button (hidden during active scan, shown after any result) */
+    s_lf_scan_btn = lv_btn_create(function_page);
+    lv_obj_set_size(s_lf_scan_btn, 140, 36);
+    lv_obj_align(s_lf_scan_btn, LV_ALIGN_BOTTOM_MID, 0, -50);
+    lv_obj_set_style_bg_color(s_lf_scan_btn, lv_color_hex(0x1A237E), 0);
+    lv_obj_add_flag(s_lf_scan_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_lf_scan_btn, s_lf_scan_again_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *sb = lv_label_create(s_lf_scan_btn);
+    lv_label_set_text(sb, LV_SYMBOL_REFRESH " Scan Again");
+    lv_obj_set_style_text_font(sb, &lv_font_montserrat_12, 0);
+    lv_obj_center(sb);
+
     /* Save button (hidden until successful read) */
     s_lf_save_btn = lv_btn_create(function_page);
     lv_obj_set_size(s_lf_save_btn, 140, 36);
@@ -47553,7 +47598,8 @@ static void show_cham_lf_read_screen(void)
     static const uint8_t reader_mode[] = {1};
     bool sent = cham_send_cmd(1001, reader_mode, 1, s_lf_on_mode_set);
     if (!sent) {
-        lv_label_set_text(s_lf_status_lbl, "Not connected — go back and reconnect");
+        lv_label_set_text(s_lf_status_lbl, "Not connected - go back and reconnect");
+        if (s_lf_scan_btn) lv_obj_clear_flag(s_lf_scan_btn, LV_OBJ_FLAG_HIDDEN);
     }
 
     /* 50 ms poll timer keeps cham_poll() alive and picks up scan result */
