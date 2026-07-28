@@ -47348,13 +47348,13 @@ static void show_nfc_hub_screen(void)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /* Screen-scoped globals — all NULLed by chameleon_screen_stop() */
-static lv_timer_t *s_cham_tmr      = NULL;   /* 50 ms poll timer */
-static lv_obj_t   *s_cham_stat_lbl = NULL;   /* status text strip at top */
-static lv_obj_t   *s_cham_content  = NULL;   /* main content container (rebuilt on state change) */
-static lv_obj_t   *s_cham_bat_lbl  = NULL;   /* battery label (updated in-place when READY) */
+static lv_timer_t *s_cham_tmr       = NULL;  /* 50 ms poll timer */
+static lv_obj_t   *s_cham_content   = NULL;  /* main content area (rebuilt on state change) */
+static lv_obj_t   *s_cham_prog_lbl  = NULL;  /* live-updated label inside content (scan / connecting) */
+static lv_obj_t   *s_cham_bat_lbl   = NULL;  /* battery label (updated in-place when READY) */
 static lv_obj_t   *s_cham_scan_list = NULL;  /* lv_list during scan */
-static cham_state_t s_cham_ui_st   = (cham_state_t)0xFF; /* last-rendered state */
-static int         s_cham_list_n   = 0;       /* # items currently in scan list */
+static cham_state_t s_cham_ui_st    = (cham_state_t)0xFF; /* last-rendered state */
+static int         s_cham_list_n    = 0;      /* # items currently in scan list */
 
 /* ── Scan list item tap: start connecting to that device ── */
 static void s_cham_list_item_cb(lv_event_t *e)
@@ -47367,11 +47367,8 @@ static void s_cham_list_item_cb(lv_event_t *e)
 static void s_cham_scan_btn_cb(lv_event_t *e)
 {
     (void)e;
-    if (!ensure_ble_mode()) {
-        if (s_cham_stat_lbl)
-            lv_label_set_text(s_cham_stat_lbl, "BLE init failed");
-        return;
-    }
+    /* ensure_ble_mode() must run first; ble_gap_disc() silently fails without it */
+    if (!ensure_ble_mode()) return;
     cham_scan_start();
 }
 
@@ -47492,10 +47489,20 @@ static void s_cham_rebuild_content(cham_state_t st)
         lv_obj_align(cr, LV_ALIGN_BOTTOM_MID, 0, -4);
 
     } else if (st == CHAM_STATE_SCANNING) {
-        /* ── Scanning: result list + Stop button ── */
+        /* ── Scanning: status strip + result list + Stop button ── */
+        /* Status strip sits at top of content area (below topbar) */
+        s_cham_prog_lbl = lv_label_create(s_cham_content);
+        lv_label_set_text(s_cham_prog_lbl, cham_get_status_msg());
+        lv_obj_set_style_text_font(s_cham_prog_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(s_cham_prog_lbl, lv_color_hex(0xB0BEC5), 0);
+        lv_obj_set_style_text_align(s_cham_prog_lbl, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(s_cham_prog_lbl, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(s_cham_prog_lbl, lv_pct(100));
+        lv_obj_align(s_cham_prog_lbl, LV_ALIGN_TOP_MID, 0, 2);
+
         s_cham_scan_list = lv_list_create(s_cham_content);
-        lv_obj_set_size(s_cham_scan_list, 228, 200);
-        lv_obj_align(s_cham_scan_list, LV_ALIGN_TOP_MID, 0, 0);
+        lv_obj_set_size(s_cham_scan_list, 228, 160);
+        lv_obj_align(s_cham_scan_list, LV_ALIGN_TOP_MID, 0, 22);
         lv_obj_set_style_bg_color(s_cham_scan_list, lv_color_hex(0x1A1A2E), 0);
         lv_obj_set_style_border_color(s_cham_scan_list, lv_color_hex(0x4A4A5A), 0);
         lv_obj_set_style_border_width(s_cham_scan_list, 1, 0);
@@ -47535,14 +47542,14 @@ static void s_cham_rebuild_content(cham_state_t st)
         lv_obj_set_style_text_color(spin_lbl, lv_color_hex(0x42A5F5), 0);
         lv_obj_align(spin_lbl, LV_ALIGN_TOP_MID, 0, 20);
 
-        lv_obj_t *prog = lv_label_create(s_cham_content);
-        lv_label_set_text(prog, cham_get_status_msg());
-        lv_obj_set_style_text_font(prog, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(prog, lv_color_hex(0xB0BEC5), 0);
-        lv_obj_set_style_text_align(prog, LV_TEXT_ALIGN_CENTER, 0);
-        lv_label_set_long_mode(prog, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(prog, lv_pct(100));
-        lv_obj_align(prog, LV_ALIGN_TOP_MID, 0, 50);
+        s_cham_prog_lbl = lv_label_create(s_cham_content);
+        lv_label_set_text(s_cham_prog_lbl, cham_get_status_msg());
+        lv_obj_set_style_text_font(s_cham_prog_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(s_cham_prog_lbl, lv_color_hex(0xB0BEC5), 0);
+        lv_obj_set_style_text_align(s_cham_prog_lbl, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(s_cham_prog_lbl, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(s_cham_prog_lbl, lv_pct(100));
+        lv_obj_align(s_cham_prog_lbl, LV_ALIGN_TOP_MID, 0, 50);
 
         lv_obj_t *cbtn = lv_btn_create(s_cham_content);
         lv_obj_set_size(cbtn, 100, 36);
@@ -47626,15 +47633,15 @@ static void s_cham_rebuild_content(cham_state_t st)
 static void s_cham_poll_timer(lv_timer_t *t)
 {
     (void)t;
-    if (!s_cham_stat_lbl) return; /* screen was torn down */
+    if (!s_cham_content) return; /* screen was torn down */
 
     bool changed = cham_poll();
     if (!changed) return;
 
     cham_state_t st = cham_get_state();
 
-    /* Always refresh status strip */
-    lv_label_set_text(s_cham_stat_lbl, cham_get_status_msg());
+    /* Update live-status label (scanning progress or connecting step) */
+    if (s_cham_prog_lbl) lv_label_set_text(s_cham_prog_lbl, cham_get_status_msg());
 
     /* State transition: full content rebuild */
     if (st != s_cham_ui_st) {
@@ -47677,7 +47684,7 @@ static void chameleon_screen_stop(void)
 {
     if (s_cham_tmr)       { lv_timer_del(s_cham_tmr); s_cham_tmr = NULL; }
     /* NULL all LVGL pointers — they will be freed with function_page */
-    s_cham_stat_lbl  = NULL;
+    s_cham_prog_lbl  = NULL;
     s_cham_content   = NULL;
     s_cham_bat_lbl   = NULL;
     s_cham_scan_list = NULL;
@@ -47694,16 +47701,6 @@ static void show_chameleon_screen(void)
     g_screen_stop_fn  = chameleon_screen_stop;   /* MANDATORY — before building UI */
     g_screen_back_fn  = show_nfc_hub_screen;
     apply_menu_bg();
-
-    /* Status strip: single-line status text at top of function_page */
-    s_cham_stat_lbl = lv_label_create(function_page);
-    lv_label_set_text(s_cham_stat_lbl, cham_get_status_msg());
-    lv_obj_set_style_text_font(s_cham_stat_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(s_cham_stat_lbl, lv_color_hex(0xB0BEC5), 0);
-    lv_obj_set_style_text_align(s_cham_stat_lbl, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_long_mode(s_cham_stat_lbl, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(s_cham_stat_lbl, 240);
-    lv_obj_set_pos(s_cham_stat_lbl, 0, 12);
 
     /* Build initial content for current state */
     s_cham_ui_st = (cham_state_t)0xFF; /* force rebuild */

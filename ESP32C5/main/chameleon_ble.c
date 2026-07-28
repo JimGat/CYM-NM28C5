@@ -462,21 +462,58 @@ static int s_scan_gap_cb(struct ble_gap_event *event, void *arg)
     if (event->type == BLE_GAP_EVENT_DISC) {
         const struct ble_gap_disc_desc *desc = &event->disc;
         struct ble_hs_adv_fields fields;
-        if (ble_hs_adv_parse_fields(&fields, desc->data, desc->length_data) != 0)
-            return 0;
-        if (!fields.name || fields.name_len == 0) return 0;
 
+        /* Parse AD fields — tolerate parse failure (still might match by UUID) */
+        bool parsed = (ble_hs_adv_parse_fields(&fields, desc->data,
+                                                desc->length_data) == 0);
+
+        /* Primary filter: NUS service UUID in advertisement (128-bit list).
+         * The Chameleon always advertises the NUS service UUID; this is more
+         * reliable than name matching (name may be in scan response only,
+         * or may be user-renamed). */
+        bool has_nus = false;
+        if (parsed && fields.uuids128 != NULL) {
+            for (int i = 0; i < fields.num_uuids128; i++) {
+                if (ble_uuid_cmp(&fields.uuids128[i].u, &s_nus_svc_uuid.u) == 0) {
+                    has_nus = true;
+                    break;
+                }
+            }
+        }
+
+        /* Secondary filter: device name starts with "Chameleon" (handles any
+         * renamed device and catches the name whether in adv or scan response) */
         char name[32] = {0};
-        int nlen = (fields.name_len < 31) ? fields.name_len : 31;
-        memcpy(name, fields.name, nlen);
+        bool has_cham_name = false;
+        if (parsed && fields.name && fields.name_len > 0) {
+            int nlen = (fields.name_len < 31) ? fields.name_len : 31;
+            memcpy(name, fields.name, nlen);
+            has_cham_name = (strncmp(name, "Chameleon", 9) == 0);
+        }
 
-        bool is_cham = (strncmp(name, "ChameleonUltra", 14) == 0 ||
-                        strncmp(name, "ChameleonLite",  13) == 0);
-        if (!is_cham) return 0;
+        if (!has_nus && !has_cham_name) return 0;
 
-        /* Deduplicate by address */
+        /* If found by UUID but name is unknown, use a placeholder */
+        if (name[0] == '\0') {
+            char addr_str[18];
+            snprintf(addr_str, sizeof(addr_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     desc->addr.val[0], desc->addr.val[1], desc->addr.val[2],
+                     desc->addr.val[3], desc->addr.val[4], desc->addr.val[5]);
+            snprintf(name, sizeof(name), "Chameleon [%s]", addr_str + 9); /* last 3 octets */
+        }
+
+        /* Deduplicate by address; update RSSI and name if already seen */
         for (int i = 0; i < s_scan_count; i++) {
-            if (memcmp(s_scan_results[i].addr, desc->addr.val, 6) == 0) return 0;
+            if (memcmp(s_scan_results[i].addr, desc->addr.val, 6) == 0) {
+                s_scan_results[i].rssi = desc->rssi;
+                if (has_cham_name && s_scan_results[i].name[0] == 'C' &&
+                    s_scan_results[i].name[9] == '[') {
+                    /* Replace placeholder with real name */
+                    strlcpy(s_scan_results[i].name, name, sizeof(s_scan_results[i].name));
+                    s_changed = true;
+                }
+                return 0;
+            }
         }
 
         if (s_scan_count < CHAM_MAX_SCAN) {
@@ -485,10 +522,15 @@ static int s_scan_gap_cb(struct ble_gap_event *event, void *arg)
             memcpy(r->addr, desc->addr.val, 6);
             r->addr_type = desc->addr.type;
             r->rssi      = desc->rssi;
-            r->is_lite   = (strncmp(name, "ChameleonLite", 13) == 0);
+            /* Lite detection: name contains "Lite", or confirmed via getDeviceType later */
+            r->is_lite   = (strstr(name, "Lite") != NULL);
             s_scan_count++;
             s_changed = true;
-            ESP_LOGI(TAG, "Found Chameleon: %s RSSI=%d", name, desc->rssi);
+            ESP_LOGI(TAG, "Found Chameleon: \"%s\" addr=%02X:%02X:%02X:%02X:%02X:%02X RSSI=%d "
+                     "(by %s)", name,
+                     desc->addr.val[0], desc->addr.val[1], desc->addr.val[2],
+                     desc->addr.val[3], desc->addr.val[4], desc->addr.val[5],
+                     desc->rssi, has_nus ? "NUS UUID" : "name");
         }
     } else if (event->type == BLE_GAP_EVENT_DISC_COMPLETE) {
         /* Continuous scan — restart unless stopped */
