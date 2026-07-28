@@ -8,6 +8,7 @@
 LV_FONT_DECLARE(lv_extra_symbols);
 /* Mutable Montserrat copies with lv_extra_symbols chained as .fallback.
    Used for labels that mix ASCII text with FA icon / arrow glyphs. */
+static lv_font_t g_font_icon12;
 static lv_font_t g_font_icon14;
 static lv_font_t g_font_icon16;
 LV_IMG_DECLARE(lab_bg);
@@ -1619,6 +1620,12 @@ static char          drone_csv_path[80];
 static QueueHandle_t drone_pcap_queue     = NULL;
 static FILE         *drone_pcap_file      = NULL;
 static char          drone_pcap_path[80];
+
+// Drone Detail paginated view state
+static int           s_detail_page        = 0;
+static int           s_detail_idx         = 0;
+static lv_obj_t     *s_detail_cont        = NULL;
+static lv_obj_t     *s_detail_page_lbl    = NULL;
 
 // ── WiFi Channel Analyzer (Chanalizer) state ─────────────────────────────────
 // Portrait layout: 240×320. Two-phase UI: SSID picker → bell-curve chart.
@@ -5546,6 +5553,8 @@ void app_main(void)
        icons (lv_extra_symbols).  The originals are const in flash so we copy
        them to RAM and set .fallback there, then use these pointers for the
        specific labels that mix ASCII text with FA/arrow glyphs. */
+    memcpy(&g_font_icon12, &lv_font_montserrat_12, sizeof(lv_font_t));
+    g_font_icon12.fallback = &lv_extra_symbols;
     memcpy(&g_font_icon14, &lv_font_montserrat_14, sizeof(lv_font_t));
     g_font_icon14.fallback = &lv_extra_symbols;
     memcpy(&g_font_icon16, &lv_font_montserrat_16, sizeof(lv_font_t));
@@ -36701,34 +36710,27 @@ static void drone_row_tap_cb(lv_event_t *e)
     drone_show_detail((int)(intptr_t)lv_event_get_user_data(e));
 }
 
-static void drone_show_detail(int idx)
+/* Rebuild the content area for the current detail page.
+ * Called on entry and by each nav button. Guards against stale pointer after nav away. */
+static void drone_detail_rebuild_page(void)
 {
-    if (idx < 0 || idx >= g_drone_count) return;
+    if (!s_detail_cont || !lv_obj_is_valid(s_detail_cont)) return;
+    lv_obj_clean(s_detail_cont);   /* delete all child labels */
+
+    if (s_detail_idx < 0 || s_detail_idx >= g_drone_count) return;
     drone_rec_t r;
     portENTER_CRITICAL(&g_drone_mux);
-    r = g_drones[idx];
+    r = g_drones[s_detail_idx];
     portEXIT_CRITICAL(&g_drone_mux);
 
-    create_function_page_base("Drone Detail");
-
-    lv_obj_t *cont = lv_obj_create(function_page);
-    lv_obj_set_size(cont, lv_pct(100), LCD_V_RES - 30 - 44);
-    lv_obj_align(cont, LV_ALIGN_TOP_MID, 0, 30);
-    lv_obj_set_style_bg_opa(cont, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(cont, 0, 0);
-    lv_obj_set_style_pad_all(cont, 6, 0);
-    lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(cont, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_set_style_pad_gap(cont, 2, 0);
-    lv_obj_set_scrollbar_mode(cont, LV_SCROLLBAR_MODE_AUTO);
-
-    char ms[18], buf[120];
+    char ms[18], buf[140];
     snprintf(ms, sizeof(ms), "%02X:%02X:%02X:%02X:%02X:%02X",
              r.mac[5],r.mac[4],r.mac[3],r.mac[2],r.mac[1],r.mac[0]);
 
+    /* Helper: add one text row to the content container */
     #define DR(fmt,...) do { \
         snprintf(buf, sizeof(buf), fmt, ##__VA_ARGS__); \
-        lv_obj_t *_l = lv_label_create(cont); \
+        lv_obj_t *_l = lv_label_create(s_detail_cont); \
         lv_label_set_text(_l, buf); \
         lv_obj_set_style_text_font(_l, &lv_font_montserrat_12, 0); \
         lv_obj_set_style_text_color(_l, ui_text_color(), 0); \
@@ -36736,25 +36738,135 @@ static void drone_show_detail(int idx)
         lv_label_set_long_mode(_l, LV_LABEL_LONG_WRAP); \
     } while(0)
 
-    DR("MAC: %s", ms);
-    DR("Source: %s  RSSI: %d dBm  Pkts: %lu",
-       r.source == RID_SRC_BLE ? "BLE" : "WiFi", r.rssi, (unsigned long)r.pkt_count);
-    DR("UAS ID: %s", r.uas_id[0] ? r.uas_id : "(none)");
-    DR("ID Type: %d  Aircraft: %s", r.id_type, drone_ua_str(r.ua_type));
-    if (r.has_loc) {
-        DR("Lat: %.6f  Lon: %.6f", r.lat, r.lon);
-        DR("Alt Geo: %.1f m  Baro: %.1f m", r.alt_geo, r.alt_baro);
-        DR("Speed: %.1f m/s  Vert: %+.1f m/s", r.speed, r.vert_speed);
-        DR("Heading: %d deg", r.heading);
-    } else {
-        DR("Position: not reported");
+    switch (s_detail_page) {
+        case 0:  /* ── Identity ── */
+            DR("MAC:  %s", ms);
+            DR("Via:  %s   RSSI: %d dBm   Pkts: %lu",
+               r.source == RID_SRC_BLE ? "BLE" : "WiFi",
+               r.rssi, (unsigned long)r.pkt_count);
+            DR("UAS ID:  %s", r.uas_id[0] ? r.uas_id : "(none)");
+            DR("ID Type:  %d", r.id_type);
+            DR("Aircraft:  %s", drone_ua_str(r.ua_type));
+            break;
+        case 1:  /* ── Location ── */
+            if (r.has_loc) {
+                DR("Lat:      %.6f", r.lat);
+                DR("Lon:      %.6f", r.lon);
+                DR("Alt Geo:  %.1f m", r.alt_geo);
+                DR("Alt Baro: %.1f m", r.alt_baro);
+                DR("Speed:    %.1f m/s", r.speed);
+                DR("Vert:     %+.1f m/s", r.vert_speed);
+                DR("Heading:  %d\xc2\xb0", r.heading);   /* UTF-8 degree sign */
+            } else {
+                DR("No location data reported");
+            }
+            break;
+        default: /* ── Extended ── */
+            if (r.has_sys) {
+                DR("Pilot Lat: %.6f", r.pilot_lat);
+                DR("Pilot Lon: %.6f", r.pilot_lon);
+            } else {
+                DR("Pilot position: not reported");
+            }
+            DR("Desc:  %s", r.self_id[0] ? r.self_id : "(none)");
+            DR("OpID:  %s", r.op_id[0]   ? r.op_id   : "(none)");
+            break;
     }
-    if (r.has_sys)  DR("Pilot: %.6f, %.6f", r.pilot_lat, r.pilot_lon);
-    if (r.self_id[0]) DR("Desc: %s", r.self_id);
-    if (r.op_id[0])   DR("OpID: %s", r.op_id);
     #undef DR
-    // No bottom Back button — navigation uses the top-bar ‹ Back, which returns
-    // to the drone list via NAV_SHOW_TABLE ("Drone Detector"), not Home.
+
+    /* Update page indicator label */
+    if (s_detail_page_lbl && lv_obj_is_valid(s_detail_page_lbl))
+        lv_label_set_text_fmt(s_detail_page_lbl, "%d / 3", s_detail_page + 1);
+}
+
+/* Nav button callback: user_data = delta (-1 prev, 0 first, +1 next) */
+static void drone_detail_nav_cb(lv_event_t *e)
+{
+    int delta = (int)(intptr_t)lv_event_get_user_data(e);
+    if (delta == 0) {
+        s_detail_page = 0;
+    } else {
+        s_detail_page = (s_detail_page + delta + 3) % 3;
+    }
+    drone_detail_rebuild_page();
+}
+
+static void drone_show_detail(int idx)
+{
+    if (idx < 0 || idx >= g_drone_count) return;
+    s_detail_idx  = idx;
+    s_detail_page = 0;
+
+    create_function_page_base("Drone Detail");
+    /* No stop hook needed — no timers or tasks started by this screen. */
+
+    /* ── Content area (fills space above nav row) ── */
+    s_detail_cont = lv_obj_create(function_page);
+    lv_obj_set_size(s_detail_cont, lv_pct(100), LCD_V_RES - 30 - 48);
+    lv_obj_align(s_detail_cont, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_opa(s_detail_cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_detail_cont, 0, 0);
+    lv_obj_set_style_pad_all(s_detail_cont, 6, 0);
+    lv_obj_set_flex_flow(s_detail_cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_detail_cont, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_gap(s_detail_cont, 4, 0);
+    lv_obj_clear_flag(s_detail_cont, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* ── Navigation row: [◀ Prev]  [1/3]  [Next ▶] ── */
+    lv_obj_t *nav = lv_obj_create(function_page);
+    lv_obj_set_size(nav, lv_pct(100), 40);
+    lv_obj_align(nav, LV_ALIGN_BOTTOM_MID, 0, -2);
+    lv_obj_set_style_bg_opa(nav, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(nav, 0, 0);
+    lv_obj_set_style_pad_hor(nav, 6, 0);
+    lv_obj_set_style_pad_ver(nav, 4, 0);
+    lv_obj_set_flex_flow(nav, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(nav, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(nav, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Prev button */
+    lv_obj_t *prev_btn = lv_btn_create(nav);
+    lv_obj_set_size(prev_btn, 74, 30);
+    lv_obj_set_style_bg_color(prev_btn, lv_color_hex(0x1A237E), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(prev_btn, 6, 0);
+    lv_obj_t *prev_lbl = lv_label_create(prev_btn);
+    lv_label_set_text(prev_lbl, LV_SYMBOL_LEFT " Prev");
+    lv_obj_set_style_text_font(prev_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(prev_lbl, lv_color_white(), 0);
+    lv_obj_center(prev_lbl);
+    lv_obj_add_event_cb(prev_btn, drone_detail_nav_cb, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)-1);
+
+    /* Page indicator — tap to jump back to page 1 */
+    lv_obj_t *page_btn = lv_btn_create(nav);
+    lv_obj_set_size(page_btn, 52, 30);
+    lv_obj_set_style_bg_color(page_btn, lv_color_hex(0x37474F), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(page_btn, 6, 0);
+    s_detail_page_lbl = lv_label_create(page_btn);
+    lv_label_set_text(s_detail_page_lbl, "1 / 3");
+    lv_obj_set_style_text_font(s_detail_page_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_detail_page_lbl, lv_color_hex(0xFFCA28), 0);
+    lv_obj_center(s_detail_page_lbl);
+    lv_obj_add_event_cb(page_btn, drone_detail_nav_cb, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)0);
+
+    /* Next button */
+    lv_obj_t *next_btn = lv_btn_create(nav);
+    lv_obj_set_size(next_btn, 74, 30);
+    lv_obj_set_style_bg_color(next_btn, lv_color_hex(0x1B5E20), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(next_btn, 6, 0);
+    lv_obj_t *next_lbl = lv_label_create(next_btn);
+    lv_label_set_text(next_lbl, "Next " LV_SYMBOL_RIGHT);
+    lv_obj_set_style_text_font(next_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(next_lbl, lv_color_white(), 0);
+    lv_obj_center(next_lbl);
+    lv_obj_add_event_cb(next_btn, drone_detail_nav_cb, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)+1);
+
+    /* Render first page */
+    drone_detail_rebuild_page();
 }
 
 // Main screen builder. Safe to call both for fresh start and from detail-view back.
@@ -37230,7 +37342,9 @@ static void drone_spoof_stop(void)
 {
     s_spoof_active = false;
     if (s_spoof_timer)    { lv_timer_del(s_spoof_timer); s_spoof_timer = NULL; }
-    if (!s_spoof_use_wifi) drone_spoof_ble_stop();
+    /* Only call NimBLE APIs if BLE is actually initialized — calling into an
+     * uninitialised NimBLE stack (e.g. user never pressed Start) causes a crash. */
+    if (current_radio_mode == RADIO_MODE_BLE) drone_spoof_ble_stop();
     /* NULL every LVGL pointer reachable from the timer callback */
     s_spoof_status_lbl = NULL;
     s_spoof_kb         = NULL;
@@ -37258,22 +37372,19 @@ static lv_obj_t *spoof_add_field(lv_obj_t *parent, const char *label_txt,
     lv_obj_set_style_text_color(lbl, lv_color_hex(0x90CAF9), 0);   /* light-blue label */
     lv_obj_set_width(lbl, lv_pct(100));
 
-    /* Textarea */
+    /* Textarea — styled to match the BT scan save overlay reference */
     lv_obj_t *ta = lv_textarea_create(parent);
     lv_obj_set_width(ta, lv_pct(100));
-    lv_obj_set_height(ta, LV_SIZE_CONTENT);
+    lv_obj_set_height(ta, 36);
     lv_textarea_set_one_line(ta, true);
     lv_textarea_set_max_length(ta, maxlen);
     lv_textarea_set_text(ta, initial);
-    lv_obj_set_style_bg_color(ta, lv_color_hex(0x1A1A2E), 0);
+    lv_obj_set_style_text_font(ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(ta, ui_bg_color(), 0);
     lv_obj_set_style_text_color(ta, ui_text_color(), 0);
-    lv_obj_set_style_text_font(ta, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_border_color(ta, lv_color_hex(0x1B5E20), 0);
-    lv_obj_set_style_border_width(ta, 1, 0);
-    lv_obj_set_style_radius(ta, 4, 0);
-    lv_obj_set_style_pad_all(ta, 4, 0);
+    lv_obj_set_style_border_color(ta, ui_accent_color(), 0);
 
-    /* Flashing block cursor — matches the project standard */
+    /* Flashing block cursor — matches project standard (BT scan save reference) */
     lv_obj_set_style_bg_opa(ta,      LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_obj_set_style_border_color(ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
     lv_obj_set_style_border_width(ta, 2,             LV_PART_CURSOR | LV_STATE_FOCUSED);
@@ -37289,10 +37400,10 @@ static void show_drone_spoof_screen(void)
     g_screen_stop_fn = drone_spoof_stop;
     g_screen_back_fn = show_drone_stuff_screen;
 
-    /* ── Status label (top of page) ── */
+    /* ── Status label (top of page) — uses g_font_icon12 to render FA glyphs ── */
     s_spoof_status_lbl = lv_label_create(function_page);
     lv_label_set_text(s_spoof_status_lbl, "Idle — configure fields and press Start");
-    lv_obj_set_style_text_font(s_spoof_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(s_spoof_status_lbl, &g_font_icon12, 0);
     lv_obj_set_style_text_color(s_spoof_status_lbl, lv_color_hex(0x66BB6A), 0);
     lv_obj_set_width(s_spoof_status_lbl, lv_pct(100));
     lv_obj_set_style_text_align(s_spoof_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
@@ -37336,7 +37447,7 @@ static void show_drone_spoof_screen(void)
                       s_spoof_use_wifi
                           ? LV_SYMBOL_WIFI "  WiFi beacon (ch 6)"
                           : MY_SYMBOL_BLUETOOTH_B "  BLE (UUID 0xFFFA)");
-    lv_obj_set_style_text_font(s_spoof_mode_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(s_spoof_mode_lbl, &g_font_icon12, 0);  /* FA glyph needs icon12 */
     lv_obj_set_style_text_color(s_spoof_mode_lbl, lv_color_hex(0xFFCA28), 0);
 
     /* ── Input fields ── */
@@ -37365,15 +37476,19 @@ static void show_drone_spoof_screen(void)
     lv_obj_center(start_lbl);
     lv_obj_add_event_cb(s_spoof_start_btn, spoof_start_btn_cb, LV_EVENT_CLICKED, NULL);
 
-    /* ── Keyboard — hidden until a textarea is tapped ── */
+    /* ── Keyboard — styled to match BT scan save reference ── */
     s_spoof_kb = lv_keyboard_create(function_page);
     lv_obj_set_size(s_spoof_kb, lv_pct(100), lv_pct(40));
     lv_obj_align(s_spoof_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_keyboard_set_mode(s_spoof_kb, LV_KEYBOARD_MODE_TEXT_LOWER);
-    /* Theme colours for keyboard keys */
-    lv_obj_set_style_bg_color(s_spoof_kb, lv_color_hex(0x1A1A2E), 0);
-    lv_obj_set_style_bg_color(s_spoof_kb, UI_ACCENT_CYAN, LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_set_style_text_font(s_spoof_kb, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(s_spoof_kb, ui_bg_color(),    LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_spoof_kb, ui_text_color(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_spoof_kb, lv_color_make(0, 100, 0), LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(s_spoof_kb, lv_color_make(0, 150, 0), LV_PART_ITEMS | LV_STATE_PRESSED);
     lv_obj_set_style_text_color(s_spoof_kb, ui_text_color(), LV_PART_ITEMS);
+    lv_obj_set_style_border_color(s_spoof_kb, ui_border_color(), LV_PART_ITEMS);
+    lv_obj_set_style_border_width(s_spoof_kb, 1, LV_PART_ITEMS);
     lv_obj_add_flag(s_spoof_kb, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(s_spoof_kb, spoof_kb_event_cb, LV_EVENT_READY,         NULL);
     lv_obj_add_event_cb(s_spoof_kb, spoof_kb_event_cb, LV_EVENT_CANCEL,        NULL);
