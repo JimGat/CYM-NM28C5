@@ -88,7 +88,8 @@ static void show_my_screen(void)
 
 | Screen | Stop fn | Key cleanup |
 |--------|---------|-------------|
-| Drone Detector | `drone_detector_stop` | `drone_scan_active=false` + task poll (≤3.5s) + free stack + NULL UI ptrs |
+| Drone Detector | `drone_detector_stop` | `drone_scan_active=false` + task poll (≤3.5s) + free stack + NULL UI ptrs; `g_screen_back_fn=show_drone_stuff_screen` |
+| Drone Spoof | `drone_spoof_stop` | timer del + `drone_spoof_ble_stop()` + NULL 10 UI ptrs; `g_screen_back_fn=show_drone_stuff_screen` |
 
 ### v2.11.6
 

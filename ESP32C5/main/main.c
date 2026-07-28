@@ -2843,6 +2843,8 @@ static void show_airtag_scan_screen(void);
 static void airtag_scan_stop(void);
 static void airtag_scan_task(void *pvParameters);
 static void show_drone_detector_screen(void);
+static void show_drone_stuff_screen(void);
+static void show_drone_spoof_screen(void);
 static void drone_exit_cb(lv_event_t *e);
 static void drone_task(void *pvParameters);
 static void drone_show_detail(int idx);
@@ -13451,6 +13453,7 @@ static const nav_show_entry_t NAV_SHOW_TABLE[] = {
     { "Select Attack",        show_attack_tiles_screen     },
     { "WiFi Observer",        show_sniff_karma_screen      },
     { "Compromised Data",     show_wifi_monitor_screen     },
+    { "Drone Stuff",          show_drone_stuff_screen      },
     { "Drone Detector",       show_drone_detector_screen   },
     { "Bluetooth",            show_bluetooth_screen        },
     { "BT Scan & Select",     show_bt_scan_select_screen   },
@@ -14101,8 +14104,12 @@ static void main_tile_event_cb(lv_event_t *e)
         settings_nav_timer = lv_timer_create(settings_nav_timer_cb, 800, NULL);
     } else if (strcmp(tile_name, "Deauth Monitor") == 0) {
         show_deauth_monitor_screen();
+    } else if (strcmp(tile_name, "Drone Stuff") == 0) {
+        show_drone_stuff_screen();
     } else if (strcmp(tile_name, "Drone Detect") == 0) {
         show_drone_detector_screen();
+    } else if (strcmp(tile_name, "Drone Spoof") == 0) {
+        show_drone_spoof_screen();
     } else if (strcmp(tile_name, "Chanalizer") == 0) {
         show_wifi_analyzer_screen();
     } else if (strcmp(tile_name, "WiFi Scope") == 0) {
@@ -17518,7 +17525,7 @@ static void show_wifi_menu_screen(void)
     (void)dm_tile;
     lv_obj_t *obs_tile  = create_tile(tiles, MY_SYMBOL_BINOCULARS, "WiFi\nObserver",   UI_ACCENT_PURPLE, main_tile_event_cb, "WiFi Sniff&Karma");
     (void)obs_tile;
-    lv_obj_t *dd_tile   = create_tile(tiles, MY_SYMBOL_JET_FIGHTER,"Drone\nDetect",    lv_color_hex(0x1B5E20), main_tile_event_cb, "Drone Detect");
+    lv_obj_t *dd_tile   = create_tile(tiles, MY_SYMBOL_JET_FIGHTER,"Drone\nStuff",     lv_color_hex(0x1B5E20), main_tile_event_cb, "Drone Stuff");
     (void)dd_tile;
     lv_obj_t *wana_tile = create_tile(tiles, MY_SYMBOL_CHART_BAR,  "Chan-\nalizer",    lv_color_hex(0x1A237E), main_tile_event_cb, "Chanalizer");
     (void)wana_tile;
@@ -36680,12 +36687,12 @@ static void drone_detector_stop(void)
     if (drone_pcap_queue) { vQueueDelete(drone_pcap_queue); drone_pcap_queue = NULL; }
 }
 
-// Exit callback — delegates cleanup to stop hook, then navigates back.
+// Exit callback — delegates cleanup to stop hook, then navigates to Drone Stuff submenu.
 static void drone_exit_cb(lv_event_t *e)
 {
     (void)e;
     drone_detector_stop();
-    show_wifi_menu_screen();
+    show_drone_stuff_screen();
 }
 
 // Detail view — scrollable parsed fields for one drone record.
@@ -36763,7 +36770,8 @@ static void show_drone_detector_screen(void)
     }
 
     create_function_page_base("Drone Detector");
-    g_screen_stop_fn = drone_detector_stop;
+    g_screen_stop_fn  = drone_detector_stop;
+    g_screen_back_fn  = show_drone_stuff_screen;   /* Back goes to Drone Stuff submenu */
     drone_ui_active = true;
 
     drone_status_lbl = lv_label_create(function_page);
@@ -36876,6 +36884,529 @@ static void show_drone_detector_screen(void)
         ESP_LOGE(TAG, "Drone detector: failed to allocate task stack");
         drone_scan_active = false;
     }
+}
+
+// ============================================================================
+// DRONE STUFF — Submenu + Drone Spoof (ASTM F3411-22a Remote ID broadcast)
+// ============================================================================
+
+// ── OpenDroneID protocol constants ───────────────────────────────────────────
+#define ODID_PROTO_VER            2    /* F3411-22a */
+#define ODID_MSGTYPE_BASIC_ID     0
+#define ODID_MSGTYPE_LOCATION     1
+#define ODID_MSGTYPE_OPERATOR_ID  5
+
+/* BLE advertising instance for drone spoof.  Shares slot with BLE_SPAM_ADV_INSTANCE
+ * (both equal 1) — these screens are never active simultaneously. */
+#define DRONE_SPOOF_ADV_INSTANCE  1
+
+// ── Drone Spoof state ─────────────────────────────────────────────────────────
+static lv_obj_t   *s_spoof_status_lbl  = NULL;
+static lv_obj_t   *s_spoof_kb          = NULL;
+static lv_obj_t   *s_spoof_ta_uasid    = NULL;
+static lv_obj_t   *s_spoof_ta_opid     = NULL;
+static lv_obj_t   *s_spoof_ta_lat      = NULL;
+static lv_obj_t   *s_spoof_ta_lon      = NULL;
+static lv_obj_t   *s_spoof_ta_alt      = NULL;
+static lv_obj_t   *s_spoof_start_btn   = NULL;
+static lv_obj_t   *s_spoof_mode_lbl    = NULL;
+static lv_obj_t   *s_spoof_active_ta   = NULL;   /* which textarea the keyboard is bound to */
+static lv_timer_t *s_spoof_timer       = NULL;
+static bool        s_spoof_active      = false;
+static bool        s_spoof_use_wifi    = false;   /* false=BLE, true=WiFi beacon */
+static uint8_t     s_spoof_counter     = 0;
+static int         s_spoof_msg_phase   = 0;       /* rotates BasicID→Location→OperatorID */
+static char        s_spoof_uasid[21]   = "CYM-DRONE-001";
+static char        s_spoof_opid[21]    = "CYM-OPERATOR";
+static char        s_spoof_lat_str[16] = "37.773972";
+static char        s_spoof_lon_str[16] = "-122.431297";
+static char        s_spoof_alt_str[16] = "100.0";
+
+// ── OpenDroneID message encoders ─────────────────────────────────────────────
+
+/* 25-byte Basic ID message (F3411-22a §6.3).
+ * id_type: 0=None 1=SerialNumber 2=CAA 3=UTM
+ * ua_type: 0=None 1=Aeroplane 2=HelicopterMultirotor */
+static void odid_encode_basic_id(uint8_t *msg, const char *uas_id,
+                                  uint8_t id_type, uint8_t ua_type)
+{
+    memset(msg, 0, 25);
+    msg[0] = (uint8_t)((ODID_MSGTYPE_BASIC_ID << 4) | ODID_PROTO_VER);
+    msg[1] = (uint8_t)((id_type << 4) | (ua_type & 0x0F));
+    strncpy((char *)&msg[2], uas_id, 20);
+}
+
+/* 25-byte Location/Vector message (F3411-22a §6.4).
+ * lat/lon in decimal degrees, alt_geo in metres MSL. */
+static void odid_encode_location(uint8_t *msg, float lat, float lon, float alt_geo)
+{
+    memset(msg, 0, 25);
+    msg[0] = (uint8_t)((ODID_MSGTYPE_LOCATION << 4) | ODID_PROTO_VER);
+    msg[1] = (uint8_t)((2 << 4) | 0);   /* OperationalStatus=Airborne, HeightType=AboveTakeoff */
+    msg[2] = 0;                           /* TrackDirection=0 (North) */
+    msg[3] = 0;                           /* SpeedHorizontal=0 */
+    msg[4] = 0;                           /* SpeedVertical=0 */
+    int32_t ilat = (int32_t)(lat * 1e7f);
+    int32_t ilon = (int32_t)(lon * 1e7f);
+    memcpy(&msg[5], &ilat, 4);            /* Latitude (int32 LE, 1e-7 deg) */
+    memcpy(&msg[9], &ilon, 4);            /* Longitude (int32 LE, 1e-7 deg) */
+    /* Altitude encoding: (alt_m + 1000) / 0.5 = (alt_m + 1000) * 2 */
+    uint16_t alt_enc = (uint16_t)((alt_geo + 1000.0f) * 2.0f);
+    memcpy(&msg[13], &alt_enc, 2);        /* AltitudePressure */
+    memcpy(&msg[15], &alt_enc, 2);        /* AltitudeGeodetic */
+    memcpy(&msg[17], &alt_enc, 2);        /* Height AGL */
+    /* bytes 19-24: accuracy fields + timestamp = 0 (lowest accuracy — appropriate for testing) */
+}
+
+/* 25-byte Operator ID message (F3411-22a §6.8). */
+static void odid_encode_operator_id(uint8_t *msg, const char *op_id)
+{
+    memset(msg, 0, 25);
+    msg[0] = (uint8_t)((ODID_MSGTYPE_OPERATOR_ID << 4) | ODID_PROTO_VER);
+    msg[1] = 0;   /* OperatorIdType=0 (FAA designation) */
+    strncpy((char *)&msg[2], op_id, 20);
+}
+
+// ── BLE broadcast helpers ─────────────────────────────────────────────────────
+
+static void drone_spoof_ble_stop(void)
+{
+    ble_gap_ext_adv_stop(DRONE_SPOOF_ADV_INSTANCE);
+}
+
+/* Transmit one 25-byte ODID message as a BLE extended advertising PDU.
+ * Service UUID 0xFFFA + rolling counter per ASTM F3411-22a §7.2. */
+static void drone_spoof_ble_broadcast(const uint8_t *msg)
+{
+    /* Service data AD: [UUID16_LSB UUID16_MSB counter message[25]] */
+    uint8_t svc_buf[28];
+    svc_buf[0] = 0xFA;                /* UUID 0xFFFA LSB */
+    svc_buf[1] = 0xFF;                /* UUID 0xFFFA MSB */
+    svc_buf[2] = s_spoof_counter++;   /* rolling packet counter */
+    memcpy(&svc_buf[3], msg, 25);
+
+    /* Configure advertising instance if not already running */
+    if (!ble_gap_ext_adv_active(DRONE_SPOOF_ADV_INSTANCE)) {
+        struct ble_gap_ext_adv_params p = {0};
+        p.connectable   = 0;
+        p.scannable     = 0;
+        p.legacy_pdu    = 1;           /* legacy PDU = widest receiver support */
+        p.own_addr_type = BLE_OWN_ADDR_RANDOM;
+        p.primary_phy   = BLE_HCI_LE_PHY_1M;
+        p.itvl_min      = BLE_GAP_ADV_ITVL_MS(100);
+        p.itvl_max      = BLE_GAP_ADV_ITVL_MS(200);
+        p.sid           = DRONE_SPOOF_ADV_INSTANCE;
+        int rc = ble_gap_ext_adv_configure(DRONE_SPOOF_ADV_INSTANCE, &p, NULL, NULL, NULL);
+        if (rc != 0 && rc != BLE_HS_EALREADY) {
+            ESP_LOGW(TAG, "[DRONESPOOF] configure rc=%d", rc);
+            return;
+        }
+    }
+
+    struct ble_hs_adv_fields fields;
+    memset(&fields, 0, sizeof(fields));
+    fields.flags               = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    fields.svc_data_uuid16     = svc_buf;
+    fields.svc_data_uuid16_len = sizeof(svc_buf);
+
+    struct os_mbuf *om = os_msys_get_pkthdr(BLE_HS_ADV_MAX_SZ, 0);
+    if (!om) return;
+    int rc = ble_hs_adv_set_fields_mbuf(&fields, om);
+    if (rc != 0) { os_mbuf_free_chain(om); return; }
+
+    ble_gap_ext_adv_stop(DRONE_SPOOF_ADV_INSTANCE);
+    rc = ble_gap_ext_adv_set_data(DRONE_SPOOF_ADV_INSTANCE, om);
+    if (rc != 0) return;
+    ble_gap_ext_adv_start(DRONE_SPOOF_ADV_INSTANCE, 0, 0);
+}
+
+// ── WiFi beacon broadcast helper ─────────────────────────────────────────────
+
+/* Build a minimal 802.11 beacon frame carrying an ASTM F3411 vendor-specific IE.
+ * OUI FA-0B-BC / type 0x0D is the ASTM OpenDroneID WiFi broadcast designation.
+ * buf must be at least 120 bytes.  Returns the frame length written, 0 on error. */
+static size_t drone_spoof_build_wifi_frame(uint8_t *buf, size_t bufsz,
+                                            const uint8_t *odid_msg)
+{
+    if (bufsz < 120) return 0;
+    size_t p = 0;
+
+    /* Radiotap header — 8 bytes, no optional fields */
+    buf[p++]=0x00; buf[p++]=0x00;   /* version, pad */
+    buf[p++]=0x08; buf[p++]=0x00;   /* header length = 8 */
+    buf[p++]=0x00; buf[p++]=0x00; buf[p++]=0x00; buf[p++]=0x00;  /* present flags = none */
+
+    /* 802.11 MAC header — Beacon (FC=0x80 0x00) */
+    buf[p++]=0x80; buf[p++]=0x00;   /* frame control: mgmt, subtype=beacon */
+    buf[p++]=0x00; buf[p++]=0x00;   /* duration = 0 */
+    memset(&buf[p], 0xFF, 6); p+=6; /* DA = broadcast */
+
+    /* Source and BSSID = CYM WiFi MAC with last byte XOR'd so it reads as a
+     * distinct device address rather than CYM's own infrastructure MAC. */
+    uint8_t src_mac[6] = {0};
+    esp_wifi_get_mac(WIFI_IF_STA, src_mac);
+    src_mac[5] ^= 0xA5;
+    memcpy(&buf[p], src_mac, 6); p+=6;   /* SA */
+    memcpy(&buf[p], src_mac, 6); p+=6;   /* BSSID */
+    buf[p++]=0x00; buf[p++]=0x00;         /* sequence control */
+
+    /* Beacon fixed parameters — 12 bytes */
+    memset(&buf[p], 0, 8); p+=8;         /* timestamp = 0 */
+    buf[p++]=0x64; buf[p++]=0x00;        /* beacon interval = 100 TU */
+    buf[p++]=0x11; buf[p++]=0x04;        /* capability: ESS + short preamble */
+
+    /* SSID IE (tag 0) */
+    const char *ssid = "Drone";
+    uint8_t ssid_len = (uint8_t)strlen(ssid);
+    buf[p++]=0x00; buf[p++]=ssid_len;
+    memcpy(&buf[p], ssid, ssid_len); p+=ssid_len;
+
+    /* Supported Rates IE (tag 1) */
+    const uint8_t rates[]={0x82,0x84,0x8B,0x96,0x0C,0x12,0x18,0x24};
+    buf[p++]=0x01; buf[p++]=(uint8_t)sizeof(rates);
+    memcpy(&buf[p], rates, sizeof(rates)); p+=sizeof(rates);
+
+    /* DS Parameter Set IE (tag 3) — channel 6 */
+    buf[p++]=0x03; buf[p++]=0x01; buf[p++]=0x06;
+
+    /* Vendor-specific IE (tag 0xDD): ASTM OUI FA-0B-BC, type 0x0D, then 25-byte ODID */
+    buf[p++]=0xDD;          /* vendor-specific IE tag */
+    buf[p++]=4+25;          /* length: OUI(3) + type(1) + odid_msg(25) */
+    buf[p++]=0xFA; buf[p++]=0x0B; buf[p++]=0xBC;  /* ASTM International OUI */
+    buf[p++]=0x0D;          /* OpenDroneID sub-type */
+    memcpy(&buf[p], odid_msg, 25); p+=25;
+
+    return p;
+}
+
+// ── Timer callback — alternates BasicID / Location / OperatorID every 400 ms ─
+
+static void drone_spoof_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!s_spoof_active) return;
+
+    float lat = strtof(s_spoof_lat_str, NULL);
+    float lon = strtof(s_spoof_lon_str, NULL);
+    float alt = strtof(s_spoof_alt_str, NULL);
+
+    uint8_t msg[25];
+    int phase = s_spoof_msg_phase % 3;
+    switch (phase) {
+        case 0: odid_encode_basic_id(msg, s_spoof_uasid, 1, 2);    break;  /* SerialNumber, Multirotor */
+        case 1: odid_encode_location(msg, lat, lon, alt);            break;
+        case 2: odid_encode_operator_id(msg, s_spoof_opid);         break;
+    }
+    s_spoof_msg_phase++;
+
+    if (!s_spoof_use_wifi) {
+        drone_spoof_ble_broadcast(msg);
+    } else {
+        uint8_t frame[160];
+        size_t flen = drone_spoof_build_wifi_frame(frame, sizeof(frame), msg);
+        if (flen > 0) {
+            esp_err_t e = esp_wifi_80211_tx(WIFI_IF_STA, frame, flen, false);
+            if (e != ESP_OK) esp_wifi_80211_tx(WIFI_IF_AP, frame, flen, false);
+        }
+    }
+
+    if (s_spoof_status_lbl) {
+        static const char *phase_names[] = {"BasicID", "Location", "OperatorID"};
+        char sb[72];
+        snprintf(sb, sizeof(sb),
+                 s_spoof_use_wifi
+                     ? LV_SYMBOL_WIFI " Broadcast: %s [WiFi ch6]"
+                     : MY_SYMBOL_BLUETOOTH_B " Broadcast: %s [BLE UUID:FFFA]",
+                 phase_names[phase]);
+        lv_label_set_text(s_spoof_status_lbl, sb);
+    }
+}
+
+// ── Input helpers — sync active textarea to state on keyboard close ───────────
+
+static void spoof_sync_fields(void)
+{
+    if (s_spoof_ta_uasid) strncpy(s_spoof_uasid,    lv_textarea_get_text(s_spoof_ta_uasid), 20);
+    if (s_spoof_ta_opid)  strncpy(s_spoof_opid,     lv_textarea_get_text(s_spoof_ta_opid),  20);
+    if (s_spoof_ta_lat)   strncpy(s_spoof_lat_str,  lv_textarea_get_text(s_spoof_ta_lat),   15);
+    if (s_spoof_ta_lon)   strncpy(s_spoof_lon_str,  lv_textarea_get_text(s_spoof_ta_lon),   15);
+    if (s_spoof_ta_alt)   strncpy(s_spoof_alt_str,  lv_textarea_get_text(s_spoof_ta_alt),   15);
+    s_spoof_uasid[20]   = '\0';
+    s_spoof_opid[20]    = '\0';
+    s_spoof_lat_str[15] = '\0';
+    s_spoof_lon_str[15] = '\0';
+    s_spoof_alt_str[15] = '\0';
+}
+
+/* Tap any textarea → bind keyboard + show it */
+static void spoof_ta_click_cb(lv_event_t *e)
+{
+    s_spoof_active_ta = lv_event_get_target(e);
+    if (s_spoof_kb) {
+        lv_keyboard_set_textarea(s_spoof_kb, s_spoof_active_ta);
+        lv_obj_clear_flag(s_spoof_kb, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(s_spoof_kb);
+    }
+}
+
+/* Keyboard Ready (✓) or Cancel (×) → hide keyboard, sync fields */
+static void spoof_kb_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
+        if (s_spoof_kb) lv_obj_add_flag(s_spoof_kb, LV_OBJ_FLAG_HIDDEN);
+        spoof_sync_fields();
+        s_spoof_active_ta = NULL;
+    }
+}
+
+// ── Mode toggle ───────────────────────────────────────────────────────────────
+
+static void spoof_mode_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_spoof_active) return;   /* don't change mode while broadcasting */
+    s_spoof_use_wifi = !s_spoof_use_wifi;
+    if (s_spoof_mode_lbl) {
+        lv_label_set_text(s_spoof_mode_lbl,
+                          s_spoof_use_wifi
+                              ? LV_SYMBOL_WIFI "  WiFi beacon (ch 6)"
+                              : MY_SYMBOL_BLUETOOTH_B "  BLE (UUID 0xFFFA)");
+    }
+}
+
+// ── Start / Stop ──────────────────────────────────────────────────────────────
+
+static void spoof_start_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_spoof_active) {
+        /* ---- STOP ---- */
+        s_spoof_active = false;
+        if (s_spoof_timer) { lv_timer_del(s_spoof_timer); s_spoof_timer = NULL; }
+        if (!s_spoof_use_wifi) drone_spoof_ble_stop();
+        if (s_spoof_status_lbl) lv_label_set_text(s_spoof_status_lbl, "Idle — configure fields and press Start");
+        if (s_spoof_start_btn) {
+            lv_obj_set_style_bg_color(s_spoof_start_btn, lv_color_hex(0x1B5E20), LV_STATE_DEFAULT);
+            lv_obj_t *lbl = lv_obj_get_child(s_spoof_start_btn, -1);
+            if (lbl) lv_label_set_text(lbl, LV_SYMBOL_PLAY " Start Broadcasting");
+        }
+    } else {
+        /* ---- START ---- */
+        spoof_sync_fields();
+
+        /* Switch radio mode — blocks briefly but happens in LVGL callback context */
+        bool radio_ok;
+        if (!s_spoof_use_wifi) {
+            radio_ok = ensure_ble_mode();
+        } else {
+            radio_ok = ensure_wifi_mode();
+        }
+        if (!radio_ok) {
+            if (s_spoof_status_lbl)
+                lv_label_set_text(s_spoof_status_lbl, LV_SYMBOL_WARNING " Radio switch failed");
+            return;
+        }
+
+        s_spoof_active    = true;
+        s_spoof_counter   = 0;
+        s_spoof_msg_phase = 0;
+        if (!s_spoof_timer)
+            s_spoof_timer = lv_timer_create(drone_spoof_timer_cb, 400, NULL);
+
+        if (s_spoof_status_lbl)
+            lv_label_set_text(s_spoof_status_lbl, "Starting broadcast...");
+        if (s_spoof_start_btn) {
+            lv_obj_set_style_bg_color(s_spoof_start_btn, COLOR_MATERIAL_RED, LV_STATE_DEFAULT);
+            lv_obj_t *lbl = lv_obj_get_child(s_spoof_start_btn, -1);
+            if (lbl) lv_label_set_text(lbl, LV_SYMBOL_STOP " Stop Broadcasting");
+        }
+    }
+}
+
+// ── Stop hook ─────────────────────────────────────────────────────────────────
+
+static void drone_spoof_stop(void)
+{
+    s_spoof_active = false;
+    if (s_spoof_timer)    { lv_timer_del(s_spoof_timer); s_spoof_timer = NULL; }
+    if (!s_spoof_use_wifi) drone_spoof_ble_stop();
+    /* NULL every LVGL pointer reachable from the timer callback */
+    s_spoof_status_lbl = NULL;
+    s_spoof_kb         = NULL;
+    s_spoof_ta_uasid   = NULL;
+    s_spoof_ta_opid    = NULL;
+    s_spoof_ta_lat     = NULL;
+    s_spoof_ta_lon     = NULL;
+    s_spoof_ta_alt     = NULL;
+    s_spoof_start_btn  = NULL;
+    s_spoof_mode_lbl   = NULL;
+    s_spoof_active_ta  = NULL;
+}
+
+// ── Drone Spoof screen ────────────────────────────────────────────────────────
+
+/* Helper: create a labelled textarea inside the form container.
+ * Returns the newly created textarea. */
+static lv_obj_t *spoof_add_field(lv_obj_t *parent, const char *label_txt,
+                                  const char *initial, uint8_t maxlen)
+{
+    /* Field label */
+    lv_obj_t *lbl = lv_label_create(parent);
+    lv_label_set_text(lbl, label_txt);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(0x90CAF9), 0);   /* light-blue label */
+    lv_obj_set_width(lbl, lv_pct(100));
+
+    /* Textarea */
+    lv_obj_t *ta = lv_textarea_create(parent);
+    lv_obj_set_width(ta, lv_pct(100));
+    lv_obj_set_height(ta, LV_SIZE_CONTENT);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_max_length(ta, maxlen);
+    lv_textarea_set_text(ta, initial);
+    lv_obj_set_style_bg_color(ta, lv_color_hex(0x1A1A2E), 0);
+    lv_obj_set_style_text_color(ta, ui_text_color(), 0);
+    lv_obj_set_style_text_font(ta, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_border_color(ta, lv_color_hex(0x1B5E20), 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    lv_obj_set_style_radius(ta, 4, 0);
+    lv_obj_set_style_pad_all(ta, 4, 0);
+
+    /* Flashing block cursor — matches the project standard */
+    lv_obj_set_style_bg_opa(ta,      LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(ta, 2,             LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(ta,  LV_BORDER_SIDE_LEFT, LV_PART_CURSOR | LV_STATE_FOCUSED);
+
+    lv_obj_add_event_cb(ta, spoof_ta_click_cb, LV_EVENT_CLICKED, NULL);
+    return ta;
+}
+
+static void show_drone_spoof_screen(void)
+{
+    create_function_page_base("Drone Spoof");
+    g_screen_stop_fn = drone_spoof_stop;
+    g_screen_back_fn = show_drone_stuff_screen;
+
+    /* ── Status label (top of page) ── */
+    s_spoof_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_spoof_status_lbl, "Idle — configure fields and press Start");
+    lv_obj_set_style_text_font(s_spoof_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_spoof_status_lbl, lv_color_hex(0x66BB6A), 0);
+    lv_obj_set_width(s_spoof_status_lbl, lv_pct(100));
+    lv_obj_set_style_text_align(s_spoof_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_spoof_status_lbl, LV_ALIGN_TOP_MID, 0, 32);
+
+    /* ── Scrollable form container ── */
+    lv_obj_t *form = lv_obj_create(function_page);
+    lv_obj_set_size(form, lv_pct(100), LCD_V_RES - 30 - 22 - 2);
+    lv_obj_align(form, LV_ALIGN_TOP_MID, 0, 56);
+    lv_obj_set_style_bg_opa(form, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(form, 0, 0);
+    lv_obj_set_style_pad_all(form, 4, 0);
+    lv_obj_set_style_pad_gap(form, 4, 0);
+    lv_obj_set_flex_flow(form, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(form, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
+    lv_obj_set_scrollbar_mode(form, LV_SCROLLBAR_MODE_AUTO);
+
+    /* ── Mode toggle row ── */
+    lv_obj_t *mode_row = lv_obj_create(form);
+    lv_obj_set_size(mode_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(mode_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(mode_row, 0, 0);
+    lv_obj_set_style_pad_all(mode_row, 0, 0);
+    lv_obj_set_flex_flow(mode_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(mode_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(mode_row, 6, 0);
+
+    lv_obj_t *mode_btn = lv_btn_create(mode_row);
+    lv_obj_set_size(mode_btn, 60, 26);
+    lv_obj_set_style_bg_color(mode_btn, lv_color_hex(0x1B5E20), LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(mode_btn, 0, 0);
+    lv_obj_set_style_radius(mode_btn, 6, 0);
+    lv_obj_t *mode_btn_lbl = lv_label_create(mode_btn);
+    lv_label_set_text(mode_btn_lbl, "Mode");
+    lv_obj_set_style_text_font(mode_btn_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(mode_btn_lbl);
+    lv_obj_add_event_cb(mode_btn, spoof_mode_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    s_spoof_mode_lbl = lv_label_create(mode_row);
+    lv_label_set_text(s_spoof_mode_lbl,
+                      s_spoof_use_wifi
+                          ? LV_SYMBOL_WIFI "  WiFi beacon (ch 6)"
+                          : MY_SYMBOL_BLUETOOTH_B "  BLE (UUID 0xFFFA)");
+    lv_obj_set_style_text_font(s_spoof_mode_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_spoof_mode_lbl, lv_color_hex(0xFFCA28), 0);
+
+    /* ── Input fields ── */
+    s_spoof_ta_uasid = spoof_add_field(form, "UAS ID (20 chars max):",
+                                        s_spoof_uasid, 20);
+    s_spoof_ta_opid  = spoof_add_field(form, "Operator ID (20 chars max):",
+                                        s_spoof_opid, 20);
+    s_spoof_ta_lat   = spoof_add_field(form, "Latitude (decimal deg, e.g. 37.773972):",
+                                        s_spoof_lat_str, 15);
+    s_spoof_ta_lon   = spoof_add_field(form, "Longitude (decimal deg, e.g. -122.431297):",
+                                        s_spoof_lon_str, 15);
+    s_spoof_ta_alt   = spoof_add_field(form, "Altitude MSL (metres, e.g. 100.0):",
+                                        s_spoof_alt_str, 15);
+
+    /* ── Start / Stop button ── */
+    s_spoof_start_btn = lv_btn_create(form);
+    lv_obj_set_size(s_spoof_start_btn, lv_pct(100), 36);
+    lv_obj_set_style_bg_color(s_spoof_start_btn, lv_color_hex(0x1B5E20), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(s_spoof_start_btn, lv_color_hex(0x2E7D32), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(s_spoof_start_btn, 0, 0);
+    lv_obj_set_style_radius(s_spoof_start_btn, 8, 0);
+    lv_obj_t *start_lbl = lv_label_create(s_spoof_start_btn);
+    lv_label_set_text(start_lbl, LV_SYMBOL_PLAY " Start Broadcasting");
+    lv_obj_set_style_text_font(start_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(start_lbl, lv_color_white(), 0);
+    lv_obj_center(start_lbl);
+    lv_obj_add_event_cb(s_spoof_start_btn, spoof_start_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    /* ── Keyboard — hidden until a textarea is tapped ── */
+    s_spoof_kb = lv_keyboard_create(function_page);
+    lv_obj_set_size(s_spoof_kb, lv_pct(100), lv_pct(40));
+    lv_obj_align(s_spoof_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_keyboard_set_mode(s_spoof_kb, LV_KEYBOARD_MODE_TEXT_LOWER);
+    /* Theme colours for keyboard keys */
+    lv_obj_set_style_bg_color(s_spoof_kb, lv_color_hex(0x1A1A2E), 0);
+    lv_obj_set_style_bg_color(s_spoof_kb, UI_ACCENT_CYAN, LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(s_spoof_kb, ui_text_color(), LV_PART_ITEMS);
+    lv_obj_add_flag(s_spoof_kb, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_spoof_kb, spoof_kb_event_cb, LV_EVENT_READY,         NULL);
+    lv_obj_add_event_cb(s_spoof_kb, spoof_kb_event_cb, LV_EVENT_CANCEL,        NULL);
+    lv_obj_add_event_cb(s_spoof_kb, spoof_kb_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+}
+
+// ── Drone Stuff submenu ───────────────────────────────────────────────────────
+
+static void show_drone_stuff_screen(void)
+{
+    create_function_page_base("Drone Stuff");
+    /* No timer or task — no stop hook needed.
+     * Back goes to WiFi menu (not in NAV_SHOW_TABLE, so set g_screen_back_fn). */
+    g_screen_back_fn = show_wifi_menu_screen;
+    apply_menu_bg();
+
+    lv_obj_t *tiles = lv_obj_create(function_page);
+    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(tiles, 0, 0);
+    lv_obj_set_style_pad_all(tiles, 4, 0);
+    lv_obj_set_style_pad_gap(tiles, 4, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *detect_tile = create_tile(tiles, MY_SYMBOL_JET_FIGHTER, "Drone\nDetect",
+                                         lv_color_hex(0x1B5E20), main_tile_event_cb, "Drone Detect");
+    (void)detect_tile;
+    lv_obj_t *spoof_tile = create_tile(tiles, MY_SYMBOL_GHOST, "Drone\nSpoof",
+                                        lv_color_hex(0x4A148C), main_tile_event_cb, "Drone Spoof");
+    (void)spoof_tile;
 }
 
 // ============================================================================
