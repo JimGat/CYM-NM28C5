@@ -47370,13 +47370,25 @@ static lv_timer_t *s_lf_tmr         = NULL;
 static lv_obj_t   *s_lf_status_lbl  = NULL;
 static lv_obj_t   *s_lf_uid_lbl     = NULL;
 static lv_obj_t   *s_lf_save_btn    = NULL;
-static lv_obj_t   *s_lf_scan_btn    = NULL; /* "Scan Again" — shown after any result */
-static uint8_t     s_lf_uid[5]      = {0};
+static lv_obj_t   *s_lf_scan_btn    = NULL; /* "Scan Again" - shown after any result */
+static uint8_t     s_lf_uid[8]      = {0};  /* 8 bytes covers EM410X(5) and HID(up to 8) */
 static int         s_lf_uid_len     = 0;
 static volatile bool s_lf_result_ready = false;
 static volatile bool s_lf_result_ok    = false;
 static volatile bool s_lf_mode_ok      = false;
 static int64_t       s_lf_scan_deadline = 0;  /* esp_timer_get_time() deadline for retry loop */
+
+/* LF protocol rotation — cycled through during each 7-second scan window */
+#define LF_PROTO_COUNT 5
+static const struct { uint16_t cmd; const char *name; } s_lf_protos[LF_PROTO_COUNT] = {
+    { 3000, "EM410X"   },
+    { 3002, "HID Prox" },
+    { 3004, "Viking"   },
+    { 3014, "PAC"      },
+    { 3010, "IoProx"   },
+};
+static int s_lf_proto_idx       = 0;  /* which protocol is being tried now */
+static int s_lf_found_proto_idx = 0;  /* which protocol found the card (for display) */
 
 /* Forward declarations */
 static void show_cham_lf_read_screen(void);
@@ -47427,6 +47439,7 @@ static void s_lf_restart_scan(void)
     s_lf_result_ok    = false;
     s_lf_mode_ok      = false;
     s_lf_uid_len      = 0;
+    s_lf_proto_idx    = 0;  /* always start with EM410X */
     if (s_lf_uid_lbl)  lv_obj_add_flag(s_lf_uid_lbl,  LV_OBJ_FLAG_HIDDEN);
     if (s_lf_save_btn) lv_obj_add_flag(s_lf_save_btn, LV_OBJ_FLAG_HIDDEN);
     if (s_lf_scan_btn) lv_obj_add_flag(s_lf_scan_btn, LV_OBJ_FLAG_HIDDEN);
@@ -47446,18 +47459,22 @@ static void s_lf_scan_again_cb(lv_event_t *e)
 
 static void s_lf_on_scan_result(bool ok, const uint8_t *data, uint16_t dlen)
 {
-    if (ok && data && dlen >= 5) {
-        /* Card found - copy UID and signal the poll timer */
-        int copy = (dlen < 5) ? (int)dlen : 5;
+    if (ok && data && dlen >= 1) {
+        /* Card found on current protocol - copy raw UID bytes */
+        int copy = (dlen < (int)sizeof(s_lf_uid)) ? (int)dlen : (int)sizeof(s_lf_uid);
         memcpy(s_lf_uid, data, copy);
-        s_lf_uid_len      = copy;
-        s_lf_result_ok    = true;
-        s_lf_result_ready = true;
+        s_lf_uid_len        = copy;
+        s_lf_found_proto_idx = s_lf_proto_idx;
+        s_lf_result_ok      = true;
+        s_lf_result_ready   = true;
     } else if (esp_timer_get_time() < s_lf_scan_deadline) {
-        /* No card yet, still within 7-second window - retry immediately.
-         * scanEM410Xtag returns quickly when no card is present; the
-         * ChameleonUltraGUI sends no data and relies on app-level retry. */
-        cham_send_cmd_ex(3000, NULL, 0, s_lf_on_scan_result, 2000000LL);
+        /* No card on this protocol - advance to next and retry.
+         * Cycles EM410X -> HID Prox -> Viking -> PAC -> IoProx -> EM410X...
+         * Each attempt takes ~600 ms; 7-second window gives ~2 passes through
+         * all 5 protocols. */
+        s_lf_proto_idx = (s_lf_proto_idx + 1) % LF_PROTO_COUNT;
+        cham_send_cmd_ex(s_lf_protos[s_lf_proto_idx].cmd, NULL, 0,
+                         s_lf_on_scan_result, 2000000LL);
     } else {
         /* Scan window expired - report failure to poll timer */
         s_lf_uid_len      = 0;
@@ -47476,10 +47493,11 @@ static void s_lf_on_mode_set(bool ok, const uint8_t *data, uint16_t dlen)
         s_lf_result_ready = true; /* let timer pick up the failure */
         return;
     }
-    /* Start 7-second scan window; s_lf_on_scan_result retries on each "no card"
-     * response until the deadline expires.  No data field - protocol sends dlen=0. */
+    /* Start 7-second scan window; s_lf_on_scan_result cycles EM410X -> HID Prox ->
+     * Viking -> PAC -> IoProx -> EM410X... until a card is found or window expires. */
+    s_lf_proto_idx     = 0;
     s_lf_scan_deadline = esp_timer_get_time() + 7000000LL;
-    cham_send_cmd_ex(3000, NULL, 0, s_lf_on_scan_result, 2000000LL);
+    cham_send_cmd_ex(s_lf_protos[0].cmd, NULL, 0, s_lf_on_scan_result, 2000000LL);
 }
 
 /* ── LF read: 50 ms poll timer ── */
@@ -47494,8 +47512,8 @@ static void s_lf_poll_timer(lv_timer_t *t)
     if (!s_lf_status_lbl) return; /* screen already torn down */
 
     if (s_lf_result_ok && s_lf_uid_len > 0) {
-        /* Show UID */
-        char uid_str[20] = {0};
+        /* Show protocol name + raw UID hex */
+        char uid_str[30] = {0};
         for (int i = 0; i < s_lf_uid_len; i++) {
             char byte[4];
             snprintf(byte, sizeof(byte), "%02X%s",
@@ -47503,8 +47521,9 @@ static void s_lf_poll_timer(lv_timer_t *t)
             strlcat(uid_str, byte, sizeof(uid_str));
         }
         if (s_lf_uid_lbl) {
-            char buf[48];
-            snprintf(buf, sizeof(buf), "EM410X\n%s", uid_str);
+            char buf[60];
+            snprintf(buf, sizeof(buf), "%s\n%s",
+                     s_lf_protos[s_lf_found_proto_idx].name, uid_str);
             lv_label_set_text(s_lf_uid_lbl, buf);
             lv_obj_clear_flag(s_lf_uid_lbl, LV_OBJ_FLAG_HIDDEN);
         }
