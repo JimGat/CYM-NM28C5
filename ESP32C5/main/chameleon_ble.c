@@ -123,6 +123,11 @@ static volatile bool     s_pend_write_ok = false; /* write response received */
 /* Device info */
 static cham_device_info_t s_dev_info;
 
+/* Battery retry — Chameleon BMS ADC may not be ready immediately after connect */
+static bool    s_batt_retry_pending = false;
+static int64_t s_batt_retry_at      = 0;
+static void s_cb_battery_retry(bool ok, const uint8_t *data, uint16_t dlen); /* forward declaration */
+
 /* 250 ms defer timer before ble_gap_connect */
 static esp_timer_handle_t s_defer_tmr = NULL;
 
@@ -202,6 +207,22 @@ static int s_rx_feed(uint8_t byte)
 /* ── Device info chain callbacks ─────────────────────────────────────────── */
 /* Called from cham_poll() in response order. Each cb fires the next command. */
 
+static void s_cb_battery_retry(bool ok, const uint8_t *data, uint16_t dlen)
+{
+    if (ok && dlen >= 3) {
+        uint16_t mv  = ((uint16_t)data[0] << 8) | data[1];
+        uint8_t  pct = data[2];
+        if (mv > 0) {
+            s_dev_info.battery_mv  = mv;
+            s_dev_info.battery_pct = pct;
+            s_changed = true;
+            ESP_LOGI(TAG, "Battery retry: %u%% (%u mV)", pct, mv);
+        } else {
+            ESP_LOGI(TAG, "Battery retry: still 0 — device may have no battery");
+        }
+    }
+}
+
 static void s_cb_battery(bool ok, const uint8_t *data, uint16_t dlen)
 {
     if (ok && dlen >= 3) {
@@ -217,6 +238,13 @@ static void s_cb_battery(bool ok, const uint8_t *data, uint16_t dlen)
              s_dev_info.battery_pct,
              s_dev_info.ble_addr,
              s_dev_info.chip_id);
+    /* If battery read came back as 0, the BMS ADC may not have been ready yet.
+     * Schedule a retry 3 s after entering READY state. */
+    if (s_dev_info.battery_mv == 0) {
+        s_batt_retry_pending = true;
+        s_batt_retry_at      = esp_timer_get_time() + 3000000LL;
+        ESP_LOGI(TAG, "Battery read 0 — retry scheduled in 3 s");
+    }
 }
 
 static void s_cb_ble_addr(bool ok, const uint8_t *data, uint16_t dlen)
@@ -429,6 +457,7 @@ static int s_gap_cb(struct ble_gap_event *event, void *arg)
         s_pend_cmd     = 0xFFFF;
         s_pend_cb      = NULL;
         s_pend_write_ok = false;
+        s_batt_retry_pending = false;
         memset(&s_rxs, 0, sizeof(s_rxs));
         s_ev_disconnected = true;
         break;
@@ -980,6 +1009,15 @@ bool cham_poll(void)
             changed = true;
             if (cb) cb(false, NULL, 0);
         }
+    }
+
+    /* ── Battery retry (fires 3 s after READY if initial read was 0) ── */
+
+    if (s_batt_retry_pending && s_state == CHAM_STATE_READY &&
+        s_pend_cmd == 0xFFFF &&
+        esp_timer_get_time() >= s_batt_retry_at) {
+        s_batt_retry_pending = false;
+        cham_send_cmd(1025, NULL, 0, s_cb_battery_retry);
     }
 
     return changed;

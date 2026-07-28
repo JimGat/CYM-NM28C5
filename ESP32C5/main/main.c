@@ -47842,9 +47842,9 @@ static void s_cham_rebuild_content(cham_state_t st)
                      info->fw_version >> 8, info->fw_version & 0xFF);
             s_cham_info_row(card, buf, lv_color_hex(0xCE93D8));
 
-            /* Row 2: battery — show N/A when device reports 0 mV (USB-only, no battery) */
+            /* Row 2: battery — show "--" while BMS ADC warms up (retry fires in 3 s) */
             if (info->battery_mv == 0) {
-                strlcpy(buf, "Battery: N/A (USB powered)", sizeof(buf));
+                strlcpy(buf, "Battery: --", sizeof(buf));
             } else {
                 snprintf(buf, sizeof(buf), "Battery: %d%%  (%d mV)",
                          info->battery_pct, info->battery_mv);
@@ -47971,7 +47971,7 @@ static void s_cham_poll_timer(lv_timer_t *t)
         if (info) {
             char buf[40];
             if (info->battery_mv == 0) {
-                strlcpy(buf, "Battery: N/A (USB powered)", sizeof(buf));
+                strlcpy(buf, "Battery: --", sizeof(buf));
             } else {
                 snprintf(buf, sizeof(buf), "Battery: %d%%  (%d mV)",
                          info->battery_pct, info->battery_mv);
