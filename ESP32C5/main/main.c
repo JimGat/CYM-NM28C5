@@ -47870,14 +47870,14 @@ static void s_cham_rebuild_content(cham_state_t st)
 
         s_cham_stub_tile(tiles, LV_SYMBOL_WIFI,    "Read HF");
 
-        /* Read LF — live tile, navigates to LF card reader sub-screen */
+        /* Read LF — live tile matching stub tile style, navigates to LF reader */
         {
             lv_obj_t *btn = lv_btn_create(tiles);
             lv_obj_set_size(btn, 72, 54);
-            lv_obj_set_style_bg_color(btn, lv_color_hex(0x1B3A2A), 0);
+            lv_obj_set_style_bg_color(btn, lv_color_hex(0x2A2A3A), 0);
             lv_obj_set_style_radius(btn, 8, 0);
             lv_obj_set_style_border_width(btn, 1, 0);
-            lv_obj_set_style_border_color(btn, lv_color_hex(0x2E7D52), 0);
+            lv_obj_set_style_border_color(btn, lv_color_hex(0x4A4A5A), 0);
 
             lv_obj_t *col = lv_obj_create(btn);
             lv_obj_set_size(col, LV_PCT(100), LV_PCT(100));
@@ -47890,7 +47890,7 @@ static void s_cham_rebuild_content(cham_state_t st)
             lv_obj_t *ico = lv_label_create(col);
             lv_label_set_text(ico, LV_SYMBOL_AUDIO);
             lv_obj_set_style_text_font(ico, &g_font_icon16, 0);
-            lv_obj_set_style_text_color(ico, lv_color_hex(0x66BB6A), 0);
+            lv_obj_set_style_text_color(ico, lv_color_hex(0xCE93D8), 0);
 
             lv_obj_t *nm = lv_label_create(col);
             lv_label_set_text(nm, "Read LF");
@@ -47900,7 +47900,7 @@ static void s_cham_rebuild_content(cham_state_t st)
             lv_obj_t *sub2 = lv_label_create(col);
             lv_label_set_text(sub2, "EM410X");
             lv_obj_set_style_text_font(sub2, &lv_font_montserrat_12, 0);
-            lv_obj_set_style_text_color(sub2, lv_color_hex(0x4CAF50), 0);
+            lv_obj_set_style_text_color(sub2, lv_color_hex(0x546E7A), 0);
 
             lv_obj_add_event_cb(btn, s_cham_lf_tile_cb, LV_EVENT_CLICKED, NULL);
         }

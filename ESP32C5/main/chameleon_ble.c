@@ -222,9 +222,10 @@ static void s_cb_battery(bool ok, const uint8_t *data, uint16_t dlen)
 static void s_cb_ble_addr(bool ok, const uint8_t *data, uint16_t dlen)
 {
     if (ok && dlen >= 6) {
+        /* Chameleon returns BLE address LSB-first (little-endian); reverse for display */
         snprintf(s_dev_info.ble_addr, sizeof(s_dev_info.ble_addr),
                  "%02X:%02X:%02X:%02X:%02X:%02X",
-                 data[0], data[1], data[2], data[3], data[4], data[5]);
+                 data[5], data[4], data[3], data[2], data[1], data[0]);
     }
     cham_send_cmd(1025, NULL, 0, s_cb_battery);  /* getBatteryCharge */
 }
@@ -946,7 +947,11 @@ bool cham_poll(void)
 
             /* Match to pending command */
             if (s_pend_cmd != 0xFFFF && fcmd == s_pend_cmd) {
-                bool ok = (fstatus == 0);
+                /* Firmware v2.x uses 0x0068 as its alternate OK status code;
+                 * 0x0000 is the standard spec OK.  Both are treated as success.
+                 * Real errors (0x0001..0x0005 and scan-specific 0x0065/0x0066)
+                 * remain non-zero and will have dlen=0 from the device. */
+                bool ok = (fstatus == 0 || fstatus == 0x0068);
                 cham_cmd_result_cb_t cb = s_pend_cb;
                 s_pend_cmd = 0xFFFF;
                 s_pend_cb  = NULL;
