@@ -6805,7 +6805,8 @@ void app_main(void)
                             for (int n = 0; n < (int)new_count; n++) {
                                 if (memcmp(deauth_target_bssids[t], new_records[n].bssid, 6) == 0) {
                                     if (new_records[n].ssid[0] != 0) {
-                                        strncpy(ssid_str, (const char *)new_records[n].ssid, sizeof(ssid_str) - 1);
+                                        memcpy(ssid_str, new_records[n].ssid, sizeof(ssid_str) - 1);
+                                        ssid_str[sizeof(ssid_str) - 1] = '\0';
                                     }
                                     break;
                                 }
@@ -7077,7 +7078,7 @@ void app_main(void)
                     drone_rec_t *r = &g_drones[di];
                     dd_snap[di].src = r->source;
                     if (r->uas_id[0])
-                        snprintf(dd_snap[di].line, 72, "[%s] %s  %ddBm",
+                        snprintf(dd_snap[di].line, 72, "[%s] %.50s  %ddBm",
                                  r->source == RID_SRC_BLE ? "BLE" : "WiFi",
                                  r->uas_id, r->rssi);
                     else
@@ -14958,8 +14959,8 @@ static void show_wifi_connect_screen(void)
         while (*p && *p != '"') p++;
         size_t ssid_len = p - ssid_start;
         if (ssid_len > sizeof(parsed_ssid) - 1) ssid_len = sizeof(parsed_ssid) - 1;
-        strncpy(parsed_ssid, ssid_start, ssid_len);
-        
+        memcpy(parsed_ssid, ssid_start, ssid_len);
+        parsed_ssid[ssid_len] = '\0';
         if (*p == '"') p++;
         while (*p && *p != '"') p++;
         if (*p == '"') p++;
@@ -30005,7 +30006,7 @@ static void show_clone_browser_screen(void)
             if (ent->d_name[0] == '.') continue;
             if (!strstr(ent->d_name, ".json")) continue;
             snprintf(s_clone_files[s_clone_count], 80,
-                     "/sdcard/lab/ble/clones/%s", ent->d_name);
+                     "/sdcard/lab/ble/clones/%.55s", ent->d_name);
             s_clone_count++;
         }
         closedir(dir);

@@ -38,6 +38,7 @@
 #include "host/ble_gatt.h"
 #include "host/ble_uuid.h"
 #include "host/ble_hs_adv.h"
+#include "host/ble_store.h"
 #include "services/gap/ble_svc_gap.h"
 #include "os/os_mbuf.h"
 
@@ -364,42 +365,6 @@ static int s_svc_disc_cb(uint16_t conn_handle, const struct ble_gatt_error *erro
     return 0;
 }
 
-/* ── MTU exchange callback ───────────────────────────────────────────────── */
-static int s_mtu_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
-                    uint16_t mtu, void *arg)
-{
-    (void)arg;
-    if (error->status == 0) {
-        ESP_LOGI(TAG, "MTU negotiated: %u", mtu);
-    } else {
-        ESP_LOGW(TAG, "MTU exchange failed (%d), proceeding anyway", error->status);
-    }
-
-    /* Proactively initiate security BEFORE service discovery.
-     * If we call disc_all_svcs immediately, the Chameleon may reject the ATT
-     * request mid-flight while the SMP exchange is negotiating — causing a 30 s
-     * SMP timeout and disconnect.  By calling security_initiate first, the
-     * encrypted link is established cleanly; disc_all_svcs is then issued from
-     * cham_poll() when ENC_CHANGE fires.
-     *
-     * If security_initiate returns non-zero (link already encrypted, or peer
-     * doesn't require security), fall through to discovery immediately. */
-    int sec_rc = ble_gap_security_initiate(conn_handle);
-    if (sec_rc == 0) {
-        ESP_LOGI(TAG, "Security initiated — waiting for ENC_CHANGE before discovery");
-        return 0;
-    }
-    ESP_LOGD(TAG, "security_initiate rc=%d — starting discovery directly", sec_rc);
-
-    int rc = ble_gattc_disc_all_svcs(conn_handle, s_svc_disc_cb, NULL);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "Svc disc start failed: %d", rc);
-        s_ev_error = true;
-        strlcpy(s_status_msg, "Svc discovery failed", sizeof(s_status_msg));
-    }
-    return 0;
-}
-
 /* ── Main GAP event callback ─────────────────────────────────────────────── */
 static int s_gap_cb(struct ble_gap_event *event, void *arg)
 {
@@ -411,10 +376,29 @@ static int s_gap_cb(struct ble_gap_event *event, void *arg)
             s_conn_handle = event->connect.conn_handle;
             s_ev_connected = true;
             ESP_LOGI(TAG, "Connected: conn_handle=%u", s_conn_handle);
-            /* Kick MTU exchange to 512; Chameleon may use large response frames */
-            ble_gattc_exchange_mtu(s_conn_handle, s_mtu_cb, NULL);
+
+            /* Security MUST be established before any ATT operations — the
+             * Chameleon drops ATT requests on an unencrypted link (NUS service
+             * is protected).  Initiate security immediately; disc_all_svcs runs
+             * from cham_poll() once ENC_CHANGE fires.
+             *
+             * If security_initiate fails (not applicable, already encrypted,
+             * etc.) treat the link as ready and set s_ev_enc_ok so discovery
+             * proceeds.  Every possible error is logged for diagnosis. */
+            int sec_rc = ble_gap_security_initiate(s_conn_handle);
+            ESP_LOGI(TAG, "security_initiate rc=%d (%s)",
+                     sec_rc,
+                     sec_rc == 0              ? "pairing started, await ENC_CHANGE" :
+                     sec_rc == BLE_HS_EALREADY? "already encrypted"               :
+                     sec_rc == BLE_HS_ENOTCONN? "not connected?"                  :
+                     sec_rc == BLE_HS_ENOTSUP ? "not supported"                   :
+                                                "unexpected error");
+            if (sec_rc != 0) {
+                /* Link usable without security — skip straight to discovery */
+                s_ev_enc_ok = true;
+            }
         } else {
-            ESP_LOGW(TAG, "Connect failed: %d", event->connect.status);
+            ESP_LOGW(TAG, "Connect failed: status=%d", event->connect.status);
             s_ev_error = true;
             snprintf(s_status_msg, sizeof(s_status_msg),
                      "Connect failed (%d)", event->connect.status);
@@ -422,7 +406,10 @@ static int s_gap_cb(struct ble_gap_event *event, void *arg)
         break;
 
     case BLE_GAP_EVENT_DISCONNECT:
-        ESP_LOGI(TAG, "Disconnected: reason=%d", event->disconnect.reason);
+        ESP_LOGI(TAG, "Disconnected: reason=%d (0x%02x)",
+                 event->disconnect.reason,
+                 event->disconnect.reason > 0x200
+                     ? event->disconnect.reason - 0x200 : event->disconnect.reason);
         s_conn_handle  = BLE_HS_CONN_HANDLE_NONE;
         s_svc_start    = 0;
         s_svc_end      = 0;
@@ -456,48 +443,57 @@ static int s_gap_cb(struct ble_gap_event *event, void *arg)
         break;
 
     case BLE_GAP_EVENT_PASSKEY_ACTION:
+        ESP_LOGI(TAG, "PASSKEY_ACTION: action=%d numcmp=%" PRIu32,
+                 event->passkey.params.action,
+                 event->passkey.params.numcmp);
         if (event->passkey.params.action == BLE_SM_IOACT_NUMCMP) {
-            /* Numeric comparison — store number and signal poll() to show UI */
             s_passkey_num = event->passkey.params.numcmp;
             s_ev_passkey  = true;
-            ESP_LOGI(TAG, "Passkey numcmp: %06" PRIu32, s_passkey_num);
         } else {
-            /* DISP or INPUT — auto-accept with zero passkey (unlikely for Chameleon) */
+            /* DISP or INPUT — auto-accept */
             struct ble_sm_io io = {0};
             io.action = event->passkey.params.action;
             ble_sm_inject_io(event->passkey.conn_handle, &io);
-            ESP_LOGW(TAG, "Passkey action type=%d — auto-accepted",
-                     event->passkey.params.action);
+            ESP_LOGW(TAG, "Passkey action %d auto-accepted", event->passkey.params.action);
         }
         break;
 
     case BLE_GAP_EVENT_ENC_CHANGE:
-        ESP_LOGI(TAG, "Encryption changed: status=%d state=%d",
+        ESP_LOGI(TAG, "ENC_CHANGE: status=%d state=%d",
                  event->enc_change.status, (int)s_state);
         if (event->enc_change.status == 0) {
-            /* Encryption established — restart discovery from scratch.
-             * Covers two cases:
-             *   (a) PAIRING: user confirmed numeric comparison
-             *   (b) DISCOVERING: Just Works / silent pairing happened while
-             *       disc_all_svcs was in flight; the ATT request was quietly
-             *       rejected; we need to re-issue it now that the link is encrypted */
-            if (s_state == CHAM_STATE_PAIRING    ||
-                s_state == CHAM_STATE_DISCOVERING ||
-                s_state == CHAM_STATE_CONNECTING) {
-                /* CONNECTING: poll() hasn't processed s_ev_connected yet but
-                 * ENC_CHANGE already fired (fast Just Works).  s_ev_enc_ok will
-                 * be consumed after s_ev_connected transitions us to DISCOVERING. */
-                s_ev_enc_ok = true;
-            }
+            /* Encryption up — disc_all_svcs fires from cham_poll() */
+            s_ev_enc_ok = true;
         } else {
-            /* Pairing failed — the peer will typically disconnect next */
+            ESP_LOGE(TAG, "ENC_CHANGE failed status=%d", event->enc_change.status);
             s_ev_error = true;
             snprintf(s_status_msg, sizeof(s_status_msg),
                      "Pairing failed (%d)", event->enc_change.status);
         }
         break;
 
+    case BLE_GAP_EVENT_REPEAT_PAIRING: {
+        /* Chameleon has a stale bond entry; we have none.  Delete theirs and
+         * retry so fresh Just Works pairing proceeds without SMP failure. */
+        struct ble_gap_conn_desc desc;
+        ESP_LOGW(TAG, "REPEAT_PAIRING conn=%u cur_key=%u new_key=%u — deleting stale bond",
+                 event->repeat_pairing.conn_handle,
+                 event->repeat_pairing.cur_key_size,
+                 event->repeat_pairing.new_key_size);
+        if (ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc) == 0) {
+            ble_store_util_delete_peer(&desc.peer_id_addr);
+        }
+        return BLE_GAP_REPEAT_PAIRING_RETRY;
+    }
+
+    case BLE_GAP_EVENT_PARING_COMPLETE:
+        ESP_LOGI(TAG, "PAIRING_COMPLETE: status=%d conn=%u",
+                 event->pairing_complete.status,
+                 event->pairing_complete.conn_handle);
+        break;
+
     default:
+        ESP_LOGD(TAG, "GAP event type=%d (unhandled)", event->type);
         break;
     }
     return 0;
@@ -870,15 +866,22 @@ bool cham_poll(void)
 
     if (s_ev_enc_ok) {
         s_ev_enc_ok = false;
-        /* Encryption is up — reset GATT discovery state and restart.
-         * Works for both explicit pairing (PAIRING state) and silent
-         * Just Works pairing that happened while discovery was in flight. */
-        s_svc_start  = 0; s_svc_end  = 0;
-        s_tx_val_hdl = 0; s_rx_val_hdl = 0; s_cccd_hdl = 0;
-        s_state = CHAM_STATE_DISCOVERING;
-        strlcpy(s_status_msg, "Discovering services...", sizeof(s_status_msg));
-        ble_gattc_disc_all_svcs(s_conn_handle, s_svc_disc_cb, NULL);
-        changed = true;
+        if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+            ESP_LOGW(TAG, "enc_ok but already disconnected — ignoring");
+        } else {
+            s_svc_start  = 0; s_svc_end  = 0;
+            s_tx_val_hdl = 0; s_rx_val_hdl = 0; s_cccd_hdl = 0;
+            s_state = CHAM_STATE_DISCOVERING;
+            strlcpy(s_status_msg, "Discovering services...", sizeof(s_status_msg));
+            int drc = ble_gattc_disc_all_svcs(s_conn_handle, s_svc_disc_cb, NULL);
+            ESP_LOGI(TAG, "disc_all_svcs rc=%d", drc);
+            if (drc != 0) {
+                ESP_LOGE(TAG, "disc_all_svcs failed: %d", drc);
+                s_ev_error = true;
+                strlcpy(s_status_msg, "Svc discovery failed", sizeof(s_status_msg));
+            }
+            changed = true;
+        }
     }
 
     if (s_ev_cccd_ok) {
