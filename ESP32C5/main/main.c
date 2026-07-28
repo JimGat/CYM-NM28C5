@@ -47447,8 +47447,11 @@ static void s_cham_stub_tile(lv_obj_t *parent, const char *icon, const char *nam
 /* ── Rebuild the s_cham_content area for the current state ── */
 static void s_cham_rebuild_content(cham_state_t st)
 {
-    /* Remove old content and clear derived pointers */
+    /* Remove old content and clear all derived pointers.
+     * s_cham_prog_lbl MUST be nulled here — the READY branch does not set it,
+     * so leaving a stale pointer causes use-after-free on the next poll tick. */
     if (s_cham_content) { lv_obj_del(s_cham_content); s_cham_content = NULL; }
+    s_cham_prog_lbl  = NULL;
     s_cham_bat_lbl   = NULL;
     s_cham_scan_list = NULL;
     s_cham_list_n    = 0;

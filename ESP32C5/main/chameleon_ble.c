@@ -918,8 +918,17 @@ bool cham_poll(void)
             uint16_t fdlen   = s_rxs.dlen;
             const uint8_t *fdata = s_rxs.buf + 9;
 
-            ESP_LOGD(TAG, "RX frame cmd=0x%04X status=0x%04X dlen=%u",
-                     fcmd, fstatus, fdlen);
+            ESP_LOGI(TAG, "RX frame cmd=0x%04X status=0x%04X dlen=%u pend=0x%04X",
+                     fcmd, fstatus, fdlen, s_pend_cmd);
+            if (fdlen > 0 && fdlen <= 16) {
+                /* Log first up to 16 data bytes so we can verify response format */
+                char hex[50] = {0};
+                int hpos = 0;
+                for (int hi = 0; hi < (int)fdlen && hpos < 47; hi++) {
+                    hpos += snprintf(hex + hpos, sizeof(hex) - hpos, "%02X ", fdata[hi]);
+                }
+                ESP_LOGI(TAG, "  data[%u]: %s", fdlen, hex);
+            }
 
             /* Match to pending command */
             if (s_pend_cmd != 0xFFFF && fcmd == s_pend_cmd) {
@@ -930,6 +939,9 @@ bool cham_poll(void)
                 s_pend_write_ok = false;
                 changed = true;
                 if (cb) cb(ok, ok ? fdata : NULL, ok ? fdlen : 0);
+            } else if (s_pend_cmd != 0xFFFF) {
+                ESP_LOGW(TAG, "RX cmd mismatch: got 0x%04X expected 0x%04X — ignoring",
+                         fcmd, s_pend_cmd);
             }
         } else if (result == -1) {
             /* Framing error — log and continue */
