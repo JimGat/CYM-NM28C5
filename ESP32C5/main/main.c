@@ -47363,6 +47363,7 @@ static lv_obj_t   *s_cham_bat_lbl   = NULL;  /* battery label (updated in-place 
 static lv_obj_t   *s_cham_scan_list = NULL;  /* lv_list during scan */
 static cham_state_t s_cham_ui_st    = (cham_state_t)0xFF; /* last-rendered state */
 static int         s_cham_list_n    = 0;      /* # items currently in scan list */
+static bool        s_cham_nav_child = false;  /* set before entering a child screen; prevents stop hook from disconnecting */
 
 /* LF read sub-screen globals — NULLed by cham_lf_read_stop() */
 static lv_timer_t *s_lf_tmr         = NULL;
@@ -47379,7 +47380,12 @@ static volatile bool s_lf_mode_ok      = false;
 static void show_cham_lf_read_screen(void);
 
 /* ── LF read: tile button callback ── */
-static void s_cham_lf_tile_cb(lv_event_t *e) { (void)e; show_cham_lf_read_screen(); }
+static void s_cham_lf_tile_cb(lv_event_t *e)
+{
+    (void)e;
+    s_cham_nav_child = true;  /* guard: stop hook must not disconnect during child nav */
+    show_cham_lf_read_screen();
+}
 
 /* ── LF read: save Flipper .rfid file ── */
 static void s_lf_save_cb(lv_event_t *e)
@@ -47508,10 +47514,10 @@ static void show_cham_lf_read_screen(void)
 
     /* Icon */
     lv_obj_t *icon = lv_label_create(function_page);
-    lv_label_set_text(icon, LV_SYMBOL_AUDIO);
-    lv_obj_set_style_text_font(icon, &lv_font_montserrat_20, 0);
+    lv_label_set_text(icon, MY_SYMBOL_KEY);
+    lv_obj_set_style_text_font(icon, &lv_extra_symbols, 0);
     lv_obj_set_style_text_color(icon, lv_color_hex(0x66BB6A), 0);
-    lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 100);
+    lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 80);
 
     /* UID result label (hidden until card read) */
     s_lf_uid_lbl = lv_label_create(function_page);
@@ -47600,36 +47606,37 @@ static lv_obj_t *s_cham_info_row(lv_obj_t *parent, const char *text, lv_color_t 
     return lbl;
 }
 
-/* ── Stub feature tile ── */
+/* ── Stub feature tile (matches create_small_tile style) ── */
 static void s_cham_stub_tile(lv_obj_t *parent, const char *icon, const char *name)
 {
     lv_obj_t *btn = lv_btn_create(parent);
     lv_obj_set_size(btn, 72, 54);
-    lv_obj_set_style_bg_color(btn, lv_color_hex(0x2A2A3A), 0);
+    lv_obj_set_style_bg_color(btn, ui_card_color(), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(btn, ui_card_pressed_color(), LV_STATE_PRESSED);
     lv_obj_set_style_radius(btn, 8, 0);
     lv_obj_set_style_border_width(btn, 1, 0);
-    lv_obj_set_style_border_color(btn, lv_color_hex(0x4A4A5A), 0);
+    lv_obj_set_style_border_color(btn, ui_border_color(), 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(btn, 4, 0);
+    lv_obj_set_style_pad_row(btn, 2, 0);
 
-    lv_obj_t *col = lv_obj_create(btn);
-    lv_obj_set_size(col, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(col, 0, 0);
-    lv_obj_set_style_pad_all(col, 2, 0);
-    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-    lv_obj_t *ico = lv_label_create(col);
+    lv_obj_t *ico = lv_label_create(btn);
     lv_label_set_text(ico, icon);
-    lv_obj_set_style_text_font(ico, &g_font_icon16, 0);
+    lv_obj_set_style_text_font(ico, &lv_extra_symbols, 0);  /* FA glyphs, always renders */
     lv_obj_set_style_text_color(ico, lv_color_hex(0xCE93D8), 0);
 
-    lv_obj_t *nm = lv_label_create(col);
+    lv_obj_t *nm = lv_label_create(btn);
     lv_label_set_text(nm, name);
     lv_obj_set_style_text_font(nm, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(nm, lv_color_hex(0xB0BEC5), 0);
+    lv_obj_set_style_text_color(nm, ui_text_color(), 0);
+    lv_obj_set_style_text_align(nm, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(nm, 64);
 
-    lv_obj_t *ph = lv_label_create(col);
-    lv_label_set_text(ph, "Phase 2");
+    lv_obj_t *ph = lv_label_create(btn);
+    lv_label_set_text(ph, "Soon");
     lv_obj_set_style_text_font(ph, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(ph, lv_color_hex(0x546E7A), 0);
 }
@@ -47872,47 +47879,46 @@ static void s_cham_rebuild_content(cham_state_t st)
         lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW);
         lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-        s_cham_stub_tile(tiles, LV_SYMBOL_WIFI,    "Read HF");
+        s_cham_stub_tile(tiles, MY_SYMBOL_MICROCHIP, "Read HF");
 
-        /* Read LF — live tile: green border distinguishes it from inactive stubs.
-         * col MUST have LV_OBJ_FLAG_CLICKABLE cleared; lv_obj_create() sets it
-         * by default in LVGL 8, which intercepts touches before btn gets them. */
+        /* Read LF — live tile. Direct flex-column on lv_btn avoids the inner
+         * lv_obj_create() container which would intercept touch events in LVGL 8. */
         {
             lv_obj_t *btn = lv_btn_create(tiles);
             lv_obj_set_size(btn, 72, 54);
-            lv_obj_set_style_bg_color(btn, lv_color_hex(0x2A2A3A), 0);
+            lv_obj_set_style_bg_color(btn, ui_card_color(), LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(btn, ui_card_pressed_color(), LV_STATE_PRESSED);
             lv_obj_set_style_radius(btn, 8, 0);
-            lv_obj_set_style_border_width(btn, 1, 0);
+            lv_obj_set_style_border_width(btn, 2, 0);
             lv_obj_set_style_border_color(btn, lv_color_hex(0x2E7D52), 0); /* green = live */
+            lv_obj_set_style_shadow_width(btn, 0, 0);
+            lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_COLUMN);
+            lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_all(btn, 4, 0);
+            lv_obj_set_style_pad_row(btn, 2, 0);
 
-            lv_obj_t *col = lv_obj_create(btn);
-            lv_obj_set_size(col, LV_PCT(100), LV_PCT(100));
-            lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
-            lv_obj_set_style_border_width(col, 0, 0);
-            lv_obj_set_style_pad_all(col, 2, 0);
-            lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
-            lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-            lv_obj_clear_flag(col, LV_OBJ_FLAG_CLICKABLE); /* let touches reach btn */
+            lv_obj_t *ico = lv_label_create(btn);
+            lv_label_set_text(ico, MY_SYMBOL_KEY);
+            lv_obj_set_style_text_font(ico, &lv_extra_symbols, 0);
+            lv_obj_set_style_text_color(ico, lv_color_hex(0x66BB6A), 0); /* green = live */
 
-            lv_obj_t *ico = lv_label_create(col);
-            lv_label_set_text(ico, LV_SYMBOL_AUDIO);
-            lv_obj_set_style_text_font(ico, &g_font_icon16, 0);
-            lv_obj_set_style_text_color(ico, lv_color_hex(0xCE93D8), 0);
-
-            lv_obj_t *nm = lv_label_create(col);
+            lv_obj_t *nm = lv_label_create(btn);
             lv_label_set_text(nm, "Read LF");
             lv_obj_set_style_text_font(nm, &lv_font_montserrat_12, 0);
-            lv_obj_set_style_text_color(nm, lv_color_hex(0xB0BEC5), 0);
+            lv_obj_set_style_text_color(nm, ui_text_color(), 0);
+            lv_obj_set_style_text_align(nm, LV_TEXT_ALIGN_CENTER, 0);
+            lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+            lv_obj_set_width(nm, 64);
 
-            lv_obj_t *sub2 = lv_label_create(col);
+            lv_obj_t *sub2 = lv_label_create(btn);
             lv_label_set_text(sub2, "EM410X");
             lv_obj_set_style_text_font(sub2, &lv_font_montserrat_12, 0);
-            lv_obj_set_style_text_color(sub2, lv_color_hex(0x66BB6A), 0); /* green = live */
+            lv_obj_set_style_text_color(sub2, lv_color_hex(0x66BB6A), 0);
 
             lv_obj_add_event_cb(btn, s_cham_lf_tile_cb, LV_EVENT_CLICKED, NULL);
         }
 
-        s_cham_stub_tile(tiles, LV_SYMBOL_LIST,    "Slots");
+        s_cham_stub_tile(tiles, MY_SYMBOL_DATABASE, "Slots");
 
         /* Disconnect button */
         lv_obj_t *dbtn = lv_btn_create(s_cham_content);
@@ -47985,17 +47991,18 @@ static void s_cham_poll_timer(lv_timer_t *t)
 static void chameleon_screen_stop(void)
 {
     if (s_cham_tmr)       { lv_timer_del(s_cham_tmr); s_cham_tmr = NULL; }
-    /* NULL all LVGL pointers — they will be freed with function_page */
     s_cham_prog_lbl  = NULL;
     s_cham_content   = NULL;
     s_cham_bat_lbl   = NULL;
     s_cham_scan_list = NULL;
     s_cham_ui_st     = (cham_state_t)0xFF;
     s_cham_list_n    = 0;
-    /* Disconnect BLE so the Chameleon can sleep and re-advertise.
-     * The main screen is the terminal point — navigating back or home
-     * means the user is done with this session. */
-    cham_disconnect();
+    /* Disconnect only when leaving the Chameleon feature entirely (not when
+     * navigating to a child screen like the LF reader). */
+    if (!s_cham_nav_child) {
+        cham_disconnect();
+    }
+    s_cham_nav_child = false;
 }
 
 /* ── Main screen entry point ── */
