@@ -162,6 +162,7 @@ LV_IMG_DECLARE(deedee_img);
 #include "oui_lookup.h"
 #include "gatt_walker.h"
 #include "ble_honeypair.h"
+#include "chameleon_ble.h"
 #include "ble_blueduck.h"
 #include "ble_whisperpair.h"
 #include "rf_hat_config.h"
@@ -5586,6 +5587,7 @@ void app_main(void)
     }
 
     gw_init(sd_spi_mutex);
+    cham_init();
 
     // Screenshot worker (queue + background saver task)
     screenshot_queue = xQueueCreate(1, sizeof(screenshot_msg_t));
@@ -47340,57 +47342,377 @@ static void show_nfc_hub_screen(void)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Chameleon Ultra — stub screen (BLE 125 kHz LF + 13.56 MHz HF)
+// Chameleon Ultra / Lite — BLE RFID/NFC controller (125 kHz LF + 13.56 MHz HF)
 // Concept: @bkbroiler | Protocol ref: ChameleonUltraGUI (GameTec-live)
+// Phase 1: BLE scan, connect, device info.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/* Screen-scoped globals — all NULLed by chameleon_screen_stop() */
+static lv_timer_t *s_cham_tmr      = NULL;   /* 50 ms poll timer */
+static lv_obj_t   *s_cham_stat_lbl = NULL;   /* status text strip at top */
+static lv_obj_t   *s_cham_content  = NULL;   /* main content container (rebuilt on state change) */
+static lv_obj_t   *s_cham_bat_lbl  = NULL;   /* battery label (updated in-place when READY) */
+static lv_obj_t   *s_cham_scan_list = NULL;  /* lv_list during scan */
+static cham_state_t s_cham_ui_st   = (cham_state_t)0xFF; /* last-rendered state */
+static int         s_cham_list_n   = 0;       /* # items currently in scan list */
+
+/* ── Scan list item tap: start connecting to that device ── */
+static void s_cham_list_item_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    cham_connect(idx);
+}
+
+/* ── Scan button ── */
+static void s_cham_scan_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!ensure_ble_mode()) {
+        if (s_cham_stat_lbl)
+            lv_label_set_text(s_cham_stat_lbl, "BLE init failed");
+        return;
+    }
+    cham_scan_start();
+}
+
+/* ── Stop scan button ── */
+static void s_cham_stop_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    cham_scan_stop();
+}
+
+/* ── Cancel connect / Disconnect button ── */
+static void s_cham_disc_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    cham_disconnect();
+}
+
+/* ── Helper: make a compact info label row ── */
+static lv_obj_t *s_cham_info_row(lv_obj_t *parent, const char *text, lv_color_t col)
+{
+    lv_obj_t *lbl = lv_label_create(parent);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(lbl, col, 0);
+    lv_obj_set_width(lbl, lv_pct(100));
+    lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
+    return lbl;
+}
+
+/* ── Stub feature tile ── */
+static void s_cham_stub_tile(lv_obj_t *parent, const char *icon, const char *name)
+{
+    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, 72, 54);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0x2A2A3A), 0);
+    lv_obj_set_style_radius(btn, 8, 0);
+    lv_obj_set_style_border_width(btn, 1, 0);
+    lv_obj_set_style_border_color(btn, lv_color_hex(0x4A4A5A), 0);
+
+    lv_obj_t *col = lv_obj_create(btn);
+    lv_obj_set_size(col, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(col, 0, 0);
+    lv_obj_set_style_pad_all(col, 2, 0);
+    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *ico = lv_label_create(col);
+    lv_label_set_text(ico, icon);
+    lv_obj_set_style_text_font(ico, &g_font_icon16, 0);
+    lv_obj_set_style_text_color(ico, lv_color_hex(0xCE93D8), 0);
+
+    lv_obj_t *nm = lv_label_create(col);
+    lv_label_set_text(nm, name);
+    lv_obj_set_style_text_font(nm, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(nm, lv_color_hex(0xB0BEC5), 0);
+
+    lv_obj_t *ph = lv_label_create(col);
+    lv_label_set_text(ph, "Phase 2");
+    lv_obj_set_style_text_font(ph, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ph, lv_color_hex(0x546E7A), 0);
+}
+
+/* ── Rebuild the s_cham_content area for the current state ── */
+static void s_cham_rebuild_content(cham_state_t st)
+{
+    /* Remove old content and clear derived pointers */
+    if (s_cham_content) { lv_obj_del(s_cham_content); s_cham_content = NULL; }
+    s_cham_bat_lbl   = NULL;
+    s_cham_scan_list = NULL;
+    s_cham_list_n    = 0;
+
+    if (!function_page) return;
+
+    /* Content container fills below the status strip */
+    s_cham_content = lv_obj_create(function_page);
+    lv_obj_set_size(s_cham_content, 240, 258);
+    lv_obj_set_pos(s_cham_content, 0, 30);
+    lv_obj_set_style_bg_opa(s_cham_content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_cham_content, 0, 0);
+    lv_obj_set_style_pad_all(s_cham_content, 6, 0);
+    lv_obj_clear_flag(s_cham_content, LV_OBJ_FLAG_SCROLLABLE);
+
+    if (st == CHAM_STATE_DISCONNECTED || st == CHAM_STATE_ERROR) {
+        /* ── Idle / Error state: big icon + Scan button + credits ── */
+        lv_obj_t *icon = lv_label_create(s_cham_content);
+        lv_label_set_text(icon, MY_SYMBOL_DRAGON);
+        lv_obj_set_style_text_font(icon, &g_font_icon16, 0);
+        lv_obj_set_style_text_color(icon, lv_color_hex(0xCE93D8), 0);
+        lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 10);
+
+        lv_obj_t *sub = lv_label_create(s_cham_content);
+        lv_label_set_text(sub, "Chameleon Ultra / Lite\n125 kHz LF + 13.56 MHz HF\nBluetooth RFID Reader & Emulator");
+        lv_obj_set_style_text_font(sub, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(sub, lv_color_hex(0x90A4AE), 0);
+        lv_obj_set_style_text_align(sub, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(sub, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(sub, lv_pct(100));
+        lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 34);
+
+        lv_obj_t *btn = lv_btn_create(s_cham_content);
+        lv_obj_set_size(btn, 120, 38);
+        lv_obj_align(btn, LV_ALIGN_TOP_MID, 0, 110);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x6A1B9A), 0);
+        lv_obj_add_event_cb(btn, s_cham_scan_btn_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_t *bl = lv_label_create(btn);
+        lv_label_set_text(bl, "Scan for Device");
+        lv_obj_set_style_text_font(bl, &lv_font_montserrat_12, 0);
+        lv_obj_center(bl);
+
+        lv_obj_t *cr = lv_label_create(s_cham_content);
+        lv_label_set_text(cr, "Concept: @bkbroiler\nProtocol: ChameleonUltraGUI");
+        lv_obj_set_style_text_font(cr, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(cr, lv_color_hex(0x546E7A), 0);
+        lv_obj_set_style_text_align(cr, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(cr, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(cr, lv_pct(100));
+        lv_obj_align(cr, LV_ALIGN_BOTTOM_MID, 0, -4);
+
+    } else if (st == CHAM_STATE_SCANNING) {
+        /* ── Scanning: result list + Stop button ── */
+        s_cham_scan_list = lv_list_create(s_cham_content);
+        lv_obj_set_size(s_cham_scan_list, 228, 200);
+        lv_obj_align(s_cham_scan_list, LV_ALIGN_TOP_MID, 0, 0);
+        lv_obj_set_style_bg_color(s_cham_scan_list, lv_color_hex(0x1A1A2E), 0);
+        lv_obj_set_style_border_color(s_cham_scan_list, lv_color_hex(0x4A4A5A), 0);
+        lv_obj_set_style_border_width(s_cham_scan_list, 1, 0);
+        lv_list_add_text(s_cham_scan_list, "  Tap a device to connect:");
+
+        lv_obj_t *sbtn = lv_btn_create(s_cham_content);
+        lv_obj_set_size(sbtn, 120, 36);
+        lv_obj_align(sbtn, LV_ALIGN_BOTTOM_MID, 0, -2);
+        lv_obj_set_style_bg_color(sbtn, lv_color_hex(0x333344), 0);
+        lv_obj_add_event_cb(sbtn, s_cham_stop_btn_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_t *sl = lv_label_create(sbtn);
+        lv_label_set_text(sl, "Stop Scan");
+        lv_obj_set_style_text_font(sl, &lv_font_montserrat_12, 0);
+        lv_obj_center(sl);
+
+        /* Populate any results already in the buffer */
+        int count = cham_scan_result_count();
+        while (s_cham_list_n < count) {
+            const cham_scan_result_t *r = cham_scan_result_get(s_cham_list_n);
+            if (r) {
+                char row[64];
+                snprintf(row, sizeof(row), "%s  (%d dBm)", r->name, (int)r->rssi);
+                lv_obj_t *item = lv_list_add_btn(s_cham_scan_list, NULL, row);
+                lv_obj_set_style_text_font(item, &lv_font_montserrat_12, 0);
+                lv_obj_add_event_cb(item, s_cham_list_item_cb, LV_EVENT_CLICKED,
+                                    (void *)(intptr_t)s_cham_list_n);
+            }
+            s_cham_list_n++;
+        }
+
+    } else if (st == CHAM_STATE_CONNECTING || st == CHAM_STATE_DISCOVERING ||
+               st == CHAM_STATE_HANDSHAKING) {
+        /* ── Progress state: icon + status + Cancel ── */
+        lv_obj_t *spin_lbl = lv_label_create(s_cham_content);
+        lv_label_set_text(spin_lbl, LV_SYMBOL_BLUETOOTH);
+        lv_obj_set_style_text_font(spin_lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(spin_lbl, lv_color_hex(0x42A5F5), 0);
+        lv_obj_align(spin_lbl, LV_ALIGN_TOP_MID, 0, 20);
+
+        lv_obj_t *prog = lv_label_create(s_cham_content);
+        lv_label_set_text(prog, cham_get_status_msg());
+        lv_obj_set_style_text_font(prog, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(prog, lv_color_hex(0xB0BEC5), 0);
+        lv_obj_set_style_text_align(prog, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(prog, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(prog, lv_pct(100));
+        lv_obj_align(prog, LV_ALIGN_TOP_MID, 0, 50);
+
+        lv_obj_t *cbtn = lv_btn_create(s_cham_content);
+        lv_obj_set_size(cbtn, 100, 36);
+        lv_obj_align(cbtn, LV_ALIGN_BOTTOM_MID, 0, -10);
+        lv_obj_set_style_bg_color(cbtn, lv_color_hex(0x5D1A1A), 0);
+        lv_obj_add_event_cb(cbtn, s_cham_disc_btn_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_t *cl = lv_label_create(cbtn);
+        lv_label_set_text(cl, "Cancel");
+        lv_obj_set_style_text_font(cl, &lv_font_montserrat_12, 0);
+        lv_obj_center(cl);
+
+    } else if (st == CHAM_STATE_READY) {
+        /* ── Ready state: device info + feature stubs + Disconnect ── */
+        const cham_device_info_t *info = cham_get_device_info();
+
+        /* Info card */
+        lv_obj_t *card = lv_obj_create(s_cham_content);
+        lv_obj_set_size(card, 228, 118);
+        lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 0);
+        lv_obj_set_style_bg_color(card, lv_color_hex(0x1A1A2E), 0);
+        lv_obj_set_style_border_color(card, lv_color_hex(0x6A1B9A), 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_radius(card, 6, 0);
+        lv_obj_set_style_pad_all(card, 6, 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_row(card, 2, 0);
+
+        if (info) {
+            char buf[64];
+            /* Row 1: type + FW */
+            snprintf(buf, sizeof(buf), "%s  |  FW v%u.%u",
+                     info->is_lite ? "Chameleon Lite" : "Chameleon Ultra",
+                     info->fw_version >> 8, info->fw_version & 0xFF);
+            s_cham_info_row(card, buf, lv_color_hex(0xCE93D8));
+
+            /* Row 2: battery (keep pointer for live updates) */
+            snprintf(buf, sizeof(buf), "Battery: %d%%  (%d mV)",
+                     info->battery_pct, info->battery_mv);
+            s_cham_bat_lbl = s_cham_info_row(card, buf, lv_color_hex(0x81C784));
+
+            /* Row 3: BLE address */
+            snprintf(buf, sizeof(buf), "BLE: %s", info->ble_addr);
+            s_cham_info_row(card, buf, lv_color_hex(0x90A4AE));
+
+            /* Row 4: chip ID */
+            snprintf(buf, sizeof(buf), "ID: %s", info->chip_id);
+            s_cham_info_row(card, buf, lv_color_hex(0x78909C));
+        }
+
+        /* Feature stubs row */
+        lv_obj_t *tiles = lv_obj_create(s_cham_content);
+        lv_obj_set_size(tiles, 228, 68);
+        lv_obj_align(tiles, LV_ALIGN_TOP_MID, 0, 124);
+        lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(tiles, 0, 0);
+        lv_obj_set_style_pad_all(tiles, 0, 0);
+        lv_obj_set_style_pad_column(tiles, 6, 0);
+        lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+        s_cham_stub_tile(tiles, LV_SYMBOL_WIFI,    "Read HF");
+        s_cham_stub_tile(tiles, LV_SYMBOL_AUDIO,   "Read LF");
+        s_cham_stub_tile(tiles, LV_SYMBOL_LIST,    "Slots");
+
+        /* Disconnect button */
+        lv_obj_t *dbtn = lv_btn_create(s_cham_content);
+        lv_obj_set_size(dbtn, 120, 34);
+        lv_obj_align(dbtn, LV_ALIGN_BOTTOM_MID, 0, -2);
+        lv_obj_set_style_bg_color(dbtn, lv_color_hex(0x5D1A1A), 0);
+        lv_obj_add_event_cb(dbtn, s_cham_disc_btn_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_t *dl = lv_label_create(dbtn);
+        lv_label_set_text(dl, "Disconnect");
+        lv_obj_set_style_text_font(dl, &lv_font_montserrat_12, 0);
+        lv_obj_center(dl);
+    }
+}
+
+/* ── 50 ms poll timer: drives cham_poll() and updates UI ── */
+static void s_cham_poll_timer(lv_timer_t *t)
+{
+    (void)t;
+    if (!s_cham_stat_lbl) return; /* screen was torn down */
+
+    bool changed = cham_poll();
+    if (!changed) return;
+
+    cham_state_t st = cham_get_state();
+
+    /* Always refresh status strip */
+    lv_label_set_text(s_cham_stat_lbl, cham_get_status_msg());
+
+    /* State transition: full content rebuild */
+    if (st != s_cham_ui_st) {
+        s_cham_ui_st = st;
+        s_cham_rebuild_content(st);
+        return;
+    }
+
+    /* Within SCANNING: incrementally add new list items */
+    if (st == CHAM_STATE_SCANNING && s_cham_scan_list) {
+        int count = cham_scan_result_count();
+        while (s_cham_list_n < count) {
+            const cham_scan_result_t *r = cham_scan_result_get(s_cham_list_n);
+            if (r) {
+                char row[64];
+                snprintf(row, sizeof(row), "%s  (%d dBm)", r->name, (int)r->rssi);
+                lv_obj_t *item = lv_list_add_btn(s_cham_scan_list, NULL, row);
+                lv_obj_set_style_text_font(item, &lv_font_montserrat_12, 0);
+                lv_obj_add_event_cb(item, s_cham_list_item_cb, LV_EVENT_CLICKED,
+                                    (void *)(intptr_t)s_cham_list_n);
+            }
+            s_cham_list_n++;
+        }
+    }
+
+    /* Within READY: update battery label */
+    if (st == CHAM_STATE_READY && s_cham_bat_lbl) {
+        const cham_device_info_t *info = cham_get_device_info();
+        if (info) {
+            char buf[40];
+            snprintf(buf, sizeof(buf), "Battery: %d%%  (%d mV)",
+                     info->battery_pct, info->battery_mv);
+            lv_label_set_text(s_cham_bat_lbl, buf);
+        }
+    }
+}
+
+/* ── Stop hook: fires on Back or Home before screen is torn down ── */
+static void chameleon_screen_stop(void)
+{
+    if (s_cham_tmr)       { lv_timer_del(s_cham_tmr); s_cham_tmr = NULL; }
+    /* NULL all LVGL pointers — they will be freed with function_page */
+    s_cham_stat_lbl  = NULL;
+    s_cham_content   = NULL;
+    s_cham_bat_lbl   = NULL;
+    s_cham_scan_list = NULL;
+    s_cham_ui_st     = (cham_state_t)0xFF;
+    s_cham_list_n    = 0;
+    /* Do NOT call cham_disconnect() here — user may return to this screen.
+     * BLE connection persists across screen transitions within the same session. */
+}
+
+/* ── Main screen entry point ── */
 static void show_chameleon_screen(void)
 {
     create_function_page_base("Chameleon Ultra");
-    g_screen_back_fn = show_nfc_hub_screen;
+    g_screen_stop_fn  = chameleon_screen_stop;   /* MANDATORY — before building UI */
+    g_screen_back_fn  = show_nfc_hub_screen;
+    apply_menu_bg();
 
-    lv_obj_t *icon_lbl = lv_label_create(function_page);
-    lv_label_set_text(icon_lbl, MY_SYMBOL_DRAGON);
-    lv_obj_set_style_text_font(icon_lbl, &g_font_icon16, 0);
-    lv_obj_set_style_text_color(icon_lbl, lv_color_hex(0xCE93D8), 0);
-    lv_obj_align(icon_lbl, LV_ALIGN_TOP_MID, 0, 38);
+    /* Status strip: single-line status text at top of function_page */
+    s_cham_stat_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_cham_stat_lbl, cham_get_status_msg());
+    lv_obj_set_style_text_font(s_cham_stat_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_cham_stat_lbl, lv_color_hex(0xB0BEC5), 0);
+    lv_obj_set_style_text_align(s_cham_stat_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_cham_stat_lbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(s_cham_stat_lbl, 240);
+    lv_obj_set_pos(s_cham_stat_lbl, 0, 12);
 
-    lv_obj_t *title = lv_label_create(function_page);
-    lv_label_set_text(title, "Chameleon Ultra");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(title, lv_color_hex(0xCE93D8), 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 60);
+    /* Build initial content for current state */
+    s_cham_ui_st = (cham_state_t)0xFF; /* force rebuild */
+    cham_state_t cur = cham_get_state();
+    s_cham_ui_st = cur;
+    s_cham_rebuild_content(cur);
 
-    lv_obj_t *sub = lv_label_create(function_page);
-    lv_label_set_text(sub,
-        "Bluetooth RFID/NFC\n"
-        "125 kHz LF + 13.56 MHz HF\n"
-        "Reader / Writer / Cloner\n"
-        "Emulator");
-    lv_obj_set_style_text_font(sub, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(sub, lv_color_hex(0xB0BEC5), 0);
-    lv_obj_set_style_text_align(sub, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_long_mode(sub, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(sub, lv_pct(90));
-    lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 100);
-
-    lv_obj_t *coming = lv_label_create(function_page);
-    lv_label_set_text(coming, "-- Coming Soon --");
-    lv_obj_set_style_text_font(coming, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(coming, lv_color_hex(0xFFCA28), 0);
-    lv_obj_align(coming, LV_ALIGN_TOP_MID, 0, 188);
-
-    lv_obj_t *credit = lv_label_create(function_page);
-    lv_label_set_text(credit,
-        "Concept: @bkbroiler\n"
-        "Protocol ref: ChameleonUltraGUI\n"
-        "  (GameTec-live)");
-    lv_obj_set_style_text_font(credit, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(credit, lv_color_hex(0x78909C), 0);
-    lv_obj_set_style_text_align(credit, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_long_mode(credit, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(credit, lv_pct(90));
-    lv_obj_align(credit, LV_ALIGN_TOP_MID, 0, 214);
+    /* Poll timer — drives state machine and UI updates */
+    s_cham_tmr = lv_timer_create(s_cham_poll_timer, 50, NULL);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
