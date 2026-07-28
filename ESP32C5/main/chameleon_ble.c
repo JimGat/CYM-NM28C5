@@ -106,7 +106,12 @@ static volatile bool s_ev_connected    = false;
 static volatile bool s_ev_disconnected = false;
 static volatile bool s_ev_cccd_ok      = false;
 static volatile bool s_ev_error        = false;
+static volatile bool s_ev_passkey      = false; /* numeric comparison pending */
+static volatile bool s_ev_enc_ok       = false; /* pairing completed successfully */
 static volatile bool s_changed         = false; /* general "please repaint" flag */
+
+/* Numeric comparison passkey (6-digit, set alongside s_ev_passkey) */
+static uint32_t s_passkey_num = 0;
 
 /* Pending command */
 static uint16_t          s_pend_cmd  = 0xFFFF; /* 0xFFFF = none */
@@ -435,18 +440,34 @@ static int s_gap_cb(struct ble_gap_event *event, void *arg)
         break;
 
     case BLE_GAP_EVENT_PASSKEY_ACTION:
-        /*
-         * Just Works pairing: NO_IO capability means we cannot display or enter
-         * a passkey. If the Chameleon has BLE pairing enabled, it will either
-         * accept Just Works (unauthenticated bond) or reject us. Disable BLE
-         * pairing on the Chameleon if connections fail here.
-         */
-        ESP_LOGW(TAG, "Passkey action type=%d (Just Works pairing only)",
-                 event->passkey.params.action);
+        if (event->passkey.params.action == BLE_SM_IOACT_NUMCMP) {
+            /* Numeric comparison — store number and signal poll() to show UI */
+            s_passkey_num = event->passkey.params.numcmp;
+            s_ev_passkey  = true;
+            ESP_LOGI(TAG, "Passkey numcmp: %06" PRIu32, s_passkey_num);
+        } else {
+            /* DISP or INPUT — auto-accept with zero passkey (unlikely for Chameleon) */
+            struct ble_sm_io io = {0};
+            io.action = event->passkey.params.action;
+            ble_sm_inject_io(event->passkey.conn_handle, &io);
+            ESP_LOGW(TAG, "Passkey action type=%d — auto-accepted",
+                     event->passkey.params.action);
+        }
         break;
 
     case BLE_GAP_EVENT_ENC_CHANGE:
         ESP_LOGD(TAG, "Encryption changed: status=%d", event->enc_change.status);
+        if (event->enc_change.status == 0) {
+            /* Pairing (or re-encryption) succeeded */
+            if (s_state == CHAM_STATE_PAIRING) {
+                s_ev_enc_ok = true; /* poll() will restart service discovery */
+            }
+        } else {
+            /* Pairing failed — the peer will typically disconnect next */
+            s_ev_error = true;
+            snprintf(s_status_msg, sizeof(s_status_msg),
+                     "Pairing failed (%d)", event->enc_change.status);
+        }
         break;
 
     default:
@@ -711,6 +732,27 @@ cham_state_t cham_get_state(void) { return s_state; }
 
 const char *cham_get_status_msg(void) { return s_status_msg; }
 
+uint32_t cham_get_passkey(void) { return s_passkey_num; }
+
+void cham_passkey_accept(void)
+{
+    struct ble_sm_io io = {0};
+    io.action = BLE_SM_IOACT_NUMCMP;
+    io.numcmp_accept = 1;
+    ble_sm_inject_io(s_conn_handle, &io);
+    strlcpy(s_status_msg, "Pairing...", sizeof(s_status_msg));
+    s_changed = true;
+}
+
+void cham_passkey_reject(void)
+{
+    struct ble_sm_io io = {0};
+    io.action = BLE_SM_IOACT_NUMCMP;
+    io.numcmp_accept = 0;
+    ble_sm_inject_io(s_conn_handle, &io);
+    /* Peer will disconnect; BLE_GAP_EVENT_DISCONNECT → state = ERROR */
+}
+
 const cham_device_info_t *cham_get_device_info(void)
 {
     return (s_state == CHAM_STATE_READY || s_state == CHAM_STATE_HANDSHAKING)
@@ -788,6 +830,25 @@ bool cham_poll(void)
         s_ev_connected = false;
         s_state  = CHAM_STATE_DISCOVERING;
         strlcpy(s_status_msg, "Discovering services...", sizeof(s_status_msg));
+        changed = true;
+    }
+
+    if (s_ev_passkey) {
+        s_ev_passkey = false;
+        s_state = CHAM_STATE_PAIRING;
+        snprintf(s_status_msg, sizeof(s_status_msg),
+                 "Confirm: %06" PRIu32, s_passkey_num);
+        changed = true;
+    }
+
+    if (s_ev_enc_ok) {
+        s_ev_enc_ok = false;
+        /* Pairing complete — reset discovery state and restart from scratch */
+        s_svc_start  = 0; s_svc_end  = 0;
+        s_tx_val_hdl = 0; s_rx_val_hdl = 0; s_cccd_hdl = 0;
+        s_state = CHAM_STATE_DISCOVERING;
+        strlcpy(s_status_msg, "Paired! Discovering services...", sizeof(s_status_msg));
+        ble_gattc_disc_all_svcs(s_conn_handle, s_svc_disc_cb, NULL);
         changed = true;
     }
 

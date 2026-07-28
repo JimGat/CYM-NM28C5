@@ -35371,7 +35371,7 @@ static esp_err_t bt_nimble_init(void)
     ble_hs_cfg.reset_cb = bt_on_reset;
 
     // Security manager: Just Works pairing (needed for HoneyPair)
-    ble_hs_cfg.sm_io_cap       = BLE_SM_IO_CAP_NO_IO;
+    ble_hs_cfg.sm_io_cap       = BLE_SM_IO_CAP_DISP_YES_NO; /* enables numeric comparison */
     ble_hs_cfg.sm_bonding      = 1;
     ble_hs_cfg.sm_mitm         = 0;
     ble_hs_cfg.sm_sc           = 1;
@@ -47363,6 +47363,10 @@ static void s_cham_list_item_cb(lv_event_t *e)
     cham_connect(idx);
 }
 
+/* ── Pairing confirm / reject buttons ── */
+static void s_cham_pair_yes_cb(lv_event_t *e) { (void)e; cham_passkey_accept(); }
+static void s_cham_pair_no_cb(lv_event_t *e)  { (void)e; cham_passkey_reject(); }
+
 /* ── Scan button ── */
 static void s_cham_scan_btn_cb(lv_event_t *e)
 {
@@ -47532,6 +47536,57 @@ static void s_cham_rebuild_content(cham_state_t st)
             }
             s_cham_list_n++;
         }
+
+    } else if (st == CHAM_STATE_PAIRING) {
+        /* ── Numeric comparison pairing — show 6-digit code, Confirm / Reject ── */
+        lv_obj_t *bt_icon = lv_label_create(s_cham_content);
+        lv_label_set_text(bt_icon, LV_SYMBOL_BLUETOOTH);
+        lv_obj_set_style_text_font(bt_icon, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(bt_icon, lv_color_hex(0x42A5F5), 0);
+        lv_obj_align(bt_icon, LV_ALIGN_TOP_MID, 0, 10);
+
+        lv_obj_t *ptitle = lv_label_create(s_cham_content);
+        lv_label_set_text(ptitle, "Confirm Pairing");
+        lv_obj_set_style_text_font(ptitle, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ptitle, lv_color_white(), 0);
+        lv_obj_align(ptitle, LV_ALIGN_TOP_MID, 0, 36);
+
+        char code_buf[8];
+        snprintf(code_buf, sizeof(code_buf), "%06lu", (unsigned long)cham_get_passkey());
+        lv_obj_t *code_lbl = lv_label_create(s_cham_content);
+        lv_label_set_text(code_lbl, code_buf);
+        lv_obj_set_style_text_font(code_lbl, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(code_lbl, lv_color_hex(0xFFD54F), 0);
+        lv_obj_align(code_lbl, LV_ALIGN_TOP_MID, 0, 58);
+
+        lv_obj_t *hint = lv_label_create(s_cham_content);
+        lv_label_set_text(hint, "Match code on Chameleon");
+        lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(hint, lv_color_hex(0x78909C), 0);
+        lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(hint, lv_pct(100));
+        lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 90);
+
+        lv_obj_t *yes_btn = lv_btn_create(s_cham_content);
+        lv_obj_set_size(yes_btn, 108, 36);
+        lv_obj_set_style_bg_color(yes_btn, lv_color_hex(0x1B5E20), LV_STATE_DEFAULT);
+        lv_obj_align(yes_btn, LV_ALIGN_BOTTOM_LEFT, 8, -4);
+        lv_obj_add_event_cb(yes_btn, s_cham_pair_yes_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_t *yl = lv_label_create(yes_btn);
+        lv_label_set_text(yl, "Confirm");
+        lv_obj_set_style_text_font(yl, &lv_font_montserrat_12, 0);
+        lv_obj_center(yl);
+
+        lv_obj_t *no_btn = lv_btn_create(s_cham_content);
+        lv_obj_set_size(no_btn, 108, 36);
+        lv_obj_set_style_bg_color(no_btn, lv_color_hex(0x5D1A1A), LV_STATE_DEFAULT);
+        lv_obj_align(no_btn, LV_ALIGN_BOTTOM_RIGHT, -8, -4);
+        lv_obj_add_event_cb(no_btn, s_cham_pair_no_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_t *nl = lv_label_create(no_btn);
+        lv_label_set_text(nl, "Reject");
+        lv_obj_set_style_text_font(nl, &lv_font_montserrat_12, 0);
+        lv_obj_center(nl);
 
     } else if (st == CHAM_STATE_CONNECTING || st == CHAM_STATE_DISCOVERING ||
                st == CHAM_STATE_HANDSHAKING) {

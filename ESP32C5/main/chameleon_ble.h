@@ -17,6 +17,7 @@ typedef enum {
     CHAM_STATE_DISCONNECTED = 0,
     CHAM_STATE_SCANNING,
     CHAM_STATE_CONNECTING,   /* disc_cancel + defer + ble_gap_connect */
+    CHAM_STATE_PAIRING,      /* numeric comparison — waiting for user to confirm */
     CHAM_STATE_DISCOVERING,  /* MTU + service/char discovery + CCCD write */
     CHAM_STATE_HANDSHAKING,  /* reading device info */
     CHAM_STATE_READY,        /* fully connected, info valid */
@@ -51,6 +52,11 @@ typedef void (*cham_cmd_result_cb_t)(bool ok, const uint8_t *data, uint16_t dlen
 
 /* One-time module init — call from app_main before first use */
 void cham_init(void);
+
+/* Pairing (numeric comparison): call from LVGL task when state == CHAM_STATE_PAIRING */
+uint32_t cham_get_passkey(void);   /* 6-digit number to display */
+void     cham_passkey_accept(void); /* inject numcmp_accept=1 → pairing continues */
+void     cham_passkey_reject(void); /* inject numcmp_accept=0 → peer will disconnect */
 
 /* Scan for Chameleon devices; call cham_scan_result_get() to read results */
 void cham_scan_start(void);
