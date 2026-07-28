@@ -36916,10 +36916,10 @@ static bool        s_spoof_active      = false;
 static bool        s_spoof_use_wifi    = false;   /* false=BLE, true=WiFi beacon */
 static uint8_t     s_spoof_counter     = 0;
 static int         s_spoof_msg_phase   = 0;       /* rotates BasicID→Location→OperatorID */
-static char        s_spoof_uasid[21]   = "CYM-DRONE-001";
-static char        s_spoof_opid[21]    = "CYM-OPERATOR";
-static char        s_spoof_lat_str[16] = "37.773972";
-static char        s_spoof_lon_str[16] = "-122.431297";
+static char        s_spoof_uasid[21]   = "FAKE-UAS-00000001";
+static char        s_spoof_opid[21]    = "FAKE-OPERATOR";
+static char        s_spoof_lat_str[16] = "0.0";
+static char        s_spoof_lon_str[16] = "-160.0";
 static char        s_spoof_alt_str[16] = "100.0";
 
 // ── OpenDroneID message encoders ─────────────────────────────────────────────
