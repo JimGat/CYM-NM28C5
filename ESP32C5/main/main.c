@@ -17285,10 +17285,10 @@ static void deauth_client_timer_cb(lv_timer_t *timer) {
     if (s_dc_status_lbl) {
         char buf[64];
         if (s_dc_client_count > 0) {
-            snprintf(buf, sizeof(buf), "%d client(s) found — tap to target", s_dc_client_count);
+            snprintf(buf, sizeof(buf), "%d client(s) found - tap to target", s_dc_client_count);
             lv_obj_set_style_text_color(s_dc_status_lbl, lv_color_make(0, 200, 0), 0);
         } else {
-            snprintf(buf, sizeof(buf), "No clients detected — press \342\200\271 Back");
+            snprintf(buf, sizeof(buf), "No clients detected - press Back");
             lv_obj_set_style_text_color(s_dc_status_lbl, COLOR_MATERIAL_ORANGE, 0);
         }
         lv_label_set_text(s_dc_status_lbl, buf);
@@ -17299,7 +17299,7 @@ static void deauth_client_timer_cb(lv_timer_t *timer) {
 
     if (s_dc_client_count == 0) {
         lv_obj_t *none_lbl = lv_label_create(s_dc_list_cont);
-        lv_label_set_text(none_lbl, "No clients — move closer or wait for traffic");
+        lv_label_set_text(none_lbl, "No clients - move closer or wait for traffic");
         lv_obj_set_style_text_color(none_lbl, lv_color_make(130, 130, 130), 0);
         lv_obj_set_style_text_font(none_lbl, &lv_font_montserrat_12, 0);
         return;
@@ -23922,7 +23922,7 @@ static void s_sd_remount_done_cb(void *arg)
             snprintf(buf, sizeof(buf), "Mounted @ %lu MHz",
                      (unsigned long)(r->freq_khz / 1000));
         else
-            snprintf(buf, sizeof(buf), "Failed — card not responding.\n"
+            snprintf(buf, sizeof(buf), "Failed - card not responding.\n"
                      "Eject and reinsert, then retry.");
         lv_label_set_text(s_sd_remount_status, buf);
         lv_obj_set_style_text_color(s_sd_remount_status,
@@ -29783,7 +29783,7 @@ static void show_hid_decode_screen(void)
             }
         }
     }
-    if (!found_map) lv_textarea_set_text(map_ta, "0x2A4B not found — re-walk needed");
+    if (!found_map) lv_textarea_set_text(map_ta, "0x2A4B not found - re-walk needed");
 
     /* Live stream header */
     lv_obj_t *stream_hdr = lv_label_create(function_page);
@@ -29818,12 +29818,12 @@ static void show_hid_decode_screen(void)
         }
         if (hid_subscribed) {
             gw_set_int_notify_cb(hid_notify_cb, NULL);
-            lv_textarea_set_text(hid_log_ta, "Subscribed — press keys on device...\n");
+            lv_textarea_set_text(hid_log_ta, "Subscribed - press keys on device...\n");
         } else {
             lv_textarea_set_text(hid_log_ta, "No HID Input Report chr found.");
         }
     } else {
-        lv_textarea_set_text(hid_log_ta, "Not connected — re-walk to reconnect.");
+        lv_textarea_set_text(hid_log_ta, "Not connected - re-walk to reconnect.");
     }
 
     hid_notif_head = 0; hid_notif_count = 0; hid_notif_dirty = false;
@@ -30184,7 +30184,7 @@ static void show_ble_mitm_screen(void)
     /* Connection mode info */
     lv_obj_t *mode_lbl = lv_label_create(function_page);
     lv_label_set_text(mode_lbl,
-        gw_is_connected() ? LV_SYMBOL_WIFI " Active — relaying traffic"
+        gw_is_connected() ? LV_SYMBOL_WIFI " Active - relaying traffic"
                           : LV_SYMBOL_WARNING " Reconnecting to target...");
     lv_obj_set_style_text_font(mode_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(mode_lbl,
@@ -30239,7 +30239,7 @@ static void show_ble_mitm_screen(void)
         }
         lv_textarea_set_text(mitm_log_ta, "Subscribed to all notify chars.\nLogging to /sdcard/lab/ble/mitm/session.log\n");
     } else {
-        lv_textarea_set_text(mitm_log_ta, "Not connected — go back and re-walk first.");
+        lv_textarea_set_text(mitm_log_ta, "Not connected - go back and re-walk first.");
     }
 
     mitm_poll_tmr = lv_timer_create(mitm_log_poll, 300, NULL);
@@ -43293,7 +43293,7 @@ static void show_cc1101_replay_screen(void)
 
     // Status
     s_cc1101_rep_status = lv_label_create(card);
-    lv_label_set_text(s_cc1101_rep_status, "Ready — tap a repeat count");
+    lv_label_set_text(s_cc1101_rep_status, "Ready - tap a repeat count");
     lv_obj_set_style_text_font(s_cc1101_rep_status, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_cc1101_rep_status, lv_color_hex(0x66BB6A), 0);
 
@@ -44656,7 +44656,7 @@ static void show_cc1101_foxhunt_screen(void)
     s_fox_haptic_ctr = 0;
 
     if (!cc1101_is_init() && cc1101_init() != ESP_OK) {
-        s_cc1101_stub_screen("Fox Hunt — No CC1101",
+        s_cc1101_stub_screen("Fox Hunt - No CC1101",
                              "Check DIP 1 ON.\nRun HW Test first.");
         return;
     }
@@ -47376,6 +47376,7 @@ static int         s_lf_uid_len     = 0;
 static volatile bool s_lf_result_ready = false;
 static volatile bool s_lf_result_ok    = false;
 static volatile bool s_lf_mode_ok      = false;
+static int64_t       s_lf_scan_deadline = 0;  /* esp_timer_get_time() deadline for retry loop */
 
 /* Forward declarations */
 static void show_cham_lf_read_screen(void);
@@ -47402,7 +47403,7 @@ static void s_lf_save_cb(lv_event_t *e)
 
     FILE *f = fopen(path, "w");
     if (!f) {
-        if (s_lf_status_lbl) lv_label_set_text(s_lf_status_lbl, "Save failed — SD error");
+        if (s_lf_status_lbl) lv_label_set_text(s_lf_status_lbl, "Save failed - SD error");
         return;
     }
     fprintf(f, "Filetype: Flipper RFID key\nVersion: 1\n");
@@ -47445,16 +47446,24 @@ static void s_lf_scan_again_cb(lv_event_t *e)
 
 static void s_lf_on_scan_result(bool ok, const uint8_t *data, uint16_t dlen)
 {
-    s_lf_result_ok = ok;
     if (ok && data && dlen >= 5) {
-        /* Standard EM410X: 5-byte UID */
+        /* Card found - copy UID and signal the poll timer */
         int copy = (dlen < 5) ? (int)dlen : 5;
         memcpy(s_lf_uid, data, copy);
-        s_lf_uid_len = copy;
+        s_lf_uid_len      = copy;
+        s_lf_result_ok    = true;
+        s_lf_result_ready = true;
+    } else if (esp_timer_get_time() < s_lf_scan_deadline) {
+        /* No card yet, still within 7-second window - retry immediately.
+         * scanEM410Xtag returns quickly when no card is present; the
+         * ChameleonUltraGUI sends no data and relies on app-level retry. */
+        cham_send_cmd_ex(3000, NULL, 0, s_lf_on_scan_result, 2000000LL);
     } else {
-        s_lf_uid_len = 0;
+        /* Scan window expired - report failure to poll timer */
+        s_lf_uid_len      = 0;
+        s_lf_result_ok    = false;
+        s_lf_result_ready = true;
     }
-    s_lf_result_ready = true;
 }
 
 /* ── LF read: mode-set callback — on success, start the card scan ── */
@@ -47467,11 +47476,10 @@ static void s_lf_on_mode_set(bool ok, const uint8_t *data, uint16_t dlen)
         s_lf_result_ready = true; /* let timer pick up the failure */
         return;
     }
-    /* Send 3000 ms scan duration as 2-byte big-endian uint16 (required by protocol).
-     * Without this field the Chameleon uses a zero/default timeout and returns
-     * "no tag found" almost instantly even when a card is present. */
-    static const uint8_t scan_tm[2] = { 0x0B, 0xB8 }; /* 0x0BB8 = 3000 ms */
-    cham_send_cmd_ex(3000, scan_tm, 2, s_lf_on_scan_result, 8000000LL);
+    /* Start 7-second scan window; s_lf_on_scan_result retries on each "no card"
+     * response until the deadline expires.  No data field - protocol sends dlen=0. */
+    s_lf_scan_deadline = esp_timer_get_time() + 7000000LL;
+    cham_send_cmd_ex(3000, NULL, 0, s_lf_on_scan_result, 2000000LL);
 }
 
 /* ── LF read: 50 ms poll timer ── */
@@ -48497,7 +48505,7 @@ static void show_rf433_foxhunt_screen(void)
     y += 26;
 
     lv_obj_t *note = lv_label_create(function_page);
-    lv_label_set_text(note, "Activity level only — no true RSSI");
+    lv_label_set_text(note, "Activity level only - no true RSSI");
     lv_obj_set_style_text_font(note, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(note, lv_color_hex(0x78909C), 0);
     lv_obj_align(note, LV_ALIGN_TOP_MID, 0, y);
@@ -49704,7 +49712,7 @@ static void s_rfid_kt_scan_and_start_cb(lv_event_t *e)
     // Quick blocking scan — 3s timeout
     rfid_err_t r = rfid_manager_scan_card(s_rfid_kt_card, 3000);
     if (r != RFID_OK) {
-        if (s_rfid_kt_status) lv_label_set_text(s_rfid_kt_status, "No card — try again");
+        if (s_rfid_kt_status) lv_label_set_text(s_rfid_kt_status, "No card - try again");
         return;
     }
     if (s_rfid_kt_card->protocol != RFID_PROTO_MIFARE_CLASSIC_1K &&
@@ -52382,9 +52390,9 @@ static void espnow_refresh_cb(lv_timer_t *t)
         portEXIT_CRITICAL(&espnow_mux);
         char buf[48];
         if (espnow_scout_active)
-            snprintf(buf, sizeof(buf), "Hopping ch%d  —  %d device(s)", espnow_current_ch, cnt);
+            snprintf(buf, sizeof(buf), "Hopping ch%d - %d device(s)", espnow_current_ch, cnt);
         else
-            snprintf(buf, sizeof(buf), "Stopped  —  %d device(s)", cnt);
+            snprintf(buf, sizeof(buf), "Stopped - %d device(s)", cnt);
         lv_label_set_text(espnow_status_lbl, buf);
     }
     espnow_rebuild_list();
@@ -52685,7 +52693,7 @@ static void espnow_pktlog_export_cb(lv_event_t *ev)
     FILE *f = fopen(path, "w");
     if (!f) {
         if (espnow_pl_status && lv_obj_is_valid(espnow_pl_status))
-            lv_label_set_text(espnow_pl_status, "Export failed — check SD");
+            lv_label_set_text(espnow_pl_status, "Export failed - check SD");
         return;
     }
 
@@ -52766,7 +52774,7 @@ static void espnow_pktlog_rebuild(void)
 
     if (count == 0) {
         lv_obj_t *ph = lv_label_create(espnow_pl_list);
-        lv_label_set_text(ph, "No packets yet — waiting...");
+        lv_label_set_text(ph, "No packets yet - waiting...");
         lv_obj_set_style_text_color(ph, lv_color_make(100, 100, 100), 0);
         lv_obj_set_style_text_font(ph, &lv_font_montserrat_12, 0);
         return;
