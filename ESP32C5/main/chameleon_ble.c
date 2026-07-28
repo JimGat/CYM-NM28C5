@@ -459,91 +459,106 @@ static int s_gap_cb(struct ble_gap_event *event, void *arg)
 static int s_scan_gap_cb(struct ble_gap_event *event, void *arg)
 {
     (void)arg;
-    if (event->type == BLE_GAP_EVENT_DISC) {
-        const struct ble_gap_disc_desc *desc = &event->disc;
-        struct ble_hs_adv_fields fields;
 
-        /* Parse AD fields — tolerate parse failure (still might match by UUID) */
-        bool parsed = (ble_hs_adv_parse_fields(&fields, desc->data,
-                                                desc->length_data) == 0);
+    /* Extract common fields from either extended or legacy disc event.
+     * ble_gap_ext_disc() delivers ALL PDUs (legacy + extended) as EXT_DISC,
+     * so the DISC branch is a safety fallback only. */
+    const uint8_t *adv_data = NULL;
+    uint8_t        adv_len  = 0;
+    ble_addr_t     addr     = {0};
+    int8_t         rssi     = 0;
 
-        /* Primary filter: NUS service UUID in advertisement (128-bit list).
-         * The Chameleon always advertises the NUS service UUID; this is more
-         * reliable than name matching (name may be in scan response only,
-         * or may be user-renamed). */
-        bool has_nus = false;
-        if (parsed && fields.uuids128 != NULL) {
-            for (int i = 0; i < fields.num_uuids128; i++) {
-                if (ble_uuid_cmp(&fields.uuids128[i].u, &s_nus_svc_uuid.u) == 0) {
-                    has_nus = true;
-                    break;
-                }
-            }
-        }
-
-        /* Secondary filter: device name starts with "Chameleon" (handles any
-         * renamed device and catches the name whether in adv or scan response) */
-        char name[32] = {0};
-        bool has_cham_name = false;
-        if (parsed && fields.name && fields.name_len > 0) {
-            int nlen = (fields.name_len < 31) ? fields.name_len : 31;
-            memcpy(name, fields.name, nlen);
-            has_cham_name = (strncmp(name, "Chameleon", 9) == 0);
-        }
-
-        if (!has_nus && !has_cham_name) return 0;
-
-        /* If found by UUID but name is unknown, use a placeholder */
-        if (name[0] == '\0') {
-            char addr_str[18];
-            snprintf(addr_str, sizeof(addr_str), "%02X:%02X:%02X:%02X:%02X:%02X",
-                     desc->addr.val[0], desc->addr.val[1], desc->addr.val[2],
-                     desc->addr.val[3], desc->addr.val[4], desc->addr.val[5]);
-            snprintf(name, sizeof(name), "Chameleon [%s]", addr_str + 9); /* last 3 octets */
-        }
-
-        /* Deduplicate by address; update RSSI and name if already seen */
-        for (int i = 0; i < s_scan_count; i++) {
-            if (memcmp(s_scan_results[i].addr, desc->addr.val, 6) == 0) {
-                s_scan_results[i].rssi = desc->rssi;
-                if (has_cham_name && s_scan_results[i].name[0] == 'C' &&
-                    s_scan_results[i].name[9] == '[') {
-                    /* Replace placeholder with real name */
-                    strlcpy(s_scan_results[i].name, name, sizeof(s_scan_results[i].name));
-                    s_changed = true;
-                }
-                return 0;
-            }
-        }
-
-        if (s_scan_count < CHAM_MAX_SCAN) {
-            cham_scan_result_t *r = &s_scan_results[s_scan_count];
-            strlcpy(r->name, name, sizeof(r->name));
-            memcpy(r->addr, desc->addr.val, 6);
-            r->addr_type = desc->addr.type;
-            r->rssi      = desc->rssi;
-            /* Lite detection: name contains "Lite", or confirmed via getDeviceType later */
-            r->is_lite   = (strstr(name, "Lite") != NULL);
-            s_scan_count++;
-            s_changed = true;
-            ESP_LOGI(TAG, "Found Chameleon: \"%s\" addr=%02X:%02X:%02X:%02X:%02X:%02X RSSI=%d "
-                     "(by %s)", name,
-                     desc->addr.val[0], desc->addr.val[1], desc->addr.val[2],
-                     desc->addr.val[3], desc->addr.val[4], desc->addr.val[5],
-                     desc->rssi, has_nus ? "NUS UUID" : "name");
-        }
+    if (event->type == BLE_GAP_EVENT_EXT_DISC) {
+        const struct ble_gap_ext_disc_desc *d = &event->ext_disc;
+        adv_data = d->data;
+        adv_len  = (uint8_t)(d->length_data < 255 ? d->length_data : 255);
+        addr     = d->addr;
+        rssi     = d->rssi;
+    } else if (event->type == BLE_GAP_EVENT_DISC) {
+        const struct ble_gap_disc_desc *d = &event->disc;
+        adv_data = d->data;
+        adv_len  = d->length_data;
+        addr     = d->addr;
+        rssi     = d->rssi;
     } else if (event->type == BLE_GAP_EVENT_DISC_COMPLETE) {
-        /* Continuous scan — restart unless stopped */
+        /* Restart if still scanning (fires on timeout or external cancel) */
         if (s_state == CHAM_STATE_SCANNING) {
-            struct ble_gap_disc_params dp = {
-                .itvl = 0x60, .window = 0x60,
-                .filter_policy   = BLE_HCI_SCAN_FILT_NO_WL,
-                .limited         = 0,
-                .passive         = 0,
-                .filter_duplicates = 0,
+            struct ble_gap_ext_disc_params ep = {
+                .itvl = 0x60, .window = 0x60, .passive = 0,
             };
-            ble_gap_disc(BLE_OWN_ADDR_PUBLIC, 5000, &dp, s_scan_gap_cb, NULL);
+            ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 500, 0,
+                             0, BLE_HCI_SCAN_FILT_NO_WL, 0,
+                             &ep, NULL, s_scan_gap_cb, NULL);
         }
+        return 0;
+    } else {
+        return 0;
+    }
+
+    struct ble_hs_adv_fields fields;
+    bool parsed = (adv_data && adv_len > 0 &&
+                   ble_hs_adv_parse_fields(&fields, adv_data, adv_len) == 0);
+
+    /* Primary filter: NUS service UUID in advertisement (128-bit list).
+     * The Chameleon always advertises the NUS service UUID; this is more
+     * reliable than name matching (name may be in scan response only,
+     * or may be user-renamed). */
+    bool has_nus = false;
+    if (parsed && fields.uuids128 != NULL) {
+        for (int i = 0; i < fields.num_uuids128; i++) {
+            if (ble_uuid_cmp(&fields.uuids128[i].u, &s_nus_svc_uuid.u) == 0) {
+                has_nus = true;
+                break;
+            }
+        }
+    }
+
+    /* Secondary filter: device name starts with "Chameleon" (handles any
+     * renamed device and catches the name whether in adv or scan response) */
+    char name[32] = {0};
+    bool has_cham_name = false;
+    if (parsed && fields.name && fields.name_len > 0) {
+        int nlen = (fields.name_len < 31) ? fields.name_len : 31;
+        memcpy(name, fields.name, nlen);
+        has_cham_name = (strncmp(name, "Chameleon", 9) == 0);
+    }
+
+    if (!has_nus && !has_cham_name) return 0;
+
+    /* If found by UUID but name is unknown, use a placeholder */
+    if (name[0] == '\0') {
+        snprintf(name, sizeof(name), "Chameleon [%02X:%02X:%02X]",
+                 addr.val[3], addr.val[4], addr.val[5]);
+    }
+
+    /* Deduplicate by address; update RSSI and name if already seen */
+    for (int i = 0; i < s_scan_count; i++) {
+        if (memcmp(s_scan_results[i].addr, addr.val, 6) == 0) {
+            s_scan_results[i].rssi = rssi;
+            if (has_cham_name && s_scan_results[i].name[0] == 'C' &&
+                s_scan_results[i].name[9] == '[') {
+                /* Replace placeholder with real name */
+                strlcpy(s_scan_results[i].name, name, sizeof(s_scan_results[i].name));
+                s_changed = true;
+            }
+            return 0;
+        }
+    }
+
+    if (s_scan_count < CHAM_MAX_SCAN) {
+        cham_scan_result_t *r = &s_scan_results[s_scan_count];
+        strlcpy(r->name, name, sizeof(r->name));
+        memcpy(r->addr, addr.val, 6);
+        r->addr_type = addr.type;
+        r->rssi      = rssi;
+        r->is_lite   = (strstr(name, "Lite") != NULL);
+        s_scan_count++;
+        s_changed = true;
+        ESP_LOGI(TAG, "Found Chameleon: \"%s\" addr=%02X:%02X:%02X:%02X:%02X:%02X RSSI=%d "
+                 "(by %s)", name,
+                 addr.val[0], addr.val[1], addr.val[2],
+                 addr.val[3], addr.val[4], addr.val[5],
+                 rssi, has_nus ? "NUS UUID" : "name");
     }
     return 0;
 }
@@ -609,19 +624,18 @@ void cham_scan_start(void)
     s_connect_idx = -1;
     memset(s_scan_results, 0, sizeof(s_scan_results));
 
-    struct ble_gap_disc_params dp = {
-        .itvl            = 0x60,
-        .window          = 0x60,
-        .filter_policy   = BLE_HCI_SCAN_FILT_NO_WL,
-        .limited         = 0,
-        .passive         = 0,
-        .filter_duplicates = 0,
+    /* Use extended discovery — catches both BLE 5 extended PDUs and legacy PDUs.
+     * ble_gap_disc() (legacy only) misses devices that advertise via extended PDUs. */
+    struct ble_gap_ext_disc_params ep = {
+        .itvl = 0x60, .window = 0x60, .passive = 0,
     };
 
     /* Cancel any ongoing scan before starting ours */
     ble_gap_disc_cancel();
 
-    int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, 5000, &dp, s_scan_gap_cb, NULL);
+    int rc = ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 500, 0,
+                              0, BLE_HCI_SCAN_FILT_NO_WL, 0,
+                              &ep, NULL, s_scan_gap_cb, NULL);
     if (rc == 0 || rc == BLE_HS_EALREADY) {
         s_state = CHAM_STATE_SCANNING;
         strlcpy(s_status_msg, "Scanning...", sizeof(s_status_msg));
