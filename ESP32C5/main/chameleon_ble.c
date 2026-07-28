@@ -456,11 +456,18 @@ static int s_gap_cb(struct ble_gap_event *event, void *arg)
         break;
 
     case BLE_GAP_EVENT_ENC_CHANGE:
-        ESP_LOGD(TAG, "Encryption changed: status=%d", event->enc_change.status);
+        ESP_LOGI(TAG, "Encryption changed: status=%d state=%d",
+                 event->enc_change.status, (int)s_state);
         if (event->enc_change.status == 0) {
-            /* Pairing (or re-encryption) succeeded */
-            if (s_state == CHAM_STATE_PAIRING) {
-                s_ev_enc_ok = true; /* poll() will restart service discovery */
+            /* Encryption established — restart discovery from scratch.
+             * Covers two cases:
+             *   (a) PAIRING: user confirmed numeric comparison
+             *   (b) DISCOVERING: Just Works / silent pairing happened while
+             *       disc_all_svcs was in flight; the ATT request was quietly
+             *       rejected; we need to re-issue it now that the link is encrypted */
+            if (s_state == CHAM_STATE_PAIRING ||
+                s_state == CHAM_STATE_DISCOVERING) {
+                s_ev_enc_ok = true;
             }
         } else {
             /* Pairing failed — the peer will typically disconnect next */
@@ -843,11 +850,13 @@ bool cham_poll(void)
 
     if (s_ev_enc_ok) {
         s_ev_enc_ok = false;
-        /* Pairing complete — reset discovery state and restart from scratch */
+        /* Encryption is up — reset GATT discovery state and restart.
+         * Works for both explicit pairing (PAIRING state) and silent
+         * Just Works pairing that happened while discovery was in flight. */
         s_svc_start  = 0; s_svc_end  = 0;
         s_tx_val_hdl = 0; s_rx_val_hdl = 0; s_cccd_hdl = 0;
         s_state = CHAM_STATE_DISCOVERING;
-        strlcpy(s_status_msg, "Paired! Discovering services...", sizeof(s_status_msg));
+        strlcpy(s_status_msg, "Discovering services...", sizeof(s_status_msg));
         ble_gattc_disc_all_svcs(s_conn_handle, s_svc_disc_cb, NULL);
         changed = true;
     }
