@@ -37033,6 +37033,18 @@ static char        s_spoof_opid[21]    = "FAKE-OPERATOR";
 static char        s_spoof_lat_str[16] = "0.0";
 static char        s_spoof_lon_str[16] = "-160.0";
 static char        s_spoof_alt_str[16] = "100.0";
+// Single-field pager state (replaces scrollable form)
+static int         s_spoof_field_idx      = 0;
+static lv_obj_t   *s_spoof_field_lbl_top  = NULL;   /* "UAS ID (max 20 ch):" label */
+static lv_obj_t   *s_spoof_idx_lbl        = NULL;   /* "1 / 5" pager indicator */
+static const char *const s_spoof_field_names[] = {
+    "UAS ID (max 20 ch):",
+    "Operator ID (max 20 ch):",
+    "Latitude (decimal deg):",
+    "Longitude (decimal deg):",
+    "Altitude MSL (metres):",
+};
+static const uint8_t s_spoof_field_maxlen[] = { 20, 20, 15, 15, 15 };
 
 // ── OpenDroneID message encoders ─────────────────────────────────────────────
 
@@ -37236,40 +37248,65 @@ static void drone_spoof_timer_cb(lv_timer_t *t)
 
 // ── Input helpers — sync active textarea to state on keyboard close ───────────
 
+/* Save the text of the currently displayed textarea to its backing string. */
+static void spoof_save_current_field(void)
+{
+    if (!s_spoof_ta_uasid) return;
+    const char *txt = lv_textarea_get_text(s_spoof_ta_uasid);
+    switch (s_spoof_field_idx) {
+        case 0: strncpy(s_spoof_uasid,   txt, 20); s_spoof_uasid[20]   = '\0'; break;
+        case 1: strncpy(s_spoof_opid,    txt, 20); s_spoof_opid[20]    = '\0'; break;
+        case 2: strncpy(s_spoof_lat_str, txt, 15); s_spoof_lat_str[15] = '\0'; break;
+        case 3: strncpy(s_spoof_lon_str, txt, 15); s_spoof_lon_str[15] = '\0'; break;
+        default: strncpy(s_spoof_alt_str, txt, 15); s_spoof_alt_str[15] = '\0'; break;
+    }
+}
+
+/* Sync all backing strings before broadcasting — only one textarea exists. */
 static void spoof_sync_fields(void)
 {
-    if (s_spoof_ta_uasid) strncpy(s_spoof_uasid,    lv_textarea_get_text(s_spoof_ta_uasid), 20);
-    if (s_spoof_ta_opid)  strncpy(s_spoof_opid,     lv_textarea_get_text(s_spoof_ta_opid),  20);
-    if (s_spoof_ta_lat)   strncpy(s_spoof_lat_str,  lv_textarea_get_text(s_spoof_ta_lat),   15);
-    if (s_spoof_ta_lon)   strncpy(s_spoof_lon_str,  lv_textarea_get_text(s_spoof_ta_lon),   15);
-    if (s_spoof_ta_alt)   strncpy(s_spoof_alt_str,  lv_textarea_get_text(s_spoof_ta_alt),   15);
-    s_spoof_uasid[20]   = '\0';
-    s_spoof_opid[20]    = '\0';
-    s_spoof_lat_str[15] = '\0';
-    s_spoof_lon_str[15] = '\0';
-    s_spoof_alt_str[15] = '\0';
+    spoof_save_current_field();
 }
 
-/* Tap any textarea → bind keyboard + show it */
-static void spoof_ta_click_cb(lv_event_t *e)
+/* Load field idx into the single textarea and update label + pager indicator. */
+static void spoof_load_field(int idx)
 {
-    s_spoof_active_ta = lv_event_get_target(e);
-    if (s_spoof_kb) {
-        lv_keyboard_set_textarea(s_spoof_kb, s_spoof_active_ta);
-        lv_obj_clear_flag(s_spoof_kb, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_move_foreground(s_spoof_kb);
+    s_spoof_field_idx = idx;
+    if (!s_spoof_ta_uasid) return;
+    const char *txt;
+    switch (idx) {
+        case 0: txt = s_spoof_uasid;   break;
+        case 1: txt = s_spoof_opid;    break;
+        case 2: txt = s_spoof_lat_str; break;
+        case 3: txt = s_spoof_lon_str; break;
+        default: txt = s_spoof_alt_str; break;
     }
+    lv_textarea_set_max_length(s_spoof_ta_uasid, s_spoof_field_maxlen[idx]);
+    lv_textarea_set_text(s_spoof_ta_uasid, txt);
+    lv_textarea_set_cursor_pos(s_spoof_ta_uasid, LV_TEXTAREA_CURSOR_LAST);
+    if (s_spoof_field_lbl_top)
+        lv_label_set_text(s_spoof_field_lbl_top, s_spoof_field_names[idx]);
+    if (s_spoof_idx_lbl)
+        lv_label_set_text_fmt(s_spoof_idx_lbl, "%d / 5", idx + 1);
 }
 
-/* Keyboard Ready (✓) or Cancel (×) → hide keyboard, sync fields */
+/* Prev/Next field navigation; user_data = delta (-1, 0=jump-to-first, +1). */
+static void spoof_field_nav_cb(lv_event_t *e)
+{
+    int delta = (int)(intptr_t)lv_event_get_user_data(e);
+    spoof_save_current_field();
+    if (delta == 0)
+        spoof_load_field(0);
+    else
+        spoof_load_field((s_spoof_field_idx + delta + 5) % 5);
+}
+
+/* Keyboard ✓ (Ready) → auto-advance to next field. */
 static void spoof_kb_event_cb(lv_event_t *e)
 {
-    lv_event_code_t code = lv_event_get_code(e);
-    if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
-        if (s_spoof_kb) lv_obj_add_flag(s_spoof_kb, LV_OBJ_FLAG_HIDDEN);
-        spoof_sync_fields();
-        s_spoof_active_ta = NULL;
-    }
+    (void)e;
+    spoof_save_current_field();
+    spoof_load_field((s_spoof_field_idx + 1) % 5);
 }
 
 // ── Mode toggle ───────────────────────────────────────────────────────────────
@@ -37297,7 +37334,7 @@ static void spoof_start_btn_cb(lv_event_t *e)
         s_spoof_active = false;
         if (s_spoof_timer) { lv_timer_del(s_spoof_timer); s_spoof_timer = NULL; }
         if (!s_spoof_use_wifi) drone_spoof_ble_stop();
-        if (s_spoof_status_lbl) lv_label_set_text(s_spoof_status_lbl, "Idle — configure fields and press Start");
+        if (s_spoof_status_lbl) lv_label_set_text(s_spoof_status_lbl, "Idle: configure fields, then press Start");
         if (s_spoof_start_btn) {
             lv_obj_set_style_bg_color(s_spoof_start_btn, lv_color_hex(0x1B5E20), LV_STATE_DEFAULT);
             lv_obj_t *lbl = lv_obj_get_child(s_spoof_start_btn, -1);
@@ -37353,86 +37390,51 @@ static void drone_spoof_stop(void)
     s_spoof_ta_lat     = NULL;
     s_spoof_ta_lon     = NULL;
     s_spoof_ta_alt     = NULL;
-    s_spoof_start_btn  = NULL;
-    s_spoof_mode_lbl   = NULL;
-    s_spoof_active_ta  = NULL;
+    s_spoof_start_btn      = NULL;
+    s_spoof_mode_lbl       = NULL;
+    s_spoof_active_ta      = NULL;
+    s_spoof_field_lbl_top  = NULL;
+    s_spoof_idx_lbl        = NULL;
 }
 
 // ── Drone Spoof screen ────────────────────────────────────────────────────────
 
 /* Helper: create a labelled textarea inside the form container.
  * Returns the newly created textarea. */
-static lv_obj_t *spoof_add_field(lv_obj_t *parent, const char *label_txt,
-                                  const char *initial, uint8_t maxlen)
-{
-    /* Field label */
-    lv_obj_t *lbl = lv_label_create(parent);
-    lv_label_set_text(lbl, label_txt);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(lbl, lv_color_hex(0x90CAF9), 0);   /* light-blue label */
-    lv_obj_set_width(lbl, lv_pct(100));
-
-    /* Textarea — styled to match the BT scan save overlay reference */
-    lv_obj_t *ta = lv_textarea_create(parent);
-    lv_obj_set_width(ta, lv_pct(100));
-    lv_obj_set_height(ta, 36);
-    lv_textarea_set_one_line(ta, true);
-    lv_textarea_set_max_length(ta, maxlen);
-    lv_textarea_set_text(ta, initial);
-    lv_obj_set_style_text_font(ta, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_bg_color(ta, ui_bg_color(), 0);
-    lv_obj_set_style_text_color(ta, ui_text_color(), 0);
-    lv_obj_set_style_border_color(ta, ui_accent_color(), 0);
-
-    /* Flashing block cursor — matches project standard (BT scan save reference) */
-    lv_obj_set_style_bg_opa(ta,      LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
-    lv_obj_set_style_border_color(ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
-    lv_obj_set_style_border_width(ta, 2,             LV_PART_CURSOR | LV_STATE_FOCUSED);
-    lv_obj_set_style_border_side(ta,  LV_BORDER_SIDE_LEFT, LV_PART_CURSOR | LV_STATE_FOCUSED);
-
-    lv_obj_add_event_cb(ta, spoof_ta_click_cb, LV_EVENT_CLICKED, NULL);
-    return ta;
-}
-
+/* Single-field layout: keyboard permanently docked at bottom, one textarea visible
+ * at a time. Prev/Next buttons cycle through the 5 fields. No scrolling. */
 static void show_drone_spoof_screen(void)
 {
+    s_spoof_field_idx = 0;
+
     create_function_page_base("Drone Spoof");
     g_screen_stop_fn = drone_spoof_stop;
     g_screen_back_fn = show_drone_stuff_screen;
 
-    /* ── Status label (top of page) — uses g_font_icon12 to render FA glyphs ── */
+    /* ── Status label ── */
     s_spoof_status_lbl = lv_label_create(function_page);
-    lv_label_set_text(s_spoof_status_lbl, "Idle — configure fields and press Start");
+    lv_label_set_text(s_spoof_status_lbl, "Idle: configure fields, then press Start");
     lv_obj_set_style_text_font(s_spoof_status_lbl, &g_font_icon12, 0);
     lv_obj_set_style_text_color(s_spoof_status_lbl, lv_color_hex(0x66BB6A), 0);
     lv_obj_set_width(s_spoof_status_lbl, lv_pct(100));
     lv_obj_set_style_text_align(s_spoof_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(s_spoof_status_lbl, LV_ALIGN_TOP_MID, 0, 32);
 
-    /* ── Scrollable form container ── */
-    lv_obj_t *form = lv_obj_create(function_page);
-    lv_obj_set_size(form, lv_pct(100), LCD_V_RES - 30 - 22 - 2);
-    lv_obj_align(form, LV_ALIGN_TOP_MID, 0, 56);
-    lv_obj_set_style_bg_opa(form, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(form, 0, 0);
-    lv_obj_set_style_pad_all(form, 4, 0);
-    lv_obj_set_style_pad_gap(form, 4, 0);
-    lv_obj_set_flex_flow(form, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(form, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
-    lv_obj_set_scrollbar_mode(form, LV_SCROLLBAR_MODE_AUTO);
-
     /* ── Mode toggle row ── */
-    lv_obj_t *mode_row = lv_obj_create(form);
-    lv_obj_set_size(mode_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_t *mode_row = lv_obj_create(function_page);
+    lv_obj_set_size(mode_row, lv_pct(100), 26);
+    lv_obj_align(mode_row, LV_ALIGN_TOP_MID, 0, 50);
     lv_obj_set_style_bg_opa(mode_row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(mode_row, 0, 0);
     lv_obj_set_style_pad_all(mode_row, 0, 0);
     lv_obj_set_flex_flow(mode_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(mode_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_gap(mode_row, 6, 0);
+    lv_obj_set_flex_align(mode_row, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(mode_row, 8, 0);
+    lv_obj_clear_flag(mode_row, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *mode_btn = lv_btn_create(mode_row);
-    lv_obj_set_size(mode_btn, 60, 26);
+    lv_obj_set_size(mode_btn, 60, 24);
     lv_obj_set_style_bg_color(mode_btn, lv_color_hex(0x1B5E20), LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(mode_btn, 0, 0);
     lv_obj_set_style_radius(mode_btn, 6, 0);
@@ -37447,52 +37449,118 @@ static void show_drone_spoof_screen(void)
                       s_spoof_use_wifi
                           ? LV_SYMBOL_WIFI "  WiFi beacon (ch 6)"
                           : MY_SYMBOL_BLUETOOTH_B "  BLE (UUID 0xFFFA)");
-    lv_obj_set_style_text_font(s_spoof_mode_lbl, &g_font_icon12, 0);  /* FA glyph needs icon12 */
+    lv_obj_set_style_text_font(s_spoof_mode_lbl, &g_font_icon12, 0);
     lv_obj_set_style_text_color(s_spoof_mode_lbl, lv_color_hex(0xFFCA28), 0);
 
-    /* ── Input fields ── */
-    s_spoof_ta_uasid = spoof_add_field(form, "UAS ID (20 chars max):",
-                                        s_spoof_uasid, 20);
-    s_spoof_ta_opid  = spoof_add_field(form, "Operator ID (20 chars max):",
-                                        s_spoof_opid, 20);
-    s_spoof_ta_lat   = spoof_add_field(form, "Latitude (decimal deg, e.g. 37.773972):",
-                                        s_spoof_lat_str, 15);
-    s_spoof_ta_lon   = spoof_add_field(form, "Longitude (decimal deg, e.g. -122.431297):",
-                                        s_spoof_lon_str, 15);
-    s_spoof_ta_alt   = spoof_add_field(form, "Altitude MSL (metres, e.g. 100.0):",
-                                        s_spoof_alt_str, 15);
+    /* ── Field label (which field is active) ── */
+    s_spoof_field_lbl_top = lv_label_create(function_page);
+    lv_label_set_text(s_spoof_field_lbl_top, s_spoof_field_names[0]);
+    lv_obj_set_style_text_font(s_spoof_field_lbl_top, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_spoof_field_lbl_top, lv_color_hex(0x90CAF9), 0);
+    lv_obj_set_width(s_spoof_field_lbl_top, lv_pct(100));
+    lv_obj_align(s_spoof_field_lbl_top, LV_ALIGN_TOP_MID, 0, 80);
+
+    /* ── Single textarea (one field at a time) ── */
+    s_spoof_ta_uasid = lv_textarea_create(function_page);
+    lv_obj_set_size(s_spoof_ta_uasid, lv_pct(100), 34);
+    lv_obj_align(s_spoof_ta_uasid, LV_ALIGN_TOP_MID, 0, 98);
+    lv_textarea_set_one_line(s_spoof_ta_uasid, true);
+    lv_textarea_set_max_length(s_spoof_ta_uasid, s_spoof_field_maxlen[0]);
+    lv_textarea_set_text(s_spoof_ta_uasid, s_spoof_uasid);
+    lv_textarea_set_cursor_pos(s_spoof_ta_uasid, LV_TEXTAREA_CURSOR_LAST);
+    lv_obj_set_style_text_font(s_spoof_ta_uasid, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(s_spoof_ta_uasid, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(s_spoof_ta_uasid, ui_text_color(), 0);
+    lv_obj_set_style_border_color(s_spoof_ta_uasid, ui_accent_color(), 0);
+    lv_obj_set_style_bg_opa(s_spoof_ta_uasid, LV_OPA_TRANSP,
+                             LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(s_spoof_ta_uasid, UI_ACCENT_CYAN,
+                                  LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(s_spoof_ta_uasid, 2,
+                                  LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(s_spoof_ta_uasid, LV_BORDER_SIDE_LEFT,
+                                 LV_PART_CURSOR | LV_STATE_FOCUSED);
+
+    /* ── Field navigation row: [◀ Prev] [1/5] [Next ▶] ── */
+    lv_obj_t *nav_row = lv_obj_create(function_page);
+    lv_obj_set_size(nav_row, lv_pct(100), 30);
+    lv_obj_align(nav_row, LV_ALIGN_TOP_MID, 0, 136);
+    lv_obj_set_style_bg_opa(nav_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(nav_row, 0, 0);
+    lv_obj_set_style_pad_hor(nav_row, 4, 0);
+    lv_obj_set_style_pad_ver(nav_row, 0, 0);
+    lv_obj_set_flex_flow(nav_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(nav_row, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(nav_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *prev_btn = lv_btn_create(nav_row);
+    lv_obj_set_size(prev_btn, 76, 28);
+    lv_obj_set_style_bg_color(prev_btn, lv_color_hex(0x1A237E), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(prev_btn, 6, 0);
+    lv_obj_t *prev_lbl = lv_label_create(prev_btn);
+    lv_label_set_text(prev_lbl, LV_SYMBOL_LEFT " Prev");
+    lv_obj_set_style_text_font(prev_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(prev_lbl, lv_color_white(), 0);
+    lv_obj_center(prev_lbl);
+    lv_obj_add_event_cb(prev_btn, spoof_field_nav_cb, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)-1);
+
+    lv_obj_t *idx_btn = lv_btn_create(nav_row);
+    lv_obj_set_size(idx_btn, 52, 28);
+    lv_obj_set_style_bg_color(idx_btn, lv_color_hex(0x37474F), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(idx_btn, 6, 0);
+    s_spoof_idx_lbl = lv_label_create(idx_btn);
+    lv_label_set_text(s_spoof_idx_lbl, "1 / 5");
+    lv_obj_set_style_text_font(s_spoof_idx_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_spoof_idx_lbl, lv_color_hex(0xFFCA28), 0);
+    lv_obj_center(s_spoof_idx_lbl);
+    lv_obj_add_event_cb(idx_btn, spoof_field_nav_cb, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)0);   /* tap indicator = jump to field 1 */
+
+    lv_obj_t *next_btn = lv_btn_create(nav_row);
+    lv_obj_set_size(next_btn, 76, 28);
+    lv_obj_set_style_bg_color(next_btn, lv_color_hex(0x1B5E20), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(next_btn, 6, 0);
+    lv_obj_t *next_lbl = lv_label_create(next_btn);
+    lv_label_set_text(next_lbl, "Next " LV_SYMBOL_RIGHT);
+    lv_obj_set_style_text_font(next_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(next_lbl, lv_color_white(), 0);
+    lv_obj_center(next_lbl);
+    lv_obj_add_event_cb(next_btn, spoof_field_nav_cb, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)+1);
 
     /* ── Start / Stop button ── */
-    s_spoof_start_btn = lv_btn_create(form);
-    lv_obj_set_size(s_spoof_start_btn, lv_pct(100), 36);
+    s_spoof_start_btn = lv_btn_create(function_page);
+    lv_obj_set_size(s_spoof_start_btn, lv_pct(100), 30);
+    lv_obj_align(s_spoof_start_btn, LV_ALIGN_TOP_MID, 0, 170);
     lv_obj_set_style_bg_color(s_spoof_start_btn, lv_color_hex(0x1B5E20), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(s_spoof_start_btn, lv_color_hex(0x2E7D32), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(s_spoof_start_btn, 0, 0);
     lv_obj_set_style_radius(s_spoof_start_btn, 8, 0);
     lv_obj_t *start_lbl = lv_label_create(s_spoof_start_btn);
     lv_label_set_text(start_lbl, LV_SYMBOL_PLAY " Start Broadcasting");
-    lv_obj_set_style_text_font(start_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(start_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(start_lbl, lv_color_white(), 0);
     lv_obj_center(start_lbl);
     lv_obj_add_event_cb(s_spoof_start_btn, spoof_start_btn_cb, LV_EVENT_CLICKED, NULL);
 
-    /* ── Keyboard — styled to match BT scan save reference ── */
+    /* ── Keyboard — always visible, pre-linked to textarea ── */
     s_spoof_kb = lv_keyboard_create(function_page);
-    lv_obj_set_size(s_spoof_kb, lv_pct(100), lv_pct(40));
+    lv_obj_set_size(s_spoof_kb, lv_pct(100), 114);
     lv_obj_align(s_spoof_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_keyboard_set_textarea(s_spoof_kb, s_spoof_ta_uasid);
     lv_keyboard_set_mode(s_spoof_kb, LV_KEYBOARD_MODE_TEXT_LOWER);
     lv_obj_set_style_text_font(s_spoof_kb, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_bg_color(s_spoof_kb, ui_bg_color(),    LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_spoof_kb, ui_bg_color(), LV_PART_MAIN);
     lv_obj_set_style_text_color(s_spoof_kb, ui_text_color(), LV_PART_MAIN);
     lv_obj_set_style_bg_color(s_spoof_kb, lv_color_make(0, 100, 0), LV_PART_ITEMS);
-    lv_obj_set_style_bg_color(s_spoof_kb, lv_color_make(0, 150, 0), LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_set_style_bg_color(s_spoof_kb, lv_color_make(0, 150, 0),
+                               LV_PART_ITEMS | LV_STATE_PRESSED);
     lv_obj_set_style_text_color(s_spoof_kb, ui_text_color(), LV_PART_ITEMS);
     lv_obj_set_style_border_color(s_spoof_kb, ui_border_color(), LV_PART_ITEMS);
     lv_obj_set_style_border_width(s_spoof_kb, 1, LV_PART_ITEMS);
-    lv_obj_add_flag(s_spoof_kb, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(s_spoof_kb, spoof_kb_event_cb, LV_EVENT_READY,         NULL);
-    lv_obj_add_event_cb(s_spoof_kb, spoof_kb_event_cb, LV_EVENT_CANCEL,        NULL);
-    lv_obj_add_event_cb(s_spoof_kb, spoof_kb_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(s_spoof_kb, spoof_kb_event_cb, LV_EVENT_READY, NULL);
 }
 
 // ── Drone Stuff submenu ───────────────────────────────────────────────────────
