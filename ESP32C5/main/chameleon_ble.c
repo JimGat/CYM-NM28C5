@@ -458,19 +458,28 @@ static int s_gap_cb(struct ble_gap_event *event, void *arg)
         }
         break;
 
-    case BLE_GAP_EVENT_ENC_CHANGE:
-        ESP_LOGI(TAG, "ENC_CHANGE: status=%d state=%d",
-                 event->enc_change.status, (int)s_state);
-        if (event->enc_change.status == 0) {
-            /* Encryption up — disc_all_svcs fires from cham_poll() */
+    case BLE_GAP_EVENT_ENC_CHANGE: {
+        uint16_t enc_st = (uint16_t)event->enc_change.status;
+        ESP_LOGI(TAG, "ENC_CHANGE: status=%d (0x%03x) state=%d",
+                 enc_st, enc_st, (int)s_state);
+        if (enc_st == 0) {
+            /* Encryption established — start GATT discovery */
+            s_ev_enc_ok = true;
+        } else if (enc_st >= 0x500 && enc_st <= 0x5FF) {
+            /* Peer rejected pairing (SM_PEER error 0x500..0x5FF, e.g. 0x505 =
+             * Pairing Not Supported).  Chameleon NUS is accessible without
+             * encryption — the connection is still open, try discovery now. */
+            ESP_LOGW(TAG, "ENC_CHANGE: peer rejected pairing (0x%03x) — NUS is open, trying discovery",
+                     enc_st);
             s_ev_enc_ok = true;
         } else {
-            ESP_LOGE(TAG, "ENC_CHANGE failed status=%d", event->enc_change.status);
+            ESP_LOGE(TAG, "ENC_CHANGE: hard failure status=0x%03x", enc_st);
             s_ev_error = true;
             snprintf(s_status_msg, sizeof(s_status_msg),
-                     "Pairing failed (%d)", event->enc_change.status);
+                     "Auth failed (0x%03x)", enc_st);
         }
         break;
+    }
 
     case BLE_GAP_EVENT_REPEAT_PAIRING: {
         /* Chameleon has a stale bond entry; we have none.  Delete theirs and
@@ -834,6 +843,10 @@ bool cham_poll(void)
             s_pend_cmd = 0xFFFF;
             s_pend_cb  = NULL;
             if (cb) cb(false, NULL, 0);
+        }
+        /* Terminate any lingering connection so Chameleon can advertise for next scan */
+        if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+            ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         }
         changed = true;
     }
