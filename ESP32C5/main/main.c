@@ -35370,13 +35370,17 @@ static esp_err_t bt_nimble_init(void)
     ble_hs_cfg.sync_cb = bt_on_sync;
     ble_hs_cfg.reset_cb = bt_on_reset;
 
-    // Security manager: Just Works pairing (needed for HoneyPair)
-    ble_hs_cfg.sm_io_cap       = BLE_SM_IO_CAP_DISP_YES_NO; /* enables numeric comparison */
-    ble_hs_cfg.sm_bonding      = 1;
-    ble_hs_cfg.sm_mitm         = 0;
-    ble_hs_cfg.sm_sc           = 1;
-    ble_hs_cfg.sm_our_key_dist  = BLE_SM_PAIR_KEY_DIST_ENC;
-    ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC;
+    /* Security manager: Just Works, no persistent bonds.
+     * NO_IO forces Just Works regardless of peer IO cap — no user confirmation
+     * needed, no passkey display, no stale-bond LTK mismatches.
+     * sm_bonding=0: pair fresh each session; avoids SMP timeout when Chameleon
+     * holds a bond entry we no longer have (partial bond after a failed attempt). */
+    ble_hs_cfg.sm_io_cap        = BLE_SM_IO_CAP_NO_IO;
+    ble_hs_cfg.sm_bonding       = 0;
+    ble_hs_cfg.sm_mitm          = 0;
+    ble_hs_cfg.sm_sc            = 1;
+    ble_hs_cfg.sm_our_key_dist  = 0;
+    ble_hs_cfg.sm_their_key_dist = 0;
 
     // GAP/GATT base services + feature service table (must precede host start)
     ble_svc_gap_init();
@@ -47228,11 +47232,13 @@ static void show_nrf24_futaba_screen(void)
 // NFC / RFID Hub — top-level submenu for PN532 and Chameleon Ultra
 // ─────────────────────────────────────────────────────────────────────────────
 
-/* Dismiss callback for the PN532 standalone wiring info popup. */
+/* Dismiss callback for the PN532 standalone wiring info popup.
+ * Deletes the overlay and continues to the RFID menu. */
 static void pn532_info_popup_dismiss_cb(lv_event_t *e)
 {
     lv_obj_t *overlay = (lv_obj_t *)lv_event_get_user_data(e);
     if (overlay) lv_obj_del(overlay);
+    show_rfid_menu_screen();
 }
 
 /* Info popup shown when user taps PN532 but NM-RF-HAT is not enabled.
@@ -47268,16 +47274,15 @@ static void show_pn532_standalone_info_popup(void)
 
     lv_obj_t *msg = lv_label_create(card);
     lv_label_set_text(msg,
-        "NM-RF-HAT not enabled.\n"
-        "A PN532 breakout can be\n"
-        "wired to CN1 directly:\n\n"
+        "No NM-RF-HAT detected.\n"
+        "A PN532 breakout wired\n"
+        "to CN1 will also work:\n\n"
         "  SCL -> GPIO 8\n"
         "  SDA -> GPIO 9\n"
         "  VCC -> 3.3 V\n"
         "  GND -> GND\n\n"
-        "Set PN532 to I2C mode.\n"
-        "Enable RF-HAT in Settings\n"
-        "for DIP switch guidance.");
+        "Set PN532 jumpers to\n"
+        "I2C mode before use.");
     lv_obj_set_style_text_font(msg, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(msg, lv_color_white(), 0);
     lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
@@ -47299,15 +47304,15 @@ static void show_pn532_standalone_info_popup(void)
 }
 
 /* PN532 tile callback.
- * RF-HAT enabled: remind user to flip DIP 3 before opening RFID menu.
- * RF-HAT disabled: go straight to RFID menu (standalone CN1 breakout). */
+ * RF-HAT enabled: DIP 3 reminder popup → RFID menu.
+ * RF-HAT disabled: wiring info popup → RFID menu (standalone CN1 breakout). */
 static void nfc_hub_pn532_cb(lv_event_t *e)
 {
     (void)e;
     if (g_rf_hat_enabled)
         show_dip_switch_popup(3, "PN532 RFID/NFC", show_rfid_menu_screen);
     else
-        show_rfid_menu_screen();
+        show_pn532_standalone_info_popup();
 }
 
 /* Chameleon tile callback. */

@@ -374,7 +374,23 @@ static int s_mtu_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
     } else {
         ESP_LOGW(TAG, "MTU exchange failed (%d), proceeding anyway", error->status);
     }
-    /* Start service discovery regardless */
+
+    /* Proactively initiate security BEFORE service discovery.
+     * If we call disc_all_svcs immediately, the Chameleon may reject the ATT
+     * request mid-flight while the SMP exchange is negotiating — causing a 30 s
+     * SMP timeout and disconnect.  By calling security_initiate first, the
+     * encrypted link is established cleanly; disc_all_svcs is then issued from
+     * cham_poll() when ENC_CHANGE fires.
+     *
+     * If security_initiate returns non-zero (link already encrypted, or peer
+     * doesn't require security), fall through to discovery immediately. */
+    int sec_rc = ble_gap_security_initiate(conn_handle);
+    if (sec_rc == 0) {
+        ESP_LOGI(TAG, "Security initiated — waiting for ENC_CHANGE before discovery");
+        return 0;
+    }
+    ESP_LOGD(TAG, "security_initiate rc=%d — starting discovery directly", sec_rc);
+
     int rc = ble_gattc_disc_all_svcs(conn_handle, s_svc_disc_cb, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "Svc disc start failed: %d", rc);
@@ -465,8 +481,12 @@ static int s_gap_cb(struct ble_gap_event *event, void *arg)
              *   (b) DISCOVERING: Just Works / silent pairing happened while
              *       disc_all_svcs was in flight; the ATT request was quietly
              *       rejected; we need to re-issue it now that the link is encrypted */
-            if (s_state == CHAM_STATE_PAIRING ||
-                s_state == CHAM_STATE_DISCOVERING) {
+            if (s_state == CHAM_STATE_PAIRING    ||
+                s_state == CHAM_STATE_DISCOVERING ||
+                s_state == CHAM_STATE_CONNECTING) {
+                /* CONNECTING: poll() hasn't processed s_ev_connected yet but
+                 * ENC_CHANGE already fired (fast Just Works).  s_ev_enc_ok will
+                 * be consumed after s_ev_connected transitions us to DISCOVERING. */
                 s_ev_enc_ok = true;
             }
         } else {
