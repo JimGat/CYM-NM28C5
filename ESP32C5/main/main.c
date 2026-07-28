@@ -65,6 +65,7 @@ LV_IMG_DECLARE(deedee_img);
 #define MY_SYMBOL_BUG            "\xEF\x86\x88"   /* fa-bug              U+F188 */
 #define MY_SYMBOL_SKULL          "\xEF\x95\x8C"   /* fa-skull            U+F54C */
 #define MY_SYMBOL_GHOST          "\xEF\x9B\xA2"   /* fa-ghost            U+F6E2 */
+#define MY_SYMBOL_DRAGON         "\xEF\x9B\x95"   /* fa-dragon (chameleon tile) U+F6D5 */
 #define MY_SYMBOL_FINGERPRINT    "\xEF\x95\xB7"   /* fa-fingerprint      U+F577 */
 #define MY_SYMBOL_ID_BADGE       "\xEF\x8B\x81"   /* fa-id-badge         U+F2C1 */
 #define MY_SYMBOL_ID_CARD        "\xEF\x8B\x82"   /* fa-id-card          U+F2C2 */
@@ -2297,7 +2298,9 @@ static void show_nmrfhat_settings_screen(void);
 static void show_dip_switch_popup(uint8_t dip_pos, const char *module_name, void (*proceed_fn)(void));
 static void show_ir_menu_screen(void);
 static void show_radio_menu_screen(void);
+static void show_nfc_hub_screen(void);
 static void show_rfid_menu_screen(void);
+static void show_chameleon_screen(void);
 static void show_cc1101_screen(void);
 static void s_cal_tx_stop(void);      // calibration TX stop, called from show_cc1101_screen cleanup
 static void show_cc1101_hw_test_screen(void);
@@ -13480,6 +13483,7 @@ static const nav_show_entry_t NAV_SHOW_TABLE[] = {
     { "Zigbee Scout",         show_zigbee_wardrive_screen  },
     { "Infrared",             show_ir_menu_screen          },
     { "Radio",                show_radio_menu_screen       },
+    { "NFC / RFID Hub",       show_nfc_hub_screen          },
     { "RFID / NFC",           show_rfid_menu_screen        },
     { "CC1101 Sub-GHz",       show_cc1101_screen           },
     { "nRF24L01 2.4GHz",      show_nrf24_screen            },
@@ -14138,8 +14142,8 @@ static void main_tile_event_cb(lv_event_t *e)
         show_zigbee_wardrive_screen();
     } else if (strcmp(tile_name, "Radio Menu") == 0) {
         show_radio_menu_screen();
-    } else if (strcmp(tile_name, "RFID Menu") == 0) {
-        show_dip_switch_popup(3, "PN532 RFID/NFC", show_rfid_menu_screen);
+    } else if (strcmp(tile_name, "NFC Hub") == 0) {
+        show_nfc_hub_screen();
     }
 }
 
@@ -14385,11 +14389,12 @@ static void show_main_tiles(void)
     create_tile(tiles_container, LV_SYMBOL_SETTINGS,    "Settings",     UI_ACCENT_GREEN,        main_tile_event_cb, "Settings");
     create_tile(tiles_container, LV_SYMBOL_POWER,       "Go Dark",      lv_color_hex(0x8A8FA8), main_tile_event_cb, "Go Dark");
     create_tile(tiles_container, MY_SYMBOL_SITEMAP,     "Zigbee",       lv_color_hex(0x00695C), main_tile_event_cb, "Zigbee");
+    // NFC/RFID Hub — always visible; works with RF-HAT PN532 (DIP 3) or standalone breakout on CN1
+    create_tile(tiles_container, MY_SYMBOL_MICROCHIP, "NFC/\nRFID",  lv_color_hex(0x00695C), main_tile_event_cb, "NFC Hub");
     // NM-RF-HAT tiles — shown only when the addon board is enabled in Hardware Options
     if (g_rf_hat_enabled) {
-        create_tile(tiles_container, MY_SYMBOL_WAVE,      "Infrared",   lv_color_hex(0xE65100), main_tile_event_cb, "IR Menu");
-        create_tile(tiles_container, MY_SYMBOL_TOWER,     "Radio",      lv_color_hex(0x6A1B9A), main_tile_event_cb, "Radio Menu");
-        create_tile(tiles_container, MY_SYMBOL_MICROCHIP, "RFID/NFC",  lv_color_hex(0x00695C), main_tile_event_cb, "RFID Menu");
+        create_tile(tiles_container, MY_SYMBOL_WAVE,  "Infrared", lv_color_hex(0xE65100), main_tile_event_cb, "IR Menu");
+        create_tile(tiles_container, MY_SYMBOL_TOWER, "Radio",    lv_color_hex(0x6A1B9A), main_tile_event_cb, "Radio Menu");
     }
 
     apply_menu_bg();
@@ -47218,6 +47223,177 @@ static void show_nrf24_futaba_screen(void)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// NFC / RFID Hub — top-level submenu for PN532 and Chameleon Ultra
+// ─────────────────────────────────────────────────────────────────────────────
+
+/* Dismiss callback for the PN532 standalone wiring info popup. */
+static void pn532_info_popup_dismiss_cb(lv_event_t *e)
+{
+    lv_obj_t *overlay = (lv_obj_t *)lv_event_get_user_data(e);
+    if (overlay) lv_obj_del(overlay);
+}
+
+/* Info popup shown when user taps PN532 but NM-RF-HAT is not enabled.
+ * Explains how to wire a standalone PN532 breakout to CN1 (GPIO8/GPIO9). */
+static void show_pn532_standalone_info_popup(void)
+{
+    lv_obj_t *overlay = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(overlay, 0, 0);
+    lv_obj_set_style_bg_color(overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(overlay, 0, 0);
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *card = lv_obj_create(overlay);
+    lv_obj_set_size(card, 218, 230);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x0D3B2E), 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x4DB6AC), 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(card, 8, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, MY_SYMBOL_MICROCHIP "  PN532 Standalone");
+    lv_obj_set_style_text_font(title, &g_font_icon14, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0x4DB6AC), 0);
+
+    lv_obj_t *msg = lv_label_create(card);
+    lv_label_set_text(msg,
+        "NM-RF-HAT not enabled.\n"
+        "A PN532 breakout can be\n"
+        "wired to CN1 directly:\n\n"
+        "  SCL -> GPIO 8\n"
+        "  SDA -> GPIO 9\n"
+        "  VCC -> 3.3 V\n"
+        "  GND -> GND\n\n"
+        "Set PN532 to I2C mode.\n"
+        "Enable RF-HAT in Settings\n"
+        "for DIP switch guidance.");
+    lv_obj_set_style_text_font(msg, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(msg, lv_color_white(), 0);
+    lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(msg, 192);
+
+    lv_obj_t *ok_btn = lv_btn_create(card);
+    lv_obj_set_size(ok_btn, 150, 32);
+    lv_obj_set_style_bg_color(ok_btn, lv_color_hex(0x00695C), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(ok_btn, lv_color_hex(0x4DB6AC), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(ok_btn, 0, 0);
+    lv_obj_set_style_radius(ok_btn, 6, 0);
+    lv_obj_t *ok_lbl = lv_label_create(ok_btn);
+    lv_label_set_text(ok_lbl, "OK");
+    lv_obj_set_style_text_font(ok_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ok_lbl, lv_color_white(), 0);
+    lv_obj_center(ok_lbl);
+    /* Tap OK to dismiss overlay */
+    lv_obj_add_event_cb(ok_btn, pn532_info_popup_dismiss_cb, LV_EVENT_CLICKED, overlay);
+}
+
+/* PN532 tile callback: DIP popup (RF-HAT) or wiring info (standalone). */
+static void nfc_hub_pn532_cb(lv_event_t *e)
+{
+    (void)e;
+    if (g_rf_hat_enabled)
+        show_dip_switch_popup(3, "PN532 RFID/NFC", show_rfid_menu_screen);
+    else
+        show_pn532_standalone_info_popup();
+}
+
+/* Chameleon tile callback. */
+static void nfc_hub_chameleon_cb(lv_event_t *e)
+{
+    (void)e;
+    show_chameleon_screen();
+}
+
+static void show_nfc_hub_screen(void)
+{
+    create_function_page_base("NFC / RFID Hub");
+    g_screen_back_fn = create_home_ui;
+    apply_menu_bg();
+
+    lv_obj_t *tiles = lv_obj_create(function_page);
+    lv_obj_set_size(tiles, lv_pct(100), LCD_V_RES - 30);
+    lv_obj_align(tiles, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(tiles, 0, 0);
+    lv_obj_set_style_pad_all(tiles, 8, 0);
+    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Chameleon Ultra — dragon icon, purple */
+    create_tile(tiles, MY_SYMBOL_DRAGON, "Chameleon\nUltra",
+                lv_color_hex(0x4A0E8F), nfc_hub_chameleon_cb, "Chameleon");
+    /* PN532 — microchip icon, teal */
+    create_tile(tiles, MY_SYMBOL_MICROCHIP, "PN532\nNFC",
+                lv_color_hex(0x00695C), nfc_hub_pn532_cb, "PN532");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Chameleon Ultra — stub screen (BLE 125 kHz LF + 13.56 MHz HF)
+// Concept: @bkbroiler | Protocol ref: ChameleonUltraGUI (GameTec-live)
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void show_chameleon_screen(void)
+{
+    create_function_page_base("Chameleon Ultra");
+    g_screen_back_fn = show_nfc_hub_screen;
+
+    lv_obj_t *icon_lbl = lv_label_create(function_page);
+    lv_label_set_text(icon_lbl, MY_SYMBOL_DRAGON);
+    lv_obj_set_style_text_font(icon_lbl, &g_font_icon16, 0);
+    lv_obj_set_style_text_color(icon_lbl, lv_color_hex(0xCE93D8), 0);
+    lv_obj_align(icon_lbl, LV_ALIGN_TOP_MID, 0, 38);
+
+    lv_obj_t *title = lv_label_create(function_page);
+    lv_label_set_text(title, "Chameleon Ultra");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0xCE93D8), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 60);
+
+    lv_obj_t *sub = lv_label_create(function_page);
+    lv_label_set_text(sub,
+        "Bluetooth RFID/NFC\n"
+        "125 kHz LF + 13.56 MHz HF\n"
+        "Reader / Writer / Cloner\n"
+        "Emulator");
+    lv_obj_set_style_text_font(sub, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(sub, lv_color_hex(0xB0BEC5), 0);
+    lv_obj_set_style_text_align(sub, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(sub, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(sub, lv_pct(90));
+    lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 100);
+
+    lv_obj_t *coming = lv_label_create(function_page);
+    lv_label_set_text(coming, "-- Coming Soon --");
+    lv_obj_set_style_text_font(coming, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(coming, lv_color_hex(0xFFCA28), 0);
+    lv_obj_align(coming, LV_ALIGN_TOP_MID, 0, 188);
+
+    lv_obj_t *credit = lv_label_create(function_page);
+    lv_label_set_text(credit,
+        "Concept: @bkbroiler\n"
+        "Protocol ref: ChameleonUltraGUI\n"
+        "  (GameTec-live)");
+    lv_obj_set_style_text_font(credit, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(credit, lv_color_hex(0x78909C), 0);
+    lv_obj_set_style_text_align(credit, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(credit, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(credit, lv_pct(90));
+    lv_obj_align(credit, LV_ALIGN_TOP_MID, 0, 214);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // RFID / NFC  (PN532 on NM-RF-HAT DIP 3, I2C SCL=GPIO8 SDA=GPIO9)
 // FOR AUTHORIZED SECURITY RESEARCH AND EDUCATION ONLY.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -47822,6 +47998,7 @@ static void show_rfid_menu_screen(void)
     rfid_storage_ensure_dirs();
 
     create_function_page_base("RFID / NFC");
+    g_screen_back_fn = show_nfc_hub_screen;
     apply_menu_bg();
 
     lv_obj_t *hdr = lv_label_create(function_page);

@@ -1,5 +1,6 @@
 #include "gatt_walker.h"
 #include <stdio.h>
+#include <inttypes.h>
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
@@ -307,7 +308,7 @@ static bool s_write_json(void)
     }
     jb_raw(&j, " }"); jb_comma(&j);
 
-    char fp[12]; snprintf(fp, sizeof(fp), "0x%08X", r->fingerprint);
+    char fp[12]; snprintf(fp, sizeof(fp), "0x%08" PRIX32, r->fingerprint);
     jb_str(&j, "fingerprint", fp); jb_comma(&j);
 
     jb_key(&j, "services"); jb_raw(&j, "[\n");
