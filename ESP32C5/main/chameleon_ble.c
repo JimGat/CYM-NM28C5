@@ -976,11 +976,14 @@ bool cham_poll(void)
 
             /* Match to pending command */
             if (s_pend_cmd != 0xFFFF && fcmd == s_pend_cmd) {
-                /* Firmware v2.x uses 0x0068 as its alternate OK status code;
-                 * 0x0000 is the standard spec OK.  Both are treated as success.
-                 * Real errors (0x0001..0x0005 and scan-specific 0x0065/0x0066)
-                 * remain non-zero and will have dlen=0 from the device. */
-                bool ok = (fstatus == 0 || fstatus == 0x0068);
+                /* Success status codes:
+                 *   0x0000 = STATUS_HF_TAG_OK  — HF (13.56 MHz) operation succeeded
+                 *   0x0040 = STATUS_LF_TAG_OK  — LF (125 kHz) card read succeeded
+                 *   0x0068 = STATUS_SUCCESS     — generic device operation success (FW v2.x)
+                 * All three carry a valid payload.  All other codes are errors; the
+                 * most common non-success LF codes are 0x0041 (no card) and 0x0067
+                 * (command not supported by this firmware version). */
+                bool ok = (fstatus == 0 || fstatus == 0x0040 || fstatus == 0x0068);
                 cham_cmd_result_cb_t cb = s_pend_cb;
                 s_pend_cmd = 0xFFFF;
                 s_pend_cb  = NULL;

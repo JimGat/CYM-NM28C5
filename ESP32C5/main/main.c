@@ -47371,7 +47371,7 @@ static lv_obj_t   *s_lf_status_lbl  = NULL;
 static lv_obj_t   *s_lf_uid_lbl     = NULL;
 static lv_obj_t   *s_lf_save_btn    = NULL;
 static lv_obj_t   *s_lf_scan_btn    = NULL; /* "Scan Again" - shown after any result */
-static uint8_t     s_lf_uid[8]      = {0};  /* 8 bytes covers EM410X(5) and HID(up to 8) */
+static uint8_t     s_lf_uid[16]     = {0};  /* 16 bytes: EM410X(5) or HID Prox 16-byte struct */
 static int         s_lf_uid_len     = 0;
 static volatile bool s_lf_result_ready = false;
 static volatile bool s_lf_result_ok    = false;
@@ -47402,29 +47402,49 @@ static void s_cham_lf_tile_cb(lv_event_t *e)
     show_cham_lf_read_screen();
 }
 
-/* ── LF read: save Flipper .rfid file ── */
+/* ── LF read: save .rfid file (Flipper-compatible for EM410X, CYM format for HID) ── */
 static void s_lf_save_cb(lv_event_t *e)
 {
     (void)e;
     if (s_lf_uid_len <= 0) return;
 
-    /* Build a timestamp-based filename */
     int64_t now_us = esp_timer_get_time();
     char path[64];
-    snprintf(path, sizeof(path), "/sdcard/lab/rfid/em410x_%lld.rfid", now_us / 1000000LL);
+    FILE *f = NULL;
 
-    FILE *f = fopen(path, "w");
-    if (!f) {
-        if (s_lf_status_lbl) lv_label_set_text(s_lf_status_lbl, "Save failed - SD error");
-        return;
+    if (s_lf_found_proto_idx == 1 && s_lf_uid_len >= 10) {
+        /* HID Prox 16-byte struct: [hidType][FC 4B big-endian][CN 5B big-endian][issue 1B][oem 2B][pad 3B] */
+        uint32_t fc = ((uint32_t)s_lf_uid[1] << 24) | ((uint32_t)s_lf_uid[2] << 16) |
+                      ((uint32_t)s_lf_uid[3] << 8) | s_lf_uid[4];
+        uint32_t cn = ((uint32_t)s_lf_uid[7] << 16) | ((uint32_t)s_lf_uid[8] << 8) | s_lf_uid[9];
+        snprintf(path, sizeof(path), "/sdcard/lab/rfid/hid_%lld.rfid", now_us / 1000000LL);
+        f = fopen(path, "w");
+        if (!f) {
+            if (s_lf_status_lbl) lv_label_set_text(s_lf_status_lbl, "Save failed - SD error");
+            return;
+        }
+        fprintf(f, "Filetype: Flipper RFID key\nVersion: 1\n");
+        fprintf(f, "Key type: HID 26 bit\n");
+        fprintf(f, "Facility code: %lu\n", (unsigned long)fc);
+        fprintf(f, "Card number: %lu\n", (unsigned long)cn);
+        /* Preserve raw Chameleon bytes for future re-encoding */
+        fprintf(f, "# Raw Chameleon data:");
+        for (int i = 0; i < s_lf_uid_len; i++) fprintf(f, " %02X", s_lf_uid[i]);
+        fprintf(f, "\n");
+    } else {
+        /* EM410X and other protocols: Flipper EM4100 format */
+        snprintf(path, sizeof(path), "/sdcard/lab/rfid/em410x_%lld.rfid", now_us / 1000000LL);
+        f = fopen(path, "w");
+        if (!f) {
+            if (s_lf_status_lbl) lv_label_set_text(s_lf_status_lbl, "Save failed - SD error");
+            return;
+        }
+        fprintf(f, "Filetype: Flipper RFID key\nVersion: 1\n");
+        fprintf(f, "Key type: EM4100\n");
+        fprintf(f, "Data:");
+        for (int i = 0; i < s_lf_uid_len; i++) fprintf(f, " %02X", s_lf_uid[i]);
+        fprintf(f, "\n");
     }
-    fprintf(f, "Filetype: Flipper RFID key\nVersion: 1\n");
-    fprintf(f, "Key type: EM4100\n");
-    fprintf(f, "Data:");
-    for (int i = 0; i < s_lf_uid_len; i++) {
-        fprintf(f, " %02X", s_lf_uid[i]);
-    }
-    fprintf(f, "\n");
     fclose(f);
 
     if (s_lf_save_btn) lv_obj_add_flag(s_lf_save_btn, LV_OBJ_FLAG_HIDDEN);
@@ -47469,10 +47489,16 @@ static void s_lf_on_scan_result(bool ok, const uint8_t *data, uint16_t dlen)
         s_lf_result_ready   = true;
     } else if (esp_timer_get_time() < s_lf_scan_deadline) {
         /* No card on this protocol - advance to next and retry.
-         * Cycles EM410X -> HID Prox -> Viking -> PAC -> IoProx -> EM410X...
-         * Each attempt takes ~600 ms; 7-second window gives ~2 passes through
-         * all 5 protocols. */
+         * EM410X takes ~600 ms per attempt; HID/Viking/PAC/IoProx ~100 ms each.
+         * 7-second window yields multiple passes through all protocols.
+         * 0x0067 (INVALID_CMD) means this protocol is unsupported by the firmware;
+         * cycling to next protocol is the correct response. */
         s_lf_proto_idx = (s_lf_proto_idx + 1) % LF_PROTO_COUNT;
+        if (s_lf_status_lbl) {
+            char sbuf[48];
+            snprintf(sbuf, sizeof(sbuf), "Scanning: %s...", s_lf_protos[s_lf_proto_idx].name);
+            lv_label_set_text(s_lf_status_lbl, sbuf);
+        }
         cham_send_cmd_ex(s_lf_protos[s_lf_proto_idx].cmd, NULL, 0,
                          s_lf_on_scan_result, 2000000LL);
     } else {
@@ -47512,16 +47538,26 @@ static void s_lf_poll_timer(lv_timer_t *t)
     if (!s_lf_status_lbl) return; /* screen already torn down */
 
     if (s_lf_result_ok && s_lf_uid_len > 0) {
-        /* Show protocol name + raw UID hex */
-        char uid_str[30] = {0};
-        for (int i = 0; i < s_lf_uid_len; i++) {
-            char byte[4];
-            snprintf(byte, sizeof(byte), "%02X%s",
-                     s_lf_uid[i], (i < s_lf_uid_len - 1) ? " " : "");
-            strlcat(uid_str, byte, sizeof(uid_str));
+        /* Build protocol-specific display string */
+        char uid_str[50] = {0};
+        if (s_lf_found_proto_idx == 1 && s_lf_uid_len >= 10) {
+            /* HID Prox 16-byte struct: [hidType][FC 4B BE][CN 5B BE][issue][oem 2B][pad 3B]
+             * H10301 uses 8-bit FC (byte 4) and 16-bit CN (bytes 8-9). */
+            uint32_t fc = ((uint32_t)s_lf_uid[1] << 24) | ((uint32_t)s_lf_uid[2] << 16) |
+                          ((uint32_t)s_lf_uid[3] << 8) | s_lf_uid[4];
+            uint32_t cn = ((uint32_t)s_lf_uid[7] << 16) | ((uint32_t)s_lf_uid[8] << 8) | s_lf_uid[9];
+            snprintf(uid_str, sizeof(uid_str), "FC:%lu  CN:%lu", (unsigned long)fc, (unsigned long)cn);
+        } else {
+            /* EM410X (5 bytes) and other protocols: raw hex */
+            int show = (s_lf_uid_len < 8) ? s_lf_uid_len : 8;
+            for (int i = 0; i < show; i++) {
+                char byte[4];
+                snprintf(byte, sizeof(byte), "%02X%s", s_lf_uid[i], (i < show - 1) ? " " : "");
+                strlcat(uid_str, byte, sizeof(uid_str));
+            }
         }
         if (s_lf_uid_lbl) {
-            char buf[60];
+            char buf[80];
             snprintf(buf, sizeof(buf), "%s\n%s",
                      s_lf_protos[s_lf_found_proto_idx].name, uid_str);
             lv_label_set_text(s_lf_uid_lbl, buf);
