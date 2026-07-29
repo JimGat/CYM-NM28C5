@@ -47366,12 +47366,15 @@ static int         s_cham_list_n    = 0;      /* # items currently in scan list 
 static bool        s_cham_nav_child = false;  /* set before entering a child screen; prevents stop hook from disconnecting */
 
 /* LF read sub-screen globals — NULLed by cham_lf_read_stop() */
-static lv_timer_t *s_lf_tmr         = NULL;
-static lv_obj_t   *s_lf_status_lbl  = NULL;
-static lv_obj_t   *s_lf_uid_lbl     = NULL;
-static lv_obj_t   *s_lf_save_btn    = NULL;
-static lv_obj_t   *s_lf_scan_btn    = NULL; /* "Scan Again" - shown after any result */
-static uint8_t     s_lf_uid[16]     = {0};  /* 16 bytes: EM410X(5) or HID Prox 16-byte struct */
+static lv_timer_t *s_lf_tmr          = NULL;
+static lv_obj_t   *s_lf_status_lbl   = NULL;
+static lv_obj_t   *s_lf_uid_lbl      = NULL;
+static lv_obj_t   *s_lf_save_btn     = NULL;
+static lv_obj_t   *s_lf_scan_btn     = NULL; /* "Scan Again" - shown after any result */
+static lv_obj_t   *s_lf_save_overlay = NULL; /* filename keyboard overlay */
+static lv_obj_t   *s_lf_save_ta      = NULL; /* textarea inside overlay */
+static char        s_lf_save_default[32];     /* default filename built from card data */
+static uint8_t     s_lf_uid[16]      = {0};  /* 16 bytes: EM410X(5) or HID Prox 16-byte struct */
 static int         s_lf_uid_len     = 0;
 static volatile bool s_lf_result_ready = false;
 static volatile bool s_lf_result_ok    = false;
@@ -47402,43 +47405,50 @@ static void s_cham_lf_tile_cb(lv_event_t *e)
     show_cham_lf_read_screen();
 }
 
-/* ── LF read: save .rfid file (Flipper-compatible for EM410X, CYM format for HID) ── */
-static void s_lf_save_cb(lv_event_t *e)
+/* ── LF read: build a default filename from the card data ── */
+static void s_lf_build_save_name(void)
 {
-    (void)e;
-    if (s_lf_uid_len <= 0) return;
-
-    int64_t now_us = esp_timer_get_time();
-    char path[64];
-    FILE *f = NULL;
-
     if (s_lf_found_proto_idx == 1 && s_lf_uid_len >= 10) {
-        /* HID Prox 16-byte struct: [hidType][FC 4B big-endian][CN 5B big-endian][issue 1B][oem 2B][pad 3B] */
         uint32_t fc = ((uint32_t)s_lf_uid[1] << 24) | ((uint32_t)s_lf_uid[2] << 16) |
                       ((uint32_t)s_lf_uid[3] << 8) | s_lf_uid[4];
         uint32_t cn = ((uint32_t)s_lf_uid[7] << 16) | ((uint32_t)s_lf_uid[8] << 8) | s_lf_uid[9];
-        snprintf(path, sizeof(path), "/sdcard/lab/rfid/hid_%lld.rfid", now_us / 1000000LL);
+        snprintf(s_lf_save_default, sizeof(s_lf_save_default), "hid_%lu_%lu",
+                 (unsigned long)fc, (unsigned long)cn);
+    } else {
+        /* EM410X and others: em_XXYYZZ... (lower-case hex) */
+        char hex[18] = {0};
+        int show = (s_lf_uid_len < 8) ? s_lf_uid_len : 8;
+        for (int i = 0; i < show; i++)
+            snprintf(hex + i * 2, sizeof(hex) - (size_t)(i * 2), "%02x", s_lf_uid[i]);
+        snprintf(s_lf_save_default, sizeof(s_lf_save_default), "em_%s", hex);
+    }
+}
+
+/* ── LF read: write the .rfid file given a caller-supplied name ── */
+static bool s_lf_write_rfid_file(const char *name)
+{
+    char path[64];
+    FILE *f;
+    if (s_lf_found_proto_idx == 1 && s_lf_uid_len >= 10) {
+        /* HID Prox: Flipper HID 26 bit format */
+        uint32_t fc = ((uint32_t)s_lf_uid[1] << 24) | ((uint32_t)s_lf_uid[2] << 16) |
+                      ((uint32_t)s_lf_uid[3] << 8) | s_lf_uid[4];
+        uint32_t cn = ((uint32_t)s_lf_uid[7] << 16) | ((uint32_t)s_lf_uid[8] << 8) | s_lf_uid[9];
+        snprintf(path, sizeof(path), "/sdcard/lab/rfid/%.28s.rfid", name);
         f = fopen(path, "w");
-        if (!f) {
-            if (s_lf_status_lbl) lv_label_set_text(s_lf_status_lbl, "Save failed - SD error");
-            return;
-        }
+        if (!f) return false;
         fprintf(f, "Filetype: Flipper RFID key\nVersion: 1\n");
         fprintf(f, "Key type: HID 26 bit\n");
         fprintf(f, "Facility code: %lu\n", (unsigned long)fc);
         fprintf(f, "Card number: %lu\n", (unsigned long)cn);
-        /* Preserve raw Chameleon bytes for future re-encoding */
         fprintf(f, "# Raw Chameleon data:");
         for (int i = 0; i < s_lf_uid_len; i++) fprintf(f, " %02X", s_lf_uid[i]);
         fprintf(f, "\n");
     } else {
-        /* EM410X and other protocols: Flipper EM4100 format */
-        snprintf(path, sizeof(path), "/sdcard/lab/rfid/em410x_%lld.rfid", now_us / 1000000LL);
+        /* EM410X and others: Flipper EM4100 format */
+        snprintf(path, sizeof(path), "/sdcard/lab/rfid/%.28s.rfid", name);
         f = fopen(path, "w");
-        if (!f) {
-            if (s_lf_status_lbl) lv_label_set_text(s_lf_status_lbl, "Save failed - SD error");
-            return;
-        }
+        if (!f) return false;
         fprintf(f, "Filetype: Flipper RFID key\nVersion: 1\n");
         fprintf(f, "Key type: EM4100\n");
         fprintf(f, "Data:");
@@ -47446,9 +47456,132 @@ static void s_lf_save_cb(lv_event_t *e)
         fprintf(f, "\n");
     }
     fclose(f);
+    return true;
+}
 
-    if (s_lf_save_btn) lv_obj_add_flag(s_lf_save_btn, LV_OBJ_FLAG_HIDDEN);
-    if (s_lf_status_lbl) lv_label_set_text(s_lf_status_lbl, "Saved to /sdcard/lab/rfid/");
+/* ── LF save overlay: confirm ── */
+static void s_lf_save_confirm_cb(lv_event_t *e)
+{
+    (void)e;
+    const char *nm = s_lf_save_ta ? lv_textarea_get_text(s_lf_save_ta) : NULL;
+    if (!nm || !nm[0]) nm = s_lf_save_default;
+
+    bool ok = (s_lf_uid_len > 0) && s_lf_write_rfid_file(nm);
+
+    if (s_lf_save_overlay) { lv_obj_del(s_lf_save_overlay); s_lf_save_overlay = NULL; s_lf_save_ta = NULL; }
+    if (s_lf_status_lbl)
+        lv_label_set_text(s_lf_status_lbl, ok ? "Saved to /sdcard/lab/rfid/" : "Save failed - SD error");
+    if (ok && s_lf_save_btn) lv_obj_add_flag(s_lf_save_btn, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* ── LF save overlay: cancel ── */
+static void s_lf_save_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_lf_save_overlay) { lv_obj_del(s_lf_save_overlay); s_lf_save_overlay = NULL; s_lf_save_ta = NULL; }
+}
+
+/* ── LF read: Save button → open filename keyboard overlay ── */
+static void s_lf_save_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_lf_uid_len <= 0) return;
+
+    s_lf_build_save_name();
+
+    /* Full-screen dim overlay */
+    s_lf_save_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(s_lf_save_overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(s_lf_save_overlay, 0, 0);
+    lv_obj_set_style_bg_color(s_lf_save_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_lf_save_overlay, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(s_lf_save_overlay, 0, 0);
+    lv_obj_set_style_pad_all(s_lf_save_overlay, 0, 0);
+    lv_obj_clear_flag(s_lf_save_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(s_lf_save_overlay, 0, 0);
+
+    /* Keyboard — green theme, docked at bottom */
+    lv_obj_t *kb = lv_keyboard_create(s_lf_save_overlay);
+    lv_obj_set_width(kb, LCD_H_RES);
+    lv_obj_set_style_text_font(kb, &lv_font_montserrat_12, 0);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
+    lv_obj_set_style_bg_color(kb, ui_bg_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(kb, ui_text_color(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(kb, lv_color_make(0, 100, 0), LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(kb, lv_color_make(0, 150, 0), LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(kb, ui_text_color(), LV_PART_ITEMS);
+    lv_obj_set_style_border_color(kb, ui_border_color(), LV_PART_ITEMS);
+    lv_obj_set_style_border_width(kb, 1, LV_PART_ITEMS);
+
+    /* Card panel above keyboard */
+    lv_obj_t *card = lv_obj_create(s_lf_save_overlay);
+    lv_obj_set_size(card, LCD_H_RES - 16, LV_SIZE_CONTENT);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 4);
+    lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x00838F), 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 8, 0);
+    lv_obj_set_style_pad_row(card, 4, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, LV_SYMBOL_SAVE "  Save LF card");
+    lv_obj_set_style_text_color(title, lv_color_hex(0x4DD0E1), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
+
+    /* Textarea — pre-filled default name, cursor at end */
+    s_lf_save_ta = lv_textarea_create(card);
+    lv_obj_set_width(s_lf_save_ta, LCD_H_RES - 32);
+    lv_obj_set_height(s_lf_save_ta, 36);
+    lv_textarea_set_max_length(s_lf_save_ta, 28);
+    lv_textarea_set_one_line(s_lf_save_ta, true);
+    lv_textarea_set_text(s_lf_save_ta, s_lf_save_default);  /* pre-filled, not just placeholder */
+    lv_obj_set_style_text_font(s_lf_save_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(s_lf_save_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(s_lf_save_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(s_lf_save_ta, ui_accent_color(), 0);
+    lv_obj_set_style_bg_opa(s_lf_save_ta,    LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(s_lf_save_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(s_lf_save_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(s_lf_save_ta,  LV_BORDER_SIDE_LEFT, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_keyboard_set_textarea(kb, s_lf_save_ta);
+
+    /* Button row */
+    lv_obj_t *btn_row = lv_obj_create(card);
+    lv_obj_set_size(btn_row, LCD_H_RES - 32, 32);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel_btn, 90, 28);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x455A64), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(cancel_btn, 6, 0);
+    lv_obj_set_style_border_width(cancel_btn, 0, 0);
+    lv_obj_t *cl = lv_label_create(cancel_btn);
+    lv_label_set_text(cl, "Cancel");
+    lv_obj_set_style_text_font(cl, &lv_font_montserrat_12, 0);
+    lv_obj_center(cl);
+    lv_obj_add_event_cb(cancel_btn, s_lf_save_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *save_btn2 = lv_btn_create(btn_row);
+    lv_obj_set_size(save_btn2, 90, 28);
+    lv_obj_set_style_bg_color(save_btn2, lv_color_hex(0x006064), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(save_btn2, 6, 0);
+    lv_obj_set_style_border_width(save_btn2, 0, 0);
+    lv_obj_t *sl2 = lv_label_create(save_btn2);
+    lv_label_set_text(sl2, LV_SYMBOL_SAVE " Save");
+    lv_obj_set_style_text_font(sl2, &lv_font_montserrat_12, 0);
+    lv_obj_center(sl2);
+    lv_obj_add_event_cb(save_btn2, s_lf_save_confirm_cb, LV_EVENT_CLICKED, NULL);
 }
 
 /* ── LF read: scan result callback (fires from cham_poll via cham_send_cmd_ex) ── */
@@ -47579,10 +47712,12 @@ static void s_lf_poll_timer(lv_timer_t *t)
 static void cham_lf_read_stop(void)
 {
     if (s_lf_tmr) { lv_timer_del(s_lf_tmr); s_lf_tmr = NULL; }
-    s_lf_status_lbl  = NULL;
-    s_lf_uid_lbl     = NULL;
-    s_lf_save_btn    = NULL;
-    s_lf_scan_btn    = NULL;
+    /* Close keyboard overlay if open — prevents use-after-free on the textarea */
+    if (s_lf_save_overlay) { lv_obj_del(s_lf_save_overlay); s_lf_save_overlay = NULL; s_lf_save_ta = NULL; }
+    s_lf_status_lbl   = NULL;
+    s_lf_uid_lbl      = NULL;
+    s_lf_save_btn     = NULL;
+    s_lf_scan_btn     = NULL;
     s_lf_result_ready = false;
     s_lf_result_ok    = false;
     s_lf_mode_ok      = false;
@@ -48020,7 +48155,7 @@ static void s_cham_rebuild_content(cham_state_t st)
             lv_obj_set_width(nm, 64);
 
             lv_obj_t *sub2 = lv_label_create(btn);
-            lv_label_set_text(sub2, "EM410X");
+            lv_label_set_text(sub2, "HID / EM");
             lv_obj_set_style_text_font(sub2, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(sub2, lv_color_hex(0x66BB6A), 0);
 
