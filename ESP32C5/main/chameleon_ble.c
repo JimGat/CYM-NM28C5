@@ -480,21 +480,33 @@ static int s_gap_cb(struct ble_gap_event *event, void *arg)
         }
         break;
 
-    case BLE_GAP_EVENT_PASSKEY_ACTION:
-        ESP_LOGI(TAG, "PASSKEY_ACTION: action=%d numcmp=%" PRIu32,
-                 event->passkey.params.action,
+    case BLE_GAP_EVENT_PASSKEY_ACTION: {
+        /* Which authenticated method the Chameleon requests tells us its IO
+         * capability — logged so a single diagnostic build reveals the scheme.
+         * Auto-satisfy every case (Chameleon has no screen/keyboard for a human
+         * to compare/enter): NUMCMP → accept; INPUT → inject the Chameleon
+         * Ultra fixed passkey 123456; DISP → surface our passkey. */
+        uint8_t act = event->passkey.params.action;
+        ESP_LOGI(TAG, "PASSKEY_ACTION: action=%d numcmp=%" PRIu32, act,
                  event->passkey.params.numcmp);
-        if (event->passkey.params.action == BLE_SM_IOACT_NUMCMP) {
-            s_passkey_num = event->passkey.params.numcmp;
-            s_ev_passkey  = true;
+        struct ble_sm_io io = {0};
+        io.action = act;
+        if (act == BLE_SM_IOACT_NUMCMP) {
+            io.numcmp_accept = 1;
+            ESP_LOGW(TAG, "  NUMCMP %" PRIu32 " → auto-accept", event->passkey.params.numcmp);
+        } else if (act == BLE_SM_IOACT_INPUT) {
+            io.passkey = 123456;
+            ESP_LOGW(TAG, "  INPUT → inject fixed passkey 123456");
+        } else if (act == BLE_SM_IOACT_DISP) {
+            io.passkey = 123456;
+            ESP_LOGW(TAG, "  DISP → passkey 123456");
         } else {
-            /* DISP or INPUT — auto-accept */
-            struct ble_sm_io io = {0};
-            io.action = event->passkey.params.action;
-            ble_sm_inject_io(event->passkey.conn_handle, &io);
-            ESP_LOGW(TAG, "Passkey action %d auto-accepted", event->passkey.params.action);
+            ESP_LOGW(TAG, "  action %d (OOB?) — injecting empty", act);
         }
+        int irc = ble_sm_inject_io(event->passkey.conn_handle, &io);
+        ESP_LOGI(TAG, "  inject_io rc=%d", irc);
         break;
+    }
 
     case BLE_GAP_EVENT_ENC_CHANGE: {
         uint16_t enc_st = (uint16_t)event->enc_change.status;
@@ -511,10 +523,22 @@ static int s_gap_cb(struct ble_gap_event *event, void *arg)
                      enc_st);
             s_ev_enc_ok = true;
         } else {
-            ESP_LOGE(TAG, "ENC_CHANGE: hard failure status=0x%03x", enc_st);
+            /* Hard failure — almost always a stale/mismatched bond: our LTK and
+             * the Chameleon's no longer agree (one side was cleared/factory-reset
+             * independently).  Delete our peer bond so the NEXT attempt starts
+             * clean on our side; the user then only has to clear the Chameleon's
+             * side ("Device Settings -> Clear bounded devices") for a fresh pair.
+             * We do NOT auto-retry here: while the peer still holds its old bond
+             * it would re-encrypt with the same stale key and loop. */
+            ESP_LOGE(TAG, "ENC_CHANGE: hard failure status=0x%03x — deleting our peer bond", enc_st);
+            struct ble_gap_conn_desc desc;
+            if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE &&
+                ble_gap_conn_find(s_conn_handle, &desc) == 0) {
+                ble_store_util_delete_peer(&desc.peer_id_addr);
+            }
             s_ev_error = true;
             snprintf(s_status_msg, sizeof(s_status_msg),
-                     "Auth failed (0x%03x)", enc_st);
+                     "Auth failed - clear bonds on Chameleon, then retry");
         }
         break;
     }
@@ -769,6 +793,33 @@ bool cham_connect(int idx)
     s_ev_cccd_ok   = false;
     s_ev_error     = false;
     memset(&s_rxs, 0, sizeof(s_rxs));
+
+    /* ── Security config for Chameleon pairing (surgical — set only here) ──
+     * The Chameleon Ultra's Nordic-UART CCCD requires an AUTHENTICATED (MITM)
+     * encrypted link: an unauthenticated Just-Works key is rejected with ATT
+     * 0x05 (Insufficient Authentication) → CCCD write fails → connection never
+     * reaches READY.  Enable MITM + bonding with KEYBOARD_DISPLAY IO so LE-SC
+     * can negotiate whatever authenticated method the peer supports (numeric
+     * comparison or passkey entry).  Set here rather than at global BLE init so
+     * only Chameleon connects are affected — BLE Scan/Spam etc. are untouched. */
+    ble_hs_cfg.sm_io_cap         = BLE_SM_IO_CAP_KEYBOARD_DISP;
+    ble_hs_cfg.sm_bonding        = 1;
+    ble_hs_cfg.sm_mitm           = 1;
+    ble_hs_cfg.sm_sc             = 1;
+    ble_hs_cfg.sm_our_key_dist   = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+
+    /* NOTE: the bond is intentionally KEPT across connects.  When "BLE pairing"
+     * is enabled on the Chameleon (Device Settings; the firmware default is
+     * DISABLED, but our test unit has it ENABLED with PIN 123456) the device
+     * bonds and persists the LTK.  If we cleared our side every time, the two
+     * ends would desync (Chameleon keeps its bond, we drop ours) and the
+     * reconnect would come up "already encrypted" with a key we no longer hold →
+     * CCCD write ATT 0x05 → ENC_CHANGE hard failure.  Keeping matching bonds on
+     * both ends lets a reconnect re-use the same LTK (fast, no re-pair).  A
+     * genuinely stale/mismatched bond is recovered lazily: REPEAT_PAIRING (peer
+     * re-pairs while we hold a bond) deletes+retries, and an ENC_CHANGE hard
+     * failure deletes our peer bond so the next attempt starts clean. */
 
     /* Cancel scan, then wait 250 ms for NimBLE to settle before connecting */
     ble_gap_disc_cancel();
