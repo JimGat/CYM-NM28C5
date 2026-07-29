@@ -48701,6 +48701,46 @@ static void s_cham_slots_tile_cb(lv_event_t *e)
     show_cham_slots_screen();
 }
 
+/* ── Stub tile helper — grayed-out upcoming-phase placeholder ── */
+/* Creates a 72x54 non-interactive card tile with a dimmed icon and subtitle.
+ * Used in the READY state to preview phases not yet implemented. */
+static void s_cham_stub_tile(lv_obj_t *parent, const char *icon,
+                              const char *name, const char *subtitle)
+{
+    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, 72, 54);
+    lv_obj_set_style_bg_color(btn, ui_card_color(), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(btn, ui_card_color(), LV_STATE_PRESSED); /* no press feedback */
+    lv_obj_set_style_radius(btn, 8, 0);
+    lv_obj_set_style_border_width(btn, 1, 0);
+    lv_obj_set_style_border_color(btn, lv_color_hex(0x37474F), 0); /* dark grey = "soon" */
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(btn, 4, 0);
+    lv_obj_set_style_pad_row(btn, 2, 0);
+    lv_obj_clear_flag(btn, LV_OBJ_FLAG_CLICKABLE); /* not interactive */
+
+    lv_obj_t *ico = lv_label_create(btn);
+    lv_label_set_text(ico, icon);
+    lv_obj_set_style_text_font(ico, &lv_extra_symbols, 0);
+    lv_obj_set_style_text_color(ico, lv_color_hex(0x546E7A), 0); /* dim teal-grey */
+
+    lv_obj_t *nm = lv_label_create(btn);
+    lv_label_set_text(nm, name);
+    lv_obj_set_style_text_font(nm, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(nm, lv_color_hex(0x78909C), 0); /* muted */
+    lv_obj_set_style_text_align(nm, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(nm, 64);
+
+    lv_obj_t *sub = lv_label_create(btn);
+    lv_label_set_text(sub, subtitle);
+    lv_obj_set_style_text_font(sub, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sub, lv_color_hex(0x37474F), 0); /* very dim */
+}
+
 /* ── Scan list helpers ── */
 
 static lv_color_t s_rssi_color(int8_t rssi)
@@ -48936,9 +48976,10 @@ static void s_cham_rebuild_content(cham_state_t st)
         /* ── Ready state: device info + feature stubs + Disconnect ── */
         const cham_device_info_t *info = cham_get_device_info();
 
-        /* Info card */
+        /* Info card — height trimmed to 84px to fit 4 label rows exactly,
+         * freeing ~34px for a second tile row below the first. */
         lv_obj_t *card = lv_obj_create(s_cham_content);
-        lv_obj_set_size(card, 228, 118);
+        lv_obj_set_size(card, 228, 84);
         lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 0);
         lv_obj_set_style_bg_color(card, lv_color_hex(0x1A1A2E), 0);
         lv_obj_set_style_border_color(card, lv_color_hex(0x6A1B9A), 0);
@@ -48975,10 +49016,10 @@ static void s_cham_rebuild_content(cham_state_t st)
             s_cham_info_row(card, buf, lv_color_hex(0x78909C));
         }
 
-        /* Feature stubs row */
+        /* Tile row 1: Read HF / Read LF / Slots — card shrink moved this from y=124 → y=88 */
         lv_obj_t *tiles = lv_obj_create(s_cham_content);
-        lv_obj_set_size(tiles, 228, 68);
-        lv_obj_align(tiles, LV_ALIGN_TOP_MID, 0, 124);
+        lv_obj_set_size(tiles, 228, 60);
+        lv_obj_align(tiles, LV_ALIGN_TOP_MID, 0, 88);
         lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(tiles, 0, 0);
         lv_obj_set_style_pad_all(tiles, 0, 0);
@@ -49097,6 +49138,24 @@ static void s_cham_rebuild_content(cham_state_t st)
             lv_obj_set_style_text_color(sub3, lv_color_hex(0xCE93D8), 0);
 
             lv_obj_add_event_cb(btn, s_cham_slots_tile_cb, LV_EVENT_CLICKED, NULL);
+        }
+
+        /* Tile row 2: upcoming-phase placeholders at y=152 */
+        {
+            lv_obj_t *tiles2 = lv_obj_create(s_cham_content);
+            lv_obj_set_size(tiles2, 228, 60);
+            lv_obj_align(tiles2, LV_ALIGN_TOP_MID, 0, 152);
+            lv_obj_set_style_bg_opa(tiles2, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(tiles2, 0, 0);
+            lv_obj_set_style_pad_all(tiles2, 0, 0);
+            lv_obj_set_style_pad_column(tiles2, 6, 0);
+            lv_obj_clear_flag(tiles2, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_set_flex_flow(tiles2, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(tiles2, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER);
+            s_cham_stub_tile(tiles2, MY_SYMBOL_FOLDER_PLUS, "Cards",   "Phase 5");
+            s_cham_stub_tile(tiles2, MY_SYMBOL_KEY,         "MF Keys", "Phase 6");
+            s_cham_stub_tile(tiles2, MY_SYMBOL_XRAY,        "Detect",  "Phase 6");
         }
 
         /* Disconnect button */
