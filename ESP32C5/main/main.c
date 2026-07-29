@@ -48285,10 +48285,10 @@ static lv_obj_t *s_cham_info_row(lv_obj_t *parent, const char *text, lv_color_t 
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * Chameleon Ultra Slot Manager — Phase 4
- * getSlotInfo (1015): sense_type + tag_type for all 8 slots.
- * getActiveSlot (1023): currently active slot index (0-7).
- * setActiveSlot (1011): switch active slot (1-byte payload: slot index).
- * deleteSlotTag (1019): erase slot data (1-byte payload: slot index).
+ * getSlotInfo    (1019 / 0x03FB): returns 32 bytes = 8 × [hf_type u16 BE, lf_type u16 BE].
+ * getActiveSlot  (1018 / 0x03FA): currently active slot index (0-7) in data[0].
+ * setActiveSlot  (1003 / 0x03EB): switch active slot (1-byte payload: slot 0-7).
+ * deleteSlotTag  (1024 / 0x0400): erase slot (2-byte payload: [slot 0-7, sense_type]).
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
@@ -48297,8 +48297,8 @@ static lv_timer_t  *s_sm_tmr          = NULL;
 static lv_obj_t    *s_sm_status_lbl   = NULL;  /* "Loading..." / status text  */
 static lv_obj_t    *s_sm_list_cont    = NULL;  /* flex-column container: 8 rows */
 static lv_obj_t    *s_sm_confirm_pop  = NULL;  /* delete-confirm popup */
-static uint8_t      s_sm_sense[8]     = {0};   /* tag_sense_type per slot: 0=none, 1=LF, 2=HF */
-static uint8_t      s_sm_type[8]      = {0};   /* tag_type enum per slot */
+static uint16_t     s_sm_hf_type[8]   = {0};   /* HF tag type per slot (0 = no HF card) */
+static uint16_t     s_sm_lf_type[8]   = {0};   /* LF tag type per slot (0 = no LF card) */
 static int8_t       s_sm_active       = -1;    /* active slot 0-7; -1 = unknown */
 static int8_t       s_sm_pending_del  = -1;    /* slot awaiting delete confirm  */
 static volatile bool s_sm_loaded      = false; /* info + active both fetched */
@@ -48310,49 +48310,46 @@ static volatile bool s_sm_loading     = false; /* BLE command chain in flight */
 #define CHAM_SENSE_LF   1
 #define CHAM_SENSE_HF   2
 
-/* Human-readable card type name.
- * Returns a string literal for known types; formats into fallback_buf for others. */
-static const char *s_sm_type_name(uint8_t sense, uint8_t type,
+/* Human-readable card type name derived from GET_SLOT_INFO hf/lf type words.
+ * lf_type checked first (non-zero wins); hf_type second.
+ * LF types: 1=EM410X, 2=HID H10301. HF types: 1=MFC 1K, 5=NTAG213, etc. */
+static const char *s_sm_type_name(uint16_t hf_type, uint16_t lf_type,
                                   char *fallback_buf, size_t sz)
 {
-    if (sense == CHAM_SENSE_NO || type == 0) return "Empty";
-    if (sense == CHAM_SENSE_LF) {
-        switch (type) {
+    if (hf_type == 0 && lf_type == 0) return "Empty";
+    if (lf_type != 0) {
+        switch (lf_type) {
             case 1:  return "EM410X";
-            case 14: return "HID 26-bit";
-            case 15: return "HID 35-bit";
+            case 2:  return "HID H10301";
             default:
-                snprintf(fallback_buf, sz, "LF type %u", type);
+                snprintf(fallback_buf, sz, "LF type %u", lf_type);
                 return fallback_buf;
         }
     }
     /* HF */
-    switch (type) {
+    switch (hf_type) {
+        case 1:  return "MFC 1K";
         case 2:  return "MFC Mini";
-        case 3:  return "MFC 1K";
-        case 4:  return "MFC 2K";
-        case 5:  return "MFC 4K";
-        case 6:  return "NTAG213";
-        case 7:  return "NTAG215";
-        case 8:  return "NTAG216";
-        case 9:  return "Ultralight";
-        case 10: return "UL-C";
+        case 3:  return "MFC 2K";
+        case 4:  return "MFC 4K";
+        case 5:  return "NTAG213";
+        case 6:  return "NTAG215";
+        case 7:  return "NTAG216";
+        case 8:  return "Ultralight";
+        case 9:  return "UL-C";
         default:
-            snprintf(fallback_buf, sz, "HF type %u", type);
+            snprintf(fallback_buf, sz, "HF type %u", hf_type);
             return fallback_buf;
     }
 }
 
-/* Accent color for a slot based on sense type and active status */
+/* Accent color for a slot: gold=active, blue=HF, green=LF, grey=empty */
 static lv_color_t s_sm_slot_color(int slot)
 {
-    if (slot == (int)s_sm_active)
-        return lv_color_hex(0xFFD54F); /* gold  — active slot */
-    switch (s_sm_sense[slot]) {
-        case CHAM_SENSE_HF: return lv_color_hex(0x42A5F5); /* blue  — HF card */
-        case CHAM_SENSE_LF: return lv_color_hex(0x66BB6A); /* green — LF card */
-        default:            return lv_color_hex(0x546E7A); /* gray  — empty   */
-    }
+    if (slot == (int)s_sm_active)        return lv_color_hex(0xFFD54F);
+    if (s_sm_hf_type[slot] != 0)         return lv_color_hex(0x42A5F5);
+    if (s_sm_lf_type[slot] != 0)         return lv_color_hex(0x66BB6A);
+    return lv_color_hex(0x546E7A);
 }
 
 /* Forward declarations */
@@ -48378,17 +48375,18 @@ static void s_sm_on_active_slot(bool ok, const uint8_t *data, uint16_t dlen)
 
 static void s_sm_on_slot_info(bool ok, const uint8_t *data, uint16_t dlen)
 {
-    if (!ok || !data || dlen < 16) {
+    /* Response: 8 slots × [hf_type u16 BE, lf_type u16 BE] = 32 bytes */
+    if (!ok || !data || dlen < 32) {
         s_sm_loading = false;
         if (s_sm_status_lbl) lv_label_set_text(s_sm_status_lbl, "Read failed - tap retry");
         return;
     }
     for (int i = 0; i < 8; i++) {
-        s_sm_sense[i] = data[i * 2];
-        s_sm_type[i]  = data[i * 2 + 1];
+        s_sm_hf_type[i] = ((uint16_t)data[i * 4    ] << 8) | data[i * 4 + 1];
+        s_sm_lf_type[i] = ((uint16_t)data[i * 4 + 2] << 8) | data[i * 4 + 3];
     }
-    /* Chain: fetch active slot index next */
-    if (!cham_send_cmd(1023, NULL, 0, s_sm_on_active_slot)) {
+    /* Chain: fetch active slot index (getActiveSlot = 1018) */
+    if (!cham_send_cmd(1018, NULL, 0, s_sm_on_active_slot)) {
         s_sm_loading = false;
         if (s_sm_status_lbl) lv_label_set_text(s_sm_status_lbl, "Busy - retrying...");
     }
@@ -48425,7 +48423,7 @@ static void s_sm_load_info(void)
     if (s_sm_loading) return; /* already in flight */
     s_sm_loading = true;
     if (s_sm_status_lbl) lv_label_set_text(s_sm_status_lbl, "Loading...");
-    if (!cham_send_cmd(1015, NULL, 0, s_sm_on_slot_info)) {
+    if (!cham_send_cmd(1019, NULL, 0, s_sm_on_slot_info)) { /* getSlotInfo = 0x03FB */
         s_sm_loading = false; /* not ready yet; poll timer will retry */
     }
 }
@@ -48439,7 +48437,7 @@ static void s_sm_render_rows(void)
     char fb[16]; /* fallback buffer for unknown type names */
     for (int i = 0; i < 8; i++) {
         bool is_active = (i == (int)s_sm_active);
-        bool is_empty  = (s_sm_sense[i] == CHAM_SENSE_NO || s_sm_type[i] == 0);
+        bool is_empty  = (s_sm_hf_type[i] == 0 && s_sm_lf_type[i] == 0);
         lv_color_t col = s_sm_slot_color(i);
 
         /* Row container: flex-row with clickable area for activation */
@@ -48483,7 +48481,7 @@ static void s_sm_render_rows(void)
 
         /* Type name label: grows to fill middle */
         lv_obj_t *type_lbl = lv_label_create(row);
-        const char *tname = s_sm_type_name(s_sm_sense[i], s_sm_type[i],
+        const char *tname = s_sm_type_name(s_sm_hf_type[i], s_sm_lf_type[i],
                                            fb, sizeof(fb));
         lv_label_set_text(type_lbl, tname);
         lv_obj_set_style_text_font(type_lbl, &lv_font_montserrat_12, 0);
@@ -48553,8 +48551,11 @@ static void s_sm_confirm_yes_cb(lv_event_t *e)
     int slot = (int)s_sm_pending_del;
     s_sm_pending_del = -1;
     if (slot < 0 || slot > 7) return;
-    uint8_t payload[1] = { (uint8_t)slot };
-    if (!cham_send_cmd(1019, payload, 1, s_sm_on_delete)) {
+    /* deleteSlotTag (0x0400) needs [slot_index, sense_type] — derive sense from loaded data */
+    uint8_t sense = (s_sm_hf_type[slot] != 0) ? CHAM_SENSE_HF :
+                    (s_sm_lf_type[slot] != 0)  ? CHAM_SENSE_LF : CHAM_SENSE_NO;
+    uint8_t payload[2] = { (uint8_t)slot, sense };
+    if (!cham_send_cmd(1024, payload, 2, s_sm_on_delete)) {
         if (s_sm_status_lbl) lv_label_set_text(s_sm_status_lbl, "Busy - try again");
     } else {
         if (s_sm_status_lbl) lv_label_set_text(s_sm_status_lbl, "Clearing slot...");
@@ -48621,7 +48622,7 @@ static void s_sm_row_tap_cb(lv_event_t *e)
     int slot = (int)(intptr_t)lv_event_get_user_data(e);
     if (slot == (int)s_sm_active) return; /* already active, no-op */
     uint8_t payload[1] = { (uint8_t)slot };
-    if (!cham_send_cmd(1011, payload, 1, s_sm_on_activate)) {
+    if (!cham_send_cmd(1003, payload, 1, s_sm_on_activate)) { /* setActiveSlot = 0x03EB */
         if (s_sm_status_lbl) lv_label_set_text(s_sm_status_lbl, "Busy - try again");
         return;
     }
@@ -48659,6 +48660,8 @@ static void cham_slots_stop(void)
     s_sm_loading     = false;
     s_sm_active      = -1;
     s_sm_pending_del = -1;
+    memset(s_sm_hf_type, 0, sizeof(s_sm_hf_type));
+    memset(s_sm_lf_type, 0, sizeof(s_sm_lf_type));
     /* BLE connection stays alive */
 }
 
