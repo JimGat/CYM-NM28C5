@@ -2302,6 +2302,7 @@ static void show_radio_menu_screen(void);
 static void show_nfc_hub_screen(void);
 static void show_rfid_menu_screen(void);
 static void show_chameleon_screen(void);
+static void show_cham_slots_screen(void);
 static void show_cc1101_screen(void);
 static void s_cal_tx_stop(void);      // calibration TX stop, called from show_cc1101_screen cleanup
 static void show_cc1101_hw_test_screen(void);
@@ -48276,39 +48277,428 @@ static lv_obj_t *s_cham_info_row(lv_obj_t *parent, const char *text, lv_color_t 
     return lbl;
 }
 
-/* ── Stub feature tile (matches create_small_tile style) ── */
-static void s_cham_stub_tile(lv_obj_t *parent, const char *icon, const char *name)
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Chameleon Ultra Slot Manager — Phase 4
+ * getSlotInfo (1015): sense_type + tag_type for all 8 slots.
+ * getActiveSlot (1023): currently active slot index (0-7).
+ * setActiveSlot (1011): switch active slot (1-byte payload: slot index).
+ * deleteSlotTag (1019): erase slot data (1-byte payload: slot index).
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+/* Sub-screen globals — reset by cham_slots_stop() */
+static lv_timer_t  *s_sm_tmr          = NULL;
+static lv_obj_t    *s_sm_status_lbl   = NULL;  /* "Loading..." / status text  */
+static lv_obj_t    *s_sm_list_cont    = NULL;  /* flex-column container: 8 rows */
+static lv_obj_t    *s_sm_confirm_pop  = NULL;  /* delete-confirm popup */
+static uint8_t      s_sm_sense[8]     = {0};   /* tag_sense_type per slot: 0=none, 1=LF, 2=HF */
+static uint8_t      s_sm_type[8]      = {0};   /* tag_type enum per slot */
+static int8_t       s_sm_active       = -1;    /* active slot 0-7; -1 = unknown */
+static int8_t       s_sm_pending_del  = -1;    /* slot awaiting delete confirm  */
+static volatile bool s_sm_loaded      = false; /* info + active both fetched */
+static volatile bool s_sm_changed     = false; /* UI needs refresh */
+static volatile bool s_sm_loading     = false; /* BLE command chain in flight */
+
+/* Chameleon tag sense type constants (tag_base_type.h) */
+#define CHAM_SENSE_NO   0
+#define CHAM_SENSE_LF   1
+#define CHAM_SENSE_HF   2
+
+/* Human-readable card type name.
+ * Returns a string literal for known types; formats into fallback_buf for others. */
+static const char *s_sm_type_name(uint8_t sense, uint8_t type,
+                                  char *fallback_buf, size_t sz)
 {
-    lv_obj_t *btn = lv_btn_create(parent);
-    lv_obj_set_size(btn, 72, 54);
-    lv_obj_set_style_bg_color(btn, ui_card_color(), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(btn, ui_card_pressed_color(), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(btn, 8, 0);
-    lv_obj_set_style_border_width(btn, 1, 0);
-    lv_obj_set_style_border_color(btn, ui_border_color(), 0);
-    lv_obj_set_style_shadow_width(btn, 0, 0);
-    lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_all(btn, 4, 0);
-    lv_obj_set_style_pad_row(btn, 2, 0);
+    if (sense == CHAM_SENSE_NO || type == 0) return "Empty";
+    if (sense == CHAM_SENSE_LF) {
+        switch (type) {
+            case 1:  return "EM410X";
+            case 14: return "HID 26-bit";
+            case 15: return "HID 35-bit";
+            default:
+                snprintf(fallback_buf, sz, "LF type %u", type);
+                return fallback_buf;
+        }
+    }
+    /* HF */
+    switch (type) {
+        case 2:  return "MFC Mini";
+        case 3:  return "MFC 1K";
+        case 4:  return "MFC 2K";
+        case 5:  return "MFC 4K";
+        case 6:  return "NTAG213";
+        case 7:  return "NTAG215";
+        case 8:  return "NTAG216";
+        case 9:  return "Ultralight";
+        case 10: return "UL-C";
+        default:
+            snprintf(fallback_buf, sz, "HF type %u", type);
+            return fallback_buf;
+    }
+}
 
-    lv_obj_t *ico = lv_label_create(btn);
-    lv_label_set_text(ico, icon);
-    lv_obj_set_style_text_font(ico, &lv_extra_symbols, 0);  /* FA glyphs, always renders */
-    lv_obj_set_style_text_color(ico, lv_color_hex(0xCE93D8), 0);
+/* Accent color for a slot based on sense type and active status */
+static lv_color_t s_sm_slot_color(int slot)
+{
+    if (slot == (int)s_sm_active)
+        return lv_color_hex(0xFFD54F); /* gold  — active slot */
+    switch (s_sm_sense[slot]) {
+        case CHAM_SENSE_HF: return lv_color_hex(0x42A5F5); /* blue  — HF card */
+        case CHAM_SENSE_LF: return lv_color_hex(0x66BB6A); /* green — LF card */
+        default:            return lv_color_hex(0x546E7A); /* gray  — empty   */
+    }
+}
 
-    lv_obj_t *nm = lv_label_create(btn);
-    lv_label_set_text(nm, name);
-    lv_obj_set_style_text_font(nm, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(nm, ui_text_color(), 0);
-    lv_obj_set_style_text_align(nm, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(nm, 64);
+/* Forward declarations */
+static void s_sm_on_slot_info(bool ok, const uint8_t *data, uint16_t dlen);
+static void s_sm_on_active_slot(bool ok, const uint8_t *data, uint16_t dlen);
+static void s_sm_load_info(void);
+static void s_sm_row_tap_cb(lv_event_t *e);
+static void s_sm_del_btn_cb(lv_event_t *e);
 
-    lv_obj_t *ph = lv_label_create(btn);
-    lv_label_set_text(ph, "Soon");
-    lv_obj_set_style_text_font(ph, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(ph, lv_color_hex(0x546E7A), 0);
+/* ── BLE response callbacks ── */
+
+static void s_sm_on_active_slot(bool ok, const uint8_t *data, uint16_t dlen)
+{
+    s_sm_loading = false;
+    if (ok && data && dlen >= 1) {
+        s_sm_active = (int8_t)data[0];
+    } else {
+        s_sm_active = -1;
+    }
+    s_sm_loaded  = true;
+    s_sm_changed = true;
+}
+
+static void s_sm_on_slot_info(bool ok, const uint8_t *data, uint16_t dlen)
+{
+    if (!ok || !data || dlen < 16) {
+        s_sm_loading = false;
+        if (s_sm_status_lbl) lv_label_set_text(s_sm_status_lbl, "Read failed - tap retry");
+        return;
+    }
+    for (int i = 0; i < 8; i++) {
+        s_sm_sense[i] = data[i * 2];
+        s_sm_type[i]  = data[i * 2 + 1];
+    }
+    /* Chain: fetch active slot index next */
+    if (!cham_send_cmd(1023, NULL, 0, s_sm_on_active_slot)) {
+        s_sm_loading = false;
+        if (s_sm_status_lbl) lv_label_set_text(s_sm_status_lbl, "Busy - retrying...");
+    }
+}
+
+static void s_sm_on_activate(bool ok, const uint8_t *data, uint16_t dlen)
+{
+    (void)data; (void)dlen;
+    if (!s_sm_status_lbl) return; /* screen gone */
+    if (!ok) {
+        lv_label_set_text(s_sm_status_lbl, "Activate failed - try again");
+        return;
+    }
+    s_sm_loaded = false;
+    s_sm_load_info();
+}
+
+static void s_sm_on_delete(bool ok, const uint8_t *data, uint16_t dlen)
+{
+    (void)data; (void)dlen;
+    if (!s_sm_status_lbl) return; /* screen gone */
+    if (!ok) {
+        lv_label_set_text(s_sm_status_lbl, "Clear failed - try again");
+        return;
+    }
+    lv_label_set_text(s_sm_status_lbl, "Cleared - reloading...");
+    s_sm_loaded = false;
+    s_sm_load_info();
+}
+
+/* ── Kick off the two-command info load sequence ── */
+static void s_sm_load_info(void)
+{
+    if (s_sm_loading) return; /* already in flight */
+    s_sm_loading = true;
+    if (s_sm_status_lbl) lv_label_set_text(s_sm_status_lbl, "Loading...");
+    if (!cham_send_cmd(1015, NULL, 0, s_sm_on_slot_info)) {
+        s_sm_loading = false; /* not ready yet; poll timer will retry */
+    }
+}
+
+/* ── Render / refresh the 8 slot rows ── */
+static void s_sm_render_rows(void)
+{
+    if (!s_sm_list_cont || !s_sm_status_lbl) return;
+    lv_obj_clean(s_sm_list_cont); /* remove old rows */
+
+    char fb[16]; /* fallback buffer for unknown type names */
+    for (int i = 0; i < 8; i++) {
+        bool is_active = (i == (int)s_sm_active);
+        bool is_empty  = (s_sm_sense[i] == CHAM_SENSE_NO || s_sm_type[i] == 0);
+        lv_color_t col = s_sm_slot_color(i);
+
+        /* Row container: flex-row with clickable area for activation */
+        lv_obj_t *row = lv_obj_create(s_sm_list_cont);
+        lv_obj_set_size(row, 228, 29);
+        lv_obj_set_style_bg_color(row, lv_color_hex(0x1A1A2E), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(row, lv_color_hex(0x2D2D48), LV_STATE_PRESSED);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_STATE_DEFAULT);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_side(row,
+            LV_BORDER_SIDE_LEFT | LV_BORDER_SIDE_BOTTOM, 0);
+        lv_obj_set_style_border_color(row, col, 0);
+        lv_obj_set_style_border_opa(row, is_empty ? LV_OPA_20 : LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(row, 0, 0);
+        lv_obj_set_style_pad_all(row, 0, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, s_sm_row_tap_cb, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)i);
+
+        /* Slot number badge: colored box, 30 px wide */
+        lv_obj_t *num_box = lv_obj_create(row);
+        lv_obj_set_size(num_box, 30, 29);
+        lv_obj_set_style_bg_color(num_box,
+            is_active ? lv_color_hex(0x3D2E00) : lv_color_hex(0x131328), 0);
+        lv_obj_set_style_bg_opa(num_box, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(num_box, 0, 0);
+        lv_obj_set_style_radius(num_box, 0, 0);
+        lv_obj_set_style_pad_all(num_box, 0, 0);
+        lv_obj_clear_flag(num_box, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t *num_lbl = lv_label_create(num_box);
+        char snum[4];
+        snprintf(snum, sizeof(snum), "%d", i + 1);
+        lv_label_set_text(num_lbl, snum);
+        lv_obj_set_style_text_font(num_lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(num_lbl, col, 0);
+        lv_obj_center(num_lbl);
+
+        /* Type name label: grows to fill middle */
+        lv_obj_t *type_lbl = lv_label_create(row);
+        const char *tname = s_sm_type_name(s_sm_sense[i], s_sm_type[i],
+                                           fb, sizeof(fb));
+        lv_label_set_text(type_lbl, tname);
+        lv_obj_set_style_text_font(type_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(type_lbl,
+            is_empty ? lv_color_hex(0x37474F) : col, 0);
+        lv_label_set_long_mode(type_lbl, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_flex_grow(type_lbl, 1, 0);
+        lv_obj_set_style_pad_left(type_lbl, 6, 0);
+
+        /* ACTIVE badge — gold, shown only when this is the active slot */
+        if (is_active) {
+            lv_obj_t *badge = lv_label_create(row);
+            lv_label_set_text(badge, "ACTIVE");
+            lv_obj_set_style_text_font(badge, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(badge, lv_color_hex(0xFFD54F), 0);
+            lv_obj_set_style_pad_right(badge, 2, 0);
+        }
+
+        /* Trash/clear button — right edge, always visible; disabled for empty slots */
+        lv_obj_t *del_btn = lv_btn_create(row);
+        lv_obj_set_size(del_btn, 28, 29);
+        lv_obj_set_style_bg_color(del_btn, lv_color_hex(0x1A1A2E), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(del_btn, lv_color_hex(0x5D1A1A), LV_STATE_PRESSED);
+        lv_obj_set_style_bg_opa(del_btn, LV_OPA_COVER, LV_STATE_DEFAULT);
+        lv_obj_set_style_radius(del_btn, 0, 0);
+        lv_obj_set_style_border_width(del_btn, 0, 0);
+        lv_obj_set_style_shadow_width(del_btn, 0, 0);
+        lv_obj_set_style_pad_all(del_btn, 0, 0);
+        if (is_empty) {
+            lv_obj_add_state(del_btn, LV_STATE_DISABLED);
+            lv_obj_set_style_opa(del_btn, LV_OPA_20, LV_STATE_DISABLED);
+        }
+        lv_obj_add_event_cb(del_btn, s_sm_del_btn_cb, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)i);
+        lv_obj_t *del_ico = lv_label_create(del_btn);
+        lv_label_set_text(del_ico, LV_SYMBOL_TRASH);
+        lv_obj_set_style_text_color(del_ico, lv_color_hex(0xEF9A9A), LV_STATE_DEFAULT);
+        lv_obj_set_style_text_color(del_ico, lv_color_hex(0xEF5350), LV_STATE_PRESSED);
+        lv_obj_set_style_text_font(del_ico, &lv_font_montserrat_12, 0);
+        lv_obj_center(del_ico);
+    }
+
+    /* Bottom status: show active slot number */
+    if (s_sm_active >= 0 && s_sm_active <= 7) {
+        char sb[56];
+        snprintf(sb, sizeof(sb), "Active: Slot %d - tap another row to switch",
+                 s_sm_active + 1);
+        lv_label_set_text(s_sm_status_lbl, sb);
+    } else {
+        lv_label_set_text(s_sm_status_lbl, "Tap a slot row to make it active");
+    }
+}
+
+/* ── Delete confirm popup callbacks ── */
+
+static void s_sm_confirm_no_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_sm_confirm_pop) { lv_obj_del(s_sm_confirm_pop); s_sm_confirm_pop = NULL; }
+    s_sm_pending_del = -1;
+}
+
+static void s_sm_confirm_yes_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_sm_confirm_pop) { lv_obj_del(s_sm_confirm_pop); s_sm_confirm_pop = NULL; }
+    int slot = (int)s_sm_pending_del;
+    s_sm_pending_del = -1;
+    if (slot < 0 || slot > 7) return;
+    uint8_t payload[1] = { (uint8_t)slot };
+    if (!cham_send_cmd(1019, payload, 1, s_sm_on_delete)) {
+        if (s_sm_status_lbl) lv_label_set_text(s_sm_status_lbl, "Busy - try again");
+    } else {
+        if (s_sm_status_lbl) lv_label_set_text(s_sm_status_lbl, "Clearing slot...");
+    }
+}
+
+static void s_sm_show_confirm(int slot)
+{
+    if (s_sm_confirm_pop) { lv_obj_del(s_sm_confirm_pop); s_sm_confirm_pop = NULL; }
+    s_sm_pending_del = slot;
+
+    s_sm_confirm_pop = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(s_sm_confirm_pop, 204, 90);
+    lv_obj_align(s_sm_confirm_pop, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(s_sm_confirm_pop, lv_color_hex(0x1A1A2E), 0);
+    lv_obj_set_style_border_color(s_sm_confirm_pop, lv_color_hex(0xF44336), 0);
+    lv_obj_set_style_border_width(s_sm_confirm_pop, 2, 0);
+    lv_obj_set_style_radius(s_sm_confirm_pop, 8, 0);
+    lv_obj_set_style_pad_all(s_sm_confirm_pop, 8, 0);
+    lv_obj_clear_flag(s_sm_confirm_pop, LV_OBJ_FLAG_SCROLLABLE);
+
+    char msg[40];
+    snprintf(msg, sizeof(msg), "Clear slot %d? All data lost!", slot + 1);
+    lv_obj_t *msg_lbl = lv_label_create(s_sm_confirm_pop);
+    lv_label_set_text(msg_lbl, msg);
+    lv_obj_set_style_text_font(msg_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(msg_lbl, lv_color_hex(0xEF9A9A), 0);
+    lv_obj_set_style_text_align(msg_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(msg_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(msg_lbl, 186);
+    lv_obj_align(msg_lbl, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *yes = lv_btn_create(s_sm_confirm_pop);
+    lv_obj_set_size(yes, 88, 30);
+    lv_obj_align(yes, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_set_style_bg_color(yes, lv_color_hex(0xB71C1C), 0);
+    lv_obj_add_event_cb(yes, s_sm_confirm_yes_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *yl = lv_label_create(yes);
+    lv_label_set_text(yl, LV_SYMBOL_TRASH " Clear");
+    lv_obj_set_style_text_font(yl, &lv_font_montserrat_12, 0);
+    lv_obj_center(yl);
+
+    lv_obj_t *no = lv_btn_create(s_sm_confirm_pop);
+    lv_obj_set_size(no, 88, 30);
+    lv_obj_align(no, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(no, lv_color_hex(0x263238), 0);
+    lv_obj_add_event_cb(no, s_sm_confirm_no_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *nl = lv_label_create(no);
+    lv_label_set_text(nl, "Cancel");
+    lv_obj_set_style_text_font(nl, &lv_font_montserrat_12, 0);
+    lv_obj_center(nl);
+}
+
+/* ── Row event callbacks ── */
+
+static void s_sm_del_btn_cb(lv_event_t *e)
+{
+    int slot = (int)(intptr_t)lv_event_get_user_data(e);
+    s_sm_show_confirm(slot);
+}
+
+static void s_sm_row_tap_cb(lv_event_t *e)
+{
+    int slot = (int)(intptr_t)lv_event_get_user_data(e);
+    if (slot == (int)s_sm_active) return; /* already active, no-op */
+    uint8_t payload[1] = { (uint8_t)slot };
+    if (!cham_send_cmd(1011, payload, 1, s_sm_on_activate)) {
+        if (s_sm_status_lbl) lv_label_set_text(s_sm_status_lbl, "Busy - try again");
+        return;
+    }
+    if (s_sm_status_lbl) lv_label_set_text(s_sm_status_lbl, "Switching...");
+}
+
+/* ── Poll timer (50 ms) ── */
+static void s_sm_poll_timer(lv_timer_t *t)
+{
+    (void)t;
+    if (!s_sm_status_lbl) return; /* screen torn down */
+
+    if (s_sm_loaded && s_sm_changed) {
+        s_sm_changed = false;
+        s_sm_render_rows();
+        return;
+    }
+    /* Retry load if not yet complete and no command in flight */
+    if (!s_sm_loaded && !s_sm_loading) {
+        s_sm_load_info();
+    }
+}
+
+/* ── Stop hook ── */
+static void cham_slots_stop(void)
+{
+    cham_cancel_pending();
+    if (s_sm_tmr) { lv_timer_del(s_sm_tmr); s_sm_tmr = NULL; }
+    if (s_sm_confirm_pop) { lv_obj_del(s_sm_confirm_pop); s_sm_confirm_pop = NULL; }
+    s_sm_status_lbl  = NULL;
+    s_sm_list_cont   = NULL;
+    s_sm_loaded      = false;
+    s_sm_changed     = false;
+    s_sm_loading     = false;
+    s_sm_active      = -1;
+    s_sm_pending_del = -1;
+    /* BLE connection stays alive */
+}
+
+/* ── Screen entry point ── */
+static void show_cham_slots_screen(void)
+{
+    create_function_page_base("Slot Manager");
+    g_screen_stop_fn = cham_slots_stop;
+    g_screen_back_fn = show_chameleon_screen;
+    apply_menu_bg();
+
+    /* Status / info label — single line at top */
+    s_sm_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_sm_status_lbl, "Loading...");
+    lv_obj_set_style_text_font(s_sm_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_sm_status_lbl, lv_color_hex(0xB0BEC5), 0);
+    lv_obj_set_style_text_align(s_sm_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_sm_status_lbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(s_sm_status_lbl, 236);
+    lv_obj_align(s_sm_status_lbl, LV_ALIGN_BOTTOM_MID, 0, -2);
+
+    /* Scrollable flex-column container for the 8 slot rows */
+    s_sm_list_cont = lv_obj_create(function_page);
+    lv_obj_set_size(s_sm_list_cont, 236, 242);
+    lv_obj_align(s_sm_list_cont, LV_ALIGN_TOP_MID, 0, 4);
+    lv_obj_set_style_bg_color(s_sm_list_cont, lv_color_hex(0x12122A), 0);
+    lv_obj_set_style_border_color(s_sm_list_cont, lv_color_hex(0x3D3D6B), 0);
+    lv_obj_set_style_border_width(s_sm_list_cont, 1, 0);
+    lv_obj_set_style_radius(s_sm_list_cont, 4, 0);
+    lv_obj_set_style_pad_all(s_sm_list_cont, 4, 0);
+    lv_obj_set_style_pad_row(s_sm_list_cont, 1, 0);
+    lv_obj_set_flex_flow(s_sm_list_cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_sm_list_cont, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_scroll_dir(s_sm_list_cont, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_sm_list_cont, LV_SCROLLBAR_MODE_AUTO);
+
+    s_sm_tmr = lv_timer_create(s_sm_poll_timer, 50, NULL);
+    s_sm_load_info();
+}
+
+/* ── Tile callback — wires the Slots tile to this screen ── */
+static void s_cham_slots_tile_cb(lv_event_t *e)
+{
+    (void)e;
+    s_cham_nav_child = true;
+    show_cham_slots_screen();
 }
 
 /* ── Scan list helpers ── */
@@ -48672,7 +49062,42 @@ static void s_cham_rebuild_content(cham_state_t st)
             lv_obj_add_event_cb(btn, s_cham_lf_tile_cb, LV_EVENT_CLICKED, NULL);
         }
 
-        s_cham_stub_tile(tiles, MY_SYMBOL_DATABASE, "Slots");
+        /* Slots — live tile (Phase 4: 8-slot viewer, activate, clear) */
+        {
+            lv_obj_t *btn = lv_btn_create(tiles);
+            lv_obj_set_size(btn, 72, 54);
+            lv_obj_set_style_bg_color(btn, ui_card_color(), LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(btn, ui_card_pressed_color(), LV_STATE_PRESSED);
+            lv_obj_set_style_radius(btn, 8, 0);
+            lv_obj_set_style_border_width(btn, 2, 0);
+            lv_obj_set_style_border_color(btn, lv_color_hex(0x7B1FA2), 0); /* purple = slots */
+            lv_obj_set_style_shadow_width(btn, 0, 0);
+            lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_COLUMN);
+            lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_all(btn, 4, 0);
+            lv_obj_set_style_pad_row(btn, 2, 0);
+
+            lv_obj_t *ico = lv_label_create(btn);
+            lv_label_set_text(ico, MY_SYMBOL_DATABASE);
+            lv_obj_set_style_text_font(ico, &lv_extra_symbols, 0);
+            lv_obj_set_style_text_color(ico, lv_color_hex(0xCE93D8), 0); /* purple = slots */
+
+            lv_obj_t *nm = lv_label_create(btn);
+            lv_label_set_text(nm, "Slots");
+            lv_obj_set_style_text_font(nm, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(nm, ui_text_color(), 0);
+            lv_obj_set_style_text_align(nm, LV_TEXT_ALIGN_CENTER, 0);
+            lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+            lv_obj_set_width(nm, 64);
+
+            lv_obj_t *sub3 = lv_label_create(btn);
+            lv_label_set_text(sub3, "8 slots");
+            lv_obj_set_style_text_font(sub3, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(sub3, lv_color_hex(0xCE93D8), 0);
+
+            lv_obj_add_event_cb(btn, s_cham_slots_tile_cb, LV_EVENT_CLICKED, NULL);
+        }
 
         /* Disconnect button */
         lv_obj_t *dbtn = lv_btn_create(s_cham_content);
