@@ -47342,7 +47342,7 @@ static void show_nfc_hub_screen(void)
     lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
 
     /* Chameleon Ultra — dragon icon, purple */
-    create_tile(tiles, MY_SYMBOL_DRAGON, "Chameleon\nUltra",
+    create_tile(tiles, MY_SYMBOL_DRAGON, "Cham\nUltra",
                 lv_color_hex(0x4A0E8F), nfc_hub_chameleon_cb, "Chameleon");
     /* PN532 — microchip icon, teal */
     create_tile(tiles, MY_SYMBOL_MICROCHIP, "PN532\nNFC",
@@ -47364,6 +47364,426 @@ static lv_obj_t   *s_cham_scan_list = NULL;  /* lv_list during scan */
 static cham_state_t s_cham_ui_st    = (cham_state_t)0xFF; /* last-rendered state */
 static int         s_cham_list_n    = 0;      /* # items currently in scan list */
 static bool        s_cham_nav_child = false;  /* set before entering a child screen; prevents stop hook from disconnecting */
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Chameleon HF Card Reader — Phase 3
+ * scan14ATag (cmd 2000): detect any ISO 14443-A card, return UID+ATQA+SAK.
+ * Retries until a card is found or the 30-second scan window expires.
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/* HF read sub-screen globals — NULLed by cham_hf_read_stop() */
+static lv_timer_t *s_hf_tmr          = NULL;
+static lv_obj_t   *s_hf_status_lbl   = NULL;
+static lv_obj_t   *s_hf_uid_lbl      = NULL;
+static lv_obj_t   *s_hf_save_btn     = NULL;
+static lv_obj_t   *s_hf_scan_btn     = NULL;
+static lv_obj_t   *s_hf_save_overlay = NULL;
+static lv_obj_t   *s_hf_save_ta      = NULL;
+static char        s_hf_save_default[32];
+
+/* Parsed card data */
+static uint8_t  s_hf_uid[10]    = {0};  /* up to 10-byte UID */
+static int      s_hf_uid_len    = 0;
+static uint8_t  s_hf_atqa[2]   = {0};  /* big-endian after device reversal */
+static uint8_t  s_hf_sak       = 0;
+static char     s_hf_type_str[24] = {0};
+
+static volatile bool s_hf_result_ready  = false;
+static volatile bool s_hf_result_ok     = false;
+static volatile bool s_hf_mode_ok       = false;
+static int64_t       s_hf_scan_deadline = 0;
+
+/* Determine card type from ATQA+SAK */
+static void s_hf_detect_type(void)
+{
+    /* atqa = big-endian (high byte first, standard representation) */
+    uint16_t atqa = ((uint16_t)s_hf_atqa[0] << 8) | s_hf_atqa[1];
+
+    if (s_hf_sak & 0x20) {
+        strlcpy(s_hf_type_str, "ISO 14443-4", sizeof(s_hf_type_str));
+    } else if (s_hf_sak == 0x09) {
+        strlcpy(s_hf_type_str, "MIFARE Mini", sizeof(s_hf_type_str));
+    } else if (s_hf_sak == 0x08 || s_hf_sak == 0x28) {
+        strlcpy(s_hf_type_str, "MIFARE Classic 1K", sizeof(s_hf_type_str));
+    } else if (s_hf_sak == 0x18 || s_hf_sak == 0x38) {
+        strlcpy(s_hf_type_str, "MIFARE Classic 4K", sizeof(s_hf_type_str));
+    } else if (s_hf_sak == 0x00) {
+        /* NTAG213/215/216 and Ultralight all present with SAK=0x00 ATQA=0x0044.
+         * GET_VERSION (hf14ARawCommand 0x60) can distinguish sub-types; for now
+         * show generic label. */
+        (void)atqa;
+        strlcpy(s_hf_type_str, "NTAG/Ultralight", sizeof(s_hf_type_str));
+    } else {
+        snprintf(s_hf_type_str, sizeof(s_hf_type_str), "ISO14A SAK=%02X", s_hf_sak);
+    }
+}
+
+/* scan14ATag (2000) result callback */
+static void s_hf_on_scan_result(bool ok, const uint8_t *data, uint16_t dlen)
+{
+    if (ok && data && dlen >= 4) {
+        /* Response: [uidLen][UID×N][ATQA_lo][ATQA_hi][SAK][atsLen?][ATS?] */
+        int uid_len = (int)data[0];
+        if (uid_len < 1 || uid_len > 10 || dlen < (uint16_t)(1 + uid_len + 3)) goto retry;
+
+        int uidlen = uid_len < 10 ? uid_len : 10;
+        memcpy(s_hf_uid, &data[1], uidlen);
+        s_hf_uid_len = uidlen;
+
+        /* Device sends ATQA as [lo, hi]; reverse to big-endian for display/compare */
+        s_hf_atqa[0] = data[1 + uid_len + 1];  /* hi byte (was at pos N+2) */
+        s_hf_atqa[1] = data[1 + uid_len];       /* lo byte (was at pos N+1) */
+        s_hf_sak = data[1 + uid_len + 2];
+
+        s_hf_detect_type();
+        s_hf_result_ok    = true;
+        s_hf_result_ready = true;
+        return;
+    }
+retry:
+    if (esp_timer_get_time() < s_hf_scan_deadline) {
+        if (s_hf_status_lbl)
+            lv_label_set_text(s_hf_status_lbl, "Hold card near Chameleon...");
+        cham_send_cmd_ex(2000, NULL, 0, s_hf_on_scan_result, 2000000LL);
+    } else {
+        s_hf_uid_len      = 0;
+        s_hf_result_ok    = false;
+        s_hf_result_ready = true;
+    }
+}
+
+/* Mode-set callback — sets 30-second scan window then starts scan14ATag */
+static void s_hf_on_mode_set(bool ok, const uint8_t *data, uint16_t dlen)
+{
+    (void)data; (void)dlen;
+    s_hf_mode_ok = ok;
+    if (!ok) { s_hf_result_ok = false; s_hf_result_ready = true; return; }
+    s_hf_scan_deadline = esp_timer_get_time() + 30000000LL;  /* 30 seconds */
+    cham_send_cmd_ex(2000, NULL, 0, s_hf_on_scan_result, 2000000LL);
+}
+
+/* Restart the mode-set + scan sequence (on Scan Again tap) */
+static void s_hf_restart_scan(void)
+{
+    s_hf_result_ready = false;
+    s_hf_result_ok    = false;
+    s_hf_mode_ok      = false;
+    s_hf_uid_len      = 0;
+    if (s_hf_uid_lbl)  lv_obj_add_flag(s_hf_uid_lbl,  LV_OBJ_FLAG_HIDDEN);
+    if (s_hf_save_btn) lv_obj_add_flag(s_hf_save_btn, LV_OBJ_FLAG_HIDDEN);
+    if (s_hf_scan_btn) lv_obj_add_flag(s_hf_scan_btn, LV_OBJ_FLAG_HIDDEN);
+    if (s_hf_status_lbl)
+        lv_label_set_text(s_hf_status_lbl, "Hold card near Chameleon...");
+    static const uint8_t reader_mode[] = {1};
+    bool sent = cham_send_cmd(1001, reader_mode, 1, s_hf_on_mode_set);
+    if (!sent && s_hf_status_lbl)
+        lv_label_set_text(s_hf_status_lbl, "Not connected - go back and reconnect");
+}
+
+static void s_hf_scan_again_cb(lv_event_t *e) { (void)e; s_hf_restart_scan(); }
+
+/* Build default filename from UID and type */
+static void s_hf_build_save_name(void)
+{
+    char uid_hex[21] = {0};
+    int show = s_hf_uid_len < 10 ? s_hf_uid_len : 10;
+    for (int i = 0; i < show; i++)
+        snprintf(uid_hex + i * 2, sizeof(uid_hex) - (size_t)(i * 2), "%02x", s_hf_uid[i]);
+
+    /* Prefix by broad card family */
+    const char *pfx = (s_hf_sak == 0x00) ? "nfc" :
+                      (s_hf_sak & 0x20)  ? "iso4" : "mfc";
+    snprintf(s_hf_save_default, sizeof(s_hf_save_default), "%s_%s", pfx, uid_hex);
+}
+
+/* Write a minimal Flipper .nfc file */
+static bool s_hf_write_nfc_file(const char *name)
+{
+    char path[72];
+    snprintf(path, sizeof(path), "%s/%.36s.nfc", RFID_DIR_HF, name);
+    FILE *f = fopen(path, "w");
+    if (!f) return false;
+
+    /* Flipper NFC v4 header */
+    fprintf(f, "Filetype: Flipper NFC device\nVersion: 4\n");
+
+    /* Device type string */
+    const char *dev_type;
+    if (s_hf_sak == 0x00)                  dev_type = "Mifare Ultralight";
+    else if (s_hf_sak == 0x08 || s_hf_sak == 0x28) dev_type = "Mifare Classic";
+    else if (s_hf_sak == 0x18 || s_hf_sak == 0x38) dev_type = "Mifare Classic";
+    else if (s_hf_sak == 0x09)              dev_type = "Mifare Mini";
+    else if (s_hf_sak & 0x20)              dev_type = "Iso14443-4a";
+    else                                    dev_type = "Iso14443-3a";
+    fprintf(f, "Device type: %s\n", dev_type);
+
+    /* UID */
+    fprintf(f, "UID:");
+    for (int i = 0; i < s_hf_uid_len; i++) fprintf(f, " %02X", s_hf_uid[i]);
+    fprintf(f, "\n");
+
+    /* ATQA (big-endian, stored as hex bytes) */
+    fprintf(f, "ATQA: %02X %02X\n", s_hf_atqa[0], s_hf_atqa[1]);
+    fprintf(f, "SAK: %02X\n", s_hf_sak);
+
+    /* MIFARE Classic type annotation */
+    if (s_hf_sak == 0x08 || s_hf_sak == 0x28)
+        fprintf(f, "Mifare Classic type: 1K\n");
+    else if (s_hf_sak == 0x18 || s_hf_sak == 0x38)
+        fprintf(f, "Mifare Classic type: 4K\n");
+
+    fprintf(f, "# Captured by CYM-NM28C5 via Chameleon Ultra BLE\n");
+    fprintf(f, "# Full dump (pages/sectors) not yet captured\n");
+    fclose(f);
+    return true;
+}
+
+/* Save overlay: confirm */
+static void s_hf_save_confirm_cb(lv_event_t *e)
+{
+    (void)e;
+    const char *nm = s_hf_save_ta ? lv_textarea_get_text(s_hf_save_ta) : NULL;
+    if (!nm || !nm[0]) nm = s_hf_save_default;
+    bool ok = (s_hf_uid_len > 0) && s_hf_write_nfc_file(nm);
+    if (s_hf_save_overlay) { lv_obj_del(s_hf_save_overlay); s_hf_save_overlay = NULL; s_hf_save_ta = NULL; }
+    if (s_hf_status_lbl)
+        lv_label_set_text(s_hf_status_lbl, ok ? "Saved to /sdcard/lab/rfid/hf/" : "Save failed - SD error");
+    if (ok && s_hf_save_btn) lv_obj_add_flag(s_hf_save_btn, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* Save overlay: cancel */
+static void s_hf_save_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_hf_save_overlay) { lv_obj_del(s_hf_save_overlay); s_hf_save_overlay = NULL; s_hf_save_ta = NULL; }
+}
+
+/* Save button → open filename keyboard overlay */
+static void s_hf_save_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_hf_uid_len <= 0) return;
+    s_hf_build_save_name();
+
+    s_hf_save_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(s_hf_save_overlay, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_pos(s_hf_save_overlay, 0, 0);
+    lv_obj_set_style_bg_color(s_hf_save_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_hf_save_overlay, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(s_hf_save_overlay, 0, 0);
+    lv_obj_set_style_pad_all(s_hf_save_overlay, 0, 0);
+    lv_obj_clear_flag(s_hf_save_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(s_hf_save_overlay, 0, 0);
+
+    lv_obj_t *kb = lv_keyboard_create(s_hf_save_overlay);
+    lv_obj_set_width(kb, LCD_H_RES);
+    lv_obj_set_style_text_font(kb, &lv_font_montserrat_12, 0);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
+    lv_obj_set_style_bg_color(kb, ui_bg_color(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(kb, ui_text_color(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(kb, lv_color_make(0, 80, 120), LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(kb, lv_color_make(0, 110, 160), LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(kb, ui_text_color(), LV_PART_ITEMS);
+    lv_obj_set_style_border_color(kb, ui_border_color(), LV_PART_ITEMS);
+    lv_obj_set_style_border_width(kb, 1, LV_PART_ITEMS);
+
+    lv_obj_t *card = lv_obj_create(s_hf_save_overlay);
+    lv_obj_set_size(card, LCD_H_RES - 16, LV_SIZE_CONTENT);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 4);
+    lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x0288D1), 0);  /* blue = HF */
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 8, 0);
+    lv_obj_set_style_pad_row(card, 4, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, LV_SYMBOL_SAVE "  Save HF card");
+    lv_obj_set_style_text_color(title, lv_color_hex(0x4FC3F7), 0);  /* light blue */
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
+
+    s_hf_save_ta = lv_textarea_create(card);
+    lv_obj_set_width(s_hf_save_ta, LCD_H_RES - 32);
+    lv_obj_set_height(s_hf_save_ta, 36);
+    lv_textarea_set_max_length(s_hf_save_ta, 36);
+    lv_textarea_set_one_line(s_hf_save_ta, true);
+    lv_textarea_set_text(s_hf_save_ta, s_hf_save_default);
+    lv_obj_set_style_text_font(s_hf_save_ta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_bg_color(s_hf_save_ta, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(s_hf_save_ta, ui_text_color(), 0);
+    lv_obj_set_style_border_color(s_hf_save_ta, ui_accent_color(), 0);
+    lv_obj_set_style_bg_opa(s_hf_save_ta,    LV_OPA_TRANSP, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(s_hf_save_ta, UI_ACCENT_CYAN, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(s_hf_save_ta, 2, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(s_hf_save_ta,  LV_BORDER_SIDE_LEFT, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    lv_keyboard_set_textarea(kb, s_hf_save_ta);
+
+    lv_obj_t *btn_row = lv_obj_create(card);
+    lv_obj_set_size(btn_row, LCD_H_RES - 32, 32);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel_btn, 90, 28);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x455A64), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(cancel_btn, 6, 0);
+    lv_obj_set_style_border_width(cancel_btn, 0, 0);
+    lv_obj_t *cl = lv_label_create(cancel_btn);
+    lv_label_set_text(cl, "Cancel");
+    lv_obj_set_style_text_font(cl, &lv_font_montserrat_12, 0);
+    lv_obj_center(cl);
+    lv_obj_add_event_cb(cancel_btn, s_hf_save_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *save_btn2 = lv_btn_create(btn_row);
+    lv_obj_set_size(save_btn2, 90, 28);
+    lv_obj_set_style_bg_color(save_btn2, lv_color_hex(0x01579B), LV_STATE_DEFAULT);  /* dark blue */
+    lv_obj_set_style_radius(save_btn2, 6, 0);
+    lv_obj_set_style_border_width(save_btn2, 0, 0);
+    lv_obj_t *sl2 = lv_label_create(save_btn2);
+    lv_label_set_text(sl2, LV_SYMBOL_SAVE " Save");
+    lv_obj_set_style_text_font(sl2, &lv_font_montserrat_12, 0);
+    lv_obj_center(sl2);
+    lv_obj_add_event_cb(save_btn2, s_hf_save_confirm_cb, LV_EVENT_CLICKED, NULL);
+}
+
+/* 50 ms poll timer — drives cham_poll() and updates UI on result */
+static void s_hf_poll_timer(lv_timer_t *t)
+{
+    (void)t;
+    cham_poll();
+    if (!s_hf_result_ready) return;
+    s_hf_result_ready = false;
+    if (!s_hf_status_lbl) return;
+
+    if (s_hf_result_ok && s_hf_uid_len > 0) {
+        /* Build "TYPE\nUID hex" display */
+        char uid_str[32] = {0};
+        for (int i = 0; i < s_hf_uid_len; i++) {
+            char b[4];
+            snprintf(b, sizeof(b), "%02X%s", s_hf_uid[i], (i < s_hf_uid_len - 1) ? " " : "");
+            strlcat(uid_str, b, sizeof(uid_str));
+        }
+        if (s_hf_uid_lbl) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "%s\n%s", s_hf_type_str, uid_str);
+            lv_label_set_text(s_hf_uid_lbl, buf);
+            lv_obj_clear_flag(s_hf_uid_lbl, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (s_hf_save_btn) lv_obj_clear_flag(s_hf_save_btn, LV_OBJ_FLAG_HIDDEN);
+        if (s_hf_scan_btn) lv_obj_clear_flag(s_hf_scan_btn, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(s_hf_status_lbl, "Card read - tap Save to export");
+    } else if (!s_hf_mode_ok) {
+        lv_label_set_text(s_hf_status_lbl, "Mode switch failed - tap Scan Again");
+        if (s_hf_scan_btn) lv_obj_clear_flag(s_hf_scan_btn, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_label_set_text(s_hf_status_lbl, "No card detected - tap Scan Again");
+        if (s_hf_scan_btn) lv_obj_clear_flag(s_hf_scan_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* Stop hook — fires on Back/Home before parent screen is rebuilt */
+static void cham_hf_read_stop(void)
+{
+    if (s_hf_tmr) { lv_timer_del(s_hf_tmr); s_hf_tmr = NULL; }
+    if (s_hf_save_overlay) { lv_obj_del(s_hf_save_overlay); s_hf_save_overlay = NULL; s_hf_save_ta = NULL; }
+    s_hf_status_lbl   = NULL;
+    s_hf_uid_lbl      = NULL;
+    s_hf_save_btn     = NULL;
+    s_hf_scan_btn     = NULL;
+    s_hf_result_ready = false;
+    s_hf_result_ok    = false;
+    s_hf_mode_ok      = false;
+    s_hf_uid_len      = 0;
+}
+
+/* Tile button callback */
+static void s_cham_hf_tile_cb(lv_event_t *e);
+
+/* HF read main screen */
+static void show_cham_hf_read_screen(void)
+{
+    create_function_page_base("HF Card Reader");
+    g_screen_stop_fn = cham_hf_read_stop;
+    g_screen_back_fn = show_chameleon_screen;
+    apply_menu_bg();
+
+    s_hf_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_hf_status_lbl, "Hold card near Chameleon...");
+    lv_obj_set_style_text_font(s_hf_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_hf_status_lbl, lv_color_hex(0xB0BEC5), 0);
+    lv_obj_set_style_text_align(s_hf_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_hf_status_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_hf_status_lbl, 220);
+    lv_obj_align(s_hf_status_lbl, LV_ALIGN_TOP_MID, 0, 40);
+
+    /* NFC icon */
+    lv_obj_t *icon = lv_label_create(function_page);
+    lv_label_set_text(icon, MY_SYMBOL_MICROCHIP);
+    lv_obj_set_style_text_font(icon, &lv_extra_symbols, 0);
+    lv_obj_set_style_text_color(icon, lv_color_hex(0x4FC3F7), 0);  /* light blue */
+    lv_obj_align(icon, LV_ALIGN_CENTER, 0, -20);
+
+    /* UID + type result label (hidden until card found) */
+    s_hf_uid_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_hf_uid_lbl, "");
+    lv_obj_set_style_text_font(s_hf_uid_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_hf_uid_lbl, lv_color_hex(0x4FC3F7), 0);
+    lv_obj_set_style_text_align(s_hf_uid_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_hf_uid_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_hf_uid_lbl, 220);
+    lv_obj_align(s_hf_uid_lbl, LV_ALIGN_CENTER, 0, 20);
+    lv_obj_add_flag(s_hf_uid_lbl, LV_OBJ_FLAG_HIDDEN);
+
+    /* Save button (hidden until card found) */
+    s_hf_save_btn = lv_btn_create(function_page);
+    lv_obj_set_size(s_hf_save_btn, 100, 34);
+    lv_obj_align(s_hf_save_btn, LV_ALIGN_BOTTOM_MID, -56, -10);
+    lv_obj_set_style_bg_color(s_hf_save_btn, lv_color_hex(0x01579B), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(s_hf_save_btn, 8, 0);
+    lv_obj_set_style_border_width(s_hf_save_btn, 0, 0);
+    lv_obj_t *slbl = lv_label_create(s_hf_save_btn);
+    lv_label_set_text(slbl, LV_SYMBOL_SAVE " Save");
+    lv_obj_set_style_text_font(slbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(slbl);
+    lv_obj_add_event_cb(s_hf_save_btn, s_hf_save_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(s_hf_save_btn, LV_OBJ_FLAG_HIDDEN);
+
+    /* Scan Again button (hidden until result) */
+    s_hf_scan_btn = lv_btn_create(function_page);
+    lv_obj_set_size(s_hf_scan_btn, 100, 34);
+    lv_obj_align(s_hf_scan_btn, LV_ALIGN_BOTTOM_MID, 56, -10);
+    lv_obj_set_style_bg_color(s_hf_scan_btn, lv_color_hex(0x37474F), LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(s_hf_scan_btn, 8, 0);
+    lv_obj_set_style_border_width(s_hf_scan_btn, 0, 0);
+    lv_obj_t *rlbl = lv_label_create(s_hf_scan_btn);
+    lv_label_set_text(rlbl, LV_SYMBOL_REFRESH " Scan");
+    lv_obj_set_style_text_font(rlbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(rlbl);
+    lv_obj_add_event_cb(s_hf_scan_btn, s_hf_scan_again_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(s_hf_scan_btn, LV_OBJ_FLAG_HIDDEN);
+
+    /* Poll timer drives cham_poll() at 50 ms */
+    s_hf_tmr = lv_timer_create(s_hf_poll_timer, 50, NULL);
+
+    /* Kick off the initial scan */
+    s_hf_restart_scan();
+}
+
+static void s_cham_hf_tile_cb(lv_event_t *e)
+{
+    (void)e;
+    s_cham_nav_child = true;
+    show_cham_hf_read_screen();
+}
 
 /* LF read sub-screen globals — NULLed by cham_lf_read_stop() */
 static lv_timer_t *s_lf_tmr          = NULL;
@@ -48123,7 +48543,34 @@ static void s_cham_rebuild_content(cham_state_t st)
         lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW);
         lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-        s_cham_stub_tile(tiles, MY_SYMBOL_MICROCHIP, "Read HF");
+        /* Read HF — live tile (Phase 3: ISO 14443-A, NTAG, MIFARE) */
+        {
+            lv_obj_t *btn = lv_btn_create(tiles);
+            lv_obj_set_size(btn, 70, 74);
+            lv_obj_set_style_bg_color(btn, lv_color_hex(0x01579B), LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(btn, lv_color_hex(0x0288D1), LV_STATE_PRESSED);
+            lv_obj_set_style_radius(btn, 10, 0);
+            lv_obj_set_style_border_width(btn, 0, 0);
+            lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_COLUMN);
+            lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_add_event_cb(btn, s_cham_hf_tile_cb, LV_EVENT_CLICKED, NULL);
+            lv_obj_t *icon = lv_label_create(btn);
+            lv_label_set_text(icon, MY_SYMBOL_MICROCHIP);
+            lv_obj_set_style_text_font(icon, &lv_extra_symbols, 0);
+            lv_obj_set_style_text_color(icon, lv_color_hex(0x4FC3F7), 0);
+            lv_obj_t *lbl = lv_label_create(btn);
+            lv_label_set_text(lbl, "Read HF");
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(lbl, lv_color_hex(0xECEFF1), 0);
+            lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+            lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+            lv_obj_set_width(lbl, 62);
+            lv_obj_t *sub = lv_label_create(btn);
+            lv_label_set_text(sub, "NTAG/MFC");
+            lv_obj_set_style_text_font(sub, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(sub, lv_color_hex(0x90A4AE), 0);
+            lv_obj_set_style_text_align(sub, LV_TEXT_ALIGN_CENTER, 0);
+        }
 
         /* Read LF — live tile. Direct flex-column on lv_btn avoids the inner
          * lv_obj_create() container which would intercept touch events in LVGL 8. */
