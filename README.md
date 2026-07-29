@@ -2076,13 +2076,16 @@ The **NFC / RFID Hub** tile is permanently visible on the main menu — no RF-HA
 
 #### Chameleon Ultra
 
-**Coming soon.** The Chameleon Ultra is a Bluetooth RFID/NFC reader, writer, cloner, and emulator supporting:
-- **LF 125 kHz** — EM4100, HID Prox, and other low-frequency formats
-- **HF 13.56 MHz** — MIFARE Classic, NTAG, ISO14443A/B
+CYM can pair with a **Chameleon Ultra** or **Chameleon Lite** over Bluetooth and use it as a full RFID/NFC read/write/emulate engine — without needing a phone or laptop.
 
-Concept credit: **@bkbroiler**. Protocol reference: [ChameleonUltraGUI by GameTec-live](https://github.com/GameTec-live/ChameleonUltraGUI).
+**Supported operations (v2.11.x):**
+- **BLE scan & connect** — auto-discovers Chameleon devices, shows RSSI-coded signal strength
+- **Read LF 125 kHz** — EM4100, HID Prox H10301; saves Flipper-compatible `.rfid` files to SD
+- **Read HF 13.56 MHz** — ISO 14443-A scan; MIFARE Classic, NTAG, Ultralight detection; saves Flipper-compatible `.nfc` files to SD
+- **Slot Manager** — 8-slot view, activate slot, clear slot; LF/HF type names displayed per slot
 
-The BLE stack and protocol implementation will be added in a future release. The hub tile and stub screen are present in firmware from v2.11.12.
+Protocol reference: [ChameleonUltraGUI by GameTec-live](https://github.com/GameTec-live/ChameleonUltraGUI).
+Concept credit: **@bkbroiler**.
 
 #### PN532 NFC/RFID
 
@@ -2985,13 +2988,13 @@ This project wouldn't be where it is without the brilliant minds and generous ti
 
 **Heartfelt thanks to:**
 
-- **@Birolt29** — An extraordinary contributor who has gone far above and beyond at every stage of this project. Birol performed deep ESP32-C5 DMA and render pipeline analysis on real hardware, submitted multiple major patch sets, and caught critical bugs before they ever reached users. His contributions include: the v2.10.15 hardware optimization patch (upload stability, mbedTLS PSRAM routing, BLE Spam memory hardening); the v2.11.x render performance series (LCD SPI 40→80 MHz, internal DMA draw buffers, -O2 optimization, LVGL memcpy, 15 ms refresh period, PSRAM 80 MHz — bringing full-frame render from 148 ms to ~77 ms); the SD remount mutex fix that eliminated a hard reset race; moving 17.4 KB of IR/RF433 name tables to PSRAM BSS; the GATT Walker double-init reset fix; and serial-validated testing of every patch on real hardware. The firmware is faster, more stable, and more reliable because of Birol. 🙏
+- **@Birolt29** — An extraordinary contributor who has gone far above and beyond at every stage of this project. Birol performed deep ESP32-C5 DMA and render pipeline analysis on real hardware, submitted multiple major patch sets, and caught critical bugs before they ever reached users. His contributions include: the v2.10.15 hardware optimization patch (upload stability, mbedTLS PSRAM routing, BLE Spam memory hardening); the v2.11.x render performance series (LCD SPI 40→80 MHz, internal DMA draw buffers, -O2 optimization, LVGL memcpy, 15 ms refresh period, PSRAM 80 MHz — bringing full-frame render from 148 ms to ~77 ms); the SD remount mutex fix that eliminated a hard reset race; moving 17.4 KB of IR/RF433 name tables to PSRAM BSS; the GATT Walker double-init reset fix; diagnosing and fixing the wardrive GPS crash (GitHub issue #12 — stack-allocated `lv_msgbox` button map dangling after function return); and serial-validated testing of every patch on real hardware. The firmware is faster, more stable, and more reliable because of Birol. 🙏
 
 - **Anubis** — For creating the first community video showcase of CYM in the wild. Taking the time to film, edit, and publish a video of this project means the world — it helps new users discover what CYM can do and gives the project a presence beyond GitHub. Thank you! 🎬
 
 - **ᛕ ᛊ ߇ ᛙ ᚢ (Kevin)** — For deep technical testing and helping diagnose the toughest issues
 - **sithwrld999** — For thorough testing and finding edge cases we missed
-- **bkbroiler** — For hands-on testing and constructive feedback
+- **bkbroiler** — For hands-on testing, constructive feedback, and the original concept behind the Chameleon Ultra BLE integration — the idea of using CYM as a wireless RFID controller came from them
 - **HeavyButter** — For testing and just being Paranoid Butter
 - **eCowboy** — For Hardware testing and design suggestons
 - **OrdoOuroborus** — For testing, review, and contributions for feature ideas
