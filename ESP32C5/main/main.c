@@ -12049,8 +12049,14 @@ static void wardrive_start_btn_cb(lv_event_t *e)
                 return;
             } else {
                 // No GPS data at all
+                // NOTE: lv_btnmatrix_set_map() stores the map pointer without copying it
+                // (map_p = map), so the button-text array MUST outlive the msgbox. A stack
+                // compound literal here dangles after this function returns and crashes on the
+                // next display refresh (has_popovers_in_top_row walks the freed map_p → Load
+                // access fault). Use a static array so the map is valid for the widget lifetime.
+                static const char *gps_no_data_btns[] = {"OK", ""};
                 lv_obj_t *mbox = lv_msgbox_create(NULL, "Error", "No GPS data available\nPlease wait for fix or move\nnear window",
-                                                  (const char *[]){"OK", ""}, true);
+                                                  gps_no_data_btns, true);
                 lv_obj_center(mbox);
                 return;
             }
@@ -48626,6 +48632,7 @@ static void s_sm_row_tap_cb(lv_event_t *e)
 static void s_sm_poll_timer(lv_timer_t *t)
 {
     (void)t;
+    cham_poll(); /* drain BLE RX ring and fire any pending command callbacks */
     if (!s_sm_status_lbl) return; /* screen torn down */
 
     if (s_sm_loaded && s_sm_changed) {
@@ -48675,8 +48682,8 @@ static void show_cham_slots_screen(void)
 
     /* Scrollable flex-column container for the 8 slot rows */
     s_sm_list_cont = lv_obj_create(function_page);
-    lv_obj_set_size(s_sm_list_cont, 236, 242);
-    lv_obj_align(s_sm_list_cont, LV_ALIGN_TOP_MID, 0, 4);
+    lv_obj_set_size(s_sm_list_cont, 236, 236);
+    lv_obj_align(s_sm_list_cont, LV_ALIGN_TOP_MID, 0, 34); /* below 30px topbar */
     lv_obj_set_style_bg_color(s_sm_list_cont, lv_color_hex(0x12122A), 0);
     lv_obj_set_style_border_color(s_sm_list_cont, lv_color_hex(0x3D3D6B), 0);
     lv_obj_set_style_border_width(s_sm_list_cont, 1, 0);
@@ -48806,7 +48813,7 @@ static void s_cham_rebuild_content(cham_state_t st)
     lv_obj_set_pos(s_cham_content, 0, 30);
     lv_obj_set_style_bg_opa(s_cham_content, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_cham_content, 0, 0);
-    lv_obj_set_style_pad_all(s_cham_content, 6, 0);
+    lv_obj_set_style_pad_all(s_cham_content, 2, 0); /* tight pad so tile row 2 fits above disconnect */
     lv_obj_clear_flag(s_cham_content, LV_OBJ_FLAG_SCROLLABLE);
 
     if (st == CHAM_STATE_DISCONNECTED || st == CHAM_STATE_ERROR) {
@@ -49161,7 +49168,7 @@ static void s_cham_rebuild_content(cham_state_t st)
         /* Disconnect button */
         lv_obj_t *dbtn = lv_btn_create(s_cham_content);
         lv_obj_set_size(dbtn, 120, 34);
-        lv_obj_align(dbtn, LV_ALIGN_BOTTOM_MID, 0, -2);
+        lv_obj_align(dbtn, LV_ALIGN_BOTTOM_MID, 0, 0); /* flush to bottom gives ~6px gap above tile row 2 */
         lv_obj_set_style_bg_color(dbtn, lv_color_hex(0x5D1A1A), 0);
         lv_obj_add_event_cb(dbtn, s_cham_disc_btn_cb, LV_EVENT_CLICKED, NULL);
         lv_obj_t *dl = lv_label_create(dbtn);
