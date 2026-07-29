@@ -47795,11 +47795,28 @@ static void s_cham_hf_tile_cb(lv_event_t *e)
     show_cham_hf_read_screen();
 }
 
+/* Tag sense type constants (shared by LF/HF read and clone sections) */
+#define CHAM_SENSE_NO   0
+#define CHAM_SENSE_LF   1
+#define CHAM_SENSE_HF   2
+
+/* Clone-to-slot shared state — valid while picker popup is open or clone is in flight.
+ * Declared here (before the stop hook and clone functions that reference them). */
+static lv_obj_t *s_clone_popup      = NULL;
+static lv_obj_t *s_clone_status_lbl = NULL;
+static int        s_clone_slot       = -1;
+static uint16_t   s_clone_tag_type;          /* TagSpecificType: 100=EM410X, 200=HID */
+static uint8_t    s_clone_sense;             /* CHAM_SENSE_LF/HF */
+static uint16_t   s_clone_write_cmd;         /* 5000=EM410X_SET_EMU_ID, 5002=HIDPROX */
+static uint8_t    s_clone_payload[16];
+static uint8_t    s_clone_payload_len;
+
 /* LF read sub-screen globals — NULLed by cham_lf_read_stop() */
 static lv_timer_t *s_lf_tmr          = NULL;
 static lv_obj_t   *s_lf_status_lbl   = NULL;
 static lv_obj_t   *s_lf_uid_lbl      = NULL;
 static lv_obj_t   *s_lf_save_btn     = NULL;
+static lv_obj_t   *s_lf_clone_btn    = NULL; /* "Clone to Slot" - shown after success */
 static lv_obj_t   *s_lf_scan_btn     = NULL; /* "Scan Again" - shown after any result */
 static lv_obj_t   *s_lf_save_overlay = NULL; /* filename keyboard overlay */
 static lv_obj_t   *s_lf_save_ta      = NULL; /* textarea inside overlay */
@@ -48126,9 +48143,10 @@ static void s_lf_poll_timer(lv_timer_t *t)
             lv_label_set_text(s_lf_uid_lbl, buf);
             lv_obj_clear_flag(s_lf_uid_lbl, LV_OBJ_FLAG_HIDDEN);
         }
-        if (s_lf_save_btn) lv_obj_clear_flag(s_lf_save_btn, LV_OBJ_FLAG_HIDDEN);
-        if (s_lf_scan_btn) lv_obj_clear_flag(s_lf_scan_btn, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(s_lf_status_lbl, "Card read - tap Save to export");
+        if (s_lf_save_btn)  lv_obj_clear_flag(s_lf_save_btn,  LV_OBJ_FLAG_HIDDEN);
+        if (s_lf_clone_btn) lv_obj_clear_flag(s_lf_clone_btn, LV_OBJ_FLAG_HIDDEN);
+        if (s_lf_scan_btn)  lv_obj_clear_flag(s_lf_scan_btn,  LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(s_lf_status_lbl, "Card read - Save or Clone to Slot");
     } else if (!s_lf_mode_ok) {
         lv_label_set_text(s_lf_status_lbl, "Mode switch failed - tap Scan Again");
         if (s_lf_scan_btn) lv_obj_clear_flag(s_lf_scan_btn, LV_OBJ_FLAG_HIDDEN);
@@ -48141,21 +48159,241 @@ static void s_lf_poll_timer(lv_timer_t *t)
 /* ── LF read: stop hook ── */
 static void cham_lf_read_stop(void)
 {
-    /* Cancel any in-flight BLE command so LF scan callbacks cannot fire into
-     * freed LVGL objects after this screen is torn down. */
+    /* Cancel any in-flight BLE command so LF scan / clone callbacks cannot fire
+     * into freed LVGL objects after this screen is torn down. */
     cham_cancel_pending();
     if (s_lf_tmr) { lv_timer_del(s_lf_tmr); s_lf_tmr = NULL; }
     /* Close keyboard overlay if open — prevents use-after-free on the textarea */
     if (s_lf_save_overlay) { lv_obj_del(s_lf_save_overlay); s_lf_save_overlay = NULL; s_lf_save_ta = NULL; }
-    s_lf_status_lbl   = NULL;
-    s_lf_uid_lbl      = NULL;
-    s_lf_save_btn     = NULL;
-    s_lf_scan_btn     = NULL;
-    s_lf_result_ready = false;
-    s_lf_result_ok    = false;
-    s_lf_mode_ok      = false;
-    s_lf_uid_len      = 0;
+    /* Clone popup is parented to function_page and gets deleted with it, but NULL the
+     * status label pointer now so in-flight clone callbacks see NULL and bail cleanly. */
+    s_clone_popup      = NULL;
+    s_clone_status_lbl = NULL;
+    s_lf_status_lbl    = NULL;
+    s_lf_uid_lbl       = NULL;
+    s_lf_save_btn      = NULL;
+    s_lf_clone_btn     = NULL;
+    s_lf_scan_btn      = NULL;
+    s_lf_result_ready  = false;
+    s_lf_result_ok     = false;
+    s_lf_mode_ok       = false;
+    s_lf_uid_len       = 0;
     /* Leave BLE connection alive — user stays on Chameleon session */
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Clone-to-Slot — Phase 5
+ * Shared state and 4-step command chain used by LF (and future HF) clone flows.
+ * Sequence: SET_ACTIVE_SLOT(1003) → SET_SLOT_TAG_TYPE(1004) → write UID(5000/5002)
+ *           → SAVE_SETTINGS(1013).
+ * Tag type values (TagSpecificType enum): EM410X=100, HIDProx=200.
+ * Write commands write to the ACTIVE slot, so SET_ACTIVE_SLOT must precede them.
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+/* Step 4 — SAVE_SETTINGS response */
+static void s_clone_on_saved(bool ok, const uint8_t *data, uint16_t dlen)
+{
+    (void)data; (void)dlen;
+    if (!s_clone_status_lbl) return;
+    if (ok) {
+        lv_label_set_text(s_clone_status_lbl, "Cloned! Check Slot Manager.");
+        lv_obj_set_style_text_color(s_clone_status_lbl, lv_color_hex(0x66BB6A), 0);
+    } else {
+        lv_label_set_text(s_clone_status_lbl, "Save failed - try again");
+        lv_obj_set_style_text_color(s_clone_status_lbl, lv_color_hex(0xEF9A9A), 0);
+    }
+}
+
+/* Step 3 — write UID/data to emulator response */
+static void s_clone_on_write(bool ok, const uint8_t *data, uint16_t dlen)
+{
+    (void)data; (void)dlen;
+    if (!s_clone_status_lbl) return;
+    if (!ok) {
+        lv_label_set_text(s_clone_status_lbl, "Write failed - try again");
+        lv_obj_set_style_text_color(s_clone_status_lbl, lv_color_hex(0xEF9A9A), 0);
+        return;
+    }
+    lv_label_set_text(s_clone_status_lbl, "Saving to flash...");
+    if (!cham_send_cmd(1013, NULL, 0, s_clone_on_saved)) {
+        lv_label_set_text(s_clone_status_lbl, "Busy - retry later");
+    }
+}
+
+/* Step 2 — SET_SLOT_TAG_TYPE response */
+static void s_clone_on_type_set(bool ok, const uint8_t *data, uint16_t dlen)
+{
+    (void)data; (void)dlen;
+    if (!s_clone_status_lbl) return;
+    if (!ok) {
+        lv_label_set_text(s_clone_status_lbl, "Type set failed - try again");
+        lv_obj_set_style_text_color(s_clone_status_lbl, lv_color_hex(0xEF9A9A), 0);
+        return;
+    }
+    lv_label_set_text(s_clone_status_lbl, "Writing card data...");
+    if (!cham_send_cmd(s_clone_write_cmd, s_clone_payload, s_clone_payload_len,
+                       s_clone_on_write)) {
+        lv_label_set_text(s_clone_status_lbl, "Busy - retry later");
+    }
+}
+
+/* Step 1 — SET_ACTIVE_SLOT response */
+static void s_clone_on_slot_set(bool ok, const uint8_t *data, uint16_t dlen)
+{
+    (void)data; (void)dlen;
+    if (!s_clone_status_lbl) return;
+    if (!ok) {
+        lv_label_set_text(s_clone_status_lbl, "Slot switch failed - try again");
+        lv_obj_set_style_text_color(s_clone_status_lbl, lv_color_hex(0xEF9A9A), 0);
+        return;
+    }
+    /* SET_SLOT_TAG_TYPE (1004): [slot_index (1B), tag_type (2B BE)] */
+    uint8_t tp[3] = {
+        (uint8_t)s_clone_slot,
+        (uint8_t)(s_clone_tag_type >> 8),
+        (uint8_t)(s_clone_tag_type & 0xFF)
+    };
+    lv_label_set_text(s_clone_status_lbl, "Setting card type...");
+    if (!cham_send_cmd(1004, tp, 3, s_clone_on_type_set)) {
+        lv_label_set_text(s_clone_status_lbl, "Busy - retry later");
+    }
+}
+
+/* Slot picker button callback — one per slot (0-7 via user_data) */
+static void s_clone_slot_btn_cb(lv_event_t *e)
+{
+    int slot = (int)(intptr_t)lv_event_get_user_data(e);
+    s_clone_slot = slot;
+
+    /* Hide the 8 slot buttons, show a status label */
+    lv_obj_t *cont = lv_obj_get_parent(lv_event_get_target(e));
+    lv_obj_clean(cont); /* remove slot buttons */
+
+    /* Replace container with a status label for the clone progress */
+    s_clone_status_lbl = lv_label_create(cont);
+    lv_label_set_text(s_clone_status_lbl, "Switching slot...");
+    lv_obj_set_style_text_font(s_clone_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_clone_status_lbl, lv_color_hex(0xB0BEC5), 0);
+    lv_obj_set_style_text_align(s_clone_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_clone_status_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_clone_status_lbl, 170);
+    lv_obj_center(s_clone_status_lbl);
+
+    /* Kick off the 4-step clone sequence */
+    uint8_t slot_payload[1] = { (uint8_t)slot };
+    if (!cham_send_cmd(1003, slot_payload, 1, s_clone_on_slot_set)) {
+        lv_label_set_text(s_clone_status_lbl, "Chameleon busy - close and retry");
+    }
+}
+
+/* Close button callback for the clone popup */
+static void s_clone_close_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_clone_popup) { lv_obj_del(s_clone_popup); s_clone_popup = NULL; s_clone_status_lbl = NULL; }
+}
+
+/* Build and show the slot picker popup.
+ * parent should be function_page (deleted with the screen). */
+static void s_lf_show_clone_picker(lv_obj_t *parent)
+{
+    if (s_clone_popup) { lv_obj_del(s_clone_popup); s_clone_popup = NULL; s_clone_status_lbl = NULL; }
+
+    s_clone_popup = lv_obj_create(parent);
+    lv_obj_set_size(s_clone_popup, 210, 230);
+    lv_obj_align(s_clone_popup, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(s_clone_popup, lv_color_hex(0x1A1A2E), 0);
+    lv_obj_set_style_border_color(s_clone_popup, lv_color_hex(0x66BB6A), 0);
+    lv_obj_set_style_border_width(s_clone_popup, 2, 0);
+    lv_obj_set_style_radius(s_clone_popup, 8, 0);
+    lv_obj_set_style_pad_all(s_clone_popup, 8, 0);
+    lv_obj_set_style_pad_row(s_clone_popup, 4, 0);
+    lv_obj_clear_flag(s_clone_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_shadow_width(s_clone_popup, 0, 0);
+
+    /* Title */
+    lv_obj_t *title = lv_label_create(s_clone_popup);
+    lv_label_set_text(title, "Clone to Slot");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0x66BB6A), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    /* Slot buttons container: 2-column grid, 4 rows */
+    lv_obj_t *grid = lv_obj_create(s_clone_popup);
+    lv_obj_set_size(grid, 194, 148);
+    lv_obj_align(grid, LV_ALIGN_TOP_MID, 0, 22);
+    lv_obj_set_style_bg_opa(grid, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(grid, 0, 0);
+    lv_obj_set_style_pad_all(grid, 0, 0);
+    lv_obj_set_style_pad_column(grid, 4, 0);
+    lv_obj_set_style_pad_row(grid, 4, 0);
+    lv_obj_clear_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
+
+    for (int i = 0; i < 8; i++) {
+        lv_obj_t *btn = lv_btn_create(grid);
+        lv_obj_set_size(btn, 93, 32);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x263238), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x2E7D32), LV_STATE_PRESSED);
+        lv_obj_set_style_radius(btn, 4, 0);
+        lv_obj_set_style_border_width(btn, 1, 0);
+        lv_obj_set_style_border_color(btn, lv_color_hex(0x37474F), 0);
+        lv_obj_set_style_shadow_width(btn, 0, 0);
+        lv_obj_set_style_pad_all(btn, 0, 0);
+        lv_obj_add_event_cb(btn, s_clone_slot_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        lv_obj_t *lbl = lv_label_create(btn);
+        char sname[12];
+        snprintf(sname, sizeof(sname), "Slot %d", i + 1);
+        lv_label_set_text(lbl, sname);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0xB0BEC5), 0);
+        lv_obj_center(lbl);
+    }
+
+    /* Cancel button */
+    lv_obj_t *cancel = lv_btn_create(s_clone_popup);
+    lv_obj_set_size(cancel, 194, 30);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(cancel, lv_color_hex(0x37474F), 0);
+    lv_obj_set_style_radius(cancel, 4, 0);
+    lv_obj_set_style_shadow_width(cancel, 0, 0);
+    lv_obj_set_style_pad_all(cancel, 0, 0);
+    lv_obj_set_style_border_width(cancel, 0, 0);
+    lv_obj_add_event_cb(cancel, s_clone_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *cl = lv_label_create(cancel);
+    lv_label_set_text(cl, "Cancel");
+    lv_obj_set_style_text_font(cl, &lv_font_montserrat_12, 0);
+    lv_obj_center(cl);
+}
+
+/* LF Clone to Slot button callback — fills clone state from current read, opens picker */
+static void s_lf_clone_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!s_lf_result_ok || s_lf_uid_len == 0) return;
+
+    /* Determine tag type and write command from which LF protocol found the card */
+    if (s_lf_found_proto_idx == 1) {
+        /* HID Prox H10301: TagSpecificType=200, cmd=5002, payload=first 13 bytes of 16-byte struct */
+        s_clone_tag_type    = 200;
+        s_clone_sense       = CHAM_SENSE_LF;
+        s_clone_write_cmd   = 5002;
+        s_clone_payload_len = 13; /* drop last 3 pad bytes of the 16-byte HID scan response */
+        memcpy(s_clone_payload, s_lf_uid, 13);
+    } else {
+        /* EM410X and others: TagSpecificType=100, cmd=5000, payload=5-byte UID */
+        s_clone_tag_type    = 100;
+        s_clone_sense       = CHAM_SENSE_LF;
+        s_clone_write_cmd   = 5000;
+        s_clone_payload_len = (s_lf_uid_len <= 5) ? (uint8_t)s_lf_uid_len : 5;
+        memcpy(s_clone_payload, s_lf_uid, s_clone_payload_len);
+    }
+
+    /* Retrieve function_page parent — popup is parented there so it's torn down with the screen */
+    lv_obj_t *parent = lv_obj_get_parent(s_lf_clone_btn);
+    s_lf_show_clone_picker(parent);
 }
 
 /* ── LF read: main screen ── */
@@ -48194,11 +48432,13 @@ static void show_cham_lf_read_screen(void)
     lv_obj_align(s_lf_uid_lbl, LV_ALIGN_TOP_MID, 0, 140);
     lv_obj_add_flag(s_lf_uid_lbl, LV_OBJ_FLAG_HIDDEN);
 
-    /* Scan Again button (hidden during active scan, shown after any result) */
+    /* Scan Again button (hidden until any result) */
     s_lf_scan_btn = lv_btn_create(function_page);
-    lv_obj_set_size(s_lf_scan_btn, 140, 36);
-    lv_obj_align(s_lf_scan_btn, LV_ALIGN_BOTTOM_MID, 0, -50);
+    lv_obj_set_size(s_lf_scan_btn, 140, 34);
+    lv_obj_align(s_lf_scan_btn, LV_ALIGN_BOTTOM_MID, 0, -90);
     lv_obj_set_style_bg_color(s_lf_scan_btn, lv_color_hex(0x1A237E), 0);
+    lv_obj_set_style_radius(s_lf_scan_btn, 6, 0);
+    lv_obj_set_style_shadow_width(s_lf_scan_btn, 0, 0);
     lv_obj_add_flag(s_lf_scan_btn, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(s_lf_scan_btn, s_lf_scan_again_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *sb = lv_label_create(s_lf_scan_btn);
@@ -48206,11 +48446,27 @@ static void show_cham_lf_read_screen(void)
     lv_obj_set_style_text_font(sb, &lv_font_montserrat_12, 0);
     lv_obj_center(sb);
 
+    /* Clone to Slot button (hidden until successful read) */
+    s_lf_clone_btn = lv_btn_create(function_page);
+    lv_obj_set_size(s_lf_clone_btn, 140, 34);
+    lv_obj_align(s_lf_clone_btn, LV_ALIGN_BOTTOM_MID, 0, -52);
+    lv_obj_set_style_bg_color(s_lf_clone_btn, lv_color_hex(0x4A148C), 0); /* purple = clone/write */
+    lv_obj_set_style_radius(s_lf_clone_btn, 6, 0);
+    lv_obj_set_style_shadow_width(s_lf_clone_btn, 0, 0);
+    lv_obj_add_flag(s_lf_clone_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_lf_clone_btn, s_lf_clone_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *clb = lv_label_create(s_lf_clone_btn);
+    lv_label_set_text(clb, LV_SYMBOL_COPY " Clone to Slot");
+    lv_obj_set_style_text_font(clb, &lv_font_montserrat_12, 0);
+    lv_obj_center(clb);
+
     /* Save button (hidden until successful read) */
     s_lf_save_btn = lv_btn_create(function_page);
-    lv_obj_set_size(s_lf_save_btn, 140, 36);
-    lv_obj_align(s_lf_save_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_size(s_lf_save_btn, 140, 34);
+    lv_obj_align(s_lf_save_btn, LV_ALIGN_BOTTOM_MID, 0, -14);
     lv_obj_set_style_bg_color(s_lf_save_btn, lv_color_hex(0x1B5E20), 0);
+    lv_obj_set_style_radius(s_lf_save_btn, 6, 0);
+    lv_obj_set_style_shadow_width(s_lf_save_btn, 0, 0);
     lv_obj_add_flag(s_lf_save_btn, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(s_lf_save_btn, s_lf_save_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *sl = lv_label_create(s_lf_save_btn);
@@ -48305,11 +48561,6 @@ static volatile bool s_sm_loaded      = false; /* info + active both fetched */
 static volatile bool s_sm_changed     = false; /* UI needs refresh */
 static volatile bool s_sm_loading     = false; /* BLE command chain in flight */
 
-/* Chameleon tag sense type constants (tag_base_type.h) */
-#define CHAM_SENSE_NO   0
-#define CHAM_SENSE_LF   1
-#define CHAM_SENSE_HF   2
-
 /* Human-readable card type name derived from GET_SLOT_INFO hf/lf type words.
  * lf_type checked first (non-zero wins); hf_type second.
  * LF types: 1=EM410X, 2=HID H10301. HF types: 1=MFC 1K, 5=NTAG213, etc. */
@@ -48318,9 +48569,10 @@ static const char *s_sm_type_name(uint16_t hf_type, uint16_t lf_type,
 {
     if (hf_type == 0 && lf_type == 0) return "Empty";
     if (lf_type != 0) {
+        /* lf_type values are TagSpecificType enum: EM410X=100, HIDProx=200 */
         switch (lf_type) {
-            case 1:  return "EM410X";
-            case 2:  return "HID H10301";
+            case 100: return "EM410X";
+            case 200: return "HID H10301";
             default:
                 snprintf(fallback_buf, sz, "LF type %u", lf_type);
                 return fallback_buf;
