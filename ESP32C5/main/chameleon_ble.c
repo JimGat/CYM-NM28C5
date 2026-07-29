@@ -798,6 +798,15 @@ void cham_disconnect(void)
     s_pend_cb  = NULL;
 }
 
+/* Cancel any in-flight command without disconnecting BLE.
+ * Call from sub-screen stop hooks to prevent stale callbacks firing
+ * into freed LVGL objects after the sub-screen is torn down. */
+void cham_cancel_pending(void)
+{
+    s_pend_cmd = 0xFFFF;
+    s_pend_cb  = NULL;
+}
+
 cham_state_t cham_get_state(void) { return s_state; }
 
 const char *cham_get_status_msg(void) { return s_status_msg; }

@@ -47693,6 +47693,9 @@ static void s_hf_poll_timer(lv_timer_t *t)
 /* Stop hook — fires on Back/Home before parent screen is rebuilt */
 static void cham_hf_read_stop(void)
 {
+    /* Cancel any in-flight BLE command so s_hf_on_scan_result / s_hf_on_mode_set
+     * cannot fire into freed LVGL objects after this screen is torn down. */
+    cham_cancel_pending();
     if (s_hf_tmr) { lv_timer_del(s_hf_tmr); s_hf_tmr = NULL; }
     if (s_hf_save_overlay) { lv_obj_del(s_hf_save_overlay); s_hf_save_overlay = NULL; s_hf_save_ta = NULL; }
     s_hf_status_lbl   = NULL;
@@ -48131,6 +48134,9 @@ static void s_lf_poll_timer(lv_timer_t *t)
 /* ── LF read: stop hook ── */
 static void cham_lf_read_stop(void)
 {
+    /* Cancel any in-flight BLE command so LF scan callbacks cannot fire into
+     * freed LVGL objects after this screen is torn down. */
+    cham_cancel_pending();
     if (s_lf_tmr) { lv_timer_del(s_lf_tmr); s_lf_tmr = NULL; }
     /* Close keyboard overlay if open — prevents use-after-free on the textarea */
     if (s_lf_save_overlay) { lv_obj_del(s_lf_save_overlay); s_lf_save_overlay = NULL; s_lf_save_ta = NULL; }
@@ -48305,6 +48311,51 @@ static void s_cham_stub_tile(lv_obj_t *parent, const char *icon, const char *nam
     lv_obj_set_style_text_color(ph, lv_color_hex(0x546E7A), 0);
 }
 
+/* ── Scan list helpers ── */
+
+static lv_color_t s_rssi_color(int8_t rssi)
+{
+    if (rssi >= -65) return lv_color_hex(0x4CAF50); /* green  - strong */
+    if (rssi >= -75) return lv_color_hex(0xFFC107); /* amber  - medium */
+    return                  lv_color_hex(0xF44336); /* red    - weak   */
+}
+
+/* Add a styled Chameleon device row to the scan list.
+ * Each row shows a BT icon, the device name, RSSI value, and a colored
+ * left border whose hue encodes signal strength. */
+static void s_cham_add_scan_row(lv_obj_t *list, const cham_scan_result_t *r, int idx)
+{
+    lv_color_t col = s_rssi_color(r->rssi);
+    const char *bars = (r->rssi >= -65) ? "|||"
+                     : (r->rssi >= -75) ? "|| " : "|  ";
+    char row[72];
+    snprintf(row, sizeof(row), "%s  [%s] %ddBm", r->name, bars, (int)r->rssi);
+
+    lv_obj_t *item = lv_list_add_btn(list, LV_SYMBOL_BLUETOOTH, row);
+    /* Dark card background with colored left border = RSSI strength */
+    lv_obj_set_style_bg_color(item, lv_color_hex(0x1A1A2E), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(item, lv_color_hex(0x2D2D48), LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(item, LV_OPA_COVER, LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(item, 3, 0);
+    lv_obj_set_style_border_side(item, LV_BORDER_SIDE_LEFT, 0);
+    lv_obj_set_style_border_color(item, col, 0);
+    lv_obj_set_style_border_color(item, col, LV_STATE_PRESSED);
+    lv_obj_set_height(item, 38);
+    lv_obj_set_style_pad_left(item, 8, 0);
+    lv_obj_set_style_pad_top(item, 0, 0);
+    lv_obj_set_style_pad_bottom(item, 0, 0);
+    /* BT symbol (child 0): purple; text label (child 1): light lavender */
+    lv_obj_t *sym = lv_obj_get_child(item, 0);
+    lv_obj_t *lbl = lv_obj_get_child(item, 1);
+    if (sym) lv_obj_set_style_text_color(sym, lv_color_hex(0x7E57C2), 0);
+    if (lbl) {
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0xE8EAF6), 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+    }
+    lv_obj_add_event_cb(item, s_cham_list_item_cb, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)idx);
+}
+
 /* ── Rebuild the s_cham_content area for the current state ── */
 static void s_cham_rebuild_content(cham_state_t st)
 {
@@ -48377,35 +48428,38 @@ static void s_cham_rebuild_content(cham_state_t st)
         lv_obj_align(s_cham_prog_lbl, LV_ALIGN_TOP_MID, 0, 2);
 
         s_cham_scan_list = lv_list_create(s_cham_content);
-        lv_obj_set_size(s_cham_scan_list, 228, 160);
+        lv_obj_set_size(s_cham_scan_list, 228, 162);
         lv_obj_align(s_cham_scan_list, LV_ALIGN_TOP_MID, 0, 22);
-        lv_obj_set_style_bg_color(s_cham_scan_list, lv_color_hex(0x1A1A2E), 0);
-        lv_obj_set_style_border_color(s_cham_scan_list, lv_color_hex(0x4A4A5A), 0);
+        lv_obj_set_style_bg_color(s_cham_scan_list, lv_color_hex(0x12122A), 0);
+        lv_obj_set_style_border_color(s_cham_scan_list, lv_color_hex(0x3D3D6B), 0);
         lv_obj_set_style_border_width(s_cham_scan_list, 1, 0);
-        lv_list_add_text(s_cham_scan_list, "  Tap a device to connect:");
+        lv_obj_set_style_radius(s_cham_scan_list, 6, 0);
+        /* Styled header row */
+        lv_obj_t *hdr = lv_list_add_text(s_cham_scan_list, "  Tap a device to connect:");
+        if (hdr) {
+            lv_obj_set_style_text_color(hdr, lv_color_hex(0x7E57C2), 0);
+            lv_obj_set_style_text_font(hdr, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_bg_color(hdr, lv_color_hex(0x1E1E3A), 0);
+        }
 
         lv_obj_t *sbtn = lv_btn_create(s_cham_content);
-        lv_obj_set_size(sbtn, 120, 36);
+        lv_obj_set_size(sbtn, 120, 34);
         lv_obj_align(sbtn, LV_ALIGN_BOTTOM_MID, 0, -2);
-        lv_obj_set_style_bg_color(sbtn, lv_color_hex(0x333344), 0);
+        lv_obj_set_style_bg_color(sbtn, lv_color_hex(0x2D2D48), 0);
+        lv_obj_set_style_border_color(sbtn, lv_color_hex(0x5E35B1), 0);
+        lv_obj_set_style_border_width(sbtn, 1, 0);
         lv_obj_add_event_cb(sbtn, s_cham_stop_btn_cb, LV_EVENT_CLICKED, NULL);
         lv_obj_t *sl = lv_label_create(sbtn);
-        lv_label_set_text(sl, "Stop Scan");
+        lv_label_set_text(sl, LV_SYMBOL_STOP " Stop Scan");
         lv_obj_set_style_text_font(sl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(sl, lv_color_hex(0xCE93D8), 0);
         lv_obj_center(sl);
 
         /* Populate any results already in the buffer */
         int count = cham_scan_result_count();
         while (s_cham_list_n < count) {
             const cham_scan_result_t *r = cham_scan_result_get(s_cham_list_n);
-            if (r) {
-                char row[64];
-                snprintf(row, sizeof(row), "%s  (%d dBm)", r->name, (int)r->rssi);
-                lv_obj_t *item = lv_list_add_btn(s_cham_scan_list, NULL, row);
-                lv_obj_set_style_text_font(item, &lv_font_montserrat_12, 0);
-                lv_obj_add_event_cb(item, s_cham_list_item_cb, LV_EVENT_CLICKED,
-                                    (void *)(intptr_t)s_cham_list_n);
-            }
+            if (r) s_cham_add_scan_row(s_cham_scan_list, r, s_cham_list_n);
             s_cham_list_n++;
         }
 
@@ -48543,33 +48597,42 @@ static void s_cham_rebuild_content(cham_state_t st)
         lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW);
         lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-        /* Read HF — live tile (Phase 3: ISO 14443-A, NTAG, MIFARE) */
+        /* Read HF — live tile (Phase 3: ISO 14443-A, NTAG, MIFARE).
+         * Matches Read LF tile layout exactly — same size, card bg, border,
+         * padding — only accent color differs (blue vs. green). */
         {
             lv_obj_t *btn = lv_btn_create(tiles);
-            lv_obj_set_size(btn, 70, 74);
-            lv_obj_set_style_bg_color(btn, lv_color_hex(0x01579B), LV_STATE_DEFAULT);
-            lv_obj_set_style_bg_color(btn, lv_color_hex(0x0288D1), LV_STATE_PRESSED);
-            lv_obj_set_style_radius(btn, 10, 0);
-            lv_obj_set_style_border_width(btn, 0, 0);
+            lv_obj_set_size(btn, 72, 54);
+            lv_obj_set_style_bg_color(btn, ui_card_color(), LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(btn, ui_card_pressed_color(), LV_STATE_PRESSED);
+            lv_obj_set_style_radius(btn, 8, 0);
+            lv_obj_set_style_border_width(btn, 2, 0);
+            lv_obj_set_style_border_color(btn, lv_color_hex(0x1565C0), 0); /* blue = HF */
+            lv_obj_set_style_shadow_width(btn, 0, 0);
             lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_COLUMN);
             lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-            lv_obj_add_event_cb(btn, s_cham_hf_tile_cb, LV_EVENT_CLICKED, NULL);
+            lv_obj_set_style_pad_all(btn, 4, 0);
+            lv_obj_set_style_pad_row(btn, 2, 0);
+
             lv_obj_t *icon = lv_label_create(btn);
             lv_label_set_text(icon, MY_SYMBOL_MICROCHIP);
             lv_obj_set_style_text_font(icon, &lv_extra_symbols, 0);
-            lv_obj_set_style_text_color(icon, lv_color_hex(0x4FC3F7), 0);
+            lv_obj_set_style_text_color(icon, lv_color_hex(0x42A5F5), 0); /* blue = HF */
+
             lv_obj_t *lbl = lv_label_create(btn);
             lv_label_set_text(lbl, "Read HF");
             lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
-            lv_obj_set_style_text_color(lbl, lv_color_hex(0xECEFF1), 0);
+            lv_obj_set_style_text_color(lbl, ui_text_color(), 0);
             lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
-            lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
-            lv_obj_set_width(lbl, 62);
+            lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
+            lv_obj_set_width(lbl, 64);
+
             lv_obj_t *sub = lv_label_create(btn);
             lv_label_set_text(sub, "NTAG/MFC");
             lv_obj_set_style_text_font(sub, &lv_font_montserrat_12, 0);
-            lv_obj_set_style_text_color(sub, lv_color_hex(0x90A4AE), 0);
-            lv_obj_set_style_text_align(sub, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_set_style_text_color(sub, lv_color_hex(0x42A5F5), 0);
+
+            lv_obj_add_event_cb(btn, s_cham_hf_tile_cb, LV_EVENT_CLICKED, NULL);
         }
 
         /* Read LF — live tile. Direct flex-column on lv_btn avoids the inner
@@ -48650,14 +48713,7 @@ static void s_cham_poll_timer(lv_timer_t *t)
         int count = cham_scan_result_count();
         while (s_cham_list_n < count) {
             const cham_scan_result_t *r = cham_scan_result_get(s_cham_list_n);
-            if (r) {
-                char row[64];
-                snprintf(row, sizeof(row), "%s  (%d dBm)", r->name, (int)r->rssi);
-                lv_obj_t *item = lv_list_add_btn(s_cham_scan_list, NULL, row);
-                lv_obj_set_style_text_font(item, &lv_font_montserrat_12, 0);
-                lv_obj_add_event_cb(item, s_cham_list_item_cb, LV_EVENT_CLICKED,
-                                    (void *)(intptr_t)s_cham_list_n);
-            }
+            if (r) s_cham_add_scan_row(s_cham_scan_list, r, s_cham_list_n);
             s_cham_list_n++;
         }
     }

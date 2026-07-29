@@ -69,6 +69,10 @@ bool cham_connect(int idx);
 /* Disconnect and return to DISCONNECTED */
 void cham_disconnect(void);
 
+/* Cancel any in-flight command without disconnecting BLE.
+ * Call from sub-screen stop hooks so stale callbacks don't fire into freed LVGL objects. */
+void cham_cancel_pending(void);
+
 /* State / info queries — safe to call any time */
 cham_state_t              cham_get_state(void);
 const char               *cham_get_status_msg(void);
