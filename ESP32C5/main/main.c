@@ -22616,10 +22616,15 @@ static const sd_provision_item_t SD_ITEMS[] = {
     { SD_ITEM_DIR,  "/sdcard/lab/nrf24",                     NULL },  /* nRF24L01 sniffer captures */
     { SD_ITEM_DIR,  "/sdcard/lab/zigbee",                    NULL },  /* Zigbee Scout wardrive CSV + PCAP */
     { SD_ITEM_DIR,  "/sdcard/lab/zwave",                     NULL },  /* Z-Wave Scout capture CSV */
+    { SD_ITEM_DIR,  "/sdcard/lab/tpms",                      NULL },  /* TPMS Monitor Schrader CSV captures */
+    { SD_ITEM_DIR,  "/sdcard/lab/espnow",                    NULL },  /* ESP-NOW Scout device export JSON + pktlog */
     { SD_ITEM_DIR,  "/sdcard/lab/rfid",                      NULL },  /* RFID/NFC card dumps (root) */
     { SD_ITEM_DIR,  "/sdcard/lab/rfid/lf",                  NULL },  /* LF cards (.rfid — EM410X, HID) */
     { SD_ITEM_DIR,  "/sdcard/lab/rfid/hf",                  NULL },  /* HF cards (.nfc — NTAG, MFC, UL) */
     { SD_ITEM_DIR,  "/sdcard/lab/rfid/keys",                NULL },  /* MIFARE key dictionaries */
+    { SD_ITEM_DIR,  "/sdcard/lab/rfid/import",              NULL },  /* Drop Flipper .nfc files here to import (PN532) */
+    { SD_ITEM_DIR,  "/sdcard/lab/rfid/export",              NULL },  /* Flipper .nfc exports (PN532) */
+    { SD_ITEM_DIR,  "/sdcard/lab/rfid/logs",                NULL },  /* RFID activity logs (reserved) */
     /* Seed MIFARE key dictionary with the 8 most common factory/default keys */
     { SD_ITEM_FILE, "/sdcard/lab/rfid/keys/mf_keys.dic",
       "# MIFARE Classic key dictionary — one 12-hex-char key per line\n"
@@ -22658,6 +22663,7 @@ static const sd_provision_item_t SD_ITEMS[] = {
       "ble_unknown_device_alert=false\nwifi_unknown_oui_alert=false\n" },
     { SD_ITEM_FILE, "/sdcard/lab/bluetooth/lookout.csv",     BT_LOOKOUT_CSV_HEADER },
     { SD_ITEM_FILE, "/sdcard/lab/bluetooth/blacklist.csv",   "mac,name,oui_only\n" },
+    { SD_ITEM_FILE, "/sdcard/lab/bluetooth/spooflist.csv",   "mac,name\n" },
     { SD_ITEM_FILE, "/sdcard/lab/wigle.txt",
       "# Paste your WiGLE API key on the next line\n" },
     { SD_ITEM_FILE, "/sdcard/lab/wdgwars.txt",

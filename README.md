@@ -2629,9 +2629,9 @@ All data is stored on the SD card. `/sdcard/lab/` is the root for all project da
     │   └── whisperpair/      # WhisperPair (CVE-2025-36911) probe/exploit logs
     │       └── wp_<timestamp>.json
     ├── bluetooth/
-    │   ├── lookout.csv       # BT Lookout watchlist: MAC,name,rssi_threshold,oui_only
-    │   ├── blacklist.csv     # BT Blacklist: MAC[,oui_only] — suppressed globally
-    │   ├── spooflist.csv     # Device Spoof targets: MAC,Name (one per line)
+    │   ├── lookout.csv       # BT Lookout watchlist: MAC,name,rssi_threshold,oui_only (seeded)
+    │   ├── blacklist.csv     # BT Blacklist: MAC[,oui_only] — suppressed globally (seeded)
+    │   ├── spooflist.csv     # Device Spoof targets: mac,name — one entry per line (seeded)
     │   └── scans/            # BT Scan & Select saved snapshots
     │       └── btsc_00001_HHMMSS_LAT_LON_label.json   # GPS-tagged JSON; scan_id NVS-persisted
     ├── cellular/
@@ -2662,6 +2662,10 @@ All data is stored on the SD card. `/sdcard/lab/` is the root for all project da
     │   └── <freq>MHz_<ts>.sub
     ├── rf433/                # NM-RF-HAT RF433 OOK captures (Flipper Zero .sub format)
     │   └── <Signal>.sub
+    ├── espnow/               # ESP-NOW Scout device export JSON + packet logs
+    │   ├── scout_<timestamp>.json    # Full device table snapshot
+    │   ├── pktlog_<timestamp>.txt    # 200-frame ring buffer export (hex + ASCII)
+    │   └── profiles.json    # Optional: known-device labels + LMK keys (user-created)
     ├── zigbee/               # Zigbee Scout wardrive logs (ESP32-C5 802.15.4 PHY)
     │   ├── zgwd_<timestamp>.csv   # One row per PAN sighting (PAN ID, channel, RSSI, GPS)
     │   └── zgwd_<timestamp>.pcap  # PCAP DLT 195 (IEEE 802.15.4 with FCS)
@@ -2680,7 +2684,7 @@ All data is stored on the SD card. `/sdcard/lab/` is the root for all project da
     │   │   └── *.nfc
     │   ├── export/           # Flipper .nfc exports (PN532)
     │   │   └── *.nfc
-    │   └── logs/             # (reserved)
+    │   └── logs/             # RFID activity logs (reserved)
     ├── screenshots/          # UI screenshots (BMP)
     │   └── screen_<n>.bmp
     └── wardrives/            # GPS + WiFi wardrive logs (WiGLE CSV 1.6 format)
