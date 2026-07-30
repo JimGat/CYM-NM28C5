@@ -22616,7 +22616,23 @@ static const sd_provision_item_t SD_ITEMS[] = {
     { SD_ITEM_DIR,  "/sdcard/lab/nrf24",                     NULL },  /* nRF24L01 sniffer captures */
     { SD_ITEM_DIR,  "/sdcard/lab/zigbee",                    NULL },  /* Zigbee Scout wardrive CSV + PCAP */
     { SD_ITEM_DIR,  "/sdcard/lab/zwave",                     NULL },  /* Z-Wave Scout capture CSV */
-    { SD_ITEM_DIR,  "/sdcard/lab/rfid",                      NULL },  /* RFID/NFC card dumps */
+    { SD_ITEM_DIR,  "/sdcard/lab/rfid",                      NULL },  /* RFID/NFC card dumps (root) */
+    { SD_ITEM_DIR,  "/sdcard/lab/rfid/lf",                  NULL },  /* LF cards (.rfid — EM410X, HID) */
+    { SD_ITEM_DIR,  "/sdcard/lab/rfid/hf",                  NULL },  /* HF cards (.nfc — NTAG, MFC, UL) */
+    { SD_ITEM_DIR,  "/sdcard/lab/rfid/keys",                NULL },  /* MIFARE key dictionaries */
+    /* Seed MIFARE key dictionary with the 8 most common factory/default keys */
+    { SD_ITEM_FILE, "/sdcard/lab/rfid/keys/mf_keys.dic",
+      "# MIFARE Classic key dictionary — one 12-hex-char key per line\n"
+      "# CYM-NM28C5 built-in keys are tried first; add more below for wider coverage\n"
+      "# Download the full 1M+ key dictionary from the CYM SD Asset Repository\n"
+      "FFFFFFFFFFFF\n"
+      "A0A1A2A3A4A5\n"
+      "D3F7D3F7D3F7\n"
+      "000000000000\n"
+      "B0B1B2B3B4B5\n"
+      "4D3A99C351DD\n"
+      "1A982C7E459A\n"
+      "AABBCCDDEEFF\n" },
     /* ── Seed files (written only on creation; never overwrite existing) ── */
     { SD_ITEM_FILE, "/sdcard/lab/white.txt",                 "" },
     { SD_ITEM_FILE, "/sdcard/lab/eviltwin.txt",              "" },
@@ -47400,6 +47416,29 @@ static volatile bool s_hf_result_ok     = false;
 static volatile bool s_hf_mode_ok       = false;
 static int64_t       s_hf_scan_deadline = 0;
 
+/* Phase 6 dump globals — declared here (before write/poll functions that use them) */
+static lv_obj_t *s_hf_dump_btn     = NULL;
+static bool      s_hf_dump_active  = false;
+static int       s_hf_dump_type    = 0;  /* 0=none, 1=NTAG pages done, 2=MFC blocks done */
+
+/* MIFARE Classic dump state */
+static uint8_t  s_mf_dump[64][16];
+static bool     s_mf_block_ok[64];
+static int      s_mf_cur_sector;
+static int      s_mf_cur_block;
+static uint8_t  s_mf_found_key[6];
+static uint8_t  s_mf_found_type;
+static int      s_mf_key_try_idx;
+static bool     s_mf_trying_b;
+static int      s_mf_sectors_done;
+static uint8_t *s_mf_dict_keys  = NULL;
+static int      s_mf_dict_count = 0;
+
+/* NTAG dump state */
+static uint8_t s_ntag_dump[222][4];
+static int     s_ntag_cur_page;
+static int     s_ntag_max_pages;
+
 /* Determine card type from ATQA+SAK */
 static void s_hf_detect_type(void)
 {
@@ -47503,9 +47542,17 @@ static void s_hf_build_save_name(void)
     snprintf(s_hf_save_default, sizeof(s_hf_save_default), "%s_%s", pfx, uid_hex);
 }
 
-/* Write a minimal Flipper .nfc file */
+/* Forward declarations — dump-save writers defined in Phase 6 block below */
+static bool s_mf_save_dump_file(const char *name);
+static bool s_ntag_save_dump_file(const char *name);
+
+/* Write a Flipper .nfc file; delegates to full-dump writers when a dump is ready */
 static bool s_hf_write_nfc_file(const char *name)
 {
+    /* After a Phase 6 dump, delegate to the richer writers that include block/page data */
+    if (s_hf_dump_type == 2) return s_mf_save_dump_file(name);
+    if (s_hf_dump_type == 1) return s_ntag_save_dump_file(name);
+
     char path[72];
     snprintf(path, sizeof(path), "%s/%.36s.nfc", RFID_DIR_HF, name);
     FILE *f = fopen(path, "w");
@@ -47540,7 +47587,7 @@ static bool s_hf_write_nfc_file(const char *name)
         fprintf(f, "Mifare Classic type: 4K\n");
 
     fprintf(f, "# Captured by CYM-NM28C5 via Chameleon Ultra BLE\n");
-    fprintf(f, "# Full dump (pages/sectors) not yet captured\n");
+    fprintf(f, "# UID-only save — tap Dump Card first for full sector/page data\n");
     fclose(f);
     return true;
 }
@@ -47687,7 +47734,9 @@ static void s_hf_poll_timer(lv_timer_t *t)
         }
         if (s_hf_save_btn) lv_obj_clear_flag(s_hf_save_btn, LV_OBJ_FLAG_HIDDEN);
         if (s_hf_scan_btn) lv_obj_clear_flag(s_hf_scan_btn, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(s_hf_status_lbl, "Card read - tap Save to export");
+        if (s_hf_dump_btn && !s_hf_dump_active) lv_obj_clear_flag(s_hf_dump_btn, LV_OBJ_FLAG_HIDDEN);
+        s_hf_dump_type = 0; /* reset — new card detected, previous dump no longer valid */
+        lv_label_set_text(s_hf_status_lbl, "Card read - Dump Card for full data");
     } else if (!s_hf_mode_ok) {
         lv_label_set_text(s_hf_status_lbl, "Mode switch failed - tap Scan Again");
         if (s_hf_scan_btn) lv_obj_clear_flag(s_hf_scan_btn, LV_OBJ_FLAG_HIDDEN);
@@ -47695,6 +47744,331 @@ static void s_hf_poll_timer(lv_timer_t *t)
         lv_label_set_text(s_hf_status_lbl, "No card detected - tap Scan Again");
         if (s_hf_scan_btn) lv_obj_clear_flag(s_hf_scan_btn, LV_OBJ_FLAG_HIDDEN);
     }
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * PHASE 6 — Full card dump
+ *   MIFARE Classic 1K: MF1_CHECK_ONE_KEY_BLOCK (4009) → MF1_READ_ONE_BLOCK (4010)
+ *   NTAG / Ultralight: HF14A_RAW (2001) with ISO 14443-A READ command (0x30)
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+#define MF_BUILTIN_KEY_COUNT 8
+static const uint8_t s_mf_builtin_keys[MF_BUILTIN_KEY_COUNT][6] = {
+    {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF},  /* factory default */
+    {0xA0,0xA1,0xA2,0xA3,0xA4,0xA5},  /* NXP transport */
+    {0xD3,0xF7,0xD3,0xF7,0xD3,0xF7},  /* NXP public */
+    {0x00,0x00,0x00,0x00,0x00,0x00},  /* blank */
+    {0xB0,0xB1,0xB2,0xB3,0xB4,0xB5},
+    {0x4D,0x3A,0x99,0xC3,0x51,0xDD},
+    {0x1A,0x98,0x2C,0x7E,0x45,0x9A},
+    {0xAA,0xBB,0xCC,0xDD,0xEE,0xFF},
+};
+
+/* ── Load key dictionary from SD card ── */
+static void s_mf_load_dict(void)
+{
+    if (s_mf_dict_keys) { free(s_mf_dict_keys); s_mf_dict_keys = NULL; s_mf_dict_count = 0; }
+    FILE *f = fopen("/sdcard/lab/rfid/keys/mf_keys.dic", "r");
+    if (!f) f = fopen("/sdcard/lab/rfid/mf_keys.dic", "r"); /* legacy path */
+    if (!f) return;
+    /* Two-pass: count valid lines then allocate and parse */
+    int count = 0;
+    char line[32];
+    while (fgets(line, sizeof(line), f) && count < 512) {
+        int hc = 0;
+        for (const char *p = line; *p && hc < 12; p++)
+            if (isxdigit((unsigned char)*p)) hc++;
+        if (hc >= 12) count++;
+    }
+    if (count == 0) { fclose(f); return; }
+    s_mf_dict_keys = (uint8_t *)malloc((size_t)count * 6);
+    if (!s_mf_dict_keys) { fclose(f); return; }
+    rewind(f);
+    int idx = 0;
+    while (fgets(line, sizeof(line), f) && idx < count) {
+        char hx[13] = {0};
+        int hc = 0;
+        for (const char *p = line; *p && hc < 12; p++)
+            if (isxdigit((unsigned char)*p)) hx[hc++] = *p;
+        if (hc < 12) continue;
+        for (int b = 0; b < 6; b++) {
+            char bb[3] = {hx[b*2], hx[b*2+1], '\0'};
+            s_mf_dict_keys[idx * 6 + b] = (uint8_t)strtoul(bb, NULL, 16);
+        }
+        idx++;
+    }
+    fclose(f);
+    s_mf_dict_count = idx;
+}
+
+static const uint8_t *s_mf_get_key(int idx)
+{
+    if (idx < MF_BUILTIN_KEY_COUNT) return s_mf_builtin_keys[idx];
+    int di = idx - MF_BUILTIN_KEY_COUNT;
+    if (s_mf_dict_keys && di < s_mf_dict_count) return s_mf_dict_keys + di * 6;
+    return NULL;
+}
+static int s_mf_key_total(void) { return MF_BUILTIN_KEY_COUNT + s_mf_dict_count; }
+
+/* Forward declarations for MFC dump callback chain */
+static void s_mf_try_next_check(void);
+static void s_mf_on_key_check(bool ok, const uint8_t *data, uint16_t dlen);
+
+/* ── Save MIFARE dump to .nfc (Flipper format with Block N: lines) ── */
+static bool s_mf_save_dump_file(const char *name)
+{
+    char path[80];
+    snprintf(path, sizeof(path), "%s/%.36s.nfc", RFID_DIR_HF, name);
+    FILE *f = fopen(path, "w");
+    if (!f) return false;
+    fprintf(f, "Filetype: Flipper NFC device\nVersion: 4\n");
+    /* Device type based on SAK */
+    if (s_hf_sak == 0x09)
+        fprintf(f, "Device type: Mifare Mini\n");
+    else
+        fprintf(f, "Device type: Mifare Classic\n");
+    fprintf(f, "UID:");
+    for (int i = 0; i < s_hf_uid_len; i++) fprintf(f, " %02X", s_hf_uid[i]);
+    fprintf(f, "\nATQA: %02X %02X\nSAK: %02X\n", s_hf_atqa[0], s_hf_atqa[1], s_hf_sak);
+    if (s_hf_sak == 0x08 || s_hf_sak == 0x28)
+        fprintf(f, "Mifare Classic type: 1K\n");
+    else if (s_hf_sak == 0x18 || s_hf_sak == 0x38)
+        fprintf(f, "Mifare Classic type: 4K\n");
+    fprintf(f, "Data format version: 2\n# Captured by CYM-NM28C5 via Chameleon Ultra BLE\n");
+    fprintf(f, "# Blocks read: %d/64\n", s_mf_sectors_done * 4);
+    for (int b = 0; b < 64; b++) {
+        fprintf(f, "Block %d:", b);
+        if (s_mf_block_ok[b]) {
+            for (int j = 0; j < 16; j++) fprintf(f, " %02X", s_mf_dump[b][j]);
+        } else {
+            for (int j = 0; j < 16; j++) fprintf(f, " 00"); /* unknown block */
+        }
+        fprintf(f, "\n");
+    }
+    fclose(f);
+    return true;
+}
+
+/* ── Save NTAG dump to .nfc (Flipper format with Page N: lines) ── */
+static bool s_ntag_save_dump_file(const char *name)
+{
+    char path[80];
+    snprintf(path, sizeof(path), "%s/%.36s.nfc", RFID_DIR_HF, name);
+    FILE *f = fopen(path, "w");
+    if (!f) return false;
+    fprintf(f, "Filetype: Flipper NFC device\nVersion: 4\n");
+    /* Best-guess type from page count */
+    const char *dtype = (s_ntag_max_pages <= 45)   ? "NTAG213" :
+                        (s_ntag_max_pages <= 135)  ? "NTAG215" : "NTAG216";
+    fprintf(f, "Device type: %s\n", dtype);
+    fprintf(f, "UID:");
+    for (int i = 0; i < s_hf_uid_len; i++) fprintf(f, " %02X", s_hf_uid[i]);
+    fprintf(f, "\nATQA: %02X %02X\nSAK: %02X\n", s_hf_atqa[0], s_hf_atqa[1], s_hf_sak);
+    fprintf(f, "# Captured by CYM-NM28C5 via Chameleon Ultra BLE\n");
+    for (int p = 0; p < s_ntag_cur_page; p++) {
+        fprintf(f, "Page %d: %02X %02X %02X %02X\n", p,
+                s_ntag_dump[p][0], s_ntag_dump[p][1],
+                s_ntag_dump[p][2], s_ntag_dump[p][3]);
+    }
+    fclose(f);
+    return true;
+}
+
+/* ── MIFARE dump complete ── */
+static void s_mf_dump_done(void)
+{
+    s_hf_dump_active = false;
+    if (s_mf_dict_keys) { free(s_mf_dict_keys); s_mf_dict_keys = NULL; s_mf_dict_count = 0; }
+    s_hf_dump_type = 2; /* MFC */
+    if (!s_hf_status_lbl) return;
+    char sb[64];
+    snprintf(sb, sizeof(sb), "Dumped %d/16 sectors - tap Save", s_mf_sectors_done);
+    lv_label_set_text(s_hf_status_lbl, sb);
+    if (s_hf_save_btn) lv_obj_clear_flag(s_hf_save_btn, LV_OBJ_FLAG_HIDDEN);
+    if (s_hf_dump_btn) lv_obj_clear_flag(s_hf_dump_btn, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* ── Advance to next sector ── */
+static void s_mf_advance_sector(void)
+{
+    s_mf_cur_sector++;
+    if (s_mf_cur_sector >= 16) {
+        s_mf_dump_done();
+        return;
+    }
+    if (s_hf_status_lbl) {
+        char sb[48];
+        snprintf(sb, sizeof(sb), "Attacking sector %d/16...", s_mf_cur_sector);
+        lv_label_set_text(s_hf_status_lbl, sb);
+    }
+    s_mf_key_try_idx = 0;
+    s_mf_trying_b    = false;
+    s_mf_try_next_check();
+}
+
+/* ── Read blocks of current sector (called when key is found) ── */
+static void s_mf_on_block_read(bool ok, const uint8_t *data, uint16_t dlen)
+{
+    int blk = s_mf_cur_sector * 4 + s_mf_cur_block;
+    if (ok && data && dlen >= 16) {
+        memcpy(s_mf_dump[blk], data, 16);
+        s_mf_block_ok[blk] = true;
+    }
+    s_mf_cur_block++;
+    if (s_mf_cur_block < 4) {
+        /* Read next block in same sector using same found key */
+        int next_blk = s_mf_cur_sector * 4 + s_mf_cur_block;
+        uint8_t payload[8] = {
+            (uint8_t)next_blk, s_mf_found_type,
+            s_mf_found_key[0], s_mf_found_key[1], s_mf_found_key[2],
+            s_mf_found_key[3], s_mf_found_key[4], s_mf_found_key[5]
+        };
+        if (!cham_send_cmd(4010, payload, 8, s_mf_on_block_read))
+            s_mf_advance_sector(); /* busy fallback */
+    } else {
+        s_mf_advance_sector();
+    }
+}
+
+/* ── Try next key in the list for current sector ── */
+static void s_mf_try_next_check(void)
+{
+    const uint8_t *key = s_mf_get_key(s_mf_key_try_idx);
+    if (!key) {
+        /* Exhausted all keys for this key_type */
+        if (!s_mf_trying_b) {
+            s_mf_trying_b    = true;
+            s_mf_key_try_idx = 0;
+            s_mf_try_next_check();
+            return;
+        }
+        /* Both KeyA and KeyB exhausted — skip sector */
+        s_mf_advance_sector();
+        return;
+    }
+    uint8_t key_type = s_mf_trying_b ? 0x61 : 0x60;
+    int auth_blk = s_mf_cur_sector * 4; /* any block in sector works for auth */
+    uint8_t payload[8] = { (uint8_t)auth_blk, key_type,
+                            key[0], key[1], key[2], key[3], key[4], key[5] };
+    if (!cham_send_cmd(4009, payload, 8, s_mf_on_key_check))
+        s_mf_dump_done(); /* channel busy — abort */
+}
+
+static void s_mf_on_key_check(bool ok, const uint8_t *data, uint16_t dlen)
+{
+    (void)data; (void)dlen;
+    if (ok) {
+        /* Key found — store it and read all 4 blocks */
+        const uint8_t *key = s_mf_get_key(s_mf_key_try_idx);
+        if (key) memcpy(s_mf_found_key, key, 6);
+        s_mf_found_type = s_mf_trying_b ? 0x61 : 0x60;
+        s_mf_sectors_done++;
+        s_mf_cur_block = 0;
+        int blk = s_mf_cur_sector * 4;
+        uint8_t payload[8] = { (uint8_t)blk, s_mf_found_type,
+            s_mf_found_key[0], s_mf_found_key[1], s_mf_found_key[2],
+            s_mf_found_key[3], s_mf_found_key[4], s_mf_found_key[5] };
+        if (!cham_send_cmd(4010, payload, 8, s_mf_on_block_read))
+            s_mf_advance_sector();
+    } else {
+        s_mf_key_try_idx++;
+        s_mf_try_next_check();
+    }
+}
+
+/* ── Start MIFARE Classic dump ── */
+static void s_mf_dump_start(void)
+{
+    cham_cancel_pending();
+    s_mf_load_dict();
+    memset(s_mf_dump, 0, sizeof(s_mf_dump));
+    memset(s_mf_block_ok, 0, sizeof(s_mf_block_ok));
+    s_mf_cur_sector  = 0;
+    s_mf_cur_block   = 0;
+    s_mf_key_try_idx = 0;
+    s_mf_trying_b    = false;
+    s_mf_sectors_done = 0;
+    s_hf_dump_active = true;
+    s_hf_dump_type   = 0;
+    if (s_hf_dump_btn) lv_obj_add_flag(s_hf_dump_btn, LV_OBJ_FLAG_HIDDEN);
+    if (s_hf_status_lbl) lv_label_set_text(s_hf_status_lbl, "Attacking sector 0/16...");
+    s_mf_try_next_check();
+}
+
+/* ── NTAG page read callback ── */
+static void s_ntag_on_page_read(bool ok, const uint8_t *data, uint16_t dlen)
+{
+    if (ok && data && dlen >= 16 && s_ntag_cur_page + 4 <= 222) {
+        /* READ returns 4 pages × 4 bytes = 16 bytes */
+        for (int i = 0; i < 4 && s_ntag_cur_page + i < 222; i++) {
+            memcpy(s_ntag_dump[s_ntag_cur_page + i], data + i * 4, 4);
+        }
+        /* Auto-detect total pages from CC byte at page 3 byte 2 */
+        if (s_ntag_cur_page == 0) {
+            uint8_t cc = s_ntag_dump[3][2]; /* CC memory size byte */
+            if      (cc == 0x12) s_ntag_max_pages = 45;
+            else if (cc == 0x3E) s_ntag_max_pages = 135;
+            else if (cc == 0x6D) s_ntag_max_pages = 231;
+        }
+        s_ntag_cur_page += 4;
+    }
+
+    if (!ok || s_ntag_cur_page >= s_ntag_max_pages) {
+        /* Done */
+        s_hf_dump_active = false;
+        s_hf_dump_type   = 1; /* NTAG */
+        if (!s_hf_status_lbl) return;
+        char sb[56];
+        snprintf(sb, sizeof(sb), "Read %d pages - tap Save", s_ntag_cur_page);
+        lv_label_set_text(s_hf_status_lbl, sb);
+        if (s_hf_save_btn) lv_obj_clear_flag(s_hf_save_btn, LV_OBJ_FLAG_HIDDEN);
+        if (s_hf_dump_btn) lv_obj_clear_flag(s_hf_dump_btn, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    if (s_hf_status_lbl) {
+        char sb[48];
+        snprintf(sb, sizeof(sb), "Reading page %d/%d...", s_ntag_cur_page, s_ntag_max_pages);
+        lv_label_set_text(s_hf_status_lbl, sb);
+    }
+    /* Send next READ: HF14A_RAW (2001), options=0x0F (wait|auto-sel|append-crc|check-crc) */
+    uint8_t payload[3] = { 0x0F, 0x30, (uint8_t)s_ntag_cur_page };
+    if (!cham_send_cmd(2001, payload, 3, s_ntag_on_page_read)) {
+        s_hf_dump_active = false;
+        if (s_hf_status_lbl) lv_label_set_text(s_hf_status_lbl, "Dump stopped - Chameleon busy");
+        if (s_hf_dump_btn) lv_obj_clear_flag(s_hf_dump_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* ── Start NTAG / Ultralight page dump ── */
+static void s_ntag_dump_start(void)
+{
+    cham_cancel_pending();
+    memset(s_ntag_dump, 0, sizeof(s_ntag_dump));
+    s_ntag_cur_page  = 0;
+    s_ntag_max_pages = 45; /* default NTAG213; auto-detected from CC at page 3 */
+    s_hf_dump_active = true;
+    s_hf_dump_type   = 0;
+    if (s_hf_dump_btn) lv_obj_add_flag(s_hf_dump_btn, LV_OBJ_FLAG_HIDDEN);
+    if (s_hf_status_lbl) lv_label_set_text(s_hf_status_lbl, "Reading page 0...");
+    uint8_t payload[3] = { 0x0F, 0x30, 0x00 }; /* READ page 0 */
+    if (!cham_send_cmd(2001, payload, 3, s_ntag_on_page_read)) {
+        s_hf_dump_active = false;
+        if (s_hf_status_lbl) lv_label_set_text(s_hf_status_lbl, "Chameleon busy - try again");
+        if (s_hf_dump_btn) lv_obj_clear_flag(s_hf_dump_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* ── Dump button tap ── */
+static void s_hf_dump_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_hf_dump_active) return;
+    bool is_ntag = (s_hf_sak == 0x00 || !(s_hf_sak & 0x08));
+    bool is_mfc  = (s_hf_sak == 0x08 || s_hf_sak == 0x28 ||
+                    s_hf_sak == 0x18 || s_hf_sak == 0x38 ||
+                    s_hf_sak == 0x09);
+    if (is_mfc)       s_mf_dump_start();
+    else if (is_ntag) s_ntag_dump_start();
 }
 
 /* Stop hook — fires on Back/Home before parent screen is rebuilt */
@@ -47709,10 +48083,15 @@ static void cham_hf_read_stop(void)
     s_hf_uid_lbl      = NULL;
     s_hf_save_btn     = NULL;
     s_hf_scan_btn     = NULL;
+    s_hf_dump_btn     = NULL;
     s_hf_result_ready = false;
     s_hf_result_ok    = false;
     s_hf_mode_ok      = false;
     s_hf_uid_len      = 0;
+    /* Cancel any running dump; dict heap freed in s_mf_dump_done but guard here too */
+    s_hf_dump_active  = false;
+    s_hf_dump_type    = 0;
+    if (s_mf_dict_keys) { free(s_mf_dict_keys); s_mf_dict_keys = NULL; s_mf_dict_count = 0; }
 }
 
 /* Tile button callback */
@@ -47781,6 +48160,21 @@ static void show_cham_hf_read_screen(void)
     lv_obj_add_event_cb(s_hf_scan_btn, s_hf_scan_again_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_flag(s_hf_scan_btn, LV_OBJ_FLAG_HIDDEN);
 
+    /* Dump Card button — full sector/page read via Chameleon (hidden until card found) */
+    s_hf_dump_btn = lv_btn_create(function_page);
+    lv_obj_set_size(s_hf_dump_btn, 216, 34);
+    lv_obj_align(s_hf_dump_btn, LV_ALIGN_BOTTOM_MID, 0, -52);
+    lv_obj_set_style_bg_color(s_hf_dump_btn, lv_color_hex(0x1B5E20), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(s_hf_dump_btn, lv_color_hex(0x388E3C), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(s_hf_dump_btn, 8, 0);
+    lv_obj_set_style_border_width(s_hf_dump_btn, 0, 0);
+    lv_obj_t *dlbl = lv_label_create(s_hf_dump_btn);
+    lv_label_set_text(dlbl, LV_SYMBOL_DOWNLOAD " Dump Card");
+    lv_obj_set_style_text_font(dlbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(dlbl);
+    lv_obj_add_event_cb(s_hf_dump_btn, s_hf_dump_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(s_hf_dump_btn, LV_OBJ_FLAG_HIDDEN);
+
     /* Poll timer drives cham_poll() at 50 ms */
     s_hf_tmr = lv_timer_create(s_hf_poll_timer, 50, NULL);
 
@@ -47813,6 +48207,8 @@ static uint8_t    s_clone_payload_len;
 /* HF clone: heap buffer for NTAG page data (cmd 4022 payload) */
 static uint8_t   *s_clone_hf_buf     = NULL;
 static uint16_t   s_clone_hf_buf_len = 0;
+/* Set true in s_clone_on_saved so the slot manager refreshes on next poll */
+static bool        s_sm_needs_refresh = false;
 /* File browser state — populated when long-press opens the browser popup */
 static lv_obj_t  *s_fb_popup         = NULL;
 static int         s_fb_target_slot   = -1;
@@ -48208,8 +48604,9 @@ static void s_clone_on_saved(bool ok, const uint8_t *data, uint16_t dlen)
     (void)data; (void)dlen;
     if (!s_clone_status_lbl) return;
     if (ok) {
-        lv_label_set_text(s_clone_status_lbl, "Cloned! Check Slot Manager.");
+        lv_label_set_text(s_clone_status_lbl, "Loaded! Slot list refreshing...");
         lv_obj_set_style_text_color(s_clone_status_lbl, lv_color_hex(0x66BB6A), 0);
+        s_sm_needs_refresh = true; /* tell slot manager poll timer to reload */
     } else {
         lv_label_set_text(s_clone_status_lbl, "Save failed - try again");
         lv_obj_set_style_text_color(s_clone_status_lbl, lv_color_hex(0xEF9A9A), 0);
@@ -48934,6 +49331,11 @@ static void s_sm_poll_timer(lv_timer_t *t)
         s_sm_render_rows();
         return;
     }
+    /* s_clone_on_saved sets this flag after a successful clone */
+    if (s_sm_needs_refresh) {
+        s_sm_needs_refresh = false;
+        s_sm_loaded = false;
+    }
     /* Retry load if not yet complete and no command in flight */
     if (!s_sm_loaded && !s_sm_loading) {
         s_sm_load_info();
@@ -49083,14 +49485,14 @@ static bool s_parse_nfc_file(const char *path, char *err_out, size_t err_sz)
             else if (strstr(dt, "NTAG216"))     tag_type = 1102;
             else if (strstr(dt, "Ultralight"))  tag_type = 1100; /* best guess */
             else if (strstr(dt, "Classic") || strstr(dt, "classic")) {
-                /* MIFARE Classic not yet supported in HF clone */
+                /* MFC slot-write command not yet confirmed - dump works, load to slot pending */
                 fclose(f);
-                snprintf(err_out, err_sz, "MFC - coming soon");
+                snprintf(err_out, err_sz, "MFC load to slot not supported yet");
                 return false;
             }
         } else if (strncmp(line, "Mifare Classic type:", 20) == 0) {
             fclose(f);
-            snprintf(err_out, err_sz, "MFC - coming soon");
+            snprintf(err_out, err_sz, "MFC load to slot not supported yet");
             return false;
         } else if (strncmp(line, "Page ", 5) == 0) {
             int pg = atoi(line + 5);
