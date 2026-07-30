@@ -2078,14 +2078,27 @@ The **NFC / RFID Hub** tile is permanently visible on the main menu — no RF-HA
 
 CYM can pair with a **Chameleon Ultra** or **Chameleon Lite** over Bluetooth and use it as a full RFID/NFC read/write/emulate engine — without needing a phone or laptop.
 
-**Supported operations (v2.11.x):**
-- **BLE scan & connect** — auto-discovers Chameleon devices, shows RSSI-coded signal strength
-- **Read LF 125 kHz** — EM4100, HID Prox H10301; saves Flipper-compatible `.rfid` files to SD
-- **Read HF 13.56 MHz** — ISO 14443-A scan; MIFARE Classic, NTAG, Ultralight detection; saves Flipper-compatible `.nfc` files to SD
-- **Slot Manager** — 8-slot view, activate slot, clear slot; LF/HF type names displayed per slot
+**Supported operations (v2.11.44+):**
+- **BLE scan & connect** — auto-discovers Chameleon devices by NUS service UUID, shows RSSI-coded signal strength; supports both pairing-disabled and pairing-enabled units (auto-injects fixed passkey 123456 for units with BLE pairing ON)
+- **Read LF 125 kHz** — EM4100, HID Prox H10301 (FC+CN display); saves Flipper-compatible `.rfid` files to `/sdcard/lab/rfid/lf/`
+- **Read HF 13.56 MHz** — ISO 14443-A scan; MIFARE Classic, NTAG213/215/216, Ultralight detection from SAK byte; saves Flipper-compatible `.nfc` files to `/sdcard/lab/rfid/hf/`
+- **Dump Card (full sector/page read)** — appears after any card is detected on HF Read; for MIFARE Classic 1K runs a key attack (8 built-in keys + `/sdcard/lab/rfid/keys/mf_keys.dic` dictionary) and reads all 64 blocks; for NTAG/Ultralight reads all pages via raw ISO 14443-A READ commands; output `.nfc` file includes full `Block N:` / `Page N:` data in Flipper format
+- **Slot Manager** — 8-slot view showing LF/HF type per slot; activate slot, clear slot
+- **Clone to Slot** — after an LF card read, tap "Clone to Slot", pick a target slot; 4-step BLE chain writes card to Chameleon flash (EM410X and HID H10301 supported)
+- **Load from SD** — long-press any slot row to open the SD file browser; lists `.rfid` (LF) and `.nfc` (HF, NTAG/Ultralight) files; tap to load directly to that slot
 
 Protocol reference: [ChameleonUltraGUI by GameTec-live](https://github.com/GameTec-live/ChameleonUltraGUI).
 Concept credit: **@bkbroiler**.
+
+**SD card layout for Chameleon:**
+
+| Path | Contents |
+|------|----------|
+| `/sdcard/lab/rfid/lf/` | LF card saves (`.rfid` — EM410X, HID Prox) |
+| `/sdcard/lab/rfid/hf/` | HF card saves (`.nfc` — NTAG, MIFARE, Ultralight) |
+| `/sdcard/lab/rfid/keys/mf_keys.dic` | MIFARE Classic key dictionary (one 12-hex-char key per line) |
+
+The key dictionary is seeded on first SD provision with 8 common factory/default keys. For broader coverage, download the extended dictionary from the **[CYM SD Asset Repository](https://github.com/JimGat/CYM-NM28C5-SD-Assets)** and replace the seeded file.
 
 #### PN532 NFC/RFID
 
@@ -2656,14 +2669,17 @@ All data is stored on the SD card. `/sdcard/lab/` is the root for all project da
     │   └── zwave_<timestamp>.csv  # One row per received frame (node IDs, cmd class, GPS)
     ├── tpms/                 # TPMS Monitor captures (CC1101 315/433 MHz)
     │   └── tpms_<timestamp>.csv   # One row per valid Schrader packet (sensor ID, PSI, kPa, temp, flags, RSSI)
-    ├── rfid/                 # NM-RF-HAT NFC/RFID (PN532)
-    │   ├── hf/               # 13.56 MHz card saves (JSON)
-    │   │   └── <name>.json
-    │   ├── import/           # Drop Flipper .nfc files here to import
+    ├── rfid/                 # NFC/RFID hub (Chameleon Ultra + PN532)
+    │   ├── lf/               # LF 125 kHz card saves (Flipper .rfid — EM410X, HID Prox)
+    │   │   └── <name>.rfid
+    │   ├── hf/               # HF 13.56 MHz card saves (Flipper .nfc — NTAG, MIFARE, UL)
+    │   │   └── <name>.nfc
+    │   ├── keys/             # MIFARE key dictionaries
+    │   │   └── mf_keys.dic   # Seeded: 8 common factory keys; replace with extended dict
+    │   ├── import/           # Drop Flipper .nfc files here to import (PN532)
     │   │   └── *.nfc
-    │   ├── export/           # Flipper .nfc exports
+    │   ├── export/           # Flipper .nfc exports (PN532)
     │   │   └── *.nfc
-    │   ├── keys/             # (reserved)
     │   └── logs/             # (reserved)
     ├── screenshots/          # UI screenshots (BMP)
     │   └── screen_<n>.bmp
@@ -2702,6 +2718,43 @@ Requires a curated binary table at `/sdcard/lab/ouilist.bin`. Generate or refres
    ```
 
 The firmware loads the binary into PSRAM on first entry to any BT feature and searches it with binary search — no large stack allocations. If the file is missing, vendor lookup is skipped transparently and scan results show `[Unknown]` as before.
+
+### MIFARE Key Dictionary
+
+The **Dump Card** feature on the Chameleon Ultra HF Read screen can crack MIFARE Classic sector keys using a dictionary attack. CYM tries 8 built-in factory/default keys automatically, then loads extras from:
+
+```
+/sdcard/lab/rfid/keys/mf_keys.dic
+```
+
+**Format:** one key per line, 12 hex characters (6 bytes), comments start with `#`:
+
+```
+# My custom site keys
+FFFFFFFFFFFF
+A0A1A2A3A4A5
+D3F7D3F7D3F7
+000000000000
+```
+
+SD Provision seeds this file with the 8 most common defaults. For broader coverage (common vendor keys, leaked key sets, etc.), download the extended dictionary from the **[CYM SD Asset Repository](https://github.com/JimGat/CYM-NM28C5-SD-Assets)** and replace the file. The dictionary can have up to 512 entries; larger files are capped at that limit.
+
+---
+
+### CYM SD Asset Repository
+
+Pre-built SD card assets are hosted at **[github.com/JimGat/CYM-NM28C5-SD-Assets](https://github.com/JimGat/CYM-NM28C5-SD-Assets)**. Download these files and place them in `/sdcard/lab/` before first use for the best out-of-box experience:
+
+| File | Destination | Purpose |
+|------|-------------|---------|
+| `ouilist.bin` | `/sdcard/lab/ouilist.bin` | OUI vendor table — adds manufacturer names to BLE scan results (binary-search lookup) |
+| `mf_keys.dic` | `/sdcard/lab/rfid/keys/mf_keys.dic` | Extended MIFARE Classic key dictionary for Dump Card sector attacks |
+
+Additional assets in the repository:
+- `mf_keys.dic` — extended MIFARE key list (common vendor keys, leaked key sets, broader coverage than the 8 built-in defaults)
+- `ouilist.bin` — pre-built OUI binary (regenerate anytime with `python tools/oui_convert.py oui.csv ouilist.bin` from a fresh IEEE OUI CSV)
+
+Both files are optional — CYM runs without them, but OUI lookup will show `[Unknown]` and MIFARE dumps will only try the 8 built-in default keys.
 
 ---
 
