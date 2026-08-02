@@ -112,6 +112,10 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
     - [GATT Connect Timeout](#gatt-connect-timeout)
     - [Data Transfer](#data-transfer)
   - [Zigbee Scout](#6-zigbee-scout)
+  - [NFC / RFID Hub](#8-nfc--rfid-hub)
+    - [Chameleon Ultra](#chameleon-ultra)
+    - [PN532 NFC/RFID](#pn532-nfcrfid)
+      - [NTAG213/215/216 Full Dump](#ntag213215216-full-dump-workflow)
   - [NM-RF-HAT](#7-nm-rf-hat)
     - [Infrared (DIP 4)](#infrared-dip-4)
       - [LED RMT — RGB LED Strip Remote](#led-rmt--rgb-led-strip-remote)
@@ -149,6 +153,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **Chanalizer** | Wide 520 px WiFi channel map — auto-scrolling left/right with touch-drag pause; SSID color grouping, group legend, channel annotations; portrait 240 px viewport over 2.4 GHz + 5 GHz |
 | **WiFi Band Scope** | Promiscuous RSSI per-channel waterfall (2.4 GHz 13-ch or 5 GHz 25-ch); band toggle updates axis label and resets peaks; 60 ms dwell / 0.8 s full 2.4 sweep |
 | **Drone Detector** | Dual-mode (BLE5 extended + WiFi 2.4/5 GHz) passive Remote ID scanner. Detects all ASTM F3411-compliant drones via BLE service UUID 0xFFFA and WiFi Remote ID beacons; DJI presence by OUI / service UUID 0xFFF0. Alternates BLE and WiFi scan phases; logs to SD. |
+| **Drone Spoof** | Broadcasts a synthetic ASTM F3411 Remote ID beacon over BLE or WiFi. Configurable UAS ID, operator ID, GPS coordinates, altitude, speed, and heading. For RF research, drone regulation testing, and authorized counter-UAS research. |
 | **Wardriving** | GPS + WiFi logging, dual-band filter (2.4 GHz / 5 GHz / Both), optional BLE time-sliced scanning, WiGLE CSV 1.6, upload log tracking, raw PCAP toggle, GPS mark waypoints (GPX output), WiGLE and WDG Wars upload; GPS last-known position hold with 150 m stale accuracy when signal is lost; live dashboard shows separate WiFi network count and BLE device count |
 | **GPS** | NMEA RMC auto-syncs system clock (FAT timestamps); last-known position persisted to NVS (5-minute throttle); manual fallback editor in Settings → GPS Info; all data-collection features (wardrive, GATT Walker, marks) use best available GPS transparently |
 | **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk (with **advanced advertising fingerprinting** — AD-type decode, Company ID lookup, URIs, flags), Bluetooth Lookout, BLE Spam (8 modes incl. Sour Apple), Device Spoof (general + directed), BLE Disconnect (directed), BLE PCAP (Kismet PCAPNG raw capture; BLE 5.0 extended advertisement support), **BlueDuck** (BLE HID DuckyScript keyboard injector), **HoneyPair** (BLE persona honeypot), **WhisperPair** (CVE-2025-36911 Google Fast Pair KBP bypass — auto-scan, sequential run-all FP targets, AES-128-ECB exploit); BT Scan & Select supports **Save List** (GPS-tagged JSON snapshot of every device found); **Matter [M] detection** passive tagging of Thread/BLE Matter devices by GATT service `0xFFF6`; **GATT Interactive** (live read/write/subscribe to individual characteristics after walk); **GATT HID Decoder** (parses HID Report Map, decodes live keyboard/mouse input); **Saved Clones** browser; **BLE MITM Proxy** |
@@ -186,7 +191,9 @@ Home
 │   ├── Deauth Monitor
 │   ├── Deauth Client
 │   ├── WiFi Observer (Sniffer / Karma)
-│   ├── Drone Detect
+│   ├── Drone Stuff
+│   │   ├── Drone Detect
+│   │   └── Drone Spoof
 │   ├── Chanalizer
 │   ├── WiFi Scope
 │   └── ESP-NOW Scout
@@ -288,13 +295,15 @@ Home
 │       ├── LBK Test (loopback)
 │       ├── Fox Hunt (433.92 MHz fixed, edge-count activity, haptic)
 │       └── OOK Scan (EV1527 decoder via R4A_433 superheterodyne RX)
-└── RFID/NFC [RF-HAT DIP 3]
-    ├── Scan & Read  →  Read All (full page dump)  →  Save / Export .nfc
-    ├── Clone/Write  →  Select source  →  Clone to blank NTAG
-    ├── Card Emulate →  Select saved card  →  Emulate / Stop
-    ├── Key Test     →  MIFARE Classic dict attack
-    ├── Saved Cards  →  load / emulate / Flipper .nfc import
-    └── HW Test      →  PN532 I2C probe, I2C bus scan
+└── NFC / RFID Hub  [always visible]
+    ├── Chameleon Ultra  [BLE — coming soon]
+    └── PN532 NFC  [RF-HAT DIP 3 — or standalone on CN1]
+        ├── Scan & Read  →  Read All (full page dump)  →  Save / Export .nfc
+        ├── Clone/Write  →  Select source  →  Clone to blank NTAG
+        ├── Card Emulate →  Select saved card  →  Emulate / Stop
+        ├── Key Test     →  MIFARE Classic dict attack
+        ├── Saved Cards  →  load / emulate / Flipper .nfc import
+        └── HW Test      →  PN532 I2C probe, I2C bus scan
 ```
 
 ---
@@ -836,6 +845,27 @@ Tap any row in the drone list to open a detail screen showing all decoded fields
 **Output logs** saved to `/sdcard/lab/dronedetect/`:
 - `drone_YYYYMMDD_HHMMSS.pcap` — raw BLE advertising packets (Kismet PCAPNG format)
 - `drone_YYYYMMDD_HHMMSS.json` — parsed Remote ID records for all detected drones
+
+#### Drone Spoof — How It Works
+
+**Drone Spoof** broadcasts a synthetic **ASTM F3411 Remote ID** beacon, making a receiver see a drone that does not physically exist. Use cases: testing Remote ID receiver software, authorized counter-UAS research, drone regulation compliance validation, and RF lab research.
+
+**Configurable fields:**
+
+| Field | Description |
+|-------|-------------|
+| UAS ID | 20-byte drone serial / operator identifier |
+| Operator ID | 20-byte operator string |
+| Latitude / Longitude | GPS coordinates of the spoofed position |
+| Altitude | Barometric / GPS altitude in meters |
+| Speed / Heading | Ground speed (m/s) and horizontal heading (deg) |
+
+**Broadcast modes:**
+
+- **BLE** — Extended advertising on primary PHY 1M, secondary PHY 1M. Broadcasts ASTM F3411 service UUID `0xFFFA` with a valid Remote ID message in the service-data AD. Received by any compliant Remote ID receiver.
+- **WiFi** — Management frame beacon with ODID IE (type `0xFA 0x0B 0xBC`). Reaches receivers monitoring channel 6 or the configured channel.
+
+> For authorized research only. Broadcasting a false Remote ID identifying a drone you do not operate may be illegal under your local aviation regulations. Ensure you have explicit authorization before transmitting outside of a shielded lab environment.
 
 #### BT Scan & Select — How It Works
 
@@ -2040,6 +2070,57 @@ The Scout rotates through all 16 channels (11–26) with an 800 ms dwell per cha
 
 ---
 
+### 8. NFC / RFID Hub
+
+The **NFC / RFID Hub** tile is permanently visible on the main menu — no RF-HAT required to enter it. From the hub, choose:
+
+#### Chameleon Ultra
+
+CYM can pair with a **Chameleon Ultra** or **Chameleon Lite** over Bluetooth and use it as a full RFID/NFC read/write/emulate engine — without needing a phone or laptop.
+
+**Supported operations (v2.11.44+):**
+- **BLE scan & connect** — auto-discovers Chameleon devices by NUS service UUID, shows RSSI-coded signal strength; supports both pairing-disabled and pairing-enabled units (auto-injects fixed passkey 123456 for units with BLE pairing ON)
+- **Read LF 125 kHz** — EM4100, HID Prox H10301 (FC+CN display); saves Flipper-compatible `.rfid` files to `/sdcard/lab/rfid/lf/`
+- **Read HF 13.56 MHz** — ISO 14443-A scan; MIFARE Classic, NTAG213/215/216, Ultralight detection from SAK byte; saves Flipper-compatible `.nfc` files to `/sdcard/lab/rfid/hf/`
+- **Dump Card (full sector/page read)** — appears after any card is detected on HF Read; for MIFARE Classic 1K runs a key attack (8 built-in keys + `/sdcard/lab/rfid/keys/mf_keys.dic` dictionary) and reads all 64 blocks; for NTAG/Ultralight reads all pages via raw ISO 14443-A READ commands; output `.nfc` file includes full `Block N:` / `Page N:` data in Flipper format
+- **Slot Manager** — 8-slot view showing LF/HF type per slot; activate slot, clear slot
+- **Clone to Slot** — after an LF card read, tap "Clone to Slot", pick a target slot; 4-step BLE chain writes card to Chameleon flash (EM410X and HID H10301 supported)
+- **Load from SD** — long-press any slot row to open the SD file browser; lists `.rfid` (LF) and `.nfc` (HF, NTAG/Ultralight) files; tap to load directly to that slot
+
+Protocol reference: [ChameleonUltraGUI by GameTec-live](https://github.com/GameTec-live/ChameleonUltraGUI).
+Concept credit: **@bkbroiler**.
+
+**SD card layout for Chameleon:**
+
+| Path | Contents |
+|------|----------|
+| `/sdcard/lab/rfid/lf/` | LF card saves (`.rfid` — EM410X, HID Prox) |
+| `/sdcard/lab/rfid/hf/` | HF card saves (`.nfc` — NTAG, MIFARE, Ultralight) |
+| `/sdcard/lab/rfid/keys/mf_keys.dic` | MIFARE Classic key dictionary (one 12-hex-char key per line) |
+
+The key dictionary is seeded on first SD provision with 8 common factory/default keys. For broader coverage, download the extended dictionary from the **[CYM SD Asset Repository](https://github.com/JimGat/CYM-NM28C5-SD-Assets)** and replace the seeded file.
+
+#### PN532 NFC/RFID
+
+The PN532 tile routes to the full PN532 feature screen. Two hardware configurations are supported:
+
+**With NM-RF-HAT (DIP 3 ON):** The standard path — a DIP-switch reminder popup appears before entering the feature screen.
+
+**Standalone PN532 breakout on CN1 (no RF-HAT needed):** Wire a PN532 breakout board directly to the CN1 header:
+
+| PN532 pin | CN1 / ESP32-C5 |
+|-----------|----------------|
+| SCL | GPIO 8 |
+| SDA | GPIO 9 |
+| VCC | 3.3 V |
+| GND | GND |
+
+Set the PN532 to **I2C mode** using its onboard DIP switch or solder bridges (varies by breakout). When RF-HAT is not enabled in Settings, tapping the PN532 tile shows wiring instructions. Enable RF-HAT in Settings → Hardware Options to see the DIP 3 reminder instead.
+
+> All PN532 feature details (Scan & Read, Clone/Write, Card Emulate, Key Test, Saved Cards, HW Test) are documented in the [NM-RF-HAT](#7-nm-rf-hat) section below.
+
+---
+
 ### 7. NM-RF-HAT
 
 The **NM-RF-HAT** is an optional RF expansion board that connects to the NM-CYD-C5 via its FPC2 header. It provides five RF modules gated by a 6-position DIP switch — only one module is powered at a time (hardware exclusion via P-channel MOSFETs).
@@ -2548,9 +2629,9 @@ All data is stored on the SD card. `/sdcard/lab/` is the root for all project da
     │   └── whisperpair/      # WhisperPair (CVE-2025-36911) probe/exploit logs
     │       └── wp_<timestamp>.json
     ├── bluetooth/
-    │   ├── lookout.csv       # BT Lookout watchlist: MAC,name,rssi_threshold,oui_only
-    │   ├── blacklist.csv     # BT Blacklist: MAC[,oui_only] — suppressed globally
-    │   ├── spooflist.csv     # Device Spoof targets: MAC,Name (one per line)
+    │   ├── lookout.csv       # BT Lookout watchlist: MAC,name,rssi_threshold,oui_only (seeded)
+    │   ├── blacklist.csv     # BT Blacklist: MAC[,oui_only] — suppressed globally (seeded)
+    │   ├── spooflist.csv     # Device Spoof targets: mac,name — one entry per line (seeded)
     │   └── scans/            # BT Scan & Select saved snapshots
     │       └── btsc_00001_HHMMSS_LAT_LON_label.json   # GPS-tagged JSON; scan_id NVS-persisted
     ├── cellular/
@@ -2581,6 +2662,10 @@ All data is stored on the SD card. `/sdcard/lab/` is the root for all project da
     │   └── <freq>MHz_<ts>.sub
     ├── rf433/                # NM-RF-HAT RF433 OOK captures (Flipper Zero .sub format)
     │   └── <Signal>.sub
+    ├── espnow/               # ESP-NOW Scout device export JSON + packet logs
+    │   ├── scout_<timestamp>.json    # Full device table snapshot
+    │   ├── pktlog_<timestamp>.txt    # 200-frame ring buffer export (hex + ASCII)
+    │   └── profiles.json    # Optional: known-device labels + LMK keys (user-created)
     ├── zigbee/               # Zigbee Scout wardrive logs (ESP32-C5 802.15.4 PHY)
     │   ├── zgwd_<timestamp>.csv   # One row per PAN sighting (PAN ID, channel, RSSI, GPS)
     │   └── zgwd_<timestamp>.pcap  # PCAP DLT 195 (IEEE 802.15.4 with FCS)
@@ -2588,15 +2673,18 @@ All data is stored on the SD card. `/sdcard/lab/` is the root for all project da
     │   └── zwave_<timestamp>.csv  # One row per received frame (node IDs, cmd class, GPS)
     ├── tpms/                 # TPMS Monitor captures (CC1101 315/433 MHz)
     │   └── tpms_<timestamp>.csv   # One row per valid Schrader packet (sensor ID, PSI, kPa, temp, flags, RSSI)
-    ├── rfid/                 # NM-RF-HAT NFC/RFID (PN532)
-    │   ├── hf/               # 13.56 MHz card saves (JSON)
-    │   │   └── <name>.json
-    │   ├── import/           # Drop Flipper .nfc files here to import
+    ├── rfid/                 # NFC/RFID hub (Chameleon Ultra + PN532)
+    │   ├── lf/               # LF 125 kHz card saves (Flipper .rfid — EM410X, HID Prox)
+    │   │   └── <name>.rfid
+    │   ├── hf/               # HF 13.56 MHz card saves (Flipper .nfc — NTAG, MIFARE, UL)
+    │   │   └── <name>.nfc
+    │   ├── keys/             # MIFARE key dictionaries
+    │   │   └── mf_keys.dic   # Seeded: 8 common factory keys; replace with extended dict
+    │   ├── import/           # Drop Flipper .nfc files here to import (PN532)
     │   │   └── *.nfc
-    │   ├── export/           # Flipper .nfc exports
+    │   ├── export/           # Flipper .nfc exports (PN532)
     │   │   └── *.nfc
-    │   ├── keys/             # (reserved)
-    │   └── logs/             # (reserved)
+    │   └── logs/             # RFID activity logs (reserved)
     ├── screenshots/          # UI screenshots (BMP)
     │   └── screen_<n>.bmp
     └── wardrives/            # GPS + WiFi wardrive logs (WiGLE CSV 1.6 format)
@@ -2634,6 +2722,43 @@ Requires a curated binary table at `/sdcard/lab/ouilist.bin`. Generate or refres
    ```
 
 The firmware loads the binary into PSRAM on first entry to any BT feature and searches it with binary search — no large stack allocations. If the file is missing, vendor lookup is skipped transparently and scan results show `[Unknown]` as before.
+
+### MIFARE Key Dictionary
+
+The **Dump Card** feature on the Chameleon Ultra HF Read screen can crack MIFARE Classic sector keys using a dictionary attack. CYM tries 8 built-in factory/default keys automatically, then loads extras from:
+
+```
+/sdcard/lab/rfid/keys/mf_keys.dic
+```
+
+**Format:** one key per line, 12 hex characters (6 bytes), comments start with `#`:
+
+```
+# My custom site keys
+FFFFFFFFFFFF
+A0A1A2A3A4A5
+D3F7D3F7D3F7
+000000000000
+```
+
+SD Provision seeds this file with the 8 most common defaults. For broader coverage (common vendor keys, leaked key sets, etc.), download the extended dictionary from the **[CYM SD Asset Repository](https://github.com/JimGat/CYM-NM28C5-SD-Assets)** and replace the file. The dictionary can have up to 512 entries; larger files are capped at that limit.
+
+---
+
+### CYM SD Asset Repository
+
+Pre-built SD card assets are hosted at **[github.com/JimGat/CYM-NM28C5-SD-Assets](https://github.com/JimGat/CYM-NM28C5-SD-Assets)**. Download these files and place them in `/sdcard/lab/` before first use for the best out-of-box experience:
+
+| File | Destination | Purpose |
+|------|-------------|---------|
+| `ouilist.bin` | `/sdcard/lab/ouilist.bin` | OUI vendor table — adds manufacturer names to BLE scan results (binary-search lookup) |
+| `mf_keys.dic` | `/sdcard/lab/rfid/keys/mf_keys.dic` | Extended MIFARE Classic key dictionary for Dump Card sector attacks |
+
+Additional assets in the repository:
+- `mf_keys.dic` — extended MIFARE key list (common vendor keys, leaked key sets, broader coverage than the 8 built-in defaults)
+- `ouilist.bin` — pre-built OUI binary (regenerate anytime with `python tools/oui_convert.py oui.csv ouilist.bin` from a fresh IEEE OUI CSV)
+
+Both files are optional — CYM runs without them, but OUI lookup will show `[Unknown]` and MIFARE dumps will only try the 8 built-in default keys.
 
 ---
 
@@ -2920,13 +3045,13 @@ This project wouldn't be where it is without the brilliant minds and generous ti
 
 **Heartfelt thanks to:**
 
-- **@Birolt29** — An extraordinary contributor who has gone far above and beyond at every stage of this project. Birol performed deep ESP32-C5 DMA and render pipeline analysis on real hardware, submitted multiple major patch sets, and caught critical bugs before they ever reached users. His contributions include: the v2.10.15 hardware optimization patch (upload stability, mbedTLS PSRAM routing, BLE Spam memory hardening); the v2.11.x render performance series (LCD SPI 40→80 MHz, internal DMA draw buffers, -O2 optimization, LVGL memcpy, 15 ms refresh period, PSRAM 80 MHz — bringing full-frame render from 148 ms to ~77 ms); the SD remount mutex fix that eliminated a hard reset race; moving 17.4 KB of IR/RF433 name tables to PSRAM BSS; the GATT Walker double-init reset fix; and serial-validated testing of every patch on real hardware. The firmware is faster, more stable, and more reliable because of Birol. 🙏
+- **@Birolt29** — An extraordinary contributor who has gone far above and beyond at every stage of this project. Birol performed deep ESP32-C5 DMA and render pipeline analysis on real hardware, submitted multiple major patch sets, and caught critical bugs before they ever reached users. His contributions include: the v2.10.15 hardware optimization patch (upload stability, mbedTLS PSRAM routing, BLE Spam memory hardening); the v2.11.x render performance series (LCD SPI 40→80 MHz, internal DMA draw buffers, -O2 optimization, LVGL memcpy, 15 ms refresh period, PSRAM 80 MHz — bringing full-frame render from 148 ms to ~77 ms); the SD remount mutex fix that eliminated a hard reset race; moving 17.4 KB of IR/RF433 name tables to PSRAM BSS; the GATT Walker double-init reset fix; diagnosing and fixing the wardrive GPS crash (GitHub issue #12 — stack-allocated `lv_msgbox` button map dangling after function return); and serial-validated testing of every patch on real hardware. The firmware is faster, more stable, and more reliable because of Birol. 🙏
 
 - **Anubis** — For creating the first community video showcase of CYM in the wild. Taking the time to film, edit, and publish a video of this project means the world — it helps new users discover what CYM can do and gives the project a presence beyond GitHub. Thank you! 🎬
 
 - **ᛕ ᛊ ߇ ᛙ ᚢ (Kevin)** — For deep technical testing and helping diagnose the toughest issues
 - **sithwrld999** — For thorough testing and finding edge cases we missed
-- **bkbroiler** — For hands-on testing and constructive feedback
+- **bkbroiler** — For hands-on testing, constructive feedback, and the original concept behind the Chameleon Ultra BLE integration — the idea of using CYM as a wireless RFID controller came from them
 - **HeavyButter** — For testing and just being Paranoid Butter
 - **eCowboy** — For Hardware testing and design suggestons
 - **OrdoOuroborus** — For testing, review, and contributions for feature ideas

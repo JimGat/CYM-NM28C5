@@ -415,7 +415,7 @@ static void s_wp_task(void *arg)
 
     {
         char msg[64];
-        snprintf(msg, sizeof(msg), "%s — writing KBP packet...",
+        snprintf(msg, sizeof(msg), "%s - writing KBP packet...",
                  s_mode == WP_MODE_PROBE ? "Probing" : "Exploiting");
         s_set_status(msg);
     }
@@ -438,7 +438,7 @@ static void s_wp_task(void *arg)
     }
     if (s_op_rc != 0) {
         /* Write rejected by device — strongly suggests patched */
-        s_set_status("KBP write rejected — likely patched");
+        s_set_status("KBP write rejected - likely patched");
         result = WP_RESULT_PATCHED;
         detail = "Device rejected KBP write (patched)";
         goto done;
@@ -457,17 +457,17 @@ static void s_wp_task(void *arg)
         char msg[80];
         snprintf(msg, sizeof(msg),
                  s_mode == WP_MODE_PROBE
-                     ? "VULNERABLE — device accepted plaintext KBP"
-                     : "VULNERABLE — unauthorized pairing accepted");
+                     ? "VULNERABLE - device accepted plaintext KBP"
+                     : "VULNERABLE - unauthorized pairing accepted");
         s_set_status(msg);
         result = WP_RESULT_VULNERABLE;
         detail = (s_mode == WP_MODE_PROBE)
                      ? "Accepted KBP without pairing mode check (CVE-2025-36911)"
                      : "Unauthorized pairing handshake accepted";
     } else {
-        s_set_status("No response — device patched or requires pairing mode");
+        s_set_status("No response - device patched or requires pairing mode");
         result = WP_RESULT_PATCHED;
-        detail = "No KBP notification within timeout — device appears patched";
+        detail = "No KBP notification within timeout - device appears patched";
     }
     goto done;
 

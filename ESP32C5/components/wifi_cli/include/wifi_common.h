@@ -113,6 +113,7 @@ typedef struct {
     int satellites;
     bool valid;
     char time_utc[10];  /* "HH:MM:SS" from GGA field 1, empty if no fix */
+    float speed;        /* ground speed in m/s from RMC field 7 (SOG, knots->m/s); 0 when no fix */
 } gps_data_t;
 
 // Target BSSID structure

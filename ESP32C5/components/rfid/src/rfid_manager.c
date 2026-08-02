@@ -1,5 +1,6 @@
 #include "rfid_manager.h"
 #include "rfid_types.h"
+#include "rfid_storage.h"
 #include "hf/pn532_driver.h"
 #include "hf/pn532_reader.h"
 #include "hf/pn532_target.h"
@@ -11,6 +12,9 @@
 #include "freertos/task.h"
 #include "esp_heap_caps.h"
 #include <string.h>
+#include <stdio.h>
+#include <ctype.h>
+#include <stdlib.h>
 
 static const char *TAG = "rfid_mgr";
 
@@ -225,6 +229,60 @@ rfid_err_t rfid_manager_scan_card(rfid_card_t *card_out, uint32_t timeout_ms)
 
 // ── MIFARE key dict test ──────────────────────────────────────────────────────
 
+/* Maximum SD dictionary keys to load (caps PSRAM use at 512 × 6 = 3072 bytes) */
+#define RFID_MGR_DICT_MAX 512
+
+/*
+ * Load extra keys from /sdcard/lab/rfid/keys/mf_keys.dic into PSRAM.
+ * File format: one 12-hex-char key per line; '#' lines are comments; blanks ignored.
+ * On success: *buf_out is PSRAM-allocated (caller must free), *count_out is key count.
+ * If the file is absent or empty, *buf_out = NULL, *count_out = 0 (not an error).
+ */
+static void rfid_mgr_dict_load(uint8_t **buf_out, int *count_out)
+{
+    *buf_out   = NULL;
+    *count_out = 0;
+
+    FILE *f = fopen(RFID_DIR_KEYS "/mf_keys.dic", "r");
+    if (!f) return;
+
+    /* First pass: count valid key lines */
+    int count = 0;
+    char line[32];
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+        int hc = 0;
+        for (const char *p = line; *p && hc < 12; p++)
+            if (isxdigit((unsigned char)*p)) hc++;
+        if (hc >= 12 && count < RFID_MGR_DICT_MAX) count++;
+    }
+    if (count == 0) { fclose(f); return; }
+
+    uint8_t *buf = heap_caps_malloc((size_t)count * 6, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) { fclose(f); return; }
+
+    /* Second pass: parse and store */
+    rewind(f);
+    int idx = 0;
+    while (fgets(line, sizeof(line), f) && idx < count) {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+        char hx[13] = {0};
+        int hc = 0;
+        for (const char *p = line; *p && hc < 12; p++)
+            if (isxdigit((unsigned char)*p)) hx[hc++] = *p;
+        if (hc < 12) continue;
+        for (int b = 0; b < 6; b++) {
+            char bb[3] = {hx[b * 2], hx[b * 2 + 1], '\0'};
+            buf[idx * 6 + b] = (uint8_t)strtoul(bb, NULL, 16);
+        }
+        idx++;
+    }
+    fclose(f);
+    *buf_out   = buf;
+    *count_out = idx;
+    ESP_LOGI(TAG, "dict loaded %d extra keys from mf_keys.dic", idx);
+}
+
 rfid_err_t rfid_manager_test_mifare_keys(rfid_card_t *card,
                                           rfid_key_progress_cb_t progress_cb,
                                           void *ctx)
@@ -236,28 +294,41 @@ rfid_err_t rfid_manager_test_mifare_keys(rfid_card_t *card,
         proto != (int)RFID_PROTO_MIFARE_CLASSIC_4K)
         return RFID_ERR_NOT_SUPPORTED;
 
+    /* Load SD dictionary keys — silently skipped if file absent */
+    uint8_t *dict_buf   = NULL;
+    int      dict_count = 0;
+    rfid_mgr_dict_load(&dict_buf, &dict_count);
+
+    int total_keys = (int)MIFARE_DEFAULT_KEY_COUNT + dict_count;
+
     uint8_t num_sectors = (proto == (int)RFID_PROTO_MIFARE_CLASSIC_4K)
                           ? MIFARE_4K_SECTORS : MIFARE_1K_SECTORS;
 
     for (uint8_t s = 0; s < num_sectors; s++) {
         bool found = false;
-        for (uint8_t ki = 0; ki < MIFARE_DEFAULT_KEY_COUNT && !found; ki++) {
+        for (int ki = 0; ki < total_keys && !found; ki++) {
+            /* Built-in keys first, then SD dictionary keys */
+            const uint8_t *key;
+            if (ki < (int)MIFARE_DEFAULT_KEY_COUNT) {
+                key = MIFARE_DEFAULT_KEYS[ki];
+            } else {
+                key = dict_buf + (ki - (int)MIFARE_DEFAULT_KEY_COUNT) * 6;
+            }
             for (int kt = 0; kt < 2 && !found; kt++) {
                 mifare_key_type_t ktype = (kt == 0) ? MIFARE_KEY_A : MIFARE_KEY_B;
-                rfid_err_t r = mifare_auth_sector(s, ktype, MIFARE_DEFAULT_KEYS[ki],
+                rfid_err_t r = mifare_auth_sector(s, ktype, key,
                                                    card->uid, card->uid_len);
                 if (r == RFID_OK) {
                     found = true;
                     if (card->key_count < RFID_MAX_KEYS) {
                         card->keys[card->key_count].sector = s;
                         card->keys[card->key_count].type   = ktype;
-                        memcpy(card->keys[card->key_count].key,
-                               MIFARE_DEFAULT_KEYS[ki], 6);
+                        memcpy(card->keys[card->key_count].key, key, 6);
                         card->keys[card->key_count].valid = true;
                         card->key_count++;
                     }
-                    // Read all blocks in this sector (blk fits uint8_t, always < RFID_MAX_BLOCKS)
-                    uint8_t first = mifare_sector_first_block(s);
+                    /* Read all blocks in this sector (blk always < RFID_MAX_BLOCKS) */
+                    uint8_t first  = mifare_sector_first_block(s);
                     uint8_t bcount = mifare_sector_block_count(s);
                     for (uint8_t b = 0; b < bcount; b++) {
                         uint8_t blk = first + b;
@@ -269,6 +340,8 @@ rfid_err_t rfid_manager_test_mifare_keys(rfid_card_t *card,
         }
         if (progress_cb) progress_cb(s, num_sectors, found, ctx);
     }
+
+    if (dict_buf) free(dict_buf);
     return RFID_OK;
 }
 

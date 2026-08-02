@@ -1,5 +1,6 @@
 #include "gatt_walker.h"
 #include <stdio.h>
+#include <inttypes.h>
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
@@ -76,22 +77,22 @@ static const char *s_ble_error_desc(int rc)
     /* NimBLE host-layer errors */
     switch (rc) {
     case 2:  return "Already connecting";
-    case 6:  return "Out of memory — restart device";
+    case 6:  return "Out of memory - restart device";
     case 7:  return "Not connected";
-    case 13: return "No response — needs pairing or asleep";
-    case 15: return "Radio busy — stop scan first";
+    case 13: return "No response - needs pairing or asleep";
+    case 15: return "Radio busy - stop scan first";
     case 21: return "No local BLE address";
-    case 22: return "BLE stack not ready — restart BT";
+    case 22: return "BLE stack not ready - restart BT";
     }
     /* HCI controller errors: BLE_HS_ERR_HCI_BASE = 0x200 */
     if (rc >= 0x200 && rc < 0x300) {
         switch (rc - 0x200) {
-        case 0x05: return "Auth failure — device requires bonding";
-        case 0x06: return "PIN missing — device requires pairing";
-        case 0x08: return "Connection timeout — out of range";
-        case 0x12: return "LMP timeout — not responding";
+        case 0x05: return "Auth failure - device requires bonding";
+        case 0x06: return "PIN missing - device requires pairing";
+        case 0x08: return "Connection timeout - out of range";
+        case 0x12: return "LMP timeout - not responding";
         case 0x16: return "Terminated by local host";
-        case 0x22: return "LL timeout — link layer lost";
+        case 0x22: return "LL timeout - link layer lost";
         case 0x3B: return "Failed to establish connection";
         case 0x3E: return "Connection rejected by device";
         }
@@ -307,7 +308,7 @@ static bool s_write_json(void)
     }
     jb_raw(&j, " }"); jb_comma(&j);
 
-    char fp[12]; snprintf(fp, sizeof(fp), "0x%08X", r->fingerprint);
+    char fp[12]; snprintf(fp, sizeof(fp), "0x%08" PRIX32, r->fingerprint);
     jb_str(&j, "fingerprint", fp); jb_comma(&j);
 
     jb_key(&j, "services"); jb_raw(&j, "[\n");
@@ -456,7 +457,7 @@ static void s_finish(void)
 
     if (saved) {
         s_fire_event(GW_EVENT_SAVED);
-        s_notify_ui(s_keep_connected ? "Walk complete — connected" : "Walk complete");
+        s_notify_ui(s_keep_connected ? "Walk complete - connected" : "Walk complete");
         s_set_state(GW_STATE_COMPLETE);
         s_fire_event(GW_EVENT_COMPLETE);
     } else {

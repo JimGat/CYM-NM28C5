@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include "esp_timer.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 
 static const char *TAG = "bt_lookout";
@@ -19,7 +20,7 @@ typedef enum { ALERT_IDLE, ALERT_FLASH_ON, ALERT_FLASH_OFF } alert_state_t;
 
 typedef struct { uint8_t mac[6]; int64_t last_us; } cooldown_slot_t;
 
-static bt_lookout_entry_t s_entries[BT_LOOKOUT_MAX_ENTRIES];
+EXT_RAM_BSS_ATTR static bt_lookout_entry_t s_entries[BT_LOOKOUT_MAX_ENTRIES];
 static int                s_count        = 0;
 static bool               s_active       = false;
 
