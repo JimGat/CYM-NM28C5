@@ -643,6 +643,10 @@ static char     g_saved_wifi_pass[65] = ""; // Home network password
 #define NVS_KEY_WD_PCAP      "wd_pcap"
 #define NVS_KEY_WD_BLE       "wd_ble"
 #define NVS_KEY_WD_RADIO     "wd_radio"
+#define NVS_KEY_WD_ADAPT     "wd_adaptive"   // adaptive speed-based capture on/off
+#define NVS_KEY_WD_MMODE     "wd_manmode"    // manual mode (0=Stationary,1=Walk,2=Car)
+#define NVS_KEY_WD_GBAUD     "wd_gpsbaud"    // GPS UART baud (9600/38400/115200)
+#define NVS_KEY_WD_SUNIT     "wd_sunit"      // speed unit (0=km/h, 1=mph)
 #define NVS_KEY_GPS_LAT      "gps_lat_i"
 #define NVS_KEY_GPS_LON      "gps_lon_i"
 #define NVS_KEY_GPS_ALT      "gps_alt_i"
@@ -686,7 +690,7 @@ typedef enum { WD_RADIO_WIFI_ONLY = 0, WD_RADIO_BLE_ONLY } wd_radio_mode_t;
 // Wardrive BLE time-slice parameters
 #define WDP_BLE_INTERVAL_S   30     // seconds of WiFi scanning between BLE passes
 #define WDP_BLE_DWELL_MS     8000   // ms to scan BLE each pass
-#define WDP_BLE_MAX_DEVICES  200
+#define WDP_BLE_MAX_DEVICES  2000   // PSRAM dedup buffer; a real drive sees far more than 200
 
 // BLE PCAP capture
 #define BLE_PCAP_DIR         "/sdcard/lab/ble/captures"
@@ -802,6 +806,9 @@ static StackType_t *gps_task_stack = NULL;
 static esp_err_t init_gps_uart(void);
 static bool parse_gps_nmea(const char *nmea_sentence);
 static void gps_task(void *arg);
+static void gps_set_update_rate_hz(int hz);  // defined near GPS impl; used earlier in wardrive task
+static bool gps_apply_baud_live(int target); // defined near GPS impl; used by the Options screen
+                                             // returns false if the module refused the switch
 static void screenshot_btn_event_cb(lv_event_t *e);
 
 // Battery voltage monitor forward declarations (DISABLED - using regular C5 chip)
@@ -1189,6 +1196,114 @@ typedef enum {
     WDP_TIER_5_DFS,
 } wdp_channel_tier_t;
 
+// ---------------------------------------------------------------------------
+// Adaptive wardrive: speed-based capture profiles (Stationary / Walk / Car).
+// Band is ALWAYS the user's choice; adaptive logic only tunes dwell + DFS
+// exploration weight and GPS update rate. Non-DFS 5 GHz is never dropped.
+// ---------------------------------------------------------------------------
+typedef enum {
+    WD_MODE_STATIONARY = 0,  // Hareketsiz
+    WD_MODE_WALK,            // Yuruyus
+    WD_MODE_CAR,             // Arac
+    WD_MODE_COUNT
+} wd_mode_t;
+
+// dwell[mode][tier] in ms — tier index matches wdp_channel_tier_t order.
+// Car's DFS dwell is short AND its D-UCB selection is rate-limited (see below).
+static const int wd_dwell_table[WD_MODE_COUNT][4] = {
+    /* STATIONARY */ { 500, 450, 450, 300 },
+    /* WALK       */ { 350, 300, 300, 250 },
+    /* CAR        */ { 150, 130, 130, 130 },
+};
+
+// Speed thresholds (m/s) with hysteresis. 1 knot = 0.514 m/s.
+#define WD_SPEED_CAR_ENTER   5.556f   // 20 km/h
+#define WD_SPEED_CAR_EXIT    3.333f   // 12 km/h
+#define WD_SPEED_WALK_ENTER  0.833f   // 3 km/h
+#define WD_SPEED_STAT_ENTER  0.556f   // 2 km/h
+#define WD_EMA_ALPHA         0.3f     // smoothing over ~last 4-5 fixes
+#define WD_MODE_MIN_DWELL_MS 5000     // min time in a state before a switch (anti-flap)
+// Car mode: visit DFS arms at most ~1 in this many D-UCB selections.
+#define WD_CAR_DFS_SELECT_RATIO 10
+
+// Adaptive settings (NVS-backed; bound in the Wardrive Options screen).
+static bool     g_wd_adaptive    = true;               // adaptive ON by default
+static int      g_wd_manual_mode = WD_MODE_STATIONARY; // used only when adaptive OFF
+static int      g_wd_gps_baud    = 9600;               // GPS UART baud (9600/38400/115200)
+static int      g_wd_speed_unit  = 0;                  // 0 = km/h, 1 = mph (dashboard readout)
+
+static const char *wd_mode_name(wd_mode_t m)
+{
+    switch (m) {
+        case WD_MODE_STATIONARY: return "Stationary";
+        case WD_MODE_WALK:       return "Walking";
+        case WD_MODE_CAR:        return "Driving";
+        default:                 return "?";
+    }
+}
+
+// FontAwesome glyph per mode (rendered with g_font_icon* which chains
+// lv_extra_symbols as fallback): house / person-walking / car.
+static const char *wd_mode_icon(wd_mode_t m)
+{
+    switch (m) {
+        case WD_MODE_STATIONARY: return LV_SYMBOL_HOME;         // U+F015 house
+        case WD_MODE_WALK:       return MY_SYMBOL_PERSON_WALKING; // U+E553
+        case WD_MODE_CAR:        return MY_SYMBOL_CAR;          // U+F1B9
+        default:                 return "";
+    }
+}
+
+// Adaptive runtime state.
+static wd_mode_t g_wd_active_mode   = WD_MODE_STATIONARY;
+static float     g_wd_speed_ema     = 0.0f;
+static int64_t   g_wd_mode_since_us = 0;
+
+// Classify capture mode from a raw ground-speed sample (m/s), with EMA
+// smoothing + min-time-in-state hysteresis. Returns the (possibly unchanged)
+// active mode. Only meaningful when adaptive is ON.
+static wd_mode_t wd_classify_mode(float raw_speed_ms)
+{
+    if (raw_speed_ms < 0.0f) raw_speed_ms = 0.0f;
+    g_wd_speed_ema = WD_EMA_ALPHA * raw_speed_ms + (1.0f - WD_EMA_ALPHA) * g_wd_speed_ema;
+    float s = g_wd_speed_ema;
+
+    wd_mode_t cur = g_wd_active_mode;
+    wd_mode_t next = cur;
+    switch (cur) {
+        case WD_MODE_STATIONARY:
+            if (s >= WD_SPEED_CAR_ENTER)       next = WD_MODE_CAR;
+            else if (s >= WD_SPEED_WALK_ENTER) next = WD_MODE_WALK;
+            break;
+        case WD_MODE_WALK:
+            if (s >= WD_SPEED_CAR_ENTER)       next = WD_MODE_CAR;
+            else if (s <  WD_SPEED_STAT_ENTER) next = WD_MODE_STATIONARY;
+            break;
+        case WD_MODE_CAR:
+            if (s < WD_SPEED_CAR_EXIT)
+                next = (s < WD_SPEED_WALK_ENTER) ? WD_MODE_STATIONARY : WD_MODE_WALK;
+            break;
+        default: break;
+    }
+    if (next != cur) {
+        int64_t now = esp_timer_get_time();
+        if (now - g_wd_mode_since_us >= WD_MODE_MIN_DWELL_MS * 1000LL) {
+            g_wd_active_mode   = next;
+            g_wd_mode_since_us = now;
+            ESP_LOGI(TAG, "[WDP] Adaptive mode -> %s (%.1f m/s)",
+                     wd_mode_name(next), (double)s);
+        }
+    }
+    return g_wd_active_mode;
+}
+
+// The mode used for dwell/DFS decisions this iteration (adaptive or manual).
+static inline wd_mode_t wd_effective_mode(void)
+{
+    return g_wd_adaptive ? g_wd_active_mode
+                         : (wd_mode_t)(g_wd_manual_mode % WD_MODE_COUNT);
+}
+
 typedef struct {
     int channel;
     wdp_channel_tier_t tier;
@@ -1206,6 +1321,7 @@ typedef struct {
     bool     written_to_file;
     float    latitude;
     float    longitude;
+    float    altitude;  // GPS altitude (m) at time of discovery; fills the WiGLE AltitudeMeters column
     float    accuracy;  // GPS accuracy at time of discovery (m); GPS_STALE_ACCURACY_M if held
 } wdp_network_t;
 
@@ -1240,6 +1356,7 @@ static lv_obj_t *wd_ui_ble_box = NULL;      // BLE counter box
 static lv_obj_t *wd_ui_header = NULL;
 static lv_obj_t *wd_ui_table = NULL;
 static lv_obj_t *wd_ui_channel_label = NULL;
+static lv_obj_t *wd_ui_speed_label = NULL;   // live speed + active mode (bottom-left)
 static lv_timer_t *wd_ui_timer = NULL;
 static volatile bool wd_ui_update_flag = false;
 static volatile int wdp_current_channel = 0;
@@ -1263,6 +1380,9 @@ typedef struct {
     int8_t  rssi;
     float   latitude;
     float   longitude;
+    float   altitude;         // GPS altitude at detection (m) — CSV AltitudeMeters
+    float   accuracy;         // GPS accuracy at detection (m); GPS_STALE_ACCURACY_M if held
+    char    first_seen[24];   // UTC "YYYY-MM-DD HH:MM:SS" captured when first detected (with the position)
     bool    written;
 } wdp_ble_device_t;
 static wdp_ble_device_t *wdp_ble_devices = NULL;
@@ -1602,7 +1722,7 @@ static FILE         *deauth_pcap_file  = NULL;
 static char          deauth_pcap_path[64] = "";
 
 // Drone Detector state
-static drone_rec_t   g_drones[DRONE_MAX];
+EXT_RAM_BSS_ATTR static drone_rec_t   g_drones[DRONE_MAX];
 static int           g_drone_count        = 0;
 static portMUX_TYPE  g_drone_mux          = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool drone_scan_active    = false;
@@ -1669,7 +1789,7 @@ static bool               wana_scroll_paused = false;  // true while user is dra
 static int8_t             wana_scroll_dir    = 1;      // +1=right, -1=left (ping-pong)
 static int                wana_scroll_x      = 0;      // current viewport start in buf (0..280)
 static int                wana_drag_last_x   = 0;      // last touch x for delta calculation
-static wifi_ap_record_t   wana_aps[WANA_MAX_APS];
+EXT_RAM_BSS_ATTR static wifi_ap_record_t   wana_aps[WANA_MAX_APS];
 static int                wana_ap_count      = 0;
 static lv_obj_t          *wana_ssid_lbls[WANA_MAX_LABELS];
 static int                wana_lbl_buf_x[WANA_MAX_LABELS];  // label x in buffer coords
@@ -2451,6 +2571,7 @@ static void reset_function_page_children(void) {
     wd_ui_counter_box = NULL;
     wd_ui_ble_box = NULL;
     wd_ui_channel_label = NULL;
+    wd_ui_speed_label = NULL;
     wd_ui_header = NULL;
     wd_ui_table = NULL;
     karma_log_ta = NULL;
@@ -3557,6 +3678,14 @@ static void nvs_settings_load(void)
         uint8_t wr = 0;
         // Don't load wardrive radio mode from NVS — always use default (WiFi) on boot
         // if (nvs_get_u8(h, NVS_KEY_WD_RADIO, &wr) == ESP_OK) g_wd_radio_mode = (wd_radio_mode_t)wr;
+        uint8_t wad = 0;
+        if (nvs_get_u8(h, NVS_KEY_WD_ADAPT, &wad) == ESP_OK) g_wd_adaptive = (wad != 0);
+        uint8_t wmm = 0;
+        if (nvs_get_u8(h, NVS_KEY_WD_MMODE, &wmm) == ESP_OK && wmm < WD_MODE_COUNT) g_wd_manual_mode = wmm;
+        uint8_t wsu = 0;
+        if (nvs_get_u8(h, NVS_KEY_WD_SUNIT, &wsu) == ESP_OK && wsu <= 1) g_wd_speed_unit = wsu;
+        uint8_t wgb = 0;   // GPS baud: 0=9600 (standard), 1=115200 (5 Hz). Boot autodetect re-syncs the module to this.
+        if (nvs_get_u8(h, NVS_KEY_WD_GBAUD, &wgb) == ESP_OK) g_wd_gps_baud = (wgb == 1) ? 115200 : 9600;
         uint8_t wble = 0;
         // g_wd_ble is always true — no longer user-configurable
         uint8_t rfhat = 0;
@@ -3933,11 +4062,27 @@ void print_memory_stats(void) {
 
 // Helper functions for Wardrive
 static void get_timestamp_string(char* buffer, size_t size) {
+    // Emit real UTC for the WiGLE FirstSeen column. The system clock is synced
+    // from GPRMC/GNRMC on the first fix (see parse_gps_nmea), and wardrive rows
+    // are only written while a fix is held, so it is populated in practice.
+    // Previously this was a fixed date plus a per-dwell counter, which shipped a
+    // fabricated date/time with every uploaded observation.
+    time_t now = time(NULL);
+    struct tm t;
+    gmtime_r(&now, &t);
+    if (t.tm_year + 1900 >= 2024) {
+        snprintf(buffer, size, "%04d-%02d-%02d %02d:%02d:%02d",
+                 t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                 t.tm_hour, t.tm_min, t.tm_sec);
+        return;
+    }
+    // Clock never GPS-synced: fall back to the legacy synthetic counter so the
+    // CSV still parses and rows stay ordered.
     static uint32_t timestamp_counter = 0;
     timestamp_counter++;
-    snprintf(buffer, size, "2025-09-26 %02d:%02d:%02d", 
+    snprintf(buffer, size, "2025-09-26 %02d:%02d:%02d",
              (int)((timestamp_counter / 3600) % 24),
-             (int)((timestamp_counter / 60) % 60), 
+             (int)((timestamp_counter / 60) % 60),
              (int)(timestamp_counter % 60));
 }
 
@@ -3963,6 +4108,56 @@ static const char* get_auth_mode_wiggle(wifi_auth_mode_t mode) {
             return "WAPI_PSK";
         default:
             return "Unknown";
+    }
+}
+
+// Compact auth label for the wardrive table (fits the 44px Auth column; the CSV
+// still uses the full WiGLE string from get_auth_mode_wiggle()).
+static const char *wd_auth_disp(wifi_auth_mode_t m)
+{
+    switch (m) {
+        case WIFI_AUTH_OPEN:                 return "OPEN";
+        case WIFI_AUTH_WEP:                  return "WEP";
+        case WIFI_AUTH_WPA_PSK:              return "WPA";
+        case WIFI_AUTH_WPA2_PSK:             return "WPA2";
+        case WIFI_AUTH_WPA_WPA2_PSK:         return "WPA/2";
+        case WIFI_AUTH_WPA2_ENTERPRISE:      return "WPA2E";
+        case WIFI_AUTH_WPA3_PSK:             return "WPA3";
+        case WIFI_AUTH_WPA2_WPA3_PSK:        return "WPA2/3";
+        case WIFI_AUTH_WAPI_PSK:             return "WAPI";
+        default:                             return "?";
+    }
+}
+
+// Render the leftmost "band badge" column as a colored rounded chip so the band
+// is readable at a glance without cluttering the SSID: 5 GHz = red, 2.4 GHz =
+// amber, BLE = blue (matching the existing scan palette). Registered on wd_ui_table.
+static void wd_table_draw_event_cb(lv_event_t *e)
+{
+    lv_obj_t *tbl = lv_event_get_target(e);
+    lv_obj_draw_part_dsc_t *dsc = lv_event_get_draw_part_dsc(e);
+    if (!dsc || dsc->part != LV_PART_ITEMS) return;
+    uint32_t col_cnt = lv_table_get_col_cnt(tbl);
+    if (col_cnt == 0) return;
+    uint32_t col = dsc->id % col_cnt;
+    if (col != 0) return;                    // band badge column only
+    uint32_t row = dsc->id / col_cnt;
+    const char *v = lv_table_get_cell_value(tbl, row, col);
+    if (!v || !v[0]) return;
+
+    lv_color_t badge;
+    if (v[0] == 'B')            badge = UI_ACCENT_BLUE;      // "BLE"
+    else if (v[0] == '5')       badge = COLOR_MATERIAL_GREEN; // "5"  = 5 GHz
+    else                        badge = UI_ACCENT_AMBER;      // "2.4" = 2.4 GHz
+
+    if (dsc->rect_dsc) {
+        dsc->rect_dsc->bg_color = badge;
+        dsc->rect_dsc->bg_opa   = LV_OPA_COVER;
+        dsc->rect_dsc->radius   = 5;
+    }
+    if (dsc->label_dsc) {
+        dsc->label_dsc->color = lv_color_black();       // readable on the chip
+        dsc->label_dsc->align = LV_TEXT_ALIGN_CENTER;   // center "5"/"2.4"/"BLE"
     }
 }
 
@@ -5458,6 +5653,84 @@ static void show_splash_screen(void)
     splash_timer = lv_timer_create(splash_timer_cb, 100, NULL);
 }
 
+// ── GPS status icon (top-bar) ────────────────────────────────────────────────
+// A small satellite glyph shown in the top bar on EVERY screen (main + sub-menus).
+//   - no module (no UART bytes ever seen)  -> hidden entirely, like the battery.
+//   - module present, GPS fix              -> green satellite.
+//   - module present, no fix               -> satellite + red circle/slash (banned).
+// Each icon is fully self-contained: it owns a 1 Hz lv_timer and a small heap ctx,
+// both released in its LV_EVENT_DELETE handler, so there is no global pointer that
+// can dangle across a screen rebuild (cym-screen-stop-hooks safety).
+typedef struct { lv_obj_t *cont, *sat, *circle, *slash; lv_timer_t *timer; } gps_stat_icon_t;
+
+static const lv_point_t s_gps_slash_pts[] = { {4, 17}, {17, 4} };
+
+static void gps_stat_icon_apply(gps_stat_icon_t *g)
+{
+    if (!g || !g->cont) return;
+    bool present = g_gps_uart_data_seen;   // any UART byte ever = module wired up
+    bool fix     = current_gps.valid;
+    if (!present) { lv_obj_add_flag(g->cont, LV_OBJ_FLAG_HIDDEN); return; }
+    lv_obj_clear_flag(g->cont, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_text_color(g->sat, fix ? lv_color_hex(0x37D067)   // green = fix
+                                            : lv_color_hex(0x9AA0B0), 0); // grey = searching
+    if (fix) { lv_obj_add_flag(g->circle, LV_OBJ_FLAG_HIDDEN);
+               lv_obj_add_flag(g->slash,  LV_OBJ_FLAG_HIDDEN); }
+    else     { lv_obj_clear_flag(g->circle, LV_OBJ_FLAG_HIDDEN);
+               lv_obj_clear_flag(g->slash,  LV_OBJ_FLAG_HIDDEN); }
+}
+
+static void gps_stat_icon_timer_cb(lv_timer_t *t) { gps_stat_icon_apply((gps_stat_icon_t *)t->user_data); }
+
+static void gps_stat_icon_del_cb(lv_event_t *e)
+{
+    gps_stat_icon_t *g = (gps_stat_icon_t *)lv_event_get_user_data(e);
+    if (!g) return;
+    if (g->timer) { lv_timer_del(g->timer); g->timer = NULL; }
+    free(g);
+}
+
+// Build a GPS status icon aligned to the RIGHT of `parent` (a 30px top bar) at x_ofs.
+static void gps_status_icon_create(lv_obj_t *parent, lv_coord_t x_ofs)
+{
+    gps_stat_icon_t *g = (gps_stat_icon_t *)calloc(1, sizeof(*g));
+    if (!g) return;
+
+    lv_obj_t *c = lv_obj_create(parent);
+    g->cont = c;
+    lv_obj_set_size(c, 22, 22);
+    lv_obj_set_style_bg_opa(c, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(c, 0, 0);
+    lv_obj_set_style_pad_all(c, 0, 0);
+    lv_obj_clear_flag(c, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(c, LV_ALIGN_RIGHT_MID, x_ofs, 0);
+
+    g->sat = lv_label_create(c);
+    lv_label_set_text(g->sat, MY_SYMBOL_SATELLITE);
+    lv_obj_set_style_text_font(g->sat, &lv_extra_symbols, 0);
+    lv_obj_center(g->sat);
+
+    g->circle = lv_obj_create(c);
+    lv_obj_set_size(g->circle, 22, 22);
+    lv_obj_set_style_radius(g->circle, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(g->circle, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(g->circle, lv_color_hex(0xE23030), 0);
+    lv_obj_set_style_border_width(g->circle, 2, 0);
+    lv_obj_set_style_pad_all(g->circle, 0, 0);
+    lv_obj_clear_flag(g->circle, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_center(g->circle);
+
+    g->slash = lv_line_create(c);
+    lv_line_set_points(g->slash, s_gps_slash_pts, 2);
+    lv_obj_set_style_line_color(g->slash, lv_color_hex(0xE23030), 0);
+    lv_obj_set_style_line_width(g->slash, 2, 0);
+    lv_obj_center(g->slash);
+
+    lv_obj_add_event_cb(c, gps_stat_icon_del_cb, LV_EVENT_DELETE, g);
+    g->timer = lv_timer_create(gps_stat_icon_timer_cb, 1000, g);
+    gps_stat_icon_apply(g);   // reflect current state immediately
+}
+
 static void create_home_ui(void)
 {
     title_bar = lv_obj_create(lv_scr_act());
@@ -5483,18 +5756,35 @@ static void create_home_ui(void)
     lv_obj_align(battery_label, LV_ALIGN_RIGHT_MID, -8, 0);
     if (last_voltage_str[0] == '\0') lv_obj_add_flag(battery_label, LV_OBJ_FLAG_HIDDEN);
 
+    // GPS status icon in the (otherwise empty) far-right status slot.
+    gps_status_icon_create(title_bar, -12);
+
     show_main_tiles();
 }
 
 void app_main(void)
 {
+    // Initialize NVS (required for settings, touch calibration, etc)
+    // MUST come before the GPS init below: init_gps_uart() reads the saved GPS baud
+    // (gps_load_baud_setting) so that gps_autodetect_and_sync() aims at the rate the
+    // user actually chose. With GPS first, nvs_open() failed silently, the autodetect
+    // fell back to the 9600 default, and a module holding 115200 in its battery-backed
+    // RAM got commanded back DOWN to 9600 — while the UI, loaded later, still claimed
+    // 115200. NVS init is a few ms, so GPS still starts essentially at boot.
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_ret);
+
 	//Initialize GPS UART and start background monitor task
 	if (init_gps_uart() == ESP_OK) {
 		ESP_LOGI(TAG, "GPS UART initialized on TX=%d RX=%d", GPS_TX_PIN, GPS_RX_PIN);
 		// Allocate GPS task stack from PSRAM
 		gps_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
 		if (gps_task_stack != NULL) {
-			TaskHandle_t task_handle = xTaskCreateStatic(gps_task, "gps_task", 4096, NULL, 
+			TaskHandle_t task_handle = xTaskCreateStatic(gps_task, "gps_task", 4096, NULL,
 				tskIDLE_PRIORITY + 1, gps_task_stack, &gps_task_buffer);
 			if (task_handle == NULL) {
 				ESP_LOGE(TAG, "Failed to start GPS task");
@@ -5509,14 +5799,6 @@ void app_main(void)
 	} else {
 		ESP_LOGE(TAG, "GPS UART init failed");
 	}
-    
-    // Initialize NVS (required for settings, touch calibration, etc)
-    esp_err_t nvs_ret = nvs_flash_init();
-    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        nvs_ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(nvs_ret);
 
     // Initialize LED (WS2812 on GPIO27 - no WiFi dependency)
     if (init_led() != ESP_OK) {
@@ -7267,7 +7549,9 @@ void app_main(void)
             if (wd_ui_update_flag && wardrive_ui_active) {
                 wd_ui_update_flag = false;
 
-                if (wd_ui_channel_label && lv_obj_is_valid(wd_ui_channel_label)) {
+                // BLE-only shows a static "SCAN" (no D-UCB channel hopping) — don't overwrite it.
+                if (wd_ui_channel_label && lv_obj_is_valid(wd_ui_channel_label)
+                        && g_wd_radio_mode != WD_RADIO_BLE_ONLY) {
                     char wd_ch_buf[16];
                     if (wdp_current_channel < 0)
                         snprintf(wd_ch_buf, sizeof(wd_ch_buf), "BLE");
@@ -7295,6 +7579,21 @@ void app_main(void)
                     lv_label_set_text(wd_ui_counter_label, cnt_buf);
                 }
 
+                if (wd_ui_speed_label && lv_obj_is_valid(wd_ui_speed_label)) {
+                    // Mode icon (house/walk/car) + current ground speed in the user's
+                    // unit — same in adaptive and manual. The box border colour tells
+                    // them apart (green = adaptive, red = manual).
+                    wd_mode_t m = wd_effective_mode();
+                    float spd = current_gps.valid ? current_gps.speed : 0.0f;  // m/s
+                    float disp = g_wd_speed_unit ? spd * 2.23694f : spd * 3.6f; // mph : km/h
+                    const char *unit = g_wd_speed_unit ? "mph" : "km/h";
+                    char spd_buf[48];
+                    // Speed + unit on the left (digit changes stay anchored), mode
+                    // icon on the right with a leading space.
+                    snprintf(spd_buf, sizeof(spd_buf), "%.0f %s  %s", (double)disp, unit, wd_mode_icon(m));
+                    lv_label_set_text(wd_ui_speed_label, spd_buf);
+                }
+
                 if (wd_ui_ble_label && lv_obj_is_valid(wd_ui_ble_label)) {
                     char ble_buf[16];
                     snprintf(ble_buf, sizeof(ble_buf), "%d", wdp_ble_count);
@@ -7307,24 +7606,16 @@ void app_main(void)
                     lv_table_set_col_cnt(wd_ui_table, 5);
                     for (int i = 0; i < WDP_SCREEN_FIFO_SIZE; i++) {
                         wdp_network_t *net = &wdp_screen_fifo[i];
+                        lv_table_set_cell_value(wd_ui_table, i, 0, net->channel >= 36 ? "5" : "2.4"); // band badge
                         char ssid_trunc[20];
                         strncpy(ssid_trunc, net->ssid[0] ? net->ssid : "[hidden]", 19);
                         ssid_trunc[19] = '\0';
-                        lv_table_set_cell_value(wd_ui_table, i, 0, ssid_trunc);
+                        lv_table_set_cell_value(wd_ui_table, i, 1, ssid_trunc);
                         char ch_str[4]; snprintf(ch_str, sizeof(ch_str), "%d", net->channel);
-                        lv_table_set_cell_value(wd_ui_table, i, 1, ch_str);
+                        lv_table_set_cell_value(wd_ui_table, i, 2, ch_str);
                         char rssi_str[8]; snprintf(rssi_str, sizeof(rssi_str), "%d", net->rssi);
-                        lv_table_set_cell_value(wd_ui_table, i, 2, rssi_str);
-                        const char *auth = get_auth_mode_wiggle(net->authmode);
-                        char auth_short[8]; strncpy(auth_short, auth, 7); auth_short[7] = '\0';
-                        lv_table_set_cell_value(wd_ui_table, i, 3, auth_short);
-                        char coord_str[24];
-                        if (net->latitude != 0.0f || net->longitude != 0.0f) {
-                            snprintf(coord_str, sizeof(coord_str), "%.2f", (double)net->latitude);
-                        } else {
-                            snprintf(coord_str, sizeof(coord_str), "--");
-                        }
-                        lv_table_set_cell_value(wd_ui_table, i, 4, coord_str);
+                        lv_table_set_cell_value(wd_ui_table, i, 3, rssi_str);
+                        lv_table_set_cell_value(wd_ui_table, i, 4, wd_auth_disp(net->authmode));
                     }
                 }
             }
@@ -9382,7 +9673,18 @@ static void wdp_ducb_init(void) {
     }
 }
 
+static int wdp_ducb_select_counter = 0;
+
 static int wdp_ducb_select_channel(void) {
+    // Tier-weighted exploration: in Car mode the 19 DFS channels are the main
+    // cost (they rarely host real APs), so gate them to ~1 visit per
+    // WD_CAR_DFS_SELECT_RATIO selections. Non-DFS 5 GHz keeps full weight in
+    // every mode — coverage is never sacrificed. Stationary/Walk = normal.
+    bool car_ratelimit_dfs = (wd_effective_mode() == WD_MODE_CAR);
+    bool allow_dfs = !car_ratelimit_dfs ||
+                     (wdp_ducb_select_counter % WD_CAR_DFS_SELECT_RATIO == 0);
+    wdp_ducb_select_counter++;
+
     wdp_ducb_discounted_total *= WDP_DUCB_GAMMA;
     for (int i = 0; i < wdp_ducb_channel_count; i++) {
         wdp_ducb_channels[i].discounted_reward *= WDP_DUCB_GAMMA;
@@ -9391,6 +9693,9 @@ static int wdp_ducb_select_channel(void) {
     int best_idx = 0;
     double best_ucb = -1.0;
     for (int i = 0; i < wdp_ducb_channel_count; i++) {
+        // Keep DFS arms out of the running on the rate-limited iterations.
+        if (!allow_dfs && wdp_ducb_channels[i].tier == WDP_TIER_5_DFS) continue;
+
         if (wdp_ducb_channels[i].discounted_pulls < 0.001) {
             best_idx = i;
             break;
@@ -9414,13 +9719,11 @@ static void wdp_ducb_update(int channel_idx, double reward) {
 }
 
 static int wdp_get_dwell_ms(wdp_channel_tier_t tier) {
-    switch (tier) {
-        case WDP_TIER_24_PRIMARY:   return WDP_DWELL_PRIMARY_MS;
-        case WDP_TIER_24_SECONDARY: return WDP_DWELL_DEFAULT_MS;
-        case WDP_TIER_5_NON_DFS:    return WDP_DWELL_DEFAULT_MS;
-        case WDP_TIER_5_DFS:        return WDP_DWELL_DFS_MS;
-        default:                    return WDP_DWELL_DEFAULT_MS;
-    }
+    // Dwell now depends on the active capture mode (adaptive or manual).
+    // Band is unaffected — only per-tier dwell time changes with speed.
+    int t = (int)tier;
+    if (t < 0 || t >= 4) t = WDP_TIER_24_SECONDARY;
+    return wd_dwell_table[wd_effective_mode()][t];
 }
 
 // ============================================================================
@@ -10139,10 +10442,24 @@ static int wdp_ble_gap_cb(struct ble_gap_event *event, void *arg)
         return 0;
     }
 
-    // Dedup by MAC
+    // Dedup by MAC — but let a later report (e.g. an active-scan SCAN_RSP) backfill
+    // a name when the first report (ADV) didn't carry one. Many privacy devices put
+    // their name only in the scan response, so passive scanning shows mostly "-".
     int cnt = wdp_ble_count;
-    for (int i = 0; i < cnt; i++)
-        if (memcmp(wdp_ble_devices[i].mac, addr_val, 6) == 0) return 0;
+    for (int i = 0; i < cnt; i++) {
+        if (memcmp(wdp_ble_devices[i].mac, addr_val, 6) == 0) {
+            if (wdp_ble_devices[i].name[0] == '\0') {
+                struct ble_hs_adv_fields nf;
+                if (ble_hs_adv_parse_fields(&nf, adv_data, adv_data_len) == 0
+                    && nf.name && nf.name_len > 0) {
+                    int nl = nf.name_len < 31 ? nf.name_len : 31;
+                    memcpy(wdp_ble_devices[i].name, nf.name, nl);
+                    wdp_ble_devices[i].name[nl] = '\0';
+                }
+            }
+            return 0;
+        }
+    }
 
     if (cnt >= WDP_BLE_MAX_DEVICES) return 0;
 
@@ -10153,9 +10470,15 @@ static int wdp_ble_gap_cb(struct ble_gap_event *event, void *arg)
         const gps_data_t *g = gps_best();
         dev->latitude  = g->latitude;
         dev->longitude = g->longitude;
+        dev->altitude  = g->altitude;
+        dev->accuracy  = gps_best_accuracy();
     }
     dev->name[0]   = '\0';
     dev->written   = false;
+    // Capture the first-seen time now, alongside the position above, so the CSV FirstSeen
+    // matches where/when the device was actually detected (BLE-only flushes at stop, so a
+    // single flush-time stamp would put every device at the same wrong time).
+    get_timestamp_string(dev->first_seen, sizeof(dev->first_seen));
 
     struct ble_hs_adv_fields fields;
     if (ble_hs_adv_parse_fields(&fields, adv_data, adv_data_len) == 0
@@ -10247,6 +10570,7 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     wdp_seen_networks[idx].written_to_file = false;
     wdp_seen_networks[idx].latitude  = g->valid ? g->latitude  : 0.0f;
     wdp_seen_networks[idx].longitude = g->valid ? g->longitude : 0.0f;
+    wdp_seen_networks[idx].altitude  = g->valid ? g->altitude  : 0.0f;
     wdp_seen_networks[idx].accuracy  = g->valid ? gps_best_accuracy() : 0.0f;
 
     wdp_seen_count++;  // Increment dedup buffer count
@@ -11193,6 +11517,19 @@ static void wardrive_task(void *pvParameters) {
 }
 
 // Wardrive promisc task: D-UCB channel selection + beacon sniffing
+// Rotate the wardrive CSV to a new part once it reaches this size, BEFORE it approaches
+// the upload ceiling (wdup_upload_one loads the whole file into a single PSRAM buffer;
+// ~3-5 MB practical / 8 MiB hard reject). Each part is a standalone WigleWifi CSV.
+#define WD_CSV_ROTATE_BYTES (2 * 1024 * 1024)
+
+// Write the WigleWifi-1.6 two-line header to a freshly opened wardrive CSV part.
+static void wd_write_csv_header(FILE *f)
+{
+    fprintf(f, "WigleWifi-1.6,appRelease=%s,model=NM-CYD-C5,release=%s,device=CheapYellowMonster,display=240x320,board=ESP32C5,brand=JanOS\n",
+            FW_VERSION, FW_VERSION);
+    fprintf(f, "MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type\n");
+}
+
 static void wardrive_promisc_task(void *pvParameters) {
     (void)pvParameters;
     ESP_LOGI(TAG, "Wardrive promisc task started");
@@ -11202,8 +11539,28 @@ static void wardrive_promisc_task(void *pvParameters) {
     bool ble_scan_feasible = true;   // set false after BLE_ERR_MEM_CAPACITY — stops retry loop
 
     wardrive_file_counter = (int)(esp_timer_get_time() / 1000000);
+    // One journey stamp shared by every rotated CSV part + the marks GPX, so a long
+    // drive's files group together (WigleWifi_<stamp>-001.csv, -002.csv, ...). Real UTC
+    // when the clock is GPS-synced; "up<sec>" uptime fallback before the first fix.
+    char wd_stamp[24];
+    {
+        time_t nowt = time(NULL);
+        struct tm tmv;
+        gmtime_r(&nowt, &tmv);
+        if (tmv.tm_year + 1900 >= 2024)
+            strftime(wd_stamp, sizeof(wd_stamp), "%Y%m%d-%H%M%S", &tmv);
+        else
+            snprintf(wd_stamp, sizeof(wd_stamp), "up%d", wardrive_file_counter);
+    }
+    int  wd_part  = 1;    // current CSV part number (rotates at WD_CSV_ROTATE_BYTES)
+    long wd_bytes = 0;    // bytes written to the current part so far
+    // Filename prefix by radio mode: WD_BLE_ vs WD_Wifi_. WiGLE/WDG identify the file
+    // by the "WigleWifi-1.6" line INSIDE the CSV (+ the per-row Type column), NOT the
+    // filename, so a clear self-describing WD_<mode>_ name uploads fine to both
+    // (validated) and avoids the misleading "WigleWifi" prefix on a Bluetooth capture.
+    const char *wd_prefix = (g_wd_radio_mode == WD_RADIO_BLE_ONLY) ? "WD_BLE_" : "WD_Wifi_";
     snprintf(wd_marks_fname, sizeof(wd_marks_fname),
-             "/sdcard/lab/wardrives/wd%d_marks.gpx", wardrive_file_counter);
+             "/sdcard/lab/wardrives/%s%s_marks.gpx", wd_prefix, wd_stamp);
 
     // Initialize wardrive buffers
     wdp_seen_count = 0;
@@ -11261,8 +11618,8 @@ static void wardrive_promisc_task(void *pvParameters) {
     }
     if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
 
-    char filename[64];
-    snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/wd%d.csv", wardrive_file_counter);
+    char filename[80];
+    snprintf(filename, sizeof(filename), "/sdcard/lab/wardrives/%s%s-%03d.csv", wd_prefix, wd_stamp, wd_part);
 
     if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
     FILE *file = fopen(filename, "w");
@@ -11281,17 +11638,25 @@ static void wardrive_promisc_task(void *pvParameters) {
         vTaskDelete(NULL);
         return;
     }
-    fprintf(file, "WigleWifi-1.6,appRelease=%s,model=NM-CYD-C5,release=%s,device=CheapYellowMonster,display=240x320,board=ESP32C5,brand=JanOS\n",
-            FW_VERSION, FW_VERSION);
-    fprintf(file, "MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type\n");
+    wd_write_csv_header(file);
     fflush(file);
+    { int _fd = fileno(file); if (_fd >= 0) fsync(_fd); }  // persist the header's directory entry immediately
     if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
 
-    // For BLE-only mode, unload WiFi to free up DMA
+    // For BLE-only mode, FULLY deinit WiFi (not just stop) to free the ~42KB DMA
+    // pool the WiFi driver holds from boot. esp_wifi_stop() alone leaves that DMA
+    // allocated, so the BLE controller can sync but then starves its adv-report
+    // buffers (hci_err 0x207 BLE_ERR_MEM_CAPACITY -> collects 0 devices). Full
+    // esp_wifi_deinit() returns the pool. Setting RADIO_MODE_NONE also disables the
+    // vestigial coex bt_nimble_init() retry (~11760, guarded by RADIO_MODE_WIFI) so
+    // a BLE-only run can never fall into the old re-init spiral. On stop, the restore
+    // path below calls ensure_wifi_mode() for the full wifi_cli_init() reinit.
     if (g_wd_radio_mode == WD_RADIO_BLE_ONLY && wifi_initialized) {
-        ESP_LOGI(TAG, "Wardrive BLE-only: stopping WiFi to free DMA");
+        ESP_LOGI(TAG, "Wardrive BLE-only: full WiFi deinit to free DMA pool");
         esp_wifi_stop();
+        esp_wifi_deinit();
         wifi_initialized = false;
+        current_radio_mode = RADIO_MODE_NONE;
     }
 
     wdp_ducb_init();
@@ -11337,7 +11702,9 @@ static void wardrive_promisc_task(void *pvParameters) {
                      (unsigned)dma_after_nimble, (unsigned)(dma_before_nimble - dma_after_nimble));
 
 #if MYNEWT_VAL(BLE_EXT_ADV)
-            struct ble_gap_ext_disc_params bpe = { .itvl = 0x0040, .window = 0x0040, .passive = 1 };
+            // Active scan (passive=0): solicit SCAN_RSP so privacy devices that carry
+            // their name only in the scan response show a Name instead of "-".
+            struct ble_gap_ext_disc_params bpe = { .itvl = 0x0040, .window = 0x0040, .passive = 0 };
             size_t dma_before_scan = heap_caps_get_free_size(MALLOC_CAP_DMA);
             if (ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 0, 0, 0,
                                  BLE_HCI_SCAN_FILT_NO_WL, 0,
@@ -11350,8 +11717,10 @@ static void wardrive_promisc_task(void *pvParameters) {
                 ESP_LOGI(TAG, "[WDP] BLE scan running (100%% duty, continuous)");
             }
 #else
+            // Active scan (passive=0): solicit SCAN_RSP so privacy devices that carry
+            // their name only in the scan response show a Name instead of "-".
             struct ble_gap_disc_params bp = { .itvl = 0x0040, .window = 0x0040,
-                .filter_policy = BLE_HCI_SCAN_FILT_NO_WL, .passive = 1, .filter_duplicates = 0 };
+                .filter_policy = BLE_HCI_SCAN_FILT_NO_WL, .passive = 0, .filter_duplicates = 0 };
             size_t dma_before_scan = heap_caps_get_free_size(MALLOC_CAP_DMA);
             if (ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &bp, wdp_ble_gap_cb, NULL) == 0) {
                 size_t dma_after_scan = heap_caps_get_free_size(MALLOC_CAP_DMA);
@@ -11373,8 +11742,32 @@ static void wardrive_promisc_task(void *pvParameters) {
     int64_t last_ble_us   = esp_timer_get_time();
     int64_t last_flush_us = esp_timer_get_time();
     int networks_since_flush = 0;
+    wd_mode_t wd_rate_mode = WD_MODE_COUNT; // force GPS-rate apply on first iteration
 
     while (wardrive_active) {
+        // Adaptive: reclassify capture mode from current ground speed each iteration.
+        // Band is untouched; only dwell + DFS exploration weight change with speed.
+        if (g_wd_adaptive) wd_classify_mode(gps_best()->speed);
+
+        // On a mode change, retune the GPS fix rate: 5 Hz in Car (needs baud
+        // >= 38400 to fit the NMEA volume), 1 Hz otherwise.
+        wd_mode_t wd_eff = wd_effective_mode();
+        if (wd_eff != wd_rate_mode) {
+            wd_rate_mode = wd_eff;
+            // Log the mode's full per-tier dwell table + DFS policy so a mode change
+            // (adaptive by speed, or a manual-mode selection at wardrive start) can be
+            // verified on the serial console.
+            ESP_LOGI(TAG, "[WD] mode=%s (%s) dwell 24p/24s/5n/5d=%d/%d/%d/%d ms, DFS=%s",
+                     wd_mode_name(wd_eff), g_wd_adaptive ? "adaptive" : "manual",
+                     wd_dwell_table[wd_eff][0], wd_dwell_table[wd_eff][1],
+                     wd_dwell_table[wd_eff][2], wd_dwell_table[wd_eff][3],
+                     (wd_eff == WD_MODE_CAR) ? "1/10 (rate-limited)" : "full");
+            // 5 Hz needs 115200: at 38400 the module silently stays 1 Hz (full multi-GNSS
+            // NMEA at 5 Hz overruns 38400), so only 115200 unlocks real 5 Hz (bench-proven).
+            int hz = (wd_eff == WD_MODE_CAR && g_wd_gps_baud >= 115200) ? 5 : 1;
+            gps_set_update_rate_hz(hz);
+        }
+
         int ch_idx = wdp_ducb_select_channel();
         int channel = wdp_ducb_channels[ch_idx].channel;
         int dwell_ms = wdp_get_dwell_ms(wdp_ducb_channels[ch_idx].tier);
@@ -11529,16 +11922,17 @@ static void wardrive_promisc_task(void *pvParameters) {
                        2412 + (net->channel - 1) * 5 :
                        (net->channel == 14) ? 2484 :
                        (net->channel >= 36)  ? 5000 + 5 * net->channel : 0;
-            int wr = fprintf(file, "%s,%s,[%s],%s,%d,%d,%d,%.7f,%.7f,0.00,%.2f,,,WIFI\n",
+            int wr = fprintf(file, "%s,%s,[%s],%s,%d,%d,%d,%.7f,%.7f,%.2f,%.2f,,,WIFI\n",
                     mac_str, escaped_ssid, auth, timestamp,
                     net->channel, freq, net->rssi, net->latitude, net->longitude,
-                    (double)net->accuracy);
+                    (double)net->altitude, (double)net->accuracy);
             if (wr < 0) {
                 sd_error_report("Wardrive CSV", "fprintf", "WiFi line write failed");
                 net->written_to_file = true; // Mark as written to avoid re-attempts
             } else {
                 net->written_to_file = true;
                 networks_since_flush++;
+                wd_bytes += wr;                // track part size for rotation
                 wdp_push_to_screen_fifo(net);  // Add to screen FIFO only on successful CSV write
             }
         }
@@ -11567,13 +11961,15 @@ static void wardrive_promisc_task(void *pvParameters) {
                          bd->mac[2], bd->mac[1], bd->mac[0]);
                 char ble_name[64];
                 escape_csv_field(bd->name[0] ? bd->name : "[BLE]", ble_name, sizeof(ble_name));
-                int wr_ble = fprintf(file, "%s,%s,[BLE],%s,37,2402,%d,%.7f,%.7f,0.00,0.00,,,BLE\n",
-                        ble_mac, ble_name, timestamp,
-                        bd->rssi, bd->latitude, bd->longitude);
+                int wr_ble = fprintf(file, "%s,%s,[BLE],%s,37,2402,%d,%.7f,%.7f,%.2f,%.2f,,,BLE\n",
+                        ble_mac, ble_name, bd->first_seen,
+                        bd->rssi, bd->latitude, bd->longitude,
+                        (double)bd->altitude, (double)bd->accuracy);
                 if (wr_ble < 0) {
                     sd_error_report("Wardrive CSV", "fprintf", "BLE line write failed");
                 } else {
                     networks_since_flush++;
+                    wd_bytes += wr_ble;        // track part size for rotation
                 }
                 bd->written = true;
                 ble_written++;
@@ -11596,8 +11992,42 @@ static void wardrive_promisc_task(void *pvParameters) {
             if (fflush(file) != 0) {
                 sd_error_report("Wardrive CSV", "fflush", "buffer flush failed");
             }
+            // fflush alone pushes stdio -> FATFS but does NOT update the directory entry
+            // (file size); an abrupt power-off (car unplug) would then read the file as
+            // truncated/0-byte. fsync forces FATFS to persist the FAT + dir so every
+            // flushed row survives a power cut, without forcing the user to Stop cleanly.
+            { int _fd = fileno(file); if (_fd >= 0) fsync(_fd); }
             networks_since_flush = 0;
             last_flush_us = now_us;
+
+            // Rotate to a new CSV part before the file nears the upload ceiling. Open the
+            // new part BEFORE closing the old one so a failure can never lose the file;
+            // the shared wd_stamp keeps every part grouped as one journey.
+            // NOTE: we are ALREADY inside the sd_spi_mutex critical section taken above —
+            // sd_spi_mutex is a plain (non-recursive) mutex, so taking it again here would
+            // self-deadlock the wardrive task and freeze the UI with the SD lock held.
+            if (wd_bytes >= WD_CSV_ROTATE_BYTES) {
+                char newname[80];
+                snprintf(newname, sizeof(newname),
+                         "/sdcard/lab/wardrives/%s%s-%03d.csv", wd_prefix, wd_stamp, wd_part + 1);
+                FILE *nf = fopen(newname, "w");
+                if (nf) {
+                    wd_write_csv_header(nf);
+                    fflush(nf);
+                    { int _nfd = fileno(nf); if (_nfd >= 0) fsync(_nfd); }
+                    fclose(file);              // close old only after the new part is safe on SD
+                    file = nf;
+                    wd_part++;
+                    snprintf(filename, sizeof(filename), "%s", newname);
+                    wd_bytes = 0;
+                }
+                if (nf) {
+                    ESP_LOGI(TAG, "[WD] CSV rotated -> part %d (%s)", wd_part, filename);
+                } else {
+                    sd_error_report("Wardrive CSV", "rotate", "open next part failed");
+                    wd_bytes = WD_CSV_ROTATE_BYTES / 2;   // back off; keep current file, retry later
+                }
+            }
 
             // Resume BLE if it was running
             if (ble_continuous) {
@@ -11622,6 +12052,9 @@ static void wardrive_promisc_task(void *pvParameters) {
         }
     }
 
+    // Restore GPS to 1 Hz so other screens (Settings > GPS Info) aren't left at 5 Hz.
+    gps_set_update_rate_hz(1);
+
     // Stop continuous BLE scan before turning off WiFi promiscuous
     if (ble_continuous) {
         ble_gap_disc_cancel();
@@ -11634,8 +12067,8 @@ static void wardrive_promisc_task(void *pvParameters) {
 
     // In BLE-only mode, flush all buffered BLE devices to CSV after scan stops
     if (file && g_wd_radio_mode == WD_RADIO_BLE_ONLY && wdp_ble_devices) {
-        char timestamp[32];
-        get_timestamp_string(timestamp, sizeof(timestamp));
+        // Each device carries its own first-seen timestamp (captured at detection), so no
+        // single flush-time stamp here.
         int ble_cnt = wdp_ble_count;
         int ble_flushed = 0;
         for (int i = 0; i < ble_cnt; i++) {
@@ -11657,9 +12090,10 @@ static void wardrive_promisc_task(void *pvParameters) {
                      bd->mac[2], bd->mac[1], bd->mac[0]);
             char ble_name[64];
             escape_csv_field(bd->name[0] ? bd->name : "[BLE]", ble_name, sizeof(ble_name));
-            fprintf(file, "%s,%s,[BLE],%s,37,2402,%d,%.7f,%.7f,0.00,0.00,,,BLE\n",
-                    ble_mac, ble_name, timestamp,
-                    bd->rssi, bd->latitude, bd->longitude);
+            fprintf(file, "%s,%s,[BLE],%s,37,2402,%d,%.7f,%.7f,%.2f,%.2f,,,BLE\n",
+                    ble_mac, ble_name, bd->first_seen,
+                    bd->rssi, bd->latitude, bd->longitude,
+                    (double)bd->altitude, (double)bd->accuracy);
             bd->written = true;
             ble_flushed++;
         }
@@ -11683,25 +12117,27 @@ static void wardrive_promisc_task(void *pvParameters) {
     }
 
     wardrive_active = false;
-    wardrive_task_handle = NULL;
 
     // ========== DMA TRACKING: After wardrive stops ==========
     size_t dma_after_stop = heap_caps_get_free_size(MALLOC_CAP_DMA);
     ESP_LOGI(TAG, "[DMA_TRACK] After promisc stop — DMA: %u bytes", (unsigned)dma_after_stop);
     // ========================================================
 
-    ESP_LOGI(TAG, "Wardrive promisc stopped. Total networks: %d. File: wd%d.csv",
-             wdp_seen_count, wardrive_file_counter);
+    ESP_LOGI(TAG, "Wardrive promisc stopped. Total networks: %d. Files: %s%s-001..%03d.csv",
+             wdp_seen_count, wd_prefix, wd_stamp, wd_part);
     log_heap_stats("wardrive-stop");
 
     // Restore WiFi if we stopped it for BLE-only mode
     if (g_wd_radio_mode == WD_RADIO_BLE_ONLY && !wifi_initialized) {
-        ESP_LOGI(TAG, "Wardrive BLE-only done: restarting WiFi");
-        esp_wifi_start();
-        wifi_initialized = true;
-        current_radio_mode = RADIO_MODE_WIFI;
+        ESP_LOGI(TAG, "Wardrive BLE-only done: full WiFi reinit");
+        ensure_wifi_mode();  // driver was esp_wifi_deinit()'d, needs full wifi_cli_init()
     }
 
+    // Publish task-done LAST. The stop hook polls wardrive_task_handle==NULL as the
+    // "fully finished" signal; setting it only after the WiFi reinit above guarantees
+    // the stop hook's own restore then sees wifi_initialized==true and skips it — no
+    // double esp_wifi_init() -> 0x103 -> esp_restart race on top-Back teardown.
+    wardrive_task_handle = NULL;
     vTaskDelete(NULL);
 }
 
@@ -11710,7 +12146,8 @@ static void wd_ui_timer_cb(lv_timer_t *timer) {
     (void)timer;
     if (!wardrive_ui_active) return;
 
-    if (wd_ui_channel_label) {
+    // In BLE-only mode the box shows a static "SCAN" (no D-UCB channel hopping) — don't overwrite it.
+    if (wd_ui_channel_label && g_wd_radio_mode != WD_RADIO_BLE_ONLY) {
         char wd_ch_buf[16];
         if (wdp_current_channel < 0)
             snprintf(wd_ch_buf, sizeof(wd_ch_buf), "BLE");
@@ -11750,10 +12187,10 @@ static void wd_ui_timer_cb(lv_timer_t *timer) {
     // Update table with last 50 networks/devices (WiFi or BLE depending on mode)
     if (wd_ui_table) {
         int total, show, start;
-        lv_table_set_col_cnt(wd_ui_table, 5);
 
         if (g_wd_radio_mode == WD_RADIO_BLE_ONLY) {
-            // Show BLE devices
+            // BLE dashboard: B | MAC | Name/Type | RSSI (4 cols, matches the header)
+            lv_table_set_col_cnt(wd_ui_table, 4);
             total = wdp_ble_count;
             show = (total > 50) ? 50 : total;
             start = total - show;
@@ -11761,21 +12198,31 @@ static void wd_ui_timer_cb(lv_timer_t *timer) {
 
             for (int i = 0; i < show; i++) {
                 wdp_ble_device_t *dev = &wdp_ble_devices[start + show - 1 - i];
+                lv_table_set_cell_value(wd_ui_table, i, 0, "BLE");   // band badge (blue)
                 char addr_str[18];
                 snprintf(addr_str, sizeof(addr_str), "%02X:%02X:%02X:%02X:%02X:%02X",
                          dev->mac[0], dev->mac[1], dev->mac[2], dev->mac[3], dev->mac[4], dev->mac[5]);
-                lv_table_set_cell_value(wd_ui_table, i, 0, addr_str);
+                lv_table_set_cell_value(wd_ui_table, i, 1, addr_str);
+
+                // Name/Type — advertised name (truncated to fit), dash when unnamed.
+                // wdp_ble_device_t carries only name, so Type falls back to Name.
+                char name_trunc[12];
+                if (dev->name[0]) {
+                    strncpy(name_trunc, dev->name, sizeof(name_trunc) - 1);
+                    name_trunc[sizeof(name_trunc) - 1] = '\0';
+                } else {
+                    name_trunc[0] = '-';
+                    name_trunc[1] = '\0';
+                }
+                lv_table_set_cell_value(wd_ui_table, i, 2, name_trunc);
 
                 char rssi_str[8];
                 snprintf(rssi_str, sizeof(rssi_str), "%d", dev->rssi);
-                lv_table_set_cell_value(wd_ui_table, i, 1, rssi_str);
-
-                lv_table_set_cell_value(wd_ui_table, i, 2, "BLE");
-                lv_table_set_cell_value(wd_ui_table, i, 3, "");
-                lv_table_set_cell_value(wd_ui_table, i, 4, "");
+                lv_table_set_cell_value(wd_ui_table, i, 3, rssi_str);
             }
         } else {
             // Show WiFi networks
+            lv_table_set_col_cnt(wd_ui_table, 5);
             total = wdp_seen_count;
             show = (total > 50) ? 50 : total;
             start = total - show;
@@ -11783,32 +12230,21 @@ static void wd_ui_timer_cb(lv_timer_t *timer) {
 
             for (int i = 0; i < show; i++) {
                 wdp_network_t *net = &wdp_seen_networks[start + show - 1 - i];
+                lv_table_set_cell_value(wd_ui_table, i, 0, net->channel >= 36 ? "5" : "2.4"); // band badge
                 char ssid_trunc[20];
                 strncpy(ssid_trunc, net->ssid[0] ? net->ssid : "[hidden]", 19);
                 ssid_trunc[19] = '\0';
-                lv_table_set_cell_value(wd_ui_table, i, 0, ssid_trunc);
+                lv_table_set_cell_value(wd_ui_table, i, 1, ssid_trunc);
 
                 char ch_str[4];
                 snprintf(ch_str, sizeof(ch_str), "%d", net->channel);
-                lv_table_set_cell_value(wd_ui_table, i, 1, ch_str);
+                lv_table_set_cell_value(wd_ui_table, i, 2, ch_str);
 
                 char rssi_str[8];
                 snprintf(rssi_str, sizeof(rssi_str), "%d", net->rssi);
-                lv_table_set_cell_value(wd_ui_table, i, 2, rssi_str);
+                lv_table_set_cell_value(wd_ui_table, i, 3, rssi_str);
 
-                const char *auth = get_auth_mode_wiggle(net->authmode);
-                char auth_short[8];
-                strncpy(auth_short, auth, 7);
-                auth_short[7] = '\0';
-                lv_table_set_cell_value(wd_ui_table, i, 3, auth_short);
-
-                char coord_str[24];
-                if (net->latitude != 0.0f || net->longitude != 0.0f) {
-                    snprintf(coord_str, sizeof(coord_str), "%.2f", (double)net->latitude);
-                } else {
-                    snprintf(coord_str, sizeof(coord_str), "--");
-                }
-                lv_table_set_cell_value(wd_ui_table, i, 4, coord_str);
+                lv_table_set_cell_value(wd_ui_table, i, 4, wd_auth_disp(net->authmode));
             }
         }
     }
@@ -12106,14 +12542,17 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_set_style_pad_all(wd_ch_box, 0, 0);
     lv_obj_clear_flag(wd_ch_box, LV_OBJ_FLAG_SCROLLABLE);
 
+    // BLE-only mode does no D-UCB channel selection — label the box "BLE / SCAN"
+    // instead of the meaningless "CH --" (channel hopping is WiFi-only).
+    bool wd_ble_only = (g_wd_radio_mode == WD_RADIO_BLE_ONLY);
     lv_obj_t *wd_ch_title = lv_label_create(wd_ch_box);
-    lv_label_set_text(wd_ch_title, "D-UCB");
+    lv_label_set_text(wd_ch_title, wd_ble_only ? "BLE" : "D-UCB");
     lv_obj_set_style_text_color(wd_ch_title, lv_color_make(76, 175, 80), 0);
     lv_obj_set_style_text_font(wd_ch_title, &lv_font_montserrat_12, 0);
     lv_obj_align(wd_ch_title, LV_ALIGN_TOP_MID, 0, 2);
 
     wd_ui_channel_label = lv_label_create(wd_ch_box);
-    lv_label_set_text(wd_ui_channel_label, "CH --");
+    lv_label_set_text(wd_ui_channel_label, wd_ble_only ? "SCAN" : "CH --");
     lv_obj_set_style_text_color(wd_ui_channel_label, ui_text_color(), 0);
     lv_obj_set_style_text_font(wd_ui_channel_label, &lv_font_montserrat_16, 0);
     lv_obj_align(wd_ui_channel_label, LV_ALIGN_BOTTOM_MID, 0, -2);
@@ -12176,8 +12615,9 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     // y=101: boxes end at 55+42=97, 4px gap. height=164: stops 4px above stop btn.
     // Frozen header row — 1-row table, no scrolling
     wd_ui_header = lv_table_create(function_page);
-    lv_obj_set_size(wd_ui_header, lv_pct(97), LV_SIZE_CONTENT);
-    lv_obj_align(wd_ui_header, LV_ALIGN_TOP_MID, 0, 101);
+    lv_obj_set_size(wd_ui_header, lv_pct(97), 26);
+    lv_obj_align(wd_ui_header, LV_ALIGN_TOP_MID, 0, 99);
+    lv_obj_clear_flag(wd_ui_header, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_color(wd_ui_header, lv_color_make(30, 30, 30), 0);
     lv_obj_set_style_border_color(wd_ui_header, lv_color_make(50, 50, 50), 0);
     lv_obj_set_style_border_width(wd_ui_header, 1, 0);
@@ -12189,29 +12629,43 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_set_style_bg_opa(wd_ui_header, LV_OPA_COVER, LV_PART_ITEMS);
     lv_obj_set_style_text_color(wd_ui_header, lv_color_make(20, 20, 20), LV_PART_ITEMS);
     lv_obj_set_style_text_font(wd_ui_header, &lv_font_montserrat_12, LV_PART_ITEMS);
-    lv_obj_set_style_pad_top(wd_ui_header, 2, LV_PART_ITEMS);
+    lv_obj_set_style_pad_top(wd_ui_header, 6, LV_PART_ITEMS);    // white space above text (was clipping top)
     lv_obj_set_style_pad_bottom(wd_ui_header, 2, LV_PART_ITEMS);
     lv_obj_set_style_pad_left(wd_ui_header, 4, LV_PART_ITEMS);
     lv_obj_set_style_pad_right(wd_ui_header, 2, LV_PART_ITEMS);
     lv_obj_set_scroll_dir(wd_ui_header, LV_DIR_NONE);
     lv_obj_set_scrollbar_mode(wd_ui_header, LV_SCROLLBAR_MODE_OFF);
-    lv_table_set_col_cnt(wd_ui_header, 5);
-    lv_table_set_col_width(wd_ui_header, 0, 82);
-    lv_table_set_col_width(wd_ui_header, 1, 26);
-    lv_table_set_col_width(wd_ui_header, 2, 36);
-    lv_table_set_col_width(wd_ui_header, 3, 44);
-    lv_table_set_col_width(wd_ui_header, 4, 45);
-    lv_table_set_row_cnt(wd_ui_header, 1);
-    lv_table_set_cell_value(wd_ui_header, 0, 0, "SSID");
-    lv_table_set_cell_value(wd_ui_header, 0, 1, "Ch");
-    lv_table_set_cell_value(wd_ui_header, 0, 2, "RSSI");
-    lv_table_set_cell_value(wd_ui_header, 0, 3, "Auth");
-    lv_table_set_cell_value(wd_ui_header, 0, 4, "Lat");
+    if (wd_ble_only) {
+        // BLE-only: B | MAC | Name | RSSI (Ch/Auth are WiFi-only and always empty)
+        lv_table_set_col_cnt(wd_ui_header, 4);
+        lv_table_set_col_width(wd_ui_header, 0, 30);
+        lv_table_set_col_width(wd_ui_header, 1, 118);
+        lv_table_set_col_width(wd_ui_header, 2, 50);
+        lv_table_set_col_width(wd_ui_header, 3, 34);
+        lv_table_set_row_cnt(wd_ui_header, 1);
+        lv_table_set_cell_value(wd_ui_header, 0, 0, "B");
+        lv_table_set_cell_value(wd_ui_header, 0, 1, "MAC");
+        lv_table_set_cell_value(wd_ui_header, 0, 2, "Name");
+        lv_table_set_cell_value(wd_ui_header, 0, 3, "RSSI");
+    } else {
+        lv_table_set_col_cnt(wd_ui_header, 5);
+        lv_table_set_col_width(wd_ui_header, 0, 30);
+        lv_table_set_col_width(wd_ui_header, 1, 92);
+        lv_table_set_col_width(wd_ui_header, 2, 24);
+        lv_table_set_col_width(wd_ui_header, 3, 34);
+        lv_table_set_col_width(wd_ui_header, 4, 52);
+        lv_table_set_row_cnt(wd_ui_header, 1);
+        lv_table_set_cell_value(wd_ui_header, 0, 0, "B");   // band column (single char fits 30px w/o wrapping)
+        lv_table_set_cell_value(wd_ui_header, 0, 1, "SSID");
+        lv_table_set_cell_value(wd_ui_header, 0, 2, "Ch");
+        lv_table_set_cell_value(wd_ui_header, 0, 3, "RSSI");
+        lv_table_set_cell_value(wd_ui_header, 0, 4, "Auth");
+    }
 
     // Scrollable data table — sits below the frozen header
     wd_ui_table = lv_table_create(function_page);
-    lv_obj_set_size(wd_ui_table, lv_pct(97), 160);
-    lv_obj_align(wd_ui_table, LV_ALIGN_TOP_MID, 0, 121);
+    lv_obj_set_size(wd_ui_table, lv_pct(97), 155);
+    lv_obj_align(wd_ui_table, LV_ALIGN_TOP_MID, 0, 127);
     lv_obj_set_style_bg_color(wd_ui_table, lv_color_make(15, 15, 15), 0);
     lv_obj_set_style_border_color(wd_ui_table, lv_color_make(50, 50, 50), 0);
     lv_obj_set_style_border_width(wd_ui_table, 1, 0);
@@ -12224,15 +12678,26 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_set_style_pad_left(wd_ui_table, 4, LV_PART_ITEMS);
     lv_obj_set_style_pad_right(wd_ui_table, 2, LV_PART_ITEMS);
 
-    // Column widths sum to 233 px (= lv_pct(97) of 240). Vertical scroll only.
-    lv_table_set_col_cnt(wd_ui_table, 5);
-    lv_table_set_col_width(wd_ui_table, 0, 82);   // SSID
-    lv_table_set_col_width(wd_ui_table, 1, 26);   // Ch
-    lv_table_set_col_width(wd_ui_table, 2, 36);   // RSSI
-    lv_table_set_col_width(wd_ui_table, 3, 44);   // Auth
-    lv_table_set_col_width(wd_ui_table, 4, 45);   // Lat
+    // Column widths sum to ~232 px (= lv_pct(97) of 240). Vertical scroll only.
+    // Lat dropped from the on-screen table (full coords are in the CSV; current
+    // position is already shown in the top bar) to give SSID/Auth room.
+    if (wd_ble_only) {
+        lv_table_set_col_cnt(wd_ui_table, 4);
+        lv_table_set_col_width(wd_ui_table, 0, 30);    // Band badge (BLE)
+        lv_table_set_col_width(wd_ui_table, 1, 118);   // MAC
+        lv_table_set_col_width(wd_ui_table, 2, 50);    // Name/Type
+        lv_table_set_col_width(wd_ui_table, 3, 34);    // RSSI
+    } else {
+        lv_table_set_col_cnt(wd_ui_table, 5);
+        lv_table_set_col_width(wd_ui_table, 0, 30);   // Band badge (5/2.4/BLE)
+        lv_table_set_col_width(wd_ui_table, 1, 92);   // SSID
+        lv_table_set_col_width(wd_ui_table, 2, 24);   // Ch
+        lv_table_set_col_width(wd_ui_table, 3, 34);   // RSSI
+        lv_table_set_col_width(wd_ui_table, 4, 52);   // Auth
+    }
     lv_obj_set_scroll_dir(wd_ui_table, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(wd_ui_table, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_add_event_cb(wd_ui_table, wd_table_draw_event_cb, LV_EVENT_DRAW_PART_BEGIN, NULL);
     lv_table_set_row_cnt(wd_ui_table, 1);
 
     // ─── Bottom button row: [Stop] [Mark] ────────────────────────
@@ -12241,6 +12706,25 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     wd_marks_fname[0] = '\0';  // task will fill this in once counter is set
 
     // Bottom-left "X Stop" removed — top-bar ‹ Back stops wardrive (g_screen_stop_fn = wardrive_screen_stop).
+
+    // Bottom-left live speed + active capture mode readout.
+    // Border colour signals the source: green = adaptive, red = manual.
+    lv_obj_t *spd_box = lv_obj_create(function_page);
+    lv_obj_set_size(spd_box, 116, 30);   // wide enough for "120 mph  <icon>"
+    lv_obj_align(spd_box, LV_ALIGN_BOTTOM_LEFT, 6, -5);
+    lv_obj_set_style_bg_color(spd_box, lv_color_make(30, 30, 45), 0);
+    lv_obj_set_style_border_color(spd_box,
+        g_wd_adaptive ? lv_color_make(76, 175, 80) : COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_border_width(spd_box, 2, 0);
+    lv_obj_set_style_radius(spd_box, 8, 0);
+    lv_obj_set_style_pad_all(spd_box, 0, 0);
+    lv_obj_clear_flag(spd_box, LV_OBJ_FLAG_SCROLLABLE);
+
+    wd_ui_speed_label = lv_label_create(spd_box);
+    lv_label_set_text(wd_ui_speed_label, "0 km/h  " LV_SYMBOL_HOME);
+    lv_obj_set_style_text_color(wd_ui_speed_label, ui_text_color(), 0);
+    lv_obj_set_style_text_font(wd_ui_speed_label, &g_font_icon14, 0);  // montserrat_14 + FA fallback (bigger)
+    lv_obj_align(wd_ui_speed_label, LV_ALIGN_RIGHT_MID, -6, 0);  // right-aligned: icon fixed at right as speed grows
 
     // Mark button — double-tap for quick mark, single tap opens note dialog
     lv_obj_t *mark_btn = lv_btn_create(function_page);
@@ -12302,8 +12786,13 @@ static void wardrive_screen_stop(void)
     if (wardrive_active || wardrive_task_handle != NULL) {
         ESP_LOGI(TAG, "Stopping Wardrive...");
         wardrive_active = false;
-        
-        for (int i = 0; i < 20 && wardrive_task_handle != NULL; i++) {
+
+        // Wait up to 3 s: the task now publishes wardrive_task_handle=NULL only after
+        // its own WiFi reinit (~700 ms wifi_cli_init on a BLE-only exit), so 1 s could
+        // time out mid-reinit and force-delete the task inside esp_wifi_init(). Once the
+        // task clears the handle it has already restored WiFi (wifi_initialized==true),
+        // so the restore below is skipped and there is no double-init reset.
+        for (int i = 0; i < 60 && wardrive_task_handle != NULL; i++) {
             vTaskDelay(pdMS_TO_TICKS(50));
         }
         
@@ -12322,10 +12811,8 @@ static void wardrive_screen_stop(void)
 
     // Restore WiFi if we stopped it for BLE-only mode
     if (g_wd_radio_mode == WD_RADIO_BLE_ONLY && !wifi_initialized) {
-        ESP_LOGI(TAG, "Wardrive BLE-only done: restarting WiFi");
-        esp_wifi_start();
-        wifi_initialized = true;
-        current_radio_mode = RADIO_MODE_WIFI;
+        ESP_LOGI(TAG, "Wardrive BLE-only done: full WiFi reinit");
+        ensure_wifi_mode();  // driver was esp_wifi_deinit()'d, needs full wifi_cli_init()
     }
 
     esp_wifi_set_promiscuous(false);
@@ -13766,6 +14253,9 @@ static void create_function_page_base(const char *name)
     // Sits just left of the Go Dark button (now flush far-right, x=0 w=30).
     lv_obj_align(battery_label, LV_ALIGN_RIGHT_MID, -32, 0);
     if (last_voltage_str[0] == '\0') lv_obj_add_flag(battery_label, LV_OBJ_FLAG_HIDDEN);
+
+    // GPS status icon, just left of the Go Dark button (battery slot is empty here).
+    gps_status_icon_create(page_title_bar, -42);
 }
 
 // ============================================================================
@@ -19716,6 +20206,128 @@ static lv_obj_t *wd_opts_band_dd  = NULL;
 static lv_obj_t *wd_opts_pcap_sw  = NULL;
 static lv_obj_t *wd_opts_ble_sw   = NULL;
 static lv_obj_t *wd_opts_radio_dd = NULL;
+static lv_obj_t *wd_opts_adapt_sw = NULL;
+static lv_obj_t *wd_opts_mmode_dd = NULL;
+static lv_obj_t *wd_opts_mmode_lbl = NULL;
+static lv_obj_t *wd_opts_sunit_dd = NULL;
+static lv_obj_t *wd_opts_gbaud_dd = NULL;
+static lv_obj_t *s_gbaud_modal    = NULL;   // 115200 consent modal overlay (transient)
+
+// Hide the Manual Mode label + dropdown while adaptive is ON (adaptive picks the
+// mode from speed, so a manual choice would be meaningless). Hidden children are
+// skipped by the flex layout, so the gap collapses too.
+static void wd_opts_apply_adaptive_enable(bool adaptive_on)
+{
+    if (wd_opts_mmode_lbl) {
+        if (adaptive_on) lv_obj_add_flag(wd_opts_mmode_lbl, LV_OBJ_FLAG_HIDDEN);
+        else             lv_obj_clear_flag(wd_opts_mmode_lbl, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (wd_opts_mmode_dd) {
+        if (adaptive_on) lv_obj_add_flag(wd_opts_mmode_dd, LV_OBJ_FLAG_HIDDEN);
+        else             lv_obj_clear_flag(wd_opts_mmode_dd, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void wd_opts_adapt_sw_cb(lv_event_t *e)
+{
+    (void)e;
+    bool on = wd_opts_adapt_sw && lv_obj_has_state(wd_opts_adapt_sw, LV_STATE_CHECKED);
+    wd_opts_apply_adaptive_enable(on);
+}
+
+// Tear down the 115200 consent modal.
+static void gbaud_modal_close(void)
+{
+    if (s_gbaud_modal) { lv_obj_del(s_gbaud_modal); s_gbaud_modal = NULL; }
+}
+// Yes: keep the 115200 selection (applied on Save via gps_apply_baud_live).
+static void gbaud_yes_cb(lv_event_t *e) { (void)e; gbaud_modal_close(); }
+// No: revert the dropdown back to 9600.
+static void gbaud_no_cb(lv_event_t *e)
+{
+    (void)e;
+    if (wd_opts_gbaud_dd) lv_dropdown_set_selected(wd_opts_gbaud_dd, 0);
+    gbaud_modal_close();
+}
+
+// Warn the moment the user picks 115200 (other firmware needs 9600 to see the GPS).
+// Custom modal (not lv_msgbox) so we get a light card, a red No (left) and a green Yes
+// (right), centred. Full-screen backdrop on the top layer eats input behind it, so the
+// user must answer before anything else -> no dangling-overlay lifecycle risk.
+static void wd_opts_gbaud_dd_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!wd_opts_gbaud_dd) return;
+    if (lv_dropdown_get_selected(wd_opts_gbaud_dd) != 1) return;   // only 115200 warns
+    if (g_wd_gps_baud >= 115200) return;   // already at 115200 (consented earlier) -> no re-warn
+    gbaud_modal_close();   // paranoia: never stack two
+
+    s_gbaud_modal = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(s_gbaud_modal);
+    lv_obj_set_size(s_gbaud_modal, LCD_H_RES, LCD_V_RES);
+    lv_obj_set_style_bg_color(s_gbaud_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_gbaud_modal, LV_OPA_50, 0);
+    lv_obj_clear_flag(s_gbaud_modal, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_gbaud_modal, LV_OBJ_FLAG_CLICKABLE);   // swallow background taps
+
+    lv_obj_t *card = lv_obj_create(s_gbaud_modal);
+    lv_obj_set_size(card, LCD_H_RES - 28, LV_SIZE_CONTENT);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, lv_color_make(0xEC, 0xEC, 0xEC), 0);   // light gray
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_set_style_pad_row(card, 10, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, "GPS 115200 baud");
+    lv_obj_set_style_text_color(title, lv_color_black(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+
+    lv_obj_t *msg = lv_label_create(card);
+    lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(msg, LCD_H_RES - 56);
+    lv_label_set_text(msg,
+        "Switch GPS from standard 9600 to 115200 for 5 Hz precision (finer position "
+        "spacing while driving).\n\n"
+        "WARNING: other firmware (e.g. Marauder) expects 9600 and will NOT see the GPS "
+        "until you set this back to 9600 here.\n\n"
+        "Applied on Save. Continue?");
+    lv_obj_set_style_text_color(msg, lv_color_make(0x22, 0x22, 0x22), 0);
+    lv_obj_set_style_text_font(msg, &lv_font_montserrat_12, 0);
+
+    lv_obj_t *btnrow = lv_obj_create(card);
+    lv_obj_remove_style_all(btnrow);
+    lv_obj_set_width(btnrow, LV_PCT(100));
+    lv_obj_set_height(btnrow, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_top(btnrow, 6, 0);
+    lv_obj_set_style_pad_column(btnrow, 16, 0);
+    lv_obj_clear_flag(btnrow, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(btnrow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btnrow, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *no_btn = lv_btn_create(btnrow);          // No: red, left
+    lv_obj_set_size(no_btn, 80, 36);
+    lv_obj_set_style_bg_color(no_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_radius(no_btn, 8, 0);
+    lv_obj_t *no_lbl = lv_label_create(no_btn);
+    lv_label_set_text(no_lbl, "No");
+    lv_obj_set_style_text_font(no_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(no_lbl);
+    lv_obj_add_event_cb(no_btn, gbaud_no_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *yes_btn = lv_btn_create(btnrow);         // Yes: green, right
+    lv_obj_set_size(yes_btn, 80, 36);
+    lv_obj_set_style_bg_color(yes_btn, UI_ACCENT_GREEN, 0);
+    lv_obj_set_style_radius(yes_btn, 8, 0);
+    lv_obj_t *yes_lbl = lv_label_create(yes_btn);
+    lv_label_set_text(yes_lbl, "Yes");
+    lv_obj_set_style_text_font(yes_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(yes_lbl);
+    lv_obj_add_event_cb(yes_btn, gbaud_yes_cb, LV_EVENT_CLICKED, NULL);
+}
 
 static void wd_opts_save_cb(lv_event_t *e)
 {
@@ -19723,11 +20335,22 @@ static void wd_opts_save_cb(lv_event_t *e)
     if (wd_opts_band_dd) g_wd_band = (wd_band_t)lv_dropdown_get_selected(wd_opts_band_dd);
     if (wd_opts_pcap_sw) g_wd_pcap = lv_obj_has_state(wd_opts_pcap_sw, LV_STATE_CHECKED);
     if (wd_opts_radio_dd) g_wd_radio_mode = (wd_radio_mode_t)lv_dropdown_get_selected(wd_opts_radio_dd);
+    if (wd_opts_adapt_sw) g_wd_adaptive = lv_obj_has_state(wd_opts_adapt_sw, LV_STATE_CHECKED);
+    if (wd_opts_mmode_dd) g_wd_manual_mode = (int)lv_dropdown_get_selected(wd_opts_mmode_dd);
+    if (wd_opts_sunit_dd) g_wd_speed_unit = (int)lv_dropdown_get_selected(wd_opts_sunit_dd);
+    if (wd_opts_gbaud_dd) {
+        int newbaud = (lv_dropdown_get_selected(wd_opts_gbaud_dd) == 1) ? 115200 : 9600;
+        gps_apply_baud_live(newbaud);   // commands the module now + updates g_wd_gps_baud
+    }
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_u8(h, NVS_KEY_WD_BAND, (uint8_t)g_wd_band);
         nvs_set_u8(h, NVS_KEY_WD_PCAP, g_wd_pcap ? 1 : 0);
         nvs_set_u8(h, NVS_KEY_WD_RADIO, (uint8_t)g_wd_radio_mode);
+        nvs_set_u8(h, NVS_KEY_WD_ADAPT, g_wd_adaptive ? 1 : 0);
+        nvs_set_u8(h, NVS_KEY_WD_MMODE, (uint8_t)g_wd_manual_mode);
+        nvs_set_u8(h, NVS_KEY_WD_SUNIT, (uint8_t)g_wd_speed_unit);
+        nvs_set_u8(h, NVS_KEY_WD_GBAUD, (g_wd_gps_baud >= 115200) ? 1 : 0);
         nvs_commit(h);
         nvs_close(h);
     }
@@ -19735,6 +20358,12 @@ static void wd_opts_save_cb(lv_event_t *e)
     wd_opts_pcap_sw = NULL;
     wd_opts_ble_sw  = NULL;
     wd_opts_radio_dd = NULL;
+    wd_opts_adapt_sw = NULL;
+    wd_opts_mmode_dd = NULL;
+    wd_opts_mmode_lbl = NULL;
+    wd_opts_sunit_dd = NULL;
+    wd_opts_gbaud_dd = NULL;
+    gbaud_modal_close();   // defensive: drop any stray consent overlay before leaving
     show_wardrive_menu_screen();
 }
 
@@ -19747,11 +20376,11 @@ static void show_wardrive_options_screen(void)
     lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 34);
     lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(content, 0, 0);
-    lv_obj_set_style_pad_all(content, 8, 0);
-    lv_obj_set_style_pad_row(content, 12, 0);
+    lv_obj_set_style_pad_all(content, 6, 0);
+    lv_obj_set_style_pad_row(content, 6, 0);
     lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+    // Scrollable when Manual Mode is shown (thin default scrollbar).
 
     // Band label
     lv_obj_t *band_lbl = lv_label_create(content);
@@ -19770,23 +20399,14 @@ static void show_wardrive_options_screen(void)
     lv_obj_set_style_border_color(wd_opts_band_dd, UI_ACCENT_GREEN, 0);
     lv_obj_set_style_border_width(wd_opts_band_dd, 1, 0);
 
-    // PCAP toggle row
-    lv_obj_t *pcap_row = lv_obj_create(content);
-    lv_obj_set_size(pcap_row, LCD_H_RES - 32, 30);
-    lv_obj_set_style_bg_opa(pcap_row, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(pcap_row, 0, 0);
-    lv_obj_set_style_pad_all(pcap_row, 0, 0);
-    lv_obj_clear_flag(pcap_row, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *pcap_lbl = lv_label_create(pcap_row);
-    lv_label_set_text(pcap_lbl, "Raw PCAP capture");
-    lv_obj_set_style_text_font(pcap_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(pcap_lbl, ui_text_color(), 0);
-    lv_obj_align(pcap_lbl, LV_ALIGN_LEFT_MID, 0, 0);
-
-    wd_opts_pcap_sw = lv_switch_create(pcap_row);
-    lv_obj_align(wd_opts_pcap_sw, LV_ALIGN_RIGHT_MID, 0, 0);
-    if (g_wd_pcap) lv_obj_add_state(wd_opts_pcap_sw, LV_STATE_CHECKED);
+    /* "Raw PCAP capture" row is INTENTIONALLY NOT BUILT.
+     * g_wd_pcap is saved to NVS, loaded at boot and was shown here, but NO capture
+     * path ever reads it — there is no wardrive pcap writer (the pcap code in this
+     * file belongs to handshake capture and MITM). The switch therefore promised a
+     * feature that does not exist. Hiding the row rather than deleting the setting:
+     * g_wd_pcap, its NVS key and the save/load code are all still in place, so
+     * re-enabling is just restoring this block once a writer exists.
+     * wd_opts_pcap_sw stays NULL and wd_opts_save_cb already NULL-guards it. */
 
     // Radio mode label
     lv_obj_t *radio_lbl = lv_label_create(content);
@@ -19804,6 +20424,87 @@ static void show_wardrive_options_screen(void)
     lv_obj_set_style_bg_color(wd_opts_radio_dd, ui_card_color(), 0);
     lv_obj_set_style_border_color(wd_opts_radio_dd, UI_ACCENT_GREEN, 0);
     lv_obj_set_style_border_width(wd_opts_radio_dd, 1, 0);
+
+    // Adaptive mode toggle row (speed-based capture profiles)
+    lv_obj_t *adapt_row = lv_obj_create(content);
+    lv_obj_set_size(adapt_row, LCD_H_RES - 32, 30);
+    lv_obj_set_style_bg_opa(adapt_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(adapt_row, 0, 0);
+    lv_obj_set_style_pad_all(adapt_row, 0, 0);
+    lv_obj_clear_flag(adapt_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *adapt_lbl = lv_label_create(adapt_row);
+    lv_label_set_text(adapt_lbl, "Speed Adaptive Mode");
+    lv_obj_set_style_text_font(adapt_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(adapt_lbl, ui_text_color(), 0);
+    lv_obj_align(adapt_lbl, LV_ALIGN_LEFT_MID, 0, 0);
+
+    wd_opts_adapt_sw = lv_switch_create(adapt_row);
+    lv_obj_set_size(wd_opts_adapt_sw, 44, 22);
+    lv_obj_align(wd_opts_adapt_sw, LV_ALIGN_RIGHT_MID, 0, 0);
+    if (g_wd_adaptive) lv_obj_add_state(wd_opts_adapt_sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(wd_opts_adapt_sw, wd_opts_adapt_sw_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    // Manual mode dropdown (shown only when adaptive is OFF)
+    wd_opts_mmode_lbl = lv_label_create(content);
+    lv_label_set_text(wd_opts_mmode_lbl, "Manual Mode");
+    lv_obj_set_style_text_color(wd_opts_mmode_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(wd_opts_mmode_lbl, &lv_font_montserrat_14, 0);
+
+    wd_opts_mmode_dd = lv_dropdown_create(content);
+    // Each option carries its per-mode dwell (2.4 GHz primary channel) + DFS policy
+    // so the menu is self-documenting: dwell shrinks with speed, DFS is rate-limited
+    // to ~1/10 of channel picks in Driving (kept full in Stationary/Walking).
+    lv_dropdown_set_options(wd_opts_mmode_dd,
+                            "Stationary (500ms, DFS full)\n"
+                            "Walking (350ms, DFS full)\n"
+                            "Driving (150ms, DFS 1/10)");
+    lv_dropdown_set_selected(wd_opts_mmode_dd, (uint16_t)(g_wd_manual_mode % WD_MODE_COUNT));
+    lv_obj_set_width(wd_opts_mmode_dd, LCD_H_RES - 32);
+    lv_obj_set_style_text_font(wd_opts_mmode_dd, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wd_opts_mmode_dd, ui_text_color(), 0);
+    lv_obj_set_style_bg_color(wd_opts_mmode_dd, ui_card_color(), 0);
+    lv_obj_set_style_border_color(wd_opts_mmode_dd, UI_ACCENT_GREEN, 0);
+    lv_obj_set_style_border_width(wd_opts_mmode_dd, 1, 0);
+
+    // GPS baud (advanced). 9600 is the safe standard; 115200 unlocks real 5 Hz fixes
+    // for finer position spacing while driving (bench-proven ~5x). Picking 115200 pops
+    // a consent dialog because other firmware expects 9600. Boot autodetect re-syncs
+    // the module to whatever is saved here, so a wrong baud can never brick GPS.
+    lv_obj_t *gbaud_lbl = lv_label_create(content);
+    lv_label_set_text(gbaud_lbl, "GPS Baud (5Hz)");
+    lv_obj_set_style_text_color(gbaud_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(gbaud_lbl, &lv_font_montserrat_14, 0);
+
+    wd_opts_gbaud_dd = lv_dropdown_create(content);
+    lv_dropdown_set_options(wd_opts_gbaud_dd, "9600 (standard)\n115200 (5Hz precise)");
+    lv_dropdown_set_selected(wd_opts_gbaud_dd, (g_wd_gps_baud >= 115200) ? 1 : 0);
+    lv_obj_set_width(wd_opts_gbaud_dd, LCD_H_RES - 32);
+    lv_obj_set_style_text_font(wd_opts_gbaud_dd, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wd_opts_gbaud_dd, ui_text_color(), 0);
+    lv_obj_set_style_bg_color(wd_opts_gbaud_dd, ui_card_color(), 0);
+    lv_obj_set_style_border_color(wd_opts_gbaud_dd, UI_ACCENT_GREEN, 0);
+    lv_obj_set_style_border_width(wd_opts_gbaud_dd, 1, 0);
+    lv_obj_add_event_cb(wd_opts_gbaud_dd, wd_opts_gbaud_dd_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    // Speed unit dropdown (dashboard readout)
+    lv_obj_t *sunit_lbl = lv_label_create(content);
+    lv_label_set_text(sunit_lbl, "Speed Unit");
+    lv_obj_set_style_text_color(sunit_lbl, ui_text_color(), 0);
+    lv_obj_set_style_text_font(sunit_lbl, &lv_font_montserrat_14, 0);
+
+    wd_opts_sunit_dd = lv_dropdown_create(content);
+    lv_dropdown_set_options(wd_opts_sunit_dd, "km/h\nmph");
+    lv_dropdown_set_selected(wd_opts_sunit_dd, (uint16_t)(g_wd_speed_unit & 1));
+    lv_obj_set_width(wd_opts_sunit_dd, LCD_H_RES - 32);
+    lv_obj_set_style_text_font(wd_opts_sunit_dd, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wd_opts_sunit_dd, ui_text_color(), 0);
+    lv_obj_set_style_bg_color(wd_opts_sunit_dd, ui_card_color(), 0);
+    lv_obj_set_style_border_color(wd_opts_sunit_dd, UI_ACCENT_GREEN, 0);
+    lv_obj_set_style_border_width(wd_opts_sunit_dd, 1, 0);
+
+    // Reflect the current adaptive state (grey out Manual Mode if adaptive is ON).
+    wd_opts_apply_adaptive_enable(g_wd_adaptive);
 
     // Save button
     lv_obj_t *save_btn = lv_btn_create(function_page);
@@ -20167,9 +20868,11 @@ static void show_wardrive_manage_screen(void)
         char meta_buf[48];
         snprintf(meta_buf, sizeof(meta_buf), "%s  %s", size_buf, date_buf);
 
-        // Row container (44px tall, full-width minus margin)
+        // Row container (56px tall, full-width minus margin). Tall enough for a
+        // 2-line filename (WD_ names + timestamp + -NNN part are long and wrap) plus
+        // the size/date line below it, with no overlap.
         lv_obj_t *row = lv_obj_create(list);
-        lv_obj_set_size(row, LCD_H_RES - 6, 44);
+        lv_obj_set_size(row, LCD_H_RES - 6, 56);
         lv_obj_set_style_bg_color(row, ui_card_color(), 0);
         lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(row, 0, 0);
@@ -20181,30 +20884,32 @@ static void show_wardrive_manage_screen(void)
 
         // Left accent strip (upload status color)
         lv_obj_t *accent = lv_obj_create(row);
-        lv_obj_set_size(accent, 4, 34);
+        lv_obj_set_size(accent, 4, 46);
         lv_obj_align(accent, LV_ALIGN_LEFT_MID, 4, 0);
         lv_obj_set_style_bg_color(accent, acc_color, 0);
         lv_obj_set_style_bg_opa(accent, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(accent, 0, 0);
         lv_obj_set_style_radius(accent, 2, 0);
 
-        // Filename label (top line)
+        // Filename label — up to 2 lines (long WD_ names wrap), height-capped so a
+        // 3rd line would dot instead of pushing into the meta line below.
         lv_obj_t *name_lbl = lv_label_create(row);
         lv_label_set_text(name_lbl, fname);
         lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(name_lbl, ui_text_color(), 0);
         lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
-        lv_obj_set_width(name_lbl, 148);
-        lv_obj_align(name_lbl, LV_ALIGN_TOP_LEFT, 14, 5);
+        lv_obj_set_size(name_lbl, 148, 32);   // 2 lines of montserrat_12
+        lv_obj_align(name_lbl, LV_ALIGN_TOP_LEFT, 14, 4);
 
-        // Meta label (bottom line): size + date
+        // Meta label (size + date) sits BELOW the 2-line filename box — no overlap
+        // regardless of how far the name wraps.
         lv_obj_t *meta_lbl = lv_label_create(row);
         lv_label_set_text(meta_lbl, meta_buf);
         lv_obj_set_style_text_font(meta_lbl, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(meta_lbl, lv_color_make(120, 120, 120), 0);
         lv_label_set_long_mode(meta_lbl, LV_LABEL_LONG_DOT);
         lv_obj_set_width(meta_lbl, 148);
-        lv_obj_align(meta_lbl, LV_ALIGN_BOTTOM_LEFT, 14, -5);
+        lv_obj_align(meta_lbl, LV_ALIGN_TOP_LEFT, 14, 38);
 
         // Status badge (right side, upper)
         lv_obj_t *status_lbl = lv_label_create(row);
@@ -24525,9 +25230,11 @@ static void show_gps_info_screen(void)
     lv_obj_clear_flag(div, LV_OBJ_FLAG_SCROLLABLE);
     y += 8;
 
-    // UART config (static — hardware reference)
+    // UART config — baud reflects the configured GPS baud (Wardrive Options)
     lv_obj_t *uart_lbl = lv_label_create(card);
-    lv_label_set_text(uart_lbl, "UART1  IO4=RX  IO5=TX\n9600 baud  ATGM336");
+    char uart_info[64];
+    snprintf(uart_info, sizeof(uart_info), "UART1  IO4=RX  IO5=TX\n%d baud  ATGM336", g_wd_gps_baud);
+    lv_label_set_text(uart_lbl, uart_info);
     lv_obj_set_style_text_font(uart_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(uart_lbl, ui_muted_color(), 0);
     lv_obj_align(uart_lbl, LV_ALIGN_TOP_LEFT, 0, y);
@@ -27656,13 +28363,16 @@ static void bt_sas_refresh_list(void)
             lv_obj_add_event_cb(bt_sas_nav_up, bt_sas_scroll_up_cb, LV_EVENT_CLICKED, NULL);
             lv_obj_add_event_cb(bt_sas_nav_up, bt_sas_scroll_up_cb, LV_EVENT_LONG_PRESSED_REPEAT, NULL);
 
-            bt_sas_nav_pos = lv_label_create(bt_sas_list);
-            lv_obj_add_flag(bt_sas_nav_pos, LV_OBJ_FLAG_FLOATING);
+            // Page indicator lives OUTSIDE the list, on the header strip right of the
+            // "Tap a device to select" hint (same y=35 baseline), right-aligned. Kept off
+            // the list so no row label — selected, marked or just long — can ever run under
+            // the digits; that overlap is why it moved off the rows.
+            bt_sas_nav_pos = lv_label_create(function_page);
             lv_obj_set_size(bt_sas_nav_pos, 44, LV_SIZE_CONTENT);
             lv_obj_set_style_text_font(bt_sas_nav_pos, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(bt_sas_nav_pos, lv_color_make(255, 230, 0), 0);
-            lv_obj_set_style_text_align(bt_sas_nav_pos, LV_TEXT_ALIGN_CENTER, 0);
-            lv_obj_align(bt_sas_nav_pos, LV_ALIGN_RIGHT_MID, -1, 0);
+            lv_obj_set_style_text_align(bt_sas_nav_pos, LV_TEXT_ALIGN_RIGHT, 0);
+            lv_obj_align(bt_sas_nav_pos, LV_ALIGN_TOP_RIGHT, -5, 35);
 
             bt_sas_nav_dn = lv_btn_create(bt_sas_list);
             lv_obj_add_flag(bt_sas_nav_dn, LV_OBJ_FLAG_FLOATING);
@@ -34073,8 +34783,260 @@ void attack_event_cb(lv_event_t *e)
 // Standard stdio behavior restored; no write overrides
 
 // === GPS IMPLEMENTATION ===
+
+// True position-fix cadence: incremented on EVERY GGA that yields a fix,
+// regardless of which task (gps_task or the wardrive loop) drained the UART. The
+// gps_task heartbeat prints and resets it — this is the real number under load.
+static volatile uint32_t g_gga_parses = 0;
+
+// ATGM336H uses the CASIC/PCAS command set (NOT PMTK). Send "$<body>*<CS>\r\n"
+// where <CS> is the XOR of every char in <body>, 2 upper-hex digits. Checksum
+// is computed here so it is always correct regardless of the body string.
+static void gps_send_pcas(const char *body)
+{
+	uint8_t cs = 0;
+	for (const char *p = body; *p; p++) cs ^= (uint8_t)*p;
+	char cmd[48];
+	int n = snprintf(cmd, sizeof(cmd), "$%s*%02X\r\n", body, cs);
+	if (n > 0 && n < (int)sizeof(cmd)) {
+		uart_write_bytes(GPS_UART_NUM, cmd, n);
+		uart_wait_tx_done(GPS_UART_NUM, pdMS_TO_TICKS(100));
+	}
+}
+
+static void gps_send_ubx(uint8_t cls, uint8_t id, const uint8_t *payload, uint16_t len); // u-blox binary
+
+// The GPS output rate (Hz) currently commanded on the module. Starts at the
+// ATGM336H power-on default of 1 Hz. Tracked so we NEVER retransmit a rate we
+// already set — a redundant PCAS02 makes the AT6558 nav engine re-init and drop
+// its current fix (turned instant hot-start into a "wait for lock" at every
+// wardrive start). At 9600 baud the desired rate is always 1 Hz, so with this
+// guard the firmware sends the module zero bytes — identical to the pre-adaptive
+// behaviour that always fixed instantly.
+static int s_gps_applied_hz = 1;
+
+// Set GPS fix output rate. hz: 1 / 2 / 5 (PCAS02 interval in ms). 5 Hz needs
+// baud >= 38400 to fit the extra NMEA volume — callers must guard on baud.
+// No-op (no UART traffic) when the requested rate equals the current rate.
+static void gps_set_update_rate_hz(int hz)
+{
+	int want = (hz >= 5) ? 5 : (hz >= 2) ? 2 : 1;
+	if (want == s_gps_applied_hz) return;   // already at this rate — send nothing
+	int ms = (want == 5) ? 200 : (want == 2) ? 500 : 1000;
+	char body[24];
+	snprintf(body, sizeof(body), "PCAS02,%d", ms);      // CASIC / AT6558
+	gps_send_pcas(body);
+	snprintf(body, sizeof(body), "PMTK220,%d", ms);     // MTK
+	gps_send_pcas(body);
+	// u-blox has no NMEA command for the navigation rate — it needs binary
+	// UBX-CFG-RATE (measRate ms, navRate 1 cycle, timeRef 1 = GPS time).
+	{
+		uint8_t rate_payload[6] = { (uint8_t)(ms & 0xFF), (uint8_t)(ms >> 8), 0x01, 0x00, 0x01, 0x00 };
+		gps_send_ubx(0x06, 0x08, rate_payload, sizeof(rate_payload));
+	}
+	s_gps_applied_hz = want;
+}
+
+// PCAS01 baud code for the ATGM336H: 0=4800 1=9600 2=19200 3=38400 4=57600 5=115200.
+static int gps_pcas_baud_code(int baud)
+{
+	switch (baud) {
+		case 115200: return 5;
+		case 57600:  return 4;
+		case 38400:  return 3;
+		case 19200:  return 2;
+		default:     return 1; // 9600
+	}
+}
+
+// The baud our UART + the module are currently running at (set by autodetect).
+static int s_gps_applied_baud = 9600;
+
+// Send a binary UBX message (u-blox only). Frame: B5 62 <cls> <id> <len_le>
+// <payload> <ck_a> <ck_b>, checksum = 8-bit Fletcher over cls..payload. Modules
+// that are not u-blox see this as noise between NMEA sentences and drop it.
+static void gps_send_ubx(uint8_t cls, uint8_t id, const uint8_t *payload, uint16_t len)
+{
+	uint8_t buf[32];
+	if ((size_t)len + 8 > sizeof(buf)) return;
+	buf[0] = 0xB5; buf[1] = 0x62; buf[2] = cls; buf[3] = id;
+	buf[4] = (uint8_t)(len & 0xFF); buf[5] = (uint8_t)(len >> 8);
+	for (uint16_t i = 0; i < len; i++) buf[6 + i] = payload[i];
+	uint8_t a = 0, b = 0;
+	for (uint16_t i = 2; i < 6 + len; i++) { a = (uint8_t)(a + buf[i]); b = (uint8_t)(b + a); }
+	buf[6 + len] = a; buf[7 + len] = b;
+	uart_write_bytes(GPS_UART_NUM, (const char *)buf, 8 + len);
+	uart_wait_tx_done(GPS_UART_NUM, pdMS_TO_TICKS(100));
+}
+
+// UBX-CFG-PRT (u-blox): set UART1 to `baud`, 8N1, in = UBX+NMEA+RTCM, out = UBX+NMEA.
+// This is u-blox's documented way to change the port baud; u-blox has no NMEA
+// sentence for it that we can rely on. 20-byte payload, all little-endian.
+static void gps_send_ubx_cfg_prt(int baud)
+{
+	uint8_t p[20] = {0};
+	p[0]  = 0x01;                              // portID: UART1
+	p[4]  = 0xD0; p[5] = 0x08;                 // mode: 8 data bits, no parity, 1 stop bit
+	p[8]  = (uint8_t)(baud       & 0xFF);      // baudRate (u32)
+	p[9]  = (uint8_t)((baud >> 8)  & 0xFF);
+	p[10] = (uint8_t)((baud >> 16) & 0xFF);
+	p[11] = (uint8_t)((baud >> 24) & 0xFF);
+	p[12] = 0x07;                              // inProtoMask:  UBX + NMEA + RTCM
+	p[14] = 0x03;                              // outProtoMask: UBX + NMEA
+	gps_send_ubx(0x06, 0x00, p, sizeof(p));
+}
+
+// Ask the module to change UART baud in every command family we might be talking
+// to. A module silently ignores a message addressed to a different vendor, so
+// sending all of them is safe and removes the need to know which chipset is
+// fitted. Per-vendor documented mechanism (see gps-modules-reference):
+//   CASIC / AT6558 (ATGM336H)  -> $PCAS01,<code>          NMEA proprietary
+//   MTK            (PA6H etc.) -> $PMTK251,<baud>          NMEA proprietary
+//   u-blox         (NEO-6M/8M) -> UBX-CFG-PRT              BINARY, not NMEA
+// Caller must verify afterwards that the module actually moved — a module that
+// speaks none of these stays where it is.
+static void gps_send_baud_cmds(int target)
+{
+	char body[40];
+	snprintf(body, sizeof(body), "PCAS01,%d", gps_pcas_baud_code(target));
+	gps_send_pcas(body);
+	snprintf(body, sizeof(body), "PMTK251,%d", target);
+	gps_send_pcas(body);
+	// UBX-CFG-PRT is written from the u-blox interface spec but is UNVERIFIED on
+	// real hardware: the only "NEO-6M" on the bench turned out not to be a genuine
+	// u-blox (it ignores UBX-CFG-PRT and emits multi-GNSS $GN sentences a GPS-only
+	// NEO-6M cannot produce). It is harmless to send and should help a real u-blox;
+	// do not claim it as tested until someone runs it against a genuine part.
+	gps_send_ubx_cfg_prt(target);
+}
+
+// Listen at a given baud for a short window and report whether the module is
+// speaking there. You cannot ASK the module its baud out-of-band (you'd have to
+// already be at its baud to be understood and to read the reply) — but it streams
+// NMEA continuously, so we just listen: a valid "$G.." sentence at baud X means
+// the module is running at X. Window must exceed one 1 Hz burst period.
+static bool gps_probe_nmea(int baud, int window_ms)
+{
+	uart_set_baudrate(GPS_UART_NUM, baud);
+	uart_flush_input(GPS_UART_NUM);
+	int64_t end = esp_timer_get_time() + (int64_t)window_ms * 1000;
+	char buf[256];
+	while (esp_timer_get_time() < end) {
+		int n = uart_read_bytes(GPS_UART_NUM, (uint8_t *)buf, sizeof(buf) - 1, pdMS_TO_TICKS(100));
+		for (int i = 0; i + 1 < n; i++)
+			if (buf[i] == '$' && buf[i + 1] == 'G') return true; // $GPxxx / $GNxxx
+	}
+	return false;
+}
+
+// Find the module's ACTUAL baud and make our UART + the module agree on the
+// configured target. The ATGM336H persists its baud in battery-backed RAM, so it
+// may be at any previously-set rate regardless of our NVS setting; trusting NVS
+// blindly gives a silent no-fix (garbage read at the wrong baud). Probe the
+// configured baud first, then the others; if the module is elsewhere, command it
+// to the target and re-sync. Runs once at boot before gps_task starts.
+static void gps_autodetect_and_sync(void)
+{
+	int target = g_wd_gps_baud;
+	const int cand[] = { target, 115200, 38400, 9600 };
+	int detected = 0;
+	for (int i = 0; i < 4 && detected == 0; i++) {
+		bool dup = false;
+		for (int j = 0; j < i; j++) if (cand[j] == cand[i]) dup = true;
+		if (dup) continue;
+		if (gps_probe_nmea(cand[i], 1300)) detected = cand[i];
+	}
+
+	if (detected == 0) {
+		uart_set_baudrate(GPS_UART_NUM, target);
+		s_gps_applied_baud = target;
+		ESP_LOGW(TAG, "GPS: no NMEA at any baud (module absent?); staying at %d", target);
+		return;
+	}
+	if (detected == target) {
+		uart_set_baudrate(GPS_UART_NUM, target);
+		s_gps_applied_baud = target;
+		ESP_LOGI(TAG, "GPS: module at configured baud %d", target);
+		return;
+	}
+
+	// Module is at a different baud than configured — command it to target.
+	ESP_LOGW(TAG, "GPS: module at %d, configured %d — re-syncing", detected, target);
+	uart_set_baudrate(GPS_UART_NUM, detected);           // talk to it where it is
+	gps_send_baud_cmds(target);                          // CASIC + MTK + u-blox
+	vTaskDelay(pdMS_TO_TICKS(150));
+	if (gps_probe_nmea(target, 1300)) {                  // did it move?
+		s_gps_applied_baud = target;
+		ESP_LOGI(TAG, "GPS: re-sync OK, now at %d", target);
+	} else {
+		// Module did not switch — adopt its real baud so GPS still works, and keep
+		// the in-RAM setting consistent (persisted to NVS on next Options save).
+		uart_set_baudrate(GPS_UART_NUM, detected);
+		s_gps_applied_baud = detected;
+		g_wd_gps_baud      = detected;
+		ESP_LOGW(TAG, "GPS: re-sync failed; adopting module baud %d", detected);
+	}
+}
+
+// Runtime baud switch from the Wardrive Options screen. Commands the module at the
+// CURRENT baud, then moves our UART and the tracked baud to `target`. gps_task keeps
+// reading throughout and a live fix survives the switch (bench-proven). We never write
+// the module's own flash (no PCAS00) so we cannot permanently alter someone's module.
+// NOTE: do NOT rely on "a power cycle puts the module back to 9600" — these modules
+// carry a backup battery and keep their baud across a cold boot. What actually makes a
+// wrong baud unbrickable is gps_autodetect_and_sync(): it PROBES the candidate rates at
+// boot and adopts whatever the module is really speaking.
+// Only 9600 and 115200 are offered (38400 was measured to silently stay at 1 Hz).
+static bool gps_apply_baud_live(int target)
+{
+	if (target != 9600 && target != 115200) target = 9600;
+	if (target == s_gps_applied_baud) { g_wd_gps_baud = target; return true; }   // already there
+
+	const int prev = s_gps_applied_baud;
+	gps_send_baud_cmds(target);                  // CASIC + MTK + u-blox, sent at the current baud
+	vTaskDelay(pdMS_TO_TICKS(200));
+
+	// VERIFY, never assume. A module that speaks none of those families simply
+	// ignored us and is still at `prev`; moving our UART anyway would leave the
+	// GPS mute for the whole session (it only recovers at the next boot, via
+	// gps_autodetect_and_sync). So listen at the target first, and fall back.
+	if (!gps_probe_nmea(target, 1300)) {
+		uart_set_baudrate(GPS_UART_NUM, prev);
+		uart_flush_input(GPS_UART_NUM);
+		s_gps_applied_baud = prev;
+		g_wd_gps_baud      = prev;
+		ESP_LOGW(TAG, "GPS: module did not accept baud %d (unsupported command set?) — staying at %d",
+		         target, prev);
+		return false;
+	}
+
+	uart_flush_input(GPS_UART_NUM);
+	s_gps_applied_baud = target;
+	g_wd_gps_baud      = target;
+	if (target < 115200) gps_set_update_rate_hz(1);   // 9600 cannot carry >1 Hz
+	ESP_LOGI(TAG, "GPS: live baud switch -> %d (verified)", target);
+	return true;
+}
+
+// Load ONLY the saved GPS baud from NVS. init_gps_uart() runs at the very top of
+// app_main(), long before nvs_settings_load(), so g_wd_gps_baud is still the 9600
+// compile-time default when the autodetect below picks its target. Without this,
+// a saved 115200 was ignored at boot — and worse, a module that had kept 115200 in
+// its battery-backed RAM got commanded back DOWN to 9600, while nvs_settings_load()
+// later set g_wd_gps_baud=115200 so the UI claimed 115200 with the hardware at 9600.
+static void gps_load_baud_setting(void)
+{
+	nvs_handle_t h;
+	if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return;
+	uint8_t wgb = 0;
+	if (nvs_get_u8(h, NVS_KEY_WD_GBAUD, &wgb) == ESP_OK)
+		g_wd_gps_baud = (wgb == 1) ? 115200 : 9600;
+	nvs_close(h);
+}
+
 static esp_err_t init_gps_uart(void)
 {
+	gps_load_baud_setting();   // must precede gps_autodetect_and_sync()
 	uart_config_t uart_config = {
 		.baud_rate = 9600,
 		.data_bits = UART_DATA_8_BITS,
@@ -34088,6 +35050,15 @@ static esp_err_t init_gps_uart(void)
 	if ((err = uart_driver_install(GPS_UART_NUM, GPS_BUF_SIZE * 2, 0, 0, NULL, 0)) != ESP_OK) return err;
 	if ((err = uart_param_config(GPS_UART_NUM, &uart_config)) != ESP_OK) return err;
 	if ((err = uart_set_pin(GPS_UART_NUM, GPS_TX_PIN, GPS_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE)) != ESP_OK) return err;
+
+	// Detect the module's real baud (battery-backed, may not match NVS) and sync.
+	gps_autodetect_and_sync();
+	// Normalise the fix RATE to a known 1 Hz. Rate also lives in battery-backed RAM and
+	// can be stale (e.g. 5 Hz from a previous 115200 session); our rate guard assumes 1 Hz
+	// at boot, so a stale high rate at 9600 would truncate the stream (RMC dropped). No fix
+	// exists yet at boot, so this PCAS02 does not cost a hot-start (that risk is runtime-only).
+	gps_send_pcas("PCAS02,1000");
+	s_gps_applied_hz = 1;
 	return ESP_OK;
 }
 
@@ -34148,6 +35119,7 @@ static bool parse_gps_nmea(const char *nmea_sentence)
 			current_gps.valid = true;
 			g_gps_last_known = current_gps;  // always snapshot every valid fix
 			g_gps_save_pending = true;       // main loop will call nvs_save_last_gps()
+			g_gga_parses++;                  // true fix cadence (any reader)
 			return true;
 		}
 	}
@@ -34163,6 +35135,7 @@ static bool parse_gps_nmea(const char *nmea_sentence)
 		int field = 0;
 		char status = 'V';
 		int hh = 0, mm = 0, ss = 0, day = 0, mon = 0, yr = 0;
+		float sog_ms = 0.0f; // speed over ground, m/s (field 7 = knots)
 
 		while (token != NULL) {
 			switch (field) {
@@ -34174,6 +35147,9 @@ static bool parse_gps_nmea(const char *nmea_sentence)
 					}
 					break;
 				case 2: status = token[0]; break; // A=active, V=void
+				case 7: // Speed over ground in knots -> m/s (adaptive wardrive)
+					sog_ms = (float)atof(token) * 0.514444f;
+					break;
 				case 9: // DDMMYY
 					if (strlen(token) >= 6) {
 						day = (token[0]-'0')*10 + (token[1]-'0');
@@ -34185,6 +35161,9 @@ static bool parse_gps_nmea(const char *nmea_sentence)
 			token = strtok_r(NULL, ",", &sp);
 			field++;
 		}
+
+		// Ground speed for adaptive wardrive: valid only while the fix is active.
+		current_gps.speed = (status == 'A') ? sog_ms : 0.0f;
 
 		if (status == 'V' && current_gps.valid) {
 			current_gps.valid = false;
@@ -34230,16 +35209,44 @@ static bool parse_gps_nmea(const char *nmea_sentence)
 static void gps_task(void *arg)
 {
 	(void)arg;
+	static int64_t  s_dbg_last_us = 0;
+	static uint32_t s_dbg_bytes   = 0;
+	static uint16_t s_dbg_gga     = 0;   // [GPSDBG] GGA (position) sentences per window
+	static uint16_t s_dbg_rmc     = 0;   // [GPSDBG] RMC (time/speed) sentences per window
+	static char     s_dbg_line[80] = "";
 	for (;;) {
 		int len = uart_read_bytes(GPS_UART_NUM, (uint8_t *)gps_rx_buffer, GPS_BUF_SIZE - 1, pdMS_TO_TICKS(200));
 		if (len > 0) {
 			g_gps_uart_data_seen = true;   // at least one byte received — module is wired up
+			s_dbg_bytes += (uint32_t)len;  // [GPSDBG] throughput accounting
 			gps_rx_buffer[len] = '\0';
 			char *line = strtok(gps_rx_buffer, "\r\n");
 			while (line != NULL) {
+				if (line[0] == '$') {       // remember last well-formed sentence for the debug line
+					strncpy(s_dbg_line, line, sizeof(s_dbg_line) - 1);
+					s_dbg_line[sizeof(s_dbg_line) - 1] = '\0';
+					if (strstr(line, "GGA")) s_dbg_gga++;        // position-fix cadence
+					else if (strstr(line, "RMC")) s_dbg_rmc++;   // time/speed cadence
+				}
 				parse_gps_nmea(line);
 				line = strtok(NULL, "\r\n");
 			}
+		}
+		// GPS status heartbeat (every 5 s). bytes/s>0 with last=[] (no valid $G
+		// sentence) means our UART baud does not match the module — the auto-detect
+		// at boot should prevent this, but it is logged for field diagnosis.
+		// gga/rmc = sentences in the window; divide by 5 for effective Hz.
+		int64_t now = esp_timer_get_time();
+		if (now - s_dbg_last_us >= 5000000) {
+			s_dbg_last_us = now;
+			uint32_t fixes = g_gga_parses; g_gga_parses = 0;   // TRUE fix cadence (both readers)
+			ESP_LOGI(TAG, "[GPSDBG] baud=%d hz=%d bytes5s=%lu task_gga=%u rmc=%u FIX/5s=%lu sats=%d valid=%d fix=%.5f,%.5f last=[%s]",
+			         s_gps_applied_baud, s_gps_applied_hz, (unsigned long)s_dbg_bytes,
+			         (unsigned)s_dbg_gga, (unsigned)s_dbg_rmc, (unsigned long)fixes,
+			         current_gps.satellites, (int)current_gps.valid,
+			         (double)current_gps.latitude, (double)current_gps.longitude, s_dbg_line);
+			s_dbg_bytes = 0; s_dbg_gga = 0; s_dbg_rmc = 0;
+			s_dbg_line[0] = '\0';
 		}
 		vTaskDelay(pdMS_TO_TICKS(100));
 	}
@@ -50401,8 +51408,12 @@ static void chameleon_screen_stop(void)
     s_cham_ui_st     = (cham_state_t)0xFF;
     s_cham_list_n    = 0;
     /* Disconnect only when leaving the Chameleon feature entirely (not when
-     * navigating to a child screen like the LF reader). */
-    if (!s_cham_nav_child) {
+     * navigating to a child screen like the LF reader) AND only if NimBLE is
+     * actually up. BLE is brought up lazily by the Scan button (ensure_ble_mode),
+     * so entering the screen and leaving WITHOUT scanning — or leaving after a BLE
+     * wardrive tore NimBLE down — means the host is gone; cham_disconnect() ->
+     * ble_gap_disc_cancel() -> ble_hs_is_enabled() then faults (Load access fault). */
+    if (!s_cham_nav_child && nimble_initialized) {
         cham_disconnect();
     }
     s_cham_nav_child = false;

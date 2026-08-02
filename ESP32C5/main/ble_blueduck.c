@@ -11,6 +11,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_heap_caps.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -55,8 +56,8 @@ static const bd_persona_t s_personas[] = {
 
 #define BD_SCRIPT_DIR   "/sdcard/lab/ble/blueduck/scripts"
 
-static char   s_script_names[BD_MAX_SCRIPTS][64];
-static char   s_script_paths[BD_MAX_SCRIPTS][128];
+EXT_RAM_BSS_ATTR static char   s_script_names[BD_MAX_SCRIPTS][64];
+EXT_RAM_BSS_ATTR static char   s_script_paths[BD_MAX_SCRIPTS][128];
 static int    s_script_count = 0;
 /* PSRAM-backed script content cache — loaded during blueduck_scan_scripts()
    while WiFi DMA RAM is still available; BLE leaves < 1 KB DMA-capable free
