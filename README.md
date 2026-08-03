@@ -5,7 +5,7 @@
 <h1 align="center">Cheap Yellow Monster</h1>
 
 <p align="center">
-  <b>v2.11.0</b>
+  <b>v2.12.0</b>
 </p>
 
 <p align="center">
@@ -154,8 +154,8 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **WiFi Band Scope** | Promiscuous RSSI per-channel waterfall (2.4 GHz 13-ch or 5 GHz 25-ch); band toggle updates axis label and resets peaks; 60 ms dwell / 0.8 s full 2.4 sweep |
 | **Drone Detector** | Dual-mode (BLE5 extended + WiFi 2.4/5 GHz) passive Remote ID scanner. Detects all ASTM F3411-compliant drones via BLE service UUID 0xFFFA and WiFi Remote ID beacons; DJI presence by OUI / service UUID 0xFFF0. Alternates BLE and WiFi scan phases; logs to SD. |
 | **Drone Spoof** | Broadcasts a synthetic ASTM F3411 Remote ID beacon over BLE or WiFi. Configurable UAS ID, operator ID, GPS coordinates, altitude, speed, and heading. For RF research, drone regulation testing, and authorized counter-UAS research. |
-| **Wardriving** | GPS + WiFi logging, dual-band filter (2.4 GHz / 5 GHz / Both), optional BLE time-sliced scanning, WiGLE CSV 1.6, upload log tracking, raw PCAP toggle, GPS mark waypoints (GPX output), WiGLE and WDG Wars upload; GPS last-known position hold with 150 m stale accuracy when signal is lost; live dashboard shows separate WiFi network count and BLE device count |
-| **GPS** | NMEA RMC auto-syncs system clock (FAT timestamps); last-known position persisted to NVS (5-minute throttle); manual fallback editor in Settings → GPS Info; all data-collection features (wardrive, GATT Walker, marks) use best available GPS transparently |
+| **Wardriving** | GPS + WiFi + BLE logging, dual-band (2.4 GHz / 5 GHz / Both); **speed-adaptive capture** (Stationary / Walking / Driving profiles, GPS-triggered with hysteresis); **D-UCB channel bandit** rewards new networks per dwell, DFS tier-weighted at speed; **BLE-only mode fixed** (v2.12.0 — was collecting 0 devices); **BLE dashboard** B\|MAC\|Name\|RSSI with active scan + SCAN_RSP name backfill; **CSV fsync** — power-cut safe at 10/20/30 s verified; **auto-rotation** into journey-grouped parts (WD_Wifi_\<stamp\>-NNN.csv / WD_BLE_\<stamp\>-NNN.csv); WiGLE CSV 1.6, WiGLE + WDG Wars upload; GPS mark waypoints (GPX); last-known position hold with 150 m stale accuracy; AltitudeMeters + AccuracyMeters filled from real GPS fix |
+| **GPS** | NMEA auto-syncs system clock; **boot-time baud auto-detect** (module keeps baud in battery-backed RAM across power cycles); **optional 115200 / 5 Hz** opt-in with verify-and-revert safety (5.2 fix/s measured under full wardrive load; 18 m → 3.6 m between fixes at 65 km/h); **multi-vendor rate commands** (CASIC, MTK, u-blox UBX); **GPS status icon** in the top bar of every screen; last-known position persisted to NVS; manual fallback editor in Settings → GPS Info |
 | **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk (with **advanced advertising fingerprinting** — AD-type decode, Company ID lookup, URIs, flags), Bluetooth Lookout, BLE Spam (8 modes incl. Sour Apple), Device Spoof (general + directed), BLE Disconnect (directed), BLE PCAP (Kismet PCAPNG raw capture; BLE 5.0 extended advertisement support), **BlueDuck** (BLE HID DuckyScript keyboard injector), **HoneyPair** (BLE persona honeypot), **WhisperPair** (CVE-2025-36911 Google Fast Pair KBP bypass — auto-scan, sequential run-all FP targets, AES-128-ECB exploit); BT Scan & Select supports **Save List** (GPS-tagged JSON snapshot of every device found); **Matter [M] detection** passive tagging of Thread/BLE Matter devices by GATT service `0xFFF6`; **GATT Interactive** (live read/write/subscribe to individual characteristics after walk); **GATT HID Decoder** (parses HID Report Map, decodes live keyboard/mouse input); **Saved Clones** browser; **BLE MITM Proxy** |
 | **Deauth Client** | Passive discovery of clients associated with any nearby AP — without connecting or running any attack. Lists client MACs, associated BSSID, RSSI, and last-seen time; useful for pre-attack recon and monitoring |
 | **Zigbee Scout** | IEEE 802.15.4 passive wardrive using the ESP32-C5's built-in PHY; logs PAN IDs, channel, RSSI, device addresses, and NWK/APS frame metadata to WiGLE-compatible CSV + PCAP; RSSI locator locks onto a specific PAN; logs to `/sdcard/lab/zigbee/` |
@@ -178,7 +178,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 
 ## Menu Map
 
-Complete navigation tree as of v2.11.0. Items marked `[stub]` are placeholders with "Coming in next version" screens. Items marked `[RF-HAT]` require the NM-RF-HAT expansion board enabled in Settings → Hardware Options.
+Complete navigation tree as of v2.12.0. Items marked `[stub]` are placeholders with "Coming in next version" screens. Items marked `[RF-HAT]` require the NM-RF-HAT expansion board enabled in Settings → Hardware Options.
 
 ```
 Home
@@ -296,7 +296,13 @@ Home
 │       ├── Fox Hunt (433.92 MHz fixed, edge-count activity, haptic)
 │       └── OOK Scan (EV1527 decoder via R4A_433 superheterodyne RX)
 └── NFC / RFID Hub  [always visible]
-    ├── Chameleon Ultra  [BLE — coming soon]
+    ├── Chameleon Ultra  [BLE]
+    │   ├── Scan & Connect
+    │   ├── Read LF         ← EM410X / HID H10301 → .rfid
+    │   ├── Read HF         ← ISO 14443-A → .nfc; Dump Card after detect
+    │   ├── Slot Manager    ← browse / activate all 8 slots
+    │   ├── Clone to Slot   ← write captured UID to any slot
+    │   └── Load from SD    ← long-press .rfid/.nfc to load into active slot
     └── PN532 NFC  [RF-HAT DIP 3 — or standalone on CN1]
         ├── Scan & Read  →  Read All (full page dump)  →  Save / Export .nfc
         ├── Clone/Write  →  Select source  →  Clone to blank NTAG
@@ -1610,7 +1616,7 @@ Wardrive
 
 #### Starting a Wardrive
 
-Tap **Wardrive** from the main menu, then **Start Wardrive**. The firmware switches the radio to promiscuous mode, begins D-UCB channel hopping, and writes a new WiGLE CSV 1.6 file to `/sdcard/lab/wardrives/`.
+Tap **Wardrive** from the main menu, then **Start Wardrive**. The firmware switches the radio to promiscuous mode, begins D-UCB channel hopping, and writes a new WiGLE CSV 1.6 file to `/sdcard/lab/wardrives/` (filename: `WD_Wifi_<date>-001.csv`). Files auto-rotate into sequentially numbered parts within the same journey (`-001`, `-002`, …) to stay within upload size limits.
 
 **GPS at start-up:**
 - If a live GPS fix is already active, wardrive starts immediately.
@@ -1622,16 +1628,26 @@ Tap **Wardrive** from the main menu, then **Start Wardrive**. The firmware switc
 - Scanning only pauses if there is truly no position at all (no live fix, no last-known).
 - When signal returns, live coordinates and accuracy resume automatically.
 
+**Adaptive speed-based capture:** With Speed Adaptive Mode on (default), dwell time and DFS channel weighting adjust automatically based on real GPS speed:
+
+| Profile | Trigger | Dwell | DFS |
+|---------|---------|-------|-----|
+| **Stationary** | < 5 km/h | 500 ms | Full weight |
+| **Walking** | 5–20 km/h | 300 ms | Full weight |
+| **Driving** | > 20 km/h | 150 ms | 1 in 10 sweeps |
+
+The active profile and a live speed readout appear in the dashboard footer. The profile border is green (adaptive) or red (manual override).
+
 The live dashboard shows:
 
 | Field | Description |
 |-------|-------------|
-| **D-UCB** (green box) | Current channel being scanned — shows **BLE** during a BLE time-slice pass |
+| **Band badge** | Green = 5 GHz, amber = 2.4 GHz — visible per-row in the AP table |
+| **D-UCB** (green box) | Current channel being scanned — shows **BLE** during a BLE pass |
 | **WiFi** (cyan box) | Unique WiFi networks logged this session |
-| **BLE** (purple box) | BLE devices collected across all BLE passes this session |
+| **BLE** (purple box) | BLE devices collected this session |
 | **GPS bar** | Live coordinates (green) or last-known position (amber) with satellite count |
-
-The three stat boxes span the full screen width below the GPS bar. The BLE counter increments in real time during each 8-second BLE pass so you can confirm BLE scanning is working.
+| **GPS icon** (top bar) | Green satellite = fix, grey with red slash = no fix |
 
 **Stop** — ends the session, closes all open files, and returns to the Wardrive menu.
 
@@ -1677,27 +1693,32 @@ Tap **Options** from the Wardrive menu to configure the current session paramete
 | Option | Values | Default | Description |
 |--------|--------|---------|-------------|
 | **Band** | Both / 2.4 GHz / 5 GHz | Both | Restricts D-UCB channel hopping to the selected band |
-| **Raw PCAP** | On / Off | Off | When enabled, writes a `.pcap` file alongside the CSV for each session |
-| **BLE Wardrive** | On / Off | Off | Enables BLE time-sliced scanning (see below) |
+| **Speed Adaptive Mode** | On / Off | On | Auto-adjusts dwell and DFS weighting by GPS speed; when off, reveals Manual Mode dropdown |
+| **Manual Mode** | Stationary / Walking / Driving | Driving | Fixed capture profile when adaptive mode is off; shows profile parameters in label |
+| **BLE Wardrive** | On / Off | Off | Enables BLE time-sliced scanning alongside WiFi (see below) |
+| **BLE-only Wardrive** | On / Off | Off | Dedicated BLE-only run — calls `esp_wifi_deinit()` to free WiFi DMA pool before NimBLE starts |
+| **GPS Baud** | 9600 / 115200 | 9600 | Opt-in 115200 enables 5 Hz GPS fixes (5.2 fix/s measured); verify-and-revert safety prevents lock-out |
 
 #### BLE Time-Sliced Wardriving
 
 When **BLE Wardrive** is enabled, the firmware periodically pauses WiFi scanning for a short BLE pass:
 
 1. Every **30 seconds** of WiFi scanning, the promiscuous sniffer is paused.
-2. The radio switches to BLE mode and runs an **8-second active BLE scan**.
-3. All discovered BLE devices (deduplicated by MAC) are recorded with the current GPS fix.
+2. The radio switches to BLE mode and runs an **active BLE scan** (solicits `SCAN_RSP` — the packet where most devices advertise their name).
+3. All discovered BLE devices (deduplicated by MAC, with name backfill on subsequent sightings) are recorded with the current GPS fix, altitude, and accuracy from the real GPS reading at detection time.
 4. The radio switches back to WiFi, D-UCB is rebuilt, and scanning resumes.
 
-During the BLE pass, the D-UCB box shows **BLE** and the purple **BLE** counter increments as devices are discovered — confirming the scan is active even though the WiFi table is idle.
+During the BLE pass, the D-UCB box shows **BLE** and the purple **BLE** counter increments as devices are discovered.
 
-**BLE rows in the CSV** follow the same WiGLE 1.6 format as WiFi rows, with `Type=BLE`, `Channel=37`, `Frequency=2402`, and `[BLE]` as the auth mode:
+**BLE-only wardrive** runs NimBLE without any active WiFi driver. In v2.12.0 this required calling `esp_wifi_deinit()` to release the WiFi DMA pool before NimBLE starts — without it the controller failed with `0x207 BLE_ERR_MEM_CAPACITY` and collected zero devices. The BLE-only dashboard uses a dedicated `B | MAC | Name | RSSI` layout with a "BLE / SCAN" channel box, distinct from the WiFi dashboard. BLE device cap is 2000 (stored in PSRAM).
+
+**BLE rows in the CSV** follow the same WiGLE 1.6 format as WiFi rows, with real `AltitudeMeters` and `AccuracyMeters` filled from the GPS fix at discovery time:
 
 ```
-AA:BB:CC:DD:EE:FF,"My Speaker",[BLE],2026-05-08 12:34:56,37,2402,-72,37.123456,-122.456789,42.0,0.00,,,BLE
+AA:BB:CC:DD:EE:FF,"My Speaker",[BLE],2026-05-08 12:34:56,37,2402,-72,37.123456,-122.456789,42.0,8.40,,,BLE
 ```
 
-This produces a single CSV file containing both WiFi and BLE sightings, uploadable directly to WiGLE which supports both types in the same file.
+Mixed WiFi+BLE CSV files (from BLE time-slice mode) upload directly to WiGLE and WDG Wars — both services process both types in the same file.
 
 #### D-UCB Band Filtering
 
@@ -1711,7 +1732,7 @@ The D-UCB channel scheduler respects the **Band** option:
 
 #### Manage Data Screen
 
-**Manage Data** lists all wardrive CSV files in `/sdcard/lab/wardrives/`. Each row shows the filename and upload status read from `upload_log.csv`:
+**Manage Data** lists all wardrive CSV files in `/sdcard/lab/wardrives/`. Each row shows the filename (wrapping to two lines for long names) and upload status read from `upload_log.csv`:
 
 | Row color | Meaning |
 |-----------|---------|
@@ -1721,12 +1742,14 @@ The D-UCB channel scheduler respects the **Band** option:
 
 Each row has an **X** button to delete that file from the SD card. Tap **Upload** to proceed to the upload screen (which returns to Manage Data when done, so you can check updated statuses).
 
+**Journey-grouped filenames:** Each wardrive session produces files named `WD_Wifi_<YYYYMMDD_HHMMSS>-NNN.csv` (and `WD_BLE_<stamp>-NNN.csv` for BLE-only runs). When a file reaches the rotation threshold, it is closed and a new part is opened with the next sequential suffix — all parts of the same journey share the same date/time stamp.
+
 The upload log at `/sdcard/lab/wardrives/upload_log.csv` records one row per file per service:
 
 ```
-wd000001.csv,WIGLE,OK
-wd000001.csv,WDGWARS,OK
-wd000002.csv,WIGLE,FAIL
+WD_Wifi_20260803_141500-001.csv,WIGLE,OK
+WD_Wifi_20260803_141500-001.csv,WDGWARS,OK
+WD_Wifi_20260803_141500-002.csv,WIGLE,New
 ```
 
 #### Wardrive File Format
@@ -1736,11 +1759,11 @@ WiGLE CSV 1.6 — accepted directly by WiGLE and WDG Wars without conversion.
 ```
 WigleWifi-1.6,appRelease=v1.0.4,model=NM-CYD-C5,...
 MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type
-AA:BB:CC:DD:EE:FF,"MyNetwork",[WPA2_PSK],2026-05-08 12:34:56,6,2437,-65,37.123456,-122.456789,0.00,8.40,,,WIFI
-11:22:33:44:55:66,"BLE Device",[BLE],2026-05-08 12:35:02,37,2402,-72,37.123456,-122.456789,0.00,150.00,,,BLE
+AA:BB:CC:DD:EE:FF,"MyNetwork",[WPA2_PSK],2026-08-03 14:15:23,6,2437,-65,37.123456,-122.456789,42.0,8.40,,,WIFI
+11:22:33:44:55:66,"BLE Device",[BLE],2026-08-03 14:15:30,37,2402,-72,37.123456,-122.456789,42.0,8.40,,,BLE
 ```
 
-`AccuracyMeters` is populated per-network from the GPS reading at discovery time. A live fix with HDOP 2.1 produces accuracy = `2.1 × 4 = 8.4 m`. A network logged from last-known fallback coordinates produces `150.00 m`. WiGLE uses this field to place the network on its map with an appropriate uncertainty radius.
+`FirstSeen` is stamped from the GPS-synced clock at the moment the network is first detected. `AltitudeMeters` and `AccuracyMeters` are filled from the live GPS reading at that moment. `AccuracyMeters` = HDOP × 4 (e.g. HDOP 2.1 → 8.4 m); fallback coordinates produce `150.00 m`. WiGLE uses this field to place networks on its map with an appropriate uncertainty radius.
 
 #### Wardriving Workflow — Field Use
 
@@ -2322,7 +2345,7 @@ Copy any `.ir` file directly into `/sdcard/lab/infrared/` — no conversion need
 | **Scan & Read** | Hold a card near the antenna — detected in under a second. Panel border turns green, card type and UID appear. **Auto-reads after 1 second** of stable detection (no button tap needed). If NDEF content is present, the URL or text is decoded and shown on screen. Read button turns green when card is ready; tap it to re-read manually. |
 | **Clone / Write** | Read a source card on Scan & Read, then open Clone/Write. The source card's data is shown. Hold a **blank NTAG213/215/216** card on the antenna and tap **Clone to Blank Card** to write pages 4-44. MIFARE Classic cards are rejected with a clear error — they cannot receive NTAG data. Use a Magic/CUID blank card to clone all pages including UID. |
 | **Card Emulate** | Select a saved card; PN532 enters `TgInitAsTarget` mode presenting the card's UID to any nearby reader. Responds to NTAG READ (0x30) commands using saved page data. MIFARE Classic CRYPTO1 auth is not supported in emulation. |
-| **Key Test** | Present a MIFARE Classic 1K/4K card; runs default key dictionary against each sector; displays unlocked block data. For authorized testing on own cards only. |
+| **Key Test** | Present a MIFARE Classic 1K/4K card; tries 16 built-in default keys then automatically loads up to 512 additional keys from `/sdcard/lab/rfid/keys/mf_keys.dic` (same file as Chameleon Dump Card); displays unlocked block data. For authorized testing on own cards only. |
 | **Saved Cards** | Scrollable list of saved JSON cards. Drop Flipper `.nfc` files in `/sdcard/lab/rfid/import/` to import directly. |
 | **HW Test** | PN532 I2C probe — reads IC identifier, firmware version, support bitmask. Full I2C bus scan on failure. |
 
@@ -3045,7 +3068,7 @@ This project wouldn't be where it is without the brilliant minds and generous ti
 
 **Heartfelt thanks to:**
 
-- **@Birolt29** — An extraordinary contributor who has gone far above and beyond at every stage of this project. Birol performed deep ESP32-C5 DMA and render pipeline analysis on real hardware, submitted multiple major patch sets, and caught critical bugs before they ever reached users. His contributions include: the v2.10.15 hardware optimization patch (upload stability, mbedTLS PSRAM routing, BLE Spam memory hardening); the v2.11.x render performance series (LCD SPI 40→80 MHz, internal DMA draw buffers, -O2 optimization, LVGL memcpy, 15 ms refresh period, PSRAM 80 MHz — bringing full-frame render from 148 ms to ~77 ms); the SD remount mutex fix that eliminated a hard reset race; moving 17.4 KB of IR/RF433 name tables to PSRAM BSS; the GATT Walker double-init reset fix; diagnosing and fixing the wardrive GPS crash (GitHub issue #12 — stack-allocated `lv_msgbox` button map dangling after function return); and serial-validated testing of every patch on real hardware. The firmware is faster, more stable, and more reliable because of Birol. 🙏
+- **@Birolt29** — An extraordinary contributor who has gone far above and beyond at every stage of this project. Birol performed deep ESP32-C5 DMA and render pipeline analysis on real hardware, submitted multiple major patch sets, and caught critical bugs before they ever reached users. His contributions include: the v2.10.15 hardware optimization patch (upload stability, mbedTLS PSRAM routing, BLE Spam memory hardening); the v2.11.x render performance series (LCD SPI 40→80 MHz, internal DMA draw buffers, -O2 optimization, LVGL memcpy, 15 ms refresh period, PSRAM 80 MHz — bringing full-frame render from 148 ms to ~77 ms); the SD remount mutex fix that eliminated a hard reset race; moving 17.4 KB of IR/RF433 name tables to PSRAM BSS; the GATT Walker double-init reset fix; diagnosing and fixing the wardrive GPS crash (GitHub issue #12 — stack-allocated `lv_msgbox` button map dangling after function return); and for v2.12.0, an entire wardrive overhaul: fixing a silent SD mutex self-deadlock that froze the device mid-session; root-causing and fixing BLE-only wardrive which had been collecting zero devices for months (`esp_wifi_deinit()` needed before NimBLE); +52% DMA headroom by moving five large arrays to PSRAM BSS (internal BSS 129 KB → 113 KB, wardrive DMA floor 20,807 → 31,615 bytes); GPS boot-time baud auto-detect and optional 115200 / 5 Hz with multi-vendor commands (CASIC, MTK, u-blox); adaptive speed-based capture profiles with D-UCB bandit and DFS tier-weighting; GPS status icon in the top bar; FirstSeen fix (was hardcoded 2025-09-26); CSV fsync power-cut safety; journey-grouped CSV rotation; BLE active scan with SCAN_RSP name backfill; BLE-mode dashboard; AltitudeMeters and AccuracyMeters filled from real GPS; and serial-validated testing of every change on real hardware. The firmware is faster, more stable, and more reliable because of Birol. 🙏
 
 - **Anubis** — For creating the first community video showcase of CYM in the wild. Taking the time to film, edit, and publish a video of this project means the world — it helps new users discover what CYM can do and gives the project a presence beyond GitHub. Thank you! 🎬
 
