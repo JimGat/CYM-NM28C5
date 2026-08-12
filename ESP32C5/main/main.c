@@ -690,7 +690,11 @@ typedef enum { WD_RADIO_WIFI_ONLY = 0, WD_RADIO_BLE_ONLY } wd_radio_mode_t;
 // Wardrive BLE time-slice parameters
 #define WDP_BLE_INTERVAL_S   30     // seconds of WiFi scanning between BLE passes
 #define WDP_BLE_DWELL_MS     8000   // ms to scan BLE each pass
-#define WDP_BLE_MAX_DEVICES  2000   // PSRAM dedup buffer; a real drive sees far more than 200
+#define WDP_BLE_MAX_DEVICES  10000  // PSRAM dedup buffer (~835 KB). A 54-min drive filled the old
+                                    // 2000 cap silently mid-session (data past the cap was dropped
+                                    // with no log/UI); 10000 covers ~4.5 h at that rate. Linear dedup
+                                    // scan at 10000 is ~3% CPU in dense BLE — safe. UI shows "FULL"
+                                    // and the log warns once if this is ever reached (see gap cb).
 
 // BLE PCAP capture
 #define BLE_PCAP_DIR         "/sdcard/lab/ble/captures"
@@ -1202,18 +1206,22 @@ typedef enum {
 // exploration weight and GPS update rate. Non-DFS 5 GHz is never dropped.
 // ---------------------------------------------------------------------------
 typedef enum {
-    WD_MODE_STATIONARY = 0,  // Hareketsiz
-    WD_MODE_WALK,            // Yuruyus
-    WD_MODE_CAR,             // Arac
+    WD_MODE_STATIONARY = 0,  // not moving
+    WD_MODE_WALK,            // walking
+    WD_MODE_CAR,             // driving
+    WD_MODE_HIGHWAY,         // driving fast (>90 km/h)
     WD_MODE_COUNT
 } wd_mode_t;
 
 // dwell[mode][tier] in ms — tier index matches wdp_channel_tier_t order.
 // Car's DFS dwell is short AND its D-UCB selection is rate-limited (see below).
+// Highway hops faster still, but keeps 2.4 GHz primary >= one ~102 ms beacon
+// interval so a passive scan still catches at least one beacon per visit.
 static const int wd_dwell_table[WD_MODE_COUNT][4] = {
     /* STATIONARY */ { 500, 450, 450, 300 },
     /* WALK       */ { 350, 300, 300, 250 },
     /* CAR        */ { 150, 130, 130, 130 },
+    /* HIGHWAY    */ { 110, 100, 100,  90 },
 };
 
 // Speed thresholds (m/s) with hysteresis. 1 knot = 0.514 m/s.
@@ -1221,10 +1229,15 @@ static const int wd_dwell_table[WD_MODE_COUNT][4] = {
 #define WD_SPEED_CAR_EXIT    3.333f   // 12 km/h
 #define WD_SPEED_WALK_ENTER  0.833f   // 3 km/h
 #define WD_SPEED_STAT_ENTER  0.556f   // 2 km/h
+#define WD_SPEED_HWY_ENTER   25.0f    // 90 km/h
+#define WD_SPEED_HWY_EXIT    20.83f   // 75 km/h (15 km/h hysteresis under enter)
 #define WD_EMA_ALPHA         0.3f     // smoothing over ~last 4-5 fixes
 #define WD_MODE_MIN_DWELL_MS 5000     // min time in a state before a switch (anti-flap)
+#define WD_MODE_SLOW_DWELL_MS 15000   // longer settle for Walk<->Stationary only (GPS-jitter churn)
 // Car mode: visit DFS arms at most ~1 in this many D-UCB selections.
+// Highway rate-limits DFS harder still (DFS APs rarely repay a visit at speed).
 #define WD_CAR_DFS_SELECT_RATIO 10
+#define WD_HWY_DFS_SELECT_RATIO 30
 
 // Adaptive settings (NVS-backed; bound in the Wardrive Options screen).
 static bool     g_wd_adaptive    = true;               // adaptive ON by default
@@ -1238,6 +1251,7 @@ static const char *wd_mode_name(wd_mode_t m)
         case WD_MODE_STATIONARY: return "Stationary";
         case WD_MODE_WALK:       return "Walking";
         case WD_MODE_CAR:        return "Driving";
+        case WD_MODE_HIGHWAY:    return "Highway";
         default:                 return "?";
     }
 }
@@ -1250,6 +1264,7 @@ static const char *wd_mode_icon(wd_mode_t m)
         case WD_MODE_STATIONARY: return LV_SYMBOL_HOME;         // U+F015 house
         case WD_MODE_WALK:       return MY_SYMBOL_PERSON_WALKING; // U+E553
         case WD_MODE_CAR:        return MY_SYMBOL_CAR;          // U+F1B9
+        case WD_MODE_HIGHWAY:    return MY_SYMBOL_CAR;          // reuse car glyph (name says Highway)
         default:                 return "";
     }
 }
@@ -1258,6 +1273,19 @@ static const char *wd_mode_icon(wd_mode_t m)
 static wd_mode_t g_wd_active_mode   = WD_MODE_STATIONARY;
 static float     g_wd_speed_ema     = 0.0f;
 static int64_t   g_wd_mode_since_us = 0;
+
+// One-shot adaptive-mode transition event. Set by wd_classify_mode when a switch
+// is actually applied; drained by the wardrive loop into a per-session sidecar
+// CSV (WD_<mode>_<stamp>_mode.csv) so an UNATTENDED long drive can be validated
+// afterwards — mode switches are otherwise ONLY in the serial log, which no
+// laptop captures on a road trip. Single producer+consumer (the wardrive task),
+// so a plain struct + flag is race-free here.
+static struct {
+    bool      pending;
+    wd_mode_t from;
+    wd_mode_t to;
+    float     speed_ms;
+} g_wd_mode_evt = { .pending = false };
 
 // Classify capture mode from a raw ground-speed sample (m/s), with EMA
 // smoothing + min-time-in-state hysteresis. Returns the (possibly unchanged)
@@ -1280,18 +1308,34 @@ static wd_mode_t wd_classify_mode(float raw_speed_ms)
             else if (s <  WD_SPEED_STAT_ENTER) next = WD_MODE_STATIONARY;
             break;
         case WD_MODE_CAR:
-            if (s < WD_SPEED_CAR_EXIT)
+            if (s >= WD_SPEED_HWY_ENTER)       next = WD_MODE_HIGHWAY;
+            else if (s < WD_SPEED_CAR_EXIT)
                 next = (s < WD_SPEED_WALK_ENTER) ? WD_MODE_STATIONARY : WD_MODE_WALK;
+            break;
+        case WD_MODE_HIGHWAY:
+            // Step down only to Car; Car then handles any further downshift.
+            if (s < WD_SPEED_HWY_EXIT)         next = WD_MODE_CAR;
             break;
         default: break;
     }
     if (next != cur) {
         int64_t now = esp_timer_get_time();
-        if (now - g_wd_mode_since_us >= WD_MODE_MIN_DWELL_MS * 1000LL) {
+        // Walk<->Stationary flaps on GPS standstill jitter (a real stop still shows
+        // phantom 3-6 km/h wander) and only inflate the mode log - both slow modes
+        // capture the same. Require a longer settle for that slow-pair switch;
+        // Car/Highway transitions stay responsive at WD_MODE_MIN_DWELL_MS.
+        bool slow_pair = (cur  == WD_MODE_STATIONARY || cur  == WD_MODE_WALK) &&
+                         (next == WD_MODE_STATIONARY || next == WD_MODE_WALK);
+        int64_t min_dwell_ms = slow_pair ? WD_MODE_SLOW_DWELL_MS : WD_MODE_MIN_DWELL_MS;
+        if (now - g_wd_mode_since_us >= min_dwell_ms * 1000LL) {
             g_wd_active_mode   = next;
             g_wd_mode_since_us = now;
             ESP_LOGI(TAG, "[WDP] Adaptive mode -> %s (%.1f m/s)",
                      wd_mode_name(next), (double)s);
+            g_wd_mode_evt.from     = cur;
+            g_wd_mode_evt.to       = next;
+            g_wd_mode_evt.speed_ms = s;
+            g_wd_mode_evt.pending  = true;   // wardrive loop flushes it to the mode CSV
         }
     }
     return g_wd_active_mode;
@@ -1353,6 +1397,7 @@ static lv_obj_t *wd_ui_counter_label = NULL;
 static lv_obj_t *wd_ui_ble_label = NULL;
 static lv_obj_t *wd_ui_counter_box = NULL;  // WiFi counter box
 static lv_obj_t *wd_ui_ble_box = NULL;      // BLE counter box
+static lv_obj_t *wd_ui_sats_label = NULL;   // SATS box value (replaces the old top-line "Sats: N")
 static lv_obj_t *wd_ui_header = NULL;
 static lv_obj_t *wd_ui_table = NULL;
 static lv_obj_t *wd_ui_channel_label = NULL;
@@ -2570,6 +2615,7 @@ static void reset_function_page_children(void) {
     wd_ui_ble_label = NULL;
     wd_ui_counter_box = NULL;
     wd_ui_ble_box = NULL;
+    wd_ui_sats_label = NULL;
     wd_ui_channel_label = NULL;
     wd_ui_speed_label = NULL;
     wd_ui_header = NULL;
@@ -3676,8 +3722,7 @@ static void nvs_settings_load(void)
         uint8_t wp = 0;
         if (nvs_get_u8(h, NVS_KEY_WD_PCAP, &wp) == ESP_OK) g_wd_pcap = (wp != 0);
         uint8_t wr = 0;
-        // Don't load wardrive radio mode from NVS — always use default (WiFi) on boot
-        // if (nvs_get_u8(h, NVS_KEY_WD_RADIO, &wr) == ESP_OK) g_wd_radio_mode = (wd_radio_mode_t)wr;
+        if (nvs_get_u8(h, NVS_KEY_WD_RADIO, &wr) == ESP_OK) g_wd_radio_mode = (wd_radio_mode_t)wr;
         uint8_t wad = 0;
         if (nvs_get_u8(h, NVS_KEY_WD_ADAPT, &wad) == ESP_OK) g_wd_adaptive = (wad != 0);
         uint8_t wmm = 0;
@@ -4533,6 +4578,16 @@ static void run_touch_calibration(void)
     lv_obj_set_style_img_recolor(bg_img, lv_color_black(), 0);
     lv_obj_set_style_img_recolor_opa(bg_img, LV_OPA_10, 0);
     lv_obj_move_to_index(bg_img, 0);
+
+    // Persistent hint: resistive touch requires firm pressure; the red dot shows where firmware detected the press.
+    lv_obj_t *hint_lbl = lv_label_create(scr);
+    lv_obj_set_style_text_color(hint_lbl, lv_color_hex(0xFFD600), 0);
+    lv_obj_set_style_text_font(hint_lbl, &lv_font_montserrat_12, 0);
+    lv_label_set_long_mode(hint_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(hint_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(hint_lbl, 220);
+    lv_obj_align(hint_lbl, LV_ALIGN_TOP_MID, 0, 10);
+    lv_label_set_text(hint_lbl, "Resistive touch - press firmly\nRed dot shows detected point");
 
     lv_obj_t *lbl = lv_label_create(scr);
     lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
@@ -7563,14 +7618,21 @@ void app_main(void)
                 if (wd_ui_gps_label && lv_obj_is_valid(wd_ui_gps_label)) {
                     char gps_buf[80];
                     if (current_gps.valid) {
-                        snprintf(gps_buf, sizeof(gps_buf), LV_SYMBOL_GPS " %.5f, %.5f  Sats: %d",
-                                 current_gps.latitude, current_gps.longitude, current_gps.satellites);
+                        snprintf(gps_buf, sizeof(gps_buf), LV_SYMBOL_GPS " %.5f, %.5f",
+                                 current_gps.latitude, current_gps.longitude);
                         lv_obj_set_style_text_color(wd_ui_gps_label, COLOR_MATERIAL_GREEN, 0);
                     } else {
-                        snprintf(gps_buf, sizeof(gps_buf), "Waiting for GPS fix...  Sats: %d", current_gps.satellites);
+                        snprintf(gps_buf, sizeof(gps_buf), "Waiting for GPS fix...");
                         lv_obj_set_style_text_color(wd_ui_gps_label, COLOR_MATERIAL_ORANGE, 0);
                     }
                     lv_label_set_text(wd_ui_gps_label, gps_buf);
+                }
+
+                // Satellite count moved off the top line into its own SATS box.
+                if (wd_ui_sats_label && lv_obj_is_valid(wd_ui_sats_label)) {
+                    char sat_buf[12];
+                    snprintf(sat_buf, sizeof(sat_buf), "%d", current_gps.satellites);
+                    lv_label_set_text(wd_ui_sats_label, sat_buf);
                 }
 
                 if (wd_ui_counter_label && lv_obj_is_valid(wd_ui_counter_label)) {
@@ -7595,8 +7657,13 @@ void app_main(void)
                 }
 
                 if (wd_ui_ble_label && lv_obj_is_valid(wd_ui_ble_label)) {
-                    char ble_buf[16];
-                    snprintf(ble_buf, sizeof(ble_buf), "%d", wdp_ble_count);
+                    char ble_buf[24];
+                    // Flag saturation so a full dedup buffer (dropping new devices) is
+                    // visible instead of the count silently plateauing at the cap.
+                    if (wdp_ble_count >= WDP_BLE_MAX_DEVICES)
+                        snprintf(ble_buf, sizeof(ble_buf), "%d FULL", wdp_ble_count);
+                    else
+                        snprintf(ble_buf, sizeof(ble_buf), "%d", wdp_ble_count);
                     lv_label_set_text(wd_ui_ble_label, ble_buf);
                 }
 
@@ -9632,7 +9699,70 @@ static void ducb_update(int channel_idx, double reward) {
 // Wardrive Promisc: D-UCB, Dedup, Promiscuous Callback
 // ============================================================================
 
+// ─── GPS-derived regulatory domain ────────────────────────────────────────
+// Single source of truth, used by BOTH esp_wifi_set_country() (which channels the
+// radio will accept) and wdp_ducb_init() (which channels we bother to put in the
+// bandit's arm list). Keeping them in sync matters: a set_channel the radio
+// rejects leaves the hardware on the PREVIOUS channel, so the dwell's new-network
+// reward gets mis-credited to the dead arm and D-UCB then over-selects it.
+typedef enum { WDP_DOMAIN_OTHER = 0, WDP_DOMAIN_ETSI, WDP_DOMAIN_FCC } wdp_domain_t;
+
+// Pure function of the current GPS position - safe to call in any order relative
+// to esp_wifi_set_country(). No fix (or outside both boxes) => OTHER, which keeps
+// the pre-v2.12.0-2 behaviour untouched (AUTO country, full channel list).
+static wdp_domain_t wdp_gps_domain(void)
+{
+    const gps_data_t *g = gps_best();
+    if (!g->valid) return WDP_DOMAIN_OTHER;
+    const float lat = g->latitude, lon = g->longitude;
+    if (lat >= 27.0f && lat <= 72.0f && lon >= -25.0f && lon <= 45.0f) return WDP_DOMAIN_ETSI;
+    if (lat >= -56.0f && lat <= 72.0f && lon >= -170.0f && lon <= -30.0f) return WDP_DOMAIN_FCC;
+    return WDP_DOMAIN_OTHER;
+}
+
+// 5 GHz mask for wifi_country_t.wifi_5g_channel_mask. Bit positions mirror
+// wifi_5g_channel_bit_t (esp_wifi_types_generic.h): bit1=ch36 .. bit28=ch177.
+//   ETSI 0x001FFFFE = bits 1-20  = ch 36-144   (149+ is not WiFi in the EU)
+//   FCC  0x03FFFFFE = bits 1-25  = ch 36-165
+// 0 means "no explicit restriction" - the caller then leaves the country on AUTO
+// and the channel list unfiltered.
+static uint32_t wdp_domain_5g_mask(wdp_domain_t d)
+{
+    switch (d) {
+        case WDP_DOMAIN_ETSI: return 0x001FFFFEu;
+        case WDP_DOMAIN_FCC:  return 0x03FFFFFEu;
+        default:              return 0u;
+    }
+}
+
+// Bit index of a 5 GHz channel number within that mask, or -1 if unknown.
+static int wdp_5g_channel_bit(uint8_t ch)
+{
+    static const uint8_t chans[] = {
+        36, 40, 44, 48, 52, 56, 60, 64,
+        100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
+        149, 153, 157, 161, 165, 169, 173, 177
+    };
+    for (int i = 0; i < (int)(sizeof(chans) / sizeof(chans[0])); i++)
+        if (chans[i] == ch) return i + 1;   // bit1 = ch36
+    return -1;
+}
+
+// True if this channel may be added to the D-UCB arm list under the given mask.
+// 2.4 GHz channels and an all-zero (unrestricted) mask always pass.
+static bool wdp_channel_allowed(uint8_t ch, uint32_t mask5g)
+{
+    if (mask5g == 0u || ch < 36) return true;
+    int bit = wdp_5g_channel_bit(ch);
+    if (bit < 0) return true;               // unknown channel: don't second-guess
+    return (mask5g & (1u << bit)) != 0u;
+}
+
 static void wdp_ducb_init(void) {
+    // Filter the 5 GHz arms by the same regulatory mask the radio is given, so we
+    // never spend selections on channels set_channel will reject.
+    const wdp_domain_t wd_dom  = wdp_gps_domain();
+    const uint32_t     wd_mask = wdp_domain_5g_mask(wd_dom);
     wdp_ducb_channel_count = 0;
     wdp_ducb_discounted_total = 0.0;
     if (g_wd_band != WD_BAND_5G) {
@@ -9655,6 +9785,7 @@ static void wdp_ducb_init(void) {
     }
     if (g_wd_band != WD_BAND_24G) {
         for (int i = 0; i < (int)WDP_CH_5_NON_DFS_COUNT; i++) {
+            if (!wdp_channel_allowed(wdp_ch_5_non_dfs[i], wd_mask)) continue;
             wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_5_non_dfs[i];
             wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_5_NON_DFS;
             wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
@@ -9663,6 +9794,7 @@ static void wdp_ducb_init(void) {
             wdp_ducb_channel_count++;
         }
         for (int i = 0; i < (int)WDP_CH_5_DFS_COUNT; i++) {
+            if (!wdp_channel_allowed(wdp_ch_5_dfs[i], wd_mask)) continue;
             wdp_ducb_channels[wdp_ducb_channel_count].channel = wdp_ch_5_dfs[i];
             wdp_ducb_channels[wdp_ducb_channel_count].tier = WDP_TIER_5_DFS;
             wdp_ducb_channels[wdp_ducb_channel_count].discounted_reward = 0.0;
@@ -9671,18 +9803,25 @@ static void wdp_ducb_init(void) {
             wdp_ducb_channel_count++;
         }
     }
+    ESP_LOGI(TAG, "[WD] D-UCB arms=%d domain=%s 5g-mask=0x%08X",
+             wdp_ducb_channel_count,
+             wd_dom == WDP_DOMAIN_ETSI ? "ETSI" : (wd_dom == WDP_DOMAIN_FCC ? "FCC" : "OTHER"),
+             (unsigned)wd_mask);
 }
 
 static int wdp_ducb_select_counter = 0;
 
 static int wdp_ducb_select_channel(void) {
-    // Tier-weighted exploration: in Car mode the 19 DFS channels are the main
-    // cost (they rarely host real APs), so gate them to ~1 visit per
-    // WD_CAR_DFS_SELECT_RATIO selections. Non-DFS 5 GHz keeps full weight in
-    // every mode — coverage is never sacrificed. Stationary/Walk = normal.
-    bool car_ratelimit_dfs = (wd_effective_mode() == WD_MODE_CAR);
-    bool allow_dfs = !car_ratelimit_dfs ||
-                     (wdp_ducb_select_counter % WD_CAR_DFS_SELECT_RATIO == 0);
+    // Tier-weighted exploration: in Car/Highway mode the 19 DFS channels are the
+    // main cost (they rarely host real APs), so gate them to ~1 visit per
+    // ratio selections (Car 1/10, Highway 1/30). Non-DFS 5 GHz keeps full weight
+    // in every mode — coverage is never sacrificed. Stationary/Walk = normal.
+    wd_mode_t sel_mode = wd_effective_mode();
+    int  dfs_ratio = (sel_mode == WD_MODE_HIGHWAY) ? WD_HWY_DFS_SELECT_RATIO
+                                                   : WD_CAR_DFS_SELECT_RATIO;
+    bool ratelimit_dfs = (sel_mode == WD_MODE_CAR || sel_mode == WD_MODE_HIGHWAY);
+    bool allow_dfs = !ratelimit_dfs ||
+                     (wdp_ducb_select_counter % dfs_ratio == 0);
     wdp_ducb_select_counter++;
 
     wdp_ducb_discounted_total *= WDP_DUCB_GAMMA;
@@ -10461,7 +10600,16 @@ static int wdp_ble_gap_cb(struct ble_gap_event *event, void *arg)
         }
     }
 
-    if (cnt >= WDP_BLE_MAX_DEVICES) return 0;
+    if (cnt >= WDP_BLE_MAX_DEVICES) {
+        static bool wdp_ble_full_logged = false;
+        if (!wdp_ble_full_logged) {
+            wdp_ble_full_logged = true;
+            ESP_LOGW(TAG, "[WD] BLE dedup buffer FULL at %d devices — further BLE devices "
+                          "this session are dropped. Stop/restart the wardrive to continue.",
+                     WDP_BLE_MAX_DEVICES);
+        }
+        return 0;
+    }
 
     wdp_ble_device_t *dev = &wdp_ble_devices[cnt];
     memcpy(dev->mac, addr_val, 6);
@@ -11510,6 +11658,47 @@ static void log_heap_stats(const char *where)
              (unsigned)int_block, (unsigned)dma_free);
 }
 
+// Append one pending adaptive-mode transition to the per-session sidecar CSV
+// (WD_<mode>_<stamp>_mode.csv), then clear the event. Called from the wardrive
+// task OUTSIDE the CSV mutex section, so it takes sd_spi_mutex itself — never
+// nested, so it cannot self-deadlock the way the rotation path once did. A
+// failed open just drops the (diagnostic) line; the main capture CSV is never
+// touched. WiGLE/WDG never receive it: wd_is_uploadable_csv() excludes
+// *_mode.csv from BOTH upload paths (readdir "Upload All" + Manage list), so
+// only the WD_<mode>_<stamp>-NNN.csv capture parts are ever POSTed.
+static void wd_mode_log_flush(const char *stamp, const char *prefix)
+{
+    if (!g_wd_mode_evt.pending) return;
+    g_wd_mode_evt.pending = false;
+
+    char path[96];
+    snprintf(path, sizeof(path), "/sdcard/lab/wardrives/%s%s_mode.csv", prefix, stamp);
+    char ts[32];
+    get_timestamp_string(ts, sizeof(ts));
+
+    const gps_data_t *g = gps_best();
+    double lat = g->valid ? g->latitude : 0.0;
+    double lon = g->valid ? g->longitude : 0.0;
+    double disp = g_wd_speed_unit ? g_wd_mode_evt.speed_ms * 2.23694
+                                  : g_wd_mode_evt.speed_ms * 3.6;
+    const char *unit = g_wd_speed_unit ? "mph" : "km/h";
+
+    if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
+    struct stat mst;
+    bool need_hdr = (stat(path, &mst) != 0);      // same idiom as the wardrives dir check
+    FILE *f = fopen(path, "a");
+    if (f) {
+        if (need_hdr) fprintf(f, "UTC,FromMode,ToMode,Speed,Unit,Lat,Lon\n");
+        fprintf(f, "%s,%s,%s,%.1f,%s,%.6f,%.6f\n",
+                ts, wd_mode_name(g_wd_mode_evt.from), wd_mode_name(g_wd_mode_evt.to),
+                disp, unit, lat, lon);
+        fflush(f);
+        { int fd = fileno(f); if (fd >= 0) fsync(fd); }  // survive an abrupt car unplug
+        fclose(f);
+    }
+    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
+}
+
 // Wardrive task kept as wrapper
 static void wardrive_task(void *pvParameters) {
     (void)pvParameters;
@@ -11528,6 +11717,58 @@ static void wd_write_csv_header(FILE *f)
     fprintf(f, "WigleWifi-1.6,appRelease=%s,model=NM-CYD-C5,release=%s,device=CheapYellowMonster,display=240x320,board=ESP32C5,brand=JanOS\n",
             FW_VERSION, FW_VERSION);
     fprintf(f, "MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type\n");
+}
+
+// ── Wardrive regulatory domain (GPS-derived) ────────────────────────────────
+// The reg-domain decides which 5 GHz channels esp_wifi_set_channel() will accept.
+// With AUTO policy the driver adopts the country from received beacon country-IEs,
+// which fluctuates during a drive and leaves upper DFS (EU ch 100-144) intermittently
+// blocked — that is why a stock run captures ~zero ch100+ APs while 36-48 work fine.
+// We PIN the domain from the GPS position: MANUAL policy + an explicit 5 GHz mask.
+// The mask is the documented lever — esp_wifi_types states it "takes effect only when
+// policy is manual". Two regions we are certain about; everything else keeps the prior
+// PH/AUTO behaviour (we do not guess masks for domains we cannot verify — e.g. JP/CN):
+//
+//   ETSI  (Europe, UK, Turkey, N.Africa, W.Middle-East):  36-64 + 100-140/144, NO 149+
+//         mask = BIT(1)..BIT(20)          = 0x001FFFFE
+//   FCC   (Americas: US/CA/MX/Central+South):  36-64 + 100-144 + 149-165
+//         mask = BIT(1)..BIT(25)          = 0x03FFFFFE
+//
+// Boxes are coarse but separated (ETSI lon -25..45, FCC lon -170..-30) so they never
+// overlap. Wardrive is passive RX only — no CAC/TX, so tuning a DFS channel here carries
+// no radar-detection obligation and a bounding-box miss is harmless (at worst a few
+// channels are scanned or skipped; never an illegal transmission).
+static void wdp_apply_wardrive_country(void)
+{
+    const gps_data_t *g = gps_best();
+    const float lat = g->latitude, lon = g->longitude;
+    // Same helper the D-UCB arm list uses, so the radio's allowed set and the
+    // scanned set can never drift apart.
+    const wdp_domain_t dom  = wdp_gps_domain();
+    const uint32_t     mask = wdp_domain_5g_mask(dom);
+    const bool in_fcc = (dom == WDP_DOMAIN_FCC);
+
+    if (mask != 0u) {
+        // MANUAL + explicit 5 GHz mask. cc is cosmetic under MANUAL (2.4G governed by
+        // schan/nchan = ch 1-13, 5G governed entirely by the mask). RX-only, so no TX.
+        wifi_country_t wc = { .schan = 1, .nchan = 13,
+                              .policy = WIFI_COUNTRY_POLICY_MANUAL };
+        memcpy(wc.cc, in_fcc ? "US" : "DE", 3);  // cc[3] ← "US\0" / "DE\0"
+#if CONFIG_SOC_WIFI_SUPPORT_5G
+        wc.wifi_5g_channel_mask = mask;
+#endif
+        esp_err_t e = esp_wifi_set_country(&wc);
+        ESP_LOGI(TAG, "[WD] regdomain=%s MANUAL 5g-mask=0x%08X (GPS %.4f,%.4f) -> %s",
+                 in_fcc ? "FCC/US" : "ETSI/DE", (unsigned)mask,
+                 (double)lat, (double)lon, esp_err_to_name(e));
+    } else {
+        // Unknown/unverified domain or no fix — keep the prior behaviour untouched.
+        wifi_country_t wc = { .cc = "PH", .schan = 1, .nchan = 14,
+                              .policy = WIFI_COUNTRY_POLICY_AUTO };
+        esp_err_t e = esp_wifi_set_country(&wc);
+        ESP_LOGI(TAG, "[WD] regdomain=AUTO/PH (%s) -> %s",
+                 g->valid ? "GPS outside ETSI/FCC boxes" : "no GPS fix", esp_err_to_name(e));
+    }
 }
 
 static void wardrive_promisc_task(void *pvParameters) {
@@ -11665,6 +11906,12 @@ static void wardrive_promisc_task(void *pvParameters) {
     if (g_wd_ble && !wdp_ble_devices) {
         wdp_ble_devices = heap_caps_calloc(WDP_BLE_MAX_DEVICES, sizeof(wdp_ble_device_t),
                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!wdp_ble_devices) {
+            // ~835 KB PSRAM alloc failed (fragmentation). BLE collects nothing this run;
+            // the gap cb NULL-guards, so this is degraded-not-crashed. Make it visible.
+            ESP_LOGW(TAG, "[WD] BLE device table alloc FAILED (%d entries) — BLE capture disabled this run",
+                     WDP_BLE_MAX_DEVICES);
+        }
     }
     wdp_ble_count = 0;
 
@@ -11679,6 +11926,11 @@ static void wardrive_promisc_task(void *pvParameters) {
         esp_wifi_set_promiscuous_filter(&filt);
         esp_wifi_set_promiscuous_rx_cb(wdp_promiscuous_cb);
         esp_wifi_set_promiscuous(true);
+
+        // Pin the reg-domain (GPS-derived) so EU DFS ch 100-144 become tunable. Must
+        // run after esp_wifi_start()/promiscuous is up; persists for a WiFi-only drive
+        // (the coex-restore path below re-applies it for combined mode).
+        wdp_apply_wardrive_country();
 
         // ========== DMA TRACKING: After promisc ==========
         size_t dma_after_promisc = heap_caps_get_free_size(MALLOC_CAP_DMA);
@@ -11747,24 +11999,31 @@ static void wardrive_promisc_task(void *pvParameters) {
     while (wardrive_active) {
         // Adaptive: reclassify capture mode from current ground speed each iteration.
         // Band is untouched; only dwell + DFS exploration weight change with speed.
-        if (g_wd_adaptive) wd_classify_mode(gps_best()->speed);
+        if (g_wd_adaptive) {
+            wd_classify_mode(gps_best()->speed);
+            wd_mode_log_flush(wd_stamp, wd_prefix);   // persist a transition, if one just fired
+        }
 
-        // On a mode change, retune the GPS fix rate: 5 Hz in Car (needs baud
-        // >= 38400 to fit the NMEA volume), 1 Hz otherwise.
+        // On a mode change, retune the GPS fix rate: 5 Hz in Car/Highway (needs
+        // baud >= 115200 to fit the NMEA volume), 1 Hz otherwise.
         wd_mode_t wd_eff = wd_effective_mode();
         if (wd_eff != wd_rate_mode) {
             wd_rate_mode = wd_eff;
             // Log the mode's full per-tier dwell table + DFS policy so a mode change
             // (adaptive by speed, or a manual-mode selection at wardrive start) can be
             // verified on the serial console.
+            const char *dfs_policy = (wd_eff == WD_MODE_CAR)     ? "1/10 (rate-limited)"
+                                   : (wd_eff == WD_MODE_HIGHWAY) ? "1/30 (rate-limited)"
+                                                                 : "full";
             ESP_LOGI(TAG, "[WD] mode=%s (%s) dwell 24p/24s/5n/5d=%d/%d/%d/%d ms, DFS=%s",
                      wd_mode_name(wd_eff), g_wd_adaptive ? "adaptive" : "manual",
                      wd_dwell_table[wd_eff][0], wd_dwell_table[wd_eff][1],
                      wd_dwell_table[wd_eff][2], wd_dwell_table[wd_eff][3],
-                     (wd_eff == WD_MODE_CAR) ? "1/10 (rate-limited)" : "full");
+                     dfs_policy);
             // 5 Hz needs 115200: at 38400 the module silently stays 1 Hz (full multi-GNSS
             // NMEA at 5 Hz overruns 38400), so only 115200 unlocks real 5 Hz (bench-proven).
-            int hz = (wd_eff == WD_MODE_CAR && g_wd_gps_baud >= 115200) ? 5 : 1;
+            bool fast_mode = (wd_eff == WD_MODE_CAR || wd_eff == WD_MODE_HIGHWAY);
+            int hz = (fast_mode && g_wd_gps_baud >= 115200) ? 5 : 1;
             gps_set_update_rate_hz(hz);
         }
 
@@ -11774,7 +12033,18 @@ static void wardrive_promisc_task(void *pvParameters) {
 
         // Only set WiFi channel in WiFi mode; in BLE-only mode, WiFi is not running
         if (g_wd_radio_mode != WD_RADIO_BLE_ONLY) {
-            esp_wifi_set_channel((uint8_t)channel, WIFI_SECOND_CHAN_NONE);
+            esp_err_t sc = esp_wifi_set_channel((uint8_t)channel, WIFI_SECOND_CHAN_NONE);
+            if (sc != ESP_OK) {
+                // A rejected channel (reg-domain blocks it) leaves the radio on the
+                // PREVIOUS channel and poisons the D-UCB reward for this arm. Log each
+                // distinct failing channel once so a coverage gap is visible, not silent.
+                static uint8_t wdp_ch_fail_logged[178] = {0};
+                if (channel < 178 && !wdp_ch_fail_logged[channel]) {
+                    wdp_ch_fail_logged[channel] = 1;
+                    ESP_LOGW(TAG, "[WD] set_channel(%d) rejected: %s (reg-domain?)",
+                             channel, esp_err_to_name(sc));
+                }
+            }
         }
         wdp_current_channel = channel;
         wd_ui_update_flag = true;
@@ -11843,11 +12113,9 @@ static void wardrive_promisc_task(void *pvParameters) {
             if (!via_coex) {
                 // Radio-switch path: restore WiFi (it was stopped for BLE).
                 ensure_wifi_mode();
-                wifi_country_t wifi_country = {
-                    .cc = "PH", .schan = 1, .nchan = 14,
-                    .policy = WIFI_COUNTRY_POLICY_AUTO,
-                };
-                esp_wifi_set_country(&wifi_country);
+                // Re-pin the GPS-derived reg-domain (ensure_wifi_mode() resets it to
+                // PH/AUTO) so DFS ch 100-144 stay tunable across combined-mode slices.
+                wdp_apply_wardrive_country();
                 apply_wifi_power_settings();
                 wdp_ducb_init();  // rebuild channel list after reinit
                 esp_wifi_set_promiscuous_filter(&filt);
@@ -12160,14 +12428,21 @@ static void wd_ui_timer_cb(lv_timer_t *timer) {
     if (wd_ui_gps_label) {
         char gps_buf[80];
         if (current_gps.valid) {
-            snprintf(gps_buf, sizeof(gps_buf), LV_SYMBOL_GPS " %.5f, %.5f  Sats: %d",
-                     current_gps.latitude, current_gps.longitude, current_gps.satellites);
+            snprintf(gps_buf, sizeof(gps_buf), LV_SYMBOL_GPS " %.5f, %.5f",
+                     current_gps.latitude, current_gps.longitude);
             lv_obj_set_style_text_color(wd_ui_gps_label, COLOR_MATERIAL_GREEN, 0);
         } else {
-            snprintf(gps_buf, sizeof(gps_buf), "Waiting for GPS fix...  Sats: %d", current_gps.satellites);
+            snprintf(gps_buf, sizeof(gps_buf), "Waiting for GPS fix...");
             lv_obj_set_style_text_color(wd_ui_gps_label, COLOR_MATERIAL_ORANGE, 0);
         }
         lv_label_set_text(wd_ui_gps_label, gps_buf);
+    }
+
+    // Satellite count moved off the top line into its own SATS box.
+    if (wd_ui_sats_label) {
+        char sat_buf[12];
+        snprintf(sat_buf, sizeof(sat_buf), "%d", current_gps.satellites);
+        lv_label_set_text(wd_ui_sats_label, sat_buf);
     }
 
     // Total networks counter
@@ -12177,10 +12452,14 @@ static void wd_ui_timer_cb(lv_timer_t *timer) {
         lv_label_set_text(wd_ui_counter_label, cnt_buf);
     }
 
-    // BLE device counter
+    // BLE device counter. Same saturation flag as the flag-driven update path
+    // (both sites write this label; a cap hit must be visible from either).
     if (wd_ui_ble_label) {
-        char ble_buf[16];
-        snprintf(ble_buf, sizeof(ble_buf), "%d", wdp_ble_count);
+        char ble_buf[24];
+        if (wdp_ble_count >= WDP_BLE_MAX_DEVICES)
+            snprintf(ble_buf, sizeof(ble_buf), "%d FULL", wdp_ble_count);
+        else
+            snprintf(ble_buf, sizeof(ble_buf), "%d", wdp_ble_count);
         lv_label_set_text(wd_ui_ble_label, ble_buf);
     }
 
@@ -12518,7 +12797,7 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     // Parent to lv_layer_top() so this label renders above the D-UCB and
     // Networks boxes regardless of child creation order.
     wd_ui_gps_label = lv_label_create(lv_layer_top());
-    lv_label_set_text(wd_ui_gps_label, "Waiting for GPS fix...  Sats: 0");
+    lv_label_set_text(wd_ui_gps_label, "Waiting for GPS fix...");
     lv_obj_set_style_text_color(wd_ui_gps_label, COLOR_MATERIAL_ORANGE, 0);
     lv_obj_set_style_text_font(wd_ui_gps_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_align(wd_ui_gps_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -12526,11 +12805,15 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_set_width(wd_ui_gps_label, LCD_H_RES);
     lv_obj_align(wd_ui_gps_label, LV_ALIGN_TOP_MID, 0, 35);
 
-    // ─── Three stat boxes: [D-UCB] [WiFi] [BLE] ─────────────────
-    // Layout at y=55, h=42. Three boxes across 240px:
-    //   x=4  w=72: D-UCB channel (green)
-    //   x=84 w=74: WiFi networks (cyan)
-    //   x=166 w=70: BLE devices (purple)
+    // ─── Three stat boxes ───────────────────────────────────────
+    // Layout at y=55, h=42. Three boxes across 240px. The two radio modes are
+    // mutually exclusive (wd_radio_mode_t has only WIFI_ONLY / BLE_ONLY), so the
+    // middle and right slots are reused per mode and the SATS box always takes
+    // the right slot:
+    //   WiFi mode: x=4 D-UCB (green) | x=84 WiFi count (cyan) | x=166 SATS (amber)
+    //   BLE  mode: x=4 BLE/SCAN      | x=84 BLE count (purple)| x=166 SATS (amber)
+    // The hidden box of the inactive mode still sits in a reused slot; that is
+    // fine because LV_OBJ_FLAG_HIDDEN suppresses both drawing and hit-testing.
 
     lv_obj_t *wd_ch_box = lv_obj_create(function_page);
     lv_obj_set_size(wd_ch_box, 72, 42);
@@ -12587,7 +12870,11 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     // ─── BLE device counter ───────────────────────────────────────
     wd_ui_ble_box = lv_obj_create(function_page);
     lv_obj_set_size(wd_ui_ble_box, 70, 42);
-    lv_obj_align(wd_ui_ble_box, LV_ALIGN_TOP_LEFT, 166, 55);
+    // BLE-only mode: sit next to the BLE/SCAN box (the WiFi slot is hidden then)
+    // and leave the right slot to SATS. WiFi mode hides this box entirely.
+    // (x=86 centres the 70px box in the 90px gap between D-UCB's right edge at
+    //  76 and the SATS box's left edge at 166 -> 10px either side.)
+    lv_obj_align(wd_ui_ble_box, LV_ALIGN_TOP_LEFT, wd_ble_only ? 86 : 166, 55);
     lv_obj_set_style_bg_color(wd_ui_ble_box, lv_color_make(30, 30, 45), 0);
     lv_obj_set_style_border_color(wd_ui_ble_box, lv_color_make(171, 71, 188), 0);
     lv_obj_set_style_border_width(wd_ui_ble_box, 2, 0);
@@ -12610,6 +12897,32 @@ static void wardrive_start_btn_cb(lv_event_t *e)
     lv_obj_set_style_text_color(wd_ui_ble_label, ui_text_color(), 0);
     lv_obj_set_style_text_font(wd_ui_ble_label, &lv_font_montserrat_20, 0);
     lv_obj_align(wd_ui_ble_label, LV_ALIGN_BOTTOM_MID, 0, -2);
+
+    // ─── GPS satellite counter ────────────────────────────────────
+    // Shown in BOTH radio modes: the satellite count used to ride on the top
+    // GPS line, which crowded the coordinates. Right slot (x=166) is free in
+    // WiFi mode (BLE box hidden) and freed in BLE mode (BLE box moved to 86).
+    lv_obj_t *wd_sats_box = lv_obj_create(function_page);
+    lv_obj_set_size(wd_sats_box, 70, 42);
+    lv_obj_align(wd_sats_box, LV_ALIGN_TOP_LEFT, 166, 55);
+    lv_obj_set_style_bg_color(wd_sats_box, lv_color_make(30, 30, 45), 0);
+    lv_obj_set_style_border_color(wd_sats_box, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_border_width(wd_sats_box, 2, 0);
+    lv_obj_set_style_radius(wd_sats_box, 10, 0);
+    lv_obj_set_style_pad_all(wd_sats_box, 0, 0);
+    lv_obj_clear_flag(wd_sats_box, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *sats_title = lv_label_create(wd_sats_box);
+    lv_label_set_text(sats_title, "SATS");
+    lv_obj_set_style_text_color(sats_title, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_text_font(sats_title, &lv_font_montserrat_12, 0);
+    lv_obj_align(sats_title, LV_ALIGN_TOP_MID, 0, 2);
+
+    wd_ui_sats_label = lv_label_create(wd_sats_box);
+    lv_label_set_text(wd_ui_sats_label, "0");
+    lv_obj_set_style_text_color(wd_ui_sats_label, ui_text_color(), 0);
+    lv_obj_set_style_text_font(wd_ui_sats_label, &lv_font_montserrat_20, 0);
+    lv_obj_align(wd_ui_sats_label, LV_ALIGN_BOTTOM_MID, 0, -2);
 
     // ─── Recent networks table ────────────────────────────────────
     // y=101: boxes end at 55+42=97, 4px gap. height=164: stops 4px above stop btn.
@@ -12836,6 +13149,7 @@ static void wardrive_screen_stop(void)
     wd_ui_ble_label = NULL;
     wd_ui_counter_box = NULL;
     wd_ui_ble_box = NULL;
+    wd_ui_sats_label = NULL;
     wd_ui_channel_label = NULL;
     wd_ui_header = NULL;
     wd_ui_table = NULL;
@@ -18009,9 +18323,8 @@ static void show_global_attacks_screen(void)
     lv_obj_t *snifferdog_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Sniffer dog", COLOR_MATERIAL_PURPLE, NULL, NULL);
     lv_obj_add_event_cb(snifferdog_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Snifferdog");
     
-    // Wardrive tile - Teal
-    lv_obj_t *wardrive_tile = create_tile(tiles, MY_SYMBOL_CAR, "Wardrive", COLOR_MATERIAL_RED, NULL, NULL);
-    lv_obj_add_event_cb(wardrive_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Start Wardrive");
+    // Wardrive is a passive collection tool, not an attack.
+    // It lives on the main home screen and has its own dedicated menu.
 }
 
 // WiFi menu screen — sub-menu grouping all WiFi functions
@@ -18041,7 +18354,7 @@ static void show_wifi_menu_screen(void)
     (void)obs_tile;
     lv_obj_t *dd_tile   = create_tile(tiles, MY_SYMBOL_JET_FIGHTER,"Drone\nStuff",     lv_color_hex(0x1B5E20), main_tile_event_cb, "Drone Stuff");
     (void)dd_tile;
-    lv_obj_t *wana_tile = create_tile(tiles, MY_SYMBOL_CHART_BAR,  "Chan-\nalizer",    lv_color_hex(0x1A237E), main_tile_event_cb, "Chanalizer");
+    lv_obj_t *wana_tile = create_tile(tiles, MY_SYMBOL_CHART_BAR,  "Channel\nAnalyzer", lv_color_hex(0x1A237E), main_tile_event_cb, "Chanalizer");
     (void)wana_tile;
     lv_obj_t *wscope_tile = create_tile(tiles, MY_SYMBOL_WAVE,     "WiFi\nScope",      lv_color_hex(0x006064), main_tile_event_cb, "WiFi Scope");
     (void)wscope_tile;
@@ -19615,6 +19928,21 @@ static int wdup_tls_write_all(esp_tls_t *tls, const char *buf, int len)
 }
 
 // Returns 0=ok, 1=duplicate, -1=error
+// True only for a real, uploadable capture CSV in lab/wardrives/. Excludes the
+// upload journal (upload_log.csv) and the adaptive-mode sidecar
+// (WD_..._mode.csv) — both end in .csv but must NEVER be POSTed to WiGLE/WDG.
+// The Manage list already hid upload_log.csv by name; this makes the same skip
+// real for the readdir-based "Upload All" path too. Verified needed: before
+// this, upload_log.csv self-logged real OK/FAIL uploads (it was POSTing itself).
+static bool wd_is_uploadable_csv(const char *name)
+{
+    size_t nl = name ? strlen(name) : 0;
+    if (nl <= 4 || strcasecmp(name + nl - 4, ".csv") != 0)     return false; // must be .csv
+    if (strcmp(name, "upload_log.csv") == 0)                   return false; // upload journal
+    if (nl >= 9 && strcasecmp(name + nl - 9, "_mode.csv") == 0) return false; // mode sidecar
+    return true;
+}
+
 static int wdup_upload_one(const char *filepath, const char *filename,
                             bool use_wigle)
 {
@@ -19917,8 +20245,7 @@ static void wdup_task(void *pvParameters)
     struct dirent *ent;
     if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
         while ((ent = readdir(dir)) != NULL) {
-            size_t nl = strlen(ent->d_name);
-            if (nl > 4 && strcasecmp(ent->d_name + nl - 4, ".csv") == 0) total++;
+            if (wd_is_uploadable_csv(ent->d_name)) total++;
         }
         rewinddir(dir);
         xSemaphoreGive(sd_spi_mutex);
@@ -19948,8 +20275,7 @@ static void wdup_task(void *pvParameters)
         }
         if (!got) break;
 
-        size_t nl = strlen(dname);
-        if (nl <= 4 || strcasecmp(dname + nl - 4, ".csv") != 0) continue;
+        if (!wd_is_uploadable_csv(dname)) continue;
         cur++;
         wdup_prog_cur = cur;
 
@@ -20458,7 +20784,8 @@ static void show_wardrive_options_screen(void)
     lv_dropdown_set_options(wd_opts_mmode_dd,
                             "Stationary (500ms, DFS full)\n"
                             "Walking (350ms, DFS full)\n"
-                            "Driving (150ms, DFS 1/10)");
+                            "Driving (150ms, DFS 1/10)\n"
+                            "Highway (110ms, DFS 1/30)");
     lv_dropdown_set_selected(wd_opts_mmode_dd, (uint16_t)(g_wd_manual_mode % WD_MODE_COUNT));
     lv_obj_set_width(wd_opts_mmode_dd, LCD_H_RES - 32);
     lv_obj_set_style_text_font(wd_opts_mmode_dd, &lv_font_montserrat_12, 0);
@@ -20785,9 +21112,7 @@ static void show_wardrive_manage_screen(void)
             struct dirent *ent;
             while ((ent = readdir(dir)) != NULL && wd_manage_count < WD_MANAGE_MAX_FILES) {
                 const char *nm = ent->d_name;
-                size_t nl = strlen(nm);
-                if (nl <= 4 || strcasecmp(nm + nl - 4, ".csv") != 0) continue;
-                if (strcmp(nm, "upload_log.csv") == 0) continue;
+                if (!wd_is_uploadable_csv(nm)) continue;
                 snprintf(wd_manage_paths[wd_manage_count], sizeof(wd_manage_paths[0]),
                          "/sdcard/lab/wardrives/%s", nm);
                 struct stat st;
@@ -22922,18 +23247,19 @@ static void rfhat_toggle_cb(lv_event_t *e)
         lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
 
         lv_obj_t *icon = lv_label_create(popup);
-        lv_label_set_text(icon, LV_SYMBOL_WARNING " NM-RF-HAT");
+        lv_label_set_text(icon, LV_SYMBOL_OK " NM-RF-HAT");
         lv_obj_set_style_text_font(icon, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(icon, COLOR_MATERIAL_AMBER, 0);
         lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 0);
 
         lv_obj_t *msg = lv_label_create(popup);
         lv_label_set_text(msg,
-            "NM-RF-HAT is currently under\n"
-            "active development. Not all\n"
-            "modules are functional yet.\n\n"
-            "Please be patient and submit\n"
-            "feedback to @jimgat");
+            "All 5 modules active:\n"
+            "CC1101 | nRF24 | PN532\n"
+            "IR (Capture/Replay) | RF433\n\n"
+            "Enable DIP switch for each\n"
+            "module before use.\n"
+            "DIP 1-5, one at a time.");
         lv_obj_set_style_text_font(msg, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(msg, ui_text_color(), 0);
         lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);

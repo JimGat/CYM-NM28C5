@@ -33,14 +33,18 @@
 
 ---
 
-## 🎬 Featured Video
+## 🎬 Featured Videos
 
 <p align="center">
   <a href="https://youtu.be/IDm4uz38IDE" target="_blank">
-    <img src="https://img.youtube.com/vi/IDm4uz38IDE/maxresdefault.jpg" alt="Cheap Yellow Monster — Video Review by Anubis" width="70%"/>
+    <img src="https://img.youtube.com/vi/IDm4uz38IDE/maxresdefault.jpg" alt="Cheap Yellow Monster — Video Review by Anubis" width="48%"/>
+  </a>
+  &nbsp;
+  <a href="https://youtu.be/00yGLaB4jWk" target="_blank">
+    <img src="https://img.youtube.com/vi/00yGLaB4jWk/maxresdefault.jpg" alt="Cheap Yellow Monster Firmware for Esp32-C5 CYD — Valleytech Custom Solutions" width="48%"/>
   </a>
   <br/>
-  <em>CYM in the wild — video by <strong>Anubis</strong> &nbsp;·&nbsp; <a href="https://youtu.be/IDm4uz38IDE">Watch on YouTube ▶</a></em>
+  <em><a href="https://youtu.be/IDm4uz38IDE">CYM in the wild — Anubis ▶</a> &nbsp;·&nbsp; <a href="https://youtu.be/00yGLaB4jWk">CYM Firmware Review (v2.12.0) — Valleytech Custom Solutions ▶</a></em>
 </p>
 
 ---
@@ -69,7 +73,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 
 ## Table of Contents
 
-- [Featured Video](#-featured-video)
+- [Featured Videos](#-featured-videos)
 - [Features Overview](#features-overview)
 - [Menu Map](#menu-map)
 - [Screenshots](#screenshots)
@@ -3071,6 +3075,8 @@ This project wouldn't be where it is without the brilliant minds and generous ti
 - **@Birolt29** — An extraordinary contributor who has gone far above and beyond at every stage of this project. Birol performed deep ESP32-C5 DMA and render pipeline analysis on real hardware, submitted multiple major patch sets, and caught critical bugs before they ever reached users. His contributions include: the v2.10.15 hardware optimization patch (upload stability, mbedTLS PSRAM routing, BLE Spam memory hardening); the v2.11.x render performance series (LCD SPI 40→80 MHz, internal DMA draw buffers, -O2 optimization, LVGL memcpy, 15 ms refresh period, PSRAM 80 MHz — bringing full-frame render from 148 ms to ~77 ms); the SD remount mutex fix that eliminated a hard reset race; moving 17.4 KB of IR/RF433 name tables to PSRAM BSS; the GATT Walker double-init reset fix; diagnosing and fixing the wardrive GPS crash (GitHub issue #12 — stack-allocated `lv_msgbox` button map dangling after function return); and for v2.12.0, an entire wardrive overhaul: fixing a silent SD mutex self-deadlock that froze the device mid-session; root-causing and fixing BLE-only wardrive which had been collecting zero devices for months (`esp_wifi_deinit()` needed before NimBLE); +52% DMA headroom by moving five large arrays to PSRAM BSS (internal BSS 129 KB → 113 KB, wardrive DMA floor 20,807 → 31,615 bytes); GPS boot-time baud auto-detect and optional 115200 / 5 Hz with multi-vendor commands (CASIC, MTK, u-blox); adaptive speed-based capture profiles with D-UCB bandit and DFS tier-weighting; GPS status icon in the top bar; FirstSeen fix (was hardcoded 2025-09-26); CSV fsync power-cut safety; journey-grouped CSV rotation; BLE active scan with SCAN_RSP name backfill; BLE-mode dashboard; AltitudeMeters and AccuracyMeters filled from real GPS; and serial-validated testing of every change on real hardware. The firmware is faster, more stable, and more reliable because of Birol. 🙏
 
 - **Anubis** — For creating the first community video showcase of CYM in the wild. Taking the time to film, edit, and publish a video of this project means the world — it helps new users discover what CYM can do and gives the project a presence beyond GitHub. Thank you! 🎬
+
+- **Kal (Valleytech Custom Solutions)** — For a thorough and fair video walkthrough of CYM v2.12.0 on the Valleytech Custom Solutions channel. The review covered the web flasher, Chameleon Ultra integration, Zigbee Scout, Go Dark mode, WiFi/BLE feature depth, and the broader Lab5/NerdMiner ecosystem. The feedback from the video and comments directly drove first-run UX improvements in v2.12.2. Thank you! 🎬
 
 - **ᛕ ᛊ ߇ ᛙ ᚢ (Kevin)** — For deep technical testing and helping diagnose the toughest issues
 - **sithwrld999** — For thorough testing and finding edge cases we missed
