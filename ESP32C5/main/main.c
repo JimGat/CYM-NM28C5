@@ -4579,6 +4579,16 @@ static void run_touch_calibration(void)
     lv_obj_set_style_img_recolor_opa(bg_img, LV_OPA_10, 0);
     lv_obj_move_to_index(bg_img, 0);
 
+    // Persistent hint: resistive touch requires firm pressure; the red dot shows where firmware detected the press.
+    lv_obj_t *hint_lbl = lv_label_create(scr);
+    lv_obj_set_style_text_color(hint_lbl, lv_color_hex(0xFFD600), 0);
+    lv_obj_set_style_text_font(hint_lbl, &lv_font_montserrat_12, 0);
+    lv_label_set_long_mode(hint_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(hint_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(hint_lbl, 220);
+    lv_obj_align(hint_lbl, LV_ALIGN_TOP_MID, 0, 10);
+    lv_label_set_text(hint_lbl, "Resistive touch - press firmly\nRed dot shows detected point");
+
     lv_obj_t *lbl = lv_label_create(scr);
     lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
     lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
@@ -18313,9 +18323,8 @@ static void show_global_attacks_screen(void)
     lv_obj_t *snifferdog_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "Sniffer dog", COLOR_MATERIAL_PURPLE, NULL, NULL);
     lv_obj_add_event_cb(snifferdog_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Snifferdog");
     
-    // Wardrive tile - Teal
-    lv_obj_t *wardrive_tile = create_tile(tiles, MY_SYMBOL_CAR, "Wardrive", COLOR_MATERIAL_RED, NULL, NULL);
-    lv_obj_add_event_cb(wardrive_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"Start Wardrive");
+    // Wardrive is a passive collection tool, not an attack.
+    // It lives on the main home screen and has its own dedicated menu.
 }
 
 // WiFi menu screen — sub-menu grouping all WiFi functions
@@ -18345,7 +18354,7 @@ static void show_wifi_menu_screen(void)
     (void)obs_tile;
     lv_obj_t *dd_tile   = create_tile(tiles, MY_SYMBOL_JET_FIGHTER,"Drone\nStuff",     lv_color_hex(0x1B5E20), main_tile_event_cb, "Drone Stuff");
     (void)dd_tile;
-    lv_obj_t *wana_tile = create_tile(tiles, MY_SYMBOL_CHART_BAR,  "Chan-\nalizer",    lv_color_hex(0x1A237E), main_tile_event_cb, "Chanalizer");
+    lv_obj_t *wana_tile = create_tile(tiles, MY_SYMBOL_CHART_BAR,  "Channel\nAnalyzer", lv_color_hex(0x1A237E), main_tile_event_cb, "Chanalizer");
     (void)wana_tile;
     lv_obj_t *wscope_tile = create_tile(tiles, MY_SYMBOL_WAVE,     "WiFi\nScope",      lv_color_hex(0x006064), main_tile_event_cb, "WiFi Scope");
     (void)wscope_tile;
@@ -23238,18 +23247,19 @@ static void rfhat_toggle_cb(lv_event_t *e)
         lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
 
         lv_obj_t *icon = lv_label_create(popup);
-        lv_label_set_text(icon, LV_SYMBOL_WARNING " NM-RF-HAT");
+        lv_label_set_text(icon, LV_SYMBOL_OK " NM-RF-HAT");
         lv_obj_set_style_text_font(icon, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(icon, COLOR_MATERIAL_AMBER, 0);
         lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 0);
 
         lv_obj_t *msg = lv_label_create(popup);
         lv_label_set_text(msg,
-            "NM-RF-HAT is currently under\n"
-            "active development. Not all\n"
-            "modules are functional yet.\n\n"
-            "Please be patient and submit\n"
-            "feedback to @jimgat");
+            "All 5 modules active:\n"
+            "CC1101 | nRF24 | PN532\n"
+            "IR (Capture/Replay) | RF433\n\n"
+            "Enable DIP switch for each\n"
+            "module before use.\n"
+            "DIP 1-5, one at a time.");
         lv_obj_set_style_text_font(msg, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(msg, ui_text_color(), 0);
         lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
