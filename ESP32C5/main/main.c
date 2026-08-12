@@ -1482,6 +1482,8 @@ static bool           ble_pcap_save_enabled = true;  // toggled on PCAP screen
 static lv_obj_t      *ble_pcap_save_sw   = NULL;
 static lv_obj_t      *ble_pcap_fn_lbl    = NULL;
 static char           ble_pcap_fname[96] = "";
+static bool           ble_pcap_filter_active = false;  // targeted capture: filter by MAC
+static uint8_t        ble_pcap_filter_mac[6] = {0};    // only queue packets from this addr
 
 // Wardrive attack state
 static TaskHandle_t wardrive_task_handle = NULL;
@@ -1671,8 +1673,9 @@ static lv_timer_t *arp_scan_check_timer = NULL;
 #define MITM_MAX_HOSTS    64
 #define MITM_QUEUE_SIZE   256
 #define MITM_MAX_FRAME    1600
-#define LINKTYPE_ETHERNET   1
-#define LINKTYPE_IEEE80211  105
+#define LINKTYPE_ETHERNET         1
+#define LINKTYPE_IEEE80211        105
+#define LINKTYPE_IEEE80211_RADIO  127   // radiotap: includes RSSI + per-frame metadata
 
 typedef struct {
     uint16_t len;
@@ -1765,6 +1768,64 @@ typedef struct {
 static QueueHandle_t deauth_pcap_queue = NULL;
 static FILE         *deauth_pcap_file  = NULL;
 static char          deauth_pcap_path[64] = "";
+
+// ── WiFi Packet Capture (targeted promiscuous PCAP) state ────────────────────
+// Queue items are PSRAM-malloc'd; writer is the LVGL 200 ms timer.
+// Format: DLT_IEEE802_11_RADIO (127) — radiotap header carries per-frame RSSI.
+// Output: /sdcard/lab/pcaps/wifi_XXXXXX_NNNNNNNNNN.pcap
+#define WIFI_CAP_QUEUE_DEPTH  64
+
+typedef struct {
+    uint8_t  it_version;
+    uint8_t  it_pad;
+    uint16_t it_len;      /* 12 (LE) */
+    uint32_t it_present;  /* bit 5 = dBm Antenna Signal */
+    int8_t   it_signal;
+    uint8_t  it_align[3];
+} __attribute__((packed)) wifi_cap_radiotap_t;
+
+typedef struct {
+    uint8_t  *frame;      /* PSRAM-allocated; freed by timer writer after write */
+    uint16_t  len;
+    int8_t    rssi;
+    uint8_t   channel;
+    uint64_t  ts_us;
+} wifi_cap_pkt_t;
+
+static volatile bool     s_wcap_running      = false;
+static volatile uint32_t s_wcap_count        = 0;
+static FILE             *s_wcap_file         = NULL;
+static QueueHandle_t     s_wcap_queue        = NULL;
+static uint8_t           s_wcap_bssid[6]     = {0};
+static char              s_wcap_ssid[33]     = "";
+static uint8_t           s_wcap_channel      = 6;
+static char              s_wcap_filepath[80] = "";
+static lv_obj_t         *s_wcap_cnt_lbl      = NULL;
+static lv_obj_t         *s_wcap_status_lbl   = NULL;
+static lv_obj_t         *s_wcap_fn_lbl       = NULL;
+static lv_timer_t       *s_wcap_ui_timer     = NULL;
+static lv_obj_t         *s_wcap_list_cont    = NULL;
+static lv_obj_t         *s_wcap_info_cont    = NULL;
+
+// ── BLE Targeted Capture picker state ────────────────────────────────────────
+#define BLE_TARG_MAX       24
+#define BLE_TARG_SCAN_SECS  8
+
+typedef struct {
+    uint8_t addr[6];
+    uint8_t addr_type;
+    int8_t  rssi;
+    char    name[20];
+} ble_targ_dev_t;
+
+EXT_RAM_BSS_ATTR static ble_targ_dev_t s_targ_devs[BLE_TARG_MAX];
+static volatile int    s_targ_count      = 0;
+static int             s_targ_displayed  = 0;
+static lv_timer_t     *s_targ_timer      = NULL;
+static lv_obj_t       *s_targ_list_cont  = NULL;
+static lv_obj_t       *s_targ_hdr_lbl    = NULL;
+static volatile bool   s_targ_scanning   = false;
+static int             s_targ_tick       = 0;
 
 // Drone Detector state
 EXT_RAM_BSS_ATTR static drone_rec_t   g_drones[DRONE_MAX];
@@ -2890,6 +2951,10 @@ static void wpasec_upload_timer_cb(lv_timer_t *timer);
 // BLE PCAP capture
 static void show_ble_pcap_screen(void);
 static void ble_pcap_stop(void);
+
+// WiFi frame capture + BLE targeted capture
+static void show_wifi_pcap_screen(void);
+static void show_ble_targeted_pcap_screen(void);
 
 // Wardrive submenu + upload helpers
 static void show_wardrive_menu_screen(void);
@@ -14943,6 +15008,8 @@ static void main_tile_event_cb(lv_event_t *e)
         show_wscope_screen();
     } else if (strcmp(tile_name, "ESP-NOW Scout") == 0) {
         show_espnow_scout_screen();
+    } else if (strcmp(tile_name, "WiFi Capture") == 0) {
+        show_wifi_pcap_screen();
     } else if (strcmp(tile_name, "Bluetooth") == 0) {
         show_bluetooth_screen();
     } else if (strcmp(tile_name, "Wardrive") == 0) {
@@ -18292,6 +18359,352 @@ static void show_attack_tiles_screen(void)
 }
 
 // Global WiFi Attacks screen
+// ════════════════════════════════════════════════════════════════════════════
+// WiFi Packet Capture — targeted promiscuous frame capture to PCAP
+// Select AP from last scan; lock channel; stream frames to SD via LVGL timer.
+// Format: DLT_IEEE802_11_RADIO (127) with 12-byte radiotap header (RSSI field).
+// Output: /sdcard/lab/pcaps/wifi_XXXXXX_NNNNNNNNNN.pcap
+// ════════════════════════════════════════════════════════════════════════════
+
+// Promiscuous RX callback — fires from WiFi task, must not block.
+// Filters by BSSID extracted from 802.11 DS bits; enqueues PSRAM-allocated descriptor.
+static void wifi_cap_promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    if (!s_wcap_running || !s_wcap_queue) return;
+    if (type == WIFI_PKT_CTRL) return;  // skip acks/RTS/CTS - high volume, low value
+
+    const wifi_promiscuous_pkt_t *p = (const wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *frame = p->payload;
+    int len = (int)p->rx_ctrl.sig_len;
+    if (len < 10 || len > 2346) return;
+
+    // Extract BSSID position from 802.11 DS bits and frame type.
+    // Management (type=0) or IBSS (ds=0): addr3=BSSID.
+    // ToDS (ds=1): addr1=BSSID. FromDS (ds=2): addr2=BSSID.
+    if (len >= 22) {
+        uint8_t frame_type = (frame[0] >> 2) & 0x03;
+        uint8_t ds_bits    = frame[1] & 0x03;
+        const uint8_t *bssid;
+        if (frame_type == 0 || ds_bits == 0) bssid = frame + 16;
+        else if (ds_bits == 0x01)            bssid = frame + 4;
+        else if (ds_bits == 0x02)            bssid = frame + 10;
+        else                                 bssid = frame + 16;
+        if (memcmp(bssid, s_wcap_bssid, 6) != 0) return;
+    }
+
+    wifi_cap_pkt_t *pkt = heap_caps_malloc(sizeof(wifi_cap_pkt_t),
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!pkt) return;
+    pkt->frame = heap_caps_malloc((size_t)len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!pkt->frame) { heap_caps_free(pkt); return; }
+    memcpy(pkt->frame, frame, (size_t)len);
+    pkt->len     = (uint16_t)len;
+    pkt->rssi    = p->rx_ctrl.rssi;
+    pkt->channel = (uint8_t)p->rx_ctrl.channel;
+    pkt->ts_us   = (uint64_t)esp_timer_get_time();
+    if (xQueueSend(s_wcap_queue, &pkt, 0) != pdTRUE) {
+        heap_caps_free(pkt->frame);
+        heap_caps_free(pkt);
+    }
+}
+
+// LVGL 200 ms timer: drain up to 32 packets from queue, write PCAP records, update counter.
+// Runs inside lvgl_mutex — safe to call LVGL directly after releasing sd_spi_mutex.
+static void wifi_pcap_timer_cb(lv_timer_t *tmr)
+{
+    (void)tmr;
+    if (!s_wcap_file || !s_wcap_queue) return;
+
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(150)) == pdTRUE) {
+        wifi_cap_pkt_t *pkt = NULL;
+        int written = 0;
+        while (written < 32 && xQueueReceive(s_wcap_queue, &pkt, 0) == pdTRUE && pkt) {
+            uint32_t rt_sz = sizeof(wifi_cap_radiotap_t);
+            pcap_record_header_t rh;
+            rh.ts_sec  = (uint32_t)(pkt->ts_us / 1000000ULL);
+            rh.ts_usec = (uint32_t)(pkt->ts_us % 1000000ULL);
+            rh.incl_len = rt_sz + pkt->len;
+            rh.orig_len = rt_sz + pkt->len;
+            wifi_cap_radiotap_t rt = {
+                .it_version = 0, .it_pad = 0,
+                .it_len     = (uint16_t)rt_sz,
+                .it_present = 0x00000020UL,  // bit 5 = dBm Antenna Signal
+                .it_signal  = pkt->rssi,
+                .it_align   = {0, 0, 0},
+            };
+            fwrite(&rh,         sizeof(rh),  1, s_wcap_file);
+            fwrite(&rt,         sizeof(rt),  1, s_wcap_file);
+            fwrite(pkt->frame,  pkt->len,    1, s_wcap_file);
+            heap_caps_free(pkt->frame);
+            heap_caps_free(pkt);
+            s_wcap_count++;
+            written++;
+        }
+        if (written > 0) fflush(s_wcap_file);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    if (s_wcap_cnt_lbl) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "Packets: %lu", (unsigned long)s_wcap_count);
+        lv_label_set_text(s_wcap_cnt_lbl, buf);
+    }
+}
+
+// Stop promiscuous capture: drain remaining queue, close file.
+// Called from screen stop hook and STOP button handler.
+static void wifi_cap_stop(void)
+{
+    if (!s_wcap_running) return;
+    s_wcap_running = false;
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(NULL);
+
+    if (s_wcap_file && sd_spi_mutex &&
+        xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        if (s_wcap_queue) {
+            wifi_cap_pkt_t *pkt = NULL;
+            while (xQueueReceive(s_wcap_queue, &pkt, 0) == pdTRUE && pkt) {
+                uint32_t rt_sz = sizeof(wifi_cap_radiotap_t);
+                pcap_record_header_t rh;
+                rh.ts_sec  = (uint32_t)(pkt->ts_us / 1000000ULL);
+                rh.ts_usec = (uint32_t)(pkt->ts_us % 1000000ULL);
+                rh.incl_len = rt_sz + pkt->len;
+                rh.orig_len = rt_sz + pkt->len;
+                wifi_cap_radiotap_t rt = {
+                    .it_version = 0, .it_pad = 0,
+                    .it_len = (uint16_t)rt_sz,
+                    .it_present = 0x00000020UL,
+                    .it_signal = pkt->rssi,
+                    .it_align = {0, 0, 0},
+                };
+                fwrite(&rh,        sizeof(rh), 1, s_wcap_file);
+                fwrite(&rt,        sizeof(rt), 1, s_wcap_file);
+                fwrite(pkt->frame, pkt->len,   1, s_wcap_file);
+                heap_caps_free(pkt->frame);
+                heap_caps_free(pkt);
+                s_wcap_count++;
+            }
+        }
+        fflush(s_wcap_file);
+        fclose(s_wcap_file);
+        s_wcap_file = NULL;
+        ESP_LOGI(TAG, "WiFi capture saved: %s (%lu pkts)", s_wcap_filepath, (unsigned long)s_wcap_count);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    if (s_wcap_queue) { vQueueDelete(s_wcap_queue); s_wcap_queue = NULL; }
+}
+
+static void wifi_pcap_screen_stop(void)
+{
+    if (s_wcap_ui_timer) { lv_timer_del(s_wcap_ui_timer); s_wcap_ui_timer = NULL; }
+    s_wcap_cnt_lbl    = NULL;
+    s_wcap_status_lbl = NULL;
+    s_wcap_fn_lbl     = NULL;
+    s_wcap_list_cont  = NULL;
+    s_wcap_info_cont  = NULL;
+    wifi_cap_stop();
+}
+
+// AP list item tap: open PCAP file, lock channel, start promiscuous, switch UI.
+static void wifi_pcap_ap_tap_cb(lv_event_t *e)
+{
+    if (s_wcap_running) return;
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    wifi_ap_record_t *results = wifi_scanner_get_results_ptr();
+    if (idx < 0 || idx >= (int)wifi_scanner_get_count()) return;
+
+    memcpy(s_wcap_bssid, results[idx].bssid, 6);
+    strlcpy(s_wcap_ssid,
+            results[idx].ssid[0] ? (char *)results[idx].ssid : "[hidden]",
+            sizeof(s_wcap_ssid));
+    s_wcap_channel = results[idx].primary;
+
+    if (!ensure_wifi_mode()) { ESP_LOGE(TAG, "WiFi PCAP: WiFi init failed"); return; }
+
+    uint64_t ts = (uint64_t)(esp_timer_get_time() / 1000ULL);
+    snprintf(s_wcap_filepath, sizeof(s_wcap_filepath),
+             "/sdcard/lab/pcaps/wifi_%02X%02X%02X_%llu.pcap",
+             s_wcap_bssid[3], s_wcap_bssid[4], s_wcap_bssid[5],
+             (unsigned long long)ts);
+
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        s_wcap_file = fopen(s_wcap_filepath, "wb");
+        if (s_wcap_file) {
+            pcap_global_header_t gh = {
+                .magic_number  = 0xa1b2c3d4,
+                .version_major = 2,
+                .version_minor = 4,
+                .thiszone      = 0,
+                .sigfigs       = 0,
+                .snaplen       = 65535,
+                .network       = LINKTYPE_IEEE80211_RADIO,
+            };
+            fwrite(&gh, sizeof(gh), 1, s_wcap_file);
+            fflush(s_wcap_file);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    if (!s_wcap_file) { ESP_LOGE(TAG, "WiFi PCAP: cannot open %s", s_wcap_filepath); return; }
+
+    s_wcap_queue = xQueueCreate(WIFI_CAP_QUEUE_DEPTH, sizeof(wifi_cap_pkt_t *));
+    if (!s_wcap_queue) { fclose(s_wcap_file); s_wcap_file = NULL; return; }
+
+    s_wcap_count   = 0;
+    s_wcap_running = true;
+    esp_wifi_set_channel(s_wcap_channel, WIFI_SECOND_CHAN_NONE);
+    wifi_promiscuous_filter_t filt = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT |
+                       WIFI_PROMIS_FILTER_MASK_DATA |
+                       WIFI_PROMIS_FILTER_MASK_MISC,
+    };
+    esp_wifi_set_promiscuous_filter(&filt);
+    esp_wifi_set_promiscuous_rx_cb(wifi_cap_promisc_cb);
+    esp_wifi_set_promiscuous(true);
+
+    if (s_wcap_list_cont) lv_obj_add_flag(s_wcap_list_cont, LV_OBJ_FLAG_HIDDEN);
+    if (s_wcap_info_cont) lv_obj_clear_flag(s_wcap_info_cont, LV_OBJ_FLAG_HIDDEN);
+    if (s_wcap_status_lbl) {
+        char buf[52];
+        snprintf(buf, sizeof(buf), "Capturing: %.18s CH%u", s_wcap_ssid, s_wcap_channel);
+        lv_label_set_text(s_wcap_status_lbl, buf);
+    }
+    if (s_wcap_fn_lbl) {
+        const char *sn = strrchr(s_wcap_filepath, '/');
+        lv_label_set_text(s_wcap_fn_lbl, sn ? sn + 1 : s_wcap_filepath);
+    }
+    if (s_wcap_cnt_lbl) lv_label_set_text(s_wcap_cnt_lbl, "Packets: 0");
+    s_wcap_ui_timer = lv_timer_create(wifi_pcap_timer_cb, 200, NULL);
+    ESP_LOGI(TAG, "WiFi PCAP: %s CH%u -> %s", s_wcap_ssid, s_wcap_channel, s_wcap_filepath);
+}
+
+// STOP button: drain queue, close file, return to AP picker list.
+static void wifi_pcap_stop_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_wcap_ui_timer) { lv_timer_del(s_wcap_ui_timer); s_wcap_ui_timer = NULL; }
+    wifi_cap_stop();
+    if (s_wcap_info_cont) lv_obj_add_flag(s_wcap_info_cont, LV_OBJ_FLAG_HIDDEN);
+    if (s_wcap_list_cont) lv_obj_clear_flag(s_wcap_list_cont, LV_OBJ_FLAG_HIDDEN);
+    if (s_wcap_status_lbl) {
+        char buf[52];
+        snprintf(buf, sizeof(buf), "Saved: %lu pkts", (unsigned long)s_wcap_count);
+        lv_label_set_text(s_wcap_status_lbl, buf);
+        lv_obj_clear_flag(s_wcap_status_lbl, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// WiFi Packet Capture screen: AP picker (idle) <-> capture status (running).
+static void show_wifi_pcap_screen(void)
+{
+    create_function_page_base("WiFi Capture");
+    g_screen_stop_fn = wifi_pcap_screen_stop;
+    apply_menu_bg();
+
+    // ── AP picker (visible when idle) ──────────────────────────────────────────
+    s_wcap_list_cont = lv_obj_create(function_page);
+    lv_obj_set_size(s_wcap_list_cont, LCD_H_RES - 8, LCD_V_RES - 40);
+    lv_obj_align(s_wcap_list_cont, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_set_style_bg_color(s_wcap_list_cont, lv_color_hex(0x0D1117), 0);
+    lv_obj_set_style_border_color(s_wcap_list_cont, lv_color_hex(0x333333), 0);
+    lv_obj_set_style_border_width(s_wcap_list_cont, 1, 0);
+    lv_obj_set_style_pad_all(s_wcap_list_cont, 4, 0);
+    lv_obj_set_style_pad_gap(s_wcap_list_cont, 3, 0);
+    lv_obj_set_flex_flow(s_wcap_list_cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scroll_dir(s_wcap_list_cont, LV_DIR_VER);
+
+    uint16_t count = wifi_scanner_get_count();
+    wifi_ap_record_t *results = wifi_scanner_get_results_ptr();
+
+    if (count == 0) {
+        lv_obj_t *msg = lv_label_create(s_wcap_list_cont);
+        lv_label_set_text(msg, "No WiFi scan data.\n\nRun 'Scan & Attack' first\nto discover APs,\nthen return here.");
+        lv_obj_set_style_text_font(msg, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(msg, lv_color_hex(0x888888), 0);
+        lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(msg, LCD_H_RES - 24);
+        lv_obj_center(msg);
+    } else {
+        lv_obj_t *hdr = lv_label_create(s_wcap_list_cont);
+        lv_label_set_text(hdr, "Tap an AP to start capture:");
+        lv_obj_set_style_text_font(hdr, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(hdr, lv_color_hex(0xAAAAAA), 0);
+
+        int visible = (count > 32) ? 32 : (int)count;
+        for (int i = 0; i < visible; i++) {
+            char buf[52];
+            const char *ssid_str = results[i].ssid[0] ? (char *)results[i].ssid : "[hidden]";
+            snprintf(buf, sizeof(buf), "%-16.16s CH%-3u %+4d",
+                     ssid_str, results[i].primary, results[i].rssi);
+            lv_obj_t *btn = lv_btn_create(s_wcap_list_cont);
+            lv_obj_set_size(btn, lv_pct(100), 26);
+            lv_obj_set_style_bg_color(btn, lv_color_hex(0x1A2233), 0);
+            lv_obj_set_style_bg_color(btn, lv_color_hex(0x223355), LV_STATE_PRESSED);
+            lv_obj_set_style_radius(btn, 3, 0);
+            lv_obj_set_style_pad_all(btn, 3, 0);
+            lv_obj_t *lbl = lv_label_create(btn);
+            lv_label_set_text(lbl, buf);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(lbl, UI_ACCENT_CYAN, 0);
+            lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 4, 0);
+            lv_obj_add_event_cb(btn, wifi_pcap_ap_tap_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        }
+    }
+
+    // ── Capture status panel (hidden until capture starts) ─────────────────────
+    s_wcap_info_cont = lv_obj_create(function_page);
+    lv_obj_set_size(s_wcap_info_cont, LCD_H_RES - 8, LCD_V_RES - 40);
+    lv_obj_align(s_wcap_info_cont, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_set_style_bg_opa(s_wcap_info_cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_wcap_info_cont, 0, 0);
+    lv_obj_clear_flag(s_wcap_info_cont, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_wcap_info_cont, LV_OBJ_FLAG_HIDDEN);
+
+    s_wcap_status_lbl = lv_label_create(s_wcap_info_cont);
+    lv_label_set_text(s_wcap_status_lbl, "Capturing...");
+    lv_obj_set_style_text_font(s_wcap_status_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_wcap_status_lbl, UI_ACCENT_CYAN, 0);
+    lv_label_set_long_mode(s_wcap_status_lbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(s_wcap_status_lbl, LCD_H_RES - 16);
+    lv_obj_set_style_text_align(s_wcap_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_wcap_status_lbl, LV_ALIGN_TOP_MID, 0, 10);
+
+    s_wcap_fn_lbl = lv_label_create(s_wcap_info_cont);
+    lv_label_set_text(s_wcap_fn_lbl, "");
+    lv_obj_set_style_text_font(s_wcap_fn_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_wcap_fn_lbl, lv_color_hex(0x888888), 0);
+    lv_label_set_long_mode(s_wcap_fn_lbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(s_wcap_fn_lbl, LCD_H_RES - 16);
+    lv_obj_set_style_text_align(s_wcap_fn_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_wcap_fn_lbl, LV_ALIGN_TOP_MID, 0, 30);
+
+    s_wcap_cnt_lbl = lv_label_create(s_wcap_info_cont);
+    lv_label_set_text(s_wcap_cnt_lbl, "Packets: 0");
+    lv_obj_set_style_text_font(s_wcap_cnt_lbl, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(s_wcap_cnt_lbl, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_align(s_wcap_cnt_lbl, LV_ALIGN_CENTER, 0, -20);
+
+    lv_obj_t *fmt_lbl = lv_label_create(s_wcap_info_cont);
+    lv_label_set_text(fmt_lbl, LV_SYMBOL_WIFI " DLT 127 - Radiotap+802.11\nWireshark + Kismet compatible");
+    lv_obj_set_style_text_font(fmt_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(fmt_lbl, lv_color_hex(0x777777), 0);
+    lv_obj_set_style_text_align(fmt_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(fmt_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(fmt_lbl, LCD_H_RES - 16);
+    lv_obj_align(fmt_lbl, LV_ALIGN_CENTER, 0, 28);
+
+    lv_obj_t *stop_btn = lv_btn_create(s_wcap_info_cont);
+    lv_obj_set_size(stop_btn, LCD_H_RES - 32, 44);
+    lv_obj_align(stop_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_radius(stop_btn, 8, 0);
+    lv_obj_t *stop_lbl = lv_label_create(stop_btn);
+    lv_label_set_text(stop_lbl, "STOP CAPTURE");
+    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(stop_lbl);
+    lv_obj_add_event_cb(stop_btn, wifi_pcap_stop_btn_cb, LV_EVENT_CLICKED, NULL);
+}
+
 static void show_global_attacks_screen(void)
 {
     create_function_page_base("Global WiFi Attacks");
@@ -18360,6 +18773,8 @@ static void show_wifi_menu_screen(void)
     (void)wscope_tile;
     lv_obj_t *espnow_tile = create_tile(tiles, MY_SYMBOL_SATELLITE_DISH, "ESP-NOW\nScout", lv_color_hex(0x004D40), main_tile_event_cb, "ESP-NOW Scout");
     (void)espnow_tile;
+    lv_obj_t *wcap_tile = create_tile(tiles, LV_SYMBOL_DOWNLOAD, "WiFi\nCapture", lv_color_hex(0x00695C), main_tile_event_cb, "WiFi Capture");
+    (void)wcap_tile;
 }
 
 // WiFi Sniff & Karma screen
@@ -26829,6 +27244,192 @@ static void ble_pcap_write_epb(FILE *f, const ble_pcap_pkt_t *pkt)
     fwrite(&block_len, 4, 1, f);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// BLE Targeted Capture — 8-second BLE scan with live device picker.
+// User taps a device; filter MAC is set; opens BLE PCAP for that device only.
+// ════════════════════════════════════════════════════════════════════════════
+
+// BLE GAP callback: dedup discovered advertisers into s_targ_devs[]
+static int ble_targ_gap_cb(struct ble_gap_event *event, void *arg)
+{
+    (void)arg;
+    if (!s_targ_scanning) return 0;
+
+    uint8_t  addr[6];
+    uint8_t  addr_type;
+    int8_t   rssi;
+    const uint8_t *adv_data = NULL;
+    uint8_t  adv_len = 0;
+
+#if MYNEWT_VAL(BLE_EXT_ADV)
+    if (event->type == BLE_GAP_EVENT_EXT_DISC) {
+        memcpy(addr, event->ext_disc.addr.val, 6);
+        addr_type = event->ext_disc.addr.type;
+        rssi      = event->ext_disc.rssi;
+        adv_data  = event->ext_disc.data;
+        adv_len   = event->ext_disc.length_data;
+    } else return 0;
+#else
+    if (event->type == BLE_GAP_EVENT_DISC) {
+        memcpy(addr, event->disc.addr.val, 6);
+        addr_type = event->disc.addr.type;
+        rssi      = event->disc.rssi;
+        adv_data  = event->disc.data;
+        adv_len   = event->disc.length_data;
+    } else return 0;
+#endif
+
+    // Dedup: update RSSI if already seen
+    for (int i = 0; i < s_targ_count; i++) {
+        if (memcmp(s_targ_devs[i].addr, addr, 6) == 0) {
+            s_targ_devs[i].rssi = rssi;
+            return 0;
+        }
+    }
+    if (s_targ_count >= BLE_TARG_MAX) return 0;
+
+    int idx = s_targ_count;
+    memcpy(s_targ_devs[idx].addr, addr, 6);
+    s_targ_devs[idx].addr_type = addr_type;
+    s_targ_devs[idx].rssi      = rssi;
+    s_targ_devs[idx].name[0]   = '\0';
+    if (adv_data && adv_len > 0) {
+        struct ble_hs_adv_fields fields;
+        if (ble_hs_adv_parse_fields(&fields, adv_data, adv_len) == 0 &&
+            fields.name && fields.name_len > 0) {
+            int nlen = (int)fields.name_len < 19 ? (int)fields.name_len : 19;
+            memcpy(s_targ_devs[idx].name, fields.name, (size_t)nlen);
+            s_targ_devs[idx].name[nlen] = '\0';
+        }
+    }
+    s_targ_count++;
+    return 0;
+}
+
+// Device list item tap: stop discovery, set filter MAC, open BLE PCAP
+static void ble_targ_item_tap_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_targ_count) return;
+    s_targ_scanning = false;
+    ble_gap_disc_cancel();
+    memcpy(ble_pcap_filter_mac, s_targ_devs[idx].addr, 6);
+    ble_pcap_filter_active = true;
+    ESP_LOGI(TAG, "BLE Targeted: filter %02X:%02X:%02X:%02X:%02X:%02X",
+             ble_pcap_filter_mac[0], ble_pcap_filter_mac[1], ble_pcap_filter_mac[2],
+             ble_pcap_filter_mac[3], ble_pcap_filter_mac[4], ble_pcap_filter_mac[5]);
+    show_ble_pcap_screen();
+}
+
+// 1-second timer: add newly discovered devices to list; update countdown header.
+static void ble_targ_timer_cb(lv_timer_t *tmr)
+{
+    (void)tmr;
+    s_targ_tick++;
+    if (s_targ_tick >= BLE_TARG_SCAN_SECS) {
+        s_targ_scanning = false;
+        ble_gap_disc_cancel();
+    }
+
+    if (s_targ_hdr_lbl) {
+        if (s_targ_scanning) {
+            char hdrbuf[40];
+            snprintf(hdrbuf, sizeof(hdrbuf), "Scanning... %ds remaining",
+                     BLE_TARG_SCAN_SECS - s_targ_tick);
+            lv_label_set_text(s_targ_hdr_lbl, hdrbuf);
+        } else {
+            lv_label_set_text(s_targ_hdr_lbl, "Tap device to start capture:");
+        }
+    }
+
+    // Append only new devices — preserves scroll position and avoids full rebuild
+    int n = s_targ_count;
+    for (int i = s_targ_displayed; i < n && s_targ_list_cont; i++) {
+        char buf[52];
+        snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X %+4d %-12.12s",
+                 s_targ_devs[i].addr[0], s_targ_devs[i].addr[1],
+                 s_targ_devs[i].addr[2], s_targ_devs[i].addr[3],
+                 s_targ_devs[i].addr[4], s_targ_devs[i].addr[5],
+                 s_targ_devs[i].rssi,
+                 s_targ_devs[i].name[0] ? s_targ_devs[i].name : "");
+        lv_obj_t *btn = lv_btn_create(s_targ_list_cont);
+        lv_obj_set_size(btn, lv_pct(100), 26);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x1A1A2E), 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x2244AA), LV_STATE_PRESSED);
+        lv_obj_set_style_radius(btn, 3, 0);
+        lv_obj_set_style_pad_all(btn, 3, 0);
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, buf);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0x00E5FF), 0);
+        lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 2, 0);
+        lv_obj_add_event_cb(btn, ble_targ_item_tap_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+    }
+    s_targ_displayed = n;
+}
+
+static void ble_targ_screen_stop(void)
+{
+    if (s_targ_timer) { lv_timer_del(s_targ_timer); s_targ_timer = NULL; }
+    s_targ_list_cont = NULL;
+    s_targ_hdr_lbl   = NULL;
+    if (s_targ_scanning) {
+        s_targ_scanning = false;
+        ble_gap_disc_cancel();
+    }
+}
+
+// BLE Targeted Capture picker — 8-second BLE discovery, user picks target device.
+static void show_ble_targeted_pcap_screen(void)
+{
+    if (!ensure_ble_mode()) {
+        ESP_LOGE(TAG, "BLE Targeted: BLE init failed");
+        return;
+    }
+
+    s_targ_count     = 0;
+    s_targ_displayed = 0;
+    s_targ_tick      = 0;
+    s_targ_scanning  = true;
+    memset(s_targ_devs, 0, sizeof(s_targ_devs));
+
+    create_function_page_base("BLE Targeted");
+    g_screen_stop_fn = ble_targ_screen_stop;
+    apply_menu_bg();
+
+    s_targ_list_cont = lv_obj_create(function_page);
+    lv_obj_set_size(s_targ_list_cont, LCD_H_RES - 8, LCD_V_RES - 40);
+    lv_obj_align(s_targ_list_cont, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_set_style_bg_color(s_targ_list_cont, lv_color_hex(0x0D1117), 0);
+    lv_obj_set_style_border_color(s_targ_list_cont, lv_color_hex(0x333333), 0);
+    lv_obj_set_style_border_width(s_targ_list_cont, 1, 0);
+    lv_obj_set_style_pad_all(s_targ_list_cont, 4, 0);
+    lv_obj_set_style_pad_gap(s_targ_list_cont, 3, 0);
+    lv_obj_set_flex_flow(s_targ_list_cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scroll_dir(s_targ_list_cont, LV_DIR_VER);
+
+    s_targ_hdr_lbl = lv_label_create(s_targ_list_cont);
+    lv_label_set_text(s_targ_hdr_lbl, "Scanning... 8s remaining");
+    lv_obj_set_style_text_font(s_targ_hdr_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_targ_hdr_lbl, lv_color_hex(0xAAAAAA), 0);
+
+#if MYNEWT_VAL(BLE_EXT_ADV)
+    struct ble_gap_ext_disc_params ep = { .itvl = 0x60, .window = 0x60, .passive = 0 };
+    ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 0, 0,
+                     0, BLE_HCI_SCAN_FILT_NO_WL, 0,
+                     &ep, &ep, ble_targ_gap_cb, NULL);
+#else
+    struct ble_gap_disc_params dp = {
+        .itvl = 0x60, .window = 0x60,
+        .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
+        .limited = 0, .passive = 0, .filter_duplicates = 0,
+    };
+    ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &dp, ble_targ_gap_cb, NULL);
+#endif
+
+    s_targ_timer = lv_timer_create(ble_targ_timer_cb, 1000, NULL);
+}
+
 // BLE GAP callback for PCAP capture
 static int ble_pcap_gap_cb(struct ble_gap_event *event, void *arg)
 {
@@ -26842,6 +27443,8 @@ static int ble_pcap_gap_cb(struct ble_gap_event *event, void *arg)
 #if MYNEWT_VAL(BLE_EXT_ADV)
     if (event->type == BLE_GAP_EVENT_EXT_DISC) {
         struct ble_gap_ext_disc_desc *d = &event->ext_disc;
+        // Targeted capture: skip packets not from the filtered advertiser address
+        if (ble_pcap_filter_active && memcmp(d->addr.val, ble_pcap_filter_mac, 6) != 0) return 0;
         memcpy(pkt.addr, d->addr.val, 6);
         pkt.addr_type    = d->addr.type;
         pkt.rssi         = d->rssi;
@@ -26860,6 +27463,7 @@ static int ble_pcap_gap_cb(struct ble_gap_event *event, void *arg)
 
     if (event->type == BLE_GAP_EVENT_DISC) {
         struct ble_gap_disc_desc *d = &event->disc;
+        if (ble_pcap_filter_active && memcmp(d->addr.val, ble_pcap_filter_mac, 6) != 0) return 0;
         memcpy(pkt.addr, d->addr.val, 6);
         pkt.addr_type    = d->addr.type;
         pkt.event_type   = (uint8_t)d->event_type;
@@ -26877,6 +27481,9 @@ static void ble_pcap_stop(void)
     if (!ble_pcap_active) return;
     ble_pcap_active = false;
     ble_gap_disc_cancel();
+    // Clear targeted filter so next BLE PCAP open captures all devices
+    ble_pcap_filter_active = false;
+    memset(ble_pcap_filter_mac, 0, 6);
 
     if (ble_pcap_timer) { lv_timer_del(ble_pcap_timer); ble_pcap_timer = NULL; }
 
@@ -26986,6 +27593,21 @@ static void show_ble_pcap_screen(void)
     lv_label_set_long_mode(fn_lbl, LV_LABEL_LONG_DOT);
     lv_obj_set_width(fn_lbl, LCD_H_RES - 8);
     lv_obj_set_style_text_align(fn_lbl, LV_TEXT_ALIGN_CENTER, 0);
+
+    // Targeted capture filter indicator
+    if (ble_pcap_filter_active) {
+        lv_obj_t *filt_lbl = lv_label_create(function_page);
+        char filtbuf[40];
+        snprintf(filtbuf, sizeof(filtbuf), "Target: %02X:%02X:%02X:%02X:%02X:%02X",
+                 ble_pcap_filter_mac[0], ble_pcap_filter_mac[1], ble_pcap_filter_mac[2],
+                 ble_pcap_filter_mac[3], ble_pcap_filter_mac[4], ble_pcap_filter_mac[5]);
+        lv_label_set_text(filt_lbl, filtbuf);
+        lv_obj_set_style_text_font(filt_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(filt_lbl, COLOR_MATERIAL_AMBER, 0);
+        lv_obj_set_style_text_align(filt_lbl, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(filt_lbl, LCD_H_RES - 8);
+        lv_obj_align(filt_lbl, LV_ALIGN_TOP_MID, 0, 52);
+    }
 
     // Packet counter
     ble_pcap_cnt_label = lv_label_create(function_page);
@@ -28362,9 +28984,13 @@ static void show_bluetooth_screen(void)
     lv_obj_t *btatk_tile = create_tile(tiles, MY_SYMBOL_SKULL_CROSS, "BT\nAttacks", COLOR_MATERIAL_AMBER, NULL, NULL);
     lv_obj_add_event_cb(btatk_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Attacks");
 
-    // BLE PCAP - teal/purple
+    // BLE PCAP - teal
     lv_obj_t *pcap_tile = create_tile(tiles, MY_SYMBOL_NET_WIRED, "BLE\nPCAP", lv_color_hex(0x00897B), NULL, NULL);
     lv_obj_add_event_cb(pcap_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE PCAP");
+
+    // BLE Targeted Capture - targeted single-device filter PCAP
+    lv_obj_t *tgtcap_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "BLE\nTargeted", lv_color_hex(0x1B5E20), NULL, NULL);
+    lv_obj_add_event_cb(tgtcap_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Targeted");
 
     // HoneyPair - BLE honeypot / pairing telemetry logger
     lv_obj_t *hp_tile = create_tile(tiles, MY_SYMBOL_USER_SECRET, "Honey\nPair",
@@ -35004,6 +35630,12 @@ void attack_event_cb(lv_event_t *e)
     // BLE PCAP capture
     if (strcmp(attack_name, "BLE PCAP") == 0) {
         show_ble_pcap_screen();
+        return;
+    }
+
+    // BLE Targeted Capture - scan picker + single-device PCAP filter
+    if (strcmp(attack_name, "BLE Targeted") == 0) {
+        show_ble_targeted_pcap_screen();
         return;
     }
 
