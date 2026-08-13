@@ -374,18 +374,14 @@ void nrf24_jam_sweep(volatile bool *active)
 {
     if (!s_drv) return;
 
-    // PTX mode, no CRC, no AA, 2 Mbps, max power
+    // PTX mode, no CRC, no AA, 2 Mbps, max power (+20 dBm via AT2401C PA).
+    // 3-byte address minimises packet air time (sniffer mode already uses 3-byte AW).
     nrf24_write_reg(REG_EN_AA,      0x00);
     nrf24_write_reg(REG_SETUP_RETR, 0x00);
+    nrf24_write_reg(REG_SETUP_AW,   0x01);  // 3-byte address
     nrf24_write_reg(REG_RF_SETUP,   RF_SETUP_DR_HIGH | RF_SETUP_PWR(3));
     nrf24_write_reg(REG_CONFIG,     CONFIG_PWR_UP);
     vTaskDelay(pdMS_TO_TICKS(2));
-
-    uint8_t tx_cmd[33] = { CMD_W_PAYLOAD };
-    memset(tx_cmd + 1, 0xFF, 32);
-    uint8_t rx_tmp[33];
-
-    nrf24_flush_tx();
 
     // CE-pulse approach: CE goes low between every channel so the chip returns
     // to STANDBY-I and re-latches RF_CH before each packet.  The "CE stays HIGH"
@@ -393,30 +389,47 @@ void nrf24_jam_sweep(volatile bool *active)
     // ignores subsequent RF_CH writes while CE is held high, so every packet
     // lands on the initial channel (ch 0 = 2400 MHz).
     //
-    // Timing per channel at 2 Mbps, 32-byte payload:
-    //   ~30 µs  SPI (RF_CH + STATUS + payload)
-    //   ~15 µs  CE pulse (spec min 10 µs)
-    //   ~175 µs wait for packet to clear FIFO (packet air time ≈ 165 µs)
-    //   ────────────────────────────────────────────────
-    //   ~220 µs total → ~4500 packets/s across 126 channels → ~36 sweeps/s
+    // 1-byte payload at 2 Mbps, 3-byte address, no CRC:
+    //   preamble(8) + addr(24) + data(8) = 40 bits → ~20 µs air time
+    //   ~15 µs SPI  +  10 µs CE min  +  20 µs air margin  =  ~45 µs/channel
+    //
+    // Bluetooth band: nRF24 ch 2-80 = 2402-2480 MHz (all 79 Classic BT channels).
+    // Sweeping ch 0-1 and 81-125 hits spectrum BT never occupies — pure waste.
+    //
+    //   79 channels × 45 µs = 3.6 ms active + 10 ms yield → ~74 sweeps/sec
+    //   vs. prior 32-byte payload on ch 0-125: ~220 µs → ~21 hits/sec per BT channel
+    //   Improvement: ~3.5× more hits per BT channel per second.
+    //
+    // Fundamental limitation: Bluetooth Classic uses Adaptive Frequency Hopping
+    // (AFH) to route around narrow-band interference.  A single-channel swept
+    // radio cannot fully overcome AFH at range; at close range (< 2 m) the
+    // AT2401C's +20 dBm output provides meaningful disruption.
 
-    uint8_t ch = 0;
+    uint8_t tx_cmd[2] = { CMD_W_PAYLOAD, 0xFF };
+    uint8_t rx_tmp[2];
+
+    nrf24_flush_tx();
+
+    uint8_t ch = 2;   // start at 2402 MHz — lowest Bluetooth channel
     while (active && *active) {
-        nrf24_write_reg(REG_RF_CH, ch);
+        nrf24_write_reg(REG_RF_CH,  ch);
         nrf24_write_reg(REG_STATUS, 0x70);
-        csn_low(); spi_xfer_buf(tx_cmd, rx_tmp, 33); csn_high();
+        csn_low(); spi_xfer_buf(tx_cmd, rx_tmp, 2); csn_high();
 
         ce_high();
-        esp_rom_delay_us(15);   // chip latches RF_CH and starts TX
+        esp_rom_delay_us(10);   // spec minimum CE pulse
         ce_low();
 
-        esp_rom_delay_us(175);  // wait for packet to finish before next CE rise
+        esp_rom_delay_us(20);   // packet air time + STANDBY-I settling margin
 
-        ch = (ch >= 125) ? 0 : ch + 1;
-        if (ch == 0)
-            vTaskDelay(pdMS_TO_TICKS(20));  // yield once per sweep for WDT
+        if (++ch > 80) {        // 2480 MHz = highest BT channel
+            ch = 2;
+            vTaskDelay(pdMS_TO_TICKS(10));  // one FreeRTOS tick per sweep for WDT
+        }
     }
 
+    // Restore default address width (5 bytes) before handing back to other nRF24 functions
+    nrf24_write_reg(REG_SETUP_AW, 0x03);
     ce_low();
     nrf24_flush_tx();
     nrf24_standby();
