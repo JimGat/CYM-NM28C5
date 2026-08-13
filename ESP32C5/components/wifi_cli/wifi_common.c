@@ -45,31 +45,42 @@ const char* authmode_to_string(wifi_auth_mode_t mode) {
 void escape_csv_field(const char* input, char* output, size_t output_size) {
     size_t i = 0, j = 0;
     bool needs_quotes = false;
-    
+
     if (!input || !output || output_size < 3) return;
-    
+
+    // Neutralize control chars (CR/LF/TAB/etc.) to a space: an unescaped CR or LF in
+    // an SSID/name splits the CSV row across two physical lines, which silently drops
+    // that network on WiGLE/WDGWars upload (observed on DE->TR wardrive: vehicle
+    // "R-MDVR" DVR APs broadcast an SSID ending in a raw CR -> 47 networks lost).
+    // WiGLE's own client replaces bad chars rather than preserving them, so match that.
+    // Only ',' and '"' still require RFC 4180 quoting (control chars become spaces).
     for (i = 0; input[i] != '\0'; i++) {
-        if (input[i] == ',' || input[i] == '"' || input[i] == '\n') {
+        if (input[i] == ',' || input[i] == '"') {
             needs_quotes = true;
             break;
         }
     }
-    
+
     if (needs_quotes) {
         output[j++] = '"';
         for (i = 0; input[i] != '\0' && j < output_size - 3; i++) {
-            if (input[i] == '"') {
+            unsigned char c = (unsigned char)input[i];
+            if (c < 0x20) c = ' ';
+            if (c == '"') {
                 output[j++] = '"';
                 output[j++] = '"';
             } else {
-                output[j++] = input[i];
+                output[j++] = (char)c;
             }
         }
         output[j++] = '"';
         output[j] = '\0';
     } else {
-        strncpy(output, input, output_size - 1);
-        output[output_size - 1] = '\0';
+        for (i = 0; input[i] != '\0' && j < output_size - 1; i++) {
+            unsigned char c = (unsigned char)input[i];
+            output[j++] = (c < 0x20) ? ' ' : (char)c;
+        }
+        output[j] = '\0';
     }
 }
 

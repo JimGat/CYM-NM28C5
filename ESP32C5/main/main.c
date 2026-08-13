@@ -1234,6 +1234,8 @@ static const int wd_dwell_table[WD_MODE_COUNT][4] = {
 #define WD_EMA_ALPHA         0.3f     // smoothing over ~last 4-5 fixes
 #define WD_MODE_MIN_DWELL_MS 5000     // min time in a state before a switch (anti-flap)
 #define WD_MODE_SLOW_DWELL_MS 15000   // longer settle for Walk<->Stationary only (GPS-jitter churn)
+#define WD_MODE_HWY_DWELL_MS  12000   // longer settle for Car<->Highway (overtaking spikes / traffic dips)
+#define WD_MODE_CAR_DWELL_MS  12000   // longer settle for Walk<->Car (stop-and-go crawl across the 12-20 km/h band)
 // Car mode: visit DFS arms at most ~1 in this many D-UCB selections.
 // Highway rate-limits DFS harder still (DFS APs rarely repay a visit at speed).
 #define WD_CAR_DFS_SELECT_RATIO 10
@@ -1326,7 +1328,23 @@ static wd_mode_t wd_classify_mode(float raw_speed_ms)
         // Car/Highway transitions stay responsive at WD_MODE_MIN_DWELL_MS.
         bool slow_pair = (cur  == WD_MODE_STATIONARY || cur  == WD_MODE_WALK) &&
                          (next == WD_MODE_STATIONARY || next == WD_MODE_WALK);
-        int64_t min_dwell_ms = slow_pair ? WD_MODE_SLOW_DWELL_MS : WD_MODE_MIN_DWELL_MS;
+        // Car<->Highway oscillates on overtaking speed spikes and brief traffic dips
+        // (~21% of Highway segments ran <30s on the DE->TR drive). A longer min-dwell
+        // damps it; Highway is only ever reached from Car and only steps back to Car,
+        // so this pair is exactly Car<->Highway.
+        bool hwy_pair  = (cur == WD_MODE_HIGHWAY || next == WD_MODE_HIGHWAY);
+        // Walk<->Car oscillates in stop-and-go traffic: speed swings across the whole
+        // 12-20 km/h Car band (CAR_EXIT..CAR_ENTER) so both thresholds get crossed every
+        // creep, flapping the mode every 5-13 s (seen on the 2026-08-12 city drive). A
+        // longer settle keeps Car params during brief crawls. This pair is ONLY
+        // Walk<->Car: Stationary->Car (pull-away) and Car->Stationary (hard stop) are
+        // excluded, so they stay responsive at WD_MODE_MIN_DWELL_MS.
+        bool car_pair  = (cur  == WD_MODE_WALK || cur  == WD_MODE_CAR) &&
+                         (next == WD_MODE_WALK || next == WD_MODE_CAR);
+        int64_t min_dwell_ms = slow_pair ? WD_MODE_SLOW_DWELL_MS
+                             : hwy_pair  ? WD_MODE_HWY_DWELL_MS
+                             : car_pair  ? WD_MODE_CAR_DWELL_MS
+                             : WD_MODE_MIN_DWELL_MS;
         if (now - g_wd_mode_since_us >= min_dwell_ms * 1000LL) {
             g_wd_active_mode   = next;
             g_wd_mode_since_us = now;
@@ -10741,7 +10759,34 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
         } else if (tag == 3 && tag_len == 1) {
             beacon_channel = body[offset + 2];
         } else if (tag == 48) {
-            authmode = WIFI_AUTH_WPA2_PSK;
+            authmode = WIFI_AUTH_WPA2_PSK;  // RSN IE present -> at least WPA2
+            // Refine from the RSN AKM suite list so WPA3/Enterprise are not mislabeled
+            // WPA2. RSN IE layout: version(2) group-cipher(4) pairwise-cnt(2)
+            // pairwise(4*n) akm-cnt(2) akm(4*m) ... AKM OUI 00-0F-AC: 8/9=SAE(WPA3),
+            // 2/6=PSK(WPA2), 1/5=802.1X(Enterprise). All reads bounds-checked vs tag_len.
+            const uint8_t *rsn = &body[offset + 2];
+            int rl = tag_len, p = 2 + 4;               // skip version + group cipher
+            if (p + 2 <= rl) {
+                int pcnt = rsn[p] | (rsn[p + 1] << 8); // pairwise cipher count
+                p += 2 + 4 * pcnt;                     // skip pairwise suites
+                if (p + 2 <= rl) {
+                    int akm = rsn[p] | (rsn[p + 1] << 8);
+                    p += 2;
+                    bool psk = false, sae = false, ent = false;
+                    for (int a = 0; a < akm && p + 4 <= rl; a++, p += 4) {
+                        if (rsn[p] == 0x00 && rsn[p + 1] == 0x0F && rsn[p + 2] == 0xAC) {
+                            uint8_t t = rsn[p + 3];
+                            if (t == 8 || t == 9)      sae = true;
+                            else if (t == 2 || t == 6) psk = true;
+                            else if (t == 1 || t == 5) ent = true;
+                        }
+                    }
+                    if (sae && psk)  authmode = WIFI_AUTH_WPA2_WPA3_PSK;
+                    else if (sae)    authmode = WIFI_AUTH_WPA3_PSK;
+                    else if (ent)    authmode = WIFI_AUTH_WPA2_ENTERPRISE;
+                    // else stays WPA2_PSK
+                }
+            }
         } else if (tag == 221) {
             if (tag_len >= 4 && body[offset+2] == 0x00 && body[offset+3] == 0x50 &&
                 body[offset+4] == 0xF2 && body[offset+5] == 0x01) {
@@ -10749,6 +10794,14 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
             }
         }
         offset += 2 + tag_len;
+    }
+
+    // WEP: privacy bit set in the beacon capability field but no RSN/WPA IE seen.
+    // (Previously these fell through as Open, understating their crypto on upload.)
+    // Capability info = the 2 bytes just before the tagged params; body = frame+24+12,
+    // so its low byte is frame[34], valid because len >= 36 was checked above.
+    if (authmode == WIFI_AUTH_OPEN && (frame[34] & 0x10)) {
+        authmode = WIFI_AUTH_WEP;
     }
 
     // Check if GPS moved 150+ feet; if so, clear dedup buffer to allow re-discovery
@@ -20358,6 +20411,23 @@ static bool wd_is_uploadable_csv(const char *name)
     return true;
 }
 
+// True if the upload journal (loaded once into `ulog`) already records this file as
+// OK or DUP for the given service ("WIGLE"/"WDG"). Lets "Upload All" skip files that
+// are already on the server instead of re-POSTing them in full every run. Per-service:
+// a WDG-OK / WiGLE-FAIL file is skipped for WDG but still retried for WiGLE. A FAIL-only
+// entry is NOT "done" -> it retries. Filenames are unique + fully anchored by ",SVC,ST"
+// so a plain substring test cannot false-match another line.
+static bool wdup_log_has_done(const char *ulog, const char *fname, const char *svc)
+{
+    if (!ulog || !fname || !svc) return false;
+    char needle[300];
+    snprintf(needle, sizeof(needle), "%s,%s,OK", fname, svc);
+    if (strstr(ulog, needle)) return true;
+    snprintf(needle, sizeof(needle), "%s,%s,DUP", fname, svc);
+    if (strstr(ulog, needle)) return true;
+    return false;
+}
+
 static int wdup_upload_one(const char *filepath, const char *filename,
                             bool use_wigle)
 {
@@ -20589,6 +20659,21 @@ static void wdup_task(void *pvParameters)
         int n = wdup_explicit_count;
         int ok_count2 = 0, dup_count2 = 0, fail_count2 = 0;
         wdup_prog_total = n;
+        // Same skip-already-uploaded optimization as "Upload All": load the journal
+        // once (PSRAM only, DMA-safe) and skip (file,service) pairs already OK/DUP.
+        char *ulog = NULL;
+        if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+            FILE *lf = fopen(WDUP_LOG_PATH, "rb");
+            if (lf) {
+                fseek(lf, 0, SEEK_END); long ls = ftell(lf); fseek(lf, 0, SEEK_SET);
+                if (ls > 0 && ls <= 512 * 1024) {
+                    ulog = (char *)heap_caps_malloc((size_t)ls + 1, MALLOC_CAP_SPIRAM);
+                    if (ulog) { size_t nr = fread(ulog, 1, (size_t)ls, lf); ulog[nr] = '\0'; }
+                }
+                fclose(lf);
+            }
+            xSemaphoreGive(sd_spi_mutex);
+        }
         char xmsg[128];
         snprintf(xmsg, sizeof(xmsg), "Uploading %d selected file(s)...", n);
         wdup_push_msg(xmsg, cyan);
@@ -20599,7 +20684,10 @@ static void wdup_task(void *pvParameters)
             const char *xname  = strrchr(xfpath, '/');
             xname = xname ? xname + 1 : xfpath;
             wdup_prog_cur = si + 1;
-            if (do_wigle) {
+            if (do_wigle && wdup_log_has_done(ulog, xname, "WIGLE")) {
+                snprintf(xmsg, sizeof(xmsg), "[%d/%d] WiGLE: %.50s -> already uploaded (skip)", si+1, n, xname);
+                wdup_push_msg(xmsg, amber); dup_count2++; wdup_wigle_dup_cnt++;
+            } else if (do_wigle) {
                 snprintf(xmsg, sizeof(xmsg), "[%d/%d] WiGLE: %.50s...", si+1, n, xname);
                 wdup_push_msg(xmsg, cyan);
                 int r = wdup_upload_one(xfpath, xname, true);
@@ -20617,7 +20705,10 @@ static void wdup_task(void *pvParameters)
                 }
                 vTaskDelay(pdMS_TO_TICKS(800));
             }
-            if (do_wdg && wdup_active) {
+            if (do_wdg && wdup_active && wdup_log_has_done(ulog, xname, "WDG")) {
+                snprintf(xmsg, sizeof(xmsg), "[%d/%d] WDG: %.50s -> already uploaded (skip)", si+1, n, xname);
+                wdup_push_msg(xmsg, amber); dup_count2++; wdup_wdg_dup_cnt++;
+            } else if (do_wdg && wdup_active) {
                 snprintf(xmsg, sizeof(xmsg), "[%d/%d] WDG: %.50s...", si+1, n, xname);
                 wdup_push_msg(xmsg, cyan);
                 int r = wdup_upload_one(xfpath, xname, false);
@@ -20636,6 +20727,7 @@ static void wdup_task(void *pvParameters)
                 vTaskDelay(pdMS_TO_TICKS(800));
             }
         }
+        if (ulog) free(ulog);
         snprintf(xmsg, sizeof(xmsg), "Done: %d OK, %d dup, %d failed",
                  ok_count2, dup_count2, fail_count2);
         wdup_push_msg(xmsg, (fail_count2 > 0) ? red : green);
@@ -20678,6 +20770,24 @@ static void wdup_task(void *pvParameters)
     wdup_push_msg(msg, cyan);
     wdup_prog_total = total;
 
+    // Load the upload journal once (PSRAM) so already-OK/DUP files can be skipped
+    // instead of re-POSTed in full every run. NULL => no skipping (upload everything).
+    char *ulog = NULL;
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        FILE *lf = fopen(WDUP_LOG_PATH, "rb");
+        if (lf) {
+            fseek(lf, 0, SEEK_END); long ls = ftell(lf); fseek(lf, 0, SEEK_SET);
+            if (ls > 0 && ls <= 512 * 1024) {
+                // PSRAM only: never take from the internal heap the DMA pool lives in.
+                // If PSRAM is unavailable, ulog stays NULL -> skip disabled, upload all.
+                ulog = (char *)heap_caps_malloc((size_t)ls + 1, MALLOC_CAP_SPIRAM);
+                if (ulog) { size_t nr = fread(ulog, 1, (size_t)ls, lf); ulog[nr] = '\0'; }
+            }
+            fclose(lf);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
     int cur = 0, ok_count = 0, dup_count = 0, fail_count = 0;
 
     while (wdup_active) {
@@ -20697,8 +20807,11 @@ static void wdup_task(void *pvParameters)
         char fpath[320];
         snprintf(fpath, sizeof(fpath), "/sdcard/lab/wardrives/%s", dname);
 
-        // Upload to WiGLE
-        if (do_wigle) {
+        // Upload to WiGLE (skip if the journal already has it OK/DUP)
+        if (do_wigle && wdup_log_has_done(ulog, dname, "WIGLE")) {
+            snprintf(msg, sizeof(msg), "[%d/%d] WiGLE: %.50s -> already uploaded (skip)", cur, total, dname);
+            wdup_push_msg(msg, amber); dup_count++; wdup_wigle_dup_cnt++;
+        } else if (do_wigle) {
             snprintf(msg, sizeof(msg), "[%d/%d] WiGLE: %.60s...", cur, total, dname);
             wdup_push_msg(msg, cyan);
             int r = wdup_upload_one(fpath, dname, true);
@@ -20724,8 +20837,11 @@ static void wdup_task(void *pvParameters)
             vTaskDelay(pdMS_TO_TICKS(800));
         }
 
-        // Upload to WDG Wars
-        if (do_wdg) {
+        // Upload to WDG Wars (skip if the journal already has it OK/DUP)
+        if (do_wdg && wdup_log_has_done(ulog, dname, "WDG")) {
+            snprintf(msg, sizeof(msg), "[%d/%d] WDG: %.50s -> already uploaded (skip)", cur, total, dname);
+            wdup_push_msg(msg, amber); dup_count++; wdup_wdg_dup_cnt++;
+        } else if (do_wdg) {
             snprintf(msg, sizeof(msg), "[%d/%d] WDG: %.60s...", cur, total, dname);
             wdup_push_msg(msg, cyan);
             int r = wdup_upload_one(fpath, dname, false);
@@ -20755,6 +20871,7 @@ static void wdup_task(void *pvParameters)
     if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
         closedir(dir); xSemaphoreGive(sd_spi_mutex);
     }
+    if (ulog) free(ulog);
 
     snprintf(msg, sizeof(msg), "Done: %d OK, %d dup, %d failed", ok_count, dup_count, fail_count);
     wdup_push_msg(msg, (fail_count > 0) ? red : green);
@@ -21375,6 +21492,66 @@ static void wdm_sel_none_cb(lv_event_t *e)
     wdm_update_actions();
 }
 
+// A wardrive drive writes a DATA file "<prefix><stamp>-NNN.csv" plus two per-drive
+// companion sidecars sharing the same "<prefix><stamp>" base: "<base>_mode.csv"
+// (mode-transition log) and "<base>_marks.gpx" (GPS marks). Sidecars are not uploadable,
+// so they never appear on the Upload/Manage screens (wd_is_uploadable_csv filters them
+// out) and get ORPHANED on the SD card once their data file is deleted — over many drives
+// they pile up. This sweep removes every _mode.csv/_marks.gpx that has NO surviving
+// "<base>-NNN.csv" data file (cleans BOTH just-deleted and previously-orphaned sidecars).
+// upload_log.csv is not a sidecar so it is never matched/removed. Caller MUST hold
+// sd_spi_mutex. Names buffer is PSRAM-only (DMA-safe); on PSRAM-alloc fail we skip the
+// sweep (no regression). Two-phase (snapshot then remove) to avoid deleting while the
+// directory handle is open.
+#define WD_SWEEP_MAX_FILES 192
+#define WD_SWEEP_NAME_LEN  48
+static void wd_sweep_orphan_sidecars(void)
+{
+    const char *dir_path = "/sdcard/lab/wardrives";
+    char (*names)[WD_SWEEP_NAME_LEN] =
+        heap_caps_malloc((size_t)WD_SWEEP_MAX_FILES * WD_SWEEP_NAME_LEN,
+                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!names) return;                        // no PSRAM -> skip, uploads/deletes unaffected
+    int n = 0;
+    DIR *d = opendir(dir_path);
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL && n < WD_SWEEP_MAX_FILES) {
+            size_t l = strlen(ent->d_name);
+            if (l == 0 || l >= WD_SWEEP_NAME_LEN) continue;
+            strcpy(names[n++], ent->d_name);
+        }
+        closedir(d);
+    }
+    for (int i = 0; i < n; i++) {
+        const char *nm = names[i];
+        size_t l = strlen(nm);
+        int is_mode  = (l >= 9  && strcasecmp(nm + l - 9,  "_mode.csv")  == 0);
+        int is_marks = (l >= 10 && strcasecmp(nm + l - 10, "_marks.gpx") == 0);
+        if (!is_mode && !is_marks) continue;
+        int blen = is_mode ? (int)(l - 9) : (int)(l - 10);
+        if (blen <= 0) continue;
+        bool has_data = false;                 // any "<base>-<digits>.csv" still present?
+        for (int j = 0; j < n && !has_data; j++) {
+            const char *dn = names[j];
+            size_t dl = strlen(dn);
+            if (dl < (size_t)blen + 6) continue;               // base + "-N.csv"
+            if (strncmp(dn, nm, blen) != 0 || dn[blen] != '-') continue;
+            if (strcasecmp(dn + dl - 4, ".csv") != 0) continue;
+            bool digits = (dn + blen + 1 < dn + dl - 4);       // at least 1 part digit
+            for (const char *q = dn + blen + 1; q < dn + dl - 4; q++)
+                if (*q < '0' || *q > '9') { digits = false; break; }
+            if (digits) has_data = true;
+        }
+        if (!has_data) {
+            char full[320];
+            snprintf(full, sizeof(full), "%s/%s", dir_path, nm);
+            remove(full);                      // best-effort orphan cleanup
+        }
+    }
+    heap_caps_free(names);
+}
+
 // Confirm-delete overlay callbacks
 static void wdm_confirm_ok_cb(lv_event_t *e)
 {
@@ -21389,6 +21566,7 @@ static void wdm_confirm_ok_cb(lv_event_t *e)
             remove(wd_manage_paths[i]);
             wd_manage_paths[i][0] = '\0';
         }
+        wd_sweep_orphan_sidecars();  // remove _mode.csv/_marks.gpx left with no data file
         xSemaphoreGive(sd_spi_mutex);
     }
     for (int i = 0; i < wd_manage_count; i++) {
@@ -21511,9 +21689,12 @@ static void show_wardrive_manage_screen(void)
         if (lf) {
             fseek(lf, 0, SEEK_END);
             long lsz = ftell(lf); rewind(lf);
-            if (lsz > 0 && lsz < 8192) {
+            // Load into PSRAM up to 512 KB (matches the wdup upload-skip loader). The old
+            // 8 KB cap left the buffer NULL once upload_log.csv grew past ~8 KB, so every
+            // file wrongly showed "New" even after a successful WiGLE/WDG upload.
+            if (lsz > 0 && lsz <= 512 * 1024) {
                 log_buf = heap_caps_malloc(lsz + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-                if (log_buf) { fread(log_buf, 1, lsz, lf); log_buf[lsz] = '\0'; }
+                if (log_buf) { size_t nr = fread(log_buf, 1, lsz, lf); log_buf[nr] = '\0'; }
             }
             fclose(lf);
         }
