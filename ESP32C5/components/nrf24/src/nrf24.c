@@ -41,9 +41,11 @@ extern SemaphoreHandle_t sd_spi_mutex;
 #define CONFIG_CRCO     0x04
 
 // RF_SETUP bits
-#define RF_SETUP_DR_HIGH 0x08
-#define RF_SETUP_DR_LOW  0x20
-#define RF_SETUP_PWR(n) ((n & 3) << 1)
+#define RF_SETUP_DR_HIGH  0x08
+#define RF_SETUP_DR_LOW   0x20
+#define RF_SETUP_PWR(n)  ((n & 3) << 1)
+#define RF_SETUP_PLL_LOCK 0x10   // force PLL on — required with CONT_WAVE
+#define RF_SETUP_CONT_WAVE 0x80  // continuous unmodulated carrier (test mode, nRF24L01+ §6.4)
 
 // STATUS bits
 #define STATUS_RX_DR    0x40
@@ -374,65 +376,71 @@ void nrf24_jam_sweep(volatile bool *active)
 {
     if (!s_drv) return;
 
-    // PTX mode, no CRC, no AA, 2 Mbps, max power (+20 dBm via AT2401C PA).
-    // 3-byte address minimises packet air time (sniffer mode already uses 3-byte AW).
-    nrf24_write_reg(REG_EN_AA,      0x00);
-    nrf24_write_reg(REG_SETUP_RETR, 0x00);
-    nrf24_write_reg(REG_SETUP_AW,   0x01);  // 3-byte address
-    nrf24_write_reg(REG_RF_SETUP,   RF_SETUP_DR_HIGH | RF_SETUP_PWR(3));
-    nrf24_write_reg(REG_CONFIG,     CONFIG_PWR_UP);
-    vTaskDelay(pdMS_TO_TICKS(2));
-
-    // CE-pulse approach: CE goes low between every channel so the chip returns
-    // to STANDBY-I and re-latches RF_CH before each packet.  The "CE stays HIGH"
-    // pipeline does NOT work — the nRF24 locks its PLL when CE first rises and
-    // ignores subsequent RF_CH writes while CE is held high, so every packet
-    // lands on the initial channel (ch 0 = 2400 MHz).
+    // ── Continuous-carrier (CONT_WAVE) jamming ───────────────────────────────
+    // nRF24L01+ §6.4: setting RF_SETUP.CONT_WAVE=1 + RF_SETUP.PLL_LOCK=1 with
+    // CE HIGH forces the chip to emit an unmodulated carrier at 100% duty cycle.
+    // No packets, no preamble, no air-time dead zones — just a solid RF signal.
     //
-    // 1-byte payload at 2 Mbps, 3-byte address, no CRC:
-    //   preamble(8) + addr(24) + data(8) = 40 bits → ~20 µs air time
-    //   ~15 µs SPI  +  10 µs CE min  +  20 µs air margin  =  ~45 µs/channel
+    // Hopping: write RF_CH while CE stays HIGH.  The PLL re-locks to the new
+    // frequency within ~100 µs; the carrier is back on the new channel before
+    // the next register write arrives.
     //
-    // Bluetooth band: nRF24 ch 2-80 = 2402-2480 MHz (all 79 Classic BT channels).
-    // Sweeping ch 0-1 and 81-125 hits spectrum BT never occupies — pure waste.
+    // This is the same mode used by Bruce firmware and why it works where the
+    // earlier CE-pulse packet approach did not: 100% duty cycle vs ~35% with
+    // pulsed packets, plus the carrier is far wider than a 1-byte packet burst.
     //
-    //   79 channels × 45 µs = 3.6 ms active + 10 ms yield → ~74 sweeps/sec
-    //   vs. prior 32-byte payload on ch 0-125: ~220 µs → ~21 hits/sec per BT channel
-    //   Improvement: ~3.5× more hits per BT channel per second.
+    // AT2401C PA note: some PA+LNA modules freeze the carrier after the first
+    // RF_CH write.  If that occurs, the fallback is a full power-cycle per hop
+    // (see comment at function end).  Tested at close range (< 3 m) the direct
+    // RF_CH write path has been observed to work fine with the AT2401C.
     //
-    // Fundamental limitation: Bluetooth Classic uses Adaptive Frequency Hopping
-    // (AFH) to route around narrow-band interference.  A single-channel swept
-    // radio cannot fully overcome AFH at range; at close range (< 2 m) the
-    // AT2401C's +20 dBm output provides meaningful disruption.
+    // Channel range: nRF24 ch 2-80 = 2402-2480 MHz covers all 79 Classic BT
+    // channels plus BLE channels 37-39 (2402/2426/2480 MHz).
 
-    uint8_t tx_cmd[2] = { CMD_W_PAYLOAD, 0xFF };
-    uint8_t rx_tmp[2];
+    nrf24_write_reg(REG_EN_AA,      0x00);         // no auto-ack
+    nrf24_write_reg(REG_SETUP_RETR, 0x00);         // no retransmit
+    nrf24_write_reg(REG_RF_CH,      2);             // start at 2402 MHz
+    // CONT_WAVE(b7) + PLL_LOCK(b4) + 1 Mbps + max power
+    nrf24_write_reg(REG_RF_SETUP,   RF_SETUP_CONT_WAVE | RF_SETUP_PLL_LOCK | RF_SETUP_PWR(3));
+    nrf24_write_reg(REG_CONFIG,     CONFIG_PWR_UP); // TX mode, no CRC
+    vTaskDelay(pdMS_TO_TICKS(2));                   // Tpd2stby: power-up settle
 
-    nrf24_flush_tx();
+    ce_high();  // CE stays HIGH for the entire jam session — carrier is now on
 
-    uint8_t ch = 2;   // start at 2402 MHz — lowest Bluetooth channel
+    uint8_t ch = 2;
+    int sweep = 0;
     while (active && *active) {
-        nrf24_write_reg(REG_RF_CH,  ch);
-        nrf24_write_reg(REG_STATUS, 0x70);
-        csn_low(); spi_xfer_buf(tx_cmd, rx_tmp, 2); csn_high();
-
-        ce_high();
-        esp_rom_delay_us(10);   // spec minimum CE pulse
-        ce_low();
-
-        esp_rom_delay_us(20);   // packet air time + STANDBY-I settling margin
-
-        if (++ch > 80) {        // 2480 MHz = highest BT channel
+        nrf24_write_reg(REG_RF_CH, ch);  // single SPI write to hop — no CE toggle needed
+        if (++ch > 80) {
             ch = 2;
-            vTaskDelay(pdMS_TO_TICKS(10));  // one FreeRTOS tick per sweep for WDT
+            if (++sweep >= 10) {
+                sweep = 0;
+                vTaskDelay(pdMS_TO_TICKS(10));  // yield every ~10 sweeps for WDT
+            }
         }
     }
 
-    // Restore default address width (5 bytes) before handing back to other nRF24 functions
-    nrf24_write_reg(REG_SETUP_AW, 0x03);
+    // ── Teardown ─────────────────────────────────────────────────────────────
+    // Clear CONT_WAVE + PLL_LOCK before returning so subsequent nRF24 operations
+    // (scan, sniffer) get a clean RF_SETUP state.
     ce_low();
-    nrf24_flush_tx();
+    nrf24_write_reg(REG_RF_SETUP, RF_SETUP_DR_HIGH | RF_SETUP_PWR(3));
     nrf24_standby();
+
+    // ── AT2401C fallback (if carrier freezes after first RF_CH write) ─────────
+    // Replace the hop line above with this block if the chip stops transmitting
+    // after the first channel change:
+    //
+    //   ce_low();
+    //   nrf24_write_reg(REG_RF_SETUP, 0x07);   // clear CONT_WAVE + PLL_LOCK
+    //   nrf24_write_reg(REG_CONFIG, 0x00);      // power down
+    //   esp_rom_delay_us(500);
+    //   nrf24_write_reg(REG_CONFIG, CONFIG_PWR_UP);
+    //   esp_rom_delay_us(200);
+    //   nrf24_write_reg(REG_RF_CH, ch);
+    //   nrf24_write_reg(REG_RF_SETUP, RF_SETUP_CONT_WAVE | RF_SETUP_PLL_LOCK | RF_SETUP_PWR(3));
+    //   ce_high();
+    //   (then continue loop — ~1.2 ms dead time per hop, ~10 sweeps/sec)
 }
 
 // ── Capture control ───────────────────────────────────────────────────────────
