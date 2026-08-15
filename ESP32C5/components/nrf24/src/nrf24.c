@@ -376,73 +376,76 @@ void nrf24_jam_sweep(volatile bool *active)
 {
     if (!s_drv) return;
 
-    // ── Continuous-carrier (CONT_WAVE) jamming ────────────────────────────────
+    // ── Continuous-carrier (CONT_WAVE) jamming — Bruce-compatible PA sequence ─
     // nRF24L01+ §6.4: RF_SETUP.CONT_WAVE=1 + RF_SETUP.PLL_LOCK=1 with CE HIGH
-    // emits an unmodulated carrier at 100% duty cycle — no packet overhead, no
-    // preamble, no air-time dead zones.
+    // emits an unmodulated carrier at 100% duty cycle per channel dwell.
     //
-    // Per-hop sequence (required for reliable channel hopping on AT2401C PA):
-    //   1. CE low  → nRF24 enters STANDBY-I (PLL off)
-    //   2. Clear CONT_WAVE+PLL_LOCK in RF_SETUP → disarms carrier mode
-    //   3. Write RF_CH (new channel)
-    //   4. Re-set CONT_WAVE+PLL_LOCK in RF_SETUP → re-arms carrier mode
-    //   5. CE high → PLL locks on new channel, carrier transmits
-    //   6. 130 µs dwell → Tstby2a: PLL fully settled before next hop
+    // The AT2401C PA+LNA requires a full power-down/power-up cycle between hops.
+    // Cheaper approaches (CE toggle alone, RF_SETUP clear+reset alone) suppress
+    // the carrier entirely — observed as zero signal on TinySA in v2.12.7/8.
+    // This matches Bruce firmware's nrf_jammer_api.cpp PA-module path exactly.
     //
-    // Steps 2+4 (clear+re-set CONT_WAVE) are critical: without them the nRF24
-    // state machine does not re-enter CONT_WAVE after CE-low and the carrier
-    // simply never comes back on (observed as zero signal on TinySA in v2.12.7).
+    // Per-hop sequence (~2 ms total):
+    //   CE low + clear CONT_WAVE+PLL_LOCK  →  power-down CONFIG  →  500 µs
+    //   →  power-up CONFIG  →  500 µs  →  write RF_CH  →  re-arm CONT_WAVE+PLL_LOCK
+    //   →  CE high  →  1 ms carrier dwell
     //
-    // Timing: ~6 µs SPI (3 reg writes) + CE transitions + 130 µs dwell ≈ 140 µs
-    //   79 BT channels × 140 µs = ~11 ms/sweep → ~90 sweeps/sec
-    //   100% duty cycle while CE is high on each channel.
+    // ~82 channels (BLE adv ch 37/38/39 doubled) × ~2 ms = ~164 ms/sweep → ~6 sweeps/sec
+    // 100% duty cycle during each 1 ms dwell.
     //
-    // Channel prioritisation: BLE advertising channels 37/38/39 sit at nRF24
-    // ch 2 (2402 MHz), ch 26 (2426 MHz), and ch 80 (2480 MHz).  These are fixed
-    // and non-adaptive — hitting them harder kills BLE discovery/reconnect.
-    // The hot-channel array visits ch 2, 26, 80 twice per sweep for ~2× coverage
-    // on those three channels without lengthening the overall sweep significantly.
+    // Channel table: ch 2-80 (2402-2480 MHz = all 79 Classic BT + BLE channels).
+    // BLE advertising channels 37/38/39 (nRF24 ch 2/26/80) are fixed and non-AFH
+    // — doubling their hit rate breaks BLE discovery and reconnect faster.
 
-    // Channels to sweep: full BT/BLE band ch 2-80 with BLE adv channels doubled.
-    // Layout: ch 2-25, [ch 26 extra], ch 26-79, [ch 80 extra], ch 80.
-    // Build at runtime — 82 entries, all in local stack (82 bytes).
     uint8_t channels[82];
     int nch = 0;
     for (uint8_t c = 2; c <= 80; c++) {
         channels[nch++] = c;
-        if (c == 26 || c == 80) channels[nch++] = c;  // double BLE adv ch 38/39
+        if (c == 2 || c == 26 || c == 80)
+            channels[nch++] = c;  // double BLE adv channels 37/38/39
     }
-    // ch 2 (BLE adv ch 37) is already at index 0 — visited first every sweep.
 
     const uint8_t RF_SETUP_JAM = RF_SETUP_CONT_WAVE | RF_SETUP_PLL_LOCK | RF_SETUP_PWR(3);
-    const uint8_t RF_SETUP_CLR = RF_SETUP_PWR(3);  // CONT_WAVE+PLL_LOCK cleared
+    const uint8_t RF_SETUP_CLR = RF_SETUP_PWR(3);
 
+    // Initial power-up into TX mode
+    ce_low();
     nrf24_write_reg(REG_EN_AA,      0x00);
     nrf24_write_reg(REG_SETUP_RETR, 0x00);
     nrf24_write_reg(REG_CONFIG,     CONFIG_PWR_UP);
-    vTaskDelay(pdMS_TO_TICKS(2));   // Tpd2stby: power-up settle
+    vTaskDelay(pdMS_TO_TICKS(2));
 
     int idx = 0, sweep = 0;
     while (active && *active) {
+        // Bruce PA-module hop sequence: full power cycle to ensure AT2401C
+        // re-locks to the new channel on every hop.
         ce_low();
-        nrf24_write_reg(REG_RF_SETUP, RF_SETUP_CLR);   // disarm CONT_WAVE
-        nrf24_write_reg(REG_RF_CH,    channels[idx]);   // set new channel
-        nrf24_write_reg(REG_RF_SETUP, RF_SETUP_JAM);   // re-arm CONT_WAVE
+        nrf24_write_reg(REG_RF_SETUP, RF_SETUP_CLR);   // clear CONT_WAVE+PLL_LOCK
+        nrf24_write_reg(REG_CONFIG,   0x00);            // power down
+        esp_rom_delay_us(500);
+
+        nrf24_write_reg(REG_CONFIG,   CONFIG_PWR_UP);   // power up
+        esp_rom_delay_us(500);
+
+        nrf24_write_reg(REG_RF_CH,    channels[idx]);   // new channel
+        nrf24_write_reg(REG_RF_SETUP, RF_SETUP_JAM);   // arm CONT_WAVE+PLL_LOCK
         ce_high();
-        esp_rom_delay_us(130);                          // Tstby2a PLL lock
+        esp_rom_delay_us(1000);                         // 1 ms carrier dwell
 
         if (++idx >= nch) {
             idx = 0;
-            if (++sweep >= 5) {
+            if (++sweep >= 3) {
                 sweep = 0;
-                vTaskDelay(pdMS_TO_TICKS(10));  // yield every ~5 sweeps for WDT
+                vTaskDelay(pdMS_TO_TICKS(10));  // yield every ~3 sweeps for WDT
             }
         }
     }
 
-    // Teardown: clear CONT_WAVE+PLL_LOCK so scan/sniffer get a clean RF_SETUP.
+    // Teardown: leave chip in a clean state for scan/sniffer/HW-test.
     ce_low();
-    nrf24_write_reg(REG_RF_SETUP, RF_SETUP_DR_HIGH | RF_SETUP_PWR(3));
+    nrf24_write_reg(REG_RF_SETUP, RF_SETUP_CLR);
+    nrf24_write_reg(REG_CONFIG,   0x00);        // power down
+    vTaskDelay(pdMS_TO_TICKS(2));
     nrf24_standby();
 }
 
