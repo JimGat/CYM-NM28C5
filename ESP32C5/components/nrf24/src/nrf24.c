@@ -372,7 +372,7 @@ bool nrf24_carrier_detect(void)
 
 // ── Jammer sweep ─────────────────────────────────────────────────────────────
 
-void nrf24_jam_sweep(volatile bool *active)
+void nrf24_jam_sweep(volatile bool *active, nrf24_jam_mode_t mode)
 {
     if (!s_drv) return;
 
@@ -386,23 +386,60 @@ void nrf24_jam_sweep(volatile bool *active)
     // This matches Bruce firmware's nrf_jammer_api.cpp PA-module path exactly.
     //
     // Per-hop sequence (~2 ms total):
-    //   CE low + clear CONT_WAVE+PLL_LOCK  →  power-down CONFIG  →  500 µs
-    //   →  power-up CONFIG  →  500 µs  →  write RF_CH  →  re-arm CONT_WAVE+PLL_LOCK
-    //   →  CE high  →  1 ms carrier dwell
+    //   CE low + clear CONT_WAVE+PLL_LOCK  ->  power-down CONFIG  ->  500 us
+    //   ->  power-up CONFIG  ->  500 us  ->  write RF_CH  ->  re-arm CONT_WAVE+PLL_LOCK
+    //   ->  CE high  ->  1 ms carrier dwell
     //
-    // ~82 channels (BLE adv ch 37/38/39 doubled) × ~2 ms = ~164 ms/sweep → ~6 sweeps/sec
-    // 100% duty cycle during each 1 ms dwell.
-    //
-    // Channel table: ch 2-80 (2402-2480 MHz = all 79 Classic BT + BLE channels).
-    // BLE advertising channels 37/38/39 (nRF24 ch 2/26/80) are fixed and non-AFH
-    // — doubling their hit rate breaks BLE discovery and reconnect faster.
+    // Yield every 20 hops (40 ms max CPU hold) keeps LVGL render times normal.
+    // Do NOT increase this: 82 hops * 2 ms = 164 ms starvation causes WDT warnings.
 
-    uint8_t channels[82];
+    // ── Build channel list for the requested mode ─────────────────────────────
+    // NRF24_JAM_BLE:  3 channels (2/26/80 = BLE adv ch 37/38/39).
+    //                 3 ch * 2 ms = 6 ms/sweep -> ~167 sweeps/sec.
+    //                 Each adv channel gets full AT2401C power every 6 ms.
+    // NRF24_JAM_BT:   82 channels (2-80, BLE adv doubled).
+    //                 Covers all 79 Classic BT FHSS channels; AFH cannot find
+    //                 minimum 20 clean channels -> link degrades and drops.
+    // NRF24_JAM_WIFI: 33 channels around WiFi 2.4 GHz ch 1/6/11 centers (+/-5 MHz).
+    //                 ch1 zone: nRF24 7-17 | ch6 zone: 32-42 | ch11 zone: 57-67.
+    // NRF24_JAM_ALL:  126 channels (nRF24 ch 0-125 = 2400-2525 MHz, full ISM band).
+
+    uint8_t channels[128];
     int nch = 0;
-    for (uint8_t c = 2; c <= 80; c++) {
-        channels[nch++] = c;
-        if (c == 2 || c == 26 || c == 80)
-            channels[nch++] = c;  // double BLE adv channels 37/38/39
+
+    switch (mode) {
+        case NRF24_JAM_BLE:
+            // Only the three fixed BLE advertising channels (non-AFH).
+            channels[nch++] = 2;   // BLE adv ch 37 = 2402 MHz
+            channels[nch++] = 26;  // BLE adv ch 38 = 2426 MHz
+            channels[nch++] = 80;  // BLE adv ch 39 = 2480 MHz
+            break;
+
+        default:
+        case NRF24_JAM_BT:
+            // All 79 BT Classic channels, BLE adv channels doubled for extra coverage.
+            for (uint8_t c = 2; c <= 80; c++) {
+                channels[nch++] = c;
+                if (c == 2 || c == 26 || c == 80)
+                    channels[nch++] = c;
+            }
+            break;
+
+        case NRF24_JAM_WIFI: {
+            // +/-5 MHz band around WiFi ch 1 (2412), ch 6 (2437), ch 11 (2462).
+            // nRF24 channel N = 2400+N MHz.
+            static const uint8_t wifi_zones[3][2] = {{7,17},{32,42},{57,67}};
+            for (int z = 0; z < 3; z++)
+                for (uint8_t c = wifi_zones[z][0]; c <= wifi_zones[z][1]; c++)
+                    channels[nch++] = c;
+            break;
+        }
+
+        case NRF24_JAM_ALL:
+            // Full nRF24 range: 2400-2525 MHz.
+            for (uint8_t c = 0; c <= 125; c++)
+                channels[nch++] = c;
+            break;
     }
 
     const uint8_t RF_SETUP_JAM = RF_SETUP_CONT_WAVE | RF_SETUP_PLL_LOCK | RF_SETUP_PWR(3);

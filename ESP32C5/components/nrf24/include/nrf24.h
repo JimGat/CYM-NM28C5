@@ -99,8 +99,16 @@ esp_err_t nrf24_sfhss_scan(nrf24_sfhss_t *out, uint32_t timeout_ms,
                             volatile bool *cancel);
 
 // ── Jammer (channel sweeper) ──────────────────────────────────────────────────
-// Rapidly sweep all 126 channels in PTX mode. Blocks until *active becomes false.
-void nrf24_jam_sweep(volatile bool *active);
+// Target band selector for nrf24_jam_sweep().
+typedef enum {
+    NRF24_JAM_BLE  = 0,  // BLE advertising channels only (ch 2/26/80 = BLE adv 37/38/39)
+    NRF24_JAM_BT   = 1,  // All 79 BT Classic channels 2402-2480 MHz + BLE adv doubled
+    NRF24_JAM_WIFI = 2,  // WiFi 2.4GHz bands: +-5 MHz around ch 1/6/11 centers
+    NRF24_JAM_ALL  = 3,  // Full nRF24 range 2400-2525 MHz (all 126 channels)
+} nrf24_jam_mode_t;
+
+// Sweep the selected band in CONT_WAVE mode. Blocks until *active becomes false.
+void nrf24_jam_sweep(volatile bool *active, nrf24_jam_mode_t mode);
 
 // ── Capture control (cancel from another task) ────────────────────────────────
 void nrf24_capture_cancel(void);
