@@ -415,9 +415,14 @@ void nrf24_jam_sweep(volatile bool *active)
     nrf24_write_reg(REG_CONFIG,     CONFIG_PWR_UP);
     vTaskDelay(pdMS_TO_TICKS(2));
 
-    int idx = 0, sweep = 0;
+    // Each hop busy-waits ~2 ms (500+500+1000 µs).  Yielding every 20 hops
+    // caps LVGL starvation at ~40 ms — well under the 10 s WDT threshold and
+    // short enough that render times stay normal.  Do NOT yield less often:
+    // 82 hops × 2 ms = 164 ms between yields starves priority-1 LVGL for
+    // 500+ ms (observed as CRITICAL render warnings in the serial log).
+    int idx = 0, hops_since_yield = 0;
     while (active && *active) {
-        // Bruce PA-module hop sequence: full power cycle to ensure AT2401C
+        // Bruce PA-module hop sequence: full power cycle ensures AT2401C
         // re-locks to the new channel on every hop.
         ce_low();
         nrf24_write_reg(REG_RF_SETUP, RF_SETUP_CLR);   // clear CONT_WAVE+PLL_LOCK
@@ -432,12 +437,11 @@ void nrf24_jam_sweep(volatile bool *active)
         ce_high();
         esp_rom_delay_us(1000);                         // 1 ms carrier dwell
 
-        if (++idx >= nch) {
-            idx = 0;
-            if (++sweep >= 3) {
-                sweep = 0;
-                vTaskDelay(pdMS_TO_TICKS(10));  // yield every ~3 sweeps for WDT
-            }
+        if (++idx >= nch) idx = 0;
+
+        if (++hops_since_yield >= 20) {
+            hops_since_yield = 0;
+            vTaskDelay(pdMS_TO_TICKS(20));  // yield ~40 ms of CPU to LVGL every 20 hops
         }
     }
 
