@@ -276,7 +276,9 @@ static volatile bool ble_spam_needs_ui_update = false;
 static int ble_spam_mode = BLE_SPAM_MODE_ALL;
 
 // BLE Blaster — 4-instance advertising flood + optional nRF24 BLE-only layer
-#define BLE_BLASTER_NUM_INST 4
+/* CONFIG_BT_NIMBLE_MAX_EXT_ADV_INSTANCES=1 gives indices 0+1 (default + 1 extra).
+ * The controller rejects instances 2+ with rc=3. Keep this at 2. */
+#define BLE_BLASTER_NUM_INST 2
 static volatile bool   s_blaster_active     = false;
 static volatile bool   s_blaster_nrf_active = false;
 static lv_obj_t       *s_blaster_status_lbl = NULL;
@@ -34640,7 +34642,7 @@ static void s_blaster_timer_cb(lv_timer_t *t)
     if (!s_blaster_status_lbl) return;
     static int blink = 0;
     if (s_blaster_active) {
-        // Rotate all 4 instance MACs every 500 ms to keep scanners busy.
+        // Rotate both instance MACs every 500 ms to keep scanners busy.
         for (int i = 0; i < BLE_BLASTER_NUM_INST; i++)
             s_blaster_arm_inst(i);
         s_blaster_pkt_count += BLE_BLASTER_NUM_INST;
