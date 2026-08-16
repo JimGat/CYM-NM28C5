@@ -492,28 +492,28 @@ void nrf24_jam_sweep(volatile bool *active, nrf24_jam_mode_t mode)
     nrf24_write_reg(REG_CONFIG,     CONFIG_PWR_UP);
     vTaskDelay(pdMS_TO_TICKS(2));
 
-    // Each hop: 500+500+dwell µs.  Yield every 20 hops caps LVGL starvation
-    // at ~40 ms — well under WDT and short enough for normal render times.
-    int idx = 0, hops_since_yield = 0;
+    // Per-hop timing: 300 µs power-down + 300 µs power-up + dwell_us carrier.
+    // WiFi: 300+300+1000 = 1600 µs/hop.  Others: 300+300+500 = 1100 µs/hop.
+    // Yield 10 ms once per full sweep to feed LVGL and WDT — IDLE task runs at
+    // least every ~160 ms (ALL 101-ch sweep), well inside the 5 s WDT window.
+    int idx = 0;
     while (active && *active) {
         ce_low();
         nrf24_write_reg(REG_RF_SETUP, RF_SETUP_CLR);   // clear CONT_WAVE+PLL_LOCK
         nrf24_write_reg(REG_CONFIG,   0x00);            // power down → AT2401C resets
-        esp_rom_delay_us(500);
+        esp_rom_delay_us(300);
 
         nrf24_write_reg(REG_CONFIG,   CONFIG_PWR_UP);   // power up
-        esp_rom_delay_us(500);
+        esp_rom_delay_us(300);
 
         nrf24_write_reg(REG_RF_CH,    channels[idx]);   // new channel
         nrf24_write_reg(REG_RF_SETUP, RF_SETUP_JAM);   // arm CONT_WAVE+PLL_LOCK
         ce_high();
         esp_rom_delay_us(dwell_us);                     // carrier on
 
-        if (++idx >= nch) idx = 0;
-
-        if (++hops_since_yield >= 20) {
-            hops_since_yield = 0;
-            vTaskDelay(pdMS_TO_TICKS(20));  // yield ~40 ms to LVGL every 20 hops
+        if (++idx >= nch) {
+            idx = 0;
+            vTaskDelay(pdMS_TO_TICKS(10));  // yield 10 ms per complete sweep for LVGL/WDT
         }
     }
 
