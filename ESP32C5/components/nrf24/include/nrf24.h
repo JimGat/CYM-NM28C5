@@ -115,6 +115,10 @@ typedef enum {
     NRF24_JAM_FULL    = 9,  // Bruce "Full"          — 124 ch 2401-2524 MHz complete spectrum
 } nrf24_jam_mode_t;
 
+// Set FHSS mode (true = Fisher-Yates shuffle each sweep; false = sequential).
+// Must be called before nrf24_jam_sweep. Default: false (sequential).
+void nrf24_jam_set_fhss(bool fhss);
+
 // Sweep the selected band. Blocks until *active becomes false.
 void nrf24_jam_sweep(volatile bool *active, nrf24_jam_mode_t mode);
 

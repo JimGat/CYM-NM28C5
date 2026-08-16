@@ -2051,6 +2051,9 @@ EXT_RAM_BSS_ATTR static bool           s_n24_jam_active    = false;
 EXT_RAM_BSS_ATTR static nrf24_jam_mode_t s_n24_jam_mode    = NRF24_JAM_TEST;
 EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_jam_status    = NULL;
 EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_mode_btns[10] = {NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL};
+EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_seq_btn        = NULL;
+EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_fhss_btn       = NULL;
+EXT_RAM_BSS_ATTR static bool           s_n24_jam_fhss       = false;
 EXT_RAM_BSS_ATTR static lv_timer_t    *s_n24_jam_tmr        = NULL;
 EXT_RAM_BSS_ATTR static TaskHandle_t   s_n24_jam_task       = NULL;
 
@@ -49364,12 +49367,27 @@ static void s_n24_jam_dismiss_cb(lv_event_t *e)
     if (overlay) lv_obj_del(overlay);
 }
 
+static void s_n24_fhss_toggle_cb(lv_event_t *e)
+{
+    if (s_n24_jam_active) return;
+    s_n24_jam_fhss = (bool)(intptr_t)lv_event_get_user_data(e);
+    nrf24_jam_set_fhss(s_n24_jam_fhss);
+    if (s_n24_seq_btn)
+        lv_obj_set_style_bg_color(s_n24_seq_btn,
+            s_n24_jam_fhss ? lv_color_hex(0x2A2A2A) : lv_color_hex(0xC62828), 0);
+    if (s_n24_fhss_btn)
+        lv_obj_set_style_bg_color(s_n24_fhss_btn,
+            s_n24_jam_fhss ? lv_color_hex(0xC62828) : lv_color_hex(0x2A2A2A), 0);
+}
+
 // Stop hook for nRF24 Jammer screen.
 static void nrf24_jam_screen_stop(void)
 {
     s_n24_jam_active = false;  // signals the jam task to exit via nrf24_jam_sweep()
     if (s_n24_jam_tmr) { lv_timer_del(s_n24_jam_tmr); s_n24_jam_tmr = NULL; }
     s_n24_jam_status = NULL;
+    s_n24_seq_btn    = NULL;
+    s_n24_fhss_btn   = NULL;
     for (int i = 0; i < 10; i++) s_n24_mode_btns[i] = NULL;
 }
 
@@ -49519,6 +49537,38 @@ static void show_nrf24_jammer_screen(void)
             lv_obj_center(ml);
             lv_obj_add_event_cb(mbtn, s_n24_mode_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)m);
             s_n24_mode_btns[m] = mbtn;
+        }
+    }
+
+    /* SEQ / FHSS hop-mode toggle row */
+    lv_obj_t *hop_row = lv_obj_create(card);
+    lv_obj_set_width(hop_row, LV_PCT(100));
+    lv_obj_set_height(hop_row, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(hop_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(hop_row, 0, 0);
+    lv_obj_set_style_pad_all(hop_row, 0, 0);
+    lv_obj_set_style_pad_column(hop_row, 6, 0);
+    lv_obj_set_flex_flow(hop_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(hop_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(hop_row, LV_OBJ_FLAG_SCROLLABLE);
+    {
+        static const char *const hop_lbl[] = {"SEQ", "FHSS"};
+        lv_obj_t **hop_ptrs[] = {&s_n24_seq_btn, &s_n24_fhss_btn};
+        for (int h = 0; h < 2; h++) {
+            lv_obj_t *hb = lv_btn_create(hop_row);
+            lv_obj_set_flex_grow(hb, 1);
+            lv_obj_set_height(hb, 26);
+            bool active_h = (h == 1) ? s_n24_jam_fhss : !s_n24_jam_fhss;
+            lv_obj_set_style_bg_color(hb, active_h ? lv_color_hex(0xC62828) : lv_color_hex(0x2A2A2A), 0);
+            lv_obj_set_style_radius(hb, 6, 0);
+            lv_obj_set_style_border_width(hb, 0, 0);
+            lv_obj_t *hl = lv_label_create(hb);
+            lv_label_set_text(hl, hop_lbl[h]);
+            lv_obj_set_style_text_font(hl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(hl, lv_color_white(), 0);
+            lv_obj_center(hl);
+            lv_obj_add_event_cb(hb, s_n24_fhss_toggle_cb, LV_EVENT_CLICKED, (void *)(intptr_t)(h == 1));
+            *hop_ptrs[h] = hb;
         }
     }
 

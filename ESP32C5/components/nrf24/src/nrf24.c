@@ -8,6 +8,7 @@
 #include "freertos/task.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_random.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -370,34 +371,65 @@ bool nrf24_carrier_detect(void)
     return (nrf24_read_reg(REG_RPD) & 0x01) != 0;
 }
 
-// ── Jammer (Bruce firmware approach) ─────────────────────────────────────────
-// CONT_WAVE (RF_SETUP.CONT_WAVE=1, PLL_LOCK=1) with CE HIGH throughout.
-// Channel changes via direct RF_CH register write while CW is active — NO
-// power-cycle between hops.  This matches Bruce firmware nrf_jammer.cpp exactly.
+// ── Jammer (CONT_WAVE, CE-toggle per hop) ────────────────────────────────────
+// CONT_WAVE (RF_SETUP.CONT_WAVE=1, PLL_LOCK=1) with CE toggled LOW/HIGH on
+// every channel change.  The AT2401C PA+LNA on the NM-RF-HAT REQUIRES CE to go
+// LOW before writing RF_CH — writing RF_CH while CE=HIGH leaves the AT2401C PLL
+// locked on the first frequency (confirmed v2.13.17: single spike at 2448 MHz).
 //
-// Why no power-cycle: at SPI bus speed (~5-15 µs/write), 79 BT channels sweep
-// in ~1 ms.  During each PLL retuning the AT2401C output chirps across multiple
-// channels producing broadband noise — far more disruptive to AFH BT than the
-// clean settled tones produced by our earlier power-cycling approach (v2.13.14).
-static void s_contwave_jam(volatile bool *active, const uint8_t *ch, int nch)
+// CE-toggle approach:
+//   CE LOW → SPI write RF_CH (AT2401C TXEN drops; SPI bus contention resolves)
+//   → CE HIGH → 500 µs (130 µs PLL lock + 370 µs AT2401C engagement)
+//   → next hop
+//
+// SPI bus note: nRF24 shares SPI2_HOST with the 80 MHz LCD DMA.  The jam task
+// (priority 2) preempts LVGL (priority 1) so no new DMA launches during the
+// sweep.  Any in-flight DMA at sweep start completes naturally; CE is LOW during
+// the SPI write so AT2401C is disengaged, and the SPI wait does not affect output.
+//
+// Per-hop timing: ~506 µs normal, ~5 ms on first hop if DMA in flight.
+//   Test 40ch: ~20 ms/sweep + 10 ms yield → 33 sweeps/sec
+//   BT   79ch: ~40 ms/sweep + 10 ms yield → 20 sweeps/sec
+
+static bool s_jam_fhss = false;   // set via nrf24_jam_set_fhss()
+
+void nrf24_jam_set_fhss(bool fhss) { s_jam_fhss = fhss; }
+
+static void s_contwave_jam(volatile bool *active, const uint8_t *ch_in, int nch)
 {
     const uint8_t RF_SETUP_JAM = RF_SETUP_CONT_WAVE | RF_SETUP_PLL_LOCK | RF_SETUP_PWR(3);
+
+    // Working copy: may be shuffled per sweep in FHSS mode.
+    uint8_t channels[128];
+    memcpy(channels, ch_in, (size_t)nch);
 
     ce_low();
     nrf24_write_reg(REG_CONFIG,     CONFIG_PWR_UP);
     nrf24_write_reg(REG_EN_AA,      0x00);
     nrf24_write_reg(REG_SETUP_RETR, 0x00);
-    nrf24_write_reg(REG_RF_CH,      ch[0]);
+    nrf24_write_reg(REG_RF_CH,      channels[0]);
     nrf24_write_reg(REG_RF_SETUP,   RF_SETUP_JAM);
     ce_high();
-    vTaskDelay(pdMS_TO_TICKS(2));   // initial PLL lock
+    esp_rom_delay_us(500);          // initial PLL lock + AT2401C engagement
 
     int idx = 0;
     while (active && *active) {
-        nrf24_write_reg(REG_RF_CH, ch[idx]);   // hop: write channel, PLL retuning begins
+        ce_low();                                    // AT2401C TXEN → LOW, de-engages
+        nrf24_write_reg(REG_RF_CH, channels[idx]);  // write channel in Standby-I
+        ce_high();                                   // AT2401C TXEN → HIGH, re-engages at new freq
+        esp_rom_delay_us(500);                       // 130 µs PLL + 370 µs AT2401C settle
+
         if (++idx >= nch) {
             idx = 0;
-            vTaskDelay(pdMS_TO_TICKS(10));     // yield once per sweep for LVGL/WDT
+            if (s_jam_fhss) {
+                // Fisher-Yates shuffle: randomize order each sweep so AFH cannot
+                // predict or pre-filter our hop pattern (matches Bruce FHSS mode).
+                for (int i = nch - 1; i > 0; i--) {
+                    int j = (int)(esp_random() % (uint32_t)(i + 1));
+                    uint8_t tmp = channels[i]; channels[i] = channels[j]; channels[j] = tmp;
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));           // yield once per sweep for LVGL/WDT
         }
     }
 
