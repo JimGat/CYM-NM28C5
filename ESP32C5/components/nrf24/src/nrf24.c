@@ -370,11 +370,72 @@ bool nrf24_carrier_detect(void)
     return (nrf24_read_reg(REG_RPD) & 0x01) != 0;
 }
 
-// Note: burst-TX jamming (CE-pulsed GFSK packets) was tested and found NOT to
-// engage the AT2401C PA on the NM-RF-HAT.  The ~32 µs packet is too brief for
-// the PA to latch before the burst ends — zero signal observed on TinySA even
-// with Max Hold after device power-cycle.  CONT_WAVE with a full AT2401C
-// power-cycle per hop reliably produces +20 dBm output and is used for all modes.
+// ── GFSK burst jammer ────────────────────────────────────────────────────────
+// Sends 3 × 32-byte 0xAA packets per channel hop at 2 Mbps.
+//
+// Signal characteristics (vs previous approaches):
+//   Single-byte CE-pulse (v2.13.10): TXEN HIGH ~32 µs → AT2401C never latches.
+//   CONT_WAVE (v2.13.14):            TXEN HIGH indefinitely at one tone → AT2401C
+//                                    amplifies but CW is rejected by BT GFSK limiter.
+//   This function: TXEN HIGH 480 µs (3 × 160 µs) → AT2401C engages; 2 Mbps GFSK
+//   produces ~3 MHz Carson bandwidth, matching Bruce firmware signal type exactly.
+//
+// Per-hop timing:
+//   SPI setup (flush + RF_CH + STATUS + 3×33-byte FIFO load): ~135 µs
+//   CE HIGH: 130 µs PLL lock + 480 µs TX + 30 µs inter-packet = ~640 µs
+//   Total: ~775 µs/hop (no power-cycle overhead)
+//
+//   BLE 40ch: 40 × 775 µs ≈ 31 ms/sweep  (32 hits/ch/sec)
+//   BT  82ch: 82 × 775 µs ≈ 64 ms/sweep  (15 hits/ch/sec)
+//   ALL 101ch: 101 × 775 µs ≈ 78 ms/sweep (13 hits/ch/sec)
+static void s_gfsk_jam(volatile bool *active, const uint8_t *ch, int nch)
+{
+    // 0xAA = 10101010 at 2 Mbps GFSK = maximum frequency deviation on every bit.
+    // Identical to the BT preamble pattern — interferes with BT sync correlation.
+    static const uint8_t pkt_buf[33] = {
+        CMD_W_PAYLOAD,
+        0xAA,0xAA,0xAA,0xAA, 0xAA,0xAA,0xAA,0xAA,
+        0xAA,0xAA,0xAA,0xAA, 0xAA,0xAA,0xAA,0xAA,
+        0xAA,0xAA,0xAA,0xAA, 0xAA,0xAA,0xAA,0xAA,
+        0xAA,0xAA,0xAA,0xAA, 0xAA,0xAA,0xAA,0xAA,
+    };
+
+    ce_low();
+    nrf24_write_reg(REG_CONFIG,     CONFIG_PWR_UP);               // TX mode, no CRC
+    nrf24_write_reg(REG_EN_AA,      0x00);                        // no auto-ACK
+    nrf24_write_reg(REG_SETUP_RETR, 0x00);                        // no retransmit
+    nrf24_write_reg(REG_RF_SETUP,   RF_SETUP_DR_HIGH | RF_SETUP_PWR(3)); // 2 Mbps, PA=11
+    static const uint8_t addr[5] = {0xAA,0xAA,0xAA,0xAA,0xAA};
+    nrf24_write_reg_multi(REG_TX_ADDR, addr, 5);
+    nrf24_cmd_byte(CMD_FLUSH_TX);
+    vTaskDelay(pdMS_TO_TICKS(2));
+
+    int idx = 0;
+    while (active && *active) {
+        nrf24_write_reg(REG_RF_CH,  ch[idx]);         // new channel
+        nrf24_write_reg(REG_STATUS, 0x30);            // clear TX_DS + MAX_RT
+        nrf24_cmd_byte(CMD_FLUSH_TX);
+
+        // Load 3 × 32-byte packets (FIFO holds exactly 3 × 32 = 96 bytes max).
+        // AT2401C TXEN goes HIGH when nRF24 enters TX Active after 130 µs PLL lock,
+        // stays HIGH for the full 480 µs burst — sufficient for PA engagement.
+        csn_low(); spi_xfer_buf(pkt_buf, NULL, 33); csn_high();
+        csn_low(); spi_xfer_buf(pkt_buf, NULL, 33); csn_high();
+        csn_low(); spi_xfer_buf(pkt_buf, NULL, 33); csn_high();
+
+        ce_high();
+        esp_rom_delay_us(750);  // 130 µs PLL + 480 µs TX + 140 µs margin
+        ce_low();
+
+        if (++idx >= nch) {
+            idx = 0;
+            vTaskDelay(pdMS_TO_TICKS(10));  // yield 10 ms per sweep for LVGL/WDT
+        }
+    }
+
+    nrf24_cmd_byte(CMD_FLUSH_TX);
+    nrf24_standby();
+}
 
 // ── Jammer sweep ─────────────────────────────────────────────────────────────
 
@@ -382,29 +443,13 @@ void nrf24_jam_sweep(volatile bool *active, nrf24_jam_mode_t mode)
 {
     if (!s_drv) return;
 
-    // ── CONT_WAVE jamming — all modes, AT2401C power-cycle per hop ───────────
-    // nRF24L01+ §6.4: RF_SETUP.CONT_WAVE=1 + RF_SETUP.PLL_LOCK=1 with CE HIGH
-    // emits an unmodulated carrier at 100% duty cycle for the dwell period.
-    // This is Bruce firmware's "Test" mode — the CONT_WAVE bit is the nRF24's
-    // built-in RF test mode; Bruce named the menu option "Test" after it.
-    //
-    // The AT2401C PA+LNA requires a full power-down/power-up cycle on every hop.
-    // Burst TX (CE-pulsed GFSK packets) does NOT engage the PA — the ~32 µs
-    // burst is too short for the AT2401C to latch before it ends.  Power-cycle
-    // is the only proven path to +20 dBm on this hardware.
-    //
-    // Per-hop sequence:
-    //   CE low + clear CONT_WAVE+PLL_LOCK  ->  power-down CONFIG  ->  500 us
-    //   ->  power-up CONFIG  ->  500 us  ->  write RF_CH  ->  re-arm CONT_WAVE+PLL_LOCK
-    //   ->  CE high  ->  dwell (WiFi 1000 us / others 500 us)
-    //
-    // Dwell times: WiFi uses 1000 µs — OFDM needs sustained carrier interference.
-    // All others use 500 µs: 130 µs PLL lock + 370 µs actual carrier, faster sweep.
-    //   BLE  40 ch × 1500 µs ≈  60 ms/sweep @ +20 dBm
-    //   BT   82 ch × 1500 µs ≈ 123 ms/sweep @ +20 dBm
-    //   ALL 101 ch × 1500 µs ≈ 152 ms/sweep @ +20 dBm (capped at ch 100 = 2500 MHz)
-    //
-    // Yield every 20 hops keeps LVGL render times normal (<40 ms starvation).
+    // ── Jammer routing ──────────────────────────────────────────────────────────
+    // WiFi: CONT_WAVE (unmodulated carrier, AT2401C power-cycle per hop) — OFDM
+    //   needs sustained carrier to lose sync; CW is adequate.
+    // All other modes: s_gfsk_jam() — 3 × 32-byte 0xAA at 2 Mbps GFSK per hop.
+    //   CONT_WAVE was +20 dBm but failed to disrupt BT because modern chips reject
+    //   narrowband CW in their GFSK IF limiters.  3 MHz-wide GFSK noise matches
+    //   Bruce firmware signal type and acts as wideband noise to BT demodulators.
 
     // ── Build channel list for the requested mode ─────────────────────────────
     // BLE:    40 ch at 2 MHz spacing (2402-2480 MHz) — every BLE data+adv hop.
@@ -477,18 +522,24 @@ void nrf24_jam_sweep(volatile bool *active, nrf24_jam_mode_t mode)
             break;
     }
 
+    // ── Mode routing ─────────────────────────────────────────────────────────────
+    // WiFi (OFDM): CONT_WAVE — sustained unmodulated carrier disrupts OFDM timing.
+    //   Not enough to break GFSK/FHSS links, but adequate for single-channel OFDM.
+    // All BT/BLE/HID/RC/Zigbee/All: GFSK burst — 3×32-byte 0xAA packets at 2 Mbps
+    //   = ~3 MHz Carson bandwidth, identical to Bruce firmware signal type.
+    //   CW was rejected by modern BT chips' GFSK limiters despite +20 dBm output.
+    if (mode != NRF24_JAM_WIFI) {
+        s_gfsk_jam(active, channels, nch);
+        return;
+    }
+
+    // ── CONT_WAVE path (WiFi only) ────────────────────────────────────────────
     const uint8_t RF_SETUP_JAM = RF_SETUP_CONT_WAVE | RF_SETUP_PLL_LOCK | RF_SETUP_PWR(3);
     const uint8_t RF_SETUP_CLR = RF_SETUP_PWR(3);
 
     // WiFi: 1000 µs dwell — OFDM channels need sustained carrier interference.
-    // All other modes: 500 µs — AT2401C requires ≥370 µs of actual carrier after
-    // the 130 µs PLL lock to fully engage the PA.  300 µs (170 µs carrier) is not
-    // enough — PA does not latch and no signal appears on TinySA.
-    //   BLE  40 ch × 1100 µs ≈  44 ms/sweep   (22.7 hits/ch/sec)
-    //   BT   82 ch × 1100 µs ≈  90 ms/sweep   (11 hits/ch/sec)
-    //   ALL 101 ch × 1100 µs ≈ 111 ms/sweep   (9 hits/ch/sec)
-    //   HID  25 ch × 1100 µs ≈  27.5 ms/sweep (36 hits/ch/sec)
-    const uint32_t dwell_us = (mode == NRF24_JAM_WIFI) ? 1000 : 500;
+    //   33 ch × 1600 µs ≈ 53 ms/sweep
+    const uint32_t dwell_us = 1000;
 
     // Initial power-up
     ce_low();
