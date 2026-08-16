@@ -2048,9 +2048,9 @@ EXT_RAM_BSS_ATTR static int       s_n24_page = 0;
 EXT_RAM_BSS_ATTR static lv_obj_t *s_n24_pages[NRF24_NUM_PAGES];
 EXT_RAM_BSS_ATTR static lv_obj_t *s_n24_page_lbl = NULL;
 EXT_RAM_BSS_ATTR static bool           s_n24_jam_active    = false;
-EXT_RAM_BSS_ATTR static nrf24_jam_mode_t s_n24_jam_mode    = NRF24_JAM_ALL;
+EXT_RAM_BSS_ATTR static nrf24_jam_mode_t s_n24_jam_mode    = NRF24_JAM_TEST;
 EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_jam_status    = NULL;
-EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_mode_btns[7]  = {NULL,NULL,NULL,NULL,NULL,NULL,NULL};
+EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_mode_btns[10] = {NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL};
 EXT_RAM_BSS_ATTR static lv_timer_t    *s_n24_jam_tmr        = NULL;
 EXT_RAM_BSS_ATTR static TaskHandle_t   s_n24_jam_task       = NULL;
 
@@ -49329,8 +49329,8 @@ static void s_n24_jam_timer_cb(lv_timer_t *t)
     (void)t;
     if (!s_n24_jam_status) return;
     static int blink = 0;
-    // Indexed by nrf24_jam_mode_t: BLE=0, BT=1, WiFi=2, All=3, HID=4, RC=5, Zigbee=6
-    static const char *const s_jam_mode_names[] = {"BLE","BT","WiFi","All","Mouse","RC","Zigbee"};
+    // Indexed by nrf24_jam_mode_t: Test=0,BT=1,BLE=2,BLEAdv=3,WiFi=4,Zigbee=5,USB=6,RC=7,Video=8,Full=9
+    static const char *const s_jam_mode_names[] = {"Test","BT","BLE","BLE Adv","WiFi","Zigbee","USB","RC","Video","Full"};
     if (s_n24_jam_active) {
         lv_label_set_text_fmt(s_n24_jam_status,
             blink++ & 1 ? "JAMMING %s..." : "JAMMING %s   ",
@@ -49370,7 +49370,7 @@ static void nrf24_jam_screen_stop(void)
     s_n24_jam_active = false;  // signals the jam task to exit via nrf24_jam_sweep()
     if (s_n24_jam_tmr) { lv_timer_del(s_n24_jam_tmr); s_n24_jam_tmr = NULL; }
     s_n24_jam_status = NULL;
-    for (int i = 0; i < 7; i++) s_n24_mode_btns[i] = NULL;
+    for (int i = 0; i < 10; i++) s_n24_mode_btns[i] = NULL;
 }
 
 // Mode selector button: update s_n24_jam_mode and highlight the chosen button.
@@ -49379,7 +49379,7 @@ static void s_n24_mode_btn_cb(lv_event_t *e)
     int mode = (int)(intptr_t)lv_event_get_user_data(e);
     if (s_n24_jam_active) return;  // don't allow mode change while jamming
     s_n24_jam_mode = (nrf24_jam_mode_t)mode;
-    for (int i = 0; i < 7; i++) {
+    for (int i = 0; i < 10; i++) {
         if (!s_n24_mode_btns[i]) continue;
         lv_obj_set_style_bg_color(s_n24_mode_btns[i],
             i == mode ? lv_color_hex(0xC62828) : lv_color_hex(0x2A2A2A), 0);
@@ -49478,13 +49478,19 @@ static void show_nrf24_jammer_screen(void)
     lv_obj_set_style_text_color(note, lv_color_make(150, 150, 150), 0);
     lv_obj_set_style_text_align(note, LV_TEXT_ALIGN_CENTER, 0);
 
-    // 7-mode selector: two flex rows.
-    // Row 1: BLE | BT | Mouse | RC   (burst TX modes — fast GFSK sweep)
-    // Row 2: WiFi | Zigbee | All     (WiFi/All use CONT_WAVE)
-    // s_mode_labels indexed by enum: BLE=0,BT=1,WiFi=2,All=3,HID=4,RC=5,Zigbee=6
-    static const char *const s_mode_labels[7] = {"BLE","BT","WiFi","All","Mouse","RC","Zigbee"};
-    static const nrf24_jam_mode_t s_row1_modes[] = {NRF24_JAM_BLE,NRF24_JAM_BT,NRF24_JAM_HID,NRF24_JAM_RC};
-    static const nrf24_jam_mode_t s_row2_modes[] = {NRF24_JAM_WIFI,NRF24_JAM_ZIGBEE,NRF24_JAM_ALL};
+    // 10-mode selector: two flex rows of 5, matching Bruce firmware nrf_jammer.cpp.
+    // Row 1: Test | BT | BLE | Adv | USB
+    // Row 2: WiFi | Zigbee | RC  | Video | Full
+    // s_mode_labels indexed by nrf24_jam_mode_t enum value (0-9).
+    static const char *const s_mode_labels[10] = {
+        "Test","BT","BLE","Adv","WiFi","Zigbee","USB","RC","Video","Full"
+    };
+    static const nrf24_jam_mode_t s_row1_modes[] = {
+        NRF24_JAM_TEST, NRF24_JAM_BT, NRF24_JAM_BLE, NRF24_JAM_BLE_ADV, NRF24_JAM_USB
+    };
+    static const nrf24_jam_mode_t s_row2_modes[] = {
+        NRF24_JAM_WIFI, NRF24_JAM_ZIGBEE, NRF24_JAM_RC, NRF24_JAM_VIDEO, NRF24_JAM_FULL
+    };
     for (int r = 0; r < 2; r++) {
         lv_obj_t *mrow = lv_obj_create(card);
         lv_obj_set_width(mrow, LV_PCT(100));
@@ -49492,13 +49498,12 @@ static void show_nrf24_jammer_screen(void)
         lv_obj_set_style_bg_opa(mrow, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(mrow, 0, 0);
         lv_obj_set_style_pad_all(mrow, 0, 0);
-        lv_obj_set_style_pad_column(mrow, 5, 0);
+        lv_obj_set_style_pad_column(mrow, 4, 0);
         lv_obj_set_flex_flow(mrow, LV_FLEX_FLOW_ROW);
         lv_obj_set_flex_align(mrow, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_clear_flag(mrow, LV_OBJ_FLAG_SCROLLABLE);
         const nrf24_jam_mode_t *modes = (r == 0) ? s_row1_modes : s_row2_modes;
-        int cnt = (r == 0) ? 4 : 3;
-        for (int j = 0; j < cnt; j++) {
+        for (int j = 0; j < 5; j++) {
             nrf24_jam_mode_t m = modes[j];
             lv_obj_t *mbtn = lv_btn_create(mrow);
             lv_obj_set_flex_grow(mbtn, 1);

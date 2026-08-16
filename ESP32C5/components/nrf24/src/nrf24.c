@@ -370,70 +370,41 @@ bool nrf24_carrier_detect(void)
     return (nrf24_read_reg(REG_RPD) & 0x01) != 0;
 }
 
-// ── GFSK burst jammer ────────────────────────────────────────────────────────
-// Sends 3 × 32-byte 0xAA packets per channel hop at 2 Mbps.
+// ── Jammer (Bruce firmware approach) ─────────────────────────────────────────
+// CONT_WAVE (RF_SETUP.CONT_WAVE=1, PLL_LOCK=1) with CE HIGH throughout.
+// Channel changes via direct RF_CH register write while CW is active — NO
+// power-cycle between hops.  This matches Bruce firmware nrf_jammer.cpp exactly.
 //
-// Signal characteristics (vs previous approaches):
-//   Single-byte CE-pulse (v2.13.10): TXEN HIGH ~32 µs → AT2401C never latches.
-//   CONT_WAVE (v2.13.14):            TXEN HIGH indefinitely at one tone → AT2401C
-//                                    amplifies but CW is rejected by BT GFSK limiter.
-//   This function: TXEN HIGH 480 µs (3 × 160 µs) → AT2401C engages; 2 Mbps GFSK
-//   produces ~3 MHz Carson bandwidth, matching Bruce firmware signal type exactly.
-//
-// Per-hop timing:
-//   SPI setup (flush + RF_CH + STATUS + 3×33-byte FIFO load): ~135 µs
-//   CE HIGH: 130 µs PLL lock + 480 µs TX + 30 µs inter-packet = ~640 µs
-//   Total: ~775 µs/hop (no power-cycle overhead)
-//
-//   BLE 40ch: 40 × 775 µs ≈ 31 ms/sweep  (32 hits/ch/sec)
-//   BT  82ch: 82 × 775 µs ≈ 64 ms/sweep  (15 hits/ch/sec)
-//   ALL 101ch: 101 × 775 µs ≈ 78 ms/sweep (13 hits/ch/sec)
-static void s_gfsk_jam(volatile bool *active, const uint8_t *ch, int nch, uint32_t dwell_us)
+// Why no power-cycle: at SPI bus speed (~5-15 µs/write), 79 BT channels sweep
+// in ~1 ms.  During each PLL retuning the AT2401C output chirps across multiple
+// channels producing broadband noise — far more disruptive to AFH BT than the
+// clean settled tones produced by our earlier power-cycling approach (v2.13.14).
+static void s_contwave_jam(volatile bool *active, const uint8_t *ch, int nch)
 {
-    // 0xAA = 10101010 at 2 Mbps GFSK = maximum frequency deviation on every bit.
-    // Identical to the BT preamble pattern — interferes with BT sync correlation.
-    static const uint8_t pkt_buf[33] = {
-        CMD_W_PAYLOAD,
-        0xAA,0xAA,0xAA,0xAA, 0xAA,0xAA,0xAA,0xAA,
-        0xAA,0xAA,0xAA,0xAA, 0xAA,0xAA,0xAA,0xAA,
-        0xAA,0xAA,0xAA,0xAA, 0xAA,0xAA,0xAA,0xAA,
-        0xAA,0xAA,0xAA,0xAA, 0xAA,0xAA,0xAA,0xAA,
-    };
+    const uint8_t RF_SETUP_JAM = RF_SETUP_CONT_WAVE | RF_SETUP_PLL_LOCK | RF_SETUP_PWR(3);
 
     ce_low();
-    nrf24_write_reg(REG_CONFIG,     CONFIG_PWR_UP);               // TX mode, no CRC
-    nrf24_write_reg(REG_EN_AA,      0x00);                        // no auto-ACK
-    nrf24_write_reg(REG_SETUP_RETR, 0x00);                        // no retransmit
-    nrf24_write_reg(REG_RF_SETUP,   RF_SETUP_DR_HIGH | RF_SETUP_PWR(3)); // 2 Mbps, PA=11
-    static const uint8_t addr[5] = {0xAA,0xAA,0xAA,0xAA,0xAA};
-    nrf24_write_reg_multi(REG_TX_ADDR, addr, 5);
-    nrf24_cmd_byte(CMD_FLUSH_TX);
-    vTaskDelay(pdMS_TO_TICKS(2));
+    nrf24_write_reg(REG_CONFIG,     CONFIG_PWR_UP);
+    nrf24_write_reg(REG_EN_AA,      0x00);
+    nrf24_write_reg(REG_SETUP_RETR, 0x00);
+    nrf24_write_reg(REG_RF_CH,      ch[0]);
+    nrf24_write_reg(REG_RF_SETUP,   RF_SETUP_JAM);
+    ce_high();
+    vTaskDelay(pdMS_TO_TICKS(2));   // initial PLL lock
 
     int idx = 0;
     while (active && *active) {
-        nrf24_write_reg(REG_RF_CH,  ch[idx]);         // new channel
-        nrf24_write_reg(REG_STATUS, 0x30);            // clear TX_DS + MAX_RT
-        nrf24_cmd_byte(CMD_FLUSH_TX);
-
-        // Load 3 × 32-byte packets (FIFO holds exactly 3 × 32 = 96 bytes max).
-        // AT2401C TXEN goes HIGH when nRF24 enters TX Active after 130 µs PLL lock,
-        // stays HIGH for the full 480 µs burst — sufficient for PA engagement.
-        csn_low(); spi_xfer_buf(pkt_buf, NULL, 33); csn_high();
-        csn_low(); spi_xfer_buf(pkt_buf, NULL, 33); csn_high();
-        csn_low(); spi_xfer_buf(pkt_buf, NULL, 33); csn_high();
-
-        ce_high();
-        esp_rom_delay_us(dwell_us);  // 130 µs PLL + 480 µs TX + margin; BT=2000 µs
-        ce_low();
-
+        nrf24_write_reg(REG_RF_CH, ch[idx]);   // hop: write channel, PLL retuning begins
         if (++idx >= nch) {
             idx = 0;
-            vTaskDelay(pdMS_TO_TICKS(10));  // yield 10 ms per sweep for LVGL/WDT
+            vTaskDelay(pdMS_TO_TICKS(10));     // yield once per sweep for LVGL/WDT
         }
     }
 
-    nrf24_cmd_byte(CMD_FLUSH_TX);
+    ce_low();
+    nrf24_write_reg(REG_RF_SETUP, RF_SETUP_PWR(3));  // clear CONT_WAVE+PLL_LOCK
+    nrf24_write_reg(REG_CONFIG,   0x00);
+    vTaskDelay(pdMS_TO_TICKS(2));
     nrf24_standby();
 }
 
@@ -443,147 +414,87 @@ void nrf24_jam_sweep(volatile bool *active, nrf24_jam_mode_t mode)
 {
     if (!s_drv) return;
 
-    // ── Jammer routing ──────────────────────────────────────────────────────────
-    // WiFi: CONT_WAVE (unmodulated carrier, AT2401C power-cycle per hop) — OFDM
-    //   needs sustained carrier to lose sync; CW is adequate.
-    // All other modes: s_gfsk_jam() — 3 × 32-byte 0xAA at 2 Mbps GFSK per hop.
-    //   CONT_WAVE was +20 dBm but failed to disrupt BT because modern chips reject
-    //   narrowband CW in their GFSK IF limiters.  3 MHz-wide GFSK noise matches
-    //   Bruce firmware signal type and acts as wideband noise to BT demodulators.
-
-    // ── Build channel list for the requested mode ─────────────────────────────
-    // BLE:    40 ch at 2 MHz spacing (2402-2480 MHz) — every BLE data+adv hop.
-    // BT:     82 ch 1 MHz spacing (2-80) with BLE adv ch doubled for 2× density.
-    // WiFi:   33 ch around 2.4 GHz ch 1/6/11 centers (+/-5 MHz each).
-    // ALL:   101 ch (0-100 = 2400-2500 MHz); capped at 100 — AT2401C rated to 2500 MHz.
-    // HID:    25 ch at 3 MHz spacing (5-77 MHz) — Logitech Unifying / MS wireless.
-    // RC:     79 ch at 1 MHz (2-80) — full range FHSS RC without BLE doubling.
-    // Zigbee: 16 ch at 5 MHz spacing (5-80) — IEEE 802.15.4 ch11-26.
-
+    // Channel tables match Bruce firmware nrf_jammer.cpp exactly.
     uint8_t channels[128];
     int nch = 0;
 
     switch (mode) {
-        case NRF24_JAM_BLE:
-            // All 40 BLE channels (advertising + data) at 2 MHz spacing 2402-2480 MHz.
-            // nRF24 ch = (freq - 2400): ch 2,4,6,...,80 — covers every BLE data hop.
-            for (uint8_t c = 2; c <= 80; c += 2) channels[nch++] = c;
-            break;
-
         default:
-        case NRF24_JAM_BT:
-            // 79 BT Classic channels (1 MHz spacing 2402-2480 MHz, nRF24 ch 2-80).
-            // BLE adv channels 2/26/80 doubled for 2× coverage — disrupts AFH below
-            // the 20-clean-channel threshold that BT requires to maintain a link.
-            for (uint8_t c = 2; c <= 80; c++) {
-                channels[nch++] = c;
-                if (c == 2 || c == 26 || c == 80)
-                    channels[nch++] = c;
-            }
-            break;
-
-        case NRF24_JAM_WIFI: {
-            // +/-5 MHz band around WiFi ch 1 (2412), ch 6 (2437), ch 11 (2462).
-            // nRF24 channel N = 2400+N MHz.
-            static const uint8_t wifi_zones[3][2] = {{7,17},{32,42},{57,67}};
-            for (int z = 0; z < 3; z++)
-                for (uint8_t c = wifi_zones[z][0]; c <= wifi_zones[z][1]; c++)
-                    channels[nch++] = c;
+        case NRF24_JAM_TEST: {
+            // Bruce "Test" — 40 even ch: upper band (2450-2480) then lower (2402-2448).
+            static const uint8_t t[] = {
+                50,52,54,56,58,60,62,64,66,68,70,72,74,76,78,80,
+                 2, 4, 6, 8,10,12,14,16,18,20,22,24,26,28,30,32,
+                34,36,38,40,42,44,46,48
+            };
+            memcpy(channels, t, sizeof(t)); nch = (int)sizeof(t);
             break;
         }
 
-        case NRF24_JAM_ALL:
-            // 2400-2500 MHz (nRF24 ch 0-100 = 101 channels).
-            // Capped at 100 to stay within AT2401C spec (rated to 2500 MHz).
-            // Channels 101-125 push AT2401C out of spec and can lock up the PA,
-            // killing TX on all subsequent channels and modes until power-cycle.
-            for (uint8_t c = 0; c <= 100; c++)
-                channels[nch++] = c;
-            break;
-
-        case NRF24_JAM_HID:
-            // Wireless HID — Logitech Unifying / Microsoft 2.4 GHz mice and keyboards.
-            // Protocols hop at ~3 MHz spacing over 2405-2477 MHz (25 channels).
-            // nRF24 ch 5,8,11,...,77 (ch = freq - 2400).
-            for (uint8_t c = 5; c <= 77; c += 3) channels[nch++] = c;
-            break;
-
-        case NRF24_JAM_RC:
-            // RC toys and drones — full 2402-2480 MHz sweep at 1 MHz resolution.
-            // FHSS RC protocols (DSMX, FlySky AFHDS2A, FrSky) hop across the entire
-            // band; 1 MHz sweep without BLE channel doubling maximises hop speed.
+        case NRF24_JAM_BT:
+            // Bruce "Bluetooth" — 79 sequential BT Classic channels 2402-2480 MHz.
             for (uint8_t c = 2; c <= 80; c++) channels[nch++] = c;
             break;
 
-        case NRF24_JAM_ZIGBEE:
-            // IEEE 802.15.4 channels 11-26 in the 2.4 GHz band.
-            // f = 2405 + 5*(ch-11) MHz -> nRF24 ch = f - 2400: 5,10,15,...,80 (16 ch).
-            for (uint8_t c = 5; c <= 80; c += 5) channels[nch++] = c;
+        case NRF24_JAM_BLE:
+            // Bruce "BLEch" — 40 sequential channels 2402-2441 MHz.
+            for (uint8_t c = 2; c <= 41; c++) channels[nch++] = c;
+            break;
+
+        case NRF24_JAM_BLE_ADV: {
+            // Bruce "BLE Adv Pri" — 12 advertising priority channels.
+            static const uint8_t a[] = {37,38,39,1,2,3,25,26,27,79,80,81};
+            memcpy(channels, a, sizeof(a)); nch = (int)sizeof(a);
+            break;
+        }
+
+        case NRF24_JAM_WIFI: {
+            // Bruce "WiFi" — 16 channels around 2.4 GHz band centers.
+            static const uint8_t w[] = {2,7,12,17,22,27,32,37,42,47,52,57,62,67,72,77};
+            memcpy(channels, w, sizeof(w)); nch = (int)sizeof(w);
+            break;
+        }
+
+        case NRF24_JAM_ZIGBEE: {
+            // Bruce "Zigbee" — 48 ch, 3 nRF24 channels per IEEE 802.15.4 ch11-26.
+            static const uint8_t z[] = {
+                 4, 5, 6,  9,10,11, 14,15,16, 19,20,21,
+                24,25,26, 29,30,31, 34,35,36, 39,40,41,
+                44,45,46, 49,50,51, 54,55,56, 59,60,61,
+                64,65,66, 69,70,71, 74,75,76, 79,80,81
+            };
+            memcpy(channels, z, sizeof(z)); nch = (int)sizeof(z);
+            break;
+        }
+
+        case NRF24_JAM_USB: {
+            // Bruce "USB" — 20 even channels covering 2.4 GHz USB dongle band.
+            static const uint8_t u[] = {32,34,36,38,40,42,44,46,48,50,
+                                         52,54,56,58,60,62,64,66,68,70};
+            memcpy(channels, u, sizeof(u)); nch = (int)sizeof(u);
+            break;
+        }
+
+        case NRF24_JAM_RC: {
+            // Bruce "RC" — 20 odd channels covering RC protocol hop band.
+            static const uint8_t r[] = {1,3,5,7,9,11,13,15,17,19,
+                                         21,23,25,27,29,31,33,35,37,39};
+            memcpy(channels, r, sizeof(r)); nch = (int)sizeof(r);
+            break;
+        }
+
+        case NRF24_JAM_VIDEO:
+            // Bruce "Video Stream" — 33 even channels in upper band 2460-2524 MHz.
+            for (uint8_t c = 60; c <= 124; c += 2) channels[nch++] = c;
+            break;
+
+        case NRF24_JAM_FULL:
+            // Bruce "Full" — 124 channels 2401-2524 MHz (complete nRF24 spectrum).
+            for (uint8_t c = 1; c <= 124; c++) channels[nch++] = c;
             break;
     }
 
-    // ── Mode routing ─────────────────────────────────────────────────────────────
-    // WiFi (OFDM): CONT_WAVE — sustained unmodulated carrier disrupts OFDM timing.
-    // All BT/BLE/HID/RC/Zigbee/All: GFSK burst — 3×32-byte 0xAA at 2 Mbps GFSK.
-    //   ~3 MHz Carson bandwidth, same signal type as Bruce firmware.
-    //
-    // BT dwell = 2000 µs: BT Classic AFH hops 1600×/sec (625 µs/hop).  At 750 µs
-    //   dwell our hit window per channel is too short to reliably catch a hop in
-    //   progress.  2000 µs triples the overlap probability per channel hit.
-    //   BT 82ch × 2750 µs ≈ 225 ms/sweep (4.4 hits/ch/sec × 2 ms = 0.88% duty).
-    // Other modes 750 µs: BLE/HID/Zigbee/All have shorter hop windows or no FHSS.
-    if (mode != NRF24_JAM_WIFI) {
-        const uint32_t dwell = (mode == NRF24_JAM_BT) ? 2000 : 750;
-        s_gfsk_jam(active, channels, nch, dwell);
-        return;
-    }
-
-    // ── CONT_WAVE path (WiFi only) ────────────────────────────────────────────
-    const uint8_t RF_SETUP_JAM = RF_SETUP_CONT_WAVE | RF_SETUP_PLL_LOCK | RF_SETUP_PWR(3);
-    const uint8_t RF_SETUP_CLR = RF_SETUP_PWR(3);
-
-    // WiFi: 1000 µs dwell — OFDM channels need sustained carrier interference.
-    //   33 ch × 1600 µs ≈ 53 ms/sweep
-    const uint32_t dwell_us = 1000;
-
-    // Initial power-up
-    ce_low();
-    nrf24_write_reg(REG_EN_AA,      0x00);
-    nrf24_write_reg(REG_SETUP_RETR, 0x00);
-    nrf24_write_reg(REG_CONFIG,     CONFIG_PWR_UP);
-    vTaskDelay(pdMS_TO_TICKS(2));
-
-    // Per-hop timing: 300 µs power-down + 300 µs power-up + dwell_us carrier.
-    // WiFi: 300+300+1000 = 1600 µs/hop.  Others: 300+300+500 = 1100 µs/hop.
-    // Yield 10 ms once per full sweep to feed LVGL and WDT — IDLE task runs at
-    // least every ~160 ms (ALL 101-ch sweep), well inside the 5 s WDT window.
-    int idx = 0;
-    while (active && *active) {
-        ce_low();
-        nrf24_write_reg(REG_RF_SETUP, RF_SETUP_CLR);   // clear CONT_WAVE+PLL_LOCK
-        nrf24_write_reg(REG_CONFIG,   0x00);            // power down → AT2401C resets
-        esp_rom_delay_us(300);
-
-        nrf24_write_reg(REG_CONFIG,   CONFIG_PWR_UP);   // power up
-        esp_rom_delay_us(300);
-
-        nrf24_write_reg(REG_RF_CH,    channels[idx]);   // new channel
-        nrf24_write_reg(REG_RF_SETUP, RF_SETUP_JAM);   // arm CONT_WAVE+PLL_LOCK
-        ce_high();
-        esp_rom_delay_us(dwell_us);                     // carrier on
-
-        if (++idx >= nch) {
-            idx = 0;
-            vTaskDelay(pdMS_TO_TICKS(10));  // yield 10 ms per complete sweep for LVGL/WDT
-        }
-    }
-
-    // Teardown: leave chip in a clean state for scan/sniffer/HW-test.
-    ce_low();
-    nrf24_write_reg(REG_RF_SETUP, RF_SETUP_CLR);
-    nrf24_write_reg(REG_CONFIG,   0x00);        // power down
-    vTaskDelay(pdMS_TO_TICKS(2));
-    nrf24_standby();
+    s_contwave_jam(active, channels, nch);
 }
 
 // ── Capture control ───────────────────────────────────────────────────────────

@@ -99,18 +99,23 @@ esp_err_t nrf24_sfhss_scan(nrf24_sfhss_t *out, uint32_t timeout_ms,
                             volatile bool *cancel);
 
 // ── Jammer (channel sweeper) ──────────────────────────────────────────────────
-// Target band selector for nrf24_jam_sweep().
+// Channel sets and mode names match Bruce firmware nrf_jammer.cpp exactly.
+// All modes use CONT_WAVE (RF_SETUP.CONT_WAVE=1, PLL_LOCK=1) with CE HIGH,
+// hopping via direct RF_CH writes at SPI speed — no power-cycle between hops.
 typedef enum {
-    NRF24_JAM_BLE    = 0,  // All 40 BLE channels 2402-2480 MHz at 2 MHz spacing (burst TX)
-    NRF24_JAM_BT     = 1,  // 79 BT Classic channels 2402-2480 MHz + BLE adv doubled (burst TX)
-    NRF24_JAM_WIFI   = 2,  // WiFi 2.4GHz: +/-5 MHz around ch 1/6/11 centers (CONT_WAVE)
-    NRF24_JAM_ALL    = 3,  // Full nRF24 range 2400-2525 MHz, 126 channels (CONT_WAVE)
-    NRF24_JAM_HID    = 4,  // Wireless HID — Logitech Unifying/MS ~3 MHz spacing, 25 ch (burst TX)
-    NRF24_JAM_RC     = 5,  // RC/drone — 1 MHz sweep 2402-2480 MHz, 79 channels (burst TX)
-    NRF24_JAM_ZIGBEE = 6,  // Zigbee/IoT — IEEE 802.15.4 ch11-26, 5 MHz spacing, 16 ch (burst TX)
+    NRF24_JAM_TEST    = 0,  // Bruce "Test"          — 40 even ch: upper(50-80) then lower(2-48)
+    NRF24_JAM_BT      = 1,  // Bruce "Bluetooth"     — 79 ch sequential 2402-2480 MHz
+    NRF24_JAM_BLE     = 2,  // Bruce "BLEch"         — 40 ch sequential 2402-2441 MHz
+    NRF24_JAM_BLE_ADV = 3,  // Bruce "BLE Adv Pri"   — 12 ch advertising priority
+    NRF24_JAM_WIFI    = 4,  // Bruce "WiFi"          — 16 ch around 2.4 GHz centers
+    NRF24_JAM_ZIGBEE  = 5,  // Bruce "Zigbee"        — 48 ch, 3 per IEEE 802.15.4 ch11-26
+    NRF24_JAM_USB     = 6,  // Bruce "USB"           — 20 even ch 2432-2470 MHz dongle band
+    NRF24_JAM_RC      = 7,  // Bruce "RC"            — 20 odd ch 2401-2439 MHz
+    NRF24_JAM_VIDEO   = 8,  // Bruce "Video Stream"  — 33 even ch 2460-2524 MHz upper band
+    NRF24_JAM_FULL    = 9,  // Bruce "Full"          — 124 ch 2401-2524 MHz complete spectrum
 } nrf24_jam_mode_t;
 
-// Sweep the selected band in CONT_WAVE mode. Blocks until *active becomes false.
+// Sweep the selected band. Blocks until *active becomes false.
 void nrf24_jam_sweep(volatile bool *active, nrf24_jam_mode_t mode);
 
 // ── Capture control (cancel from another task) ────────────────────────────────
