@@ -480,10 +480,15 @@ void nrf24_jam_sweep(volatile bool *active, nrf24_jam_mode_t mode)
     const uint8_t RF_SETUP_JAM = RF_SETUP_CONT_WAVE | RF_SETUP_PLL_LOCK | RF_SETUP_PWR(3);
     const uint8_t RF_SETUP_CLR = RF_SETUP_PWR(3);
 
-    // WiFi: 1000 µs dwell — OFDM channels need sustained carrier.
-    // All other modes: 500 µs — 370 µs of actual carrier after 130 µs PLL lock;
-    // faster sweep gives more channel coverage per second at +20 dBm.
-    const uint32_t dwell_us = (mode == NRF24_JAM_WIFI) ? 1000 : 500;
+    // WiFi: 1000 µs dwell — OFDM channels need sustained carrier interference.
+    // All other modes: 300 µs — 170 µs of actual carrier after 130 µs PLL lock;
+    // 70 µs is enough to corrupt any overlapping BT/BLE packet at +20 dBm,
+    // and shorter dwell = faster sweep = more hits per channel per second.
+    //   BLE  40 ch × 900 µs ≈  36 ms/sweep   (27.8 hits/ch/sec)
+    //   BT   82 ch × 900 µs ≈  74 ms/sweep   (13.5 hits/ch/sec)
+    //   ALL 101 ch × 900 µs ≈  91 ms/sweep   (11 hits/ch/sec)
+    //   HID  25 ch × 900 µs ≈  22.5 ms/sweep (44 hits/ch/sec)
+    const uint32_t dwell_us = (mode == NRF24_JAM_WIFI) ? 1000 : 300;
 
     // Initial power-up
     ce_low();
@@ -493,7 +498,7 @@ void nrf24_jam_sweep(volatile bool *active, nrf24_jam_mode_t mode)
     vTaskDelay(pdMS_TO_TICKS(2));
 
     // Per-hop timing: 300 µs power-down + 300 µs power-up + dwell_us carrier.
-    // WiFi: 300+300+1000 = 1600 µs/hop.  Others: 300+300+500 = 1100 µs/hop.
+    // WiFi: 300+300+1000 = 1600 µs/hop.  Others: 300+300+300 = 900 µs/hop.
     // Yield 10 ms once per full sweep to feed LVGL and WDT — IDLE task runs at
     // least every ~160 ms (ALL 101-ch sweep), well inside the 5 s WDT window.
     int idx = 0;
