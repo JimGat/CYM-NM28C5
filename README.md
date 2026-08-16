@@ -22,7 +22,7 @@
 </p>
 
 <p align="center">
-  <a href="https://jimgat.github.io/CYM-NM28C5/" target="_blank">
+  <a href="https://jimgat.github.io/cym/" target="_blank">
     <img src="https://img.shields.io/badge/⚡%20Web%20Flasher-Flash%20in%20Browser-39ff14?style=for-the-badge&logo=googlechrome&logoColor=black" alt="Web Flasher"/>
   </a>
 </p>
@@ -2857,7 +2857,7 @@ After each build the compiled binaries are automatically copied to `ESP32C5/bina
 
 ### Flash — Web Flasher (Easiest — No Install Required)
 
-**[https://jimgat.github.io/CYM-NM28C5/](https://jimgat.github.io/CYM-NM28C5/)**
+**[https://jimgat.github.io/cym/](https://jimgat.github.io/cym/)**
 
 A custom-built browser flasher using Chrome or Edge WebSerial. No drivers, no terminal, no file selection — everything is fetched automatically. Click the LAB5 logo on the page to visit the store.
 
