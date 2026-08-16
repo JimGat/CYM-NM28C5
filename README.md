@@ -3018,7 +3018,7 @@ You can also install directly through the Launcher OTA screen without copying th
     {
       "name": "Cheap Yellow Monster",
       "fid": "",
-      "link": "https://github.com/JimGat/CYM-NM28C5/releases/latest/download/CYM-NM28C5.bin"
+      "link": "https://github.com/JimGat/CYM/releases/latest/download/CYM-NM28C5.bin"
     }
   ]
 }
