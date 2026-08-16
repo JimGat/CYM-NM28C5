@@ -414,10 +414,12 @@ static void s_contwave_jam(volatile bool *active, const uint8_t *ch_in, int nch)
 
     int idx = 0;
     while (active && *active) {
-        ce_low();                                    // AT2401C TXEN → LOW, de-engages
-        nrf24_write_reg(REG_RF_CH, channels[idx]);  // write channel in Standby-I
-        ce_high();                                   // AT2401C TXEN → HIGH, re-engages at new freq
-        esp_rom_delay_us(500);                       // 130 µs PLL + 370 µs AT2401C settle
+        // CE stays HIGH throughout — AT2401C stays in TX mode continuously.
+        // Writing RF_CH while CE is HIGH causes the nRF24 PLL to resync to the
+        // new channel (~130 µs transition). During that transition the output is a
+        // frequency chirp that contributes broadband interference. This is Bruce's
+        // exact approach: hop rate is limited only by SPI bus speed (~50 µs/write).
+        nrf24_write_reg(REG_RF_CH, channels[idx]);
 
         if (++idx >= nch) {
             idx = 0;
@@ -429,7 +431,7 @@ static void s_contwave_jam(volatile bool *active, const uint8_t *ch_in, int nch)
                     uint8_t tmp = channels[i]; channels[i] = channels[j]; channels[j] = tmp;
                 }
             }
-            vTaskDelay(pdMS_TO_TICKS(10));           // yield once per sweep for LVGL/WDT
+            vTaskDelay(pdMS_TO_TICKS(10));   // yield once per sweep for LVGL/WDT
         }
     }
 
