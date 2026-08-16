@@ -2125,7 +2125,7 @@ Concept credit: **@bkbroiler**.
 | `/sdcard/lab/rfid/hf/` | HF card saves (`.nfc` — NTAG, MIFARE, Ultralight) |
 | `/sdcard/lab/rfid/keys/mf_keys.dic` | MIFARE Classic key dictionary (one 12-hex-char key per line) |
 
-The key dictionary is seeded on first SD provision with 8 common factory/default keys. For broader coverage, download the extended dictionary from the **[CYM SD Asset Repository](https://github.com/JimGat/CYM-NM28C5-SD-Assets)** and replace the seeded file.
+The key dictionary is seeded on first SD provision with 8 common factory/default keys. For broader coverage, download the extended dictionary from the **[CYM SD Asset Repository](https://github.com/JimGat/CYM-SD-Assets)** and replace the seeded file.
 
 #### PN532 NFC/RFID
 
@@ -2768,13 +2768,13 @@ D3F7D3F7D3F7
 000000000000
 ```
 
-SD Provision seeds this file with the 8 most common defaults. For broader coverage (common vendor keys, leaked key sets, etc.), download the extended dictionary from the **[CYM SD Asset Repository](https://github.com/JimGat/CYM-NM28C5-SD-Assets)** and replace the file. The dictionary can have up to 512 entries; larger files are capped at that limit.
+SD Provision seeds this file with the 8 most common defaults. For broader coverage (common vendor keys, leaked key sets, etc.), download the extended dictionary from the **[CYM SD Asset Repository](https://github.com/JimGat/CYM-SD-Assets)** and replace the file. The dictionary can have up to 512 entries; larger files are capped at that limit.
 
 ---
 
 ### CYM SD Asset Repository
 
-Pre-built SD card assets are hosted at **[github.com/JimGat/CYM-NM28C5-SD-Assets](https://github.com/JimGat/CYM-NM28C5-SD-Assets)**. Download these files and place them in `/sdcard/lab/` before first use for the best out-of-box experience:
+Pre-built SD card assets are hosted at **[github.com/JimGat/CYM-SD-Assets](https://github.com/JimGat/CYM-SD-Assets)**. Download these files and place them in `/sdcard/lab/` before first use for the best out-of-box experience:
 
 | File | Destination | Purpose |
 |------|-------------|---------|
