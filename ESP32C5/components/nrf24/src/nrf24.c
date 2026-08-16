@@ -388,7 +388,7 @@ bool nrf24_carrier_detect(void)
 //   BLE 40ch: 40 × 775 µs ≈ 31 ms/sweep  (32 hits/ch/sec)
 //   BT  82ch: 82 × 775 µs ≈ 64 ms/sweep  (15 hits/ch/sec)
 //   ALL 101ch: 101 × 775 µs ≈ 78 ms/sweep (13 hits/ch/sec)
-static void s_gfsk_jam(volatile bool *active, const uint8_t *ch, int nch)
+static void s_gfsk_jam(volatile bool *active, const uint8_t *ch, int nch, uint32_t dwell_us)
 {
     // 0xAA = 10101010 at 2 Mbps GFSK = maximum frequency deviation on every bit.
     // Identical to the BT preamble pattern — interferes with BT sync correlation.
@@ -424,7 +424,7 @@ static void s_gfsk_jam(volatile bool *active, const uint8_t *ch, int nch)
         csn_low(); spi_xfer_buf(pkt_buf, NULL, 33); csn_high();
 
         ce_high();
-        esp_rom_delay_us(750);  // 130 µs PLL + 480 µs TX + 140 µs margin
+        esp_rom_delay_us(dwell_us);  // 130 µs PLL + 480 µs TX + margin; BT=2000 µs
         ce_low();
 
         if (++idx >= nch) {
@@ -524,12 +524,17 @@ void nrf24_jam_sweep(volatile bool *active, nrf24_jam_mode_t mode)
 
     // ── Mode routing ─────────────────────────────────────────────────────────────
     // WiFi (OFDM): CONT_WAVE — sustained unmodulated carrier disrupts OFDM timing.
-    //   Not enough to break GFSK/FHSS links, but adequate for single-channel OFDM.
-    // All BT/BLE/HID/RC/Zigbee/All: GFSK burst — 3×32-byte 0xAA packets at 2 Mbps
-    //   = ~3 MHz Carson bandwidth, identical to Bruce firmware signal type.
-    //   CW was rejected by modern BT chips' GFSK limiters despite +20 dBm output.
+    // All BT/BLE/HID/RC/Zigbee/All: GFSK burst — 3×32-byte 0xAA at 2 Mbps GFSK.
+    //   ~3 MHz Carson bandwidth, same signal type as Bruce firmware.
+    //
+    // BT dwell = 2000 µs: BT Classic AFH hops 1600×/sec (625 µs/hop).  At 750 µs
+    //   dwell our hit window per channel is too short to reliably catch a hop in
+    //   progress.  2000 µs triples the overlap probability per channel hit.
+    //   BT 82ch × 2750 µs ≈ 225 ms/sweep (4.4 hits/ch/sec × 2 ms = 0.88% duty).
+    // Other modes 750 µs: BLE/HID/Zigbee/All have shorter hop windows or no FHSS.
     if (mode != NRF24_JAM_WIFI) {
-        s_gfsk_jam(active, channels, nch);
+        const uint32_t dwell = (mode == NRF24_JAM_BT) ? 2000 : 750;
+        s_gfsk_jam(active, channels, nch, dwell);
         return;
     }
 
