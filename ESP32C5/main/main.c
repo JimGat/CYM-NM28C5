@@ -34687,7 +34687,8 @@ static void s_blaster_stop_cb(lv_event_t *e)
         ble_gap_ext_adv_stop(i);
     if (s_blaster_layers_lbl)
         lv_label_set_text(s_blaster_layers_lbl,
-            nrf24_is_init() ? "BLE + RF jam available" : "BLE flood only");
+            nrf24_is_init() ? "BLE + RF jam available"
+                            : "BLE flood only\nNM-RF-HAT? Enable DIP 2 for RF jam");
 }
 
 static void ble_blaster_screen_stop(void)
@@ -34740,10 +34741,13 @@ static void show_ble_blaster_screen(void)
     lv_obj_set_style_text_font(s_blaster_status_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_blaster_status_lbl, lv_color_hex(0x66BB6A), 0);
 
-    // Shows which attack layers are active (BLE only vs BLE + RF jam)
+    // Shows active layers; hints DIP 2 when RF-HAT nRF24 is not yet detected.
     s_blaster_layers_lbl = lv_label_create(card);
     lv_label_set_text(s_blaster_layers_lbl,
-        has_nrf ? "BLE + RF jam available" : "BLE flood only");
+        has_nrf ? "BLE + RF jam available"
+                : "BLE flood only\nNM-RF-HAT? Enable DIP 2 for RF jam");
+    lv_obj_set_width(s_blaster_layers_lbl, LCD_H_RES - 40);
+    lv_label_set_long_mode(s_blaster_layers_lbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_font(s_blaster_layers_lbl, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_blaster_layers_lbl, lv_color_make(150, 150, 150), 0);
     lv_obj_set_style_text_align(s_blaster_layers_lbl, LV_TEXT_ALIGN_CENTER, 0);
