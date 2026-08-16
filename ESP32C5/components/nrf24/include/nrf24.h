@@ -101,10 +101,13 @@ esp_err_t nrf24_sfhss_scan(nrf24_sfhss_t *out, uint32_t timeout_ms,
 // ── Jammer (channel sweeper) ──────────────────────────────────────────────────
 // Target band selector for nrf24_jam_sweep().
 typedef enum {
-    NRF24_JAM_BLE  = 0,  // BLE advertising channels only (ch 2/26/80 = BLE adv 37/38/39)
-    NRF24_JAM_BT   = 1,  // All 79 BT Classic channels 2402-2480 MHz + BLE adv doubled
-    NRF24_JAM_WIFI = 2,  // WiFi 2.4GHz bands: +-5 MHz around ch 1/6/11 centers
-    NRF24_JAM_ALL  = 3,  // Full nRF24 range 2400-2525 MHz (all 126 channels)
+    NRF24_JAM_BLE    = 0,  // All 40 BLE channels 2402-2480 MHz at 2 MHz spacing (burst TX)
+    NRF24_JAM_BT     = 1,  // 79 BT Classic channels 2402-2480 MHz + BLE adv doubled (burst TX)
+    NRF24_JAM_WIFI   = 2,  // WiFi 2.4GHz: +/-5 MHz around ch 1/6/11 centers (CONT_WAVE)
+    NRF24_JAM_ALL    = 3,  // Full nRF24 range 2400-2525 MHz, 126 channels (CONT_WAVE)
+    NRF24_JAM_HID    = 4,  // Wireless HID — Logitech Unifying/MS ~3 MHz spacing, 25 ch (burst TX)
+    NRF24_JAM_RC     = 5,  // RC/drone — 1 MHz sweep 2402-2480 MHz, 79 channels (burst TX)
+    NRF24_JAM_ZIGBEE = 6,  // Zigbee/IoT — IEEE 802.15.4 ch11-26, 5 MHz spacing, 16 ch (burst TX)
 } nrf24_jam_mode_t;
 
 // Sweep the selected band in CONT_WAVE mode. Blocks until *active becomes false.

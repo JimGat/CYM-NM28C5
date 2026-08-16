@@ -436,15 +436,13 @@ void nrf24_jam_sweep(volatile bool *active, nrf24_jam_mode_t mode)
     // Do NOT increase this: 82 hops * 2 ms = 164 ms starvation causes WDT warnings.
 
     // ── Build channel list for the requested mode ─────────────────────────────
-    // NRF24_JAM_BLE:  3 channels (2/26/80 = BLE adv ch 37/38/39).
-    //                 3 ch * 2 ms = 6 ms/sweep -> ~167 sweeps/sec.
-    //                 Each adv channel gets full AT2401C power every 6 ms.
-    // NRF24_JAM_BT:   82 channels (2-80, BLE adv doubled).
-    //                 Covers all 79 Classic BT FHSS channels; AFH cannot find
-    //                 minimum 20 clean channels -> link degrades and drops.
-    // NRF24_JAM_WIFI: 33 channels around WiFi 2.4 GHz ch 1/6/11 centers (+/-5 MHz).
-    //                 ch1 zone: nRF24 7-17 | ch6 zone: 32-42 | ch11 zone: 57-67.
-    // NRF24_JAM_ALL:  126 channels (nRF24 ch 0-125 = 2400-2525 MHz, full ISM band).
+    // BLE:    40 ch at 2 MHz spacing (2402-2480 MHz) — every BLE data+adv hop.
+    // BT:     82 ch 1 MHz spacing (2-80) with BLE adv ch doubled for 2× density.
+    // WiFi:   33 ch around 2.4 GHz ch 1/6/11 centers (+/-5 MHz each).
+    // ALL:    126 ch (0-125 = 2400-2525 MHz, full ISM band, CONT_WAVE).
+    // HID:    25 ch at 3 MHz spacing (5-77 MHz) — Logitech Unifying / MS wireless.
+    // RC:     79 ch at 1 MHz (2-80) — full range FHSS RC without BLE doubling.
+    // Zigbee: 16 ch at 5 MHz spacing (5-80) — IEEE 802.15.4 ch11-26.
 
     uint8_t channels[128];
     int nch = 0;
@@ -453,14 +451,14 @@ void nrf24_jam_sweep(volatile bool *active, nrf24_jam_mode_t mode)
         case NRF24_JAM_BLE:
             // All 40 BLE channels (advertising + data) at 2 MHz spacing 2402-2480 MHz.
             // nRF24 ch = (freq - 2400): ch 2,4,6,...,80 — covers every BLE data hop.
-            // CONT_WAVE would only cover 3 adv channels; burst TX sweeps all 40.
-            for (uint8_t c = 2; c <= 80; c += 2) channels[nch++] = c;  // 40 channels
+            for (uint8_t c = 2; c <= 80; c += 2) channels[nch++] = c;
             break;
 
         default:
         case NRF24_JAM_BT:
-            // All 79 BT Classic channels (1 MHz spacing 2402-2480 MHz, nRF24 ch 2-80).
-            // BLE adv channels doubled so they get 2× coverage vs data channels.
+            // 79 BT Classic channels (1 MHz spacing 2402-2480 MHz, nRF24 ch 2-80).
+            // BLE adv channels 2/26/80 doubled for 2× coverage — disrupts AFH below
+            // the 20-clean-channel threshold that BT requires to maintain a link.
             for (uint8_t c = 2; c <= 80; c++) {
                 channels[nch++] = c;
                 if (c == 2 || c == 26 || c == 80)
@@ -483,13 +481,34 @@ void nrf24_jam_sweep(volatile bool *active, nrf24_jam_mode_t mode)
             for (uint8_t c = 0; c <= 125; c++)
                 channels[nch++] = c;
             break;
+
+        case NRF24_JAM_HID:
+            // Wireless HID — Logitech Unifying / Microsoft 2.4 GHz mice and keyboards.
+            // Protocols hop at ~3 MHz spacing over 2405-2477 MHz (25 channels).
+            // nRF24 ch 5,8,11,...,77 (ch = freq - 2400).
+            for (uint8_t c = 5; c <= 77; c += 3) channels[nch++] = c;
+            break;
+
+        case NRF24_JAM_RC:
+            // RC toys and drones — full 2402-2480 MHz sweep at 1 MHz resolution.
+            // FHSS RC protocols (DSMX, FlySky AFHDS2A, FrSky) hop across the entire
+            // band; 1 MHz sweep without BLE channel doubling maximises hop speed.
+            for (uint8_t c = 2; c <= 80; c++) channels[nch++] = c;
+            break;
+
+        case NRF24_JAM_ZIGBEE:
+            // IEEE 802.15.4 channels 11-26 in the 2.4 GHz band.
+            // f = 2405 + 5*(ch-11) MHz -> nRF24 ch = f - 2400: 5,10,15,...,80 (16 ch).
+            for (uint8_t c = 5; c <= 80; c += 5) channels[nch++] = c;
+            break;
     }
 
-    // BLE / BT modes use burst TX — modulated GFSK disrupts connected devices
-    // and channels change in standby-I (~130 µs) vs the 1 ms AT2401C power cycle
-    // that CONT_WAVE requires.  WiFi and ALL modes keep CONT_WAVE for broad
-    // continuous carrier coverage across the ISM band.
-    if (mode == NRF24_JAM_BLE || mode == NRF24_JAM_BT) {
+    // BLE / BT / HID / RC / Zigbee use burst TX — modulated GFSK, fast hop in
+    // standby-I (~130 µs/ch) without the AT2401C power-cycle overhead that
+    // CONT_WAVE requires (~2 ms/ch).  WiFi and ALL keep CONT_WAVE for broad
+    // continuous carrier coverage.
+    if (mode == NRF24_JAM_BLE || mode == NRF24_JAM_BT ||
+        mode == NRF24_JAM_HID || mode == NRF24_JAM_RC || mode == NRF24_JAM_ZIGBEE) {
         s_burst_jam(active, channels, nch);
         nrf24_standby();
         return;

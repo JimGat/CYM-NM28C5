@@ -2050,7 +2050,7 @@ EXT_RAM_BSS_ATTR static lv_obj_t *s_n24_page_lbl = NULL;
 EXT_RAM_BSS_ATTR static bool           s_n24_jam_active    = false;
 EXT_RAM_BSS_ATTR static nrf24_jam_mode_t s_n24_jam_mode    = NRF24_JAM_ALL;
 EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_jam_status    = NULL;
-EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_mode_btns[4]  = {NULL,NULL,NULL,NULL};
+EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_mode_btns[7]  = {NULL,NULL,NULL,NULL,NULL,NULL,NULL};
 EXT_RAM_BSS_ATTR static lv_timer_t    *s_n24_jam_tmr        = NULL;
 EXT_RAM_BSS_ATTR static TaskHandle_t   s_n24_jam_task       = NULL;
 
@@ -49329,7 +49329,8 @@ static void s_n24_jam_timer_cb(lv_timer_t *t)
     (void)t;
     if (!s_n24_jam_status) return;
     static int blink = 0;
-    static const char *const s_jam_mode_names[] = {"BLE", "BT", "WiFi", "All"};
+    // Indexed by nrf24_jam_mode_t: BLE=0, BT=1, WiFi=2, All=3, HID=4, RC=5, Zigbee=6
+    static const char *const s_jam_mode_names[] = {"BLE","BT","WiFi","All","Mouse","RC","Zigbee"};
     if (s_n24_jam_active) {
         lv_label_set_text_fmt(s_n24_jam_status,
             blink++ & 1 ? "JAMMING %s..." : "JAMMING %s   ",
@@ -49369,7 +49370,7 @@ static void nrf24_jam_screen_stop(void)
     s_n24_jam_active = false;  // signals the jam task to exit via nrf24_jam_sweep()
     if (s_n24_jam_tmr) { lv_timer_del(s_n24_jam_tmr); s_n24_jam_tmr = NULL; }
     s_n24_jam_status = NULL;
-    for (int i = 0; i < 4; i++) s_n24_mode_btns[i] = NULL;
+    for (int i = 0; i < 7; i++) s_n24_mode_btns[i] = NULL;
 }
 
 // Mode selector button: update s_n24_jam_mode and highlight the chosen button.
@@ -49378,7 +49379,7 @@ static void s_n24_mode_btn_cb(lv_event_t *e)
     int mode = (int)(intptr_t)lv_event_get_user_data(e);
     if (s_n24_jam_active) return;  // don't allow mode change while jamming
     s_n24_jam_mode = (nrf24_jam_mode_t)mode;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 7; i++) {
         if (!s_n24_mode_btns[i]) continue;
         lv_obj_set_style_bg_color(s_n24_mode_btns[i],
             i == mode ? lv_color_hex(0xC62828) : lv_color_hex(0x2A2A2A), 0);
@@ -49477,34 +49478,43 @@ static void show_nrf24_jammer_screen(void)
     lv_obj_set_style_text_color(note, lv_color_make(150, 150, 150), 0);
     lv_obj_set_style_text_align(note, LV_TEXT_ALIGN_CENTER, 0);
 
-    // 2x2 mode selector grid: BLE Only / BT Classic / WiFi 2.4G / All Bands
-    static const char *const s_mode_labels[4] = {"BLE Only", "BT Classic", "WiFi 2.4G", "All Bands"};
-    static lv_coord_t s_jam_col_dsc[] = {LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_TEMPLATE_LAST};
-    static lv_coord_t s_jam_row_dsc[] = {36, 36, LV_GRID_TEMPLATE_LAST};
-    lv_obj_t *mode_grid = lv_obj_create(card);
-    lv_obj_set_width(mode_grid, LV_PCT(100));
-    lv_obj_set_height(mode_grid, LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_opa(mode_grid, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(mode_grid, 0, 0);
-    lv_obj_set_style_pad_all(mode_grid, 0, 0);
-    lv_obj_set_style_pad_gap(mode_grid, 6, 0);
-    lv_obj_set_grid_dsc_array(mode_grid, s_jam_col_dsc, s_jam_row_dsc);
-    lv_obj_clear_flag(mode_grid, LV_OBJ_FLAG_SCROLLABLE);
-    for (int i = 0; i < 4; i++) {
-        lv_obj_t *mbtn = lv_btn_create(mode_grid);
-        lv_obj_set_grid_cell(mbtn, LV_GRID_ALIGN_STRETCH, i % 2, 1,
-                                    LV_GRID_ALIGN_STRETCH, i / 2, 1);
-        bool sel = ((int)s_n24_jam_mode == i);
-        lv_obj_set_style_bg_color(mbtn, sel ? lv_color_hex(0xC62828) : lv_color_hex(0x2A2A2A), 0);
-        lv_obj_set_style_radius(mbtn, 6, 0);
-        lv_obj_set_style_border_width(mbtn, 0, 0);
-        lv_obj_t *ml = lv_label_create(mbtn);
-        lv_label_set_text(ml, s_mode_labels[i]);
-        lv_obj_set_style_text_font(ml, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(ml, lv_color_white(), 0);
-        lv_obj_center(ml);
-        lv_obj_add_event_cb(mbtn, s_n24_mode_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
-        s_n24_mode_btns[i] = mbtn;
+    // 7-mode selector: two flex rows.
+    // Row 1: BLE | BT | Mouse | RC   (burst TX modes — fast GFSK sweep)
+    // Row 2: WiFi | Zigbee | All     (WiFi/All use CONT_WAVE)
+    // s_mode_labels indexed by enum: BLE=0,BT=1,WiFi=2,All=3,HID=4,RC=5,Zigbee=6
+    static const char *const s_mode_labels[7] = {"BLE","BT","WiFi","All","Mouse","RC","Zigbee"};
+    static const nrf24_jam_mode_t s_row1_modes[] = {NRF24_JAM_BLE,NRF24_JAM_BT,NRF24_JAM_HID,NRF24_JAM_RC};
+    static const nrf24_jam_mode_t s_row2_modes[] = {NRF24_JAM_WIFI,NRF24_JAM_ZIGBEE,NRF24_JAM_ALL};
+    for (int r = 0; r < 2; r++) {
+        lv_obj_t *mrow = lv_obj_create(card);
+        lv_obj_set_width(mrow, LV_PCT(100));
+        lv_obj_set_height(mrow, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(mrow, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(mrow, 0, 0);
+        lv_obj_set_style_pad_all(mrow, 0, 0);
+        lv_obj_set_style_pad_column(mrow, 5, 0);
+        lv_obj_set_flex_flow(mrow, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(mrow, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(mrow, LV_OBJ_FLAG_SCROLLABLE);
+        const nrf24_jam_mode_t *modes = (r == 0) ? s_row1_modes : s_row2_modes;
+        int cnt = (r == 0) ? 4 : 3;
+        for (int j = 0; j < cnt; j++) {
+            nrf24_jam_mode_t m = modes[j];
+            lv_obj_t *mbtn = lv_btn_create(mrow);
+            lv_obj_set_flex_grow(mbtn, 1);
+            lv_obj_set_height(mbtn, 30);
+            bool sel = (s_n24_jam_mode == m);
+            lv_obj_set_style_bg_color(mbtn, sel ? lv_color_hex(0xC62828) : lv_color_hex(0x2A2A2A), 0);
+            lv_obj_set_style_radius(mbtn, 6, 0);
+            lv_obj_set_style_border_width(mbtn, 0, 0);
+            lv_obj_t *ml = lv_label_create(mbtn);
+            lv_label_set_text(ml, s_mode_labels[m]);
+            lv_obj_set_style_text_font(ml, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(ml, lv_color_white(), 0);
+            lv_obj_center(ml);
+            lv_obj_add_event_cb(mbtn, s_n24_mode_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)m);
+            s_n24_mode_btns[m] = mbtn;
+        }
     }
 
     lv_obj_t *btn_row = lv_obj_create(card);
