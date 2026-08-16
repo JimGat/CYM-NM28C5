@@ -370,51 +370,11 @@ bool nrf24_carrier_detect(void)
     return (nrf24_read_reg(REG_RPD) & 0x01) != 0;
 }
 
-// ── Burst-TX jammer ──────────────────────────────────────────────────────────
-// Fires 1-byte GFSK packets at 2 Mbps on each channel in rapid succession.
-// Unlike CONT_WAVE, CE is pulsed per packet — TXEN follows CE naturally so
-// the AT2401C works in its normal burst-amplifier role with no power-cycle
-// between hops.  Channel changes happen in standby-I (~130 µs) instead of
-// the full power-down/up (1 ms) CONT_WAVE requires.
-//
-// Per-hop timing: RF_CH write (~10 µs) + W_TX_PAYLOAD (~10 µs) +
-//                 CE pulse 15 µs + packet on air ~20 µs + guard 60 µs
-//                 ≈ 115 µs/hop.
-// 40 BLE channels × 115 µs = 4.6 ms/sweep → ~215 sweeps/sec per channel.
-// Yields 1 tick (10 ms) after each full sweep to feed LVGL and WDT.
-static void s_burst_jam(volatile bool *active, const uint8_t *ch, int nch)
-{
-    // TX mode, no CRC, no auto-ACK, no retry, 2 Mbps, PA bits = 11 (AT2401C delivers +20 dBm)
-    ce_low();
-    nrf24_write_reg(REG_CONFIG,      CONFIG_PWR_UP);              // TX, no CRC
-    nrf24_write_reg(REG_EN_AA,       0x00);                       // disable auto-ACK
-    nrf24_write_reg(REG_SETUP_RETR,  0x00);                       // no retransmit
-    nrf24_write_reg(REG_RF_SETUP,    RF_SETUP_DR_HIGH | RF_SETUP_PWR(3));  // 2 Mbps, PA=11
-    static const uint8_t addr[5] = {0xAA,0xAA,0xAA,0xAA,0xAA};
-    nrf24_write_reg_multi(REG_TX_ADDR, addr, 5);
-    nrf24_write_reg(REG_RX_PW_P0, 1);
-    nrf24_cmd_byte(CMD_FLUSH_TX);
-    vTaskDelay(pdMS_TO_TICKS(2));  // Tpd2stby settle
-
-    // Timing matched to Bruce firmware reference (~350 µs/hop):
-    //   CE HIGH: 15 µs (≥10 µs spec minimum, longer gives AT2401C PA more time to arm)
-    //   Post-CE-low wait: 335 µs (130 µs PLL lock + 32 µs 1-byte TX + 173 µs margin)
-    //   Total per hop: ~350 µs
-    while (active && *active) {
-        for (int i = 0; i < nch && *active; i++) {
-            nrf24_write_reg(REG_RF_CH, ch[i]);            // set channel (chip in Standby-I)
-            uint8_t tx_pkt[2] = { CMD_W_PAYLOAD, 0xAA }; // 1-byte jam payload
-            csn_low(); spi_xfer_buf(tx_pkt, NULL, 2); csn_high();
-            ce_high();
-            esp_rom_delay_us(15);                         // 15 µs CE — extra margin for AT2401C
-            ce_low();
-            esp_rom_delay_us(335);                        // PLL lock + TX complete + margin
-            nrf24_write_reg(REG_STATUS, 0x30);            // clear TX_DS + MAX_RT
-        }
-        nrf24_cmd_byte(CMD_FLUSH_TX);
-        vTaskDelay(pdMS_TO_TICKS(10));  // yield 1 tick between sweeps for LVGL/WDT
-    }
-}
+// Note: burst-TX jamming (CE-pulsed GFSK packets) was tested and found NOT to
+// engage the AT2401C PA on the NM-RF-HAT.  The ~32 µs packet is too brief for
+// the PA to latch before the burst ends — zero signal observed on TinySA even
+// with Max Hold after device power-cycle.  CONT_WAVE with a full AT2401C
+// power-cycle per hop reliably produces +20 dBm output and is used for all modes.
 
 // ── Jammer sweep ─────────────────────────────────────────────────────────────
 
@@ -422,28 +382,35 @@ void nrf24_jam_sweep(volatile bool *active, nrf24_jam_mode_t mode)
 {
     if (!s_drv) return;
 
-    // ── Continuous-carrier (CONT_WAVE) jamming — Bruce-compatible PA sequence ─
+    // ── CONT_WAVE jamming — all modes, AT2401C power-cycle per hop ───────────
     // nRF24L01+ §6.4: RF_SETUP.CONT_WAVE=1 + RF_SETUP.PLL_LOCK=1 with CE HIGH
-    // emits an unmodulated carrier at 100% duty cycle per channel dwell.
+    // emits an unmodulated carrier at 100% duty cycle for the dwell period.
+    // This is Bruce firmware's "Test" mode — the CONT_WAVE bit is the nRF24's
+    // built-in RF test mode; Bruce named the menu option "Test" after it.
     //
-    // The AT2401C PA+LNA requires a full power-down/power-up cycle between hops.
-    // Cheaper approaches (CE toggle alone, RF_SETUP clear+reset alone) suppress
-    // the carrier entirely — observed as zero signal on TinySA in v2.12.7/8.
-    // This matches Bruce firmware's nrf_jammer_api.cpp PA-module path exactly.
+    // The AT2401C PA+LNA requires a full power-down/power-up cycle on every hop.
+    // Burst TX (CE-pulsed GFSK packets) does NOT engage the PA — the ~32 µs
+    // burst is too short for the AT2401C to latch before it ends.  Power-cycle
+    // is the only proven path to +20 dBm on this hardware.
     //
-    // Per-hop sequence (~2 ms total):
+    // Per-hop sequence:
     //   CE low + clear CONT_WAVE+PLL_LOCK  ->  power-down CONFIG  ->  500 us
     //   ->  power-up CONFIG  ->  500 us  ->  write RF_CH  ->  re-arm CONT_WAVE+PLL_LOCK
-    //   ->  CE high  ->  1 ms carrier dwell
+    //   ->  CE high  ->  dwell (WiFi 1000 us / others 500 us)
     //
-    // Yield every 20 hops (40 ms max CPU hold) keeps LVGL render times normal.
-    // Do NOT increase this: 82 hops * 2 ms = 164 ms starvation causes WDT warnings.
+    // Dwell times: WiFi uses 1000 µs — OFDM needs sustained carrier interference.
+    // All others use 500 µs: 130 µs PLL lock + 370 µs actual carrier, faster sweep.
+    //   BLE  40 ch × 1500 µs ≈  60 ms/sweep @ +20 dBm
+    //   BT   82 ch × 1500 µs ≈ 123 ms/sweep @ +20 dBm
+    //   ALL 101 ch × 1500 µs ≈ 152 ms/sweep @ +20 dBm (capped at ch 100 = 2500 MHz)
+    //
+    // Yield every 20 hops keeps LVGL render times normal (<40 ms starvation).
 
     // ── Build channel list for the requested mode ─────────────────────────────
     // BLE:    40 ch at 2 MHz spacing (2402-2480 MHz) — every BLE data+adv hop.
     // BT:     82 ch 1 MHz spacing (2-80) with BLE adv ch doubled for 2× density.
     // WiFi:   33 ch around 2.4 GHz ch 1/6/11 centers (+/-5 MHz each).
-    // ALL:    126 ch (0-125 = 2400-2525 MHz, full ISM band, CONT_WAVE).
+    // ALL:   101 ch (0-100 = 2400-2500 MHz); capped at 100 — AT2401C rated to 2500 MHz.
     // HID:    25 ch at 3 MHz spacing (5-77 MHz) — Logitech Unifying / MS wireless.
     // RC:     79 ch at 1 MHz (2-80) — full range FHSS RC without BLE doubling.
     // Zigbee: 16 ch at 5 MHz spacing (5-80) — IEEE 802.15.4 ch11-26.
@@ -510,43 +477,28 @@ void nrf24_jam_sweep(volatile bool *active, nrf24_jam_mode_t mode)
             break;
     }
 
-    // All modes except WiFi use burst TX — modulated GFSK, fast hop in
-    // standby-I (~210 µs/ch) vs the 2 ms AT2401C power-cycle CONT_WAVE requires.
-    //
-    // ALL mode (126 ch × 210 µs = ~26 ms/sweep) = equivalent of Bruce firmware
-    // "Test" mode: full ISM band burst TX sweep that leaves no clean FHSS channel
-    // for BT AFH to escape to.  CONT_WAVE ALL was 252 ms/sweep — 10× slower.
-    //
-    // WiFi keeps CONT_WAVE: targeted continuous carrier around ch 1/6/11
-    // drowns out WiFi OFDM more effectively than short burst packets.
-    if (mode != NRF24_JAM_WIFI) {
-        s_burst_jam(active, channels, nch);
-        nrf24_standby();
-        return;
-    }
-
     const uint8_t RF_SETUP_JAM = RF_SETUP_CONT_WAVE | RF_SETUP_PLL_LOCK | RF_SETUP_PWR(3);
     const uint8_t RF_SETUP_CLR = RF_SETUP_PWR(3);
 
-    // Initial power-up into TX mode (CONT_WAVE path for WiFi / ALL modes)
+    // WiFi: 1000 µs dwell — OFDM channels need sustained carrier.
+    // All other modes: 500 µs — 370 µs of actual carrier after 130 µs PLL lock;
+    // faster sweep gives more channel coverage per second at +20 dBm.
+    const uint32_t dwell_us = (mode == NRF24_JAM_WIFI) ? 1000 : 500;
+
+    // Initial power-up
     ce_low();
     nrf24_write_reg(REG_EN_AA,      0x00);
     nrf24_write_reg(REG_SETUP_RETR, 0x00);
     nrf24_write_reg(REG_CONFIG,     CONFIG_PWR_UP);
     vTaskDelay(pdMS_TO_TICKS(2));
 
-    // Each hop busy-waits ~2 ms (500+500+1000 µs).  Yielding every 20 hops
-    // caps LVGL starvation at ~40 ms — well under the 10 s WDT threshold and
-    // short enough that render times stay normal.  Do NOT yield less often:
-    // 82 hops × 2 ms = 164 ms between yields starves priority-1 LVGL for
-    // 500+ ms (observed as CRITICAL render warnings in the serial log).
+    // Each hop: 500+500+dwell µs.  Yield every 20 hops caps LVGL starvation
+    // at ~40 ms — well under WDT and short enough for normal render times.
     int idx = 0, hops_since_yield = 0;
     while (active && *active) {
-        // Bruce PA-module hop sequence: full power cycle ensures AT2401C
-        // re-locks to the new channel on every hop.
         ce_low();
         nrf24_write_reg(REG_RF_SETUP, RF_SETUP_CLR);   // clear CONT_WAVE+PLL_LOCK
-        nrf24_write_reg(REG_CONFIG,   0x00);            // power down
+        nrf24_write_reg(REG_CONFIG,   0x00);            // power down → AT2401C resets
         esp_rom_delay_us(500);
 
         nrf24_write_reg(REG_CONFIG,   CONFIG_PWR_UP);   // power up
@@ -555,13 +507,13 @@ void nrf24_jam_sweep(volatile bool *active, nrf24_jam_mode_t mode)
         nrf24_write_reg(REG_RF_CH,    channels[idx]);   // new channel
         nrf24_write_reg(REG_RF_SETUP, RF_SETUP_JAM);   // arm CONT_WAVE+PLL_LOCK
         ce_high();
-        esp_rom_delay_us(1000);                         // 1 ms carrier dwell
+        esp_rom_delay_us(dwell_us);                     // carrier on
 
         if (++idx >= nch) idx = 0;
 
         if (++hops_since_yield >= 20) {
             hops_since_yield = 0;
-            vTaskDelay(pdMS_TO_TICKS(20));  // yield ~40 ms of CPU to LVGL every 20 hops
+            vTaskDelay(pdMS_TO_TICKS(20));  // yield ~40 ms to LVGL every 20 hops
         }
     }
 
