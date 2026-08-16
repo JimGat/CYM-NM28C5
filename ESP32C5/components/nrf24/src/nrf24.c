@@ -409,17 +409,30 @@ static void s_contwave_jam(volatile bool *active, const uint8_t *ch_in, int nch)
     nrf24_write_reg(REG_SETUP_RETR, 0x00);
     nrf24_write_reg(REG_RF_CH,      channels[0]);
     nrf24_write_reg(REG_RF_SETUP,   RF_SETUP_JAM);
+    // Prime: first channel already written above; settle once at startup.
     ce_high();
-    esp_rom_delay_us(500);          // initial PLL lock + AT2401C engagement
+    esp_rom_delay_us(500);   // one-time: PLL lock + AT2401C TX mode engagement
+    ce_low();
 
+    // Fast CE-toggle loop. On this hardware the nRF24 does NOT retune its PLL
+    // from RF_CH writes while CE stays HIGH in CONT_WAVE mode (empirically
+    // confirmed: single spike with CE-stays-HIGH approach). CE must pulse LOW
+    // between hops so the PLL resyncs to the new channel.
+    //
+    // 50 µs dwell (CE HIGH): shorter than the nRF24 PLL lock time (~130 µs).
+    // The PLL never fully settles — the output is a continuous frequency chirp
+    // sweeping from the previous channel toward the new one. This wideband chirp
+    // is amplified by the AT2401C to +20 dBm and is more effective against BT
+    // AFH than a settled CW tone on each channel.
+    //
+    // Hop rate: 50 µs dwell + ~50 µs SPI write (CE LOW) = ~100 µs/hop.
+    // BT mode (79 ch): ~7.9 ms/sweep = 10 complete sweeps per BT hop (625 µs).
     int idx = 0;
     while (active && *active) {
-        // CE stays HIGH throughout — AT2401C stays in TX mode continuously.
-        // Writing RF_CH while CE is HIGH causes the nRF24 PLL to resync to the
-        // new channel (~130 µs transition). During that transition the output is a
-        // frequency chirp that contributes broadband interference. This is Bruce's
-        // exact approach: hop rate is limited only by SPI bus speed (~50 µs/write).
         nrf24_write_reg(REG_RF_CH, channels[idx]);
+        ce_high();
+        esp_rom_delay_us(50);
+        ce_low();
 
         if (++idx >= nch) {
             idx = 0;
