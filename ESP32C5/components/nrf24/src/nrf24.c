@@ -431,7 +431,7 @@ static void s_contwave_jam(volatile bool *active, const uint8_t *ch_in, int nch)
     while (active && *active) {
         nrf24_write_reg(REG_RF_CH, channels[idx]);
         ce_high();
-        esp_rom_delay_us(50);
+        esp_rom_delay_us(500);   // 500us confirmed minimum for TinySA-visible output
         ce_low();
 
         if (++idx >= nch) {
