@@ -511,12 +511,16 @@ void nrf24_jam_sweep(volatile bool *active, nrf24_jam_mode_t mode)
             break;
     }
 
-    // BLE / BT / HID / RC / Zigbee use burst TX — modulated GFSK, fast hop in
-    // standby-I (~130 µs/ch) without the AT2401C power-cycle overhead that
-    // CONT_WAVE requires (~2 ms/ch).  WiFi and ALL keep CONT_WAVE for broad
-    // continuous carrier coverage.
-    if (mode == NRF24_JAM_BLE || mode == NRF24_JAM_BT ||
-        mode == NRF24_JAM_HID || mode == NRF24_JAM_RC || mode == NRF24_JAM_ZIGBEE) {
+    // All modes except WiFi use burst TX — modulated GFSK, fast hop in
+    // standby-I (~210 µs/ch) vs the 2 ms AT2401C power-cycle CONT_WAVE requires.
+    //
+    // ALL mode (126 ch × 210 µs = ~26 ms/sweep) = equivalent of Bruce firmware
+    // "Test" mode: full ISM band burst TX sweep that leaves no clean FHSS channel
+    // for BT AFH to escape to.  CONT_WAVE ALL was 252 ms/sweep — 10× slower.
+    //
+    // WiFi keeps CONT_WAVE: targeted continuous carrier around ch 1/6/11
+    // drowns out WiFi OFDM more effectively than short burst packets.
+    if (mode != NRF24_JAM_WIFI) {
         s_burst_jam(active, channels, nch);
         nrf24_standby();
         return;
