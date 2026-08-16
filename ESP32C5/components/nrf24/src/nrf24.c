@@ -396,23 +396,19 @@ static void s_burst_jam(volatile bool *active, const uint8_t *ch, int nch)
     nrf24_cmd_byte(CMD_FLUSH_TX);
     vTaskDelay(pdMS_TO_TICKS(2));  // Tpd2stby settle
 
-    // nRF24L01+ TX timing from Standby-I (datasheet Table 16):
-    //   Tstby2a (PLL lock):  130 µs  ← from CE HIGH
-    //   1-byte packet @ 2 Mbps: ~32 µs (preamble 8µs + addr 20µs + payload 4µs)
-    //   Total minimum:       ~162 µs from CE HIGH before chip is back in Standby-I
-    // We use 10 µs CE pulse + 200 µs post-CE-low = 210 µs total — safe margin.
-    // Bruce firmware reference: ~350 µs/hop.
-    // Previous value was 75 µs (90 µs total) — too short: PLL never locked, FIFO
-    // filled after 3 hops, and no signal appeared on TinySA.
+    // Timing matched to Bruce firmware reference (~350 µs/hop):
+    //   CE HIGH: 15 µs (≥10 µs spec minimum, longer gives AT2401C PA more time to arm)
+    //   Post-CE-low wait: 335 µs (130 µs PLL lock + 32 µs 1-byte TX + 173 µs margin)
+    //   Total per hop: ~350 µs
     while (active && *active) {
         for (int i = 0; i < nch && *active; i++) {
             nrf24_write_reg(REG_RF_CH, ch[i]);            // set channel (chip in Standby-I)
             uint8_t tx_pkt[2] = { CMD_W_PAYLOAD, 0xAA }; // 1-byte jam payload
             csn_low(); spi_xfer_buf(tx_pkt, NULL, 2); csn_high();
             ce_high();
-            esp_rom_delay_us(10);                         // ≥10 µs minimum CE pulse
+            esp_rom_delay_us(15);                         // 15 µs CE — extra margin for AT2401C
             ce_low();
-            esp_rom_delay_us(200);                        // 130 µs PLL + 32 µs TX + margin
+            esp_rom_delay_us(335);                        // PLL lock + TX complete + margin
             nrf24_write_reg(REG_STATUS, 0x30);            // clear TX_DS + MAX_RT
         }
         nrf24_cmd_byte(CMD_FLUSH_TX);
@@ -485,8 +481,11 @@ void nrf24_jam_sweep(volatile bool *active, nrf24_jam_mode_t mode)
         }
 
         case NRF24_JAM_ALL:
-            // Full nRF24 range: 2400-2525 MHz.
-            for (uint8_t c = 0; c <= 125; c++)
+            // 2400-2500 MHz (nRF24 ch 0-100 = 101 channels).
+            // Capped at 100 to stay within AT2401C spec (rated to 2500 MHz).
+            // Channels 101-125 push AT2401C out of spec and can lock up the PA,
+            // killing TX on all subsequent channels and modes until power-cycle.
+            for (uint8_t c = 0; c <= 100; c++)
                 channels[nch++] = c;
             break;
 
