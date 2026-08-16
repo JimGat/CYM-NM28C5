@@ -370,6 +370,48 @@ bool nrf24_carrier_detect(void)
     return (nrf24_read_reg(REG_RPD) & 0x01) != 0;
 }
 
+// ── Burst-TX jammer ──────────────────────────────────────────────────────────
+// Fires 1-byte GFSK packets at 2 Mbps on each channel in rapid succession.
+// Unlike CONT_WAVE, CE is pulsed per packet — TXEN follows CE naturally so
+// the AT2401C works in its normal burst-amplifier role with no power-cycle
+// between hops.  Channel changes happen in standby-I (~130 µs) instead of
+// the full power-down/up (1 ms) CONT_WAVE requires.
+//
+// Per-hop timing: RF_CH write (~10 µs) + W_TX_PAYLOAD (~10 µs) +
+//                 CE pulse 15 µs + packet on air ~20 µs + guard 60 µs
+//                 ≈ 115 µs/hop.
+// 40 BLE channels × 115 µs = 4.6 ms/sweep → ~215 sweeps/sec per channel.
+// Yields 1 tick (10 ms) after each full sweep to feed LVGL and WDT.
+static void s_burst_jam(volatile bool *active, const uint8_t *ch, int nch)
+{
+    // TX mode, no CRC, no auto-ACK, no retry, 2 Mbps, PA bits = 11 (AT2401C delivers +20 dBm)
+    ce_low();
+    nrf24_write_reg(REG_CONFIG,      CONFIG_PWR_UP);              // TX, no CRC
+    nrf24_write_reg(REG_EN_AA,       0x00);                       // disable auto-ACK
+    nrf24_write_reg(REG_SETUP_RETR,  0x00);                       // no retransmit
+    nrf24_write_reg(REG_RF_SETUP,    RF_SETUP_DR_HIGH | RF_SETUP_PWR(3));  // 2 Mbps, PA=11
+    static const uint8_t addr[5] = {0xAA,0xAA,0xAA,0xAA,0xAA};
+    nrf24_write_reg_multi(REG_TX_ADDR, addr, 5);
+    nrf24_write_reg(REG_RX_PW_P0, 1);
+    nrf24_cmd_byte(CMD_FLUSH_TX);
+    vTaskDelay(pdMS_TO_TICKS(2));  // Tpd2stby settle
+
+    while (active && *active) {
+        for (int i = 0; i < nch && *active; i++) {
+            nrf24_write_reg(REG_RF_CH, ch[i]);           // set channel (in standby-I)
+            uint8_t tx_pkt[2] = { CMD_W_PAYLOAD, 0xAA };// 1-byte alternating jam pattern
+            csn_low(); spi_xfer_buf(tx_pkt, NULL, 2); csn_high();
+            ce_high();                                   // pulse CE → AT2401C outputs +20 dBm
+            esp_rom_delay_us(15);
+            ce_low();
+            esp_rom_delay_us(75);                        // packet on air ~20 µs + TX_DS settle
+            nrf24_write_reg(REG_STATUS, 0x30);           // clear TX_DS + MAX_RT
+        }
+        nrf24_cmd_byte(CMD_FLUSH_TX);
+        vTaskDelay(pdMS_TO_TICKS(10));  // yield 1 tick between sweeps for LVGL/WDT
+    }
+}
+
 // ── Jammer sweep ─────────────────────────────────────────────────────────────
 
 void nrf24_jam_sweep(volatile bool *active, nrf24_jam_mode_t mode)
@@ -409,15 +451,16 @@ void nrf24_jam_sweep(volatile bool *active, nrf24_jam_mode_t mode)
 
     switch (mode) {
         case NRF24_JAM_BLE:
-            // Only the three fixed BLE advertising channels (non-AFH).
-            channels[nch++] = 2;   // BLE adv ch 37 = 2402 MHz
-            channels[nch++] = 26;  // BLE adv ch 38 = 2426 MHz
-            channels[nch++] = 80;  // BLE adv ch 39 = 2480 MHz
+            // All 40 BLE channels (advertising + data) at 2 MHz spacing 2402-2480 MHz.
+            // nRF24 ch = (freq - 2400): ch 2,4,6,...,80 — covers every BLE data hop.
+            // CONT_WAVE would only cover 3 adv channels; burst TX sweeps all 40.
+            for (uint8_t c = 2; c <= 80; c += 2) channels[nch++] = c;  // 40 channels
             break;
 
         default:
         case NRF24_JAM_BT:
-            // All 79 BT Classic channels, BLE adv channels doubled for extra coverage.
+            // All 79 BT Classic channels (1 MHz spacing 2402-2480 MHz, nRF24 ch 2-80).
+            // BLE adv channels doubled so they get 2× coverage vs data channels.
             for (uint8_t c = 2; c <= 80; c++) {
                 channels[nch++] = c;
                 if (c == 2 || c == 26 || c == 80)
@@ -442,10 +485,20 @@ void nrf24_jam_sweep(volatile bool *active, nrf24_jam_mode_t mode)
             break;
     }
 
+    // BLE / BT modes use burst TX — modulated GFSK disrupts connected devices
+    // and channels change in standby-I (~130 µs) vs the 1 ms AT2401C power cycle
+    // that CONT_WAVE requires.  WiFi and ALL modes keep CONT_WAVE for broad
+    // continuous carrier coverage across the ISM band.
+    if (mode == NRF24_JAM_BLE || mode == NRF24_JAM_BT) {
+        s_burst_jam(active, channels, nch);
+        nrf24_standby();
+        return;
+    }
+
     const uint8_t RF_SETUP_JAM = RF_SETUP_CONT_WAVE | RF_SETUP_PLL_LOCK | RF_SETUP_PWR(3);
     const uint8_t RF_SETUP_CLR = RF_SETUP_PWR(3);
 
-    // Initial power-up into TX mode
+    // Initial power-up into TX mode (CONT_WAVE path for WiFi / ALL modes)
     ce_low();
     nrf24_write_reg(REG_EN_AA,      0x00);
     nrf24_write_reg(REG_SETUP_RETR, 0x00);
