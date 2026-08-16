@@ -396,16 +396,24 @@ static void s_burst_jam(volatile bool *active, const uint8_t *ch, int nch)
     nrf24_cmd_byte(CMD_FLUSH_TX);
     vTaskDelay(pdMS_TO_TICKS(2));  // Tpd2stby settle
 
+    // nRF24L01+ TX timing from Standby-I (datasheet Table 16):
+    //   Tstby2a (PLL lock):  130 µs  ← from CE HIGH
+    //   1-byte packet @ 2 Mbps: ~32 µs (preamble 8µs + addr 20µs + payload 4µs)
+    //   Total minimum:       ~162 µs from CE HIGH before chip is back in Standby-I
+    // We use 10 µs CE pulse + 200 µs post-CE-low = 210 µs total — safe margin.
+    // Bruce firmware reference: ~350 µs/hop.
+    // Previous value was 75 µs (90 µs total) — too short: PLL never locked, FIFO
+    // filled after 3 hops, and no signal appeared on TinySA.
     while (active && *active) {
         for (int i = 0; i < nch && *active; i++) {
-            nrf24_write_reg(REG_RF_CH, ch[i]);           // set channel (in standby-I)
-            uint8_t tx_pkt[2] = { CMD_W_PAYLOAD, 0xAA };// 1-byte alternating jam pattern
+            nrf24_write_reg(REG_RF_CH, ch[i]);            // set channel (chip in Standby-I)
+            uint8_t tx_pkt[2] = { CMD_W_PAYLOAD, 0xAA }; // 1-byte jam payload
             csn_low(); spi_xfer_buf(tx_pkt, NULL, 2); csn_high();
-            ce_high();                                   // pulse CE → AT2401C outputs +20 dBm
-            esp_rom_delay_us(15);
+            ce_high();
+            esp_rom_delay_us(10);                         // ≥10 µs minimum CE pulse
             ce_low();
-            esp_rom_delay_us(75);                        // packet on air ~20 µs + TX_DS settle
-            nrf24_write_reg(REG_STATUS, 0x30);           // clear TX_DS + MAX_RT
+            esp_rom_delay_us(200);                        // 130 µs PLL + 32 µs TX + margin
+            nrf24_write_reg(REG_STATUS, 0x30);            // clear TX_DS + MAX_RT
         }
         nrf24_cmd_byte(CMD_FLUSH_TX);
         vTaskDelay(pdMS_TO_TICKS(10));  // yield 1 tick between sweeps for LVGL/WDT
