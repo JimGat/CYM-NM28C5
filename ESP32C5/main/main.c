@@ -34642,7 +34642,10 @@ static const uint8_t s_blaster_adv_data[] = {0x02, 0x01, 0x06};
 static void s_blaster_nrf_task_fn(void *arg)
 {
     (void)arg;
-    nrf24_jam_sweep(&s_blaster_nrf_active, NRF24_JAM_BLE);
+    // BLE_ADV mode: 9 channels focused on the 3 BLE advertising frequencies
+    // (±1 MHz guard around nRF24 ch2/ch26/ch80 = BLE adv ch37/38/39).
+    // Matches exactly what the ESP32 BLE flood is targeting above.
+    nrf24_jam_sweep(&s_blaster_nrf_active, NRF24_JAM_BLE_ADV);
     s_blaster_nrf_task = NULL;
     vTaskDelete(NULL);
 }

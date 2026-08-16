@@ -489,8 +489,12 @@ void nrf24_jam_sweep(volatile bool *active, nrf24_jam_mode_t mode)
             break;
 
         case NRF24_JAM_BLE_ADV: {
-            // Bruce "BLE Adv Pri" — 12 advertising priority channels.
-            static const uint8_t a[] = {37,38,39,1,2,3,25,26,27,79,80,81};
+            // BLE advertising priority — 9 channels: nRF24 ±1 guard around each
+            // BLE advertising channel (BLE ch37=nRF24 ch2, ch38=nRF24 ch26, ch39=nRF24 ch80).
+            // NOTE: nRF24 ch37/38/39 = 2437-2439 MHz are NOT BLE advertising channels —
+            // the original Bruce array mistakenly used BLE channel INDEX numbers as nRF24
+            // channel numbers. Corrected to actual nRF24 frequencies.
+            static const uint8_t a[] = {1,2,3, 25,26,27, 79,80,81};
             memcpy(channels, a, sizeof(a)); nch = (int)sizeof(a);
             break;
         }
