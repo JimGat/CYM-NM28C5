@@ -660,6 +660,7 @@ static char     g_saved_wifi_pass[65] = ""; // Home network password
 #define NVS_KEY_WD_MMODE     "wd_manmode"    // manual mode (0=Stationary,1=Walk,2=Car)
 #define NVS_KEY_WD_GBAUD     "wd_gpsbaud"    // GPS UART baud (9600/38400/115200)
 #define NVS_KEY_WD_SUNIT     "wd_sunit"      // speed unit (0=km/h, 1=mph)
+#define NVS_KEY_GPS_DBG      "gps_dbg_ser"   // GPS serial debug log (0=off default)
 #define NVS_KEY_GPS_LAT      "gps_lat_i"
 #define NVS_KEY_GPS_LON      "gps_lon_i"
 #define NVS_KEY_GPS_ALT      "gps_alt_i"
@@ -1258,6 +1259,7 @@ static const int wd_dwell_table[WD_MODE_COUNT][4] = {
 static bool     g_wd_adaptive    = true;               // adaptive ON by default
 static int      g_wd_manual_mode = WD_MODE_STATIONARY; // used only when adaptive OFF
 static int      g_wd_gps_baud    = 9600;               // GPS UART baud (9600/38400/115200)
+static bool     g_gps_debug_serial = false;            // [GPSDBG] heartbeat to serial (off by default)
 static int      g_wd_speed_unit  = 0;                  // 0 = km/h, 1 = mph (dashboard readout)
 
 static const char *wd_mode_name(wd_mode_t m)
@@ -3830,6 +3832,8 @@ static void nvs_settings_load(void)
         if (nvs_get_u8(h, NVS_KEY_WD_SUNIT, &wsu) == ESP_OK && wsu <= 1) g_wd_speed_unit = wsu;
         uint8_t wgb = 0;   // GPS baud: 0=9600 (standard), 1=115200 (5 Hz). Boot autodetect re-syncs the module to this.
         if (nvs_get_u8(h, NVS_KEY_WD_GBAUD, &wgb) == ESP_OK) g_wd_gps_baud = (wgb == 1) ? 115200 : 9600;
+        uint8_t gps_dbg = 0;
+        if (nvs_get_u8(h, NVS_KEY_GPS_DBG, &gps_dbg) == ESP_OK) g_gps_debug_serial = (gps_dbg != 0);
         uint8_t wble = 0;
         // g_wd_ble is always true — no longer user-configurable
         uint8_t rfhat = 0;
@@ -25844,6 +25848,17 @@ static void gps_info_refresh_cb(lv_timer_t *t)
     lv_obj_set_style_text_color(gps_info_acc_lbl, pos_color, 0);
 }
 
+static void gps_dbg_serial_sw_cb(lv_event_t *e)
+{
+    g_gps_debug_serial = (lv_obj_get_state(lv_event_get_target(e)) & LV_STATE_CHECKED) != 0;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, NVS_KEY_GPS_DBG, g_gps_debug_serial ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
 // Teardown for the GPS Info screen — runs on any exit (top ‹ Back, Home, forward
 // nav, bottom Back) via the g_screen_stop_fn hook.
 static void gps_info_stop(void)
@@ -26180,6 +26195,25 @@ static void show_gps_info_screen(void)
     // Populate immediately then start 1 s refresh timer
     gps_info_refresh_cb(NULL);
     gps_info_refresh_timer = lv_timer_create(gps_info_refresh_cb, 1000, NULL);
+
+    // GPS Serial Debug toggle row
+    lv_obj_t *dbg_row = lv_obj_create(function_page);
+    lv_obj_set_size(dbg_row, 220, 32);
+    lv_obj_align(dbg_row, LV_ALIGN_BOTTOM_MID, 0, -50);
+    lv_obj_set_style_bg_opa(dbg_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(dbg_row, 0, 0);
+    lv_obj_set_style_pad_all(dbg_row, 0, 0);
+    lv_obj_clear_flag(dbg_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *dbg_lbl = lv_label_create(dbg_row);
+    lv_label_set_text(dbg_lbl, "Serial GPS log");
+    lv_obj_set_style_text_font(dbg_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(dbg_lbl, ui_muted_color(), 0);
+    lv_obj_align(dbg_lbl, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_t *dbg_sw = lv_switch_create(dbg_row);
+    lv_obj_set_size(dbg_sw, 40, 20);
+    lv_obj_align(dbg_sw, LV_ALIGN_RIGHT_MID, 0, 0);
+    if (g_gps_debug_serial) lv_obj_add_state(dbg_sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(dbg_sw, gps_dbg_serial_sw_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     // Set Position button (amber)
     lv_obj_t *setpos_btn = lv_btn_create(function_page);
@@ -36609,11 +36643,12 @@ static void gps_task(void *arg)
 		if (now - s_dbg_last_us >= 5000000) {
 			s_dbg_last_us = now;
 			uint32_t fixes = g_gga_parses; g_gga_parses = 0;   // TRUE fix cadence (both readers)
-			ESP_LOGI(TAG, "[GPSDBG] baud=%d hz=%d bytes5s=%lu task_gga=%u rmc=%u FIX/5s=%lu sats=%d valid=%d fix=%.5f,%.5f last=[%s]",
-			         s_gps_applied_baud, s_gps_applied_hz, (unsigned long)s_dbg_bytes,
-			         (unsigned)s_dbg_gga, (unsigned)s_dbg_rmc, (unsigned long)fixes,
-			         current_gps.satellites, (int)current_gps.valid,
-			         (double)current_gps.latitude, (double)current_gps.longitude, s_dbg_line);
+			if (g_gps_debug_serial)
+				ESP_LOGI(TAG, "[GPSDBG] baud=%d hz=%d bytes5s=%lu task_gga=%u rmc=%u FIX/5s=%lu sats=%d valid=%d fix=%.5f,%.5f last=[%s]",
+				         s_gps_applied_baud, s_gps_applied_hz, (unsigned long)s_dbg_bytes,
+				         (unsigned)s_dbg_gga, (unsigned)s_dbg_rmc, (unsigned long)fixes,
+				         current_gps.satellites, (int)current_gps.valid,
+				         (double)current_gps.latitude, (double)current_gps.longitude, s_dbg_line);
 			s_dbg_bytes = 0; s_dbg_gga = 0; s_dbg_rmc = 0;
 			s_dbg_line[0] = '\0';
 		}
