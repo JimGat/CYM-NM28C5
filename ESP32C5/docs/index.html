@@ -282,7 +282,7 @@
           <span class="pill"><strong>Offsets</strong> 0x2000 / 0x8000 / 0x10000</span>
           <span class="pill" id="versionPill"><strong>Version</strong> loading</span>
         </div>
-        <div class="hero-cta"><a href="https://github.com/JimGat/cym#readme" target="_blank" rel="noopener noreferrer">📘 Project instructions / README <span>opens new window</span></a></div>
+        <div class="hero-cta"><a href="https://github.com/JimGat/CYM#readme" target="_blank" rel="noopener noreferrer">📘 Project instructions / README <span>opens new window</span></a></div>
       </header>
 
       <div class="split">
@@ -384,7 +384,7 @@
     </div>
 
     <footer>
-      <a id="repoLink" href="https://github.com/JimGat/cym">JimGat/cym</a> &mdash;
+      <a id="repoLink" href="https://github.com/JimGat/CYM">JimGat/cym</a> &mdash;
       <span id="pageVersion" class="mono">Web flasher v1.1.0</span>
     </footer>
 
@@ -420,8 +420,8 @@
       };
 
       const state = { manifest:null, channel:"stable", port:null, onDisconnect:null, esploader:null, chip:null, connected:false, flashing:false, monitorPort:null, monitorReader:null, monitorWriter:null, monitorPipe:null, monitorDisconnect:null, monitorConnected:false, lastPort:null };
-      const PAGE_VERSION = "2.9.9";  // repo renamed JimGat/CYM-NM28C5 → JimGat/cym
-      const RAW_BASE = "https://raw.githubusercontent.com/JimGat/cym/Jimgat_Dev/ESP32C5";
+      const PAGE_VERSION = "2.9.10"; // repo renamed JimGat/CYM-NM28C5 → JimGat/CYM
+      const RAW_BASE = "https://raw.githubusercontent.com/JimGat/CYM/Jimgat_Dev/ESP32C5";
       const DEV_MANIFEST_URL = `${RAW_BASE}/docs/manifest.json`;
       const RAW_BIN = `${RAW_BASE}/binaries-esp32c5`;
       const CONNECT_TIMEOUT_MS = 20000;
@@ -433,7 +433,7 @@
         const host = window.location.hostname || "";
         const parts = window.location.pathname.split("/").filter(Boolean);
         if (host.endsWith(".github.io") && parts.length) return { owner: host.replace(/\.github\.io$/, ""), repo: parts[0] };
-        return { owner: "JimGat", repo: "cym" };
+        return { owner: "JimGat", repo: "CYM" };
       };
 
       const setRepoLink = () => {
