@@ -2053,6 +2053,8 @@ EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_jam_status    = NULL;
 EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_mode_btns[10] = {NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL};
 EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_seq_btn        = NULL;
 EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_fhss_btn       = NULL;
+EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_jam_btn        = NULL;
+EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_stop_btn       = NULL;
 EXT_RAM_BSS_ATTR static bool           s_n24_jam_fhss       = false;
 EXT_RAM_BSS_ATTR static lv_timer_t    *s_n24_jam_tmr        = NULL;
 EXT_RAM_BSS_ATTR static TaskHandle_t   s_n24_jam_task       = NULL;
@@ -49339,9 +49341,13 @@ static void s_n24_jam_timer_cb(lv_timer_t *t)
             blink++ & 1 ? "JAMMING %s..." : "JAMMING %s   ",
             s_jam_mode_names[s_n24_jam_mode]);
         lv_obj_set_style_text_color(s_n24_jam_status, UI_ACCENT_RED, 0);
+        if (s_n24_jam_btn)  lv_obj_set_style_bg_color(s_n24_jam_btn,  lv_color_hex(0xF44336), 0);
+        if (s_n24_stop_btn) lv_obj_set_style_bg_color(s_n24_stop_btn, lv_color_hex(0xF9A825), 0);
     } else {
         lv_label_set_text(s_n24_jam_status, "Stopped");
         lv_obj_set_style_text_color(s_n24_jam_status, lv_color_hex(0x66BB6A), 0);
+        if (s_n24_jam_btn)  lv_obj_set_style_bg_color(s_n24_jam_btn,  lv_color_hex(0x5C1818), 0);
+        if (s_n24_stop_btn) lv_obj_set_style_bg_color(s_n24_stop_btn, lv_color_make(50, 50, 50), 0);
     }
 }
 
@@ -49388,6 +49394,8 @@ static void nrf24_jam_screen_stop(void)
     s_n24_jam_status = NULL;
     s_n24_seq_btn    = NULL;
     s_n24_fhss_btn   = NULL;
+    s_n24_jam_btn    = NULL;
+    s_n24_stop_btn   = NULL;
     for (int i = 0; i < 10; i++) s_n24_mode_btns[i] = NULL;
 }
 
@@ -49584,7 +49592,7 @@ static void show_nrf24_jammer_screen(void)
 
     lv_obj_t *start_btn = lv_btn_create(btn_row);
     lv_obj_set_size(start_btn, 80, 32);
-    lv_obj_set_style_bg_color(start_btn, lv_color_hex(0xB71C1C), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(start_btn, lv_color_hex(0x5C1818), LV_STATE_DEFAULT);  // dim red = idle
     lv_obj_set_style_bg_color(start_btn, lv_color_hex(0xD32F2F), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(start_btn, 0, 0);
     lv_obj_set_style_radius(start_btn, 6, 0);
@@ -49593,10 +49601,11 @@ static void show_nrf24_jammer_screen(void)
     lv_obj_set_style_text_color(sl, lv_color_white(), 0);
     lv_obj_center(sl);
     lv_obj_add_event_cb(start_btn, s_n24_jam_start_cb, LV_EVENT_CLICKED, NULL);
+    s_n24_jam_btn = start_btn;
 
     lv_obj_t *stop_btn = lv_btn_create(btn_row);
     lv_obj_set_size(stop_btn, 80, 32);
-    lv_obj_set_style_bg_color(stop_btn, lv_color_make(50, 50, 50), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_make(50, 50, 50), LV_STATE_DEFAULT);  // grey = idle
     lv_obj_set_style_bg_color(stop_btn, lv_color_make(70, 70, 70), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(stop_btn, 0, 0);
     lv_obj_set_style_radius(stop_btn, 6, 0);
@@ -49605,6 +49614,7 @@ static void show_nrf24_jammer_screen(void)
     lv_obj_set_style_text_color(stl, lv_color_white(), 0);
     lv_obj_center(stl);
     lv_obj_add_event_cb(stop_btn, s_n24_jam_stop_cb, LV_EVENT_CLICKED, NULL);
+    s_n24_stop_btn = stop_btn;
 
     lv_obj_move_foreground(overlay);
 
