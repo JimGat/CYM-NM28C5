@@ -5,7 +5,7 @@
 <h1 align="center">Cheap Yellow Monster</h1>
 
 <p align="center">
-  <b>v2.12.0</b>
+  <b>v2.13.23</b>
 </p>
 
 <p align="center">
@@ -156,11 +156,11 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **Karma AP** | Respond to probe requests, rogue access point |
 | **Chanalizer** | Wide 520 px WiFi channel map — auto-scrolling left/right with touch-drag pause; SSID color grouping, group legend, channel annotations; portrait 240 px viewport over 2.4 GHz + 5 GHz |
 | **WiFi Band Scope** | Promiscuous RSSI per-channel waterfall (2.4 GHz 13-ch or 5 GHz 25-ch); band toggle updates axis label and resets peaks; 60 ms dwell / 0.8 s full 2.4 sweep |
-| **Drone Detector** | Dual-mode (BLE5 extended + WiFi 2.4/5 GHz) passive Remote ID scanner. Detects all ASTM F3411-compliant drones via BLE service UUID 0xFFFA and WiFi Remote ID beacons; DJI presence by OUI / service UUID 0xFFF0. Alternates BLE and WiFi scan phases; logs to SD. |
+| **Drone Detector** | Dual-mode (BLE5 extended + WiFi 2.4/5 GHz) passive Remote ID scanner. Passively monitors for ASTM F3411-compliant drone Remote ID beacons via BLE service UUID 0xFFFA and WiFi ODID management frames; DJI presence by OUI / service UUID 0xFFF0. Alternates BLE and WiFi scan phases; logs to SD. Note: DJI drones using OcuSync 4 broadcast Remote ID only on the ground. |
 | **Drone Spoof** | Broadcasts a synthetic ASTM F3411 Remote ID beacon over BLE or WiFi. Configurable UAS ID, operator ID, GPS coordinates, altitude, speed, and heading. For RF research, drone regulation testing, and authorized counter-UAS research. |
-| **Wardriving** | GPS + WiFi + BLE logging, dual-band (2.4 GHz / 5 GHz / Both); **speed-adaptive capture** (Stationary / Walking / Driving profiles, GPS-triggered with hysteresis); **D-UCB channel bandit** rewards new networks per dwell, DFS tier-weighted at speed; **BLE-only mode fixed** (v2.12.0 — was collecting 0 devices); **BLE dashboard** B\|MAC\|Name\|RSSI with active scan + SCAN_RSP name backfill; **CSV fsync** — power-cut safe at 10/20/30 s verified; **auto-rotation** into journey-grouped parts (WD_Wifi_\<stamp\>-NNN.csv / WD_BLE_\<stamp\>-NNN.csv); WiGLE CSV 1.6, WiGLE + WDG Wars upload; GPS mark waypoints (GPX); last-known position hold with 150 m stale accuracy; AltitudeMeters + AccuracyMeters filled from real GPS fix |
+| **Wardriving** | GPS + WiFi + BLE logging, dual-band (2.4 GHz / 5 GHz / Both); **speed-adaptive capture** (Stationary / Walking / Driving profiles, GPS-triggered with hysteresis); **D-UCB channel bandit** rewards new networks per dwell, DFS tier-weighted at speed; **BLE-only mode fixed** (v2.13.x — was collecting 0 devices); **BLE dashboard** B\|MAC\|Name\|RSSI with active scan + SCAN_RSP name backfill; **CSV fsync** — power-cut safe at 10/20/30 s verified; **auto-rotation** into journey-grouped parts (WD_Wifi_\<stamp\>-NNN.csv / WD_BLE_\<stamp\>-NNN.csv); WiGLE CSV 1.6, WiGLE + WDG Wars upload; GPS mark waypoints (GPX); last-known position hold with 150 m stale accuracy; AltitudeMeters + AccuracyMeters filled from real GPS fix |
 | **GPS** | NMEA auto-syncs system clock; **boot-time baud auto-detect** (module keeps baud in battery-backed RAM across power cycles); **optional 115200 / 5 Hz** opt-in with verify-and-revert safety (5.2 fix/s measured under full wardrive load; 18 m → 3.6 m between fixes at 65 km/h); **multi-vendor rate commands** (CASIC, MTK, u-blox UBX); **GPS status icon** in the top bar of every screen; last-known position persisted to NVS; manual fallback editor in Settings → GPS Info |
-| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk (with **advanced advertising fingerprinting** — AD-type decode, Company ID lookup, URIs, flags), Bluetooth Lookout, BLE Spam (8 modes incl. Sour Apple), Device Spoof (general + directed), BLE Disconnect (directed), BLE PCAP (Kismet PCAPNG raw capture; BLE 5.0 extended advertisement support), **BlueDuck** (BLE HID DuckyScript keyboard injector), **HoneyPair** (BLE persona honeypot), **WhisperPair** (CVE-2025-36911 Google Fast Pair KBP bypass — auto-scan, sequential run-all FP targets, AES-128-ECB exploit); BT Scan & Select supports **Save List** (GPS-tagged JSON snapshot of every device found); **Matter [M] detection** passive tagging of Thread/BLE Matter devices by GATT service `0xFFF6`; **GATT Interactive** (live read/write/subscribe to individual characteristics after walk); **GATT HID Decoder** (parses HID Report Map, decodes live keyboard/mouse input); **Saved Clones** browser; **BLE MITM Proxy** |
+| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk (with **advanced advertising fingerprinting** — AD-type decode, Company ID lookup, URIs, flags), Bluetooth Lookout, BLE Spam (8 modes incl. Sour Apple), Device Spoof (general + directed), BLE Disconnect (directed), BLE PCAP (Kismet PCAPNG; advertising-layer reconstruction from NimBLE reports; BLE 5.0 extended advertising support), **BlueDuck** (BLE HID DuckyScript keyboard injector), **HoneyPair** (BLE persona honeypot), **WhisperPair** (CVE-2025-36911 Google Fast Pair KBP bypass — auto-scan, sequential run-all FP targets, AES-128-ECB exploit); BT Scan & Select supports **Save List** (GPS-tagged JSON snapshot of every device found); **Matter [M] detection** passive tagging of Thread/BLE Matter devices by GATT service `0xFFF6`; **GATT Interactive** (live read/write/subscribe to individual characteristics after walk); **GATT HID Decoder** (parses HID Report Map, decodes live keyboard/mouse input); **GATT Profile Snapshots** (Saved Clones) browser; **BLE Notify Logger** (BLE MITM) |
 | **Deauth Client** | Passive discovery of clients associated with any nearby AP — without connecting or running any attack. Lists client MACs, associated BSSID, RSSI, and last-seen time; useful for pre-attack recon and monitoring |
 | **Zigbee Scout** | IEEE 802.15.4 passive wardrive using the ESP32-C5's built-in PHY; logs PAN IDs, channel, RSSI, device addresses, and NWK/APS frame metadata to WiGLE-compatible CSV + PCAP; RSSI locator locks onto a specific PAN; logs to `/sdcard/lab/zigbee/` |
 | **ESP-NOW Scout** | Passive ESP-NOW device discovery and packet analysis. Hops channels 1–13 (200 ms/ch) sniffing vendor-specific 802.11 Action frames (OUI `18:FE:34`, type `0x04`). Tracks up to 32 unique senders with src/dst MAC, channel, RSSI, packet count, first/last seen timestamp, and broadcast vs. unicast (encrypted) status. **Tap any discovered device** to lock the radio to its channel and open a session sub-screen. Session modes: *This Dev Pkt Log* (filtered to selected src MAC) and *All Ch Pkt Log* (every ESP-NOW frame on that channel). Packet log shows last 20 frames in a terminal-style dark view — hex dump, timestamp, RSSI, and ASCII interpretation for broadcast (plaintext) frames. Encrypted unicast frames show an AES-128-ECB probe result if an LMK is loaded from `profiles.json`. Export full 200-frame ring buffer to timestamped `.txt` on SD. Known-device labels and LMK keys loaded from `/sdcard/lab/espnow/profiles.json`. Discovery device table exported to timestamped JSON. Logs to `/sdcard/lab/espnow/`. |
@@ -182,7 +182,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 
 ## Menu Map
 
-Complete navigation tree as of v2.12.0. Items marked `[stub]` are placeholders with "Coming in next version" screens. Items marked `[RF-HAT]` require the NM-RF-HAT expansion board enabled in Settings → Hardware Options.
+Complete navigation tree as of v2.13.23. Items marked `[stub]` are placeholders with "Coming in next version" screens. Items marked `[RF-HAT]` require the NM-RF-HAT expansion board enabled in Settings → Hardware Options.
 
 ```
 Home
@@ -215,11 +215,11 @@ Home
 │   │   ├── Device Spoof
 │   │   ├── Blue Duck (BLE HID DuckyScript)
 │   │   ├── Whisper Pair (CVE-2025-36911)
-│   │   └── BLE MITM Proxy
+│   │   └── BLE Notify Logger (BLE MITM)
 │   ├── BLE PCAP
 │   ├── Honey Pair
 │   ├── List Wizard
-│   └── Saved Clones          ← browse cloned GATT device profiles
+│   └── GATT Profile Snapshots ← browse GATT profiles captured by GATT Walker (UI label: Saved Clones)
 ├── Wardrive
 │   ├── Start Wardrive
 │   ├── Options
@@ -777,18 +777,18 @@ Bluetooth
 │   ├── BLE Spam        (Apple Prox. Pair / Samsung / Google / Windows / All / AirTag / SmartTag / Sour Apple)
 │   ├── Device Spoof    (select from spooflist.csv or add new entry via keyboard)
 │   ├── WhisperPair     ← CVE-2025-36911 Fast Pair KBP pairing bypass (detect / probe / exploit)
-│   └── BLE MITM Proxy  ← transparent GATT proxy; logs all reads, writes, and notifications
+│   └── BLE Notify Logger (BLE MITM)  ← connects to a target BLE device and logs GATT notifications, reads, and writes
 ├── BlueDuck            ← BLE HID keyboard injector + DuckyScript engine
 │   ├── Script selector (scans /sdcard/lab/ble/blueduck/scripts/)
 │   ├── Persona picker  (9 device identities + auto-rotate)
 │   └── Live stats      (connects / payloads / disconnects)
 ├── BT Observer         ← 10 s scan + adv fingerprinting + sequential GATT walk
-├── BLE PCAP            ← raw Kismet PCAPNG capture; streams to SD card
+├── BLE PCAP            ← Kismet PCAPNG; advertising-layer reconstruction from NimBLE reports
 ├── AirTag Scan
 ├── Drone Detector
 ├── BT Locator
 ├── List Wizard         ← multi-select btsc_*.json files → Unique / Common set ops
-├── Saved Clones        ← browse / view saved GATT device clone profiles
+├── GATT Profile Snapshots ← browse / view GATT profiles captured by GATT Walker (UI label: Saved Clones)
 └── Bluetooth Lookout   ← continuous watchlist monitor
     ├── Edit Watchlist
     ├── Edit Blacklist
@@ -807,16 +807,16 @@ Bluetooth
 | **Tag Locator** | Per-tag RSSI tracking launched from the AirTag Scan found-tags list |
 | **Bluetooth Lookout** | Continuous BLE monitor that alerts when a watchlisted device (by full MAC or OUI prefix) is detected nearby. Triggers 3 × 1-second vibrator pulses on each detection (requires vibrator hardware). |
 | **BLE Spam** | Broadcasts fake BLE advertisements — Apple Prox. Pair (13 device types), Samsung Fast Connect (6 models), Google Fast Pair (12 model IDs), Windows Swift Pair, Apple Find My (AirTag), Samsung SmartTag, **Sour Apple** (Apple Nearby Action 0x0F — cycles 11 action types to flood iOS with system popups), or All simultaneously |
-| **Drone Detector** | Dual-mode passive Remote ID scanner (BLE5 extended advertising + WiFi promiscuous 2.4 & 5 GHz). Detects all ASTM F3411-compliant drones (DJI, Autel, Parrot, Skydio, …) via ASTM service UUID 0xFFFA; DJI presence via OUI 48:1C:B9 or service 0xFFF0. WiFi side covers NAN channel 6, ODID management IE, and DJI proprietary DroneID vendor IE (OUI 26:37:12). Tap any detected drone to open a detail view with parsed operator ID, UAS serial, location, altitude, and speed. Logs PCAP + JSON to `/sdcard/lab/dronedetect/`. |
+| **Drone Detector** | Dual-mode passive Remote ID scanner (BLE5 extended advertising + WiFi promiscuous 2.4 & 5 GHz). Passively monitors for ASTM F3411-compliant drone Remote ID beacons (DJI, Autel, Parrot, Skydio, …) via ASTM service UUID 0xFFFA; DJI presence via OUI 48:1C:B9 or service 0xFFF0. WiFi side covers NAN channel 6, ODID management IE, and DJI proprietary DroneID vendor IE (OUI 26:37:12). Note: DJI models using OcuSync 4 broadcast Remote ID only on the ground; detection in flight requires an ASTM F3411-compliant transmission. Tap any detected drone to open a detail view with parsed operator ID, UAS serial, location, altitude, and speed. Logs PCAP + JSON to `/sdcard/lab/dronedetect/`. |
 | **Device Spoof (directed)** | Clones the MAC address and name of a device pre-selected in BT Scan & Select — no additional selection step required |
 | **Device Spoof (general)** | Loads `/sdcard/lab/bluetooth/spooflist.csv`; select an entry or add new devices via on-screen keyboard, then START to begin spoofing |
 | **BLE Disconnect (directed)** | Floods a BT Scan & Select pre-selected target with BLE TERMINATE_IND frames to force disconnection |
-| **BLE PCAP** | Captures raw BLE advertising packets to SD card in Kismet PCAPNG format (link type 256 — `LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR`). Includes a 10-byte pseudo-header per packet: RF channel 37, RSSI, noise floor, and BLE access address. Queue-based write path keeps the SD bus free for the UI. Live packet count shown on screen. |
+| **BLE PCAP** | Captures BLE advertising packets to SD card in Kismet PCAPNG format (link type 256 — `LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR`). Packets are reconstructed from NimBLE GAP advertising reports (not raw LL capture). Each Enhanced Packet Block includes a 10-byte pseudo-header: RF channel forced to 37, RSSI, noise floor, and BLE access address. Queue-based write path keeps the SD bus free for the UI. Live packet count shown on screen. |
 | **BlueDuck** | BLE HID keyboard injector. Pairs with any nearby BLE-capable device, then executes DuckyScript payloads — sending keystrokes as if from a Bluetooth keyboard. Nine built-in device personas (Wireless Keyboard, AirPods Pro, Fitbit, Galaxy Buds, Garmin Fenix, Apple Watch, JBL speaker, Logitech MX Keys, Samsung TV). Auto-rotate mode cycles personas every 5 minutes. Scripts are preloaded into PSRAM at scan time (immune to SD DMA OOM during BLE). HUMAN_MODE with SLOW/NORMAL/FAST variable-speed typing. Full Android (Win+H/B/N), Windows (Win+R/L, Ctrl+Shift+Esc, Win+Shift+S), and iOS (Cmd+H/Space) keyboard shortcut support — 13-script library in `resources/blueduck_scripts/`. Session stats shown live; all events logged to `/sdcard/lab/ble/blueduck/`. |
 | **HoneyPair** | BLE persona honeypot. Continuously cycles through 9 consumer device personas (AirPods, Galaxy Buds, Garmin watch, etc.), logging every device that initiates a pairing request. Persona MACs are randomised and deduplicated across sessions; auto-rotate every 5 minutes prevents stale scan-response caching. GATT/HID enumeration runs on any device that completes pairing. All events logged to `/sdcard/lab/ble/honeypair/`. |
 | **WhisperPair** | CVE-2025-36911 Google Fast Pair Key-Based Pairing (KBP) bypass scanner. Passively detects Fast Pair–capable devices during BLE scan (tagged `[FP]` in scan list). Three attack modes: **Detect** (passive advertisement fingerprinting), **Probe** (GATT connect + service enumeration, confirms 0xFE2C service presence), and **Exploit** (writes a crafted AES-128-ECB encrypted KBP packet to trigger unsolicited pairing on vulnerable devices). All results logged to `/sdcard/lab/ble/whisperpair/`. *For authorized security research only.* |
 
-> **Note:** WiFi and BLE share the same radio. The firmware automatically switches between `RADIO_MODE_WIFI` and `RADIO_MODE_BLE` as needed.
+> **Note:** WiFi and BLE share the same radio. Wardrive mode uses hardware coexistence (`CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y`) to run both concurrently — BLE operates at 12.5% duty cycle (320 ms interval / 40 ms window) to leave WiFi promiscuous mode unimpeded. All other screens use exclusive radio access: switching between WiFi and BLE stops the active radio first via `RADIO_MODE_WIFI` / `RADIO_MODE_BLE`.
 
 #### Drone Detector — How It Works
 
@@ -1342,18 +1342,20 @@ The HID decoder is read-only — it subscribes to input reports but does not inj
 - Device name, address, address type, OUI manufacturer, FNV-32 fingerprint
 - All services, characteristics, and descriptor handles with their UUIDs and values read at clone time
 
-**Saved Clones** (accessible from the Bluetooth menu tile) browses all saved clone files. Each row in the list shows the device name/MAC and the capture timestamp. Tap any row to:
+**GATT Profile Snapshots** (accessible from the Bluetooth menu tile as "Saved Clones") browses all saved profile snapshot files. Each row in the list shows the device name/MAC and the capture timestamp. Tap any row to:
 
 - View the full GATT profile offline (no device connection needed)
 - Re-identify a device by comparing its fingerprint against new scans
 
-Clones persist across reboots and can be exported from the SD card for offline analysis. They are stored in standard JSON — identical format to GATT Walker output — and are compatible with any JSON tooling.
+Snapshots persist across reboots and can be exported from the SD card for offline analysis. They are stored in standard JSON — identical format to GATT Walker output — and are compatible with any JSON tooling. Note: a GATT profile snapshot captures the attribute tree, values, and fingerprint at a point in time; it is not a full operational device emulation.
 
 ---
 
-#### BLE MITM Proxy
+#### BLE Notify Logger (BLE MITM)
 
-**BLE MITM** (in BT Attacks) inserts CYM between two BLE peers — one real device and one or more nearby clients — and transparently proxies GATT traffic while logging every read, write, and notification in both directions.
+> **Current implementation:** BLE MITM connects to the target BLE device as a GATT client and logs notifications, indications, and attribute reads from that device. The full two-sided transparent proxy described below (steps 2-3) is the target design; verify against the installed firmware version for current relay capability.
+
+**BLE MITM** (in BT Attacks) connects to a selected BLE device and logs GATT traffic — reads, writes, and notifications — from that device to SD card. Full relay mode: CYM inserts itself between two BLE peers, proxying GATT traffic in both directions while logging every exchange.
 
 **How it works:**
 
@@ -1412,7 +1414,9 @@ Tap **+ Add to Watchlist** on any group card. Each OUI is written to `lookout.cs
 
 #### BLE PCAP — How It Works
 
-**BLE PCAP** captures raw BLE advertising packets from the air and writes them to SD card in **Kismet PCAPNG format** — the same format used by Kismet Wireless, Wireshark, and other BLE analysis tools.
+**BLE PCAP** captures BLE advertising packets and writes them to SD card in **Kismet PCAPNG format** — the same format used by Kismet Wireless, Wireshark, and other BLE analysis tools.
+
+> **Implementation note:** Packets are **reconstructed from NimBLE GAP advertising reports**, not from raw LL-layer radio capture. The RF channel field in each packet's pseudo-header is forced to **channel 37** regardless of the actual advertising channel used. Payload and metadata come from `BLE_GAP_EVENT_EXT_DISC` events from the NimBLE stack, which may omit or truncate low-level LL fields present in a raw radio capture.
 
 The ESP32-C5 uses BLE 5.0 extended advertising (`CONFIG_BT_NIMBLE_EXT_ADV=y`), so the scanner uses `ble_gap_ext_disc()` and handles `BLE_GAP_EVENT_EXT_DISC` events — capturing both legacy (1M PHY) and extended (Coded PHY) advertisements that legacy-only scanners would miss.
 
