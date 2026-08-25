@@ -161,6 +161,7 @@ LV_IMG_DECLARE(deedee_img);
 #include "bt_lookout.h"
 #include "oui_lookup.h"
 #include "gatt_walker.h"
+#include "obs_store.h"
 #include "ble_honeypair.h"
 #include "chameleon_ble.h"
 #include "ble_blueduck.h"
@@ -801,6 +802,9 @@ typedef struct {
 // Use GPS definitions from wifi_common.h via wifi_cli.h
 static gps_data_t current_gps      = {0};
 static gps_data_t g_gps_last_known = {0};  // persists across GPS dropouts; loaded from NVS at boot
+
+// Passive observation store — PSRAM-backed ring buffer; shared by WiFi and BLE adapters below.
+static obs_store_t g_obs_store;
 #define GPS_STALE_ACCURACY_M 150.0f         // ~city block; used when position is held from last fix
 // Set by GPS task when a new valid fix arrives; main loop calls nvs_save_last_gps() from
 // main-task context to avoid nvs_commit() disabling flash cache in a background task.
@@ -1757,6 +1761,7 @@ static lv_obj_t *ble_scan_status_label = NULL;
 static volatile bool ble_scan_ui_active = false;
 static volatile bool ble_scan_needs_ui_update = false;
 static volatile bool ble_scan_finished = false;
+static volatile bool ble_obs_store_pending = false;  /* main loop feeds bt_devices → g_obs_store once per scan */
 static char ble_scan_status_text[48] = "";
 
 // Deauth Monitor state
@@ -5941,6 +5946,11 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(nvs_ret);
 
+    // Passive observation store: 512-record PSRAM ring buffer
+    if (!obs_store_init(&g_obs_store, 0)) {
+        ESP_LOGE(TAG, "obs_store_init failed — observation store disabled");
+    }
+
 	//Initialize GPS UART and start background monitor task
 	if (init_gps_uart() == ESP_OK) {
 		ESP_LOGI(TAG, "GPS UART initialized on TX=%d RX=%d", GPS_TX_PIN, GPS_RX_PIN);
@@ -7041,6 +7051,53 @@ void app_main(void)
                     scan_done_ui_flag = false;
                 } else {
                 scan_done_ui_flag = false;
+
+                // WiFi→obs_store adapter: feed every scan result into the passive observation store.
+                // Runs under lvgl_mutex (held by main loop), safe to call obs_store_add here.
+                if (g_obs_store.records) {
+                    const gps_data_t *gps = gps_best();
+                    uint8_t gps_flags = 0;
+                    if (gps && gps->valid) {
+                        gps_flags = (gps->accuracy < GPS_STALE_ACCURACY_M - 1.0f)
+                                    ? OBS_FLAG_GPS_VALID : OBS_FLAG_GPS_STALE;
+                    }
+                    for (uint16_t wi = 0; wi < g_shared_scan_count && wi < MAX_SCAN_RESULTS; wi++) {
+                        const wifi_ap_record_t *ap = &g_shared_scan_results[wi];
+                        obs_record_t obs = {0};
+                        obs.src_radio   = (uint8_t)OBS_RADIO_WIFI;
+                        obs.obs_type    = (uint8_t)OBS_TYPE_WIFI_AP;
+                        obs.flags       = gps_flags;
+                        if (ap->ssid[0] == '\0') obs.flags |= OBS_FLAG_HIDDEN_SSID;
+                        memcpy(obs.mac, ap->bssid, 6);
+                        obs.rssi_cur    = (int8_t)ap->rssi;
+                        obs.rssi_peak   = (int8_t)ap->rssi;
+                        obs.channel     = ap->primary;
+                        obs.auth_mode   = (uint8_t)ap->authmode;
+                        /* Infer PHY from band and protocol flags */
+                        if (ap->phy_11ax)      obs.phy = (uint8_t)OBS_PHY_11AX;
+                        else if (ap->phy_11ac) obs.phy = (uint8_t)OBS_PHY_11AC;
+                        else if (ap->phy_11n)  obs.phy = (uint8_t)OBS_PHY_11N;
+                        else if (ap->phy_11g)  obs.phy = (uint8_t)OBS_PHY_11G;
+                        else if (ap->phy_11b)  obs.phy = (uint8_t)OBS_PHY_11B;
+                        /* PMF inferred from auth mode (WPA3 → likely MFP required) */
+                        if (ap->authmode == WIFI_AUTH_WPA3_PSK ||
+                            ap->authmode == WIFI_AUTH_WPA2_WPA3_PSK ||
+                            ap->authmode == WIFI_AUTH_WPA3_ENTERPRISE ||
+                            ap->authmode == WIFI_AUTH_WPA3_ENT_192) {
+                            obs.flags |= OBS_FLAG_PMF_INFERRED;
+                        }
+                        if (gps && gps->valid) {
+                            obs.latitude    = gps->latitude;
+                            obs.longitude   = gps->longitude;
+                            obs.altitude_m  = gps->altitude;
+                            obs.accuracy_m  = gps->accuracy;
+                        }
+                        obs.hit_count   = 1;
+                        if (ap->ssid[0]) strncpy(obs.label, (const char *)ap->ssid, sizeof(obs.label) - 1);
+                        obs_store_add(&g_obs_store, &obs);
+                    }
+                }
+
                 wifi_sas_page = 0;
 
                 if (function_page) { lv_obj_del(function_page); function_page = NULL; }
@@ -7379,6 +7436,41 @@ void app_main(void)
                     bt_sas_status_label && lv_obj_is_valid(bt_sas_status_label)) {
                     lv_label_set_text(bt_sas_status_label,
                         bt_device_count > 0 ? "Tap a device to select" : "No devices found");
+                }
+            }
+
+            // BLE→obs_store adapter: runs once after every BLE scan completes
+            if (ble_obs_store_pending && g_obs_store.records) {
+                ble_obs_store_pending = false;
+                const gps_data_t *gps = gps_best();
+                uint8_t gps_flags = 0;
+                if (gps && gps->valid) {
+                    gps_flags = (gps->accuracy < GPS_STALE_ACCURACY_M - 1.0f)
+                                ? OBS_FLAG_GPS_VALID : OBS_FLAG_GPS_STALE;
+                }
+                for (int bi = 0; bi < bt_device_count; bi++) {
+                    const bt_device_info_t *dev = &bt_devices[bi];
+                    obs_record_t obs = {0};
+                    obs.src_radio  = (uint8_t)OBS_RADIO_BLE;
+                    obs.obs_type   = (uint8_t)OBS_TYPE_BLE_ADV;
+                    obs.flags      = gps_flags;
+                    if (dev->addr_type != 0) obs.flags |= OBS_FLAG_RANDOM_ADDR;
+                    memcpy(obs.mac, dev->addr, 6);
+                    obs.rssi_cur   = dev->rssi;
+                    obs.rssi_peak  = dev->rssi;
+                    /* Map NimBLE PHY constants: 1=1M, 2=2M, 3=Coded */
+                    if      (dev->phy == 2) obs.phy = (uint8_t)OBS_PHY_BLE_2M;
+                    else if (dev->phy == 3) obs.phy = (uint8_t)OBS_PHY_BLE_CODED;
+                    else                    obs.phy = (uint8_t)OBS_PHY_BLE_1M;
+                    if (gps && gps->valid) {
+                        obs.latitude   = gps->latitude;
+                        obs.longitude  = gps->longitude;
+                        obs.altitude_m = gps->altitude;
+                        obs.accuracy_m = gps->accuracy;
+                    }
+                    obs.hit_count = 1;
+                    if (dev->name[0]) strncpy(obs.label, dev->name, sizeof(obs.label) - 1);
+                    obs_store_add(&g_obs_store, &obs);
                 }
             }
 
@@ -38259,6 +38351,7 @@ static void bt_scan_task(void *pvParameters)
     snprintf(ble_scan_status_text, sizeof(ble_scan_status_text),
              "%d devices (%d AT, %d ST)", bt_device_count, bt_airtag_count, bt_smarttag_count);
     ble_scan_finished = true;
+    ble_obs_store_pending = true;   /* main loop will feed bt_devices → g_obs_store */
     ble_scan_needs_ui_update = true;
     bt_locator_needs_ui_update = true;
     bt_sas_needs_update = true;
