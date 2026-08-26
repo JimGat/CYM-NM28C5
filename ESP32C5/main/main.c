@@ -162,6 +162,7 @@ LV_IMG_DECLARE(deedee_img);
 #include "oui_lookup.h"
 #include "gatt_walker.h"
 #include "obs_store.h"
+#include "obs_detectors.h"
 #include "ble_honeypair.h"
 #include "chameleon_ble.h"
 #include "ble_blueduck.h"
@@ -804,7 +805,8 @@ static gps_data_t current_gps      = {0};
 static gps_data_t g_gps_last_known = {0};  // persists across GPS dropouts; loaded from NVS at boot
 
 // Passive observation store — PSRAM-backed ring buffer; shared by WiFi and BLE adapters below.
-static obs_store_t g_obs_store;
+static obs_store_t      g_obs_store;
+static obs_registry_t  *g_obs_registry = NULL;  /* built-in detector registry, init in app_main */
 #define GPS_STALE_ACCURACY_M 150.0f         // ~city block; used when position is held from last fix
 // Set by GPS task when a new valid fix arrives; main loop calls nvs_save_last_gps() from
 // main-task context to avoid nvs_commit() disabling flash cache in a background task.
@@ -5950,6 +5952,7 @@ void app_main(void)
     if (!obs_store_init(&g_obs_store, 0)) {
         ESP_LOGE(TAG, "obs_store_init failed — observation store disabled");
     }
+    g_obs_registry = obs_detectors_default_registry();
 
 	//Initialize GPS UART and start background monitor task
 	if (init_gps_uart() == ESP_OK) {
@@ -7094,6 +7097,7 @@ void app_main(void)
                         }
                         obs.hit_count   = 1;
                         if (ap->ssid[0]) strncpy(obs.label, (const char *)ap->ssid, sizeof(obs.label) - 1);
+                        if (g_obs_registry) obs_registry_run(g_obs_registry, &obs);
                         obs_store_add(&g_obs_store, &obs);
                     }
                 }
@@ -7470,6 +7474,23 @@ void app_main(void)
                     }
                     obs.hit_count = 1;
                     if (dev->name[0]) strncpy(obs.label, dev->name, sizeof(obs.label) - 1);
+                    /* Evidence tags from parsed advertisement data */
+                    if (dev->company_id != 0 && obs.evidence_count < OBS_MAX_EVIDENCE)
+                        obs.evidence[obs.evidence_count++] = (uint8_t)OBS_EV_MFR_DATA;
+                    if (dev->fp_svc_uuid != 0 && obs.evidence_count < OBS_MAX_EVIDENCE)
+                        obs.evidence[obs.evidence_count++] = (uint8_t)OBS_EV_SVC_UUID;
+                    /* Pre-classify: write canonical label when device name is absent */
+                    if (!obs.label[0]) {
+                        if      (dev->is_airtag)          strncpy(obs.label, "AirTag",    sizeof(obs.label) - 1);
+                        else if (dev->is_possible_airtag) strncpy(obs.label, "FindMy",    sizeof(obs.label) - 1);
+                        else if (dev->is_smarttag)        strncpy(obs.label, "SmartTag",  sizeof(obs.label) - 1);
+                        else if (dev->is_tile)            strncpy(obs.label, "Tile",      sizeof(obs.label) - 1);
+                        else if (dev->is_eddystone)       strncpy(obs.label, "Eddystone", sizeof(obs.label) - 1);
+                        else if (dev->is_fast_pair)       strncpy(obs.label, "FastPair",  sizeof(obs.label) - 1);
+                        else if (dev->is_matter)          strncpy(obs.label, "Matter",    sizeof(obs.label) - 1);
+                        else if (dev->is_bthome)          strncpy(obs.label, "BTHome",    sizeof(obs.label) - 1);
+                    }
+                    if (g_obs_registry) obs_registry_run(g_obs_registry, &obs);
                     obs_store_add(&g_obs_store, &obs);
                 }
             }
