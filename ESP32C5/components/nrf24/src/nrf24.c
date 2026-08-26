@@ -18,6 +18,19 @@ static const char *TAG = "nrf24";
 // Shared SPI bus mutex owned by main.c
 extern SemaphoreHandle_t sd_spi_mutex;
 
+// ── Bench instrumentation (NRF24_BENCH) ──────────────────────────────────────
+// Enable with -DNRF24_BENCH in CMakeLists.txt (add to idf_build_set_property
+// COMPILE_DEFINITIONS). Never define in production builds.
+// Also enable CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y in sdkconfig for the
+// vTaskGetRunTimeStats() dump in app_main when using NRF24_BENCH.
+#ifdef NRF24_BENCH
+// Per-sweep accumulators reset at the start of each nrf24_scan_channels() call.
+static uint32_t s_bench_sweep_count  = 0;   // total sweeps completed
+static uint32_t s_bench_max_ch_us    = 0;   // worst-case per-channel us this sweep
+static uint32_t s_bench_missed_count = 0;   // channels where elapsed > BENCH_DEADLINE_US
+#define BENCH_DEADLINE_US  400U  // flag when per-channel time exceeds this (normal: ~145 µs)
+#endif
+
 // ── nRF24L01+ registers ───────────────────────────────────────────────────────
 #define REG_CONFIG      0x00
 #define REG_EN_AA       0x01
@@ -419,14 +432,15 @@ static void s_contwave_jam(volatile bool *active, const uint8_t *ch_in, int nch)
     // confirmed: single spike with CE-stays-HIGH approach). CE must pulse LOW
     // between hops so the PLL resyncs to the new channel.
     //
-    // 50 µs dwell (CE HIGH): shorter than the nRF24 PLL lock time (~130 µs).
-    // The PLL never fully settles — the output is a continuous frequency chirp
-    // sweeping from the previous channel toward the new one. This wideband chirp
-    // is amplified by the AT2401C to +20 dBm and is more effective against BT
-    // AFH than a settled CW tone on each channel.
+    // 500 µs dwell (CE HIGH): minimum for nRF24 PLL lock (~130 µs) plus AT2401C
+    // TX-mode engagement. The original design intent was 50 µs (CE-LOW PLL-chirp
+    // mode, faster hops at the cost of incomplete PLL settling) but that produced
+    // no TinySA-visible output at this hop rate. 500 µs is the empirically
+    // confirmed working floor on the NM-RF-HAT (v2.13.x field tests).
     //
-    // Hop rate: 50 µs dwell + ~50 µs SPI write (CE LOW) = ~100 µs/hop.
-    // BT mode (79 ch): ~7.9 ms/sweep = 10 complete sweeps per BT hop (625 µs).
+    // Hop rate: 500 µs dwell + ~2 µs SPI write (CE LOW) ≈ 502 µs/hop.
+    // Test mode (40 ch): ~20 ms/sweep + 10 ms yield → ~33 sweeps/sec.
+    // BT   mode (79 ch): ~40 ms/sweep + 10 ms yield → ~20 sweeps/sec.
     int idx = 0;
     while (active && *active) {
         nrf24_write_reg(REG_RF_CH, channels[idx]);
@@ -575,17 +589,49 @@ esp_err_t nrf24_scan_channels(uint8_t start_ch, uint8_t stop_ch,
     nrf24_write_reg(REG_CONFIG, CONFIG_PWR_UP | CONFIG_PRIM_RX);
     nrf24_write_reg(REG_EN_AA, 0x00);
 
+#ifdef NRF24_BENCH
+    s_bench_max_ch_us    = 0;
+    s_bench_missed_count = 0;
+    uint64_t bench_total_ch_us = 0;
+    uint32_t bench_ch_count    = 0;
+#endif
+
     for (uint8_t ch = start_ch; ch <= stop_ch; ch++) {
         if ((cancel && *cancel) || s_drv->cancel) break;
+#ifdef NRF24_BENCH
+        uint64_t t_ch_start = esp_timer_get_time();
+#endif
         nrf24_write_reg(REG_RF_CH, ch);
         ce_high();
         esp_rom_delay_us(140);   // ≥130 µs for RPD latch (nRF24L01+ datasheet)
         bool carrier = nrf24_carrier_detect();
         ce_low();
+#ifdef NRF24_BENCH
+        {
+            uint32_t elapsed = (uint32_t)(esp_timer_get_time() - t_ch_start);
+            bench_total_ch_us += elapsed;
+            if (elapsed > s_bench_max_ch_us) s_bench_max_ch_us = elapsed;
+            if (elapsed > BENCH_DEADLINE_US)  s_bench_missed_count++;
+            bench_ch_count++;
+        }
+#endif
         if (cb) cb(ch, carrier, ctx);
         // Yield every 8 channels — 126×200µs was starving the LVGL main loop
         if ((ch & 0x07) == 0x07) vTaskDelay(pdMS_TO_TICKS(10));
     }
+
+#ifdef NRF24_BENCH
+    s_bench_sweep_count++;
+    if (bench_ch_count > 0 && (s_bench_sweep_count % 10) == 0) {
+        ESP_LOGI(TAG, "[BENCH] sweep=%lu ch=%lu avg_us=%lu max_us=%lu missed=%lu",
+                 (unsigned long)s_bench_sweep_count,
+                 (unsigned long)bench_ch_count,
+                 (unsigned long)(bench_total_ch_us / bench_ch_count),
+                 (unsigned long)s_bench_max_ch_us,
+                 (unsigned long)s_bench_missed_count);
+    }
+#endif
+
     return ESP_OK;
 }
 

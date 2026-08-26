@@ -7966,6 +7966,19 @@ void app_main(void)
             nvs_save_last_gps(&g_gps_last_known);
         }
         
+#if defined(NRF24_BENCH) && defined(CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS)
+        // Runtime stats dump every ~30 s. Requires CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+        // in sdkconfig.defaults (add manually — never ship this in production builds).
+        {
+            static uint32_t s_bench_loop_count = 0;
+            if (++s_bench_loop_count % 3000 == 0) {  // 3000 × ~10ms ≈ 30 s
+                static char s_rt_buf[1024];
+                vTaskGetRunTimeStats(s_rt_buf);
+                ESP_LOGI("bench", "[RTSTATS]\n%s", s_rt_buf);
+            }
+        }
+#endif
+
         vTaskDelay(pdMS_TO_TICKS(sleep_ms > 10 ? 10 : sleep_ms));
     }
 }
@@ -8036,6 +8049,23 @@ void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_
             uint64_t sem_done = esp_timer_get_time();
             xSemaphoreGive(sd_spi_mutex);
             uint64_t flush_done = esp_timer_get_time();
+
+#ifdef NRF24_BENCH
+            {
+                static uint32_t s_bench_flush_count = 0;
+                static uint64_t s_bench_flush_total_us = 0;
+                static uint32_t s_bench_flush_max_us = 0;
+                uint32_t this_flush_us = (uint32_t)(flush_done - flush_start);
+                s_bench_flush_total_us += this_flush_us;
+                if (this_flush_us > s_bench_flush_max_us) s_bench_flush_max_us = this_flush_us;
+                if (++s_bench_flush_count % 100 == 0) {
+                    ESP_LOGI("flush", "[BENCH] count=%lu avg_us=%lu max_us=%lu",
+                             (unsigned long)s_bench_flush_count,
+                             (unsigned long)(s_bench_flush_total_us / s_bench_flush_count),
+                             (unsigned long)s_bench_flush_max_us);
+                }
+            }
+#endif
 
             if (sd_provision_active && (area->y2 - area->y1) > 50) {
                 ESP_LOGI(TAG, "[FLUSH-PROV-SUCCESS] draw=%lld us, sem_wait=%lld us, total=%lld us",
