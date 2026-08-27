@@ -37,14 +37,18 @@
 
 <p align="center">
   <a href="https://youtu.be/IDm4uz38IDE" target="_blank">
-    <img src="https://img.youtube.com/vi/IDm4uz38IDE/maxresdefault.jpg" alt="Cheap Yellow Monster — Video Review by Anubis" width="48%"/>
+    <img src="https://img.youtube.com/vi/IDm4uz38IDE/maxresdefault.jpg" alt="Cheap Yellow Monster — Video Review by Anubis" width="31%"/>
   </a>
   &nbsp;
   <a href="https://youtu.be/00yGLaB4jWk" target="_blank">
-    <img src="https://img.youtube.com/vi/00yGLaB4jWk/maxresdefault.jpg" alt="Cheap Yellow Monster Firmware for Esp32-C5 CYD — Valleytech Custom Solutions" width="48%"/>
+    <img src="https://img.youtube.com/vi/00yGLaB4jWk/maxresdefault.jpg" alt="Cheap Yellow Monster Firmware for Esp32-C5 CYD — Valleytech Custom Solutions" width="31%"/>
+  </a>
+  &nbsp;
+  <a href="https://youtu.be/c0BH9R4tqLY" target="_blank">
+    <img src="https://img.youtube.com/vi/c0BH9R4tqLY/maxresdefault.jpg" alt="How to Install Lab5 Cheap Yellow Monster JimGat Firmware — Yellow Purple" width="31%"/>
   </a>
   <br/>
-  <em><a href="https://youtu.be/IDm4uz38IDE">CYM in the wild — Anubis ▶</a> &nbsp;·&nbsp; <a href="https://youtu.be/00yGLaB4jWk">CYM Firmware Review (v2.12.0) — Valleytech Custom Solutions ▶</a></em>
+  <em><a href="https://youtu.be/IDm4uz38IDE">CYM in the wild — Anubis ▶</a> &nbsp;·&nbsp; <a href="https://youtu.be/00yGLaB4jWk">CYM Firmware Review (v2.12.0) — Valleytech Custom Solutions ▶</a> &nbsp;·&nbsp; <a href="https://youtu.be/c0BH9R4tqLY">CYM Installation Tutorial — Yellow Purple ▶</a></em>
 </p>
 
 ---
