@@ -815,6 +815,40 @@ static lv_obj_t   *s_obs_list       = NULL;
 static lv_obj_t   *s_obs_status_lbl = NULL;
 static lv_timer_t *s_obs_tmr        = NULL;
 static uint32_t    s_obs_last_count  = UINT32_MAX;  /* dirty-check: rebuild list only when count changes */
+
+// Device Detail + Locate sub-screen state
+static obs_record_t   s_obs_detail_rec;                   /* copy of the record being inspected */
+static uint8_t        s_obs_saved_vib_pct  = 100;         /* vibrator pct saved on locate entry */
+static volatile bool  s_obs_loc_running    = false;       /* locate task alive flag */
+static lv_obj_t      *s_obs_loc_rssi_lbl   = NULL;
+static lv_obj_t      *s_obs_loc_bar        = NULL;
+static lv_obj_t      *s_obs_loc_status_lbl = NULL;
+static volatile bool  s_obs_ring_cancel    = false;       /* ring task cancel flag */
+static TaskHandle_t   s_obs_ring_task_hdl  = NULL;
+static lv_obj_t      *s_obs_ring_status_lbl = NULL;
+
+// AirTag FMN sound service — from public Apple FMN accessory research.
+// TODO: confirm exact characteristic UUID and write value using GATT Walker on a live AirTag.
+#define OBS_RING_FMN_SVC  "7DFC9000-7D1C-4951-86AA-8D9728F8D66C"
+#define OBS_RING_FMN_SND  "7DFC9001-7D1C-4951-86AA-8D9728F8D66C"
+static const uint8_t OBS_RING_PLAY_CMD[] = {0x01, 0x00, 0x03};
+
+// NimBLE 128-bit UUID bytes (little-endian, reversed from string representation)
+static const ble_uuid128_t s_obs_ring_fmn_svc_uuid = BLE_UUID128_INIT(
+    0x6C, 0xD6, 0xF8, 0x28, 0x97, 0x8D, 0xAA, 0x86,
+    0x51, 0x49, 0x1C, 0x7D, 0x00, 0x90, 0xFC, 0x7D
+);
+static const ble_uuid128_t s_obs_ring_fmn_snd_uuid = BLE_UUID128_INIT(
+    0x6C, 0xD6, 0xF8, 0x28, 0x97, 0x8D, 0xAA, 0x86,
+    0x51, 0x49, 0x1C, 0x7D, 0x01, 0x90, 0xFC, 0x7D
+);
+// Ring task GATT state
+static SemaphoreHandle_t s_obs_ring_sem      = NULL;
+static uint16_t          s_obs_ring_conn_hdl = BLE_HS_CONN_HANDLE_NONE;
+static int               s_obs_ring_gatt_rc  = 0;
+static uint16_t          s_obs_ring_svc_start = 0;
+static uint16_t          s_obs_ring_svc_end   = 0;
+static uint16_t          s_obs_ring_snd_hdl   = 0;
 #define GPS_STALE_ACCURACY_M 150.0f         // ~city block; used when position is held from last fix
 // Set by GPS task when a new valid fix arrives; main loop calls nvs_save_last_gps() from
 // main-task context to avoid nvs_commit() disabling flash cache in a background task.
@@ -3153,6 +3187,8 @@ static void show_wifi_analyzer_screen(void);
 static void show_wscope_screen(void);
 static void wscope_task(void *p);
 static void show_obs_store_screen(void);
+static void show_obs_device_detail_screen(void);
+static void show_obs_device_locate_screen(void);
 static void show_espnow_scout_screen(void);
 static void espnow_scout_stop(void);
 static void espnow_rebuild_list(void);
@@ -57474,6 +57510,68 @@ static void obs_store_screen_stop(void)
     s_obs_last_count  = UINT32_MAX;
 }
 
+/* ── Device type classifier ──────────────────────────────────────────────── */
+/* Maps the obs_detectors label string to an action capability set. */
+
+typedef enum {
+    OBS_DEV_UNKNOWN   = 0,
+    OBS_DEV_AIRTAG    = 1,  /* ring + locate */
+    OBS_DEV_FINDMY    = 2,  /* ring + locate (FMN accessories) */
+    OBS_DEV_SMARTTAG  = 3,  /* locate only (Samsung cloud auth required to ring) */
+    OBS_DEV_TILE      = 4,  /* locate only (Tile cloud auth required to ring) */
+    OBS_DEV_PWNAGOTCHI = 5, /* info only (WiFi, no BLE locate) */
+    OBS_DEV_EDDYSTONE = 6,  /* info only */
+    OBS_DEV_FASTPAIR  = 7,  /* info only */
+    OBS_DEV_MATTER    = 8,  /* info only */
+} obs_dev_type_t;
+
+static obs_dev_type_t obs_get_dev_type(const char *label)
+{
+    if (!label || !label[0]) return OBS_DEV_UNKNOWN;
+    if (strncasecmp(label, "AirTag",     6) == 0) return OBS_DEV_AIRTAG;
+    if (strncasecmp(label, "FindMy",     6) == 0) return OBS_DEV_FINDMY;
+    if (strncasecmp(label, "SmartTag",   8) == 0) return OBS_DEV_SMARTTAG;
+    if (strncasecmp(label, "Tile",       4) == 0) return OBS_DEV_TILE;
+    if (strncasecmp(label, "pwn",        3) == 0) return OBS_DEV_PWNAGOTCHI;
+    if (strncasecmp(label, "Eddystone",  9) == 0) return OBS_DEV_EDDYSTONE;
+    if (strncasecmp(label, "FastPair",   8) == 0) return OBS_DEV_FASTPAIR;
+    if (strncasecmp(label, "Matter",     6) == 0) return OBS_DEV_MATTER;
+    return OBS_DEV_UNKNOWN;
+}
+
+/* True if this device type supports BLE locate (has a trackable BLE address). */
+static bool obs_dev_can_locate(obs_dev_type_t t)
+{
+    return (t == OBS_DEV_AIRTAG   || t == OBS_DEV_FINDMY ||
+            t == OBS_DEV_SMARTTAG || t == OBS_DEV_TILE);
+}
+
+/* True if this device type supports direct BLE ring (no cloud auth required). */
+static bool obs_dev_can_ring(obs_dev_type_t t)
+{
+    return (t == OBS_DEV_AIRTAG || t == OBS_DEV_FINDMY);
+}
+
+/* ── Passive Log card tap callbacks ──────────────────────────────────────── */
+
+/* Free the malloc'd record copy stored as lv_obj user_data on delete. */
+static void obs_card_delete_cb(lv_event_t *e)
+{
+    lv_obj_t *obj = lv_event_get_target(e);
+    void *ud = lv_obj_get_user_data(obj);
+    if (ud) free(ud);
+}
+
+/* Tap on a classified card: copy record to shared static, open Detail screen. */
+static void obs_card_tap_cb(lv_event_t *e)
+{
+    lv_obj_t *obj = lv_event_get_target(e);
+    obs_record_t *rec = (obs_record_t *)lv_obj_get_user_data(obj);
+    if (!rec) return;
+    memcpy(&s_obs_detail_rec, rec, sizeof(obs_record_t));
+    show_obs_device_detail_screen();
+}
+
 /* Rebuild the scrollable record list.  Called from the refresh timer and on open. */
 static void obs_store_rebuild_list(void)
 {
@@ -57576,6 +57674,20 @@ static void obs_store_rebuild_list(void)
             r.confidence > 0 ? lv_color_hex(0x80CBC4) : ui_muted_color(), 0);
         lv_label_set_long_mode(l2, LV_LABEL_LONG_CLIP);
         lv_obj_set_width(l2, lv_pct(100));
+
+        /* Classified records are tappable — tap opens Device Detail. */
+        if (r.confidence > 0) {
+            obs_record_t *rec_copy = malloc(sizeof(obs_record_t));
+            if (rec_copy) {
+                memcpy(rec_copy, &r, sizeof(obs_record_t));
+                lv_obj_set_user_data(card, rec_copy);
+                lv_obj_add_event_cb(card, obs_card_delete_cb, LV_EVENT_DELETE, NULL);
+                lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+                lv_obj_add_event_cb(card, obs_card_tap_cb, LV_EVENT_CLICKED, NULL);
+                /* Dim on press so user gets tap feedback */
+                lv_obj_set_style_bg_opa(card, LV_OPA_70, LV_STATE_PRESSED);
+            }
+        }
     }
 }
 
@@ -57698,6 +57810,559 @@ static void show_obs_store_screen(void)
     obs_store_refresh_cb(NULL);
 
     s_obs_tmr = lv_timer_create(obs_store_refresh_cb, 2000, NULL);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Device Locate — RSSI-based proximity tracking with vibrator feedback.
+ * Reuses existing bt_tracking_mode / bt_tracking_mac / bt_tracking_rssi
+ * globals already wired into bt_gap_event_callback.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Async shim: update locate UI from locate task (runs outside lvgl_mutex). */
+typedef struct { int8_t rssi; bool found; } obs_loc_update_t;
+
+static void obs_loc_ui_async(void *data)
+{
+    obs_loc_update_t *u = (obs_loc_update_t *)data;
+    if (s_obs_loc_rssi_lbl && lv_obj_is_valid(s_obs_loc_rssi_lbl)) {
+        char buf[24];
+        if (u->found)
+            snprintf(buf, sizeof(buf), "%d dBm", u->rssi);
+        else
+            snprintf(buf, sizeof(buf), "Searching...");
+        lv_label_set_text(s_obs_loc_rssi_lbl, buf);
+    }
+    if (s_obs_loc_bar && lv_obj_is_valid(s_obs_loc_bar)) {
+        int val = 0;
+        if (u->found && u->rssi >= -69) {
+            int pct = 10 + (u->rssi + 69) * 90 / 29;
+            val = (pct > 100) ? 100 : pct;
+        }
+        lv_bar_set_value(s_obs_loc_bar, val, LV_ANIM_OFF);
+    }
+    if (s_obs_loc_status_lbl && lv_obj_is_valid(s_obs_loc_status_lbl)) {
+        const char *txt = u->found ? "In range" : "Not seen this scan";
+        lv_label_set_text(s_obs_loc_status_lbl, txt);
+    }
+    free(u);
+}
+
+/* Locate background task: scan 10 s cycles, update vibrator + LVGL every 500 ms. */
+static void obs_locate_task(void *arg)
+{
+    (void)arg;
+    char mac_str[18];
+    snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+             s_obs_detail_rec.mac[0], s_obs_detail_rec.mac[1], s_obs_detail_rec.mac[2],
+             s_obs_detail_rec.mac[3], s_obs_detail_rec.mac[4], s_obs_detail_rec.mac[5]);
+    ESP_LOGI(TAG, "obs_locate: tracking %s", mac_str);
+
+    while (s_obs_loc_running) {
+        bt_tracking_found = false;
+        bt_tracking_rssi  = 0;
+
+        int rc = bt_start_scan();
+        if (rc != 0) {
+            ESP_LOGE(TAG, "obs_locate: scan start failed %d", rc);
+            break;
+        }
+
+        /* Scan 10 s, update every 500 ms */
+        for (int i = 0; i < 100 && s_obs_loc_running; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            if (i % 5 == 0) {
+                obs_loc_update_t *u = malloc(sizeof(obs_loc_update_t));
+                if (u) {
+                    u->found = bt_tracking_found;
+                    u->rssi  = bt_tracking_rssi;
+                    lv_async_call(obs_loc_ui_async, u);
+                }
+                if (bt_tracking_found) {
+                    int rssi = bt_tracking_rssi;
+                    if (rssi >= -69) {
+                        int pct = 10 + (rssi + 69) * 90 / 29;
+                        g_vibtest_strength_pct = (pct > 100) ? 100 : pct;
+                        vibrator_on();
+                    } else {
+                        vibrator_off();
+                    }
+                } else {
+                    vibrator_off();
+                }
+            }
+        }
+
+        bt_stop_scan();
+        if (!s_obs_loc_running) break;
+    }
+
+    vibrator_off();
+    g_vibtest_strength_pct = s_obs_saved_vib_pct;
+    bt_tracking_mode        = false;
+    s_obs_loc_running       = false;
+    ESP_LOGI(TAG, "obs_locate: stopped");
+    vTaskDelete(NULL);
+}
+
+static void obs_device_locate_stop(void)
+{
+    s_obs_loc_running = false;
+    bt_tracking_mode  = false;
+    vibrator_off();
+    g_vibtest_strength_pct = s_obs_saved_vib_pct;
+    vTaskDelay(pdMS_TO_TICKS(200));
+    s_obs_loc_rssi_lbl   = NULL;
+    s_obs_loc_bar        = NULL;
+    s_obs_loc_status_lbl = NULL;
+}
+
+static void show_obs_device_locate_screen(void)
+{
+    create_function_page_base("Device Locate");
+    g_screen_stop_fn = obs_device_locate_stop;
+    g_screen_back_fn = show_obs_device_detail_screen;
+    apply_menu_bg();
+
+    bool is_ble = (s_obs_detail_rec.src_radio == (uint8_t)OBS_RADIO_BLE);
+    char identity[40];
+    if (s_obs_detail_rec.label[0])
+        snprintf(identity, sizeof(identity), "%s", s_obs_detail_rec.label);
+    else
+        snprintf(identity, sizeof(identity), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 s_obs_detail_rec.mac[0], s_obs_detail_rec.mac[1], s_obs_detail_rec.mac[2],
+                 s_obs_detail_rec.mac[3], s_obs_detail_rec.mac[4], s_obs_detail_rec.mac[5]);
+
+    /* Device name header */
+    lv_obj_t *name_lbl = lv_label_create(function_page);
+    lv_label_set_text(name_lbl, identity);
+    lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(name_lbl, lv_color_hex(0x80CBC4), 0);
+    lv_obj_align(name_lbl, LV_ALIGN_TOP_LEFT, 6, 30);
+
+    /* MAC line */
+    char mac_buf[20];
+    snprintf(mac_buf, sizeof(mac_buf), "%02X:%02X:%02X:%02X:%02X:%02X",
+             s_obs_detail_rec.mac[0], s_obs_detail_rec.mac[1], s_obs_detail_rec.mac[2],
+             s_obs_detail_rec.mac[3], s_obs_detail_rec.mac[4], s_obs_detail_rec.mac[5]);
+    lv_obj_t *mac_lbl = lv_label_create(function_page);
+    lv_label_set_text(mac_lbl, mac_buf);
+    lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(mac_lbl, ui_muted_color(), 0);
+    lv_obj_align(mac_lbl, LV_ALIGN_TOP_LEFT, 6, 52);
+
+    /* Live RSSI value */
+    s_obs_loc_rssi_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_obs_loc_rssi_lbl, "Starting scan...");
+    lv_obj_set_style_text_font(s_obs_loc_rssi_lbl, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(s_obs_loc_rssi_lbl, ui_text_color(), 0);
+    lv_obj_align(s_obs_loc_rssi_lbl, LV_ALIGN_TOP_MID, 0, 90);
+
+    /* Signal strength bar */
+    s_obs_loc_bar = lv_bar_create(function_page);
+    lv_obj_set_size(s_obs_loc_bar, LCD_H_RES - 40, 18);
+    lv_obj_align(s_obs_loc_bar, LV_ALIGN_TOP_MID, 0, 130);
+    lv_bar_set_range(s_obs_loc_bar, 0, 100);
+    lv_bar_set_value(s_obs_loc_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(s_obs_loc_bar, ui_card_color(), 0);
+    lv_obj_set_style_bg_color(s_obs_loc_bar, lv_color_hex(0x4CAF50), LV_PART_INDICATOR);
+
+    /* Status text */
+    s_obs_loc_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_obs_loc_status_lbl, "Searching...");
+    lv_obj_set_style_text_font(s_obs_loc_status_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_obs_loc_status_lbl, ui_muted_color(), 0);
+    lv_obj_align(s_obs_loc_status_lbl, LV_ALIGN_TOP_MID, 0, 160);
+
+    lv_obj_t *hint = lv_label_create(function_page);
+    lv_label_set_text(hint, "Vibration strength tracks signal");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint, ui_muted_color(), 0);
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 200);
+
+    if (!is_ble) {
+        lv_obj_t *warn = lv_label_create(function_page);
+        lv_label_set_text(warn, "Note: WiFi RSSI locate not supported");
+        lv_obj_set_style_text_font(warn, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(warn, lv_color_hex(0xFFA726), 0);
+        lv_obj_align(warn, LV_ALIGN_TOP_MID, 0, 225);
+        return;
+    }
+
+    /* Start tracking task */
+    s_obs_saved_vib_pct = (uint8_t)g_vibtest_strength_pct;
+    memcpy(bt_tracking_mac, s_obs_detail_rec.mac, 6);
+    bt_tracking_mode  = true;
+    bt_tracking_found = false;
+    bt_tracking_rssi  = 0;
+    s_obs_loc_running = true;
+
+    ensure_ble_mode();
+    xTaskCreate(obs_locate_task, "obs_loc", 4096, NULL, 2, NULL);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Ring Device — BLE connect + GATT write for AirTag / FindMy play-sound.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Async shim: update ring status label from ring task. */
+typedef struct { char msg[80]; } obs_ring_msg_t;
+
+static void obs_ring_status_async(void *data)
+{
+    obs_ring_msg_t *m = (obs_ring_msg_t *)data;
+    if (s_obs_ring_status_lbl && lv_obj_is_valid(s_obs_ring_status_lbl))
+        lv_label_set_text(s_obs_ring_status_lbl, m->msg);
+    free(m);
+}
+
+static void obs_ring_set_status(const char *msg)
+{
+    obs_ring_msg_t *m = malloc(sizeof(obs_ring_msg_t));
+    if (!m) return;
+    snprintf(m->msg, sizeof(m->msg), "%s", msg);
+    lv_async_call(obs_ring_status_async, m);
+}
+
+/* GAP event callback for the ring connect sequence. */
+static int obs_ring_gap_cb(struct ble_gap_event *e, void *arg)
+{
+    (void)arg;
+    switch (e->type) {
+    case BLE_GAP_EVENT_CONNECT:
+        s_obs_ring_conn_hdl = (e->connect.status == 0)
+                              ? e->connect.conn_handle
+                              : BLE_HS_CONN_HANDLE_NONE;
+        s_obs_ring_gatt_rc  = e->connect.status;
+        if (s_obs_ring_sem) xSemaphoreGive(s_obs_ring_sem);
+        break;
+    case BLE_GAP_EVENT_DISCONNECT:
+        s_obs_ring_conn_hdl = BLE_HS_CONN_HANDLE_NONE;
+        if (s_obs_ring_sem) xSemaphoreGive(s_obs_ring_sem);
+        break;
+    default:
+        break;
+    }
+    return 0;
+}
+
+/* GATT service discovery callback — captures FMN service handle range. */
+static int obs_ring_svc_disc_cb(uint16_t conn_hdl,
+                                  const struct ble_gatt_error *err,
+                                  const struct ble_gatt_svc *svc, void *arg)
+{
+    (void)conn_hdl; (void)arg;
+    if (err->status == 0 && svc) {
+        s_obs_ring_svc_start = svc->start_handle;
+        s_obs_ring_svc_end   = svc->end_handle;
+    }
+    if (err->status != 0) {
+        s_obs_ring_gatt_rc = (err->status == BLE_HS_EDONE) ? 0 : err->status;
+        if (s_obs_ring_sem) xSemaphoreGive(s_obs_ring_sem);
+    }
+    return 0;
+}
+
+/* GATT characteristic discovery callback — locates the play-sound write handle. */
+static int obs_ring_chr_disc_cb(uint16_t conn_hdl,
+                                  const struct ble_gatt_error *err,
+                                  const struct ble_gatt_chr *chr, void *arg)
+{
+    (void)conn_hdl; (void)arg;
+    if (err->status == 0 && chr) {
+        if (ble_uuid_cmp(&chr->uuid.u, &s_obs_ring_fmn_snd_uuid.u) == 0)
+            s_obs_ring_snd_hdl = chr->val_handle;
+    }
+    if (err->status != 0) {
+        s_obs_ring_gatt_rc = (err->status == BLE_HS_EDONE) ? 0 : err->status;
+        if (s_obs_ring_sem) xSemaphoreGive(s_obs_ring_sem);
+    }
+    return 0;
+}
+
+/* GATT write callback — signals write completion. */
+static int obs_ring_write_cb(uint16_t conn_hdl, const struct ble_gatt_error *err,
+                               struct ble_gatt_attr *attr, void *arg)
+{
+    (void)conn_hdl; (void)attr; (void)arg;
+    s_obs_ring_gatt_rc = err->status;
+    if (s_obs_ring_sem) xSemaphoreGive(s_obs_ring_sem);
+    return 0;
+}
+
+/* Ring task: connect → discover FMN service → write play-sound → disconnect. */
+static void obs_ring_task(void *arg)
+{
+    (void)arg;
+    bool is_random = !!(s_obs_detail_rec.flags & OBS_FLAG_RANDOM_ADDR);
+
+    obs_ring_set_status("Switching to BLE...");
+    ensure_ble_mode();
+    ble_gap_disc_cancel();
+
+    s_obs_ring_sem = xSemaphoreCreateBinary();
+    if (!s_obs_ring_sem) { obs_ring_set_status("Alloc failed"); goto done; }
+
+    /* Connect */
+    obs_ring_set_status("Connecting...");
+    ble_att_set_preferred_mtu(64);
+    ble_addr_t peer;
+    peer.type = is_random ? BLE_ADDR_RANDOM : BLE_ADDR_PUBLIC;
+    memcpy(peer.val, s_obs_detail_rec.mac, 6);
+    s_obs_ring_conn_hdl = BLE_HS_CONN_HANDLE_NONE;
+    s_obs_ring_svc_start = 0;
+    s_obs_ring_svc_end   = 0;
+    s_obs_ring_snd_hdl   = 0;
+
+    int rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &peer, 10000, NULL, obs_ring_gap_cb, NULL);
+    if (rc != 0) {
+        char buf[56]; snprintf(buf, sizeof(buf), "Connect init failed (%d)", rc);
+        obs_ring_set_status(buf);
+        goto done;
+    }
+    if (xSemaphoreTake(s_obs_ring_sem, pdMS_TO_TICKS(12000)) != pdTRUE
+        || s_obs_ring_conn_hdl == BLE_HS_CONN_HANDLE_NONE) {
+        obs_ring_set_status("Connect timeout");
+        ble_gap_conn_cancel();
+        goto done;
+    }
+    if (s_obs_ring_cancel) { obs_ring_set_status("Cancelled"); goto disconnect; }
+
+    /* Discover FMN sound service */
+    obs_ring_set_status("Finding sound service...");
+    rc = ble_gattc_disc_svc_by_uuid(s_obs_ring_conn_hdl,
+                                     &s_obs_ring_fmn_svc_uuid.u,
+                                     obs_ring_svc_disc_cb, NULL);
+    if (rc != 0) {
+        obs_ring_set_status("Service disc failed");
+        goto disconnect;
+    }
+    if (xSemaphoreTake(s_obs_ring_sem, pdMS_TO_TICKS(6000)) != pdTRUE
+        || s_obs_ring_svc_end == 0) {
+        obs_ring_set_status("Sound service not found\nRun GATT Walker to verify UUID");
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        goto disconnect;
+    }
+    if (s_obs_ring_cancel) { obs_ring_set_status("Cancelled"); goto disconnect; }
+
+    /* Discover all characteristics in the service, find play-sound handle */
+    obs_ring_set_status("Finding sound characteristic...");
+    rc = ble_gattc_disc_all_chrs(s_obs_ring_conn_hdl,
+                                  s_obs_ring_svc_start, s_obs_ring_svc_end,
+                                  obs_ring_chr_disc_cb, NULL);
+    if (rc != 0) {
+        obs_ring_set_status("Chr disc failed");
+        goto disconnect;
+    }
+    if (xSemaphoreTake(s_obs_ring_sem, pdMS_TO_TICKS(6000)) != pdTRUE
+        || s_obs_ring_snd_hdl == 0) {
+        obs_ring_set_status("Sound chr not found\nRun GATT Walker to verify UUID");
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        goto disconnect;
+    }
+    if (s_obs_ring_cancel) { obs_ring_set_status("Cancelled"); goto disconnect; }
+
+    /* Write play-sound command */
+    obs_ring_set_status("Sending play-sound command...");
+    rc = ble_gattc_write_flat(s_obs_ring_conn_hdl, s_obs_ring_snd_hdl,
+                               OBS_RING_PLAY_CMD, sizeof(OBS_RING_PLAY_CMD),
+                               obs_ring_write_cb, NULL);
+    if (rc != 0) {
+        obs_ring_set_status("Write failed");
+        goto disconnect;
+    }
+    if (xSemaphoreTake(s_obs_ring_sem, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        obs_ring_set_status("Write timeout");
+        goto disconnect;
+    }
+    if (s_obs_ring_gatt_rc == 0) {
+        obs_ring_set_status("Sound command sent!");
+    } else {
+        char buf[56]; snprintf(buf, sizeof(buf), "Write error (%d)\nTry GATT Walker to verify", s_obs_ring_gatt_rc);
+        obs_ring_set_status(buf);
+    }
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+disconnect:
+    if (s_obs_ring_conn_hdl != BLE_HS_CONN_HANDLE_NONE) {
+        ble_gap_terminate(s_obs_ring_conn_hdl, BLE_ERR_REM_USER_CONN_TERM);
+        xSemaphoreTake(s_obs_ring_sem, pdMS_TO_TICKS(3000));
+        s_obs_ring_conn_hdl = BLE_HS_CONN_HANDLE_NONE;
+    }
+done:
+    if (s_obs_ring_sem) { vSemaphoreDelete(s_obs_ring_sem); s_obs_ring_sem = NULL; }
+    s_obs_ring_task_hdl = NULL;
+    ESP_LOGI(TAG, "obs_ring: task done");
+    vTaskDelete(NULL);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Device Detail screen — shows record info and action buttons.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Ring button tap — launch ring task if not already running. */
+static void obs_ring_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_obs_ring_task_hdl) {
+        if (s_obs_ring_status_lbl && lv_obj_is_valid(s_obs_ring_status_lbl))
+            lv_label_set_text(s_obs_ring_status_lbl, "Already in progress...");
+        return;
+    }
+    s_obs_ring_cancel = false;
+    xTaskCreate(obs_ring_task, "obs_ring", 6144, NULL, 2, &s_obs_ring_task_hdl);
+}
+
+/* Locate button tap — navigate to Locate sub-screen. */
+static void obs_locate_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    show_obs_device_locate_screen();
+}
+
+static void obs_device_detail_stop(void)
+{
+    /* Cancel any in-progress ring task */
+    s_obs_ring_cancel = true;
+    if (s_obs_ring_conn_hdl != BLE_HS_CONN_HANDLE_NONE) {
+        ble_gap_terminate(s_obs_ring_conn_hdl, BLE_ERR_REM_USER_CONN_TERM);
+    }
+    /* Poll up to 3 s for ring task to exit */
+    for (int i = 0; i < 30 && s_obs_ring_task_hdl; i++)
+        vTaskDelay(pdMS_TO_TICKS(100));
+    s_obs_ring_status_lbl = NULL;
+}
+
+static void show_obs_device_detail_screen(void)
+{
+    create_function_page_base("Device Detail");
+    g_screen_stop_fn = obs_device_detail_stop;
+    g_screen_back_fn = show_obs_store_screen;
+    apply_menu_bg();
+
+    const obs_record_t *r = &s_obs_detail_rec;
+    obs_dev_type_t dev_type = obs_get_dev_type(r->label);
+    bool is_ble = (r->src_radio == (uint8_t)OBS_RADIO_BLE);
+    bool can_ring   = obs_dev_can_ring(dev_type);
+    bool can_locate = obs_dev_can_locate(dev_type) && is_ble;
+
+    static const char *ev_names[] = { "", "OUI", "SVC", "MFR", "SSID", "RATE!", "RSSI!", "REC" };
+
+    /* ── Device label / badge ── */
+    char badge[6];
+    snprintf(badge, sizeof(badge), "[%s]", is_ble ? "B" : "W");
+    lv_obj_t *badge_lbl = lv_label_create(function_page);
+    lv_label_set_text(badge_lbl, badge);
+    lv_obj_set_style_text_font(badge_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(badge_lbl, ui_muted_color(), 0);
+    lv_obj_align(badge_lbl, LV_ALIGN_TOP_LEFT, 6, 30);
+
+    lv_obj_t *name_lbl = lv_label_create(function_page);
+    lv_label_set_text(name_lbl, r->label[0] ? r->label : "(no name)");
+    lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(name_lbl, lv_color_hex(0x80CBC4), 0);
+    lv_obj_align(name_lbl, LV_ALIGN_TOP_LEFT, 36, 30);
+    lv_obj_set_width(name_lbl, LCD_H_RES - 42);
+    lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_CLIP);
+
+    /* ── MAC ── */
+    char mac_buf[20];
+    snprintf(mac_buf, sizeof(mac_buf), "%02X:%02X:%02X:%02X:%02X:%02X",
+             r->mac[0], r->mac[1], r->mac[2], r->mac[3], r->mac[4], r->mac[5]);
+    lv_obj_t *mac_lbl = lv_label_create(function_page);
+    lv_label_set_text(mac_lbl, mac_buf);
+    lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(mac_lbl, ui_muted_color(), 0);
+    lv_obj_align(mac_lbl, LV_ALIGN_TOP_LEFT, 6, 52);
+
+    /* ── Signal ── */
+    char sig_buf[48];
+    snprintf(sig_buf, sizeof(sig_buf), "RSSI %d dBm  peak %d dBm  ch %u",
+             r->rssi_cur, r->rssi_peak, r->channel);
+    lv_obj_t *sig_lbl = lv_label_create(function_page);
+    lv_label_set_text(sig_lbl, sig_buf);
+    lv_obj_set_style_text_font(sig_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sig_lbl, ui_text_color(), 0);
+    lv_obj_align(sig_lbl, LV_ALIGN_TOP_LEFT, 6, 70);
+
+    /* ── Confidence + hits ── */
+    char conf_buf[40];
+    snprintf(conf_buf, sizeof(conf_buf), "Confidence: %u   Seen: %u time%s",
+             r->confidence, r->hit_count, r->hit_count == 1 ? "" : "s");
+    lv_obj_t *conf_lbl = lv_label_create(function_page);
+    lv_label_set_text(conf_lbl, conf_buf);
+    lv_obj_set_style_text_font(conf_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(conf_lbl, ui_text_color(), 0);
+    lv_obj_align(conf_lbl, LV_ALIGN_TOP_LEFT, 6, 88);
+
+    /* ── Evidence tags ── */
+    char ev_buf[64] = "Evidence: ";
+    bool any_ev = false;
+    for (uint8_t i = 0; i < r->evidence_count && i < OBS_MAX_EVIDENCE; i++) {
+        uint8_t ev = r->evidence[i];
+        if (ev > 0 && ev < 8) {
+            if (any_ev) strncat(ev_buf, "  ", sizeof(ev_buf) - strlen(ev_buf) - 1);
+            strncat(ev_buf, ev_names[ev], sizeof(ev_buf) - strlen(ev_buf) - 1);
+            any_ev = true;
+        }
+    }
+    if (!any_ev) strncat(ev_buf, "none", sizeof(ev_buf) - strlen(ev_buf) - 1);
+    lv_obj_t *ev_lbl = lv_label_create(function_page);
+    lv_label_set_text(ev_lbl, ev_buf);
+    lv_obj_set_style_text_font(ev_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ev_lbl, lv_color_hex(0x80CBC4), 0);
+    lv_obj_align(ev_lbl, LV_ALIGN_TOP_LEFT, 6, 106);
+
+    /* ── Action buttons ── */
+    int btn_y = 135;
+    int btn_x = 6;
+    int btn_w = can_ring && can_locate ? (LCD_H_RES / 2 - 10) : (LCD_H_RES - 12);
+
+    if (can_ring) {
+        lv_obj_t *ring_btn = lv_btn_create(function_page);
+        lv_obj_set_size(ring_btn, btn_w, 36);
+        lv_obj_set_pos(ring_btn, btn_x, btn_y);
+        lv_obj_set_style_bg_color(ring_btn, lv_color_hex(0xC62828), 0);
+        lv_obj_set_style_radius(ring_btn, 5, 0);
+        lv_obj_add_event_cb(ring_btn, obs_ring_btn_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_t *rl = lv_label_create(ring_btn);
+        lv_label_set_text(rl, "Ring Device");
+        lv_obj_set_style_text_font(rl, &lv_font_montserrat_14, 0);
+        lv_obj_center(rl);
+        btn_x += btn_w + 8;
+    }
+
+    if (can_locate) {
+        lv_obj_t *loc_btn = lv_btn_create(function_page);
+        lv_obj_set_size(loc_btn, btn_w, 36);
+        lv_obj_set_pos(loc_btn, btn_x, btn_y);
+        lv_obj_set_style_bg_color(loc_btn, lv_color_hex(0x1565C0), 0);
+        lv_obj_set_style_radius(loc_btn, 5, 0);
+        lv_obj_add_event_cb(loc_btn, obs_locate_btn_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_t *ll = lv_label_create(loc_btn);
+        lv_label_set_text(ll, "Locate");
+        lv_obj_set_style_text_font(ll, &lv_font_montserrat_14, 0);
+        lv_obj_center(ll);
+    }
+
+    /* Ring status label — updated by obs_ring_set_status via lv_async_call */
+    s_obs_ring_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_obs_ring_status_lbl, can_ring ? "Tap 'Ring Device' to trigger sound" : "");
+    lv_obj_set_style_text_font(s_obs_ring_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_obs_ring_status_lbl, ui_muted_color(), 0);
+    lv_obj_align(s_obs_ring_status_lbl, LV_ALIGN_TOP_LEFT, 6, 183);
+    lv_obj_set_width(s_obs_ring_status_lbl, LCD_H_RES - 12);
+    lv_label_set_long_mode(s_obs_ring_status_lbl, LV_LABEL_LONG_WRAP);
+
+    /* Info-only notice for devices without ring/locate */
+    if (!can_ring && !can_locate) {
+        lv_obj_t *info = lv_label_create(function_page);
+        lv_label_set_text(info, "No direct device actions available\nfor this device type.");
+        lv_obj_set_style_text_font(info, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(info, ui_muted_color(), 0);
+        lv_obj_set_style_text_align(info, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(info, LCD_H_RES - 12);
+        lv_obj_align(info, LV_ALIGN_TOP_MID, 0, btn_y);
+    }
 }
 
 static void espnow_stop(void)
