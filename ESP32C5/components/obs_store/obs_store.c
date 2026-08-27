@@ -195,6 +195,17 @@ obs_record_t *obs_store_add(obs_store_t *store, const obs_record_t *rec)
     return dst;
 }
 
+bool obs_record_ev_add(obs_record_t *rec, uint8_t ev)
+{
+    if (!rec) return false;
+    for (uint8_t i = 0; i < rec->evidence_count; i++) {
+        if (rec->evidence[i] == ev) return false;
+    }
+    if (rec->evidence_count >= OBS_MAX_EVIDENCE) return false;
+    rec->evidence[rec->evidence_count++] = ev;
+    return true;
+}
+
 uint32_t obs_store_count(const obs_store_t *store)
 {
     return store ? store->count : 0;

@@ -807,6 +807,14 @@ static gps_data_t g_gps_last_known = {0};  // persists across GPS dropouts; load
 // Passive observation store — PSRAM-backed ring buffer; shared by WiFi and BLE adapters below.
 static obs_store_t      g_obs_store;
 static obs_registry_t  *g_obs_registry = NULL;  /* built-in detector registry, init in app_main */
+#define OBS_EXPORT_DIR   "/sdcard/lab/obs"
+#define OBS_UI_MAX_SHOWN 64                      /* max cards rendered in the Passive Log screen */
+
+// Passive Log screen UI state (managed by show_obs_store_screen / obs_store_screen_stop)
+static lv_obj_t   *s_obs_list       = NULL;
+static lv_obj_t   *s_obs_status_lbl = NULL;
+static lv_timer_t *s_obs_tmr        = NULL;
+static uint32_t    s_obs_last_count  = UINT32_MAX;  /* dirty-check: rebuild list only when count changes */
 #define GPS_STALE_ACCURACY_M 150.0f         // ~city block; used when position is held from last fix
 // Set by GPS task when a new valid fix arrives; main loop calls nvs_save_last_gps() from
 // main-task context to avoid nvs_commit() disabling flash cache in a background task.
@@ -3144,6 +3152,7 @@ static void drone_row_tap_cb(lv_event_t *e);
 static void show_wifi_analyzer_screen(void);
 static void show_wscope_screen(void);
 static void wscope_task(void *p);
+static void show_obs_store_screen(void);
 static void show_espnow_scout_screen(void);
 static void espnow_scout_stop(void);
 static void espnow_rebuild_list(void);
@@ -7098,7 +7107,11 @@ void app_main(void)
                         obs.hit_count   = 1;
                         if (ap->ssid[0]) strncpy(obs.label, (const char *)ap->ssid, sizeof(obs.label) - 1);
                         if (g_obs_registry) obs_registry_run(g_obs_registry, &obs);
-                        obs_store_add(&g_obs_store, &obs);
+                        {
+                            obs_record_t *stored = obs_store_add(&g_obs_store, &obs);
+                            if (stored && stored->hit_count > 1)
+                                obs_record_ev_add(stored, (uint8_t)OBS_EV_RECURRENCE);
+                        }
                     }
                 }
 
@@ -7491,7 +7504,11 @@ void app_main(void)
                         else if (dev->is_bthome)          strncpy(obs.label, "BTHome",    sizeof(obs.label) - 1);
                     }
                     if (g_obs_registry) obs_registry_run(g_obs_registry, &obs);
-                    obs_store_add(&g_obs_store, &obs);
+                    {
+                        obs_record_t *stored = obs_store_add(&g_obs_store, &obs);
+                        if (stored && stored->hit_count > 1)
+                            obs_record_ev_add(stored, (uint8_t)OBS_EV_RECURRENCE);
+                    }
                 }
             }
 
@@ -15227,6 +15244,8 @@ static void main_tile_event_cb(lv_event_t *e)
         show_wifi_analyzer_screen();
     } else if (strcmp(tile_name, "WiFi Scope") == 0) {
         show_wscope_screen();
+    } else if (strcmp(tile_name, "Passive Log") == 0) {
+        show_obs_store_screen();
     } else if (strcmp(tile_name, "ESP-NOW Scout") == 0) {
         show_espnow_scout_screen();
     } else if (strcmp(tile_name, "WiFi Capture") == 0) {
@@ -18996,6 +19015,8 @@ static void show_wifi_menu_screen(void)
     (void)espnow_tile;
     lv_obj_t *wcap_tile = create_tile(tiles, LV_SYMBOL_DOWNLOAD, "WiFi\nCapture", lv_color_hex(0x00695C), main_tile_event_cb, "WiFi Capture");
     (void)wcap_tile;
+    lv_obj_t *obslog_tile = create_tile(tiles, MY_SYMBOL_DATABASE, "Passive\nLog", lv_color_hex(0x311B92), main_tile_event_cb, "Passive Log");
+    (void)obslog_tile;
 }
 
 // WiFi Sniff & Karma screen
@@ -24413,6 +24434,7 @@ static const sd_provision_item_t SD_ITEMS[] = {
     { SD_ITEM_DIR,  "/sdcard/lab/zwave",                     NULL },  /* Z-Wave Scout capture CSV */
     { SD_ITEM_DIR,  "/sdcard/lab/tpms",                      NULL },  /* TPMS Monitor Schrader CSV captures */
     { SD_ITEM_DIR,  "/sdcard/lab/espnow",                    NULL },  /* ESP-NOW Scout device export JSON + pktlog */
+    { SD_ITEM_DIR,  "/sdcard/lab/obs",                       NULL },  /* Passive Log JSONL exports (obs_store) */
     { SD_ITEM_DIR,  "/sdcard/lab/rfid",                      NULL },  /* RFID/NFC card dumps (root) */
     { SD_ITEM_DIR,  "/sdcard/lab/rfid/lf",                  NULL },  /* LF cards (.rfid — EM410X, HID) */
     { SD_ITEM_DIR,  "/sdcard/lab/rfid/hf",                  NULL },  /* HF cards (.nfc — NTAG, MFC, UL) */
@@ -57433,6 +57455,251 @@ static void espnow_refresh_cb(lv_timer_t *t)
 
 /* ── Button callbacks ────────────────────────────────────────────────────────── */
 // Teardown-only stop hook (top-bar ‹ Back / Home invoke it via g_screen_stop_fn).
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Passive Log screen — read-only view of the obs_store ring buffer.
+ *
+ * Displays the most recent OBS_UI_MAX_SHOWN records with confidence scores,
+ * evidence tags, signal strength, and hit counts.  Classified records
+ * (confidence > 0) are shown first.  A 2-second timer refreshes the list
+ * when the record count changes.  Export writes all records as JSONL to
+ * /sdcard/lab/obs/ using obs_record_to_json().
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Stop hook — called by nav stack on Back/Home.  Deletes timer, NULLs pointers. */
+static void obs_store_screen_stop(void)
+{
+    if (s_obs_tmr) { lv_timer_del(s_obs_tmr); s_obs_tmr = NULL; }
+    s_obs_list        = NULL;
+    s_obs_status_lbl  = NULL;
+    s_obs_last_count  = UINT32_MAX;
+}
+
+/* Rebuild the scrollable record list.  Called from the refresh timer and on open. */
+static void obs_store_rebuild_list(void)
+{
+    if (!s_obs_list || !lv_obj_is_valid(s_obs_list)) return;
+    lv_obj_clean(s_obs_list);
+
+    uint32_t total = g_obs_store.count;
+    if (total == 0) {
+        lv_obj_t *empty = lv_label_create(s_obs_list);
+        lv_label_set_text(empty, "No observations yet.\nRun WiFi Scan or BLE Scan first.");
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(empty, ui_muted_color(), 0);
+        lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(empty, lv_pct(100));
+        return;
+    }
+
+    /* Collect up to OBS_UI_MAX_SHOWN indices: classified first, then unclassified. */
+    uint32_t idx[OBS_UI_MAX_SHOWN];
+    uint32_t nshow = 0;
+
+    /* Pass 1: classified (confidence > 0) */
+    for (uint32_t i = total; i > 0 && nshow < OBS_UI_MAX_SHOWN; i--) {
+        if (g_obs_store.records[i - 1].confidence > 0)
+            idx[nshow++] = i - 1;
+    }
+    /* Pass 2: fill remaining slots with unclassified, newest first */
+    for (uint32_t i = total; i > 0 && nshow < OBS_UI_MAX_SHOWN; i--) {
+        if (g_obs_store.records[i - 1].confidence == 0) {
+            /* Check not already included (only needed if we had > MAX classified) */
+            bool dup = false;
+            for (uint32_t k = 0; k < nshow; k++) { if (idx[k] == i - 1) { dup = true; break; } }
+            if (!dup) idx[nshow++] = i - 1;
+        }
+    }
+
+    static const char *ev_names[] = { "", "OUI", "SVC", "MFR", "SSID", "RATE!", "RSSI!", "REC" };
+
+    for (uint32_t j = 0; j < nshow; j++) {
+        obs_record_t r = g_obs_store.records[idx[j]];   /* local copy under lvgl_mutex */
+
+        /* Border color reflects classification confidence */
+        lv_color_t border_col;
+        if      (r.confidence >= 80) border_col = lv_color_hex(0x4CAF50);
+        else if (r.confidence >= 50) border_col = lv_color_hex(0xFFA726);
+        else if (r.confidence >  0)  border_col = lv_color_hex(0x546E7A);
+        else                         border_col = lv_color_hex(0x37474F);
+
+        lv_obj_t *card = lv_obj_create(s_obs_list);
+        lv_obj_set_size(card, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_pad_top(card, 3, 0);
+        lv_obj_set_style_pad_bottom(card, 3, 0);
+        lv_obj_set_style_pad_left(card, 5, 0);
+        lv_obj_set_style_pad_right(card, 5, 0);
+        lv_obj_set_style_pad_gap(card, 1, 0);
+        lv_obj_set_style_radius(card, 4, 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_border_color(card, border_col, 0);
+        lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+
+        /* Row 1: [W]/[B] badge + label/MAC + peak RSSI */
+        bool is_ble = (r.obs_type == (uint8_t)OBS_TYPE_BLE_ADV ||
+                       r.obs_type == (uint8_t)OBS_TYPE_BLE_EXT);
+        char r1[64];
+        if (r.label[0]) {
+            snprintf(r1, sizeof(r1), "%s %-19s%4ddBm",
+                     is_ble ? "[B]" : "[W]", r.label, r.rssi_cur);
+        } else {
+            snprintf(r1, sizeof(r1), "%s %02X:%02X:%02X:%02X:%02X:%02X %4ddBm",
+                     is_ble ? "[B]" : "[W]",
+                     r.mac[0], r.mac[1], r.mac[2], r.mac[3], r.mac[4], r.mac[5],
+                     r.rssi_cur);
+        }
+        lv_obj_t *l1 = lv_label_create(card);
+        lv_label_set_text(l1, r1);
+        lv_obj_set_style_text_font(l1, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l1, ui_text_color(), 0);
+        lv_label_set_long_mode(l1, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(l1, lv_pct(100));
+
+        /* Row 2: evidence tags + confidence + hit count */
+        char r2[64];
+        int r2_off = 0;
+        for (uint8_t ei = 0; ei < r.evidence_count && ei < OBS_MAX_EVIDENCE; ei++) {
+            uint8_t ev = r.evidence[ei];
+            if (ev > 0 && ev < 8)
+                r2_off += snprintf(r2 + r2_off, (int)sizeof(r2) - r2_off, "%s ", ev_names[ev]);
+        }
+        if (r.confidence > 0)
+            snprintf(r2 + r2_off, (int)sizeof(r2) - r2_off, "c:%u  %ux", r.confidence, r.hit_count);
+        else
+            snprintf(r2 + r2_off, (int)sizeof(r2) - r2_off, "%ux", r.hit_count);
+
+        lv_obj_t *l2 = lv_label_create(card);
+        lv_label_set_text(l2, r2);
+        lv_obj_set_style_text_font(l2, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l2,
+            r.confidence > 0 ? lv_color_hex(0x80CBC4) : ui_muted_color(), 0);
+        lv_label_set_long_mode(l2, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(l2, lv_pct(100));
+    }
+}
+
+/* 2-second refresh timer: updates status label and rebuilds list on count change. */
+static void obs_store_refresh_cb(lv_timer_t *t)
+{
+    (void)t;
+    uint32_t cnt = g_obs_store.count;
+
+    if (s_obs_status_lbl && lv_obj_is_valid(s_obs_status_lbl)) {
+        uint32_t classified = 0;
+        for (uint32_t i = 0; i < cnt; i++) {
+            if (g_obs_store.records[i].confidence > 0) classified++;
+        }
+        char buf[64];
+        if (g_obs_store.overflow > 0)
+            snprintf(buf, sizeof(buf), "%lu records | %lu classified | +%lu dropped",
+                     (unsigned long)cnt, (unsigned long)classified,
+                     (unsigned long)g_obs_store.overflow);
+        else
+            snprintf(buf, sizeof(buf), "%lu records | %lu classified",
+                     (unsigned long)cnt, (unsigned long)classified);
+        lv_label_set_text(s_obs_status_lbl, buf);
+    }
+
+    if (cnt != s_obs_last_count) {
+        s_obs_last_count = cnt;
+        obs_store_rebuild_list();
+    }
+}
+
+/* Export all records to /sdcard/lab/obs/obs_TIMESTAMP.jsonl (one JSON object per line). */
+static void obs_store_export_jsonl(lv_event_t *e)
+{
+    (void)e;
+    ensure_sd_mounted();
+
+    struct stat st;
+    if (stat(OBS_EXPORT_DIR, &st) != 0) mkdir(OBS_EXPORT_DIR, 0775);
+
+    char path[80];
+    time_t now_t = 0;
+    time(&now_t);
+    struct tm *tm_info = localtime(&now_t);
+    if (tm_info && now_t > 1000000) {
+        snprintf(path, sizeof(path), OBS_EXPORT_DIR "/obs_%04d%02d%02d_%02d%02d%02d.jsonl",
+                 tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
+                 tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
+    } else {
+        snprintf(path, sizeof(path), OBS_EXPORT_DIR "/obs_%llu.jsonl",
+                 (unsigned long long)(esp_timer_get_time() / 1000000LL));
+    }
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        if (s_obs_status_lbl && lv_obj_is_valid(s_obs_status_lbl))
+            lv_label_set_text(s_obs_status_lbl, "Export failed - check SD card");
+        return;
+    }
+
+    char jbuf[320];
+    uint32_t written = 0;
+    for (uint32_t i = 0; i < g_obs_store.count; i++) {
+        if (obs_record_to_json(&g_obs_store.records[i], jbuf, sizeof(jbuf)) > 0) {
+            fprintf(f, "%s\n", jbuf);
+            written++;
+        }
+    }
+    fclose(f);
+
+    if (s_obs_status_lbl && lv_obj_is_valid(s_obs_status_lbl)) {
+        char buf[80];
+        snprintf(buf, sizeof(buf), "Exported %lu records to SD", (unsigned long)written);
+        lv_label_set_text(s_obs_status_lbl, buf);
+    }
+    ESP_LOGI(TAG, "obs_store: exported %lu records to %s", (unsigned long)written, path);
+}
+
+/* Main screen builder. */
+static void show_obs_store_screen(void)
+{
+    create_function_page_base("Passive Log");
+    g_screen_stop_fn = obs_store_screen_stop;
+    g_screen_back_fn = show_wifi_menu_screen;
+    apply_menu_bg();
+
+    /* Status bar */
+    s_obs_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_obs_status_lbl, "Loading...");
+    lv_obj_set_style_text_font(s_obs_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_obs_status_lbl, ui_muted_color(), 0);
+    lv_obj_align(s_obs_status_lbl, LV_ALIGN_TOP_LEFT, 4, 32);
+    lv_obj_set_width(s_obs_status_lbl, LCD_H_RES - 8);
+    lv_label_set_long_mode(s_obs_status_lbl, LV_LABEL_LONG_CLIP);
+
+    /* Export button */
+    lv_obj_t *exp_btn = lv_btn_create(function_page);
+    lv_obj_set_size(exp_btn, 120, 26);
+    lv_obj_align(exp_btn, LV_ALIGN_TOP_RIGHT, -4, 28);
+    lv_obj_set_style_bg_color(exp_btn, lv_color_hex(0x311B92), 0);
+    lv_obj_set_style_radius(exp_btn, 4, 0);
+    lv_obj_add_event_cb(exp_btn, obs_store_export_jsonl, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *exp_lbl = lv_label_create(exp_btn);
+    lv_label_set_text(exp_lbl, "Export JSONL");
+    lv_obj_set_style_text_font(exp_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(exp_lbl);
+
+    /* Scrollable record list — fills remaining vertical space */
+    s_obs_list = lv_obj_create(function_page);
+    lv_obj_set_size(s_obs_list, LCD_H_RES - 8, LCD_V_RES - 62);
+    lv_obj_align(s_obs_list, LV_ALIGN_BOTTOM_MID, 0, -2);
+    lv_obj_set_style_bg_opa(s_obs_list, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_obs_list, 0, 0);
+    lv_obj_set_style_pad_all(s_obs_list, 2, 0);
+    lv_obj_set_style_pad_gap(s_obs_list, 3, 0);
+    lv_obj_set_flex_flow(s_obs_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scrollbar_mode(s_obs_list, LV_SCROLLBAR_MODE_AUTO);
+
+    /* Initial populate and status */
+    obs_store_refresh_cb(NULL);
+
+    s_obs_tmr = lv_timer_create(obs_store_refresh_cb, 2000, NULL);
+}
+
 static void espnow_stop(void)
 {
     espnow_scout_stop();

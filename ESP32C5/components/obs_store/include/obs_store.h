@@ -204,6 +204,10 @@ uint32_t obs_store_overflow(const obs_store_t *store);
  */
 int obs_record_to_json(const obs_record_t *rec, char *buf, size_t buflen);
 
+/* Add an evidence tag to rec if not already present and space permits.
+ * Returns true if added, false if already present or evidence[] is full. */
+bool obs_record_ev_add(obs_record_t *rec, uint8_t ev);
+
 /* ── Detector registry interface ────────────────────────────────────────── */
 /*
  * Detectors are registered by pointer; they are not dynamically allocated.
