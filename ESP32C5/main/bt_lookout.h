@@ -20,7 +20,7 @@
 #include <stdbool.h>
 
 /* ── Constants ─────────────────────────────────────────────────── */
-#define BT_LOOKOUT_MAX_ENTRIES    64
+#define BT_LOOKOUT_MAX_ENTRIES    16
 #define BT_LOOKOUT_MAX_COOLDOWN   16
 #define BT_LOOKOUT_CSV_PATH       "/sdcard/lab/bluetooth/lookout.csv"
 #define BT_LOOKOUT_CSV_HEADER     "mac,name,rssi_threshold,oui_only\n"

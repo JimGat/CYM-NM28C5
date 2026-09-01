@@ -64,12 +64,12 @@ static const ble_uuid128_t s_nus_rx_uuid = BLE_UUID128_INIT(
 /* ── Frame codec constants ───────────────────────────────────────────────── */
 #define CHAM_SOF         0x11U
 #define CHAM_LRC1        0xEFU   /* lrc([0x11]) = (0x100 - 0x11) & 0xFF */
-#define CHAM_MAX_PAYLOAD 4096
+#define CHAM_MAX_PAYLOAD 1024
 #define CHAM_MAX_FRAME   (9 + CHAM_MAX_PAYLOAD + 1)
 #define CHAM_CMD_TIMEOUT_US (3000000LL)  /* 3 s per command */
 
 /* ── RX ring buffer ──────────────────────────────────────────────────────── */
-#define CHAM_RX_RING_SIZE 4200   /* > CHAM_MAX_FRAME for headroom */
+#define CHAM_RX_RING_SIZE 1100   /* > CHAM_MAX_FRAME (1034) for headroom — CYD port: 4200→1100 saves 3KB DRAM */
 
 static uint8_t  s_rx_ring[CHAM_RX_RING_SIZE];
 static volatile int s_rx_wr = 0;  /* NimBLE task writes */
@@ -583,13 +583,8 @@ static int s_scan_gap_cb(struct ble_gap_event *event, void *arg)
     ble_addr_t     addr     = {0};
     int8_t         rssi     = 0;
 
-    if (event->type == BLE_GAP_EVENT_EXT_DISC) {
-        const struct ble_gap_ext_disc_desc *d = &event->ext_disc;
-        adv_data = d->data;
-        adv_len  = (uint8_t)(d->length_data < 255 ? d->length_data : 255);
-        addr     = d->addr;
-        rssi     = d->rssi;
-    } else if (event->type == BLE_GAP_EVENT_DISC) {
+    /* CYD port: legacy scan only delivers DISC events (no EXT_DISC). */
+    if (event->type == BLE_GAP_EVENT_DISC) {
         const struct ble_gap_disc_desc *d = &event->disc;
         adv_data = d->data;
         adv_len  = d->length_data;
@@ -598,12 +593,10 @@ static int s_scan_gap_cb(struct ble_gap_event *event, void *arg)
     } else if (event->type == BLE_GAP_EVENT_DISC_COMPLETE) {
         /* Restart if still scanning (fires on timeout or external cancel) */
         if (s_state == CHAM_STATE_SCANNING) {
-            struct ble_gap_ext_disc_params ep = {
+            struct ble_gap_disc_params ep = {
                 .itvl = 0x60, .window = 0x60, .passive = 0,
             };
-            ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 500, 0,
-                             0, BLE_HCI_SCAN_FILT_NO_WL, 0,
-                             &ep, NULL, s_scan_gap_cb, NULL);
+            ble_gap_disc(BLE_OWN_ADDR_PUBLIC, 500, &ep, s_scan_gap_cb, NULL);
         }
         return 0;
     } else {
@@ -739,18 +732,15 @@ void cham_scan_start(void)
     s_connect_idx = -1;
     memset(s_scan_results, 0, sizeof(s_scan_results));
 
-    /* Use extended discovery — catches both BLE 5 extended PDUs and legacy PDUs.
-     * ble_gap_disc() (legacy only) misses devices that advertise via extended PDUs. */
-    struct ble_gap_ext_disc_params ep = {
+    /* CYD port: classic ESP32 has no extended advertising — use legacy discovery. */
+    struct ble_gap_disc_params ep = {
         .itvl = 0x60, .window = 0x60, .passive = 0,
     };
 
     /* Cancel any ongoing scan before starting ours */
     ble_gap_disc_cancel();
 
-    int rc = ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 500, 0,
-                              0, BLE_HCI_SCAN_FILT_NO_WL, 0,
-                              &ep, NULL, s_scan_gap_cb, NULL);
+    int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, 500, &ep, s_scan_gap_cb, NULL);
     if (rc == 0 || rc == BLE_HS_EALREADY) {
         s_state = CHAM_STATE_SCANNING;
         strlcpy(s_status_msg, "Scanning...", sizeof(s_status_msg));

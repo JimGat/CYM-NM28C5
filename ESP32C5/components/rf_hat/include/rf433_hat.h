@@ -23,11 +23,11 @@
 #include <stdbool.h>
 
 // ── Limits ───────────────────────────────────────────────────────────────────
-#define RF433_HAT_MAX_PULSES       512   // max pulse entries per signal
+#define RF433_HAT_MAX_PULSES       128   // max pulse entries per signal
 #define RF433_HAT_NAME_LEN         32    // signal name max length (incl. null)
 #define RF433_HAT_REMOTE_NAME_LEN  48    // remote dir basename max length
-#define RF433_HAT_MAX_REMOTES      32    // max remote dirs listed at once
-#define RF433_HAT_MAX_SIGNALS      64    // max signals listed per remote dir
+#define RF433_HAT_MAX_REMOTES      16    // max remote dirs listed at once
+#define RF433_HAT_MAX_SIGNALS      32    // max signals listed per remote dir
 #define RF433_HAT_SAVE_EXT         ".sub"
 
 // Default 433.92 MHz — the OOK module is fixed-frequency.

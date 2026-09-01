@@ -22,7 +22,7 @@
 #include <stdbool.h>
 
 // ── Limits ───────────────────────────────────────────────────────────────────
-#define IR_HAT_MAX_TIMINGS       1024  // max mark/space entries per signal (matches Flipper)
+#define IR_HAT_MAX_TIMINGS       256   // CYD port: 1024→512→256 (each ir_signal_t 4KB→1.1KB; saves ~12KB DRAM across the 4 static signal buffers)
 #define IR_HAT_NAME_LEN          32    // signal name max length (incl. null)
 #define IR_HAT_REMOTE_NAME_LEN   64    // remote file basename max length (no path/ext)
 #define IR_HAT_MAX_REMOTES       32    // max .ir files listed at once

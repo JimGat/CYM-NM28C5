@@ -6,7 +6,7 @@
 #include "freertos/semphr.h"
 #include "wifi_common.h"
 
-#define BD_MAX_SCRIPTS 32
+#define BD_MAX_SCRIPTS 8
 
 typedef const gps_data_t *(*bd_gps_fn_t)(void);
 

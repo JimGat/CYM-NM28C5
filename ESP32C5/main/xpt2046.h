@@ -58,12 +58,14 @@ typedef struct {
 // ─── API ─────────────────────────────────────────────────────────────────────
 
 /**
- * @brief Attach XPT2046 to an already-initialised SPI host.
- *        Must be called AFTER spi_bus_initialize().
+ * @brief Initialise the XPT2046 touch controller via GPIO bit-banged SPI.
+ *        (CYD2USB: hardware SPI does not work on this board — the touch is
+ *        bit-banged on CLK=25/MOSI=32/MISO=39, per the witnessmenow CYD
+ *        reference implementation.) The @p host parameter is ignored.
  *
  * @param handle     Pointer to caller-allocated handle struct
- * @param host       SPI host (same host as display, e.g. SPI2_HOST)
- * @param cs_gpio    Chip-select GPIO (TOUCH_CS = GPIO 1)
+ * @param host       Ignored (kept for API compatibility)
+ * @param cs_gpio    Chip-select GPIO (TOUCH_CS = GPIO 33)
  * @param screen_w   Screen width in pixels  (LCD_H_RES)
  * @param screen_h   Screen height in pixels (LCD_V_RES)
  */

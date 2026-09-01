@@ -731,30 +731,22 @@ static void bd_ext_adv_start(int persona_idx)
     ESP_LOGI(TAG, "bd_ext_adv_start: persona=%d ('%s') synced=%d",
              persona_idx, s_personas[persona_idx].name, ble_hs_synced());
 
-    ble_gap_ext_adv_stop(BD_ADV_INSTANCE);
+    /* CYD port: classic ESP32 controller has no extended advertising — use legacy adv. */
+
+    ble_gap_adv_stop();
 
     ble_svc_gap_device_name_set(s_personas[persona_idx].name);
     ble_svc_gap_device_appearance_set(s_personas[persona_idx].appearance);
 
-    struct ble_gap_ext_adv_params p;
+    struct ble_gap_adv_params p;
     memset(&p, 0, sizeof(p));
-    p.connectable   = 1;
-    p.scannable     = 1;
-    p.legacy_pdu    = 1;
-    p.own_addr_type = BLE_OWN_ADDR_RANDOM;
-    p.primary_phy   = BLE_HCI_LE_PHY_1M;
-    p.secondary_phy = BLE_HCI_LE_PHY_1M;
-    p.itvl_min      = BLE_GAP_ADV_ITVL_MS(200);
-    p.itvl_max      = BLE_GAP_ADV_ITVL_MS(350);
-    p.sid           = BD_ADV_INSTANCE;
+    p.conn_mode = BLE_GAP_CONN_MODE_UND;
+    p.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    p.itvl_min  = BLE_GAP_ADV_ITVL_MS(200);
+    p.itvl_max  = BLE_GAP_ADV_ITVL_MS(350);
 
-    int rc = ble_gap_ext_adv_configure(BD_ADV_INSTANCE, &p, NULL, bd_gap_cb, NULL);
-    if (rc != 0) { ESP_LOGE(TAG, "ext_adv_configure: rc=%d", rc); return; }
-
-    ble_addr_t rnd = { .type = BLE_ADDR_RANDOM };
-    memcpy(rnd.val, s_persona_addr[persona_idx], 6);
-    rc = ble_gap_ext_adv_set_addr(BD_ADV_INSTANCE, &rnd);
-    if (rc != 0) { ESP_LOGE(TAG, "ext_adv_set_addr: rc=%d", rc); return; }
+    int rc = ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER, &p, bd_gap_cb, NULL);
+    if (rc != 0 && rc != BLE_HS_EALREADY) { ESP_LOGE(TAG, "adv_start: rc=%d", rc); return; }
 
     /* Advertise name + appearance only — NO HID UUID in adv payload.
      * Omitting UUID 0x1812 prevents passive scanners from showing a generic HID icon;
@@ -768,23 +760,12 @@ static void bd_ext_adv_start(int persona_idx)
     f.appearance            = s_personas[persona_idx].appearance;
     f.appearance_is_present = 1;
 
-    struct os_mbuf *om = os_msys_get_pkthdr(BLE_HS_ADV_MAX_SZ, 0);
-    if (!om) { ESP_LOGE(TAG, "ext_adv: no mbuf"); return; }
+    rc = ble_gap_adv_set_fields(&f);
+    if (rc != 0) { ESP_LOGE(TAG, "adv_set_fields: rc=%d", rc); return; }
 
-    rc = ble_hs_adv_set_fields_mbuf(&f, om);
-    if (rc != 0) { os_mbuf_free_chain(om); ESP_LOGE(TAG, "set_fields: rc=%d", rc); return; }
-
-    rc = ble_gap_ext_adv_set_data(BD_ADV_INSTANCE, om);
-    if (rc != 0) { ESP_LOGE(TAG, "set_data: rc=%d", rc); return; }
-
-    rc = ble_gap_ext_adv_start(BD_ADV_INSTANCE, 0, 0);
-    if (rc == 0 || rc == BLE_HS_EALREADY) {
-        const uint8_t *a = s_persona_addr[persona_idx];
-        ESP_LOGI(TAG, "Advertising as '%s'  %02X:%02X:%02X:%02X:%02X:%02X",
-                 s_personas[persona_idx].name, a[5], a[4], a[3], a[2], a[1], a[0]);
-    } else {
-        ESP_LOGE(TAG, "ext_adv_start: rc=%d", rc);
-    }
+    const uint8_t *a = s_persona_addr[persona_idx];
+    ESP_LOGI(TAG, "Advertising as '%s'  %02X:%02X:%02X:%02X:%02X:%02X",
+             s_personas[persona_idx].name, a[5], a[4], a[3], a[2], a[1], a[0]);
 }
 
 // ── GAP callback ──────────────────────────────────────────────────────────────
@@ -926,7 +907,7 @@ void blueduck_stop(void)
     s_auto_rotate = false;
     s_executing   = false;
     esp_timer_stop(s_rot_timer);
-    ble_gap_ext_adv_stop(BD_ADV_INSTANCE);
+    ble_gap_adv_stop();
     if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;

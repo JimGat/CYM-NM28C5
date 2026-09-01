@@ -204,22 +204,32 @@ esp_err_t wifi_attacks_init_portal_html_buffer(void) {
         return ESP_OK;
     }
     
-    // Allocate 1MB buffer from PSRAM for large HTML files
+    // CYD port: try the full 1MB from PSRAM first (PORTAL_HTML_MAX_SIZE); if that
+    // fails (classic ESP32-2432S028R has no PSRAM), fall back to a much smaller
+    // internal-RAM buffer so portals still work for typical (<=~120KB) HTML.
     custom_portal_html = (char *)heap_caps_malloc(PORTAL_HTML_MAX_SIZE, MALLOC_CAP_SPIRAM);
     if (custom_portal_html == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate %d bytes from PSRAM for portal HTML buffer", PORTAL_HTML_MAX_SIZE);
-        return ESP_ERR_NO_MEM;
+        const size_t small = 128 * 1024;
+        custom_portal_html = (char *)heap_caps_malloc(small, MALLOC_CAP_8BIT);
+        if (custom_portal_html != NULL) {
+            ESP_LOGW(TAG, "No PSRAM — using %d-byte internal-RAM portal buffer", (int)small);
+            custom_portal_html_size = small;
+        } else {
+            ESP_LOGE(TAG, "Failed to allocate portal HTML buffer (PSRAM %d and internal %d bytes)",
+                     PORTAL_HTML_MAX_SIZE, (int)small);
+            return ESP_ERR_NO_MEM;
+        }
+    } else {
+        custom_portal_html_size = PORTAL_HTML_MAX_SIZE;
+        ESP_LOGI(TAG, "Portal HTML buffer allocated: %d bytes from PSRAM at %p", 
+                 PORTAL_HTML_MAX_SIZE, (void*)custom_portal_html);
     }
     
     custom_portal_html[0] = '\0';  // Initialize as empty string
-    custom_portal_html_size = PORTAL_HTML_MAX_SIZE;
     
-    ESP_LOGI(TAG, "Portal HTML buffer allocated: %d bytes from PSRAM at %p", 
-             PORTAL_HTML_MAX_SIZE, (void*)custom_portal_html);
-    
-    // Verify it's actually in PSRAM
+    // Verify allocation (PSRAM on C5, internal RAM on classic ESP32)
     if (heap_caps_get_allocated_size(custom_portal_html) > 0) {
-        ESP_LOGI(TAG, "Verified: Buffer is in PSRAM");
+        ESP_LOGI(TAG, "Verified: Portal HTML buffer allocated");
     }
     
     return ESP_OK;
