@@ -18,35 +18,39 @@ extern "C" {
 #endif
 
 // Maximum limits
-#define MAX_AP_CNT 128
-#define MAX_SCAN_RESULTS 128
-#define MAX_PROBES 200
-#define MAX_CLIENTS_PER_AP 50
-#define MAX_TARGET_BSSIDS 50
-#define MAX_WHITELIST_ENTRIES 150
-#define MAX_SNIFFER_APS 100
-#define MAX_PROBE_REQUESTS 200
+// CYD port (classic ESP32, no PSRAM): halved vs C5 to fit DRAM budget.
+// wifi_ap_record_t is 92B — MAX_SCAN_RESULTS 128→64 saves 5.9KB of static DRAM.
+#define MAX_AP_CNT 64
+// CYD port: 30 results (was 40) — saves 1KB static DRAM on 240x320 UI.
+#define MAX_SCAN_RESULTS 30
+#define MAX_PROBES 100
+#define MAX_CLIENTS_PER_AP 24
+#define MAX_TARGET_BSSIDS 24
+#define MAX_WHITELIST_ENTRIES 48
+#define MAX_SNIFFER_APS 48
+#define MAX_PROBE_REQUESTS 100
 #define DNS_PORT 53
 #define DNS_MAX_PACKET_SIZE 512
-#define MAX_HTML_FILES 20
-#define MAX_HTML_FILENAME 64
+#define MAX_HTML_FILES 12
+#define MAX_HTML_FILENAME 48
 
 // GPIO pins
-#define NEOPIXEL_GPIO 27
+#define NEOPIXEL_GPIO 27   // CYD has no WS2812 by default — wire one to GPIO27 or leave unconnected (harmless)
 #define LED_COUNT 1
 #define RMT_RES_HZ (10 * 1000 * 1000)
 
-// GPS UART pins — NM-CYD-C5 LP-UART
+// GPS UART pins — CYD: wire GPS TX->GPIO16(RX), GPS RX->GPIO17(TX) on P3 header
 #define GPS_UART_NUM UART_NUM_1
-#define GPS_TX_PIN 5
-#define GPS_RX_PIN 4
-#define GPS_BUF_SIZE 1024
+#define GPS_TX_PIN 17
+#define GPS_RX_PIN 16
+#define GPS_BUF_SIZE 512
 
-// SD Card SPI pins — NM-CYD-C5 (shares SPI2_HOST with display + touch)
-#define SD_MISO_PIN 2
-#define SD_MOSI_PIN 7
-#define SD_CLK_PIN  6
-#define SD_CS_PIN   10
+// SD Card SPI pins — ESP32-2432S028R (CYD, shares HSPI/SPI2_HOST with touch on stock board,
+// but on CYM-port the touch gets its own bus; SD keeps the classic CYD SPI2 pins)
+#define SD_MISO_PIN 19
+#define SD_MOSI_PIN 23
+#define SD_CLK_PIN  18
+#define SD_CS_PIN   5
 
 // Application states
 typedef enum {

@@ -28,7 +28,11 @@
 #include "os/os_mbuf.h"
 
 /* Janos porting: replace these two includes + ets_aes_* calls with your AES impl */
+#if CONFIG_IDF_TARGET_ESP32C5
 #include "esp32c5/rom/aes.h"   /* ets_aes_enable/disable/setkey_enc/block */
+#else
+#include "esp32/rom/aes.h"   /* same ets_aes_* ROM API on classic ESP32 */
+#endif
 
 static const char *TAG = "wp";
 
@@ -94,7 +98,7 @@ static void s_aes128_ecb_encrypt(const uint8_t key[16],
 {
     ets_aes_enable();
     ets_aes_setkey_enc(key, AES128);
-    ets_aes_block(in, out);
+    ets_aes_crypt(in, out);
     ets_aes_disable();
 }
 

@@ -15,6 +15,12 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 # Ensure linker option is applied IDF-wide to the final app link
 idf_build_set_property(LINK_OPTIONS "-Wl,-zmuldefs" APPEND)
 
+# picolibc specs pull in crt0.o with a stray .vectors section unless -nostartfiles
+# is passed at link time (IDF adds it to ldflags, which the link rule here does not
+# substitute). Without this, the .vectors orphan section shifts WindowVectors and
+# the xtensa linker fails with "bbci/j: cannot encode".
+idf_build_set_property(LINK_OPTIONS "-nostartfiles" APPEND)
+
 # Make 'main' headers (e.g., lvgl_memory.h) visible globally for components that include by name
 idf_build_set_property(COMPILE_OPTIONS "-I${CMAKE_SOURCE_DIR}/main" APPEND)
 
@@ -22,7 +28,7 @@ idf_build_set_property(COMPILE_OPTIONS "-I${CMAKE_SOURCE_DIR}/main" APPEND)
 # The codebase has pre-existing unused function warnings that should be cleaned up separately
 idf_build_set_property(COMPILE_OPTIONS "-Wno-error" APPEND)
 
-project(CYM-NM28C5)
+project(CYM-ESP32-CYD)
 
 # Expose PROJECT_VER as FW_VERSION compile definition so wifi_common.h picks it
 # up without a separate hardcoded string.  All translation units see this.
@@ -32,8 +38,8 @@ idf_build_set_property(COMPILE_DEFINITIONS "FW_VERSION=\"${PROJECT_VER}\"" APPEN
 idf_component_get_property(lwip_lib lwip COMPONENT_LIB)
 target_compile_definitions(${lwip_lib} PRIVATE IP_FORWARD_ALLOW_TX_ON_RX_NETIF=1)
 
-# ===== POST-BUILD: copy binaries to binaries-esp32c5 every build =====
-set(EXPORT_DIR "${CMAKE_SOURCE_DIR}/binaries-esp32c5")
+# ===== POST-BUILD: copy binaries to binaries-esp32-cyd every build =====
+set(EXPORT_DIR "${CMAKE_SOURCE_DIR}/binaries-esp32-cyd")
 file(MAKE_DIRECTORY "${EXPORT_DIR}")
 
 # gen_<PROJECT>_binary is the ESP-IDF target that produces the .bin file.
@@ -51,10 +57,10 @@ add_custom_command(
             "${EXPORT_DIR}/partition-table.bin"
     # Merge bootloader + partition table + firmware into one flat image.
     # Flash at 0x0000 with any flasher that accepts a full binary.
-    COMMAND python -m esptool --chip esp32c5 merge_bin
+    COMMAND python -m esptool --chip esp32 merge_bin
             -o "${EXPORT_DIR}/${CMAKE_PROJECT_NAME}-full.bin"
-            --flash_mode dio --flash_freq 80m --flash_size 16MB
-            0x2000  "${CMAKE_BINARY_DIR}/bootloader/bootloader.bin"
+            --flash_mode dio --flash_freq 80m --flash_size 4MB
+            0x0     "${CMAKE_BINARY_DIR}/bootloader/bootloader.bin"
             0x8000  "${CMAKE_BINARY_DIR}/partition_table/partition-table.bin"
             0x10000 "${CMAKE_BINARY_DIR}/${CMAKE_PROJECT_NAME}.bin"
     COMMENT "Copying firmware and generating merged full flash image in ${EXPORT_DIR}"

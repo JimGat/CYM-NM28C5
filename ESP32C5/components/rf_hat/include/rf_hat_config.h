@@ -42,49 +42,49 @@
 // Empirically confirmed: emitter (green LED) is on GPIO8, detector (blue LED) on GPIO9.
 // Swapped from initial guess: GPIO8=TX, GPIO9=RX.
 #ifndef RF_HAT_IR_TX_GPIO
-#define RF_HAT_IR_TX_GPIO    8   // FPC2 Pin 7 — emitter (confirmed by LED observation)
+#define RF_HAT_IR_TX_GPIO    26   // CYD free header pin (was C5 GPIO8)
 #endif
 #ifndef RF_HAT_IR_RX_GPIO
-#define RF_HAT_IR_RX_GPIO    9   // FPC2 Pin 9 — detector (confirmed by LED observation)
+#define RF_HAT_IR_RX_GPIO    27   // CYD free header pin (was C5 GPIO9)
 #endif
 
 // ── RF433 OOK/ASK (DIP 5) ────────────────────────────────────────────────────
 // 433_DT = OOK TX drive (ESP32→module), 433_DR = OOK RX output (module→ESP32)
 // Shares GPIO8/9 with IR via DIP-enforced power exclusion — swapped to match IR.
 #ifndef RF_HAT_RF433_TX_GPIO
-#define RF_HAT_RF433_TX_GPIO 8   // FPC2 Pin 7 — same net as IR_DT (TX)
+#define RF_HAT_RF433_TX_GPIO 26  // CYD free header pin (was C5 GPIO8)
 #endif
 #ifndef RF_HAT_RF433_RX_GPIO
-#define RF_HAT_RF433_RX_GPIO 9   // FPC2 Pin 9 — same net as IR_DR (RX)
+#define RF_HAT_RF433_RX_GPIO 27  // CYD free header pin (was C5 GPIO9)
 #endif
 
 // ── CC1101 Sub-GHz SPI (DIP 1) ───────────────────────────────────────────────
 // Shares SPI bus (GPIO2/6/7) with display and SD. CS and GDO0 on GPIO9/8.
 #ifndef RF_HAT_CC1101_CS_GPIO
-#define RF_HAT_CC1101_CS_GPIO    9   // IO27, FPC2 Pin 9 (CSN_CC1101)
+#define RF_HAT_CC1101_CS_GPIO    27  // CYD free header pin (was C5 GPIO9)
 #endif
 #ifndef RF_HAT_CC1101_GDO0_GPIO
-#define RF_HAT_CC1101_GDO0_GPIO  8   // IO22, FPC2 Pin 7 (GDO0_CC1101)
+#define RF_HAT_CC1101_GDO0_GPIO  26  // CYD free header pin (was C5 GPIO8)
 #endif
 
 // ── nRF24L01 SPI (DIP 2) ─────────────────────────────────────────────────────
 // CSN shares GPIO9 with CC1101 — DIP-exclusive so no bus conflict.
 // CE is GPIO8 (IO22 → NRF24_CE per schematic).
 #ifndef RF_HAT_NRF24_CS_GPIO
-#define RF_HAT_NRF24_CS_GPIO  9   // IO27, FPC2 Pin 9 (NRF24_CSN)
+#define RF_HAT_NRF24_CS_GPIO  27  // CYD free header pin (was C5 GPIO9)
 #endif
 #ifndef RF_HAT_NRF24_CE_GPIO
-#define RF_HAT_NRF24_CE_GPIO  8   // IO22, FPC2 Pin 7 (NRF24_CE)
+#define RF_HAT_NRF24_CE_GPIO  26  // CYD free header pin (was C5 GPIO8)
 #endif
 
 // ── PN532 NFC/RFID I2C (DIP 3) ───────────────────────────────────────────────
 // GPIO8 (IO22/FPC2 Pin 7) = SCL, GPIO9 (IO27/FPC2 Pin 9) = SDA.
 // Per hardware documentation and user testing with direct-connect module.
 #ifndef RF_HAT_PN532_SCL_GPIO
-#define RF_HAT_PN532_SCL_GPIO 8   // IO22, FPC2 Pin 7 — SCL
+#define RF_HAT_PN532_SCL_GPIO 26  // CYD free header pin (was C5 GPIO8) — SCL
 #endif
 #ifndef RF_HAT_PN532_SDA_GPIO
-#define RF_HAT_PN532_SDA_GPIO 9   // IO27, FPC2 Pin 9 — SDA
+#define RF_HAT_PN532_SDA_GPIO 27  // CYD free header pin (was C5 GPIO9) — SDA
 #endif
 
 // ── SD card directories created by rf_hat modules ────────────────────────────

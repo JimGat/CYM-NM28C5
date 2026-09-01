@@ -1,2 +1,7 @@
 CLAUDE.md
 HERMES.md
+
+# ESP-IDF build & flash artifacts
+build-esp32/
+binaries-esp32-cyd/
+sdkconfig-esp32c5-backup

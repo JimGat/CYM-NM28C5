@@ -244,6 +244,28 @@ esp_err_t wifi_wardrive_init_sd_ex(uint32_t freq_khz, bool format_if_failed) {
                  (unsigned)available, (unsigned)required_mem);
     }
 
+    // CYD port (classic ESP32): the display + touch use SPI3_HOST, so SPI2_HOST is
+    // free for the SD card. Make sure the SD SPI bus is initialised with the SD
+    // pins (MOSI=23, MISO=19, CLK=18) before mounting, otherwise sdspi mount
+    // fails with ESP_ERR_INVALID_STATE ("SPI bus may not be properly initialized").
+    {
+        spi_bus_config_t sdbuscfg = {
+            .mosi_io_num = SD_MOSI_PIN,
+            .miso_io_num = SD_MISO_PIN,
+            .sclk_io_num = SD_CLK_PIN,
+            .quadwp_io_num = -1,
+            .quadhd_io_num = -1,
+            .max_transfer_sz = 4096,
+        };
+        esp_err_t brc = spi_bus_initialize(SPI2_HOST, &sdbuscfg, SPI_DMA_CH_AUTO);
+        if (brc == ESP_OK) {
+            ESP_LOGI(TAG, "[SD] SPI2_HOST initialised for SD (MOSI=%d MISO=%d CLK=%d)",
+                     SD_MOSI_PIN, SD_MISO_PIN, SD_CLK_PIN);
+        } else if (brc != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "[SD] SPI2_HOST init returned %s (0x%x)", esp_err_to_name(brc), brc);
+        }
+    }
+
     ESP_LOGI(TAG, "[SD] Configuring mount parameters (fmt=%d)...", (int)format_if_failed);
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = format_if_failed,
