@@ -6548,19 +6548,24 @@ void app_main(void)
 
             boot_btn_prev_pressed = btn_pressed;
 
-            /* Touch-to-wake: hold top-right corner (x>=190, y<=40) for 5 s.
-             * Polled directly here rather than via LVGL indev — LVGL indev reads
-             * may not fire reliably while the display panel is off. */
+            /* Touch-to-wake: hold anywhere on screen for 5 s.
+             * Any sustained touch wakes from go dark — the entire screen is
+             * the wake zone. Corner-only was too easy to miss in practice. */
             {
                 static int64_t touch_wake_hold_ms = 0;
+                static uint32_t dark_touch_log_ctr = 0;
                 xpt2046_touch_point_t tp = {0};
-                bool in_zone = false;
-                if (xpt2046_read_touch(&touch_handle, &tp) && tp.touched)
-                    in_zone = (tp.x >= 190 && tp.y <= 40);
-                if (in_zone) {
-                    int64_t now_ms = (int64_t)(esp_timer_get_time() / 1000);
-                    if (touch_wake_hold_ms == 0) touch_wake_hold_ms = now_ms;
-                    if (now_ms - touch_wake_hold_ms >= 5000) {
+                bool touched = xpt2046_read_touch(&touch_handle, &tp) && tp.touched;
+                /* Diagnostic: log touch state every ~1 s (100 iters × 10 ms) */
+                if (++dark_touch_log_ctr >= 100) {
+                    dark_touch_log_ctr = 0;
+                    ESP_LOGI("GODARK", "touch_wake poll: touched=%d x=%u y=%u hold_ms=%lld",
+                             (int)touched, tp.x, tp.y, touch_wake_hold_ms);
+                }
+                if (touched) {
+                    int64_t t_now = (int64_t)(esp_timer_get_time() / 1000);
+                    if (touch_wake_hold_ms == 0) touch_wake_hold_ms = t_now;
+                    if (t_now - touch_wake_hold_ms >= 5000) {
                         touch_wake_hold_ms = 0;
                         go_dark_disable();
                     }
@@ -14452,7 +14457,7 @@ static void show_go_dark_confirm(void)
     lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
 
     lv_obj_t *hint = lv_label_create(card);
-    lv_label_set_text(hint, "Screen & LED off.\nAll ops continue.\n\nTo wake:\n- Double-click BOOT\n- Hold top-right corner\n  for 5 seconds");
+    lv_label_set_text(hint, "Screen & LED off.\nAll ops continue.\n\nTo wake:\n- Double-click BOOT\n- Hold screen 5 seconds");
     lv_obj_set_style_text_color(hint, ui_muted_color(), 0);
     lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
