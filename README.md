@@ -1667,7 +1667,7 @@ The live dashboard shows:
 
 **Waking from Go Dark:**
 - **Boot button** — press the physical BOOT button on the board.
-- **Touch-to-wake** — hold a finger on the top-right corner of the screen (where the power icon is) for about 1 second. Useful when the boot button is hard to reach inside a printed case.
+- **Touch-to-wake** — hold a finger on the top-right corner of the screen (where the power icon is) for about 5 seconds. Useful when the boot button is hard to reach inside a printed case.
 
 #### Mark Button — GPS Waypoints
 

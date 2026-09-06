@@ -8204,7 +8204,7 @@ void lvgl_touch_read_cb(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
         if (in_zone) {
             int64_t now_ms = esp_timer_get_time() / 1000;
             if (godark_hold_start_ms == 0) godark_hold_start_ms = now_ms;
-            if (now_ms - godark_hold_start_ms >= 800) {
+            if (now_ms - godark_hold_start_ms >= 5000) {
                 godark_hold_start_ms = 0;
                 go_dark_disable();
             }
@@ -35111,6 +35111,15 @@ static void show_ble_blaster_screen(void)
     s_blaster_tmr = lv_timer_create(s_blaster_timer_cb, 500, NULL);
 }
 
+/* Navigate to Passive Log from the BT Attacks menu.
+ * show_obs_store_screen() defaults back to WiFi menu; override to return here. */
+static void bt_passivelog_tile_cb(lv_event_t *e)
+{
+    (void)e;
+    show_obs_store_screen();
+    g_screen_back_fn = show_bt_attacks_screen;
+}
+
 static void show_bt_attacks_screen(void)
 {
     create_function_page_base("BT Attacks");
@@ -35144,6 +35153,9 @@ static void show_bt_attacks_screen(void)
 
     lv_obj_t *mitm_tile = create_tile(tiles, MY_SYMBOL_MASK, "BLE\nMITM", lv_color_make(160, 20, 20), NULL, NULL);
     lv_obj_add_event_cb(mitm_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE MITM");
+
+    lv_obj_t *plog_tile = create_tile(tiles, LV_SYMBOL_LIST, "Passive\nLog", lv_color_make(74, 20, 140), NULL, NULL);
+    lv_obj_add_event_cb(plog_tile, bt_passivelog_tile_cb, LV_EVENT_CLICKED, NULL);
 }
 
 // ============================================================================
@@ -41439,6 +41451,37 @@ static void found_tag_track_btn_cb(lv_event_t *e)
 /**
  * Show a scrollable list of detected AirTags and SmartTags with a Track button per entry
  */
+static void obs_ring_task(void *arg);  /* defined later; used by found_tag_ring_btn_cb */
+
+/* Ring a specific AirTag directly from the Found Tags list.
+ * Populates s_obs_detail_rec (mac + random-addr flag) and launches obs_ring_task.
+ * s_obs_ring_status_lbl is intentionally NULLed — ring runs silently since
+ * there is no status label widget in this screen context. */
+static void found_tag_ring_btn_cb(lv_event_t *e)
+{
+    int dev_idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (dev_idx < 0 || dev_idx >= bt_device_count) return;
+    bt_device_info_t *dev = &bt_devices[dev_idx];
+    if (s_obs_ring_task_hdl) return;  /* ring already in progress */
+
+    memset(&s_obs_detail_rec, 0, sizeof(s_obs_detail_rec));
+    memcpy(s_obs_detail_rec.mac, dev->addr, 6);
+    if (dev->addr_type != 0)
+        s_obs_detail_rec.flags |= OBS_FLAG_RANDOM_ADDR;
+    s_obs_ring_status_lbl = NULL;
+    s_obs_ring_cancel = false;
+    xTaskCreate(obs_ring_task, "obs_ring", 6144, NULL, 2, &s_obs_ring_task_hdl);
+}
+
+/* Navigate to GATT Walker for any tag in the Found Tags list.
+ * Back from GATT Walker returns to Found Tags. */
+static void found_tag_gatt_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    show_gatt_walker_screen();
+    g_screen_back_fn = show_found_tags_screen;
+}
+
 static void show_found_tags_screen(void)
 {
     // Pause the airtag scan update flag so list is stable while browsing
@@ -41525,10 +41568,20 @@ static void show_found_tags_screen(void)
         lv_obj_set_style_text_color(rssi_label, lv_color_make(176, 176, 176), 0);
         lv_obj_align(rssi_label, LV_ALIGN_TOP_RIGHT, -70, 0);
 
-        // Track button
-        lv_obj_t *track_btn = lv_btn_create(row);
-        lv_obj_set_size(track_btn, 60, 36);
-        lv_obj_align(track_btn, LV_ALIGN_TOP_RIGHT, 0, 4);
+        /* ── Action buttons (right column: Track / Ring / GATT Walk) ── */
+        lv_obj_t *btn_col = lv_obj_create(row);
+        lv_obj_set_size(btn_col, 62, LV_SIZE_CONTENT);
+        lv_obj_align(btn_col, LV_ALIGN_TOP_RIGHT, 0, 0);
+        lv_obj_set_style_bg_opa(btn_col, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(btn_col, 0, 0);
+        lv_obj_set_style_pad_all(btn_col, 0, 0);
+        lv_obj_set_style_pad_gap(btn_col, 3, 0);
+        lv_obj_clear_flag(btn_col, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(btn_col, LV_FLEX_FLOW_COLUMN);
+
+        /* Track */
+        lv_obj_t *track_btn = lv_btn_create(btn_col);
+        lv_obj_set_size(track_btn, 60, 26);
         lv_obj_set_style_bg_color(track_btn, COLOR_MATERIAL_BLUE, LV_STATE_DEFAULT);
         lv_obj_set_style_bg_color(track_btn, lv_color_lighten(COLOR_MATERIAL_BLUE, 50), LV_STATE_PRESSED);
         lv_obj_set_style_border_width(track_btn, 0, 0);
@@ -41539,6 +41592,36 @@ static void show_found_tags_screen(void)
         lv_obj_set_style_text_color(track_lbl, lv_color_white(), 0);
         lv_obj_center(track_lbl);
         lv_obj_add_event_cb(track_btn, found_tag_track_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+        /* Ring — AirTag only (SmartTag ring UUIDs TBD after GATT walk) */
+        if (dev->is_airtag) {
+            lv_obj_t *ring_btn = lv_btn_create(btn_col);
+            lv_obj_set_size(ring_btn, 60, 26);
+            lv_obj_set_style_bg_color(ring_btn, lv_color_make(200, 80, 0), LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(ring_btn, lv_color_lighten(lv_color_make(200, 80, 0), 50), LV_STATE_PRESSED);
+            lv_obj_set_style_border_width(ring_btn, 0, 0);
+            lv_obj_set_style_radius(ring_btn, 6, 0);
+            lv_obj_t *ring_lbl = lv_label_create(ring_btn);
+            lv_label_set_text(ring_lbl, "Ring");
+            lv_obj_set_style_text_font(ring_lbl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(ring_lbl, lv_color_white(), 0);
+            lv_obj_center(ring_lbl);
+            lv_obj_add_event_cb(ring_btn, found_tag_ring_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        }
+
+        /* GATT Walk — all tag types */
+        lv_obj_t *gatt_btn = lv_btn_create(btn_col);
+        lv_obj_set_size(gatt_btn, 60, 26);
+        lv_obj_set_style_bg_color(gatt_btn, lv_color_make(30, 130, 50), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(gatt_btn, lv_color_lighten(lv_color_make(30, 130, 50), 50), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(gatt_btn, 0, 0);
+        lv_obj_set_style_radius(gatt_btn, 6, 0);
+        lv_obj_t *gatt_lbl = lv_label_create(gatt_btn);
+        lv_label_set_text(gatt_lbl, "GATT");
+        lv_obj_set_style_text_font(gatt_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(gatt_lbl, lv_color_white(), 0);
+        lv_obj_center(gatt_lbl);
+        lv_obj_add_event_cb(gatt_btn, found_tag_gatt_btn_cb, LV_EVENT_CLICKED, NULL);
     }
 
     if (found == 0) {
