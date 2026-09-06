@@ -443,6 +443,16 @@ static int  s_mtu_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
 static void s_finish(void)
 {
     s_result->fingerprint = s_compute_fingerprint();
+
+    /* Filename built here (fingerprint now known), not at gw_walk() start:
+     * fingerprint FIRST field so a repeat device is obvious at a glance in
+     * the SD file list, ahead of timestamp + MAC (GH issue #16). */
+    snprintf(s_result->filepath, sizeof(s_result->filepath),
+             "/sdcard/lab/gattwalker/%08" PRIX32 "_%s_%02X%02X%02X%02X%02X%02X_gattwalk.json",
+             s_result->fingerprint, s_result->timestamp,
+             s_result->mac[5], s_result->mac[4], s_result->mac[3],
+             s_result->mac[2], s_result->mac[1], s_result->mac[0]);
+
     s_set_state(GW_STATE_SAVING);
     s_notify_ui("Saving results...");
     s_fire_event(GW_EVENT_READING); /* final reading-done event */
@@ -893,11 +903,7 @@ bool gw_walk(const uint8_t mac[6], uint8_t addr_type, const char *name,
     s_result->gps_valid = gps_valid;
 
     s_make_timestamp(s_result->timestamp, sizeof(s_result->timestamp));
-
-    snprintf(s_result->filepath, sizeof(s_result->filepath),
-             "/sdcard/lab/gattwalker/%s_%02X%02X%02X%02X%02X%02X_gattwalk.json",
-             s_result->timestamp,
-             mac[5], mac[4], mac[3], mac[2], mac[1], mac[0]);
+    /* filepath is built in s_finish() once the fingerprint is known (issue #16) */
 
     s_cancel_req     = false;
     s_conn_handle    = BLE_HS_CONN_HANDLE_NONE;
