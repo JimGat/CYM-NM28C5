@@ -826,6 +826,7 @@ static lv_obj_t      *s_obs_loc_status_lbl = NULL;
 static volatile bool  s_obs_ring_cancel    = false;       /* ring task cancel flag */
 static TaskHandle_t   s_obs_ring_task_hdl  = NULL;
 static lv_obj_t      *s_obs_ring_status_lbl = NULL;
+static lv_obj_t      *s_ring_status_popup   = NULL;
 
 // AirTag FMN sound service — from public Apple FMN accessory research.
 // TODO: confirm exact characteristic UUID and write value using GATT Walker on a live AirTag.
@@ -41457,10 +41458,21 @@ static void found_tag_track_btn_cb(lv_event_t *e)
  */
 static void obs_ring_task(void *arg);  /* defined later; used by found_tag_ring_btn_cb */
 
-/* Ring a specific AirTag directly from the Found Tags list.
- * Populates s_obs_detail_rec (mac + random-addr flag) and launches obs_ring_task.
- * s_obs_ring_status_lbl is intentionally NULLed — ring runs silently since
- * there is no status label widget in this screen context. */
+/* Polling timer — closes the ring status popup once the ring task exits. */
+static void ring_popup_close_cb(lv_timer_t *t)
+{
+    if (s_obs_ring_task_hdl != NULL) return;  /* still running */
+    if (s_ring_status_popup && lv_obj_is_valid(s_ring_status_popup)) {
+        lv_obj_del(s_ring_status_popup);
+        s_ring_status_popup = NULL;
+    }
+    s_obs_ring_status_lbl = NULL;
+    lv_timer_del(t);
+}
+
+/* Ring a tracker directly from the Found Tags list.
+ * Creates a floating status popup on lv_layer_top() so the ring task
+ * can report progress regardless of what screen is currently showing. */
 static void found_tag_ring_btn_cb(lv_event_t *e)
 {
     int dev_idx = (int)(intptr_t)lv_event_get_user_data(e);
@@ -41472,9 +41484,40 @@ static void found_tag_ring_btn_cb(lv_event_t *e)
     memcpy(s_obs_detail_rec.mac, dev->addr, 6);
     if (dev->addr_type != 0)
         s_obs_detail_rec.flags |= OBS_FLAG_RANDOM_ADDR;
-    s_obs_ring_status_lbl = NULL;
     s_obs_ring_cancel = false;
+
+    /* Build floating status popup on lv_layer_top() so it survives navigation. */
+    if (s_ring_status_popup && lv_obj_is_valid(s_ring_status_popup))
+        lv_obj_del(s_ring_status_popup);
+    s_ring_status_popup = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_ring_status_popup, 210, 80);
+    lv_obj_center(s_ring_status_popup);
+    lv_obj_set_style_bg_color(s_ring_status_popup, lv_color_make(28, 28, 30), 0);
+    lv_obj_set_style_bg_opa(s_ring_status_popup, LV_OPA_90, 0);
+    lv_obj_set_style_radius(s_ring_status_popup, 10, 0);
+    lv_obj_set_style_border_width(s_ring_status_popup, 1, 0);
+    lv_obj_set_style_border_color(s_ring_status_popup, lv_color_make(60, 60, 60), 0);
+    lv_obj_set_style_pad_all(s_ring_status_popup, 8, 0);
+    lv_obj_clear_flag(s_ring_status_popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(s_ring_status_popup);
+    lv_label_set_text(title, "Ring");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(title, lv_color_make(255, 149, 0), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *status_lbl = lv_label_create(s_ring_status_popup);
+    lv_label_set_text(status_lbl, "Connecting...");
+    lv_label_set_long_mode(status_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(status_lbl, 194);
+    lv_obj_set_style_text_font(status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(status_lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_align(status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(status_lbl, LV_ALIGN_BOTTOM_MID, 0, 0);
+    s_obs_ring_status_lbl = status_lbl;
+
     xTaskCreate(obs_ring_task, "obs_ring", 6144, NULL, 2, &s_obs_ring_task_hdl);
+    lv_timer_create(ring_popup_close_cb, 500, NULL);
 }
 
 /* Pre-target GATT Walker for a specific tag and navigate to the walk screen.
@@ -41498,6 +41541,8 @@ static void found_tag_gatt_btn_cb(lv_event_t *e)
         strncpy(bt_sas_target_name, "AirTag", sizeof(bt_sas_target_name) - 1);
     } else if (dev->is_smarttag) {
         strncpy(bt_sas_target_name, "SmartTag", sizeof(bt_sas_target_name) - 1);
+    } else if (dev->is_tile) {
+        strncpy(bt_sas_target_name, "Tile", sizeof(bt_sas_target_name) - 1);
     } else {
         strncpy(bt_sas_target_name, "Tag", sizeof(bt_sas_target_name) - 1);
     }
@@ -41534,7 +41579,7 @@ static void show_found_tags_screen(void)
     int found = 0;
     for (int i = 0; i < bt_device_count; i++) {
         bt_device_info_t *dev = &bt_devices[i];
-        if (!dev->is_airtag && !dev->is_smarttag && !dev->is_possible_airtag) continue;
+        if (!dev->is_airtag && !dev->is_smarttag && !dev->is_tile && !dev->is_possible_airtag) continue;
         found++;
 
         // Row container
@@ -41572,6 +41617,9 @@ static void show_found_tags_screen(void)
         } else if (dev->is_smarttag) {
             badge_text  = "SmartTag";
             badge_color = lv_color_make(90, 200, 250);
+        } else if (dev->is_tile) {
+            badge_text  = "Tile";
+            badge_color = lv_color_make(0, 180, 220);
         } else {
             badge_text  = "AirTag? (Proximity)";
             badge_color = lv_color_make(255, 214, 10);
