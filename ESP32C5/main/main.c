@@ -829,10 +829,12 @@ static lv_obj_t      *s_obs_ring_status_lbl = NULL;
 static lv_obj_t      *s_ring_status_popup   = NULL;
 
 // AirTag FMN sound service — from public Apple FMN accessory research.
-// TODO: confirm exact characteristic UUID and write value using GATT Walker on a live AirTag.
+// AirTag FMN sound service (confirmed via GATT Walker v2.13.35).
+// Non-owner ring (mechanism #2 / anti-stalking locator): single 0x01 byte.
+// The 3-byte owner format {0x01,0x00,0x03} returns ATT error 0x0D (invalid length).
 #define OBS_RING_FMN_SVC  "7DFC9000-7D1C-4951-86AA-8D9728F8D66C"
 #define OBS_RING_FMN_SND  "7DFC9001-7D1C-4951-86AA-8D9728F8D66C"
-static const uint8_t OBS_RING_PLAY_CMD[] = {0x01, 0x00, 0x03};
+static const uint8_t OBS_RING_PLAY_CMD[] = {0x01};
 
 // NimBLE 128-bit UUID bytes (little-endian, reversed from string representation)
 static const ble_uuid128_t s_obs_ring_fmn_svc_uuid = BLE_UUID128_INIT(
@@ -58422,10 +58424,23 @@ static void obs_ring_task(void *arg)
     if (s_obs_ring_gatt_rc == 0) {
         obs_ring_set_status("Sound command sent!");
     } else {
-        char buf[56]; snprintf(buf, sizeof(buf), "Write error (%d)\nTry GATT Walker to verify", s_obs_ring_gatt_rc);
+        /* Translate NimBLE ATT error (rc = 256 + att_code) to human text. */
+        const char *att_desc = "error";
+        if (s_obs_ring_gatt_rc >= 256) {
+            switch (s_obs_ring_gatt_rc - 256) {
+                case 0x03: att_desc = "write not permitted"; break;
+                case 0x05: att_desc = "auth required";       break;
+                case 0x08: att_desc = "authorization denied";break;
+                case 0x0D: att_desc = "wrong payload length";break;
+                case 0x0F: att_desc = "encryption required"; break;
+                default:   att_desc = "ATT error";           break;
+            }
+        }
+        char buf[72];
+        snprintf(buf, sizeof(buf), "Write error %d\n(%s)", s_obs_ring_gatt_rc, att_desc);
         obs_ring_set_status(buf);
     }
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    vTaskDelay(pdMS_TO_TICKS(3000));
 
 disconnect:
     if (s_obs_ring_conn_hdl != BLE_HS_CONN_HANDLE_NONE) {
