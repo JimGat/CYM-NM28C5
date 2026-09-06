@@ -41683,8 +41683,8 @@ static void show_found_tags_screen(void)
         lv_obj_center(track_lbl);
         lv_obj_add_event_cb(track_btn, found_tag_track_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
 
-        /* Ring — AirTag only (SmartTag ring UUIDs TBD after GATT walk) */
-        if (dev->is_airtag) {
+        /* Ring — AirTag + SmartTag: both implement FMN 7dfc9001, non-owner {0x01} confirmed */
+        if (dev->is_airtag || dev->is_smarttag) {
             lv_obj_t *ring_btn = lv_btn_create(btn_col);
             lv_obj_set_size(ring_btn, 60, 26);
             lv_obj_set_style_bg_color(ring_btn, lv_color_make(200, 80, 0), LV_STATE_DEFAULT);
