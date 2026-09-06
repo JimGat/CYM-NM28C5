@@ -1288,7 +1288,7 @@ static const int wd_dwell_table[WD_MODE_COUNT][4] = {
 
 // Speed thresholds (m/s) with hysteresis. 1 knot = 0.514 m/s.
 #define WD_SPEED_CAR_ENTER   5.556f   // 20 km/h
-#define WD_SPEED_CAR_EXIT    3.333f   // 12 km/h
+#define WD_SPEED_CAR_EXIT    2.222f   // 8 km/h (was 12 km/h: stop-and-go crawl sat right on it)
 #define WD_SPEED_WALK_ENTER  0.833f   // 3 km/h
 #define WD_SPEED_STAT_ENTER  0.556f   // 2 km/h
 #define WD_SPEED_HWY_ENTER   25.0f    // 90 km/h
@@ -1298,6 +1298,8 @@ static const int wd_dwell_table[WD_MODE_COUNT][4] = {
 #define WD_MODE_SLOW_DWELL_MS 15000   // longer settle for Walk<->Stationary only (GPS-jitter churn)
 #define WD_MODE_HWY_DWELL_MS  12000   // longer settle for Car<->Highway (overtaking spikes / traffic dips)
 #define WD_MODE_CAR_DWELL_MS  12000   // longer settle for Walk<->Car (stop-and-go crawl across the 12-20 km/h band)
+#define WD_CAR_SLOW_SUSTAIN_MS 20000  // Car may only step down after the speed has stayed
+                                      // below CAR_EXIT this long (see wd_classify_mode)
 // Car mode: visit DFS arms at most ~1 in this many D-UCB selections.
 // Highway rate-limits DFS harder still (DFS APs rarely repay a visit at speed).
 #define WD_CAR_DFS_SELECT_RATIO 10
@@ -1338,6 +1340,9 @@ static const char *wd_mode_icon(wd_mode_t m)
 static wd_mode_t g_wd_active_mode   = WD_MODE_STATIONARY;
 static float     g_wd_speed_ema     = 0.0f;
 static int64_t   g_wd_mode_since_us = 0;
+// Start of the current uninterrupted below-CAR_EXIT stretch while in Car mode
+// (0 = not currently slow). Only touched by wd_classify_mode.
+static int64_t   g_wd_car_slow_since_us = 0;
 
 // One-shot adaptive-mode transition event. Set by wd_classify_mode when a switch
 // is actually applied; drained by the wardrive loop into a per-session sidecar
@@ -1374,8 +1379,27 @@ static wd_mode_t wd_classify_mode(float raw_speed_ms)
             break;
         case WD_MODE_CAR:
             if (s >= WD_SPEED_HWY_ENTER)       next = WD_MODE_HIGHWAY;
-            else if (s < WD_SPEED_CAR_EXIT)
-                next = (s < WD_SPEED_WALK_ENTER) ? WD_MODE_STATIONARY : WD_MODE_WALK;
+            else if (s < WD_SPEED_CAR_EXIT) {
+                // Stop-and-go: a car legitimately crosses the WHOLE 8-20 km/h band on
+                // every creep, so an INSTANT threshold crossing (even gated by a dwell)
+                // cannot tell a 12 s traffic dip from parking and walking away - it only
+                // rate-limits the flapping. Lowering CAR_EXIT just moves where it flaps
+                // (2026-08-14 drive: exits moved from 11-12 to 6.4-8.0 km/h, still 30
+                // Walk<->Car flips in 90 min, 5 pairs sitting exactly on the 12 s floor).
+                // So require the low speed to be SUSTAINED before stepping down. Real
+                // crawls on that drive lasted >=47 s, spurious dips <=14 s.
+                // The timer keys on the CONDITION, not on the target mode, so a car
+                // decelerating 8 -> 3 -> 1 km/h does not restart it; the target is picked
+                // from the speed at the moment the window completes, which also lets a
+                // vehicle coming to a halt go straight to Stationary instead of emitting
+                // a phantom Walk segment on the way.
+                int64_t now_slow = esp_timer_get_time();
+                if (g_wd_car_slow_since_us == 0) g_wd_car_slow_since_us = now_slow;
+                if (now_slow - g_wd_car_slow_since_us >= WD_CAR_SLOW_SUSTAIN_MS * 1000LL)
+                    next = (s < WD_SPEED_WALK_ENTER) ? WD_MODE_STATIONARY : WD_MODE_WALK;
+            } else {
+                g_wd_car_slow_since_us = 0;   // re-accelerated: the stretch is over
+            }
             break;
         case WD_MODE_HIGHWAY:
             // Step down only to Car; Car then handles any further downshift.
@@ -1396,10 +1420,15 @@ static wd_mode_t wd_classify_mode(float raw_speed_ms)
         // damps it; Highway is only ever reached from Car and only steps back to Car,
         // so this pair is exactly Car<->Highway.
         bool hwy_pair  = (cur == WD_MODE_HIGHWAY || next == WD_MODE_HIGHWAY);
-        // Walk<->Car oscillates in stop-and-go traffic: speed swings across the whole
-        // 12-20 km/h Car band (CAR_EXIT..CAR_ENTER) so both thresholds get crossed every
-        // creep, flapping the mode every 5-13 s (seen on the 2026-08-12 city drive). A
-        // longer settle keeps Car params during brief crawls. This pair is ONLY
+        // Walk<->Car oscillates in stop-and-go traffic: speed swings across the Car band
+        // (CAR_EXIT..CAR_ENTER) so both thresholds get crossed every creep, flapping the
+        // mode every 5-13 s (seen on the 2026-08-12 city drive). The dwell alone only
+        // rate-limited it - every deceleration still crossed the old 12 km/h CAR_EXIT and
+        // flipped at the 12 s floor (2026-08-13 test: 10 of 26 flips sat exactly on it),
+        // so CAR_EXIT dropped to 8 km/h to widen the band. A longer settle keeps Car
+        // params during brief crawls. The Car->Walk direction is now additionally
+        // gated by WD_CAR_SLOW_SUSTAIN_MS above; this dwell still covers Walk->Car.
+        // This pair is ONLY
         // Walk<->Car: Stationary->Car (pull-away) and Car->Stationary (hard stop) are
         // excluded, so they stay responsive at WD_MODE_MIN_DWELL_MS.
         bool car_pair  = (cur  == WD_MODE_WALK || cur  == WD_MODE_CAR) &&
@@ -1411,6 +1440,7 @@ static wd_mode_t wd_classify_mode(float raw_speed_ms)
         if (now - g_wd_mode_since_us >= min_dwell_ms * 1000LL) {
             g_wd_active_mode   = next;
             g_wd_mode_since_us = now;
+            g_wd_car_slow_since_us = 0;   // fresh window on the next entry into Car
             ESP_LOGI(TAG, "[WDP] Adaptive mode -> %s (%.1f m/s)",
                      wd_mode_name(next), (double)s);
             g_wd_mode_evt.from     = cur;
@@ -10576,8 +10606,13 @@ static float wdp_gps_distance_m(float lat1, float lon1, float lat2, float lon2) 
 }
 
 static void wdp_clear_dedup_buffer(void) {
+    // Count only - deliberately NO memset. This runs in the promiscuous RX callback
+    // (WiFi task) while the wardrive task may be formatting a row out of this same
+    // buffer, and wiping it mid-format produced an all-zero CSV row (real MAC, then
+    // channel/RSSI/lat/lon all 0 - seen once in 12k rows on 2026-08-13). The memset was
+    // redundant anyway: nothing ever reads past wdp_seen_count, and every field of an
+    // entry is assigned on insert, so stale bytes are never visible.
     wdp_seen_count = 0;
-    memset(wdp_seen_networks, 0, sizeof(wdp_seen_networks));
     const gps_data_t *g = gps_best();
     wdp_last_gps_lat = g->valid ? g->latitude : 0.0f;
     wdp_last_gps_lon = g->valid ? g->longitude : 0.0f;
@@ -12511,36 +12546,46 @@ static void wardrive_promisc_task(void *pvParameters) {
         for (int i = 0; i < wdp_seen_count; i++) {
             if (wdp_seen_networks[i].written_to_file) continue;
             wdp_network_t *net = &wdp_seen_networks[i];
+            // Format from a private SNAPSHOT, never from the live slot: the promiscuous
+            // RX callback runs in the WiFi task and can clear (GPS moved 45.72 m) and
+            // refill this buffer at any point during the row below. Copying first shrinks
+            // that window from the whole fprintf down to one ~60-byte struct copy.
+            wdp_network_t snap = *net;
+            if (snap.channel == 0) continue;  // never a valid beacon; slot was mid-refill
 
             // Skip whitelisted networks (privacy filter: don't upload operator's own networks to WiGLE/WDG)
-            if (is_bssid_whitelisted(net->bssid) || is_ssid_whitelisted(net->ssid)) {
+            if (is_bssid_whitelisted(snap.bssid) || is_ssid_whitelisted(snap.ssid)) {
                 net->written_to_file = true;  // Mark as written to skip on future iterations
                 continue;
             }
 
             char mac_str[18];
             snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
-                     net->bssid[0], net->bssid[1], net->bssid[2],
-                     net->bssid[3], net->bssid[4], net->bssid[5]);
+                     snap.bssid[0], snap.bssid[1], snap.bssid[2],
+                     snap.bssid[3], snap.bssid[4], snap.bssid[5]);
             char escaped_ssid[64];
-            escape_csv_field(net->ssid, escaped_ssid, sizeof(escaped_ssid));
-            const char *auth = get_auth_mode_wiggle(net->authmode);
-            int freq = (net->channel >= 1 && net->channel <= 13) ?
-                       2412 + (net->channel - 1) * 5 :
-                       (net->channel == 14) ? 2484 :
-                       (net->channel >= 36)  ? 5000 + 5 * net->channel : 0;
+            escape_csv_field(snap.ssid, escaped_ssid, sizeof(escaped_ssid));
+            const char *auth = get_auth_mode_wiggle(snap.authmode);
+            int freq = (snap.channel >= 1 && snap.channel <= 13) ?
+                       2412 + (snap.channel - 1) * 5 :
+                       (snap.channel == 14) ? 2484 :
+                       (snap.channel >= 36)  ? 5000 + 5 * snap.channel : 0;
             int wr = fprintf(file, "%s,%s,[%s],%s,%d,%d,%d,%.7f,%.7f,%.2f,%.2f,,,WIFI\n",
                     mac_str, escaped_ssid, auth, timestamp,
-                    net->channel, freq, net->rssi, net->latitude, net->longitude,
-                    (double)net->altitude, (double)net->accuracy);
+                    snap.channel, freq, snap.rssi, snap.latitude, snap.longitude,
+                    (double)snap.altitude, (double)snap.accuracy);
+            // Only stamp the slot if it still holds the network we just wrote. If the RX
+            // callback recycled it meanwhile, stamping would mark a DIFFERENT, unwritten
+            // network as done and silently drop it; leaving it alone writes it next dwell.
+            bool same_slot = (memcmp(snap.bssid, net->bssid, 6) == 0);
             if (wr < 0) {
                 sd_error_report("Wardrive CSV", "fprintf", "WiFi line write failed");
-                net->written_to_file = true; // Mark as written to avoid re-attempts
+                if (same_slot) net->written_to_file = true; // avoid re-attempts
             } else {
-                net->written_to_file = true;
+                if (same_slot) net->written_to_file = true;
                 networks_since_flush++;
-                wd_bytes += wr;                // track part size for rotation
-                wdp_push_to_screen_fifo(net);  // Add to screen FIFO only on successful CSV write
+                wd_bytes += wr;                 // track part size for rotation
+                wdp_push_to_screen_fifo(&snap); // Add to screen FIFO only on successful CSV write
             }
         }
         // In WiFi-only mode, write BLE devices during scan (if any detected via coex)
