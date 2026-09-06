@@ -6547,6 +6547,27 @@ void app_main(void)
             }
 
             boot_btn_prev_pressed = btn_pressed;
+
+            /* Touch-to-wake: hold top-right corner (x>=190, y<=40) for 5 s.
+             * Polled directly here rather than via LVGL indev — LVGL indev reads
+             * may not fire reliably while the display panel is off. */
+            {
+                static int64_t touch_wake_hold_ms = 0;
+                xpt2046_touch_point_t tp = {0};
+                bool in_zone = false;
+                if (xpt2046_read_touch(&touch_handle, &tp) && tp.touched)
+                    in_zone = (tp.x >= 190 && tp.y <= 40);
+                if (in_zone) {
+                    int64_t now_ms = (int64_t)(esp_timer_get_time() / 1000);
+                    if (touch_wake_hold_ms == 0) touch_wake_hold_ms = now_ms;
+                    if (now_ms - touch_wake_hold_ms >= 5000) {
+                        touch_wake_hold_ms = 0;
+                        go_dark_disable();
+                    }
+                } else {
+                    touch_wake_hold_ms = 0;
+                }
+            }
         }
 
         // Disco LED update — driven from main task to keep RMT calls single-threaded
@@ -8191,26 +8212,9 @@ void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_
 void lvgl_touch_read_cb(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
 {
     if (go_dark_active) {
-        /* Screen is off. Still poll touch so the user can wake by holding a finger
-         * on the Go Dark button zone (top-right corner: x>=190, y<=40) for ~800 ms.
-         * This lets the device be woken from inside a case where the boot button
-         * may not be accessible. All other touches are ignored while dark. */
-        static int64_t godark_hold_start_ms = 0;
-        xpt2046_handle_t *touch_h = (xpt2046_handle_t *)indev_drv->user_data;
-        xpt2046_touch_point_t pt = {0};
-        bool in_zone = false;
-        if (xpt2046_read_touch(touch_h, &pt) && pt.touched)
-            in_zone = (pt.x >= 190 && pt.y <= 40);
-        if (in_zone) {
-            int64_t now_ms = esp_timer_get_time() / 1000;
-            if (godark_hold_start_ms == 0) godark_hold_start_ms = now_ms;
-            if (now_ms - godark_hold_start_ms >= 5000) {
-                godark_hold_start_ms = 0;
-                go_dark_disable();
-            }
-        } else {
-            godark_hold_start_ms = 0;
-        }
+        /* Screen is off — suppress all LVGL touch events.
+         * Touch-to-wake is handled directly in the main loop alongside the
+         * boot-button poll (see go_dark_active block in app_main). */
         data->state = LV_INDEV_STATE_RELEASED;
         return;
     }
@@ -14448,7 +14452,7 @@ static void show_go_dark_confirm(void)
     lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
 
     lv_obj_t *hint = lv_label_create(card);
-    lv_label_set_text(hint, "Screen & LED off.\nAll ops continue.\n\nDouble-click BOOT\nto resume.");
+    lv_label_set_text(hint, "Screen & LED off.\nAll ops continue.\n\nTo wake:\n- Double-click BOOT\n- Hold top-right corner\n  for 5 seconds");
     lv_obj_set_style_text_color(hint, ui_muted_color(), 0);
     lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
@@ -41473,11 +41477,31 @@ static void found_tag_ring_btn_cb(lv_event_t *e)
     xTaskCreate(obs_ring_task, "obs_ring", 6144, NULL, 2, &s_obs_ring_task_hdl);
 }
 
-/* Navigate to GATT Walker for any tag in the Found Tags list.
- * Back from GATT Walker returns to Found Tags. */
+/* Pre-target GATT Walker for a specific tag and navigate to the walk screen.
+ * Populates the SAS target globals (bt_sas_target_addr/name/addr_type/idx)
+ * so gw_deferred_start_cb() connects to this device immediately, bypassing
+ * the normal BT scan-and-select flow. */
 static void found_tag_gatt_btn_cb(lv_event_t *e)
 {
-    (void)e;
+    int dev_idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (dev_idx < 0 || dev_idx >= bt_device_count) return;
+    bt_device_info_t *dev = &bt_devices[dev_idx];
+
+    memcpy(bt_sas_target_addr, dev->addr, 6);
+    bt_sas_target_addr_type = dev->addr_type;
+    bt_sas_selected_idx     = dev_idx;
+    bt_sas_target_is_matter = false;
+    if (dev->name[0] != '\0') {
+        strncpy(bt_sas_target_name, dev->name, sizeof(bt_sas_target_name) - 1);
+        bt_sas_target_name[sizeof(bt_sas_target_name) - 1] = '\0';
+    } else if (dev->is_airtag) {
+        strncpy(bt_sas_target_name, "AirTag", sizeof(bt_sas_target_name) - 1);
+    } else if (dev->is_smarttag) {
+        strncpy(bt_sas_target_name, "SmartTag", sizeof(bt_sas_target_name) - 1);
+    } else {
+        strncpy(bt_sas_target_name, "Tag", sizeof(bt_sas_target_name) - 1);
+    }
+
     show_gatt_walker_screen();
     g_screen_back_fn = show_found_tags_screen;
 }
@@ -41522,62 +41546,78 @@ static void show_found_tags_screen(void)
         lv_obj_set_style_pad_all(row, 6, 0);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
+        // Two-column row: info on left (grows), RSSI + buttons on right (fixed 66px)
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+        lv_obj_set_style_pad_gap(row, 6, 0);
+
+        // Left column — badge, MAC, name (expands to fill remaining width)
+        lv_obj_t *info_col = lv_obj_create(row);
+        lv_obj_set_size(info_col, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(info_col, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(info_col, 0, 0);
+        lv_obj_set_style_pad_all(info_col, 0, 0);
+        lv_obj_set_style_pad_gap(info_col, 2, 0);
+        lv_obj_clear_flag(info_col, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(info_col, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_grow(info_col, 1);
+
         // Type badge
-        lv_obj_t *type_label = lv_label_create(row);
+        lv_obj_t *type_label = lv_label_create(info_col);
         const char *badge_text;
         lv_color_t badge_color;
         if (dev->is_airtag) {
             badge_text  = "AirTag";
-            badge_color = lv_color_make(255, 149, 0);   // Apple orange
+            badge_color = lv_color_make(255, 149, 0);
         } else if (dev->is_smarttag) {
             badge_text  = "SmartTag";
-            badge_color = lv_color_make(90, 200, 250);  // Samsung blue
+            badge_color = lv_color_make(90, 200, 250);
         } else {
             badge_text  = "AirTag? (Proximity)";
-            badge_color = lv_color_make(255, 214, 10);  // Yellow — owner-nearby mode
+            badge_color = lv_color_make(255, 214, 10);
         }
         lv_label_set_text(type_label, badge_text);
         lv_obj_set_style_text_font(type_label, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(type_label, badge_color, 0);
-        lv_obj_align(type_label, LV_ALIGN_TOP_LEFT, 0, 0);
 
         // MAC address
         char addr_str[18];
         bt_format_addr(dev->addr, addr_str);
-        lv_obj_t *mac_label = lv_label_create(row);
+        lv_obj_t *mac_label = lv_label_create(info_col);
         lv_label_set_text(mac_label, addr_str);
         lv_obj_set_style_text_font(mac_label, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(mac_label, lv_color_make(176, 176, 176), 0);
-        lv_obj_align(mac_label, LV_ALIGN_TOP_LEFT, 0, 18);
 
-        // Name (if available)
+        // Name (if available) — wraps within left column; never bleeds into buttons
         if (dev->name[0] != '\0') {
-            lv_obj_t *name_label = lv_label_create(row);
+            lv_obj_t *name_label = lv_label_create(info_col);
             lv_label_set_text(name_label, dev->name);
             lv_obj_set_style_text_font(name_label, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(name_label, ui_text_color(), 0);
-            lv_obj_align(name_label, LV_ALIGN_TOP_LEFT, 0, 32);
+            lv_label_set_long_mode(name_label, LV_LABEL_LONG_WRAP);
+            lv_obj_set_width(name_label, lv_pct(100));
         }
 
-        // RSSI
-        char rssi_buf[16];
-        snprintf(rssi_buf, sizeof(rssi_buf), "%d dBm", (int)dev->rssi);
-        lv_obj_t *rssi_label = lv_label_create(row);
-        lv_label_set_text(rssi_label, rssi_buf);
-        lv_obj_set_style_text_font(rssi_label, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(rssi_label, lv_color_make(176, 176, 176), 0);
-        lv_obj_align(rssi_label, LV_ALIGN_TOP_RIGHT, -70, 0);
-
-        /* ── Action buttons (right column: Track / Ring / GATT Walk) ── */
+        // Right column — RSSI + action buttons (fixed 66px)
         lv_obj_t *btn_col = lv_obj_create(row);
-        lv_obj_set_size(btn_col, 62, LV_SIZE_CONTENT);
-        lv_obj_align(btn_col, LV_ALIGN_TOP_RIGHT, 0, 0);
+        lv_obj_set_size(btn_col, 66, LV_SIZE_CONTENT);
         lv_obj_set_style_bg_opa(btn_col, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(btn_col, 0, 0);
         lv_obj_set_style_pad_all(btn_col, 0, 0);
         lv_obj_set_style_pad_gap(btn_col, 3, 0);
         lv_obj_clear_flag(btn_col, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_flex_flow(btn_col, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(btn_col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
+
+        // RSSI at top of right column
+        char rssi_buf[16];
+        snprintf(rssi_buf, sizeof(rssi_buf), "%d dBm", (int)dev->rssi);
+        lv_obj_t *rssi_label = lv_label_create(btn_col);
+        lv_label_set_text(rssi_label, rssi_buf);
+        lv_obj_set_style_text_font(rssi_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(rssi_label, lv_color_make(176, 176, 176), 0);
+        lv_obj_set_style_text_align(rssi_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(rssi_label, 64);
 
         /* Track */
         lv_obj_t *track_btn = lv_btn_create(btn_col);
@@ -41621,7 +41661,7 @@ static void show_found_tags_screen(void)
         lv_obj_set_style_text_font(gatt_lbl, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(gatt_lbl, lv_color_white(), 0);
         lv_obj_center(gatt_lbl);
-        lv_obj_add_event_cb(gatt_btn, found_tag_gatt_btn_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_add_event_cb(gatt_btn, found_tag_gatt_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
     }
 
     if (found == 0) {
