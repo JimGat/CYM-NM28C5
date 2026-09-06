@@ -15662,12 +15662,15 @@ static void wifi_scan_rebuild_page(void)
             char name_buf[128];
             const char *band = (records[i].primary <= 14) ? "2.4GHz" : "5GHz";
 
-            /* Auth mode label + MFP color indicator.
-             * Red   = WPA3/OWE  — MFP required, deauth attacks will be ignored.
-             * Amber = WPA2      — MFP optional; cannot determine from scan record.
-             * Green = Open/WEP/WPA — no MFP, deauth attacks work. */
+            /* Auth mode sets the color family (security indicator) and label text.
+             * Red = WPA3/OWE — MFP required, deauth attacks will be ignored.
+             * Amber = WPA2   — MFP optional; cannot determine from scan record.
+             * Green = Open/WEP/WPA — no MFP, deauth attacks work.
+             * 5 GHz networks receive a slightly lighter shade of the same family
+             * color so band is distinguishable at a glance without losing the
+             * security meaning. */
             const char *auth_str;
-            lv_color_t  mfp_color;
+            lv_color_t mfp_color;
             switch (records[i].authmode) {
                 case WIFI_AUTH_WPA3_PSK:
                 case WIFI_AUTH_WPA2_WPA3_PSK:        auth_str = "WPA3";    mfp_color = COLOR_MATERIAL_RED;   break;
@@ -15683,6 +15686,8 @@ static void wifi_scan_rebuild_page(void)
                 case WIFI_AUTH_OPEN:                 auth_str = "Open";    mfp_color = COLOR_MATERIAL_GREEN; break;
                 default:                             auth_str = "?";       mfp_color = ui_text_color();      break;
             }
+            if (records[i].primary > 14)
+                mfp_color = lv_color_mix(lv_color_white(), mfp_color, 64); /* 5 GHz: ~25% lighter */
 
             if (records[i].ssid[0] != 0) {
                 snprintf(name_buf, sizeof(name_buf), "%s (%s, %s, %02X:%02X:%02X:%02X:%02X:%02X)",
@@ -57819,7 +57824,7 @@ static void show_obs_store_screen(void)
     g_screen_back_fn = show_wifi_menu_screen;
     apply_menu_bg();
 
-    /* Status bar */
+    /* Status bar — row 1 below the 30px title bar, full width */
     s_obs_status_lbl = lv_label_create(function_page);
     lv_label_set_text(s_obs_status_lbl, "Loading...");
     lv_obj_set_style_text_font(s_obs_status_lbl, &lv_font_montserrat_12, 0);
@@ -57828,10 +57833,12 @@ static void show_obs_store_screen(void)
     lv_obj_set_width(s_obs_status_lbl, LCD_H_RES - 8);
     lv_label_set_long_mode(s_obs_status_lbl, LV_LABEL_LONG_CLIP);
 
-    /* Export button */
+    /* Export button — row 2, right-aligned, stacked below status bar.
+     * Was at y=28 (overlapping the title bar) and same row as status bar
+     * (status bar width 232px ran behind the 120px button). */
     lv_obj_t *exp_btn = lv_btn_create(function_page);
-    lv_obj_set_size(exp_btn, 120, 26);
-    lv_obj_align(exp_btn, LV_ALIGN_TOP_RIGHT, -4, 28);
+    lv_obj_set_size(exp_btn, 120, 24);
+    lv_obj_align(exp_btn, LV_ALIGN_TOP_RIGHT, -4, 46);
     lv_obj_set_style_bg_color(exp_btn, lv_color_hex(0x311B92), 0);
     lv_obj_set_style_radius(exp_btn, 4, 0);
     lv_obj_add_event_cb(exp_btn, obs_store_export_jsonl, LV_EVENT_CLICKED, NULL);
@@ -57840,9 +57847,11 @@ static void show_obs_store_screen(void)
     lv_obj_set_style_text_font(exp_lbl, &lv_font_montserrat_12, 0);
     lv_obj_center(exp_lbl);
 
-    /* Scrollable record list — fills remaining vertical space */
+    /* Scrollable record list — fills remaining vertical space.
+     * Header: 30px title + 14px status row + 2px gap + 24px button + 4px gap = 74px.
+     * List height = LCD_V_RES - 74 = 246px; bottom-mid with -2 nudge puts top at y=72. */
     s_obs_list = lv_obj_create(function_page);
-    lv_obj_set_size(s_obs_list, LCD_H_RES - 8, LCD_V_RES - 62);
+    lv_obj_set_size(s_obs_list, LCD_H_RES - 8, LCD_V_RES - 74);
     lv_obj_align(s_obs_list, LV_ALIGN_BOTTOM_MID, 0, -2);
     lv_obj_set_style_bg_opa(s_obs_list, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_obs_list, 0, 0);
