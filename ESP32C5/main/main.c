@@ -6548,20 +6548,15 @@ void app_main(void)
 
             boot_btn_prev_pressed = btn_pressed;
 
-            /* Touch-to-wake: hold anywhere on screen for 5 s.
-             * Any sustained touch wakes from go dark — the entire screen is
-             * the wake zone. Corner-only was too easy to miss in practice. */
+            /* Touch-to-wake: hold screen for 5 s (any position).
+             * Polled directly here — LVGL indev reads are suppressed while dark.
+             * Full-screen zone used because LCD DMA bursts (LVGL still flushes
+             * to the off panel) can delay SPI touch reads by 150–250 ms, making
+             * a small corner zone unreliable when frames run long. */
             {
                 static int64_t touch_wake_hold_ms = 0;
-                static uint32_t dark_touch_log_ctr = 0;
                 xpt2046_touch_point_t tp = {0};
                 bool touched = xpt2046_read_touch(&touch_handle, &tp) && tp.touched;
-                /* Diagnostic: log touch state every ~1 s (100 iters × 10 ms) */
-                if (++dark_touch_log_ctr >= 100) {
-                    dark_touch_log_ctr = 0;
-                    ESP_LOGI("GODARK", "touch_wake poll: touched=%d x=%u y=%u hold_ms=%lld",
-                             (int)touched, tp.x, tp.y, touch_wake_hold_ms);
-                }
                 if (touched) {
                     int64_t t_now = (int64_t)(esp_timer_get_time() / 1000);
                     if (touch_wake_hold_ms == 0) touch_wake_hold_ms = t_now;
