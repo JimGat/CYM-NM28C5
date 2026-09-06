@@ -8191,6 +8191,26 @@ void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_
 void lvgl_touch_read_cb(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
 {
     if (go_dark_active) {
+        /* Screen is off. Still poll touch so the user can wake by holding a finger
+         * on the Go Dark button zone (top-right corner: x>=190, y<=40) for ~800 ms.
+         * This lets the device be woken from inside a case where the boot button
+         * may not be accessible. All other touches are ignored while dark. */
+        static int64_t godark_hold_start_ms = 0;
+        xpt2046_handle_t *touch_h = (xpt2046_handle_t *)indev_drv->user_data;
+        xpt2046_touch_point_t pt = {0};
+        bool in_zone = false;
+        if (xpt2046_read_touch(touch_h, &pt) && pt.touched)
+            in_zone = (pt.x >= 190 && pt.y <= 40);
+        if (in_zone) {
+            int64_t now_ms = esp_timer_get_time() / 1000;
+            if (godark_hold_start_ms == 0) godark_hold_start_ms = now_ms;
+            if (now_ms - godark_hold_start_ms >= 800) {
+                godark_hold_start_ms = 0;
+                go_dark_disable();
+            }
+        } else {
+            godark_hold_start_ms = 0;
+        }
         data->state = LV_INDEV_STATE_RELEASED;
         return;
     }

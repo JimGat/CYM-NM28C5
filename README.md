@@ -1663,7 +1663,11 @@ The live dashboard shows:
 
 **Stop** — ends the session, closes all open files, and returns to the Wardrive menu.
 
-**Go Dark** — available from the title bar power icon on every screen. The display turns off while wardriving continues in the background. Double-press the **BOOT** button to wake the display. The NeoPixel stays cyan while active.
+**Go Dark** — available from the title bar power icon on every screen. The display turns off while wardriving continues in the background. The NeoPixel stays cyan while active.
+
+**Waking from Go Dark:**
+- **Boot button** — press the physical BOOT button on the board.
+- **Touch-to-wake** — hold a finger on the top-right corner of the screen (where the power icon is) for about 1 second. Useful when the boot button is hard to reach inside a printed case.
 
 #### Mark Button — GPS Waypoints
 
