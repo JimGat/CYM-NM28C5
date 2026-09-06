@@ -227,10 +227,11 @@ static volatile uint32_t s_bt_parse_fail   = 0; // ble_hs_adv_parse_fields faile
 static volatile uint32_t s_bt_blacklisted  = 0; // dropped by blacklist
 static volatile uint32_t s_bt_already_seen = 0; // duplicate MAC
 
-// AirTag/SmartTag counters
+// AirTag/SmartTag/Tile counters
 static int bt_airtag_count = 0;
 static int bt_smarttag_count = 0;
 static int bt_possible_airtag_count = 0;  // Apple 0x05 Nearby Action (owner-nearby/paused mode)
+static int bt_tile_count = 0;
 
 // Generic BT device storage for scan_bt command
 typedef struct {
@@ -844,6 +845,15 @@ static const ble_uuid128_t s_obs_ring_fmn_svc_uuid = BLE_UUID128_INIT(
 static const ble_uuid128_t s_obs_ring_fmn_snd_uuid = BLE_UUID128_INIT(
     0x6C, 0xD6, 0xF8, 0x28, 0x97, 0x8D, 0xAA, 0x86,
     0x51, 0x49, 0x1C, 0x7D, 0x01, 0x90, 0xFC, 0x7D
+);
+
+// Tile ring: service 0xFEED, command char 9D410018-35D6-F4DD-BA60-E7BD8DC491C0 (WNR).
+// SmartTag uses Samsung FMM (0xfef3) which requires Samsung account auth — no public ring.
+static bool s_obs_ring_is_tile = false;
+static const ble_uuid16_t  s_obs_ring_tile_svc_uuid16 = BLE_UUID16_INIT(0xFEED);
+static const ble_uuid128_t s_obs_ring_tile_cmd_uuid   = BLE_UUID128_INIT(
+    0xC0, 0x91, 0xC4, 0x8D, 0xBD, 0xE7, 0x60, 0xBA,
+    0xDD, 0xF4, 0xD6, 0x35, 0x18, 0x00, 0x41, 0x9D
 );
 // Ring task GATT state
 static SemaphoreHandle_t s_obs_ring_sem      = NULL;
@@ -2552,6 +2562,7 @@ static bool hid_subscribed = false;
 static volatile int airtag_scan_snapshot_airtag = 0;
 static volatile int airtag_scan_snapshot_smarttag = 0;
 static volatile int airtag_scan_snapshot_possible_airtag = 0;
+static volatile int airtag_scan_snapshot_tile = 0;
 static volatile int airtag_scan_snapshot_total = 0;
 
 // Promiscuous filter
@@ -7799,6 +7810,7 @@ void app_main(void)
                 int snap_airtag          = airtag_scan_snapshot_airtag;
                 int snap_smarttag        = airtag_scan_snapshot_smarttag;
                 int snap_possible_airtag = airtag_scan_snapshot_possible_airtag;
+                int snap_tile            = airtag_scan_snapshot_tile;
                 int snap_total           = airtag_scan_snapshot_total;
 
                 // Hide "Scan in progress", show stats
@@ -7810,15 +7822,15 @@ void app_main(void)
                 if (airtag_scan_stats_label1 && lv_obj_is_valid(airtag_scan_stats_label1)) {
                     char stats1[96];
                     snprintf(stats1, sizeof(stats1),
-                             "Air Tags: %d\nAirTag? (Prox): %d\nSmart Tags: %d",
-                             snap_airtag, snap_possible_airtag, snap_smarttag);
+                             "AirTags: %d\nAirTag? (Prox): %d\nSmartTags: %d\nTiles: %d",
+                             snap_airtag, snap_possible_airtag, snap_smarttag, snap_tile);
                     lv_label_set_text(airtag_scan_stats_label1, stats1);
                     lv_obj_clear_flag(airtag_scan_stats_label1, LV_OBJ_FLAG_HIDDEN);
                 }
 
                 // Show "View Found Tags" button when at least one tag-type device is detected
                 if (airtag_view_tags_btn && lv_obj_is_valid(airtag_view_tags_btn)) {
-                    if (snap_airtag + snap_smarttag + snap_possible_airtag > 0) {
+                    if (snap_airtag + snap_smarttag + snap_possible_airtag + snap_tile > 0) {
                         lv_obj_clear_flag(airtag_view_tags_btn, LV_OBJ_FLAG_HIDDEN);
                     } else {
                         lv_obj_add_flag(airtag_view_tags_btn, LV_OBJ_FLAG_HIDDEN);
@@ -7826,7 +7838,7 @@ void app_main(void)
                 }
 
                 if (airtag_scan_stats_label2 && lv_obj_is_valid(airtag_scan_stats_label2)) {
-                    int other_devices = snap_total - snap_airtag - snap_smarttag - snap_possible_airtag;
+                    int other_devices = snap_total - snap_airtag - snap_smarttag - snap_possible_airtag - snap_tile;
                     if (other_devices < 0) other_devices = 0;
                     char stats2[48];
                     snprintf(stats2, sizeof(stats2), "Other BT Devices: %d", other_devices);
@@ -37574,6 +37586,7 @@ static void bt_reset_counters(void)
     bt_airtag_count = 0;
     bt_smarttag_count = 0;
     bt_possible_airtag_count = 0;
+    bt_tile_count = 0;
     bt_found_device_count = 0;
     bt_device_count = 0;
     memset(bt_found_devices, 0, sizeof(bt_found_devices));
@@ -37985,7 +37998,7 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
                 uint16_t _u = fields.uuids16[_ui].value;
                 if      (_u == 0xFEAA) dev->is_eddystone = true;
                 else if (_u == 0xFCD2) dev->is_bthome    = true;
-                else if (_u == 0xFEED) dev->is_tile       = true;
+                else if (_u == 0xFEED) { dev->is_tile = true; bt_tile_count++; }
                 else if (_u == 0xFD6F) dev->is_exposure   = true;
                 /* Record first notable SIG device-class service UUID */
                 if (!dev->fp_svc_uuid &&
@@ -41381,12 +41394,14 @@ static void airtag_scan_task(void *pvParameters)
         airtag_scan_snapshot_airtag          = bt_airtag_count;
         airtag_scan_snapshot_smarttag        = bt_smarttag_count;
         airtag_scan_snapshot_possible_airtag = bt_possible_airtag_count;
+        airtag_scan_snapshot_tile            = bt_tile_count;
         airtag_scan_snapshot_total           = bt_device_count;
         airtag_scan_update_flag = true;
 
-        ESP_LOGI(TAG, "AirTag scan cycle: %d AT, %d AT-Prox?, %d ST, %d total",
+        ESP_LOGI(TAG, "AirTag scan cycle: %d AT, %d AT-Prox?, %d ST, %d Tile, %d total",
                  airtag_scan_snapshot_airtag, airtag_scan_snapshot_possible_airtag,
-                 airtag_scan_snapshot_smarttag, airtag_scan_snapshot_total);
+                 airtag_scan_snapshot_smarttag, airtag_scan_snapshot_tile,
+                 airtag_scan_snapshot_total);
     }
 
     ESP_LOGI(TAG, "AirTag scanner task ending");
@@ -41486,7 +41501,8 @@ static void found_tag_ring_btn_cb(lv_event_t *e)
     memcpy(s_obs_detail_rec.mac, dev->addr, 6);
     if (dev->addr_type != 0)
         s_obs_detail_rec.flags |= OBS_FLAG_RANDOM_ADDR;
-    s_obs_ring_cancel = false;
+    s_obs_ring_cancel  = false;
+    s_obs_ring_is_tile = dev->is_tile;
 
     /* Build floating status popup on lv_layer_top() so it survives navigation. */
     if (s_ring_status_popup && lv_obj_is_valid(s_ring_status_popup))
@@ -41683,8 +41699,9 @@ static void show_found_tags_screen(void)
         lv_obj_center(track_lbl);
         lv_obj_add_event_cb(track_btn, found_tag_track_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
 
-        /* Ring — AirTag + SmartTag: both implement FMN 7dfc9001, non-owner {0x01} confirmed */
-        if (dev->is_airtag || dev->is_smarttag) {
+        /* Ring — AirTag (FMN 7dfc9001) and Tile (0xFEED cmd char), both WNR {0x01} trigger.
+         * SmartTag uses Samsung FMM (0xfef3) requiring Samsung account auth — no public ring. */
+        if (dev->is_airtag || dev->is_tile) {
             lv_obj_t *ring_btn = lv_btn_create(btn_col);
             lv_obj_set_size(ring_btn, 60, 26);
             lv_obj_set_style_bg_color(ring_btn, lv_color_make(200, 80, 0), LV_STATE_DEFAULT);
@@ -58316,7 +58333,10 @@ static int obs_ring_chr_disc_cb(uint16_t conn_hdl,
 {
     (void)conn_hdl; (void)arg;
     if (err->status == 0 && chr) {
-        if (ble_uuid_cmp(&chr->uuid.u, &s_obs_ring_fmn_snd_uuid.u) == 0)
+        const ble_uuid_t *target = s_obs_ring_is_tile
+            ? &s_obs_ring_tile_cmd_uuid.u
+            : &s_obs_ring_fmn_snd_uuid.u;
+        if (ble_uuid_cmp(&chr->uuid.u, target) == 0)
             s_obs_ring_snd_hdl = chr->val_handle;
     }
     if (err->status != 0) {
@@ -58374,24 +58394,30 @@ static void obs_ring_task(void *arg)
     }
     if (s_obs_ring_cancel) { obs_ring_set_status("Cancelled"); goto disconnect; }
 
-    /* Discover FMN sound service */
+    /* Discover service — FMN (128-bit) for AirTag, 0xFEED (16-bit) for Tile */
     obs_ring_set_status("Finding sound service...");
-    rc = ble_gattc_disc_svc_by_uuid(s_obs_ring_conn_hdl,
-                                     &s_obs_ring_fmn_svc_uuid.u,
-                                     obs_ring_svc_disc_cb, NULL);
+    {
+        const ble_uuid_t *svc_uuid = s_obs_ring_is_tile
+            ? &s_obs_ring_tile_svc_uuid16.u
+            : &s_obs_ring_fmn_svc_uuid.u;
+        rc = ble_gattc_disc_svc_by_uuid(s_obs_ring_conn_hdl, svc_uuid,
+                                         obs_ring_svc_disc_cb, NULL);
+    }
     if (rc != 0) {
         obs_ring_set_status("Service disc failed");
         goto disconnect;
     }
     if (xSemaphoreTake(s_obs_ring_sem, pdMS_TO_TICKS(6000)) != pdTRUE
         || s_obs_ring_svc_end == 0) {
-        obs_ring_set_status("Sound service not found\nRun GATT Walker to verify UUID");
+        obs_ring_set_status(s_obs_ring_is_tile
+            ? "Tile svc not found\nRun GATT Walker"
+            : "Sound service not found\nRun GATT Walker to verify UUID");
         vTaskDelay(pdMS_TO_TICKS(3000));
         goto disconnect;
     }
     if (s_obs_ring_cancel) { obs_ring_set_status("Cancelled"); goto disconnect; }
 
-    /* Discover all characteristics in the service, find play-sound handle */
+    /* Discover all characteristics in the service */
     obs_ring_set_status("Finding sound characteristic...");
     rc = ble_gattc_disc_all_chrs(s_obs_ring_conn_hdl,
                                   s_obs_ring_svc_start, s_obs_ring_svc_end,
@@ -58402,45 +58428,62 @@ static void obs_ring_task(void *arg)
     }
     if (xSemaphoreTake(s_obs_ring_sem, pdMS_TO_TICKS(6000)) != pdTRUE
         || s_obs_ring_snd_hdl == 0) {
-        obs_ring_set_status("Sound chr not found\nRun GATT Walker to verify UUID");
+        obs_ring_set_status(s_obs_ring_is_tile
+            ? "Tile cmd chr not found\nRun GATT Walker"
+            : "Sound chr not found\nRun GATT Walker to verify UUID");
         vTaskDelay(pdMS_TO_TICKS(3000));
         goto disconnect;
     }
     if (s_obs_ring_cancel) { obs_ring_set_status("Cancelled"); goto disconnect; }
 
-    /* Write play-sound command */
-    obs_ring_set_status("Sending play-sound command...");
-    rc = ble_gattc_write_flat(s_obs_ring_conn_hdl, s_obs_ring_snd_hdl,
-                               OBS_RING_PLAY_CMD, sizeof(OBS_RING_PLAY_CMD),
-                               obs_ring_write_cb, NULL);
-    if (rc != 0) {
-        obs_ring_set_status("Write failed");
-        goto disconnect;
-    }
-    if (xSemaphoreTake(s_obs_ring_sem, pdMS_TO_TICKS(5000)) != pdTRUE) {
-        obs_ring_set_status("Write timeout");
-        goto disconnect;
-    }
-    if (s_obs_ring_gatt_rc == 0) {
-        obs_ring_set_status("Sound command sent!");
-    } else {
-        /* Translate NimBLE ATT error (rc = 256 + att_code) to human text. */
-        const char *att_desc = "error";
-        if (s_obs_ring_gatt_rc >= 256) {
-            switch (s_obs_ring_gatt_rc - 256) {
-                case 0x03: att_desc = "write not permitted"; break;
-                case 0x05: att_desc = "auth required";       break;
-                case 0x08: att_desc = "authorization denied";break;
-                case 0x0D: att_desc = "wrong payload length";break;
-                case 0x0F: att_desc = "encryption required"; break;
-                default:   att_desc = "ATT error";           break;
-            }
+    /* Write ring command.
+     * Tile uses Write No Response (WNR) — no ACK, fire-and-forget.
+     * AirTag FMN uses Write with Response — wait for callback. */
+    obs_ring_set_status("Sending ring command...");
+    if (s_obs_ring_is_tile) {
+        /* Tile: WNR — command is queued immediately, no write callback */
+        rc = ble_gattc_write_no_rsp_flat(s_obs_ring_conn_hdl, s_obs_ring_snd_hdl,
+                                          OBS_RING_PLAY_CMD, sizeof(OBS_RING_PLAY_CMD));
+        if (rc == 0) {
+            obs_ring_set_status("Tile ring sent\nListen for beep");
+        } else {
+            char buf[48];
+            snprintf(buf, sizeof(buf), "Send failed (%d)", rc);
+            obs_ring_set_status(buf);
         }
-        char buf[72];
-        snprintf(buf, sizeof(buf), "Write error %d\n(%s)", s_obs_ring_gatt_rc, att_desc);
-        obs_ring_set_status(buf);
+        vTaskDelay(pdMS_TO_TICKS(3000));
+    } else {
+        rc = ble_gattc_write_flat(s_obs_ring_conn_hdl, s_obs_ring_snd_hdl,
+                                   OBS_RING_PLAY_CMD, sizeof(OBS_RING_PLAY_CMD),
+                                   obs_ring_write_cb, NULL);
+        if (rc != 0) {
+            obs_ring_set_status("Write failed");
+            goto disconnect;
+        }
+        if (xSemaphoreTake(s_obs_ring_sem, pdMS_TO_TICKS(5000)) != pdTRUE) {
+            obs_ring_set_status("Write timeout");
+            goto disconnect;
+        }
+        if (s_obs_ring_gatt_rc == 0) {
+            obs_ring_set_status("Sound command sent!");
+        } else {
+            const char *att_desc = "error";
+            if (s_obs_ring_gatt_rc >= 256) {
+                switch (s_obs_ring_gatt_rc - 256) {
+                    case 0x03: att_desc = "write not permitted"; break;
+                    case 0x05: att_desc = "auth required";       break;
+                    case 0x08: att_desc = "authorization denied";break;
+                    case 0x0D: att_desc = "wrong payload length";break;
+                    case 0x0F: att_desc = "encryption required"; break;
+                    default:   att_desc = "ATT error";           break;
+                }
+            }
+            char buf[72];
+            snprintf(buf, sizeof(buf), "Write error %d\n(%s)", s_obs_ring_gatt_rc, att_desc);
+            obs_ring_set_status(buf);
+        }
+        vTaskDelay(pdMS_TO_TICKS(3000));
     }
-    vTaskDelay(pdMS_TO_TICKS(3000));
 
 disconnect:
     if (s_obs_ring_conn_hdl != BLE_HS_CONN_HANDLE_NONE) {
