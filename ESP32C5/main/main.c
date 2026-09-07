@@ -8646,7 +8646,7 @@ static void deauth_stop(void)
     deauth_paused = false;
     // Full radio reset to STA-idle — same teardown as the Home path. Without this
     // ‹ Back left WiFi in APSTA (residual AP still broadcasting) + injection state;
-    // deauth/evil-twin leave the driver dirty, so match Home exactly (Birol: service
+    // deauth/evil-twin leave the driver dirty, so match Home exactly (@birolt29: service
     // seemed to keep running after ‹ Back). Safe: run_screen_stop_fn runs it while the
     // outgoing screen's UI is intact (deferred handler), like handshake_stop.
     radio_reset_to_idle();
@@ -14416,7 +14416,7 @@ static void portal_stop(void)
     // Full radio reset to STA-idle (matches Home). wifi_attacks_stop_portal leaves
     // the driver in APSTA with the "Free WiFi" AP config still set, so it keeps
     // broadcasting after ‹ Back; radio_reset_to_idle switches to STA-only so the
-    // portal AP is truly down (Birol: portal didn't close on ‹ Back, only on Home).
+    // portal AP is truly down (@birolt29: portal didn't close on ‹ Back, only on Home).
     // Safe: the Portal running screen is terminal (Portal Data is a separate tile).
     radio_reset_to_idle();
 }
@@ -18292,7 +18292,7 @@ static void wpasec_upload_timer_cb(lv_timer_t *timer)
 // Screen-exit teardown for WPA-SEC Upload — runs via g_screen_stop_fn on ANY exit
 // (top ‹ Back, Home). radio_reset_to_idle() stops the upload (wpasec_upload_active
 // =false) AND drops the STA connection (esp_wifi_stop → STA restart), so the device
-// isn't left associated to the target AP after ‹ Back (Birol: service kept running).
+// isn't left associated to the target AP after ‹ Back (@birolt29: service kept running).
 static void wpasec_stop(void)
 {
     radio_reset_to_idle();
