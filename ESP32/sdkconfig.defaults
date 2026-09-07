@@ -1,0 +1,25 @@
+# CYM ESP32 shared base sdkconfig defaults
+# Applies to all ESP32 (Xtensa LX6 dual-core) boards.
+#
+# Phase 3 — placeholder. Add real config when porting begins.
+
+# Partition table (will need custom CSV for CYD2USB flash layout)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Task WDT panic
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+
+# Bluetooth (NimBLE)
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+
+# LVGL fonts used by the UI
+CONFIG_LV_FONT_MONTSERRAT_12=y
+CONFIG_LV_FONT_MONTSERRAT_16=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_28=y
+
+# ST7789/ILI9341 byte-order fix (apply to all display boards)
+CONFIG_LV_COLOR_16_SWAP=y

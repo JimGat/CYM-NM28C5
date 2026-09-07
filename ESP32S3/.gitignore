@@ -1,0 +1,28 @@
+# Build output (all board-specific build dirs)
+build/
+build_*/
+
+# Generated sdkconfig (each board's is inside its build_* dir)
+sdkconfig
+sdkconfig.old
+
+# Managed components
+managed_components/
+dependencies.lock
+
+# IDE
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+._*
+
+# Logs / temp
+*.log
+*.tmp
+*.swp
+*~

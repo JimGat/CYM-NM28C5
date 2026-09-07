@@ -1,0 +1,26 @@
+# Hosyond ESP32-S3 3.5" board-specific sdkconfig overrides
+# Layered on top of sdkconfig.defaults (shared ESP32-S3 base).
+#
+# Board: Hosyond ESP32-S3 Touchscreen Module 3.5" 240x320 (ASIN B0H28X8SQ4)
+# SoC:   ESP32-S3R8, dual-core Xtensa LX7 240 MHz
+# Flash: 16 MB
+# PSRAM: 8 MB
+# LCD:   ST7796U SPI, 240x320 IPS
+#   GPIO pins: TBD — verify with oscilloscope/board markings on arrival
+# Touch: FT6336 capacitive I2C
+#   GPIO pins: TBD — same driver family as hosyond-s3-28, likely same I2C address
+# USB:   Type-C
+#
+# Note: Product title says 240x320 — unusual for 3.5" (most are 320x480).
+# Confirm actual resolution with the display on first boot. ST7796 natively
+# supports 320x480 but may be initialized at 240x320 by the vendor firmware.
+#
+# Dual-core advantage: jammer task pins to Core 1.
+#
+# Phase 4 — fill in when porting begins.
+
+# 16 MB flash
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# CONFIG_BOARD_HOSYOND_S3_35=y  (future Kconfig flag)

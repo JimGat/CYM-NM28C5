@@ -1,0 +1,32 @@
+# CYD2USB (ESP32-2432S028R) board-specific sdkconfig overrides
+# Layered on top of sdkconfig.defaults (shared ESP32 base).
+#
+# Board: ESP32-2432S028R (Cheap Yellow Display, CYD2USB variant)
+# SoC:   ESP32-WROOM-32 dual-core Xtensa LX6 240 MHz, 4 MB flash, no PSRAM
+# Touch: XPT2046 resistive SPI (requires calibration, same driver as NM-CYD-C5)
+# LCD:   ILI9341 SPI 240x320, backlight via GPIO21 or GPIO27 (board variant)
+# Audio: None (no amp on standard CYD)
+# LED:   RGB LED on GPIO4/16/17 (common CYD wiring — verify on board variant)
+#
+# Dual-core advantage: jammer task can be pinned to Core 1, isolated from LVGL.
+# This enables significantly better nRF24 sweep timing than the single-core C5.
+#
+# Note: CYD2USB has no PSRAM. Array sizes and buffer allocations in main.c must
+# be gated by CONFIG_BOARD_HAS_PSRAM=n and use internal DRAM allocations only.
+#
+# Phase 3 — fill in when porting begins.
+
+# 4 MB flash (standard CYD)
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# No PSRAM on standard CYD
+# CONFIG_SPIRAM is not set
+
+# Main task stack — smaller than C5 due to no PSRAM
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Compiler optimization
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# CONFIG_BOARD_CYD2USB=y  (future Kconfig flag once board_hal Kconfig is wired)

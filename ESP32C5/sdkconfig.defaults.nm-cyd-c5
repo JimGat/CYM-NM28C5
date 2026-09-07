@@ -1,0 +1,13 @@
+# NM-CYD-C5 board-specific sdkconfig overrides
+# Layered on top of sdkconfig.defaults (the shared ESP32-C5 base config).
+#
+# Board: NerdMiner ESP32-C5 CYD (NM-CYD-C5)
+# SoC:   ESP32-C5-WROOM-1-N168R, 16 MB flash, 8 MB PSRAM, WiFi 6 dual-band
+# Touch: XPT2046 resistive SPI (requires calibration)
+# LCD:   ST7789 240x320, backlight GPIO25
+# RF:    NM-RF-HAT FPC2 connector (CC1101/nRF24/PN532/IR/433MHz)
+#
+# Most config for this board lives in sdkconfig.defaults (the C5 base).
+# Add NM-CYD-C5-specific overrides here when they diverge from the Waveshare C5.
+#
+# CONFIG_BOARD_NM_CYD_C5=y  (future Kconfig flag once board_hal Kconfig is wired)

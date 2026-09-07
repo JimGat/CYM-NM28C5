@@ -1,0 +1,13 @@
+# Hosyond ESP32-S3 4.0" board-specific sdkconfig overrides
+# Layered on top of sdkconfig.defaults (shared ESP32-S3 base).
+#
+# Board: Hosyond ESP32-S3 4.0" (future — not yet owned)
+# SoC:   ESP32-S3 (dual-core Xtensa LX7 240 MHz, assumed)
+# Flash: TBD
+# PSRAM: TBD
+# LCD:   TBD — likely ST7796 or ILI9488 at higher resolution
+# Touch: TBD — likely FT6336 or FT5436 capacitive I2C (Hosyond family pattern)
+#
+# Phase 4 — placeholder. Fill in when board is acquired and researched.
+#
+# CONFIG_BOARD_HOSYOND_S3_40=y  (future Kconfig flag)

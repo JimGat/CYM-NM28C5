@@ -1,0 +1,24 @@
+# Waveshare ESP32-C5-Touch-LCD-2.8 board-specific sdkconfig overrides
+# Layered on top of sdkconfig.defaults (the shared ESP32-C5 base config).
+#
+# Board: Waveshare ESP32-C5-Touch-LCD-2.8
+# SoC:   ESP32-C5-WROOM-1-N8, 32 MB flash, 8 MB PSRAM, WiFi 6 dual-band
+# Touch: CST3530 capacitive I2C (no calibration needed), interrupt GPIO5
+# LCD:   ST7789 240x320, backlight via CH32V003 IO expander (I2C 0x24, EXIO_PWM)
+# RF:    NM-RF-HAT via SD shim + JST wires (GPIO2/GPIO3 as control signals)
+# Extra: QMI8658 IMU, SHTC3 temp/humidity, PCF85063A RTC, ES8311 audio codec
+#
+# Phase 2 — board on order (tracking 2026-09-07).
+# Fill in once porting work begins.
+#
+# Key differences from NM-CYD-C5:
+#   LCD CS:  GPIO10 (NM-CYD-C5 has LCD CS=23, SD CS=10)
+#   SD CS:   GPIO23 (swapped)
+#   SD MISO: GPIO8  (NM-CYD-C5 uses GPIO2)
+#   Flash:   32 MB  (vs 16 MB on NM-CYD-C5)
+
+# 32 MB flash (Waveshare has more flash than NM-CYD-C5)
+CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="32MB"
+
+# CONFIG_BOARD_WS_C5_28=y  (future Kconfig flag once board_hal Kconfig is wired)
