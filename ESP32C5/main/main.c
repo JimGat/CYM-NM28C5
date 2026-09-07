@@ -849,12 +849,14 @@ static const ble_uuid128_t s_obs_ring_fmn_snd_uuid = BLE_UUID128_INIT(
 
 // Tile ring: service 0xFEED, command char 9D410018-35D6-F4DD-BA60-E7BD8DC491C0 (WNR).
 // SmartTag uses Samsung FMM (0xfef3) which requires Samsung account auth — no public ring.
+// Tile SONG command: 0x08 = SONG opcode, 0x01 = song variant (Tile signature sound).
 static bool s_obs_ring_is_tile = false;
 static const ble_uuid16_t  s_obs_ring_tile_svc_uuid16 = BLE_UUID16_INIT(0xFEED);
 static const ble_uuid128_t s_obs_ring_tile_cmd_uuid   = BLE_UUID128_INIT(
     0xC0, 0x91, 0xC4, 0x8D, 0xBD, 0xE7, 0x60, 0xBA,
     0xDD, 0xF4, 0xD6, 0x35, 0x18, 0x00, 0x41, 0x9D
 );
+static const uint8_t OBS_RING_TILE_CMD[] = {0x08, 0x01};
 // Ring task GATT state
 static SemaphoreHandle_t s_obs_ring_sem      = NULL;
 static uint16_t          s_obs_ring_conn_hdl = BLE_HS_CONN_HANDLE_NONE;
@@ -41391,11 +41393,22 @@ static void airtag_scan_task(void *pvParameters)
         if (!airtag_scan_active)
             break;
 
-        airtag_scan_snapshot_airtag          = bt_airtag_count;
-        airtag_scan_snapshot_smarttag        = bt_smarttag_count;
-        airtag_scan_snapshot_possible_airtag = bt_possible_airtag_count;
-        airtag_scan_snapshot_tile            = bt_tile_count;
-        airtag_scan_snapshot_total           = bt_device_count;
+        /* Derive per-type counts from the unique-device list so the summary screen
+         * always matches what Found Tags shows (per-packet counters over-count). */
+        {
+            int tmp_at=0, tmp_st=0, tmp_pos=0, tmp_tile=0;
+            for (int _i = 0; _i < bt_device_count; _i++) {
+                if (bt_devices[_i].is_airtag)          tmp_at++;
+                if (bt_devices[_i].is_smarttag)        tmp_st++;
+                if (bt_devices[_i].is_possible_airtag) tmp_pos++;
+                if (bt_devices[_i].is_tile)            tmp_tile++;
+            }
+            airtag_scan_snapshot_airtag          = tmp_at;
+            airtag_scan_snapshot_smarttag        = tmp_st;
+            airtag_scan_snapshot_possible_airtag = tmp_pos;
+            airtag_scan_snapshot_tile            = tmp_tile;
+        }
+        airtag_scan_snapshot_total = bt_device_count;
         airtag_scan_update_flag = true;
 
         ESP_LOGI(TAG, "AirTag scan cycle: %d AT, %d AT-Prox?, %d ST, %d Tile, %d total",
@@ -41886,13 +41899,13 @@ static void show_airtag_scan_screen(void)
     lv_obj_set_style_text_color(airtag_scan_status_label, ui_text_color(), 0);
     lv_obj_align(airtag_scan_status_label, LV_ALIGN_CENTER, 0, -105);
 
-    // Stats label 1: "Air Tags: X\nAirTag? (Prox): X\nSmart Tags: X" (three lines, large font)
+    // Stats label 1: four tracker-type counts; font_16 keeps 4 lines clear of the title bar
     airtag_scan_stats_label1 = lv_label_create(function_page);
-    lv_label_set_text(airtag_scan_stats_label1, "Air Tags: 0\nAirTag? (Prox): 0\nSmart Tags: 0");
+    lv_label_set_text(airtag_scan_stats_label1, "AirTags: 0\nAirTag? (Prox): 0\nSmartTags: 0\nTiles: 0");
     lv_obj_set_style_text_align(airtag_scan_stats_label1, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(airtag_scan_stats_label1, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(airtag_scan_stats_label1, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(airtag_scan_stats_label1, ui_text_color(), 0);
-    lv_obj_align(airtag_scan_stats_label1, LV_ALIGN_CENTER, 0, -95);
+    lv_obj_align(airtag_scan_stats_label1, LV_ALIGN_CENTER, 0, -75);
     lv_obj_add_flag(airtag_scan_stats_label1, LV_OBJ_FLAG_HIDDEN);
 
     // Stats label 2: "Other BT Devices: X"
@@ -58443,7 +58456,7 @@ static void obs_ring_task(void *arg)
     if (s_obs_ring_is_tile) {
         /* Tile: WNR — command is queued immediately, no write callback */
         rc = ble_gattc_write_no_rsp_flat(s_obs_ring_conn_hdl, s_obs_ring_snd_hdl,
-                                          OBS_RING_PLAY_CMD, sizeof(OBS_RING_PLAY_CMD));
+                                          OBS_RING_TILE_CMD, sizeof(OBS_RING_TILE_CMD));
         if (rc == 0) {
             obs_ring_set_status("Tile ring sent\nListen for beep");
         } else {
