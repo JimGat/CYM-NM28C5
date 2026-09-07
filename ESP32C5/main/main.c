@@ -41712,9 +41712,10 @@ static void show_found_tags_screen(void)
         lv_obj_center(track_lbl);
         lv_obj_add_event_cb(track_btn, found_tag_track_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
 
-        /* Ring — AirTag (FMN 7dfc9001) and Tile (0xFEED cmd char), both WNR {0x01} trigger.
-         * SmartTag uses Samsung FMM (0xfef3) requiring Samsung account auth — no public ring. */
-        if (dev->is_airtag || dev->is_tile) {
+        /* Ring — AirTag only: Apple FMN 7dfc9001 supports non-owner {0x01} trigger.
+         * Tile: auth token required (signed with owner account key) — no public ring.
+         * SmartTag: Samsung FMM requires account auth — no public ring. */
+        if (dev->is_airtag) {
             lv_obj_t *ring_btn = lv_btn_create(btn_col);
             lv_obj_set_size(ring_btn, 60, 26);
             lv_obj_set_style_bg_color(ring_btn, lv_color_make(200, 80, 0), LV_STATE_DEFAULT);
@@ -41727,6 +41728,14 @@ static void show_found_tags_screen(void)
             lv_obj_set_style_text_color(ring_lbl, lv_color_white(), 0);
             lv_obj_center(ring_lbl);
             lv_obj_add_event_cb(ring_btn, found_tag_ring_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        } else if (dev->is_tile) {
+            /* Tile ring requires owner auth — show greyed label instead of button */
+            lv_obj_t *no_ring_lbl = lv_label_create(btn_col);
+            lv_label_set_text(no_ring_lbl, "No ring\n(owner\nauth req)");
+            lv_obj_set_style_text_font(no_ring_lbl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(no_ring_lbl, lv_color_make(130, 130, 130), 0);
+            lv_obj_set_style_text_align(no_ring_lbl, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_set_width(no_ring_lbl, 64);
         }
 
         /* GATT Walk — all tag types */
