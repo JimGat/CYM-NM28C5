@@ -161,6 +161,8 @@ LV_IMG_DECLARE(deedee_img);
 #include "bt_lookout.h"
 #include "oui_lookup.h"
 #include "gatt_walker.h"
+#include "obs_store.h"
+#include "obs_detectors.h"
 #include "ble_honeypair.h"
 #include "chameleon_ble.h"
 #include "ble_blueduck.h"
@@ -225,10 +227,11 @@ static volatile uint32_t s_bt_parse_fail   = 0; // ble_hs_adv_parse_fields faile
 static volatile uint32_t s_bt_blacklisted  = 0; // dropped by blacklist
 static volatile uint32_t s_bt_already_seen = 0; // duplicate MAC
 
-// AirTag/SmartTag counters
+// AirTag/SmartTag/Tile counters
 static int bt_airtag_count = 0;
 static int bt_smarttag_count = 0;
 static int bt_possible_airtag_count = 0;  // Apple 0x05 Nearby Action (owner-nearby/paused mode)
+static int bt_tile_count = 0;
 
 // Generic BT device storage for scan_bt command
 typedef struct {
@@ -274,6 +277,19 @@ static volatile int ble_spam_count = 0;
 static bool ble_spam_ui_active = false;
 static volatile bool ble_spam_needs_ui_update = false;
 static int ble_spam_mode = BLE_SPAM_MODE_ALL;
+
+// BLE Blaster — 4-instance advertising flood + optional nRF24 BLE-only layer
+/* CONFIG_BT_NIMBLE_MAX_EXT_ADV_INSTANCES=1 gives indices 0+1 (default + 1 extra).
+ * The controller rejects instances 2+ with rc=3. Keep this at 2. */
+#define BLE_BLASTER_NUM_INST 2
+static volatile bool   s_blaster_active     = false;
+static volatile bool   s_blaster_nrf_active = false;
+static lv_obj_t       *s_blaster_status_lbl = NULL;
+static lv_obj_t       *s_blaster_layers_lbl = NULL;
+static lv_obj_t       *s_blaster_count_lbl  = NULL;
+static lv_timer_t     *s_blaster_tmr        = NULL;
+static TaskHandle_t    s_blaster_nrf_task   = NULL;
+static volatile int    s_blaster_pkt_count  = 0;
 
 // HoneyPair UI state
 static lv_obj_t   *hp_status_lbl = NULL;
@@ -647,6 +663,7 @@ static char     g_saved_wifi_pass[65] = ""; // Home network password
 #define NVS_KEY_WD_MMODE     "wd_manmode"    // manual mode (0=Stationary,1=Walk,2=Car)
 #define NVS_KEY_WD_GBAUD     "wd_gpsbaud"    // GPS UART baud (9600/38400/115200)
 #define NVS_KEY_WD_SUNIT     "wd_sunit"      // speed unit (0=km/h, 1=mph)
+#define NVS_KEY_GPS_DBG      "gps_dbg_ser"   // GPS serial debug log (0=off default)
 #define NVS_KEY_GPS_LAT      "gps_lat_i"
 #define NVS_KEY_GPS_LON      "gps_lon_i"
 #define NVS_KEY_GPS_ALT      "gps_alt_i"
@@ -787,6 +804,66 @@ typedef struct {
 // Use GPS definitions from wifi_common.h via wifi_cli.h
 static gps_data_t current_gps      = {0};
 static gps_data_t g_gps_last_known = {0};  // persists across GPS dropouts; loaded from NVS at boot
+
+// Passive observation store — PSRAM-backed ring buffer; shared by WiFi and BLE adapters below.
+static obs_store_t      g_obs_store;
+static obs_registry_t  *g_obs_registry = NULL;  /* built-in detector registry, init in app_main */
+#define OBS_EXPORT_DIR   "/sdcard/lab/obs"
+#define OBS_UI_MAX_SHOWN 64                      /* max cards rendered in the Passive Log screen */
+
+// Passive Log screen UI state (managed by show_obs_store_screen / obs_store_screen_stop)
+static lv_obj_t   *s_obs_list       = NULL;
+static lv_obj_t   *s_obs_status_lbl = NULL;
+static lv_timer_t *s_obs_tmr        = NULL;
+static uint32_t    s_obs_last_count  = UINT32_MAX;  /* dirty-check: rebuild list only when count changes */
+
+// Device Detail + Locate sub-screen state
+static obs_record_t   s_obs_detail_rec;                   /* copy of the record being inspected */
+static uint8_t        s_obs_saved_vib_pct  = 100;         /* vibrator pct saved on locate entry */
+static volatile bool  s_obs_loc_running    = false;       /* locate task alive flag */
+static lv_obj_t      *s_obs_loc_rssi_lbl   = NULL;
+static lv_obj_t      *s_obs_loc_bar        = NULL;
+static lv_obj_t      *s_obs_loc_status_lbl = NULL;
+static volatile bool  s_obs_ring_cancel    = false;       /* ring task cancel flag */
+static TaskHandle_t   s_obs_ring_task_hdl  = NULL;
+static lv_obj_t      *s_obs_ring_status_lbl = NULL;
+static lv_obj_t      *s_ring_status_popup   = NULL;
+
+// AirTag FMN sound service — from public Apple FMN accessory research.
+// AirTag FMN sound service (confirmed via GATT Walker v2.13.35).
+// Non-owner ring (mechanism #2 / anti-stalking locator): single 0x01 byte.
+// The 3-byte owner format {0x01,0x00,0x03} returns ATT error 0x0D (invalid length).
+#define OBS_RING_FMN_SVC  "7DFC9000-7D1C-4951-86AA-8D9728F8D66C"
+#define OBS_RING_FMN_SND  "7DFC9001-7D1C-4951-86AA-8D9728F8D66C"
+static const uint8_t OBS_RING_PLAY_CMD[] = {0x01};
+
+// NimBLE 128-bit UUID bytes (little-endian, reversed from string representation)
+static const ble_uuid128_t s_obs_ring_fmn_svc_uuid = BLE_UUID128_INIT(
+    0x6C, 0xD6, 0xF8, 0x28, 0x97, 0x8D, 0xAA, 0x86,
+    0x51, 0x49, 0x1C, 0x7D, 0x00, 0x90, 0xFC, 0x7D
+);
+static const ble_uuid128_t s_obs_ring_fmn_snd_uuid = BLE_UUID128_INIT(
+    0x6C, 0xD6, 0xF8, 0x28, 0x97, 0x8D, 0xAA, 0x86,
+    0x51, 0x49, 0x1C, 0x7D, 0x01, 0x90, 0xFC, 0x7D
+);
+
+// Tile ring: service 0xFEED, command char 9D410018-35D6-F4DD-BA60-E7BD8DC491C0 (WNR).
+// SmartTag uses Samsung FMM (0xfef3) which requires Samsung account auth — no public ring.
+// Tile SONG command: 0x08 = SONG opcode, 0x01 = song variant (Tile signature sound).
+static bool s_obs_ring_is_tile = false;
+static const ble_uuid16_t  s_obs_ring_tile_svc_uuid16 = BLE_UUID16_INIT(0xFEED);
+static const ble_uuid128_t s_obs_ring_tile_cmd_uuid   = BLE_UUID128_INIT(
+    0xC0, 0x91, 0xC4, 0x8D, 0xBD, 0xE7, 0x60, 0xBA,
+    0xDD, 0xF4, 0xD6, 0x35, 0x18, 0x00, 0x41, 0x9D
+);
+static const uint8_t OBS_RING_TILE_CMD[] = {0x08, 0x01};
+// Ring task GATT state
+static SemaphoreHandle_t s_obs_ring_sem      = NULL;
+static uint16_t          s_obs_ring_conn_hdl = BLE_HS_CONN_HANDLE_NONE;
+static int               s_obs_ring_gatt_rc  = 0;
+static uint16_t          s_obs_ring_svc_start = 0;
+static uint16_t          s_obs_ring_svc_end   = 0;
+static uint16_t          s_obs_ring_snd_hdl   = 0;
 #define GPS_STALE_ACCURACY_M 150.0f         // ~city block; used when position is held from last fix
 // Set by GPS task when a new valid fix arrives; main loop calls nvs_save_last_gps() from
 // main-task context to avoid nvs_commit() disabling flash cache in a background task.
@@ -1226,7 +1303,7 @@ static const int wd_dwell_table[WD_MODE_COUNT][4] = {
 
 // Speed thresholds (m/s) with hysteresis. 1 knot = 0.514 m/s.
 #define WD_SPEED_CAR_ENTER   5.556f   // 20 km/h
-#define WD_SPEED_CAR_EXIT    3.333f   // 12 km/h
+#define WD_SPEED_CAR_EXIT    2.222f   // 8 km/h (was 12 km/h: stop-and-go crawl sat right on it)
 #define WD_SPEED_WALK_ENTER  0.833f   // 3 km/h
 #define WD_SPEED_STAT_ENTER  0.556f   // 2 km/h
 #define WD_SPEED_HWY_ENTER   25.0f    // 90 km/h
@@ -1234,6 +1311,10 @@ static const int wd_dwell_table[WD_MODE_COUNT][4] = {
 #define WD_EMA_ALPHA         0.3f     // smoothing over ~last 4-5 fixes
 #define WD_MODE_MIN_DWELL_MS 5000     // min time in a state before a switch (anti-flap)
 #define WD_MODE_SLOW_DWELL_MS 15000   // longer settle for Walk<->Stationary only (GPS-jitter churn)
+#define WD_MODE_HWY_DWELL_MS  12000   // longer settle for Car<->Highway (overtaking spikes / traffic dips)
+#define WD_MODE_CAR_DWELL_MS  12000   // longer settle for Walk<->Car (stop-and-go crawl across the 12-20 km/h band)
+#define WD_CAR_SLOW_SUSTAIN_MS 20000  // Car may only step down after the speed has stayed
+                                      // below CAR_EXIT this long (see wd_classify_mode)
 // Car mode: visit DFS arms at most ~1 in this many D-UCB selections.
 // Highway rate-limits DFS harder still (DFS APs rarely repay a visit at speed).
 #define WD_CAR_DFS_SELECT_RATIO 10
@@ -1243,6 +1324,7 @@ static const int wd_dwell_table[WD_MODE_COUNT][4] = {
 static bool     g_wd_adaptive    = true;               // adaptive ON by default
 static int      g_wd_manual_mode = WD_MODE_STATIONARY; // used only when adaptive OFF
 static int      g_wd_gps_baud    = 9600;               // GPS UART baud (9600/38400/115200)
+static bool     g_gps_debug_serial = false;            // [GPSDBG] heartbeat to serial (off by default)
 static int      g_wd_speed_unit  = 0;                  // 0 = km/h, 1 = mph (dashboard readout)
 
 static const char *wd_mode_name(wd_mode_t m)
@@ -1273,6 +1355,9 @@ static const char *wd_mode_icon(wd_mode_t m)
 static wd_mode_t g_wd_active_mode   = WD_MODE_STATIONARY;
 static float     g_wd_speed_ema     = 0.0f;
 static int64_t   g_wd_mode_since_us = 0;
+// Start of the current uninterrupted below-CAR_EXIT stretch while in Car mode
+// (0 = not currently slow). Only touched by wd_classify_mode.
+static int64_t   g_wd_car_slow_since_us = 0;
 
 // One-shot adaptive-mode transition event. Set by wd_classify_mode when a switch
 // is actually applied; drained by the wardrive loop into a per-session sidecar
@@ -1309,8 +1394,27 @@ static wd_mode_t wd_classify_mode(float raw_speed_ms)
             break;
         case WD_MODE_CAR:
             if (s >= WD_SPEED_HWY_ENTER)       next = WD_MODE_HIGHWAY;
-            else if (s < WD_SPEED_CAR_EXIT)
-                next = (s < WD_SPEED_WALK_ENTER) ? WD_MODE_STATIONARY : WD_MODE_WALK;
+            else if (s < WD_SPEED_CAR_EXIT) {
+                // Stop-and-go: a car legitimately crosses the WHOLE 8-20 km/h band on
+                // every creep, so an INSTANT threshold crossing (even gated by a dwell)
+                // cannot tell a 12 s traffic dip from parking and walking away - it only
+                // rate-limits the flapping. Lowering CAR_EXIT just moves where it flaps
+                // (2026-08-14 drive: exits moved from 11-12 to 6.4-8.0 km/h, still 30
+                // Walk<->Car flips in 90 min, 5 pairs sitting exactly on the 12 s floor).
+                // So require the low speed to be SUSTAINED before stepping down. Real
+                // crawls on that drive lasted >=47 s, spurious dips <=14 s.
+                // The timer keys on the CONDITION, not on the target mode, so a car
+                // decelerating 8 -> 3 -> 1 km/h does not restart it; the target is picked
+                // from the speed at the moment the window completes, which also lets a
+                // vehicle coming to a halt go straight to Stationary instead of emitting
+                // a phantom Walk segment on the way.
+                int64_t now_slow = esp_timer_get_time();
+                if (g_wd_car_slow_since_us == 0) g_wd_car_slow_since_us = now_slow;
+                if (now_slow - g_wd_car_slow_since_us >= WD_CAR_SLOW_SUSTAIN_MS * 1000LL)
+                    next = (s < WD_SPEED_WALK_ENTER) ? WD_MODE_STATIONARY : WD_MODE_WALK;
+            } else {
+                g_wd_car_slow_since_us = 0;   // re-accelerated: the stretch is over
+            }
             break;
         case WD_MODE_HIGHWAY:
             // Step down only to Car; Car then handles any further downshift.
@@ -1326,10 +1430,32 @@ static wd_mode_t wd_classify_mode(float raw_speed_ms)
         // Car/Highway transitions stay responsive at WD_MODE_MIN_DWELL_MS.
         bool slow_pair = (cur  == WD_MODE_STATIONARY || cur  == WD_MODE_WALK) &&
                          (next == WD_MODE_STATIONARY || next == WD_MODE_WALK);
-        int64_t min_dwell_ms = slow_pair ? WD_MODE_SLOW_DWELL_MS : WD_MODE_MIN_DWELL_MS;
+        // Car<->Highway oscillates on overtaking speed spikes and brief traffic dips
+        // (~21% of Highway segments ran <30s on the DE->TR drive). A longer min-dwell
+        // damps it; Highway is only ever reached from Car and only steps back to Car,
+        // so this pair is exactly Car<->Highway.
+        bool hwy_pair  = (cur == WD_MODE_HIGHWAY || next == WD_MODE_HIGHWAY);
+        // Walk<->Car oscillates in stop-and-go traffic: speed swings across the Car band
+        // (CAR_EXIT..CAR_ENTER) so both thresholds get crossed every creep, flapping the
+        // mode every 5-13 s (seen on the 2026-08-12 city drive). The dwell alone only
+        // rate-limited it - every deceleration still crossed the old 12 km/h CAR_EXIT and
+        // flipped at the 12 s floor (2026-08-13 test: 10 of 26 flips sat exactly on it),
+        // so CAR_EXIT dropped to 8 km/h to widen the band. A longer settle keeps Car
+        // params during brief crawls. The Car->Walk direction is now additionally
+        // gated by WD_CAR_SLOW_SUSTAIN_MS above; this dwell still covers Walk->Car.
+        // This pair is ONLY
+        // Walk<->Car: Stationary->Car (pull-away) and Car->Stationary (hard stop) are
+        // excluded, so they stay responsive at WD_MODE_MIN_DWELL_MS.
+        bool car_pair  = (cur  == WD_MODE_WALK || cur  == WD_MODE_CAR) &&
+                         (next == WD_MODE_WALK || next == WD_MODE_CAR);
+        int64_t min_dwell_ms = slow_pair ? WD_MODE_SLOW_DWELL_MS
+                             : hwy_pair  ? WD_MODE_HWY_DWELL_MS
+                             : car_pair  ? WD_MODE_CAR_DWELL_MS
+                             : WD_MODE_MIN_DWELL_MS;
         if (now - g_wd_mode_since_us >= min_dwell_ms * 1000LL) {
             g_wd_active_mode   = next;
             g_wd_mode_since_us = now;
+            g_wd_car_slow_since_us = 0;   // fresh window on the next entry into Car
             ESP_LOGI(TAG, "[WDP] Adaptive mode -> %s (%.1f m/s)",
                      wd_mode_name(next), (double)s);
             g_wd_mode_evt.from     = cur;
@@ -1482,6 +1608,8 @@ static bool           ble_pcap_save_enabled = true;  // toggled on PCAP screen
 static lv_obj_t      *ble_pcap_save_sw   = NULL;
 static lv_obj_t      *ble_pcap_fn_lbl    = NULL;
 static char           ble_pcap_fname[96] = "";
+static bool           ble_pcap_filter_active = false;  // targeted capture: filter by MAC
+static uint8_t        ble_pcap_filter_mac[6] = {0};    // only queue packets from this addr
 
 // Wardrive attack state
 static TaskHandle_t wardrive_task_handle = NULL;
@@ -1671,8 +1799,9 @@ static lv_timer_t *arp_scan_check_timer = NULL;
 #define MITM_MAX_HOSTS    64
 #define MITM_QUEUE_SIZE   256
 #define MITM_MAX_FRAME    1600
-#define LINKTYPE_ETHERNET   1
-#define LINKTYPE_IEEE80211  105
+#define LINKTYPE_ETHERNET         1
+#define LINKTYPE_IEEE80211        105
+#define LINKTYPE_IEEE80211_RADIO  127   // radiotap: includes RSSI + per-frame metadata
 
 typedef struct {
     uint16_t len;
@@ -1721,6 +1850,7 @@ static lv_obj_t *ble_scan_status_label = NULL;
 static volatile bool ble_scan_ui_active = false;
 static volatile bool ble_scan_needs_ui_update = false;
 static volatile bool ble_scan_finished = false;
+static volatile bool ble_obs_store_pending = false;  /* main loop feeds bt_devices → g_obs_store once per scan */
 static char ble_scan_status_text[48] = "";
 
 // Deauth Monitor state
@@ -1765,6 +1895,64 @@ typedef struct {
 static QueueHandle_t deauth_pcap_queue = NULL;
 static FILE         *deauth_pcap_file  = NULL;
 static char          deauth_pcap_path[64] = "";
+
+// ── WiFi Packet Capture (targeted promiscuous PCAP) state ────────────────────
+// Queue items are PSRAM-malloc'd; writer is the LVGL 200 ms timer.
+// Format: DLT_IEEE802_11_RADIO (127) — radiotap header carries per-frame RSSI.
+// Output: /sdcard/lab/pcaps/wifi_XXXXXX_NNNNNNNNNN.pcap
+#define WIFI_CAP_QUEUE_DEPTH  64
+
+typedef struct {
+    uint8_t  it_version;
+    uint8_t  it_pad;
+    uint16_t it_len;      /* 12 (LE) */
+    uint32_t it_present;  /* bit 5 = dBm Antenna Signal */
+    int8_t   it_signal;
+    uint8_t  it_align[3];
+} __attribute__((packed)) wifi_cap_radiotap_t;
+
+typedef struct {
+    uint8_t  *frame;      /* PSRAM-allocated; freed by timer writer after write */
+    uint16_t  len;
+    int8_t    rssi;
+    uint8_t   channel;
+    uint64_t  ts_us;
+} wifi_cap_pkt_t;
+
+static volatile bool     s_wcap_running      = false;
+static volatile uint32_t s_wcap_count        = 0;
+static FILE             *s_wcap_file         = NULL;
+static QueueHandle_t     s_wcap_queue        = NULL;
+static uint8_t           s_wcap_bssid[6]     = {0};
+static char              s_wcap_ssid[33]     = "";
+static uint8_t           s_wcap_channel      = 6;
+static char              s_wcap_filepath[80] = "";
+static lv_obj_t         *s_wcap_cnt_lbl      = NULL;
+static lv_obj_t         *s_wcap_status_lbl   = NULL;
+static lv_obj_t         *s_wcap_fn_lbl       = NULL;
+static lv_timer_t       *s_wcap_ui_timer     = NULL;
+static lv_obj_t         *s_wcap_list_cont    = NULL;
+static lv_obj_t         *s_wcap_info_cont    = NULL;
+
+// ── BLE Targeted Capture picker state ────────────────────────────────────────
+#define BLE_TARG_MAX       24
+#define BLE_TARG_SCAN_SECS  8
+
+typedef struct {
+    uint8_t addr[6];
+    uint8_t addr_type;
+    int8_t  rssi;
+    char    name[20];
+} ble_targ_dev_t;
+
+EXT_RAM_BSS_ATTR static ble_targ_dev_t s_targ_devs[BLE_TARG_MAX];
+static volatile int    s_targ_count      = 0;
+static int             s_targ_displayed  = 0;
+static lv_timer_t     *s_targ_timer      = NULL;
+static lv_obj_t       *s_targ_list_cont  = NULL;
+static lv_obj_t       *s_targ_hdr_lbl    = NULL;
+static volatile bool   s_targ_scanning   = false;
+static int             s_targ_tick       = 0;
 
 // Drone Detector state
 EXT_RAM_BSS_ATTR static drone_rec_t   g_drones[DRONE_MAX];
@@ -1953,10 +2141,17 @@ EXT_RAM_BSS_ATTR static nrf24_futaba_ctx_t *s_nfut = NULL;
 EXT_RAM_BSS_ATTR static int       s_n24_page = 0;
 EXT_RAM_BSS_ATTR static lv_obj_t *s_n24_pages[NRF24_NUM_PAGES];
 EXT_RAM_BSS_ATTR static lv_obj_t *s_n24_page_lbl = NULL;
-EXT_RAM_BSS_ATTR static bool      s_n24_jam_active = false;
-EXT_RAM_BSS_ATTR static lv_obj_t *s_n24_jam_status = NULL;
-EXT_RAM_BSS_ATTR static lv_timer_t *s_n24_jam_tmr = NULL;
-EXT_RAM_BSS_ATTR static TaskHandle_t s_n24_jam_task = NULL;
+EXT_RAM_BSS_ATTR static bool           s_n24_jam_active    = false;
+EXT_RAM_BSS_ATTR static nrf24_jam_mode_t s_n24_jam_mode    = NRF24_JAM_TEST;
+EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_jam_status    = NULL;
+EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_mode_btns[10] = {NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL};
+EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_seq_btn        = NULL;
+EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_fhss_btn       = NULL;
+EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_jam_btn        = NULL;
+EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_stop_btn       = NULL;
+EXT_RAM_BSS_ATTR static bool           s_n24_jam_fhss       = false;
+EXT_RAM_BSS_ATTR static lv_timer_t    *s_n24_jam_tmr        = NULL;
+EXT_RAM_BSS_ATTR static TaskHandle_t   s_n24_jam_task       = NULL;
 
 // ── nRF24 Fox Hunt state (declared early — cleanup in show_nrf24_screen) ──────
 static lv_obj_t   *s_n24fox_bar    = NULL;
@@ -2369,6 +2564,7 @@ static bool hid_subscribed = false;
 static volatile int airtag_scan_snapshot_airtag = 0;
 static volatile int airtag_scan_snapshot_smarttag = 0;
 static volatile int airtag_scan_snapshot_possible_airtag = 0;
+static volatile int airtag_scan_snapshot_tile = 0;
 static volatile int airtag_scan_snapshot_total = 0;
 
 // Promiscuous filter
@@ -2891,6 +3087,10 @@ static void wpasec_upload_timer_cb(lv_timer_t *timer);
 static void show_ble_pcap_screen(void);
 static void ble_pcap_stop(void);
 
+// WiFi frame capture + BLE targeted capture
+static void show_wifi_pcap_screen(void);
+static void show_ble_targeted_pcap_screen(void);
+
 // Wardrive submenu + upload helpers
 static void show_wardrive_menu_screen(void);
 static void show_wardrive_options_screen(void);
@@ -2984,6 +3184,7 @@ static void show_directed_bt_attacks_screen(void);
 static void show_ble_spoof_directed_screen(void);
 static void show_ble_disc_directed_screen(void);
 static void show_ble_spam_screen(void);
+static void show_ble_blaster_screen(void);
 static void show_ble_spoof_screen(void);
 static void show_ble_disc_screen(void);
 static void ble_spam_task(void *pvParameters);
@@ -3031,6 +3232,9 @@ static void drone_row_tap_cb(lv_event_t *e);
 static void show_wifi_analyzer_screen(void);
 static void show_wscope_screen(void);
 static void wscope_task(void *p);
+static void show_obs_store_screen(void);
+static void show_obs_device_detail_screen(void);
+static void show_obs_device_locate_screen(void);
 static void show_espnow_scout_screen(void);
 static void espnow_scout_stop(void);
 static void espnow_rebuild_list(void);
@@ -3731,6 +3935,8 @@ static void nvs_settings_load(void)
         if (nvs_get_u8(h, NVS_KEY_WD_SUNIT, &wsu) == ESP_OK && wsu <= 1) g_wd_speed_unit = wsu;
         uint8_t wgb = 0;   // GPS baud: 0=9600 (standard), 1=115200 (5 Hz). Boot autodetect re-syncs the module to this.
         if (nvs_get_u8(h, NVS_KEY_WD_GBAUD, &wgb) == ESP_OK) g_wd_gps_baud = (wgb == 1) ? 115200 : 9600;
+        uint8_t gps_dbg = 0;
+        if (nvs_get_u8(h, NVS_KEY_GPS_DBG, &gps_dbg) == ESP_OK) g_gps_debug_serial = (gps_dbg != 0);
         uint8_t wble = 0;
         // g_wd_ble is always true — no longer user-configurable
         uint8_t rfhat = 0;
@@ -5833,6 +6039,12 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(nvs_ret);
 
+    // Passive observation store: 512-record PSRAM ring buffer
+    if (!obs_store_init(&g_obs_store, 0)) {
+        ESP_LOGE(TAG, "obs_store_init failed — observation store disabled");
+    }
+    g_obs_registry = obs_detectors_default_registry();
+
 	//Initialize GPS UART and start background monitor task
 	if (init_gps_uart() == ESP_OK) {
 		ESP_LOGI(TAG, "GPS UART initialized on TX=%d RX=%d", GPS_TX_PIN, GPS_RX_PIN);
@@ -6351,6 +6563,27 @@ void app_main(void)
             }
 
             boot_btn_prev_pressed = btn_pressed;
+
+            /* Touch-to-wake: hold screen for 5 s (any position).
+             * Polled directly here — LVGL indev reads are suppressed while dark.
+             * Full-screen zone used because LCD DMA bursts (LVGL still flushes
+             * to the off panel) can delay SPI touch reads by 150–250 ms, making
+             * a small corner zone unreliable when frames run long. */
+            {
+                static int64_t touch_wake_hold_ms = 0;
+                xpt2046_touch_point_t tp = {0};
+                bool touched = xpt2046_read_touch(&touch_handle, &tp) && tp.touched;
+                if (touched) {
+                    int64_t t_now = (int64_t)(esp_timer_get_time() / 1000);
+                    if (touch_wake_hold_ms == 0) touch_wake_hold_ms = t_now;
+                    if (t_now - touch_wake_hold_ms >= 5000) {
+                        touch_wake_hold_ms = 0;
+                        go_dark_disable();
+                    }
+                } else {
+                    touch_wake_hold_ms = 0;
+                }
+            }
         }
 
         // Disco LED update — driven from main task to keep RMT calls single-threaded
@@ -6933,6 +7166,58 @@ void app_main(void)
                     scan_done_ui_flag = false;
                 } else {
                 scan_done_ui_flag = false;
+
+                // WiFi→obs_store adapter: feed every scan result into the passive observation store.
+                // Runs under lvgl_mutex (held by main loop), safe to call obs_store_add here.
+                if (g_obs_store.records) {
+                    const gps_data_t *gps = gps_best();
+                    uint8_t gps_flags = 0;
+                    if (gps && gps->valid) {
+                        gps_flags = (gps->accuracy < GPS_STALE_ACCURACY_M - 1.0f)
+                                    ? OBS_FLAG_GPS_VALID : OBS_FLAG_GPS_STALE;
+                    }
+                    for (uint16_t wi = 0; wi < g_shared_scan_count && wi < MAX_SCAN_RESULTS; wi++) {
+                        const wifi_ap_record_t *ap = &g_shared_scan_results[wi];
+                        obs_record_t obs = {0};
+                        obs.src_radio   = (uint8_t)OBS_RADIO_WIFI;
+                        obs.obs_type    = (uint8_t)OBS_TYPE_WIFI_AP;
+                        obs.flags       = gps_flags;
+                        if (ap->ssid[0] == '\0') obs.flags |= OBS_FLAG_HIDDEN_SSID;
+                        memcpy(obs.mac, ap->bssid, 6);
+                        obs.rssi_cur    = (int8_t)ap->rssi;
+                        obs.rssi_peak   = (int8_t)ap->rssi;
+                        obs.channel     = ap->primary;
+                        obs.auth_mode   = (uint8_t)ap->authmode;
+                        /* Infer PHY from band and protocol flags */
+                        if (ap->phy_11ax)      obs.phy = (uint8_t)OBS_PHY_11AX;
+                        else if (ap->phy_11ac) obs.phy = (uint8_t)OBS_PHY_11AC;
+                        else if (ap->phy_11n)  obs.phy = (uint8_t)OBS_PHY_11N;
+                        else if (ap->phy_11g)  obs.phy = (uint8_t)OBS_PHY_11G;
+                        else if (ap->phy_11b)  obs.phy = (uint8_t)OBS_PHY_11B;
+                        /* PMF inferred from auth mode (WPA3 → likely MFP required) */
+                        if (ap->authmode == WIFI_AUTH_WPA3_PSK ||
+                            ap->authmode == WIFI_AUTH_WPA2_WPA3_PSK ||
+                            ap->authmode == WIFI_AUTH_WPA3_ENTERPRISE ||
+                            ap->authmode == WIFI_AUTH_WPA3_ENT_192) {
+                            obs.flags |= OBS_FLAG_PMF_INFERRED;
+                        }
+                        if (gps && gps->valid) {
+                            obs.latitude    = gps->latitude;
+                            obs.longitude   = gps->longitude;
+                            obs.altitude_m  = gps->altitude;
+                            obs.accuracy_m  = gps->accuracy;
+                        }
+                        obs.hit_count   = 1;
+                        if (ap->ssid[0]) strncpy(obs.label, (const char *)ap->ssid, sizeof(obs.label) - 1);
+                        if (g_obs_registry) obs_registry_run(g_obs_registry, &obs);
+                        {
+                            obs_record_t *stored = obs_store_add(&g_obs_store, &obs);
+                            if (stored && stored->hit_count > 1)
+                                obs_record_ev_add(stored, (uint8_t)OBS_EV_RECURRENCE);
+                        }
+                    }
+                }
+
                 wifi_sas_page = 0;
 
                 if (function_page) { lv_obj_del(function_page); function_page = NULL; }
@@ -7274,6 +7559,62 @@ void app_main(void)
                 }
             }
 
+            // BLE→obs_store adapter: runs once after every BLE scan completes
+            if (ble_obs_store_pending && g_obs_store.records) {
+                ble_obs_store_pending = false;
+                const gps_data_t *gps = gps_best();
+                uint8_t gps_flags = 0;
+                if (gps && gps->valid) {
+                    gps_flags = (gps->accuracy < GPS_STALE_ACCURACY_M - 1.0f)
+                                ? OBS_FLAG_GPS_VALID : OBS_FLAG_GPS_STALE;
+                }
+                for (int bi = 0; bi < bt_device_count; bi++) {
+                    const bt_device_info_t *dev = &bt_devices[bi];
+                    obs_record_t obs = {0};
+                    obs.src_radio  = (uint8_t)OBS_RADIO_BLE;
+                    obs.obs_type   = (uint8_t)OBS_TYPE_BLE_ADV;
+                    obs.flags      = gps_flags;
+                    if (dev->addr_type != 0) obs.flags |= OBS_FLAG_RANDOM_ADDR;
+                    memcpy(obs.mac, dev->addr, 6);
+                    obs.rssi_cur   = dev->rssi;
+                    obs.rssi_peak  = dev->rssi;
+                    /* Map NimBLE PHY constants: 1=1M, 2=2M, 3=Coded */
+                    if      (dev->phy == 2) obs.phy = (uint8_t)OBS_PHY_BLE_2M;
+                    else if (dev->phy == 3) obs.phy = (uint8_t)OBS_PHY_BLE_CODED;
+                    else                    obs.phy = (uint8_t)OBS_PHY_BLE_1M;
+                    if (gps && gps->valid) {
+                        obs.latitude   = gps->latitude;
+                        obs.longitude  = gps->longitude;
+                        obs.altitude_m = gps->altitude;
+                        obs.accuracy_m = gps->accuracy;
+                    }
+                    obs.hit_count = 1;
+                    if (dev->name[0]) strncpy(obs.label, dev->name, sizeof(obs.label) - 1);
+                    /* Evidence tags from parsed advertisement data */
+                    if (dev->company_id != 0 && obs.evidence_count < OBS_MAX_EVIDENCE)
+                        obs.evidence[obs.evidence_count++] = (uint8_t)OBS_EV_MFR_DATA;
+                    if (dev->fp_svc_uuid != 0 && obs.evidence_count < OBS_MAX_EVIDENCE)
+                        obs.evidence[obs.evidence_count++] = (uint8_t)OBS_EV_SVC_UUID;
+                    /* Pre-classify: write canonical label when device name is absent */
+                    if (!obs.label[0]) {
+                        if      (dev->is_airtag)          strncpy(obs.label, "AirTag",    sizeof(obs.label) - 1);
+                        else if (dev->is_possible_airtag) strncpy(obs.label, "FindMy",    sizeof(obs.label) - 1);
+                        else if (dev->is_smarttag)        strncpy(obs.label, "SmartTag",  sizeof(obs.label) - 1);
+                        else if (dev->is_tile)            strncpy(obs.label, "Tile",      sizeof(obs.label) - 1);
+                        else if (dev->is_eddystone)       strncpy(obs.label, "Eddystone", sizeof(obs.label) - 1);
+                        else if (dev->is_fast_pair)       strncpy(obs.label, "FastPair",  sizeof(obs.label) - 1);
+                        else if (dev->is_matter)          strncpy(obs.label, "Matter",    sizeof(obs.label) - 1);
+                        else if (dev->is_bthome)          strncpy(obs.label, "BTHome",    sizeof(obs.label) - 1);
+                    }
+                    if (g_obs_registry) obs_registry_run(g_obs_registry, &obs);
+                    {
+                        obs_record_t *stored = obs_store_add(&g_obs_store, &obs);
+                        if (stored && stored->hit_count > 1)
+                            obs_record_ev_add(stored, (uint8_t)OBS_EV_RECURRENCE);
+                    }
+                }
+            }
+
             // Disco mode screen update (driven by disco_task flag)
             if (disco_needs_update && disco_mode_active && disco_screen_obj) {
                 disco_needs_update = false;
@@ -7471,6 +7812,7 @@ void app_main(void)
                 int snap_airtag          = airtag_scan_snapshot_airtag;
                 int snap_smarttag        = airtag_scan_snapshot_smarttag;
                 int snap_possible_airtag = airtag_scan_snapshot_possible_airtag;
+                int snap_tile            = airtag_scan_snapshot_tile;
                 int snap_total           = airtag_scan_snapshot_total;
 
                 // Hide "Scan in progress", show stats
@@ -7482,15 +7824,15 @@ void app_main(void)
                 if (airtag_scan_stats_label1 && lv_obj_is_valid(airtag_scan_stats_label1)) {
                     char stats1[96];
                     snprintf(stats1, sizeof(stats1),
-                             "Air Tags: %d\nAirTag? (Prox): %d\nSmart Tags: %d",
-                             snap_airtag, snap_possible_airtag, snap_smarttag);
+                             "AirTags: %d\nAirTag? (Prox): %d\nSmartTags: %d\nTiles: %d",
+                             snap_airtag, snap_possible_airtag, snap_smarttag, snap_tile);
                     lv_label_set_text(airtag_scan_stats_label1, stats1);
                     lv_obj_clear_flag(airtag_scan_stats_label1, LV_OBJ_FLAG_HIDDEN);
                 }
 
                 // Show "View Found Tags" button when at least one tag-type device is detected
                 if (airtag_view_tags_btn && lv_obj_is_valid(airtag_view_tags_btn)) {
-                    if (snap_airtag + snap_smarttag + snap_possible_airtag > 0) {
+                    if (snap_airtag + snap_smarttag + snap_possible_airtag + snap_tile > 0) {
                         lv_obj_clear_flag(airtag_view_tags_btn, LV_OBJ_FLAG_HIDDEN);
                     } else {
                         lv_obj_add_flag(airtag_view_tags_btn, LV_OBJ_FLAG_HIDDEN);
@@ -7498,7 +7840,7 @@ void app_main(void)
                 }
 
                 if (airtag_scan_stats_label2 && lv_obj_is_valid(airtag_scan_stats_label2)) {
-                    int other_devices = snap_total - snap_airtag - snap_smarttag - snap_possible_airtag;
+                    int other_devices = snap_total - snap_airtag - snap_smarttag - snap_possible_airtag - snap_tile;
                     if (other_devices < 0) other_devices = 0;
                     char stats2[48];
                     snprintf(stats2, sizeof(stats2), "Other BT Devices: %d", other_devices);
@@ -7766,6 +8108,19 @@ void app_main(void)
             nvs_save_last_gps(&g_gps_last_known);
         }
         
+#if defined(NRF24_BENCH) && defined(CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS)
+        // Runtime stats dump every ~30 s. Requires CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+        // in sdkconfig.defaults (add manually — never ship this in production builds).
+        {
+            static uint32_t s_bench_loop_count = 0;
+            if (++s_bench_loop_count % 3000 == 0) {  // 3000 × ~10ms ≈ 30 s
+                static char s_rt_buf[1024];
+                vTaskGetRunTimeStats(s_rt_buf);
+                ESP_LOGI("bench", "[RTSTATS]\n%s", s_rt_buf);
+            }
+        }
+#endif
+
         vTaskDelay(pdMS_TO_TICKS(sleep_ms > 10 ? 10 : sleep_ms));
     }
 }
@@ -7837,6 +8192,23 @@ void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_
             xSemaphoreGive(sd_spi_mutex);
             uint64_t flush_done = esp_timer_get_time();
 
+#ifdef NRF24_BENCH
+            {
+                static uint32_t s_bench_flush_count = 0;
+                static uint64_t s_bench_flush_total_us = 0;
+                static uint32_t s_bench_flush_max_us = 0;
+                uint32_t this_flush_us = (uint32_t)(flush_done - flush_start);
+                s_bench_flush_total_us += this_flush_us;
+                if (this_flush_us > s_bench_flush_max_us) s_bench_flush_max_us = this_flush_us;
+                if (++s_bench_flush_count % 100 == 0) {
+                    ESP_LOGI("flush", "[BENCH] count=%lu avg_us=%lu max_us=%lu",
+                             (unsigned long)s_bench_flush_count,
+                             (unsigned long)(s_bench_flush_total_us / s_bench_flush_count),
+                             (unsigned long)s_bench_flush_max_us);
+                }
+            }
+#endif
+
             if (sd_provision_active && (area->y2 - area->y1) > 50) {
                 ESP_LOGI(TAG, "[FLUSH-PROV-SUCCESS] draw=%lld us, sem_wait=%lld us, total=%lld us",
                          draw_done - draw_start, sem_done - sem_start, flush_done - flush_start);
@@ -7857,6 +8229,9 @@ void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_
 void lvgl_touch_read_cb(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
 {
     if (go_dark_active) {
+        /* Screen is off — suppress all LVGL touch events.
+         * Touch-to-wake is handled directly in the main loop alongside the
+         * boot-button poll (see go_dark_active block in app_main). */
         data->state = LV_INDEV_STATE_RELEASED;
         return;
     }
@@ -8271,7 +8646,7 @@ static void deauth_stop(void)
     deauth_paused = false;
     // Full radio reset to STA-idle — same teardown as the Home path. Without this
     // ‹ Back left WiFi in APSTA (residual AP still broadcasting) + injection state;
-    // deauth/evil-twin leave the driver dirty, so match Home exactly (Birol: service
+    // deauth/evil-twin leave the driver dirty, so match Home exactly (@birolt29: service
     // seemed to keep running after ‹ Back). Safe: run_screen_stop_fn runs it while the
     // outgoing screen's UI is intact (deferred handler), like handshake_stop.
     radio_reset_to_idle();
@@ -10272,8 +10647,13 @@ static float wdp_gps_distance_m(float lat1, float lon1, float lat2, float lon2) 
 }
 
 static void wdp_clear_dedup_buffer(void) {
+    // Count only - deliberately NO memset. This runs in the promiscuous RX callback
+    // (WiFi task) while the wardrive task may be formatting a row out of this same
+    // buffer, and wiping it mid-format produced an all-zero CSV row (real MAC, then
+    // channel/RSSI/lat/lon all 0 - seen once in 12k rows on 2026-08-13). The memset was
+    // redundant anyway: nothing ever reads past wdp_seen_count, and every field of an
+    // entry is assigned on insert, so stale bytes are never visible.
     wdp_seen_count = 0;
-    memset(wdp_seen_networks, 0, sizeof(wdp_seen_networks));
     const gps_data_t *g = gps_best();
     wdp_last_gps_lat = g->valid ? g->latitude : 0.0f;
     wdp_last_gps_lon = g->valid ? g->longitude : 0.0f;
@@ -10676,7 +11056,34 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
         } else if (tag == 3 && tag_len == 1) {
             beacon_channel = body[offset + 2];
         } else if (tag == 48) {
-            authmode = WIFI_AUTH_WPA2_PSK;
+            authmode = WIFI_AUTH_WPA2_PSK;  // RSN IE present -> at least WPA2
+            // Refine from the RSN AKM suite list so WPA3/Enterprise are not mislabeled
+            // WPA2. RSN IE layout: version(2) group-cipher(4) pairwise-cnt(2)
+            // pairwise(4*n) akm-cnt(2) akm(4*m) ... AKM OUI 00-0F-AC: 8/9=SAE(WPA3),
+            // 2/6=PSK(WPA2), 1/5=802.1X(Enterprise). All reads bounds-checked vs tag_len.
+            const uint8_t *rsn = &body[offset + 2];
+            int rl = tag_len, p = 2 + 4;               // skip version + group cipher
+            if (p + 2 <= rl) {
+                int pcnt = rsn[p] | (rsn[p + 1] << 8); // pairwise cipher count
+                p += 2 + 4 * pcnt;                     // skip pairwise suites
+                if (p + 2 <= rl) {
+                    int akm = rsn[p] | (rsn[p + 1] << 8);
+                    p += 2;
+                    bool psk = false, sae = false, ent = false;
+                    for (int a = 0; a < akm && p + 4 <= rl; a++, p += 4) {
+                        if (rsn[p] == 0x00 && rsn[p + 1] == 0x0F && rsn[p + 2] == 0xAC) {
+                            uint8_t t = rsn[p + 3];
+                            if (t == 8 || t == 9)      sae = true;
+                            else if (t == 2 || t == 6) psk = true;
+                            else if (t == 1 || t == 5) ent = true;
+                        }
+                    }
+                    if (sae && psk)  authmode = WIFI_AUTH_WPA2_WPA3_PSK;
+                    else if (sae)    authmode = WIFI_AUTH_WPA3_PSK;
+                    else if (ent)    authmode = WIFI_AUTH_WPA2_ENTERPRISE;
+                    // else stays WPA2_PSK
+                }
+            }
         } else if (tag == 221) {
             if (tag_len >= 4 && body[offset+2] == 0x00 && body[offset+3] == 0x50 &&
                 body[offset+4] == 0xF2 && body[offset+5] == 0x01) {
@@ -10684,6 +11091,14 @@ static void wdp_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
             }
         }
         offset += 2 + tag_len;
+    }
+
+    // WEP: privacy bit set in the beacon capability field but no RSN/WPA IE seen.
+    // (Previously these fell through as Open, understating their crypto on upload.)
+    // Capability info = the 2 bytes just before the tagged params; body = frame+24+12,
+    // so its low byte is frame[34], valid because len >= 36 was checked above.
+    if (authmode == WIFI_AUTH_OPEN && (frame[34] & 0x10)) {
+        authmode = WIFI_AUTH_WEP;
     }
 
     // Check if GPS moved 150+ feet; if so, clear dedup buffer to allow re-discovery
@@ -12172,36 +12587,46 @@ static void wardrive_promisc_task(void *pvParameters) {
         for (int i = 0; i < wdp_seen_count; i++) {
             if (wdp_seen_networks[i].written_to_file) continue;
             wdp_network_t *net = &wdp_seen_networks[i];
+            // Format from a private SNAPSHOT, never from the live slot: the promiscuous
+            // RX callback runs in the WiFi task and can clear (GPS moved 45.72 m) and
+            // refill this buffer at any point during the row below. Copying first shrinks
+            // that window from the whole fprintf down to one ~60-byte struct copy.
+            wdp_network_t snap = *net;
+            if (snap.channel == 0) continue;  // never a valid beacon; slot was mid-refill
 
             // Skip whitelisted networks (privacy filter: don't upload operator's own networks to WiGLE/WDG)
-            if (is_bssid_whitelisted(net->bssid) || is_ssid_whitelisted(net->ssid)) {
+            if (is_bssid_whitelisted(snap.bssid) || is_ssid_whitelisted(snap.ssid)) {
                 net->written_to_file = true;  // Mark as written to skip on future iterations
                 continue;
             }
 
             char mac_str[18];
             snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
-                     net->bssid[0], net->bssid[1], net->bssid[2],
-                     net->bssid[3], net->bssid[4], net->bssid[5]);
+                     snap.bssid[0], snap.bssid[1], snap.bssid[2],
+                     snap.bssid[3], snap.bssid[4], snap.bssid[5]);
             char escaped_ssid[64];
-            escape_csv_field(net->ssid, escaped_ssid, sizeof(escaped_ssid));
-            const char *auth = get_auth_mode_wiggle(net->authmode);
-            int freq = (net->channel >= 1 && net->channel <= 13) ?
-                       2412 + (net->channel - 1) * 5 :
-                       (net->channel == 14) ? 2484 :
-                       (net->channel >= 36)  ? 5000 + 5 * net->channel : 0;
+            escape_csv_field(snap.ssid, escaped_ssid, sizeof(escaped_ssid));
+            const char *auth = get_auth_mode_wiggle(snap.authmode);
+            int freq = (snap.channel >= 1 && snap.channel <= 13) ?
+                       2412 + (snap.channel - 1) * 5 :
+                       (snap.channel == 14) ? 2484 :
+                       (snap.channel >= 36)  ? 5000 + 5 * snap.channel : 0;
             int wr = fprintf(file, "%s,%s,[%s],%s,%d,%d,%d,%.7f,%.7f,%.2f,%.2f,,,WIFI\n",
                     mac_str, escaped_ssid, auth, timestamp,
-                    net->channel, freq, net->rssi, net->latitude, net->longitude,
-                    (double)net->altitude, (double)net->accuracy);
+                    snap.channel, freq, snap.rssi, snap.latitude, snap.longitude,
+                    (double)snap.altitude, (double)snap.accuracy);
+            // Only stamp the slot if it still holds the network we just wrote. If the RX
+            // callback recycled it meanwhile, stamping would mark a DIFFERENT, unwritten
+            // network as done and silently drop it; leaving it alone writes it next dwell.
+            bool same_slot = (memcmp(snap.bssid, net->bssid, 6) == 0);
             if (wr < 0) {
                 sd_error_report("Wardrive CSV", "fprintf", "WiFi line write failed");
-                net->written_to_file = true; // Mark as written to avoid re-attempts
+                if (same_slot) net->written_to_file = true; // avoid re-attempts
             } else {
-                net->written_to_file = true;
+                if (same_slot) net->written_to_file = true;
                 networks_since_flush++;
-                wd_bytes += wr;                // track part size for rotation
-                wdp_push_to_screen_fifo(net);  // Add to screen FIFO only on successful CSV write
+                wd_bytes += wr;                 // track part size for rotation
+                wdp_push_to_screen_fifo(&snap); // Add to screen FIFO only on successful CSV write
             }
         }
         // In WiFi-only mode, write BLE devices during scan (if any detected via coex)
@@ -13991,7 +14416,7 @@ static void portal_stop(void)
     // Full radio reset to STA-idle (matches Home). wifi_attacks_stop_portal leaves
     // the driver in APSTA with the "Free WiFi" AP config still set, so it keeps
     // broadcasting after ‹ Back; radio_reset_to_idle switches to STA-only so the
-    // portal AP is truly down (Birol: portal didn't close on ‹ Back, only on Home).
+    // portal AP is truly down (@birolt29: portal didn't close on ‹ Back, only on Home).
     // Safe: the Portal running screen is terminal (Portal Data is a separate tile).
     radio_reset_to_idle();
 }
@@ -14044,7 +14469,7 @@ static void show_go_dark_confirm(void)
     lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
 
     lv_obj_t *hint = lv_label_create(card);
-    lv_label_set_text(hint, "Screen & LED off.\nAll ops continue.\n\nDouble-click BOOT\nto resume.");
+    lv_label_set_text(hint, "Screen & LED off.\nAll ops continue.\n\nTo wake:\n- Double-click BOOT\n- Hold screen 5 seconds");
     lv_obj_set_style_text_color(hint, ui_muted_color(), 0);
     lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
@@ -14941,8 +15366,12 @@ static void main_tile_event_cb(lv_event_t *e)
         show_wifi_analyzer_screen();
     } else if (strcmp(tile_name, "WiFi Scope") == 0) {
         show_wscope_screen();
+    } else if (strcmp(tile_name, "Passive Log") == 0) {
+        show_obs_store_screen();
     } else if (strcmp(tile_name, "ESP-NOW Scout") == 0) {
         show_espnow_scout_screen();
+    } else if (strcmp(tile_name, "WiFi Capture") == 0) {
+        show_wifi_pcap_screen();
     } else if (strcmp(tile_name, "Bluetooth") == 0) {
         show_bluetooth_screen();
     } else if (strcmp(tile_name, "Wardrive") == 0) {
@@ -15274,12 +15703,15 @@ static void wifi_scan_rebuild_page(void)
             char name_buf[128];
             const char *band = (records[i].primary <= 14) ? "2.4GHz" : "5GHz";
 
-            /* Auth mode label + MFP color indicator.
-             * Red   = WPA3/OWE  — MFP required, deauth attacks will be ignored.
-             * Amber = WPA2      — MFP optional; cannot determine from scan record.
-             * Green = Open/WEP/WPA — no MFP, deauth attacks work. */
+            /* Auth mode sets the color family (security indicator) and label text.
+             * Red = WPA3/OWE — MFP required, deauth attacks will be ignored.
+             * Amber = WPA2   — MFP optional; cannot determine from scan record.
+             * Green = Open/WEP/WPA — no MFP, deauth attacks work.
+             * 5 GHz networks receive a slightly lighter shade of the same family
+             * color so band is distinguishable at a glance without losing the
+             * security meaning. */
             const char *auth_str;
-            lv_color_t  mfp_color;
+            lv_color_t mfp_color;
             switch (records[i].authmode) {
                 case WIFI_AUTH_WPA3_PSK:
                 case WIFI_AUTH_WPA2_WPA3_PSK:        auth_str = "WPA3";    mfp_color = COLOR_MATERIAL_RED;   break;
@@ -15295,6 +15727,8 @@ static void wifi_scan_rebuild_page(void)
                 case WIFI_AUTH_OPEN:                 auth_str = "Open";    mfp_color = COLOR_MATERIAL_GREEN; break;
                 default:                             auth_str = "?";       mfp_color = ui_text_color();      break;
             }
+            if (records[i].primary > 14)
+                mfp_color = lv_color_mix(lv_color_white(), mfp_color, 64); /* 5 GHz: ~25% lighter */
 
             if (records[i].ssid[0] != 0) {
                 snprintf(name_buf, sizeof(name_buf), "%s (%s, %s, %02X:%02X:%02X:%02X:%02X:%02X)",
@@ -17858,7 +18292,7 @@ static void wpasec_upload_timer_cb(lv_timer_t *timer)
 // Screen-exit teardown for WPA-SEC Upload — runs via g_screen_stop_fn on ANY exit
 // (top ‹ Back, Home). radio_reset_to_idle() stops the upload (wpasec_upload_active
 // =false) AND drops the STA connection (esp_wifi_stop → STA restart), so the device
-// isn't left associated to the target AP after ‹ Back (Birol: service kept running).
+// isn't left associated to the target AP after ‹ Back (@birolt29: service kept running).
 static void wpasec_stop(void)
 {
     radio_reset_to_idle();
@@ -18292,6 +18726,352 @@ static void show_attack_tiles_screen(void)
 }
 
 // Global WiFi Attacks screen
+// ════════════════════════════════════════════════════════════════════════════
+// WiFi Packet Capture — targeted promiscuous frame capture to PCAP
+// Select AP from last scan; lock channel; stream frames to SD via LVGL timer.
+// Format: DLT_IEEE802_11_RADIO (127) with 12-byte radiotap header (RSSI field).
+// Output: /sdcard/lab/pcaps/wifi_XXXXXX_NNNNNNNNNN.pcap
+// ════════════════════════════════════════════════════════════════════════════
+
+// Promiscuous RX callback — fires from WiFi task, must not block.
+// Filters by BSSID extracted from 802.11 DS bits; enqueues PSRAM-allocated descriptor.
+static void wifi_cap_promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    if (!s_wcap_running || !s_wcap_queue) return;
+    if (type == WIFI_PKT_CTRL) return;  // skip acks/RTS/CTS - high volume, low value
+
+    const wifi_promiscuous_pkt_t *p = (const wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *frame = p->payload;
+    int len = (int)p->rx_ctrl.sig_len;
+    if (len < 10 || len > 2346) return;
+
+    // Extract BSSID position from 802.11 DS bits and frame type.
+    // Management (type=0) or IBSS (ds=0): addr3=BSSID.
+    // ToDS (ds=1): addr1=BSSID. FromDS (ds=2): addr2=BSSID.
+    if (len >= 22) {
+        uint8_t frame_type = (frame[0] >> 2) & 0x03;
+        uint8_t ds_bits    = frame[1] & 0x03;
+        const uint8_t *bssid;
+        if (frame_type == 0 || ds_bits == 0) bssid = frame + 16;
+        else if (ds_bits == 0x01)            bssid = frame + 4;
+        else if (ds_bits == 0x02)            bssid = frame + 10;
+        else                                 bssid = frame + 16;
+        if (memcmp(bssid, s_wcap_bssid, 6) != 0) return;
+    }
+
+    wifi_cap_pkt_t *pkt = heap_caps_malloc(sizeof(wifi_cap_pkt_t),
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!pkt) return;
+    pkt->frame = heap_caps_malloc((size_t)len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!pkt->frame) { heap_caps_free(pkt); return; }
+    memcpy(pkt->frame, frame, (size_t)len);
+    pkt->len     = (uint16_t)len;
+    pkt->rssi    = p->rx_ctrl.rssi;
+    pkt->channel = (uint8_t)p->rx_ctrl.channel;
+    pkt->ts_us   = (uint64_t)esp_timer_get_time();
+    if (xQueueSend(s_wcap_queue, &pkt, 0) != pdTRUE) {
+        heap_caps_free(pkt->frame);
+        heap_caps_free(pkt);
+    }
+}
+
+// LVGL 200 ms timer: drain up to 32 packets from queue, write PCAP records, update counter.
+// Runs inside lvgl_mutex — safe to call LVGL directly after releasing sd_spi_mutex.
+static void wifi_pcap_timer_cb(lv_timer_t *tmr)
+{
+    (void)tmr;
+    if (!s_wcap_file || !s_wcap_queue) return;
+
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(150)) == pdTRUE) {
+        wifi_cap_pkt_t *pkt = NULL;
+        int written = 0;
+        while (written < 32 && xQueueReceive(s_wcap_queue, &pkt, 0) == pdTRUE && pkt) {
+            uint32_t rt_sz = sizeof(wifi_cap_radiotap_t);
+            pcap_record_header_t rh;
+            rh.ts_sec  = (uint32_t)(pkt->ts_us / 1000000ULL);
+            rh.ts_usec = (uint32_t)(pkt->ts_us % 1000000ULL);
+            rh.incl_len = rt_sz + pkt->len;
+            rh.orig_len = rt_sz + pkt->len;
+            wifi_cap_radiotap_t rt = {
+                .it_version = 0, .it_pad = 0,
+                .it_len     = (uint16_t)rt_sz,
+                .it_present = 0x00000020UL,  // bit 5 = dBm Antenna Signal
+                .it_signal  = pkt->rssi,
+                .it_align   = {0, 0, 0},
+            };
+            fwrite(&rh,         sizeof(rh),  1, s_wcap_file);
+            fwrite(&rt,         sizeof(rt),  1, s_wcap_file);
+            fwrite(pkt->frame,  pkt->len,    1, s_wcap_file);
+            heap_caps_free(pkt->frame);
+            heap_caps_free(pkt);
+            s_wcap_count++;
+            written++;
+        }
+        if (written > 0) fflush(s_wcap_file);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    if (s_wcap_cnt_lbl) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "Packets: %lu", (unsigned long)s_wcap_count);
+        lv_label_set_text(s_wcap_cnt_lbl, buf);
+    }
+}
+
+// Stop promiscuous capture: drain remaining queue, close file.
+// Called from screen stop hook and STOP button handler.
+static void wifi_cap_stop(void)
+{
+    if (!s_wcap_running) return;
+    s_wcap_running = false;
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(NULL);
+
+    if (s_wcap_file && sd_spi_mutex &&
+        xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        if (s_wcap_queue) {
+            wifi_cap_pkt_t *pkt = NULL;
+            while (xQueueReceive(s_wcap_queue, &pkt, 0) == pdTRUE && pkt) {
+                uint32_t rt_sz = sizeof(wifi_cap_radiotap_t);
+                pcap_record_header_t rh;
+                rh.ts_sec  = (uint32_t)(pkt->ts_us / 1000000ULL);
+                rh.ts_usec = (uint32_t)(pkt->ts_us % 1000000ULL);
+                rh.incl_len = rt_sz + pkt->len;
+                rh.orig_len = rt_sz + pkt->len;
+                wifi_cap_radiotap_t rt = {
+                    .it_version = 0, .it_pad = 0,
+                    .it_len = (uint16_t)rt_sz,
+                    .it_present = 0x00000020UL,
+                    .it_signal = pkt->rssi,
+                    .it_align = {0, 0, 0},
+                };
+                fwrite(&rh,        sizeof(rh), 1, s_wcap_file);
+                fwrite(&rt,        sizeof(rt), 1, s_wcap_file);
+                fwrite(pkt->frame, pkt->len,   1, s_wcap_file);
+                heap_caps_free(pkt->frame);
+                heap_caps_free(pkt);
+                s_wcap_count++;
+            }
+        }
+        fflush(s_wcap_file);
+        fclose(s_wcap_file);
+        s_wcap_file = NULL;
+        ESP_LOGI(TAG, "WiFi capture saved: %s (%lu pkts)", s_wcap_filepath, (unsigned long)s_wcap_count);
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    if (s_wcap_queue) { vQueueDelete(s_wcap_queue); s_wcap_queue = NULL; }
+}
+
+static void wifi_pcap_screen_stop(void)
+{
+    if (s_wcap_ui_timer) { lv_timer_del(s_wcap_ui_timer); s_wcap_ui_timer = NULL; }
+    s_wcap_cnt_lbl    = NULL;
+    s_wcap_status_lbl = NULL;
+    s_wcap_fn_lbl     = NULL;
+    s_wcap_list_cont  = NULL;
+    s_wcap_info_cont  = NULL;
+    wifi_cap_stop();
+}
+
+// AP list item tap: open PCAP file, lock channel, start promiscuous, switch UI.
+static void wifi_pcap_ap_tap_cb(lv_event_t *e)
+{
+    if (s_wcap_running) return;
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    wifi_ap_record_t *results = wifi_scanner_get_results_ptr();
+    if (idx < 0 || idx >= (int)wifi_scanner_get_count()) return;
+
+    memcpy(s_wcap_bssid, results[idx].bssid, 6);
+    strlcpy(s_wcap_ssid,
+            results[idx].ssid[0] ? (char *)results[idx].ssid : "[hidden]",
+            sizeof(s_wcap_ssid));
+    s_wcap_channel = results[idx].primary;
+
+    if (!ensure_wifi_mode()) { ESP_LOGE(TAG, "WiFi PCAP: WiFi init failed"); return; }
+
+    uint64_t ts = (uint64_t)(esp_timer_get_time() / 1000ULL);
+    snprintf(s_wcap_filepath, sizeof(s_wcap_filepath),
+             "/sdcard/lab/pcaps/wifi_%02X%02X%02X_%llu.pcap",
+             s_wcap_bssid[3], s_wcap_bssid[4], s_wcap_bssid[5],
+             (unsigned long long)ts);
+
+    if (sd_spi_mutex && xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
+        s_wcap_file = fopen(s_wcap_filepath, "wb");
+        if (s_wcap_file) {
+            pcap_global_header_t gh = {
+                .magic_number  = 0xa1b2c3d4,
+                .version_major = 2,
+                .version_minor = 4,
+                .thiszone      = 0,
+                .sigfigs       = 0,
+                .snaplen       = 65535,
+                .network       = LINKTYPE_IEEE80211_RADIO,
+            };
+            fwrite(&gh, sizeof(gh), 1, s_wcap_file);
+            fflush(s_wcap_file);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+    if (!s_wcap_file) { ESP_LOGE(TAG, "WiFi PCAP: cannot open %s", s_wcap_filepath); return; }
+
+    s_wcap_queue = xQueueCreate(WIFI_CAP_QUEUE_DEPTH, sizeof(wifi_cap_pkt_t *));
+    if (!s_wcap_queue) { fclose(s_wcap_file); s_wcap_file = NULL; return; }
+
+    s_wcap_count   = 0;
+    s_wcap_running = true;
+    esp_wifi_set_channel(s_wcap_channel, WIFI_SECOND_CHAN_NONE);
+    wifi_promiscuous_filter_t filt = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT |
+                       WIFI_PROMIS_FILTER_MASK_DATA |
+                       WIFI_PROMIS_FILTER_MASK_MISC,
+    };
+    esp_wifi_set_promiscuous_filter(&filt);
+    esp_wifi_set_promiscuous_rx_cb(wifi_cap_promisc_cb);
+    esp_wifi_set_promiscuous(true);
+
+    if (s_wcap_list_cont) lv_obj_add_flag(s_wcap_list_cont, LV_OBJ_FLAG_HIDDEN);
+    if (s_wcap_info_cont) lv_obj_clear_flag(s_wcap_info_cont, LV_OBJ_FLAG_HIDDEN);
+    if (s_wcap_status_lbl) {
+        char buf[52];
+        snprintf(buf, sizeof(buf), "Capturing: %.18s CH%u", s_wcap_ssid, s_wcap_channel);
+        lv_label_set_text(s_wcap_status_lbl, buf);
+    }
+    if (s_wcap_fn_lbl) {
+        const char *sn = strrchr(s_wcap_filepath, '/');
+        lv_label_set_text(s_wcap_fn_lbl, sn ? sn + 1 : s_wcap_filepath);
+    }
+    if (s_wcap_cnt_lbl) lv_label_set_text(s_wcap_cnt_lbl, "Packets: 0");
+    s_wcap_ui_timer = lv_timer_create(wifi_pcap_timer_cb, 200, NULL);
+    ESP_LOGI(TAG, "WiFi PCAP: %s CH%u -> %s", s_wcap_ssid, s_wcap_channel, s_wcap_filepath);
+}
+
+// STOP button: drain queue, close file, return to AP picker list.
+static void wifi_pcap_stop_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_wcap_ui_timer) { lv_timer_del(s_wcap_ui_timer); s_wcap_ui_timer = NULL; }
+    wifi_cap_stop();
+    if (s_wcap_info_cont) lv_obj_add_flag(s_wcap_info_cont, LV_OBJ_FLAG_HIDDEN);
+    if (s_wcap_list_cont) lv_obj_clear_flag(s_wcap_list_cont, LV_OBJ_FLAG_HIDDEN);
+    if (s_wcap_status_lbl) {
+        char buf[52];
+        snprintf(buf, sizeof(buf), "Saved: %lu pkts", (unsigned long)s_wcap_count);
+        lv_label_set_text(s_wcap_status_lbl, buf);
+        lv_obj_clear_flag(s_wcap_status_lbl, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// WiFi Packet Capture screen: AP picker (idle) <-> capture status (running).
+static void show_wifi_pcap_screen(void)
+{
+    create_function_page_base("WiFi Capture");
+    g_screen_stop_fn = wifi_pcap_screen_stop;
+    apply_menu_bg();
+
+    // ── AP picker (visible when idle) ──────────────────────────────────────────
+    s_wcap_list_cont = lv_obj_create(function_page);
+    lv_obj_set_size(s_wcap_list_cont, LCD_H_RES - 8, LCD_V_RES - 40);
+    lv_obj_align(s_wcap_list_cont, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_set_style_bg_color(s_wcap_list_cont, lv_color_hex(0x0D1117), 0);
+    lv_obj_set_style_border_color(s_wcap_list_cont, lv_color_hex(0x333333), 0);
+    lv_obj_set_style_border_width(s_wcap_list_cont, 1, 0);
+    lv_obj_set_style_pad_all(s_wcap_list_cont, 4, 0);
+    lv_obj_set_style_pad_gap(s_wcap_list_cont, 3, 0);
+    lv_obj_set_flex_flow(s_wcap_list_cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scroll_dir(s_wcap_list_cont, LV_DIR_VER);
+
+    uint16_t count = wifi_scanner_get_count();
+    wifi_ap_record_t *results = wifi_scanner_get_results_ptr();
+
+    if (count == 0) {
+        lv_obj_t *msg = lv_label_create(s_wcap_list_cont);
+        lv_label_set_text(msg, "No WiFi scan data.\n\nRun 'Scan & Attack' first\nto discover APs,\nthen return here.");
+        lv_obj_set_style_text_font(msg, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(msg, lv_color_hex(0x888888), 0);
+        lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(msg, LCD_H_RES - 24);
+        lv_obj_center(msg);
+    } else {
+        lv_obj_t *hdr = lv_label_create(s_wcap_list_cont);
+        lv_label_set_text(hdr, "Tap an AP to start capture:");
+        lv_obj_set_style_text_font(hdr, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(hdr, lv_color_hex(0xAAAAAA), 0);
+
+        int visible = (count > 32) ? 32 : (int)count;
+        for (int i = 0; i < visible; i++) {
+            char buf[52];
+            const char *ssid_str = results[i].ssid[0] ? (char *)results[i].ssid : "[hidden]";
+            snprintf(buf, sizeof(buf), "%-16.16s CH%-3u %+4d",
+                     ssid_str, results[i].primary, results[i].rssi);
+            lv_obj_t *btn = lv_btn_create(s_wcap_list_cont);
+            lv_obj_set_size(btn, lv_pct(100), 26);
+            lv_obj_set_style_bg_color(btn, lv_color_hex(0x1A2233), 0);
+            lv_obj_set_style_bg_color(btn, lv_color_hex(0x223355), LV_STATE_PRESSED);
+            lv_obj_set_style_radius(btn, 3, 0);
+            lv_obj_set_style_pad_all(btn, 3, 0);
+            lv_obj_t *lbl = lv_label_create(btn);
+            lv_label_set_text(lbl, buf);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(lbl, UI_ACCENT_CYAN, 0);
+            lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 4, 0);
+            lv_obj_add_event_cb(btn, wifi_pcap_ap_tap_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        }
+    }
+
+    // ── Capture status panel (hidden until capture starts) ─────────────────────
+    s_wcap_info_cont = lv_obj_create(function_page);
+    lv_obj_set_size(s_wcap_info_cont, LCD_H_RES - 8, LCD_V_RES - 40);
+    lv_obj_align(s_wcap_info_cont, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_set_style_bg_opa(s_wcap_info_cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_wcap_info_cont, 0, 0);
+    lv_obj_clear_flag(s_wcap_info_cont, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_wcap_info_cont, LV_OBJ_FLAG_HIDDEN);
+
+    s_wcap_status_lbl = lv_label_create(s_wcap_info_cont);
+    lv_label_set_text(s_wcap_status_lbl, "Capturing...");
+    lv_obj_set_style_text_font(s_wcap_status_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_wcap_status_lbl, UI_ACCENT_CYAN, 0);
+    lv_label_set_long_mode(s_wcap_status_lbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(s_wcap_status_lbl, LCD_H_RES - 16);
+    lv_obj_set_style_text_align(s_wcap_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_wcap_status_lbl, LV_ALIGN_TOP_MID, 0, 10);
+
+    s_wcap_fn_lbl = lv_label_create(s_wcap_info_cont);
+    lv_label_set_text(s_wcap_fn_lbl, "");
+    lv_obj_set_style_text_font(s_wcap_fn_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_wcap_fn_lbl, lv_color_hex(0x888888), 0);
+    lv_label_set_long_mode(s_wcap_fn_lbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(s_wcap_fn_lbl, LCD_H_RES - 16);
+    lv_obj_set_style_text_align(s_wcap_fn_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_wcap_fn_lbl, LV_ALIGN_TOP_MID, 0, 30);
+
+    s_wcap_cnt_lbl = lv_label_create(s_wcap_info_cont);
+    lv_label_set_text(s_wcap_cnt_lbl, "Packets: 0");
+    lv_obj_set_style_text_font(s_wcap_cnt_lbl, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(s_wcap_cnt_lbl, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_align(s_wcap_cnt_lbl, LV_ALIGN_CENTER, 0, -20);
+
+    lv_obj_t *fmt_lbl = lv_label_create(s_wcap_info_cont);
+    lv_label_set_text(fmt_lbl, LV_SYMBOL_WIFI " DLT 127 - Radiotap+802.11\nWireshark + Kismet compatible");
+    lv_obj_set_style_text_font(fmt_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(fmt_lbl, lv_color_hex(0x777777), 0);
+    lv_obj_set_style_text_align(fmt_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(fmt_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(fmt_lbl, LCD_H_RES - 16);
+    lv_obj_align(fmt_lbl, LV_ALIGN_CENTER, 0, 28);
+
+    lv_obj_t *stop_btn = lv_btn_create(s_wcap_info_cont);
+    lv_obj_set_size(stop_btn, LCD_H_RES - 32, 44);
+    lv_obj_align(stop_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_radius(stop_btn, 8, 0);
+    lv_obj_t *stop_lbl = lv_label_create(stop_btn);
+    lv_label_set_text(stop_lbl, "STOP CAPTURE");
+    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(stop_lbl);
+    lv_obj_add_event_cb(stop_btn, wifi_pcap_stop_btn_cb, LV_EVENT_CLICKED, NULL);
+}
+
 static void show_global_attacks_screen(void)
 {
     create_function_page_base("Global WiFi Attacks");
@@ -18360,6 +19140,10 @@ static void show_wifi_menu_screen(void)
     (void)wscope_tile;
     lv_obj_t *espnow_tile = create_tile(tiles, MY_SYMBOL_SATELLITE_DISH, "ESP-NOW\nScout", lv_color_hex(0x004D40), main_tile_event_cb, "ESP-NOW Scout");
     (void)espnow_tile;
+    lv_obj_t *wcap_tile = create_tile(tiles, LV_SYMBOL_DOWNLOAD, "WiFi\nCapture", lv_color_hex(0x00695C), main_tile_event_cb, "WiFi Capture");
+    (void)wcap_tile;
+    lv_obj_t *obslog_tile = create_tile(tiles, MY_SYMBOL_DATABASE, "Passive\nLog", lv_color_hex(0x311B92), main_tile_event_cb, "Passive Log");
+    (void)obslog_tile;
 }
 
 // WiFi Sniff & Karma screen
@@ -19943,6 +20727,23 @@ static bool wd_is_uploadable_csv(const char *name)
     return true;
 }
 
+// True if the upload journal (loaded once into `ulog`) already records this file as
+// OK or DUP for the given service ("WIGLE"/"WDG"). Lets "Upload All" skip files that
+// are already on the server instead of re-POSTing them in full every run. Per-service:
+// a WDG-OK / WiGLE-FAIL file is skipped for WDG but still retried for WiGLE. A FAIL-only
+// entry is NOT "done" -> it retries. Filenames are unique + fully anchored by ",SVC,ST"
+// so a plain substring test cannot false-match another line.
+static bool wdup_log_has_done(const char *ulog, const char *fname, const char *svc)
+{
+    if (!ulog || !fname || !svc) return false;
+    char needle[300];
+    snprintf(needle, sizeof(needle), "%s,%s,OK", fname, svc);
+    if (strstr(ulog, needle)) return true;
+    snprintf(needle, sizeof(needle), "%s,%s,DUP", fname, svc);
+    if (strstr(ulog, needle)) return true;
+    return false;
+}
+
 static int wdup_upload_one(const char *filepath, const char *filename,
                             bool use_wigle)
 {
@@ -20174,6 +20975,21 @@ static void wdup_task(void *pvParameters)
         int n = wdup_explicit_count;
         int ok_count2 = 0, dup_count2 = 0, fail_count2 = 0;
         wdup_prog_total = n;
+        // Same skip-already-uploaded optimization as "Upload All": load the journal
+        // once (PSRAM only, DMA-safe) and skip (file,service) pairs already OK/DUP.
+        char *ulog = NULL;
+        if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+            FILE *lf = fopen(WDUP_LOG_PATH, "rb");
+            if (lf) {
+                fseek(lf, 0, SEEK_END); long ls = ftell(lf); fseek(lf, 0, SEEK_SET);
+                if (ls > 0 && ls <= 512 * 1024) {
+                    ulog = (char *)heap_caps_malloc((size_t)ls + 1, MALLOC_CAP_SPIRAM);
+                    if (ulog) { size_t nr = fread(ulog, 1, (size_t)ls, lf); ulog[nr] = '\0'; }
+                }
+                fclose(lf);
+            }
+            xSemaphoreGive(sd_spi_mutex);
+        }
         char xmsg[128];
         snprintf(xmsg, sizeof(xmsg), "Uploading %d selected file(s)...", n);
         wdup_push_msg(xmsg, cyan);
@@ -20184,7 +21000,10 @@ static void wdup_task(void *pvParameters)
             const char *xname  = strrchr(xfpath, '/');
             xname = xname ? xname + 1 : xfpath;
             wdup_prog_cur = si + 1;
-            if (do_wigle) {
+            if (do_wigle && wdup_log_has_done(ulog, xname, "WIGLE")) {
+                snprintf(xmsg, sizeof(xmsg), "[%d/%d] WiGLE: %.50s -> already uploaded (skip)", si+1, n, xname);
+                wdup_push_msg(xmsg, amber); dup_count2++; wdup_wigle_dup_cnt++;
+            } else if (do_wigle) {
                 snprintf(xmsg, sizeof(xmsg), "[%d/%d] WiGLE: %.50s...", si+1, n, xname);
                 wdup_push_msg(xmsg, cyan);
                 int r = wdup_upload_one(xfpath, xname, true);
@@ -20202,7 +21021,10 @@ static void wdup_task(void *pvParameters)
                 }
                 vTaskDelay(pdMS_TO_TICKS(800));
             }
-            if (do_wdg && wdup_active) {
+            if (do_wdg && wdup_active && wdup_log_has_done(ulog, xname, "WDG")) {
+                snprintf(xmsg, sizeof(xmsg), "[%d/%d] WDG: %.50s -> already uploaded (skip)", si+1, n, xname);
+                wdup_push_msg(xmsg, amber); dup_count2++; wdup_wdg_dup_cnt++;
+            } else if (do_wdg && wdup_active) {
                 snprintf(xmsg, sizeof(xmsg), "[%d/%d] WDG: %.50s...", si+1, n, xname);
                 wdup_push_msg(xmsg, cyan);
                 int r = wdup_upload_one(xfpath, xname, false);
@@ -20221,6 +21043,7 @@ static void wdup_task(void *pvParameters)
                 vTaskDelay(pdMS_TO_TICKS(800));
             }
         }
+        if (ulog) free(ulog);
         snprintf(xmsg, sizeof(xmsg), "Done: %d OK, %d dup, %d failed",
                  ok_count2, dup_count2, fail_count2);
         wdup_push_msg(xmsg, (fail_count2 > 0) ? red : green);
@@ -20263,6 +21086,24 @@ static void wdup_task(void *pvParameters)
     wdup_push_msg(msg, cyan);
     wdup_prog_total = total;
 
+    // Load the upload journal once (PSRAM) so already-OK/DUP files can be skipped
+    // instead of re-POSTed in full every run. NULL => no skipping (upload everything).
+    char *ulog = NULL;
+    if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        FILE *lf = fopen(WDUP_LOG_PATH, "rb");
+        if (lf) {
+            fseek(lf, 0, SEEK_END); long ls = ftell(lf); fseek(lf, 0, SEEK_SET);
+            if (ls > 0 && ls <= 512 * 1024) {
+                // PSRAM only: never take from the internal heap the DMA pool lives in.
+                // If PSRAM is unavailable, ulog stays NULL -> skip disabled, upload all.
+                ulog = (char *)heap_caps_malloc((size_t)ls + 1, MALLOC_CAP_SPIRAM);
+                if (ulog) { size_t nr = fread(ulog, 1, (size_t)ls, lf); ulog[nr] = '\0'; }
+            }
+            fclose(lf);
+        }
+        xSemaphoreGive(sd_spi_mutex);
+    }
+
     int cur = 0, ok_count = 0, dup_count = 0, fail_count = 0;
 
     while (wdup_active) {
@@ -20282,8 +21123,11 @@ static void wdup_task(void *pvParameters)
         char fpath[320];
         snprintf(fpath, sizeof(fpath), "/sdcard/lab/wardrives/%s", dname);
 
-        // Upload to WiGLE
-        if (do_wigle) {
+        // Upload to WiGLE (skip if the journal already has it OK/DUP)
+        if (do_wigle && wdup_log_has_done(ulog, dname, "WIGLE")) {
+            snprintf(msg, sizeof(msg), "[%d/%d] WiGLE: %.50s -> already uploaded (skip)", cur, total, dname);
+            wdup_push_msg(msg, amber); dup_count++; wdup_wigle_dup_cnt++;
+        } else if (do_wigle) {
             snprintf(msg, sizeof(msg), "[%d/%d] WiGLE: %.60s...", cur, total, dname);
             wdup_push_msg(msg, cyan);
             int r = wdup_upload_one(fpath, dname, true);
@@ -20309,8 +21153,11 @@ static void wdup_task(void *pvParameters)
             vTaskDelay(pdMS_TO_TICKS(800));
         }
 
-        // Upload to WDG Wars
-        if (do_wdg) {
+        // Upload to WDG Wars (skip if the journal already has it OK/DUP)
+        if (do_wdg && wdup_log_has_done(ulog, dname, "WDG")) {
+            snprintf(msg, sizeof(msg), "[%d/%d] WDG: %.50s -> already uploaded (skip)", cur, total, dname);
+            wdup_push_msg(msg, amber); dup_count++; wdup_wdg_dup_cnt++;
+        } else if (do_wdg) {
             snprintf(msg, sizeof(msg), "[%d/%d] WDG: %.60s...", cur, total, dname);
             wdup_push_msg(msg, cyan);
             int r = wdup_upload_one(fpath, dname, false);
@@ -20340,6 +21187,7 @@ static void wdup_task(void *pvParameters)
     if (xSemaphoreTake(sd_spi_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
         closedir(dir); xSemaphoreGive(sd_spi_mutex);
     }
+    if (ulog) free(ulog);
 
     snprintf(msg, sizeof(msg), "Done: %d OK, %d dup, %d failed", ok_count, dup_count, fail_count);
     wdup_push_msg(msg, (fail_count > 0) ? red : green);
@@ -20960,6 +21808,66 @@ static void wdm_sel_none_cb(lv_event_t *e)
     wdm_update_actions();
 }
 
+// A wardrive drive writes a DATA file "<prefix><stamp>-NNN.csv" plus two per-drive
+// companion sidecars sharing the same "<prefix><stamp>" base: "<base>_mode.csv"
+// (mode-transition log) and "<base>_marks.gpx" (GPS marks). Sidecars are not uploadable,
+// so they never appear on the Upload/Manage screens (wd_is_uploadable_csv filters them
+// out) and get ORPHANED on the SD card once their data file is deleted — over many drives
+// they pile up. This sweep removes every _mode.csv/_marks.gpx that has NO surviving
+// "<base>-NNN.csv" data file (cleans BOTH just-deleted and previously-orphaned sidecars).
+// upload_log.csv is not a sidecar so it is never matched/removed. Caller MUST hold
+// sd_spi_mutex. Names buffer is PSRAM-only (DMA-safe); on PSRAM-alloc fail we skip the
+// sweep (no regression). Two-phase (snapshot then remove) to avoid deleting while the
+// directory handle is open.
+#define WD_SWEEP_MAX_FILES 192
+#define WD_SWEEP_NAME_LEN  48
+static void wd_sweep_orphan_sidecars(void)
+{
+    const char *dir_path = "/sdcard/lab/wardrives";
+    char (*names)[WD_SWEEP_NAME_LEN] =
+        heap_caps_malloc((size_t)WD_SWEEP_MAX_FILES * WD_SWEEP_NAME_LEN,
+                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!names) return;                        // no PSRAM -> skip, uploads/deletes unaffected
+    int n = 0;
+    DIR *d = opendir(dir_path);
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL && n < WD_SWEEP_MAX_FILES) {
+            size_t l = strlen(ent->d_name);
+            if (l == 0 || l >= WD_SWEEP_NAME_LEN) continue;
+            strcpy(names[n++], ent->d_name);
+        }
+        closedir(d);
+    }
+    for (int i = 0; i < n; i++) {
+        const char *nm = names[i];
+        size_t l = strlen(nm);
+        int is_mode  = (l >= 9  && strcasecmp(nm + l - 9,  "_mode.csv")  == 0);
+        int is_marks = (l >= 10 && strcasecmp(nm + l - 10, "_marks.gpx") == 0);
+        if (!is_mode && !is_marks) continue;
+        int blen = is_mode ? (int)(l - 9) : (int)(l - 10);
+        if (blen <= 0) continue;
+        bool has_data = false;                 // any "<base>-<digits>.csv" still present?
+        for (int j = 0; j < n && !has_data; j++) {
+            const char *dn = names[j];
+            size_t dl = strlen(dn);
+            if (dl < (size_t)blen + 6) continue;               // base + "-N.csv"
+            if (strncmp(dn, nm, blen) != 0 || dn[blen] != '-') continue;
+            if (strcasecmp(dn + dl - 4, ".csv") != 0) continue;
+            bool digits = (dn + blen + 1 < dn + dl - 4);       // at least 1 part digit
+            for (const char *q = dn + blen + 1; q < dn + dl - 4; q++)
+                if (*q < '0' || *q > '9') { digits = false; break; }
+            if (digits) has_data = true;
+        }
+        if (!has_data) {
+            char full[320];
+            snprintf(full, sizeof(full), "%s/%s", dir_path, nm);
+            remove(full);                      // best-effort orphan cleanup
+        }
+    }
+    heap_caps_free(names);
+}
+
 // Confirm-delete overlay callbacks
 static void wdm_confirm_ok_cb(lv_event_t *e)
 {
@@ -20974,6 +21882,7 @@ static void wdm_confirm_ok_cb(lv_event_t *e)
             remove(wd_manage_paths[i]);
             wd_manage_paths[i][0] = '\0';
         }
+        wd_sweep_orphan_sidecars();  // remove _mode.csv/_marks.gpx left with no data file
         xSemaphoreGive(sd_spi_mutex);
     }
     for (int i = 0; i < wd_manage_count; i++) {
@@ -21096,9 +22005,12 @@ static void show_wardrive_manage_screen(void)
         if (lf) {
             fseek(lf, 0, SEEK_END);
             long lsz = ftell(lf); rewind(lf);
-            if (lsz > 0 && lsz < 8192) {
+            // Load into PSRAM up to 512 KB (matches the wdup upload-skip loader). The old
+            // 8 KB cap left the buffer NULL once upload_log.csv grew past ~8 KB, so every
+            // file wrongly showed "New" even after a successful WiGLE/WDG upload.
+            if (lsz > 0 && lsz <= 512 * 1024) {
                 log_buf = heap_caps_malloc(lsz + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-                if (log_buf) { fread(log_buf, 1, lsz, lf); log_buf[lsz] = '\0'; }
+                if (log_buf) { size_t nr = fread(log_buf, 1, lsz, lf); log_buf[nr] = '\0'; }
             }
             fclose(lf);
         }
@@ -23649,6 +24561,7 @@ static const sd_provision_item_t SD_ITEMS[] = {
     { SD_ITEM_DIR,  "/sdcard/lab/zwave",                     NULL },  /* Z-Wave Scout capture CSV */
     { SD_ITEM_DIR,  "/sdcard/lab/tpms",                      NULL },  /* TPMS Monitor Schrader CSV captures */
     { SD_ITEM_DIR,  "/sdcard/lab/espnow",                    NULL },  /* ESP-NOW Scout device export JSON + pktlog */
+    { SD_ITEM_DIR,  "/sdcard/lab/obs",                       NULL },  /* Passive Log JSONL exports (obs_store) */
     { SD_ITEM_DIR,  "/sdcard/lab/rfid",                      NULL },  /* RFID/NFC card dumps (root) */
     { SD_ITEM_DIR,  "/sdcard/lab/rfid/lf",                  NULL },  /* LF cards (.rfid — EM410X, HID) */
     { SD_ITEM_DIR,  "/sdcard/lab/rfid/hf",                  NULL },  /* HF cards (.nfc — NTAG, MFC, UL) */
@@ -25232,6 +26145,17 @@ static void gps_info_refresh_cb(lv_timer_t *t)
     lv_obj_set_style_text_color(gps_info_acc_lbl, pos_color, 0);
 }
 
+static void gps_dbg_serial_sw_cb(lv_event_t *e)
+{
+    g_gps_debug_serial = (lv_obj_get_state(lv_event_get_target(e)) & LV_STATE_CHECKED) != 0;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, NVS_KEY_GPS_DBG, g_gps_debug_serial ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
 // Teardown for the GPS Info screen — runs on any exit (top ‹ Back, Home, forward
 // nav, bottom Back) via the g_screen_stop_fn hook.
 static void gps_info_stop(void)
@@ -25568,6 +26492,25 @@ static void show_gps_info_screen(void)
     // Populate immediately then start 1 s refresh timer
     gps_info_refresh_cb(NULL);
     gps_info_refresh_timer = lv_timer_create(gps_info_refresh_cb, 1000, NULL);
+
+    // GPS Serial Debug toggle row
+    lv_obj_t *dbg_row = lv_obj_create(function_page);
+    lv_obj_set_size(dbg_row, 220, 32);
+    lv_obj_align(dbg_row, LV_ALIGN_BOTTOM_MID, 0, -50);
+    lv_obj_set_style_bg_opa(dbg_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(dbg_row, 0, 0);
+    lv_obj_set_style_pad_all(dbg_row, 0, 0);
+    lv_obj_clear_flag(dbg_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *dbg_lbl = lv_label_create(dbg_row);
+    lv_label_set_text(dbg_lbl, "Serial GPS log");
+    lv_obj_set_style_text_font(dbg_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(dbg_lbl, ui_muted_color(), 0);
+    lv_obj_align(dbg_lbl, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_t *dbg_sw = lv_switch_create(dbg_row);
+    lv_obj_set_size(dbg_sw, 40, 20);
+    lv_obj_align(dbg_sw, LV_ALIGN_RIGHT_MID, 0, 0);
+    if (g_gps_debug_serial) lv_obj_add_state(dbg_sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(dbg_sw, gps_dbg_serial_sw_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     // Set Position button (amber)
     lv_obj_t *setpos_btn = lv_btn_create(function_page);
@@ -26829,6 +27772,192 @@ static void ble_pcap_write_epb(FILE *f, const ble_pcap_pkt_t *pkt)
     fwrite(&block_len, 4, 1, f);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// BLE Targeted Capture — 8-second BLE scan with live device picker.
+// User taps a device; filter MAC is set; opens BLE PCAP for that device only.
+// ════════════════════════════════════════════════════════════════════════════
+
+// BLE GAP callback: dedup discovered advertisers into s_targ_devs[]
+static int ble_targ_gap_cb(struct ble_gap_event *event, void *arg)
+{
+    (void)arg;
+    if (!s_targ_scanning) return 0;
+
+    uint8_t  addr[6];
+    uint8_t  addr_type;
+    int8_t   rssi;
+    const uint8_t *adv_data = NULL;
+    uint8_t  adv_len = 0;
+
+#if MYNEWT_VAL(BLE_EXT_ADV)
+    if (event->type == BLE_GAP_EVENT_EXT_DISC) {
+        memcpy(addr, event->ext_disc.addr.val, 6);
+        addr_type = event->ext_disc.addr.type;
+        rssi      = event->ext_disc.rssi;
+        adv_data  = event->ext_disc.data;
+        adv_len   = event->ext_disc.length_data;
+    } else return 0;
+#else
+    if (event->type == BLE_GAP_EVENT_DISC) {
+        memcpy(addr, event->disc.addr.val, 6);
+        addr_type = event->disc.addr.type;
+        rssi      = event->disc.rssi;
+        adv_data  = event->disc.data;
+        adv_len   = event->disc.length_data;
+    } else return 0;
+#endif
+
+    // Dedup: update RSSI if already seen
+    for (int i = 0; i < s_targ_count; i++) {
+        if (memcmp(s_targ_devs[i].addr, addr, 6) == 0) {
+            s_targ_devs[i].rssi = rssi;
+            return 0;
+        }
+    }
+    if (s_targ_count >= BLE_TARG_MAX) return 0;
+
+    int idx = s_targ_count;
+    memcpy(s_targ_devs[idx].addr, addr, 6);
+    s_targ_devs[idx].addr_type = addr_type;
+    s_targ_devs[idx].rssi      = rssi;
+    s_targ_devs[idx].name[0]   = '\0';
+    if (adv_data && adv_len > 0) {
+        struct ble_hs_adv_fields fields;
+        if (ble_hs_adv_parse_fields(&fields, adv_data, adv_len) == 0 &&
+            fields.name && fields.name_len > 0) {
+            int nlen = (int)fields.name_len < 19 ? (int)fields.name_len : 19;
+            memcpy(s_targ_devs[idx].name, fields.name, (size_t)nlen);
+            s_targ_devs[idx].name[nlen] = '\0';
+        }
+    }
+    s_targ_count++;
+    return 0;
+}
+
+// Device list item tap: stop discovery, set filter MAC, open BLE PCAP
+static void ble_targ_item_tap_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_targ_count) return;
+    s_targ_scanning = false;
+    ble_gap_disc_cancel();
+    memcpy(ble_pcap_filter_mac, s_targ_devs[idx].addr, 6);
+    ble_pcap_filter_active = true;
+    ESP_LOGI(TAG, "BLE Targeted: filter %02X:%02X:%02X:%02X:%02X:%02X",
+             ble_pcap_filter_mac[0], ble_pcap_filter_mac[1], ble_pcap_filter_mac[2],
+             ble_pcap_filter_mac[3], ble_pcap_filter_mac[4], ble_pcap_filter_mac[5]);
+    show_ble_pcap_screen();
+}
+
+// 1-second timer: add newly discovered devices to list; update countdown header.
+static void ble_targ_timer_cb(lv_timer_t *tmr)
+{
+    (void)tmr;
+    s_targ_tick++;
+    if (s_targ_tick >= BLE_TARG_SCAN_SECS) {
+        s_targ_scanning = false;
+        ble_gap_disc_cancel();
+    }
+
+    if (s_targ_hdr_lbl) {
+        if (s_targ_scanning) {
+            char hdrbuf[40];
+            snprintf(hdrbuf, sizeof(hdrbuf), "Scanning... %ds remaining",
+                     BLE_TARG_SCAN_SECS - s_targ_tick);
+            lv_label_set_text(s_targ_hdr_lbl, hdrbuf);
+        } else {
+            lv_label_set_text(s_targ_hdr_lbl, "Tap device to start capture:");
+        }
+    }
+
+    // Append only new devices — preserves scroll position and avoids full rebuild
+    int n = s_targ_count;
+    for (int i = s_targ_displayed; i < n && s_targ_list_cont; i++) {
+        char buf[52];
+        snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X %+4d %-12.12s",
+                 s_targ_devs[i].addr[0], s_targ_devs[i].addr[1],
+                 s_targ_devs[i].addr[2], s_targ_devs[i].addr[3],
+                 s_targ_devs[i].addr[4], s_targ_devs[i].addr[5],
+                 s_targ_devs[i].rssi,
+                 s_targ_devs[i].name[0] ? s_targ_devs[i].name : "");
+        lv_obj_t *btn = lv_btn_create(s_targ_list_cont);
+        lv_obj_set_size(btn, lv_pct(100), 26);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x1A1A2E), 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x2244AA), LV_STATE_PRESSED);
+        lv_obj_set_style_radius(btn, 3, 0);
+        lv_obj_set_style_pad_all(btn, 3, 0);
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, buf);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0x00E5FF), 0);
+        lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 2, 0);
+        lv_obj_add_event_cb(btn, ble_targ_item_tap_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+    }
+    s_targ_displayed = n;
+}
+
+static void ble_targ_screen_stop(void)
+{
+    if (s_targ_timer) { lv_timer_del(s_targ_timer); s_targ_timer = NULL; }
+    s_targ_list_cont = NULL;
+    s_targ_hdr_lbl   = NULL;
+    if (s_targ_scanning) {
+        s_targ_scanning = false;
+        ble_gap_disc_cancel();
+    }
+}
+
+// BLE Targeted Capture picker — 8-second BLE discovery, user picks target device.
+static void show_ble_targeted_pcap_screen(void)
+{
+    if (!ensure_ble_mode()) {
+        ESP_LOGE(TAG, "BLE Targeted: BLE init failed");
+        return;
+    }
+
+    s_targ_count     = 0;
+    s_targ_displayed = 0;
+    s_targ_tick      = 0;
+    s_targ_scanning  = true;
+    memset(s_targ_devs, 0, sizeof(s_targ_devs));
+
+    create_function_page_base("BLE Targeted");
+    g_screen_stop_fn = ble_targ_screen_stop;
+    apply_menu_bg();
+
+    s_targ_list_cont = lv_obj_create(function_page);
+    lv_obj_set_size(s_targ_list_cont, LCD_H_RES - 8, LCD_V_RES - 40);
+    lv_obj_align(s_targ_list_cont, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_set_style_bg_color(s_targ_list_cont, lv_color_hex(0x0D1117), 0);
+    lv_obj_set_style_border_color(s_targ_list_cont, lv_color_hex(0x333333), 0);
+    lv_obj_set_style_border_width(s_targ_list_cont, 1, 0);
+    lv_obj_set_style_pad_all(s_targ_list_cont, 4, 0);
+    lv_obj_set_style_pad_gap(s_targ_list_cont, 3, 0);
+    lv_obj_set_flex_flow(s_targ_list_cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scroll_dir(s_targ_list_cont, LV_DIR_VER);
+
+    s_targ_hdr_lbl = lv_label_create(s_targ_list_cont);
+    lv_label_set_text(s_targ_hdr_lbl, "Scanning... 8s remaining");
+    lv_obj_set_style_text_font(s_targ_hdr_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_targ_hdr_lbl, lv_color_hex(0xAAAAAA), 0);
+
+#if MYNEWT_VAL(BLE_EXT_ADV)
+    struct ble_gap_ext_disc_params ep = { .itvl = 0x60, .window = 0x60, .passive = 0 };
+    ble_gap_ext_disc(BLE_OWN_ADDR_PUBLIC, 0, 0,
+                     0, BLE_HCI_SCAN_FILT_NO_WL, 0,
+                     &ep, &ep, ble_targ_gap_cb, NULL);
+#else
+    struct ble_gap_disc_params dp = {
+        .itvl = 0x60, .window = 0x60,
+        .filter_policy = BLE_HCI_SCAN_FILT_NO_WL,
+        .limited = 0, .passive = 0, .filter_duplicates = 0,
+    };
+    ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &dp, ble_targ_gap_cb, NULL);
+#endif
+
+    s_targ_timer = lv_timer_create(ble_targ_timer_cb, 1000, NULL);
+}
+
 // BLE GAP callback for PCAP capture
 static int ble_pcap_gap_cb(struct ble_gap_event *event, void *arg)
 {
@@ -26842,6 +27971,8 @@ static int ble_pcap_gap_cb(struct ble_gap_event *event, void *arg)
 #if MYNEWT_VAL(BLE_EXT_ADV)
     if (event->type == BLE_GAP_EVENT_EXT_DISC) {
         struct ble_gap_ext_disc_desc *d = &event->ext_disc;
+        // Targeted capture: skip packets not from the filtered advertiser address
+        if (ble_pcap_filter_active && memcmp(d->addr.val, ble_pcap_filter_mac, 6) != 0) return 0;
         memcpy(pkt.addr, d->addr.val, 6);
         pkt.addr_type    = d->addr.type;
         pkt.rssi         = d->rssi;
@@ -26860,6 +27991,7 @@ static int ble_pcap_gap_cb(struct ble_gap_event *event, void *arg)
 
     if (event->type == BLE_GAP_EVENT_DISC) {
         struct ble_gap_disc_desc *d = &event->disc;
+        if (ble_pcap_filter_active && memcmp(d->addr.val, ble_pcap_filter_mac, 6) != 0) return 0;
         memcpy(pkt.addr, d->addr.val, 6);
         pkt.addr_type    = d->addr.type;
         pkt.event_type   = (uint8_t)d->event_type;
@@ -26877,6 +28009,9 @@ static void ble_pcap_stop(void)
     if (!ble_pcap_active) return;
     ble_pcap_active = false;
     ble_gap_disc_cancel();
+    // Clear targeted filter so next BLE PCAP open captures all devices
+    ble_pcap_filter_active = false;
+    memset(ble_pcap_filter_mac, 0, 6);
 
     if (ble_pcap_timer) { lv_timer_del(ble_pcap_timer); ble_pcap_timer = NULL; }
 
@@ -26986,6 +28121,21 @@ static void show_ble_pcap_screen(void)
     lv_label_set_long_mode(fn_lbl, LV_LABEL_LONG_DOT);
     lv_obj_set_width(fn_lbl, LCD_H_RES - 8);
     lv_obj_set_style_text_align(fn_lbl, LV_TEXT_ALIGN_CENTER, 0);
+
+    // Targeted capture filter indicator
+    if (ble_pcap_filter_active) {
+        lv_obj_t *filt_lbl = lv_label_create(function_page);
+        char filtbuf[40];
+        snprintf(filtbuf, sizeof(filtbuf), "Target: %02X:%02X:%02X:%02X:%02X:%02X",
+                 ble_pcap_filter_mac[0], ble_pcap_filter_mac[1], ble_pcap_filter_mac[2],
+                 ble_pcap_filter_mac[3], ble_pcap_filter_mac[4], ble_pcap_filter_mac[5]);
+        lv_label_set_text(filt_lbl, filtbuf);
+        lv_obj_set_style_text_font(filt_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(filt_lbl, COLOR_MATERIAL_AMBER, 0);
+        lv_obj_set_style_text_align(filt_lbl, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(filt_lbl, LCD_H_RES - 8);
+        lv_obj_align(filt_lbl, LV_ALIGN_TOP_MID, 0, 52);
+    }
 
     // Packet counter
     ble_pcap_cnt_label = lv_label_create(function_page);
@@ -28362,9 +29512,13 @@ static void show_bluetooth_screen(void)
     lv_obj_t *btatk_tile = create_tile(tiles, MY_SYMBOL_SKULL_CROSS, "BT\nAttacks", COLOR_MATERIAL_AMBER, NULL, NULL);
     lv_obj_add_event_cb(btatk_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BT Attacks");
 
-    // BLE PCAP - teal/purple
+    // BLE PCAP - teal
     lv_obj_t *pcap_tile = create_tile(tiles, MY_SYMBOL_NET_WIRED, "BLE\nPCAP", lv_color_hex(0x00897B), NULL, NULL);
     lv_obj_add_event_cb(pcap_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE PCAP");
+
+    // BLE Targeted Capture - targeted single-device filter PCAP
+    lv_obj_t *tgtcap_tile = create_tile(tiles, LV_SYMBOL_EYE_OPEN, "BLE\nTargeted", lv_color_hex(0x1B5E20), NULL, NULL);
+    lv_obj_add_event_cb(tgtcap_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Targeted");
 
     // HoneyPair - BLE honeypot / pairing telemetry logger
     lv_obj_t *hp_tile = create_tile(tiles, MY_SYMBOL_USER_SECRET, "Honey\nPair",
@@ -33768,6 +34922,225 @@ static void show_ble_spoof_general_screen(void) {
     lv_obj_add_event_cb(start_btn, spoof_gen_start_cb, LV_EVENT_CLICKED, NULL);
 }
 
+// ── BLE Blaster ───────────────────────────────────────────────────────────────
+// 4-instance BLE advertising flood on all 3 adv channels (37/38/39) with
+// rotating random MACs to defeat scanner deduplication.
+// Optional second layer: nRF24 BLE-only CONT_WAVE on the same 3 channels when
+// the NM-RF-HAT is installed (physical RF + protocol flood simultaneously).
+
+// Minimal ADV_NONCONN_IND payload — flags byte only, no device name.
+static const uint8_t s_blaster_adv_data[] = {0x02, 0x01, 0x06};
+
+static void s_blaster_nrf_task_fn(void *arg)
+{
+    (void)arg;
+    // BLE_ADV mode: 9 channels focused on the 3 BLE advertising frequencies
+    // (±1 MHz guard around nRF24 ch2/ch26/ch80 = BLE adv ch37/38/39).
+    // Matches exactly what the ESP32 BLE flood is targeting above.
+    nrf24_jam_sweep(&s_blaster_nrf_active, NRF24_JAM_BLE_ADV);
+    s_blaster_nrf_task = NULL;
+    vTaskDelete(NULL);
+}
+
+// Configure one ext adv instance with a fresh random static MAC and start it.
+static void s_blaster_arm_inst(int inst)
+{
+    struct ble_gap_ext_adv_params p;
+    memset(&p, 0, sizeof(p));
+    p.legacy_pdu    = 1;
+    p.connectable   = 0;
+    p.scannable     = 0;  // ADV_NONCONN_IND — no scan response overhead
+    p.own_addr_type = BLE_OWN_ADDR_RANDOM;
+    p.primary_phy   = BLE_HCI_LE_PHY_1M;
+    p.secondary_phy = BLE_HCI_LE_PHY_1M;
+    p.itvl_min      = BLE_GAP_ADV_ITVL_MS(100);
+    p.itvl_max      = BLE_GAP_ADV_ITVL_MS(100);
+    p.tx_power      = 20;
+    p.sid           = (uint8_t)inst;
+    ble_gap_ext_adv_stop(inst);
+    ble_gap_ext_adv_configure(inst, &p, NULL, NULL, NULL);
+    ble_addr_t rnd = {BLE_ADDR_RANDOM, {0}};
+    if (ble_hs_id_gen_rnd(0, &rnd) == 0)
+        ble_gap_ext_adv_set_addr(inst, &rnd);
+    struct os_mbuf *om = os_msys_get_pkthdr(sizeof(s_blaster_adv_data), 0);
+    if (om) {
+        os_mbuf_append(om, s_blaster_adv_data, sizeof(s_blaster_adv_data));
+        ble_gap_ext_adv_set_data(inst, om);
+    }
+    ble_gap_ext_adv_start(inst, 0, 0);
+}
+
+static void s_blaster_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!s_blaster_status_lbl) return;
+    static int blink = 0;
+    if (s_blaster_active) {
+        // Rotate both instance MACs every 500 ms to keep scanners busy.
+        for (int i = 0; i < BLE_BLASTER_NUM_INST; i++)
+            s_blaster_arm_inst(i);
+        s_blaster_pkt_count += BLE_BLASTER_NUM_INST;
+        if (s_blaster_count_lbl)
+            lv_label_set_text_fmt(s_blaster_count_lbl, "Bursts: %d", (int)s_blaster_pkt_count);
+        lv_label_set_text(s_blaster_status_lbl,
+            blink++ & 1 ? "BLASTING..." : "BLASTING   ");
+        lv_obj_set_style_text_color(s_blaster_status_lbl, UI_ACCENT_RED, 0);
+    } else {
+        lv_label_set_text(s_blaster_status_lbl, "Ready");
+        lv_obj_set_style_text_color(s_blaster_status_lbl, lv_color_hex(0x66BB6A), 0);
+    }
+}
+
+static void s_blaster_start_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_blaster_active) return;
+    if (!ensure_ble_mode()) {
+        if (s_blaster_status_lbl)
+            lv_label_set_text(s_blaster_status_lbl, "BLE init failed");
+        return;
+    }
+    s_blaster_active    = true;
+    s_blaster_pkt_count = 0;
+    for (int i = 0; i < BLE_BLASTER_NUM_INST; i++)
+        s_blaster_arm_inst(i);
+    bool has_nrf = nrf24_is_init();
+    if (has_nrf && !s_blaster_nrf_task) {
+        s_blaster_nrf_active = true;
+        xTaskCreate(s_blaster_nrf_task_fn, "blstr_nrf", 3072, NULL, 2, &s_blaster_nrf_task);
+    }
+    if (s_blaster_layers_lbl)
+        lv_label_set_text(s_blaster_layers_lbl,
+            has_nrf ? "BLE flood + RF jam ACTIVE" : "BLE flood ACTIVE");
+}
+
+static void s_blaster_stop_cb(lv_event_t *e)
+{
+    (void)e;
+    s_blaster_active     = false;
+    s_blaster_nrf_active = false;
+    for (int i = 0; i < BLE_BLASTER_NUM_INST; i++)
+        ble_gap_ext_adv_stop(i);
+    if (s_blaster_layers_lbl)
+        lv_label_set_text(s_blaster_layers_lbl,
+            nrf24_is_init() ? "BLE + RF jam available"
+                            : "BLE flood only\nNM-RF-HAT? Enable DIP 2 for RF jam");
+}
+
+static void ble_blaster_screen_stop(void)
+{
+    s_blaster_active     = false;
+    s_blaster_nrf_active = false;
+    if (s_blaster_tmr) { lv_timer_del(s_blaster_tmr); s_blaster_tmr = NULL; }
+    for (int i = 0; i < BLE_BLASTER_NUM_INST; i++)
+        ble_gap_ext_adv_stop(i);
+    if (current_radio_mode == RADIO_MODE_BLE) {
+        bt_nimble_deinit();
+        current_radio_mode = RADIO_MODE_NONE;
+    }
+    s_blaster_status_lbl = NULL;
+    s_blaster_layers_lbl = NULL;
+    s_blaster_count_lbl  = NULL;
+}
+
+static void show_ble_blaster_screen(void)
+{
+    create_function_page_base("BLE Blaster");
+    g_screen_stop_fn = ble_blaster_screen_stop;
+    apply_menu_bg();
+    s_blaster_active     = false;
+    s_blaster_nrf_active = false;
+    s_blaster_pkt_count  = 0;
+
+    bool has_nrf = nrf24_is_init();
+
+    lv_obj_t *card = lv_obj_create(function_page);
+    lv_obj_set_size(card, LCD_H_RES - 16, LCD_V_RES - 88);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 34);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(card, UI_ACCENT_RED, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 8, 0);
+    lv_obj_set_style_pad_all(card, 10, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(card, 10, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *hdr = lv_label_create(card);
+    lv_label_set_text(hdr, MY_SYMBOL_TOWER "  BLE Blaster");
+    lv_obj_set_style_text_font(hdr, &g_font_icon14, 0);
+    lv_obj_set_style_text_color(hdr, UI_ACCENT_RED, 0);
+
+    s_blaster_status_lbl = lv_label_create(card);
+    lv_label_set_text(s_blaster_status_lbl, "Ready");
+    lv_obj_set_style_text_font(s_blaster_status_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_blaster_status_lbl, lv_color_hex(0x66BB6A), 0);
+
+    // Shows active layers; hints DIP 2 when RF-HAT nRF24 is not yet detected.
+    s_blaster_layers_lbl = lv_label_create(card);
+    lv_label_set_text(s_blaster_layers_lbl,
+        has_nrf ? "BLE + RF jam available"
+                : "BLE flood only\nNM-RF-HAT? Enable DIP 2 for RF jam");
+    lv_obj_set_width(s_blaster_layers_lbl, LCD_H_RES - 40);
+    lv_label_set_long_mode(s_blaster_layers_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(s_blaster_layers_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_blaster_layers_lbl, lv_color_make(150, 150, 150), 0);
+    lv_obj_set_style_text_align(s_blaster_layers_lbl, LV_TEXT_ALIGN_CENTER, 0);
+
+    s_blaster_count_lbl = lv_label_create(card);
+    lv_label_set_text(s_blaster_count_lbl, "Bursts: 0");
+    lv_obj_set_style_text_font(s_blaster_count_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_blaster_count_lbl, lv_color_make(180, 180, 180), 0);
+
+    lv_obj_t *btn_row = lv_obj_create(card);
+    lv_obj_set_size(btn_row, LCD_H_RES - 36, 36);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(btn_row, 12, 0);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *blast_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(blast_btn, 90, 32);
+    lv_obj_set_style_bg_color(blast_btn, lv_color_hex(0xB71C1C), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(blast_btn, lv_color_hex(0xD32F2F), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(blast_btn, 0, 0);
+    lv_obj_set_style_radius(blast_btn, 6, 0);
+    lv_obj_t *bll = lv_label_create(blast_btn);
+    lv_label_set_text(bll, "BLAST");
+    lv_obj_set_style_text_font(bll, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bll, lv_color_white(), 0);
+    lv_obj_center(bll);
+    lv_obj_add_event_cb(blast_btn, s_blaster_start_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *stop_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(stop_btn, 80, 32);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_make(50, 50, 50), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_make(70, 70, 70), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(stop_btn, 0, 0);
+    lv_obj_set_style_radius(stop_btn, 6, 0);
+    lv_obj_t *stl = lv_label_create(stop_btn);
+    lv_label_set_text(stl, "STOP");
+    lv_obj_set_style_text_font(stl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(stl, lv_color_white(), 0);
+    lv_obj_center(stl);
+    lv_obj_add_event_cb(stop_btn, s_blaster_stop_cb, LV_EVENT_CLICKED, NULL);
+
+    s_blaster_tmr = lv_timer_create(s_blaster_timer_cb, 500, NULL);
+}
+
+/* Navigate to Passive Log from the BT Attacks menu.
+ * show_obs_store_screen() defaults back to WiFi menu; override to return here. */
+static void bt_passivelog_tile_cb(lv_event_t *e)
+{
+    (void)e;
+    show_obs_store_screen();
+    g_screen_back_fn = show_bt_attacks_screen;
+}
+
 static void show_bt_attacks_screen(void)
 {
     create_function_page_base("BT Attacks");
@@ -33787,6 +35160,9 @@ static void show_bt_attacks_screen(void)
     lv_obj_t *spam_tile = create_tile(tiles, MY_SYMBOL_PAPER_PLANE, "BLE\nSpam", COLOR_MATERIAL_RED, NULL, NULL);
     lv_obj_add_event_cb(spam_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spam");
 
+    lv_obj_t *blaster_tile = create_tile(tiles, MY_SYMBOL_TOWER, "BLE\nBlaster", lv_color_make(160, 20, 20), NULL, NULL);
+    lv_obj_add_event_cb(blaster_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Blaster");
+
     lv_obj_t *spoof_gen_tile = create_tile(tiles, MY_SYMBOL_MASK,        "Device\nSpoof", COLOR_MATERIAL_ORANGE, NULL, NULL);
     lv_obj_add_event_cb(spoof_gen_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE Spoof General");
 
@@ -33798,6 +35174,9 @@ static void show_bt_attacks_screen(void)
 
     lv_obj_t *mitm_tile = create_tile(tiles, MY_SYMBOL_MASK, "BLE\nMITM", lv_color_make(160, 20, 20), NULL, NULL);
     lv_obj_add_event_cb(mitm_tile, (lv_event_cb_t)attack_event_cb, LV_EVENT_CLICKED, (void*)"BLE MITM");
+
+    lv_obj_t *plog_tile = create_tile(tiles, LV_SYMBOL_LIST, "Passive\nLog", lv_color_make(74, 20, 140), NULL, NULL);
+    lv_obj_add_event_cb(plog_tile, bt_passivelog_tile_cb, LV_EVENT_CLICKED, NULL);
 }
 
 // ============================================================================
@@ -35007,6 +36386,12 @@ void attack_event_cb(lv_event_t *e)
         return;
     }
 
+    // BLE Targeted Capture - scan picker + single-device PCAP filter
+    if (strcmp(attack_name, "BLE Targeted") == 0) {
+        show_ble_targeted_pcap_screen();
+        return;
+    }
+
     // Directed BT Attacks menu — target-specific attacks from SAS actions screen
     if (strcmp(attack_name, "Directed BT Attacks") == 0) {
         show_directed_bt_attacks_screen();
@@ -35028,6 +36413,10 @@ void attack_event_cb(lv_event_t *e)
     // BT Attacks — active attacks guarded by authorization warning
     if (strcmp(attack_name, "BLE Spam") == 0) {
         show_attack_warning(show_ble_spam_screen);
+        return;
+    }
+    if (strcmp(attack_name, "BLE Blaster") == 0) {
+        show_attack_warning(show_ble_blaster_screen);
         return;
     }
     if (strcmp(attack_name, "BLE Spoof General") == 0) {
@@ -35566,11 +36955,12 @@ static void gps_task(void *arg)
 		if (now - s_dbg_last_us >= 5000000) {
 			s_dbg_last_us = now;
 			uint32_t fixes = g_gga_parses; g_gga_parses = 0;   // TRUE fix cadence (both readers)
-			ESP_LOGI(TAG, "[GPSDBG] baud=%d hz=%d bytes5s=%lu task_gga=%u rmc=%u FIX/5s=%lu sats=%d valid=%d fix=%.5f,%.5f last=[%s]",
-			         s_gps_applied_baud, s_gps_applied_hz, (unsigned long)s_dbg_bytes,
-			         (unsigned)s_dbg_gga, (unsigned)s_dbg_rmc, (unsigned long)fixes,
-			         current_gps.satellites, (int)current_gps.valid,
-			         (double)current_gps.latitude, (double)current_gps.longitude, s_dbg_line);
+			if (g_gps_debug_serial)
+				ESP_LOGI(TAG, "[GPSDBG] baud=%d hz=%d bytes5s=%lu task_gga=%u rmc=%u FIX/5s=%lu sats=%d valid=%d fix=%.5f,%.5f last=[%s]",
+				         s_gps_applied_baud, s_gps_applied_hz, (unsigned long)s_dbg_bytes,
+				         (unsigned)s_dbg_gga, (unsigned)s_dbg_rmc, (unsigned long)fixes,
+				         current_gps.satellites, (int)current_gps.valid,
+				         (double)current_gps.latitude, (double)current_gps.longitude, s_dbg_line);
 			s_dbg_bytes = 0; s_dbg_gga = 0; s_dbg_rmc = 0;
 			s_dbg_line[0] = '\0';
 		}
@@ -36198,6 +37588,7 @@ static void bt_reset_counters(void)
     bt_airtag_count = 0;
     bt_smarttag_count = 0;
     bt_possible_airtag_count = 0;
+    bt_tile_count = 0;
     bt_found_device_count = 0;
     bt_device_count = 0;
     memset(bt_found_devices, 0, sizeof(bt_found_devices));
@@ -36609,7 +38000,7 @@ static int bt_gap_event_callback(struct ble_gap_event *event, void *arg)
                 uint16_t _u = fields.uuids16[_ui].value;
                 if      (_u == 0xFEAA) dev->is_eddystone = true;
                 else if (_u == 0xFCD2) dev->is_bthome    = true;
-                else if (_u == 0xFEED) dev->is_tile       = true;
+                else if (_u == 0xFEED) { dev->is_tile = true; bt_tile_count++; }
                 else if (_u == 0xFD6F) dev->is_exposure   = true;
                 /* Record first notable SIG device-class service UUID */
                 if (!dev->fp_svc_uuid &&
@@ -37173,6 +38564,7 @@ static void bt_scan_task(void *pvParameters)
     snprintf(ble_scan_status_text, sizeof(ble_scan_status_text),
              "%d devices (%d AT, %d ST)", bt_device_count, bt_airtag_count, bt_smarttag_count);
     ble_scan_finished = true;
+    ble_obs_store_pending = true;   /* main loop will feed bt_devices → g_obs_store */
     ble_scan_needs_ui_update = true;
     bt_locator_needs_ui_update = true;
     bt_sas_needs_update = true;
@@ -40001,15 +41393,28 @@ static void airtag_scan_task(void *pvParameters)
         if (!airtag_scan_active)
             break;
 
-        airtag_scan_snapshot_airtag          = bt_airtag_count;
-        airtag_scan_snapshot_smarttag        = bt_smarttag_count;
-        airtag_scan_snapshot_possible_airtag = bt_possible_airtag_count;
-        airtag_scan_snapshot_total           = bt_device_count;
+        /* Derive per-type counts from the unique-device list so the summary screen
+         * always matches what Found Tags shows (per-packet counters over-count). */
+        {
+            int tmp_at=0, tmp_st=0, tmp_pos=0, tmp_tile=0;
+            for (int _i = 0; _i < bt_device_count; _i++) {
+                if (bt_devices[_i].is_airtag)          tmp_at++;
+                if (bt_devices[_i].is_smarttag)        tmp_st++;
+                if (bt_devices[_i].is_possible_airtag) tmp_pos++;
+                if (bt_devices[_i].is_tile)            tmp_tile++;
+            }
+            airtag_scan_snapshot_airtag          = tmp_at;
+            airtag_scan_snapshot_smarttag        = tmp_st;
+            airtag_scan_snapshot_possible_airtag = tmp_pos;
+            airtag_scan_snapshot_tile            = tmp_tile;
+        }
+        airtag_scan_snapshot_total = bt_device_count;
         airtag_scan_update_flag = true;
 
-        ESP_LOGI(TAG, "AirTag scan cycle: %d AT, %d AT-Prox?, %d ST, %d total",
+        ESP_LOGI(TAG, "AirTag scan cycle: %d AT, %d AT-Prox?, %d ST, %d Tile, %d total",
                  airtag_scan_snapshot_airtag, airtag_scan_snapshot_possible_airtag,
-                 airtag_scan_snapshot_smarttag, airtag_scan_snapshot_total);
+                 airtag_scan_snapshot_smarttag, airtag_scan_snapshot_tile,
+                 airtag_scan_snapshot_total);
     }
 
     ESP_LOGI(TAG, "AirTag scanner task ending");
@@ -40081,6 +41486,102 @@ static void found_tag_track_btn_cb(lv_event_t *e)
 /**
  * Show a scrollable list of detected AirTags and SmartTags with a Track button per entry
  */
+static void obs_ring_task(void *arg);  /* defined later; used by found_tag_ring_btn_cb */
+
+/* Polling timer — closes the ring status popup once the ring task exits. */
+static void ring_popup_close_cb(lv_timer_t *t)
+{
+    if (s_obs_ring_task_hdl != NULL) return;  /* still running */
+    if (s_ring_status_popup && lv_obj_is_valid(s_ring_status_popup)) {
+        lv_obj_del(s_ring_status_popup);
+        s_ring_status_popup = NULL;
+    }
+    s_obs_ring_status_lbl = NULL;
+    lv_timer_del(t);
+}
+
+/* Ring a tracker directly from the Found Tags list.
+ * Creates a floating status popup on lv_layer_top() so the ring task
+ * can report progress regardless of what screen is currently showing. */
+static void found_tag_ring_btn_cb(lv_event_t *e)
+{
+    int dev_idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (dev_idx < 0 || dev_idx >= bt_device_count) return;
+    bt_device_info_t *dev = &bt_devices[dev_idx];
+    if (s_obs_ring_task_hdl) return;  /* ring already in progress */
+
+    memset(&s_obs_detail_rec, 0, sizeof(s_obs_detail_rec));
+    memcpy(s_obs_detail_rec.mac, dev->addr, 6);
+    if (dev->addr_type != 0)
+        s_obs_detail_rec.flags |= OBS_FLAG_RANDOM_ADDR;
+    s_obs_ring_cancel  = false;
+    s_obs_ring_is_tile = dev->is_tile;
+
+    /* Build floating status popup on lv_layer_top() so it survives navigation. */
+    if (s_ring_status_popup && lv_obj_is_valid(s_ring_status_popup))
+        lv_obj_del(s_ring_status_popup);
+    s_ring_status_popup = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_ring_status_popup, 210, 80);
+    lv_obj_center(s_ring_status_popup);
+    lv_obj_set_style_bg_color(s_ring_status_popup, lv_color_make(28, 28, 30), 0);
+    lv_obj_set_style_bg_opa(s_ring_status_popup, LV_OPA_90, 0);
+    lv_obj_set_style_radius(s_ring_status_popup, 10, 0);
+    lv_obj_set_style_border_width(s_ring_status_popup, 1, 0);
+    lv_obj_set_style_border_color(s_ring_status_popup, lv_color_make(60, 60, 60), 0);
+    lv_obj_set_style_pad_all(s_ring_status_popup, 8, 0);
+    lv_obj_clear_flag(s_ring_status_popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(s_ring_status_popup);
+    lv_label_set_text(title, "Ring");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(title, lv_color_make(255, 149, 0), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *status_lbl = lv_label_create(s_ring_status_popup);
+    lv_label_set_text(status_lbl, "Connecting...");
+    lv_label_set_long_mode(status_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(status_lbl, 194);
+    lv_obj_set_style_text_font(status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(status_lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_align(status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(status_lbl, LV_ALIGN_BOTTOM_MID, 0, 0);
+    s_obs_ring_status_lbl = status_lbl;
+
+    xTaskCreate(obs_ring_task, "obs_ring", 6144, NULL, 2, &s_obs_ring_task_hdl);
+    lv_timer_create(ring_popup_close_cb, 500, NULL);
+}
+
+/* Pre-target GATT Walker for a specific tag and navigate to the walk screen.
+ * Populates the SAS target globals (bt_sas_target_addr/name/addr_type/idx)
+ * so gw_deferred_start_cb() connects to this device immediately, bypassing
+ * the normal BT scan-and-select flow. */
+static void found_tag_gatt_btn_cb(lv_event_t *e)
+{
+    int dev_idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (dev_idx < 0 || dev_idx >= bt_device_count) return;
+    bt_device_info_t *dev = &bt_devices[dev_idx];
+
+    memcpy(bt_sas_target_addr, dev->addr, 6);
+    bt_sas_target_addr_type = dev->addr_type;
+    bt_sas_selected_idx     = dev_idx;
+    bt_sas_target_is_matter = false;
+    if (dev->name[0] != '\0') {
+        strncpy(bt_sas_target_name, dev->name, sizeof(bt_sas_target_name) - 1);
+        bt_sas_target_name[sizeof(bt_sas_target_name) - 1] = '\0';
+    } else if (dev->is_airtag) {
+        strncpy(bt_sas_target_name, "AirTag", sizeof(bt_sas_target_name) - 1);
+    } else if (dev->is_smarttag) {
+        strncpy(bt_sas_target_name, "SmartTag", sizeof(bt_sas_target_name) - 1);
+    } else if (dev->is_tile) {
+        strncpy(bt_sas_target_name, "Tile", sizeof(bt_sas_target_name) - 1);
+    } else {
+        strncpy(bt_sas_target_name, "Tag", sizeof(bt_sas_target_name) - 1);
+    }
+
+    show_gatt_walker_screen();
+    g_screen_back_fn = show_found_tags_screen;
+}
+
 static void show_found_tags_screen(void)
 {
     // Pause the airtag scan update flag so list is stable while browsing
@@ -40109,7 +41610,7 @@ static void show_found_tags_screen(void)
     int found = 0;
     for (int i = 0; i < bt_device_count; i++) {
         bt_device_info_t *dev = &bt_devices[i];
-        if (!dev->is_airtag && !dev->is_smarttag && !dev->is_possible_airtag) continue;
+        if (!dev->is_airtag && !dev->is_smarttag && !dev->is_tile && !dev->is_possible_airtag) continue;
         found++;
 
         // Row container
@@ -40121,56 +41622,85 @@ static void show_found_tags_screen(void)
         lv_obj_set_style_pad_all(row, 6, 0);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
+        // Two-column row: info on left (grows), RSSI + buttons on right (fixed 66px)
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+        lv_obj_set_style_pad_gap(row, 6, 0);
+
+        // Left column — badge, MAC, name (expands to fill remaining width)
+        lv_obj_t *info_col = lv_obj_create(row);
+        lv_obj_set_size(info_col, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(info_col, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(info_col, 0, 0);
+        lv_obj_set_style_pad_all(info_col, 0, 0);
+        lv_obj_set_style_pad_gap(info_col, 2, 0);
+        lv_obj_clear_flag(info_col, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(info_col, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_grow(info_col, 1);
+
         // Type badge
-        lv_obj_t *type_label = lv_label_create(row);
+        lv_obj_t *type_label = lv_label_create(info_col);
         const char *badge_text;
         lv_color_t badge_color;
         if (dev->is_airtag) {
             badge_text  = "AirTag";
-            badge_color = lv_color_make(255, 149, 0);   // Apple orange
+            badge_color = lv_color_make(255, 149, 0);
         } else if (dev->is_smarttag) {
             badge_text  = "SmartTag";
-            badge_color = lv_color_make(90, 200, 250);  // Samsung blue
+            badge_color = lv_color_make(90, 200, 250);
+        } else if (dev->is_tile) {
+            badge_text  = "Tile";
+            badge_color = lv_color_make(0, 180, 220);
         } else {
             badge_text  = "AirTag? (Proximity)";
-            badge_color = lv_color_make(255, 214, 10);  // Yellow — owner-nearby mode
+            badge_color = lv_color_make(255, 214, 10);
         }
         lv_label_set_text(type_label, badge_text);
         lv_obj_set_style_text_font(type_label, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(type_label, badge_color, 0);
-        lv_obj_align(type_label, LV_ALIGN_TOP_LEFT, 0, 0);
 
         // MAC address
         char addr_str[18];
         bt_format_addr(dev->addr, addr_str);
-        lv_obj_t *mac_label = lv_label_create(row);
+        lv_obj_t *mac_label = lv_label_create(info_col);
         lv_label_set_text(mac_label, addr_str);
         lv_obj_set_style_text_font(mac_label, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(mac_label, lv_color_make(176, 176, 176), 0);
-        lv_obj_align(mac_label, LV_ALIGN_TOP_LEFT, 0, 18);
 
-        // Name (if available)
+        // Name (if available) — wraps within left column; never bleeds into buttons
         if (dev->name[0] != '\0') {
-            lv_obj_t *name_label = lv_label_create(row);
+            lv_obj_t *name_label = lv_label_create(info_col);
             lv_label_set_text(name_label, dev->name);
             lv_obj_set_style_text_font(name_label, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(name_label, ui_text_color(), 0);
-            lv_obj_align(name_label, LV_ALIGN_TOP_LEFT, 0, 32);
+            lv_label_set_long_mode(name_label, LV_LABEL_LONG_WRAP);
+            lv_obj_set_width(name_label, lv_pct(100));
         }
 
-        // RSSI
+        // Right column — RSSI + action buttons (fixed 66px)
+        lv_obj_t *btn_col = lv_obj_create(row);
+        lv_obj_set_size(btn_col, 66, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(btn_col, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(btn_col, 0, 0);
+        lv_obj_set_style_pad_all(btn_col, 0, 0);
+        lv_obj_set_style_pad_gap(btn_col, 3, 0);
+        lv_obj_clear_flag(btn_col, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(btn_col, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(btn_col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
+
+        // RSSI at top of right column
         char rssi_buf[16];
         snprintf(rssi_buf, sizeof(rssi_buf), "%d dBm", (int)dev->rssi);
-        lv_obj_t *rssi_label = lv_label_create(row);
+        lv_obj_t *rssi_label = lv_label_create(btn_col);
         lv_label_set_text(rssi_label, rssi_buf);
         lv_obj_set_style_text_font(rssi_label, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(rssi_label, lv_color_make(176, 176, 176), 0);
-        lv_obj_align(rssi_label, LV_ALIGN_TOP_RIGHT, -70, 0);
+        lv_obj_set_style_text_align(rssi_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(rssi_label, 64);
 
-        // Track button
-        lv_obj_t *track_btn = lv_btn_create(row);
-        lv_obj_set_size(track_btn, 60, 36);
-        lv_obj_align(track_btn, LV_ALIGN_TOP_RIGHT, 0, 4);
+        /* Track */
+        lv_obj_t *track_btn = lv_btn_create(btn_col);
+        lv_obj_set_size(track_btn, 60, 26);
         lv_obj_set_style_bg_color(track_btn, COLOR_MATERIAL_BLUE, LV_STATE_DEFAULT);
         lv_obj_set_style_bg_color(track_btn, lv_color_lighten(COLOR_MATERIAL_BLUE, 50), LV_STATE_PRESSED);
         lv_obj_set_style_border_width(track_btn, 0, 0);
@@ -40181,6 +41711,46 @@ static void show_found_tags_screen(void)
         lv_obj_set_style_text_color(track_lbl, lv_color_white(), 0);
         lv_obj_center(track_lbl);
         lv_obj_add_event_cb(track_btn, found_tag_track_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+        /* Ring — AirTag only: Apple FMN 7dfc9001 supports non-owner {0x01} trigger.
+         * Tile: auth token required (signed with owner account key) — no public ring.
+         * SmartTag: Samsung FMM requires account auth — no public ring. */
+        if (dev->is_airtag) {
+            lv_obj_t *ring_btn = lv_btn_create(btn_col);
+            lv_obj_set_size(ring_btn, 60, 26);
+            lv_obj_set_style_bg_color(ring_btn, lv_color_make(200, 80, 0), LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(ring_btn, lv_color_lighten(lv_color_make(200, 80, 0), 50), LV_STATE_PRESSED);
+            lv_obj_set_style_border_width(ring_btn, 0, 0);
+            lv_obj_set_style_radius(ring_btn, 6, 0);
+            lv_obj_t *ring_lbl = lv_label_create(ring_btn);
+            lv_label_set_text(ring_lbl, "Ring");
+            lv_obj_set_style_text_font(ring_lbl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(ring_lbl, lv_color_white(), 0);
+            lv_obj_center(ring_lbl);
+            lv_obj_add_event_cb(ring_btn, found_tag_ring_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        } else if (dev->is_tile) {
+            /* Tile ring requires owner auth — show greyed label instead of button */
+            lv_obj_t *no_ring_lbl = lv_label_create(btn_col);
+            lv_label_set_text(no_ring_lbl, "No ring\n(owner\nauth req)");
+            lv_obj_set_style_text_font(no_ring_lbl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(no_ring_lbl, lv_color_make(130, 130, 130), 0);
+            lv_obj_set_style_text_align(no_ring_lbl, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_set_width(no_ring_lbl, 64);
+        }
+
+        /* GATT Walk — all tag types */
+        lv_obj_t *gatt_btn = lv_btn_create(btn_col);
+        lv_obj_set_size(gatt_btn, 60, 26);
+        lv_obj_set_style_bg_color(gatt_btn, lv_color_make(30, 130, 50), LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(gatt_btn, lv_color_lighten(lv_color_make(30, 130, 50), 50), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(gatt_btn, 0, 0);
+        lv_obj_set_style_radius(gatt_btn, 6, 0);
+        lv_obj_t *gatt_lbl = lv_label_create(gatt_btn);
+        lv_label_set_text(gatt_lbl, "GATT");
+        lv_obj_set_style_text_font(gatt_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(gatt_lbl, lv_color_white(), 0);
+        lv_obj_center(gatt_lbl);
+        lv_obj_add_event_cb(gatt_btn, found_tag_gatt_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
     }
 
     if (found == 0) {
@@ -40338,13 +41908,13 @@ static void show_airtag_scan_screen(void)
     lv_obj_set_style_text_color(airtag_scan_status_label, ui_text_color(), 0);
     lv_obj_align(airtag_scan_status_label, LV_ALIGN_CENTER, 0, -105);
 
-    // Stats label 1: "Air Tags: X\nAirTag? (Prox): X\nSmart Tags: X" (three lines, large font)
+    // Stats label 1: four tracker-type counts; font_16 keeps 4 lines clear of the title bar
     airtag_scan_stats_label1 = lv_label_create(function_page);
-    lv_label_set_text(airtag_scan_stats_label1, "Air Tags: 0\nAirTag? (Prox): 0\nSmart Tags: 0");
+    lv_label_set_text(airtag_scan_stats_label1, "AirTags: 0\nAirTag? (Prox): 0\nSmartTags: 0\nTiles: 0");
     lv_obj_set_style_text_align(airtag_scan_stats_label1, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(airtag_scan_stats_label1, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(airtag_scan_stats_label1, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(airtag_scan_stats_label1, ui_text_color(), 0);
-    lv_obj_align(airtag_scan_stats_label1, LV_ALIGN_CENTER, 0, -95);
+    lv_obj_align(airtag_scan_stats_label1, LV_ALIGN_CENTER, 0, -75);
     lv_obj_add_flag(airtag_scan_stats_label1, LV_OBJ_FLAG_HIDDEN);
 
     // Stats label 2: "Other BT Devices: X"
@@ -48241,7 +49811,7 @@ static void show_nrf24_file_detail_screen(const char *path)
 static void s_n24_jam_task_fn(void *arg)
 {
     (void)arg;
-    nrf24_jam_sweep(&s_n24_jam_active);
+    nrf24_jam_sweep(&s_n24_jam_active, s_n24_jam_mode);
     s_n24_jam_task = NULL;
     vTaskDelete(NULL);
 }
@@ -48251,12 +49821,20 @@ static void s_n24_jam_timer_cb(lv_timer_t *t)
     (void)t;
     if (!s_n24_jam_status) return;
     static int blink = 0;
+    // Indexed by nrf24_jam_mode_t: Test=0,BT=1,BLE=2,BLEAdv=3,WiFi=4,Zigbee=5,USB=6,RC=7,Video=8,Full=9
+    static const char *const s_jam_mode_names[] = {"Test","BT","BLE","BLE Adv","WiFi","Zigbee","USB","RC","Video","Full"};
     if (s_n24_jam_active) {
-        lv_label_set_text(s_n24_jam_status, blink++ & 1 ? "JAMMING..." : "JAMMING   ");
+        lv_label_set_text_fmt(s_n24_jam_status,
+            blink++ & 1 ? "JAMMING %s..." : "JAMMING %s   ",
+            s_jam_mode_names[s_n24_jam_mode]);
         lv_obj_set_style_text_color(s_n24_jam_status, UI_ACCENT_RED, 0);
+        if (s_n24_jam_btn)  lv_obj_set_style_bg_color(s_n24_jam_btn,  lv_color_hex(0xF44336), 0);
+        if (s_n24_stop_btn) lv_obj_set_style_bg_color(s_n24_stop_btn, lv_color_hex(0xF9A825), 0);
     } else {
         lv_label_set_text(s_n24_jam_status, "Stopped");
         lv_obj_set_style_text_color(s_n24_jam_status, lv_color_hex(0x66BB6A), 0);
+        if (s_n24_jam_btn)  lv_obj_set_style_bg_color(s_n24_jam_btn,  lv_color_hex(0x5C1818), 0);
+        if (s_n24_stop_btn) lv_obj_set_style_bg_color(s_n24_stop_btn, lv_color_make(50, 50, 50), 0);
     }
 }
 
@@ -48282,12 +49860,43 @@ static void s_n24_jam_dismiss_cb(lv_event_t *e)
     if (overlay) lv_obj_del(overlay);
 }
 
+static void s_n24_fhss_toggle_cb(lv_event_t *e)
+{
+    if (s_n24_jam_active) return;
+    s_n24_jam_fhss = (bool)(intptr_t)lv_event_get_user_data(e);
+    nrf24_jam_set_fhss(s_n24_jam_fhss);
+    if (s_n24_seq_btn)
+        lv_obj_set_style_bg_color(s_n24_seq_btn,
+            s_n24_jam_fhss ? lv_color_hex(0x2A2A2A) : lv_color_hex(0xC62828), 0);
+    if (s_n24_fhss_btn)
+        lv_obj_set_style_bg_color(s_n24_fhss_btn,
+            s_n24_jam_fhss ? lv_color_hex(0xC62828) : lv_color_hex(0x2A2A2A), 0);
+}
+
 // Stop hook for nRF24 Jammer screen.
 static void nrf24_jam_screen_stop(void)
 {
     s_n24_jam_active = false;  // signals the jam task to exit via nrf24_jam_sweep()
     if (s_n24_jam_tmr) { lv_timer_del(s_n24_jam_tmr); s_n24_jam_tmr = NULL; }
     s_n24_jam_status = NULL;
+    s_n24_seq_btn    = NULL;
+    s_n24_fhss_btn   = NULL;
+    s_n24_jam_btn    = NULL;
+    s_n24_stop_btn   = NULL;
+    for (int i = 0; i < 10; i++) s_n24_mode_btns[i] = NULL;
+}
+
+// Mode selector button: update s_n24_jam_mode and highlight the chosen button.
+static void s_n24_mode_btn_cb(lv_event_t *e)
+{
+    int mode = (int)(intptr_t)lv_event_get_user_data(e);
+    if (s_n24_jam_active) return;  // don't allow mode change while jamming
+    s_n24_jam_mode = (nrf24_jam_mode_t)mode;
+    for (int i = 0; i < 10; i++) {
+        if (!s_n24_mode_btns[i]) continue;
+        lv_obj_set_style_bg_color(s_n24_mode_btns[i],
+            i == mode ? lv_color_hex(0xC62828) : lv_color_hex(0x2A2A2A), 0);
+    }
 }
 
 static void show_nrf24_jammer_screen(void)
@@ -48377,10 +49986,86 @@ static void show_nrf24_jammer_screen(void)
     lv_obj_set_style_text_color(s_n24_jam_status, lv_color_hex(0x66BB6A), 0);
 
     lv_obj_t *note = lv_label_create(card);
-    lv_label_set_text(note, "Sweeps all 126 channels\nwith max-power carrier");
+    lv_label_set_text(note, "AT2401C +20 dBm. Select band, then JAM.");
     lv_obj_set_style_text_font(note, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(note, lv_color_make(150, 150, 150), 0);
     lv_obj_set_style_text_align(note, LV_TEXT_ALIGN_CENTER, 0);
+
+    // 10-mode selector: two flex rows of 5, matching Bruce firmware nrf_jammer.cpp.
+    // Row 1: Test | BT | BLE | Adv | USB
+    // Row 2: WiFi | Zigbee | RC  | Video | Full
+    // s_mode_labels indexed by nrf24_jam_mode_t enum value (0-9).
+    static const char *const s_mode_labels[10] = {
+        "Test","BT","BLE","Adv","WiFi","Zigbee","USB","RC","Video","Full"
+    };
+    static const nrf24_jam_mode_t s_row1_modes[] = {
+        NRF24_JAM_TEST, NRF24_JAM_BT, NRF24_JAM_BLE, NRF24_JAM_BLE_ADV, NRF24_JAM_USB
+    };
+    static const nrf24_jam_mode_t s_row2_modes[] = {
+        NRF24_JAM_WIFI, NRF24_JAM_ZIGBEE, NRF24_JAM_RC, NRF24_JAM_VIDEO, NRF24_JAM_FULL
+    };
+    for (int r = 0; r < 2; r++) {
+        lv_obj_t *mrow = lv_obj_create(card);
+        lv_obj_set_width(mrow, LV_PCT(100));
+        lv_obj_set_height(mrow, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(mrow, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(mrow, 0, 0);
+        lv_obj_set_style_pad_all(mrow, 0, 0);
+        lv_obj_set_style_pad_column(mrow, 4, 0);
+        lv_obj_set_flex_flow(mrow, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(mrow, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(mrow, LV_OBJ_FLAG_SCROLLABLE);
+        const nrf24_jam_mode_t *modes = (r == 0) ? s_row1_modes : s_row2_modes;
+        for (int j = 0; j < 5; j++) {
+            nrf24_jam_mode_t m = modes[j];
+            lv_obj_t *mbtn = lv_btn_create(mrow);
+            lv_obj_set_flex_grow(mbtn, 1);
+            lv_obj_set_height(mbtn, 30);
+            bool sel = (s_n24_jam_mode == m);
+            lv_obj_set_style_bg_color(mbtn, sel ? lv_color_hex(0xC62828) : lv_color_hex(0x2A2A2A), 0);
+            lv_obj_set_style_radius(mbtn, 6, 0);
+            lv_obj_set_style_border_width(mbtn, 0, 0);
+            lv_obj_t *ml = lv_label_create(mbtn);
+            lv_label_set_text(ml, s_mode_labels[m]);
+            lv_obj_set_style_text_font(ml, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(ml, lv_color_white(), 0);
+            lv_obj_center(ml);
+            lv_obj_add_event_cb(mbtn, s_n24_mode_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)m);
+            s_n24_mode_btns[m] = mbtn;
+        }
+    }
+
+    /* SEQ / FHSS hop-mode toggle row */
+    lv_obj_t *hop_row = lv_obj_create(card);
+    lv_obj_set_width(hop_row, LV_PCT(100));
+    lv_obj_set_height(hop_row, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(hop_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(hop_row, 0, 0);
+    lv_obj_set_style_pad_all(hop_row, 0, 0);
+    lv_obj_set_style_pad_column(hop_row, 6, 0);
+    lv_obj_set_flex_flow(hop_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(hop_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(hop_row, LV_OBJ_FLAG_SCROLLABLE);
+    {
+        static const char *const hop_lbl[] = {"SEQ", "FHSS"};
+        lv_obj_t **hop_ptrs[] = {&s_n24_seq_btn, &s_n24_fhss_btn};
+        for (int h = 0; h < 2; h++) {
+            lv_obj_t *hb = lv_btn_create(hop_row);
+            lv_obj_set_flex_grow(hb, 1);
+            lv_obj_set_height(hb, 26);
+            bool active_h = (h == 1) ? s_n24_jam_fhss : !s_n24_jam_fhss;
+            lv_obj_set_style_bg_color(hb, active_h ? lv_color_hex(0xC62828) : lv_color_hex(0x2A2A2A), 0);
+            lv_obj_set_style_radius(hb, 6, 0);
+            lv_obj_set_style_border_width(hb, 0, 0);
+            lv_obj_t *hl = lv_label_create(hb);
+            lv_label_set_text(hl, hop_lbl[h]);
+            lv_obj_set_style_text_font(hl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(hl, lv_color_white(), 0);
+            lv_obj_center(hl);
+            lv_obj_add_event_cb(hb, s_n24_fhss_toggle_cb, LV_EVENT_CLICKED, (void *)(intptr_t)(h == 1));
+            *hop_ptrs[h] = hb;
+        }
+    }
 
     lv_obj_t *btn_row = lv_obj_create(card);
     lv_obj_set_size(btn_row, LCD_H_RES - 36, 36);
@@ -48394,7 +50079,7 @@ static void show_nrf24_jammer_screen(void)
 
     lv_obj_t *start_btn = lv_btn_create(btn_row);
     lv_obj_set_size(start_btn, 80, 32);
-    lv_obj_set_style_bg_color(start_btn, lv_color_hex(0xB71C1C), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(start_btn, lv_color_hex(0x5C1818), LV_STATE_DEFAULT);  // dim red = idle
     lv_obj_set_style_bg_color(start_btn, lv_color_hex(0xD32F2F), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(start_btn, 0, 0);
     lv_obj_set_style_radius(start_btn, 6, 0);
@@ -48403,10 +50088,11 @@ static void show_nrf24_jammer_screen(void)
     lv_obj_set_style_text_color(sl, lv_color_white(), 0);
     lv_obj_center(sl);
     lv_obj_add_event_cb(start_btn, s_n24_jam_start_cb, LV_EVENT_CLICKED, NULL);
+    s_n24_jam_btn = start_btn;
 
     lv_obj_t *stop_btn = lv_btn_create(btn_row);
     lv_obj_set_size(stop_btn, 80, 32);
-    lv_obj_set_style_bg_color(stop_btn, lv_color_make(50, 50, 50), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_make(50, 50, 50), LV_STATE_DEFAULT);  // grey = idle
     lv_obj_set_style_bg_color(stop_btn, lv_color_make(70, 70, 70), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(stop_btn, 0, 0);
     lv_obj_set_style_radius(stop_btn, 6, 0);
@@ -48415,6 +50101,7 @@ static void show_nrf24_jammer_screen(void)
     lv_obj_set_style_text_color(stl, lv_color_white(), 0);
     lv_obj_center(stl);
     lv_obj_add_event_cb(stop_btn, s_n24_jam_stop_cb, LV_EVENT_CLICKED, NULL);
+    s_n24_stop_btn = stop_btn;
 
     lv_obj_move_foreground(overlay);
 
@@ -56086,6 +57773,923 @@ static void espnow_refresh_cb(lv_timer_t *t)
 
 /* ── Button callbacks ────────────────────────────────────────────────────────── */
 // Teardown-only stop hook (top-bar ‹ Back / Home invoke it via g_screen_stop_fn).
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Passive Log screen — read-only view of the obs_store ring buffer.
+ *
+ * Displays the most recent OBS_UI_MAX_SHOWN records with confidence scores,
+ * evidence tags, signal strength, and hit counts.  Classified records
+ * (confidence > 0) are shown first.  A 2-second timer refreshes the list
+ * when the record count changes.  Export writes all records as JSONL to
+ * /sdcard/lab/obs/ using obs_record_to_json().
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Stop hook — called by nav stack on Back/Home.  Deletes timer, NULLs pointers. */
+static void obs_store_screen_stop(void)
+{
+    if (s_obs_tmr) { lv_timer_del(s_obs_tmr); s_obs_tmr = NULL; }
+    s_obs_list        = NULL;
+    s_obs_status_lbl  = NULL;
+    s_obs_last_count  = UINT32_MAX;
+}
+
+/* ── Device type classifier ──────────────────────────────────────────────── */
+/* Maps the obs_detectors label string to an action capability set. */
+
+typedef enum {
+    OBS_DEV_UNKNOWN   = 0,
+    OBS_DEV_AIRTAG    = 1,  /* ring + locate */
+    OBS_DEV_FINDMY    = 2,  /* ring + locate (FMN accessories) */
+    OBS_DEV_SMARTTAG  = 3,  /* locate only (Samsung cloud auth required to ring) */
+    OBS_DEV_TILE      = 4,  /* locate only (Tile cloud auth required to ring) */
+    OBS_DEV_PWNAGOTCHI = 5, /* info only (WiFi, no BLE locate) */
+    OBS_DEV_EDDYSTONE = 6,  /* info only */
+    OBS_DEV_FASTPAIR  = 7,  /* info only */
+    OBS_DEV_MATTER    = 8,  /* info only */
+} obs_dev_type_t;
+
+static obs_dev_type_t obs_get_dev_type(const char *label)
+{
+    if (!label || !label[0]) return OBS_DEV_UNKNOWN;
+    if (strncasecmp(label, "AirTag",     6) == 0) return OBS_DEV_AIRTAG;
+    if (strncasecmp(label, "FindMy",     6) == 0) return OBS_DEV_FINDMY;
+    if (strncasecmp(label, "SmartTag",   8) == 0) return OBS_DEV_SMARTTAG;
+    if (strncasecmp(label, "Tile",       4) == 0) return OBS_DEV_TILE;
+    if (strncasecmp(label, "pwn",        3) == 0) return OBS_DEV_PWNAGOTCHI;
+    if (strncasecmp(label, "Eddystone",  9) == 0) return OBS_DEV_EDDYSTONE;
+    if (strncasecmp(label, "FastPair",   8) == 0) return OBS_DEV_FASTPAIR;
+    if (strncasecmp(label, "Matter",     6) == 0) return OBS_DEV_MATTER;
+    return OBS_DEV_UNKNOWN;
+}
+
+/* True if this device type supports BLE locate (has a trackable BLE address). */
+static bool obs_dev_can_locate(obs_dev_type_t t)
+{
+    return (t == OBS_DEV_AIRTAG   || t == OBS_DEV_FINDMY ||
+            t == OBS_DEV_SMARTTAG || t == OBS_DEV_TILE);
+}
+
+/* True if this device type supports direct BLE ring (no cloud auth required). */
+static bool obs_dev_can_ring(obs_dev_type_t t)
+{
+    return (t == OBS_DEV_AIRTAG || t == OBS_DEV_FINDMY);
+}
+
+/* ── Passive Log card tap callbacks ──────────────────────────────────────── */
+
+/* Free the malloc'd record copy stored as lv_obj user_data on delete. */
+static void obs_card_delete_cb(lv_event_t *e)
+{
+    lv_obj_t *obj = lv_event_get_target(e);
+    void *ud = lv_obj_get_user_data(obj);
+    if (ud) free(ud);
+}
+
+/* Tap on a classified card: copy record to shared static, open Detail screen. */
+static void obs_card_tap_cb(lv_event_t *e)
+{
+    lv_obj_t *obj = lv_event_get_target(e);
+    obs_record_t *rec = (obs_record_t *)lv_obj_get_user_data(obj);
+    if (!rec) return;
+    memcpy(&s_obs_detail_rec, rec, sizeof(obs_record_t));
+    show_obs_device_detail_screen();
+}
+
+/* Rebuild the scrollable record list.  Called from the refresh timer and on open. */
+static void obs_store_rebuild_list(void)
+{
+    if (!s_obs_list || !lv_obj_is_valid(s_obs_list)) return;
+    lv_obj_clean(s_obs_list);
+
+    uint32_t total = g_obs_store.count;
+    if (total == 0) {
+        lv_obj_t *empty = lv_label_create(s_obs_list);
+        lv_label_set_text(empty, "No observations yet.\nRun WiFi Scan or BLE Scan first.");
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(empty, ui_muted_color(), 0);
+        lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(empty, lv_pct(100));
+        return;
+    }
+
+    /* Collect up to OBS_UI_MAX_SHOWN indices: classified first, then unclassified. */
+    uint32_t idx[OBS_UI_MAX_SHOWN];
+    uint32_t nshow = 0;
+
+    /* Pass 1: classified (confidence > 0) */
+    for (uint32_t i = total; i > 0 && nshow < OBS_UI_MAX_SHOWN; i--) {
+        if (g_obs_store.records[i - 1].confidence > 0)
+            idx[nshow++] = i - 1;
+    }
+    /* Pass 2: fill remaining slots with unclassified, newest first */
+    for (uint32_t i = total; i > 0 && nshow < OBS_UI_MAX_SHOWN; i--) {
+        if (g_obs_store.records[i - 1].confidence == 0) {
+            /* Check not already included (only needed if we had > MAX classified) */
+            bool dup = false;
+            for (uint32_t k = 0; k < nshow; k++) { if (idx[k] == i - 1) { dup = true; break; } }
+            if (!dup) idx[nshow++] = i - 1;
+        }
+    }
+
+    static const char *ev_names[] = { "", "OUI", "SVC", "MFR", "SSID", "RATE!", "RSSI!", "REC" };
+
+    for (uint32_t j = 0; j < nshow; j++) {
+        obs_record_t r = g_obs_store.records[idx[j]];   /* local copy under lvgl_mutex */
+
+        /* Border color reflects classification confidence */
+        lv_color_t border_col;
+        if      (r.confidence >= 80) border_col = lv_color_hex(0x4CAF50);
+        else if (r.confidence >= 50) border_col = lv_color_hex(0xFFA726);
+        else if (r.confidence >  0)  border_col = lv_color_hex(0x546E7A);
+        else                         border_col = lv_color_hex(0x37474F);
+
+        lv_obj_t *card = lv_obj_create(s_obs_list);
+        lv_obj_set_size(card, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_pad_top(card, 3, 0);
+        lv_obj_set_style_pad_bottom(card, 3, 0);
+        lv_obj_set_style_pad_left(card, 5, 0);
+        lv_obj_set_style_pad_right(card, 5, 0);
+        lv_obj_set_style_pad_gap(card, 1, 0);
+        lv_obj_set_style_radius(card, 4, 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_border_color(card, border_col, 0);
+        lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+
+        /* Row 1: [W]/[B] badge + label/MAC + peak RSSI */
+        bool is_ble = (r.obs_type == (uint8_t)OBS_TYPE_BLE_ADV ||
+                       r.obs_type == (uint8_t)OBS_TYPE_BLE_EXT);
+        char r1[64];
+        if (r.label[0]) {
+            snprintf(r1, sizeof(r1), "%s %-19s%4ddBm",
+                     is_ble ? "[B]" : "[W]", r.label, r.rssi_cur);
+        } else {
+            snprintf(r1, sizeof(r1), "%s %02X:%02X:%02X:%02X:%02X:%02X %4ddBm",
+                     is_ble ? "[B]" : "[W]",
+                     r.mac[0], r.mac[1], r.mac[2], r.mac[3], r.mac[4], r.mac[5],
+                     r.rssi_cur);
+        }
+        lv_obj_t *l1 = lv_label_create(card);
+        lv_label_set_text(l1, r1);
+        lv_obj_set_style_text_font(l1, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l1, ui_text_color(), 0);
+        lv_label_set_long_mode(l1, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(l1, lv_pct(100));
+
+        /* Row 2: evidence tags + confidence + hit count */
+        char r2[64];
+        int r2_off = 0;
+        for (uint8_t ei = 0; ei < r.evidence_count && ei < OBS_MAX_EVIDENCE; ei++) {
+            uint8_t ev = r.evidence[ei];
+            if (ev > 0 && ev < 8)
+                r2_off += snprintf(r2 + r2_off, (int)sizeof(r2) - r2_off, "%s ", ev_names[ev]);
+        }
+        if (r.confidence > 0)
+            snprintf(r2 + r2_off, (int)sizeof(r2) - r2_off, "c:%u  %ux", r.confidence, r.hit_count);
+        else
+            snprintf(r2 + r2_off, (int)sizeof(r2) - r2_off, "%ux", r.hit_count);
+
+        lv_obj_t *l2 = lv_label_create(card);
+        lv_label_set_text(l2, r2);
+        lv_obj_set_style_text_font(l2, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(l2,
+            r.confidence > 0 ? lv_color_hex(0x80CBC4) : ui_muted_color(), 0);
+        lv_label_set_long_mode(l2, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(l2, lv_pct(100));
+
+        /* Classified records are tappable — tap opens Device Detail. */
+        if (r.confidence > 0) {
+            obs_record_t *rec_copy = malloc(sizeof(obs_record_t));
+            if (rec_copy) {
+                memcpy(rec_copy, &r, sizeof(obs_record_t));
+                lv_obj_set_user_data(card, rec_copy);
+                lv_obj_add_event_cb(card, obs_card_delete_cb, LV_EVENT_DELETE, NULL);
+                lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+                lv_obj_add_event_cb(card, obs_card_tap_cb, LV_EVENT_CLICKED, NULL);
+                /* Dim on press so user gets tap feedback */
+                lv_obj_set_style_bg_opa(card, LV_OPA_70, LV_STATE_PRESSED);
+            }
+        }
+    }
+}
+
+/* 2-second refresh timer: updates status label and rebuilds list on count change. */
+static void obs_store_refresh_cb(lv_timer_t *t)
+{
+    (void)t;
+    uint32_t cnt = g_obs_store.count;
+
+    if (s_obs_status_lbl && lv_obj_is_valid(s_obs_status_lbl)) {
+        uint32_t classified = 0;
+        for (uint32_t i = 0; i < cnt; i++) {
+            if (g_obs_store.records[i].confidence > 0) classified++;
+        }
+        char buf[64];
+        if (g_obs_store.overflow > 0)
+            snprintf(buf, sizeof(buf), "%lu records | %lu classified | +%lu dropped",
+                     (unsigned long)cnt, (unsigned long)classified,
+                     (unsigned long)g_obs_store.overflow);
+        else
+            snprintf(buf, sizeof(buf), "%lu records | %lu classified",
+                     (unsigned long)cnt, (unsigned long)classified);
+        lv_label_set_text(s_obs_status_lbl, buf);
+    }
+
+    if (cnt != s_obs_last_count) {
+        s_obs_last_count = cnt;
+        obs_store_rebuild_list();
+    }
+}
+
+/* Export all records to /sdcard/lab/obs/obs_TIMESTAMP.jsonl (one JSON object per line). */
+static void obs_store_export_jsonl(lv_event_t *e)
+{
+    (void)e;
+    ensure_sd_mounted();
+
+    struct stat st;
+    if (stat(OBS_EXPORT_DIR, &st) != 0) mkdir(OBS_EXPORT_DIR, 0775);
+
+    char path[80];
+    time_t now_t = 0;
+    time(&now_t);
+    struct tm *tm_info = localtime(&now_t);
+    if (tm_info && now_t > 1000000) {
+        snprintf(path, sizeof(path), OBS_EXPORT_DIR "/obs_%04d%02d%02d_%02d%02d%02d.jsonl",
+                 tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
+                 tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
+    } else {
+        snprintf(path, sizeof(path), OBS_EXPORT_DIR "/obs_%llu.jsonl",
+                 (unsigned long long)(esp_timer_get_time() / 1000000LL));
+    }
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        if (s_obs_status_lbl && lv_obj_is_valid(s_obs_status_lbl))
+            lv_label_set_text(s_obs_status_lbl, "Export failed - check SD card");
+        return;
+    }
+
+    char jbuf[320];
+    uint32_t written = 0;
+    for (uint32_t i = 0; i < g_obs_store.count; i++) {
+        if (obs_record_to_json(&g_obs_store.records[i], jbuf, sizeof(jbuf)) > 0) {
+            fprintf(f, "%s\n", jbuf);
+            written++;
+        }
+    }
+    fclose(f);
+
+    if (s_obs_status_lbl && lv_obj_is_valid(s_obs_status_lbl)) {
+        char buf[80];
+        snprintf(buf, sizeof(buf), "Exported %lu records to SD", (unsigned long)written);
+        lv_label_set_text(s_obs_status_lbl, buf);
+    }
+    ESP_LOGI(TAG, "obs_store: exported %lu records to %s", (unsigned long)written, path);
+}
+
+/* Main screen builder. */
+static void show_obs_store_screen(void)
+{
+    create_function_page_base("Passive Log");
+    g_screen_stop_fn = obs_store_screen_stop;
+    g_screen_back_fn = show_wifi_menu_screen;
+    apply_menu_bg();
+
+    /* Status bar — row 1 below the 30px title bar, full width */
+    s_obs_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_obs_status_lbl, "Loading...");
+    lv_obj_set_style_text_font(s_obs_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_obs_status_lbl, ui_muted_color(), 0);
+    lv_obj_align(s_obs_status_lbl, LV_ALIGN_TOP_LEFT, 4, 32);
+    lv_obj_set_width(s_obs_status_lbl, LCD_H_RES - 8);
+    lv_label_set_long_mode(s_obs_status_lbl, LV_LABEL_LONG_CLIP);
+
+    /* Export button — row 2, right-aligned, stacked below status bar.
+     * Was at y=28 (overlapping the title bar) and same row as status bar
+     * (status bar width 232px ran behind the 120px button). */
+    lv_obj_t *exp_btn = lv_btn_create(function_page);
+    lv_obj_set_size(exp_btn, 120, 24);
+    lv_obj_align(exp_btn, LV_ALIGN_TOP_RIGHT, -4, 46);
+    lv_obj_set_style_bg_color(exp_btn, lv_color_hex(0x311B92), 0);
+    lv_obj_set_style_radius(exp_btn, 4, 0);
+    lv_obj_add_event_cb(exp_btn, obs_store_export_jsonl, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *exp_lbl = lv_label_create(exp_btn);
+    lv_label_set_text(exp_lbl, "Export JSONL");
+    lv_obj_set_style_text_font(exp_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(exp_lbl);
+
+    /* Scrollable record list — fills remaining vertical space.
+     * Header: 30px title + 14px status row + 2px gap + 24px button + 4px gap = 74px.
+     * List height = LCD_V_RES - 74 = 246px; bottom-mid with -2 nudge puts top at y=72. */
+    s_obs_list = lv_obj_create(function_page);
+    lv_obj_set_size(s_obs_list, LCD_H_RES - 8, LCD_V_RES - 74);
+    lv_obj_align(s_obs_list, LV_ALIGN_BOTTOM_MID, 0, -2);
+    lv_obj_set_style_bg_opa(s_obs_list, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_obs_list, 0, 0);
+    lv_obj_set_style_pad_all(s_obs_list, 2, 0);
+    lv_obj_set_style_pad_gap(s_obs_list, 3, 0);
+    lv_obj_set_flex_flow(s_obs_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scrollbar_mode(s_obs_list, LV_SCROLLBAR_MODE_AUTO);
+
+    /* Initial populate and status */
+    obs_store_refresh_cb(NULL);
+
+    s_obs_tmr = lv_timer_create(obs_store_refresh_cb, 2000, NULL);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Device Locate — RSSI-based proximity tracking with vibrator feedback.
+ * Reuses existing bt_tracking_mode / bt_tracking_mac / bt_tracking_rssi
+ * globals already wired into bt_gap_event_callback.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Async shim: update locate UI from locate task (runs outside lvgl_mutex). */
+typedef struct { int8_t rssi; bool found; } obs_loc_update_t;
+
+static void obs_loc_ui_async(void *data)
+{
+    obs_loc_update_t *u = (obs_loc_update_t *)data;
+    if (s_obs_loc_rssi_lbl && lv_obj_is_valid(s_obs_loc_rssi_lbl)) {
+        char buf[24];
+        if (u->found)
+            snprintf(buf, sizeof(buf), "%d dBm", u->rssi);
+        else
+            snprintf(buf, sizeof(buf), "Searching...");
+        lv_label_set_text(s_obs_loc_rssi_lbl, buf);
+    }
+    if (s_obs_loc_bar && lv_obj_is_valid(s_obs_loc_bar)) {
+        int val = 0;
+        if (u->found && u->rssi >= -69) {
+            int pct = 10 + (u->rssi + 69) * 90 / 29;
+            val = (pct > 100) ? 100 : pct;
+        }
+        lv_bar_set_value(s_obs_loc_bar, val, LV_ANIM_OFF);
+    }
+    if (s_obs_loc_status_lbl && lv_obj_is_valid(s_obs_loc_status_lbl)) {
+        const char *txt = u->found ? "In range" : "Not seen this scan";
+        lv_label_set_text(s_obs_loc_status_lbl, txt);
+    }
+    free(u);
+}
+
+/* Locate background task: scan 10 s cycles, update vibrator + LVGL every 500 ms. */
+static void obs_locate_task(void *arg)
+{
+    (void)arg;
+    char mac_str[18];
+    snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+             s_obs_detail_rec.mac[0], s_obs_detail_rec.mac[1], s_obs_detail_rec.mac[2],
+             s_obs_detail_rec.mac[3], s_obs_detail_rec.mac[4], s_obs_detail_rec.mac[5]);
+    ESP_LOGI(TAG, "obs_locate: tracking %s", mac_str);
+
+    while (s_obs_loc_running) {
+        bt_tracking_found = false;
+        bt_tracking_rssi  = 0;
+
+        int rc = bt_start_scan();
+        if (rc != 0) {
+            ESP_LOGE(TAG, "obs_locate: scan start failed %d", rc);
+            break;
+        }
+
+        /* Scan 10 s, update every 500 ms */
+        for (int i = 0; i < 100 && s_obs_loc_running; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            if (i % 5 == 0) {
+                obs_loc_update_t *u = malloc(sizeof(obs_loc_update_t));
+                if (u) {
+                    u->found = bt_tracking_found;
+                    u->rssi  = bt_tracking_rssi;
+                    lv_async_call(obs_loc_ui_async, u);
+                }
+                if (bt_tracking_found) {
+                    int rssi = bt_tracking_rssi;
+                    if (rssi >= -69) {
+                        int pct = 10 + (rssi + 69) * 90 / 29;
+                        g_vibtest_strength_pct = (pct > 100) ? 100 : pct;
+                        vibrator_on();
+                    } else {
+                        vibrator_off();
+                    }
+                } else {
+                    vibrator_off();
+                }
+            }
+        }
+
+        bt_stop_scan();
+        if (!s_obs_loc_running) break;
+    }
+
+    vibrator_off();
+    g_vibtest_strength_pct = s_obs_saved_vib_pct;
+    bt_tracking_mode        = false;
+    s_obs_loc_running       = false;
+    ESP_LOGI(TAG, "obs_locate: stopped");
+    vTaskDelete(NULL);
+}
+
+static void obs_device_locate_stop(void)
+{
+    s_obs_loc_running = false;
+    bt_tracking_mode  = false;
+    vibrator_off();
+    g_vibtest_strength_pct = s_obs_saved_vib_pct;
+    vTaskDelay(pdMS_TO_TICKS(200));
+    s_obs_loc_rssi_lbl   = NULL;
+    s_obs_loc_bar        = NULL;
+    s_obs_loc_status_lbl = NULL;
+}
+
+static void show_obs_device_locate_screen(void)
+{
+    create_function_page_base("Device Locate");
+    g_screen_stop_fn = obs_device_locate_stop;
+    g_screen_back_fn = show_obs_device_detail_screen;
+    apply_menu_bg();
+
+    bool is_ble = (s_obs_detail_rec.src_radio == (uint8_t)OBS_RADIO_BLE);
+    char identity[40];
+    if (s_obs_detail_rec.label[0])
+        snprintf(identity, sizeof(identity), "%s", s_obs_detail_rec.label);
+    else
+        snprintf(identity, sizeof(identity), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 s_obs_detail_rec.mac[0], s_obs_detail_rec.mac[1], s_obs_detail_rec.mac[2],
+                 s_obs_detail_rec.mac[3], s_obs_detail_rec.mac[4], s_obs_detail_rec.mac[5]);
+
+    /* Device name header */
+    lv_obj_t *name_lbl = lv_label_create(function_page);
+    lv_label_set_text(name_lbl, identity);
+    lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(name_lbl, lv_color_hex(0x80CBC4), 0);
+    lv_obj_align(name_lbl, LV_ALIGN_TOP_LEFT, 6, 30);
+
+    /* MAC line */
+    char mac_buf[20];
+    snprintf(mac_buf, sizeof(mac_buf), "%02X:%02X:%02X:%02X:%02X:%02X",
+             s_obs_detail_rec.mac[0], s_obs_detail_rec.mac[1], s_obs_detail_rec.mac[2],
+             s_obs_detail_rec.mac[3], s_obs_detail_rec.mac[4], s_obs_detail_rec.mac[5]);
+    lv_obj_t *mac_lbl = lv_label_create(function_page);
+    lv_label_set_text(mac_lbl, mac_buf);
+    lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(mac_lbl, ui_muted_color(), 0);
+    lv_obj_align(mac_lbl, LV_ALIGN_TOP_LEFT, 6, 52);
+
+    /* Live RSSI value */
+    s_obs_loc_rssi_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_obs_loc_rssi_lbl, "Starting scan...");
+    lv_obj_set_style_text_font(s_obs_loc_rssi_lbl, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(s_obs_loc_rssi_lbl, ui_text_color(), 0);
+    lv_obj_align(s_obs_loc_rssi_lbl, LV_ALIGN_TOP_MID, 0, 90);
+
+    /* Signal strength bar */
+    s_obs_loc_bar = lv_bar_create(function_page);
+    lv_obj_set_size(s_obs_loc_bar, LCD_H_RES - 40, 18);
+    lv_obj_align(s_obs_loc_bar, LV_ALIGN_TOP_MID, 0, 130);
+    lv_bar_set_range(s_obs_loc_bar, 0, 100);
+    lv_bar_set_value(s_obs_loc_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(s_obs_loc_bar, ui_card_color(), 0);
+    lv_obj_set_style_bg_color(s_obs_loc_bar, lv_color_hex(0x4CAF50), LV_PART_INDICATOR);
+
+    /* Status text */
+    s_obs_loc_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_obs_loc_status_lbl, "Searching...");
+    lv_obj_set_style_text_font(s_obs_loc_status_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_obs_loc_status_lbl, ui_muted_color(), 0);
+    lv_obj_align(s_obs_loc_status_lbl, LV_ALIGN_TOP_MID, 0, 160);
+
+    lv_obj_t *hint = lv_label_create(function_page);
+    lv_label_set_text(hint, "Vibration strength tracks signal");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint, ui_muted_color(), 0);
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 200);
+
+    if (!is_ble) {
+        lv_obj_t *warn = lv_label_create(function_page);
+        lv_label_set_text(warn, "Note: WiFi RSSI locate not supported");
+        lv_obj_set_style_text_font(warn, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(warn, lv_color_hex(0xFFA726), 0);
+        lv_obj_align(warn, LV_ALIGN_TOP_MID, 0, 225);
+        return;
+    }
+
+    /* Start tracking task */
+    s_obs_saved_vib_pct = (uint8_t)g_vibtest_strength_pct;
+    memcpy(bt_tracking_mac, s_obs_detail_rec.mac, 6);
+    bt_tracking_mode  = true;
+    bt_tracking_found = false;
+    bt_tracking_rssi  = 0;
+    s_obs_loc_running = true;
+
+    ensure_ble_mode();
+    xTaskCreate(obs_locate_task, "obs_loc", 4096, NULL, 2, NULL);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Ring Device — BLE connect + GATT write for AirTag / FindMy play-sound.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Async shim: update ring status label from ring task. */
+typedef struct { char msg[80]; } obs_ring_msg_t;
+
+static void obs_ring_status_async(void *data)
+{
+    obs_ring_msg_t *m = (obs_ring_msg_t *)data;
+    if (s_obs_ring_status_lbl && lv_obj_is_valid(s_obs_ring_status_lbl))
+        lv_label_set_text(s_obs_ring_status_lbl, m->msg);
+    free(m);
+}
+
+static void obs_ring_set_status(const char *msg)
+{
+    obs_ring_msg_t *m = malloc(sizeof(obs_ring_msg_t));
+    if (!m) return;
+    snprintf(m->msg, sizeof(m->msg), "%s", msg);
+    lv_async_call(obs_ring_status_async, m);
+}
+
+/* GAP event callback for the ring connect sequence. */
+static int obs_ring_gap_cb(struct ble_gap_event *e, void *arg)
+{
+    (void)arg;
+    switch (e->type) {
+    case BLE_GAP_EVENT_CONNECT:
+        s_obs_ring_conn_hdl = (e->connect.status == 0)
+                              ? e->connect.conn_handle
+                              : BLE_HS_CONN_HANDLE_NONE;
+        s_obs_ring_gatt_rc  = e->connect.status;
+        if (s_obs_ring_sem) xSemaphoreGive(s_obs_ring_sem);
+        break;
+    case BLE_GAP_EVENT_DISCONNECT:
+        s_obs_ring_conn_hdl = BLE_HS_CONN_HANDLE_NONE;
+        if (s_obs_ring_sem) xSemaphoreGive(s_obs_ring_sem);
+        break;
+    default:
+        break;
+    }
+    return 0;
+}
+
+/* GATT service discovery callback — captures FMN service handle range. */
+static int obs_ring_svc_disc_cb(uint16_t conn_hdl,
+                                  const struct ble_gatt_error *err,
+                                  const struct ble_gatt_svc *svc, void *arg)
+{
+    (void)conn_hdl; (void)arg;
+    if (err->status == 0 && svc) {
+        s_obs_ring_svc_start = svc->start_handle;
+        s_obs_ring_svc_end   = svc->end_handle;
+    }
+    if (err->status != 0) {
+        s_obs_ring_gatt_rc = (err->status == BLE_HS_EDONE) ? 0 : err->status;
+        if (s_obs_ring_sem) xSemaphoreGive(s_obs_ring_sem);
+    }
+    return 0;
+}
+
+/* GATT characteristic discovery callback — locates the play-sound write handle. */
+static int obs_ring_chr_disc_cb(uint16_t conn_hdl,
+                                  const struct ble_gatt_error *err,
+                                  const struct ble_gatt_chr *chr, void *arg)
+{
+    (void)conn_hdl; (void)arg;
+    if (err->status == 0 && chr) {
+        const ble_uuid_t *target = s_obs_ring_is_tile
+            ? &s_obs_ring_tile_cmd_uuid.u
+            : &s_obs_ring_fmn_snd_uuid.u;
+        if (ble_uuid_cmp(&chr->uuid.u, target) == 0)
+            s_obs_ring_snd_hdl = chr->val_handle;
+    }
+    if (err->status != 0) {
+        s_obs_ring_gatt_rc = (err->status == BLE_HS_EDONE) ? 0 : err->status;
+        if (s_obs_ring_sem) xSemaphoreGive(s_obs_ring_sem);
+    }
+    return 0;
+}
+
+/* GATT write callback — signals write completion. */
+static int obs_ring_write_cb(uint16_t conn_hdl, const struct ble_gatt_error *err,
+                               struct ble_gatt_attr *attr, void *arg)
+{
+    (void)conn_hdl; (void)attr; (void)arg;
+    s_obs_ring_gatt_rc = err->status;
+    if (s_obs_ring_sem) xSemaphoreGive(s_obs_ring_sem);
+    return 0;
+}
+
+/* Ring task: connect → discover FMN service → write play-sound → disconnect. */
+static void obs_ring_task(void *arg)
+{
+    (void)arg;
+    bool is_random = !!(s_obs_detail_rec.flags & OBS_FLAG_RANDOM_ADDR);
+
+    obs_ring_set_status("Switching to BLE...");
+    ensure_ble_mode();
+    ble_gap_disc_cancel();
+
+    s_obs_ring_sem = xSemaphoreCreateBinary();
+    if (!s_obs_ring_sem) { obs_ring_set_status("Alloc failed"); goto done; }
+
+    /* Connect */
+    obs_ring_set_status("Connecting...");
+    ble_att_set_preferred_mtu(64);
+    ble_addr_t peer;
+    peer.type = is_random ? BLE_ADDR_RANDOM : BLE_ADDR_PUBLIC;
+    memcpy(peer.val, s_obs_detail_rec.mac, 6);
+    s_obs_ring_conn_hdl = BLE_HS_CONN_HANDLE_NONE;
+    s_obs_ring_svc_start = 0;
+    s_obs_ring_svc_end   = 0;
+    s_obs_ring_snd_hdl   = 0;
+
+    int rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &peer, 10000, NULL, obs_ring_gap_cb, NULL);
+    if (rc != 0) {
+        char buf[56]; snprintf(buf, sizeof(buf), "Connect init failed (%d)", rc);
+        obs_ring_set_status(buf);
+        goto done;
+    }
+    if (xSemaphoreTake(s_obs_ring_sem, pdMS_TO_TICKS(12000)) != pdTRUE
+        || s_obs_ring_conn_hdl == BLE_HS_CONN_HANDLE_NONE) {
+        obs_ring_set_status("Connect timeout");
+        ble_gap_conn_cancel();
+        goto done;
+    }
+    if (s_obs_ring_cancel) { obs_ring_set_status("Cancelled"); goto disconnect; }
+
+    /* Discover service — FMN (128-bit) for AirTag, 0xFEED (16-bit) for Tile */
+    obs_ring_set_status("Finding sound service...");
+    {
+        const ble_uuid_t *svc_uuid = s_obs_ring_is_tile
+            ? &s_obs_ring_tile_svc_uuid16.u
+            : &s_obs_ring_fmn_svc_uuid.u;
+        rc = ble_gattc_disc_svc_by_uuid(s_obs_ring_conn_hdl, svc_uuid,
+                                         obs_ring_svc_disc_cb, NULL);
+    }
+    if (rc != 0) {
+        obs_ring_set_status("Service disc failed");
+        goto disconnect;
+    }
+    if (xSemaphoreTake(s_obs_ring_sem, pdMS_TO_TICKS(6000)) != pdTRUE
+        || s_obs_ring_svc_end == 0) {
+        obs_ring_set_status(s_obs_ring_is_tile
+            ? "Tile svc not found\nRun GATT Walker"
+            : "Sound service not found\nRun GATT Walker to verify UUID");
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        goto disconnect;
+    }
+    if (s_obs_ring_cancel) { obs_ring_set_status("Cancelled"); goto disconnect; }
+
+    /* Discover all characteristics in the service */
+    obs_ring_set_status("Finding sound characteristic...");
+    rc = ble_gattc_disc_all_chrs(s_obs_ring_conn_hdl,
+                                  s_obs_ring_svc_start, s_obs_ring_svc_end,
+                                  obs_ring_chr_disc_cb, NULL);
+    if (rc != 0) {
+        obs_ring_set_status("Chr disc failed");
+        goto disconnect;
+    }
+    if (xSemaphoreTake(s_obs_ring_sem, pdMS_TO_TICKS(6000)) != pdTRUE
+        || s_obs_ring_snd_hdl == 0) {
+        obs_ring_set_status(s_obs_ring_is_tile
+            ? "Tile cmd chr not found\nRun GATT Walker"
+            : "Sound chr not found\nRun GATT Walker to verify UUID");
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        goto disconnect;
+    }
+    if (s_obs_ring_cancel) { obs_ring_set_status("Cancelled"); goto disconnect; }
+
+    /* Write ring command.
+     * Tile uses Write No Response (WNR) — no ACK, fire-and-forget.
+     * AirTag FMN uses Write with Response — wait for callback. */
+    obs_ring_set_status("Sending ring command...");
+    if (s_obs_ring_is_tile) {
+        /* Tile: WNR — command is queued immediately, no write callback */
+        rc = ble_gattc_write_no_rsp_flat(s_obs_ring_conn_hdl, s_obs_ring_snd_hdl,
+                                          OBS_RING_TILE_CMD, sizeof(OBS_RING_TILE_CMD));
+        if (rc == 0) {
+            obs_ring_set_status("Tile ring sent\nListen for beep");
+        } else {
+            char buf[48];
+            snprintf(buf, sizeof(buf), "Send failed (%d)", rc);
+            obs_ring_set_status(buf);
+        }
+        vTaskDelay(pdMS_TO_TICKS(3000));
+    } else {
+        rc = ble_gattc_write_flat(s_obs_ring_conn_hdl, s_obs_ring_snd_hdl,
+                                   OBS_RING_PLAY_CMD, sizeof(OBS_RING_PLAY_CMD),
+                                   obs_ring_write_cb, NULL);
+        if (rc != 0) {
+            obs_ring_set_status("Write failed");
+            goto disconnect;
+        }
+        if (xSemaphoreTake(s_obs_ring_sem, pdMS_TO_TICKS(5000)) != pdTRUE) {
+            obs_ring_set_status("Write timeout");
+            goto disconnect;
+        }
+        if (s_obs_ring_gatt_rc == 0) {
+            obs_ring_set_status("Sound command sent!");
+        } else {
+            const char *att_desc = "error";
+            if (s_obs_ring_gatt_rc >= 256) {
+                switch (s_obs_ring_gatt_rc - 256) {
+                    case 0x03: att_desc = "write not permitted"; break;
+                    case 0x05: att_desc = "auth required";       break;
+                    case 0x08: att_desc = "authorization denied";break;
+                    case 0x0D: att_desc = "wrong payload length";break;
+                    case 0x0F: att_desc = "encryption required"; break;
+                    default:   att_desc = "ATT error";           break;
+                }
+            }
+            char buf[72];
+            snprintf(buf, sizeof(buf), "Write error %d\n(%s)", s_obs_ring_gatt_rc, att_desc);
+            obs_ring_set_status(buf);
+        }
+        vTaskDelay(pdMS_TO_TICKS(3000));
+    }
+
+disconnect:
+    if (s_obs_ring_conn_hdl != BLE_HS_CONN_HANDLE_NONE) {
+        ble_gap_terminate(s_obs_ring_conn_hdl, BLE_ERR_REM_USER_CONN_TERM);
+        xSemaphoreTake(s_obs_ring_sem, pdMS_TO_TICKS(3000));
+        s_obs_ring_conn_hdl = BLE_HS_CONN_HANDLE_NONE;
+    }
+done:
+    if (s_obs_ring_sem) { vSemaphoreDelete(s_obs_ring_sem); s_obs_ring_sem = NULL; }
+    s_obs_ring_task_hdl = NULL;
+    ESP_LOGI(TAG, "obs_ring: task done");
+    vTaskDelete(NULL);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Device Detail screen — shows record info and action buttons.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Ring button tap — launch ring task if not already running. */
+static void obs_ring_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_obs_ring_task_hdl) {
+        if (s_obs_ring_status_lbl && lv_obj_is_valid(s_obs_ring_status_lbl))
+            lv_label_set_text(s_obs_ring_status_lbl, "Already in progress...");
+        return;
+    }
+    s_obs_ring_cancel = false;
+    xTaskCreate(obs_ring_task, "obs_ring", 6144, NULL, 2, &s_obs_ring_task_hdl);
+}
+
+/* Locate button tap — navigate to Locate sub-screen. */
+static void obs_locate_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    show_obs_device_locate_screen();
+}
+
+static void obs_device_detail_stop(void)
+{
+    /* Cancel any in-progress ring task */
+    s_obs_ring_cancel = true;
+    if (s_obs_ring_conn_hdl != BLE_HS_CONN_HANDLE_NONE) {
+        ble_gap_terminate(s_obs_ring_conn_hdl, BLE_ERR_REM_USER_CONN_TERM);
+    }
+    /* Poll up to 3 s for ring task to exit */
+    for (int i = 0; i < 30 && s_obs_ring_task_hdl; i++)
+        vTaskDelay(pdMS_TO_TICKS(100));
+    s_obs_ring_status_lbl = NULL;
+}
+
+static void show_obs_device_detail_screen(void)
+{
+    create_function_page_base("Device Detail");
+    g_screen_stop_fn = obs_device_detail_stop;
+    g_screen_back_fn = show_obs_store_screen;
+    apply_menu_bg();
+
+    const obs_record_t *r = &s_obs_detail_rec;
+    obs_dev_type_t dev_type = obs_get_dev_type(r->label);
+    bool is_ble = (r->src_radio == (uint8_t)OBS_RADIO_BLE);
+    bool can_ring   = obs_dev_can_ring(dev_type);
+    bool can_locate = obs_dev_can_locate(dev_type) && is_ble;
+
+    static const char *ev_names[] = { "", "OUI", "SVC", "MFR", "SSID", "RATE!", "RSSI!", "REC" };
+
+    /* ── Device label / badge ── */
+    char badge[6];
+    snprintf(badge, sizeof(badge), "[%s]", is_ble ? "B" : "W");
+    lv_obj_t *badge_lbl = lv_label_create(function_page);
+    lv_label_set_text(badge_lbl, badge);
+    lv_obj_set_style_text_font(badge_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(badge_lbl, ui_muted_color(), 0);
+    lv_obj_align(badge_lbl, LV_ALIGN_TOP_LEFT, 6, 30);
+
+    lv_obj_t *name_lbl = lv_label_create(function_page);
+    lv_label_set_text(name_lbl, r->label[0] ? r->label : "(no name)");
+    lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(name_lbl, lv_color_hex(0x80CBC4), 0);
+    lv_obj_align(name_lbl, LV_ALIGN_TOP_LEFT, 36, 30);
+    lv_obj_set_width(name_lbl, LCD_H_RES - 42);
+    lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_CLIP);
+
+    /* ── MAC ── */
+    char mac_buf[20];
+    snprintf(mac_buf, sizeof(mac_buf), "%02X:%02X:%02X:%02X:%02X:%02X",
+             r->mac[0], r->mac[1], r->mac[2], r->mac[3], r->mac[4], r->mac[5]);
+    lv_obj_t *mac_lbl = lv_label_create(function_page);
+    lv_label_set_text(mac_lbl, mac_buf);
+    lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(mac_lbl, ui_muted_color(), 0);
+    lv_obj_align(mac_lbl, LV_ALIGN_TOP_LEFT, 6, 52);
+
+    /* ── Signal ── */
+    char sig_buf[48];
+    snprintf(sig_buf, sizeof(sig_buf), "RSSI %d dBm  peak %d dBm  ch %u",
+             r->rssi_cur, r->rssi_peak, r->channel);
+    lv_obj_t *sig_lbl = lv_label_create(function_page);
+    lv_label_set_text(sig_lbl, sig_buf);
+    lv_obj_set_style_text_font(sig_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sig_lbl, ui_text_color(), 0);
+    lv_obj_align(sig_lbl, LV_ALIGN_TOP_LEFT, 6, 70);
+
+    /* ── Confidence + hits ── */
+    char conf_buf[40];
+    snprintf(conf_buf, sizeof(conf_buf), "Confidence: %u   Seen: %u time%s",
+             r->confidence, r->hit_count, r->hit_count == 1 ? "" : "s");
+    lv_obj_t *conf_lbl = lv_label_create(function_page);
+    lv_label_set_text(conf_lbl, conf_buf);
+    lv_obj_set_style_text_font(conf_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(conf_lbl, ui_text_color(), 0);
+    lv_obj_align(conf_lbl, LV_ALIGN_TOP_LEFT, 6, 88);
+
+    /* ── Evidence tags ── */
+    char ev_buf[64] = "Evidence: ";
+    bool any_ev = false;
+    for (uint8_t i = 0; i < r->evidence_count && i < OBS_MAX_EVIDENCE; i++) {
+        uint8_t ev = r->evidence[i];
+        if (ev > 0 && ev < 8) {
+            if (any_ev) strncat(ev_buf, "  ", sizeof(ev_buf) - strlen(ev_buf) - 1);
+            strncat(ev_buf, ev_names[ev], sizeof(ev_buf) - strlen(ev_buf) - 1);
+            any_ev = true;
+        }
+    }
+    if (!any_ev) strncat(ev_buf, "none", sizeof(ev_buf) - strlen(ev_buf) - 1);
+    lv_obj_t *ev_lbl = lv_label_create(function_page);
+    lv_label_set_text(ev_lbl, ev_buf);
+    lv_obj_set_style_text_font(ev_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ev_lbl, lv_color_hex(0x80CBC4), 0);
+    lv_obj_align(ev_lbl, LV_ALIGN_TOP_LEFT, 6, 106);
+
+    /* ── Action buttons ── */
+    int btn_y = 135;
+    int btn_x = 6;
+    int btn_w = can_ring && can_locate ? (LCD_H_RES / 2 - 10) : (LCD_H_RES - 12);
+
+    if (can_ring) {
+        lv_obj_t *ring_btn = lv_btn_create(function_page);
+        lv_obj_set_size(ring_btn, btn_w, 36);
+        lv_obj_set_pos(ring_btn, btn_x, btn_y);
+        lv_obj_set_style_bg_color(ring_btn, lv_color_hex(0xC62828), 0);
+        lv_obj_set_style_radius(ring_btn, 5, 0);
+        lv_obj_add_event_cb(ring_btn, obs_ring_btn_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_t *rl = lv_label_create(ring_btn);
+        lv_label_set_text(rl, "Ring Device");
+        lv_obj_set_style_text_font(rl, &lv_font_montserrat_14, 0);
+        lv_obj_center(rl);
+        btn_x += btn_w + 8;
+    }
+
+    if (can_locate) {
+        lv_obj_t *loc_btn = lv_btn_create(function_page);
+        lv_obj_set_size(loc_btn, btn_w, 36);
+        lv_obj_set_pos(loc_btn, btn_x, btn_y);
+        lv_obj_set_style_bg_color(loc_btn, lv_color_hex(0x1565C0), 0);
+        lv_obj_set_style_radius(loc_btn, 5, 0);
+        lv_obj_add_event_cb(loc_btn, obs_locate_btn_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_t *ll = lv_label_create(loc_btn);
+        lv_label_set_text(ll, "Locate");
+        lv_obj_set_style_text_font(ll, &lv_font_montserrat_14, 0);
+        lv_obj_center(ll);
+    }
+
+    /* Ring status label — updated by obs_ring_set_status via lv_async_call */
+    s_obs_ring_status_lbl = lv_label_create(function_page);
+    lv_label_set_text(s_obs_ring_status_lbl, can_ring ? "Tap 'Ring Device' to trigger sound" : "");
+    lv_obj_set_style_text_font(s_obs_ring_status_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_obs_ring_status_lbl, ui_muted_color(), 0);
+    lv_obj_align(s_obs_ring_status_lbl, LV_ALIGN_TOP_LEFT, 6, 183);
+    lv_obj_set_width(s_obs_ring_status_lbl, LCD_H_RES - 12);
+    lv_label_set_long_mode(s_obs_ring_status_lbl, LV_LABEL_LONG_WRAP);
+
+    /* Info-only notice for devices without ring/locate */
+    if (!can_ring && !can_locate) {
+        lv_obj_t *info = lv_label_create(function_page);
+        lv_label_set_text(info, "No direct device actions available\nfor this device type.");
+        lv_obj_set_style_text_font(info, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(info, ui_muted_color(), 0);
+        lv_obj_set_style_text_align(info, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(info, LCD_H_RES - 12);
+        lv_obj_align(info, LV_ALIGN_TOP_MID, 0, btn_y);
+    }
+}
+
 static void espnow_stop(void)
 {
     espnow_scout_stop();

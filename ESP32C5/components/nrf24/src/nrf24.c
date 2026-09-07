@@ -8,6 +8,7 @@
 #include "freertos/task.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_random.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +17,19 @@ static const char *TAG = "nrf24";
 
 // Shared SPI bus mutex owned by main.c
 extern SemaphoreHandle_t sd_spi_mutex;
+
+// ── Bench instrumentation (NRF24_BENCH) ──────────────────────────────────────
+// Enable with -DNRF24_BENCH in CMakeLists.txt (add to idf_build_set_property
+// COMPILE_DEFINITIONS). Never define in production builds.
+// Also enable CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y in sdkconfig for the
+// vTaskGetRunTimeStats() dump in app_main when using NRF24_BENCH.
+#ifdef NRF24_BENCH
+// Per-sweep accumulators reset at the start of each nrf24_scan_channels() call.
+static uint32_t s_bench_sweep_count  = 0;   // total sweeps completed
+static uint32_t s_bench_max_ch_us    = 0;   // worst-case per-channel us this sweep
+static uint32_t s_bench_missed_count = 0;   // channels where elapsed > BENCH_DEADLINE_US
+#define BENCH_DEADLINE_US  400U  // flag when per-channel time exceeds this (normal: ~145 µs)
+#endif
 
 // ── nRF24L01+ registers ───────────────────────────────────────────────────────
 #define REG_CONFIG      0x00
@@ -41,9 +55,11 @@ extern SemaphoreHandle_t sd_spi_mutex;
 #define CONFIG_CRCO     0x04
 
 // RF_SETUP bits
-#define RF_SETUP_DR_HIGH 0x08
-#define RF_SETUP_DR_LOW  0x20
-#define RF_SETUP_PWR(n) ((n & 3) << 1)
+#define RF_SETUP_DR_HIGH  0x08
+#define RF_SETUP_DR_LOW   0x20
+#define RF_SETUP_PWR(n)  ((n & 3) << 1)
+#define RF_SETUP_PLL_LOCK 0x10   // force PLL on — required with CONT_WAVE
+#define RF_SETUP_CONT_WAVE 0x80  // continuous unmodulated carrier (test mode, nRF24L01+ §6.4)
 
 // STATUS bits
 #define STATUS_RX_DR    0x40
@@ -368,58 +384,182 @@ bool nrf24_carrier_detect(void)
     return (nrf24_read_reg(REG_RPD) & 0x01) != 0;
 }
 
-// ── Jammer sweep ─────────────────────────────────────────────────────────────
+// ── Jammer (CONT_WAVE, CE-toggle per hop) ────────────────────────────────────
+// CONT_WAVE (RF_SETUP.CONT_WAVE=1, PLL_LOCK=1) with CE toggled LOW/HIGH on
+// every channel change.  The AT2401C PA+LNA on the NM-RF-HAT REQUIRES CE to go
+// LOW before writing RF_CH — writing RF_CH while CE=HIGH leaves the AT2401C PLL
+// locked on the first frequency (confirmed v2.13.17: single spike at 2448 MHz).
+//
+// CE-toggle approach:
+//   CE LOW → SPI write RF_CH (AT2401C TXEN drops; SPI bus contention resolves)
+//   → CE HIGH → 500 µs (130 µs PLL lock + 370 µs AT2401C engagement)
+//   → next hop
+//
+// SPI bus note: nRF24 shares SPI2_HOST with the 80 MHz LCD DMA.  The jam task
+// (priority 2) preempts LVGL (priority 1) so no new DMA launches during the
+// sweep.  Any in-flight DMA at sweep start completes naturally; CE is LOW during
+// the SPI write so AT2401C is disengaged, and the SPI wait does not affect output.
+//
+// Per-hop timing: ~506 µs normal, ~5 ms on first hop if DMA in flight.
+//   Test 40ch: ~20 ms/sweep + 10 ms yield → 33 sweeps/sec
+//   BT   79ch: ~40 ms/sweep + 10 ms yield → 20 sweeps/sec
 
-void nrf24_jam_sweep(volatile bool *active)
+static bool s_jam_fhss = false;   // set via nrf24_jam_set_fhss()
+
+void nrf24_jam_set_fhss(bool fhss) { s_jam_fhss = fhss; }
+
+static void s_contwave_jam(volatile bool *active, const uint8_t *ch_in, int nch)
 {
-    if (!s_drv) return;
+    const uint8_t RF_SETUP_JAM = RF_SETUP_CONT_WAVE | RF_SETUP_PLL_LOCK | RF_SETUP_PWR(3);
 
-    // PTX mode, no CRC, no AA, 2 Mbps, max power
+    // Working copy: may be shuffled per sweep in FHSS mode.
+    uint8_t channels[128];
+    memcpy(channels, ch_in, (size_t)nch);
+
+    ce_low();
+    nrf24_write_reg(REG_CONFIG,     CONFIG_PWR_UP);
     nrf24_write_reg(REG_EN_AA,      0x00);
     nrf24_write_reg(REG_SETUP_RETR, 0x00);
-    nrf24_write_reg(REG_RF_SETUP,   RF_SETUP_DR_HIGH | RF_SETUP_PWR(3));
-    nrf24_write_reg(REG_CONFIG,     CONFIG_PWR_UP);
-    vTaskDelay(pdMS_TO_TICKS(2));
+    nrf24_write_reg(REG_RF_CH,      channels[0]);
+    nrf24_write_reg(REG_RF_SETUP,   RF_SETUP_JAM);
+    // Prime: first channel already written above; settle once at startup.
+    ce_high();
+    esp_rom_delay_us(500);   // one-time: PLL lock + AT2401C TX mode engagement
+    ce_low();
 
-    uint8_t tx_cmd[33] = { CMD_W_PAYLOAD };
-    memset(tx_cmd + 1, 0xFF, 32);
-    uint8_t rx_tmp[33];
-
-    nrf24_flush_tx();
-
-    // CE-pulse approach: CE goes low between every channel so the chip returns
-    // to STANDBY-I and re-latches RF_CH before each packet.  The "CE stays HIGH"
-    // pipeline does NOT work — the nRF24 locks its PLL when CE first rises and
-    // ignores subsequent RF_CH writes while CE is held high, so every packet
-    // lands on the initial channel (ch 0 = 2400 MHz).
+    // Fast CE-toggle loop. On this hardware the nRF24 does NOT retune its PLL
+    // from RF_CH writes while CE stays HIGH in CONT_WAVE mode (empirically
+    // confirmed: single spike with CE-stays-HIGH approach). CE must pulse LOW
+    // between hops so the PLL resyncs to the new channel.
     //
-    // Timing per channel at 2 Mbps, 32-byte payload:
-    //   ~30 µs  SPI (RF_CH + STATUS + payload)
-    //   ~15 µs  CE pulse (spec min 10 µs)
-    //   ~175 µs wait for packet to clear FIFO (packet air time ≈ 165 µs)
-    //   ────────────────────────────────────────────────
-    //   ~220 µs total → ~4500 packets/s across 126 channels → ~36 sweeps/s
-
-    uint8_t ch = 0;
+    // 500 µs dwell (CE HIGH): minimum for nRF24 PLL lock (~130 µs) plus AT2401C
+    // TX-mode engagement. The original design intent was 50 µs (CE-LOW PLL-chirp
+    // mode, faster hops at the cost of incomplete PLL settling) but that produced
+    // no TinySA-visible output at this hop rate. 500 µs is the empirically
+    // confirmed working floor on the NM-RF-HAT (v2.13.x field tests).
+    //
+    // Hop rate: 500 µs dwell + ~2 µs SPI write (CE LOW) ≈ 502 µs/hop.
+    // Test mode (40 ch): ~20 ms/sweep + 10 ms yield → ~33 sweeps/sec.
+    // BT   mode (79 ch): ~40 ms/sweep + 10 ms yield → ~20 sweeps/sec.
+    int idx = 0;
     while (active && *active) {
-        nrf24_write_reg(REG_RF_CH, ch);
-        nrf24_write_reg(REG_STATUS, 0x70);
-        csn_low(); spi_xfer_buf(tx_cmd, rx_tmp, 33); csn_high();
-
+        nrf24_write_reg(REG_RF_CH, channels[idx]);
         ce_high();
-        esp_rom_delay_us(15);   // chip latches RF_CH and starts TX
+        esp_rom_delay_us(500);   // 500us confirmed minimum for TinySA-visible output
         ce_low();
 
-        esp_rom_delay_us(175);  // wait for packet to finish before next CE rise
-
-        ch = (ch >= 125) ? 0 : ch + 1;
-        if (ch == 0)
-            vTaskDelay(pdMS_TO_TICKS(20));  // yield once per sweep for WDT
+        if (++idx >= nch) {
+            idx = 0;
+            if (s_jam_fhss) {
+                // Fisher-Yates shuffle: randomize order each sweep so AFH cannot
+                // predict or pre-filter our hop pattern (matches Bruce FHSS mode).
+                for (int i = nch - 1; i > 0; i--) {
+                    int j = (int)(esp_random() % (uint32_t)(i + 1));
+                    uint8_t tmp = channels[i]; channels[i] = channels[j]; channels[j] = tmp;
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));   // yield once per sweep for LVGL/WDT
+        }
     }
 
     ce_low();
-    nrf24_flush_tx();
+    nrf24_write_reg(REG_RF_SETUP, RF_SETUP_PWR(3));  // clear CONT_WAVE+PLL_LOCK
+    nrf24_write_reg(REG_CONFIG,   0x00);
+    vTaskDelay(pdMS_TO_TICKS(2));
     nrf24_standby();
+}
+
+// ── Jammer sweep ─────────────────────────────────────────────────────────────
+
+void nrf24_jam_sweep(volatile bool *active, nrf24_jam_mode_t mode)
+{
+    if (!s_drv) return;
+
+    // Channel tables match Bruce firmware nrf_jammer.cpp exactly.
+    uint8_t channels[128];
+    int nch = 0;
+
+    switch (mode) {
+        default:
+        case NRF24_JAM_TEST: {
+            // Bruce "Test" — 40 even ch: upper band (2450-2480) then lower (2402-2448).
+            static const uint8_t t[] = {
+                50,52,54,56,58,60,62,64,66,68,70,72,74,76,78,80,
+                 2, 4, 6, 8,10,12,14,16,18,20,22,24,26,28,30,32,
+                34,36,38,40,42,44,46,48
+            };
+            memcpy(channels, t, sizeof(t)); nch = (int)sizeof(t);
+            break;
+        }
+
+        case NRF24_JAM_BT:
+            // Bruce "Bluetooth" — 79 sequential BT Classic channels 2402-2480 MHz.
+            for (uint8_t c = 2; c <= 80; c++) channels[nch++] = c;
+            break;
+
+        case NRF24_JAM_BLE:
+            // Bruce "BLEch" — 40 sequential channels 2402-2441 MHz.
+            for (uint8_t c = 2; c <= 41; c++) channels[nch++] = c;
+            break;
+
+        case NRF24_JAM_BLE_ADV: {
+            // BLE advertising priority — 9 channels: nRF24 ±1 guard around each
+            // BLE advertising channel (BLE ch37=nRF24 ch2, ch38=nRF24 ch26, ch39=nRF24 ch80).
+            // NOTE: nRF24 ch37/38/39 = 2437-2439 MHz are NOT BLE advertising channels —
+            // the original Bruce array mistakenly used BLE channel INDEX numbers as nRF24
+            // channel numbers. Corrected to actual nRF24 frequencies.
+            static const uint8_t a[] = {1,2,3, 25,26,27, 79,80,81};
+            memcpy(channels, a, sizeof(a)); nch = (int)sizeof(a);
+            break;
+        }
+
+        case NRF24_JAM_WIFI: {
+            // Bruce "WiFi" — 16 channels around 2.4 GHz band centers.
+            static const uint8_t w[] = {2,7,12,17,22,27,32,37,42,47,52,57,62,67,72,77};
+            memcpy(channels, w, sizeof(w)); nch = (int)sizeof(w);
+            break;
+        }
+
+        case NRF24_JAM_ZIGBEE: {
+            // Bruce "Zigbee" — 48 ch, 3 nRF24 channels per IEEE 802.15.4 ch11-26.
+            static const uint8_t z[] = {
+                 4, 5, 6,  9,10,11, 14,15,16, 19,20,21,
+                24,25,26, 29,30,31, 34,35,36, 39,40,41,
+                44,45,46, 49,50,51, 54,55,56, 59,60,61,
+                64,65,66, 69,70,71, 74,75,76, 79,80,81
+            };
+            memcpy(channels, z, sizeof(z)); nch = (int)sizeof(z);
+            break;
+        }
+
+        case NRF24_JAM_USB: {
+            // Bruce "USB" — 20 even channels covering 2.4 GHz USB dongle band.
+            static const uint8_t u[] = {32,34,36,38,40,42,44,46,48,50,
+                                         52,54,56,58,60,62,64,66,68,70};
+            memcpy(channels, u, sizeof(u)); nch = (int)sizeof(u);
+            break;
+        }
+
+        case NRF24_JAM_RC: {
+            // Bruce "RC" — 20 odd channels covering RC protocol hop band.
+            static const uint8_t r[] = {1,3,5,7,9,11,13,15,17,19,
+                                         21,23,25,27,29,31,33,35,37,39};
+            memcpy(channels, r, sizeof(r)); nch = (int)sizeof(r);
+            break;
+        }
+
+        case NRF24_JAM_VIDEO:
+            // Bruce "Video Stream" — 33 even channels in upper band 2460-2524 MHz.
+            for (uint8_t c = 60; c <= 124; c += 2) channels[nch++] = c;
+            break;
+
+        case NRF24_JAM_FULL:
+            // Bruce "Full" — 124 channels 2401-2524 MHz (complete nRF24 spectrum).
+            for (uint8_t c = 1; c <= 124; c++) channels[nch++] = c;
+            break;
+    }
+
+    s_contwave_jam(active, channels, nch);
 }
 
 // ── Capture control ───────────────────────────────────────────────────────────
@@ -449,17 +589,49 @@ esp_err_t nrf24_scan_channels(uint8_t start_ch, uint8_t stop_ch,
     nrf24_write_reg(REG_CONFIG, CONFIG_PWR_UP | CONFIG_PRIM_RX);
     nrf24_write_reg(REG_EN_AA, 0x00);
 
+#ifdef NRF24_BENCH
+    s_bench_max_ch_us    = 0;
+    s_bench_missed_count = 0;
+    uint64_t bench_total_ch_us = 0;
+    uint32_t bench_ch_count    = 0;
+#endif
+
     for (uint8_t ch = start_ch; ch <= stop_ch; ch++) {
         if ((cancel && *cancel) || s_drv->cancel) break;
+#ifdef NRF24_BENCH
+        uint64_t t_ch_start = esp_timer_get_time();
+#endif
         nrf24_write_reg(REG_RF_CH, ch);
         ce_high();
         esp_rom_delay_us(140);   // ≥130 µs for RPD latch (nRF24L01+ datasheet)
         bool carrier = nrf24_carrier_detect();
         ce_low();
+#ifdef NRF24_BENCH
+        {
+            uint32_t elapsed = (uint32_t)(esp_timer_get_time() - t_ch_start);
+            bench_total_ch_us += elapsed;
+            if (elapsed > s_bench_max_ch_us) s_bench_max_ch_us = elapsed;
+            if (elapsed > BENCH_DEADLINE_US)  s_bench_missed_count++;
+            bench_ch_count++;
+        }
+#endif
         if (cb) cb(ch, carrier, ctx);
         // Yield every 8 channels — 126×200µs was starving the LVGL main loop
         if ((ch & 0x07) == 0x07) vTaskDelay(pdMS_TO_TICKS(10));
     }
+
+#ifdef NRF24_BENCH
+    s_bench_sweep_count++;
+    if (bench_ch_count > 0 && (s_bench_sweep_count % 10) == 0) {
+        ESP_LOGI(TAG, "[BENCH] sweep=%lu ch=%lu avg_us=%lu max_us=%lu missed=%lu",
+                 (unsigned long)s_bench_sweep_count,
+                 (unsigned long)bench_ch_count,
+                 (unsigned long)(bench_total_ch_us / bench_ch_count),
+                 (unsigned long)s_bench_max_ch_us,
+                 (unsigned long)s_bench_missed_count);
+    }
+#endif
+
     return ESP_OK;
 }
 
