@@ -5,7 +5,7 @@
 <h1 align="center">Cheap Yellow Monster</h1>
 
 <p align="center">
-  <b>v2.13.23</b>
+  <b>v2.13.43</b>
 </p>
 
 <p align="center">
@@ -164,7 +164,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 | **Drone Spoof** | Broadcasts a synthetic ASTM F3411 Remote ID beacon over BLE or WiFi. Configurable UAS ID, operator ID, GPS coordinates, altitude, speed, and heading. For RF research, drone regulation testing, and authorized counter-UAS research. |
 | **Wardriving** | GPS + WiFi + BLE logging, dual-band (2.4 GHz / 5 GHz / Both); **speed-adaptive capture** (Stationary / Walking / Driving profiles, GPS-triggered with hysteresis); **D-UCB channel bandit** rewards new networks per dwell, DFS tier-weighted at speed; **BLE-only mode fixed** (v2.13.x — was collecting 0 devices); **BLE dashboard** B\|MAC\|Name\|RSSI with active scan + SCAN_RSP name backfill; **CSV fsync** — power-cut safe at 10/20/30 s verified; **auto-rotation** into journey-grouped parts (WD_Wifi_\<stamp\>-NNN.csv / WD_BLE_\<stamp\>-NNN.csv); WiGLE CSV 1.6, WiGLE + WDG Wars upload; GPS mark waypoints (GPX); last-known position hold with 150 m stale accuracy; AltitudeMeters + AccuracyMeters filled from real GPS fix |
 | **GPS** | NMEA auto-syncs system clock; **boot-time baud auto-detect** (module keeps baud in battery-backed RAM across power cycles); **optional 115200 / 5 Hz** opt-in with verify-and-revert safety (5.2 fix/s measured under full wardrive load; 18 m → 3.6 m between fixes at 65 km/h); **multi-vendor rate commands** (CASIC, MTK, u-blox UBX); **GPS status icon** in the top bar of every screen; last-known position persisted to NVS; manual fallback editor in Settings → GPS Info |
-| **BLE** | AirTag scanner, SmartTag detection, BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk (with **advanced advertising fingerprinting** — AD-type decode, Company ID lookup, URIs, flags), Bluetooth Lookout, BLE Spam (8 modes incl. Sour Apple), Device Spoof (general + directed), BLE Disconnect (directed), BLE PCAP (Kismet PCAPNG; advertising-layer reconstruction from NimBLE reports; BLE 5.0 extended advertising support), **BlueDuck** (BLE HID DuckyScript keyboard injector), **HoneyPair** (BLE persona honeypot), **WhisperPair** (CVE-2025-36911 Google Fast Pair KBP bypass — auto-scan, sequential run-all FP targets, AES-128-ECB exploit); BT Scan & Select supports **Save List** (GPS-tagged JSON snapshot of every device found); **Matter [M] detection** passive tagging of Thread/BLE Matter devices by GATT service `0xFFF6`; **GATT Interactive** (live read/write/subscribe to individual characteristics after walk); **GATT HID Decoder** (parses HID Report Map, decodes live keyboard/mouse input); **GATT Profile Snapshots** (Saved Clones) browser; **BLE Notify Logger** (BLE MITM) |
+| **BLE** | **Tracker Scanner**: AirTag, Samsung SmartTag, and Tile detection — four-category summary (AirTags / AirTag? Prox / SmartTags / Tiles); Found Tags list with type badge, Track, GATT Walk, and Ring buttons; **Ring confirmed working on AirTag** (Apple FMN non-owner `{0x01}` trigger); SmartTag and Tile require owner auth (greyed note). BLE Locator, GATT Walker fingerprinting, BT Observer multi-walk (with **advanced advertising fingerprinting** — AD-type decode, Company ID lookup, URIs, flags), Bluetooth Lookout, BLE Spam (8 modes incl. Sour Apple), Device Spoof (general + directed), BLE Disconnect (directed), BLE PCAP (Kismet PCAPNG; advertising-layer reconstruction from NimBLE reports; BLE 5.0 extended advertising support), **BlueDuck** (BLE HID DuckyScript keyboard injector), **HoneyPair** (BLE persona honeypot), **WhisperPair** (CVE-2025-36911 Google Fast Pair KBP bypass — auto-scan, sequential run-all FP targets, AES-128-ECB exploit); BT Scan & Select supports **Save List** (GPS-tagged JSON snapshot of every device found); **Matter [M] detection** passive tagging of Thread/BLE Matter devices by GATT service `0xFFF6`; **GATT Interactive** (live read/write/subscribe to individual characteristics after walk); **GATT HID Decoder** (parses HID Report Map, decodes live keyboard/mouse input); **GATT Profile Snapshots** (Saved Clones) browser; **BLE Notify Logger** (BLE MITM) |
 | **Deauth Client** | Passive discovery of clients associated with any nearby AP — without connecting or running any attack. Lists client MACs, associated BSSID, RSSI, and last-seen time; useful for pre-attack recon and monitoring |
 | **Zigbee Scout** | IEEE 802.15.4 passive wardrive using the ESP32-C5's built-in PHY; logs PAN IDs, channel, RSSI, device addresses, and NWK/APS frame metadata to WiGLE-compatible CSV + PCAP; RSSI locator locks onto a specific PAN; logs to `/sdcard/lab/zigbee/` |
 | **ESP-NOW Scout** | Passive ESP-NOW device discovery and packet analysis. Hops channels 1–13 (200 ms/ch) sniffing vendor-specific 802.11 Action frames (OUI `18:FE:34`, type `0x04`). Tracks up to 32 unique senders with src/dst MAC, channel, RSSI, packet count, first/last seen timestamp, and broadcast vs. unicast (encrypted) status. **Tap any discovered device** to lock the radio to its channel and open a session sub-screen. Session modes: *This Dev Pkt Log* (filtered to selected src MAC) and *All Ch Pkt Log* (every ESP-NOW frame on that channel). Packet log shows last 20 frames in a terminal-style dark view — hex dump, timestamp, RSSI, and ASCII interpretation for broadcast (plaintext) frames. Encrypted unicast frames show an AES-128-ECB probe result if an LMK is loaded from `profiles.json`. Export full 200-frame ring buffer to timestamped `.txt` on SD. Known-device labels and LMK keys loaded from `/sdcard/lab/espnow/profiles.json`. Discovery device table exported to timestamped JSON. Logs to `/sdcard/lab/espnow/`. |
@@ -186,7 +186,7 @@ The NM-CYD-C5 can be purchased at [nmminer.com](https://www.nmminer.com/product/
 
 ## Menu Map
 
-Complete navigation tree as of v2.13.23. Items marked `[stub]` are placeholders with "Coming in next version" screens. Items marked `[RF-HAT]` require the NM-RF-HAT expansion board enabled in Settings → Hardware Options.
+Complete navigation tree as of v2.13.43. Items marked `[stub]` are placeholders with "Coming in next version" screens. Items marked `[RF-HAT]` require the NM-RF-HAT expansion board enabled in Settings → Hardware Options.
 
 ```
 Home
@@ -807,7 +807,7 @@ Bluetooth
 | **BT Observer** | Configurable-duration BLE scan (default 10 s, set via Settings → Timing) followed by sequential GATT walks on every discovered device (5 s timeout per device). Results shown in a scrollable live list; tap any row to open the full GATT detail view. **Advanced advertising fingerprinting** decodes every AD type in each device's advertising payload — company IDs (from Bluetooth SIG assigned numbers), URI schemes, service UUIDs, TX power, flags, and custom manufacturer data. Fingerprint data is appended to the JSON alongside the GATT walk. |
 | **BT Locator** | RSSI-based proximity tracking of a selected BLE device; updates every 10 s. Vibrator strength scales logarithmically with signal strength — silent below −69 dBm, 10% at −69 dBm, 100% at −40 dBm (requires vibrator hardware). |
 | **GATT Walker** | Full BLE GATT inspection — walks all services, characteristics, and descriptors; reads attribute values; computes FNV-32 device fingerprint; saves enriched JSON to SD card with service/characteristic names, decoded properties, ASCII data preview, OUI manufacturer, and optional GPS geotag |
-| **AirTag Scanner** | Passive BLE scan — detects Apple AirTags and Samsung SmartTags by manufacturer ID |
+| **AirTag Scanner** | Passive BLE scan — detects Apple AirTags, Samsung SmartTags, and Tile trackers. Live summary shows four categories. Found Tags list shows type badge, RSSI, Track + GATT Walk buttons per device; Ring button for AirTag (Apple FMN non-owner `{0x01}` confirmed). SmartTag and Tile ring requires owner auth — clearly labeled. |
 | **Tag Locator** | Per-tag RSSI tracking launched from the AirTag Scan found-tags list |
 | **Bluetooth Lookout** | Continuous BLE monitor that alerts when a watchlisted device (by full MAC or OUI prefix) is detected nearby. Triggers 3 × 1-second vibrator pulses on each detection (requires vibrator hardware). |
 | **BLE Spam** | Broadcasts fake BLE advertisements — Apple Prox. Pair (13 device types), Samsung Fast Connect (6 models), Google Fast Pair (12 model IDs), Windows Swift Pair, Apple Find My (AirTag), Samsung SmartTag, **Sour Apple** (Apple Nearby Action 0x0F — cycles 11 action types to flood iOS with system popups), or All simultaneously |
@@ -1008,11 +1008,12 @@ Look for devices with recognizable characteristics:
 
 | Device | MAC behavior | How to spot |
 |--------|-------------|-------------|
-| Apple AirTag | Rotates every ~24 h when unpaired from owner | Name `AirTag`, manufacturer `Apple`, `is_airtag: true` flag |
+| Apple AirTag | Rotates every ~24 h when not near owner | Name `AirTag`, manufacturer `Apple`, `is_airtag: true` flag; detected directly by AirTag Scanner |
+| Samsung SmartTag | Rotates periodically | SmartThings Find service `0xFD5A` in adv data; AirTag Scanner shows type badge `SmartTag` |
+| Tile tracker | **Static MAC** | Service UUID `0xFEED` in advertisement; AirTag Scanner shows type badge `Tile`; static MAC makes it ideal for List Wizard cross-session matching |
 | Oura Ring | Static MAC | OUI `70:C8:8B` (Oura Health) or name `Oura Ring` |
 | Fitbit | Static MAC | OUI `E8:AB:F3` / `EC:5C:68` (Google/Fitbit) or name `Charge`, `Versa`, `Sense` |
 | Garmin watch | Static MAC | OUI `C4:5A:B1` / `58:93:D8` (Garmin) or name `fenix`, `vivosmart` |
-| Tile tracker | Static MAC | OUI from Tile, Inc.; name `Tile` |
 | General fixed-MAC | Static | Same full MAC across both sessions; not in OUI Groups above |
 
 Devices that rotated their MAC between sessions will **not** appear in Common — they are not reliable tracking vectors.
@@ -1030,48 +1031,68 @@ In the result overlay, tap **Lookout** to append all Common results to the BT Lo
 
 ---
 
-#### AirTag / SmartTag Locator — How It Works
+#### Tracker Scanner (AirTag / SmartTag / Tile) — How It Works
 
-The AirTag Scanner and Tag Locator work together to let you find a hidden tracking device using only the NM-CYD-C5 — no phone required.
+The Tracker Scanner and Tag Locator work together to let you detect and locate hidden tracking devices using only the NM-CYD-C5 — no phone required. Three tracker families are supported: Apple AirTag, Samsung SmartTag, and Tile.
 
 **Step 1 — Scan**
 
-Open **AirTag Scan** from the Bluetooth tile. The device switches the radio to BLE and begins a passive scan. Detected Apple AirTags and Samsung SmartTags are counted on screen, separated from general BLE traffic:
+Open **AirTag Scan** from the Bluetooth tile. The device switches the radio to BLE and begins a continuous passive scan. Detections are categorized by tracker type and updated live:
 
 ```
-Air Tags:   2
-Smart Tags: 1
+AirTags:          2
+AirTag? (Prox):   1
+SmartTags:        1
+Tiles:            1
 
 Other BT Devices: 14
-Total BT devices: 17
+Total BT devices: 19
 ```
 
-Once at least one tag is found the **View Found Tags** button appears.
+- **AirTag? (Prox)** — AirTags in owner-proximity mode: the owner's iPhone is nearby, so the tag is advertising with a `Nearby Action 0x05` payload instead of the Find My type byte. These are real AirTags but their anti-stalking audio has been suppressed by proximity to the owner.
+
+The scan runs continuously in the background after the first detection. Counts always reflect unique devices, not raw advertisement packets — the same device sending many ads registers as one device.
+
+Once at least one tracker is found the **View Found Tags** button appears.
 
 **Step 2 — View Found Tags**
 
-Tap **View Found Tags** to open a scrollable list of every detected AirTag and SmartTag. Each entry shows:
+Tap **View Found Tags** to open a scrollable list of every detected tracker. Each entry shows:
 
-- Type badge (orange **AirTag** or cyan **SmartTag**)
-- MAC address
-- Device name (if advertised)
+- Type badge (orange **AirTag**, cyan **SmartTag**, teal **Tile**, yellow **AirTag?**)
+- MAC address (last 3 octets shown, full MAC for GATT connect)
+- Device name (if advertised — SmartTag reads "Searching..." when unowned)
 - Last seen RSSI in dBm
-- A blue **Track** button
+- **Track** button — starts RSSI proximity tracking
+- **Ring** button or auth note — see per-tracker table below
+- **GATT Walk** button — full GATT inspection saved to `/sdcard/lab/gatt/`
 
-**Step 3 — Track**
+**Per-tracker ring support:**
 
-Tap **Track** on any device. The firmware locks onto that device's MAC address and starts the BT Locator tracking task, which rescans for that specific MAC every 10 seconds and updates the live RSSI reading on screen.
+| Tracker | Ring | Notes |
+|---------|------|-------|
+| **Apple AirTag** | Yes — `{0x01}` non-owner trigger | Apple FMN service `7DFC9000-7D1C-4951-86AA-8D9728F8D66C`, char `7DFC9001-...` (Write + Response). Single byte `{0x01}` triggers the anti-stalking locator tone without any auth. Apple deliberately designed this path so anyone who finds an unwanted AirTag can identify it. The tone is quieter than an owner-initiated ring. |
+| **Samsung SmartTag** | No — "No ring / owner auth req" | Uses Samsung Find My Mobile protocol (BLE service `0xFEF3` + SmartThings `594a34fc-...`). Commands require Samsung account authentication. Does **not** implement Apple FMN despite superficially similar advertising. GATT walk confirmed: char `00000100-0004-1000-8000-001a11000101` (Write) is present but requires a signed session from Samsung's servers. Device name reads `Searching...` when not bound to an owner account. |
+| **Tile** | No — "No ring / owner auth req" | Tile BLE protocol (service `0xFEED`): command char `9D410018-35d6-f4dd-ba60-e7bd8dc491c0` (Write No Response) accepts writes but they must be signed with the owner's account key issued by Tile's cloud. Sending unauthenticated bytes (including `{0x01}` and `{0x08, 0x01}`) is silently ignored. Tile's MAC is static — it does not rotate — which is useful for tracking and List Wizard correlation. |
+
+**Step 3 — Ring an AirTag**
+
+Tap the **Ring** button on an AirTag Found Tags entry. CYM connects via BLE and sends a single-byte write to the Apple FMN sound characteristic (`7DFC9001`). Within a few seconds the AirTag emits its locator chirp. A status popup shows progress (`Connecting...` → `Writing...` → `Done — listen for chirp`). The ATT error code is translated on failure (e.g. ATT err 0x08 = Insufficient Authorization). Only AirTags implement this open path — SmartTag and Tile show an auth note in place of a Ring button.
+
+**Step 4 — Track**
+
+Tap **Track** on any device. The firmware locks onto that device's MAC address and starts the BT Locator tracking task, which rescans for that specific MAC every ~10 seconds and updates the live RSSI reading on screen.
 
 Use the RSSI value to home in on the tag — a higher (less negative) number means you are closer:
 
 | RSSI | Approximate distance | Vibrator strength |
 |------|----------------------|-------------------|
-| −40 dBm or stronger | Very close (within ~1 m) | 100% |
-| −55 dBm | Nearby (~1–3 m) | ~58% |
-| −69 dBm | ~5 m range edge | 10% (threshold) |
-| Below −69 dBm | Far away or obstructed | Silent |
+| -40 dBm or stronger | Very close (within ~1 m) | 100% |
+| -55 dBm | Nearby (~1-3 m) | ~58% |
+| -69 dBm | ~5 m range edge | 10% (threshold) |
+| Below -69 dBm | Far away or obstructed | Silent |
 
-Vibrator strength updates every 500 ms and scales linearly with dBm (which is already a log-scale of power), giving a natural haptic proximity feel. The strength used by **Settings → Vibrator Test** is saved on entry and fully restored when you exit the locator.
+Vibrator strength updates every 500 ms and scales linearly with dBm (which is already a log-scale of power), giving a natural haptic proximity feel. The strength used by **Settings -> Vibrator Test** is saved on entry and fully restored when you exit the locator.
 
 <p align="center">
   <img width="340" alt="AirTag Far Away" src="docs/screenshots/airtag_detection_far.jpg" />
@@ -1086,6 +1107,15 @@ Vibrator strength updates every 500 ms and scales linearly with dBm (which is al
 </p>
 
 Tap **Exit** at any time to stop tracking and return to the main menu. The radio switches back to WiFi mode automatically.
+
+**Step 5 — GATT Walk any tracker**
+
+Tap **GATT Walk** on any Found Tags entry to connect and enumerate the device's full BLE service tree. The output is saved to `/sdcard/lab/gatt/` as a timestamped JSON with FNV-32 fingerprint filename. Useful for:
+
+- Confirming ring characteristic handles and properties
+- Reading the device's reported firmware version and serial number
+- Identifying which authentication services are present
+- Building known-device profiles for future tracking correlation
 
 #### GATT Walker — How It Works
 
