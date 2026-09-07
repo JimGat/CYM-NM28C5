@@ -3084,6 +3084,16 @@ This is not a uniquely American position. Every jurisdiction with a radio commun
 
 ---
 
+## Community
+
+CYM is not an official LAB5 project, but it is **unofficially supported** by the LAB5 community. The NM-CYD-C5 hardware community lives on the LAB5 Discord, and CYM has a dedicated thread there for setup help, field tips, and development discussion.
+
+**→ [Join the LAB5 Discord](https://discord.gg/Vuq2SmCbk5)** — direct invite
+
+**→ [lab5.eu.com](https://lab5.eu.com/)** — website and forums
+
+---
+
 ## Support This Project
 
 If you find Cheap Yellow Monster useful and would like to support its continued development, consider buying me a coffee! Your support helps fund hardware, research, and development time.
