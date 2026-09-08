@@ -6,6 +6,7 @@ idf_component_register(
         "src/radio_hat.c"
     INCLUDE_DIRS "include"
     REQUIRES
+        board_hal
         nvs_flash
         esp_timer
         freertos

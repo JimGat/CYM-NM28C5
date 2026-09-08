@@ -133,12 +133,18 @@ menu "CYM Board Selection"
     # ── Touch driver selection ─────────────────────────────────────────────────
 
     config BOARD_HAS_RF_HAT
-        bool
+        bool "NM-RF-HAT expansion board"
         default y if BOARD_NM_CYD_C5
+        default n
         help
-            NM-RF-HAT expansion board attached via FPC2. Enables CC1101, nRF24L01+,
-            PN532 NFC, IR, and 433 MHz OOK RF modules. Not available on CYD2USB or
-            Waveshare boards (no FPC connector).
+            NM-RF-HAT expansion board. Enables CC1101, nRF24L01+, PN532 NFC, IR,
+            and 433 MHz OOK RF modules.
+
+            NM-CYD-C5: connected via FPC2 connector (default y).
+            CYD2USB (Classic CYD / Halehound): connected via SD Card Shim that
+              routes the HSPI SPI bus through the SD card slot. SD card is relocated
+              to the RF-HAT onboard socket. Enable y when building with the shim.
+            Waveshare WS-C5-28: connected via JST 12-pin SH1.0 connector + SD shim.
 
     config BOARD_TOUCH_XPT2046
         bool

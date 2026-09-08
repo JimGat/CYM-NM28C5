@@ -46,12 +46,26 @@
 #define BOARD_LCD_WIDTH        240
 #define BOARD_LCD_HEIGHT       320
 
+// ── NM-RF-HAT via SD Card Shim (CONFIG_BOARD_HAS_RF_HAT=y build only) ─────────
+// The SD Card Shim sits in the Classic CYD's microSD slot and routes the HSPI
+// SPI bus (GPIO18/SCK, GPIO23/MOSI, GPIO19/MISO, GPIO5/CS) to the NM-RF-HAT's
+// FPC2 connector. SD card is relocated to the RF-HAT onboard SD socket.
+//
+// After the shim, BOARD_SD_SCK/MOSI/MISO/CS defined above become the RF-HAT SPI
+// bus. The RF-HAT SPI host stays SPI2_HOST (HSPI).
+//
+// BOARD_RFHAT_PIN_A and BOARD_RFHAT_PIN_B are the GPIO equivalents of GPIO8
+// (IO22) and GPIO9 (IO27) on NM-CYD-C5 — the two control lines shared by all
+// five RF-HAT modules (CC1101, nRF24, PN532, IR, RF433). These route from
+// FPC2 pins 7 and 9 through the shim to free GPIOs on the Classic CYD.
+// *** GPIO ASSIGNMENTS PENDING CONFIRMATION FROM HALEHOUND SCHEMATIC ***
+#define BOARD_RFHAT_PIN_A       -1    // TODO: confirm from Halehound shim wiring
+#define BOARD_RFHAT_PIN_B       -1    // TODO: confirm from Halehound shim wiring
+
 // ── Not present on CYD2USB ───────────────────────────────────────────────────
 #define BOARD_VIBRATOR_GPIO     -1
 #define BOARD_RGB_LED_GPIO      -1    // no WS2812; has discrete RGB instead
 #define BOARD_RGB_LED_COUNT      0
-#define BOARD_RFHAT_PIN_A       -1
-#define BOARD_RFHAT_PIN_B       -1
 #define BOARD_GPS_TX_GPIO       -1
 #define BOARD_GPS_RX_GPIO       -1
 #define BOARD_I2C_SDA           -1

@@ -1,8 +1,19 @@
 #pragma once
+#include "board_hal.h"  // BOARD_RFHAT_PIN_A / BOARD_RFHAT_PIN_B
 
 // =============================================================================
-// NM-RF-HAT — hardware pin configuration for NM-CYD-C5
+// NM-RF-HAT — hardware pin configuration
 // =============================================================================
+// Default GPIO assignments are for NM-CYD-C5 (FPC2 connector).
+// On CYD2USB (Classic CYD / Halehound) with the SD Card Shim, the shim routes
+// FPC2 Pin 7 (RF-HAT IO22) and FPC2 Pin 9 (RF-HAT IO27) to board-specific GPIOs.
+// Set BOARD_RFHAT_PIN_A / BOARD_RFHAT_PIN_B >= 0 in the board header to override.
+//
+// BOARD_RFHAT_PIN_A overrides the default GPIO8 for all PIN_A roles:
+//   GDO0 (CC1101), NRF24_CE, PN532_SCL, IR_TX, RF433_TX
+// BOARD_RFHAT_PIN_B overrides the default GPIO9 for all PIN_B roles:
+//   CC1101_CS / NRF24_CSN, PN532_SDA, IR_RX, RF433_RX
+//
 // GPIO assignments verified against SCH_NM-RF-HAT_v1.0.pdf and
 // SCH_NM-CYD-C5-v1.0.pdf (RockBase-iot GitHub).
 //
@@ -37,54 +48,65 @@
 //   6  | Battery switch  | (not a module)      |
 // =============================================================================
 
+// Board-level overrides: if BOARD_RFHAT_PIN_A / BOARD_RFHAT_PIN_B are defined
+// and non-negative (from board_hal.h), use them as the two control GPIOs for
+// all modules. -1 means "not configured" and the defaults below apply.
+#if defined(BOARD_RFHAT_PIN_A) && (BOARD_RFHAT_PIN_A >= 0)
+#  define _RF_HAT_PIN_A  BOARD_RFHAT_PIN_A
+#else
+#  define _RF_HAT_PIN_A  8   // NM-CYD-C5 default: IO22
+#endif
+#if defined(BOARD_RFHAT_PIN_B) && (BOARD_RFHAT_PIN_B >= 0)
+#  define _RF_HAT_PIN_B  BOARD_RFHAT_PIN_B
+#else
+#  define _RF_HAT_PIN_B  9   // NM-CYD-C5 default: IO27
+#endif
+
 // ── IR (DIP 4) ───────────────────────────────────────────────────────────────
 // IR_DT = IR transmit drive (ESP32→IR LED transistor), IR_DR = demodulated RX
-// Empirically confirmed: emitter (green LED) is on GPIO8, detector (blue LED) on GPIO9.
-// Swapped from initial guess: GPIO8=TX, GPIO9=RX.
+// Empirically confirmed: emitter (green LED) is on PIN_A, detector (blue LED) on PIN_B.
 #ifndef RF_HAT_IR_TX_GPIO
-#define RF_HAT_IR_TX_GPIO    8   // FPC2 Pin 7 — emitter (confirmed by LED observation)
+#define RF_HAT_IR_TX_GPIO    _RF_HAT_PIN_A  // FPC2 Pin 7 — emitter
 #endif
 #ifndef RF_HAT_IR_RX_GPIO
-#define RF_HAT_IR_RX_GPIO    9   // FPC2 Pin 9 — detector (confirmed by LED observation)
+#define RF_HAT_IR_RX_GPIO    _RF_HAT_PIN_B  // FPC2 Pin 9 — detector
 #endif
 
 // ── RF433 OOK/ASK (DIP 5) ────────────────────────────────────────────────────
 // 433_DT = OOK TX drive (ESP32→module), 433_DR = OOK RX output (module→ESP32)
-// Shares GPIO8/9 with IR via DIP-enforced power exclusion — swapped to match IR.
+// Shares PIN_A/PIN_B with IR via DIP-enforced power exclusion.
 #ifndef RF_HAT_RF433_TX_GPIO
-#define RF_HAT_RF433_TX_GPIO 8   // FPC2 Pin 7 — same net as IR_DT (TX)
+#define RF_HAT_RF433_TX_GPIO _RF_HAT_PIN_A  // FPC2 Pin 7 — same net as IR_DT (TX)
 #endif
 #ifndef RF_HAT_RF433_RX_GPIO
-#define RF_HAT_RF433_RX_GPIO 9   // FPC2 Pin 9 — same net as IR_DR (RX)
+#define RF_HAT_RF433_RX_GPIO _RF_HAT_PIN_B  // FPC2 Pin 9 — same net as IR_DR (RX)
 #endif
 
 // ── CC1101 Sub-GHz SPI (DIP 1) ───────────────────────────────────────────────
-// Shares SPI bus (GPIO2/6/7) with display and SD. CS and GDO0 on GPIO9/8.
+// CS on PIN_B, GDO0 interrupt on PIN_A.
 #ifndef RF_HAT_CC1101_CS_GPIO
-#define RF_HAT_CC1101_CS_GPIO    9   // IO27, FPC2 Pin 9 (CSN_CC1101)
+#define RF_HAT_CC1101_CS_GPIO    _RF_HAT_PIN_B  // IO27, FPC2 Pin 9 (CSN_CC1101)
 #endif
 #ifndef RF_HAT_CC1101_GDO0_GPIO
-#define RF_HAT_CC1101_GDO0_GPIO  8   // IO22, FPC2 Pin 7 (GDO0_CC1101)
+#define RF_HAT_CC1101_GDO0_GPIO  _RF_HAT_PIN_A  // IO22, FPC2 Pin 7 (GDO0_CC1101)
 #endif
 
 // ── nRF24L01 SPI (DIP 2) ─────────────────────────────────────────────────────
-// CSN shares GPIO9 with CC1101 — DIP-exclusive so no bus conflict.
-// CE is GPIO8 (IO22 → NRF24_CE per schematic).
+// CSN shares PIN_B with CC1101 (DIP-exclusive). CE is PIN_A.
 #ifndef RF_HAT_NRF24_CS_GPIO
-#define RF_HAT_NRF24_CS_GPIO  9   // IO27, FPC2 Pin 9 (NRF24_CSN)
+#define RF_HAT_NRF24_CS_GPIO  _RF_HAT_PIN_B  // IO27, FPC2 Pin 9 (NRF24_CSN)
 #endif
 #ifndef RF_HAT_NRF24_CE_GPIO
-#define RF_HAT_NRF24_CE_GPIO  8   // IO22, FPC2 Pin 7 (NRF24_CE)
+#define RF_HAT_NRF24_CE_GPIO  _RF_HAT_PIN_A  // IO22, FPC2 Pin 7 (NRF24_CE)
 #endif
 
 // ── PN532 NFC/RFID I2C (DIP 3) ───────────────────────────────────────────────
-// GPIO8 (IO22/FPC2 Pin 7) = SCL, GPIO9 (IO27/FPC2 Pin 9) = SDA.
-// Per hardware documentation and user testing with direct-connect module.
+// PIN_A = SCL, PIN_B = SDA per hardware documentation.
 #ifndef RF_HAT_PN532_SCL_GPIO
-#define RF_HAT_PN532_SCL_GPIO 8   // IO22, FPC2 Pin 7 — SCL
+#define RF_HAT_PN532_SCL_GPIO _RF_HAT_PIN_A  // IO22, FPC2 Pin 7 — SCL
 #endif
 #ifndef RF_HAT_PN532_SDA_GPIO
-#define RF_HAT_PN532_SDA_GPIO 9   // IO27, FPC2 Pin 9 — SDA
+#define RF_HAT_PN532_SDA_GPIO _RF_HAT_PIN_B  // IO27, FPC2 Pin 9 — SDA
 #endif
 
 // ── SD card directories created by rf_hat modules ────────────────────────────
