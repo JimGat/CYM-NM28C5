@@ -13175,6 +13175,17 @@ static void wd_gps_show_prompt_modal(void)
     wd_gps_prompt_state = 1;  // prompt shown
 }
 
+// Closes the "No GPS data available" error msgbox when OK (or the X) is pressed.
+// lv_msgbox_create() footer buttons do NOT self-close in LVGL 8 — without this the
+// popup stayed stuck forever. Use the _async close: deleting the msgbox inside its
+// own button VALUE_CHANGED event would free the object mid-dispatch (use-after-free);
+// the async variant defers deletion to the next lv_timer_handler.
+static void wd_gps_no_data_mbox_cb(lv_event_t *e)
+{
+    lv_obj_t *mbox = lv_event_get_current_target(e);
+    if (mbox) lv_msgbox_close_async(mbox);
+}
+
 static void wardrive_start_btn_cb(lv_event_t *e)
 {
     (void)e;
@@ -13202,6 +13213,7 @@ static void wardrive_start_btn_cb(lv_event_t *e)
                 lv_obj_t *mbox = lv_msgbox_create(NULL, "Error", "No GPS data available\nPlease wait for fix or move\nnear window",
                                                   gps_no_data_btns, true);
                 lv_obj_center(mbox);
+                lv_obj_add_event_cb(mbox, wd_gps_no_data_mbox_cb, LV_EVENT_VALUE_CHANGED, NULL);
                 return;
             }
         }
