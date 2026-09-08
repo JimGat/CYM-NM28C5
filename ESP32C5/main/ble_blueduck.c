@@ -728,6 +728,7 @@ static void bd_gen_persona_addrs(void)
 
 static void bd_ext_adv_start(int persona_idx)
 {
+#if CONFIG_BT_NIMBLE_EXT_ADV
     ESP_LOGI(TAG, "bd_ext_adv_start: persona=%d ('%s') synced=%d",
              persona_idx, s_personas[persona_idx].name, ble_hs_synced());
 
@@ -785,6 +786,10 @@ static void bd_ext_adv_start(int persona_idx)
     } else {
         ESP_LOGE(TAG, "ext_adv_start: rc=%d", rc);
     }
+#else
+    ESP_LOGW(TAG, "bd_ext_adv_start: CONFIG_BT_NIMBLE_EXT_ADV not enabled on this target");
+    (void)persona_idx;
+#endif /* CONFIG_BT_NIMBLE_EXT_ADV */
 }
 
 // ── GAP callback ──────────────────────────────────────────────────────────────
@@ -926,7 +931,9 @@ void blueduck_stop(void)
     s_auto_rotate = false;
     s_executing   = false;
     esp_timer_stop(s_rot_timer);
+#if CONFIG_BT_NIMBLE_EXT_ADV
     ble_gap_ext_adv_stop(BD_ADV_INSTANCE);
+#endif
     if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;

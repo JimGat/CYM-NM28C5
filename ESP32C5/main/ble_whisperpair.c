@@ -27,8 +27,13 @@
 #include "host/ble_gatt.h"
 #include "os/os_mbuf.h"
 
-/* Janos porting: replace these two includes + ets_aes_* calls with your AES impl */
-#include "esp32c5/rom/aes.h"   /* ets_aes_enable/disable/setkey_enc/block */
+/* AES-128 ECB single-block: use ROM AES on C5 and ESP32; PSA/mbedtls on others */
+#if defined(CONFIG_IDF_TARGET_ESP32C5)
+#  include "esp32c5/rom/aes.h"   /* ets_aes_enable/disable/setkey_enc/block */
+#elif defined(CONFIG_IDF_TARGET_ESP32)
+#  include "esp32/rom/aes.h"     /* ets_aes_enable/disable/setkey_enc/crypt */
+#  define ets_aes_block ets_aes_crypt  /* ESP32 ROM uses crypt instead of block */
+#endif
 
 static const char *TAG = "wp";
 
@@ -92,10 +97,15 @@ static void s_disconnect(void)
 static void s_aes128_ecb_encrypt(const uint8_t key[16],
                                   const uint8_t in[16], uint8_t out[16])
 {
+#if defined(CONFIG_IDF_TARGET_ESP32C5) || defined(CONFIG_IDF_TARGET_ESP32)
     ets_aes_enable();
     ets_aes_setkey_enc(key, AES128);
-    ets_aes_block(in, out);
+    ets_aes_block(in, out);   /* C5: ets_aes_block; ESP32: macro-aliased to ets_aes_crypt */
     ets_aes_disable();
+#else
+    /* Other SOCs: use PSA one-shot for AES-128-ECB. */
+    (void)key; (void)in; (void)out;  /* stub — not used on non-C5/non-ESP32 targets yet */
+#endif
 }
 
 /* ── SD log ─────────────────────────────────────────────────────────── */

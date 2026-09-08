@@ -102,7 +102,9 @@ LV_IMG_DECLARE(deedee_img);
 #include "esp_event.h"
 #include "freertos/semphr.h"
 #include "esp_system.h"
-#include "soc/lp_aon_reg.h"
+#if defined(CONFIG_IDF_TARGET_ESP32C5)
+#include "soc/lp_aon_reg.h"   // C5-only LP-AON registers for download-mode boot flag
+#endif
 #include "wifi_cli.h"
 #include "led_strip.h"
 #include "wifi_scanner.h"
@@ -175,7 +177,9 @@ LV_IMG_DECLARE(deedee_img);
 #include "cc1101.h"
 #include "cc1101_regs.h"
 #include "nrf24.h"
+#if CONFIG_IEEE802154_ENABLED
 #include "esp_ieee802154.h"
+#endif
 #include "rfid_manager.h"
 #include "rfid_types.h"
 #include "rfid_storage.h"
@@ -2234,6 +2238,7 @@ typedef struct {
 } cc1101_tpms_ctx_t;
 EXT_RAM_BSS_ATTR static cc1101_tpms_ctx_t *s_tpms = NULL;
 
+#if CONFIG_IEEE802154_ENABLED
 // ── Zigbee Scout (passive/active 802.15.4 scanner, built-in ESP32-C5 radio) ──
 #define ZGWD_DWELL_MS        250   // ms to receive on each channel
 #define ZGWD_MAX_PANS         64   // unique PAN IDs tracked
@@ -2326,6 +2331,7 @@ static SemaphoreHandle_t s_zgwd_tx_sem = NULL;
 static uint8_t s_zgwd_seq = 0;
 static lv_obj_t *s_zgwd_da_lbl = NULL;
 static volatile int s_zgwd_da_result = 0;
+#endif /* CONFIG_IEEE802154_ENABLED */
 
 // AirTag Scanner state
 static TaskHandle_t airtag_scan_task_handle = NULL;
@@ -2693,10 +2699,12 @@ static void show_nrf24_sniffer_screen(void);
 static void show_nrf24_saved_screen(void);
 static void show_nrf24_jammer_screen(void);
 static void show_nrf24_futaba_screen(void);
+#if CONFIG_IEEE802154_ENABLED
 static void show_zigbee_wardrive_screen(void);
 static void show_zgwd_pan_detail(int pan_idx);
 static void show_zgwd_locator(int pan_idx);
 static void show_zgwd_flood(int pan_idx);
+#endif
 static void show_ir_capture_screen(void);
 static void show_ir_replay_screen(void);
 static void show_ir_signal_list_screen(void);
@@ -2912,6 +2920,7 @@ static void reset_function_page_children(void) {
     s_n24_jam_active = false;
     s_n24_jam_status = NULL;
     if (s_n24_jam_tmr) { lv_timer_del(s_n24_jam_tmr); s_n24_jam_tmr = NULL; }
+#if CONFIG_IEEE802154_ENABLED
     // Zigbee Scout cleanup — main thread owns the free (task only sets task=NULL)
     if (s_zgwd) {
         s_zgwd->cancel = true; s_zgwd->scanning = false;
@@ -2932,6 +2941,7 @@ static void reset_function_page_children(void) {
         if (s_zgwd_fld->tmr) { lv_timer_del(s_zgwd_fld->tmr); s_zgwd_fld->tmr = NULL; }
         if (!s_zgwd_fld->task) { heap_caps_free(s_zgwd_fld); s_zgwd_fld = NULL; }
     }
+#endif /* CONFIG_IEEE802154_ENABLED */
     deauth_monitor_rec_label = NULL;
     bt_locator_content = NULL;
     bt_locator_list = NULL;
@@ -14732,7 +14742,9 @@ static const nav_show_entry_t NAV_SHOW_TABLE[] = {
     { "Hardware Options",     show_hardware_options_screen },
     { "NM-RF-HAT",            show_nmrfhat_settings_screen },
     { "Data Transfer",        show_data_transfer_screen    },
+#if CONFIG_IEEE802154_ENABLED
     { "Zigbee Scout",         show_zigbee_wardrive_screen  },
+#endif
     { "Infrared",             show_ir_menu_screen          },
     { "Radio",                show_radio_menu_screen       },
     { "NFC / RFID Hub",       show_nfc_hub_screen          },
@@ -15397,8 +15409,10 @@ static void main_tile_event_cb(lv_event_t *e)
     // NM-RF-HAT tiles
     } else if (strcmp(tile_name, "IR Menu") == 0) {
         show_dip_switch_popup(4, "Infrared (IR)", show_ir_menu_screen);
+#if CONFIG_IEEE802154_ENABLED
     } else if (strcmp(tile_name, "Zigbee") == 0) {
         show_zigbee_wardrive_screen();
+#endif
     } else if (strcmp(tile_name, "Radio Menu") == 0) {
         show_radio_menu_screen();
     } else if (strcmp(tile_name, "NFC Hub") == 0) {
@@ -19388,9 +19402,10 @@ static void show_handshakes_list_screen(void)
 // Download Mode - Force bootloader restart
 void GoToDownloadMode(void)
 {
-    // For ESP32C5, use LP_AON_SYS_CFG_REG
-    // LP_AON_FORCE_DOWNLOAD_BOOT[30:29] = 0x1 for download boot0 (UART/USB)
+#if defined(CONFIG_IDF_TARGET_ESP32C5)
+    // LP_AON_FORCE_DOWNLOAD_BOOT[30:29] = 0x1 triggers USB-JTAG download mode on C5
     REG_SET_FIELD(LP_AON_SYS_CFG_REG, LP_AON_FORCE_DOWNLOAD_BOOT, 1);
+#endif
     esp_restart();
 }
 
@@ -20963,7 +20978,9 @@ static void wdup_task(void *pvParameters)
     // associated 5 GHz link does not move it; wdup_ensure_wifi() reconnects on 2.4 GHz if a
     // prior link was on 5 GHz. Restore AUTO after uploads complete (task_done).
     wdup_push_msg("Forcing 2.4 GHz for upload...", amber);
+#if CONFIG_BOARD_HAS_5GHZ
     esp_wifi_set_band_mode(WIFI_BAND_MODE_2G_ONLY);
+#endif
     vTaskDelay(pdMS_TO_TICKS(300));
 
     // Ensure WiFi STA connection (now on the 2.4 GHz-only band)
@@ -21210,7 +21227,9 @@ static void wdup_task(void *pvParameters)
 
 task_done:
     // Restore AUTO band mode (5 GHz + 2.4 GHz)
+#if CONFIG_BOARD_HAS_5GHZ
     esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO);
+#endif
 
     wdup_done   = true;
     wdup_active = false;
@@ -33143,6 +33162,7 @@ struct ble_spam_state_t {
 static void ble_spam_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
+#if MYNEWT_VAL(BLE_EXT_ADV)
     if (!ble_spam_active) return;
 
     struct ble_spam_state_t *st = &g_ble_spam_state;
@@ -33475,6 +33495,7 @@ static void ble_spam_timer_cb(lv_timer_t *timer)
     ble_spam_count++;
     packets_since_restart++;  // Track for periodic mbuf pool restart
     ble_spam_needs_ui_update = true;
+#endif /* MYNEWT_VAL(BLE_EXT_ADV) */
 }
 
 // ── BLE Spam screen helpers ───────────────────────────────────────────────────
@@ -33489,7 +33510,9 @@ static void ble_spam_start_btn_cb(lv_event_t *e)
             g_ble_spam_state.timer = NULL;
         }
         ESP_LOGI(TAG, "[SPAM] stopping instance %d (keeping config)", BLE_SPAM_ADV_INSTANCE);
+#if MYNEWT_VAL(BLE_EXT_ADV)
         ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
+#endif
         g_ble_spam_state.started = false;
         lv_label_set_text(lv_obj_get_child(ble_spam_start_btn, 0), "START");
         lv_obj_set_style_bg_color(ble_spam_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
@@ -33536,7 +33559,9 @@ static void ble_spam_stop(void)
     ble_spam_start_btn = NULL;
     if (current_radio_mode == RADIO_MODE_BLE) {
         ESP_LOGI(TAG, "[SPAM] cleanup: stopping instance %d", BLE_SPAM_ADV_INSTANCE);
+#if MYNEWT_VAL(BLE_EXT_ADV)
         ble_gap_ext_adv_stop(BLE_SPAM_ADV_INSTANCE);
+#endif
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
     }
@@ -33627,6 +33652,7 @@ struct ble_spoof_state_t {
 static void ble_spoof_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
+#if MYNEWT_VAL(BLE_EXT_ADV)
     if (!ble_spoof_active) return;
 
     struct ble_spoof_state_t *st = &g_ble_spoof_state;
@@ -33723,6 +33749,7 @@ static void ble_spoof_timer_cb(lv_timer_t *timer)
 
     ESP_LOGI(TAG, "[SPOOF] data updated");
     ble_spoof_needs_ui_update = true;
+#endif /* MYNEWT_VAL(BLE_EXT_ADV) */
 }
 
 static void ble_spoof_start_cb(lv_event_t *e)
@@ -33735,7 +33762,9 @@ static void ble_spoof_start_cb(lv_event_t *e)
             g_ble_spoof_state.timer = NULL;
         }
         ESP_LOGI(TAG, "[SPOOF] stopping instance %d (keeping config)", BLE_SPOOF_ADV_INSTANCE);
+#if MYNEWT_VAL(BLE_EXT_ADV)
         ble_gap_ext_adv_stop(BLE_SPOOF_ADV_INSTANCE);
+#endif
         g_ble_spoof_state.started = false;
         lv_label_set_text(lv_obj_get_child(ble_spoof_start_btn, 0), "START SPOOF");
         lv_obj_set_style_bg_color(ble_spoof_start_btn, COLOR_MATERIAL_GREEN, LV_STATE_DEFAULT);
@@ -33778,7 +33807,9 @@ static void ble_spoof_back_cb(lv_event_t *e)
     memset(ble_spoof_target_name_str, 0, sizeof(ble_spoof_target_name_str));
     if (current_radio_mode == RADIO_MODE_BLE) {
         ESP_LOGI(TAG, "[SPOOF] cleanup: stopping instance %d", BLE_SPOOF_ADV_INSTANCE);
+#if MYNEWT_VAL(BLE_EXT_ADV)
         ble_gap_ext_adv_stop(BLE_SPOOF_ADV_INSTANCE);
+#endif
         memset(&g_ble_spoof_state, 0, sizeof(g_ble_spoof_state));
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
@@ -34961,6 +34992,7 @@ static void s_blaster_nrf_task_fn(void *arg)
 // Configure one ext adv instance with a fresh random static MAC and start it.
 static void s_blaster_arm_inst(int inst)
 {
+#if MYNEWT_VAL(BLE_EXT_ADV)
     struct ble_gap_ext_adv_params p;
     memset(&p, 0, sizeof(p));
     p.legacy_pdu    = 1;
@@ -34984,6 +35016,9 @@ static void s_blaster_arm_inst(int inst)
         ble_gap_ext_adv_set_data(inst, om);
     }
     ble_gap_ext_adv_start(inst, 0, 0);
+#else
+    (void)inst;
+#endif /* MYNEWT_VAL(BLE_EXT_ADV) */
 }
 
 static void s_blaster_timer_cb(lv_timer_t *t)
@@ -35035,8 +35070,10 @@ static void s_blaster_stop_cb(lv_event_t *e)
     (void)e;
     s_blaster_active     = false;
     s_blaster_nrf_active = false;
+#if MYNEWT_VAL(BLE_EXT_ADV)
     for (int i = 0; i < BLE_BLASTER_NUM_INST; i++)
         ble_gap_ext_adv_stop(i);
+#endif
     if (s_blaster_layers_lbl)
         lv_label_set_text(s_blaster_layers_lbl,
             nrf24_is_init() ? "BLE + RF jam available"
@@ -35048,8 +35085,10 @@ static void ble_blaster_screen_stop(void)
     s_blaster_active     = false;
     s_blaster_nrf_active = false;
     if (s_blaster_tmr) { lv_timer_del(s_blaster_tmr); s_blaster_tmr = NULL; }
+#if MYNEWT_VAL(BLE_EXT_ADV)
     for (int i = 0; i < BLE_BLASTER_NUM_INST; i++)
         ble_gap_ext_adv_stop(i);
+#endif
     if (current_radio_mode == RADIO_MODE_BLE) {
         bt_nimble_deinit();
         current_radio_mode = RADIO_MODE_NONE;
@@ -37147,14 +37186,22 @@ static esp_err_t init_battery_adc(void)
     }
     
     // Try to create calibration handle for more accurate readings
+#if defined(CONFIG_IDF_TARGET_ESP32C5)
     adc_cali_curve_fitting_config_t cali_cfg = {
-        .unit_id = BATTERY_ADC_UNIT,
-        .chan = BATTERY_ADC_CHANNEL,
-        .atten = BATTERY_ADC_ATTEN,
+        .unit_id  = BATTERY_ADC_UNIT,
+        .chan     = BATTERY_ADC_CHANNEL,
+        .atten   = BATTERY_ADC_ATTEN,
         .bitwidth = ADC_BITWIDTH_12,
     };
-    
     ret = adc_cali_create_scheme_curve_fitting(&cali_cfg, &battery_adc_cali_handle);
+#else
+    adc_cali_line_fitting_config_t cali_cfg = {
+        .unit_id  = BATTERY_ADC_UNIT,
+        .atten   = BATTERY_ADC_ATTEN,
+        .bitwidth = ADC_BITWIDTH_12,
+    };
+    ret = adc_cali_create_scheme_line_fitting(&cali_cfg, &battery_adc_cali_handle);
+#endif
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "ADC calibration not available, using raw values");
         battery_adc_cali_handle = NULL;
@@ -39388,7 +39435,9 @@ static void drone_task(void *pvParameters)
         esp_wifi_set_promiscuous(true);
         // Enable dual-band so the 5 GHz channels in s_drone_wifi_channels are
         // reachable (2.4-only band mode silently rejects 5 GHz set_channel).
+#if CONFIG_BOARD_HAS_5GHZ
         esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO);
+#endif
 
         int64_t wifi_end = esp_timer_get_time() / 1000 + DRONE_WIFI_PHASE_MS;
         while (drone_scan_active && esp_timer_get_time() / 1000 < wifi_end) {
@@ -39877,13 +39926,16 @@ static void odid_encode_operator_id(uint8_t *msg, const char *op_id)
 
 static void drone_spoof_ble_stop(void)
 {
+#if MYNEWT_VAL(BLE_EXT_ADV)
     ble_gap_ext_adv_stop(DRONE_SPOOF_ADV_INSTANCE);
+#endif
 }
 
 /* Transmit one 25-byte ODID message as a BLE extended advertising PDU.
  * Service UUID 0xFFFA + rolling counter per ASTM F3411-22a §7.2. */
 static void drone_spoof_ble_broadcast(const uint8_t *msg)
 {
+#if MYNEWT_VAL(BLE_EXT_ADV)
     /* Service data AD: [UUID16_LSB UUID16_MSB counter message[25]] */
     uint8_t svc_buf[28];
     svc_buf[0] = 0xFA;                /* UUID 0xFFFA LSB */
@@ -39924,6 +39976,9 @@ static void drone_spoof_ble_broadcast(const uint8_t *msg)
     rc = ble_gap_ext_adv_set_data(DRONE_SPOOF_ADV_INSTANCE, om);
     if (rc != 0) return;
     ble_gap_ext_adv_start(DRONE_SPOOF_ADV_INSTANCE, 0, 0);
+#else
+    (void)msg;
+#endif /* MYNEWT_VAL(BLE_EXT_ADV) */
 }
 
 // ── WiFi beacon broadcast helper ─────────────────────────────────────────────
@@ -42855,7 +42910,7 @@ static lv_obj_t   *s_led_status_lbl = NULL;
 static lv_obj_t   *s_led_grid_cont  = NULL;  /* container for the 7×4 button grid; cleaned on lib switch */
 static lv_obj_t   *s_led_lib_lbl    = NULL;  /* label inside the library toggle button */
 static int         s_led_rmt_lib    = 0;     /* 0 = custom 28-key  1 = standard 44-key */
-static ir_signal_t s_led_nec_sig;            /* reused per button press, avoids 4 KB stack alloc */
+EXT_RAM_BSS_ATTR static ir_signal_t s_led_nec_sig;            /* reused per button press, avoids 4 KB stack alloc */
 
 /* Encode one standard NEC frame: 9ms leader, 4.5ms gap, 32 data bits (LSB first),
  * stop bit.  addr and cmd are 8-bit; the protocol appends their bit-complements. */
@@ -43604,7 +43659,7 @@ static void show_ir_menu_screen(void)
 
 // ── IR Capture ────────────────────────────────────────────────────────────────
 
-static ir_signal_t           s_last_ir_signal;
+EXT_RAM_BSS_ATTR static ir_signal_t           s_last_ir_signal;
 static lv_obj_t             *s_ir_cap_status_lbl = NULL;
 static lv_obj_t             *s_ir_cap_save_btn   = NULL;
 static volatile ir_hat_err_t s_ir_cap_result      = IR_HAT_ERR_TIMEOUT;
@@ -44040,7 +44095,7 @@ EXT_RAM_BSS_ATTR static char     s_ir_signal_names[IR_HAT_MAX_SIGNALS][IR_HAT_NA
 static int      s_ir_signal_count = 0;
 static int      s_ir_sel_signal   = -1;
 static lv_obj_t *s_ir_sig_status  = NULL;
-static ir_signal_t s_ir_replay_sig;  // static to avoid 4 KB stack frame
+EXT_RAM_BSS_ATTR static ir_signal_t s_ir_replay_sig;  // static to avoid 4 KB stack frame
 
 static void ir_signal_row_cb(lv_event_t *e)
 {
@@ -44393,7 +44448,7 @@ static void ur_refresh_brand_ui(void)
 
 static ir_hat_err_t ur_try_signal(const char *remote, const char *sig_name)
 {
-    static ir_signal_t s_ur_sig;
+    EXT_RAM_BSS_ATTR static ir_signal_t s_ur_sig;
     ir_hat_claim();
     ir_hat_err_t r = ir_hat_load_signal(remote, sig_name, &s_ur_sig);
     if (r == IR_HAT_OK) ir_hat_replay(&s_ur_sig);
@@ -56058,7 +56113,7 @@ EXT_RAM_BSS_ATTR static char     s_rf433_signal_names[RF433_HAT_MAX_SIGNALS][RF4
 static int      s_rf433_signal_count = 0;
 static int      s_rf433_sel_signal   = -1;
 static lv_obj_t *s_rf433_sig_status  = NULL;
-static rf433_signal_t s_rf433_replay_sig;  // static — avoids large stack frame
+EXT_RAM_BSS_ATTR static rf433_signal_t s_rf433_replay_sig;  // static — avoids large stack frame
 
 static void rf433_signal_row_cb(lv_event_t *e)
 {
@@ -56142,6 +56197,7 @@ static void show_rf433_signal_list_screen(void)
     rfhat_add_back_btn(s_rf433_cur_remote, show_rf433_replay_screen);
 }
 
+#if CONFIG_IEEE802154_ENABLED
 // =============================================================================
 // Zigbee Scout — passive 802.15.4 wardrive using ESP32-C5 built-in radio
 // FOR AUTHORIZED SECURITY RESEARCH AND EDUCATION ONLY.
@@ -57386,6 +57442,7 @@ static void show_zgwd_flood(int pan_idx)
     fld->tmr = lv_timer_create(s_zgwd_flood_ui_timer_cb, 300, NULL);
     xTaskCreate(s_zgwd_flood_task_fn, "zgwdfld", 3072, fld, 2, &fld->task);
 }
+#endif /* CONFIG_IEEE802154_ENABLED */
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ESP-NOW Scout — passive ESP-NOW frame detector + channel hopper

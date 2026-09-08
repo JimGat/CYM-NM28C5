@@ -28,6 +28,7 @@
  */
 
 #include "chameleon_ble.h"
+#include "esp_attr.h"
 #include <string.h>
 #include <stdio.h>
 #include <inttypes.h>
@@ -71,7 +72,7 @@ static const ble_uuid128_t s_nus_rx_uuid = BLE_UUID128_INIT(
 /* ── RX ring buffer ──────────────────────────────────────────────────────── */
 #define CHAM_RX_RING_SIZE 4200   /* > CHAM_MAX_FRAME for headroom */
 
-static uint8_t  s_rx_ring[CHAM_RX_RING_SIZE];
+EXT_RAM_BSS_ATTR static uint8_t  s_rx_ring[CHAM_RX_RING_SIZE];
 static volatile int s_rx_wr = 0;  /* NimBLE task writes */
 static          int s_rx_rd = 0;  /* poll (main task) reads */
 
@@ -85,7 +86,7 @@ typedef struct {
     bool     hdr_done;  /* set after pos==8 LRC check passes */
 } cham_rxs_t;
 
-static cham_rxs_t s_rxs;
+EXT_RAM_BSS_ATTR static cham_rxs_t s_rxs;
 
 /* ── Global state ────────────────────────────────────────────────────────── */
 static cham_state_t s_state = CHAM_STATE_DISCONNECTED;
@@ -583,13 +584,16 @@ static int s_scan_gap_cb(struct ble_gap_event *event, void *arg)
     ble_addr_t     addr     = {0};
     int8_t         rssi     = 0;
 
+#if MYNEWT_VAL(BLE_EXT_ADV)
     if (event->type == BLE_GAP_EVENT_EXT_DISC) {
         const struct ble_gap_ext_disc_desc *d = &event->ext_disc;
         adv_data = d->data;
         adv_len  = (uint8_t)(d->length_data < 255 ? d->length_data : 255);
         addr     = d->addr;
         rssi     = d->rssi;
-    } else if (event->type == BLE_GAP_EVENT_DISC) {
+    } else
+#endif
+    if (event->type == BLE_GAP_EVENT_DISC) {
         const struct ble_gap_disc_desc *d = &event->disc;
         adv_data = d->data;
         adv_len  = d->length_data;

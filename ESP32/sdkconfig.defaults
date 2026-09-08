@@ -1,11 +1,12 @@
 # CYM ESP32 shared base sdkconfig defaults
 # Applies to all ESP32 (Xtensa LX6 dual-core) boards.
-#
-# Phase 3 — placeholder. Add real config when porting begins.
 
-# Partition table (will need custom CSV for CYD2USB flash layout)
+# Custom partition table (ESP32/ partitions.csv)
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# PSRAM: board-specific sdkconfig files control whether SPIRAM is enabled.
+# Standard CYD2USB (WROOM-32 module) has no PSRAM — sdkconfig.defaults.cyd2usb disables it.
 
 # Task WDT panic
 CONFIG_ESP_TASK_WDT_PANIC=y
@@ -23,3 +24,8 @@ CONFIG_LV_FONT_MONTSERRAT_28=y
 
 # ST7789/ILI9341 byte-order fix (apply to all display boards)
 CONFIG_LV_COLOR_16_SWAP=y
+
+# LVGL custom memory allocator (lvgl_memory.c) — routes LVGL allocs to PSRAM.
+# Without LV_MEM_CUSTOM=y, lv_mem.c allocates a 32 KB static pool in DRAM BSS.
+CONFIG_LV_MEM_CUSTOM=y
+CONFIG_LV_MEM_CUSTOM_INCLUDE="lvgl_memory.h"

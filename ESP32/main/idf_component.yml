@@ -1,0 +1,7 @@
+## IDF Component Manager Manifest File
+## CYM ESP32 (CYD2USB) — same managed components as ESP32C5 build
+dependencies:
+  idf:
+    version: '>=5.3.0'
+  lvgl/lvgl: '8.4.0'
+  espressif/esp_lcd_touch: '1.1.2'

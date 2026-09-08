@@ -20,6 +20,14 @@ menu "CYM Board Selection"
                 ST7789 display, CH32V003 IO expander for backlight, ES8311 audio.
                 Note: LCD CS and SD CS are swapped vs NM-CYD-C5.
 
+        config BOARD_CYD2USB
+            bool "ESP32-2432S028R Classic CYD (CYD2USB) [Phase 3]"
+            help
+                Cheap Yellow Display with dual USB — ESP32 (single-core), ILI9341
+                2.8\" 240x320, XPT2046 resistive touch, 4 MB flash, no PSRAM.
+                Display+touch share VSPI (SPI3_HOST); SD card on separate HSPI
+                (SPI2_HOST). RGB LED active-LOW common-anode on GPIO 4/16/17.
+
     endchoice
 
     # ── Capability flags — automatically derived from board selection ──────────
@@ -41,7 +49,7 @@ menu "CYM Board Selection"
 
     config BOARD_HAS_DUAL_CORE
         bool
-        default n
+        default y if BOARD_CYD2USB
         help
             Dual-core SoC (ESP32 / ESP32-S3). When set, the nRF24 jammer task
             should be pinned to Core 1 via xTaskCreatePinnedToCore to isolate it
@@ -52,6 +60,7 @@ menu "CYM Board Selection"
         default y if BOARD_NM_CYD_C5 || BOARD_WS_C5_28
         help
             Built-in 802.15.4 radio (Zigbee/Thread passive scanner).
+            Not present on ESP32 (CYD2USB).
 
     config BOARD_HAS_VIBRATOR
         bool
@@ -62,9 +71,26 @@ menu "CYM Board Selection"
 
     config BOARD_HAS_RGB_LED
         bool
-        default y if BOARD_NM_CYD_C5
+        default y if BOARD_NM_CYD_C5 || BOARD_CYD2USB
         help
-            WS2812 addressable RGB LED (NeoPixel) on BOARD_RGB_LED_GPIO.
+            Addressable or discrete RGB LED. NM-CYD-C5 uses WS2812 (NeoPixel).
+            CYD2USB uses a common-anode RGB LED (active-LOW) on GPIO 4/16/17.
+
+    config BOARD_LCD_INVERT_COLOR
+        bool
+        default y if BOARD_CYD2USB
+        help
+            Invert LCD color output. ILI9341 panels on CYD family boards come in
+            both normal and color-inverted variants. Set y for boards confirmed to
+            need inversion; n for normal panels. Calls esp_lcd_panel_invert_color().
+
+    config BOARD_HAS_DUAL_SPI_BUS
+        bool
+        default y if BOARD_CYD2USB
+        help
+            Board uses two separate SPI buses — one for display+touch (VSPI/SPI3)
+            and a second for the SD card (HSPI/SPI2). Single-bus boards share one
+            bus for all three peripherals with separate CS lines.
 
     config BOARD_HAS_IMU
         bool
@@ -108,7 +134,7 @@ menu "CYM Board Selection"
 
     config BOARD_TOUCH_XPT2046
         bool
-        default y if BOARD_NM_CYD_C5
+        default y if BOARD_NM_CYD_C5 || BOARD_CYD2USB
         help
             XPT2046 resistive SPI touch. Requires 4-point calibration on first
             boot. Position-compensated pressure formula Z1 + 4095 - Z2.

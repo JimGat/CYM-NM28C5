@@ -1,0 +1,11 @@
+# CYM-CYD2USB partition table — 4 MB flash (ESP32-2432S028R)
+#
+# Layout mirrors the ESP32C5 partition table scaled to 4 MB.
+# Firmware is ~1.5–2.0 MB on ESP32 (no ieee802154, smaller BLE stack).
+# Storage FAT partition uses remaining space after firmware.
+#
+# Name,   Type, SubType, Offset,   Size,    Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+factory,  app,  factory, 0x10000,  0x2F0000,
+storage,  data, fat,     0x300000, 0xF0000,

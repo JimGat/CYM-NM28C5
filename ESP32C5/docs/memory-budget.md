@@ -15,12 +15,12 @@
 <!-- MEMORY_METRICS_START -->
 | Metric | Value |
 |--------|-------|
-| Version | v2.13.45 |
+| Version | v2.13.47 |
 | Build date | 2026-09-08 |
 | .iram0.text | 138,876 B (135.6 KB) |
 | .dram0.data | 23,881 B (23.3 KB) |
-| .dram0.bss  (internal) | 113,352 B (110.7 KB) |
-| .ext_ram.bss  (PSRAM) | 167,032 B (163.1 KB) |
+| .dram0.bss  (internal) | 86,384 B (84.4 KB) |
+| .ext_ram.bss  (PSRAM) | 193,992 B (189.4 KB) |
 | App binary size | 3,073,168 B (3001.1 KB) |
 <!-- MEMORY_METRICS_END -->
 
@@ -29,7 +29,7 @@
 <!-- BSS_TABLE_START -->
 | Library / object | Internal BSS |
 |-----------------|-------------|
-| `libmain.a` | 76,710 B (74.9 KB) |
+| `libmain.a` | 49,742 B (48.6 KB) |
 | `libnet80211.a` | 13,559 B (13.2 KB) |
 | `librf_hat.a` | 11,352 B (11.1 KB) |
 | `librfid.a` | 5,032 B (4.9 KB) |

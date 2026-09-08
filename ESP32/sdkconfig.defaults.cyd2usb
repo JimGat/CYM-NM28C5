@@ -20,8 +20,16 @@
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
 
-# No PSRAM on standard CYD
-# CONFIG_SPIRAM is not set
+# PSRAM — enabled to place large BSS arrays in external RAM (mirrors C5 SPIRAM_ALLOW_BSS_SEG pattern).
+# If your board has an ESP32-WROVER module (4 MB PSRAM), this will work.
+# If your board has ESP32-WROOM-32 (no PSRAM), it will panic at boot in psram_enable.
+# Disable and report if it crashes, and we will reduce static array sizes instead.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_QUAD=y
+CONFIG_SPIRAM_SPEED_40M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 
 # Main task stack — smaller than C5 due to no PSRAM
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
@@ -29,4 +37,4 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 # Compiler optimization
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 
-# CONFIG_BOARD_CYD2USB=y  (future Kconfig flag once board_hal Kconfig is wired)
+CONFIG_BOARD_CYD2USB=y

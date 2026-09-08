@@ -21,6 +21,8 @@
 #  include "boards/nm_cyd_c5.h"
 #elif defined(CONFIG_BOARD_WS_C5_28)
 #  include "boards/ws_c5_28.h"
+#elif defined(CONFIG_BOARD_CYD2USB)
+#  include "boards/cyd2usb.h"
 #else
 // Fallback: default to NM-CYD-C5 if no board is explicitly configured.
 // This ensures the existing build (which predates Kconfig board selection)
