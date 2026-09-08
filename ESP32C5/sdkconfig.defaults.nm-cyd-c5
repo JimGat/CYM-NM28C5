@@ -10,4 +10,5 @@
 # Most config for this board lives in sdkconfig.defaults (the C5 base).
 # Add NM-CYD-C5-specific overrides here when they diverge from the Waveshare C5.
 #
-# CONFIG_BOARD_NM_CYD_C5=y  (future Kconfig flag once board_hal Kconfig is wired)
+# board_hal Kconfig — select NM-CYD-C5 board variant
+CONFIG_BOARD_NM_CYD_C5=y

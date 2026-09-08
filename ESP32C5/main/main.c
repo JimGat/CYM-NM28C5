@@ -85,6 +85,7 @@ LV_IMG_DECLARE(deedee_img);
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
 #include "xpt2046.h"
+#include "board_hal.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
@@ -6025,6 +6026,9 @@ static void create_home_ui(void)
 
 void app_main(void)
 {
+    // Log active board identity so crash logs are unambiguous about which board built the binary.
+    board_hal_log_info();
+
     // Initialize NVS (required for settings, touch calibration, etc)
     // MUST come before the GPS init below: init_gps_uart() reads the saved GPS baud
     // (gps_load_baud_setting) so that gps_autodetect_and_sync() aims at the rate the

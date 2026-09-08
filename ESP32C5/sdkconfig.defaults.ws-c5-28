@@ -21,4 +21,5 @@
 CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="32MB"
 
-# CONFIG_BOARD_WS_C5_28=y  (future Kconfig flag once board_hal Kconfig is wired)
+# board_hal Kconfig — select Waveshare C5-28 board variant
+CONFIG_BOARD_WS_C5_28=y

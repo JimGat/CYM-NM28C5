@@ -1,0 +1,123 @@
+menu "CYM Board Selection"
+
+    choice BOARD_SELECT
+        prompt "Target board"
+        default BOARD_NM_CYD_C5
+        help
+            Select the target hardware board. This controls pin definitions,
+            capability flags, and HAL driver selection throughout the firmware.
+
+        config BOARD_NM_CYD_C5
+            bool "NM-CYD-C5 (NerdMiner ESP32-C5 CYD) [PRIMARY]"
+            help
+                NM-CYD-C5 with NM-RF-HAT support. WiFi 6 dual-band, XPT2046
+                resistive touch, ST7789 display, WS2812 LED, ERM vibrator.
+
+        config BOARD_WS_C5_28
+            bool "Waveshare ESP32-C5-Touch-LCD-2.8 [Phase 2]"
+            help
+                Waveshare ESP32-C5 2.8\" board. CST3530 capacitive touch,
+                ST7789 display, CH32V003 IO expander for backlight, ES8311 audio.
+                Note: LCD CS and SD CS are swapped vs NM-CYD-C5.
+
+    endchoice
+
+    # ── Capability flags — automatically derived from board selection ──────────
+    # These control #ifdef blocks throughout the firmware for board-specific
+    # behaviour. Do not set them directly; they follow BOARD_SELECT.
+
+    config BOARD_HAS_PSRAM
+        bool
+        default y if BOARD_NM_CYD_C5 || BOARD_WS_C5_28
+        help
+            Board has PSRAM. Enables large buffer allocations, LVGL PSRAM draw
+            buffers, and the 1 MB captive-portal HTML buffer.
+
+    config BOARD_HAS_5GHZ
+        bool
+        default y if BOARD_NM_CYD_C5 || BOARD_WS_C5_28
+        help
+            WiFi 6 dual-band (2.4 + 5 GHz). Set band mode WIFI_BAND_MODE_AUTO.
+
+    config BOARD_HAS_DUAL_CORE
+        bool
+        default n
+        help
+            Dual-core SoC (ESP32 / ESP32-S3). When set, the nRF24 jammer task
+            should be pinned to Core 1 via xTaskCreatePinnedToCore to isolate it
+            from LVGL/WiFi/BLE on Core 0 for better sweep timing.
+
+    config BOARD_HAS_802154
+        bool
+        default y if BOARD_NM_CYD_C5 || BOARD_WS_C5_28
+        help
+            Built-in 802.15.4 radio (Zigbee/Thread passive scanner).
+
+    config BOARD_HAS_VIBRATOR
+        bool
+        default y if BOARD_NM_CYD_C5
+        help
+            ERM vibrator motor driven via SC8002B amp on BOARD_VIBRATOR_GPIO.
+            Haptic feedback for BT Lookout, deauth launch, BT locator proximity.
+
+    config BOARD_HAS_RGB_LED
+        bool
+        default y if BOARD_NM_CYD_C5
+        help
+            WS2812 addressable RGB LED (NeoPixel) on BOARD_RGB_LED_GPIO.
+
+    config BOARD_HAS_IMU
+        bool
+        default y if BOARD_WS_C5_28
+        help
+            QMI8658 6-axis IMU (Waveshare only).
+
+    config BOARD_HAS_TEMP_HUMIDITY
+        bool
+        default y if BOARD_WS_C5_28
+        help
+            SHTC3 temperature + humidity sensor (Waveshare only).
+
+    config BOARD_HAS_RTC
+        bool
+        default y if BOARD_WS_C5_28
+        help
+            PCF85063A real-time clock (Waveshare only).
+
+    config BOARD_HAS_AUDIO_CODEC
+        bool
+        default y if BOARD_WS_C5_28
+        help
+            ES8311 I2S audio codec + NS4150B amp (Waveshare). Supports mic + speaker.
+
+    config BOARD_HAS_BACKLIGHT_EXPANDER
+        bool
+        default y if BOARD_WS_C5_28
+        help
+            LCD backlight controlled via CH32V003 IO expander (I2C 0x24) instead
+            of a direct GPIO. Use custom_io_expander_set_pwm() for brightness.
+
+    config BOARD_HAS_IO_EXPANDER
+        bool
+        default y if BOARD_WS_C5_28
+        help
+            CH32V003 secondary MCU on I2C 0x24. Controls LCD RST, touch RST,
+            audio amp enable, and backlight PWM.
+
+    # ── Touch driver selection ─────────────────────────────────────────────────
+
+    config BOARD_TOUCH_XPT2046
+        bool
+        default y if BOARD_NM_CYD_C5
+        help
+            XPT2046 resistive SPI touch. Requires 4-point calibration on first
+            boot. Position-compensated pressure formula Z1 + 4095 - Z2.
+
+    config BOARD_TOUCH_CST3530
+        bool
+        default y if BOARD_WS_C5_28
+        help
+            CST3530 capacitive I2C touch. Interrupt-driven via BOARD_TOUCH_INT.
+            No calibration needed.
+
+endmenu
