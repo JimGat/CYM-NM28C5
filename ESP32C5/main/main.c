@@ -6019,6 +6019,15 @@ static void show_splash_screen(void)
     lv_obj_set_style_text_color(version_label, lv_color_hex(0xD8D8D8), 0);
     lv_obj_align(version_label, LV_ALIGN_CENTER, 0, 64);
 
+#if defined(CONFIG_BOARD_CYD2USB)
+    /* Permanent reduced-functionality notice on Classic CYD (no PSRAM, no RF-HAT, 2.4 GHz only) */
+    lv_obj_t *board_notice = lv_label_create(splash_screen);
+    lv_label_set_text(board_notice, "Classic CYD - reduced functionality");
+    lv_obj_set_style_text_font(board_notice, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(board_notice, lv_color_hex(0xFFA500), 0);
+    lv_obj_align(board_notice, LV_ALIGN_CENTER, 0, 83);
+#endif
+
     splash_loading_label = lv_label_create(splash_screen);
     lv_label_set_text(splash_loading_label, "LOADING...");
     lv_obj_set_style_text_font(splash_loading_label, &lv_font_montserrat_14, 0);
