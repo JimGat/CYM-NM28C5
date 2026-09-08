@@ -22,11 +22,19 @@
 #include <stdbool.h>
 
 // ── Limits ───────────────────────────────────────────────────────────────────
-#define IR_HAT_MAX_TIMINGS       1024  // max mark/space entries per signal (matches Flipper)
+// On no-PSRAM builds (e.g. CYD2USB / ESP32-WROOM-32), ir_signal_t arrays and
+// name lists land in DRAM BSS. Reduce them aggressively to fit the 99 KB budget.
+#if defined(CONFIG_BOARD_HAS_PSRAM) && CONFIG_BOARD_HAS_PSRAM
+#  define IR_HAT_MAX_TIMINGS     1024  // max mark/space entries per signal (matches Flipper)
+#  define IR_HAT_MAX_REMOTES     32    // max .ir files listed at once
+#  define IR_HAT_MAX_SIGNALS     64    // max signals listed per remote file
+#else
+#  define IR_HAT_MAX_TIMINGS     128   // reduced: 4×ir_signal_t DRAM savings ~14 KB
+#  define IR_HAT_MAX_REMOTES     4     // reduced: name arrays from 2 KB → 256 bytes each
+#  define IR_HAT_MAX_SIGNALS     8     // reduced: signal name arrays from 2 KB → 256 bytes
+#endif
 #define IR_HAT_NAME_LEN          32    // signal name max length (incl. null)
 #define IR_HAT_REMOTE_NAME_LEN   64    // remote file basename max length (no path/ext)
-#define IR_HAT_MAX_REMOTES       32    // max .ir files listed at once
-#define IR_HAT_MAX_SIGNALS       64    // max signals listed per remote file
 #define IR_HAT_SAVE_EXT          ".ir"
 
 // ── Signal struct ─────────────────────────────────────────────────────────────

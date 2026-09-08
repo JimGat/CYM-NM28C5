@@ -6,7 +6,11 @@
 #include "freertos/semphr.h"
 #include "wifi_common.h"
 
-#define BD_MAX_SCRIPTS 32
+#if defined(CONFIG_BOARD_HAS_PSRAM) && CONFIG_BOARD_HAS_PSRAM
+#  define BD_MAX_SCRIPTS 32
+#else
+#  define BD_MAX_SCRIPTS 8   // reduced: s_script_paths/names land in DRAM on no-PSRAM boards
+#endif
 
 typedef const gps_data_t *(*bd_gps_fn_t)(void);
 

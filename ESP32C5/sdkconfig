@@ -4477,6 +4477,31 @@ CONFIG_WL_SECTOR_SIZE=4096
 # end of Wear Levelling
 
 #
+# CYM Board Selection
+#
+# default:
+CONFIG_BOARD_NM_CYD_C5=y
+# default:
+# CONFIG_BOARD_WS_C5_28 is not set
+# default:
+# CONFIG_BOARD_CYD2USB is not set
+# default:
+CONFIG_BOARD_HAS_PSRAM=y
+# default:
+CONFIG_BOARD_HAS_5GHZ=y
+# default:
+CONFIG_BOARD_HAS_802154=y
+# default:
+CONFIG_BOARD_HAS_VIBRATOR=y
+# default:
+CONFIG_BOARD_HAS_RGB_LED=y
+# default:
+CONFIG_BOARD_HAS_RF_HAT=y
+# default:
+CONFIG_BOARD_TOUCH_XPT2046=y
+# end of CYM Board Selection
+
+#
 # CMake Utilities
 #
 # default:

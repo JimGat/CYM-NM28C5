@@ -20,8 +20,14 @@
 #include <stdbool.h>
 
 /* ── Constants ─────────────────────────────────────────────────── */
-#define BT_LOOKOUT_MAX_ENTRIES    64
-#define BT_LOOKOUT_MAX_COOLDOWN   16
+#include "sdkconfig.h"
+#if defined(CONFIG_BOARD_HAS_PSRAM) && CONFIG_BOARD_HAS_PSRAM
+#  define BT_LOOKOUT_MAX_ENTRIES    64
+#  define BT_LOOKOUT_MAX_COOLDOWN   16
+#else
+#  define BT_LOOKOUT_MAX_ENTRIES    16   /* 48 bytes × 16 = 768 bytes vs 3072 on no-PSRAM */
+#  define BT_LOOKOUT_MAX_COOLDOWN    8
+#endif
 #define BT_LOOKOUT_CSV_PATH       "/sdcard/lab/bluetooth/lookout.csv"
 #define BT_LOOKOUT_CSV_HEADER     "mac,name,rssi_threshold,oui_only\n"
 #define BT_LOOKOUT_RSSI_ANY       (-99)  /* trigger regardless of measured RSSI */

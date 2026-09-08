@@ -15,13 +15,13 @@
 <!-- MEMORY_METRICS_START -->
 | Metric | Value |
 |--------|-------|
-| Version | v2.13.47 |
+| Version | v2.13.48 |
 | Build date | 2026-09-08 |
 | .iram0.text | 138,876 B (135.6 KB) |
 | .dram0.data | 23,881 B (23.3 KB) |
-| .dram0.bss  (internal) | 86,384 B (84.4 KB) |
+| .dram0.bss  (internal) | 81,360 B (79.5 KB) |
 | .ext_ram.bss  (PSRAM) | 193,992 B (189.4 KB) |
-| App binary size | 3,073,168 B (3001.1 KB) |
+| App binary size | 3,073,200 B (3001.2 KB) |
 <!-- MEMORY_METRICS_END -->
 
 ### Top internal BSS consumers  *(auto-updated)*
@@ -32,7 +32,6 @@
 | `libmain.a` | 49,742 B (48.6 KB) |
 | `libnet80211.a` | 13,559 B (13.2 KB) |
 | `librf_hat.a` | 11,352 B (11.1 KB) |
-| `librfid.a` | 5,032 B (4.9 KB) |
 | `libmesh.a` | 3,955 B (3.9 KB) |
 | `liblwip.a` | 3,908 B (3.8 KB) |
 | `libieee802154.a` | 3,590 B (3.5 KB) |
@@ -44,6 +43,7 @@
 | `liblvgl__lvgl.a` | 840 B |
 | `libesp_libc.a` | 508 B |
 | `libtfpsacrypto.a` | 428 B |
+| `libble_app.a` | 371 B |
 <!-- BSS_TABLE_END -->
 
 ---

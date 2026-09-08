@@ -84,8 +84,22 @@ LV_IMG_DECLARE(deedee_img);
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
+#if defined(CONFIG_BOARD_CYD2USB)
+#include "esp_lcd_ili9341.h"
+#endif
 #include "xpt2046.h"
 #include "board_hal.h"
+
+// PSRAM_ATTR: place static symbol in external RAM when PSRAM is present.
+// On boards without PSRAM (e.g. CYD2USB / ESP32-WROOM-32), compiles to nothing
+// and the symbol lands in internal DRAM BSS. Array sizes must be reduced via
+// CONFIG_BOARD_HAS_PSRAM guards to avoid DRAM overflow on no-PSRAM targets.
+#if CONFIG_BOARD_HAS_PSRAM
+#  define PSRAM_ATTR EXT_RAM_BSS_ATTR
+#else
+#  define PSRAM_ATTR
+#endif
+
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
@@ -220,7 +234,11 @@ static volatile bool nimble_initialized  = false;
 static bool          s_ble_for_blueduck  = false; /* selects GATT table at bt_nimble_init time */
 
 // BLE device tracking for deduplication
+#if CONFIG_BOARD_HAS_PSRAM
 #define BT_MAX_DEVICES 128
+#else
+#define BT_MAX_DEVICES  16   // further reduced for CYD2USB DRAM budget
+#endif
 static uint8_t bt_found_devices[BT_MAX_DEVICES][6];
 static int bt_found_device_count = 0;
 
@@ -260,7 +278,7 @@ typedef struct {
     bool     is_exposure;      /* COVID-19 Exposure Notification (svc UUID 0xFD6F) */
 } bt_device_info_t;
 
-EXT_RAM_BSS_ATTR static bt_device_info_t bt_devices[BT_MAX_DEVICES];
+PSRAM_ATTR static bt_device_info_t bt_devices[BT_MAX_DEVICES];
 static int bt_device_count = 0;
 
 // BLE Spam attack state
@@ -351,7 +369,11 @@ static volatile bool ble_spoof_needs_ui_update = false;
 //
 // Stage 1: passive detect + channel hop (1-13, 200 ms dwell)
 // Stage 2: label known devices from /sdcard/lab/espnow/profiles.json
-#define ESPNOW_MAX_DEVICES   32
+#if defined(CONFIG_BOARD_HAS_PSRAM) && CONFIG_BOARD_HAS_PSRAM
+#  define ESPNOW_MAX_DEVICES   32
+#else
+#  define ESPNOW_MAX_DEVICES   8
+#endif
 #define ESPNOW_MAX_PROFILES  16
 #define ESPNOW_DWELL_MS      200
 #define ESPNOW_EXPORT_DIR    "/sdcard/lab/espnow"
@@ -375,7 +397,7 @@ typedef struct {
     uint8_t lmk[16];   // Stage 2: known peer LMK; zero = not loaded
 } espnow_profile_t;
 
-EXT_RAM_BSS_ATTR static espnow_device_t  espnow_devices[ESPNOW_MAX_DEVICES];
+PSRAM_ATTR static espnow_device_t  espnow_devices[ESPNOW_MAX_DEVICES];
 static int              espnow_device_count   = 0;
 static espnow_profile_t espnow_profiles[ESPNOW_MAX_PROFILES];
 static int              espnow_profile_count  = 0;
@@ -419,10 +441,14 @@ static lv_obj_t      *espnow_pl_status    = NULL;
 static lv_timer_t    *espnow_pl_timer     = NULL;
 
 // BLE Spoof general list (spooflist.txt)
-#define SPOOF_LIST_MAX  64
+#if defined(CONFIG_BOARD_HAS_PSRAM) && CONFIG_BOARD_HAS_PSRAM
+#  define SPOOF_LIST_MAX  64
+#else
+#  define SPOOF_LIST_MAX  8
+#endif
 #define SPOOF_LIST_PATH "/sdcard/lab/bluetooth/spooflist.csv"
 typedef struct { uint8_t mac[6]; char name[33]; } spoof_list_entry_t;
-EXT_RAM_BSS_ATTR static spoof_list_entry_t s_spoof_list[SPOOF_LIST_MAX];
+PSRAM_ATTR static spoof_list_entry_t s_spoof_list[SPOOF_LIST_MAX];
 static int  s_spoof_list_count    = 0;
 static int  s_spoof_list_selected = -1;
 static lv_obj_t *s_spoof_add_popup  = NULL;
@@ -455,22 +481,44 @@ static void (*s_ble_disc_return_fn)(void) = NULL;
 
 // ============================================================================
 
-// Pin configuration — NM-CYD-C5 (RockBase-iot/NM-CYD-C5, User_Setup-NM-CYD-C5.h)
+// Pin configuration — board-variant via board_hal.h BOARD_* defines.
+// BOARD_* defines are set by the board header selected by Kconfig (board_hal.h).
+#if defined(CONFIG_BOARD_CYD2USB)
+// CYD2USB (ESP32-2432S028R) — ILI9341 on VSPI (SPI3_HOST); XPT2046 on same bus;
+// SD card on separate HSPI (SPI2_HOST). See ESP32C5/components/board_hal/include/boards/cyd2usb.h
+#define LCD_MOSI        BOARD_SPI_MOSI       // GPIO13
+#define LCD_MISO        BOARD_SPI_MISO       // GPIO12
+#define LCD_CLK         BOARD_SPI_SCK        // GPIO14
+#define LCD_CS          BOARD_LCD_CS         // GPIO15
+#define LCD_DC          BOARD_LCD_DC         // GPIO2
+#define LCD_RST         BOARD_LCD_RST        // -1 (tied to EN via RC)
+#define TOUCH_CS        BOARD_TOUCH_CS       // GPIO33
+#define LCD_BL_IO       BOARD_BACKLIGHT_GPIO // GPIO21
+#define LCD_BL_ACTIVE_LEVEL 1
+#define BOOT_BTN_GPIO   BOARD_BOOT_BTN_GPIO  // GPIO0
+#define GO_DARK_DBL_CLICK_MS 800
+#define LCD_H_RES       BOARD_LCD_WIDTH      // 240
+#define LCD_V_RES       BOARD_LCD_HEIGHT     // 320
+#define LCD_HOST        BOARD_SPI_HOST       // SPI3_HOST (VSPI)
+
+#else
+// NM-CYD-C5 (RockBase-iot/NM-CYD-C5, User_Setup-NM-CYD-C5.h)
+// Display, touch, and SD all share SPI2_HOST. SD CS is GPIO10 (wifi_common.h).
 #define LCD_MOSI 7
 #define LCD_MISO 2
 #define LCD_CLK  6
 #define LCD_CS   23
 #define LCD_DC   24
 #define LCD_RST  -1   // Tied to board RST/EN — not a GPIO
-
-// XPT2046 resistive touch — SPI shared bus (T_IRQ not connected, polling only)
 #define TOUCH_CS  1
-
-// Backlight GPIO (HIGH = on; GPIO 25 is strapping pin but safe after boot)
 #define LCD_BL_IO 25
 #define LCD_BL_ACTIVE_LEVEL 1
 #define BOOT_BTN_GPIO        28   // NM-CYD-C5 BOOT button = IO28 (strapping pin, input-safe)
 #define GO_DARK_DBL_CLICK_MS 800
+#define LCD_H_RES 240
+#define LCD_V_RES 320
+#define LCD_HOST SPI2_HOST
+#endif
 
 // NOTE: No battery ADC on NM-CYD-C5 — GPIO6 is SPI SCK, not battery monitor.
 
@@ -478,10 +526,6 @@ static void (*s_ble_disc_return_fn)(void) = NULL;
 #define SCREEN_INACTIVITY_CHECK_MS 1000
 #define SCREEN_BACKLIGHT_ACTIVE_PERCENT 80
 #define SCREEN_BACKLIGHT_DIM_PERCENT 0
-
-#define LCD_H_RES 240
-#define LCD_V_RES 320
-#define LCD_HOST SPI2_HOST
 
 // Vibrator motor — GPIO26 → SC8002B amp (SPEAK_IN). LEDC PWM drives the amp
 // input; a Schottky diode + flyback diode on the speaker header rectify the BTL
@@ -936,13 +980,17 @@ static volatile bool g_wcs_scan_active  = false;  /* WCS client scan owns SCAN_D
 
 // Whitelist for BSSID and SSID protection
 #define MAX_WHITELISTED_BSSIDS 150
+#if CONFIG_BOARD_HAS_PSRAM
 #define MAX_WHITELISTED_SSIDS 50
+#else
+#define MAX_WHITELISTED_SSIDS 16
+#endif
 typedef struct {
     uint8_t bssid[6];
 } whitelisted_bssid_t;
 whitelisted_bssid_t whiteListedBssids[MAX_WHITELISTED_BSSIDS];
 int whitelistedBssidsCount = 0;
-EXT_RAM_BSS_ATTR static char whitelistedSsids[MAX_WHITELISTED_SSIDS][33];
+PSRAM_ATTR static char whitelistedSsids[MAX_WHITELISTED_SSIDS][33];
 static int whitelistedSsidCount = 0;
 
 // ============================================================================
@@ -1174,7 +1222,7 @@ static volatile bool handshake_attack_active = false;
 static volatile bool handshake_waiting_for_scan = false;
 static volatile bool g_handshaker_global_mode = false;
 static bool handshake_selected_mode = false;
-EXT_RAM_BSS_ATTR static wifi_ap_record_t handshake_targets[MAX_AP_CNT];
+PSRAM_ATTR static wifi_ap_record_t handshake_targets[MAX_AP_CNT];
 static int handshake_target_count = 0;
 static bool handshake_captured[MAX_AP_CNT];
 static int handshake_current_index = 0;
@@ -1500,14 +1548,22 @@ typedef struct {
     float    accuracy;  // GPS accuracy at time of discovery (m); GPS_STALE_ACCURACY_M if held
 } wdp_network_t;
 
-#define WDP_DEDUP_BUFFER_SIZE  100
-#define WDP_SCREEN_FIFO_SIZE   20
+#if defined(CONFIG_BOARD_HAS_PSRAM) && CONFIG_BOARD_HAS_PSRAM
+#  define WDP_DEDUP_BUFFER_SIZE  100
+#else
+#  define WDP_DEDUP_BUFFER_SIZE  20
+#endif
+#if defined(CONFIG_BOARD_HAS_PSRAM) && CONFIG_BOARD_HAS_PSRAM
+#  define WDP_SCREEN_FIFO_SIZE   20
+#else
+#  define WDP_SCREEN_FIFO_SIZE   8
+#endif
 #define WDP_GPS_MOVE_THRESHOLD_M 45.72  // 150 feet in meters
 
-EXT_RAM_BSS_ATTR static wdp_ducb_channel_t wdp_ducb_channels[WDP_TOTAL_CHANNELS];
+PSRAM_ATTR static wdp_ducb_channel_t wdp_ducb_channels[WDP_TOTAL_CHANNELS];
 static int wdp_ducb_channel_count = 0;
 static double wdp_ducb_discounted_total = 0.0;
-EXT_RAM_BSS_ATTR static wdp_network_t wdp_seen_networks[WDP_DEDUP_BUFFER_SIZE];  // Persistent 100-entry dedup buffer (no cycling)
+PSRAM_ATTR static wdp_network_t wdp_seen_networks[WDP_DEDUP_BUFFER_SIZE];  // Persistent 100-entry dedup buffer (no cycling)
 static volatile int wdp_seen_count = 0;  // Current count in dedup buffer (0-100)
 static volatile int wdp_total_networks = 0;  // Cumulative counter (increments on new CSV write, never resets during wardrive)
 static volatile int wdp_dwell_new_networks = 0;
@@ -1734,8 +1790,13 @@ static volatile int     wdup_wdg_ok_cnt      = 0;
 static volatile int     wdup_wdg_dup_cnt     = 0;
 static volatile int     wdup_wdg_fail_cnt    = 0;
 // wd_manage_paths declared here so wdup_task (explicit mode) can reference it
+#if CONFIG_BOARD_HAS_PSRAM
 #define WD_MANAGE_MAX_FILES 64
-EXT_RAM_BSS_ATTR static char wd_manage_paths[WD_MANAGE_MAX_FILES][320];
+PSRAM_ATTR static char wd_manage_paths[WD_MANAGE_MAX_FILES][320];
+#else
+#define WD_MANAGE_MAX_FILES 16
+static char wd_manage_paths[WD_MANAGE_MAX_FILES][128];
+#endif
 
 // SD Card settings screen state
 // Queue item for provision textarea updates: provision task queues these,
@@ -1859,7 +1920,11 @@ static volatile bool ble_obs_store_pending = false;  /* main loop feeds bt_devic
 static char ble_scan_status_text[48] = "";
 
 // Deauth Monitor state
-#define DEAUTH_MONITOR_MAX_ATTACKS 50
+#if defined(CONFIG_BOARD_HAS_PSRAM) && CONFIG_BOARD_HAS_PSRAM
+#  define DEAUTH_MONITOR_MAX_ATTACKS 50
+#else
+#  define DEAUTH_MONITOR_MAX_ATTACKS 12
+#endif
 typedef struct {
     char ssid[33];
     uint8_t bssid[6];
@@ -1876,7 +1941,7 @@ static int deauth_monitor_current_channel = 1;
 static int deauth_monitor_channel_index = 0;
 static int64_t deauth_monitor_last_channel_hop = 0;
 
-EXT_RAM_BSS_ATTR static deauth_monitor_attack_t deauth_monitor_attacks[DEAUTH_MONITOR_MAX_ATTACKS];
+PSRAM_ATTR static deauth_monitor_attack_t deauth_monitor_attacks[DEAUTH_MONITOR_MAX_ATTACKS];
 static volatile int deauth_monitor_attack_count = 0;
 static portMUX_TYPE deauth_monitor_spin = portMUX_INITIALIZER_UNLOCKED;
 
@@ -1950,7 +2015,7 @@ typedef struct {
     char    name[20];
 } ble_targ_dev_t;
 
-EXT_RAM_BSS_ATTR static ble_targ_dev_t s_targ_devs[BLE_TARG_MAX];
+PSRAM_ATTR static ble_targ_dev_t s_targ_devs[BLE_TARG_MAX];
 static volatile int    s_targ_count      = 0;
 static int             s_targ_displayed  = 0;
 static lv_timer_t     *s_targ_timer      = NULL;
@@ -1960,7 +2025,7 @@ static volatile bool   s_targ_scanning   = false;
 static int             s_targ_tick       = 0;
 
 // Drone Detector state
-EXT_RAM_BSS_ATTR static drone_rec_t   g_drones[DRONE_MAX];
+PSRAM_ATTR static drone_rec_t   g_drones[DRONE_MAX];
 static int           g_drone_count        = 0;
 static portMUX_TYPE  g_drone_mux          = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool drone_scan_active    = false;
@@ -2000,7 +2065,11 @@ static lv_obj_t     *s_detail_page_lbl    = NULL;
 #define WANA_SEP_X     200   // separator stripe x-start
 #define WANA_5G_X      208   // 5 GHz band x-start
 #define WANA_5G_W      312   // 5 GHz band width  (208+312=520)
-#define WANA_MAX_APS     48
+#if defined(CONFIG_BOARD_HAS_PSRAM) && CONFIG_BOARD_HAS_PSRAM
+#  define WANA_MAX_APS   48
+#else
+#  define WANA_MAX_APS   8
+#endif
 #define WANA_MAX_LABELS  48
 #define WANA_MAX_SSIDS   20   // max unique SSID groups shown in picker
 #define WANA_MAX_SCROLL  (WANA_WIDE_W - 240)   // 280
@@ -2027,7 +2096,7 @@ static bool               wana_scroll_paused = false;  // true while user is dra
 static int8_t             wana_scroll_dir    = 1;      // +1=right, -1=left (ping-pong)
 static int                wana_scroll_x      = 0;      // current viewport start in buf (0..280)
 static int                wana_drag_last_x   = 0;      // last touch x for delta calculation
-EXT_RAM_BSS_ATTR static wifi_ap_record_t   wana_aps[WANA_MAX_APS];
+PSRAM_ATTR static wifi_ap_record_t   wana_aps[WANA_MAX_APS];
 static int                wana_ap_count      = 0;
 static lv_obj_t          *wana_ssid_lbls[WANA_MAX_LABELS];
 static int                wana_lbl_buf_x[WANA_MAX_LABELS];  // label x in buffer coords
@@ -2109,7 +2178,7 @@ typedef struct {
     TaskHandle_t    task;
     uint64_t        tap_expire_us;
 } nrf24_cs_ctx_t;
-EXT_RAM_BSS_ATTR static nrf24_cs_ctx_t *s_ncs = NULL;
+PSRAM_ATTR static nrf24_cs_ctx_t *s_ncs = NULL;
 
 typedef struct {
     volatile bool    active;
@@ -2127,7 +2196,7 @@ typedef struct {
     lv_timer_t      *tmr;
     TaskHandle_t     task;
 } nrf24_sniff_ctx_t;
-EXT_RAM_BSS_ATTR static nrf24_sniff_ctx_t *s_nsniff = NULL;
+PSRAM_ATTR static nrf24_sniff_ctx_t *s_nsniff = NULL;
 
 typedef struct {
     volatile bool    active;
@@ -2141,22 +2210,22 @@ typedef struct {
     TaskHandle_t     task;
     int              scan_ticks;
 } nrf24_futaba_ctx_t;
-EXT_RAM_BSS_ATTR static nrf24_futaba_ctx_t *s_nfut = NULL;
+PSRAM_ATTR static nrf24_futaba_ctx_t *s_nfut = NULL;
 
-EXT_RAM_BSS_ATTR static int       s_n24_page = 0;
-EXT_RAM_BSS_ATTR static lv_obj_t *s_n24_pages[NRF24_NUM_PAGES];
-EXT_RAM_BSS_ATTR static lv_obj_t *s_n24_page_lbl = NULL;
-EXT_RAM_BSS_ATTR static bool           s_n24_jam_active    = false;
-EXT_RAM_BSS_ATTR static nrf24_jam_mode_t s_n24_jam_mode    = NRF24_JAM_TEST;
-EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_jam_status    = NULL;
-EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_mode_btns[10] = {NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL};
-EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_seq_btn        = NULL;
-EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_fhss_btn       = NULL;
-EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_jam_btn        = NULL;
-EXT_RAM_BSS_ATTR static lv_obj_t      *s_n24_stop_btn       = NULL;
-EXT_RAM_BSS_ATTR static bool           s_n24_jam_fhss       = false;
-EXT_RAM_BSS_ATTR static lv_timer_t    *s_n24_jam_tmr        = NULL;
-EXT_RAM_BSS_ATTR static TaskHandle_t   s_n24_jam_task       = NULL;
+PSRAM_ATTR static int       s_n24_page = 0;
+PSRAM_ATTR static lv_obj_t *s_n24_pages[NRF24_NUM_PAGES];
+PSRAM_ATTR static lv_obj_t *s_n24_page_lbl = NULL;
+PSRAM_ATTR static bool           s_n24_jam_active    = false;
+PSRAM_ATTR static nrf24_jam_mode_t s_n24_jam_mode    = NRF24_JAM_TEST;
+PSRAM_ATTR static lv_obj_t      *s_n24_jam_status    = NULL;
+PSRAM_ATTR static lv_obj_t      *s_n24_mode_btns[10] = {NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL};
+PSRAM_ATTR static lv_obj_t      *s_n24_seq_btn        = NULL;
+PSRAM_ATTR static lv_obj_t      *s_n24_fhss_btn       = NULL;
+PSRAM_ATTR static lv_obj_t      *s_n24_jam_btn        = NULL;
+PSRAM_ATTR static lv_obj_t      *s_n24_stop_btn       = NULL;
+PSRAM_ATTR static bool           s_n24_jam_fhss       = false;
+PSRAM_ATTR static lv_timer_t    *s_n24_jam_tmr        = NULL;
+PSRAM_ATTR static TaskHandle_t   s_n24_jam_task       = NULL;
 
 // ── nRF24 Fox Hunt state (declared early — cleanup in show_nrf24_screen) ──────
 static lv_obj_t   *s_n24fox_bar    = NULL;
@@ -2236,7 +2305,7 @@ typedef struct {
     TaskHandle_t     task;
     FILE            *log_fp;
 } cc1101_tpms_ctx_t;
-EXT_RAM_BSS_ATTR static cc1101_tpms_ctx_t *s_tpms = NULL;
+PSRAM_ATTR static cc1101_tpms_ctx_t *s_tpms = NULL;
 
 #if CONFIG_IEEE802154_ENABLED
 // ── Zigbee Scout (passive/active 802.15.4 scanner, built-in ESP32-C5 radio) ──
@@ -2319,11 +2388,11 @@ typedef struct {
     int          sent;
 } zgwd_flood_ctx_t;
 
-EXT_RAM_BSS_ATTR static zgwd_ctx_t       *s_zgwd      = NULL;
-EXT_RAM_BSS_ATTR static zgwd_loc_ctx_t   *s_zgwd_loc  = NULL;
-EXT_RAM_BSS_ATTR static zgwd_flood_ctx_t *s_zgwd_fld  = NULL;
+PSRAM_ATTR static zgwd_ctx_t       *s_zgwd      = NULL;
+PSRAM_ATTR static zgwd_loc_ctx_t   *s_zgwd_loc  = NULL;
+PSRAM_ATTR static zgwd_flood_ctx_t *s_zgwd_fld  = NULL;
 // PAN data saved when navigating to detail/locator/flood, restored on return to scout
-EXT_RAM_BSS_ATTR static zgwd_pan_entry_t  s_zgwd_saved_pans[ZGWD_MAX_PANS];
+PSRAM_ATTR static zgwd_pan_entry_t  s_zgwd_saved_pans[ZGWD_MAX_PANS];
 static int s_zgwd_saved_pan_count   = 0;
 static int s_zgwd_saved_frame_count = 0;
 static QueueHandle_t  s_zgwd_rx_q  = NULL;
@@ -2456,7 +2525,11 @@ static int       lw_acc_nsel      = 0;      // number of files in last accumulat
 static bool      lw_acc_is_union  = false;  // true=Unique, false=Common
 
 // ── BT Observer ─────────────────────────────────────────────────
-#define BTO_MAX_DEVICES 40
+#if defined(CONFIG_BOARD_HAS_PSRAM) && CONFIG_BOARD_HAS_PSRAM
+#  define BTO_MAX_DEVICES 40
+#else
+#  define BTO_MAX_DEVICES 8
+#endif
 
 typedef enum {
     BTO_DEV_QUEUED = 0,
@@ -2487,7 +2560,7 @@ typedef enum {
     BTO_STATE_STOPPED,
 } bto_state_t;
 
-EXT_RAM_BSS_ATTR static bto_device_t bto_devices[BTO_MAX_DEVICES];
+PSRAM_ATTR static bto_device_t bto_devices[BTO_MAX_DEVICES];
 static volatile int     bto_device_count    = 0;
 static volatile int     bto_current_idx     = -1;
 static volatile bto_state_t bto_state       = BTO_STATE_IDLE;
@@ -3848,6 +3921,7 @@ static void check_heap_integrity(const char* location) {
 
 static void init_display(void)
 {
+    // ── Display + touch SPI bus init ────────────────────────────────────────
     spi_bus_config_t buscfg = {
         .mosi_io_num = LCD_MOSI,
         .miso_io_num = LCD_MISO,
@@ -3860,10 +3934,38 @@ static void init_display(void)
     esp_err_t spi_ret = spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO);
     if (spi_ret != ESP_OK) { ESP_LOGE(TAG, "SPI INIT FAILED — halting"); while(1) vTaskDelay(pdMS_TO_TICKS(500)); }
 
+#if defined(CONFIG_BOARD_CYD2USB)
+    // CYD2USB: display uses SPI3_HOST (VSPI). SD card uses a SEPARATE SPI2_HOST (HSPI)
+    // with different pins (18/23/19). Initialize it here so wifi_wardrive_init_sd can
+    // add devices to it. NM-CYD-C5 shares SPI2_HOST between display and SD, so its
+    // bus init above already covers SD. CYD2USB requires this second init.
+    spi_bus_config_t sd_buscfg = {
+        .mosi_io_num = BOARD_SD_MOSI,   // GPIO23
+        .miso_io_num = BOARD_SD_MISO,   // GPIO19
+        .sclk_io_num = BOARD_SD_SCK,    // GPIO18
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4096,
+    };
+    esp_err_t sd_spi_ret = spi_bus_initialize(SPI2_HOST, &sd_buscfg, SPI_DMA_CH_AUTO);
+    if (sd_spi_ret != ESP_OK) {
+        ESP_LOGW(TAG, "SD SPI bus init failed (%s) — SD card unavailable", esp_err_to_name(sd_spi_ret));
+    }
+#endif
+
+    // ── LCD panel I/O and panel driver ──────────────────────────────────────
     esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num = LCD_DC,
         .cs_gpio_num = LCD_CS,
-        .pclk_hz = 80 * 1000 * 1000,   // 80MHz LCD SPI (was 40) — halves the per-flush SPI push time. REQUIRES the draw buffers in INTERNAL SRAM (see app_main): at 80MHz a PSRAM-sourced DMA underruns the SPI FIFO and the display tears. 40MHz is the max with PSRAM buffers.
+#if defined(CONFIG_BOARD_CYD2USB)
+        // ILI9341 write clock max is 40 MHz. NM-CYD-C5 (ST7789) runs at 80 MHz with
+        // internal SRAM draw buffers; ILI9341 requires slower timing.
+        .pclk_hz = 40 * 1000 * 1000,
+#else
+        // 80 MHz for ST7789. REQUIRES internal SRAM draw buffers — see app_main. At
+        // 80 MHz, PSRAM-sourced DMA underruns the SPI FIFO causing full-screen tearing.
+        .pclk_hz = 80 * 1000 * 1000,
+#endif
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
         .spi_mode = 0,
@@ -3878,10 +3980,18 @@ static void init_display(void)
         .bits_per_pixel = 16,
     };
 
+#if defined(CONFIG_BOARD_CYD2USB)
+    ESP_ERROR_CHECK(esp_lcd_new_panel_ili9341(lcd_io_handle, &panel_config, &panel_handle));
+#else
     ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(lcd_io_handle, &panel_config, &panel_handle));
+#endif
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
+#if defined(CONFIG_BOARD_LCD_INVERT_COLOR)
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
+#else
     ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, false));
+#endif
 }
 
 // ============================================================================
@@ -22602,12 +22712,20 @@ static void show_new_folder_screen(void)
 
 // ─── Delete File browser ──────────────────────────────────────────────────────
 
+#if CONFIG_BOARD_HAS_PSRAM
 #define DELBR_MAX_DIRS 32
+#else
+#define DELBR_MAX_DIRS  8
+#endif
 
 static char      s_delbr_cwd[300];
 static lv_obj_t *s_delbr_list     = NULL;
 static lv_obj_t *s_delbr_path_lbl = NULL;
-EXT_RAM_BSS_ATTR static char s_delbr_dirs[DELBR_MAX_DIRS][256];
+#if defined(CONFIG_BOARD_HAS_PSRAM) && CONFIG_BOARD_HAS_PSRAM
+PSRAM_ATTR static char s_delbr_dirs[DELBR_MAX_DIRS][256];
+#else
+static char s_delbr_dirs[DELBR_MAX_DIRS][128];  // reduced path width for DRAM budget
+#endif
 static int       s_delbr_dir_count = 0;
 static char      s_delbr_del_target[300];
 
@@ -25496,12 +25614,20 @@ static void show_sd_free_space_screen(void)
 // ─── Interactive SD file browser ─────────────────────────────────────────────
 
 #define SD_TREE_ROOT     "/sdcard"
+#if CONFIG_BOARD_HAS_PSRAM
 #define SD_TREE_MAX_DIRS 64
+#else
+#define SD_TREE_MAX_DIRS 16
+#endif
 
 static char      s_sd_tree_cwd[300];
 static lv_obj_t *s_sd_tree_list  = NULL;
 static lv_obj_t *s_sd_path_lbl   = NULL;
-EXT_RAM_BSS_ATTR static char s_sd_dir_paths[SD_TREE_MAX_DIRS][256];
+#if defined(CONFIG_BOARD_HAS_PSRAM) && CONFIG_BOARD_HAS_PSRAM
+PSRAM_ATTR static char s_sd_dir_paths[SD_TREE_MAX_DIRS][256];
+#else
+static char s_sd_dir_paths[SD_TREE_MAX_DIRS][128];  // reduced path width for DRAM budget
+#endif
 static int       s_sd_dir_count  = 0;
 
 static void sd_tree_populate(const char *path);
@@ -32163,8 +32289,12 @@ static void gw_clone_btn_cb(lv_event_t *e)
 }
 
 /* ── Saved Clones browser ── */
-#define CLONE_LIST_MAX 30
-static EXT_RAM_BSS_ATTR char s_clone_files[CLONE_LIST_MAX][80];
+#if defined(CONFIG_BOARD_HAS_PSRAM) && CONFIG_BOARD_HAS_PSRAM
+#  define CLONE_LIST_MAX 30
+#else
+#  define CLONE_LIST_MAX 8
+#endif
+static PSRAM_ATTR char s_clone_files[CLONE_LIST_MAX][80];
 static int  s_clone_count = 0;
 static lv_obj_t *clone_browser_list = NULL;
 static lv_obj_t *clone_browser_status = NULL;
@@ -42910,7 +43040,7 @@ static lv_obj_t   *s_led_status_lbl = NULL;
 static lv_obj_t   *s_led_grid_cont  = NULL;  /* container for the 7×4 button grid; cleaned on lib switch */
 static lv_obj_t   *s_led_lib_lbl    = NULL;  /* label inside the library toggle button */
 static int         s_led_rmt_lib    = 0;     /* 0 = custom 28-key  1 = standard 44-key */
-EXT_RAM_BSS_ATTR static ir_signal_t s_led_nec_sig;            /* reused per button press, avoids 4 KB stack alloc */
+PSRAM_ATTR static ir_signal_t s_led_nec_sig;            /* reused per button press, avoids 4 KB stack alloc */
 
 /* Encode one standard NEC frame: 9ms leader, 4.5ms gap, 32 data bits (LSB first),
  * stop bit.  addr and cmd are 8-bit; the protocol appends their bit-complements. */
@@ -42998,8 +43128,8 @@ static void s_ir_edit_show_remotes(void);
 static void s_ir_edit_show_signals(void);
 
 /* Persistent arrays keep callback user-data pointers valid after the list is built. */
-EXT_RAM_BSS_ATTR static char      s_ir_edit_remote_names[IR_HAT_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
-EXT_RAM_BSS_ATTR static char      s_ir_edit_sig_names[IR_HAT_MAX_SIGNALS][IR_HAT_NAME_LEN];
+PSRAM_ATTR static char      s_ir_edit_remote_names[IR_HAT_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
+PSRAM_ATTR static char      s_ir_edit_sig_names[IR_HAT_MAX_SIGNALS][IR_HAT_NAME_LEN];
 
 static char      s_ir_edit_remote[IR_HAT_REMOTE_NAME_LEN];
 static int       s_ir_edit_sig_idx          = -1;
@@ -43659,7 +43789,7 @@ static void show_ir_menu_screen(void)
 
 // ── IR Capture ────────────────────────────────────────────────────────────────
 
-EXT_RAM_BSS_ATTR static ir_signal_t           s_last_ir_signal;
+PSRAM_ATTR static ir_signal_t           s_last_ir_signal;
 static lv_obj_t             *s_ir_cap_status_lbl = NULL;
 static lv_obj_t             *s_ir_cap_save_btn   = NULL;
 static volatile ir_hat_err_t s_ir_cap_result      = IR_HAT_ERR_TIMEOUT;
@@ -43667,7 +43797,7 @@ static lv_obj_t             *s_ir_save_popup      = NULL;
 static uint32_t              s_ir_cap_signal_idx  = 0;  // auto-name counter
 
 // Remote names for save picker
-EXT_RAM_BSS_ATTR static char s_ir_cap_remotes[IR_HAT_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
+PSRAM_ATTR static char s_ir_cap_remotes[IR_HAT_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
 static int  s_ir_cap_remote_count = 0;
 
 // Keyboard naming overlay state (multi-step: remote name → signal name → save)
@@ -44043,7 +44173,7 @@ static void show_ir_capture_screen(void)
 
 // ── IR Replay — Level 1: remote file browser ──────────────────────────────────
 
-EXT_RAM_BSS_ATTR static char s_ir_remote_names[IR_HAT_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
+PSRAM_ATTR static char s_ir_remote_names[IR_HAT_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
 static int  s_ir_remote_count = 0;
 static char s_ir_cur_remote[IR_HAT_REMOTE_NAME_LEN];
 
@@ -44091,11 +44221,11 @@ static void show_ir_replay_screen(void)
 
 // ── IR Replay — Level 2: signal list within a remote ─────────────────────────
 
-EXT_RAM_BSS_ATTR static char     s_ir_signal_names[IR_HAT_MAX_SIGNALS][IR_HAT_NAME_LEN];
+PSRAM_ATTR static char     s_ir_signal_names[IR_HAT_MAX_SIGNALS][IR_HAT_NAME_LEN];
 static int      s_ir_signal_count = 0;
 static int      s_ir_sel_signal   = -1;
 static lv_obj_t *s_ir_sig_status  = NULL;
-EXT_RAM_BSS_ATTR static ir_signal_t s_ir_replay_sig;  // static to avoid 4 KB stack frame
+PSRAM_ATTR static ir_signal_t s_ir_replay_sig;  // static to avoid 4 KB stack frame
 
 static void ir_signal_row_cb(lv_event_t *e)
 {
@@ -44411,7 +44541,7 @@ static lv_obj_t *s_ur_brand_lbl    = NULL;
 static lv_obj_t *s_ur_status_lbl   = NULL;
 static lv_obj_t *s_ur_search_popup = NULL;
 
-EXT_RAM_BSS_ATTR static char  s_ur_search_remotes[IR_HAT_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
+PSRAM_ATTR static char  s_ur_search_remotes[IR_HAT_MAX_REMOTES][IR_HAT_REMOTE_NAME_LEN];
 static int   s_ur_search_count = 0;
 static int   s_ur_search_idx   = 0;
 static lv_obj_t *s_ur_search_info_lbl  = NULL;
@@ -44448,7 +44578,7 @@ static void ur_refresh_brand_ui(void)
 
 static ir_hat_err_t ur_try_signal(const char *remote, const char *sig_name)
 {
-    EXT_RAM_BSS_ATTR static ir_signal_t s_ur_sig;
+    PSRAM_ATTR static ir_signal_t s_ur_sig;
     ir_hat_claim();
     ir_hat_err_t r = ir_hat_load_signal(remote, sig_name, &s_ur_sig);
     if (r == IR_HAT_OK) ir_hat_replay(&s_ur_sig);
@@ -45195,7 +45325,7 @@ typedef struct {
     char             csv_path[80];
 } zwave_ctx_t;
 
-EXT_RAM_BSS_ATTR static zwave_ctx_t *s_zwave = NULL;
+PSRAM_ATTR static zwave_ctx_t *s_zwave = NULL;
 
 // ── Helper: generic "coming soon" sub-screen ──────────────────────────────────
 
@@ -47120,13 +47250,17 @@ static void ook_age_str(int64_t last_us, char *buf, size_t sz)
 // ── RF433 OOK raw capture (GPIO9, R4A_433 demodulated output) ─────────────────
 // ISR shared with Fox Hunt but installed/removed per session — not concurrent.
 static volatile bool     s_rf433_ook_cap_active = false;
+#if defined(CONFIG_BOARD_HAS_PSRAM) && CONFIG_BOARD_HAS_PSRAM
 static volatile int32_t  s_rf433_ook_buf[2048];
+#else
+static volatile int32_t  s_rf433_ook_buf[256];  // reduced for DRAM budget (8 KB → 1 KB)
+#endif
 static volatile int      s_rf433_ook_wr   = 0;
 static volatile int64_t  s_rf433_ook_last = 0;
 
 IRAM_ATTR static void s_rf433_ook_cap_isr(void *arg)
 {
-    if (!s_rf433_ook_cap_active || s_rf433_ook_wr >= 2047) return;
+    if (!s_rf433_ook_cap_active || s_rf433_ook_wr >= (int)(sizeof(s_rf433_ook_buf)/sizeof(s_rf433_ook_buf[0])) - 1) return;
     int64_t now = esp_timer_get_time();
     if (s_rf433_ook_last == 0) { s_rf433_ook_last = now; return; }
     int64_t dt = now - s_rf433_ook_last;
@@ -49682,8 +49816,8 @@ static void show_nrf24_sniffer_screen(void)
 // ── Saved Files ───────────────────────────────────────────────────────────────
 
 typedef struct { char path[NRF24_SUB_PATH_LEN]; } nrf24_saved_path_t;
-EXT_RAM_BSS_ATTR static nrf24_saved_path_t *s_n24_saved_paths = NULL;
-EXT_RAM_BSS_ATTR static int                 s_n24_saved_count  = 0;
+PSRAM_ATTR static nrf24_saved_path_t *s_n24_saved_paths = NULL;
+PSRAM_ATTR static int                 s_n24_saved_count  = 0;
 
 static void show_nrf24_file_detail_screen(const char *path);  // forward decl
 
@@ -54047,7 +54181,11 @@ static void s_rf433_scan_lvgl_cb(void *arg)
 static void s_rf433_scan_task_fn(void *arg)
 {
     (void)arg;
+#if defined(CONFIG_BOARD_HAS_PSRAM) && CONFIG_BOARD_HAS_PSRAM
     static int32_t buf[2048];
+#else
+    static int32_t buf[256];  // reduced for DRAM budget; enough for short OOK packets
+#endif
     while (!s_rf433_scan_stop) {
         int count = 0;
         rf433_ook_capture(buf, &count, 700);
@@ -54928,10 +55066,14 @@ static void show_rfid_hw_test_screen(void)
 
 // ── Saved Cards ───────────────────────────────────────────────────────────────
 
-#define RFID_MAX_LIST_DISPLAY  20
+#if defined(CONFIG_BOARD_HAS_PSRAM) && CONFIG_BOARD_HAS_PSRAM
+#  define RFID_MAX_LIST_DISPLAY  20
+#else
+#  define RFID_MAX_LIST_DISPLAY  4
+#endif
 #define RFID_MAX_IMPORT_FILES  10
 
-EXT_RAM_BSS_ATTR static rfid_card_entry_t s_rfid_entries[RFID_MAX_LIST_DISPLAY];
+PSRAM_ATTR static rfid_card_entry_t s_rfid_entries[RFID_MAX_LIST_DISPLAY];
 static int               s_rfid_entry_count = 0;
 static char s_nfc_import_paths[RFID_MAX_IMPORT_FILES][RFID_FILENAME_LEN];
 static int  s_nfc_import_count = 0;
@@ -55843,7 +55985,7 @@ static volatile rf433_hat_err_t     s_rf433_cap_result   = RF433_HAT_ERR_TIMEOUT
 static lv_obj_t                    *s_rf433_save_popup   = NULL;
 static uint32_t                     s_rf433_cap_sig_idx  = 0;  // auto-name counter
 
-EXT_RAM_BSS_ATTR static char s_rf433_cap_remotes[RF433_HAT_MAX_REMOTES][RF433_HAT_REMOTE_NAME_LEN];
+PSRAM_ATTR static char s_rf433_cap_remotes[RF433_HAT_MAX_REMOTES][RF433_HAT_REMOTE_NAME_LEN];
 static int  s_rf433_cap_remote_count = 0;
 
 static void s_rf433_ui_update(void *arg)
@@ -56059,7 +56201,7 @@ static void show_rf433_capture_screen(void)
 
 // ── RF433 Replay — Level 1: remote (directory) list ──────────────────────────
 
-EXT_RAM_BSS_ATTR static char s_rf433_remote_names[RF433_HAT_MAX_REMOTES][RF433_HAT_REMOTE_NAME_LEN];
+PSRAM_ATTR static char s_rf433_remote_names[RF433_HAT_MAX_REMOTES][RF433_HAT_REMOTE_NAME_LEN];
 static int  s_rf433_remote_count = 0;
 static char s_rf433_cur_remote[RF433_HAT_REMOTE_NAME_LEN];
 
@@ -56109,11 +56251,11 @@ static void show_rf433_replay_screen(void)
 
 // ── RF433 Replay — Level 2: signal list inside a remote ──────────────────────
 
-EXT_RAM_BSS_ATTR static char     s_rf433_signal_names[RF433_HAT_MAX_SIGNALS][RF433_HAT_NAME_LEN];
+PSRAM_ATTR static char     s_rf433_signal_names[RF433_HAT_MAX_SIGNALS][RF433_HAT_NAME_LEN];
 static int      s_rf433_signal_count = 0;
 static int      s_rf433_sel_signal   = -1;
 static lv_obj_t *s_rf433_sig_status  = NULL;
-EXT_RAM_BSS_ATTR static rf433_signal_t s_rf433_replay_sig;  // static — avoids large stack frame
+PSRAM_ATTR static rf433_signal_t s_rf433_replay_sig;  // static — avoids large stack frame
 
 static void rf433_signal_row_cb(lv_event_t *e)
 {

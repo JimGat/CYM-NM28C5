@@ -29,6 +29,14 @@
 
 #include "chameleon_ble.h"
 #include "esp_attr.h"
+#include "sdkconfig.h"
+
+// PSRAM_ATTR: place in external RAM when available; no-op on no-PSRAM boards
+#if CONFIG_BOARD_HAS_PSRAM
+#  define PSRAM_ATTR EXT_RAM_BSS_ATTR
+#else
+#  define PSRAM_ATTR
+#endif
 #include <string.h>
 #include <stdio.h>
 #include <inttypes.h>
@@ -65,14 +73,21 @@ static const ble_uuid128_t s_nus_rx_uuid = BLE_UUID128_INIT(
 /* ── Frame codec constants ───────────────────────────────────────────────── */
 #define CHAM_SOF         0x11U
 #define CHAM_LRC1        0xEFU   /* lrc([0x11]) = (0x100 - 0x11) & 0xFF */
-#define CHAM_MAX_PAYLOAD 4096
+#if defined(CONFIG_BOARD_HAS_PSRAM) && CONFIG_BOARD_HAS_PSRAM
+#  define CHAM_MAX_PAYLOAD 4096
+#  define CHAM_RX_RING_SIZE 4200  /* > CHAM_MAX_FRAME for headroom */
+#else
+// No-PSRAM build: buffers land in DRAM BSS — cap at 512-byte payload.
+// Chameleon commands for NFC emulation and standalone card ops are ≤512 bytes.
+#  define CHAM_MAX_PAYLOAD 512
+#  define CHAM_RX_RING_SIZE 600   /* > CHAM_MAX_FRAME (521+9+1=531) for headroom */
+#endif
 #define CHAM_MAX_FRAME   (9 + CHAM_MAX_PAYLOAD + 1)
 #define CHAM_CMD_TIMEOUT_US (3000000LL)  /* 3 s per command */
 
 /* ── RX ring buffer ──────────────────────────────────────────────────────── */
-#define CHAM_RX_RING_SIZE 4200   /* > CHAM_MAX_FRAME for headroom */
 
-EXT_RAM_BSS_ATTR static uint8_t  s_rx_ring[CHAM_RX_RING_SIZE];
+PSRAM_ATTR static uint8_t  s_rx_ring[CHAM_RX_RING_SIZE];
 static volatile int s_rx_wr = 0;  /* NimBLE task writes */
 static          int s_rx_rd = 0;  /* poll (main task) reads */
 
@@ -86,7 +101,7 @@ typedef struct {
     bool     hdr_done;  /* set after pos==8 LRC check passes */
 } cham_rxs_t;
 
-EXT_RAM_BSS_ATTR static cham_rxs_t s_rxs;
+PSRAM_ATTR static cham_rxs_t s_rxs;
 
 /* ── Global state ────────────────────────────────────────────────────────── */
 static cham_state_t s_state = CHAM_STATE_DISCONNECTED;

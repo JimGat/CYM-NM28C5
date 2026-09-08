@@ -30,6 +30,7 @@ idf_component_register(
         "${C5_MAIN}"
     REQUIRES
         heap driver esp_event console bt esp_adc esp-tls esp_http_server esp_wifi board_hal
+        espressif__esp_lcd_ili9341
     PRIV_REQUIRES
         wifi_attacks wifi_cli wifi_scanner wifi_sniffer wifi_wardrive sniffer
         frame_analyzer hccapx_serializer pcap_serializer esp_driver_ledc

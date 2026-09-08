@@ -23,11 +23,21 @@
 #include <stdbool.h>
 
 // ── Limits ───────────────────────────────────────────────────────────────────
-#define RF433_HAT_MAX_PULSES       512   // max pulse entries per signal
+// On no-PSRAM builds, name arrays land in DRAM BSS — reduce to fit budget.
+#if defined(CONFIG_BOARD_HAS_PSRAM) && CONFIG_BOARD_HAS_PSRAM
+#  define RF433_HAT_MAX_PULSES     512   // max pulse entries per signal
+#else
+#  define RF433_HAT_MAX_PULSES     64    // reduced for DRAM budget (2 KB → 296 bytes per replay signal)
+#endif
+#if defined(CONFIG_BOARD_HAS_PSRAM) && CONFIG_BOARD_HAS_PSRAM
+#  define RF433_HAT_MAX_REMOTES    32    // max remote dirs listed at once
+#  define RF433_HAT_MAX_SIGNALS    64    // max signals listed per remote dir
+#else
+#  define RF433_HAT_MAX_REMOTES    4     // reduced for DRAM budget
+#  define RF433_HAT_MAX_SIGNALS    8     // reduced: name arrays from 2 KB → 256 bytes
+#endif
 #define RF433_HAT_NAME_LEN         32    // signal name max length (incl. null)
 #define RF433_HAT_REMOTE_NAME_LEN  48    // remote dir basename max length
-#define RF433_HAT_MAX_REMOTES      32    // max remote dirs listed at once
-#define RF433_HAT_MAX_SIGNALS      64    // max signals listed per remote dir
 #define RF433_HAT_SAVE_EXT         ".sub"
 
 // Default 433.92 MHz — the OOK module is fixed-frequency.

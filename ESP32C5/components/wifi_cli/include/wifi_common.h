@@ -17,9 +17,14 @@ extern "C" {
 #define FW_VERSION "unknown"
 #endif
 
-// Maximum limits
-#define MAX_AP_CNT 128
+// Maximum limits — reduced on no-PSRAM boards to fit in internal DRAM
+#if defined(CONFIG_BOARD_HAS_PSRAM)
+#define MAX_AP_CNT       128
 #define MAX_SCAN_RESULTS 128
+#else
+#define MAX_AP_CNT        16
+#define MAX_SCAN_RESULTS  16
+#endif
 #define MAX_PROBES 200
 #define MAX_CLIENTS_PER_AP 50
 #define MAX_TARGET_BSSIDS 50
@@ -42,11 +47,20 @@ extern "C" {
 #define GPS_RX_PIN 4
 #define GPS_BUF_SIZE 1024
 
-// SD Card SPI pins — NM-CYD-C5 (shares SPI2_HOST with display + touch)
+// SD Card SPI pins — board-variant (CYD2USB uses separate HSPI bus for SD)
+#include "sdkconfig.h"
+#if defined(CONFIG_BOARD_CYD2USB)
+#define SD_MISO_PIN 19   // BOARD_SD_MISO
+#define SD_MOSI_PIN 23   // BOARD_SD_MOSI
+#define SD_CLK_PIN  18   // BOARD_SD_SCK
+#define SD_CS_PIN    5   // BOARD_SD_CS
+#else
+// NM-CYD-C5: shares SPI2_HOST with display + touch
 #define SD_MISO_PIN 2
 #define SD_MOSI_PIN 7
 #define SD_CLK_PIN  6
 #define SD_CS_PIN   10
+#endif
 
 // Application states
 typedef enum {

@@ -20,16 +20,9 @@
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
 
-# PSRAM — enabled to place large BSS arrays in external RAM (mirrors C5 SPIRAM_ALLOW_BSS_SEG pattern).
-# If your board has an ESP32-WROVER module (4 MB PSRAM), this will work.
-# If your board has ESP32-WROOM-32 (no PSRAM), it will panic at boot in psram_enable.
-# Disable and report if it crashes, and we will reduce static array sizes instead.
-CONFIG_SPIRAM=y
-CONFIG_SPIRAM_MODE_QUAD=y
-CONFIG_SPIRAM_SPEED_40M=y
-CONFIG_SPIRAM_USE_MALLOC=y
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
-CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+# PSRAM — CYD2USB (ESP32-WROOM-32) has no PSRAM.
+# Large static arrays are size-reduced via CONFIG_BOARD_HAS_PSRAM=n guards in main.c.
+# If using a WROVER variant (4 MB PSRAM), add CONFIG_SPIRAM=y here.
 
 # Main task stack — smaller than C5 due to no PSRAM
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
@@ -38,3 +31,10 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 
 CONFIG_BOARD_CYD2USB=y
+
+# Disable WiFi IRAM speed optimizations to free ~10-17 KB IRAM each.
+# Saves >10 KB (IRAM_OPT) + >17 KB (RX_IRAM_OPT) at the cost of reduced WiFi throughput.
+# Required on CYD2USB (no PSRAM, tight IRAM budget). Acceptable: CYD is a local-range
+# toolkit, not a high-throughput device.
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n

@@ -132,6 +132,14 @@ menu "CYM Board Selection"
 
     # ── Touch driver selection ─────────────────────────────────────────────────
 
+    config BOARD_HAS_RF_HAT
+        bool
+        default y if BOARD_NM_CYD_C5
+        help
+            NM-RF-HAT expansion board attached via FPC2. Enables CC1101, nRF24L01+,
+            PN532 NFC, IR, and 433 MHz OOK RF modules. Not available on CYD2USB or
+            Waveshare boards (no FPC connector).
+
     config BOARD_TOUCH_XPT2046
         bool
         default y if BOARD_NM_CYD_C5 || BOARD_CYD2USB

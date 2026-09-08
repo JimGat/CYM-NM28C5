@@ -176,12 +176,15 @@ static TaskHandle_t  s_emu_task = NULL;
 static volatile bool s_emu_stop = false;
 static rfid_emu_cb_t s_emu_cb   = NULL;
 static void         *s_emu_ctx  = NULL;
-static rfid_card_t   s_emu_card;
+// Heap-allocated to avoid 5 KB static BSS: only allocated when emulate starts.
+// On PSRAM builds the malloc goes to PSRAM (CONFIG_SPIRAM_USE_MALLOC=y).
+// On no-PSRAM builds this is never called (no PN532 hardware present).
+static rfid_card_t  *s_emu_card = NULL;
 
 static void s_emu_task_fn(void *arg)
 {
     (void)arg;
-    pn532_emulate_card(&s_emu_card, s_emu_cb, s_emu_ctx, &s_emu_stop);
+    pn532_emulate_card(s_emu_card, s_emu_cb, s_emu_ctx, &s_emu_stop);
     s_emu_task = NULL;
     vTaskDelete(NULL);
 }
@@ -192,7 +195,11 @@ rfid_err_t rfid_manager_start_emulate(const rfid_card_t *card,
     if (!s_mgr_init) return RFID_ERR_NOT_INIT;
     if (!card) return RFID_ERR_HW;
     rfid_manager_stop_emulate();
-    memcpy(&s_emu_card, card, sizeof(rfid_card_t));
+    if (!s_emu_card) {
+        s_emu_card = malloc(sizeof(rfid_card_t));
+        if (!s_emu_card) return RFID_ERR_HW;
+    }
+    memcpy(s_emu_card, card, sizeof(rfid_card_t));
     s_emu_cb   = cb;
     s_emu_ctx  = ctx;
     s_emu_stop = false;
