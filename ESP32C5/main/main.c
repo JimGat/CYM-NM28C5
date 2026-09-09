@@ -5447,45 +5447,47 @@ static esp_err_t sd_cache_init(void) {
         return ESP_OK;
     }
     
-    // Allocate main structure in PSRAM
-    sd_cache = (sd_cache_t *)heap_caps_calloc(1, sizeof(sd_cache_t), MALLOC_CAP_SPIRAM);
+    // Allocate main structure — prefer PSRAM on boards that have it; fall back to
+    // default heap (internal SRAM) on boards without PSRAM (e.g. CYD-2432S028).
+    // These are small pointer arrays (~1-2 KB total) so internal SRAM is fine.
+    sd_cache = (sd_cache_t *)calloc(1, sizeof(sd_cache_t));
     if (sd_cache == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate SD cache structure in PSRAM");
+        ESP_LOGE(TAG, "Failed to allocate SD cache structure");
         return ESP_ERR_NO_MEM;
     }
-    
+
     // Allocate eviltwin entries array
     sd_cache->eviltwin_capacity = SD_CACHE_INITIAL_CAPACITY;
-    sd_cache->eviltwin_entries = (char **)heap_caps_calloc(sd_cache->eviltwin_capacity, sizeof(char *), MALLOC_CAP_SPIRAM);
+    sd_cache->eviltwin_entries = (char **)calloc(sd_cache->eviltwin_capacity, sizeof(char *));
     if (sd_cache->eviltwin_entries == NULL) {
         ESP_LOGE(TAG, "Failed to allocate eviltwin entries array");
         return ESP_ERR_NO_MEM;
     }
-    
+
     // Allocate portals entries array
     sd_cache->portals_capacity = SD_CACHE_INITIAL_CAPACITY;
-    sd_cache->portals_entries = (char **)heap_caps_calloc(sd_cache->portals_capacity, sizeof(char *), MALLOC_CAP_SPIRAM);
+    sd_cache->portals_entries = (char **)calloc(sd_cache->portals_capacity, sizeof(char *));
     if (sd_cache->portals_entries == NULL) {
         ESP_LOGE(TAG, "Failed to allocate portals entries array");
         return ESP_ERR_NO_MEM;
     }
-    
+
     // Allocate HTML filenames array
-    sd_cache->html_filenames = (char **)heap_caps_calloc(SD_CACHE_MAX_HTML_FILES, sizeof(char *), MALLOC_CAP_SPIRAM);
+    sd_cache->html_filenames = (char **)calloc(SD_CACHE_MAX_HTML_FILES, sizeof(char *));
     if (sd_cache->html_filenames == NULL) {
         ESP_LOGE(TAG, "Failed to allocate HTML filenames array");
         return ESP_ERR_NO_MEM;
     }
-    
+
     // Allocate handshake names array
-    sd_cache->handshake_names = (char **)heap_caps_calloc(SD_CACHE_MAX_HANDSHAKES, sizeof(char *), MALLOC_CAP_SPIRAM);
+    sd_cache->handshake_names = (char **)calloc(SD_CACHE_MAX_HANDSHAKES, sizeof(char *));
     if (sd_cache->handshake_names == NULL) {
         ESP_LOGE(TAG, "Failed to allocate handshake names array");
         return ESP_ERR_NO_MEM;
     }
-    
+
     sd_cache->loaded = false;
-    ESP_LOGI(TAG, "SD cache initialized in PSRAM");
+    ESP_LOGI(TAG, "SD cache initialized");
     return ESP_OK;
 }
 
@@ -6387,7 +6389,11 @@ void app_main(void)
         return;
     }
 
+    // Try PSRAM first; fall back to internal RAM on no-PSRAM boards (e.g. CYD-2432S028)
     screenshot_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
+    if (screenshot_task_stack == NULL) {
+        screenshot_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_INTERNAL);
+    }
     if (screenshot_task_stack != NULL) {
         screenshot_task_handle = xTaskCreateStatic(
             screenshot_save_task,
@@ -6401,11 +6407,11 @@ void app_main(void)
             ESP_LOGE(TAG, "Failed to create screenshot save task");
             heap_caps_free(screenshot_task_stack);
             screenshot_task_stack = NULL;
-            return;
+            // Non-critical — continue without screenshot support
         }
     } else {
-        ESP_LOGE(TAG, "Failed to allocate screenshot task stack");
-        return;
+        ESP_LOGW(TAG, "Failed to allocate screenshot task stack — screenshots disabled");
+        // Non-critical — continue without screenshot support
     }
 
     // 15 lines per buffer — works for both 16-bit (7200 B) and 32-bit (14400 B) color depth.
