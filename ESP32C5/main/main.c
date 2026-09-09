@@ -6389,10 +6389,12 @@ void app_main(void)
         return;
     }
 
-    // Try PSRAM first; fall back to internal RAM on no-PSRAM boards (e.g. CYD-2432S028)
+    // Try PSRAM first; fall back to internal DRAM on no-PSRAM boards (e.g. CYD-2432S028).
+    // MALLOC_CAP_8BIT is mandatory: MALLOC_CAP_INTERNAL alone can return IRAM (0x40000000+),
+    // which xPortcheckValidStackMem rejects — FreeRTOS requires task stacks to be in DRAM.
     screenshot_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_SPIRAM);
     if (screenshot_task_stack == NULL) {
-        screenshot_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_INTERNAL);
+        screenshot_task_stack = (StackType_t *)heap_caps_malloc(4096 * sizeof(StackType_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     }
     if (screenshot_task_stack != NULL) {
         screenshot_task_handle = xTaskCreateStatic(
