@@ -6020,7 +6020,7 @@ static void show_splash_screen(void)
     lv_obj_align(version_label, LV_ALIGN_CENTER, 0, 64);
 
 #if defined(CONFIG_BOARD_CYD2USB)
-    /* Permanent reduced-functionality notice on Classic CYD (no PSRAM, no RF-HAT, 2.4 GHz only) */
+    /* Permanent reduced-functionality notice on Classic CYD (no PSRAM, 2.4 GHz only, no vibrator) */
     lv_obj_t *board_notice = lv_label_create(splash_screen);
     lv_label_set_text(board_notice, "Classic CYD - reduced functionality");
     lv_obj_set_style_text_font(board_notice, &lv_font_montserrat_12, 0);

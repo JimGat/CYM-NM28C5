@@ -58,9 +58,12 @@
 // (IO22) and GPIO9 (IO27) on NM-CYD-C5 — the two control lines shared by all
 // five RF-HAT modules (CC1101, nRF24, PN532, IR, RF433). These route from
 // FPC2 pins 7 and 9 through the shim to free GPIOs on the Classic CYD.
-// *** GPIO ASSIGNMENTS PENDING CONFIRMATION FROM HALEHOUND SCHEMATIC ***
-#define BOARD_RFHAT_PIN_A       -1    // TODO: confirm from Halehound shim wiring
-#define BOARD_RFHAT_PIN_B       -1    // TODO: confirm from Halehound shim wiring
+//
+// Confirmed from Halehound SD Card Shim wiring:
+//   IO8  → GPIO22 = PIN_A  (GDO0, CE, SCL, IR_TX, 433_TX)
+//   IO9  → GPIO27 = PIN_B  (CC1101_CS, NRF24_CSN, SDA, IR_RX, 433_RX)
+#define BOARD_RFHAT_PIN_A       22    // GPIO22 — FPC2 Pin 7 via SD Card Shim
+#define BOARD_RFHAT_PIN_B       27    // GPIO27 — FPC2 Pin 9 via SD Card Shim
 
 // ── Not present on CYD2USB ───────────────────────────────────────────────────
 #define BOARD_VIBRATOR_GPIO     -1

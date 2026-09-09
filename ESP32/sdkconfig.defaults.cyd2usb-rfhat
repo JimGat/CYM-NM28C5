@@ -1,0 +1,22 @@
+# CYD2USB + NM-RF-HAT via SD Card Shim — sdkconfig overrides
+# Layered on top of sdkconfig.defaults + sdkconfig.defaults.cyd2usb.
+#
+# Build target: CYM-CYD2USB-RFHAT (Halehound and similar configurations)
+#
+# Hardware configuration:
+#   - ESP32-2432S028R (Classic CYD) with SD Card Shim installed
+#   - SD Card Shim routes HSPI SPI bus (GPIO18/23/19/5) to NM-RF-HAT FPC2 connector
+#   - SD card relocated to NM-RF-HAT onboard socket (always accessible)
+#   - PIN_A = GPIO22, PIN_B = GPIO27 (confirmed from Halehound schematic)
+#
+# All five NM-RF-HAT modules are available with this build:
+#   CC1101 (Sub-GHz), nRF24L01+ (2.4 GHz ISM), PN532 (NFC/RFID), IR, RF433 OOK
+#
+# Build command (from ESP32/ directory):
+#   idf.py -B build_cyd2usb-rfhat \
+#     -DSDKCONFIG=build_cyd2usb-rfhat/sdkconfig \
+#     "-DSDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.cyd2usb;sdkconfig.defaults.cyd2usb-rfhat" \
+#     build
+
+# Enable the NM-RF-HAT expansion board
+CONFIG_BOARD_HAS_RF_HAT=y
