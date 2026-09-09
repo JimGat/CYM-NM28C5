@@ -50,10 +50,17 @@ extern "C" {
 // SD Card SPI pins — board-variant (CYD2USB uses separate HSPI bus for SD)
 #include "sdkconfig.h"
 #if defined(CONFIG_BOARD_CYD2USB)
+// CYD2USB: SD card is on a separate HSPI bus
 #define SD_MISO_PIN 19   // BOARD_SD_MISO
 #define SD_MOSI_PIN 23   // BOARD_SD_MOSI
 #define SD_CLK_PIN  18   // BOARD_SD_SCK
 #define SD_CS_PIN    5   // BOARD_SD_CS
+#elif defined(CONFIG_BOARD_WS_C5_28)
+// WS-C5-28: SD shares SPI2_HOST with LCD; CS is GPIO23 (swapped vs NM-CYD-C5)
+#define SD_MISO_PIN  8   // BOARD_SPI_MISO
+#define SD_MOSI_PIN  7   // BOARD_SPI_MOSI
+#define SD_CLK_PIN   6   // BOARD_SPI_SCK
+#define SD_CS_PIN   23   // BOARD_SD_CS (NOTE: swapped — NM-CYD-C5 uses GPIO10)
 #else
 // NM-CYD-C5: shares SPI2_HOST with display + touch
 #define SD_MISO_PIN 2

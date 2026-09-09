@@ -87,7 +87,14 @@ LV_IMG_DECLARE(deedee_img);
 #if defined(CONFIG_BOARD_CYD2USB)
 #include "esp_lcd_ili9341.h"
 #endif
+#if defined(CONFIG_BOARD_TOUCH_XPT2046)
 #include "xpt2046.h"
+#endif
+#if defined(CONFIG_BOARD_WS_C5_28)
+#include "esp_lcd_touch_cst3530.h"
+#include "custom_io_expander_ch32v003.h"
+#include "driver/i2c_master.h"
+#endif
 #include "board_hal.h"
 
 // PSRAM_ATTR: place static symbol in external RAM when PSRAM is present.
@@ -501,6 +508,27 @@ static void (*s_ble_disc_return_fn)(void) = NULL;
 #define LCD_V_RES       BOARD_LCD_HEIGHT     // 320
 #define LCD_HOST        BOARD_SPI_HOST       // SPI3_HOST (VSPI)
 
+#elif defined(CONFIG_BOARD_WS_C5_28)
+// WS-C5-28 (Waveshare ESP32-C5-Touch-LCD-2.8)
+// ST7789 + SD share SPI2_HOST. CST3530 touch is I2C on GPIO0/GPIO1.
+// CRITICAL: LCD CS=GPIO10, SD CS=GPIO23 — SWAPPED vs NM-CYD-C5.
+// Backlight: CH32V003 IO expander via I2C (BOARD_BACKLIGHT_GPIO = -1).
+// LCD RST: CH32V003 PIN_1 via I2C (BOARD_LCD_RST = -1; SWRESET used instead).
+#define LCD_MOSI        BOARD_SPI_MOSI       // GPIO7
+#define LCD_MISO        BOARD_SPI_MISO       // GPIO8 (SD only; ST7789 write-only)
+#define LCD_CLK         BOARD_SPI_SCK        // GPIO6
+#define LCD_CS          BOARD_LCD_CS         // GPIO10 (swapped vs NM-CYD-C5 GPIO23)
+#define LCD_DC          BOARD_LCD_DC         // GPIO9
+#define LCD_RST         BOARD_LCD_RST        // -1 (CH32V003 PIN_1; SWRESET suffices)
+#define TOUCH_CS        -1                   // CST3530 is I2C — no SPI CS
+#define LCD_BL_IO       BOARD_BACKLIGHT_GPIO // -1 (CH32V003 EXIO_PWM via I2C 0x24)
+#define LCD_BL_ACTIVE_LEVEL 1
+#define BOOT_BTN_GPIO   BOARD_BOOT_BTN_GPIO  // GPIO28
+#define GO_DARK_DBL_CLICK_MS 800
+#define LCD_H_RES       BOARD_LCD_WIDTH      // 240
+#define LCD_V_RES       BOARD_LCD_HEIGHT     // 320
+#define LCD_HOST        BOARD_SPI_HOST       // SPI2_HOST (shared with SD)
+
 #else
 // NM-CYD-C5 (RockBase-iot/NM-CYD-C5, User_Setup-NM-CYD-C5.h)
 // Display, touch, and SD all share SPI2_HOST. SD CS is GPIO10 (wifi_common.h).
@@ -832,7 +860,13 @@ static void style_modal_overlay(lv_obj_t *overlay, lv_opa_t opacity) {
 
 static esp_lcd_panel_handle_t panel_handle;
 static esp_lcd_panel_io_handle_t lcd_io_handle;
+#if defined(CONFIG_BOARD_TOUCH_XPT2046)
 static xpt2046_handle_t touch_handle;
+#elif defined(CONFIG_BOARD_TOUCH_CST3530)
+static esp_lcd_touch_handle_t touch_handle;
+static i2c_master_bus_handle_t s_i2c_bus;
+static esp_io_expander_handle_t s_io_expander;
+#endif
 static lv_obj_t *touch_dot;  // DEBUG: visual touch indicator
 static lv_obj_t *title_bar;
 static lv_obj_t *function_page = NULL;
@@ -2791,7 +2825,9 @@ static void show_rf433_signal_list_screen(void);
 static void show_rf433_jammer_screen(void);
 static void show_rf433_loopback_screen(void);
 static void show_vibrator_test_popup(void);
+#if defined(CONFIG_BOARD_TOUCH_XPT2046)
 static void run_touch_calibration(void);
+#endif
 void vibrator_on(void);
 void vibrator_off(void);
 void vibrator_pulse(uint32_t duration_ms);
@@ -4234,12 +4270,23 @@ static void nvs_settings_save_wifi_creds(const char *ssid, const char *pass)
 
 static void init_backlight(void)
 {
-    // NM-CYD-C5: backlight is GPIO 25 (HIGH = on).
+#if defined(CONFIG_BOARD_HAS_BACKLIGHT_EXPANDER)
+    // WS-C5-28: backlight is controlled via CH32V003 IO expander EXIO_PWM (I2C 0x24).
+    // s_io_expander must be initialized by init_i2c_bus() before this is called.
+    if (s_io_expander) {
+        ESP_ERROR_CHECK(custom_io_expander_set_pwm(s_io_expander, 255));
+        ESP_LOGI(TAG, "Backlight ON (CH32V003 EXIO_PWM via I2C 0x%02X)", BOARD_IO_EXPANDER_I2C_ADDR);
+    } else {
+        ESP_LOGW(TAG, "Backlight: IO expander not ready — screen may be dark");
+    }
+#else
+    // NM-CYD-C5 / CYD2USB: backlight is a direct GPIO (HIGH = on).
     // Brightness dimming is handled via a software overlay on lv_layer_top().
     gpio_reset_pin(LCD_BL_IO);
     gpio_set_direction(LCD_BL_IO, GPIO_MODE_OUTPUT);
     gpio_set_level(LCD_BL_IO, LCD_BL_ACTIVE_LEVEL);
     ESP_LOGI(TAG, "Backlight ON (GPIO %d)", LCD_BL_IO);
+#endif
 }
 
 static void set_backlight_percent(uint8_t percent)
@@ -4756,9 +4803,10 @@ static void sniffer_task(void *pvParameters) {
 }
 
 // ============================================================================
-// Touch Calibration
+// Touch Calibration (XPT2046 only — CST3530 capacitive needs no calibration)
 // ============================================================================
 
+#if defined(CONFIG_BOARD_TOUCH_XPT2046)
 static bool touch_cal_nvs_load(touch_cal_t *cal)
 {
     nvs_handle_t h;
@@ -5110,9 +5158,11 @@ static void run_touch_calibration(void)
     lv_obj_clean(scr);
     ESP_LOGI(TAG, "Touch calibration complete");
 }
+#endif  // CONFIG_BOARD_TOUCH_XPT2046
 
 static void init_touch(void)
 {
+#if defined(CONFIG_BOARD_TOUCH_XPT2046)
     esp_err_t ret = xpt2046_init(&touch_handle, LCD_HOST, TOUCH_CS, LCD_H_RES, LCD_V_RES);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "XPT2046 touch init failed: %s", esp_err_to_name(ret));
@@ -5133,7 +5183,62 @@ static void init_touch(void)
         touch_handle.swap_xy  = false;
         ESP_LOGI(TAG, "No NVS touch cal — using default invert_x/y; calibration needed");
     }
+
+#elif defined(CONFIG_BOARD_TOUCH_CST3530)
+    // CST3530 capacitive touch on WS-C5-28.
+    // I2C bus is already initialized by init_i2c_bus() before init_touch() is called.
+    esp_lcd_panel_io_i2c_config_t tp_io_cfg = ESP_LCD_TOUCH_IO_I2C_CST3530_CONFIG();
+    esp_lcd_panel_io_handle_t tp_io;
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(s_i2c_bus, &tp_io_cfg, &tp_io));
+
+    esp_lcd_touch_config_t tp_cfg = {
+        .x_max = LCD_H_RES,
+        .y_max = LCD_V_RES,
+        .rst_gpio_num = -1,   // RST via CH32V003 (handled in init_i2c_bus)
+        .int_gpio_num = BOARD_TOUCH_INT,
+        .levels = {
+            .reset = 0,
+            .interrupt = 0,
+        },
+        .flags = {
+            .swap_xy = 0,
+            .mirror_x = 0,
+            .mirror_y = 0,
+        },
+    };
+    ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_cst3530(tp_io, &tp_cfg, &touch_handle));
+    ESP_LOGI(TAG, "CST3530 touch initialised (I2C, INT=GPIO%d)", BOARD_TOUCH_INT);
+    // CST3530 capacitive touch needs no calibration
+    touch_cal_loaded = true;
+#endif
 }
+
+#if defined(CONFIG_BOARD_WS_C5_28)
+// Initialize the shared I2C bus (GPIO0/GPIO1) and bring up the CH32V003 IO expander.
+// Must be called before init_touch() and init_backlight() on WS-C5-28.
+static void init_i2c_bus(void)
+{
+    i2c_master_bus_config_t i2c_cfg = {
+        .i2c_port = I2C_NUM_0,
+        .sda_io_num = BOARD_I2C_SDA,   // GPIO0
+        .scl_io_num = BOARD_I2C_SCL,   // GPIO1
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_cfg, &s_i2c_bus));
+    ESP_LOGI(TAG, "I2C bus init OK (SDA=GPIO%d, SCL=GPIO%d)", BOARD_I2C_SDA, BOARD_I2C_SCL);
+
+    // Bring up CH32V003 IO expander at I2C 0x24 (controls LCD RST, Touch RST, backlight PWM)
+    esp_err_t ret = custom_io_expander_new_i2c_ch32v003(s_i2c_bus, BOARD_IO_EXPANDER_I2C_ADDR, &s_io_expander);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "CH32V003 IO expander init failed: %s", esp_err_to_name(ret));
+        s_io_expander = NULL;
+        return;
+    }
+    ESP_LOGI(TAG, "CH32V003 IO expander OK (I2C 0x%02X)", BOARD_IO_EXPANDER_I2C_ADDR);
+}
+#endif
 
 static void log_sd_root_listing(void)
 {
@@ -6246,6 +6351,9 @@ void app_main(void)
     g_font_icon14.fallback = &lv_extra_symbols;
     memcpy(&g_font_icon16, &lv_font_montserrat_16, sizeof(lv_font_t));
     g_font_icon16.fallback = &lv_extra_symbols;
+#if defined(CONFIG_BOARD_WS_C5_28)
+    init_i2c_bus();   // I2C bus for CST3530 touch + CH32V003 backlight — must be first
+#endif
     init_display();
     init_touch();
     init_backlight();
@@ -6400,7 +6508,11 @@ void app_main(void)
     lv_indev_drv_init(&indev_drv);
     indev_drv.type = LV_INDEV_TYPE_POINTER;
     indev_drv.read_cb = lvgl_touch_read_cb;
+#if defined(CONFIG_BOARD_TOUCH_XPT2046)
     indev_drv.user_data = &touch_handle;
+#else
+    indev_drv.user_data = NULL;  // CST3530: touch_handle is a global, not passed via user_data
+#endif
     lv_indev_drv_register(&indev_drv);
 
     if (screen_idle_timer == NULL) {
@@ -6584,7 +6696,8 @@ void app_main(void)
     // Hide popup
     hide_sd_loading_popup();
 
-    // Check for calibration reset trigger file on SD card
+    // Check for calibration reset trigger file on SD card (XPT2046 only)
+#if defined(CONFIG_BOARD_TOUCH_XPT2046)
     if (sd_mounted_lazy) {
         struct stat st;
         if (stat("/sdcard/calibrate.txt", &st) == 0) {
@@ -6597,6 +6710,7 @@ void app_main(void)
     if (!touch_cal_loaded) {
         touch_cal_needed = true;
     }
+#endif  // CONFIG_BOARD_TOUCH_XPT2046
 
     // Brief splash hold so user can read the boot screen, then transition
     vTaskDelay(pdMS_TO_TICKS(2000));
@@ -6607,11 +6721,13 @@ void app_main(void)
     splash_loading_label = NULL;
     splash_detecting_label = NULL;
 
-    // Run calibration if needed (first boot or SD trigger file found)
+    // Run calibration if needed (XPT2046 only — CST3530 capacitive needs no calibration)
+#if defined(CONFIG_BOARD_TOUCH_XPT2046)
     if (touch_cal_needed) {
         touch_cal_needed = false;
         run_touch_calibration();
     }
+#endif
 
     create_home_ui();
     lv_obj_invalidate(lv_scr_act());
@@ -6704,8 +6820,15 @@ void app_main(void)
              * a small corner zone unreliable when frames run long. */
             {
                 static int64_t touch_wake_hold_ms = 0;
+                bool touched = false;
+#if defined(CONFIG_BOARD_TOUCH_XPT2046)
                 xpt2046_touch_point_t tp = {0};
-                bool touched = xpt2046_read_touch(&touch_handle, &tp) && tp.touched;
+                touched = xpt2046_read_touch(&touch_handle, &tp) && tp.touched;
+#elif defined(CONFIG_BOARD_TOUCH_CST3530)
+                uint16_t tp_x[1], tp_y[1]; uint8_t tp_cnt = 0;
+                esp_lcd_touch_read_data(touch_handle);
+                touched = esp_lcd_touch_get_coordinates(touch_handle, tp_x, tp_y, NULL, &tp_cnt, 1) && tp_cnt > 0;
+#endif
                 if (touched) {
                     int64_t t_now = (int64_t)(esp_timer_get_time() / 1000);
                     if (touch_wake_hold_ms == 0) touch_wake_hold_ms = t_now;
@@ -8368,18 +8491,34 @@ void lvgl_touch_read_cb(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
         data->state = LV_INDEV_STATE_RELEASED;
         return;
     }
+
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    bool touched = false;
+    uint16_t touch_x = 0, touch_y = 0;
+
+#if defined(CONFIG_BOARD_TOUCH_XPT2046)
     static int call_count = 0;
     xpt2046_handle_t *touch = (xpt2046_handle_t *)indev_drv->user_data;
     xpt2046_touch_point_t point;
-    const int64_t now_ms = esp_timer_get_time() / 1000;
-    bool touched = false;
-    
-    // Debug counter kept but no console prints (avoid VFS write during draw)
     call_count++;
     if (xpt2046_read_touch(touch, &point) && point.touched) {
         touched = true;
+        touch_x = point.x;
+        touch_y = point.y;
         last_input_ms = now_ms;
     }
+
+#elif defined(CONFIG_BOARD_TOUCH_CST3530)
+    uint16_t tp_x[1] = {0}, tp_y[1] = {0};
+    uint8_t tp_cnt = 0;
+    esp_lcd_touch_read_data(touch_handle);
+    if (esp_lcd_touch_get_coordinates(touch_handle, tp_x, tp_y, NULL, &tp_cnt, 1) && tp_cnt > 0) {
+        touched = true;
+        touch_x = tp_x[0];
+        touch_y = tp_y[0];
+        last_input_ms = now_ms;
+    }
+#endif
 
     if (screen_dimmed) {
         if (touched) {
@@ -8406,8 +8545,8 @@ void lvgl_touch_read_cb(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
     }
 
     if (touched) {
-        data->point.x = point.x;
-        data->point.y = point.y;
+        data->point.x = touch_x;
+        data->point.y = touch_y;
         data->state = LV_INDEV_STATE_PRESSED;
         touch_pressed_flag = true;
         touch_x_flag = data->point.x;

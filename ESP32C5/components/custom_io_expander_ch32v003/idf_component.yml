@@ -1,0 +1,12 @@
+dependencies:
+  esp_io_expander:
+    public: true
+    version: ^1.0.1
+  idf: '>=5.3'
+description: Custom IO Expander - CH32V003
+repository: git://github.com/waveshareteam/Waveshare-ESP32-components.git
+repository_info:
+  commit_sha: a601dda0fe2effa2a4147414d432273ba48e1d23
+  path: sensor/custom_io_expander_ch32v003
+url: https://github.com/waveshareteam/Waveshare-ESP32-components
+version: 2.0.0
