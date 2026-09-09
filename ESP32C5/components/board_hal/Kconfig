@@ -78,11 +78,11 @@ menu "CYM Board Selection"
 
     config BOARD_LCD_INVERT_COLOR
         bool
-        default y if BOARD_CYD2USB
         help
             Invert LCD color output. ILI9341 panels on CYD family boards come in
             both normal and color-inverted variants. Set y for boards confirmed to
             need inversion; n for normal panels. Calls esp_lcd_panel_invert_color().
+            CYD2USB (2432S028) confirmed to NOT need inversion — leave at default n.
 
     config BOARD_HAS_DUAL_SPI_BUS
         bool
