@@ -14,6 +14,7 @@
 #include "nvs_flash.h"
 #include "led_strip.h"
 // Note: Legacy RMT driver removed in ESP-IDF 6.x - using led_strip component instead
+#include "board_hal.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -119,9 +120,11 @@ static esp_err_t init_wifi(void) {
 
 esp_err_t init_led(void) {
     if (g_led_strip != NULL) return ESP_OK;  // already initialised (e.g. after BLE→WiFi switch)
+    // Skip on boards with no WS2812 (BOARD_RGB_LED_COUNT == 0 means no LED fitted)
+    if (BOARD_RGB_LED_COUNT == 0) return ESP_OK;
     led_strip_config_t strip_cfg = {
-        .strip_gpio_num = NEOPIXEL_GPIO,
-        .max_leds = LED_COUNT,
+        .strip_gpio_num = BOARD_RGB_LED_GPIO,
+        .max_leds = BOARD_RGB_LED_COUNT,
         .led_model = LED_MODEL_WS2812,
         .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
         .flags.invert_out = false,
