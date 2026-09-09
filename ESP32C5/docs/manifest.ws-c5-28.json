@@ -1,0 +1,11 @@
+{
+  "name": "Cheap Yellow Monster - WS-C5-28",
+  "version": "v2.13.53",
+  "build": "v2.13.53",
+  "chipFamily": "ESP32-C5",
+  "parts": [
+    { "path": "../binaries-ws-c5-28/bootloader.bin",      "offset": 8192   },
+    { "path": "../binaries-ws-c5-28/partition-table.bin", "offset": 32768  },
+    { "path": "../binaries-ws-c5-28/CYM-WS-C5-28.bin",   "offset": 65536  }
+  ]
+}

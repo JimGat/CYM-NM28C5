@@ -6,11 +6,10 @@
     <title>Cheap Yellow Monster Web Flasher</title>
     <link rel="icon" type="image/x-icon" href="favicon.ico">
     <link rel="apple-touch-icon" href="favicon-32.png">
-    <meta name="description" content="Browser flasher and serial monitor for Cheap Yellow Monster firmware on the NM-CYD-C5 (ESP32-C5).">
+    <meta name="description" content="Browser flasher and serial monitor for Cheap Yellow Monster firmware — NM-CYD-C5 and WS-C5-28 boards.">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <!-- CryptoJS removed — tasmota-webserial-esptool handles MD5 internally -->
     <style>
       :root {
         --bg:#050e05;
@@ -34,7 +33,6 @@
         background:url('lab_bg.png') center/cover fixed no-repeat;
       }
 
-      /* Dark overlay so text stays readable over the lab backdrop */
       body::before {
         content:'';
         position:fixed;
@@ -44,7 +42,6 @@
         pointer-events:none;
       }
 
-      /* DeeDee sneaking in from the bottom-right */
       .deedee {
         position:fixed;
         bottom:0;
@@ -58,7 +55,6 @@
       }
       .deedee:hover { transform:scale(1.04) rotate(-2deg); }
 
-      /* Nuclear launch button — glows red when ready to flash */
       @keyframes nuclear-pulse {
         0%,100% { box-shadow: 0 0 12px 2px rgba(255,30,30,0.7), 0 0 30px 6px rgba(255,0,0,0.4); }
         50%      { box-shadow: 0 0 24px 6px rgba(255,60,60,1.0), 0 0 60px 16px rgba(255,0,0,0.6); }
@@ -74,7 +70,6 @@
       a { color:inherit; }
       code, .mono, .log { font-family:Consolas,"Liberation Mono",monospace; }
 
-      /* ── Header ── */
       header {
         border:1px solid var(--border);
         border-radius:20px;
@@ -98,6 +93,7 @@
         display:block;
         filter:drop-shadow(0 0 16px rgba(57,255,20,0.4));
       }
+
       .eyebrow {
         display:inline-flex;
         align-items:center;
@@ -142,11 +138,9 @@
       .hero-cta a:hover { transform:translateY(-1px); box-shadow:0 14px 34px rgba(255,230,0,0.38), 0 0 30px rgba(57,255,20,0.28); }
       .hero-cta span { font-size:12px; font-weight:600; opacity:.82; text-transform:uppercase; letter-spacing:.05em; }
 
-      /* ── Layout ── */
       .split { display:grid; grid-template-columns:1.3fr 1fr; gap:14px; }
       .stack { display:grid; gap:14px; align-content:start; }
 
-      /* ── Cards ── */
       .card {
         border-radius:16px;
         padding:18px;
@@ -158,7 +152,6 @@
       .card h2 { margin:0 0 10px; font-size:17px; color:var(--accent); text-shadow:0 0 12px rgba(57,255,20,0.4); }
       .controls { display:flex; flex-direction:column; gap:14px; }
 
-      /* ── Buttons ── */
       button, .button-link {
         display:inline-flex;
         align-items:center;
@@ -187,7 +180,6 @@
       }
       .ghost:hover { background:rgba(57,255,20,0.1); }
 
-      /* ── Form controls ── */
       .check, select, .text-input {
         border:1px solid rgba(57,255,20,0.2);
         background:#061406;
@@ -202,7 +194,6 @@
       .text-input { flex:1; min-width:220px; }
       select:focus, .text-input:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 2px rgba(57,255,20,0.2); }
 
-      /* ── Misc ── */
       .status-line, .actions { display:flex; flex-wrap:wrap; gap:10px; }
       .hint { padding:10px 12px; border-radius:12px; font-size:12.5px; line-height:1.45; border:1px solid rgba(57,255,20,0.12); background:rgba(57,255,20,0.03); }
       .hint strong { color:var(--text); }
@@ -228,10 +219,10 @@
 
       .badge { display:inline-block; padding:2px 10px; border-radius:999px; border:1px solid rgba(57,255,20,0.4); background:rgba(57,255,20,0.12); color:var(--ok); font-size:12px; }
 
-      .channel-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
-      .channel-label { font-size:13px; font-weight:600; color:var(--muted); }
-      .channel-btn { min-height:32px; padding:6px 14px; border-radius:8px; font-size:13px; font-weight:600; color:var(--text); background:rgba(57,255,20,0.04); box-shadow:inset 0 0 0 1px var(--border); }
-      .channel-btn.active { color:#050e05; background:linear-gradient(135deg, var(--accent), #80ff50); box-shadow:0 4px 14px rgba(57,255,20,0.35); }
+      .selector-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+      .selector-label { font-size:13px; font-weight:600; color:var(--muted); min-width:48px; }
+      .sel-btn { min-height:32px; padding:6px 14px; border-radius:8px; font-size:13px; font-weight:600; color:var(--text); background:rgba(57,255,20,0.04); box-shadow:inset 0 0 0 1px var(--border); }
+      .sel-btn.active { color:#050e05; background:linear-gradient(135deg, var(--accent), #80ff50); box-shadow:0 4px 14px rgba(57,255,20,0.35); }
 
       .dev-warn { padding:10px 12px; border-radius:12px; font-size:12.5px; line-height:1.45; border:1px solid rgba(255,200,0,.4); background:rgba(255,200,0,.06); color:#ffc040; }
       .dev-warn strong { color:#ffe060; }
@@ -275,12 +266,12 @@
           </a>
           <div style="text-align:center;font-size:11px;margin-top:4px;opacity:.75;">Unofficially supported by LAB5 &mdash; <a href="https://discord.gg/Vuq2SmCbk5" target="_blank" rel="noopener" style="color:inherit;">join the Discord</a></div>
         </div>
-        <div class="eyebrow">Cheap Yellow Monster &nbsp;·&nbsp; NM-CYD-C5 &nbsp;·&nbsp; ESP32-C5</div>
-        <p>Web Serial flasher powered by esptool-js. Flash the current release firmware for the NM-CYD-C5 WiFi 6 &amp; BLE security toolkit directly from your browser — no software install required.</p>
+        <div class="eyebrow">Cheap Yellow Monster &nbsp;·&nbsp; ESP32-C5</div>
+        <p id="headerDesc">Web Serial flasher powered by esptool-js. Select your board, then flash firmware directly from your browser — no software install required.</p>
         <div class="hero-meta">
           <span class="pill"><strong>Chip</strong> ESP32-C5</span>
-          <span class="pill"><strong>Board</strong> NM-CYD-C5</span>
-          <span class="pill"><strong>Offsets</strong> 0x2000 / 0x8000 / 0x10000</span>
+          <span class="pill" id="boardPill"><strong>Board</strong> NM-CYD-C5</span>
+          <span class="pill" id="offsetsPill"><strong>Offsets</strong> 0x2000 / 0x8000 / 0x10000</span>
           <span class="pill" id="versionPill"><strong>Version</strong> loading</span>
         </div>
         <div class="hero-cta"><a href="https://github.com/JimGat/CYM#readme" target="_blank" rel="noopener noreferrer">📘 Project instructions / README <span>opens new window</span></a></div>
@@ -291,16 +282,27 @@
           <div class="card">
             <h2>Control</h2>
             <div class="controls">
-              <div class="channel-row">
-                <span class="channel-label">Channel</span>
-                <button class="channel-btn active" data-ch="stable">Stable</button>
-                <button class="channel-btn" data-ch="dev">Dev</button>
+
+              <!-- Channel (branch) selector -->
+              <div class="selector-row">
+                <span class="selector-label">Channel</span>
+                <button class="sel-btn active" data-ch="stable">Stable</button>
+                <button class="sel-btn" data-ch="dev">Dev</button>
               </div>
+
+              <!-- Board selector -->
+              <div class="selector-row">
+                <span class="selector-label">Board</span>
+                <button class="sel-btn active" data-board="nm-cyd-c5">NM-CYD-C5</button>
+                <button class="sel-btn" data-board="ws-c5-28">WS-C5-28</button>
+              </div>
+
               <div id="devWarning" class="dev-warn" style="display:none;"><strong>Development build</strong> &mdash; binaries fetched live from the <code>Jimgat_Dev</code> branch. May be unstable.</div>
+
               <div class="actions">
                 <button id="connectBtn">Connect</button>
                 <button id="flashBtn" class="ghost" disabled>Flash All</button>
-                <button id="quickFlashBtn" class="ghost" disabled title="Flash only CYM-NM28C5.bin @ 0x10000 (skips bootloader + partition table)">Quick Flash</button>
+                <button id="quickFlashBtn" class="ghost" disabled title="Flash only the app binary @ 0x10000 (skips bootloader + partition table)">Quick Flash</button>
                 <label class="check"><input id="eraseAll" type="checkbox">Erase</label>
                 <select id="baudSelect" aria-label="Baud rate">
                   <option value="115200">115200 baud (reliable)</option>
@@ -350,19 +352,19 @@
               <li><strong>ROM mode:</strong> hold BOOT, plug the board in via USB-C, then release BOOT.</li>
               <li><strong>Close serial hogs:</strong> quit any terminal monitors or apps holding the COM port before connecting.</li>
               <li><strong>Stuck?</strong> Unplug, click Connect, then plug in again while holding BOOT.</li>
-              <li><strong>After flash:</strong> press RESET if the board does not auto-reboot. Insert a FAT32 MicroSD card (≤ 32 GB) before booting.</li>
-              <li><strong>Power:</strong> use a clean 5 V USB supply rated ≥ 500 mA. Undervoltage is the most common cause of reset loops during WiFi scanning.</li>
+              <li><strong>After flash:</strong> press RESET if the board does not auto-reboot. Insert a FAT32 MicroSD card (&le; 32 GB) before booting.</li>
+              <li><strong>Power:</strong> use a clean 5 V USB supply rated &ge; 500 mA. Undervoltage is the most common cause of reset loops during WiFi scanning.</li>
             </ul>
           </div>
 
           <div class="card">
             <h2>Direct downloads</h2>
             <p>Same binaries used by this flasher.</p>
-            <div class="link-grid">
-              <a href="../binaries-esp32c5/CYM-NM28C5.bin"><code>CYM-NM28C5.bin</code><span>Main application (0x10000)</span></a>
-              <a href="../binaries-esp32c5/bootloader.bin"><code>bootloader.bin</code><span>Bootloader (0x2000)</span></a>
-              <a href="../binaries-esp32c5/partition-table.bin"><code>partition-table.bin</code><span>Partition table (0x8000)</span></a>
-              <a href="manifest.json"><code>manifest.json</code><span>Web flasher manifest</span></a>
+            <div class="link-grid" id="downloadLinks">
+              <a id="dlApp" href="../binaries-esp32c5/CYM-NM28C5.bin"><code id="dlAppName">CYM-NM28C5.bin</code><span>Main application (0x10000)</span></a>
+              <a id="dlBoot" href="../binaries-esp32c5/bootloader.bin"><code>bootloader.bin</code><span>Bootloader (0x2000)</span></a>
+              <a id="dlPart" href="../binaries-esp32c5/partition-table.bin"><code>partition-table.bin</code><span>Partition table (0x8000)</span></a>
+              <a id="dlManifest" href="manifest.json"><code id="dlManifestName">manifest.json</code><span>Web flasher manifest</span></a>
             </div>
           </div>
 
@@ -376,7 +378,7 @@
             <p>If you find this toolkit useful and would like to support its continued development, consider buying the developer a coffee!</p>
             <div style="margin-top:14px;">
               <a href="https://buymeacoffee.com/wjvasxixlg" target="_blank" rel="noopener" style="display:inline-flex; align-items:center; gap:10px; min-height:44px; padding:12px 18px; border-radius:12px; text-decoration:none; font-weight:600; color:#050e05; background:linear-gradient(135deg, #FFDD00, #FFE600); box-shadow:0 8px 24px rgba(255,221,0,0.35);">
-                ☕ Buy Me a Coffee
+                &#x2615; Buy Me a Coffee
               </a>
             </div>
           </div>
@@ -387,52 +389,98 @@
     <footer>
       <a id="repoLink" href="https://github.com/JimGat/CYM">JimGat/cym</a> &mdash;
       <a href="https://discord.gg/Vuq2SmCbk5" target="_blank" rel="noopener">LAB5 Discord</a> &mdash;
-      <span id="pageVersion" class="mono">Web flasher v1.1.0</span>
+      <span id="pageVersion" class="mono">Web flasher v2.10.0</span>
     </footer>
 
     <script type="module">
       // tasmota-webserial-esptool v9.2.23 — fixes ESP32-C5 OPI PSRAM Flash ID:0
-      // Full API: connectWithPort (factory only) → initialize() → connectWithResetStrategies()
-      //           → detectChip() → runStub() → flashData() on the STUB LOADER
       import { connectWithPort } from "https://esm.sh/tasmota-webserial-esptool@9.2.23";
 
       const ui = {
-        status: document.getElementById("statusText"),
-        chip: document.getElementById("chipText"),
-        manifest: document.getElementById("manifestText"),
-        version: document.getElementById("versionPill"),
-        release: document.getElementById("releaseInfo"),
-        log: document.getElementById("log"),
-        progress: document.getElementById("progressBar"),
-        connectBtn: document.getElementById("connectBtn"),
-        flashBtn: document.getElementById("flashBtn"),
+        status:        document.getElementById("statusText"),
+        chip:          document.getElementById("chipText"),
+        manifest:      document.getElementById("manifestText"),
+        version:       document.getElementById("versionPill"),
+        release:       document.getElementById("releaseInfo"),
+        log:           document.getElementById("log"),
+        progress:      document.getElementById("progressBar"),
+        connectBtn:    document.getElementById("connectBtn"),
+        flashBtn:      document.getElementById("flashBtn"),
         quickFlashBtn: document.getElementById("quickFlashBtn"),
-        eraseAll: document.getElementById("eraseAll"),
-        baud: document.getElementById("baudSelect"),
-        repoLink: document.getElementById("repoLink"),
-        pageVersion: document.getElementById("pageVersion"),
-        monitorBtn: document.getElementById("monitorBtn"),
-        monitorBaud: document.getElementById("monitorBaudSelect"),
+        eraseAll:      document.getElementById("eraseAll"),
+        baud:          document.getElementById("baudSelect"),
+        repoLink:      document.getElementById("repoLink"),
+        pageVersion:   document.getElementById("pageVersion"),
+        monitorBtn:    document.getElementById("monitorBtn"),
+        monitorBaud:   document.getElementById("monitorBaudSelect"),
         clearMonitorBtn: document.getElementById("clearMonitorBtn"),
         monitorStatus: document.getElementById("monitorStatusText"),
-        monitorLog: document.getElementById("monitorLog"),
-        monitorInput: document.getElementById("monitorInput"),
+        monitorLog:    document.getElementById("monitorLog"),
+        monitorInput:  document.getElementById("monitorInput"),
         monitorSendBtn: document.getElementById("monitorSendBtn"),
-        devWarning: document.getElementById("devWarning"),
+        devWarning:    document.getElementById("devWarning"),
+        boardPill:     document.getElementById("boardPill"),
+        headerDesc:    document.getElementById("headerDesc"),
+        dlApp:         document.getElementById("dlApp"),
+        dlAppName:     document.getElementById("dlAppName"),
+        dlBoot:        document.getElementById("dlBoot"),
+        dlPart:        document.getElementById("dlPart"),
+        dlManifest:    document.getElementById("dlManifest"),
+        dlManifestName: document.getElementById("dlManifestName"),
       };
 
-      const state = { manifest:null, channel:"stable", port:null, onDisconnect:null, esploader:null, chip:null, connected:false, flashing:false, monitorPort:null, monitorReader:null, monitorWriter:null, monitorPipe:null, monitorDisconnect:null, monitorConnected:false, lastPort:null };
-      const PAGE_VERSION = "2.9.10"; // repo renamed JimGat/CYM-NM28C5 → JimGat/CYM
-      const RAW_BASE = "https://raw.githubusercontent.com/JimGat/CYM/Jimgat_Dev/ESP32C5";
-      const DEV_MANIFEST_URL = `${RAW_BASE}/docs/manifest.json`;
-      const RAW_BIN = `${RAW_BASE}/binaries-esp32c5`;
-      const CONNECT_TIMEOUT_MS = 20000;
-      const CONNECT_RETRY_DELAY_MS = 500;
-      const monitorEncoder = new TextEncoder();
+      // Board definitions — add new boards here.
+      const RAW_BASE     = "https://raw.githubusercontent.com/JimGat/CYM/Jimgat_Dev/ESP32C5";
+      const BOARDS = {
+        "nm-cyd-c5": {
+          label:          "NM-CYD-C5",
+          desc:           "Web Serial flasher for the NM-CYD-C5 WiFi 6 &amp; BLE security toolkit (ESP32-C5, 16 MB flash, 8 MB PSRAM).",
+          stableManifest: "manifest.json",
+          devManifest:    `${RAW_BASE}/docs/manifest.json`,
+          devBinDir:      `${RAW_BASE}/binaries-esp32c5`,
+          stableBinDir:   "../binaries-esp32c5",
+          appBin:         "CYM-NM28C5.bin",
+          manifestFile:   "manifest.json",
+        },
+        "ws-c5-28": {
+          label:          "WS-C5-28",
+          desc:           "Web Serial flasher for the Waveshare ESP32-C5-Touch-LCD-2.8 (ESP32-C5, 32 MB flash, 8 MB PSRAM, capacitive touch).",
+          stableManifest: "manifest.ws-c5-28.json",
+          devManifest:    `${RAW_BASE}/docs/manifest.ws-c5-28.json`,
+          devBinDir:      `${RAW_BASE}/binaries-ws-c5-28`,
+          stableBinDir:   "../binaries-ws-c5-28",
+          appBin:         "CYM-WS-C5-28.bin",
+          manifestFile:   "manifest.ws-c5-28.json",
+        },
+      };
+
+      const state = {
+        manifest:         null,
+        channel:          "stable",
+        board:            "nm-cyd-c5",
+        port:             null,
+        onDisconnect:     null,
+        esploader:        null,
+        chip:             null,
+        connected:        false,
+        flashing:         false,
+        monitorPort:      null,
+        monitorReader:    null,
+        monitorWriter:    null,
+        monitorPipe:      null,
+        monitorDisconnect: null,
+        monitorConnected: false,
+        lastPort:         null,
+      };
+
+      const PAGE_VERSION    = "2.10.0"; // multi-board support
+      const CONNECT_TIMEOUT_MS   = 20000;
+      const monitorEncoder  = new TextEncoder();
       const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+      // ── Repo detection (GitHub Pages or direct) ───────────────────────────────
       const repoInfo = () => {
-        const host = window.location.hostname || "";
+        const host  = window.location.hostname || "";
         const parts = window.location.pathname.split("/").filter(Boolean);
         if (host.endsWith(".github.io") && parts.length) return { owner: host.replace(/\.github\.io$/, ""), repo: parts[0] };
         return { owner: "JimGat", repo: "CYM" };
@@ -440,10 +488,11 @@
 
       const setRepoLink = () => {
         const repo = repoInfo();
-        ui.repoLink.href = `https://github.com/${repo.owner}/${repo.repo}`;
+        ui.repoLink.href        = `https://github.com/${repo.owner}/${repo.repo}`;
         ui.repoLink.textContent = `${repo.owner}/${repo.repo}`;
       };
 
+      // ── Logging ───────────────────────────────────────────────────────────────
       const log = (msg) => {
         const time = new Date().toLocaleTimeString();
         for (const line of (Array.isArray(msg) ? msg : [msg])) ui.log.textContent += `[${time}] ${line}\n`;
@@ -466,24 +515,51 @@
         ui.monitorLog.scrollTop = ui.monitorLog.scrollHeight;
       };
 
+      // ── Board UI sync ─────────────────────────────────────────────────────────
+      const updateBoardUI = () => {
+        const bd = BOARDS[state.board];
+        ui.boardPill.innerHTML   = `<strong>Board</strong> ${bd.label}`;
+        ui.headerDesc.innerHTML  = bd.desc;
+        // Update download links
+        const isStable = state.channel === "stable";
+        const binDir   = isStable ? bd.stableBinDir : bd.devBinDir;
+        ui.dlApp.href           = `${binDir}/${bd.appBin}`;
+        ui.dlAppName.textContent = bd.appBin;
+        ui.dlBoot.href          = `${binDir}/bootloader.bin`;
+        ui.dlPart.href          = `${binDir}/partition-table.bin`;
+        ui.dlManifest.href      = isStable ? bd.stableManifest : bd.devManifest;
+        ui.dlManifestName.textContent = bd.manifestFile;
+      };
 
+      // ── Manifest ──────────────────────────────────────────────────────────────
       const normalizeManifest = (raw) => {
         const parts = Array.isArray(raw?.parts) && raw.parts.length ? raw.parts : (raw?.builds?.[0]?.parts || []);
-        return { name: raw?.name || "Cheap Yellow Monster", version: raw?.version || "n/a", build: raw?.build || raw?.version || "n/a", chipFamily: raw?.chipFamily || raw?.builds?.[0]?.chipFamily || "ESP32-C5", parts };
+        return {
+          name:       raw?.name || "Cheap Yellow Monster",
+          version:    raw?.version || "n/a",
+          build:      raw?.build || raw?.version || "n/a",
+          chipFamily: raw?.chipFamily || raw?.builds?.[0]?.chipFamily || "ESP32-C5",
+          parts,
+        };
       };
 
       const loadManifest = async () => {
+        const bd  = BOARDS[state.board];
         let url, raw;
         if (state.channel === "dev") {
-          url = DEV_MANIFEST_URL;
+          url = bd.devManifest;
           const res = await fetch(url, { cache: "no-store" });
           if (!res.ok) throw new Error(`Dev manifest fetch failed: ${res.status} ${res.statusText}`);
           raw = await res.json();
+          // Rewrite relative part paths to absolute GitHub raw URLs
           if (Array.isArray(raw?.parts)) {
-            raw.parts = raw.parts.map(p => ({ ...p, path: `${RAW_BIN}/${p.path.replace(/^.*[\\/]/, "")}` }));
+            raw.parts = raw.parts.map(p => ({
+              ...p,
+              path: `${bd.devBinDir}/${p.path.replace(/^.*[\\/]/, "")}`,
+            }));
           }
         } else {
-          url = new URL("manifest.json", window.location.href).toString();
+          url = new URL(bd.stableManifest, window.location.href).toString();
           const res = await fetch(url, { cache: "no-store" });
           if (!res.ok) throw new Error(`Manifest fetch failed: ${res.status} ${res.statusText}`);
           raw = await res.json();
@@ -491,16 +567,18 @@
         state.manifest = normalizeManifest(raw);
         if (!state.manifest.parts.length) throw new Error("Manifest has no flash parts.");
         ui.manifest.style.display = "inline-flex";
-        ui.manifest.textContent = `${state.manifest.parts.length} image(s)`;
+        ui.manifest.textContent   = `${state.manifest.parts.length} image(s)`;
         const chLabel = state.channel === "dev" ? " <span style=\"color:#ffa040;font-size:11px;\">(dev)</span>" : "";
         ui.version.innerHTML = `<strong>Version</strong> ${state.manifest.version}${chLabel}`;
         ui.release.innerHTML = `<span class="badge">Manifest loaded</span> ${state.manifest.name} &mdash; ${state.manifest.version} &mdash; ${state.manifest.parts.length} file(s) &mdash; chip ${state.manifest.chipFamily}`;
         ui.pageVersion.textContent = `Web flasher v${PAGE_VERSION} - build ${state.manifest.build}${state.channel === "dev" ? " (dev)" : ""}`;
         document.title = `${state.manifest.name} ${state.manifest.version}`;
+        updateBoardUI();
         setStatus("Manifest loaded.");
-        log(`Manifest [${state.channel}]: ${url}`);
+        log(`Manifest [${state.channel}/${state.board}]: ${url}`);
       };
 
+      // ── Connection ────────────────────────────────────────────────────────────
       const ensureSupport = () => {
         if ("serial" in navigator) return;
         setStatus("Web Serial not available. Use Chrome or Edge over HTTPS.", "error");
@@ -512,7 +590,7 @@
         if (state.connected) return disconnect();
         if (state.monitorConnected) await disconnectMonitor();
         ui.connectBtn.disabled = true;
-        ui.flashBtn.disabled = true;
+        ui.flashBtn.disabled   = true;
         setStatus("Requesting serial port");
         log("Requesting port access");
         try {
@@ -520,40 +598,29 @@
           state.onDisconnect = () => { disconnect().catch(() => {}); setStatus("Device disconnected. Reconnect to flash.", "error"); };
           try { state.port.addEventListener("disconnect", state.onDisconnect); } catch {}
 
-          // Open port at ROM baud rate if not already open
           if (!state.port.readable || !state.port.writable) {
             await state.port.open({ baudRate: 115200 });
           }
 
-          // tasmota logger interface
           const terminal = { clean() {}, writeLine: log, write: log, log, error: log, debug: () => {} };
 
-          // connectWithPort is a FACTORY only — creates ESPLoader, does NOT connect to chip
           state.esploader = await connectWithPort(state.port, terminal);
 
-          // Step 1: Initialize internal buffers (sets up __inputBuffer, reader, etc.)
           setStatus("Initializing transport...");
           log("Initializing transport...");
           await state.esploader.initialize();
 
-          // Step 2: Reset chip to ROM mode and sync
           setStatus(`Entering ROM mode — hold BOOT + tap RESET if needed (${CONNECT_TIMEOUT_MS/1000}s)`);
           log("Entering ROM bootloader...");
           const connTimeout = new Promise((_, rej) =>
             setTimeout(() => rej(new Error("ROM mode timeout — hold BOOT, tap RESET, release BOOT")), CONNECT_TIMEOUT_MS));
           await Promise.race([state.esploader.connectWithResetStrategies(), connTimeout]);
 
-          // Step 3: Detect chip
           setStatus("Detecting chip...");
           await state.esploader.detectChip();
           state.chip = state.esploader.chipName || "ESP32-C5";
           log(`Chip: ${state.chip}`);
 
-          // Step 4: Upload flash stub — fixes OPI PSRAM / Flash ID:0 on ESP32-C5.
-          // runStub() uses dynamic JSON import which esm.sh bundling breaks:
-          // import("./esp32c5.json") returns {default:{text,...}} in browser ESM,
-          // so stubcode.text is undefined, atob(undefined) = atob("undefined") = fails.
-          // Fix: catch the atob error and upload the stub manually from GitHub.
           setStatus(`Uploading flash stub for ${state.chip}...`);
           log("Uploading flash stub...");
           try {
@@ -563,7 +630,6 @@
           } catch (e) {
             if (!e.message?.includes("atob") && !e.message?.includes("correctly encoded")) throw e;
             log("runStub() hit esm.sh JSON module bug — uploading stub manually...");
-            // Fetch stub JSON directly from the tasmota repo
             const sResp = await fetch(
               "https://raw.githubusercontent.com/Jason2866/WebSerial_ESPTool/development/src/stubs/esp32c5.json",
               { cache: "force-cache" }
@@ -583,7 +649,6 @@
             await upload(textBytes, sData.text_start);
             if (dataBytes.length > 0) await upload(dataBytes, sData.data_start);
             await state.esploader.memFinish(sData.entry);
-            // Read OHAI handshake from stub
             const p = await state.esploader.readPacket(1000);
             const greeting = String.fromCharCode(...p);
             if (greeting !== "OHAI") throw new Error(`Stub start failed: "${greeting}"`);
@@ -592,10 +657,10 @@
           }
 
           state.connected = true;
-          ui.chip.style.display = "inline-flex";
-          ui.chip.textContent = `Chip ${state.chip}`;
+          ui.chip.style.display   = "inline-flex";
+          ui.chip.textContent     = `Chip ${state.chip}`;
           ui.connectBtn.textContent = "Disconnect";
-          ui.flashBtn.disabled = false;
+          ui.flashBtn.disabled    = false;
           ui.flashBtn.classList.add("flash-armed");
           ui.quickFlashBtn.disabled = false;
           ui.quickFlashBtn.classList.add("flash-armed");
@@ -611,6 +676,7 @@
         }
       };
 
+      // ── Fetch + Flash ─────────────────────────────────────────────────────────
       const fetchFiles = async () => {
         if (!state.manifest) await loadManifest();
         const files = [];
@@ -625,13 +691,12 @@
         return files;
       };
 
-      // appOnly=true: flash only the main app binary (CYM-NM28C5.bin @ 0x10000)
       const flash = async (appOnly = false) => {
         ensureSupport();
         if (!state.esploader) await connect();
-        ui.flashBtn.disabled = true;
+        ui.flashBtn.disabled      = true;
         ui.quickFlashBtn.disabled = true;
-        ui.connectBtn.disabled = true;
+        ui.connectBtn.disabled    = true;
         state.flashing = true;
         ui.progress.style.width = "0%";
         try {
@@ -643,30 +708,28 @@
           }
           log("Preparing flash writes");
 
-          // Erase — stop pulsing while working
           ui.flashBtn.classList.remove("flash-armed");
           if (ui.eraseAll.checked) {
             setStatus("Erasing flash (may take 20-30 s)...");
             log("Erasing flash...");
             const eraseFn = state.esploader.eraseFlash || state.esploader.erase_flash
-                         || state.esploader.eraseChip || state.esploader.flashErase;
+                         || state.esploader.eraseChip  || state.esploader.flashErase;
             if (typeof eraseFn === "function") {
               try { await eraseFn.call(state.esploader); log("Flash erased."); }
               catch (e) { log(`Erase warning: ${e?.message || e}`); }
             } else { log("Erase skipped (not supported by this library version)."); }
           }
 
-          // Try writeFlash() first; fall back to flashData() (stub must be running at this point)
           const totalBytes = files.reduce((s, f) => s + f.data.length, 0);
           if (typeof state.esploader.writeFlash === "function") {
             log("Using writeFlash() API");
             await state.esploader.writeFlash({
-              fileArray: files.map(f => ({ data: f.data, address: f.address })),
-              flashSize: "16MB",
-              flashMode: "dio",
-              flashFreq: "80m",
-              eraseAll: false,
-              compress: true,
+              fileArray:  files.map(f => ({ data: f.data, address: f.address })),
+              flashSize:  "16MB",
+              flashMode:  "dio",
+              flashFreq:  "80m",
+              eraseAll:   false,
+              compress:   true,
               reportProgress: (idx, written, total) => {
                 const pct = Math.min(100, Math.round((written / total) * 100));
                 ui.progress.style.width = `${pct}%`;
@@ -679,78 +742,63 @@
             for (let i = 0; i < files.length; i++) {
               const file = files[i];
               log(`Flashing image ${i + 1}/${files.length} @ 0x${file.address.toString(16)} (${file.data.length} bytes)`);
-              // Pass a clean copy of the ArrayBuffer to avoid any shared-buffer issues
               const buf = file.data.buffer.slice(file.data.byteOffset, file.data.byteOffset + file.data.byteLength);
-              // compress:false avoids the compressed flash code path that triggers _inputBuffer bug
               await state.esploader.flashData(
                 buf,
-                (written, total) => {
+                (written) => {
                   const pct = Math.min(100, Math.round(((writtenTotal + written) / totalBytes) * 100));
                   ui.progress.style.width = `${pct}%`;
                   setStatus(`Flashing ${i + 1}/${files.length} - ${pct}%`);
                 },
                 file.address,
-                false  // no compression — avoids _inputBuffer bug in deflate path
+                false
               );
               writtenTotal += file.data.length;
             }
           }
 
-          // Reset chip after flashing — tasmota uses hardResetToFirmware() not after()
           try { await state.esploader.hardResetToFirmware(); }
           catch { try { await state.esploader.hardReset(); } catch {} }
           ui.progress.style.width = "100%";
           setStatus("Flash complete - board rebooting!");
           log("Flash complete.");
 
-          // Do NOT call esploader.disconnect() here — that disturbs the port's stream
-          // state and makes subsequent setSignals() calls fail silently. Leave the loader
-          // fully alive so disconnect() can use hardResetToFirmware() through the live
-          // transport (same reliable path as connect-then-disconnect without flash).
           if (state.onDisconnect) {
             try { state.port?.removeEventListener("disconnect", state.onDisconnect); } catch {}
             state.onDisconnect = null;
           }
-          // state.port open, state.esploader alive → disconnect() will use the loader's
-          // own hardResetToFirmware() for a reliable reset, then tear down transport + close.
-          state.lastPort = state.port;   // save reference for Monitor reuse
+          state.lastPort = state.port;
           state.chip = null;
-          // state.connected stays true → "Disconnect" button routes to disconnect(), not connect()
           ui.chip.style.display = "none";
-          log("→ Board running firmware. Click 'Disconnect' to reset and release port, or 'Monitor' for serial output.");
+          log("-> Board running firmware. Click 'Disconnect' to reset and release port, or 'Monitor' for serial output.");
         } catch (err) {
           setStatus(err.message || "Flash failed", "error");
           log(`Error: ${err.message || err}`);
         } finally {
           state.flashing = false;
-          // After a successful flash state.connected stays true (Disconnect button still shown)
-          // but flash buttons must stay disabled — can't reflash without a fresh connect.
-          ui.flashBtn.disabled = true;
+          ui.flashBtn.disabled      = true;
           ui.quickFlashBtn.disabled = true;
-          ui.connectBtn.disabled = false;
+          ui.connectBtn.disabled    = false;
         }
       };
 
+      // ── Disconnect ────────────────────────────────────────────────────────────
       const disconnect = async () => {
         if (state.port && state.onDisconnect) try { state.port.removeEventListener("disconnect", state.onDisconnect); } catch {}
         if (state.port) {
-          // Reset board to firmware via direct setSignals() — unconditional and reliable.
-          // Do NOT use esploader.hardResetToFirmware(): after runStub() the loader becomes
-          // a stub instance that may lack this method; both calls fail silently and no reset
-          // fires. Direct setSignals() works while the port is open regardless of loader state.
-          // This requires the port to be in a clean (undisturbed) state — which is guaranteed
-          // because the flash cleanup no longer calls esploader.disconnect() prematurely.
+          // Direct setSignals() — reliable post-stub, unconditional while port is open.
+          // Do NOT use esploader.hardResetToFirmware() after runStub(); the stub instance
+          // may not implement it and both calls fail silently, leaving the board in ROM mode.
           try {
             await state.port.setSignals({ dataTerminalReady: false, requestToSend: true });
             await sleep(100);
             await state.port.setSignals({ dataTerminalReady: false, requestToSend: false });
           } catch {}
-          // Tear down loader transport to release stream locks, then close port
           if (state.esploader) {
             try { await Promise.race([state.esploader.disconnect(), sleep(800)]); } catch {}
           }
           try { await state.port.close(); } catch {}
-          state.lastPort = state.port; // save physical port for monitor reuse without re-picker
+          state.lastPort = state.port;
         }
         state.port = null; state.onDisconnect = null; state.esploader = null; state.chip = null; state.connected = false;
         ui.chip.style.display = "none";
@@ -762,6 +810,7 @@
         setStatus("Disconnected.");
       };
 
+      // ── Monitor ───────────────────────────────────────────────────────────────
       const disconnectMonitor = async () => {
         if (state.monitorPort && state.monitorDisconnect) try { state.monitorPort.removeEventListener("disconnect", state.monitorDisconnect); } catch {}
         try { if (state.monitorReader) await state.monitorReader.cancel(); } catch {}
@@ -769,7 +818,8 @@
         try { if (state.monitorWriter) state.monitorWriter.releaseLock(); } catch {}
         try { if (state.monitorPipe) await state.monitorPipe; } catch {}
         try { if (state.monitorPort) await state.monitorPort.close(); } catch {}
-        state.monitorPort = null; state.monitorReader = null; state.monitorWriter = null; state.monitorPipe = null; state.monitorDisconnect = null; state.monitorConnected = false;
+        state.monitorPort = null; state.monitorReader = null; state.monitorWriter = null;
+        state.monitorPipe = null; state.monitorDisconnect = null; state.monitorConnected = false;
         ui.monitorBtn.textContent = "Monitor";
         ui.monitorSendBtn.disabled = true;
         setMonitorStatus("Monitor disconnected.");
@@ -782,8 +832,6 @@
         if (state.connected) await disconnect();
         ui.monitorBtn.disabled = true;
         try {
-          // If we just flashed, reuse the same SerialPort — skip the requestPort() picker.
-          // state.lastPort is set by disconnect() and by the post-flash cleanup in flash().
           if (state.lastPort) {
             setMonitorStatus("Reopening port from flash session...");
             state.monitorPort = state.lastPort;
@@ -797,28 +845,24 @@
           try {
             await state.monitorPort.open({ baudRate: parseInt(ui.monitorBaud.value, 10) || 115200 });
           } catch (openErr) {
-            // Port may already be open if close() didn't fully complete — try a fresh picker
             log(`Port reopen failed (${openErr?.message || openErr}), falling back to port picker.`);
             state.monitorPort = await navigator.serial.requestPort({});
             state.monitorPort.addEventListener("disconnect", state.monitorDisconnect);
             await state.monitorPort.open({ baudRate: parseInt(ui.monitorBaud.value, 10) || 115200 });
           }
-          // Reset board to firmware run mode (same pattern as ESPConnect startMonitorFlow):
-          // RTS → EN pin: assert (true) pulls EN low = chip in reset
-          // DTR → IO0 pin: keep false = IO0 HIGH = firmware boot, not download mode
-          // Release RTS → EN HIGH → chip boots into firmware, not ROM bootloader
+          // Reset to firmware: RTS=EN low (reset), DTR=IO0 high (firmware not ROM)
           try {
             await state.monitorPort.setSignals({ dataTerminalReady: false, requestToSend: true });
             await sleep(100);
             await state.monitorPort.setSignals({ dataTerminalReady: false, requestToSend: false });
-            await sleep(400); // wait for ESP32-C5 to finish booting before reading
+            await sleep(400);
           } catch {}
           const decoder = new TextDecoderStream();
-          state.monitorPipe = state.monitorPort.readable.pipeTo(decoder.writable).catch(() => {});
+          state.monitorPipe   = state.monitorPort.readable.pipeTo(decoder.writable).catch(() => {});
           state.monitorReader = decoder.readable.getReader();
           state.monitorWriter = state.monitorPort.writable.getWriter();
           state.monitorConnected = true;
-          ui.monitorBtn.textContent = "Stop monitor";
+          ui.monitorBtn.textContent  = "Stop monitor";
           ui.monitorSendBtn.disabled = false;
           setMonitorStatus(`Monitor connected @ ${ui.monitorBaud.value} baud.`);
           monitorLine(`Monitor connected @ ${ui.monitorBaud.value} baud.`);
@@ -853,11 +897,37 @@
         ui.monitorInput.focus();
       };
 
-      ui.connectBtn.addEventListener("click", () => connect().catch(() => {}));
-      ui.flashBtn.addEventListener("click", () => flash(false).catch(() => {}));
-      ui.quickFlashBtn.addEventListener("click", () => flash(true).catch(() => {}));
-      ui.monitorBtn.addEventListener("click", () => connectMonitor().catch(() => {}));
-      ui.clearMonitorBtn.addEventListener("click", () => { ui.monitorLog.textContent = ""; });
+      // ── Channel / Board switching ─────────────────────────────────────────────
+      const switchChannel = (ch) => {
+        if (ch === state.channel) return;
+        state.channel  = ch;
+        state.manifest = null;
+        document.querySelectorAll("[data-ch]").forEach(b => b.classList.toggle("active", b.dataset.ch === ch));
+        ui.devWarning.style.display = ch === "dev" ? "" : "none";
+        loadManifest().catch(manifestError);
+      };
+
+      const switchBoard = (board) => {
+        if (board === state.board) return;
+        state.board    = board;
+        state.manifest = null;
+        document.querySelectorAll("[data-board]").forEach(b => b.classList.toggle("active", b.dataset.board === board));
+        loadManifest().catch(manifestError);
+      };
+
+      const manifestError = (err) => {
+        ui.release.textContent         = "Manifest not available.";
+        ui.version.innerHTML           = "<strong>Version</strong> unavailable";
+        ui.pageVersion.textContent     = `Web flasher v${PAGE_VERSION} - manifest unavailable`;
+        setStatus(err.message || "Manifest load failed", "error");
+      };
+
+      // ── Event wiring ──────────────────────────────────────────────────────────
+      ui.connectBtn.addEventListener("click",     () => connect().catch(() => {}));
+      ui.flashBtn.addEventListener("click",       () => flash(false).catch(() => {}));
+      ui.quickFlashBtn.addEventListener("click",  () => flash(true).catch(() => {}));
+      ui.monitorBtn.addEventListener("click",     () => connectMonitor().catch(() => {}));
+      ui.clearMonitorBtn.addEventListener("click",() => { ui.monitorLog.textContent = ""; });
       ui.monitorSendBtn.addEventListener("click", () => sendMonitor().catch((err) => { setMonitorStatus(err.message || "Send failed.", "error"); monitorLine(`Error: ${err?.message || err}`); }));
       ui.monitorInput.addEventListener("keydown", (event) => {
         if (event.key !== "Enter") return;
@@ -865,29 +935,12 @@
         sendMonitor().catch((err) => { setMonitorStatus(err.message || "Send failed.", "error"); monitorLine(`Error: ${err?.message || err}`); });
       });
 
-      const switchChannel = (ch) => {
-        if (ch === state.channel) return;
-        state.channel = ch;
-        state.manifest = null;
-        document.querySelectorAll(".channel-btn").forEach(b => b.classList.toggle("active", b.dataset.ch === ch));
-        ui.devWarning.style.display = ch === "dev" ? "" : "none";
-        loadManifest().catch((err) => {
-          ui.release.textContent = "Manifest not available.";
-          ui.version.innerHTML = "<strong>Version</strong> unavailable";
-          ui.pageVersion.textContent = `Web flasher v${PAGE_VERSION} - manifest unavailable`;
-          setStatus(err.message || "Manifest load failed", "error");
-        });
-      };
+      document.querySelectorAll("[data-ch]").forEach(b    => b.addEventListener("click", () => switchChannel(b.dataset.ch)));
+      document.querySelectorAll("[data-board]").forEach(b => b.addEventListener("click", () => switchBoard(b.dataset.board)));
 
-      document.querySelectorAll(".channel-btn").forEach(b => b.addEventListener("click", () => switchChannel(b.dataset.ch)));
-
+      // ── Boot ──────────────────────────────────────────────────────────────────
       setRepoLink();
-      loadManifest().catch((err) => {
-        ui.release.textContent = "Manifest not available yet.";
-        ui.version.innerHTML = "<strong>Version</strong> unavailable";
-        ui.pageVersion.textContent = `Web flasher v${PAGE_VERSION} - manifest unavailable`;
-        setStatus(err.message || "Manifest load failed", "error");
-      });
+      loadManifest().catch(manifestError);
     </script>
   </body>
 </html>

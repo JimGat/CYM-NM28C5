@@ -20,11 +20,16 @@ Apply the same scoped workflow automatically:
 
 Before every `idf.py build` that produces a changed binary:
 1. Increment the PATCH digit in `ESP32C5/CMakeLists.txt` → `set(PROJECT_VER "vX.Y.Z+1")`
-2. Update `ESP32C5/docs/manifest.json` → `"version"` and `"build"` to match
-3. After build, verify: `strings binaries-esp32c5/CYM-NM28C5.bin | grep vX.Y.Z+1`
+2. Update the board-specific manifest:
+   - NM-CYD-C5: `ESP32C5/docs/manifest.json` → `"version"` and `"build"`
+   - WS-C5-28: `ESP32C5/docs/manifest.ws-c5-28.json` → `"version"` and `"build"`
+3. After build, verify the correct binary in the correct directory:
+   - NM-CYD-C5: `strings binaries-esp32c5/CYM-NM28C5.bin | grep vX.Y.Z+1`
+   - WS-C5-28: `strings binaries-ws-c5-28/CYM-WS-C5-28.bin | grep vX.Y.Z+1`
 
 **No two different binaries may share a version number.**
-Never skip this step. It is the only way to track which binary is on the device.
+When building multiple boards in one session, each board gets its own version bump.
+See `cym-release-workflow.md` for the full multi-board build commands and staging lists.
 
 ## Session hygiene
 

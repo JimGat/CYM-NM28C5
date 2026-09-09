@@ -7,7 +7,7 @@ set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-zmuldefs")
 # Update ONLY this line when bumping the version. It is automatically propagated
 # to both the IDF boot log (app_init: App version) and to the FW_VERSION macro
 # used throughout the firmware — no need to edit wifi_common.h separately.
-set(PROJECT_VER "v2.13.51")
+set(PROJECT_VER "v2.13.53")
 
 # Bootstrap ESP-IDF build system
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
@@ -32,17 +32,30 @@ idf_build_set_property(COMPILE_DEFINITIONS "FW_VERSION=\"${PROJECT_VER}\"" APPEN
 idf_component_get_property(lwip_lib lwip COMPONENT_LIB)
 target_compile_definitions(${lwip_lib} PRIVATE IP_FORWARD_ALLOW_TX_ON_RX_NETIF=1)
 
-# ===== POST-BUILD: copy binaries to binaries-esp32c5 every build =====
-set(EXPORT_DIR "${CMAKE_SOURCE_DIR}/binaries-esp32c5")
+# ===== POST-BUILD: board-specific export directory and binary name =====
+# Each board gets its own output directory so binaries never overwrite each other.
+# CONFIG_* variables are available after project() in ESP-IDF CMake.
+if(CONFIG_BOARD_WS_C5_28)
+    set(EXPORT_DIR "${CMAKE_SOURCE_DIR}/binaries-ws-c5-28")
+    set(OUTPUT_BIN_NAME "CYM-WS-C5-28")
+    set(FLASH_SIZE "32MB")
+else()
+    # Default: NM-CYD-C5 (original CYM board)
+    set(EXPORT_DIR "${CMAKE_SOURCE_DIR}/binaries-esp32c5")
+    set(OUTPUT_BIN_NAME "${CMAKE_PROJECT_NAME}")
+    set(FLASH_SIZE "16MB")
+endif()
 file(MAKE_DIRECTORY "${EXPORT_DIR}")
 
 # gen_<PROJECT>_binary is the ESP-IDF target that produces the .bin file.
 # POST_BUILD on it fires unconditionally after every successful binary generation.
+# Note: the internal build artifact is always CYM-NM28C5.bin (project name);
+# it is copied to the export dir under the board-specific OUTPUT_BIN_NAME.
 add_custom_command(
     TARGET "gen_${CMAKE_PROJECT_NAME}_binary" POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy
             "${CMAKE_BINARY_DIR}/${CMAKE_PROJECT_NAME}.bin"
-            "${EXPORT_DIR}/${CMAKE_PROJECT_NAME}.bin"
+            "${EXPORT_DIR}/${OUTPUT_BIN_NAME}.bin"
     COMMAND ${CMAKE_COMMAND} -E copy
             "${CMAKE_BINARY_DIR}/bootloader/bootloader.bin"
             "${EXPORT_DIR}/bootloader.bin"
@@ -50,10 +63,10 @@ add_custom_command(
             "${CMAKE_BINARY_DIR}/partition_table/partition-table.bin"
             "${EXPORT_DIR}/partition-table.bin"
     # Merge bootloader + partition table + firmware into one flat image.
-    # Flash at 0x0000 with any flasher that accepts a full binary.
+    # Flash at 0x0000 with any flasher that accepts a single full binary.
     COMMAND python -m esptool --chip esp32c5 merge_bin
-            -o "${EXPORT_DIR}/${CMAKE_PROJECT_NAME}-full.bin"
-            --flash_mode dio --flash_freq 80m --flash_size 16MB
+            -o "${EXPORT_DIR}/${OUTPUT_BIN_NAME}-full.bin"
+            --flash_mode dio --flash_freq 80m --flash_size ${FLASH_SIZE}
             0x2000  "${CMAKE_BINARY_DIR}/bootloader/bootloader.bin"
             0x8000  "${CMAKE_BINARY_DIR}/partition_table/partition-table.bin"
             0x10000 "${CMAKE_BINARY_DIR}/${CMAKE_PROJECT_NAME}.bin"
@@ -75,7 +88,7 @@ if(Python3_FOUND)
                 "${CMAKE_BINARY_DIR}/${CMAKE_PROJECT_NAME}.map"
                 "${CMAKE_SOURCE_DIR}/docs"
                 "${PROJECT_VER}"
-                "${EXPORT_DIR}/${CMAKE_PROJECT_NAME}.bin"
+                "${EXPORT_DIR}/${OUTPUT_BIN_NAME}.bin"
         COMMENT "Updating docs/memory-budget.md from linker map"
         VERBATIM
     )
