@@ -47,8 +47,9 @@ case "$BOARD" in
 
     # ── ESP32 boards ─────────────────────────────────────────────────────────
 
-    cyd2usb)
-        # ESP32-2432S028R classic CYD (Phase 3)
+    cyd-2432s028|cyd2usb)
+        # ESP32-2432S028 classic CYD — output: CYM-CYD-2432S028.bin
+        # "cyd2usb" is an alias kept for backwards compatibility.
         SOC_DIR="$REPO_ROOT/ESP32"
         TARGET="esp32"
         BUILD_DIR="build_cyd2usb"
@@ -87,7 +88,7 @@ case "$BOARD" in
         echo ""
         echo "Known boards:"
         echo "  ESP32-C5: nm-cyd-c5  ws-c5-28"
-        echo "  ESP32:    cyd2usb"
+        echo "  ESP32:    cyd-2432s028  (alias: cyd2usb)"
         echo "  ESP32-S3: hosyond-s3-28  hosyond-s3-35  hosyond-s3-40"
         echo ""
         exit 1

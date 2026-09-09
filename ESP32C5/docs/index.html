@@ -295,6 +295,7 @@
                 <span class="selector-label">Board</span>
                 <button class="sel-btn active" data-board="nm-cyd-c5">NM-CYD-C5</button>
                 <button class="sel-btn" data-board="ws-c5-28">WS-C5-28</button>
+                <button class="sel-btn" data-board="cyd-2432s028">CYD-2432S028</button>
               </div>
 
               <div id="devWarning" class="dev-warn" style="display:none;"><strong>Development build</strong> &mdash; binaries fetched live from the <code>Jimgat_Dev</code> branch. May be unstable.</div>
@@ -430,34 +431,47 @@
       };
 
       // Board definitions — add new boards here.
-      const RAW_BASE     = "https://raw.githubusercontent.com/JimGat/CYM/Jimgat_Dev/ESP32C5";
+      // All channels use raw.githubusercontent.com for consistency across SoCs.
+      // Stable = main branch; Dev = Jimgat_Dev branch.
+      const REPO   = "JimGat/CYM";
+      const BRANCH = { stable: "main", dev: "Jimgat_Dev" };
+      const raw = (branch, soc, path) =>
+        `https://raw.githubusercontent.com/${REPO}/${branch}/${soc}/${path}`;
+
       const BOARDS = {
         "nm-cyd-c5": {
-          label:          "NM-CYD-C5",
-          desc:           "Web Serial flasher for the NM-CYD-C5 WiFi 6 &amp; BLE security toolkit (ESP32-C5, 16 MB flash, 8 MB PSRAM).",
-          stableManifest: "manifest.json",
-          devManifest:    `${RAW_BASE}/docs/manifest.json`,
-          devBinDir:      `${RAW_BASE}/binaries-esp32c5`,
-          stableBinDir:   "../binaries-esp32c5",
-          appBin:         "CYM-NM28C5.bin",
-          manifestFile:   "manifest.json",
+          label:   "NM-CYD-C5",
+          chip:    "ESP32-C5",
+          soc:     "ESP32C5",
+          desc:    "NM-CYD-C5 WiFi 6 &amp; BLE security toolkit (ESP32-C5, 16 MB flash, 8 MB PSRAM, NM-RF-HAT support).",
+          binDir:  "binaries-esp32c5",
+          appBin:  "CYM-NM28C5.bin",
+          manifest: "docs/manifest.json",
         },
         "ws-c5-28": {
-          label:          "WS-C5-28",
-          desc:           "Web Serial flasher for the Waveshare ESP32-C5-Touch-LCD-2.8 (ESP32-C5, 32 MB flash, 8 MB PSRAM, capacitive touch).",
-          stableManifest: "manifest.ws-c5-28.json",
-          devManifest:    `${RAW_BASE}/docs/manifest.ws-c5-28.json`,
-          devBinDir:      `${RAW_BASE}/binaries-ws-c5-28`,
-          stableBinDir:   "../binaries-ws-c5-28",
-          appBin:         "CYM-WS-C5-28.bin",
-          manifestFile:   "manifest.ws-c5-28.json",
+          label:   "WS-C5-28",
+          chip:    "ESP32-C5",
+          soc:     "ESP32C5",
+          desc:    "Waveshare ESP32-C5-Touch-LCD-2.8 (ESP32-C5, 32 MB flash, 8 MB PSRAM, capacitive touch, I2C backlight).",
+          binDir:  "binaries-ws-c5-28",
+          appBin:  "CYM-WS-C5-28.bin",
+          manifest: "docs/manifest.ws-c5-28.json",
+        },
+        "cyd-2432s028": {
+          label:   "CYD-2432S028",
+          chip:    "ESP32",
+          soc:     "ESP32",
+          desc:    "Classic CYD ESP32-2432S028 (ESP32 dual-core, 4 MB flash, ILI9341 320x240, XPT2046 touch, NM-RF-HAT via SD Card Shim).",
+          binDir:  "binaries-cyd-2432s028",
+          appBin:  "CYM-CYD-2432S028.bin",
+          manifest: "docs/manifest.cyd-2432s028.json",
         },
       };
 
       const state = {
-        manifest:         null,
-        channel:          "stable",
-        board:            "nm-cyd-c5",
+        manifest:          null,
+        channel:           "stable",
+        board:             "nm-cyd-c5",
         port:             null,
         onDisconnect:     null,
         esploader:        null,
@@ -517,18 +531,17 @@
 
       // ── Board UI sync ─────────────────────────────────────────────────────────
       const updateBoardUI = () => {
-        const bd = BOARDS[state.board];
+        const bd     = BOARDS[state.board];
+        const branch = BRANCH[state.channel];
+        const binUrl = raw(branch, bd.soc, bd.binDir);
         ui.boardPill.innerHTML   = `<strong>Board</strong> ${bd.label}`;
         ui.headerDesc.innerHTML  = bd.desc;
-        // Update download links
-        const isStable = state.channel === "stable";
-        const binDir   = isStable ? bd.stableBinDir : bd.devBinDir;
-        ui.dlApp.href           = `${binDir}/${bd.appBin}`;
-        ui.dlAppName.textContent = bd.appBin;
-        ui.dlBoot.href          = `${binDir}/bootloader.bin`;
-        ui.dlPart.href          = `${binDir}/partition-table.bin`;
-        ui.dlManifest.href      = isStable ? bd.stableManifest : bd.devManifest;
-        ui.dlManifestName.textContent = bd.manifestFile;
+        ui.dlApp.href            = `${binUrl}/${bd.appBin}`;
+        ui.dlAppName.textContent  = bd.appBin;
+        ui.dlBoot.href           = `${binUrl}/bootloader.bin`;
+        ui.dlPart.href           = `${binUrl}/partition-table.bin`;
+        ui.dlManifest.href       = raw(branch, bd.soc, bd.manifest);
+        ui.dlManifestName.textContent = bd.manifest.replace("docs/", "");
       };
 
       // ── Manifest ──────────────────────────────────────────────────────────────
@@ -544,27 +557,24 @@
       };
 
       const loadManifest = async () => {
-        const bd  = BOARDS[state.board];
-        let url, raw;
-        if (state.channel === "dev") {
-          url = bd.devManifest;
-          const res = await fetch(url, { cache: "no-store" });
-          if (!res.ok) throw new Error(`Dev manifest fetch failed: ${res.status} ${res.statusText}`);
-          raw = await res.json();
-          // Rewrite relative part paths to absolute GitHub raw URLs
-          if (Array.isArray(raw?.parts)) {
-            raw.parts = raw.parts.map(p => ({
-              ...p,
-              path: `${bd.devBinDir}/${p.path.replace(/^.*[\\/]/, "")}`,
-            }));
-          }
-        } else {
-          url = new URL(bd.stableManifest, window.location.href).toString();
-          const res = await fetch(url, { cache: "no-store" });
-          if (!res.ok) throw new Error(`Manifest fetch failed: ${res.status} ${res.statusText}`);
-          raw = await res.json();
+        const bd          = BOARDS[state.board];
+        const branch      = BRANCH[state.channel];
+        const manifestUrl = raw(branch, bd.soc, bd.manifest);
+        const binDirUrl   = raw(branch, bd.soc, bd.binDir);
+
+        const res = await fetch(manifestUrl, { cache: "no-store" });
+        if (!res.ok) throw new Error(`Manifest fetch failed [${state.channel}/${state.board}]: ${res.status} ${res.statusText}`);
+        const rawData = await res.json();
+
+        // Rewrite relative part paths to absolute raw.githubusercontent.com URLs
+        if (Array.isArray(rawData?.parts)) {
+          rawData.parts = rawData.parts.map(p => ({
+            ...p,
+            path: `${binDirUrl}/${p.path.replace(/^.*[\\/]/, "")}`,
+          }));
         }
-        state.manifest = normalizeManifest(raw);
+
+        state.manifest = normalizeManifest(rawData);
         if (!state.manifest.parts.length) throw new Error("Manifest has no flash parts.");
         ui.manifest.style.display = "inline-flex";
         ui.manifest.textContent   = `${state.manifest.parts.length} image(s)`;
@@ -575,7 +585,7 @@
         document.title = `${state.manifest.name} ${state.manifest.version}`;
         updateBoardUI();
         setStatus("Manifest loaded.");
-        log(`Manifest [${state.channel}/${state.board}]: ${url}`);
+        log(`Manifest [${state.channel}/${state.board}]: ${manifestUrl}`);
       };
 
       // ── Connection ────────────────────────────────────────────────────────────

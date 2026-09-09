@@ -55,6 +55,45 @@ ESP32C5/binaries-esp32c5/partition-table.bin
 
 ---
 
+### CYD-2432S028 (Classic CYD ESP32-2432S028)
+
+```bash
+cd ESP32
+idf.py -B build_cyd2usb \
+  -DSDKCONFIG=build_cyd2usb/sdkconfig \
+  "-DSDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.cyd2usb" \
+  build
+```
+
+Or from repo root: `make cyd-2432s028`
+
+| Item | Value |
+|------|-------|
+| SoC dir | `ESP32/` (not ESP32C5/) |
+| Output dir | `ESP32/binaries-cyd-2432s028/` |
+| App binary | `CYM-CYD-2432S028.bin` |
+| Full image | `CYM-CYD-2432S028-full.bin` |
+| Manifest | `ESP32/docs/manifest.cyd-2432s028.json` |
+| Web flasher board | `cyd-2432s028` |
+| Flash size | 4 MB |
+| Bootloader offset | 0x1000 (ESP32, NOT 0x2000) |
+
+Verify: `strings ESP32/binaries-cyd-2432s028/CYM-CYD-2432S028.bin | grep vX.Y.Z`
+
+Stage per commit:
+```
+ESP32/CMakeLists.txt
+ESP32/docs/manifest.cyd-2432s028.json
+ESP32C5/docs/memory-budget.md
+ESP32/binaries-cyd-2432s028/CYM-CYD-2432S028.bin
+ESP32/binaries-cyd-2432s028/CYM-CYD-2432S028-full.bin
+ESP32/binaries-cyd-2432s028/bootloader.bin
+ESP32/binaries-cyd-2432s028/partition-table.bin
+```
+(plus any source files changed for that board)
+
+---
+
 ### WS-C5-28 (Waveshare ESP32-C5-Touch-LCD-2.8)
 
 ```bash
@@ -91,11 +130,14 @@ ESP32C5/binaries-ws-c5-28/partition-table.bin
 
 ## Version numbering across boards
 
-The single `PROJECT_VER` in `ESP32C5/CMakeLists.txt` is shared but each board build
-increments it before building. Workflow when building multiple boards in one session:
+`PROJECT_VER` lives in each SoC's CMakeLists.txt. Each board build gets its own version bump.
+Workflow when building multiple boards in one session:
 
 1. Bump version → v2.13.X → build NM-CYD-C5 → commit NM-CYD-C5 files
 2. Bump version → v2.13.X+1 → build WS-C5-28 → commit WS-C5-28 files
+3. Bump version → v2.13.X+2 → build CYD-2432S028 (in ESP32/) → commit CYD-2432S028 files
+
+For CI verification across all boards: `make all-boards` (builds nm-cyd-c5, ws-c5-28, cyd-2432s028 in sequence).
 
 Never build two different boards at the same version number.
 
@@ -117,11 +159,15 @@ gh release create vX.Y.Z \
   ESP32C5/binaries-ws-c5-28/CYM-WS-C5-28.bin \
   ESP32C5/binaries-ws-c5-28/CYM-WS-C5-28-full.bin \
   ESP32C5/binaries-ws-c5-28/bootloader.bin \
-  ESP32C5/binaries-ws-c5-28/partition-table.bin
+  ESP32C5/binaries-ws-c5-28/partition-table.bin \
+  ESP32/binaries-cyd-2432s028/CYM-CYD-2432S028.bin \
+  ESP32/binaries-cyd-2432s028/CYM-CYD-2432S028-full.bin \
+  ESP32/binaries-cyd-2432s028/bootloader.bin \
+  ESP32/binaries-cyd-2432s028/partition-table.bin
 ```
 
-Note: the two `bootloader.bin` and `partition-table.bin` files differ between boards
-(16 MB vs 32 MB flash config). Use `--name` flags if GitHub CLI requires disambiguation.
+Note: bootloader.bin and partition-table.bin differ between boards (flash size and offsets).
+Use `--name board-filename` flags if GitHub CLI requires disambiguation.
 
 `*-full.bin` is a merged flat image (bootloader + partition table + firmware) generated
 by the CMake post-build hook. Flash at address `0x0000` with any full-binary flasher.
@@ -133,10 +179,11 @@ Never create a release without all binaries from all boards attached.
 
 The flasher supports board selection at runtime:
 
-| UI selector | Manifest loaded | Binary directory |
-|-------------|----------------|-----------------|
-| NM-CYD-C5 | `docs/manifest.json` | `binaries-esp32c5/` |
-| WS-C5-28 | `docs/manifest.ws-c5-28.json` | `binaries-ws-c5-28/` |
+| UI selector | SoC | Manifest | Binary directory |
+|-------------|-----|----------|-----------------|
+| NM-CYD-C5 | ESP32C5 | `ESP32C5/docs/manifest.json` | `ESP32C5/binaries-esp32c5/` |
+| WS-C5-28 | ESP32C5 | `ESP32C5/docs/manifest.ws-c5-28.json` | `ESP32C5/binaries-ws-c5-28/` |
+| CYD-2432S028 | ESP32 | `ESP32/docs/manifest.cyd-2432s028.json` | `ESP32/binaries-cyd-2432s028/` |
 
 To add a new board to the web flasher, add an entry to the `BOARDS` object in `docs/index.html`
 and create the corresponding `docs/manifest.<board>.json`.

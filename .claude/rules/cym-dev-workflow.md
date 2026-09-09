@@ -18,14 +18,18 @@ Apply the same scoped workflow automatically:
 
 ## Version bump — MANDATORY before every build
 
-Before every `idf.py build` that produces a changed binary:
-1. Increment the PATCH digit in `ESP32C5/CMakeLists.txt` → `set(PROJECT_VER "vX.Y.Z+1")`
+Before every build that produces a changed binary:
+1. Increment the PATCH digit in the SoC's CMakeLists.txt:
+   - ESP32C5 boards: `ESP32C5/CMakeLists.txt` → `set(PROJECT_VER "vX.Y.Z+1")`
+   - ESP32 boards: `ESP32/CMakeLists.txt` → `set(PROJECT_VER "vX.Y.Z+1")`
 2. Update the board-specific manifest:
    - NM-CYD-C5: `ESP32C5/docs/manifest.json` → `"version"` and `"build"`
    - WS-C5-28: `ESP32C5/docs/manifest.ws-c5-28.json` → `"version"` and `"build"`
+   - CYD-2432S028: `ESP32/docs/manifest.cyd-2432s028.json` → `"version"` and `"build"`
 3. After build, verify the correct binary in the correct directory:
-   - NM-CYD-C5: `strings binaries-esp32c5/CYM-NM28C5.bin | grep vX.Y.Z+1`
-   - WS-C5-28: `strings binaries-ws-c5-28/CYM-WS-C5-28.bin | grep vX.Y.Z+1`
+   - NM-CYD-C5: `strings ESP32C5/binaries-esp32c5/CYM-NM28C5.bin | grep vX.Y.Z+1`
+   - WS-C5-28: `strings ESP32C5/binaries-ws-c5-28/CYM-WS-C5-28.bin | grep vX.Y.Z+1`
+   - CYD-2432S028: `strings ESP32/binaries-cyd-2432s028/CYM-CYD-2432S028.bin | grep vX.Y.Z+1`
 
 **No two different binaries may share a version number.**
 When building multiple boards in one session, each board gets its own version bump.
